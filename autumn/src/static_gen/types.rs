@@ -91,6 +91,12 @@ pub struct StaticRouteMeta {
     /// registered are passed through unfiltered; see
     /// `seo::assemble_seo_bodies` for the reasoning.
     pub seo: crate::seo::SeoRouteDefaults,
+    /// The `Content-Type` declared on the route attribute with
+    /// `content_type = "..."` (#2403). `None` when not declared.
+    ///
+    /// A declared type is the author's intent. Build records it as is, and the
+    /// serve path and ISR never replace it with the route extension type.
+    pub content_type: Option<&'static str>,
 }
 
 impl std::fmt::Debug for StaticRouteMeta {
@@ -101,6 +107,7 @@ impl std::fmt::Debug for StaticRouteMeta {
             .field("revalidate", &self.revalidate)
             .field("params_fn", &self.params_fn.as_ref().map(|_| "..."))
             .field("seo", &self.seo)
+            .field("content_type", &self.content_type)
             .finish()
     }
 }
@@ -191,6 +198,15 @@ pub struct ManifestEntry {
     /// [`resolved_content_type`](crate::static_gen::resolved_content_type).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    /// `true` when [`content_type`](Self::content_type) came from
+    /// `#[static_get(.., content_type = "..")]` (#2403), not from the response.
+    ///
+    /// An inferred type can be a return-type default (`String`, `Vec<u8>`), so
+    /// the serve path replaces it with the route extension type. A declared
+    /// type is intent and is served and guarded as is. Absent means `false`,
+    /// which is what every earlier manifest holds.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub content_type_explicit: bool,
 }
 
 impl ManifestEntry {
@@ -216,6 +232,7 @@ impl ManifestEntry {
             file: file.into(),
             revalidate: None,
             content_type: None,
+            content_type_explicit: false,
         }
     }
 
@@ -230,6 +247,13 @@ impl ManifestEntry {
     #[must_use]
     pub fn with_content_type(mut self, content_type: Option<String>) -> Self {
         self.content_type = content_type;
+        self
+    }
+
+    /// Mark the recorded `Content-Type` as declared on the route (#2403).
+    #[must_use]
+    pub const fn with_content_type_explicit(mut self, explicit: bool) -> Self {
+        self.content_type_explicit = explicit;
         self
     }
 }
@@ -468,6 +492,33 @@ mod tests {
         assert!(bare.content_type.is_none());
     }
 
+    // ── #2403: a route-declared Content-Type is explicit ─────────────────────
+
+    #[test]
+    fn manifest_entry_defaults_to_not_explicit_and_omits_the_flag() {
+        let entry = ManifestEntry::new("a/index.html");
+        assert!(!entry.content_type_explicit);
+        let json = serde_json::to_string(&entry).expect("serialize");
+        assert!(!json.contains("content_type_explicit"), "{json}");
+    }
+
+    #[test]
+    fn explicit_content_type_roundtrips() {
+        let entry = ManifestEntry::new("logo.png/index.html")
+            .with_content_type(Some("application/octet-stream".to_owned()))
+            .with_content_type_explicit(true);
+        let json = serde_json::to_string(&entry).expect("serialize");
+        let loaded: ManifestEntry = serde_json::from_str(&json).expect("deserialize");
+        assert!(loaded.content_type_explicit);
+    }
+
+    #[test]
+    fn legacy_entry_without_flag_is_not_explicit() {
+        let json = r#"{ "file": "a/index.html", "revalidate": null, "content_type": "text/css" }"#;
+        let loaded: ManifestEntry = serde_json::from_str(json).expect("legacy entry loads");
+        assert!(!loaded.content_type_explicit);
+    }
+
     #[test]
     fn static_route_meta_clone() {
         let meta = StaticRouteMeta {
@@ -476,8 +527,10 @@ mod tests {
             revalidate: Some(60),
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: Some("text/plain"),
         };
         let copy = meta.clone();
+        assert_eq!(copy.content_type, Some("text/plain"));
         // Use original after clone to prove it's a real copy, not a move
         assert_eq!(meta.path, copy.path);
         assert_eq!(copy.name, "test_handler");
@@ -523,6 +576,7 @@ mod tests {
             revalidate: None,
             params_fn: Some(dummy_params),
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         };
         assert!(meta.params_fn.is_some());
         assert_eq!(meta.path, "/posts/{slug}");
@@ -536,6 +590,7 @@ mod tests {
             revalidate: None,
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         };
         let debug = format!("{meta:?}");
         assert!(debug.contains("test"));

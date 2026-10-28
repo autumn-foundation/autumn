@@ -23,7 +23,7 @@
 //! the last one happened to record. The driver clears both in the child's
 //! environment so every run measures the app, not its own last answer.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -157,8 +157,10 @@ pub fn run(opts: &CalibrateOptions<'_>) -> i32 {
         all: calibration.all_features,
         no_default: calibration.no_default_features,
     };
-    let binary = build_binary(opts, &features);
-    let manifest_dir = package_manifest_dir(opts.package);
+    let crate::routes::ResolvedBinary {
+        path: binary,
+        manifest_dir,
+    } = build_binary(opts, &features);
 
     let dump = match dump_routes(&binary, &calibration.profile, manifest_dir.as_deref()) {
         Ok(dump) => dump,
@@ -377,7 +379,10 @@ fn normalize_recorded(calibration: &Calibration) -> Calibration {
 /// Infallible from this side: both helpers report and exit the process
 /// themselves on a compilation or resolution failure, exactly as `autumn
 /// routes` does.
-fn build_binary(opts: &CalibrateOptions<'_>, features: &crate::routes::CargoFeatures) -> PathBuf {
+fn build_binary(
+    opts: &CalibrateOptions<'_>,
+    features: &crate::routes::CargoFeatures,
+) -> crate::routes::ResolvedBinary {
     eprintln!("  building (release) \u{2026}");
     // The deployed binary's feature selection is forwarded verbatim. Measuring
     // a default-feature build and then enforcing its limit on a production
@@ -388,37 +393,14 @@ fn build_binary(opts: &CalibrateOptions<'_>, features: &crate::routes::CargoFeat
         features,
         &crate::routes::CargoProfile::from_release(true),
     );
-    crate::routes::find_binary_in_profile(
+    // The package directory comes from the same selection as the binary.
+    // The child must start in that directory. Autumn reads `autumn.toml` from
+    // the working directory, not from the workspace root.
+    crate::routes::find_resolved_binary_in_profile(
         opts.package,
         opts.bin,
         &crate::routes::CargoProfile::from_release(true),
     )
-}
-
-/// Directory the calibrated package's `autumn.toml` lives in.
-///
-/// A workspace member selected with `-p` must be booted against *its* manifest,
-/// not the workspace root's: autumn's config loader searches the working
-/// directory, so without this the child would read a root `autumn.toml` (or
-/// none) and calibrate a configuration the package never runs.
-fn package_manifest_dir(package: Option<&str>) -> Option<PathBuf> {
-    let package = package?;
-    let output = Command::new("cargo")
-        .args(["metadata", "--format-version=1", "--no-deps"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
-    metadata
-        .get("packages")?
-        .as_array()?
-        .iter()
-        .find(|pkg| pkg.get("name").and_then(serde_json::Value::as_str) == Some(package))
-        .and_then(|pkg| pkg.get("manifest_path"))
-        .and_then(serde_json::Value::as_str)
-        .and_then(|manifest| Path::new(manifest).parent().map(Path::to_path_buf))
 }
 
 /// Environment every child of a calibration run shares.
@@ -513,7 +495,8 @@ fn dump_routes(
     manifest_dir: Option<&Path>,
 ) -> Result<Vec<DumpedRoute>, String> {
     let mut command = Command::new(binary);
-    command.env("AUTUMN_DUMP_ROUTES", "1");
+    command.env(crate::routes::DUMP_ENV, "1");
+    crate::routes::clear_other_dump_modes(&mut command, crate::routes::DUMP_ENV);
     // The route graph is profile-dependent, so the dump must be taken under
     // the same profile the ladder will run under.
     for (key, value) in child_env(profile) {

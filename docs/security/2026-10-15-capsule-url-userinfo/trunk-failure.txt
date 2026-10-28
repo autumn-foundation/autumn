@@ -1,0 +1,1 @@
+URL userinfo credential reached the capsule on disk: ["https://warden-userinfo-user-sentinel:warden-userinfo-pass-sentinel@payments.example/charge"]

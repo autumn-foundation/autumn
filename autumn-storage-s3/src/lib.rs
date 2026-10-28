@@ -229,6 +229,16 @@ async fn abort_multipart(client: &Client, bucket: &str, key: &str, upload_id: &s
         .await;
 }
 
+/// Check S3 egress against a failure capsule.
+///
+/// This client is not autumn-web's recorded outbound seam. A capsule replay
+/// refuses the call, and capture marks the capsule incomplete.
+fn guard_egress(method: &str) -> Result<(), BlobStoreError> {
+    // The target does not name the object: a key can hold personal data.
+    autumn_web::capsule::guard_egress("s3 blob store", method, "s3 object")
+        .map_err(|refused| BlobStoreError::backend(refused.to_string()))
+}
+
 impl BlobStore for S3BlobStore {
     fn provider_id(&self) -> &str {
         &self.options.provider_id
@@ -243,6 +253,7 @@ impl BlobStore for S3BlobStore {
         let byte_size = bytes.len() as u64;
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("PUT")?;
             let result = self
                 .client
                 .put_object()
@@ -259,6 +270,49 @@ impl BlobStore for S3BlobStore {
                 blob = blob.with_etag(e);
             }
             Ok(blob)
+        })
+    }
+
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        content_type: &'a str,
+        bytes: Bytes,
+    ) -> BlobFuture<'a, Option<Blob>> {
+        let byte_size = bytes.len() as u64;
+        Box::pin(async move {
+            validate_key(key)?;
+            guard_egress("PUT")?;
+            // `If-None-Match: *` makes S3 refuse the write (412) when the key
+            // exists, so a blob of another writer is never replaced. A 409
+            // means a parallel conditional write: the key is taken too.
+            let result = self
+                .client
+                .put_object()
+                .bucket(&self.options.bucket)
+                .key(key)
+                .content_type(content_type)
+                .if_none_match("*")
+                .body(bytes.into())
+                .send()
+                .await;
+            match result {
+                Ok(output) => {
+                    let mut blob =
+                        Blob::new(&self.options.provider_id, key, content_type, byte_size);
+                    if let Some(etag) = output.e_tag() {
+                        blob = blob.with_etag(etag.to_owned());
+                    }
+                    Ok(Some(blob))
+                }
+                Err(e)
+                    if e.raw_response()
+                        .is_some_and(|r| matches!(r.status().as_u16(), 409 | 412)) =>
+                {
+                    Ok(None)
+                }
+                Err(e) => Err(BlobStoreError::backend(e.to_string())),
+            }
         })
     }
 
@@ -291,6 +345,10 @@ impl BlobStore for S3BlobStore {
                     }
                 }
             }
+
+            // Not before the stream is read: a stream that fails first sends
+            // nothing. A short stream is guarded in `put`.
+            guard_egress("PUT")?;
 
             // The stream exceeded MULTIPART_PART_SIZE — use S3 multipart upload
             // so the payload is never fully buffered in memory.
@@ -413,6 +471,7 @@ impl BlobStore for S3BlobStore {
     fn get<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Bytes> {
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("GET")?;
             let result = self
                 .client
                 .get_object()
@@ -440,6 +499,7 @@ impl BlobStore for S3BlobStore {
     fn delete<'a>(&'a self, key: &'a str) -> BlobFuture<'a, ()> {
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("DELETE")?;
             self.client
                 .delete_object()
                 .bucket(&self.options.bucket)
@@ -454,6 +514,7 @@ impl BlobStore for S3BlobStore {
     fn head<'a>(&'a self, key: &'a str) -> BlobFuture<'a, Option<BlobMeta>> {
         Box::pin(async move {
             validate_key(key)?;
+            guard_egress("HEAD")?;
             let result = self
                 .client
                 .head_object()
@@ -627,6 +688,87 @@ mod tests {
                 bucket: "test-bucket".to_owned(),
             }),
         }
+    }
+
+    /// Serve one HTTP request on a local port and answer with `status`.
+    /// The task gives back the request head, in lower case.
+    async fn serve_one(status: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (mut buf, mut chunk) = (Vec::new(), [0_u8; 4096]);
+            let head = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "the request ended early");
+                buf.extend_from_slice(&chunk[..n]);
+                let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                if buf.len() >= end + 4 + body_len {
+                    break head;
+                }
+            };
+            let body = if status.starts_with("412") {
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>PreconditionFailed</Code>\
+                 <Message>At least one of the pre-conditions you specified did not hold</Message>\
+                 </Error>"
+            } else {
+                ""
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-length: {}\r\netag: \"e1\"\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            head
+        });
+        (endpoint, task)
+    }
+
+    fn store_at(endpoint: &str) -> S3BlobStore {
+        let client = test_client(endpoint);
+        S3BlobStore {
+            client: client.clone(),
+            presign_client: client,
+            options: Arc::new(S3Options {
+                provider_id: "s3".to_owned(),
+                bucket: "test-bucket".to_owned(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_asks_s3_to_refuse_a_taken_key() {
+        let (endpoint, server) = serve_one("412 Precondition Failed").await;
+        let result = store_at(&endpoint)
+            .put_if_absent("a/b.png", "image/png", Bytes::from_static(b"abc"))
+            .await
+            .expect("412 means the key is taken");
+        assert!(result.is_none(), "{result:?}");
+        let head = server.await.unwrap();
+        assert!(head.starts_with("put /test-bucket/a/b.png"), "{head}");
+        assert!(head.contains("\r\nif-none-match: *"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_creates_a_free_key() {
+        let (endpoint, server) = serve_one("200 OK").await;
+        let blob = store_at(&endpoint)
+            .put_if_absent("a/b.png", "image/png", Bytes::from_static(b"abc"))
+            .await
+            .expect("created")
+            .expect("the key was free");
+        assert_eq!(blob.byte_size, 3);
+        assert!(server.await.unwrap().contains("\r\nif-none-match: *"));
     }
 
     fn assert_invalid_input<T: std::fmt::Debug>(result: Result<T, BlobStoreError>) {
@@ -855,6 +997,50 @@ mod tests {
                 .presigned_url("avatars//user.png", Duration::from_secs(60))
                 .await,
         );
+    }
+
+    /// autumn-web #2351 item 1: under a capsule replay the store refuses to
+    /// call S3, and logs a divergence.
+    #[tokio::test]
+    async fn a_capsule_replay_refuses_s3_egress() {
+        let store = test_store();
+        let tape = std::sync::Arc::new(autumn_web::capsule::ReplayEffects::new(
+            autumn_web::capsule::CapsuleEffects::default(),
+        ));
+        let result =
+            autumn_web::capsule::with_effect_tape(std::sync::Arc::clone(&tape), store.get("a.txt"))
+                .await;
+        let error = result.expect_err("a replay refuses S3 egress");
+        assert!(
+            error.to_string().contains("blocked during replay"),
+            "{error}"
+        );
+        assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// autumn-web #2351, Codex review on #3222: a stream that fails before
+    /// the multipart threshold sends nothing, so a replay does not refuse it.
+    #[tokio::test]
+    async fn a_stream_error_before_any_upload_is_not_egress() {
+        let store = test_store();
+        let tape = std::sync::Arc::new(autumn_web::capsule::ReplayEffects::new(
+            autumn_web::capsule::CapsuleEffects::default(),
+        ));
+        let stream: autumn_web::storage::ByteStream<'_> =
+            Box::pin(futures::stream::iter(vec![Err(BlobStoreError::backend(
+                "the upload body failed",
+            ))]));
+        let result = autumn_web::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            store.put_stream("a.txt", "text/plain", stream),
+        )
+        .await;
+        let error = result.expect_err("the stream failed");
+        assert!(
+            error.to_string().contains("the upload body failed"),
+            "{error}"
+        );
+        assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
     }
 
     #[test]

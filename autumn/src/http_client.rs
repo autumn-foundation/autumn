@@ -2,8 +2,9 @@
 //!
 //! Exposes [`Client`](crate::http_client::Client) as `autumn_web::http::Client` — a thin `reqwest`-backed
 //! outbound HTTP client that propagates the active span's `traceparent` /
-//! `tracestate` headers, retries transient failures, and is mockable in tests
-//! via [`TestApp::http_mock`](crate::test::TestApp::http_mock).
+//! `tracestate` headers and the current request's `x-request-id`, opens one
+//! CLIENT span per attempt, retries transient failures, and is mockable in
+//! tests via [`TestApp::http_mock`](crate::test::TestApp::http_mock).
 //!
 //! # Quick start
 //!
@@ -55,7 +56,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -64,6 +65,10 @@ use reqwest::Method;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+
+use crate::config::RetryBudgetConfig;
+use crate::deadline::{DEADLINE_HEADER, Deadline};
+use crate::retry_budget::{RetryBudget, RetryBudgets, RetryKind};
 
 // ── Error ────────────────────────────────────────────────────────────────────
 
@@ -86,6 +91,18 @@ pub enum ClientError {
     /// The outbound circuit breaker is open.
     #[error("outbound circuit breaker is open")]
     CircuitBreakerOpen,
+    /// A staging fault (`[fault_injection]`, target `http`) failed the call
+    /// before it was sent.
+    #[error("{0}")]
+    FaultInjected(String),
+    /// The client-side adaptive throttle rejected the attempt locally,
+    /// because the host rejected too many recent attempts (issue #3068).
+    /// See `[http.client.adaptive_throttle]`.
+    #[error("outbound request to {host} throttled locally: the host rejects too many requests")]
+    ThrottledLocally {
+        /// The host (`host` or `host:port`).
+        host: String,
+    },
     /// The capsule recorded a transport failure for this call, and replay
     /// reproduced it (#1634).
     ///
@@ -156,6 +173,11 @@ pub enum ClientError {
     /// request or response it could not build.
     #[error("simulated network: {0}")]
     SimNetwork(String),
+
+    /// The request deadline passed before an attempt could start (issue
+    /// #3058). See [`crate::deadline`].
+    #[error("request deadline exceeded before the outbound request could start")]
+    DeadlineExceeded,
 }
 
 // ── Response ─────────────────────────────────────────────────────────────────
@@ -464,18 +486,25 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
 // ── RetryPolicy ──────────────────────────────────────────────────────────────
 
 /// Retry configuration for a [`RequestBuilder`].
+///
+/// The wait before retry `n` (0 = first retry) is full jitter:
+/// `random(0, min(max_backoff, 100 ms * 2^n))`. See [`crate::backoff`].
 #[derive(Clone, Debug)]
 pub struct RetryPolicy {
     /// Maximum number of additional attempts after the first failure.  Zero
     /// means no retries (one attempt total).
     pub max_retries: u32,
     /// When `true` (the default), only GET / HEAD / PUT / DELETE / OPTIONS /
-    /// TRACE are retried; POST and PATCH are not.
+    /// TRACE are retried; POST and PATCH are not. Clear it with
+    /// [`RequestBuilder::retry_non_idempotent`].
     pub retry_idempotent_only: bool,
-    /// Maximum Retry-After sleep duration to accept before clamping.
+    /// Cap on a `Retry-After` hint. The wait is also at most the backoff
+    /// plus 5 s, so a value above 5 s has no effect.
     pub max_retry_after: Duration,
     /// Per-request timeout.
     pub request_timeout: Option<Duration>,
+    /// Cap on the jittered backoff between attempts. Default: 20 s.
+    pub max_backoff: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -485,7 +514,55 @@ impl Default for RetryPolicy {
             retry_idempotent_only: true,
             max_retry_after: Duration::from_secs(10),
             request_timeout: Some(Duration::from_secs(30)),
+            max_backoff: Duration::from_millis(crate::backoff::DEFAULT_HTTP_MAX_BACKOFF_MS),
         }
+    }
+}
+
+/// Base of the exponential retry backoff.
+const BASE_BACKOFF: Duration = Duration::from_millis(100);
+
+/// The header that [`RequestBuilder::retry_non_idempotent`] adds.
+const IDEMPOTENCY_KEY: &str = "idempotency-key";
+
+impl RetryPolicy {
+    /// The wait before the retry that follows failed attempt `attempt`
+    /// (0-indexed).
+    ///
+    /// Without a hint, this is the jittered backoff. With a `Retry-After`
+    /// hint, the hint is capped by `max_retry_after` and `request_timeout`.
+    /// The wait is then `backoff + min(hint, 5 s)`. See
+    /// [`crate::backoff::retry_after_wait`].
+    fn retry_delay(
+        &self,
+        entropy: &dyn crate::entropy::Entropy,
+        attempt: u32,
+        hint: Option<Duration>,
+    ) -> Duration {
+        let backoff = crate::backoff::full_jitter(entropy, BASE_BACKOFF, self.max_backoff, attempt);
+        let Some(mut hint) = hint else {
+            return backoff;
+        };
+        hint = hint.min(self.max_retry_after);
+        if let Some(timeout) = self.request_timeout {
+            hint = hint.min(timeout);
+        }
+        crate::backoff::retry_after_wait(hint, backoff)
+    }
+}
+
+/// `true` for a status the client retries: `429` and `502`-`504`.
+const fn is_retryable_response(status: u16) -> bool {
+    status == 429 || is_retryable_status(status)
+}
+
+/// The server's wait hint for a retryable status: `Retry-After` on `429`
+/// (1 s when absent) and on `503`.
+fn retry_hint(status: u16, headers: &HeaderMap) -> Option<Duration> {
+    match status {
+        429 => Some(parse_retry_after(headers).unwrap_or(Duration::from_secs(1))),
+        503 => parse_retry_after(headers),
+        _ => None,
     }
 }
 
@@ -611,6 +688,7 @@ static OUTBOUND_BLOCKED: AtomicBool = AtomicBool::new(false);
 /// its real `reqwest` client — and must not let it reach anything the capsule
 /// did not record. There is deliberately no way to unset it: a process that has
 /// started replaying a capsule never goes back to serving traffic.
+#[cfg_attr(not(feature = "reporting"), allow(dead_code))]
 pub(crate) fn block_outbound_for_replay() {
     OUTBOUND_BLOCKED.store(true, Ordering::SeqCst);
 }
@@ -627,22 +705,38 @@ pub(crate) fn outbound_blocked_for_replay() -> bool {
 // `capsule` module. `OutboundRecorder` has a no-op twin below so `send` reads
 // the same on either build.
 
+/// The prefix of a recorded header value that is escaped bytes.
+#[cfg(feature = "reporting")]
+const OPAQUE_HEADER_PREFIX: &str = "[bytes] ";
+
 /// The headers the *caller* set, in the order they were set.
 ///
 /// One definition for both halves of the seam: the recorder stores this, and
 /// replay compares against it. Headers the client adds later — the injected
 /// W3C trace context, and any default the underlying `reqwest::Client` was
 /// built with — are deliberately outside it, so a client-side default can
-/// never be read as the handler changing its request.
+/// never be read as the handler changing its request. So is a Web Bot Auth
+/// `Signature` and `Signature-Input`: the client makes them new for each
+/// send, so they differ on every replay.
 #[cfg(feature = "reporting")]
 fn caller_headers(builder: &RequestBuilder) -> Vec<(String, String)> {
     builder
         .extra_headers
         .iter()
+        .filter(|(name, _)| {
+            builder.web_bot_auth.is_none()
+                || !matches!(name.as_str(), "signature" | "signature-input")
+        })
         .map(|(name, value)| {
             (
                 name.as_str().to_owned(),
-                value.to_str().unwrap_or_default().to_owned(),
+                // An opaque value is kept as escaped bytes, so two different
+                // values never record the same text. A text value with the
+                // prefix is escaped too, so it cannot look like bytes.
+                match value.to_str() {
+                    Ok(text) if !text.starts_with(OPAQUE_HEADER_PREFIX) => text.to_owned(),
+                    _ => format!("{OPAQUE_HEADER_PREFIX}{}", value.as_bytes().escape_ascii()),
+                },
             )
         })
         .collect()
@@ -659,10 +753,12 @@ const fn http_error_kind(error: &ClientError) -> crate::capsule::schema::HttpErr
         ClientError::Json(_) => Kind::Json,
         ClientError::NoMock(..) => Kind::NoMock,
         ClientError::CircuitBreakerOpen => Kind::CircuitBreakerOpen,
+        ClientError::ThrottledLocally { .. } => Kind::ThrottledLocally,
         ClientError::SsrfBlocked(_) => Kind::SsrfBlocked,
         ClientError::TooManyRedirects(_) => Kind::TooManyRedirects,
         ClientError::RedirectRejected(_) => Kind::RedirectRejected,
         ClientError::InvalidUrl(_) => Kind::InvalidUrl,
+        ClientError::FaultInjected(_) => Kind::FaultInjected,
         // Everything else — a `reqwest` transport error, and the replay-only
         // variants a recorded run cannot have produced — keeps its text alone.
         _ => Kind::Transport,
@@ -684,6 +780,15 @@ fn rebuild_client_error(
     use crate::capsule::schema::HttpErrorKind as Kind;
     match kind {
         Some(Kind::CircuitBreakerOpen) => ClientError::CircuitBreakerOpen,
+        Some(Kind::ThrottledLocally) => text
+            .strip_prefix("outbound request to ")
+            .and_then(|rest| rest.split_once(" throttled locally"))
+            .map_or_else(
+                || ClientError::ReplayedRequestFailure(text.clone()),
+                |(host, _)| ClientError::ThrottledLocally {
+                    host: host.to_owned(),
+                },
+            ),
         Some(Kind::SsrfBlocked) => {
             ClientError::SsrfBlocked(strip_prefix_payload(&text, "SSRF policy blocked address: "))
         }
@@ -693,6 +798,7 @@ fn rebuild_client_error(
         Some(Kind::InvalidUrl) => {
             ClientError::InvalidUrl(strip_prefix_payload(&text, "invalid or unresolvable URL: "))
         }
+        Some(Kind::FaultInjected) => ClientError::FaultInjected(text),
         Some(Kind::TooManyRedirects) => text
             .trim_end_matches(')')
             .rsplit_once("(max ")
@@ -732,7 +838,7 @@ fn replayed_response(
         // `next_http` already logged the divergence; the call fails closed.
         return Err(ClientError::BlockedDuringReplay(
             request.method.to_owned(),
-            request.url.to_owned(),
+            crate::capsule::redact::hide_url_userinfo(request.url),
         ));
     };
     if let Some(error) = recorded.error {
@@ -790,9 +896,9 @@ impl OutboundRecorder {
     ///
     /// Records the headers the *caller* set. Headers the client adds later —
     /// the injected W3C trace context, and any default the underlying
-    /// `reqwest::Client` was built with — are not on the tape, because replay
-    /// matches on method and URL and does not need them; the recorded request
-    /// half is a debugging aid, not the match key.
+    /// `reqwest::Client` was built with — are not on the tape. They change from
+    /// run to run, and replay compares the method, the URL, the caller-set
+    /// headers and the body.
     fn arm(builder: &RequestBuilder) -> Self {
         let scope = crate::capsule::current_scope();
         let Some(scope) = scope else {
@@ -1144,6 +1250,90 @@ pub struct Client {
     /// When present (a sim with a `SimNet`), calls go through the simulated
     /// network instead of the real one.
     sim_net: Option<Arc<crate::sim::SimNet>>,
+    /// Retry budgets and deadline header settings (issue #3058).
+    retry: RetrySettings,
+    /// Source of retry jitter. `from_state` uses the app's entropy, so a sim
+    /// seed replays the same delays.
+    entropy: Arc<dyn crate::entropy::Entropy>,
+    /// Client-side adaptive throttle (issue #3068). `None` when off.
+    throttle: Option<Arc<crate::admission::AdaptiveThrottle>>,
+}
+
+/// The app-wide client-side throttle, so that every `Client::from_state`
+/// shares one set of per-host counts (issue #3068). `config` is the setting
+/// it was built from.
+#[derive(Clone)]
+pub(crate) struct SharedThrottle {
+    throttle: Arc<crate::admission::AdaptiveThrottle>,
+    config: crate::config::AdaptiveThrottleConfig,
+}
+
+/// Put the app-wide throttle in `state` when `[http.client.adaptive_throttle]`
+/// is on.
+pub(crate) fn install_shared_throttle(
+    state: &crate::AppState,
+    config: &crate::config::HttpClientConfig,
+) {
+    let _ = shared_throttle(state, config);
+}
+
+/// Serializes the replacement of the shared throttle.
+static THROTTLE_REPLACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The app-wide throttle for the effective `config`, or `None` when it is
+/// off. A `state_initializer` can replace the config after boot. If the
+/// shared throttle was built from other settings, or there is none, a new
+/// one replaces it, so that all clients share counts for the settings in
+/// force.
+fn shared_throttle(
+    state: &crate::AppState,
+    config: &crate::config::HttpClientConfig,
+) -> Option<Arc<crate::admission::AdaptiveThrottle>> {
+    let settings = config.adaptive_throttle;
+    if !settings.enabled {
+        return None;
+    }
+    let current = || {
+        state
+            .extension::<SharedThrottle>()
+            .filter(|shared| shared.config == settings)
+            .map(|shared| Arc::clone(&shared.throttle))
+    };
+    if let Some(throttle) = current() {
+        return Some(throttle);
+    }
+    // Replace under a lock and check again, so that concurrent first calls
+    // after a config change share one throttle. Only this slow path locks.
+    let _guard = THROTTLE_REPLACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(throttle) = current() {
+        return Some(throttle);
+    }
+    let throttle = throttle_from_config(config)?;
+    state.insert_extension(SharedThrottle {
+        throttle: Arc::clone(&throttle),
+        config: settings,
+    });
+    Some(throttle)
+}
+
+/// A new throttle for `config`, or `None` when it is off.
+fn throttle_from_config(
+    config: &crate::config::HttpClientConfig,
+) -> Option<Arc<crate::admission::AdaptiveThrottle>> {
+    let t = config.adaptive_throttle;
+    t.enabled.then(|| {
+        Arc::new(crate::admission::AdaptiveThrottle::new(
+            t.k,
+            Duration::from_secs(t.window_secs),
+        ))
+    })
+}
+
+/// The entropy a client without app state uses.
+fn os_entropy() -> Arc<dyn crate::entropy::Entropy> {
+    Arc::new(crate::entropy::OsEntropy)
 }
 
 impl Client {
@@ -1164,6 +1354,7 @@ impl Client {
     pub fn with_timeout(timeout: Duration) -> Self {
         let inner = reqwest::ClientBuilder::new()
             .timeout(timeout)
+            .redirect(pooled_redirect_policy())
             .build()
             .expect("failed to build reqwest client");
         Self {
@@ -1172,14 +1363,15 @@ impl Client {
             base_url: None,
             base_urls: HashMap::new(),
             retry_policy: RetryPolicy {
-                max_retries: 3,
-                retry_idempotent_only: true,
-                max_retry_after: Duration::from_secs(10),
                 request_timeout: Some(timeout),
+                ..RetryPolicy::default()
             },
             mock: None,
             resilience_config: None,
             sim_net: None,
+            retry: RetrySettings::standalone(),
+            entropy: os_entropy(),
+            throttle: None,
         }
     }
 
@@ -1195,6 +1387,7 @@ impl Client {
     pub(crate) fn build_inner(config: &crate::config::HttpClientConfig) -> reqwest::Client {
         reqwest::ClientBuilder::new()
             .timeout(Duration::from_secs(config.timeout_secs))
+            .redirect(pooled_redirect_policy())
             .build()
             .expect("failed to build reqwest client")
     }
@@ -1217,10 +1410,18 @@ impl Client {
                 retry_idempotent_only: true,
                 max_retry_after: Duration::from_secs(config.max_retry_after_secs),
                 request_timeout: Some(timeout),
+                max_backoff: Duration::from_millis(config.max_backoff_ms),
             },
             mock: None,
             resilience_config: None,
             sim_net: None,
+            // `from_config` and `from_state` set the budgets.
+            retry: RetrySettings {
+                budgets: None,
+                send_deadline_header: config.send_deadline_header,
+            },
+            entropy: os_entropy(),
+            throttle: throttle_from_config(config),
         }
     }
 
@@ -1237,6 +1438,13 @@ impl Client {
             mock: None,
             resilience_config: None,
             sim_net: None,
+            // `from_state` sets the budgets.
+            retry: RetrySettings {
+                budgets: None,
+                send_deadline_header: true,
+            },
+            entropy: os_entropy(),
+            throttle: None,
         }
     }
 
@@ -1248,7 +1456,12 @@ impl Client {
     /// happen with the default `rustls-tls` feature).
     #[must_use]
     pub fn from_config(config: &crate::config::HttpClientConfig) -> Self {
-        Self::from_config_with_inner(Self::build_inner(config), config)
+        let mut client = Self::from_config_with_inner(Self::build_inner(config), config);
+        client.retry.budgets = config
+            .retry_budget
+            .enabled
+            .then(|| Arc::new(RetryBudgets::new(&config.retry_budget)));
+        client
     }
 
     /// Attach a mock registry (used by the test harness).
@@ -1291,6 +1504,15 @@ impl Client {
             }
         });
 
+        let budget_config = config
+            .as_ref()
+            .map_or_else(RetryBudgetConfig::default, |cfg| {
+                cfg.client.retry_budget.clone()
+            });
+        // One throttle for the whole app, so per-host counts add up.
+        let throttle = config
+            .as_ref()
+            .and_then(|cfg| shared_throttle(state, &cfg.client));
         let mut client = match (config, shared) {
             (Some(cfg), Some(inner)) => Self::from_config_with_inner(inner, &cfg.client),
             (Some(cfg), None) => Self::from_config(&cfg.client),
@@ -1298,12 +1520,21 @@ impl Client {
             (None, None) => Self::new(),
         };
 
+        // The extractor builds a new client for each request, so the budgets
+        // live in the app state. Thus all requests of one app share them.
+        client.retry.budgets = shared_retry_budgets(state, &budget_config);
+
         client.resilience_config = autumn_config.map(|c| Arc::new(c.resilience.clone()));
 
         if let Some(ext) = state.extension::<HttpMockRegistryExt>() {
             client = client.with_mock(ext.0.clone());
         }
         client.sim_net = state.extension::<crate::sim::SimNet>();
+        client.throttle = throttle;
+        // Retry jitter and the automatic key are not made again on capsule
+        // replay, so they must not go on the capsule's random tape.
+        let entropy = state.entropy_arc();
+        client.entropy = entropy.unrecorded().unwrap_or(entropy);
 
         client
     }
@@ -1330,6 +1561,9 @@ impl Client {
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
             sim_net: self.sim_net.clone(),
+            retry: self.retry.clone(),
+            entropy: self.entropy.clone(),
+            throttle: self.throttle.clone(),
         }
     }
 
@@ -1345,6 +1579,9 @@ impl Client {
             mock: self.mock.clone(),
             resilience_config: self.resilience_config.clone(),
             sim_net: self.sim_net.clone(),
+            retry: self.retry.clone(),
+            entropy: self.entropy.clone(),
+            throttle: self.throttle.clone(),
         }
     }
 
@@ -1379,6 +1616,12 @@ impl Client {
             discard_response_body: false,
             breaker_scoped: false,
             sim_net: self.sim_net.clone(),
+            forward_request_id: true,
+            retry: self.retry.clone(),
+            entropy: self.entropy.clone(),
+            throttle: self.throttle.clone(),
+            criticality: None,
+            web_bot_auth: None,
         }
     }
 
@@ -1487,6 +1730,80 @@ impl axum::extract::FromRequestParts<crate::AppState> for Client {
 /// Type alias for a redirect-`Location` validator.
 type RedirectValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+tokio::task_local! {
+    /// The redirect targets the pooled client followed during one send, in
+    /// order. An error does not say which host failed after a redirect, and
+    /// every host on the way gets its refill, so the plain path reads them
+    /// here.
+    static FOLLOWED: std::cell::RefCell<Vec<String>>;
+    /// `true` while the plain path follows redirects itself, so the pooled
+    /// client returns each redirect (see `pooled_redirect_policy`).
+    static MANUAL_REDIRECTS: bool;
+}
+
+/// Send `req` on the pooled client. Also return the redirect targets the
+/// HTTP stack followed, in order.
+async fn send_tracking_redirects(
+    req: reqwest::RequestBuilder,
+) -> (Result<reqwest::Response, reqwest::Error>, Vec<String>) {
+    FOLLOWED
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            let sent = req.send().await;
+            (sent, FOLLOWED.with(std::cell::RefCell::take))
+        })
+        .await
+}
+
+/// Set `Referer` for a redirect from `previous` to `next`, as reqwest does:
+/// the previous URL without credentials or fragment, and none on an
+/// `https` to `http` hop.
+fn set_referer(headers: &mut HeaderMap, next: &str, previous: &str) {
+    let (Ok(next), Ok(mut referer)) = (url::Url::parse(next), url::Url::parse(previous)) else {
+        return;
+    };
+    if next.scheme() == "http" && referer.scheme() == "https" {
+        headers.remove(reqwest::header::REFERER);
+        return;
+    }
+    let _ = referer.set_username("");
+    let _ = referer.set_password(None);
+    referer.set_fragment(None);
+    if let Ok(value) = HeaderValue::from_str(referer.as_str()) {
+        headers.insert(reqwest::header::REFERER, value);
+    }
+}
+
+/// The hop limit of the plain send path, as in reqwest's default policy.
+const PLAIN_MAX_REDIRECTS: usize = 10;
+
+/// The redirect policy of the pooled client: reqwest's default of
+/// [`PLAIN_MAX_REDIRECTS`] hops, but no automatic hop while a request
+/// deadline is set. The plain send path then follows the redirect itself, so
+/// each hop sends the time left at that hop in [`DEADLINE_HEADER`] (issue
+/// #3058).
+fn pooled_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if Deadline::current().is_some() || MANUAL_REDIRECTS.try_with(|m| *m).unwrap_or(false) {
+            attempt.stop()
+        } else if attempt.previous().len() > PLAIN_MAX_REDIRECTS {
+            // `previous` holds the first URL too, as in reqwest's own limit.
+            attempt.error("too many redirects")
+        } else {
+            let _ = FOLLOWED.try_with(|hops| hops.borrow_mut().push(attempt.url().to_string()));
+            attempt.follow()
+        }
+    })
+}
+
+/// The client of one hop of [`RequestBuilder::follow_loop`].
+#[derive(Clone, Copy)]
+enum HopClient<'a> {
+    /// The pooled client of the plain path.
+    Pooled(&'a reqwest::Client),
+    /// A new client per hop, with this timeout.
+    OneShot(Duration),
+}
+
 /// Per-request redirect handling.
 ///
 /// `Default` preserves the historical behaviour exactly (the shared-client fast
@@ -1509,6 +1826,10 @@ enum RedirectMode {
 const SSRF_SAFE_MAX_REDIRECTS: usize = 5;
 
 /// Fluent outbound request builder produced by [`Client`] methods.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent per-request switches; each has its own builder method"
+)]
 pub struct RequestBuilder {
     client: reqwest::Client,
     method: Method,
@@ -1527,7 +1848,7 @@ pub struct RequestBuilder {
     redirect_mode: RedirectMode,
     /// When set, connect directly to this socket, skipping DNS resolution while
     /// preserving the original `Host` header + SNI. See [`RequestBuilder::pin_to`].
-    pin_addr: Option<SocketAddr>,
+    pin_addr: Option<Vec<SocketAddr>>,
     /// When `true`, use the composed SSRF-safe send path (resolve→validate→pin
     /// with per-hop redirect validation). Set by [`Client::get_ssrf_safe`].
     ssrf_safe: bool,
@@ -1540,9 +1861,41 @@ pub struct RequestBuilder {
     breaker_scoped: bool,
     /// The simulated network, when the client came from a sim app state.
     sim_net: Option<Arc<crate::sim::SimNet>>,
+    /// When `true` (the default), `send` adds the current request's id as
+    /// `x-request-id`. See [`RequestBuilder::without_request_id`].
+    forward_request_id: bool,
+    /// Retry budgets and deadline header settings (issue #3058).
+    retry: RetrySettings,
+    /// Source of retry jitter and of the automatic `Idempotency-Key`.
+    entropy: Arc<dyn crate::entropy::Entropy>,
+    /// Client-side adaptive throttle (issue #3068).
+    throttle: Option<Arc<crate::admission::AdaptiveThrottle>>,
+    /// The criticality to send. `None` sends the inbound request's.
+    criticality: Option<crate::admission::Criticality>,
+    /// Web Bot Auth signer: each attempt sends a fresh signature.
+    web_bot_auth: Option<Arc<crate::aeo::web_bot_auth::WebBotAuthSigner>>,
 }
 
 impl RequestBuilder {
+    /// Do not send the current request's id as `x-request-id`.
+    ///
+    /// By default, a request sent during an inbound request carries that
+    /// request's id (issue #3064). Use this for a host that must not see it.
+    #[must_use]
+    pub const fn without_request_id(mut self) -> Self {
+        self.forward_request_id = false;
+        self
+    }
+
+    /// Send this criticality in the `X-Autumn-Criticality` header (issue
+    /// #3068). Without this call, the client sends the criticality of the
+    /// inbound request that it serves, if any.
+    #[must_use]
+    pub const fn criticality(mut self, criticality: crate::admission::Criticality) -> Self {
+        self.criticality = Some(criticality);
+        self
+    }
+
     /// Append a request header.
     ///
     /// Headers named `authorization`, `cookie`, or `set-cookie` are accepted
@@ -1566,6 +1919,32 @@ impl RequestBuilder {
                 tracing::warn!(header.name = name_str, error = %e, "invalid header value — header skipped");
             }
         }
+        self
+    }
+
+    /// Sign this request with Web Bot Auth (RFC 9421 HTTP Message
+    /// Signatures), so the receiving site can verify that it comes from this
+    /// app. Adds `Signature-Agent`, `Signature-Input`, and `Signature`.
+    ///
+    /// The URL must be absolute. Each attempt (a retry, a same-origin
+    /// redirect) sends a new signature, so a held builder or a late retry
+    /// never sends an expired one. See [`crate::aeo::web_bot_auth`].
+    #[must_use]
+    pub fn sign_web_bot_auth(
+        mut self,
+        signer: &crate::aeo::web_bot_auth::WebBotAuthSigner,
+    ) -> Self {
+        if let Some(h) = signer.sign_url(&self.url) {
+            self.web_bot_auth = Some(Arc::new(signer.clone()));
+            return self
+                .header("signature-agent", h.signature_agent)
+                .header("signature-input", h.signature_input)
+                .header("signature", h.signature);
+        }
+        self.pending_error = Some(ClientError::InvalidUrl(format!(
+            "Web Bot Auth needs an absolute URL, got {:?}",
+            self.url
+        )));
         self
     }
 
@@ -1608,12 +1987,30 @@ impl RequestBuilder {
 
     /// Override the maximum retry count for this request.
     ///
-    /// Also clears the idempotent-only flag so non-idempotent methods such as
-    /// `POST` and `PATCH` are retried when the caller explicitly requests it.
+    /// This does not enable retries for `POST` and `PATCH`. Use
+    /// [`retry_non_idempotent`](Self::retry_non_idempotent) for that.
     #[must_use]
     pub const fn retries(mut self, max: u32) -> Self {
         self.retry_policy.max_retries = max;
+        self
+    }
+
+    /// Retry non-idempotent methods (`POST`, `PATCH`) too.
+    ///
+    /// A retried `POST` can run two times on the server. So for a
+    /// non-idempotent method, the client sends an `Idempotency-Key` header
+    /// with a random value, the same on every attempt. A key you set with
+    /// [`header`](Self::header) is kept.
+    #[must_use]
+    pub const fn retry_non_idempotent(mut self) -> Self {
         self.retry_policy.retry_idempotent_only = false;
+        self
+    }
+
+    /// Override the cap on the jittered backoff between attempts.
+    #[must_use]
+    pub const fn max_backoff(mut self, max: Duration) -> Self {
+        self.retry_policy.max_backoff = max;
         self
     }
 
@@ -1740,8 +2137,22 @@ impl RequestBuilder {
     /// `resolve()` override applies, so a configured proxy would otherwise
     /// receive the request and re-resolve the host — defeating the pin.
     #[must_use]
-    pub const fn pin_to(mut self, addr: SocketAddr) -> Self {
-        self.pin_addr = Some(addr);
+    pub fn pin_to(self, addr: SocketAddr) -> Self {
+        self.pin_to_addrs([addr])
+    }
+
+    /// Like [`pin_to`](Self::pin_to), but accepts several addresses for one
+    /// host.
+    ///
+    /// All addresses go to one request. reqwest tries the next address only
+    /// if it cannot connect. A loop over `pin_to` could send a `POST` body
+    /// twice.
+    ///
+    /// An empty set makes `send` fail. It never drops the pin. Every other
+    /// rule of `pin_to` applies.
+    #[must_use]
+    pub fn pin_to_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.pin_addr = Some(addrs.into_iter().collect());
         self
     }
 
@@ -1859,10 +2270,12 @@ impl RequestBuilder {
                 },
             );
         }
+        // Only capsule replay (`reporting`) sets the block.
+        #[cfg(feature = "reporting")]
         if outbound_blocked_for_replay() {
             return Err(ClientError::BlockedDuringReplay(
                 self.method.to_string(),
-                self.url.clone(),
+                crate::capsule::redact::hide_url_userinfo(&self.url),
             ));
         }
 
@@ -1878,7 +2291,21 @@ impl RequestBuilder {
     }
 
     /// [`send`](Self::send), minus the replay gate and the capture tee.
-    async fn send_recorded(self) -> Result<Response, ClientError> {
+    async fn send_recorded(mut self) -> Result<Response, ClientError> {
+        // Staging fault injection (#3071). Inert outside a fault scope.
+        crate::fault_injection::inject(crate::fault_injection::FaultTarget::Http)
+            .await
+            .map_err(|fault| ClientError::FaultInjected(fault.to_string()))?;
+        // After the capture tee armed, so a capsule records only the caller's
+        // own headers and replay compares like with like.
+        if self.forward_request_id {
+            add_current_request_id(&mut self.extra_headers);
+        }
+        // After the capture tee, so a capsule records the caller's headers
+        // only and replays without a random key.
+        self.ensure_idempotency_key();
+        self.ensure_criticality_header();
+
         // A sim network serves every send path, so nothing reaches the real
         // network. Like mocks, it bypasses the process-global breaker.
         if let Some(net) = self.sim_net.clone() {
@@ -1909,10 +2336,9 @@ impl RequestBuilder {
         let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
 
         // Check if circuit breaker is open
-        if breaker.before_call().is_err() {
+        let Ok(guard) = breaker.admit() else {
             return Err(ClientError::CircuitBreakerOpen);
-        }
-        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+        };
 
         let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
         let res = self.send_inner(is_half_open).await;
@@ -1925,6 +2351,14 @@ impl RequestBuilder {
                     guard.failure();
                 }
             }
+            // Neither says anything about the host. The caller ran out of
+            // time (issue #3058): a cancelled call, which counts only past the
+            // slow-call threshold. A local throttle reject (#3068): dropping
+            // the guard records nothing for a fast call and frees a half-open
+            // slot.
+            Err(ClientError::DeadlineExceeded | ClientError::ThrottledLocally { .. }) => {
+                drop(guard);
+            }
             Err(_) => {
                 guard.failure();
             }
@@ -1933,7 +2367,7 @@ impl RequestBuilder {
     }
 
     /// The custom send path (`send_custom`), with breaker accounting exactly
-    /// like the plain-path breaker block above: `before_call` gate,
+    /// like the plain-path breaker block above: `admit` gate,
     /// `CircuitBreakerGuard` covering the call (its `Drop` releases a
     /// half-open slot if this future is cancelled or panics before finishing),
     /// `< 500` success threshold. Only reached when `breaker_scoped()` was
@@ -1941,10 +2375,24 @@ impl RequestBuilder {
     /// an external wrapper around `send()`.
     async fn send_custom_breaker_guarded(self) -> Result<Response, ClientError> {
         let breaker = breaker_for_url(self.resilience_config.as_ref(), &self.url);
-        if breaker.before_call().is_err() {
+        let Ok(guard) = breaker.admit() else {
             return Err(ClientError::CircuitBreakerOpen);
-        }
-        // Read before the breaker moves into the guard below. Mirrors the
+        };
+        // Like the breaker, the throttle keeps per-host state, so on the
+        // custom path it covers only `breaker_scoped` calls: a small, durable
+        // host set. Unscoped custom calls go to user-supplied URLs, and one
+        // entry per host would grow without bound. The ticket is taken after
+        // the breaker admits, so a fail-fast `CircuitBreakerOpen` call never
+        // reaches the throttle. `send_one` retries inside, so the throttle
+        // counts the call once. A local reject leaves the breaker neutral.
+        let ticket = match self.throttle_attempt(None) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                drop(guard);
+                return Err(error);
+            }
+        };
+        // Mirrors the
         // plain-path breaker block's own `is_half_open` (passed to
         // `send_inner` to force a single attempt): a half-open probe is a
         // budgeted, limited trial (`half_open_trial_count`), and letting
@@ -1953,10 +2401,13 @@ impl RequestBuilder {
         // instead of testing recovery with independent probes (#2480
         // review, round 10).
         let is_half_open = breaker.state() == crate::circuit_breaker::CircuitState::HalfOpen;
-        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
         let res = self.send_custom(is_half_open).await;
+        record_call(ticket, &res);
         match &res {
             Ok(resp) if resp.status().as_u16() < 500 => guard.success(),
+            // The caller ran out of time, not the upstream (issue #3058): a
+            // cancelled call, which counts only past the slow-call threshold.
+            Err(ClientError::DeadlineExceeded) => drop(guard),
             _ => guard.failure(),
         }
         res
@@ -1971,54 +2422,66 @@ impl RequestBuilder {
         // ── Real network request with retries ───────────────────────────────
         let start = crate::time::ambient_instant();
         let max_attempts = self.max_attempts(suppress_retries);
+        let mut gate = self.retry_gate(url_host(&self.url).as_deref());
+        if gate.deadline.is_some() || self.follows_redirects_itself() {
+            return self.follow_pooled(suppress_retries, &gate).await;
+        }
+        let mut last_retry = None;
+        let mut delay = Duration::ZERO;
+        // Hosts refilled for this request: the first one already was.
+        let mut refilled: std::collections::HashSet<String> =
+            url_host(&self.url).into_iter().collect();
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                // Cap the exponent to prevent u64 overflow when max_retries is large.
-                let exp = (attempt - 1).min(10);
-                let delay = Duration::from_millis(100 * (1_u64 << exp));
                 tokio::time::sleep(delay).await;
             }
-
-            let mut req = self.client.request(self.method.clone(), &self.url);
-
-            // Inject W3C trace context headers from the active span.
-            req = inject_trace_context(req);
-
-            // Apply caller-supplied headers (may override or extend trace headers).
-            for (name, value) in &self.extra_headers {
-                req = req.header(name.clone(), value.clone());
-            }
-
-            if let Some(body) = &self.body {
-                req = req.body(body.clone());
-            }
-
-            match req.send().await {
+            // A throttled attempt ends the call, retry or not.
+            let ticket = self.begin_attempt(&gate, None)?;
+            let last = attempt + 1 == max_attempts;
+            let (span, sent, followed) =
+                self.send_plain_attempt(&gate, attempt, &mut refilled).await;
+            match sent {
                 Ok(resp) => {
                     let status = resp.status();
                     let headers = resp.headers().clone();
                     let url_used = resp.url().clone();
 
-                    // 429 → honour Retry-After and retry if attempts remain.
-                    if status.as_u16() == 429 && attempt + 1 < max_attempts {
-                        tokio::time::sleep(self.retry_after_delay(&headers)).await;
-                        continue;
-                    }
-
-                    // 5xx transient gateway errors → retry if attempts remain.
-                    if is_retryable_status(status.as_u16()) && attempt + 1 < max_attempts {
-                        continue;
+                    // 429 and 502-504: retry while attempts, time and budget
+                    // remain. The HTTP stack may have followed a redirect, so
+                    // charge the host that answered.
+                    if is_retryable_response(status.as_u16()) && !last {
+                        gate.rekey(url_used.as_str());
+                        let wait = self.retry_policy.retry_delay(
+                            &*self.entropy,
+                            attempt,
+                            retry_hint(status.as_u16(), &headers),
+                        );
+                        let kind = retry_kind(status.as_u16());
+                        if gate.allow(kind, wait) {
+                            if let Some(ticket) = ticket {
+                                ticket.record(throttle_accepts(status.as_u16()));
+                            }
+                            delay = wait;
+                            last_retry = Some(kind);
+                            continue;
+                        }
                     }
 
                     let body = if self.discard_response_body {
                         // Dropped unread — see `discard_response_body`.
-                        Bytes::new()
+                        Ok(Bytes::new())
                     } else {
-                        resp.bytes()
-                            .await
-                            .map_err(|e| ClientError::Request(e.without_url()))?
+                        read_body_in_span(resp, &span, &gate).await
                     };
+                    // Count the attempt only now: a body that fails to arrive
+                    // is a transport error, not an accept.
+                    if let Some(ticket) = ticket {
+                        ticket.record(body.is_ok() && throttle_accepts(status.as_u16()));
+                    }
+                    let body = body?;
+                    // Refund only after the body arrived.
+                    gate.finish(last_retry, status.as_u16());
                     let elapsed = crate::time::ambient_instant().saturating_duration_since(start);
                     log_request(
                         self.method.as_str(),
@@ -2035,15 +2498,201 @@ impl RequestBuilder {
                         url: Some(url_used),
                     });
                 }
+                // The request deadline stopped the attempt.
+                Err(e) if e.is_timeout() && gate.expired() => {
+                    return Err(ClientError::DeadlineExceeded);
+                }
                 // Only retry transient connect/timeout errors; non-transient errors
                 // (e.g. malformed URL) fail immediately.
-                Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {}
-                Err(e) => return Err(ClientError::Request(e.without_url())),
+                Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
+                    if let Some(ticket) = ticket {
+                        ticket.record(false);
+                    }
+                    // The HTTP stack may have followed a redirect: charge the
+                    // host that failed.
+                    // The host that failed: the last redirect target, or the
+                    // request's own host.
+                    gate.rekey(followed.last().map_or(self.url.as_str(), String::as_str));
+                    let wait = self.retry_policy.retry_delay(&*self.entropy, attempt, None);
+                    if !gate.allow(RetryKind::Transient, wait) {
+                        return Err(ClientError::Request(e.without_url()));
+                    }
+                    delay = wait;
+                    last_retry = Some(RetryKind::Transient);
+                }
+                Err(e) => {
+                    if let Some(ticket) = ticket {
+                        ticket.record(false);
+                    }
+                    return Err(ClientError::Request(e.without_url()));
+                }
             }
         }
 
         // The retry loop always returns inside the last attempt; this is unreachable.
         unreachable!("retry loop exited without returning a result — this is a bug")
+    }
+
+    /// The deadline and retry budget for one send to `host`.
+    fn retry_gate(&self, host: Option<&str>) -> RetryGate {
+        let mut gate = RetryGate::start(
+            self.retry.budgets.clone(),
+            host,
+            self.retry.send_deadline_header,
+        );
+        gate.signer.clone_from(&self.web_bot_auth);
+        gate
+    }
+
+    /// `true` when a header needs the client to follow redirects itself:
+    ///
+    /// - A caller's own deadline header needs a new value per attempt and
+    ///   per hop.
+    /// - An HTTP message signature is a credential that the pooled client's
+    ///   redirects would carry to the next host; the manual follow strips it
+    ///   on a cross-origin hop.
+    fn follows_redirects_itself(&self) -> bool {
+        self.extra_headers
+            .get(DEADLINE_HEADER)
+            .and_then(crate::deadline::parse_header)
+            .is_some()
+            || self.extra_headers.contains_key("signature")
+    }
+
+    /// The plain path under a request deadline. The pooled client does not
+    /// follow a redirect then (see `pooled_redirect_policy`), so this follows
+    /// it, and each hop sends the time left at that hop.
+    async fn follow_pooled(
+        self,
+        suppress_retries: bool,
+        gate: &RetryGate,
+    ) -> Result<Response, ClientError> {
+        // `send_one` asks the throttle (issue #3068) for each attempt of
+        // each hop, as the plain path does for each attempt.
+        let client = self.client.clone();
+        MANUAL_REDIRECTS
+            .scope(
+                true,
+                self.follow_loop(
+                    PLAIN_MAX_REDIRECTS,
+                    Arc::new(|_: &str| true),
+                    HopClient::Pooled(&client),
+                    suppress_retries,
+                    gate,
+                ),
+            )
+            .await
+    }
+
+    /// Add an `Idempotency-Key` header when this request can retry a
+    /// non-idempotent method and the caller set no key. Every attempt sends
+    /// the same key, so the server can drop a duplicate.
+    fn ensure_idempotency_key(&mut self) {
+        let retries_unsafe_method = !is_idempotent_method(&self.method)
+            && !self.retry_policy.retry_idempotent_only
+            && self.retry_policy.max_retries > 0;
+        if !retries_unsafe_method || self.extra_headers.contains_key(IDEMPOTENCY_KEY) {
+            return;
+        }
+        let key = self.entropy.uuid_v4().to_string();
+        if let Ok(value) = HeaderValue::from_str(&key) {
+            self.extra_headers
+                .insert(HeaderName::from_static(IDEMPOTENCY_KEY), value);
+        }
+    }
+
+    /// Add the `X-Autumn-Criticality` header (issue #3068): the value set by
+    /// [`Self::criticality`], else the inbound request's when it is not
+    /// `default` (a missing header means `default`, so the client does not
+    /// send it to every host). A header that the caller set wins.
+    fn ensure_criticality_header(&mut self) {
+        if self
+            .extra_headers
+            .contains_key(crate::admission::CRITICALITY_HEADER)
+        {
+            return;
+        }
+        let inbound = crate::admission::current_criticality()
+            .filter(|c| *c != crate::admission::Criticality::Default);
+        if let Some(c) = self.criticality.or(inbound) {
+            self.extra_headers.insert(
+                HeaderName::from_static(crate::admission::CRITICALITY_HEADER),
+                HeaderValue::from_static(c.as_str()),
+            );
+        }
+    }
+
+    /// Start one attempt: stop at the deadline, ask the throttle, then let
+    /// the gate record the attempt. The throttle is asked before
+    /// [`RetryGate::check`], so a throttled attempt refills no budget.
+    fn begin_attempt(
+        &self,
+        gate: &RetryGate,
+        host: Option<&str>,
+    ) -> Result<Option<ThrottleTicket>, ClientError> {
+        if gate.expired() {
+            return Err(ClientError::DeadlineExceeded);
+        }
+        let ticket = self.throttle_attempt(host)?;
+        gate.check()?;
+        Ok(ticket)
+    }
+
+    /// Send one plain-path attempt in its own CLIENT span (issue #3064). The
+    /// trace context is injected inside the span, so the next service's
+    /// parent is this attempt. Returns the span, so the caller reads the body
+    /// in it, the send result and the redirect targets followed. Each host
+    /// that served a redirect gets its refill, even when the send or the body
+    /// fails later.
+    async fn send_plain_attempt(
+        &self,
+        gate: &RetryGate,
+        attempt: u32,
+        refilled: &mut std::collections::HashSet<String>,
+    ) -> (
+        tracing::Span,
+        Result<reqwest::Response, reqwest::Error>,
+        Vec<String>,
+    ) {
+        let span = client_attempt_span(&self.method, &self.url, attempt);
+        let req = self.plain_attempt(gate, &span);
+        let (sent, followed) =
+            tracing::Instrument::instrument(send_tracking_redirects(req), span.clone()).await;
+        record_send_outcome(&span, &sent);
+        gate.record_destinations(&followed, refilled);
+        (span, sent, followed)
+    }
+
+    /// The request of one plain-path attempt: the attempt timeout under a
+    /// deadline, the trace context, then the caller's headers, which may
+    /// override or extend the trace headers.
+    fn plain_attempt(&self, gate: &RetryGate, span: &tracing::Span) -> reqwest::RequestBuilder {
+        let timeout = gate.attempt_timeout(self.retry_policy.request_timeout);
+        let mut req = self.client.request(self.method.clone(), &self.url);
+        if gate.deadline.is_some()
+            && let Some(timeout) = timeout
+        {
+            req = req.timeout(timeout);
+        }
+        req = span.in_scope(|| inject_trace_context(req, &self.extra_headers));
+        req = with_caller_headers(req, gate, timeout, &self.extra_headers, &self.url);
+        if let Some(body) = &self.body {
+            req = req.body(body.clone());
+        }
+        req
+    }
+
+    /// Ask the throttle for one attempt (issue #3068). `host` is the throttle
+    /// key; `None` takes it from the URL. Returns `Ok(None)` without a
+    /// throttle, and [`ClientError::ThrottledLocally`] when it rejects.
+    fn throttle_attempt(&self, host: Option<&str>) -> Result<Option<ThrottleTicket>, ClientError> {
+        let Some(throttle) = &self.throttle else {
+            return Ok(None);
+        };
+        let Some(host) = host.map(str::to_owned).or_else(|| throttle_host(&self.url)) else {
+            return Ok(None);
+        };
+        admit_throttle(throttle, host, &*self.entropy).map(Some)
     }
 
     /// How many attempts the retry policy allows for this request.
@@ -2092,33 +2741,52 @@ impl RequestBuilder {
         })
     }
 
-    /// The wait before a retry after a 429: `Retry-After`, capped by the policy.
-    fn retry_after_delay(&self, headers: &HeaderMap) -> Duration {
-        let mut delay = parse_retry_after(headers).unwrap_or(Duration::from_secs(1));
-        delay = delay.min(self.retry_policy.max_retry_after);
-        if let Some(req_timeout) = self.retry_policy.request_timeout {
-            delay = delay.min(req_timeout);
-        }
-        delay
-    }
-
     /// Send through the simulated network (issue #2967), with the attempts,
-    /// backoff, 429 handling and per-attempt timeout of the real retry loop.
+    /// jittered backoff, `Retry-After` on 429 and 503, and per-attempt
+    /// timeout of the real retry loop.
     async fn send_sim(self, net: &crate::sim::SimNet) -> Result<Response, ClientError> {
+        use tracing::Instrument as _;
+
         let url = self.sim_url()?;
         let host = url
             .host_str()
             .ok_or_else(|| ClientError::InvalidUrl(format!("{}: no host", self.url)))?
             .to_owned();
         let max_attempts = self.max_attempts(false);
+        let gate = self.retry_gate(url_host(url.as_str()).as_deref());
+        let mut last_retry = None;
+        let mut delay = Duration::ZERO;
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                let exp = (attempt - 1).min(10);
-                tokio::time::sleep(Duration::from_millis(100 * (1_u64 << exp))).await;
+                tokio::time::sleep(delay).await;
             }
+            let ticket = self.begin_attempt(&gate, Some(&host))?;
             let last = attempt + 1 == max_attempts;
-            let exchange = self.sim_attempt(net, &host, &url);
-            let outcome = match self.retry_policy.request_timeout {
+            // One CLIENT span per attempt, as on the real send paths. The host
+            // router sees this span in its `traceparent`.
+            let span = client_attempt_span(&self.method, url.as_str(), attempt);
+            let timeout = gate.attempt_timeout(self.retry_policy.request_timeout);
+            let deadline_header = gate.header(timeout, &self.extra_headers);
+            let exchange = self
+                .sim_attempt(net, &host, &url, timeout, deadline_header)
+                .instrument(span.clone());
+            // Under a deadline, check it before each poll of the attempt, as
+            // the real paths' request timeout does: `tokio::time::timeout`
+            // polls the attempt first, so an answer ready at the deadline
+            // would still be used.
+            let exchange = async {
+                match gate.deadline {
+                    Some(deadline) => crate::deadline::Bounded::until(deadline, exchange)
+                        .await
+                        .unwrap_or_else(|crate::deadline::DeadlineExceeded| {
+                            Err(SimAttemptError::Transient(format!(
+                                "request to {host} reached the request deadline"
+                            )))
+                        }),
+                    None => exchange.await,
+                }
+            };
+            let outcome = match timeout {
                 Some(limit) => {
                     tokio::time::timeout(limit, exchange)
                         .await
@@ -2130,23 +2798,57 @@ impl RequestBuilder {
                 }
                 None => exchange.await,
             };
+            match &outcome {
+                Ok(response) => record_attempt_status(&span, response.status.as_u16()),
+                Err(SimAttemptError::Transient(_)) => record_attempt_error(&span, "network"),
+                Err(SimAttemptError::Fatal(_)) => record_attempt_error(&span, "request"),
+            }
+            drop(span);
+            // A transient failure at the caller's deadline says nothing about
+            // the host: its ticket is dropped, which counts as an accept.
+            let deadline_stop =
+                matches!(outcome, Err(SimAttemptError::Transient(_))) && gate.expired();
+            if let Some(ticket) = ticket
+                && !deadline_stop
+            {
+                ticket.record(matches!(&outcome, Ok(r) if throttle_accepts(r.status.as_u16())));
+            }
             let response = match outcome {
                 Ok(response) => response,
                 // A drop or a timeout is transient, like a real connect or
                 // timeout error, so it is retried.
-                Err(SimAttemptError::Transient(_)) if !last => continue,
+                Err(SimAttemptError::Transient(_)) if gate.expired() => {
+                    return Err(ClientError::DeadlineExceeded);
+                }
+                Err(SimAttemptError::Transient(message)) if !last => {
+                    let wait = self.retry_policy.retry_delay(&*self.entropy, attempt, None);
+                    if !gate.allow(RetryKind::Transient, wait) {
+                        return Err(ClientError::SimNetwork(message));
+                    }
+                    delay = wait;
+                    last_retry = Some(RetryKind::Transient);
+                    continue;
+                }
                 Err(SimAttemptError::Transient(message)) => {
                     return Err(ClientError::SimNetwork(message));
                 }
                 Err(SimAttemptError::Fatal(error)) => return Err(error),
             };
-            if response.status.as_u16() == 429 && !last {
-                tokio::time::sleep(self.retry_after_delay(&response.headers)).await;
-                continue;
+            let status = response.status.as_u16();
+            if is_retryable_response(status) && !last {
+                let wait = self.retry_policy.retry_delay(
+                    &*self.entropy,
+                    attempt,
+                    retry_hint(status, &response.headers),
+                );
+                let kind = retry_kind(status);
+                if gate.allow(kind, wait) {
+                    delay = wait;
+                    last_retry = Some(kind);
+                    continue;
+                }
             }
-            if is_retryable_status(response.status.as_u16()) && !last {
-                continue;
-            }
+            gate.finish(last_retry, status);
             return Ok(response);
         }
         unreachable!("the sim retry loop returns on its last attempt")
@@ -2174,12 +2876,14 @@ impl RequestBuilder {
         net: &crate::sim::SimNet,
         host: &str,
         url: &reqwest::Url,
+        timeout: Option<Duration>,
+        deadline_header: Option<HeaderValue>,
     ) -> Result<Response, SimAttemptError> {
-        net.transmit(host, self.retry_policy.request_timeout)
+        net.transmit(host, timeout)
             .await
             .map_err(|fault| SimAttemptError::Transient(format!("request to {host} {fault}")))?;
         match (net.service(host), self.mock.as_ref()) {
-            (Some(router), _) => serve_sim_host(router, self, url.clone())
+            (Some(router), _) => serve_sim_host(router, self, url.clone(), deadline_header)
                 .await
                 .map_err(SimAttemptError::Fatal),
             (None, Some(mock)) => self.mock_response(mock).map_err(SimAttemptError::Fatal),
@@ -2239,6 +2943,13 @@ impl RequestBuilder {
             ));
         }
 
+        // An empty pin set would send the request unpinned. Fail closed.
+        if self.pin_addr.as_ref().is_some_and(Vec::is_empty) {
+            return Err(ClientError::InvalidUrl(
+                "pin_to_addrs needs at least one address".to_owned(),
+            ));
+        }
+
         // Reject `pin_to` on an IP-literal URL host up front, deterministically, before
         // any network I/O. reqwest and hyper treat an IP-literal host as already resolved
         // and do not consult the DNS resolver, so the `resolve_to_addrs` override
@@ -2255,13 +2966,20 @@ impl RequestBuilder {
             ));
         }
 
-        let timeout = self
-            .retry_policy
-            .request_timeout
+        // One gate for the whole send, across redirect hops. The request
+        // deadline also makes the one-shot client timeout shorter.
+        let gate = self.retry_gate(url_host(&self.url).as_deref());
+        // Only the deadline here: the first-attempt refill waits for
+        // `send_one`, after DNS and address checks that may stop the call.
+        if gate.expired() {
+            return Err(ClientError::DeadlineExceeded);
+        }
+        let timeout = gate
+            .attempt_timeout(self.retry_policy.request_timeout)
             .unwrap_or_else(|| Duration::from_secs(30));
 
         if self.ssrf_safe {
-            return self.send_ssrf_safe(timeout, is_half_open).await;
+            return self.send_ssrf_safe(timeout, is_half_open, &gate).await;
         }
 
         // Extract the follow parameters (ending the borrow) before moving `self`.
@@ -2271,7 +2989,13 @@ impl RequestBuilder {
         };
         if let Some((max, validator)) = follow {
             return self
-                .follow_loop(max, validator, timeout, is_half_open)
+                .follow_loop(
+                    max,
+                    validator,
+                    HopClient::OneShot(timeout),
+                    is_half_open,
+                    &gate,
+                )
                 .await;
         }
 
@@ -2293,19 +3017,22 @@ impl RequestBuilder {
             &self.extra_headers,
             self.body.as_ref(),
             &self.retry_policy,
+            &*self.entropy,
             self.discard_response_body,
             None,
             is_half_open,
+            &gate,
+            false,
+            None,
+            None,
         )
         .await
     }
 
     /// Compute the `(host, addr)` resolve override for a pinned request, if any.
     fn pin_resolve(&self) -> Result<Option<(String, Vec<SocketAddr>)>, ClientError> {
-        match self.pin_addr {
-            // Single-address pin routed through the same set-based path as the
-            // multi-address SSRF-safe pin (a one-element slice).
-            Some(addr) => Ok(Some((host_of(&self.url)?, vec![addr]))),
+        match &self.pin_addr {
+            Some(addrs) => Ok(Some((host_of(&self.url)?, addrs.clone()))),
             None => Ok(None),
         }
     }
@@ -2315,8 +3042,9 @@ impl RequestBuilder {
         self,
         max: usize,
         validator: RedirectValidator,
-        timeout: Duration,
+        hop_client: HopClient<'_>,
         is_half_open: bool,
+        gate: &RetryGate,
     ) -> Result<Response, ClientError> {
         let original =
             url::Url::parse(&self.url).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
@@ -2326,11 +3054,20 @@ impl RequestBuilder {
         let mut method = self.method.clone();
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
+        // On the pooled path the whole chain shares one retry count, as when
+        // reqwest follows the redirects. It comes from the original method:
+        // a `POST` that a 303 turns into a `GET` gets no retries the `POST`
+        // did not have.
+        let chain_retries = matches!(hop_client, HopClient::Pooled(_))
+            .then(|| ChainRetries::new(self.max_attempts(is_half_open).saturating_sub(1)));
+        // Hosts refilled for this chain: the first one already was.
+        let mut refilled: std::collections::HashSet<String> =
+            url_host(&self.url).into_iter().collect();
         for hop in 0.. {
             // Pin only applies to the first hop's original target.
             let resolve = if hop == 0 {
-                match self.pin_addr {
-                    Some(addr) => Some((host_of(&current)?, vec![addr])),
+                match &self.pin_addr {
+                    Some(addrs) => Some((host_of(&current)?, addrs.clone())),
                     None => None,
                 }
             } else {
@@ -2341,7 +3078,20 @@ impl RequestBuilder {
             if hop > 0 {
                 strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
             }
-            let client = build_oneshot_client(resolve, reqwest::redirect::Policy::none(), timeout)?;
+            let client = match hop_client {
+                HopClient::Pooled(client) => client.clone(),
+                HopClient::OneShot(timeout) => {
+                    build_oneshot_client(resolve, reqwest::redirect::Policy::none(), timeout)?
+                }
+            };
+            // Each hop uses the retry budget of its own host.
+            let hop_gate;
+            let hop_gate = if hop == 0 {
+                gate
+            } else {
+                hop_gate = gate.for_hop(&current, &mut refilled);
+                &hop_gate
+            };
             let resp = send_one(
                 &client,
                 &method,
@@ -2349,14 +3099,29 @@ impl RequestBuilder {
                 &headers,
                 body.as_ref(),
                 &self.retry_policy,
+                &*self.entropy,
                 self.discard_response_body,
                 None,
                 is_half_open,
+                hop_gate,
+                true,
+                chain_retries.as_ref(),
+                // The custom path counts a whole call instead (see
+                // `send_custom_breaker_guarded`).
+                matches!(hop_client, HopClient::Pooled(_))
+                    .then_some(self.throttle.as_ref())
+                    .flatten(),
             )
             .await?;
 
-            let Some(next) = redirect_target(&resp, &current)? else {
-                return Ok(resp);
+            let next = match redirect_target(&resp, &current) {
+                Ok(Some(next)) => next,
+                Ok(None) => return Ok(resp),
+                // reqwest returns a redirect with a bad `Location` as is.
+                Err(ClientError::InvalidUrl(_)) if matches!(hop_client, HopClient::Pooled(_)) => {
+                    return Ok(resp);
+                }
+                Err(error) => return Err(error),
             };
             if hop >= max {
                 return Err(ClientError::TooManyRedirects(max));
@@ -2366,6 +3131,11 @@ impl RequestBuilder {
             }
             // RFC 7231/7538 method+body rewriting before the next hop.
             rewrite_after_redirect(resp.status(), &mut method, &mut body, &mut headers);
+            // The pooled client stands in for reqwest's own redirect
+            // handling, which sets `Referer`.
+            if matches!(hop_client, HopClient::Pooled(_)) {
+                set_referer(&mut headers, &next, &current);
+            }
             current = next;
         }
         unreachable!("redirect loop is bounded by `max` and always returns")
@@ -2431,6 +3201,7 @@ impl RequestBuilder {
         self,
         timeout: Duration,
         is_half_open: bool,
+        gate: &RetryGate,
     ) -> Result<Response, ClientError> {
         let deadline = crate::time::ambient_instant() + timeout;
         let (follow, max) = self.ssrf_redirect_plan();
@@ -2442,8 +3213,12 @@ impl RequestBuilder {
         let mut method = self.method.clone();
         let mut headers = self.extra_headers.clone();
         let mut body = self.body.clone();
+        // Hosts refilled for this chain: the first one already was.
+        let mut refilled: std::collections::HashSet<String> =
+            url_host(&self.url).into_iter().collect();
         for hop in 0.. {
-            let remaining_for_lookup = deadline_remaining_or_timeout(deadline, &current)?;
+            let remaining_for_lookup = deadline_remaining_or_timeout(deadline, &current)
+                .map_err(|error| gate.classify(error))?;
             // Resolve host → ALL validated addresses (rejects if ANY resolved IP
             // is blocked), then pin the full set so reqwest cannot re-resolve but
             // can still fall back across the validated addresses in order.
@@ -2452,12 +3227,13 @@ impl RequestBuilder {
             // timeout of its own at all.
             let addrs = tokio::time::timeout(remaining_for_lookup, resolve_and_validate(&current))
                 .await
-                .map_err(|_| ssrf_safe_deadline_error(&current))??;
+                .map_err(|_| gate.classify(ssrf_safe_deadline_error(&current)))??;
             let host = host_of(&current)?;
             // Re-measured after the lookup, so a slow DNS response shrinks
             // what's left for the connect/response phase below rather than
             // that phase getting a fresh full `timeout` regardless.
-            let remaining_for_connect = deadline_remaining_or_timeout(deadline, &current)?;
+            let remaining_for_connect = deadline_remaining_or_timeout(deadline, &current)
+                .map_err(|error| gate.classify(error))?;
             let client = build_oneshot_client(
                 Some((host, addrs)),
                 reqwest::redirect::Policy::none(),
@@ -2468,6 +3244,14 @@ impl RequestBuilder {
             if hop > 0 {
                 strip_sensitive_headers_if_cross_origin(&mut headers, &original, &current)?;
             }
+            // Each hop uses the retry budget of its own host.
+            let hop_gate;
+            let hop_gate = if hop == 0 {
+                gate
+            } else {
+                hop_gate = gate.for_hop(&current, &mut refilled);
+                &hop_gate
+            };
             let resp = send_one(
                 &client,
                 &method,
@@ -2475,9 +3259,14 @@ impl RequestBuilder {
                 &headers,
                 body.as_ref(),
                 &self.retry_policy,
+                &*self.entropy,
                 self.discard_response_body,
                 Some(deadline),
                 is_half_open,
+                hop_gate,
+                false,
+                None,
+                None,
             )
             .await?;
 
@@ -2593,6 +3382,402 @@ fn breaker_for_url(
     )
 }
 
+// ── Deadline and retry budget (issue #3058) ──────────────────────────────────
+
+/// Why a retry of a response with `status` is necessary.
+const fn retry_kind(status: u16) -> RetryKind {
+    if status == 429 {
+        RetryKind::Throttling
+    } else {
+        RetryKind::Transient
+    }
+}
+
+/// The retry budget key of `url`: its host and its effective port. `None` for
+/// a relative URL.
+fn url_host(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(
+        parsed
+            .port_or_known_default()
+            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")),
+    )
+}
+
+/// Retry budgets and deadline header settings of a [`Client`].
+#[derive(Clone)]
+struct RetrySettings {
+    /// Retry budgets, one for each host. `None` when the budget is off.
+    budgets: Option<Arc<RetryBudgets>>,
+    /// Send [`DEADLINE_HEADER`] when a request deadline is set.
+    send_deadline_header: bool,
+}
+
+impl RetrySettings {
+    /// Settings for a client made outside an app: its own default budgets.
+    fn standalone() -> Self {
+        Self {
+            budgets: Some(Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()))),
+            send_deadline_header: true,
+        }
+    }
+}
+
+/// The shortest time left for which a retry starts. A shorter attempt cannot
+/// get an answer, and tokio timers round up to whole milliseconds.
+const MIN_ATTEMPT: Duration = Duration::from_millis(10);
+
+/// The app's retry budgets, stored in `AppState`. `config` is the setting
+/// they were built from.
+#[derive(Clone)]
+pub(crate) struct SharedRetryBudgets {
+    budgets: Arc<RetryBudgets>,
+    config: RetryBudgetConfig,
+}
+
+/// Serializes the replacement of the shared retry budgets.
+static BUDGETS_REPLACE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The app-wide retry budgets for the effective `config`, or `None` when
+/// they are off. A `state_initializer` may replace the config after boot, so
+/// budgets built from other settings are replaced, as the shared throttle is.
+fn shared_retry_budgets(
+    state: &crate::AppState,
+    config: &RetryBudgetConfig,
+) -> Option<Arc<RetryBudgets>> {
+    if !config.enabled {
+        return None;
+    }
+    let current = || {
+        state
+            .extension::<SharedRetryBudgets>()
+            .filter(|shared| shared.config == *config)
+            .map(|shared| Arc::clone(&shared.budgets))
+    };
+    if let Some(budgets) = current() {
+        return Some(budgets);
+    }
+    // Replace under a lock and check again, so that concurrent first calls
+    // after a config change share one set. Only this slow path locks.
+    let _guard = BUDGETS_REPLACE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(budgets) = current() {
+        return Some(budgets);
+    }
+    let budgets = Arc::new(RetryBudgets::new(config));
+    state.insert_extension(SharedRetryBudgets {
+        budgets: Arc::clone(&budgets),
+        config: config.clone(),
+    });
+    Some(budgets)
+}
+
+/// The request deadline and the retry budget for one send.
+///
+/// All three retry loops (plain, sim, custom) ask it the same questions.
+struct RetryGate {
+    deadline: Option<Deadline>,
+    /// All budgets of the client, to pick the budget of a redirect hop.
+    budgets: Option<Arc<RetryBudgets>>,
+    /// The budget of the current host.
+    budget: Option<Arc<RetryBudget>>,
+    /// The key of the current host's budget.
+    host: Option<String>,
+    send_header: bool,
+    /// The first-attempt refill of `budget`, done by the first
+    /// [`check`](Self::check) that finds time left, so a request that never
+    /// starts an attempt refills nothing.
+    refill_pending: AtomicBool,
+    /// The tokens [`allow`](Self::allow) took for a retry that has not
+    /// started. The next [`check`](Self::check) that lets the retry run keeps
+    /// them; a send cancelled in the backoff gives them back on drop.
+    pending_retry: std::sync::Mutex<Option<(Arc<RetryBudget>, RetryKind)>>,
+    /// The caller's own [`DEADLINE_HEADER`] value as a deadline, fixed at the
+    /// first attempt. The value is relative, so a retry or a later hop sends
+    /// what is left of it, not the whole value again.
+    caller_deadline: std::sync::OnceLock<Option<Deadline>>,
+    /// Signs each attempt again (Web Bot Auth), see [`with_caller_headers`].
+    signer: Option<Arc<crate::aeo::web_bot_auth::WebBotAuthSigner>>,
+}
+
+impl Drop for RetryGate {
+    fn drop(&mut self) {
+        let pending = self
+            .pending_retry
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((budget, kind)) = pending {
+            budget.release(kind);
+        }
+    }
+}
+
+impl RetryGate {
+    /// Read the current deadline. The first attempt is recorded in the
+    /// budget of `host` when it starts.
+    fn start(budgets: Option<Arc<RetryBudgets>>, host: Option<&str>, send_header: bool) -> Self {
+        Self::with_deadline(Deadline::current(), budgets, host, send_header)
+    }
+
+    fn with_deadline(
+        deadline: Option<Deadline>,
+        budgets: Option<Arc<RetryBudgets>>,
+        host: Option<&str>,
+        send_header: bool,
+    ) -> Self {
+        let budget = budgets
+            .as_deref()
+            .zip(host)
+            .map(|(budgets, host)| budgets.for_host(host));
+        Self {
+            deadline,
+            budgets,
+            budget,
+            host: host.map(str::to_owned),
+            send_header,
+            refill_pending: AtomicBool::new(true),
+            pending_retry: std::sync::Mutex::new(None),
+            caller_deadline: std::sync::OnceLock::new(),
+            signer: None,
+        }
+    }
+
+    /// Move to the budget of `url`'s host when it is not the current host,
+    /// for example after the HTTP stack followed a redirect.
+    ///
+    /// The plain path refills a redirect host with
+    /// [`record_destinations`](Self::record_destinations), so this does not.
+    fn rekey(&mut self, url: &str) {
+        let host = url_host(url);
+        if host.is_some() && host != self.host {
+            self.budget = self
+                .budgets
+                .as_deref()
+                .zip(host.as_deref())
+                .map(|(budgets, host)| budgets.for_host(host));
+            self.host = host;
+        }
+    }
+
+    /// Record a first attempt in the budget of `url`'s host when it is not
+    /// the current host: the HTTP stack followed a redirect and the answer is
+    /// final. The gate keeps its budget, so a refund still goes to the budget
+    /// that paid for the retry.
+    fn record_destination(&self, url: &str) {
+        let host = url_host(url);
+        // No deadline check: the HTTP stack only lists a host it sent to.
+        if host.is_none() || host == self.host {
+            return;
+        }
+        if let Some((budgets, host)) = self.budgets.as_deref().zip(host) {
+            budgets.for_host(&host).record_request();
+        }
+    }
+
+    /// [`record_destination`](Self::record_destination) for each host of a
+    /// redirect chain that is not in `seen`, then add it to `seen`.
+    fn record_destinations(&self, urls: &[String], seen: &mut std::collections::HashSet<String>) {
+        for url in urls {
+            if url_host(url).is_some_and(|host| seen.insert(host)) {
+                self.record_destination(url);
+            }
+        }
+    }
+
+    /// The gate of a redirect hop to `url`: the same deadline, and the
+    /// budget of the hop's host.
+    ///
+    /// The hop's host gets its first-attempt refill only when it is not in
+    /// `refilled`, so a host that a chain visits again is credited once.
+    fn for_hop(&self, url: &str, refilled: &mut std::collections::HashSet<String>) -> Self {
+        let mut hop = Self {
+            deadline: self.deadline,
+            budgets: self.budgets.clone(),
+            budget: self.budget.clone(),
+            host: self.host.clone(),
+            send_header: self.send_header,
+            refill_pending: AtomicBool::new(false),
+            pending_retry: std::sync::Mutex::new(None),
+            caller_deadline: self.caller_deadline.clone(),
+            signer: self.signer.clone(),
+        };
+        hop.rekey(url);
+        if url_host(url).is_some_and(|host| refilled.insert(host)) {
+            hop.refill_pending = AtomicBool::new(true);
+        }
+        hop
+    }
+
+    /// The error of a failed body read: [`ClientError::DeadlineExceeded`] for
+    /// a timeout the request deadline caused, else [`ClientError::Request`].
+    fn body_error(&self, error: reqwest::Error) -> ClientError {
+        if error.is_timeout() && self.expired() {
+            ClientError::DeadlineExceeded
+        } else {
+            ClientError::Request(error.without_url())
+        }
+    }
+
+    /// `error`, or [`ClientError::DeadlineExceeded`] when the request deadline
+    /// has passed and so is the cause.
+    fn classify(&self, error: ClientError) -> ClientError {
+        if self.expired() {
+            ClientError::DeadlineExceeded
+        } else {
+            error
+        }
+    }
+
+    /// An error when no time is left to start an attempt.
+    ///
+    /// The first check with time left does the first-attempt refill.
+    fn check(&self) -> Result<(), ClientError> {
+        if self.expired() {
+            return Err(ClientError::DeadlineExceeded);
+        }
+        // The retry starts, so it keeps its tokens.
+        self.pending_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if self.refill_pending.swap(false, Ordering::Relaxed)
+            && let Some(budget) = &self.budget
+        {
+            budget.record_request();
+        }
+        Ok(())
+    }
+
+    /// The timeout of the next attempt: `per_try`, or the time left if that is
+    /// shorter.
+    fn attempt_timeout(&self, per_try: Option<Duration>) -> Option<Duration> {
+        match (per_try, self.deadline) {
+            (Some(limit), Some(deadline)) => Some(deadline.clamp(limit)),
+            (None, Some(deadline)) => Some(deadline.remaining()),
+            (limit, None) => limit,
+        }
+    }
+
+    /// `true` when the request deadline has passed.
+    fn expired(&self) -> bool {
+        self.deadline.is_some_and(Deadline::is_expired)
+    }
+
+    /// `true` when a retry of `kind` can start after `wait`. It must have at
+    /// least [`MIN_ATTEMPT`] left after the wait, and it takes tokens from the
+    /// budget. The tokens come back if the retry never starts.
+    fn allow(&self, kind: RetryKind, wait: Duration) -> bool {
+        if self
+            .deadline
+            .is_some_and(|deadline| deadline.remaining() <= wait + MIN_ATTEMPT)
+        {
+            return false;
+        }
+        let Some(budget) = &self.budget else {
+            return true;
+        };
+        if !budget.try_acquire(kind) {
+            return false;
+        }
+        *self
+            .pending_retry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((Arc::clone(budget), kind));
+        true
+    }
+
+    /// Give back the tokens of the last retry when the final `status` is a
+    /// success (below 400).
+    fn finish(&self, last_retry: Option<RetryKind>, status: u16) {
+        if let (Some(budget), Some(kind)) = (&self.budget, last_retry)
+            && status < 400
+        {
+            budget.release(kind);
+        }
+    }
+
+    /// The [`DEADLINE_HEADER`] value for an attempt with `timeout`. `None`
+    /// with no deadline and no caller value the client can read.
+    ///
+    /// A value the caller set is kept when it is shorter, so the header never
+    /// says more than the time left. When this returns a value, the caller's
+    /// own copy of the header is not sent.
+    fn header(&self, timeout: Option<Duration>, caller: &HeaderMap) -> Option<HeaderValue> {
+        let millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        // The time left of the request deadline, when one is set.
+        let left = self.deadline.and(timeout).map(millis);
+        let Some(value) = caller.get(DEADLINE_HEADER) else {
+            return left.filter(|_| self.send_header).map(HeaderValue::from);
+        };
+        // The first attempt sends the caller's value as set; later ones send
+        // what is left of it, with or without a request deadline.
+        let mut first = None;
+        let caller_deadline = self.caller_deadline.get_or_init(|| {
+            first = crate::deadline::parse_header(value);
+            first.map(Deadline::after)
+        });
+        let theirs = first.map(millis).or_else(|| {
+            caller_deadline
+                .as_ref()
+                .map(|deadline| millis(deadline.remaining()))
+        });
+        match (left, theirs) {
+            (Some(left), Some(theirs)) => Some(HeaderValue::from(left.min(theirs))),
+            (Some(value), None) | (None, Some(value)) => Some(HeaderValue::from(value)),
+            // No deadline, and a value the client cannot read: sent as set.
+            (None, None) => None,
+        }
+    }
+}
+
+/// Add the [`DEADLINE_HEADER`] for an attempt with `timeout`, then the
+/// caller's headers. The caller's own deadline header is left out when the
+/// gate sends one, which is never longer than the caller's.
+fn with_caller_headers(
+    mut req: reqwest::RequestBuilder,
+    gate: &RetryGate,
+    timeout: Option<Duration>,
+    caller: &HeaderMap,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    let deadline_value = gate.header(timeout, caller);
+    let sends_deadline = deadline_value.is_some();
+    if let Some(value) = deadline_value {
+        req = req.header(DEADLINE_HEADER, value);
+    }
+    // A Web Bot Auth signature is made new for each attempt. A cross-origin
+    // hop already dropped the old one, and gets none.
+    let fresh = gate
+        .signer
+        .as_ref()
+        .filter(|_| caller.contains_key("signature"))
+        .and_then(|signer| signer.sign_url(url));
+    for (name, value) in caller {
+        if sends_deadline && name == DEADLINE_HEADER {
+            continue;
+        }
+        if fresh.is_some()
+            && matches!(
+                name.as_str(),
+                "signature" | "signature-input" | "signature-agent"
+            )
+        {
+            continue;
+        }
+        req = req.header(name.clone(), value.clone());
+    }
+    if let Some(h) = fresh {
+        req = req
+            .header("signature-agent", h.signature_agent)
+            .header("signature-input", h.signature_input)
+            .header("signature", h.signature);
+    }
+    req
+}
+
 // ── Custom send-path helpers (redirect / pin / SSRF-safe) ─────────────────────
 
 /// Why one simulated attempt failed.
@@ -2608,6 +3793,7 @@ async fn serve_sim_host(
     router: axum::Router,
     request: &RequestBuilder,
     url: reqwest::Url,
+    deadline_header: Option<HeaderValue>,
 ) -> Result<Response, ClientError> {
     let target = url.query().map_or_else(
         || url.path().to_owned(),
@@ -2622,12 +3808,13 @@ async fn serve_sim_host(
         let authority = &url[url::Position::BeforeHost..url::Position::AfterPort];
         builder = builder.header(reqwest::header::HOST, authority);
     }
-    // Trace context first, as on the real send path. A caller header of the
-    // same name wins.
-    for (name, value) in trace_context_headers() {
-        if !request.extra_headers.contains_key(name.as_str()) {
-            builder = builder.header(name, value);
-        }
+    // Trace context first, as on the real send path. A caller header wins.
+    for (name, value) in trace_headers_to_send(trace_context_headers(), &request.extra_headers) {
+        builder = builder.header(name, value);
+    }
+    let sends_deadline = deadline_header.is_some();
+    if let Some(value) = deadline_header {
+        builder = builder.header(DEADLINE_HEADER, value);
     }
     // The real client sends a `Content-Length` for a known-size body. A
     // caller header of the same name wins.
@@ -2638,14 +3825,40 @@ async fn serve_sim_host(
     {
         builder = builder.header(reqwest::header::CONTENT_LENGTH, body.len());
     }
+    // A Web Bot Auth signature is made new for each attempt, as on the real
+    // send path (`with_caller_headers`).
+    let fresh = request
+        .web_bot_auth
+        .as_ref()
+        .filter(|_| request.extra_headers.contains_key("signature"))
+        .and_then(|signer| signer.sign_url(url.as_str()));
     for (name, value) in &request.extra_headers {
+        if sends_deadline && name == DEADLINE_HEADER {
+            continue;
+        }
+        if fresh.is_some()
+            && matches!(
+                name.as_str(),
+                "signature" | "signature-input" | "signature-agent"
+            )
+        {
+            continue;
+        }
         builder = builder.header(name, value);
+    }
+    if let Some(h) = fresh {
+        builder = builder
+            .header("signature-agent", h.signature_agent)
+            .header("signature-input", h.signature_input)
+            .header("signature", h.signature);
     }
     let body = request.body.clone().unwrap_or_default();
     let http_request = builder
         .body(axum::body::Body::from(body))
         .map_err(|error| ClientError::SimNetwork(error.to_string()))?;
-    let response = tower::ServiceExt::oneshot(router, http_request)
+    // The host is another process: it must not see the caller's task-local
+    // deadline. Only the deadline header goes to it.
+    let response = crate::deadline::unscoped(tower::ServiceExt::oneshot(router, http_request))
         .await
         .unwrap_or_else(|never| match never {});
     let status = response.status();
@@ -2697,6 +3910,117 @@ fn build_oneshot_client(
     builder.build().map_err(ClientError::Request)
 }
 
+/// The retries a redirect chain shares (see `follow_pooled`).
+struct ChainRetries {
+    /// Retries the chain may still make.
+    left: AtomicU32,
+    /// Retries already made, so a later hop's backoff goes on from them.
+    used: AtomicU32,
+    /// When the attempt that answered with the redirect being followed runs
+    /// out of its `request_timeout`. As with reqwest's own redirects, one
+    /// timeout covers all hops of an attempt.
+    attempt_end: Mutex<Option<Instant>>,
+}
+
+impl ChainRetries {
+    const fn new(retries: u32) -> Self {
+        Self {
+            left: AtomicU32::new(retries),
+            used: AtomicU32::new(0),
+            attempt_end: Mutex::new(None),
+        }
+    }
+
+    /// Take the end of the attempt that led to this hop.
+    fn take_attempt_end(&self) -> Option<Instant> {
+        self.attempt_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Carry `end` to the next hop's first attempt.
+    fn set_attempt_end(&self, end: Option<Instant>) {
+        *self
+            .attempt_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = end;
+    }
+}
+
+/// One attempt that the throttle let through. [`Self::record`] counts the
+/// outcome. A ticket dropped without an outcome (the caller cancelled the
+/// call) counts as an accept: the host did not reject it.
+struct ThrottleTicket {
+    throttle: Arc<crate::admission::AdaptiveThrottle>,
+    host: String,
+    recorded: bool,
+}
+
+impl ThrottleTicket {
+    fn record(mut self, accepted: bool) {
+        self.recorded = true;
+        self.throttle
+            .record(&self.host, crate::time::ambient_instant(), accepted);
+    }
+}
+
+impl Drop for ThrottleTicket {
+    fn drop(&mut self) {
+        if !self.recorded {
+            self.throttle
+                .record(&self.host, crate::time::ambient_instant(), true);
+        }
+    }
+}
+
+/// Ask `throttle` for one attempt to `host` (issue #3068).
+/// [`ClientError::ThrottledLocally`] when it rejects.
+fn admit_throttle(
+    throttle: &Arc<crate::admission::AdaptiveThrottle>,
+    host: String,
+    entropy: &dyn crate::entropy::Entropy,
+) -> Result<ThrottleTicket, ClientError> {
+    let now = crate::time::ambient_instant();
+    if throttle.admit(&host, now, || entropy.next_u64()) {
+        Ok(ThrottleTicket {
+            throttle: Arc::clone(throttle),
+            host,
+            recorded: false,
+        })
+    } else {
+        tracing::debug!(host = %host, "outbound request throttled locally");
+        Err(ClientError::ThrottledLocally { host })
+    }
+}
+
+/// Count a whole call that took one throttle `ticket`. A call that the
+/// caller's deadline stopped says nothing about the host (issue #3058): its
+/// ticket is dropped, which counts as an accept.
+fn record_call(ticket: Option<ThrottleTicket>, res: &Result<Response, ClientError>) {
+    if let Some(ticket) = ticket
+        && !matches!(res, Err(ClientError::DeadlineExceeded))
+    {
+        ticket.record(matches!(res, Ok(r) if throttle_accepts(r.status.as_u16())));
+    }
+}
+
+/// `false` for the statuses a host uses to reject for overload.
+const fn throttle_accepts(status: u16) -> bool {
+    !matches!(status, 429 | 503)
+}
+
+/// The throttle key of `url`: `host`, or `host:port` with an explicit port.
+fn throttle_host(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    let host = parsed.host_str()?;
+    Some(
+        parsed
+            .port()
+            .map_or_else(|| host.to_owned(), |port| format!("{host}:{port}")),
+    )
+}
+
 /// Send a single request through `client` (no manual redirect following — the
 /// client's redirect policy governs that) with the same transient-error and
 /// 429/5xx retry behaviour as the shared path, and collect the [`Response`].
@@ -2723,16 +4047,14 @@ fn build_oneshot_client(
 /// Two more `deadline` seams round 9 found `send_ssrf_safe`'s own deadline
 /// fix had missed: `client`'s own reqwest-level timeout is fixed at
 /// build-hop-start, so a retry within the same hop still got the *original*
-/// per-attempt budget rather than what's actually left; and the 429
-/// `Retry-After` sleep is a second sleep, separate from the backoff sleep
-/// above, that the deadline check never covered at all. Both are fixed here:
-/// every attempt sends with an explicit per-request `.timeout()` recomputed
-/// from `deadline` (overriding `client`'s built-in one only when `deadline`
-/// is set, so non-SSRF-safe callers passing `None` are unaffected), and the
-/// `Retry-After` sleep is capped by the remaining budget and followed by the
-/// same deadline check the backoff sleep already has — falling through to
-/// return the 429 response as final, exactly like running out of
-/// `max_attempts` already does, rather than sleeping past the deadline first.
+/// per-attempt budget rather than what's actually left; and the
+/// `Retry-After` wait was not checked against the deadline. Both are fixed
+/// here. Every attempt sends with an explicit per-request `.timeout()`
+/// recomputed from `deadline`. This overrides `client`'s own timeout only
+/// when `deadline` is set, so callers that pass `None` see no change. If a
+/// `Retry-After` wait (on a 429 or 503, issue #3054) reaches the deadline,
+/// the loop does not sleep. It returns that response as final, as it does
+/// when `max_attempts` runs out.
 ///
 /// `suppress_retries`, when `true`, forces a single attempt regardless of
 /// `retry_policy` — the same thing [`RequestBuilder::send_inner`]'s own
@@ -2748,6 +4070,10 @@ fn build_oneshot_client(
               retry/discard/deadline/half-open knobs alongside it, for no reduction in what a \
               caller reasons about"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one retry loop; the deadline and budget checks (#3058) sit at each decision"
+)]
 async fn send_one(
     client: &reqwest::Client,
     method: &Method,
@@ -2755,18 +4081,30 @@ async fn send_one(
     extra_headers: &HeaderMap,
     body: Option<&Bytes>,
     retry_policy: &RetryPolicy,
+    entropy: &dyn crate::entropy::Entropy,
     discard_response_body: bool,
     deadline: Option<Instant>,
     suppress_retries: bool,
+    gate: &RetryGate,
+    skip_redirect_body: bool,
+    chain: Option<&ChainRetries>,
+    throttle: Option<&Arc<crate::admission::AdaptiveThrottle>>,
 ) -> Result<Response, ClientError> {
     let start = crate::time::ambient_instant();
-    let max_attempts = if suppress_retries {
+    let mut last_retry = None;
+    let mut max_attempts = if suppress_retries {
         1
     } else if is_idempotent_method(method) || !retry_policy.retry_idempotent_only {
         retry_policy.max_retries.saturating_add(1)
     } else {
         1
     };
+    // A redirect chain shares one retry count (see `follow_pooled`), and
+    // its backoff goes on from the retries earlier hops made.
+    let retries_before = chain.map_or(0, |chain| chain.used.load(Ordering::Relaxed));
+    if let Some(chain) = chain {
+        max_attempts = max_attempts.min(chain.left.load(Ordering::Relaxed).saturating_add(1));
+    }
     let mut last_transient_err: Option<reqwest::Error> = None;
 
     // A prior attempt's own connect/timeout error may be why the deadline is
@@ -2780,81 +4118,147 @@ async fn send_one(
         )
     };
 
+    // `true` when a wait of `wait` leaves less than `MIN_ATTEMPT` before the
+    // hop deadline, so no retry can run after it. `RetryGate::allow` keeps
+    // the same margin before the request deadline.
+    let reaches_hop_deadline = |wait: Duration| {
+        deadline.is_some_and(|d| {
+            crate::time::ambient_instant()
+                .checked_add(wait.saturating_add(MIN_ATTEMPT))
+                .is_none_or(|resume| resume >= d)
+        })
+    };
+
+    let mut delay = Duration::ZERO;
     for attempt in 0..max_attempts {
+        let last = attempt + 1 == max_attempts;
         if attempt > 0 {
-            if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
-                return Err(deadline_exceeded_err(&mut last_transient_err));
+            if let Some(chain) = chain {
+                chain.left.fetch_sub(1, Ordering::Relaxed);
+                chain.used.fetch_add(1, Ordering::Relaxed);
             }
-            let exp = (attempt - 1).min(10);
-            let mut delay = Duration::from_millis(100 * (1_u64 << exp));
+            if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
+                return Err(gate.classify(deadline_exceeded_err(&mut last_transient_err)));
+            }
+            let mut sleep_for = delay;
             if let Some(d) = deadline {
-                delay = delay.min(d.saturating_duration_since(crate::time::ambient_instant()));
+                sleep_for =
+                    sleep_for.min(d.saturating_duration_since(crate::time::ambient_instant()));
             }
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(sleep_for).await;
             if deadline.is_some_and(|d| crate::time::ambient_instant() >= d) {
-                return Err(deadline_exceeded_err(&mut last_transient_err));
+                return Err(gate.classify(deadline_exceeded_err(&mut last_transient_err)));
             }
         }
 
+        // With `throttle`, each attempt asks it (issue #3068), as on the plain
+        // path: a throttled retry ends the call. It asks before
+        // `RetryGate::check`, so a throttled attempt refills no budget.
+        if gate.expired() {
+            return Err(ClientError::DeadlineExceeded);
+        }
+        let ticket = match throttle.zip(throttle_host(url)) {
+            Some((throttle, host)) => Some(admit_throttle(throttle, host, entropy)?),
+            None => None,
+        };
+        gate.check()?;
         let mut req = client.request(method.clone(), url);
         // Recomputed fresh every attempt (not just retries) rather than
         // relying solely on `client`'s own timeout, which was fixed when the
         // caller built it at hop-start: without this override, a retry deep
         // into a hop's budget would still get the full original per-attempt
         // timeout rather than what's actually left before `deadline`.
-        if let Some(d) = deadline {
-            req = req.timeout(d.saturating_duration_since(crate::time::ambient_instant()));
+        let attempt_start = crate::time::ambient_instant();
+        let hop_timeout = deadline.map(|d| d.saturating_duration_since(attempt_start));
+        // On a chain the client follows itself, the first attempt of a later
+        // hop goes on with the attempt that answered with the redirect, and
+        // keeps what is left of its `request_timeout`. A retry is a new
+        // attempt, with a new timeout.
+        let carried_end = if attempt == 0 {
+            chain.and_then(ChainRetries::take_attempt_end)
+        } else {
+            None
+        };
+        let per_try = match (retry_policy.request_timeout, carried_end) {
+            (Some(_), Some(end)) => Some(end.saturating_duration_since(attempt_start)),
+            (limit, _) => limit,
+        };
+        let attempt_end = carried_end.or_else(|| {
+            retry_policy
+                .request_timeout
+                .and_then(|limit| attempt_start.checked_add(limit))
+        });
+        // The request deadline (issue #3058) can make it shorter again.
+        let attempt_timeout = if gate.deadline.is_some() {
+            gate.attempt_timeout(hop_timeout.or(per_try))
+        } else if carried_end.is_some() {
+            // A later hop of a chain without a deadline.
+            hop_timeout.or(per_try)
+        } else {
+            hop_timeout
+        };
+        if let Some(timeout) = attempt_timeout {
+            req = req.timeout(timeout);
         }
-        req = inject_trace_context(req);
-        for (name, value) in extra_headers {
-            req = req.header(name.clone(), value.clone());
-        }
+        let span = client_attempt_span(method, url, attempt);
+        req = span.in_scope(|| inject_trace_context(req, extra_headers));
+        req = with_caller_headers(req, gate, attempt_timeout, extra_headers, url);
         if let Some(body) = body {
             req = req.body(body.clone());
         }
 
-        match req.send().await {
+        match send_in_span(req, &span).await {
             Ok(resp) => {
                 let status = resp.status();
                 let headers = resp.headers().clone();
                 let url_used = resp.url().clone();
 
-                if status.as_u16() == 429 && attempt + 1 < max_attempts {
-                    let mut sleep_delay =
-                        parse_retry_after(&headers).unwrap_or(Duration::from_secs(1));
-                    sleep_delay = sleep_delay.min(retry_policy.max_retry_after);
-                    if let Some(req_timeout) = retry_policy.request_timeout {
-                        sleep_delay = sleep_delay.min(req_timeout);
-                    }
-                    if let Some(d) = deadline {
-                        sleep_delay = sleep_delay
-                            .min(d.saturating_duration_since(crate::time::ambient_instant()));
-                    }
-                    tokio::time::sleep(sleep_delay).await;
-                    if deadline.is_none_or(|d| crate::time::ambient_instant() < d) {
-                        continue;
-                    }
-                    // Deadline exceeded during (or because of) the
-                    // Retry-After wait — fall through and return this 429
-                    // response as the final outcome, exactly as running out
-                    // of max_attempts already does, instead of sleeping past
-                    // the deadline and only then giving up.
-                }
-                if is_retryable_status(status.as_u16())
-                    && attempt + 1 < max_attempts
+                if is_retryable_response(status.as_u16())
+                    && !last
                     && deadline.is_none_or(|d| crate::time::ambient_instant() < d)
                 {
-                    continue;
+                    let hint = retry_hint(status.as_u16(), &headers);
+                    let next = retry_policy.retry_delay(
+                        entropy,
+                        retries_before.saturating_add(attempt),
+                        hint,
+                    );
+                    // A wait (hinted or not) that reaches the deadline cannot
+                    // retry in time, so this response is the final outcome.
+                    let kind = retry_kind(status.as_u16());
+                    if !reaches_hop_deadline(next) && gate.allow(kind, next) {
+                        if let Some(ticket) = ticket {
+                            ticket.record(throttle_accepts(status.as_u16()));
+                        }
+                        delay = next;
+                        last_retry = Some(kind);
+                        continue;
+                    }
                 }
-
-                let body = if discard_response_body {
+                // A redirect the caller follows: its body is not needed, and
+                // may be large or never end.
+                let followed = skip_redirect_body
+                    && matches!(redirect_location(status, &headers, url), Ok(Some(_)));
+                if followed && let Some(chain) = chain {
+                    chain.set_attempt_end(attempt_end);
+                }
+                let body = if discard_response_body || followed {
                     // Dropped unread — see `RequestBuilder::discard_response_body`.
-                    Bytes::new()
+                    Ok(Bytes::new())
                 } else {
-                    resp.bytes()
-                        .await
-                        .map_err(|e| ClientError::Request(e.without_url()))?
+                    read_body_in_span(resp, &span, gate).await
                 };
+                // Count the attempt only now: a body that fails to arrive is
+                // a transport error, not an accept. A body the caller's
+                // deadline stopped drops the ticket, which counts as an accept.
+                if let Some(ticket) = ticket
+                    && !matches!(body, Err(ClientError::DeadlineExceeded))
+                {
+                    ticket.record(body.is_ok() && throttle_accepts(status.as_u16()));
+                }
+                let body = body?;
+                // Refund only after the body arrived.
+                gate.finish(last_retry, status.as_u16());
                 log_request(
                     method.as_str(),
                     &url_used,
@@ -2869,10 +4273,30 @@ async fn send_one(
                     url: Some(url_used),
                 });
             }
-            Err(e) if (e.is_connect() || e.is_timeout()) && attempt + 1 < max_attempts => {
+            // The request deadline stopped the attempt.
+            Err(e) if e.is_timeout() && gate.expired() => {
+                return Err(ClientError::DeadlineExceeded);
+            }
+            Err(e) if (e.is_connect() || e.is_timeout()) && !last => {
+                if let Some(ticket) = ticket {
+                    ticket.record(false);
+                }
+                let wait =
+                    retry_policy.retry_delay(entropy, retries_before.saturating_add(attempt), None);
+                // No retry fits in the hop, so none is charged.
+                if reaches_hop_deadline(wait) || !gate.allow(RetryKind::Transient, wait) {
+                    return Err(ClientError::Request(e.without_url()));
+                }
+                delay = wait;
+                last_retry = Some(RetryKind::Transient);
                 last_transient_err = Some(e);
             }
-            Err(e) => return Err(ClientError::Request(e.without_url())),
+            Err(e) => {
+                if let Some(ticket) = ticket {
+                    ticket.record(false);
+                }
+                return Err(ClientError::Request(e.without_url()));
+            }
         }
     }
 
@@ -2913,12 +4337,22 @@ fn scheme_is_https(url: &str) -> Result<bool, ClientError> {
 /// the non-followable 3xx `300`/`304`/`305`/`306`), or a followable status
 /// missing its `Location` header.
 fn redirect_target(resp: &Response, base: &str) -> Result<Option<String>, ClientError> {
+    redirect_location(resp.status(), resp.headers(), base)
+}
+
+/// [`redirect_target`] from a response's status and headers, before its body
+/// is read.
+fn redirect_location(
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+    base: &str,
+) -> Result<Option<String>, ClientError> {
     // Only the statuses reqwest itself follows are treated as redirects. A
     // response like `304 Not Modified` (or 300/305/306) can legitimately carry
     // a `Location` header without being a followable redirect, so matching the
     // entire 300–399 range via `is_redirection()` would wrongly issue an extra
     // request instead of returning the response to the caller.
-    match resp.status() {
+    match status {
         reqwest::StatusCode::MOVED_PERMANENTLY
         | reqwest::StatusCode::FOUND
         | reqwest::StatusCode::SEE_OTHER
@@ -2926,8 +4360,7 @@ fn redirect_target(resp: &Response, base: &str) -> Result<Option<String>, Client
         | reqwest::StatusCode::PERMANENT_REDIRECT => {}
         _ => return Ok(None),
     }
-    let Some(location) = resp
-        .headers()
+    let Some(location) = headers
         .get(reqwest::header::LOCATION)
         .and_then(|v| v.to_str().ok())
     else {
@@ -2944,8 +4377,9 @@ fn redirect_target(resp: &Response, base: &str) -> Result<Option<String>, Client
 ///
 /// If `current`'s origin (scheme + host + port, per [`url::Url::origin`])
 /// differs from the `original` request URL's origin, the `Authorization`,
-/// `Cookie`, and `Proxy-Authorization` headers are removed from `headers` so
-/// they are never forwarded to a cross-origin target (credential leak).
+/// `Cookie`, `Cookie2`, `Proxy-Authorization` and `WWW-Authenticate` headers
+/// are removed from `headers` so they are never forwarded to a cross-origin
+/// target (credential leak).
 /// Because the caller threads a single mutable `headers` map across hops, once
 /// these headers are stripped on any hop they stay stripped for the remainder
 /// of the chain — the safe, conservative behaviour.
@@ -2957,9 +4391,16 @@ fn strip_sensitive_headers_if_cross_origin(
     let current_url =
         url::Url::parse(current).map_err(|e| ClientError::InvalidUrl(e.to_string()))?;
     if current_url.origin() != original.origin() {
+        // The set reqwest's own redirect handling removes.
         headers.remove(reqwest::header::AUTHORIZATION);
         headers.remove(reqwest::header::COOKIE);
+        headers.remove("cookie2");
         headers.remove(reqwest::header::PROXY_AUTHORIZATION);
+        headers.remove(reqwest::header::WWW_AUTHENTICATE);
+        // RFC 9421 signatures (Web Bot Auth) bind to the first authority.
+        headers.remove("signature");
+        headers.remove("signature-input");
+        headers.remove("signature-agent");
     }
     Ok(())
 }
@@ -3137,16 +4578,151 @@ fn log_request(
     );
 }
 
-/// Inject the active span's W3C `traceparent` / `tracestate` headers into the
-/// request builder.  No-ops when the `telemetry-otlp` feature is disabled or
-/// when there is no active span with a valid context.
-#[allow(clippy::missing_const_for_fn)]
-fn inject_trace_context(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+/// Open the CLIENT span for one outbound attempt (issue #3064).
+///
+/// Field names follow the OpenTelemetry HTTP client conventions. The span
+/// holds the URL path only, not the query: a query can hold secrets.
+fn client_attempt_span(method: &Method, url: &str, attempt: u32) -> tracing::Span {
+    let span = tracing::info_span!(
+        "http.client.request",
+        otel.name = %method,
+        otel.kind = "client",
+        http.request.method = %method,
+        server.address = tracing::field::Empty,
+        url.path = tracing::field::Empty,
+        http.request.resend_count = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+        otel.status_code = tracing::field::Empty,
+    );
+    // The conventions leave `resend_count` unset on the first attempt.
+    if attempt > 0 {
+        span.record("http.request.resend_count", attempt);
+    }
+    // Parse the URL only when a subscriber listens.
+    if !span.is_disabled()
+        && let Ok(parsed) = reqwest::Url::parse(url)
+    {
+        span.record("server.address", parsed.host_str().unwrap_or_default());
+        span.record("url.path", parsed.path());
+    }
+    span
+}
+
+/// Record the response status on an attempt span. A 4xx or 5xx status sets
+/// the span status to `ERROR`, as the HTTP client conventions require.
+fn record_attempt_status(span: &tracing::Span, status: u16) {
+    span.record("http.response.status_code", status);
+    if status >= 400 {
+        span.record("otel.status_code", "ERROR");
+    }
+}
+
+/// Record a failed attempt: the error class and the `ERROR` span status.
+fn record_attempt_error(span: &tracing::Span, kind: &'static str) {
+    span.record("error.type", kind);
+    span.record("otel.status_code", "ERROR");
+}
+
+/// Read the response body inside the attempt `span`, so the span covers the
+/// body transfer. A read failure sets `error.type = "body"`, and `gate`
+/// classifies it (see [`RetryGate::body_error`]).
+async fn read_body_in_span(
+    response: reqwest::Response,
+    span: &tracing::Span,
+    gate: &RetryGate,
+) -> Result<Bytes, ClientError> {
+    use tracing::Instrument as _;
+
+    let body = response.bytes().instrument(span.clone()).await;
+    if body.is_err() {
+        record_attempt_error(span, "body");
+    }
+    body.map_err(|e| gate.body_error(e))
+}
+
+/// Send `request` inside `span`, then record the status code or the error
+/// class on the span.
+///
+/// The caller keeps `span` open through the body read, and ends it before a
+/// `Retry-After` sleep: the sleep is not part of the attempt.
+async fn send_in_span(
+    request: reqwest::RequestBuilder,
+    span: &tracing::Span,
+) -> Result<reqwest::Response, reqwest::Error> {
+    use tracing::Instrument as _;
+
+    let sent = request.send().instrument(span.clone()).await;
+    record_send_outcome(span, &sent);
+    sent
+}
+
+/// Record the status code or the error class of one send on its attempt
+/// `span`.
+fn record_send_outcome(span: &tracing::Span, sent: &Result<reqwest::Response, reqwest::Error>) {
+    match sent {
+        Ok(response) => record_attempt_status(span, response.status().as_u16()),
+        Err(error) => {
+            let kind = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else {
+                "request"
+            };
+            record_attempt_error(span, kind);
+        }
+    }
+}
+
+/// Inject the W3C trace-context headers of the active span, except the ones
+/// that [`trace_headers_to_send`] drops for `caller_headers`.
+fn inject_trace_context(
+    builder: reqwest::RequestBuilder,
+    caller_headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
     let mut builder = builder;
-    for (name, value) in trace_context_headers() {
+    for (name, value) in trace_headers_to_send(trace_context_headers(), caller_headers) {
         builder = builder.header(name, value);
     }
     builder
+}
+
+/// The injected trace headers to send. Skip a name that `caller_headers`
+/// holds: `RequestBuilder::header` appends, so if not, the request sends both
+/// values.
+///
+/// `traceparent` and `tracestate` are one W3C context. When the caller sets
+/// either one, skip both, so the request never mixes two contexts.
+fn trace_headers_to_send(
+    injected: Vec<(String, HeaderValue)>,
+    caller_headers: &HeaderMap,
+) -> Vec<(String, HeaderValue)> {
+    const W3C_PAIR: [&str; 2] = ["traceparent", "tracestate"];
+    let caller_has_context = W3C_PAIR
+        .iter()
+        .any(|name| caller_headers.contains_key(*name));
+    injected
+        .into_iter()
+        .filter(|(name, _)| {
+            let paired = caller_has_context && W3C_PAIR.contains(&name.as_str());
+            !paired && !caller_headers.contains_key(name.as_str())
+        })
+        .collect()
+}
+
+/// Add the current request's id as `x-request-id` (issue #3064). Do nothing
+/// when the caller set the header, or when there is no current request.
+fn add_current_request_id(headers: &mut HeaderMap) {
+    static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+    if headers.contains_key(&X_REQUEST_ID) {
+        return;
+    }
+    if let Some(value) =
+        crate::log::context::current_request_id().and_then(|id| HeaderValue::from_str(&id).ok())
+    {
+        headers.insert(X_REQUEST_ID.clone(), value);
+    }
 }
 
 /// The W3C trace-context headers for the active span. Empty when the
@@ -3187,6 +4763,249 @@ impl opentelemetry::propagation::Injector for TraceHeaderInjector<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #3068: a capsule replays a local throttle reject as the same
+    /// variant, so a handler that matches it takes the same branch.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn throttled_locally_round_trips_through_a_capsule() {
+        let err = ClientError::ThrottledLocally {
+            host: "api.example.com:8443".to_owned(),
+        };
+        let kind = http_error_kind(&err);
+        assert_eq!(
+            kind,
+            crate::capsule::schema::HttpErrorKind::ThrottledLocally
+        );
+        match rebuild_client_error(Some(kind), err.to_string()) {
+            ClientError::ThrottledLocally { host } => assert_eq!(host, "api.example.com:8443"),
+            other => panic!("rebuilt as {other:?}"),
+        }
+    }
+
+    /// Codex review on #3222: two different opaque header values record
+    /// different text, and a text value cannot look like bytes.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn opaque_header_values_record_without_collision() {
+        let recorded = |value: HeaderValue| {
+            let mut builder = Client::new().get("http://example.test/");
+            builder.extra_headers.insert("x-sig", value);
+            caller_headers(&builder).remove(0).1
+        };
+        let first = recorded(HeaderValue::from_bytes(b"a\xfe").expect("value"));
+        let second = recorded(HeaderValue::from_bytes(b"a\xff").expect("value"));
+        assert_ne!(first, second);
+        assert_eq!(recorded(HeaderValue::from_static("plain")), "plain");
+        let look_alike = recorded(HeaderValue::from_static("[bytes] a\\xfe"));
+        assert_ne!(look_alike, first);
+    }
+
+    /// Issue #3071: a capsule replays an injected fault as the same variant.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn fault_injected_round_trips_through_a_capsule() {
+        let err = ClientError::FaultInjected("fault injection: injected http error".to_owned());
+        let kind = http_error_kind(&err);
+        assert_eq!(kind, crate::capsule::schema::HttpErrorKind::FaultInjected);
+        match rebuild_client_error(Some(kind), err.to_string()) {
+            ClientError::FaultInjected(text) => {
+                assert_eq!(text, "fault injection: injected http error");
+            }
+            other => panic!("rebuilt as {other:?}"),
+        }
+    }
+
+    /// Regression (#3068 review): a local throttle reject says nothing about
+    /// the host, so it must not count as a circuit-breaker failure.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn throttled_calls_do_not_open_the_circuit_breaker() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        // 429 is a reject for the throttle, but a success for the breaker.
+        let app = axum::Router::new().route(
+            "/x",
+            axum::routing::get(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let mut config = HttpClientConfig::default();
+        config.adaptive_throttle.enabled = true;
+        let client = Client::from_config(&config);
+        let url = format!("http://{addr}/x");
+        let mut throttled = 0;
+        for _ in 0..200 {
+            match client.get(&url).no_retry().send().await {
+                Err(ClientError::ThrottledLocally { .. }) => throttled += 1,
+                Ok(r) => assert_eq!(r.status().as_u16(), 429),
+                Err(e) => panic!("unexpected error: {e}"),
+            }
+        }
+        assert!(
+            throttled > 50,
+            "the throttle must reject locally: {throttled}"
+        );
+        let breaker = crate::circuit_breaker::global_registry().get_or_create(
+            &addr.to_string(),
+            crate::circuit_breaker::CircuitBreakerPolicy::default(),
+        );
+        assert_eq!(
+            breaker.state(),
+            crate::circuit_breaker::CircuitState::Closed,
+            "local rejects must not open the breaker"
+        );
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    /// Regression (#3183 review): a `state_initializer` that replaces the
+    /// config after boot gets one shared throttle for the new settings.
+    #[test]
+    fn from_state_shares_a_throttle_built_from_the_effective_config() {
+        let state = crate::AppState::for_test();
+        let boot = HttpClientConfig::default();
+        install_shared_throttle(&state, &boot);
+        assert!(state.extension::<SharedThrottle>().is_none(), "off at boot");
+        assert!(Client::from_state(&state).throttle.is_none());
+
+        let mut replaced = crate::config::HttpConfig::default();
+        replaced.client.adaptive_throttle.enabled = true;
+        state.insert_extension(replaced.clone());
+        let a = Client::from_state(&state)
+            .throttle
+            .expect("on after replace");
+        let b = Client::from_state(&state)
+            .throttle
+            .expect("on after replace");
+        assert!(Arc::ptr_eq(&a, &b), "clients share one throttle");
+
+        replaced.client.adaptive_throttle.k = 3.0;
+        state.insert_extension(replaced.clone());
+        let c = Client::from_state(&state).throttle.expect("still on");
+        assert!(!Arc::ptr_eq(&a, &c), "new settings build a new throttle");
+
+        replaced.client.adaptive_throttle.enabled = false;
+        state.insert_extension(replaced);
+        assert!(Client::from_state(&state).throttle.is_none(), "off again");
+    }
+
+    /// A `state_initializer` that replaces the config after boot gets retry
+    /// budgets built from the new settings, shared by all clients.
+    #[test]
+    fn from_state_rebuilds_the_retry_budgets_when_their_config_changes() {
+        let state = crate::AppState::for_test();
+        let mut config = crate::config::HttpConfig::default();
+        state.insert_extension(config.clone());
+        let a = Client::from_state(&state).retry.budgets.expect("on");
+        let b = Client::from_state(&state).retry.budgets.expect("on");
+        assert!(Arc::ptr_eq(&a, &b), "clients share one set of budgets");
+
+        config.client.retry_budget.capacity = 50;
+        state.insert_extension(config.clone());
+        let c = Client::from_state(&state).retry.budgets.expect("still on");
+        assert!(!Arc::ptr_eq(&a, &c), "new settings build new budgets");
+        assert!((c.for_host("h:80").available() - 50.0).abs() < f64::EPSILON);
+
+        config.client.retry_budget.enabled = false;
+        state.insert_extension(config);
+        assert!(Client::from_state(&state).retry.budgets.is_none(), "off");
+    }
+
+    /// Regression (#3183 review): concurrent first calls after a config
+    /// change share one throttle.
+    #[test]
+    fn concurrent_first_calls_share_one_throttle() {
+        let state = crate::AppState::for_test();
+        let mut config = crate::config::HttpConfig::default();
+        config.client.adaptive_throttle.enabled = true;
+        state.insert_extension(config);
+        let throttles: Vec<_> = std::thread::scope(|scope| {
+            // Spawn all threads before the first join, so the calls overlap.
+            let mut handles = Vec::with_capacity(8);
+            for _ in 0..8 {
+                handles.push(scope.spawn(|| Client::from_state(&state).throttle.expect("on")));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+        assert!(
+            throttles.iter().all(|t| Arc::ptr_eq(t, &throttles[0])),
+            "every client must share the one throttle"
+        );
+    }
+
+    /// Regression (#3183 review): a response whose body fails to arrive is
+    /// a transport error for the throttle, not an accept.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_truncated_body_is_not_an_accept() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        // A server that sends a 200 head with a 100-byte length, 3 bytes of
+        // body, then closes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0_u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nabc")
+                    .await;
+                drop(socket);
+            }
+        });
+
+        let mut config = HttpClientConfig::default();
+        config.adaptive_throttle.enabled = true;
+        let client = Client::from_config(&config);
+        let url = format!("http://{addr}/x");
+        for _ in 0..20 {
+            let res = client.get(&url).no_retry().send().await;
+            assert!(
+                matches!(
+                    res,
+                    Err(ClientError::Request(_) | ClientError::ThrottledLocally { .. })
+                ),
+                "a truncated body is an error: {res:?}"
+            );
+        }
+        let throttle = client.throttle.as_ref().expect("on");
+        assert!(
+            throttle.reject_probability(&addr.to_string(), crate::time::ambient_instant()) > 0.5,
+            "truncated bodies must count as rejects"
+        );
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    #[test]
+    fn throttle_host_keeps_an_explicit_port() {
+        assert_eq!(
+            throttle_host("https://a.example/x").as_deref(),
+            Some("a.example")
+        );
+        assert_eq!(
+            throttle_host("http://a.example:8080/x").as_deref(),
+            Some("a.example:8080")
+        );
+        assert_eq!(throttle_host("not a url"), None);
+        assert!(throttle_accepts(200) && throttle_accepts(500));
+        assert!(!throttle_accepts(429) && !throttle_accepts(503));
+    }
     use crate::config::HttpClientConfig;
 
     // RED-PHASE TEST 1: Client can be constructed with defaults.
@@ -3485,7 +5304,9 @@ mod tests {
             timeout_secs: 10,
             max_retries: 1,
             max_retry_after_secs: 10,
+            max_backoff_ms: 20_000,
             base_urls: std::collections::HashMap::new(),
+            ..HttpClientConfig::default()
         };
         let client = Client::from_config(&config);
         assert_eq!(client.retry_policy.max_retries, 1);
@@ -3565,7 +5386,9 @@ mod tests {
             timeout_secs: 30,
             max_retries: 3,
             max_retry_after_secs: 10,
+            max_backoff_ms: 20_000,
             base_urls,
+            ..HttpClientConfig::default()
         };
         let client = Client::from_config(&config);
         let stripe = client.named("stripe");
@@ -3609,7 +5432,9 @@ mod tests {
             timeout_secs: 30,
             max_retries: 3,
             max_retry_after_secs: 10,
+            max_backoff_ms: 20_000,
             base_urls,
+            ..HttpClientConfig::default()
         };
         let client = Client::from_config(&config);
 
@@ -3675,6 +5500,62 @@ mod tests {
         let res = client.post(url).ssrf_safe().breaker_scoped().send().await;
         assert!(matches!(res, Err(ClientError::CircuitBreakerOpen)));
 
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    /// Regression (#3183 review): a fail-fast `CircuitBreakerOpen` call on
+    /// the breaker-scoped custom path never reaches the host, so the
+    /// throttle must not count it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn open_breaker_calls_are_not_charged_to_the_throttle() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let mut rc = crate::config::ResilienceConfig::default();
+        rc.circuit_breaker.defaults.failure_ratio_threshold = Some(0.5);
+        rc.circuit_breaker.defaults.minimum_sample_count = Some(3);
+        rc.circuit_breaker.defaults.open_duration_secs = Some(10);
+        let rc = Arc::new(rc);
+        let url = "http://127.0.0.1:1/blocked";
+
+        // Trip the breaker with a client that has no throttle.
+        let plain = Client {
+            resilience_config: Some(Arc::clone(&rc)),
+            ..Client::new()
+        };
+        for _ in 0..3 {
+            let _ = plain.post(url).ssrf_safe().breaker_scoped().send().await;
+        }
+
+        let throttle = Arc::new(crate::admission::AdaptiveThrottle::new(
+            2.0,
+            Duration::from_secs(120),
+        ));
+        let throttled = Client {
+            resilience_config: Some(rc),
+            throttle: Some(Arc::clone(&throttle)),
+            ..Client::new()
+        };
+        for _ in 0..50 {
+            let res = throttled
+                .post(url)
+                .ssrf_safe()
+                .breaker_scoped()
+                .send()
+                .await;
+            assert!(
+                matches!(res, Err(ClientError::CircuitBreakerOpen)),
+                "an open breaker fails fast, not through the throttle: {res:?}"
+            );
+        }
+        assert!(
+            throttle.reject_probability("127.0.0.1:1", crate::time::ambient_instant())
+                < f64::EPSILON,
+            "fail-fast calls must not be counted"
+        );
         crate::circuit_breaker::global_registry().clear();
     }
 
@@ -3873,16 +5754,93 @@ mod tests {
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
-    // TEST 32: retries() clears retry_idempotent_only so POST actually retries.
+    // TEST 32 (issue #3054): retries() sets only the count. POST retries need
+    // retry_non_idempotent().
     #[test]
-    fn retries_clears_idempotent_only_flag() {
+    fn retries_does_not_clear_idempotent_only_flag() {
         let client = Client::new();
         let builder = client.post("https://example.com").retries(2);
         assert_eq!(builder.retry_policy.max_retries, 2);
-        assert!(
-            !builder.retry_policy.retry_idempotent_only,
-            "explicit retries() call must allow non-idempotent methods to retry"
-        );
+        assert!(builder.retry_policy.retry_idempotent_only);
+        assert_eq!(builder.max_attempts(false), 1, "POST must not retry");
+
+        let builder = builder.retry_non_idempotent();
+        assert!(!builder.retry_policy.retry_idempotent_only);
+        assert_eq!(builder.max_attempts(false), 3);
+    }
+
+    #[test]
+    fn idempotency_key_is_added_only_for_opted_in_unsafe_retries() {
+        let client = Client::new();
+        let key_of = |builder: &RequestBuilder| {
+            builder
+                .extra_headers
+                .get(IDEMPOTENCY_KEY)
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+
+        let mut post = client.post("https://example.com").retry_non_idempotent();
+        post.ensure_idempotency_key();
+        let first = key_of(&post).expect("an opted-in POST gets a key");
+        post.ensure_idempotency_key();
+        assert_eq!(key_of(&post), Some(first), "the key does not change");
+
+        let mut caller = client
+            .post("https://example.com")
+            .header("Idempotency-Key", "mine")
+            .retry_non_idempotent();
+        caller.ensure_idempotency_key();
+        assert_eq!(key_of(&caller).as_deref(), Some("mine"));
+
+        for mut builder in [
+            client.post("https://example.com").retries(3),
+            client
+                .post("https://example.com")
+                .retry_non_idempotent()
+                .no_retry(),
+            client.get("https://example.com").retry_non_idempotent(),
+        ] {
+            builder.ensure_idempotency_key();
+            assert_eq!(key_of(&builder), None);
+        }
+    }
+
+    #[test]
+    fn retry_delay_is_jittered_and_capped() {
+        let entropy = crate::entropy::SeededEntropy::new(9);
+        let policy = RetryPolicy {
+            max_backoff: Duration::from_secs(1),
+            ..RetryPolicy::default()
+        };
+        for attempt in 0..40 {
+            let delay = policy.retry_delay(&entropy, attempt, None);
+            let ceiling = Duration::from_millis(crate::backoff::ceiling_ms(100, 1_000, attempt));
+            assert!(delay <= ceiling, "attempt {attempt}: {delay:?}");
+        }
+    }
+
+    #[test]
+    fn retry_delay_clamps_a_hint_to_the_backoff_window() {
+        let entropy = crate::entropy::SeededEntropy::new(10);
+        let policy = RetryPolicy::default();
+        // First retry: the backoff is in [0, 100 ms], added to the hint.
+        let wait = policy.retry_delay(&entropy, 0, Some(Duration::from_secs(2)));
+        assert!(wait >= Duration::from_secs(2) && wait <= Duration::from_millis(2_100));
+        // The 5 s slack bounds a long hint.
+        let wait = policy.retry_delay(&entropy, 0, Some(Duration::from_secs(3_600)));
+        assert!(wait >= Duration::from_secs(5) && wait <= Duration::from_millis(5_100));
+    }
+
+    #[test]
+    fn retry_hint_reads_retry_after_on_429_and_503_only() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("2"));
+        assert_eq!(retry_hint(429, &headers), Some(Duration::from_secs(2)));
+        assert_eq!(retry_hint(503, &headers), Some(Duration::from_secs(2)));
+        assert_eq!(retry_hint(502, &headers), None);
+        let empty = HeaderMap::new();
+        assert_eq!(retry_hint(429, &empty), Some(Duration::from_secs(1)));
+        assert_eq!(retry_hint(503, &empty), None);
     }
 
     // TEST 33: log_request covers the sensitive-header redaction path.
@@ -3927,13 +5885,59 @@ mod tests {
             ] {
                 let request = Client::new().get(url);
                 let parsed = reqwest::Url::parse(url).unwrap();
-                let seen = serve_sim_host(echo.clone(), &request, parsed)
+                let seen = serve_sim_host(echo.clone(), &request, parsed, None)
                     .await
                     .unwrap()
                     .text();
                 assert_eq!(seen, host, "{url}");
             }
         });
+    }
+
+    /// A sim attempt signs Web Bot Auth again, as the real send path does, so
+    /// a held builder never sends a stale signature to a simulated host.
+    #[test]
+    fn sim_host_gets_a_fresh_web_bot_auth_signature() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let echo = axum::Router::new().fallback(|headers: HeaderMap| async move {
+            let count = headers.get_all("signature").iter().count();
+            let input = headers
+                .get("signature-input")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            format!("{count} {input}")
+        });
+        let key = crate::aeo::web_bot_auth::WebBotAuthKey::from_seed_b64(
+            "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+        )
+        .unwrap();
+        let signer = crate::aeo::web_bot_auth::WebBotAuthSigner::new(key, "https://bot.example");
+        let created = |input: &str| -> u64 {
+            input
+                .split(";created=")
+                .nth(1)
+                .and_then(|r| r.split(';').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        let url = "https://payments/charge";
+        let first = created(&signer.sign_url(url).unwrap().signature_input);
+        let request = Client::new().get(url).sign_web_bot_auth(&signer);
+        std::thread::sleep(Duration::from_millis(1100));
+        let parsed = reqwest::Url::parse(url).unwrap();
+        let seen = runtime.block_on(async {
+            serve_sim_host(echo, &request, parsed, None)
+                .await
+                .unwrap()
+                .text()
+        });
+        let (count, input) = seen.split_once(' ').unwrap();
+        assert_eq!(count, "1", "{seen}");
+        assert!(created(input) > first, "{seen}");
     }
 
     /// A sim request with a body carries its `Content-Length`, as the real
@@ -3963,7 +5967,7 @@ mod tests {
                 (Client::new().post(url).bytes_body(Bytes::new()), "0"),
                 (Client::new().get(url), "none"),
             ] {
-                let seen = serve_sim_host(echo.clone(), &request, parsed.clone())
+                let seen = serve_sim_host(echo.clone(), &request, parsed.clone(), None)
                     .await
                     .unwrap()
                     .text();
@@ -4009,7 +6013,7 @@ mod tests {
             let _guard = span.enter();
             runtime.block_on(async {
                 let request = Client::new().get("http://payments/echo");
-                let traceparent = serve_sim_host(echo(), &request, url.clone())
+                let traceparent = serve_sim_host(echo(), &request, url.clone(), None)
                     .await
                     .unwrap()
                     .text();
@@ -4018,19 +6022,122 @@ mod tests {
                 let request = Client::new()
                     .get("http://payments/echo")
                     .header("traceparent", "caller-value");
-                let response = serve_sim_host(echo(), &request, url.clone()).await.unwrap();
+                let response = serve_sim_host(echo(), &request, url.clone(), None)
+                    .await
+                    .unwrap();
                 assert_eq!(response.text(), "caller-value");
             });
         });
     }
 
-    // TEST 34: inject_trace_context passthrough (without telemetry-otlp feature).
+    // TEST 34: the request id is added only inside a request.
     #[test]
-    fn inject_trace_context_passthrough_without_telemetry() {
-        let inner = reqwest::Client::new();
-        let builder = inner.get("https://example.com");
-        // Without telemetry-otlp the function is a no-op; verify it doesn't panic.
-        let _b = inject_trace_context(builder);
+    fn no_request_id_outside_a_request() {
+        let mut headers = HeaderMap::new();
+        add_current_request_id(&mut headers);
+        assert!(headers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn current_request_id_is_added() {
+        let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
+        let mut headers = HeaderMap::new();
+        crate::log::context::scope(ctx, async { add_current_request_id(&mut headers) }).await;
+        assert_eq!(headers.get("x-request-id").unwrap(), "rid-1");
+    }
+
+    #[tokio::test]
+    async fn caller_request_id_is_kept() {
+        let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-id", HeaderValue::from_static("mine"));
+        crate::log::context::scope(ctx, async { add_current_request_id(&mut headers) }).await;
+        assert_eq!(headers.get_all("x-request-id").iter().count(), 1);
+        assert_eq!(headers.get("x-request-id").unwrap(), "mine");
+    }
+
+    /// `traceparent` and `tracestate` are one W3C context. A caller value for
+    /// either one drops both injected headers, so the request never mixes two
+    /// contexts.
+    #[test]
+    fn caller_trace_header_drops_the_whole_injected_pair() {
+        let injected = || {
+            vec![
+                ("traceparent".to_owned(), HeaderValue::from_static("ours-p")),
+                ("tracestate".to_owned(), HeaderValue::from_static("ours-s")),
+                ("baggage".to_owned(), HeaderValue::from_static("ours-b")),
+            ]
+        };
+        let names = |caller: &[&'static str]| {
+            let mut headers = HeaderMap::new();
+            for name in caller {
+                headers.insert(*name, HeaderValue::from_static("mine"));
+            }
+            let mut sent: Vec<String> = trace_headers_to_send(injected(), &headers)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            sent.sort();
+            sent
+        };
+        assert_eq!(names(&[]), ["baggage", "traceparent", "tracestate"]);
+        assert_eq!(names(&["traceparent"]), ["baggage"]);
+        assert_eq!(names(&["tracestate"]), ["baggage"]);
+        assert_eq!(names(&["baggage"]), ["traceparent", "tracestate"]);
+    }
+
+    #[test]
+    fn caller_trace_header_suppresses_the_injected_one() {
+        let mut caller = HeaderMap::new();
+        caller.insert("traceparent", HeaderValue::from_static("mine"));
+        let request =
+            inject_trace_context(reqwest::Client::new().get("https://example.com"), &caller)
+                .build()
+                .unwrap();
+        assert!(request.headers().get("traceparent").is_none());
+    }
+
+    // A request built with `without_request_id` sends no id.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn without_request_id_sends_no_id() {
+        use axum::{Router, http::HeaderMap as AxumHeaders, routing::get};
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let app = Router::new().route(
+            "/echo",
+            get(|headers: AxumHeaders| async move {
+                headers
+                    .get("x-request-id")
+                    .map_or_else(|| "none".to_owned(), |v| v.to_str().unwrap().to_owned())
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let ctx = crate::log::context::LogContext::new(Some("rid-1".to_owned()));
+        let url = format!("http://{addr}/echo");
+        let (forwarded, opted_out) = crate::log::context::scope(ctx, async {
+            let forwarded = Client::new().get(&url).send().await.unwrap().text();
+            let opted_out = Client::new()
+                .get(&url)
+                .without_request_id()
+                .send()
+                .await
+                .unwrap()
+                .text();
+            (forwarded, opted_out)
+        })
+        .await;
+        assert_eq!(forwarded, "rid-1");
+        assert_eq!(opted_out, "none");
+
+        crate::circuit_breaker::global_registry().clear();
     }
 
     // TEST 35: Real GET request exercises inject_trace_context, log_request, and
@@ -4061,6 +6168,407 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 200);
         assert!(resp.url().is_some());
         assert_eq!(resp.text(), "pong");
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    /// Records each `http.client.request` span and the fields set on it.
+    #[derive(Clone, Default)]
+    struct ClientSpanCapture {
+        spans: std::sync::Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<u64, std::collections::BTreeMap<String, String>>,
+            >,
+        >,
+    }
+
+    struct SpanFieldVisitor<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+    impl tracing::field::Visit for SpanFieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(
+                field.name().to_owned(),
+                format!("{value:?}").trim_matches('"').to_owned(),
+            );
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for ClientSpanCapture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "http.client.request" {
+                return;
+            }
+            let mut fields = std::collections::BTreeMap::new();
+            attrs.record(&mut SpanFieldVisitor(&mut fields));
+            self.spans.lock().unwrap().insert(id.into_u64(), fields);
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(fields) = self.spans.lock().unwrap().get_mut(&id.into_u64()) {
+                values.record(&mut SpanFieldVisitor(fields));
+            }
+        }
+    }
+
+    /// Records how long each `http.client.request` span stays open.
+    #[derive(Clone, Default)]
+    struct ClientSpanDurations {
+        opened: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, Instant>>>,
+        closed: std::sync::Arc<std::sync::Mutex<Vec<Duration>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for ClientSpanDurations
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() == "http.client.request" {
+                self.opened
+                    .lock()
+                    .unwrap()
+                    .insert(id.into_u64(), Instant::now());
+            }
+        }
+
+        fn on_close(&self, id: tracing::span::Id, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let start = self.opened.lock().unwrap().remove(&id.into_u64());
+            if let Some(start) = start {
+                self.closed.lock().unwrap().push(start.elapsed());
+            }
+        }
+    }
+
+    /// Install both span capture layers on this thread, warm up the callsite,
+    /// and return them.
+    fn capture_client_spans() -> (
+        ClientSpanCapture,
+        ClientSpanDurations,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let fields = ClientSpanCapture::default();
+        let durations = ClientSpanDurations::default();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry()
+                .with(fields.clone())
+                .with(durations.clone()),
+        );
+        drop(client_attempt_span(&Method::GET, "http://warm.up/", 0));
+        tracing::callsite::rebuild_interest_cache();
+        fields.spans.lock().unwrap().clear();
+        durations.closed.lock().unwrap().clear();
+        (fields, durations, guard)
+    }
+
+    // The attempt span stays open while the body streams, and records a body
+    // read failure.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn attempt_span_covers_the_response_body() {
+        use axum::{Router, body::Body, routing::get};
+        use futures::StreamExt as _;
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        let app = Router::new()
+            .route(
+                "/slow",
+                get(|| async {
+                    let stream = futures::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"late"))
+                    });
+                    Body::from_stream(stream)
+                }),
+            )
+            .route(
+                "/broken",
+                get(|| async {
+                    // Headers and one chunk go out, then the body fails.
+                    let stream = futures::stream::iter([
+                        Ok(Bytes::from_static(b"partial")),
+                        Err(std::io::Error::other("cut")),
+                    ])
+                    .then(|item| async move {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        item
+                    });
+                    Body::from_stream(stream)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for custom_path in [false, true] {
+            let (fields, durations, _guard) = capture_client_spans();
+            let mut slow = Client::new().get(format!("http://{addr}/slow"));
+            let mut broken = Client::new().get(format!("http://{addr}/broken"));
+            if custom_path {
+                slow = slow.no_redirect();
+                broken = broken.no_redirect();
+            }
+            assert_eq!(slow.send().await.unwrap().text(), "late");
+            let closed = durations.closed.lock().unwrap().clone();
+            assert_eq!(closed.len(), 1, "custom={custom_path}: {closed:?}");
+            assert!(
+                closed[0] >= Duration::from_millis(250),
+                "custom={custom_path}: the span ended before the body: {closed:?}"
+            );
+
+            fields.spans.lock().unwrap().clear();
+            assert!(broken.send().await.is_err());
+            let spans: Vec<_> = fields.spans.lock().unwrap().values().cloned().collect();
+            assert_eq!(spans.len(), 1, "custom={custom_path}: {spans:?}");
+            assert_eq!(
+                spans[0].get("error.type").map(String::as_str),
+                Some("body"),
+                "custom={custom_path}: {spans:?}"
+            );
+            assert_eq!(
+                spans[0].get("otel.status_code").map(String::as_str),
+                Some("ERROR"),
+                "custom={custom_path}: {spans:?}"
+            );
+
+            // A 4xx response is an error span too.
+            fields.spans.lock().unwrap().clear();
+            let mut missing = Client::new().get(format!("http://{addr}/missing"));
+            if custom_path {
+                missing = missing.no_redirect();
+            }
+            assert_eq!(missing.send().await.unwrap().status().as_u16(), 404);
+            let spans: Vec<_> = fields.spans.lock().unwrap().values().cloned().collect();
+            assert_eq!(spans.len(), 1, "custom={custom_path}: {spans:?}");
+            assert_eq!(
+                spans[0].get("otel.status_code").map(String::as_str),
+                Some("ERROR"),
+                "custom={custom_path}: {spans:?}"
+            );
+        }
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // A sim attempt opens a CLIENT span too, one per attempt.
+    #[tokio::test]
+    async fn sim_attempts_open_client_spans() {
+        use axum::{Router, http::StatusCode, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (fields, _durations, _guard) = capture_client_spans();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let payments = Router::new().route(
+            "/charge",
+            get(move || {
+                let calls = std::sync::Arc::clone(&calls);
+                async move {
+                    if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let mut client = Client::new();
+        client.sim_net = Some(Arc::new(
+            crate::sim::SimNet::new().host("payments", payments),
+        ));
+
+        let response = client.get("http://payments/charge").send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+
+        let mut attempts: Vec<_> = fields.spans.lock().unwrap().values().cloned().collect();
+        attempts.sort_by_key(|f| f.get("http.request.resend_count").cloned());
+        assert_eq!(attempts.len(), 2, "{attempts:?}");
+        assert_eq!(
+            attempts[0].get("server.address").map(String::as_str),
+            Some("payments")
+        );
+        assert_eq!(
+            attempts[0]
+                .get("http.response.status_code")
+                .map(String::as_str),
+            Some("503")
+        );
+        assert_eq!(
+            attempts[1]
+                .get("http.response.status_code")
+                .map(String::as_str),
+            Some("200")
+        );
+        // A 5xx attempt is an error span; a 2xx attempt has no status.
+        assert_eq!(
+            attempts[0].get("otel.status_code").map(String::as_str),
+            Some("ERROR"),
+            "{attempts:?}"
+        );
+        assert_eq!(attempts[1].get("otel.status_code"), None, "{attempts:?}");
+    }
+
+    // A 429 attempt span ends before the `Retry-After` sleep, so its duration
+    // is the HTTP exchange only, on the plain and the custom send paths.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn attempt_span_ends_before_the_retry_after_sleep() {
+        use axum::{Router, http::StatusCode, response::IntoResponse as _, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        for custom_path in [false, true] {
+            let durations = ClientSpanDurations::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(durations.clone()),
+            );
+            drop(client_attempt_span(&Method::GET, "http://warm.up/", 0));
+            tracing::callsite::rebuild_interest_cache();
+            durations.closed.lock().unwrap().clear();
+
+            // The first call answers 429 with `Retry-After: 1`, the next 200.
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let app = Router::new().route(
+                "/limited",
+                get(move || {
+                    let calls = std::sync::Arc::clone(&calls);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "1")]).into_response()
+                        } else {
+                            StatusCode::OK.into_response()
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let mut request = Client::new().get(format!("http://{addr}/limited"));
+            if custom_path {
+                request = request.no_redirect();
+            }
+            assert_eq!(request.send().await.unwrap().status().as_u16(), 200);
+
+            let closed = durations.closed.lock().unwrap().clone();
+            assert_eq!(closed.len(), 2, "custom={custom_path}: {closed:?}");
+            assert!(
+                closed[0] < Duration::from_millis(500),
+                "custom={custom_path}: the 429 attempt span held the 1s sleep: {closed:?}"
+            );
+        }
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    // One CLIENT span per outbound attempt (issue #3064), on the plain and
+    // the custom send paths.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn each_attempt_opens_one_client_span() {
+        use axum::{Router, http::StatusCode, routing::get};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        for custom_path in [false, true] {
+            let capture = ClientSpanCapture::default();
+            let _guard = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            );
+            // Another test can register this callsite on a thread with no
+            // subscriber, and cache it as "never". Register it here first,
+            // rebuild the cache, then discard the warm-up span.
+            drop(client_attempt_span(&Method::GET, "http://warm.up/", 0));
+            tracing::callsite::rebuild_interest_cache();
+            capture.spans.lock().unwrap().clear();
+
+            // The first call answers 503, the next 200: two attempts.
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            let app = Router::new().route(
+                "/flaky",
+                get(move || {
+                    let calls = std::sync::Arc::clone(&calls);
+                    async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let mut request = Client::new().get(format!("http://{addr}/flaky"));
+            if custom_path {
+                request = request.no_redirect();
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+
+            let mut attempts: Vec<_> = capture.spans.lock().unwrap().values().cloned().collect();
+            attempts.sort_by_key(|f| f.get("http.request.resend_count").cloned());
+            assert_eq!(attempts.len(), 2, "custom={custom_path}: {attempts:?}");
+            for (n, fields) in attempts.iter().enumerate() {
+                assert_eq!(fields.get("otel.kind").map(String::as_str), Some("client"));
+                assert_eq!(
+                    fields.get("http.request.method").map(String::as_str),
+                    Some("GET")
+                );
+                assert_eq!(
+                    fields.get("server.address").map(String::as_str),
+                    Some("127.0.0.1")
+                );
+                let resend = fields.get("http.request.resend_count");
+                assert_eq!(resend, (n > 0).then(|| n.to_string()).as_ref());
+            }
+            assert_eq!(
+                attempts[0]
+                    .get("http.response.status_code")
+                    .map(String::as_str),
+                Some("503")
+            );
+            assert_eq!(
+                attempts[1]
+                    .get("http.response.status_code")
+                    .map(String::as_str),
+                Some("200")
+            );
+        }
 
         crate::circuit_breaker::global_registry().clear();
     }
@@ -4132,7 +6640,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // retries(1): 2 total attempts, 100 ms sleep between them.
+        // retries(1): 2 total attempts, a 0-100 ms jittered sleep between them.
         let resp = Client::new()
             .get(format!("http://127.0.0.1:{}/flaky", addr.port()))
             .retries(1)
@@ -4144,6 +6652,81 @@ mod tests {
         assert_eq!(hit.load(SeqOrdering::SeqCst), 2);
 
         crate::circuit_breaker::global_registry().clear();
+    }
+
+    /// Serve `503` + `Retry-After: 1` once, then `200`. Returns the address
+    /// and the hit counter.
+    async fn serve_down_once_with_retry_after() -> (SocketAddr, Arc<AtomicUsize>) {
+        use axum::{Router, response::IntoResponse as _, routing::get};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = Router::new().route(
+            "/down",
+            get(move || {
+                let counter = counter.clone();
+                async move {
+                    if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [("retry-after", "1")],
+                        )
+                            .into_response()
+                    } else {
+                        axum::http::StatusCode::OK.into_response()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (addr, hits)
+    }
+
+    /// Issue #3054 on the real network path (`send_inner`) and the custom
+    /// path (`send_one`, via `no_redirect`): a 503 with `Retry-After: 1`
+    /// waits at least 1 s.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn real_paths_honour_retry_after_on_503() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+
+        for custom_path in [false, true] {
+            let (addr, hits) = serve_down_once_with_retry_after().await;
+            let mut request = Client::new()
+                .get(format!("http://127.0.0.1:{}/down", addr.port()))
+                .retries(1);
+            if custom_path {
+                request = request.no_redirect();
+            }
+            let start = std::time::Instant::now();
+            let response = request.send().await.unwrap();
+            let waited = start.elapsed();
+            assert_eq!(response.status().as_u16(), 200, "custom_path={custom_path}");
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+            assert!(
+                waited >= Duration::from_secs(1),
+                "custom_path={custom_path}: waited only {waited:?}"
+            );
+        }
+
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    #[test]
+    fn from_config_reads_max_backoff_ms() {
+        let config = HttpClientConfig {
+            max_backoff_ms: 1_500,
+            ..Default::default()
+        };
+        assert_eq!(
+            Client::from_config(&config).retry_policy.max_backoff,
+            Duration::from_millis(1_500)
+        );
+        assert_eq!(RetryPolicy::default().max_backoff, Duration::from_secs(20));
     }
 
     // TEST 38: text_body sets a plain-text body.
@@ -4796,6 +7379,42 @@ mod tests {
         assert_eq!(resp.text(), "pong");
     }
 
+    // `pin_to_addrs` hands the whole set to one request, so a refused first
+    // address falls back inside reqwest instead of re-sending the body.
+    #[tokio::test]
+    async fn pin_to_addrs_falls_back_to_the_next_address_on_connect_failure() {
+        use axum::{Router, routing::get};
+        let addr = spawn(Router::new().route("/ping", get(|| async { "pong" }))).await;
+        let port = addr.port();
+
+        let resp = Client::new()
+            .get(format!("http://pinned.invalid:{port}/ping"))
+            .pin_to_addrs([
+                // The listener is IPv4 only, so this address refuses at once.
+                // `127.0.0.2` is not portable: macOS does not route it.
+                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            ])
+            .send()
+            .await
+            .expect("the second pinned address must serve the request");
+
+        assert_eq!(resp.text(), "pong");
+    }
+
+    #[tokio::test]
+    async fn pin_to_addrs_with_no_address_fails_instead_of_sending_unpinned() {
+        let result = Client::new()
+            .get("http://pinned.invalid:9/ping")
+            .pin_to_addrs([])
+            .send()
+            .await;
+        assert!(
+            matches!(result, Err(ClientError::InvalidUrl(_))),
+            "{result:?}"
+        );
+    }
+
     // TEST 54: get_ssrf_safe rejects a host that resolves to a blocked IP BEFORE
     // connecting. `localhost` resolves to 127.0.0.1 (and/or ::1), both blocked.
     // The listener's handler must never fire.
@@ -5048,6 +7667,130 @@ mod tests {
         assert!(
             headers.get("proxy-authorization").is_none(),
             "proxy-authorization must be stripped on a cross-origin redirect"
+        );
+    }
+
+    // A Web Bot Auth signature is a credential: on the default send path a
+    // cross-origin redirect must not carry it to the next host.
+    #[tokio::test]
+    async fn default_redirects_strip_message_signatures_cross_origin() {
+        use axum::{Router, routing::get};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let b_addr = spawn(Router::new().route(
+            "/dst",
+            get(move |headers: HeaderMap| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some(headers);
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let b_port = b_addr.port();
+        let a_addr = spawn(Router::new().route(
+            "/",
+            get(move || async move { redirect_302(format!("http://127.0.0.1:{b_port}/dst")) }),
+        ))
+        .await;
+
+        let resp = Client::new()
+            .get(format!("http://127.0.0.1:{}/", a_addr.port()))
+            .header("signature-agent", "\"https://bot.example\"")
+            .header("signature-input", "sig1=(\"@authority\")")
+            .header("signature", "sig1=:AAAA:")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "the redirect is still followed"
+        );
+        let headers = seen.lock().unwrap().clone().expect("B reached");
+        for name in ["signature", "signature-input", "signature-agent"] {
+            assert!(headers.get(name).is_none(), "{name} must be stripped");
+        }
+    }
+
+    // A Web Bot Auth signature is made when the request is sent, not when
+    // the builder is configured, so a held builder never sends a stale one.
+    #[tokio::test]
+    async fn web_bot_auth_signs_at_send_time() {
+        use axum::{Router, routing::get};
+
+        let seen: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
+        let seen2 = seen.clone();
+        let addr = spawn(Router::new().route(
+            "/",
+            get(move |headers: HeaderMap| {
+                let slot = seen2.clone();
+                async move {
+                    *slot.lock().unwrap() = Some(headers);
+                    "ok"
+                }
+            }),
+        ))
+        .await;
+        let key = crate::aeo::web_bot_auth::WebBotAuthKey::from_seed_b64(
+            "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+        )
+        .unwrap();
+        let signer = crate::aeo::web_bot_auth::WebBotAuthSigner::new(key, "https://bot.example");
+        let created = |input: &str| -> u64 {
+            input
+                .split(";created=")
+                .nth(1)
+                .and_then(|r| r.split(';').next())
+                .and_then(|v| v.parse().ok())
+                .unwrap()
+        };
+        let url = format!("http://127.0.0.1:{}/", addr.port());
+        let first = created(&signer.sign_url(&url).unwrap().signature_input);
+        let builder = Client::new().get(&url).sign_web_bot_auth(&signer);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        builder.send().await.unwrap();
+
+        let headers = seen.lock().unwrap().clone().expect("reached");
+        let sent = headers.get("signature-input").unwrap().to_str().unwrap();
+        assert!(created(sent) > first, "{sent}");
+        assert_eq!(headers.get_all("signature").iter().count(), 1);
+    }
+
+    // A failure capsule matches a replayed call on the headers the handler
+    // chose. A Web Bot Auth signature is made new for each send, so it is
+    // left out, or no replay of a signed call would ever match.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn capsule_matching_skips_the_web_bot_auth_signature() {
+        let key = crate::aeo::web_bot_auth::WebBotAuthKey::from_seed_b64(
+            "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A",
+        )
+        .unwrap();
+        let signer = crate::aeo::web_bot_auth::WebBotAuthSigner::new(key, "https://bot.example");
+        let builder = Client::new()
+            .get("https://api.example/x")
+            .header("x-kept", "1")
+            .sign_web_bot_auth(&signer);
+        let names: Vec<String> = caller_headers(&builder)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.contains(&"x-kept".to_owned()), "{names:?}");
+        assert!(names.contains(&"signature-agent".to_owned()), "{names:?}");
+        assert!(!names.contains(&"signature".to_owned()), "{names:?}");
+        assert!(!names.contains(&"signature-input".to_owned()), "{names:?}");
+
+        // A handler's own `Signature` header, with no signer, still counts.
+        let plain = Client::new()
+            .get("https://api.example/x")
+            .header("signature", "mine");
+        assert_eq!(
+            caller_headers(&plain),
+            vec![("signature".to_owned(), "mine".to_owned())]
         );
     }
 
@@ -5468,5 +8211,1487 @@ mod tests {
             !touched.load(Ordering::SeqCst),
             "the 300 Location target must never be requested"
         );
+    }
+
+    // ── Issue #3058: deadline and retry budget on the real send paths ────────
+    #[allow(clippy::large_futures, reason = "test futures, awaited once")]
+    mod deadline_and_budget {
+        use super::super::*;
+        use std::sync::atomic::AtomicU32;
+
+        /// A server that counts hits on `/x`. It answers with `status` and
+        /// `headers`, or never when `status` is `None`.
+        async fn counting(
+            status: Option<u16>,
+            headers: &'static [(&'static str, &'static str)],
+        ) -> (String, Arc<AtomicU32>) {
+            let hits = Arc::new(AtomicU32::new(0));
+            let counter = Arc::clone(&hits);
+            let app = axum::Router::new().route(
+                "/x",
+                axum::routing::get(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let Some(code) = status else {
+                            return std::future::pending().await;
+                        };
+                        let mut response = axum::response::Response::builder().status(code);
+                        for (name, value) in headers {
+                            response = response.header(*name, *value);
+                        }
+                        response.body(axum::body::Body::empty()).unwrap()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (format!("http://127.0.0.1:{}/x", addr.port()), hits)
+        }
+
+        /// A client whose budget allows one transient retry and never refills.
+        fn one_retry_client() -> Client {
+            let mut config = crate::config::HttpClientConfig::default();
+            config.retry_budget.capacity = 14;
+            config.retry_budget.retry_ratio = 0.0;
+            Client::from_config(&config)
+        }
+
+        /// Run `send` under a deadline `after` from now, with a 5 s safety
+        /// limit.
+        async fn with_deadline(
+            after: Duration,
+            send: impl std::future::Future<Output = Result<Response, ClientError>>,
+        ) -> Result<Response, ClientError> {
+            tokio::time::timeout(Duration::from_secs(5), Deadline::after(after).scope(send))
+                .await
+                .expect("the deadline must stop the call")
+        }
+
+        fn lock() -> std::sync::MutexGuard<'static, ()> {
+            let guard = crate::circuit_breaker::TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::circuit_breaker::global_registry().clear();
+            guard
+        }
+
+        /// A server where `/r` waits `delay`, then redirects to `/t`. Both
+        /// record the deadline header they get.
+        async fn redirecting(delay: Duration) -> (String, Arc<Mutex<Vec<(String, u64)>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let record = |path: &'static str, seen: Arc<Mutex<Vec<(String, u64)>>>| {
+                move |headers: HeaderMap| {
+                    let millis = headers
+                        .get(DEADLINE_HEADER)
+                        .and_then(|value| value.to_str().ok()?.parse().ok())
+                        .unwrap_or(u64::MAX);
+                    seen.lock().unwrap().push((path.to_owned(), millis));
+                }
+            };
+            let at_r = record("/r", Arc::clone(&seen));
+            let at_t = record("/t", Arc::clone(&seen));
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::get(move |headers: HeaderMap| async move {
+                        at_r(headers);
+                        tokio::time::sleep(delay).await;
+                        axum::response::Redirect::temporary("/t")
+                    }),
+                )
+                .route(
+                    "/t",
+                    axum::routing::get(move |headers: HeaderMap| async move {
+                        at_t(headers);
+                        "done"
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (format!("http://127.0.0.1:{}/r", addr.port()), seen)
+        }
+
+        #[tokio::test]
+        async fn plain_path_sends_a_fresh_deadline_header_after_a_redirect() {
+            let (url, seen) = redirecting(Duration::from_millis(500)).await;
+            let response = with_deadline(Duration::from_secs(3), Client::new().get(&url).send())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let seen = seen.lock().unwrap().clone();
+            let [(first, at_origin), (second, at_target)] = seen.as_slice() else {
+                panic!("two hops: {seen:?}");
+            };
+            assert_eq!((first.as_str(), second.as_str()), ("/r", "/t"));
+            assert!(*at_origin <= 3_000, "{seen:?}");
+            assert!(
+                *at_target + 400 <= *at_origin,
+                "the target gets the time left after the redirect: {seen:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_redirected_connect_error_charges_the_destination_budget() {
+            // A port with nothing listening on it.
+            let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dead_port = closed.local_addr().unwrap().port();
+            drop(closed);
+            let target = format!("http://127.0.0.1:{dead_port}/t");
+            let app = axum::Router::new().route(
+                "/r",
+                axum::routing::get(move || {
+                    let target = target.clone();
+                    async move { axum::response::Redirect::temporary(&target) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let client = Client::from_config(&crate::config::HttpClientConfig::default());
+            let budgets = client.retry.budgets.clone().unwrap();
+            let result = client
+                .get(format!("http://127.0.0.1:{origin_port}/r"))
+                .retries(1)
+                .send()
+                .await;
+            assert!(result.is_err(), "{result:?}");
+            let full = f64::from(RetryBudgetConfig::default().capacity);
+            let origin = budgets.for_host(&format!("127.0.0.1:{origin_port}"));
+            let destination = budgets.for_host(&format!("127.0.0.1:{dead_port}"));
+            assert!((origin.available() - full).abs() < f64::EPSILON, "origin");
+            assert!(destination.available() < full, "the destination paid");
+        }
+
+        #[tokio::test]
+        async fn a_redirect_under_a_deadline_sets_referer() {
+            let seen = Arc::new(Mutex::new(None));
+            let record = Arc::clone(&seen);
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::get(|| async { axum::response::Redirect::temporary("/t") }),
+                )
+                .route(
+                    "/t",
+                    axum::routing::get(move |headers: HeaderMap| async move {
+                        *record.lock().unwrap() = headers
+                            .get(reqwest::header::REFERER)
+                            .map(|value| value.to_str().unwrap().to_owned());
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let origin = format!("http://127.0.0.1:{port}/r");
+            let response = with_deadline(Duration::from_secs(3), Client::new().get(&origin).send())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(seen.lock().unwrap().as_deref(), Some(origin.as_str()));
+        }
+
+        #[test]
+        fn referer_drops_credentials_and_is_not_sent_on_a_downgrade() {
+            let mut headers = HeaderMap::new();
+            set_referer(&mut headers, "https://b/x", "https://u:p@a/y#frag");
+            assert_eq!(headers[reqwest::header::REFERER], "https://a/y");
+            set_referer(&mut headers, "http://c/z", "https://b/x");
+            assert!(!headers.contains_key(reqwest::header::REFERER));
+        }
+
+        #[test]
+        fn every_host_of_a_redirect_chain_is_refilled() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let middle = budgets.for_host("b:443");
+            let last = budgets.for_host("c:443");
+            while middle.try_acquire(RetryKind::Transient) {}
+            while last.try_acquire(RetryKind::Transient) {}
+            let (middle_before, last_before) = (middle.available(), last.available());
+            let gate =
+                RetryGate::with_deadline(None, Some(Arc::clone(&budgets)), Some("a:443"), true);
+            let mut seen = std::collections::HashSet::new();
+            gate.record_destinations(
+                &[
+                    "https://b/1".to_owned(),
+                    "https://c/2".to_owned(),
+                    "https://c/3".to_owned(),
+                ],
+                &mut seen,
+            );
+            assert!(middle.available() > middle_before, "the middle host");
+            let one_refill = middle.available() - middle_before;
+            assert!(
+                (last.available() - last_before - one_refill).abs() < f64::EPSILON,
+                "one refill per host"
+            );
+        }
+
+        /// A server whose `/r` answers 302 with `location`, and whose `/t`
+        /// answers 200. With `endless`, the 302 body never ends.
+        async fn redirect_server(location: &'static str, endless: bool) -> String {
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::get(move || async move {
+                        let body = if endless {
+                            axum::body::Body::from_stream(futures::stream::pending::<
+                                Result<Bytes, std::io::Error>,
+                            >())
+                        } else {
+                            axum::body::Body::empty()
+                        };
+                        axum::response::Response::builder()
+                            .status(302)
+                            .header("location", location)
+                            .body(body)
+                            .unwrap()
+                    }),
+                )
+                .route("/t", axum::routing::get(|| async { "done" }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://127.0.0.1:{port}/r")
+        }
+
+        #[tokio::test]
+        async fn a_redirect_under_a_deadline_does_not_read_the_redirect_body() {
+            let url = redirect_server("/t", true).await;
+            let response = with_deadline(Duration::from_secs(3), Client::new().get(&url).send())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(response.text(), "done");
+        }
+
+        #[tokio::test]
+        async fn a_bad_location_under_a_deadline_returns_the_redirect() {
+            let url = redirect_server("http://[::1", false).await;
+            let response = with_deadline(Duration::from_secs(3), Client::new().get(&url).send())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 302);
+            let plain = Client::new().get(&url).send().await.unwrap();
+            assert_eq!(
+                plain.status().as_u16(),
+                302,
+                "the same as without a deadline"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_redirect_chain_under_a_deadline_shares_one_retry_count() {
+            use axum::response::IntoResponse;
+            let origin_hits = Arc::new(AtomicU32::new(0));
+            let target_hits = Arc::new(AtomicU32::new(0));
+            let (origin, target) = (Arc::clone(&origin_hits), Arc::clone(&target_hits));
+            // Each hop fails once, then works.
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::get(move || async move {
+                        if origin.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            axum::response::Redirect::temporary("/t").into_response()
+                        }
+                    }),
+                )
+                .route(
+                    "/t",
+                    axum::routing::get(move || async move {
+                        if target.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            "done".into_response()
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("http://127.0.0.1:{port}/r");
+            let response = with_deadline(
+                Duration::from_secs(3),
+                Client::new().get(&url).retries(1).send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 503, "the one retry is spent");
+            assert_eq!(origin_hits.load(Ordering::SeqCst), 2);
+            assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+        }
+
+        /// Entropy that always draws one value.
+        #[derive(Debug)]
+        struct FixedDraw(u64);
+
+        impl crate::entropy::Entropy for FixedDraw {
+            fn next_u64(&self) -> u64 {
+                self.0
+            }
+            fn fill_bytes(&self, dest: &mut [u8]) {
+                dest.fill(0);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_cross_origin_redirect_under_a_deadline_strips_what_reqwest_strips() {
+            let seen: Arc<std::sync::Mutex<Option<HeaderMap>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let slot = Arc::clone(&seen);
+            let target = super::spawn(axum::Router::new().route(
+                "/dst",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        *slot.lock().unwrap() = Some(headers);
+                        "ok"
+                    }
+                }),
+            ))
+            .await;
+            let target_port = target.port();
+            let origin = super::spawn(axum::Router::new().route(
+                "/",
+                axum::routing::get(move || async move {
+                    super::redirect_302(format!("http://127.0.0.1:{target_port}/dst"))
+                }),
+            ))
+            .await;
+            let response = with_deadline(
+                Duration::from_secs(3),
+                Client::new()
+                    .get(format!("http://127.0.0.1:{}/", origin.port()))
+                    .header("authorization", "secret")
+                    .header("cookie", "a=b")
+                    .header("cookie2", "c=d")
+                    .header("proxy-authorization", "Basic zzz")
+                    .header("www-authenticate", "Basic realm=x")
+                    .send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let headers = seen.lock().unwrap().clone().expect("target reached");
+            for name in [
+                "authorization",
+                "cookie",
+                "cookie2",
+                "proxy-authorization",
+                "www-authenticate",
+            ] {
+                assert!(headers.get(name).is_none(), "{name} reached the target");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_retry_cancelled_during_its_backoff_gives_its_tokens_back() {
+            let (url, hits) = counting(Some(502), &[]).await;
+            let host = url_host(&url).unwrap();
+            // The first retry waits 100 % 101 = 100 ms.
+            let mut client = Client::new();
+            client.entropy = Arc::new(FixedDraw(100));
+            let budget = client.retry.budgets.clone().unwrap().for_host(&host);
+            let cancelled = tokio::time::timeout(
+                Duration::from_millis(50),
+                client.get(&url).retries(3).send(),
+            )
+            .await;
+            assert!(cancelled.is_err(), "cancelled in the backoff");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            let full = f64::from(RetryBudgetConfig::default().capacity);
+            assert!(
+                (budget.available() - full).abs() < f64::EPSILON,
+                "no retry ran, so none is paid for: {}",
+                budget.available()
+            );
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn a_deadline_stop_on_the_custom_path_is_not_a_throttle_reject() {
+            let _lock = crate::circuit_breaker::TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::circuit_breaker::global_registry().clear();
+            let (url, _hits) = counting(None, &[]).await;
+            let throttle = Arc::new(crate::admission::AdaptiveThrottle::new(
+                2.0,
+                Duration::from_secs(120),
+            ));
+            let client = Client {
+                resilience_config: Some(Arc::new(crate::config::ResilienceConfig::default())),
+                throttle: Some(Arc::clone(&throttle)),
+                ..Client::new()
+            };
+            for _ in 0..10 {
+                let result = with_deadline(
+                    Duration::from_millis(30),
+                    client.get(&url).no_redirect().breaker_scoped().send(),
+                )
+                .await;
+                assert!(
+                    matches!(result, Err(ClientError::DeadlineExceeded)),
+                    "{result:?}"
+                );
+            }
+            let host = throttle_host(&url).unwrap();
+            assert!(
+                throttle.reject_probability(&host, crate::time::ambient_instant()) < f64::EPSILON,
+                "the caller's deadline is not the host's reject"
+            );
+            crate::circuit_breaker::global_registry().clear();
+        }
+
+        #[tokio::test]
+        async fn the_throttle_applies_under_a_deadline() {
+            let (url, _hits) = counting(Some(503), &[]).await;
+            let throttle = Arc::new(crate::admission::AdaptiveThrottle::new(
+                2.0,
+                Duration::from_secs(120),
+            ));
+            let client = Client {
+                throttle: Some(Arc::clone(&throttle)),
+                ..Client::new()
+            };
+            let mut throttled = 0;
+            for _ in 0..100 {
+                let result =
+                    with_deadline(Duration::from_secs(5), client.get(&url).no_retry().send()).await;
+                if matches!(result, Err(ClientError::ThrottledLocally { .. })) {
+                    throttled += 1;
+                }
+            }
+            assert!(
+                throttled > 20,
+                "the deadline path must use the throttle: {throttled}"
+            );
+        }
+
+        #[tokio::test]
+        async fn each_retry_under_a_deadline_is_a_throttle_attempt() {
+            use axum::response::IntoResponse;
+            // Each call gets 503, 503, then 200.
+            let hits = Arc::new(AtomicU32::new(0));
+            let counter = Arc::clone(&hits);
+            let upstream = super::spawn(axum::Router::new().route(
+                "/x",
+                axum::routing::get(move || {
+                    let status = if counter.fetch_add(1, Ordering::SeqCst) % 3 < 2 {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    };
+                    async move { status.into_response() }
+                }),
+            ))
+            .await;
+            let url = format!("http://127.0.0.1:{}/x", upstream.port());
+            let throttle = Arc::new(crate::admission::AdaptiveThrottle::new(
+                2.0,
+                Duration::from_secs(120),
+            ));
+            // The highest draw: the throttle never rejects, so every call
+            // runs its three attempts.
+            let mut client = Client {
+                throttle: Some(Arc::clone(&throttle)),
+                ..Client::new()
+            };
+            client.entropy = Arc::new(FixedDraw(u64::MAX));
+            for _ in 0..10 {
+                let response =
+                    with_deadline(Duration::from_secs(4), client.get(&url).retries(2).send())
+                        .await
+                        .unwrap();
+                assert_eq!(response.status().as_u16(), 200);
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 30);
+            // 30 attempts, 10 accepts: below 1/K, as on the path without a
+            // deadline. One count per call would hide the 503s.
+            let host = throttle_host(&url).unwrap();
+            assert!(
+                throttle.reject_probability(&host, crate::time::ambient_instant()) > 0.3,
+                "each attempt counts"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_retry_sends_what_is_left_of_the_callers_deadline_header() {
+            use axum::response::IntoResponse;
+            // The first attempt takes 60 ms and fails; the retry works.
+            let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+            let slot = Arc::clone(&seen);
+            let upstream = super::spawn(axum::Router::new().route(
+                "/x",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let value = headers
+                            .get(DEADLINE_HEADER)
+                            .and_then(|v| v.to_str().ok()?.parse().ok())
+                            .unwrap_or(u64::MAX);
+                        let first = {
+                            let mut seen = slot.lock().unwrap();
+                            seen.push(value);
+                            seen.len() == 1
+                        };
+                        if first {
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            axum::http::StatusCode::BAD_GATEWAY.into_response()
+                        } else {
+                            axum::http::StatusCode::OK.into_response()
+                        }
+                    }
+                }),
+            ))
+            .await;
+            // A zero draw: the retry starts at once.
+            let mut client = Client::new();
+            client.entropy = Arc::new(FixedDraw(0));
+            let response = with_deadline(
+                Duration::from_secs(4),
+                client
+                    .get(format!("http://127.0.0.1:{}/x", upstream.port()))
+                    .header(DEADLINE_HEADER, "200")
+                    .retries(1)
+                    .send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2);
+            assert!(seen[0] <= 200, "{seen:?}");
+            // 60 ms of the caller's 200 ms are gone.
+            assert!(
+                seen[1] <= 140,
+                "the retry re-extended the deadline: {seen:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_redirect_chain_under_a_deadline_keeps_the_client_timeout() {
+            use axum::response::IntoResponse;
+            // Each hop takes 200 ms: 400 ms in all, over the 300 ms timeout.
+            let app = axum::Router::new()
+                .route(
+                    "/a",
+                    axum::routing::get(|| async {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        axum::response::Redirect::temporary("/b").into_response()
+                    }),
+                )
+                .route(
+                    "/b",
+                    axum::routing::get(|| async {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        "ok"
+                    }),
+                );
+            let upstream = super::spawn(app).await;
+            let mut client = Client::new();
+            client.retry_policy.request_timeout = Some(Duration::from_millis(300));
+            let result = with_deadline(
+                Duration::from_secs(4),
+                client
+                    .get(format!("http://127.0.0.1:{}/a", upstream.port()))
+                    .no_retry()
+                    .send(),
+            )
+            .await;
+            // Without a deadline, reqwest's one timeout covers the redirects.
+            assert!(
+                matches!(&result, Err(ClientError::Request(e)) if e.is_timeout()),
+                "the chain must not get a new timeout per hop: {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn without_a_deadline_a_retry_sends_what_is_left_of_the_callers_header() {
+            use axum::response::IntoResponse;
+            // The first attempt takes 60 ms and fails; the retry works.
+            let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+            let slot = Arc::clone(&seen);
+            let upstream = super::spawn(axum::Router::new().route(
+                "/x",
+                axum::routing::get(move |headers: HeaderMap| {
+                    let slot = Arc::clone(&slot);
+                    async move {
+                        let first = {
+                            let mut seen = slot.lock().unwrap();
+                            seen.push(header_millis(&headers));
+                            seen.len() == 1
+                        };
+                        if first {
+                            tokio::time::sleep(Duration::from_millis(60)).await;
+                            axum::http::StatusCode::BAD_GATEWAY.into_response()
+                        } else {
+                            axum::http::StatusCode::OK.into_response()
+                        }
+                    }
+                }),
+            ))
+            .await;
+            let mut client = Client::new();
+            client.entropy = Arc::new(FixedDraw(0));
+            // No task deadline: only the caller's header.
+            let response = client
+                .get(format!("http://127.0.0.1:{}/x", upstream.port()))
+                .header(DEADLINE_HEADER, "200")
+                .retries(1)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen[0], 200, "{seen:?}");
+            assert!(seen[1] <= 140, "the retry re-extended the header: {seen:?}");
+        }
+
+        #[tokio::test]
+        async fn without_a_deadline_a_redirect_hop_sends_what_is_left_of_the_callers_header() {
+            use axum::response::IntoResponse;
+            let seen: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+            let (at_a, at_b) = (Arc::clone(&seen), Arc::clone(&seen));
+            let app = axum::Router::new()
+                .route(
+                    "/a",
+                    axum::routing::get(move |headers: HeaderMap| async move {
+                        at_a.lock().unwrap().push(header_millis(&headers));
+                        tokio::time::sleep(Duration::from_millis(60)).await;
+                        axum::response::Redirect::temporary("/b").into_response()
+                    }),
+                )
+                .route(
+                    "/b",
+                    axum::routing::get(move |headers: HeaderMap| async move {
+                        at_b.lock().unwrap().push(header_millis(&headers));
+                        "ok"
+                    }),
+                );
+            let upstream = super::spawn(app).await;
+            let response = Client::new()
+                .get(format!("http://127.0.0.1:{}/a", upstream.port()))
+                .header(DEADLINE_HEADER, "200")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(seen[0], 200, "{seen:?}");
+            assert!(seen[1] <= 140, "the hop re-extended the header: {seen:?}");
+        }
+
+        /// The [`DEADLINE_HEADER`] value of a request, or `u64::MAX`.
+        fn header_millis(headers: &HeaderMap) -> u64 {
+            headers
+                .get(DEADLINE_HEADER)
+                .and_then(|v| v.to_str().ok()?.parse().ok())
+                .unwrap_or(u64::MAX)
+        }
+
+        #[tokio::test]
+        async fn a_redirect_hop_continues_the_chain_backoff() {
+            use axum::response::IntoResponse;
+            let origin_hits = Arc::new(AtomicU32::new(0));
+            let target_hits = Arc::new(AtomicU32::new(0));
+            let (origin, target) = (Arc::clone(&origin_hits), Arc::clone(&target_hits));
+            // Each hop fails once, then works.
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::get(move || async move {
+                        if origin.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::BAD_GATEWAY.into_response()
+                        } else {
+                            axum::response::Redirect::temporary("/t").into_response()
+                        }
+                    }),
+                )
+                .route(
+                    "/t",
+                    axum::routing::get(move || async move {
+                        if target.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::BAD_GATEWAY.into_response()
+                        } else {
+                            "done".into_response()
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("http://127.0.0.1:{port}/r");
+            // 20_099 = 101 × 199: the first retry waits 20_099 % 101 = 0 ms,
+            // the second 20_099 % 201 = 200 ms.
+            let mut client = Client::new();
+            client.entropy = Arc::new(FixedDraw(20_099));
+            let start = std::time::Instant::now();
+            let response =
+                with_deadline(Duration::from_secs(5), client.get(&url).retries(2).send())
+                    .await
+                    .unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(origin_hits.load(Ordering::SeqCst), 2);
+            assert_eq!(target_hits.load(Ordering::SeqCst), 2);
+            assert!(
+                start.elapsed() >= Duration::from_millis(200),
+                "the hop's retry is the chain's second: {:?}",
+                start.elapsed()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_post_redirected_to_get_under_a_deadline_gets_no_retry() {
+            use axum::response::IntoResponse;
+            let target_hits = Arc::new(AtomicU32::new(0));
+            let target = Arc::clone(&target_hits);
+            let app = axum::Router::new()
+                .route(
+                    "/r",
+                    axum::routing::post(|| async { axum::response::Redirect::to("/t") }),
+                )
+                .route(
+                    "/t",
+                    axum::routing::get(move || async move {
+                        if target.fetch_add(1, Ordering::SeqCst) == 0 {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            "done".into_response()
+                        }
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("http://127.0.0.1:{port}/r");
+            let response = with_deadline(
+                Duration::from_secs(3),
+                Client::new().post(&url).retries(3).send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 503, "as without a deadline");
+            assert_eq!(target_hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn a_backoff_past_the_hop_deadline_returns_the_response() {
+            let (url, hits) = counting(Some(502), &[]).await;
+            let policy = RetryPolicy {
+                max_retries: 20,
+                ..RetryPolicy::default()
+            };
+            let gate = RetryGate::with_deadline(None, None, None, true);
+            // Warm the connection. A cold first connect on a slow runner
+            // must not use up the hop deadline.
+            let client = reqwest::Client::new();
+            let _ = client.get(&url).send().await;
+            let result = send_one(
+                &client,
+                &Method::GET,
+                &url,
+                &HeaderMap::new(),
+                None,
+                &policy,
+                // A fixed draw gives the backoffs 97, 199, 400 and 400 ms. The
+                // fourth passes the 1 s deadline, and the last retry starts
+                // with about 300 ms left. A random draw can start a last retry
+                // with only `MIN_ATTEMPT` left, and a Windows timer can use
+                // all of it.
+                &FixedDraw(400),
+                false,
+                Some(crate::time::ambient_instant() + Duration::from_secs(1)),
+                false,
+                &gate,
+                false,
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(
+                result.map(|response| response.status().as_u16()).ok(),
+                Some(502),
+                "the last response, not a deadline error"
+            );
+            // The warm-up request, the first attempt and at least one retry.
+            assert!(hits.load(Ordering::SeqCst) >= 3, "no retry ran");
+        }
+
+        #[tokio::test]
+        async fn a_transport_retry_past_the_hop_deadline_is_not_charged() {
+            let app = axum::Router::new().route(
+                "/hang",
+                axum::routing::get(|| async {
+                    std::future::pending::<()>().await;
+                    ""
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let host = format!("127.0.0.1:{port}");
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let gate =
+                RetryGate::with_deadline(None, Some(Arc::clone(&budgets)), Some(&host), true);
+            // The attempt uses up the hop: no retry can follow it.
+            let result = send_one(
+                &reqwest::Client::new(),
+                &Method::GET,
+                &format!("http://{host}/hang"),
+                &HeaderMap::new(),
+                None,
+                &RetryPolicy::default(),
+                &crate::entropy::SeededEntropy::new(1),
+                false,
+                Some(crate::time::ambient_instant() + Duration::from_millis(200)),
+                false,
+                &gate,
+                false,
+                None,
+                None,
+            )
+            .await;
+            assert!(result.is_err(), "{result:?}");
+            let full = f64::from(RetryBudgetConfig::default().capacity);
+            let available = budgets.for_host(&host).available();
+            assert!(
+                (full - available).abs() < f64::EPSILON,
+                "no tokens for a retry that cannot run: {available}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_retry_needs_a_minimum_attempt_before_the_hop_deadline() {
+            let (url, hits) = counting(Some(502), &[]).await;
+            let gate = RetryGate::with_deadline(None, None, None, true);
+            // The 100 ms backoff ends before the hop deadline, but leaves less
+            // than `MIN_ATTEMPT` for the retry.
+            let result = send_one(
+                &reqwest::Client::new(),
+                &Method::GET,
+                &url,
+                &HeaderMap::new(),
+                None,
+                &RetryPolicy::default(),
+                &FixedDraw(100),
+                false,
+                Some(crate::time::ambient_instant() + Duration::from_millis(105)),
+                false,
+                &gate,
+                false,
+                None,
+                None,
+            )
+            .await;
+            assert_eq!(
+                result.map(|response| response.status().as_u16()).ok(),
+                Some(502),
+                "the response, not a retry that cannot run"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn an_origin_failure_after_a_redirect_charges_the_origin() {
+            // The first request redirects to a dead port; later ones hang.
+            let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dead_port = closed.local_addr().unwrap().port();
+            drop(closed);
+            let target = format!("http://127.0.0.1:{dead_port}/t");
+            let hits = Arc::new(AtomicU32::new(0));
+            let counter = Arc::clone(&hits);
+            let app = axum::Router::new().route(
+                "/r",
+                axum::routing::get(move || {
+                    let target = target.clone();
+                    let first = counter.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move {
+                        if !first {
+                            std::future::pending::<()>().await;
+                        }
+                        axum::response::Redirect::temporary(&target)
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let client = Client::with_timeout(Duration::from_millis(300));
+            let budgets = client.retry.budgets.clone().unwrap();
+            let result = client
+                .get(format!("http://127.0.0.1:{origin_port}/r"))
+                .retries(2)
+                .send()
+                .await;
+            assert!(result.is_err(), "{result:?}");
+            let full = f64::from(RetryBudgetConfig::default().capacity);
+            let cost = f64::from(RetryBudgetConfig::default().transient_cost);
+            let origin = budgets.for_host(&format!("127.0.0.1:{origin_port}"));
+            let dead = budgets.for_host(&format!("127.0.0.1:{dead_port}"));
+            assert!(
+                (full - dead.available() - cost).abs() < f64::EPSILON,
+                "the dead target pays its one retry: {}",
+                dead.available()
+            );
+            assert!(
+                (full - origin.available() - cost).abs() < f64::EPSILON,
+                "the origin pays the retry after its own timeout: {}",
+                origin.available()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_redirect_host_is_refilled_when_the_final_body_fails() {
+            // The target's body fails after the head.
+            let target_app = axum::Router::new().route(
+                "/t",
+                axum::routing::get(|| async {
+                    axum::body::Body::from_stream(futures::stream::once(async {
+                        Err::<Bytes, _>(std::io::Error::other("broken body"))
+                    }))
+                }),
+            );
+            let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_port = target_listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(target_listener, target_app).await.unwrap() });
+            let target = format!("http://127.0.0.1:{target_port}/t");
+            let origin_app = axum::Router::new().route(
+                "/r",
+                axum::routing::get(move || {
+                    let target = target.clone();
+                    async move { axum::response::Redirect::temporary(&target) }
+                }),
+            );
+            let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let origin_port = origin_listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(origin_listener, origin_app).await.unwrap() });
+
+            let client = Client::new();
+            let budgets = client.retry.budgets.clone().unwrap();
+            let drained = budgets.for_host(&format!("127.0.0.1:{target_port}"));
+            while drained.try_acquire(RetryKind::Transient) {}
+            let before = drained.available();
+            let result = client
+                .get(format!("http://127.0.0.1:{origin_port}/r"))
+                .send()
+                .await;
+            assert!(result.is_err(), "{result:?}");
+            assert!(drained.available() > before, "the target got its refill");
+        }
+
+        #[tokio::test]
+        async fn ten_redirects_are_followed_with_and_without_a_deadline() {
+            // `/r/{n}` redirects to `/r/{n - 1}`; `/r/0` answers.
+            let app = axum::Router::new().route(
+                "/r/{n}",
+                axum::routing::get(
+                    |axum::extract::Path(n): axum::extract::Path<u32>| async move {
+                        use axum::response::IntoResponse;
+                        if n == 0 {
+                            "done".into_response()
+                        } else {
+                            axum::response::Redirect::temporary(&format!("/r/{}", n - 1))
+                                .into_response()
+                        }
+                    },
+                ),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let ten = format!("http://127.0.0.1:{port}/r/10");
+            let eleven = format!("http://127.0.0.1:{port}/r/11");
+
+            let plain = Client::new().get(&ten).send().await.unwrap();
+            assert_eq!(plain.status().as_u16(), 200, "as reqwest's own limit");
+            let timed = with_deadline(Duration::from_secs(3), Client::new().get(&ten).send())
+                .await
+                .unwrap();
+            assert_eq!(timed.status().as_u16(), 200);
+
+            assert!(Client::new().get(&eleven).send().await.is_err());
+            assert!(
+                with_deadline(Duration::from_secs(3), Client::new().get(&eleven).send())
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_caller_deadline_header_is_capped_at_the_time_left() {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let record = Arc::clone(&seen);
+            let app = axum::Router::new().route(
+                "/x",
+                axum::routing::get(move |headers: HeaderMap| async move {
+                    let values: Vec<String> = headers
+                        .get_all(DEADLINE_HEADER)
+                        .iter()
+                        .map(|value| value.to_str().unwrap().to_owned())
+                        .collect();
+                    record.lock().unwrap().push(values);
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let url = format!("http://127.0.0.1:{port}/x");
+
+            // A larger caller value is cut to the time left.
+            let send = Client::new()
+                .get(&url)
+                .header(DEADLINE_HEADER, "5000")
+                .send();
+            with_deadline(Duration::from_secs(1), send).await.unwrap();
+            // A smaller caller value is kept.
+            let send = Client::new()
+                .get(&url)
+                .header(DEADLINE_HEADER, "200")
+                .send();
+            with_deadline(Duration::from_secs(3), send).await.unwrap();
+            // With no deadline, the caller's value goes as is.
+            Client::new()
+                .get(&url)
+                .header(DEADLINE_HEADER, "5000")
+                .send()
+                .await
+                .unwrap();
+
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 3);
+            assert_eq!(seen[0].len(), 1, "one header: {seen:?}");
+            assert!(seen[0][0].parse::<u64>().unwrap() <= 1_000, "{seen:?}");
+            assert_eq!(seen[1], vec!["200".to_owned()]);
+            assert_eq!(seen[2], vec!["5000".to_owned()]);
+        }
+
+        #[tokio::test]
+        async fn plain_path_follows_a_redirect_without_a_deadline() {
+            let (url, seen) = redirecting(Duration::ZERO).await;
+            let response = Client::new().get(&url).send().await.unwrap();
+            assert_eq!(response.status().as_u16(), 200);
+            assert_eq!(seen.lock().unwrap().len(), 2);
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn plain_path_stops_a_hanging_call_at_the_deadline() {
+            let _lock = lock();
+            let (url, hits) = counting(None, &[]).await;
+            let result =
+                with_deadline(Duration::from_millis(300), Client::new().get(&url).send()).await;
+            assert!(
+                matches!(result, Err(ClientError::DeadlineExceeded)),
+                "{result:?}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "no retry after the deadline"
+            );
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn plain_path_does_not_start_a_retry_that_cannot_fit() {
+            let _lock = lock();
+            let (url, hits) = counting(Some(503), &[]).await;
+            // 50 retries with jittered backoff need far more than 700 ms; the
+            // deadline stops them, and the last 503 comes back.
+            let response = with_deadline(
+                Duration::from_millis(700),
+                Client::new().get(&url).retries(50).send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 503);
+            let made = hits.load(Ordering::SeqCst);
+            assert!(
+                (2..51).contains(&made),
+                "retries stop at the deadline: {made}"
+            );
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn plain_path_skips_a_retry_after_wait_past_the_deadline() {
+            let _lock = lock();
+            let (url, hits) = counting(Some(429), &[("retry-after", "10")]).await;
+            let response = with_deadline(Duration::from_secs(2), Client::new().get(&url).send())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status().as_u16(),
+                429,
+                "the 429 comes back at once"
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn plain_path_obeys_the_retry_budget() {
+            let _lock = lock();
+            let (url, hits) = counting(Some(503), &[]).await;
+            let client = one_retry_client();
+            let first = client.get(&url).send().await.unwrap();
+            assert_eq!(first.status().as_u16(), 503);
+            assert_eq!(hits.load(Ordering::SeqCst), 2, "one retry from the budget");
+            let second = client.get(&url).send().await.unwrap();
+            assert_eq!(second.status().as_u16(), 503);
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                3,
+                "the empty budget blocks retries"
+            );
+        }
+
+        #[tokio::test]
+        async fn custom_path_obeys_the_deadline_and_the_budget() {
+            let (url, hits) = counting(Some(503), &[]).await;
+            let response = with_deadline(
+                Duration::from_millis(700),
+                Client::new().get(&url).retries(50).no_redirect().send(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status().as_u16(), 503);
+            let made = hits.load(Ordering::SeqCst);
+            assert!(
+                (2..51).contains(&made),
+                "retries stop at the deadline: {made}"
+            );
+
+            let client = one_retry_client();
+            client.get(&url).no_redirect().send().await.unwrap();
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                made + 2,
+                "one retry from the budget"
+            );
+            client.get(&url).no_redirect().send().await.unwrap();
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                made + 3,
+                "the empty budget blocks retries"
+            );
+        }
+
+        #[tokio::test]
+        async fn custom_path_reports_a_deadline_timeout_as_deadline_exceeded() {
+            let (url, hits) = counting(None, &[]).await;
+            let result = with_deadline(
+                Duration::from_millis(300),
+                Client::new().get(&url).no_redirect().send(),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(ClientError::DeadlineExceeded)),
+                "{result:?}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                1,
+                "no retry after the deadline"
+            );
+        }
+
+        /// A server whose response head arrives at once and whose body never
+        /// ends.
+        async fn stalled_body() -> String {
+            let app = axum::Router::new().route(
+                "/x",
+                axum::routing::get(|| async {
+                    let stream = futures::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+                    axum::response::Response::new(axum::body::Body::from_stream(stream))
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            format!("http://127.0.0.1:{}/x", addr.port())
+        }
+
+        #[tokio::test]
+        #[allow(clippy::await_holding_lock)]
+        async fn a_body_stalled_past_the_deadline_is_deadline_exceeded() {
+            let _lock = lock();
+            let url = stalled_body().await;
+            let plain =
+                with_deadline(Duration::from_millis(300), Client::new().get(&url).send()).await;
+            assert!(
+                matches!(plain, Err(ClientError::DeadlineExceeded)),
+                "{plain:?}"
+            );
+            let custom = with_deadline(
+                Duration::from_millis(300),
+                Client::new().get(&url).no_redirect().send(),
+            )
+            .await;
+            assert!(
+                matches!(custom, Err(ClientError::DeadlineExceeded)),
+                "{custom:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn ssrf_safe_path_fails_at_once_when_the_deadline_has_passed() {
+            let result = Deadline::at(tokio::time::Instant::now())
+                .scope(Client::new().get_ssrf_safe("https://example.com/").send())
+                .await;
+            assert!(
+                matches!(result, Err(ClientError::DeadlineExceeded)),
+                "{result:?}"
+            );
+        }
+
+        #[test]
+        fn a_redirect_hop_uses_the_budget_of_its_own_host() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let origin = RetryGate::with_deadline(
+                None,
+                Some(Arc::clone(&budgets)),
+                Some("origin:443"),
+                true,
+            );
+            let hop = origin.for_hop("https://target/x", &mut std::collections::HashSet::new());
+            assert!(Arc::ptr_eq(
+                hop.budget.as_ref().unwrap(),
+                &budgets.for_host("target:443")
+            ));
+            assert!(!Arc::ptr_eq(
+                hop.budget.as_ref().unwrap(),
+                origin.budget.as_ref().unwrap()
+            ));
+        }
+
+        #[test]
+        fn a_redirect_chain_refills_each_host_once() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let origin_budget = budgets.for_host("a:443");
+            let target_budget = budgets.for_host("b:443");
+            while origin_budget.try_acquire(RetryKind::Transient) {}
+            while target_budget.try_acquire(RetryKind::Transient) {}
+            let origin =
+                RetryGate::with_deadline(None, Some(Arc::clone(&budgets)), Some("a:443"), true);
+            let mut refilled = std::collections::HashSet::from(["a:443".to_owned()]);
+            // a -> b -> a -> b
+            origin.check().unwrap();
+            let after_first = origin_budget.available();
+            let before_b = target_budget.available();
+            origin
+                .for_hop("https://b/1", &mut refilled)
+                .check()
+                .unwrap();
+            let after_b = target_budget.available();
+            assert!(after_b > before_b, "the first visit to b refills it");
+            origin
+                .for_hop("https://a/2", &mut refilled)
+                .check()
+                .unwrap();
+            origin
+                .for_hop("https://b/3", &mut refilled)
+                .check()
+                .unwrap();
+            assert!(
+                (origin_budget.available() - after_first).abs() < f64::EPSILON,
+                "the origin is not credited again"
+            );
+            assert!(
+                (target_budget.available() - after_b).abs() < f64::EPSILON,
+                "the target is credited once"
+            );
+        }
+
+        #[test]
+        fn rekey_moves_to_the_budget_of_the_answering_host() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let mut gate = RetryGate::with_deadline(
+                None,
+                Some(Arc::clone(&budgets)),
+                Some("origin:443"),
+                true,
+            );
+            let origin = Arc::clone(gate.budget.as_ref().unwrap());
+            gate.rekey("https://origin/x");
+            assert!(
+                Arc::ptr_eq(gate.budget.as_ref().unwrap(), &origin),
+                "same host"
+            );
+            gate.rekey("https://target/x");
+            assert!(Arc::ptr_eq(
+                gate.budget.as_ref().unwrap(),
+                &budgets.for_host("target:443")
+            ));
+        }
+
+        #[test]
+        fn a_redirected_answer_refills_the_destination_budget() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let target = budgets.for_host("target:443");
+            while target.try_acquire(RetryKind::Transient) {}
+            let gate = RetryGate::with_deadline(
+                None,
+                Some(Arc::clone(&budgets)),
+                Some("origin:443"),
+                true,
+            );
+            let origin = Arc::clone(gate.budget.as_ref().unwrap());
+            let (before, origin_before) = (target.available(), origin.available());
+
+            gate.record_destination("https://origin/x");
+            assert!(
+                (target.available() - before).abs() < f64::EPSILON,
+                "same host"
+            );
+
+            gate.record_destination("https://target/x");
+            assert!(target.available() > before, "the destination is refilled");
+            assert!(
+                (origin.available() - origin_before).abs() < f64::EPSILON,
+                "the origin budget is unchanged"
+            );
+            assert!(
+                Arc::ptr_eq(gate.budget.as_ref().unwrap(), &origin),
+                "no rekey"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_expired_deadline_reclassifies_a_hop_error() {
+            let gate = Deadline::at(tokio::time::Instant::now())
+                .scope(async { RetryGate::start(None, None, true) })
+                .await;
+            let error = gate.classify(ClientError::InvalidUrl("dns stalled".into()));
+            assert!(matches!(error, ClientError::DeadlineExceeded));
+            let open = RetryGate::start(None, None, true);
+            let error = open.classify(ClientError::InvalidUrl("dns".into()));
+            assert!(matches!(error, ClientError::InvalidUrl(_)));
+        }
+
+        #[tokio::test]
+        async fn a_rejected_ssrf_safe_host_is_not_refilled() {
+            let client = Client::new();
+            let budget = client
+                .retry
+                .budgets
+                .clone()
+                .unwrap()
+                .for_host("127.0.0.1:80");
+            while budget.try_acquire(RetryKind::Transient) {}
+            let empty = budget.available();
+            // Loopback is refused before any HTTP attempt.
+            let result = client.get_ssrf_safe("http://127.0.0.1/").send().await;
+            assert!(result.is_err(), "{result:?}");
+            assert!(
+                (budget.available() - empty).abs() < f64::EPSILON,
+                "no refill without an attempt: {}",
+                budget.available()
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_followed_redirect_host_is_refilled_after_the_deadline() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let target = budgets.for_host("t:80");
+            while target.try_acquire(RetryKind::Transient) {}
+            let empty = target.available();
+            let gate = RetryGate::with_deadline(
+                Some(Deadline::after(Duration::from_millis(1))),
+                Some(budgets),
+                Some("o:80"),
+                true,
+            );
+            // The redirect was followed, then the deadline passed.
+            tokio::time::advance(Duration::from_millis(5)).await;
+            let mut seen = std::collections::HashSet::from(["o:80".to_owned()]);
+            gate.record_destinations(&["http://t/".to_owned()], &mut seen);
+            assert!(
+                target.available() > empty,
+                "the target's attempt started, so it is refilled"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_request_past_its_deadline_does_not_refill_the_budget() {
+            let budgets = Arc::new(RetryBudgets::new(&RetryBudgetConfig::default()));
+            let budget = budgets.for_host("h:80");
+            while budget.try_acquire(RetryKind::Transient) {}
+            let empty = budget.available();
+            let late = RetryGate::with_deadline(
+                Some(Deadline::at(tokio::time::Instant::now())),
+                Some(Arc::clone(&budgets)),
+                Some("h:80"),
+                true,
+            );
+            assert!(late.check().is_err());
+            assert!(
+                (budget.available() - empty).abs() < f64::EPSILON,
+                "no refill"
+            );
+
+            // Live when built, expired before the first attempt.
+            let short = RetryGate::with_deadline(
+                Some(Deadline::after(Duration::from_millis(1))),
+                Some(Arc::clone(&budgets)),
+                Some("h:80"),
+                true,
+            );
+            tokio::time::advance(Duration::from_millis(5)).await;
+            assert!(short.check().is_err());
+            assert!(
+                (budget.available() - empty).abs() < f64::EPSILON,
+                "no refill without an attempt"
+            );
+
+            let live = RetryGate::with_deadline(None, Some(budgets), Some("h:80"), true);
+            assert!(
+                (budget.available() - empty).abs() < f64::EPSILON,
+                "not when built"
+            );
+            live.check().unwrap();
+            let once = budget.available();
+            assert!(once > empty, "a live request refills at its first attempt");
+            live.check().unwrap();
+            assert!((budget.available() - once).abs() < f64::EPSILON, "once");
+        }
+
+        #[test]
+        fn budget_keys_keep_the_port() {
+            assert_eq!(url_host("http://svc:8001/a").as_deref(), Some("svc:8001"));
+            assert_eq!(url_host("https://svc/a").as_deref(), Some("svc:443"));
+            assert_eq!(url_host("http://svc/a").as_deref(), Some("svc:80"));
+            assert_eq!(url_host("/relative"), None);
+        }
+
+        #[test]
+        fn a_retry_ending_in_a_client_or_server_error_keeps_its_tokens_spent() {
+            let budget = Arc::new(RetryBudget::new(&RetryBudgetConfig::default()));
+            let gate = RetryGate {
+                deadline: None,
+                budgets: None,
+                budget: Some(Arc::clone(&budget)),
+                host: None,
+                send_header: true,
+                refill_pending: AtomicBool::new(false),
+                pending_retry: std::sync::Mutex::new(None),
+                caller_deadline: std::sync::OnceLock::new(),
+                signer: None,
+            };
+            assert!(gate.allow(RetryKind::Transient, Duration::ZERO));
+            // The retry starts.
+            gate.check().unwrap();
+            gate.finish(Some(RetryKind::Transient), 500);
+            assert!((budget.available() - 486.0).abs() < f64::EPSILON);
+            gate.finish(Some(RetryKind::Transient), 200);
+            assert!((budget.available() - 500.0).abs() < f64::EPSILON);
+        }
     }
 }

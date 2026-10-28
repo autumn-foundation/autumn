@@ -573,7 +573,7 @@ impl CustomDomainTask {
         // Warm the cache before the first tick so a restart serves stored
         // certificates on the first handshake instead of after an order.
         self.warm_all().await;
-        self.hydrate_limiter(crate::custom_domain::now_unix());
+        self.hydrate_limiter(crate::custom_domain::now_unix()).await;
         loop {
             // The tick is inside the `select!`: a pass over a thousand domains
             // is long, and shutdown must not wait for it.
@@ -872,11 +872,17 @@ impl CustomDomainTask {
 
         // One replica per hostname orders. `Fleet` grants unconditionally on
         // the in-process backend (correct for a single replica) and to exactly
-        // one replica on a distributed one.
+        // one replica on a distributed one. The key works as a mutex: hold it
+        // through the order, then free it.
         let tick_key = format!("custom-domain:{hostname}");
         let lease = match self
             .coordinator
-            .try_acquire(CUSTOM_DOMAIN_TASK, &tick_key, TaskCoordination::Fleet)
+            .try_acquire_for_period(
+                CUSTOM_DOMAIN_TASK,
+                &tick_key,
+                TaskCoordination::Fleet,
+                crate::acme::renewal::ACME_LEADER_HOLD,
+            )
             .await
         {
             Ok(Some(lease)) => lease,
@@ -915,7 +921,7 @@ impl CustomDomainTask {
                     "abandoning a custom-domain order: the hostname is no longer this tenant's to \
                      order for"
                 );
-                if let Err(e) = lease.release().await {
+                if let Err(e) = lease.release_and_free().await {
                     tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
                 }
                 return;
@@ -935,7 +941,7 @@ impl CustomDomainTask {
                     true,
                 )
                 .await;
-                if let Err(e) = lease.release().await {
+                if let Err(e) = lease.release_and_free().await {
                     tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
                 }
                 return;
@@ -950,23 +956,26 @@ impl CustomDomainTask {
         // An order can take minutes; what follows it is stamped with when it
         // actually finished, not when it began.
         let now_unix = elapsed_since(now_unix, order_started);
-        // Always release the lease, whatever the order did.
-        if let Err(e) = lease.release().await {
-            tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
-        }
 
-        let issued = match outcome {
-            Ok(issued) => issued,
-            Err(e) => {
-                self.record_failure(hostname, tenant, token, now_unix, e, true)
-                    .await;
-                return;
-            }
+        // Hold the key until the record leaves `Issuing`: installed, or a
+        // failure with its backoff written. `due_for_issuance` selects an
+        // `Issuing` record, so an earlier free lets a second replica order
+        // the same hostname.
+        let failure = match outcome {
+            Ok(issued) => self
+                .install(hostname, tenant, &issued, now_unix)
+                .await
+                .err(),
+            Err(e) => Some(e),
         };
-
-        if let Err(e) = self.install(hostname, tenant, &issued, now_unix).await {
+        if let Some(e) = failure {
             self.record_failure(hostname, tenant, token, now_unix, e, true)
                 .await;
+        }
+
+        // Always free the key, whatever the order did.
+        if let Err(e) = lease.release_and_free().await {
+            tracing::warn!(hostname, error = %e, "failed to release the custom-domain lease");
         }
     }
 
@@ -1089,7 +1098,7 @@ impl CustomDomainTask {
     /// record, so a restart does not hand the shared ACME account a fresh
     /// quota. Called once before the first pass of [`Self::run`]; safe to call
     /// again.
-    pub fn hydrate_limiter(&self, now_unix: i64) {
+    pub async fn hydrate_limiter(&self, now_unix: i64) {
         self.limiter.hydrate(
             self.registry.list().into_iter().flat_map(|d| {
                 let hostname = d.hostname;
@@ -1099,6 +1108,25 @@ impl CustomDomainTask {
             }),
             now_unix,
         );
+        // Copy orders the ledger lacks, such as those from before an upgrade.
+        // Do it before a domain can be offboarded and take its record away.
+        let recent = self
+            .registry
+            .list()
+            .into_iter()
+            .flat_map(|d| d.issuance_attempts_unix)
+            .collect();
+        if let Err(e) = self.registry.merge_global_attempts(recent, now_unix).await {
+            tracing::warn!(error = %e, "cannot copy orders into the custom-domain attempt ledger");
+        }
+        // The ledger also holds orders for offboarded domains.
+        match self.registry.load_global_attempts().await {
+            Ok(ledger) => self.limiter.hydrate_global(ledger, now_unix),
+            Err(e) => tracing::warn!(
+                error = %e,
+                "cannot read the custom-domain attempt ledger; offboarded orders do not count"
+            ),
+        }
     }
 
     /// Is there issuance budget for `hostname`? A refusal defers the domain
@@ -1140,6 +1168,14 @@ impl CustomDomainTask {
         token: Option<&str>,
         now_unix: i64,
     ) {
+        if let Err(e) = self.registry.record_global_attempt(now_unix).await {
+            tracing::warn!(
+                hostname,
+                error = %e,
+                "cannot persist the attempt ledger; this order is lost if the domain goes and the \
+                 process restarts"
+            );
+        }
         if let Err(e) = self
             .registry
             .record_attempt_for_registration(hostname, tenant, token, now_unix)
@@ -1443,5 +1479,165 @@ mod tests {
     fn a_hostname_gets_its_own_cert_id() {
         assert_ne!(cert_id_for("a.test"), cert_id_for("b.test"));
         assert_eq!(cert_id_for("a.test"), cert_id_for("a.test"));
+    }
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures::future::BoxFuture;
+
+    use crate::custom_domain::{
+        CustomDomain, CustomDomainStore, DomainVerifier, IssuedCertificate,
+        MemoryCustomDomainStore, ObservedTarget, ObservedTxt, StoreFuture,
+    };
+
+    /// Records how many leases were released at each save.
+    #[derive(Debug, Default)]
+    struct WatchStore {
+        inner: MemoryCustomDomainStore,
+        releases: Arc<AtomicUsize>,
+        saves: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl CustomDomainStore for WatchStore {
+        fn load_all(&self) -> StoreFuture<'_, std::io::Result<Vec<CustomDomain>>> {
+            self.inner.load_all()
+        }
+        fn save<'a>(&'a self, domain: &'a CustomDomain) -> StoreFuture<'a, std::io::Result<()>> {
+            self.saves
+                .lock()
+                .unwrap()
+                .push(self.releases.load(Ordering::SeqCst));
+            self.inner.save(domain)
+        }
+        fn delete<'a>(&'a self, hostname: &'a str) -> StoreFuture<'a, std::io::Result<()>> {
+            self.inner.delete(hostname)
+        }
+        fn load_attempts(&self) -> StoreFuture<'_, std::io::Result<Vec<i64>>> {
+            self.inner.load_attempts()
+        }
+        fn append_attempt(&self, at_unix: i64) -> StoreFuture<'_, std::io::Result<()>> {
+            self.inner.append_attempt(at_unix)
+        }
+        fn merge_attempts(
+            &self,
+            attempts: Vec<i64>,
+            now_unix: i64,
+        ) -> StoreFuture<'_, std::io::Result<()>> {
+            self.inner.merge_attempts(attempts, now_unix)
+        }
+    }
+
+    /// Grants every claim with a lease that counts its release.
+    struct CountingCoordinator(Arc<AtomicUsize>);
+
+    impl SchedulerCoordinator for CountingCoordinator {
+        fn backend(&self) -> &'static str {
+            "postgres"
+        }
+        fn replica_id(&self) -> &'static str {
+            "replica-a"
+        }
+        fn try_acquire<'a>(
+            &'a self,
+            _task_name: &'a str,
+            _tick_key: &'a str,
+            _coordination: TaskCoordination,
+        ) -> crate::scheduler::SchedulerFuture<
+            'a,
+            crate::AutumnResult<Option<crate::scheduler::SchedulerLease>>,
+        > {
+            let releases = Arc::clone(&self.0);
+            Box::pin(async move {
+                Ok(Some(crate::scheduler::SchedulerLease::tracked(
+                    "postgres",
+                    "replica-a",
+                    releases,
+                )))
+            })
+        }
+    }
+
+    /// Points every name at the ingress, and publishes each owner's token.
+    struct OwnedVerifier(Arc<CustomDomainRegistry>);
+
+    impl DomainVerifier for OwnedVerifier {
+        fn observe<'a>(&'a self, _hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+            Box::pin(async { ObservedTarget::Addresses(vec!["203.0.113.10".parse().unwrap()]) })
+        }
+        fn observe_txt<'a>(&'a self, name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+            Box::pin(async move {
+                let token = name
+                    .strip_prefix("_autumn-challenge.")
+                    .and_then(|host| self.0.get(host))
+                    .and_then(|domain| domain.verification_token);
+                ObservedTxt::Values(token.into_iter().collect())
+            })
+        }
+    }
+
+    struct RejectingIssuer;
+
+    impl DomainIssuer for RejectingIssuer {
+        fn issue<'a>(
+            &'a self,
+            _hostname: &'a str,
+        ) -> BoxFuture<'a, Result<IssuedCertificate, String>> {
+            Box::pin(async { Err("the CA rejected the order".to_owned()) })
+        }
+    }
+
+    // Issue #3052 (Codex review): `due_for_issuance` selects an `Issuing`
+    // record. The key must stay held until the failure and its backoff are
+    // saved, or a second replica orders the same hostname.
+    #[tokio::test]
+    async fn domain_key_stays_held_until_the_failure_is_saved() {
+        const NOW: i64 = 1_800_000_000;
+        let releases = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(WatchStore {
+            releases: Arc::clone(&releases),
+            ..WatchStore::default()
+        });
+        let registry = Arc::new(CustomDomainRegistry::new(
+            Arc::clone(&store) as Arc<dyn CustomDomainStore>,
+            100,
+        ));
+        registry.load().await.unwrap();
+        registry
+            .register("app.clientco.com", "tenant-a", NOW)
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let task = CustomDomainTask {
+            registry: Arc::clone(&registry),
+            cache: Arc::new(CustomDomainCertCache::new(8)),
+            certs: Arc::new(crate::acme::store::FsAcmeStore::new(dir.path(), "staging")),
+            provider: crate::tls::crypto_provider(),
+            verifier: Arc::new(OwnedVerifier(Arc::clone(&registry))),
+            issuer: Arc::new(RejectingIssuer),
+            limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+            ingress: ExpectedIngress {
+                hostname: Some("ingress.myapp.com".to_owned()),
+                ipv4: vec!["203.0.113.10".parse().unwrap()],
+                ipv6: vec![],
+            },
+            renew_before_days: 30,
+            reporter: Arc::new(|_| {}),
+            recovery: None,
+            coordinator: Arc::new(CountingCoordinator(Arc::clone(&releases))),
+            leadership_degraded: false,
+            cert_store_paths: None,
+            retained_cert_ids: std::collections::HashSet::new(),
+        };
+        store.saves.lock().unwrap().clear();
+
+        task.tick(NOW).await;
+
+        let saves = store.saves.lock().unwrap().clone();
+        assert!(!saves.is_empty(), "the order must save its state");
+        assert!(
+            saves.iter().all(|&released| released == 0),
+            "every save, the failure included, comes before the key frees: {saves:?}"
+        );
+        assert_eq!(releases.load(Ordering::SeqCst), 1, "the key frees once");
     }
 }

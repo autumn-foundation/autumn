@@ -10,6 +10,10 @@ Sharding composes with the primary/replica story: **each shard is a full
 primary + optional replica topology** of its own, with the same
 `replica_fallback` semantics you already use on the control role.
 
+On the SQLite tier the same extractors route to a **fleet** instead: one
+SQLite file per tenant or per slot, opened on first use. See
+[SQLite Database Fleet](sqlite-fleet.md).
+
 ## Keys, slots, and shards
 
 ```
@@ -84,7 +88,9 @@ Environment overrides address shards positionally:
 
 Pool sizes multiply across shards (N shards × pool_size + control +
 replicas). Startup logs the aggregate as `total_max_connections` —
-check it against your Postgres `max_connections` budget.
+check it against your Postgres `max_connections` budget. The readiness
+pings add one connection for each primary and each replica. The log does not
+count them.
 
 ## Handlers
 
@@ -216,12 +222,23 @@ treat cross-shard aggregates as approximate.
 
 ## The control database
 
-Framework state is **never sharded**. The `autumn_jobs` queue, Postgres
-scheduler advisory locks, sessions, feature flags, and idempotency keys
-all live on the control topology (`database.primary_url`/`url`), and the
-plain `Db` extractor still points there. Startup fails fast if you
-configure shards plus a Postgres-backed jobs/scheduler backend without a
-control role.
+Most framework state is on the control topology
+(`database.primary_url`/`url`): the `autumn_jobs` queue, the Postgres
+scheduler tick table, sessions, feature flags and the shard directory. The
+plain `Db` extractor still points there. Startup stops with an error if you
+configure shards and a Postgres jobs or scheduler backend without a control
+role.
+
+Some state is already on each shard: the outbox, the commit-hook queue,
+version history and derivation state. Idempotency keys are not in a
+database: they are in memory or Redis, with a tenant prefix.
+
+With `jobs.postgres.shard_local = true`, each shard also gets its own
+`autumn_jobs` table and workers. Then `enqueue_in_tx` on a shard connection
+commits or rolls back with the shard's data, and a control-database outage
+does not stop the shard workers. See
+[Cell and Shuffle-Shard Isolation](cell-isolation.md#shard-local-jobs) and
+[ADR 0018](../adr/0018-shard-local-framework-state.md).
 
 Jobs that operate on sharded data should carry the shard key in their
 payload and resolve the shard from state:

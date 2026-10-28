@@ -5,11 +5,15 @@ and server-rendered htmx fragments. Local development uses in-process
 `tokio::broadcast` channels. Multi-replica deployments can switch the same
 API to Redis pub/sub with `autumn.toml`.
 
+The `[realtime]` config section limits WebSockets only. See
+[WebSockets](websockets.md#limits). SSE streams use the `[server.http]`
+connection limits ([Server Connection Limits](connection-limits.md)).
+
 ## Enable
 
 ```toml
 [dependencies]
-autumn-web = { version = "0.8", features = ["ws"] }
+autumn-web = { version = "0.9", features = ["ws"] }
 ```
 
 ## Publish

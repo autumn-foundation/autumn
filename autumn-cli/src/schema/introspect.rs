@@ -53,11 +53,6 @@
 //!   full one — a pre-existing parser gap that makes a round-trip diff non-empty
 //!   for long field names. Introspection records the DB's identifier faithfully;
 //!   reconciling the two names is a later slice.
-//! - **Composite index key order**: multi-column index columns are ordered by
-//!   `attnum`, not the true index key order. The model parser only ever emits
-//!   single-column indexes (exact here), so this affects only hand-authored
-//!   multi-column indexes; recording them faithfully but with attnum ordering is
-//!   preferred over dropping them.
 //! - **Operator classes / collations / ordering on *simple* indexes**: a plain
 //!   column index with a non-default operator class, collation, or `ASC`/`DESC`
 //!   ordering is still recorded by its columns (matching what the model parser
@@ -78,9 +73,11 @@
 //! - **Composite / multi-column foreign keys**: only the first
 //!   referencing/referenced column pair is recorded (the IR [`ForeignKey`] is
 //!   single-column). The model parser never emits a composite FK.
-//! - **Foreign-key / constraint names**: the IR [`ForeignKey`] carries only
-//!   `table`/`column`, so the Postgres constraint name is not represented (and so
-//!   never diffed).
+//! - **Foreign-key / constraint names**: the IR [`ForeignKey`] carries
+//!   `table`, `column` and the `ON DELETE` / `ON UPDATE` actions
+//!   (`confdeltype` / `confupdtype`). It does not carry the constraint name,
+//!   `DEFERRABLE` / `INITIALLY DEFERRED` or `MATCH`. The diff never compares
+//!   these, and a recreate does not write them.
 //! - **Enum `CHECK` constraints**: enum recovery from `CHECK` expressions is a
 //!   later slice; a `TEXT`-with-`CHECK` column pulls back as plain
 //!   [`Text`](ColumnType::Text).
@@ -161,8 +158,8 @@
 use std::collections::BTreeMap;
 
 use autumn_schema_core::{
-    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, ForeignKey, Index, SerialKind,
-    Table,
+    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, ForeignKey, ForeignKeyAction,
+    Index, SerialKind, Table, UnknownForeignKeyAction,
 };
 use diesel::{Connection as _, PgConnection, QueryableByName, RunQueryDsl as _, sql_query};
 
@@ -187,8 +184,8 @@ pub enum IntrospectError {
     Query(String),
     /// The `SQLite` database file could not be opened. Carries only the parsed
     /// file path (a `SQLite` DSN carries no credentials), never the raw URL.
-    #[cfg(feature = "sqlite")]
     #[error("could not open the SQLite database at {path} — is the file present and readable?")]
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     ConnectionSqlite {
         /// The resolved `SQLite` file path (`:memory:` for an in-memory target).
         path: String,
@@ -211,23 +208,41 @@ pub fn introspect_postgres(url: &str) -> Result<Vec<Table>, IntrospectError> {
     // `PgConnection::establish` accepts both URL and libpq key-value DSNs; defer
     // URL parsing to the error path so a valid key-value string still connects
     // (host/port are only needed for a credential-safe message). Mirrors db_pull.
-    let mut conn = PgConnection::establish(url).map_err(|_| {
+    let mut conn = connect_postgres(url)?;
+    introspect_postgres_conn(&mut conn)
+}
+
+/// Open a Postgres connection. The error carries only the host and port.
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Connection`] if the database is unreachable.
+pub fn connect_postgres(url: &str) -> Result<PgConnection, IntrospectError> {
+    PgConnection::establish(url).map_err(|_| {
         let (host, port) = parse_host_port(url).unwrap_or_else(|| ("localhost".to_owned(), 5432));
         IntrospectError::Connection { host, port }
-    })?;
+    })
+}
 
-    let table_names = list_tables(&mut conn)?;
+/// [`introspect_postgres`] on an open connection (for example one inside the
+/// `--dev-url` replay transaction).
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Query`] if a catalog query fails.
+pub fn introspect_postgres_conn(conn: &mut PgConnection) -> Result<Vec<Table>, IntrospectError> {
+    let table_names = list_tables(conn)?;
     if table_names.is_empty() {
         return Ok(Vec::new());
     }
 
     // Batched catalog reads — a constant number of queries regardless of table
     // count (never one query per table).
-    let columns_by_table = fetch_columns(&mut conn, &table_names)?;
-    let pks_by_table = fetch_primary_keys(&mut conn, &table_names)?;
-    let indexes_by_table = fetch_indexes(&mut conn, &table_names)?;
-    let fks_by_table = fetch_foreign_keys(&mut conn, &table_names)?;
-    let checks_by_table = fetch_checks(&mut conn, &table_names)?;
+    let columns_by_table = fetch_columns(conn, &table_names)?;
+    let pks_by_table = fetch_primary_keys(conn, &table_names)?;
+    let indexes_by_table = fetch_indexes(conn, &table_names)?;
+    let fks_by_table = fetch_foreign_keys(conn, &table_names)?;
+    let checks_by_table = fetch_checks(conn, &table_names)?;
 
     let mut tables = Vec::with_capacity(table_names.len());
     for name in &table_names {
@@ -436,6 +451,30 @@ struct ForeignKeyRow {
     foreign_schema: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     foreign_column: String,
+    /// The `confdeltype` code (see [`pg_fk_action`]).
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    on_delete: String,
+    /// The `confupdtype` code (see [`pg_fk_action`]).
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    on_update: String,
+}
+
+/// Map a `pg_constraint.confdeltype` / `confupdtype` code to an action. `a`
+/// (`NO ACTION`) gives `None`.
+///
+/// # Errors
+///
+/// Returns [`UnknownForeignKeyAction`] for a code that Postgres does not
+/// document.
+fn pg_fk_action(code: &str) -> Result<Option<ForeignKeyAction>, UnknownForeignKeyAction> {
+    match code {
+        "a" => Ok(None),
+        "r" => Ok(Some(ForeignKeyAction::Restrict)),
+        "c" => Ok(Some(ForeignKeyAction::Cascade)),
+        "n" => Ok(Some(ForeignKeyAction::SetNull)),
+        "d" => Ok(Some(ForeignKeyAction::SetDefault)),
+        other => Err(UnknownForeignKeyAction(other.to_owned())),
+    }
 }
 
 #[derive(QueryableByName)]
@@ -719,7 +758,8 @@ fn fetch_foreign_keys(
     let query = format!(
         "SELECT t.relname AS table_name, att.attname AS column_name, \
          ft.relname AS foreign_table, fn.nspname AS foreign_schema, \
-         fatt.attname AS foreign_column \
+         fatt.attname AS foreign_column, \
+         con.confdeltype::text AS on_delete, con.confupdtype::text AS on_update \
          FROM pg_constraint con \
          JOIN pg_class t ON t.oid = con.conrelid \
          JOIN pg_namespace n ON n.oid = t.relnamespace \
@@ -733,6 +773,15 @@ fn fetch_foreign_keys(
     let rows: Vec<ForeignKeyRow> = sql_query(query)
         .load(conn)
         .map_err(|e| IntrospectError::Query(e.to_string()))?;
+    // Refuse an unknown action code. Then `build_table` cannot read it as
+    // `NO ACTION`.
+    for row in &rows {
+        for code in [&row.on_delete, &row.on_update] {
+            pg_fk_action(code).map_err(|e| {
+                IntrospectError::Query(format!("{}.{}: {e}", row.table_name, row.column_name))
+            })?;
+        }
+    }
     let mut by_table: BTreeMap<String, Vec<ForeignKeyRow>> = BTreeMap::new();
     for row in rows {
         by_table
@@ -944,7 +993,12 @@ fn build_table(
             } else {
                 format!("{}.{}", fk.foreign_schema, fk.foreign_table)
             };
-            column.references = Some(ForeignKey::new(foreign_table, fk.foreign_column.clone()));
+            // `fetch_foreign_keys` already refused an unknown code.
+            column.references = Some(
+                ForeignKey::new(foreign_table, fk.foreign_column.clone())
+                    .with_on_delete(pg_fk_action(&fk.on_delete).ok().flatten())
+                    .with_on_update(pg_fk_action(&fk.on_update).ok().flatten()),
+            );
         }
         table.columns.push(column);
     }
@@ -1385,9 +1439,10 @@ fn serial_kind_for(
 // SQLite introspection (`autumn schema pull` on the sqlite backend-flip)
 // ===========================================================================
 //
-// Compiled only under the `sqlite` cargo feature (the backend-flip that must never
-// be co-built with the default Postgres backend — see `autumn-cli/Cargo.toml`), so
-// the default (Postgres) build references no `SqliteConnection` here. It lifts a
+// Compiled in every build: diesel's SQLite backend is always in the CLI graph (the
+// workspace `diesel` pin), and `autumn db scrub` reads SQLite targets from the
+// default binary. `autumn schema pull` on SQLite still needs the `sqlite` cargo
+// feature. It lifts a
 // live SQLite database into the SAME `autumn_schema_core` snapshot IR as
 // [`introspect_postgres`], reading the SQLite catalog through `sqlite_master` and
 // the table-valued `pragma_*` functions in a constant number of batched queries
@@ -1440,8 +1495,7 @@ fn serial_kind_for(
 /// target [`diesel::SqliteConnection::establish`] expects, mirroring autumn-web's
 /// own `normalize_sqlite_target` (kept in lock-step so the pull connects to the same
 /// file `schema migrate` does). An empty or `:memory:` target stays `:memory:`.
-#[cfg(feature = "sqlite")]
-fn sqlite_target(url: &str) -> String {
+pub fn sqlite_target(url: &str) -> String {
     if url.starts_with("file:") {
         return url.to_owned();
     }
@@ -1468,8 +1522,7 @@ fn sqlite_target(url: &str) -> String {
 /// stripped (handling `file:p`, `file:/p`, `file://host/p`, `file:///p`), the `?query`
 /// separator honored, and the path percent-decoded — then existence-checked like a
 /// bare path.
-#[cfg(feature = "sqlite")]
-fn sqlite_existence_check_path(target: &str) -> Option<String> {
+pub fn sqlite_existence_check_path(target: &str) -> Option<String> {
     if target.is_empty() || target == ":memory:" {
         return None;
     }
@@ -1497,7 +1550,7 @@ fn sqlite_existence_check_path(target: &str) -> Option<String> {
     Some(decoded)
 }
 
-#[cfg(all(test, feature = "sqlite"))]
+#[cfg(test)]
 mod target_tests {
     use super::sqlite_existence_check_path;
 
@@ -1563,7 +1616,7 @@ mod target_tests {
 /// Returns [`IntrospectError::ConnectionSqlite`] if the database file cannot be
 /// opened, or [`IntrospectError::Query`] if a catalog query/PRAGMA fails. Neither
 /// leaks the database URL.
-#[cfg(feature = "sqlite")]
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 pub fn introspect_sqlite(url: &str) -> Result<Vec<Table>, IntrospectError> {
     use diesel::{Connection as _, SqliteConnection};
 
@@ -1584,14 +1637,26 @@ pub fn introspect_sqlite(url: &str) -> Result<Vec<Table>, IntrospectError> {
     sqlite::introspect(&mut conn)
 }
 
+/// [`introspect_sqlite`] on an open connection (for example one inside the
+/// `--dev-url` replay transaction).
+///
+/// # Errors
+///
+/// Returns [`IntrospectError::Query`] if a catalog query or PRAGMA fails.
+pub fn introspect_sqlite_conn(
+    conn: &mut diesel::SqliteConnection,
+) -> Result<Vec<Table>, IntrospectError> {
+    sqlite::introspect(conn)
+}
+
 /// `SQLite` catalog probes + IR assembly. All row DTOs and helpers live here so the
 /// default (Postgres) build never compiles a `SqliteConnection` reference.
-#[cfg(feature = "sqlite")]
 mod sqlite {
     use std::collections::BTreeMap;
 
     use autumn_schema_core::{
-        Backend, Column, ColumnDefault, ColumnType, ForeignKey, Index, SerialKind, Table,
+        Backend, Column, ColumnDefault, ColumnType, ForeignKey, ForeignKeyAction, Index,
+        SerialKind, Table,
     };
     use diesel::sql_types::{Integer, Nullable, Text};
     use diesel::{QueryableByName, RunQueryDsl as _, SqliteConnection, sql_query};
@@ -1671,6 +1736,10 @@ mod sqlite {
         /// The indexed column name, or `NULL` for an expression key.
         #[diesel(sql_type = Nullable<Text>)]
         column_name: Option<String>,
+        /// `1` when the key has a modifier the IR column list cannot hold: a
+        /// non-`BINARY` collation or `DESC` (`pragma_index_xinfo`).
+        #[diesel(sql_type = Integer)]
+        modified: i32,
     }
 
     #[derive(QueryableByName)]
@@ -1687,6 +1756,12 @@ mod sqlite {
         /// composite / no single-column PK.
         #[diesel(sql_type = Nullable<Text>)]
         foreign_column: Option<String>,
+        /// The `ON DELETE` action as SQL, for example `CASCADE`.
+        #[diesel(sql_type = Text)]
+        on_delete: String,
+        /// The `ON UPDATE` action as SQL.
+        #[diesel(sql_type = Text)]
+        on_update: String,
     }
 
     fn query_err(e: &diesel::result::Error) -> IntrospectError {
@@ -1742,9 +1817,11 @@ mod sqlite {
         out
     }
 
-    /// List app tables (name + `CREATE TABLE` SQL), excluding `SQLite` internal
-    /// tables, the Diesel migrations table, framework-owned tables, and **FTS5
-    /// search-index tables** — the `CREATE VIRTUAL TABLE "<table>__fts" USING fts5(…)`
+    /// List the app tables (name and `CREATE TABLE` SQL). The list excludes
+    /// `SQLite` internal tables, the Diesel migrations table, framework tables,
+    /// virtual tables and shadow tables. `pragma_table_list` gives a shadow
+    /// table the type `shadow`, for example rtree `_node`, `_parent` and
+    /// `_rowid`. This covers the `CREATE VIRTUAL TABLE "<table>__fts" USING fts5(…)`
     /// index a `--searchable` model generates (issue #1910) plus its internal shadow
     /// tables (`<vtab>_data`/`_idx`/`_content`/`_docsize`/`_config`). Those are stored
     /// in `sqlite_master` as `type = 'table'` with non-`sqlite_` names, but the model
@@ -1753,19 +1830,30 @@ mod sqlite {
     fn list_tables(
         conn: &mut SqliteConnection,
     ) -> Result<Vec<(String, Option<String>)>, IntrospectError> {
+        // `pragma_table_list` (SQLite 3.37+) marks the internal tables of a
+        // virtual table as `shadow` (rtree, FTS5 and other modules known to the
+        // connection). The FTS5 suffix check below stays as a fallback.
         let rows: Vec<TableRow> = sql_query(
-            "SELECT name AS name, sql AS sql FROM sqlite_master \
-             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+            "SELECT m.name AS name, m.sql AS sql FROM sqlite_master m \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             AND NOT EXISTS (SELECT 1 FROM pragma_table_list tl \
+               WHERE tl.schema = 'main' AND tl.name = m.name AND tl.type = 'shadow') \
+             ORDER BY m.name",
         )
         .load(conn)
         .map_err(|e| query_err(&e))?;
         // Virtual tables (their `sql` starts with `CREATE VIRTUAL TABLE`) are never
-        // model-expressible; collect them so their FTS5 shadow tables can be
-        // excluded alongside the vtab itself.
-        let virtual_tables: Vec<String> = rows
+        // model-expressible; collect them, and whether each is FTS5, so the FTS5
+        // shadow tables can be excluded alongside the vtab itself.
+        let virtual_tables: Vec<(String, bool)> = rows
             .iter()
-            .filter(|r| r.sql.as_deref().is_some_and(is_create_virtual_table))
-            .map(|r| r.name.clone())
+            .filter_map(|r| {
+                let sql = r
+                    .sql
+                    .as_deref()
+                    .filter(|sql| is_create_virtual_table(sql))?;
+                Some((r.name.clone(), is_fts5_virtual_table(sql)))
+            })
             .collect();
         Ok(rows
             .into_iter()
@@ -1785,17 +1873,29 @@ mod sqlite {
             .starts_with("CREATE VIRTUAL TABLE")
     }
 
+    /// Whether a `CREATE VIRTUAL TABLE` statement uses the `fts5` module.
+    fn is_fts5_virtual_table(sql: &str) -> bool {
+        sql.to_ascii_uppercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[0] == "USING" && (w[1] == "FTS5" || w[1].starts_with("FTS5(")))
+    }
+
     /// The FTS5 internal shadow-table suffixes appended to the virtual-table name.
     const FTS5_SHADOW_SUFFIXES: [&str; 5] = ["_data", "_idx", "_content", "_docsize", "_config"];
 
-    /// Whether `name` is one of the `virtual_tables` itself or one of its FTS5 shadow
-    /// tables (`<vtab>` + a [`FTS5_SHADOW_SUFFIXES`] suffix).
-    fn is_virtual_or_fts5_shadow_table(name: &str, virtual_tables: &[String]) -> bool {
-        virtual_tables.iter().any(|vtab| {
+    /// Whether `name` is one of the `virtual_tables` (name, is FTS5) or an FTS5
+    /// shadow table (an FTS5 `<vtab>` + a [`FTS5_SHADOW_SUFFIXES`] suffix). The
+    /// suffix rule applies to FTS5 tables only: `boxes_data` beside an rtree
+    /// `boxes` is an app table.
+    fn is_virtual_or_fts5_shadow_table(name: &str, virtual_tables: &[(String, bool)]) -> bool {
+        virtual_tables.iter().any(|(vtab, fts5)| {
             name == vtab
-                || FTS5_SHADOW_SUFFIXES
-                    .iter()
-                    .any(|suffix| name == format!("{vtab}{suffix}"))
+                || (*fts5
+                    && FTS5_SHADOW_SUFFIXES
+                        .iter()
+                        .any(|suffix| name == format!("{vtab}{suffix}")))
         })
     }
 
@@ -1840,17 +1940,20 @@ mod sqlite {
         Ok(group_by(rows, |r| r.table_name.clone()))
     }
 
-    /// Fetch the columns of every index in one batched `pragma_index_info` join,
-    /// grouped by `(table, index)` in key order.
+    /// Fetch the key columns of every index in one batched `pragma_index_xinfo`
+    /// join, grouped by `(table, index)` in key order. `xinfo` (not `info`) also
+    /// gives each key's collation and sort order, so a key with a modifier the IR
+    /// cannot hold is flagged.
     fn fetch_index_columns(
         conn: &mut SqliteConnection,
     ) -> Result<BTreeMap<IndexKey, Vec<IndexColumnRow>>, IntrospectError> {
         let mut rows: Vec<IndexColumnRow> = sql_query(
             "SELECT m.name AS table_name, il.name AS index_name, ii.seqno AS seqno, \
-             ii.name AS column_name \
+             ii.name AS column_name, \
+             ((ii.coll IS NOT NULL AND ii.coll <> 'BINARY') OR ii.\"desc\" <> 0) AS modified \
              FROM sqlite_master m JOIN pragma_index_list(m.name) il \
-             JOIN pragma_index_info(il.name) ii \
-             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' \
+             JOIN pragma_index_xinfo(il.name) ii \
+             WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND ii.key = 1 \
              ORDER BY m.name, il.name, ii.seqno",
         )
         .load(conn)
@@ -1884,7 +1987,8 @@ mod sqlite {
     ) -> Result<BTreeMap<String, Vec<ForeignKeyRow>>, IntrospectError> {
         let rows: Vec<ForeignKeyRow> = sql_query(
             "SELECT m.name AS table_name, fkl.\"table\" AS foreign_table, \
-             fkl.\"from\" AS column_name, fkl.\"to\" AS foreign_column \
+             fkl.\"from\" AS column_name, fkl.\"to\" AS foreign_column, \
+             fkl.on_delete AS on_delete, fkl.on_update AS on_update \
              FROM sqlite_master m JOIN pragma_foreign_key_list(m.name) fkl \
              WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' AND fkl.seq = 0 \
              AND fkl.id NOT IN ( \
@@ -1892,6 +1996,15 @@ mod sqlite {
         )
         .load(conn)
         .map_err(|e| query_err(&e))?;
+        // Refuse an unknown action. Then `build_table` cannot read it as
+        // `NO ACTION`.
+        for row in &rows {
+            for action in [&row.on_delete, &row.on_update] {
+                ForeignKeyAction::from_sql(action).map_err(|e| {
+                    IntrospectError::Query(format!("{}.{}: {e}", row.table_name, row.column_name))
+                })?;
+            }
+        }
         Ok(group_by(rows, |r| r.table_name.clone()))
     }
 
@@ -1932,7 +2045,7 @@ mod sqlite {
     }
 
     /// Normalize a raw `SQLite` `dflt_value` into a [`ColumnDefault`]. Recovers the
-    /// Autumn `Timestamp` convention default (`CURRENT_TIMESTAMP` → [`Now`]) and
+    /// Autumn `Timestamp` convention default (`CURRENT_TIMESTAMP` → `Now`) and
     /// preserves anything else verbatim.
     ///
     /// `pragma_table_info.dflt_value` reports the literal keyword `NULL` (bareword,
@@ -2160,8 +2273,16 @@ mod sqlite {
                     single_col_pks.get(&fk.foreign_table).cloned()
                 });
                 if let Some(foreign_column) = foreign_column {
-                    column.references =
-                        Some(ForeignKey::new(fk.foreign_table.clone(), foreign_column));
+                    // `fetch_foreign_keys` already refused an unknown action.
+                    column.references = Some(
+                        ForeignKey::new(fk.foreign_table.clone(), foreign_column)
+                            .with_on_delete(
+                                ForeignKeyAction::from_sql(&fk.on_delete).ok().flatten(),
+                            )
+                            .with_on_update(
+                                ForeignKeyAction::from_sql(&fk.on_update).ok().flatten(),
+                            ),
+                    );
                 }
             }
             table.columns.push(column);
@@ -2186,9 +2307,9 @@ mod sqlite {
     /// rebuild / `DropTable` rollback would produce illegal DDL. Instead a
     /// **single-column** inline `col TEXT UNIQUE` is folded into the column's
     /// `unique = true` flag: a matching `#[unique]` model is recognized as already
-    /// satisfied ([`baseline_unique_index_covers`], no `AddIndex` / no guard refusal),
+    /// satisfied (`baseline_unique_index_covers`, no `AddIndex` / no guard refusal),
     /// and the emitter renders it as inline `UNIQUE` on a rebuild/rollback
-    /// ([`render_create_table_body`]) so uniqueness is preserved. A **composite**
+    /// (`render_create_table_body`) so uniqueness is preserved. A **composite**
     /// table-level `UNIQUE(a, b)` has no single-column flag and no recreatable IR form,
     /// so it is skipped entirely (DEFERRED, #1975 — a rare brownfield shape; the live
     /// constraint is untouched).
@@ -2221,25 +2342,35 @@ mod sqlite {
                 .get(&(table_name.to_owned(), row.index_name.clone()))
                 .map_or(&[][..], Vec::as_slice);
             let has_expression = cols.iter().any(|c| c.column_name.is_none());
+            // A collated or `DESC` key cannot be rebuilt from the column list.
+            let has_modifier = cols.iter().any(|c| c.modified != 0);
             let key_columns: Vec<String> =
                 cols.iter().filter_map(|c| c.column_name.clone()).collect();
             let is_unique = row.is_unique != 0;
             let is_partial = row.partial != 0;
 
-            let simple = !is_partial && !has_expression;
+            let simple = !is_partial && !has_expression && !has_modifier;
             if simple && is_unique && key_columns.len() == 1 {
                 unique_columns.insert(key_columns[0].clone());
             }
-            // A partial or expression index is retained verbatim via its CREATE INDEX
-            // SQL (when present); a plain index is representable by its columns.
+            // A partial, expression or collated/`DESC` index is retained verbatim via
+            // its CREATE INDEX SQL (when present); a plain index is representable by
+            // its columns.
             let definition = if simple { None } else { row.index_sql.clone() };
+            // A definition-backed index with only real key columns records them,
+            // so the diff can match it to a model `#[unique]`.
+            let key_cols = if definition.is_some() && !has_expression {
+                key_columns.clone()
+            } else {
+                Vec::new()
+            };
             indexes.push(Index {
                 name: row.index_name.clone(),
                 columns: key_columns,
                 unique: is_unique,
                 definition,
                 is_partial,
-                key_columns: Vec::new(),
+                key_columns: key_cols,
             });
         }
         (indexes, unique_columns)
@@ -2514,12 +2645,16 @@ mod sqlite {
                     foreign_table: "parents".to_owned(),
                     column_name: "parent_code".to_owned(),
                     foreign_column: None,
+                    on_delete: "NO ACTION".to_owned(),
+                    on_update: "NO ACTION".to_owned(),
                 },
                 ForeignKeyRow {
                     table_name: "children".to_owned(),
                     foreign_table: "composite_parent".to_owned(),
                     column_name: "orphan_ref".to_owned(),
                     foreign_column: None,
+                    on_delete: "NO ACTION".to_owned(),
+                    on_update: "NO ACTION".to_owned(),
                 },
             ];
             // `parents` has a single-column PK `code`; `composite_parent` is absent
@@ -2598,6 +2733,7 @@ mod sqlite {
                     index_name: "idx_authors_email_unique".to_owned(),
                     seqno: 0,
                     column_name: Some("email".to_owned()),
+                    modified: 0,
                 }],
             );
             let (indexes, unique_cols) = collapse_indexes("authors", &rows, &index_columns);
@@ -2609,6 +2745,56 @@ mod sqlite {
                 "a simple index carries no definition"
             );
             assert!(unique_cols.contains("email"));
+        }
+
+        #[test]
+        fn collapse_indexes_collated_or_desc_index_keeps_its_sql() {
+            let sql = "CREATE UNIQUE INDEX idx_users_email_unique ON users (email COLLATE NOCASE)";
+            let rows = vec![IndexRow {
+                table_name: "users".to_owned(),
+                index_name: "idx_users_email_unique".to_owned(),
+                is_unique: 1,
+                origin: "c".to_owned(),
+                partial: 0,
+                index_sql: Some(sql.to_owned()),
+            }];
+            let mut index_columns = BTreeMap::new();
+            index_columns.insert(
+                ("users".to_owned(), "idx_users_email_unique".to_owned()),
+                vec![IndexColumnRow {
+                    table_name: "users".to_owned(),
+                    index_name: "idx_users_email_unique".to_owned(),
+                    seqno: 0,
+                    column_name: Some("email".to_owned()),
+                    modified: 1,
+                }],
+            );
+            let (indexes, unique_cols) = collapse_indexes("users", &rows, &index_columns);
+            assert_eq!(indexes[0].definition.as_deref(), Some(sql));
+            // Its keys are real columns, so a model `#[unique]` can match it.
+            assert_eq!(indexes[0].key_columns, vec!["email".to_owned()]);
+            assert!(!unique_cols.contains("email"), "not a plain unique column");
+        }
+
+        #[test]
+        fn introspection_keeps_a_collated_index_verbatim() {
+            use diesel::{Connection as _, RunQueryDsl as _};
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("pull.db");
+            let mut conn = SqliteConnection::establish(&db.display().to_string()).expect("open");
+            for sql in [
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL, name TEXT)",
+                "CREATE UNIQUE INDEX idx_users_email_unique ON users (email COLLATE NOCASE)",
+                "CREATE INDEX idx_users_name ON users (name DESC)",
+            ] {
+                diesel::sql_query(sql).execute(&mut conn).expect("ddl");
+            }
+            let tables = introspect(&mut conn).expect("introspect");
+            let users = tables.iter().find(|t| t.name == "users").expect("users");
+            for name in ["idx_users_email_unique", "idx_users_name"] {
+                let idx = users.indexes.iter().find(|i| i.name == name).expect(name);
+                assert!(idx.definition.is_some(), "{name} keeps its SQL: {idx:?}");
+            }
         }
 
         #[test]
@@ -2642,6 +2828,7 @@ mod sqlite {
                     index_name: "t_active_idx".to_owned(),
                     seqno: 0,
                     column_name: Some("email".to_owned()),
+                    modified: 0,
                 }],
             );
             let (indexes, _unique) = collapse_indexes("t", &rows, &index_columns);
@@ -2678,6 +2865,7 @@ mod sqlite {
                             index_name: "sqlite_autoindex_t_1".to_owned(),
                             seqno: i32::try_from(i).unwrap(),
                             column_name: Some((*c).to_owned()),
+                            modified: 0,
                         })
                         .collect(),
                 );
@@ -2711,7 +2899,20 @@ mod sqlite {
                 "CREATE TABLE posts (id INTEGER PRIMARY KEY)"
             ));
 
-            let vtabs = vec!["posts__fts".to_owned()];
+            assert!(is_fts5_virtual_table(
+                "CREATE VIRTUAL TABLE \"posts__fts\" USING fts5(\"title\")"
+            ));
+            assert!(is_fts5_virtual_table(
+                "create virtual table x using FTS5 (a)"
+            ));
+            assert!(!is_fts5_virtual_table(
+                "CREATE VIRTUAL TABLE boxes USING rtree(id, a, b)"
+            ));
+            assert!(!is_fts5_virtual_table(
+                "CREATE VIRTUAL TABLE v USING fts5vocab(posts__fts, row)"
+            ));
+
+            let vtabs = vec![("posts__fts".to_owned(), true), ("boxes".to_owned(), false)];
             // The vtab itself and each FTS5 shadow table are excluded.
             for shadow in [
                 "posts__fts",
@@ -2729,6 +2930,9 @@ mod sqlite {
             // A real application table (and a lookalike that is not a shadow) is kept.
             assert!(!is_virtual_or_fts5_shadow_table("posts", &vtabs));
             assert!(!is_virtual_or_fts5_shadow_table("posts__fts_other", &vtabs));
+            // The FTS5 suffix rule does not apply to a non-FTS5 virtual table.
+            assert!(is_virtual_or_fts5_shadow_table("boxes", &vtabs));
+            assert!(!is_virtual_or_fts5_shadow_table("boxes_data", &vtabs));
         }
     }
 }
@@ -3597,6 +3801,8 @@ mod tests {
             foreign_table: "posts".to_owned(),
             foreign_schema: "public".to_owned(),
             foreign_column: "id".to_owned(),
+            on_delete: "a".to_owned(),
+            on_update: "a".to_owned(),
         }];
         let table = build_table("comments", &columns, &pk, &indexes, &fks, &[]);
         assert_eq!(table.name, "comments");
@@ -3863,6 +4069,8 @@ mod tests {
             foreign_table: "accounts".to_owned(),
             foreign_schema: "auth".to_owned(),
             foreign_column: "id".to_owned(),
+            on_delete: "a".to_owned(),
+            on_update: "a".to_owned(),
         }];
         let table = build_table("sessions", &columns, &[], &[], &fks, &[]);
         let account_id = table
@@ -3875,6 +4083,55 @@ mod tests {
             Some(ForeignKey::new("auth.accounts", "id")),
             "a cross-schema FK target is stored schema-qualified"
         );
+    }
+
+    #[test]
+    fn build_table_reads_fk_actions() {
+        // `confdeltype` / `confupdtype` codes: a = NO ACTION, r = RESTRICT,
+        // c = CASCADE, n = SET NULL, d = SET DEFAULT.
+        let columns = vec![ColumnRow {
+            table_name: "comments".to_owned(),
+            column_name: "post_id".to_owned(),
+            udt_name: "int8".to_owned(),
+            is_nullable: "YES".to_owned(),
+            column_default: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            character_maximum_length: None,
+            domain_name: None,
+            domain_schema: None,
+            owns_sequence: false,
+            is_identity: "NO".to_owned(),
+            identity_generation: None,
+        }];
+        let fks = vec![ForeignKeyRow {
+            table_name: "comments".to_owned(),
+            column_name: "post_id".to_owned(),
+            foreign_table: "posts".to_owned(),
+            foreign_schema: "public".to_owned(),
+            foreign_column: "id".to_owned(),
+            on_delete: "c".to_owned(),
+            on_update: "n".to_owned(),
+        }];
+        let table = build_table("comments", &columns, &[], &[], &fks, &[]);
+        assert_eq!(
+            table.columns[0].references,
+            Some(
+                ForeignKey::new("posts", "id")
+                    .with_on_delete(Some(ForeignKeyAction::Cascade))
+                    .with_on_update(Some(ForeignKeyAction::SetNull))
+            )
+        );
+        for (code, want) in [
+            ("a", None),
+            ("r", Some(ForeignKeyAction::Restrict)),
+            ("c", Some(ForeignKeyAction::Cascade)),
+            ("n", Some(ForeignKeyAction::SetNull)),
+            ("d", Some(ForeignKeyAction::SetDefault)),
+        ] {
+            assert_eq!(pg_fk_action(code), Ok(want), "code {code}");
+        }
+        assert!(pg_fk_action("z").is_err());
     }
 
     #[test]
@@ -3901,6 +4158,8 @@ mod tests {
             foreign_table: "posts".to_owned(),
             foreign_schema: "public".to_owned(),
             foreign_column: "id".to_owned(),
+            on_delete: "a".to_owned(),
+            on_update: "a".to_owned(),
         }];
         let table = build_table("comments", &columns, &[], &[], &fks, &[]);
         let post_id = table.columns.iter().find(|c| c.name == "post_id").unwrap();

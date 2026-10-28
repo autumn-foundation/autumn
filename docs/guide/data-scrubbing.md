@@ -15,8 +15,9 @@ comes from introspecting the live database, not from a config file, so a column
 added yesterday cannot be missing from it. A column that is neither
 PII-classified nor explicitly declared safe aborts the scrub.
 
-> **Postgres only.** Scrubbing targets the same databases `autumn migrate`
-> resolves — the control database plus every configured shard.
+> Scrubbing targets the same databases `autumn migrate` resolves — the control
+> database plus every configured shard. A target is Postgres or [SQLite](#sqlite).
+> One run cannot mix the two.
 
 ---
 
@@ -77,8 +78,10 @@ Two sources need **no declaration at all**:
   plaintext strategy is refused outright. `null` is accepted on a nullable
   encrypted column. The scrub needs the target's `active_record_encryption`
   credentials for this and refuses before writing anything if they are missing.
-  It also refuses if it cannot tell *which* columns are encrypted — a host with
-  the CLI and `scrub.toml` but no `src/models` must name them, with their mode,
+  The scan reads every file under `src/`, in any module. Two models that
+  encrypt one column in different modes are an error, not a last-wins merge. It also refuses if it
+  cannot tell *which* columns are encrypted — a host with
+  the CLI and `scrub.toml` but no `src/` tree must name them, with their mode,
   under `[tables.<t>.encrypted]`:
 
   ```toml
@@ -95,10 +98,11 @@ Two sources need **no declaration at all**:
   the registration statically, so it needs a string-literal table name; a
   computed one is reported rather than silently ignored.
 
-Primary- and foreign-key columns are never claimed by the table-level
-inference: rewriting a key would break referential integrity. Neither are
-generated columns, which Postgres refuses to `UPDATE` and which a scrub of their
-source columns already covers.
+Table-level inference never claims primary-key, foreign-key or partition-key
+columns. A rewrite would break referential integrity or move rows between
+partitions. Declare a partition key `safe`. Inference also skips generated
+columns. Postgres refuses to `UPDATE` them, and a scrub of their source columns
+already covers them.
 
 `[defaults] safe_columns` is a cross-table convenience, not a per-column review,
 so it does **not** narrow a GDPR anonymize registration — only an explicit
@@ -708,10 +712,20 @@ apply-time error.
   database that **any** non-dev/test profile's *config file* declares — every
   `autumn-<profile>.toml` in the project is checked, not just the one an
   artifact's manifest names, so a bare `.dump` with no manifest is not treated
-  as permission to continue. That guard has its own waiver,
+  as permission to continue. The control URL and every shard URL of those
+  profiles are compared, hostless libpq URLs (`postgres:///db?host=/run/pg`,
+  `PGHOST`) included. The destination profile is never its own source. With
+  `--artifact`, only the targets the artifact restored are scrubbed. That guard
+  has its own waiver,
   `--allow-source-overwrite`, rather than riding on `--force`: the staging drill
   always passes `--force`, so a guard `--force` waived would be inert in exactly
-  the workflow it exists for.
+  the workflow it exists for. The guard compares the control URL and every
+  `[[database.shards]]` URL of each protected profile. It skips the config
+  overlay of the profile you scrub, because that overlay names the destination.
+  It never skips the profile that the artifact came from. To restore a `prod`
+  artifact with `--profile prod`, you must pass `--allow-source-overwrite`.
+  A hostless URL (`postgres:///db?host=/run/postgresql`) takes its host from
+  the `hostaddr` or `host` parameter. If both are missing, it uses `PGHOST`.
 - **A refusal writes nothing.** Classification completes before a single row is
   touched. The one exception is `--artifact`: the restore has to run before the
   scrub can read the schema it created, so a refusal *after* a restore leaves
@@ -721,21 +735,54 @@ apply-time error.
 - **Constraints survive.** PII is refused outright on a primary key, on **either
   side** of any foreign key (including every component of a composite one — so a
   natural key another table references, like `users.email` ← `orders.user_email`,
-  is protected too), and on a `CHECK`-constrained column, where no fabricated
-  value can be proven to satisfy the predicate. `null` is refused on a `NOT NULL`
+  is protected too), on a **partition key** (a rewrite moves rows between
+  partitions or aborts), and on a `CHECK`-constrained column, where no
+  fabricated value can be proven to satisfy the predicate. `null` is refused on a `NOT NULL`
   column and on a `NULLS NOT DISTINCT` unique index; a constant replacement is
-  refused on any column covered by a unique index — composite, partial, and the
-  input columns of a unique *expression* index (`(lower(email))`), whose
-  uniqueness a per-row token cannot preserve through an arbitrary expression,
-  and the *predicate* columns of a partial unique index, where a rewrite changes
-  which rows the index covers; and a `varchar(n)` bound narrows the generated token or refuses,
-  rather than truncating into collisions.
+  refused on any column covered by a unique index, composite and partial
+  included. PII is refused outright on a column read by a unique index
+  *expression* (`(lower(email))`) or *predicate*, and on a column of an
+  *exclusion* constraint: a value unique on its own can still collide after the
+  expression, and a predicate column decides which rows the index covers. A
+  `varchar(n)` bound narrows the generated token or refuses, rather than
+  truncating into collisions. A constraint declared on one partition only is
+  read as a constraint of its parent.
 - **Writes cannot be redirected.** Every statement is `public`-qualified and the
   transaction pins `search_path`, so a role- or database-level tenant
   `search_path` cannot send an `UPDATE` to a table nothing classified. The
   planned tables — and the ones `[framework] purge` empties — are locked for the
   duration, so a row inserted between the classification snapshot and the
   rewrite cannot slip through.
+- **A schema change mid-run is refused.** After the locks are taken, the
+  transaction compares `public`'s tables, columns, RLS state, triggers and rules
+  with the snapshot the plan was built from, and compares again before commit. A migration that changed the
+  schema in that window rolls the run back. The locks cover only the tables the
+  run writes, so a change to any other table after the last comparison is not
+  caught. Re-run the command. The SQL that `--dry-run` prints has the target
+  guard and the locks, but no schema-drift check. The drift check covers names, hazard
+  sets (RLS, triggers, rules, views, generated columns) and nothing else: a
+  change to a key or other constraint after the probe is not detected.
+- **Encrypted columns get the same plan-time gates.** An `#[encrypted]` column
+  must be `text`, `citext` or `varchar(n)`, and a `varchar(n)` must be wide
+  enough for the replacement envelope (148 characters; 168 for an email-shaped
+  column). A structural one (a referenced key, say) is declared `safe` and keeps
+  its ciphertext.
+- **A libpq `service` source needs the waiver.** The guard cannot read a
+  service file. A protected profile that connects through `service=`, or a
+  nonempty `PGSERVICE` in the environment, makes the guard refuse until you pass
+  `--allow-source-overwrite`.
+- **Test-only registrations are ignored.** A `ModelRegistration::anonymize` call
+  under `#[cfg(test)]` (an inline module, a `#[cfg(test)] mod tests;` file, or
+  `#![cfg(test)]`) is not a production registration. Other `cfg` predicates are
+  unknown and count as on. Files that a `#[path]` module loads resolve their own
+  child modules from the physical file name, not from the declaring module.
+  A `mod x;` declared inside a function body is not followed, so a test-only
+  function that loads a file this way does not exclude that file.
+- **Source scans read every file in `src/`.** A `.rs` file that no `mod` declares
+  still counts as production code. An old `#[model]` with an `#[encrypted]`
+  column in such a file marks that column encrypted. Delete the file, or gate it
+  with `#[cfg(test)]`. The scan does not follow `mod` declarations from the
+  crate root, because `#[path]`, macro-made modules and `include!` hide models.
 - **`NULL`s stay `NULL`.** A scrub anonymizes values; it never invents them.
 - **It is atomic.** Every statement for one database runs in a single
   transaction, so a failure can never leave a half-scrubbed database behind —
@@ -746,9 +793,71 @@ apply-time error.
 
 ---
 
+## SQLite
+
+A `sqlite://` target scrubs with the same command and the same rules:
+
+```sh
+autumn db scrub --check              # classify only
+autumn db scrub --dry-run            # print the SQL
+autumn db scrub                      # rewrite app.db in place
+autumn db scrub --artifact backups/dev/20261020T101500Z   # restore a .sqlite backup, then scrub
+```
+
+What stays the same:
+
+- the classification and `scrub.toml`
+- `#[encrypted]` columns and GDPR anonymize registrations
+- `[framework] purge`
+- the production guard (`--force`) and `--output`
+- the refusals. An unclassified column aborts the scrub.
+
+ Nothing prints a resolved URL. SQLite has no password. Output shows the
+file path only.
+
+What is different:
+
+- **No external tools.** The scrub runs in the `autumn` binary.
+- **One transaction per file.** `BEGIN IMMEDIATE` takes the write lock, so no
+  writer can add a row mid-scrub. A schema change since the plan was made
+  rolls the run back.
+- **No old bytes.** `secure_delete` is on. After the commit, `VACUUM` rewrites
+  the file and the WAL is truncated. The scrub rebuilds the planner statistics
+  first, because `sqlite_stat4` keeps sample index keys. A scrubbed file does
+  not hold the old values in free pages, indexes or the WAL. `VACUUM` needs free
+  disk space about the size of the file. If compaction fails, the scrub has
+  committed but old values may remain. The error says so.
+- **Hashing.** SQLite has no `md5`. The scrub registers `autumn_sha256` on its
+  connection. `--dry-run` prints SQL that calls it, so plain `sqlite3` cannot
+  run the printed script. Use the printed SQL for audit only. Do not run it.
+- **Compaction is checked.** If a reader blocks the WAL checkpoint, the scrub
+  reports an error. Stop the app, or run `PRAGMA wal_checkpoint(TRUNCATE)`
+  yourself, before you share the file.
+- **Schema text is not rewritten.** The scrub changes row data only. A literal in
+  an index `WHERE`, a `CHECK`, a `DEFAULT` or a trigger stays in the schema.
+  Triggers on tables the run writes are reported, as on Postgres. Review them.
+- **Foreign keys are on.** A purge that would orphan a row rolls back.
+- **Extra refusals.** A `CHECK` column cannot get a made-up value, so it is
+  refused. Autumn reads the `CHECK` clauses from the `CREATE TABLE` text. A
+  virtual table (for example FTS5) is refused, because its shadow tables hold
+  copies of row text. `--sample` is refused. A delete trigger on a purged
+  table is refused.
+- **Logical types are `TEXT`.** Autumn stores a UUID, a decimal and JSON as
+  `TEXT` on SQLite, so `auto` treats them as text and writes a redaction string.
+  Declare the right strategy for such a column: `uuid`, `zero`, `epoch` or
+  `json`. For a declared type that `auto` cannot read as a number or a date,
+  `auto` refuses.
+- **Type rules.** SQLite does not enforce column types or lengths. `varchar(n)`
+  limits do not apply. `date`, `datetime` and
+  `numeric` columns use `epoch` and `zero`.
+- **Mixed topologies.** A control database on Postgres and a shard on SQLite
+  is refused before any write.
+
+---
+
 ## Limits
 
-- **Postgres only**, and the `public` schema only. A database with base tables
+- **On Postgres, the `public` schema only.** A database with base tables
   in another non-system schema is **refused** rather than reported clean over a
   universe the classifier never looked at — and a schema holding only a
   *materialized view* counts, since it keeps its own copy of whatever it
@@ -758,14 +867,15 @@ apply-time error.
   column too — and refuses on any difference, so a privilege gap can never look
   like a clean bill of health. Foreign tables count as part of that universe: one
   left pointing at production would otherwise be classified by nothing.
-- **Row-level security is refused** on every table the run reads or writes: the
+- **Row-level security that binds the role is refused** on every table the run reads or writes: the
   ones it rewrites, the ones `[framework] purge` and `never_include` empty, the
   ones the sample reads to decide what to keep, and both endpoints of every
   foreign key the run re-counts. A role that does not bypass RLS sees only the
   rows its policies expose, and each phase then reports a success it cannot
   stand behind — a partial rewrite, a table reported emptied that is not, or a
-  re-count that misses the orphan it exists to find. Connect as the table owner
-  or a `BYPASSRLS` role.
+  re-count that misses the orphan it exists to find. A superuser, a `BYPASSRLS`
+  role and the table owner are not bound, so they pass — except that the owner
+  is bound again on a `FORCE ROW LEVEL SECURITY` table.
 
   The re-count's endpoints matter more than they look: a framework-owned table
   the run never writes still gets checked, because a constraint a migration left

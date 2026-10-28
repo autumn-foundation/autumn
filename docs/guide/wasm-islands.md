@@ -111,7 +111,7 @@ publish = false
 crate-type = ["cdylib", "rlib"]   # cdylib → the .wasm; rlib → unit-testable
 
 [dependencies]
-yew = { version = "0.21", default-features = false, features = ["csr"] }  # CSR only
+yew = { version = "0.23", default-features = false, features = ["csr"] }  # CSR only
 wasm-bindgen = "0.2"
 js-sys = "0.3"          # Math::random() — the sim's only source of randomness
 gloo-render = "0.2"     # leak-free requestAnimationFrame wrapper

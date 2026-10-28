@@ -165,6 +165,12 @@ pub struct MutationDescriptor {
     pub acknowledged_stale: Option<&'static str>,
     /// `file:line` of the declaration.
     pub location: &'static str,
+    /// For a cascade write: the child repository trait name, and whether the
+    /// cascade runs the child's own cascade.
+    ///
+    /// The flag is `true` only for `destroy`. `nullify` and `delete_all` write
+    /// one table. [`close_cascades`] uses both to find grandchild writes.
+    pub cascades_into: Option<(&'static str, bool)>,
 }
 
 inventory::collect!(MutationDescriptor);
@@ -209,6 +215,12 @@ pub struct Mutation {
     pub acknowledged_stale: Option<String>,
     /// `file:line` of the declaration.
     pub location: String,
+    /// For a cascade write: the child repository it writes to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascades_into: Option<String>,
+    /// Whether the cascade runs the child's own cascade.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cascade_recurses: bool,
 }
 
 impl Mutation {
@@ -281,6 +293,68 @@ pub fn models_match(a: &str, b: &str) -> bool {
         return a == b;
     }
     model_key(a) == model_key(b)
+}
+
+// ── Cascade closure ──────────────────────────────────────────────────
+
+/// Add the writes a `destroy` cascade makes below its direct child.
+///
+/// A repository names only its own `dependent(...)` children. Only the full
+/// set of descriptors names the grandchildren. This function follows
+/// `cascades_into` through that set. It adds one write per model it reaches.
+///
+/// An added write keeps the root's method, edges, acknowledgement and
+/// location. So the root must declare an edge for each model it reaches.
+/// The walk visits each repository once, so a cycle ends. A second call adds
+/// nothing.
+#[must_use]
+pub fn close_cascades(mutations: &[Mutation]) -> Vec<Mutation> {
+    let mut closed = mutations.to_vec();
+    // The location keeps two same-named roots apart: each owes its own edge.
+    let key = |m: &Mutation, model: &str| {
+        (
+            m.repository.clone(),
+            m.method.clone(),
+            model.to_string(),
+            m.location.clone(),
+        )
+    };
+    let mut seen: std::collections::HashSet<(String, String, String, String)> =
+        mutations.iter().map(|m| key(m, &m.model)).collect();
+    let mut by_repo: std::collections::HashMap<&str, Vec<&Mutation>> =
+        std::collections::HashMap::new();
+    for m in mutations.iter().filter(|m| m.cascades_into.is_some()) {
+        by_repo.entry(m.repository.as_str()).or_default().push(m);
+    }
+    for root in mutations.iter().filter(|m| m.cascades_into.is_some()) {
+        // Not seeded with the root: a child may share its parent's trait name.
+        let mut visited = std::collections::HashSet::new();
+        let mut queue: Vec<&str> = root
+            .cascades_into
+            .as_deref()
+            .filter(|_| root.cascade_recurses)
+            .into_iter()
+            .collect();
+        while let Some(repo) = queue.pop() {
+            if !visited.insert(repo) {
+                continue;
+            }
+            for hop in by_repo.get(repo).into_iter().flatten() {
+                if hop.cascade_recurses {
+                    queue.extend(hop.cascades_into.as_deref());
+                }
+                if seen.insert(key(root, &hop.model)) {
+                    closed.push(Mutation {
+                        model: hop.model.clone(),
+                        table: String::new(),
+                        cascades_into: None,
+                        ..root.clone()
+                    });
+                }
+            }
+        }
+    }
+    closed
 }
 
 // ── The rule ─────────────────────────────────────────────────────────
@@ -603,6 +677,7 @@ impl CoherenceManifest {
     /// Assemble the manifest from the app's registered reads and mutations.
     #[must_use]
     pub fn build(reads: &[CachedRead], mutations: &[Mutation]) -> Self {
+        let mutations = &close_cascades(mutations);
         Self {
             schema_version: MANIFEST_SCHEMA_VERSION,
             dimensions: Dimensions {
@@ -753,11 +828,14 @@ fn invalidations_dimension(mutations: &[Mutation]) -> Dimension<ManifestInvalida
         source: "macro:#[repository(..., invalidates(...))]".to_string(),
         runtime_caveat: "the edge's target is proven — `invalidates(path)` resolves to the \
                          `#[cached]` function's own generated id constant, so rustc rejects a \
-                         path that names anything else. That the invalidator is actually CALLED \
-                         on the write path is not proven by this slice: the generated \
-                         `Repository::invalidate_declared_caches()` helper must be invoked by the \
-                         app (or a commit hook). Automatic invocation is deliberately out of the \
-                         first slice — see docs/guide/cache-coherence.md."
+                         path that names anything else. Each generated write method calls the \
+                         invalidator after its own transaction commits (#3056), and a durable \
+                         commit-hook row retries it when `commit_hooks` is on. Not proven: that \
+                         the backend sweep succeeds (a failure is logged and counted in \
+                         `autumn_cache_invalidation_failures_total`). Also not proven on a \
+                         backend with no shared fill epoch: that no fill on another replica \
+                         writes an old value back. `RedisCache` has a shared epoch. See \
+                         docs/guide/cache-coherence.md."
             .to_string(),
         entries,
     }
@@ -792,9 +870,9 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
         ExcludedDimension {
             dimension: "invalidation_call_sites".to_string(),
             eventual_provenance: "provable".to_string(),
-            reason: "whether the declared invalidator actually runs on the write path is carried \
-                     as the invalidations dimension's runtime_caveat; wiring it automatically \
-                     through repository commit hooks is the next slice"
+            reason: "generated write methods call the declared invalidator after they commit \
+                     (#3056); what that does not prove is carried as the invalidations \
+                     dimension's runtime_caveat"
                 .to_string(),
         },
         ExcludedDimension {
@@ -830,9 +908,10 @@ fn excluded_dimensions() -> Vec<ExcludedDimension> {
                      `#[has_many(Child, dependent = destroy)]` means the parent's delete writes \
                      the child's table with no descriptor for it. A cascade declared on the \
                      REPOSITORY — `#[repository(..., dependent(...))]` — IS registered against \
-                     the child model it deletes or nullifies, resolved from that child \
-                     repository's own published model; `on_delete = restrict` is excluded \
-                     because it only probes and never writes"
+                     the child model it deletes or nullifies. So is each model further \
+                     down a chain of `destroy` cascades. The audit links the chain by \
+                     repository trait name. `on_delete = restrict` is excluded because it \
+                     only probes and never writes"
                 .to_string(),
         },
         ExcludedDimension {
@@ -1204,8 +1283,10 @@ pub fn with_fill_fence<R>(
 /// configured.
 ///
 /// Returns whether the invalidation was **complete**, which means exactly this:
-/// every entry the namespace held is gone, and no fill this process already had
-/// in flight can put a stale one back.
+/// every entry the namespace held is gone, and no fill already in flight can
+/// put a stale one back. The second part holds for fills in this process. It
+/// holds for fills on other replicas only if the backend has a shared fill
+/// epoch (see below).
 ///
 /// It is `false` when a registered process-level backend could not drop the
 /// namespace — a `RedisCache` whose `SCAN`/`DEL` errored, or a custom
@@ -1229,56 +1310,39 @@ pub fn with_fill_fence<R>(
 /// from "the function has not run yet". Register such a store to close that
 /// gap.
 ///
-/// The fill fence is **per process**. Another replica's in-flight fill, started
-/// before this invalidation and finishing after it, can still write a stale
-/// value into a shared backend; a `true` here does not speak for other
-/// replicas.
+/// # The fill fence
+///
+/// The local fence is **per process**. A backend can extend it to all replicas
+/// with [`Cache::fill_epoch`](super::Cache::fill_epoch) and
+/// [`Cache::insert_raw_bytes_if_epoch`](super::Cache::insert_raw_bytes_if_epoch).
+/// `RedisCache` does. It raises a per-namespace epoch in Redis **before** it
+/// sweeps. A fill stores its value only if that epoch did not move. With such a
+/// backend, a `true` is valid for all replicas. If the epoch bump fails, this
+/// returns `false`.
+///
+/// The shared fence covers `#[cached]` and `cache_fragment_in` fills. It does
+/// not cover `get_or_compute`, `Cache::clear`, or a key-level `invalidate`.
+///
+/// With a backend that has no shared epoch, a fill on another replica that
+/// started before this call can still write a stale value after it. A `true`
+/// is then valid for this process only.
 ///
 /// # Panics
 ///
 /// Panics if the internal `RwLock` is poisoned.
+#[must_use = "a `false` means stale entries can still be served"]
 pub fn invalidate_namespace(namespace: &str) -> bool {
-    // Bump the epoch FIRST, so a fill already computing is fenced out before
-    // anything is cleared — the other order leaves a window where a fill both
-    // passes the fence and lands after the clear.
-    //
-    // The bump happens under the fill fence held EXCLUSIVELY, which is what
-    // makes it atomic with respect to a concurrent `with_fill_fence`: that fill
-    // either completes its check-and-insert before this bump (and the clear
-    // below removes what it wrote) or observes the bump and skips its insert.
-    // Comparing epochs without this mutual exclusion leaves the window where a
-    // fill passes the check, this invalidation bumps and clears, and the fill's
-    // insert lands afterwards.
-    //
-    // Only the bump is exclusive. Clone the handles out and DROP both guards
-    // before calling into any backend: `clear()` can be a network round-trip,
-    // and `register_namespace_store` is public with `Cache` user-implementable,
-    // so a `clear()` that happens to call a `#[cached]` function would otherwise
-    // re-enter these non-reentrant `RwLock`s and deadlock. Releasing early is
-    // safe — the ordering argument needs only the bump to be indivisible, and
-    // every clear follows it.
-    let dedicated: Vec<std::sync::Arc<dyn super::Cache>> = {
-        let fence = FILL_FENCE
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let guard = NAMESPACES
-            .read()
-            .expect("cache namespace store lock poisoned");
-        let stores = guard
-            .as_ref()
-            .and_then(|map| map.get(namespace))
-            .map_or_else(Vec::new, |entry| {
-                entry
-                    .epoch
-                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                entry.stores.clone()
-            });
-        drop(guard);
-        drop(fence);
-        stores
-    };
-    for store in dedicated {
+    // A replay answers from the tape and reaches no store (#2351).
+    if let Some(answer) = super::replayed_namespace_removal(namespace) {
+        return answer;
+    }
+    let removal = super::NamespaceRemoval::reserve();
+    let mut complete = true;
+    for store in fence_and_collect_stores(namespace) {
+        // A shared store raises its epoch here. `clear` alone would not.
+        let swept = store.invalidate_namespace(namespace);
         store.clear();
+        complete &= registered_store_complete(&*store, swept, namespace);
     }
 
     // The dedicated stores are only half the story: once a process-level backend
@@ -1286,7 +1350,280 @@ pub fn invalidate_namespace(namespace: &str) -> bool {
     // function store holds nothing. Ask the backend — `MokaCache` and
     // `RedisCache` both drop the namespace; a backend that cannot, or one whose
     // sweep failed, says so, and that `false` is what the caller reports.
-    super::global_cache().is_none_or(|global| global.invalidate_namespace(namespace))
+    let global_failure = super::global_cache().and_then(|global| {
+        if super::NamespaceRemoval::call_installed(|| global.invalidate_namespace(namespace)) {
+            return None;
+        }
+        let reason = "the backend cannot drop a namespace, or its sweep failed";
+        report_incomplete_invalidation(namespace, reason);
+        Some(reason.to_owned())
+    });
+    finish_removal(removal, namespace, complete, global_failure)
+}
+
+/// Record a namespace removal's combined answer on the capsule seam, and
+/// return it.
+fn finish_removal(
+    removal: super::NamespaceRemoval,
+    namespace: &str,
+    stores_complete: bool,
+    global_failure: Option<String>,
+) -> bool {
+    let failure = global_failure.or_else(|| {
+        (!stores_complete).then(|| "a registered store could not drop the namespace".to_owned())
+    });
+    let complete = failure.is_none();
+    removal.record(namespace, failure.as_deref());
+    complete
+}
+
+/// Whether a registered store counts as invalidated.
+///
+/// A store with no shared epoch is cleared by `clear`, so its answer does not
+/// matter. A store with a shared epoch must have raised it.
+fn registered_store_complete(store: &dyn super::Cache, swept: bool, namespace: &str) -> bool {
+    if swept || !store.shares_fill_epoch() {
+        return true;
+    }
+    report_incomplete_invalidation(
+        namespace,
+        "a registered shared store could not raise its fill epoch",
+    );
+    false
+}
+
+/// Async form of [`invalidate_namespace`], with the same contract.
+///
+/// The epoch bump and the local store clears are the same. The wait for the
+/// fill fence runs on the blocking pool. The backend call is
+/// [`Cache::invalidate_namespace_async`](super::Cache::invalidate_namespace_async),
+/// so a network backend (Redis) does not block a runtime worker and works on a
+/// current-thread runtime.
+///
+/// A `false` result is also logged with `warn!` and counted in
+/// `autumn_cache_invalidation_failures_total`.
+#[must_use = "a `false` means stale entries can still be served"]
+pub async fn invalidate_namespace_async(namespace: &str) -> bool {
+    // A replay answers from the tape and reaches no store (#2351).
+    if let Some(answer) = super::replayed_namespace_removal(namespace) {
+        return answer;
+    }
+    // The fence is a std `RwLock`. A fill holds it shared during its insert,
+    // which can be a Redis round trip. Take it at once when it is free. Else
+    // wait for it on the blocking pool, so a writer never parks a runtime
+    // worker (and so never starves the task that the fill waits on).
+    let removal = super::NamespaceRemoval::reserve();
+    let stores = if let Some(stores) = try_fence_and_collect_stores(namespace) {
+        stores
+    } else {
+        let owned = namespace.to_owned();
+        match crate::time::spawn_blocking(move || fence_and_collect_stores(&owned)).await {
+            Ok(stores) => stores,
+            Err(join) => match join.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(_cancelled) => {
+                    let reason = "the runtime is shutting down";
+                    report_incomplete_invalidation(namespace, reason);
+                    return finish_removal(removal, namespace, false, Some(reason.to_owned()));
+                }
+            },
+        }
+    };
+    let mut complete = true;
+    for store in stores {
+        // A shared store raises its epoch here. `clear` alone would not.
+        let swept = store.invalidate_namespace_async(namespace).await.is_ok();
+        store.clear();
+        complete &= registered_store_complete(&*store, swept, namespace);
+    }
+    let mut global_failure = None;
+    if let Some(global) = super::global_cache() {
+        let sweep = super::NamespaceRemoval::call_installed(|| {
+            global.invalidate_namespace_async(namespace)
+        });
+        if let Err(error) = sweep.await {
+            report_incomplete_invalidation(namespace, error.reason());
+            global_failure = Some(error.reason().to_owned());
+        }
+    }
+    finish_removal(removal, namespace, complete, global_failure)
+}
+
+/// Runs a repository's declared invalidation after each commit of a write
+/// (#3056).
+///
+/// Generated write methods make one before the write body. The body calls
+/// [`committed`](Self::committed) after each transaction, and
+/// [`flush`](Self::flush) before each `after_create` or `after_update` hook.
+/// Thus a hook, and every other reader, sees the committed row while the hook
+/// runs. The method calls [`run`](Self::run) at its end, on `Ok` and on `Err`,
+/// for a commit that no hook followed. The guard starts pending, so a write
+/// with no tracked transaction still invalidates at its end.
+///
+/// Each invalidation runs on a spawned task, so a caller that is dropped while
+/// it waits does not stop it. If the guard drops while pending (a panic, or a
+/// cancelled request), it spawns the invalidation on the current runtime.
+/// Over-invalidation is safe: the cost is one cache miss. A request cancelled
+/// during its `COMMIT` round trip can invalidate before the server applies the
+/// commit. A durable commit-hook row (`commit_hooks`) covers that case.
+#[doc(hidden)]
+#[must_use = "call `run().await` after the write body"]
+pub struct InvalidateAfterWrite {
+    make: fn() -> super::CacheFuture<'static, bool>,
+    pending: bool,
+}
+
+impl InvalidateAfterWrite {
+    /// Arm the guard. `make` builds the repository's invalidation future.
+    pub const fn new(make: fn() -> super::CacheFuture<'static, bool>) -> Self {
+        Self {
+            make,
+            pending: true,
+        }
+    }
+
+    /// Record that a transaction ended. The next flush invalidates.
+    pub const fn committed(&mut self) {
+        self.pending = true;
+    }
+
+    /// Invalidate now if a commit is not yet invalidated, and wait for it.
+    ///
+    /// Returns whether it was complete. A `false` is already logged and
+    /// counted.
+    pub async fn flush(&mut self) -> bool {
+        if !self.pending {
+            return true;
+        }
+        self.pending = false;
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            report_skipped_invalidation("the write ran outside a Tokio runtime");
+            return false;
+        };
+        // Awaited at once, so the capsule scope and the replay tape go along:
+        // the removal is recorded and replayed like inline work (#2351).
+        #[cfg(feature = "reporting")]
+        let invalidation = crate::capsule::boundary::carry_scopes((self.make)());
+        #[cfg(not(feature = "reporting"))]
+        let invalidation = (self.make)();
+        // A caller dropped while it waits leaves the task detached.
+        #[cfg(feature = "reporting")]
+        let detached = crate::capsule::boundary::DetachGuard::arm();
+        let complete = handle.spawn(invalidation).await.unwrap_or_else(|_| {
+            report_skipped_invalidation("the invalidation task panicked or was cancelled");
+            false
+        });
+        #[cfg(feature = "reporting")]
+        detached.disarm();
+        complete
+    }
+
+    /// Flush at the end of the write.
+    pub async fn run(mut self) -> bool {
+        self.flush().await
+    }
+
+    /// Skip the invalidation: the write wrote nothing (for example a
+    /// `find_or_create_by_*` that found the row).
+    pub fn disarm(mut self) {
+        self.pending = false;
+    }
+}
+
+impl Drop for InvalidateAfterWrite {
+    fn drop(&mut self) {
+        if !self.pending {
+            return;
+        }
+        self.pending = false;
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // Not awaited: the capsule says so, and a replay gives the task
+            // the tape (#2351).
+            #[cfg(feature = "reporting")]
+            let invalidation = {
+                crate::capsule::boundary::note_detached_work();
+                crate::capsule::boundary::carry_detached((self.make)())
+            };
+            #[cfg(not(feature = "reporting"))]
+            let invalidation = (self.make)();
+            handle.spawn(invalidation);
+        } else {
+            report_skipped_invalidation("the write ended outside a Tokio runtime");
+        }
+    }
+}
+
+/// Log and count a repository invalidation that did not run to its end.
+fn report_skipped_invalidation(reason: &str) {
+    tracing::warn!(
+        reason,
+        "a repository write's declared cache invalidation did not complete; stale entries \
+         can be served until their TTL"
+    );
+    super::record_invalidation_failure();
+}
+
+/// Log and count a namespace invalidation that did not complete.
+fn report_incomplete_invalidation(namespace: &str, reason: &str) {
+    tracing::warn!(
+        namespace,
+        reason,
+        "cache namespace invalidation incomplete; stale entries can be served until their TTL"
+    );
+    super::record_invalidation_failure();
+}
+
+/// Bump the namespace epoch under the exclusive fill fence, and return the
+/// stores registered for it.
+///
+/// The epoch bump comes FIRST. Then a fill that is already computing is
+/// fenced out before the clear. In the other order, a fill can pass the fence
+/// and insert after the clear.
+///
+/// The bump holds the fill fence exclusively. Thus a concurrent
+/// `with_fill_fence` either inserts before the bump, and the clear removes its
+/// value, or it sees the bump and skips its insert.
+///
+/// Only the bump is exclusive. Both guards drop before the caller calls a
+/// backend: `clear()` can be a network round trip, and a `clear()` that calls
+/// a `#[cached]` function would re-enter these `RwLock`s and deadlock.
+fn fence_and_collect_stores(namespace: &str) -> Vec<std::sync::Arc<dyn super::Cache>> {
+    let fence = FILL_FENCE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    bump_and_collect_stores(namespace, fence)
+}
+
+/// [`fence_and_collect_stores`] if the fence is free now, else `None`.
+fn try_fence_and_collect_stores(namespace: &str) -> Option<Vec<std::sync::Arc<dyn super::Cache>>> {
+    let fence = match FILL_FENCE.try_write() {
+        Ok(fence) => fence,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    Some(bump_and_collect_stores(namespace, fence))
+}
+
+/// The epoch bump and store lookup. `fence` is the exclusive fill fence.
+fn bump_and_collect_stores(
+    namespace: &str,
+    fence: std::sync::RwLockWriteGuard<'_, ()>,
+) -> Vec<std::sync::Arc<dyn super::Cache>> {
+    let guard = NAMESPACES
+        .read()
+        .expect("cache namespace store lock poisoned");
+    let stores = guard
+        .as_ref()
+        .and_then(|map| map.get(namespace))
+        .map_or_else(Vec::new, |entry| {
+            entry
+                .epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            entry.stores.clone()
+        });
+    drop(guard);
+    drop(fence);
+    stores
 }
 
 // ── Reading the binary's own registrations ───────────────────────────
@@ -1309,7 +1646,7 @@ pub fn registered_reads() -> Vec<CachedRead> {
 /// Every repository mutation registered in this binary, as owned values.
 #[must_use]
 pub fn registered_mutations() -> Vec<Mutation> {
-    inventory::iter::<MutationDescriptor>()
+    let direct: Vec<Mutation> = inventory::iter::<MutationDescriptor>()
         .map(|d| Mutation {
             repository: d.repository.to_string(),
             method: d.method.to_string(),
@@ -1318,8 +1655,11 @@ pub fn registered_mutations() -> Vec<Mutation> {
             invalidates: d.invalidates.iter().map(|s| (*s).to_string()).collect(),
             acknowledged_stale: d.acknowledged_stale.map(ToString::to_string),
             location: d.location.to_string(),
+            cascades_into: d.cascades_into.map(|(name, _)| name.to_string()),
+            cascade_recurses: d.cascades_into.is_some_and(|(_, recurses)| recurses),
         })
-        .collect()
+        .collect();
+    close_cascades(&direct)
 }
 
 /// Prove cache coherence over everything this binary registers.
@@ -1388,7 +1728,238 @@ mod tests {
             invalidates: Vec::new(),
             acknowledged_stale: None,
             location: "src/repositories.rs:20".to_string(),
+            cascades_into: None,
+            cascade_recurses: false,
         }
+    }
+
+    // ── Cascade closure (#2364) ──────────────────────────────────────
+
+    fn cascade(repo: &str, method: &str, model: &str, into: &str) -> Mutation {
+        Mutation {
+            cascades_into: Some(into.to_string()),
+            cascade_recurses: true,
+            ..mutation(repo, method, model)
+        }
+    }
+
+    /// Post -> Comment -> Like, `destroy` at each step.
+    fn post_comment_like() -> Vec<Mutation> {
+        vec![
+            mutation("PostRepository", "delete_by_id", "app::Post"),
+            cascade(
+                "PostRepository",
+                "delete_by_id",
+                "app::Comment",
+                "CommentRepository",
+            ),
+            mutation("CommentRepository", "delete_by_id", "app::Comment"),
+            cascade(
+                "CommentRepository",
+                "delete_by_id",
+                "app::Like",
+                "LikeRepository",
+            ),
+            mutation("LikeRepository", "delete_by_id", "app::Like"),
+        ]
+    }
+
+    fn models_of(mutations: &[Mutation], repo: &str, method: &str) -> Vec<String> {
+        let mut models: Vec<String> = mutations
+            .iter()
+            .filter(|m| m.repository == repo && m.method == method)
+            .map(|m| m.model.clone())
+            .collect();
+        models.sort();
+        models
+    }
+
+    #[test]
+    fn a_nested_cascade_mutates_the_grandchild_model() {
+        let closed = close_cascades(&post_comment_like());
+        assert_eq!(
+            models_of(&closed, "PostRepository", "delete_by_id"),
+            ["app::Comment", "app::Like", "app::Post"]
+        );
+    }
+
+    #[test]
+    fn a_grandchild_read_without_a_root_edge_is_flagged() {
+        let reads = vec![read("app::likes", &["app::Like"])];
+        let mut muts = post_comment_like();
+        // The edge sits on the child, not on the root.
+        for m in muts
+            .iter_mut()
+            .filter(|m| m.repository == "CommentRepository")
+        {
+            m.invalidates = vec!["app::likes".to_string()];
+        }
+        let findings = check(&reads, &close_cascades(&muts));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.mutation == "PostRepository::delete_by_id"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_edge_covers_the_grandchild_read() {
+        let reads = vec![read("app::likes", &["app::Like"])];
+        let mut muts = post_comment_like();
+        for m in muts.iter_mut().filter(|m| m.repository == "PostRepository") {
+            m.invalidates = vec!["app::likes".to_string()];
+        }
+        let closed = close_cascades(&muts);
+        let like_writes = closed
+            .iter()
+            .filter(|m| m.repository == "PostRepository" && m.model == "app::Like")
+            .count();
+        assert_eq!(like_writes, 1, "{closed:?}");
+        assert!(
+            check(&reads, &closed)
+                .iter()
+                .all(|f| f.mutation != "PostRepository::delete_by_id"),
+            "{closed:?}"
+        );
+    }
+
+    #[test]
+    fn the_root_acknowledgement_carries_to_the_grandchild() {
+        let mut muts = post_comment_like();
+        muts[1].acknowledged_stale = Some("reason".to_string());
+        let closed = close_cascades(&muts);
+        assert!(
+            closed
+                .iter()
+                .filter(|m| m.repository == "PostRepository" && m.model == "app::Like")
+                .all(|m| m.acknowledged_stale.is_some())
+        );
+    }
+
+    #[test]
+    fn a_restrict_step_adds_no_mutation() {
+        // `restrict` registers no cascade descriptor, so the chain stops.
+        let mut muts = post_comment_like();
+        muts.retain(|m| m.cascades_into.as_deref() != Some("LikeRepository"));
+        let closed = close_cascades(&muts);
+        assert_eq!(
+            models_of(&closed, "PostRepository", "delete_by_id"),
+            ["app::Comment", "app::Post"]
+        );
+    }
+
+    #[test]
+    fn a_nullify_step_is_written_but_not_followed() {
+        // Post -destroy-> Comment -nullify-> Like -destroy-> Reaction.
+        // The `nullify` leg writes `Like` only. It never reaches `Reaction`.
+        let mut muts = post_comment_like();
+        muts[3].cascade_recurses = false;
+        muts.push(cascade(
+            "LikeRepository",
+            "delete_by_id",
+            "app::Reaction",
+            "ReactionRepository",
+        ));
+        let closed = close_cascades(&muts);
+        assert_eq!(
+            models_of(&closed, "PostRepository", "delete_by_id"),
+            ["app::Comment", "app::Like", "app::Post"]
+        );
+    }
+
+    #[test]
+    fn a_cascade_link_round_trips_through_json() {
+        let m = cascade(
+            "PostRepository",
+            "delete_by_id",
+            "app::Comment",
+            "CommentRepository",
+        );
+        let back: Mutation = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let plain = serde_json::to_string(&mutation("A", "save", "app::A")).unwrap();
+        assert!(!plain.contains("cascade"), "{plain}");
+    }
+
+    #[test]
+    fn a_cascade_cycle_terminates() {
+        let muts = vec![
+            cascade("ARepository", "delete_by_id", "app::B", "BRepository"),
+            cascade("BRepository", "delete_by_id", "app::A", "ARepository"),
+            cascade("CRepository", "delete_by_id", "app::C", "CRepository"),
+        ];
+        let closed = close_cascades(&muts);
+        assert_eq!(
+            models_of(&closed, "ARepository", "delete_by_id"),
+            ["app::A", "app::B"]
+        );
+        assert_eq!(
+            models_of(&closed, "CRepository", "delete_by_id"),
+            ["app::C"]
+        );
+    }
+
+    #[test]
+    fn two_same_named_roots_keep_their_own_edges() {
+        let mut a = post_comment_like();
+        let mut b = post_comment_like();
+        for m in &mut b {
+            m.location = "src/other.rs:1".to_string();
+        }
+        a.extend(b);
+        let like_rows = close_cascades(&a)
+            .iter()
+            .filter(|m| m.repository == "PostRepository" && m.model == "app::Like")
+            .count();
+        assert_eq!(like_rows, 2);
+    }
+
+    #[test]
+    fn a_child_may_share_its_parents_trait_name() {
+        // `admin::CommentRepository` destroys into `blog::CommentRepository`.
+        let muts = vec![
+            cascade(
+                "CommentRepository",
+                "delete_by_id",
+                "app::Comment",
+                "CommentRepository",
+            ),
+            Mutation {
+                location: "src/blog.rs:1".to_string(),
+                ..cascade(
+                    "CommentRepository",
+                    "delete_by_id",
+                    "app::Like",
+                    "LikeRepository",
+                )
+            },
+        ];
+        let closed = close_cascades(&muts);
+        let root_like = closed
+            .iter()
+            .filter(|m| m.model == "app::Like" && m.location == "src/repositories.rs:20")
+            .count();
+        assert_eq!(root_like, 1, "{closed:?}");
+    }
+
+    #[test]
+    fn closing_twice_changes_nothing() {
+        let once = close_cascades(&post_comment_like());
+        assert_eq!(close_cascades(&once), once);
+    }
+
+    #[test]
+    fn the_manifest_lists_the_closed_mutations() {
+        let manifest = CoherenceManifest::build(&[], &post_comment_like());
+        assert!(
+            manifest
+                .dimensions
+                .mutations
+                .entries
+                .iter()
+                .any(|m| m.name == "PostRepository::delete_by_id" && m.model == "app::Like")
+        );
     }
 
     // ── The rule ─────────────────────────────────────────────────────
@@ -1820,6 +2391,132 @@ mod tests {
 
     // ── Namespace invalidation ───────────────────────────────────────
 
+    #[cfg(all(feature = "cache-moka", feature = "reporting"))]
+    #[test]
+    fn a_local_namespace_invalidation_is_on_the_capsule_seam() {
+        // Codex review on #3222: with no installed cache, an invalidation
+        // reaches only process-local stores, off the seam. It is recorded
+        // here, and a replay answers it from the tape without the stores.
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
+        let store = std::sync::Arc::new(super::super::MokaCache::new(16, None));
+        register_namespace_store("tests::seam_ns", store.clone());
+
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "coherence".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(rt.block_on(crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            invalidate_namespace_async("tests::seam_ns"),
+        )));
+        let recorded = scope.effects_snapshot();
+        assert_eq!(recorded.cache.len(), 1, "{:?}", recorded.cache);
+
+        // Replayed: the recorded removal is consumed, and the store is left.
+        super::super::insert(&*store, "tests::seam_ns:1", 1_i32);
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(recorded));
+        assert!(rt.block_on(crate::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            invalidate_namespace_async("tests::seam_ns"),
+        )));
+        assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+        assert_eq!(
+            super::super::get::<i32>(&*store, "tests::seam_ns:1"),
+            Some(1)
+        );
+
+        // A replay with no recorded removal diverges.
+        let empty = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let _ = rt.block_on(crate::capsule::with_effect_tape(
+            std::sync::Arc::clone(&empty),
+            invalidate_namespace_async("tests::seam_ns"),
+        ));
+        assert!(!empty.divergences().is_empty());
+    }
+
+    /// Codex review on #3222: a shared registered store that fails while
+    /// the installed cache succeeds makes the call return `false`. The
+    /// capsule records that combined answer, once, so a replay returns it.
+    #[cfg(all(feature = "cache-moka", feature = "reporting"))]
+    #[test]
+    fn a_failed_registered_store_is_in_the_recorded_namespace_removal() {
+        struct SharedFailingStore;
+        impl super::super::Cache for SharedFailingStore {
+            fn get_value(
+                &self,
+                _key: &str,
+            ) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+                None
+            }
+            fn insert_value(
+                &self,
+                _key: &str,
+                _value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+            ) {
+            }
+            fn invalidate(&self, _key: &str) {}
+            fn clear(&self) {}
+            fn invalidate_namespace(&self, _namespace: &str) -> bool {
+                false
+            }
+            fn shares_fill_epoch(&self) -> bool {
+                true
+            }
+        }
+
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::set_global_cache(std::sync::Arc::new(super::super::MokaCache::new(16, None)));
+        register_namespace_store(
+            "tests::seam_mixed_ns",
+            std::sync::Arc::new(SharedFailingStore),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for sync in [true, false] {
+            let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+                "coherence".to_owned(),
+                std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+                std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+            ));
+            let run = || async move {
+                if sync {
+                    invalidate_namespace("tests::seam_mixed_ns")
+                } else {
+                    invalidate_namespace_async("tests::seam_mixed_ns").await
+                }
+            };
+            assert!(!rt.block_on(crate::capsule::capture::with_capture_scope(
+                std::sync::Arc::clone(&scope),
+                run(),
+            )));
+            let recorded = scope.effects_snapshot();
+            assert_eq!(recorded.cache.len(), 1, "sync={sync}: {:?}", recorded.cache);
+
+            let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(recorded));
+            assert!(
+                !rt.block_on(crate::capsule::with_effect_tape(
+                    std::sync::Arc::clone(&tape),
+                    run(),
+                )),
+                "sync={sync}: the replay returns the recorded `false`"
+            );
+            assert!(tape.finish().is_empty(), "{:?}", tape.finish());
+        }
+        super::super::clear_global_cache();
+    }
+
     #[cfg(feature = "cache-moka")]
     #[test]
     fn invalidating_a_namespace_clears_only_that_reads_store() {
@@ -2144,6 +2841,89 @@ mod tests {
         super::super::clear_global_cache();
     }
 
+    // ── #3056: async invalidation, surfaced failures ──────────────────
+
+    /// A backend whose namespace sweep always fails.
+    struct RefusingBackend;
+    impl super::super::Cache for RefusingBackend {
+        fn get_value(&self, _key: &str) -> Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
+            None
+        }
+        fn insert_value(
+            &self,
+            _key: &str,
+            _value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+        ) {
+        }
+        fn invalidate(&self, _key: &str) {}
+        fn clear(&self) {}
+        fn invalidate_namespace(&self, _namespace: &str) -> bool {
+            false
+        }
+    }
+
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn async_invalidation_with_no_backend_is_complete() {
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
+        assert!(block_on(invalidate_namespace_async(
+            "tests::async_no_backend"
+        )));
+    }
+
+    #[test]
+    fn async_invalidation_bumps_the_epoch_first() {
+        let epoch = namespace_epoch("tests::async_epoch");
+        let before = epoch.load(std::sync::atomic::Ordering::Acquire);
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::clear_global_cache();
+        assert!(block_on(invalidate_namespace_async("tests::async_epoch")));
+        assert!(
+            epoch.load(std::sync::atomic::Ordering::Acquire) > before,
+            "a fill already in flight must be fenced out"
+        );
+    }
+
+    #[test]
+    fn a_failed_async_invalidation_is_reported_and_counted() {
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::set_global_cache(std::sync::Arc::new(RefusingBackend));
+        let before = super::super::invalidation_failures_total();
+        let complete = block_on(invalidate_namespace_async("tests::async_refused"));
+        let after = super::super::invalidation_failures_total();
+        super::super::clear_global_cache();
+        assert!(!complete, "a refused sweep must not report success");
+        assert!(after > before, "the failure must be counted");
+    }
+
+    #[test]
+    fn a_failed_sync_invalidation_is_counted_too() {
+        let _guard = super::super::GLOBAL_CACHE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::super::set_global_cache(std::sync::Arc::new(RefusingBackend));
+        let before = super::super::invalidation_failures_total();
+        let complete = invalidate_namespace("tests::sync_refused");
+        let after = super::super::invalidation_failures_total();
+        super::super::clear_global_cache();
+        assert!(!complete);
+        assert!(after > before, "the failure must be counted");
+    }
+
     // ── declare_cached_read! ─────────────────────────────────────────
 
     struct DeclaredModelA;
@@ -2205,5 +2985,149 @@ mod tests {
         assert_eq!(DependencyProvenance::Declared.as_str(), "declared");
         assert_eq!(DependencyProvenance::Derived.as_str(), "derived");
         assert_eq!(DependencyProvenance::Undetermined.as_str(), "undetermined");
+    }
+
+    // ── InvalidateAfterWrite (#3056) ─────────────────────────────────
+
+    static GUARD_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_guard_run() -> crate::cache::CacheFuture<'static, bool> {
+        Box::pin(async {
+            GUARD_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        })
+    }
+
+    fn guard_runs() -> usize {
+        GUARD_RUNS.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    static SAW_SCOPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(feature = "reporting")]
+    fn note_scope() -> crate::cache::CacheFuture<'static, bool> {
+        Box::pin(async {
+            SAW_SCOPE.store(
+                crate::capsule::current_scope().is_some(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            true
+        })
+    }
+
+    /// Review fix (#2351): a flushed invalidation runs on a spawned task, and
+    /// still records into the request's capsule.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_flushed_invalidation_keeps_the_capture_scope() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "coherence".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+            assert!(InvalidateAfterWrite::new(note_scope).run().await);
+        })
+        .await;
+        assert!(SAW_SCOPE.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            !scope.is_truncated(),
+            "an awaited invalidation is not detached"
+        );
+    }
+
+    #[cfg(feature = "reporting")]
+    fn never_ends() -> crate::cache::CacheFuture<'static, bool> {
+        Box::pin(std::future::pending())
+    }
+
+    /// Codex review on #3222: a caller dropped while it waits for a flushed
+    /// invalidation leaves the task detached, so the capsule is incomplete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_flush_dropped_while_waiting_marks_the_capsule_incomplete() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "coherence".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+            let mut guard = InvalidateAfterWrite::new(never_ends);
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(10), guard.flush()).await;
+            assert!(waited.is_err(), "the invalidation never ends");
+        })
+        .await;
+        assert!(scope.is_truncated(), "the invalidation runs detached");
+    }
+
+    /// Codex review on #3222: a replay that drops the flush while it waits
+    /// logs the detached task now, before the verdict.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_replay_flush_dropped_while_waiting_is_a_divergence() {
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        crate::capsule::with_effect_tape(std::sync::Arc::clone(&tape), async {
+            let mut guard = InvalidateAfterWrite::new(never_ends);
+            let waited =
+                tokio::time::timeout(std::time::Duration::from_millis(10), guard.flush()).await;
+            assert!(waited.is_err(), "the invalidation never ends");
+        })
+        .await;
+        let divergences = tape.divergences();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(
+            divergences[0].seam,
+            crate::capsule::effects::EffectSeam::Detached
+        );
+    }
+
+    #[tokio::test]
+    async fn the_after_write_guard_invalidates_once_per_commit() {
+        // One test owns GUARD_RUNS, so the counts are exact.
+        let before = guard_runs();
+
+        // A hook flush after the commit, then the end: one invalidation.
+        let mut guard = InvalidateAfterWrite::new(count_guard_run);
+        guard.committed();
+        assert!(guard.flush().await);
+        assert!(guard.flush().await, "a second flush has nothing to do");
+        assert!(guard.run().await);
+        assert_eq!(guard_runs(), before + 1);
+
+        // A commit after the flush: the end invalidates again.
+        let mut guard = InvalidateAfterWrite::new(count_guard_run);
+        assert!(guard.flush().await);
+        guard.committed();
+        assert!(guard.run().await);
+        assert_eq!(guard_runs(), before + 3);
+
+        // No commit seen and no flush: the end still invalidates.
+        assert!(InvalidateAfterWrite::new(count_guard_run).run().await);
+        assert_eq!(guard_runs(), before + 4);
+
+        // Disarmed: nothing runs, also on drop.
+        InvalidateAfterWrite::new(count_guard_run).disarm();
+        tokio::task::yield_now().await;
+        assert_eq!(guard_runs(), before + 4);
+
+        // Dropped while pending (a panic or a cancelled request): spawned.
+        drop(InvalidateAfterWrite::new(count_guard_run));
+        for _ in 0..100 {
+            if guard_runs() == before + 5 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(guard_runs(), before + 5);
+
+        // Dropped after the final flush: nothing more runs.
+        let mut guard = InvalidateAfterWrite::new(count_guard_run);
+        assert!(guard.flush().await);
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert_eq!(guard_runs(), before + 6);
     }
 }

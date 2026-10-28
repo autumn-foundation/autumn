@@ -1,4 +1,5 @@
-// Compile-fail: `#[references(...)]` accepts only `table = "..."` (#1975).
+// Compile-fail: `#[references(...)]` accepts only `table`, `on_delete` and
+// `on_update` (#1975).
 use autumn_web::model;
 
 #[model]

@@ -450,6 +450,122 @@ pub async fn subscription_authoritative_settles_a_same_instant_tie(store: &dyn B
     assert!(!after_terminal.is_applied());
 }
 
+/// With the tie check on, a same-instant write of a different live status is
+/// reported, not ranked, and nothing is written. Other cases keep the
+/// existing rules.
+pub async fn subscription_tie_check_reports_a_same_instant_tie(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "sub-tie", None).await;
+    let tied =
+        |status, occurred| sub_upsert("sub-tie", &customer, "k", status, occurred).with_tie_check();
+    // A new subscription is never a tie.
+    let first = store
+        .upsert_subscription(tied(SubscriptionStatus::Active, 100))
+        .await
+        .unwrap();
+    assert!(first.is_applied());
+    // Same status, same instant: a redelivery.
+    let again = store
+        .upsert_subscription(tied(SubscriptionStatus::Active, 100))
+        .await
+        .unwrap();
+    assert!(again.is_unchanged());
+    // Different status, same instant, either rank direction: a tie.
+    for status in [SubscriptionStatus::PastDue, SubscriptionStatus::Paused] {
+        let tie = store.upsert_subscription(tied(status, 100)).await.unwrap();
+        assert!(tie.is_tie(), "{status:?}");
+        assert_eq!(tie.into_inner().status, SubscriptionStatus::Active);
+    }
+    // Without the check, the old ranking still applies.
+    let ranked = store
+        .upsert_subscription(sub_upsert(
+            "sub-tie",
+            &customer,
+            "k",
+            SubscriptionStatus::PastDue,
+            100,
+        ))
+        .await
+        .unwrap();
+    assert!(ranked.is_applied());
+    // An authoritative write is never a tie.
+    let live = store
+        .upsert_subscription(tied(SubscriptionStatus::Active, 100).with_authoritative())
+        .await
+        .unwrap();
+    assert!(live.is_applied());
+    // Other instants order as before.
+    let newer = store
+        .upsert_subscription(tied(SubscriptionStatus::PastDue, 101))
+        .await
+        .unwrap();
+    assert!(newer.is_applied());
+    let older = store
+        .upsert_subscription(tied(SubscriptionStatus::Active, 100))
+        .await
+        .unwrap();
+    assert!(!older.is_applied() && !older.is_tie());
+    // A terminal status on either side is final, not a tie.
+    let canceled = store
+        .upsert_subscription(tied(SubscriptionStatus::Canceled, 101))
+        .await
+        .unwrap();
+    assert!(canceled.is_applied());
+    let after = store
+        .upsert_subscription(tied(SubscriptionStatus::Active, 101))
+        .await
+        .unwrap();
+    assert!(!after.is_applied() && !after.is_tie());
+}
+
+/// Concurrent same-instant writers with different statuses. Exactly one write
+/// is applied and the others return `Tie`. No call returns an error. The
+/// memory store is mutex-atomic, so it checks the contract only. The Postgres
+/// run checks the race.
+pub async fn subscription_concurrent_ties_are_reported_once(
+    store: std::sync::Arc<dyn BillingStore>,
+) {
+    let customer = seed_customer(store.as_ref(), "sub-race", None).await;
+    // Round 0 writes a new subscription. Round 1 writes to an existing
+    // subscription, one second later.
+    for round in 0..2_i64 {
+        for n in 0..8_i64 {
+            let key = format!("{round}-{n}");
+            let base = 100 + round * 10;
+            if round == 1 {
+                store
+                    .upsert_subscription(sub_upsert(
+                        "sub-race",
+                        &customer,
+                        &key,
+                        SubscriptionStatus::Trialing,
+                        base - 1,
+                    ))
+                    .await
+                    .unwrap();
+            }
+            let write = |status| {
+                let store = store.clone();
+                let upsert = sub_upsert("sub-race", &customer, &key, status, base).with_tie_check();
+                tokio::spawn(async move { store.upsert_subscription(upsert).await })
+            };
+            let tasks = [
+                SubscriptionStatus::Active,
+                SubscriptionStatus::PastDue,
+                SubscriptionStatus::Paused,
+                SubscriptionStatus::Trialing,
+            ]
+            .map(write);
+            let mut writes = Vec::new();
+            for task in tasks {
+                writes.push(task.await.unwrap().unwrap());
+            }
+            let applied = writes.iter().filter(|w| w.is_applied()).count();
+            let ties = writes.iter().filter(|w| w.is_tie()).count();
+            assert_eq!((applied, ties), (1, 3), "round {round} run {n}: {writes:?}");
+        }
+    }
+}
+
 /// At the same instant the higher rank wins; a lower rank is stale.
 pub async fn subscription_same_instant_higher_rank_wins(store: &dyn BillingStore) {
     let customer = seed_customer(store, "sub-b", None).await;
@@ -982,6 +1098,151 @@ pub async fn open_dunning_for_subscription_is_scoped_and_filtered(store: &dyn Bi
     );
 }
 
+/// An invoice keeps the provider subscription id. Linking a subscription
+/// adopts its unlinked invoices and open dunning rows, and nothing else.
+pub async fn link_subscription_adopts_pending_invoices_and_dunning(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "adopt", None).await;
+    let sub = ProviderId::new("sub_adopt");
+    let orphan = store
+        .upsert_invoice(
+            invoice_upsert("adopt", &customer, "orphan", InvoiceStatus::Open, 100)
+                .with_provider_subscription(sub.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(orphan.provider_subscription_id.as_ref(), Some(&sub));
+    assert_eq!(orphan.subscription_id, None);
+    let closed = store
+        .upsert_invoice(
+            invoice_upsert("adopt", &customer, "closed", InvoiceStatus::Open, 100)
+                .with_provider_subscription(sub.clone()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    for (invoice, state) in [
+        (&orphan, DunningState::Pending),
+        (&closed, DunningState::Recovered),
+    ] {
+        store
+            .upsert_dunning(DunningAttempt::new(
+                invoice.id.clone(),
+                customer.clone(),
+                1,
+                at(300),
+                state,
+                at(0),
+            ))
+            .await
+            .unwrap();
+    }
+    let other = store
+        .upsert_invoice(
+            invoice_upsert("adopt", &customer, "other", InvoiceStatus::Open, 100)
+                .with_provider_subscription("sub_adopt_other"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    let linked = store
+        .upsert_invoice(
+            invoice_upsert("adopt", &customer, "linked", InvoiceStatus::Open, 100)
+                .with_provider_subscription(sub.clone())
+                .with_subscription("adopt-sub-first"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+    store
+        .link_subscription(&sub, "adopt-sub", at(2000))
+        .await
+        .unwrap();
+
+    let by_id =
+        |id: String| async move { store.invoice_by_id(&id).await.unwrap().expect("invoice") };
+    assert_eq!(
+        by_id(orphan.id.clone()).await.subscription_id.as_deref(),
+        Some("adopt-sub")
+    );
+    assert_eq!(by_id(other.id).await.subscription_id, None);
+    assert_eq!(
+        by_id(linked.id).await.subscription_id.as_deref(),
+        Some("adopt-sub-first"),
+        "an existing link is kept"
+    );
+    let row = store.dunning_by_invoice(&orphan.id).await.unwrap().unwrap();
+    assert_eq!(row.subscription_id.as_deref(), Some("adopt-sub"));
+    assert_eq!(row.updated_at, at(2000));
+    let closed = store.dunning_by_invoice(&closed.id).await.unwrap().unwrap();
+    assert_eq!(closed.subscription_id, None, "a settled row is left alone");
+    // Idempotent.
+    store
+        .link_subscription(&sub, "adopt-sub", at(3000))
+        .await
+        .unwrap();
+}
+
+/// A settle built before a link was added keeps the stored link.
+pub async fn settle_dunning_keeps_a_concurrent_link(store: &dyn BillingStore) {
+    store
+        .upsert_dunning(
+            dunning("settle-link", "k", 1, 100, DunningState::Running)
+                .with_subscription("settle-link-sub"),
+        )
+        .await
+        .unwrap();
+    let stale = dunning("settle-link", "k", 1, 100, DunningState::Exhausted);
+    assert_eq!(stale.subscription_id, None);
+    assert!(
+        store
+            .settle_dunning("settle-link-inv-k", 1, &[DunningState::Running], stale)
+            .await
+            .unwrap()
+    );
+    let row = store
+        .dunning_by_invoice("settle-link-inv-k")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.state, DunningState::Exhausted);
+    assert_eq!(row.subscription_id.as_deref(), Some("settle-link-sub"));
+}
+
+/// An invoice linked before its dunning row was opened still gets the row
+/// linked.
+pub async fn link_subscription_adopts_dunning_opened_after_the_link(store: &dyn BillingStore) {
+    let customer = seed_customer(store, "late", None).await;
+    let sub = ProviderId::new("sub_late");
+    let late = store
+        .upsert_invoice(
+            invoice_upsert("late", &customer, "k", InvoiceStatus::Open, 100)
+                .with_provider_subscription(sub.clone())
+                .with_subscription("late-sub"),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+    store
+        .upsert_dunning(DunningAttempt::new(
+            late.id.clone(),
+            customer.clone(),
+            1,
+            at(300),
+            DunningState::Pending,
+            at(0),
+        ))
+        .await
+        .unwrap();
+    store
+        .link_subscription(&sub, "late-sub", at(2000))
+        .await
+        .unwrap();
+    let row = store.dunning_by_invoice(&late.id).await.unwrap().unwrap();
+    assert_eq!(row.subscription_id.as_deref(), Some("late-sub"));
+}
+
 // ── Fix round 2 properties ──────────────────────────────────────────────
 
 /// One customer row per user: a second provider customer for a linked user
@@ -1396,6 +1657,7 @@ pub async fn run_contract(store: &dyn BillingStore) {
     subscription_newer_wins_older_stale(store).await;
     subscription_same_instant_higher_rank_wins(store).await;
     subscription_authoritative_settles_a_same_instant_tie(store).await;
+    subscription_tie_check_reports_a_same_instant_tie(store).await;
     subscription_terminal_never_left(store).await;
     subscriptions_for_customer_newest_first(store).await;
     subscription_set_status(store).await;
@@ -1413,7 +1675,10 @@ pub async fn run_contract(store: &dyn BillingStore) {
     subscription_unchanged_redelivery(store).await;
     subscription_missing_fields_keep_stored_values(store).await;
     invoice_unchanged_redelivery(store).await;
+    link_subscription_adopts_pending_invoices_and_dunning(store).await;
+    link_subscription_adopts_dunning_opened_after_the_link(store).await;
     settle_dunning_is_compare_and_set(store).await;
+    settle_dunning_keeps_a_concurrent_link(store).await;
     prune_events_deletes_applied_rows_before(store).await;
 }
 
@@ -1441,6 +1706,7 @@ mod memory {
         subscription_newer_wins_older_stale,
         subscription_same_instant_higher_rank_wins,
         subscription_authoritative_settles_a_same_instant_tie,
+        subscription_tie_check_reports_a_same_instant_tie,
         subscription_terminal_never_left,
         subscriptions_for_customer_newest_first,
         subscription_set_status,
@@ -1458,9 +1724,18 @@ mod memory {
         subscription_unchanged_redelivery,
         subscription_missing_fields_keep_stored_values,
         invoice_unchanged_redelivery,
+        link_subscription_adopts_pending_invoices_and_dunning,
+        link_subscription_adopts_dunning_opened_after_the_link,
         settle_dunning_is_compare_and_set,
+        settle_dunning_keeps_a_concurrent_link,
         prune_events_deletes_applied_rows_before,
     );
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_ties_are_reported_once() {
+        let store = std::sync::Arc::new(MemoryBillingStore::new());
+        super::subscription_concurrent_ties_are_reported_once(store).await;
+    }
 
     #[tokio::test]
     async fn whole_suite_on_one_shared_store() {
@@ -1641,4 +1916,15 @@ async fn relink_customer_default_is_unsupported_for_a_store_that_predates_it() {
         matches!(err, autumn_billing::BillingError::Unsupported(_)),
         "expected Unsupported, got {err:?}"
     );
+}
+
+/// The default `link_subscription` is a no-op, so an older store keeps
+/// compiling and keeps working.
+#[tokio::test]
+async fn link_subscription_default_is_a_no_op_for_a_store_that_predates_it() {
+    let store = LegacyStoreWithoutRelink;
+    store
+        .link_subscription(&ProviderId::new("sub"), "local", at(0))
+        .await
+        .expect("the default implementation succeeds");
 }

@@ -89,6 +89,14 @@ pub const ACCESS_LOG_TARGET: &str = "autumn::access";
 /// `route` field low-cardinality. Mirrors the metrics layer.
 pub const UNMATCHED_ROUTE: &str = "_unmatched";
 
+/// The route pattern a response carries when the request had no `MatchedPath`.
+///
+/// A plugin mounted at runtime is routed from the 404 fallback. That happens
+/// after the access log and metrics layers read the request. The plugin sets
+/// this on its response, and those layers use it when the request has no route.
+#[derive(Debug, Clone)]
+pub struct ResponseRoute(pub String);
+
 /// Shared sentinel coordinating the primary and fallback access-log layers.
 ///
 /// The fallback inserts it into the **request** extensions on the way in, and
@@ -182,10 +190,15 @@ pub struct AccessLogService<S> {
 
 /// Request facts captured before the inner service consumes the request.
 /// `None` when the request path is excluded from access logging.
+///
+/// The route and id are kept as the shared values the request already
+/// carries, not copied to text: `MatchedPath` is an `Arc<str>` (a clone is a
+/// refcount bump) and `RequestId` is rendered on the stack at emit time. The
+/// fallback layer captures these on every request and almost never emits.
 struct RequestMeta {
     method: Method,
-    route: Option<String>,
-    request_id: Option<String>,
+    route: Option<MatchedPath>,
+    request_id: Option<crate::middleware::RequestId>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for AccessLogService<S>
@@ -207,16 +220,13 @@ where
         } else {
             Some(RequestMeta {
                 method: req.method().clone(),
-                route: req
-                    .extensions()
-                    .get::<MatchedPath>()
-                    .map(|matched| matched.as_str().to_owned()),
+                route: req.extensions().get::<MatchedPath>().cloned(),
                 // Set by RequestIdLayer, which sits outer to the primary
                 // layer. Absent at the outermost fallback position.
                 request_id: req
                     .extensions()
                     .get::<crate::middleware::RequestId>()
-                    .map(ToString::to_string),
+                    .cloned(),
             })
         };
 
@@ -295,11 +305,29 @@ where
                         .headers()
                         .get(&X_REQUEST_ID)
                         .and_then(|value| value.to_str().ok());
-                    let request_id = meta.request_id.as_deref().or(header_id);
+                    // Rendered on the stack, as `RequestIdLayer` renders the
+                    // header. The field stays a `&str`, so it is recorded with
+                    // `record_str` (quoted in text output) exactly as before.
+                    let mut id_buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                    let request_id = meta
+                        .request_id
+                        .as_ref()
+                        .map(|id| id.encode(&mut id_buf))
+                        .or(header_id);
                     tracing::info!(
                         target: ACCESS_LOG_TARGET,
                         method = %meta.method,
-                        route = meta.route.as_deref().unwrap_or(UNMATCHED_ROUTE),
+                        route = meta
+                            .route
+                            .as_ref()
+                            .map(MatchedPath::as_str)
+                            .or_else(|| {
+                                response
+                                    .extensions()
+                                    .get::<ResponseRoute>()
+                                    .map(|route| route.0.as_str())
+                            })
+                            .unwrap_or(UNMATCHED_ROUTE),
                         status = response.status().as_u16(),
                         duration_ms,
                         request_id,
@@ -321,6 +349,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Collects what a scoped `fmt` subscriber writes, so a test can assert on
+    /// the rendered access-log line.
+    #[derive(Clone)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut held) = self.0.lock() {
+                held.extend_from_slice(bytes);
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     fn exclude(prefixes: &[&str]) -> Arc<[String]> {
         normalize_exclusions(prefixes.iter().map(|p| (*p).to_owned()).collect())
@@ -354,5 +405,153 @@ mod tests {
         assert!(!is_excluded("/users/1", &exclude(&[""])));
         assert!(!is_excluded("/users/1", &exclude(&["/"])));
         assert!(!is_excluded("/users/1", &[]));
+    }
+
+    #[tokio::test]
+    async fn a_response_route_names_the_log_line_when_the_request_had_none() {
+        use tower::ServiceExt as _;
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let service = AccessLogLayer::new(Vec::new()).layer(tower::service_fn(
+            |_request: Request<axum::body::Body>| async {
+                let mut response = Response::new(axum::body::Body::empty());
+                response
+                    .extensions_mut()
+                    .insert(ResponseRoute("/p/x".to_owned()));
+                Ok::<_, std::convert::Infallible>(response)
+            },
+        ));
+        let request = Request::builder()
+            .uri("/p/x")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        service.oneshot(request).await.expect("infallible");
+
+        let out = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        assert!(out.contains("/p/x"), "{out}");
+        assert!(!out.contains(UNMATCHED_ROUTE), "{out}");
+    }
+
+    /// The route and request id are captured as the request's own shared
+    /// values but still recorded as `&str` fields, so the text format quotes
+    /// them exactly as it did when they were copied to `String`s (a `display`
+    /// field would not be quoted). The route is the matched template, never
+    /// the raw path, and the id is the one the response header carries.
+    #[tokio::test]
+    #[allow(
+        clippy::literal_string_with_formatting_args,
+        reason = "route templates use {placeholders}"
+    )]
+    async fn route_and_request_id_are_recorded_as_strings() {
+        use tower::ServiceExt as _;
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // RequestIdLayer outer, access log inner: the framework's order.
+        let router = axum::Router::new()
+            .route("/users/{id}", axum::routing::get(|| async { "ok" }))
+            .layer(AccessLogLayer::new(Vec::new()))
+            .layer(crate::middleware::RequestIdLayer::default());
+        let request = Request::builder()
+            .uri("/users/7")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        let response = router.oneshot(request).await.expect("infallible");
+        let id = response
+            .headers()
+            .get(&X_REQUEST_ID)
+            .and_then(|value| value.to_str().ok())
+            .expect("x-request-id")
+            .to_owned();
+
+        let out = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        assert!(out.contains(r#"route="/users/{id}""#), "{out}");
+        assert!(out.contains(&format!(r#"request_id="{id}""#)), "{out}");
+        assert!(!out.contains("/users/7"), "{out}");
+    }
+
+    /// A proxy-sent id is logged as sent, case and hyphens included: the
+    /// stack render writes the same text the `x-request-id` header carries.
+    /// A request no route matched still records the placeholder as a string.
+    #[tokio::test]
+    async fn an_inbound_request_id_is_logged_as_sent() {
+        use tower::ServiceExt as _;
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let sent = "0E4F1C2A-9b3d-4E5F-8a6b-7C8D9E0F1A2B";
+        let service = AccessLogLayer::new(Vec::new()).layer(tower::service_fn(
+            |_request: Request<axum::body::Body>| async {
+                Ok::<_, std::convert::Infallible>(Response::new(axum::body::Body::empty()))
+            },
+        ));
+        let mut request = Request::builder()
+            .uri("/nowhere")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(
+            crate::middleware::RequestId::parse_inbound(sent).expect("well-formed inbound id"),
+        );
+        service.oneshot(request).await.expect("infallible");
+
+        let out = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        assert!(out.contains(&format!(r#"request_id="{sent}""#)), "{out}");
+        assert!(
+            out.contains(&format!(r#"route="{UNMATCHED_ROUTE}""#)),
+            "{out}"
+        );
+    }
+
+    /// The fallback never sees a `RequestId` extension (`RequestIdLayer` is
+    /// inner to it), so it still takes the id from the response header.
+    #[tokio::test]
+    async fn the_fallback_takes_the_request_id_from_the_response_header() {
+        use tower::ServiceExt as _;
+
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let header_id = "0f8fad5b-d9cb-469f-a165-70867728950e";
+        let service = AccessLogLayer::fallback(Vec::new()).layer(tower::service_fn(
+            move |_request: Request<axum::body::Body>| async move {
+                let mut response = Response::new(axum::body::Body::empty());
+                response.headers_mut().insert(
+                    X_REQUEST_ID.clone(),
+                    axum::http::HeaderValue::from_static(header_id),
+                );
+                Ok::<_, std::convert::Infallible>(response)
+            },
+        ));
+        let request = Request::builder()
+            .uri("/starting")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        service.oneshot(request).await.expect("infallible");
+
+        let out = String::from_utf8(buf.0.lock().expect("lock").clone()).expect("utf8");
+        assert!(
+            out.contains(&format!(r#"request_id="{header_id}""#)),
+            "{out}"
+        );
     }
 }

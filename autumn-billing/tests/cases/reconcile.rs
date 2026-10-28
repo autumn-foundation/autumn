@@ -7,7 +7,7 @@ use std::time::Duration;
 use autumn_billing::dunning::RETRY_JOB_NAME;
 use autumn_billing::event::{InvoiceSnapshot, SubscriptionSnapshot};
 use autumn_billing::model::{DunningAttempt, DunningState, Invoice, Subscription};
-use autumn_billing::store::CustomerUpsert;
+use autumn_billing::store::{CustomerUpsert, SubscriptionUpsert};
 use autumn_billing::{
     BillingEventKind, BillingStore, Currency, DunningPolicy, InvoiceStatus, MemoryBillingStore,
     Money, PlanId, ProviderId, ReconcileOutcome, SubscriptionStatus,
@@ -17,8 +17,8 @@ use serde_json::json;
 
 use super::support::{
     self, FailingStore, FakeParser, FakeProvider, Harness, PRO_PRICE, RecordingHooks, apply_event,
-    at, checkout_kind, event, harness, harness_dyn, harness_with_hooks, notification_kinds,
-    notification_routes, notifications_for, post_webhook,
+    at, checkout_kind, event, harness, harness_dyn, harness_dyn_hooks, harness_with_hooks,
+    notification_kinds, notification_routes, notifications_for, post_webhook,
 };
 
 const USER: &str = "42";
@@ -254,6 +254,114 @@ async fn same_second_pause_ends_paused_in_either_delivery_order() {
             "{first:?} then {second:?}"
         );
     }
+}
+
+/// Models the other webhook's write landing between this event's read of the
+/// row and its write: `racer` runs before the first `upsert_subscription`.
+async fn race_harness(live: SubscriptionStatus, racer: SubscriptionStatus) -> Harness {
+    race_harness_with_hooks(live, racer, RecordingHooks::new()).await
+}
+
+async fn race_harness_with_hooks(
+    live: SubscriptionStatus,
+    racer: SubscriptionStatus,
+    hooks: Arc<RecordingHooks>,
+) -> Harness {
+    let inner = MemoryBillingStore::shared();
+    let store = FailingStore::wrap(inner.clone());
+    let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
+    provider.script_live_subscription(
+        SubscriptionSnapshot::new("sub_1", "cus_1", live).with_price(PRO_PRICE),
+    );
+    let h = harness_dyn_hooks(support::config(), hooks, store.clone(), provider, |app| {
+        app.with_clock(TickingClock::starting_at(support::base_time()))
+    });
+    inner
+        .upsert_customer(
+            CustomerUpsert::new("local-1", "fake", "cus_1", at(0))
+                .with_user(USER)
+                .with_email("a@example.test"),
+        )
+        .await
+        .unwrap();
+    let rival = inner.clone();
+    store.before(
+        "upsert_subscription",
+        1,
+        Box::new(move || {
+            let rival = rival.clone();
+            Box::pin(async move {
+                rival
+                    .upsert_subscription(
+                        SubscriptionUpsert::new("rival", "local-1", "sub_1", racer, at(100), at(0))
+                            .with_tie_check(),
+                    )
+                    .await
+                    .unwrap();
+            })
+        }),
+    );
+    Harness {
+        client: h.client,
+        store: inner,
+        provider: h.provider,
+    }
+}
+
+#[tokio::test]
+async fn a_racing_same_second_event_for_a_new_subscription_ends_at_the_providers_status() {
+    use SubscriptionStatus::{Active, PastDue};
+    let h = race_harness(Active, PastDue).await;
+    apply_event(&h.client, event("evt_1", at(100), sub_changed(Active)))
+        .await
+        .unwrap();
+    assert_eq!(subscription(&h).await.status, Active);
+    assert_eq!(h.provider.fetch_calls(), 1);
+}
+
+#[tokio::test]
+async fn the_hook_gets_the_row_the_tie_replaced_as_its_previous_state() {
+    use SubscriptionStatus::{Active, PastDue};
+    let hooks = RecordingHooks::new();
+    let h = race_harness_with_hooks(Active, PastDue, hooks.clone()).await;
+    apply_event(&h.client, event("evt_1", at(100), sub_changed(Active)))
+        .await
+        .unwrap();
+    assert_eq!(hooks.calls(), vec!["subscription_changed:active:past_due"]);
+}
+
+#[tokio::test]
+async fn a_racing_same_second_event_for_an_existing_subscription_ends_at_the_providers_status() {
+    use SubscriptionStatus::{Active, PastDue};
+    let h = race_harness(Active, PastDue).await;
+    // The row exists at an earlier instant before the race starts.
+    h.store
+        .upsert_subscription(SubscriptionUpsert::new(
+            "sub-local",
+            "local-1",
+            "sub_1",
+            Active,
+            at(99),
+            at(0),
+        ))
+        .await
+        .unwrap();
+    apply_event(&h.client, event("evt_1", at(100), sub_changed(Active)))
+        .await
+        .unwrap();
+    assert_eq!(subscription(&h).await.status, Active);
+    assert_eq!(h.provider.fetch_calls(), 1);
+}
+
+#[tokio::test]
+async fn a_reported_tie_without_a_lookup_falls_back_to_ranking() {
+    use SubscriptionStatus::{Active, PastDue};
+    let h = race_harness(Active, PastDue).await;
+    h.provider.clear_live_subscription();
+    apply_event(&h.client, event("evt_1", at(100), sub_changed(Active)))
+        .await
+        .unwrap();
+    assert_eq!(subscription(&h).await.status, PastDue, "higher rank wins");
 }
 
 #[tokio::test]
@@ -886,4 +994,25 @@ async fn failed_apply_releases_claim_so_redelivery_applies() {
         .expect("mirror row");
     assert_eq!(sub.status, SubscriptionStatus::Active);
     assert_eq!(sub.plan_id, Some(PlanId::new("pro")));
+}
+
+/// JSON from before `provider_subscription_id` existed still reads.
+#[test]
+fn invoice_json_without_the_provider_subscription_id_reads() {
+    let invoice = Invoice::new(
+        "i",
+        "c",
+        "in_1",
+        InvoiceStatus::Open,
+        Money::from_minor(1, Currency::USD),
+        Money::zero(Currency::USD),
+        at(0),
+        at(0),
+    );
+    let mut json = serde_json::to_value(&invoice).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .remove("provider_subscription_id");
+    let read: Invoice = serde_json::from_value(json).unwrap();
+    assert_eq!(read.provider_subscription_id, None);
 }

@@ -77,6 +77,14 @@ fn block_footer(header: &str) -> String {
     format!("{RESOURCE_FOOTER_PREFIX}{pascal}{RESOURCE_FOOTER_SUFFIX}")
 }
 
+/// Catalog key the framework looks up for the NUL field error (#2439). The same
+/// key as `autumn_web::form::NUL_CHARACTER_MESSAGE_KEY`.
+pub(super) const NUL_MESSAGE_KEY: &str = "common.error.nul_character";
+
+/// English text of [`NUL_MESSAGE_KEY`]. The same text as
+/// `autumn_web::form::NUL_CHARACTER_FIELD_ERROR`.
+pub(super) const NUL_MESSAGE_ENGLISH: &str = "Cannot contain the NUL character (0x00)";
+
 /// Emits every user-facing string in a generated view, either as the literal
 /// English expression the plain scaffold uses or as a `t!(locale, "key")`
 /// lookup.
@@ -124,6 +132,17 @@ impl ViewLabels {
     /// a key it emitted but never defined would fail the user's build.
     pub(super) fn used_keys(&self) -> BTreeMap<String, String> {
         self.used.borrow().clone()
+    }
+
+    /// Add `key = ftl` to the catalog for a message that the framework looks up.
+    /// No generated view uses this key. `autumn i18n check` does not report
+    /// these keys as unused.
+    pub(super) fn framework_key(&self, key: &str, ftl: &str) {
+        if self.enabled {
+            self.used
+                .borrow_mut()
+                .insert(key.to_owned(), ftl.to_owned());
+        }
     }
 
     /// Record `key = ftl` and return the `t!` invocation for it.
@@ -574,7 +593,14 @@ pub(super) fn remove_en_ftl_keys(
 /// Marker-bounded like [`remove_marked_block`], so a hand-authored `common.*`
 /// key outside the block is never touched.
 fn prune_chrome_block(existing: &str, surviving: &std::collections::HashSet<String>) -> String {
-    prune_block(existing, COMMON_HEADER, "common.", surviving)
+    // No source names the framework key (#2439), so the scan never reports it.
+    // It stays while any chrome key stays, because then a sibling scaffold
+    // still has a form.
+    let mut surviving = surviving.clone();
+    if surviving.iter().any(|key| key.starts_with("common.")) {
+        surviving.insert(NUL_MESSAGE_KEY.to_owned());
+    }
+    prune_block(existing, COMMON_HEADER, "common.", &surviving)
 }
 
 /// Narrow one resource's block to the keys `surviving` still names, dropping
@@ -2557,6 +2583,51 @@ mod tests {
             remove_en_ftl_keys(&out, "Post", "post", &chrome(&["common.create"])),
             out
         );
+    }
+
+    /// #2439: no source names the framework key, so the scan never reports it.
+    /// A sibling that still uses the chrome keeps it too.
+    #[test]
+    fn remove_keeps_the_framework_key_while_a_sibling_survives() {
+        let nul = (
+            "common.error.nul_character",
+            "Cannot contain the NUL character (0x00)",
+        );
+        let ftl = merge_en_ftl(
+            &merge_en_ftl(
+                "",
+                "Post",
+                "post",
+                &keys(&[("common.create", "Create"), nul, ("post.name", "Post")]),
+            ),
+            "Comment",
+            "comment",
+            &keys(&[
+                ("common.create", "Create"),
+                nul,
+                ("comment.name", "Comment"),
+            ]),
+        );
+        let out = remove_en_ftl_keys(&ftl, "Post", "post", &chrome(&["common.create"]));
+        assert!(out.contains("common.error.nul_character = "), "{out}");
+        assert!(out.contains("comment.name = Comment"), "{out}");
+    }
+
+    /// The last scaffold takes the shared block, framework key included.
+    #[test]
+    fn removing_the_last_resource_takes_the_framework_key_too() {
+        let nul = (
+            "common.error.nul_character",
+            "Cannot contain the NUL character (0x00)",
+        );
+        let ftl = merge_en_ftl(
+            "",
+            "Post",
+            "post",
+            &keys(&[("common.create", "Create"), nul, ("post.name", "Post")]),
+        );
+        let out = remove_en_ftl_keys(&ftl, "Post", "post", &HashSet::new());
+        assert!(!out.contains("common.error.nul_character"), "{out}");
     }
 
     #[test]

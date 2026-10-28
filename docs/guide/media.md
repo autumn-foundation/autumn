@@ -25,8 +25,8 @@ For a runnable end-to-end demo, see [`examples/media-room`](../../examples/media
 
 ```toml
 [dependencies]
-autumn-web = "0.8"
-autumn-media-plugin = "0.8"
+autumn-web = "0.9"
+autumn-media-plugin = "0.9"
 ```
 
 ## Mounting the plugin
@@ -58,9 +58,19 @@ async fn main() {
 ```
 
 Both primitives are **off by default** — `MediaPlugin::new()` with neither
-`with_broadcast()` nor `with_rooms()` mounts nothing. A rooms-only app calls
-just `.with_rooms()`; a broadcast-only app (e.g. a one-to-many streaming site)
-calls just `.with_broadcast()`.
+`with_broadcast()` nor `with_rooms()` installs no routes, extensions or jobs,
+and logs a warning. A
+rooms-only app calls just `.with_rooms()`; a broadcast-only app (e.g. a
+one-to-many streaming site) calls just `.with_broadcast()`.
+
+| Builder call | Installs |
+|---|---|
+| `with_broadcast()` | `MediaMtxClient` and `MediaUrls` extensions |
+| `with_rooms()` | Room routes, `RoomService` and the room reaper |
+| Either one | `MediaStorage`, `MediaWorkflows` and the encode jobs |
+
+The retention sweep also starts if you set `recordings_root`. If the storage
+config is not valid, the plugin installs no storage, workflows, jobs or sweep.
 
 ### Builder options
 
@@ -94,6 +104,8 @@ production config selects S3 storage and points at your `MediaMTX` origins:
 [media]
 room_max_participants  = 6           # hard cap, mesh, no SFU (1..=6)
 room_token_ttl_seconds = 300         # room session-token lifetime (seconds)
+room_session_max_seconds = 43200     # heartbeats stop renewing after this (>= the token TTL)
+room_rate_limit_per_minute = 0       # per client IP, per room route; 0 = off
 # room_namespace       = "tenant-a"  # optional MediaMTX path namespace
 room_store_backend     = "memory"    # memory (default) | db
 
@@ -173,7 +185,7 @@ prefix (default `/api/media`) and installs a `RoomService` on `AppState`:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/api/media/rooms` | Create a room; returns a token-free `RoomSnapshot`. |
-| `POST` | `/api/media/rooms/{room_id}/join` | Join a room; returns a `JoinResponse` (session token + mesh transport targets). |
+| `POST` | `/api/media/rooms/{room_id}/join` | Join a room; returns a `JoinResponse` (session token + mesh transport targets). A `display_name` longer than 64 characters gets `400`. |
 | `POST` | `/api/media/rooms/{room_id}/leave` | Leave a room (verifies the session token). |
 | `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness and renew the advisory token expiry. |
 | `GET`  | `/api/media/rooms/{room_id}` | The **member-gated** roster (`Authorization: Bearer <session token>`). |
@@ -182,11 +194,17 @@ prefix (default `/api/media`) and installs a `RoomService` on `AppState`:
 > authenticated session (the app's `auth.session_key` in the session), and an
 > anonymous request gets `401 Unauthorized`. Call them from a signed-in browser
 > session, or send the session cookie with API clients. Leave, heartbeat and the
-> roster are authorized by the per-room session token `join` returns. The
-> plugin ships **no rate limiting** — mount the routes behind your own
-> rate-limit middleware. An `InMemoryRoomStore` caps the registry at 10,000
-> rooms as a defense-in-depth backstop, and a background reaper reclaims idle
-> rooms.
+> roster are authorized by the per-room session token `join` returns.
+>
+> Set `[media] room_rate_limit_per_minute` to limit each client IP on each
+> route. It is off by default. An over-limit request gets `429` before its body
+> is read. On create and join, the session check runs first, so an anonymous
+> caller gets `401`. The limit uses the core `#[throttle]` limiter, so the
+> client IP comes from `[security.trusted_proxies]`. Behind a reverse proxy, set
+> that too. If you do not, all clients share the proxy's IP and one bucket.
+>
+> An `InMemoryRoomStore` caps the registry at 10,000 rooms as a backstop, and a
+> background reaper removes idle rooms.
 
 A `join` response gives the joiner its own `publish` target (the WHIP URL for
 its `MediaMTX` path) plus one `subscribe` target (a WHEP URL) per existing peer.
@@ -255,6 +273,13 @@ idle rooms by `last_seen_at` / `created_at`. The `DbRoomStore` reaper is a
 last-write-wins sweep, so concurrent reapers across processes converge with no
 corruption.
 
+On the `db` backend, join, leave and the reaper's room delete each lock the
+room row in one transaction. Two joins for the last seat cannot both get it:
+one gets `409`. A join never returns a seat that a room delete then removes.
+If the room delete runs first, the join gets `404`, as for a room that is gone.
+The tables do not change. On Postgres, two reapers can deadlock. Then one logs
+a warning and deletes no rooms on that tick.
+
 Two client signals refresh `last_seen_at`: an explicit heartbeat, and — as a
 side effect — a member-gated roster poll. Do either on any interval well under
 the idle TTL (default 15 minutes, `AUTUMN_MEDIA__ROOM_IDLE_TTL_SECONDS`) and the
@@ -269,9 +294,16 @@ POST /api/media/rooms/{room_id}/heartbeat
 
 It answers `{"alive": true, "token_expires_at": "..."}` with the expiry renewed
 to `now + room_token_ttl_seconds`; the token **value** never rotates, so an
-in-flight roster poll keeps working. Like the roster, it is fail-closed: an
-unknown room, unknown participant and wrong token are one indistinguishable
-`404`. Liveness is client-driven, not media-derived — a participant that neither
+in-flight roster poll keeps working.
+
+The session ends at `joined_at + room_session_max_seconds` (default 12 hours).
+The expiry is never later than that. After it, heartbeat and roster get `404`,
+so a captured token stops working. The client leaves (leave accepts a token of
+any age), then joins again for a new token. Leave first: in a full room, the old
+seat blocks the new join until the reaper removes it.
+
+Like the roster, the heartbeat is fail-closed: an unknown room, unknown
+participant and wrong token are one indistinguishable `404`. Liveness is client-driven, not media-derived — a participant that neither
 heartbeats nor polls for a full idle TTL loses its signaling record (its live
 `MediaMTX` path is untouched, so it can simply re-join).
 
@@ -279,8 +311,10 @@ heartbeats nor polls for a full idle TTL loses its signaling record (its live
 
 ### `MediaMtxClient` and `MediaUrls`
 
-`with_broadcast()` wires the storage/encode surface. Two transport helpers
-resolve from a `MediaMtxConfig`:
+`with_broadcast()` installs both transport helpers as `AppState` extensions,
+built from `config.mediamtx`. Get them in a handler with
+`state.extension::<MediaMtxClient>()`. You can also build them yourself from a
+`MediaMtxConfig`:
 
 - **`MediaUrls::from_config(&config.mediamtx)`** builds every browser-facing and
   server-side URL a broadcast needs — `rtmp_ingest_url(key)`,
@@ -317,7 +351,8 @@ When a `recordings_root` is configured, the plugin spawns a background sweep
 that deletes source recordings older than `retention_days` (0 disables it). Set
 the root explicitly with `.recordings_root(...)` — without it, no sweep runs.
 `MediaConfig::from_arroyo_env()` wires the root automatically from
-`ARROYO_RECORDINGS_ROOT`.
+`ARROYO_RECORDINGS_ROOT`. The sweep starts only if you enable a primitive and
+the storage config is valid.
 
 ## See also
 

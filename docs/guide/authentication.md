@@ -669,10 +669,12 @@ IP rate limiting does not stop credential stuffing that rotates source IPs. The
 generated login handler therefore also counts failures **per account**:
 
 1. Each failed login increments `failed_attempts` on the account row.
-2. At `threshold`, `locked_at` is stamped and a `tracing::warn!` fires with
+2. At `threshold`, `locked_at` is stamped. A `tracing::warn!` fires with
    `event = "account_locked"`, a salted SHA-256 account digest truncated to 8
-   bytes, and an IP prefix (IPv4 /24, IPv6 /64) — correlatable across log lines
-   for incident response without putting a raw account id in the logs.
+   bytes, and an IP prefix (IPv4 /24, IPv6 /64). Only the request that sets
+   `locked_at` logs, so each lock logs once, also when many requests fail at
+   the same time. The digest and prefix let you correlate log lines without a
+   raw account id.
 
    **Set the salt.** The digest is salted from the app's
    [signing secret](./signing-secrets.md)
@@ -899,11 +901,26 @@ middleware from request extensions, so it follows the impersonated user only if
 that loader reads the auth session key. The same caveat applies to any identity
 key your app writes alongside `user_id` at login (a generated `{model}_id` /
 `{model}_email`, a `tenant_id`): impersonation swaps the configured auth session
-key and nothing else, so map the rest yourself if your handlers read them.
+key. To swap more keys, return them from
+`ImpersonationPolicy::target_session_values`. `end_impersonation` restores the
+operator's values.
 
-`RequireAuth` also publishes `RateLimitPrincipal` and the log context's
-`user_id` as the **effective** user, so rate-limit buckets and log lines follow
-the target while attribution follows the operator.
+```rust
+fn target_session_values<'a>(
+    &'a self,
+    ctx: &'a PolicyContext,
+    target: &'a ImpersonationTarget,
+) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
+    Box::pin(async move {
+        // Read the email from your own user store. `None` removes the key.
+        vec![("user_email".to_owned(), lookup_email(ctx, target).await)]
+    })
+}
+```
+
+`RequireAuth` publishes the log context's `user_id` as the **effective** user,
+so log lines follow the target. `RateLimitPrincipal` is the **operator**, so an
+operator spends their own throttle budget. They cannot lock the customer out.
 
 Read the state with the `Impersonation` extractor when you just want to branch
 on it:
@@ -946,7 +963,7 @@ And what it refuses:
 - **No self-destructive configuration.** `auth.session_key` must not be one of
   the keys impersonation reserves for its own bookkeeping (`impersonator_id`,
   `impersonated_id`, `impersonation_session_id`, `impersonator_role`,
-  `impersonator_last_strong_auth_at`, `role`) — the swap would clobber its own
+  `impersonator_last_strong_auth_at`, `impersonator_identity_keys`, `role`) — the swap would clobber its own
   record — nor the live step-up claim `last_strong_auth_at`, which the swap
   stashes aside; a collision there would let a numeric target id satisfy
   step-up with no reauthentication. Both directions refuse the
@@ -963,6 +980,37 @@ And what it refuses:
   same browser. Belt and braces: call `impersonation::clear(&session)` from your
   own login / magic-link / passkey promotion too, so the record is gone outright
   rather than merely inert.
+
+### Session-id rotation
+
+`begin_impersonation` and `end_impersonation` rotate the session id. Any state
+that is keyed by the id must follow the new id. Register a rotation hook for
+that state:
+
+```rust,ignore
+app.on_session_rotation(|rotation| async move {
+    // Move your rows from rotation.old_id to rotation.new_id.
+    Ok(())
+})
+```
+
+The hook runs after the new session is stored. It sees one event per request,
+from the first old id to the last new id. `earlier_ids` lists every id in
+between. It does not run for a destroyed
+session. A hook error is logged and does not change the response.
+
+`autumn generate auth` registers a hook that re-points the tracked-session row.
+Impersonation therefore works in apps with `[auth.sessions]` tracking.
+
+Two parallel requests that rotate the same session each publish their own
+event. Only the first finds the row. Do not rotate one session from parallel
+requests.
+
+A rotation that does not change the signed-in user retires the impersonation
+record. For a rotation you trust (for example an idle-rotation policy), call
+`impersonation::rebind(&state, &session)` right after `rotate_id()`. It returns
+`true` when the record was kept. Do not call it from a login flow. Call
+`impersonation::clear` there.
 
 Tenancy is yours to enforce — the framework checks none, and `allow_roles` does
 not look at the target at all, so it will happily impersonate any string

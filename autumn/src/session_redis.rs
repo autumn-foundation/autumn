@@ -61,8 +61,16 @@ impl RedisStore {
     }
 }
 
+/// Staging fault injection (#3071). Inert outside a fault scope.
+async fn inject_fault(operation: &'static str) -> Result<(), SessionStoreError> {
+    crate::fault_injection::inject(crate::fault_injection::FaultTarget::Redis)
+        .await
+        .map_err(|fault| SessionStoreError::backend(operation, fault))
+}
+
 impl SessionStore for RedisStore {
     async fn load(&self, id: &str) -> Result<Option<HashMap<String, String>>, SessionStoreError> {
+        inject_fault("load session").await?;
         let mut connection = self.connection.clone();
         let key = self.key_for(id);
         match connection.get::<_, Option<String>>(&key).await {
@@ -82,6 +90,7 @@ impl SessionStore for RedisStore {
     }
 
     async fn save(&self, id: &str, data: HashMap<String, String>) -> Result<(), SessionStoreError> {
+        inject_fault("save session").await?;
         let mut connection = self.connection.clone();
         let key = self.key_for(id);
         match serde_json::to_string(&data) {
@@ -102,6 +111,7 @@ impl SessionStore for RedisStore {
     }
 
     async fn destroy(&self, id: &str) -> Result<(), SessionStoreError> {
+        inject_fault("destroy session").await?;
         let mut connection = self.connection.clone();
         let key = self.key_for(id);
         connection.del::<_, ()>(&key).await.map_err(|error| {
@@ -113,7 +123,28 @@ impl SessionStore for RedisStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::session::SessionRedisConfig;
+
+    /// A `redis` fault fails each store operation before it reaches Redis.
+    #[tokio::test]
+    async fn an_injected_redis_fault_fails_the_operation() {
+        use crate::fault_injection::{FaultKind, FaultRule, FaultTarget, with_faults};
+
+        let config = SessionConfig {
+            redis: SessionRedisConfig {
+                url: Some("redis://127.0.0.1:1".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let store = RedisStore::from_config(&config).expect("a lazy store builds");
+        let rules = [FaultRule::new(FaultTarget::Redis, FaultKind::Error, 1.0)];
+        let error = with_faults(&rules, store.load("id")).await.unwrap_err();
+        assert!(error.to_string().contains("fault injection"), "{error}");
+        let error = with_faults(&rules, store.destroy("id")).await.unwrap_err();
+        assert!(error.to_string().contains("fault injection"), "{error}");
+    }
 
     #[tokio::test]
     async fn redis_store_from_config_missing_url() {

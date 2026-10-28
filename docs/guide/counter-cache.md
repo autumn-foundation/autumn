@@ -252,6 +252,9 @@ is raw SQL) but not readable from Rust.
 
 ## Limits
 
+- **No counter on a ledgered parent.** The `UPDATE` records no ledger revision.
+  Autumn refuses it with `LedgerError::OutOfBandWrite` on any child write or
+  recompute. See [Ledgered entities](ledgered-entities.md#writes-from-outside-the-repository).
 - **`belongs_to` only.** Counters over a `through =` join table are rejected at
   compile time: the association's foreign key names a column on the join table,
   not on the child, so the increment would read a column that does not exist. Map

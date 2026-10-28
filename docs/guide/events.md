@@ -136,6 +136,12 @@ A published event with **no registered listeners is a no-op**, not an error.
   is process-local, mirroring `job::enqueue_after_commit`: a crash between commit
   and enqueue can drop the reaction.) Publishing outside a transaction enqueues
   immediately.
+- **Crash-safe publish: use the outbox.** `events.publish_in_tx(conn, event)`
+  writes one outbox row per durable listener on the transaction connection.
+  After commit, the relay enqueues the job of the listener. A crash between
+  commit and enqueue cannot drop it. The listener keeps its own retry
+  settings. Needs `outbox.enabled = true` and a durable job backend. See
+  [Transactional Outbox and Inbox](outbox.md).
 - **No ordering guarantee between independent listeners.** Sync listeners run
   concurrently; durable listeners are independent queue jobs. Do not rely on one
   listener observing another's effects.

@@ -228,18 +228,10 @@ fn plan_model_with_options_impl(
     // compile error in a file the author did not write.
     metadata.set_commentable_author(super::commentable::detect_author_model(project_root));
 
-    // A UUID primary key needs app-side id generation on SQLite (no
-    // `gen_random_uuid()`), which the runtime slice deferred to #2555;
-    // reject `--id uuid` on a SQLite app at generate time rather than emit a
-    // `TEXT PRIMARY KEY` column that would accept NULL/omitted ids (AC #4).
-    if backend == autumn_web::config::DatabaseBackend::Sqlite && options.id_type == IdType::Uuid {
-        return Err(super::sqlite_uuid_pk_unsupported_error());
-    }
     // `comments:commentable` on a UUID-keyed model would plan every file and
     // then hand back a project that does not compile: the shared table stores
     // `commentable_id BIGINT` and the generated helpers take `parent_id: i64`.
-    // Refused here, before anything is written, exactly as the SQLite/UUID
-    // combination above is.
+    // Refused here, before anything is written.
     if options.id_type == IdType::Uuid && fields.iter().any(|f| f.kind.is_commentable()) {
         return Err(super::uuid_pk_commentable_unsupported_error());
     }
@@ -375,7 +367,8 @@ fn plan_model_with_options_impl(
                     "Added the shared `{table}` table. Every `#[commentable]` model \
                      attaches to it, so later models need no migration of their own. \
                      Mount the framework's comment routes once, e.g. \
-                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))`, \
+                     `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))\
+                     .declare_plugin_routes(autumn_web::commentable::route_infos(\"/comments\"))`, \
                      and render a thread with \
                      `autumn_web::widgets::comment_thread`.",
                     table = super::commentable::COMMENTS_TABLE,
@@ -791,8 +784,8 @@ fn model_struct_has_uuid_pk(project_root: &Path, base: &str) -> bool {
         .is_some_and(|field| type_is_uuid(&field.ty))
 }
 
-/// Whether a `syn::Type` is a UUID — either the fully-qualified `uuid::Uuid`
-/// (what the generator itself always emits) or the bare `Uuid` (idiomatic
+/// Whether a `syn::Type` is a UUID — the fully-qualified `uuid::Uuid`
+/// (what the generator emits for Postgres), `SqliteUuid` (`SQLite`), or the bare `Uuid` (idiomatic
 /// with a `use uuid::Uuid;` import at the top of the file, a common
 /// hand-edit of a generated model).
 fn type_is_uuid(ty: &syn::Type) -> bool {
@@ -801,6 +794,16 @@ fn type_is_uuid(ty: &syn::Type) -> bool {
     };
     if type_path.qself.is_some() {
         return false;
+    }
+    // `SqliteUuid` is the `SQLite` spelling of a UUID key (issue #2555), at any
+    // path depth.
+    if type_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|seg| seg.ident == "SqliteUuid")
+    {
+        return true;
     }
     match type_path.path.segments.len() {
         1 => type_path.path.segments[0].ident == "Uuid",
@@ -1108,9 +1111,9 @@ pub(super) const MODEL_DEPS: &[(&str, &str)] = &[
 /// Same shape, different backend: diesel on its `sqlite` feature with the
 /// bundled `libsqlite3-sys` amalgamation, `diesel-async` on the sync-connection
 /// wrapper that `autumn-web`'s `sqlite` feature runs the pool through, and no
-/// `pq-sys` — a `SQLite` app has no reason to name libpq itself. (`autumn-web`'s
-/// `db` feature still pulls it in transitively, so this trims the app's direct
-/// dependency list, not its link line.) `returning_clauses_for_sqlite_3_35`
+/// `pq-sys` — a `SQLite` app has no reason to name libpq itself. (With default
+/// features on, `autumn-web`'s `postgres` feature still pulls it in, so this
+/// trims the app's direct dependency list, not its link line; see #2605.) `returning_clauses_for_sqlite_3_35`
 /// matches `autumn-web`, so the two never disagree about `RETURNING` support.
 pub(super) const MODEL_DEPS_SQLITE: &[(&str, &str)] = &[
     ("chrono", "{ version = \"0.4\", features = [\"serde\"] }"),
@@ -3048,7 +3051,7 @@ fn render_model_file(
     }
     let _ = writeln!(out, "pub struct {name} {{");
     out.push_str("    #[id]\n");
-    let _ = writeln!(out, "    pub id: {},", id_type.rust_type());
+    let _ = writeln!(out, "    pub id: {},", id_type.rust_type_for(backend));
     for f in fields {
         if metadata.indexes.contains(&f.name) {
             out.push_str("    #[indexed]\n");
@@ -4397,6 +4400,155 @@ mod tests {
         });
     }
 
+    /// One `TEXT` cell, read with `sql_query`.
+    #[derive(diesel::QueryableByName)]
+    struct TextCell {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        sql: String,
+    }
+
+    /// The `CREATE TABLE` text of `products`, as `SQLite` stores it.
+    fn products_sql(conn: &mut diesel::SqliteConnection) -> String {
+        use diesel::RunQueryDsl as _;
+        let rows: Vec<TextCell> =
+            diesel::sql_query("SELECT sql FROM sqlite_master WHERE name = 'products'")
+                .load(conn)
+                .expect("read sqlite_master");
+        rows.into_iter().next().expect("products exists").sql
+    }
+
+    /// Whether `products` accepts a row with the SQL literal `price`.
+    fn insert_price(conn: &mut diesel::SqliteConnection, price: &str) -> bool {
+        use diesel::connection::SimpleConnection as _;
+        conn.batch_execute(&format!(
+            "INSERT INTO products (title, price) VALUES ('x', {price});"
+        ))
+        .is_ok()
+    }
+
+    /// `products` has the generator `CHECK` for `price decimal{10,2}` byte for
+    /// byte, and the `CHECK` rejects each value of the generator test.
+    fn assert_price_check_holds(conn: &mut diesel::SqliteConnection, when: &str) {
+        use crate::generate::schema_edit::{SQLITE_DECIMAL_10_2_REJECTS, sqlite_decimal_check};
+        assert!(
+            products_sql(conn).contains(&sqlite_decimal_check("price", 10, 2)),
+            "{when}: the table has no generator CHECK"
+        );
+        for value in SQLITE_DECIMAL_10_2_REJECTS {
+            assert!(
+                !insert_price(conn, &format!("'{value}'")),
+                "{when}: the CHECK accepts '{value}'"
+            );
+        }
+        assert!(
+            !insert_price(conn, "x'31392e3939'"),
+            "{when}: the CHECK accepts a blob"
+        );
+    }
+
+    /// #2598 round trip. The generator writes a `decimal{10,2}` table on
+    /// `SQLite`. The baseline comes from the real database, as `--dev-url` and
+    /// `schema pull` read it, so `price` is plain `TEXT`. The declarative lane
+    /// finds no diff. A rebuild for a different change, and its rollback, keep
+    /// the generator `CHECK`. The rebuilt table rejects the values that the
+    /// `CHECK` rejects.
+    #[test]
+    fn sqlite_decimal_check_survives_a_declarative_rebuild() {
+        use crate::schema::diff::{
+            DiffOptions, SchemaChange, SchemaContext, diff_schema, emit_down_sql_with_context,
+            emit_up_sql_with_context, guard_plan,
+        };
+        use crate::schema::introspect::introspect_sqlite_conn;
+        use crate::schema::parse::parse_models_path;
+        use autumn_schema_core::Backend;
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model(
+                tmp.path(),
+                "Product",
+                &["title:String".into(), "price:decimal{10,2}".into()],
+                "20260427000000",
+            )
+            .expect("plan")
+            .execute(Flags::default())
+            .expect("execute");
+
+            let generated_up = fs::read_dir(tmp.path().join("migrations"))
+                .expect("migrations dir")
+                .map(|entry| entry.expect("entry").path().join("up.sql"))
+                .find(|path| path.exists())
+                .expect("the generator wrote an up.sql");
+            let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+            conn.batch_execute(&fs::read_to_string(generated_up).expect("read up.sql"))
+                .expect("apply the generated migration");
+            conn.batch_execute("INSERT INTO products (title, price) VALUES ('a', '19.99');")
+                .expect("seed a row");
+            assert_price_check_holds(&mut conn, "after the generator");
+
+            // Mark the model `managed`, so that the declarative lane reads it.
+            let models = tmp.path().join("src/models");
+            let model_path = models.join("product.rs");
+            let model = fs::read_to_string(&model_path).expect("read model");
+            assert!(model.contains("#[autumn_web::model]\n"), "{model}");
+            let model = model.replace("#[autumn_web::model]\n", "#[autumn_web::model(managed)]\n");
+            fs::write(&model_path, &model).expect("mark the model managed");
+            let desired = parse_models_path(&models, Backend::Sqlite).expect("parse models");
+            assert!(desired.diagnostics.is_empty(), "{:?}", desired.diagnostics);
+            let baseline = introspect_sqlite_conn(&mut conn).expect("introspect");
+            let clean = diff_schema(&baseline, &desired, DiffOptions::default());
+            assert!(
+                clean.changes.is_empty(),
+                "the generator table and the model have a diff: {:?}",
+                clean.changes
+            );
+
+            // A different change. SQLite applies it only with a rebuild.
+            assert!(model.contains("pub title: String,"), "{model}");
+            fs::write(
+                &model_path,
+                model.replace("pub title: String,", "pub title: Option<String>,"),
+            )
+            .expect("edit model");
+            let desired = parse_models_path(&models, Backend::Sqlite).expect("parse models");
+            let plan = diff_schema(&baseline, &desired, DiffOptions::default());
+            assert!(
+                matches!(
+                    plan.changes.as_slice(),
+                    [SchemaChange::DropNotNull { column, .. }] if column == "title"
+                ),
+                "{:?}",
+                plan.changes
+            );
+            guard_plan(&plan, DiffOptions::default()).expect("guard");
+            let ctx = SchemaContext::from_tables(&desired.tables, &baseline);
+            let up = emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+            assert!(
+                up.contains("writes a new decimal CHECK for column(s) price."),
+                "the up SQL has no advisory: {up}"
+            );
+            conn.batch_execute(&up).expect("apply the rebuild");
+            assert_price_check_holds(&mut conn, "after the rebuild");
+            assert!(insert_price(&mut conn, "'0.5'"), "the CHECK rejects '0.5'");
+
+            let down = emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+            conn.batch_execute(&down).expect("apply the rollback");
+            assert_price_check_holds(&mut conn, "after the rollback");
+            let titles: Vec<TextCell> =
+                diesel::sql_query("SELECT title AS sql FROM products ORDER BY id")
+                    .load(&mut conn)
+                    .expect("read rows");
+            let titles: Vec<&str> = titles.iter().map(|row| row.sql.as_str()).collect();
+            assert_eq!(
+                titles,
+                ["a", "x"],
+                "the rebuild and the rollback keep the rows"
+            );
+        });
+    }
+
     /// The last three kinds #1924 un-rejects — `Uuid`, `Decimal`, and `Enum` —
     /// now plan cleanly on a `SQLite` app and render types that compile there.
     ///
@@ -4835,17 +4987,15 @@ mod tests {
         });
     }
 
-    /// `generate model --id uuid` on a `SQLite` app is rejected at generate time
-    /// citing #2555 (issue #1614 AC #4): `SQLite` has no `gen_random_uuid()` and
-    /// the generated `New*` insert type omits `#[id]` fields, so a `TEXT PRIMARY
-    /// KEY` column would accept NULL/omitted ids. App-side UUID generation is
-    /// tracked in #2555 — the runtime slice (#1905) deferred it and has since
-    /// closed, so the message must not send a reader to a closed issue.
+    /// `generate model --id uuid` on a `SQLite` app generates a key the database
+    /// fills in (issue #2555). `SQLite` has no `gen_random_uuid()`, so the column
+    /// default is a `randomblob` expression. `NOT NULL` closes the hole a bare
+    /// `TEXT PRIMARY KEY` leaves: `SQLite` lets such a key be `NULL`.
     #[test]
-    fn sqlite_app_uuid_primary_key_is_rejected_citing_the_tracking_issue() {
+    fn sqlite_app_uuid_primary_key_generates() {
         with_no_db_env(|| {
             let tmp = project_with_db_url("sqlite://app.db");
-            let err = plan_model_with_options(
+            let plan = plan_model_with_options(
                 tmp.path(),
                 "Post",
                 &["title:String".into()],
@@ -4855,22 +5005,85 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .unwrap_err();
-            let msg = err.to_string();
+            .expect("--id uuid must generate on SQLite");
+            plan.execute(Flags::default()).unwrap();
+
+            let up = fs::read_to_string(
+                tmp.path()
+                    .join("migrations/20260427000000_create_posts/up.sql"),
+            )
+            .unwrap();
             assert!(
-                matches!(err, GenerateError::Config(_)),
-                "expected Config error, got: {err:?}"
+                up.contains("id TEXT PRIMARY KEY NOT NULL DEFAULT (lower(hex(randomblob(4)))"),
+                "up.sql: {up}"
             );
-            assert!(msg.contains("2555"), "must cite issue #2555: {msg}");
+            assert!(!up.contains("gen_random_uuid"), "up.sql: {up}");
+            assert!(!up.contains("UUID PRIMARY KEY"), "up.sql: {up}");
+
+            let model = fs::read_to_string(tmp.path().join("src/models/post.rs")).unwrap();
             assert!(
-                msg.contains("SQLite") && msg.contains("UUID"),
-                "message must be actionable: {msg}"
+                model.contains("pub id: autumn_web::db::sqlite_types::SqliteUuid,"),
+                "model: {model}"
             );
+            assert!(!model.contains("uuid::Uuid"), "model: {model}");
+
+            let schema = fs::read_to_string(tmp.path().join("src/schema.rs")).unwrap();
+            assert!(schema.contains("id -> Text,"), "schema: {schema}");
         });
     }
 
-    /// The default INTEGER primary key still works on a `SQLite` app — only the
-    /// uuid key is gated, so `generate model` without `--id` is unaffected.
+    /// A `SqliteUuid` key counts as a UUID key. Without this, `references` to a
+    /// UUID-keyed model and `generate admin` pass on `SQLite` and write code that
+    /// does not compile.
+    #[test]
+    fn type_is_uuid_accepts_the_sqlite_spelling() {
+        for ty in [
+            "uuid::Uuid",
+            "Uuid",
+            "SqliteUuid",
+            "sqlite_types::SqliteUuid",
+            "autumn_web::db::sqlite_types::SqliteUuid",
+        ] {
+            let parsed: syn::Type = syn::parse_str(ty).unwrap();
+            assert!(type_is_uuid(&parsed), "{ty}");
+        }
+        for ty in ["i64", "String", "other::Thing"] {
+            let parsed: syn::Type = syn::parse_str(ty).unwrap();
+            assert!(!type_is_uuid(&parsed), "{ty}");
+        }
+    }
+
+    /// `references` to a model with a `SQLite` UUID key is refused, as on Postgres.
+    #[test]
+    fn sqlite_references_to_a_uuid_keyed_model_is_refused() {
+        with_no_db_env(|| {
+            let tmp = project_with_db_url("sqlite://app.db");
+            plan_model_with_options(
+                tmp.path(),
+                "Category",
+                &["name:String".into()],
+                "20260427000000",
+                &ModelOptions {
+                    id_type: IdType::Uuid,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .execute(Flags::default())
+            .unwrap();
+            let err = plan_model_with_options(
+                tmp.path(),
+                "Item",
+                &["category:references".into()],
+                "20260427000001",
+                &ModelOptions::default(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("UUID primary key"), "{err}");
+        });
+    }
+
+    /// The default INTEGER primary key still works on a `SQLite` app.
     #[test]
     fn sqlite_app_integer_primary_key_still_works() {
         with_no_db_env(|| {

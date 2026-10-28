@@ -68,12 +68,20 @@
 #[allow(unused_extern_crates)]
 extern crate self as autumn_web;
 
+// `db` is the shared layer only (#2605). It needs a backend.
+#[cfg(all(feature = "db", not(any(feature = "postgres", feature = "sqlite"))))]
+compile_error!(
+    "autumn-web: the `db` feature needs a database backend. Enable `postgres` \
+     (a default feature) or `sqlite`."
+);
+
 /// Typed accessible UI primitives (issue #1706).
 ///
 /// These make the accessible name a compile-time obligation. See [`mod@a11y`].
 #[cfg(feature = "maud")]
 pub mod a11y;
 pub mod actuator;
+pub mod admission;
 pub mod aggregate;
 /// Operator alerts for built-in failure conditions.
 ///
@@ -87,6 +95,7 @@ pub mod assets;
 pub mod audit;
 pub mod auth;
 pub mod authorization;
+pub mod backoff;
 // The build-time agent authority envelope (issue #1691): what an MCP-exposed,
 // agent-operable handler is allowed to do -- which models it writes, whether it
 // leaves the tenant, which hosts it calls, which jobs it enqueues, how
@@ -106,6 +115,7 @@ pub mod batches;
 /// availability without depending on a headless-browser stack.
 pub mod browser_detect;
 pub mod build_info;
+pub mod bulkhead;
 pub mod cache;
 #[cfg(feature = "ws")]
 pub mod channels;
@@ -115,6 +125,8 @@ pub use channels::{
     ChannelPublishError, ChannelStats, Channels, ChannelsBackend, LocalChannelsBackend,
 };
 pub mod canary;
+#[cfg(feature = "db")]
+pub mod cell_router;
 // Per-deploy capacity contract (`capacity.lock`): the proven envelope a build
 // sustains, and the admission limit it licenses. Ungated on purpose —
 // `route_listing` and `router` consult it on every boot.
@@ -137,6 +149,8 @@ pub mod circuit_breaker;
 // must-never-be-torn data respectively). Crate-private — an internal helper,
 // not part of the public API.
 mod fs_atomic;
+// Case-insensitive media-type match shared by the form gates (issue #3267).
+mod media_type;
 // Compile-time data classification (issue #1654): carries a "personal data"
 // classification on the *type* of a `#[model]` column and gates the `Json`
 // response sink on it, so a leak is a build failure rather than a production
@@ -166,12 +180,18 @@ pub mod consent;
 pub mod confidential;
 #[cfg(feature = "constela")]
 pub mod constela;
+pub mod cost;
 pub mod credentials;
 pub mod current;
 pub mod custom_domain;
 #[cfg(feature = "db")]
 pub mod db;
+#[cfg(feature = "db")]
+pub(crate) mod db_ping;
 pub(crate) mod db_url;
+pub mod fleet_layout;
+// Request deadlines (issue #3058). The module carries its own `//!` docs.
+pub mod deadline;
 pub mod dotenv;
 pub mod download;
 #[cfg(test)]
@@ -200,6 +220,7 @@ pub mod error_pages;
 pub mod extract;
 /// Deterministic fake-data generation backing factory `.fake()` support.
 pub mod fake;
+pub mod fault_injection;
 pub mod feed;
 /// View-layer value formatting helpers (currency, delimited numbers,
 /// pluralize, truncate, relative/absolute dates) for Maud templates.
@@ -207,8 +228,10 @@ pub mod feed;
 /// See [`mod@format`] for the full API.
 pub mod format;
 pub mod health;
+pub(crate) mod health_cache;
 #[cfg(feature = "db")]
 pub mod hooks;
+pub mod http_server;
 #[cfg(feature = "i18n")]
 pub mod i18n;
 pub mod idempotency;
@@ -219,6 +242,7 @@ pub mod range;
 // `SearchDocument` are not in scope — so adding one turns every intra-doc link
 // in `search.rs`'s header into a `broken_intra_doc_links` error. The module's
 // own header is the documentation.
+pub mod aeo;
 #[cfg(feature = "db")]
 pub mod search;
 pub mod seo;
@@ -582,6 +606,17 @@ pub mod etag;
 pub mod http_client;
 #[cfg(feature = "http-client")]
 pub use http_client as http;
+// Retry budget for outbound HTTP (issue #3058). Internal: the client uses it.
+#[cfg(feature = "http-client")]
+pub(crate) mod retry_budget;
+pub(crate) mod sync_shim;
+/// The crate-private types that the loom and Shuttle model checks drive.
+/// Built only under `--cfg loom_models` or `--cfg shuttle_models`.
+#[cfg(any(loom_models, shuttle_models))]
+#[doc(hidden)]
+pub mod __concurrency_models {
+    pub use crate::retry_budget::{MAX_HOSTS, RetryBudget, RetryBudgets, RetryKind};
+}
 
 #[cfg(feature = "flash")]
 pub mod flash;
@@ -653,6 +688,7 @@ pub use presence::presence_stream;
 #[cfg(feature = "presence")]
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
+pub use admission::Criticality;
 pub use route::{RepositoryApiMeta, Route, RouteIdempotency, RouteTimeout};
 // Re-exported alongside the other `Route` field types so a hand-built
 // `Route { .. }` needs only the `autumn_web::` prefix.
@@ -662,6 +698,9 @@ pub use seo::SeoRouteDefaults;
 /// Enable with the Cargo feature `markdown`.
 #[cfg(feature = "markdown")]
 pub mod markdown;
+/// Redis `PING` health indicator (issue #3059).
+#[cfg(feature = "redis")]
+pub mod redis_health;
 /// Process-wide rustls `CryptoProvider` guard for TLS Redis (`rediss://`)
 /// URLs — see [`redis_tls::open_client`] (issue #2172).
 #[cfg(feature = "redis")]
@@ -723,9 +762,12 @@ pub mod job_tracking;
 pub mod links;
 pub mod nested_form;
 pub mod payload_version;
+#[cfg(feature = "repl")]
+pub mod repl;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+pub mod slo;
 
 // ── #1343 AC4: fake-seeder registration forwarding ──────────────────────────
 //
@@ -770,6 +812,142 @@ macro_rules! __autumn_register_fake_seeder {
 macro_rules! __autumn_register_fake_seeder {
     ($model:ty, $name:expr) => {};
 }
+
+// ── #2148: console REPL registration forwarding ─────────────────────────────
+//
+// Same pattern as the fake seeder above: `#[model]` and `#[repository]` call
+// these macros always. The `repl` feature of autumn-web selects the body, so
+// Rhai and its glue reach a build only when that feature is on.
+
+/// Register a model with the console REPL (internal; invoked by `#[model]`).
+///
+/// `serde` projects a row through its `Serialize` impl. `fields [...]` projects
+/// the listed fields through a view struct that keeps their serde attributes
+/// (a model with `#[classified]` columns has no `Serialize` impl).
+#[cfg(feature = "repl")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_repl_model {
+    ($model:ty, $name:expr, $table:expr, [$($field:literal),* $(,)?], serde) => {
+        $crate::__autumn_register_repl_model!(@entry $name, $table, [$($field),*]);
+        impl $crate::repl::ReplRow for $model {
+            fn to_repl_value(
+                &self,
+            ) -> ::core::result::Result<$crate::reexports::serde_json::Value, ::std::string::String>
+            {
+                $crate::reexports::serde_json::to_value(self)
+                    .map_err(|err| ::std::string::ToString::to_string(&err))
+            }
+        }
+    };
+    (
+        $model:ty, $name:expr, $table:expr, [$($field:literal),* $(,)?],
+        fields [$($(#[$attr:meta])* $ident:ident : $ty:ty),* $(,)?]
+    ) => {
+        $crate::__autumn_register_repl_model!(@entry $name, $table, [$($field),*]);
+        impl $crate::repl::ReplRow for $model {
+            fn to_repl_value(
+                &self,
+            ) -> ::core::result::Result<$crate::reexports::serde_json::Value, ::std::string::String>
+            {
+                #[derive(::serde::Serialize)]
+                struct __AutumnReplView {
+                    $($(#[$attr])* $ident: $ty,)*
+                }
+                let view = __AutumnReplView {
+                    $($ident: ::core::clone::Clone::clone(&self.$ident),)*
+                };
+                $crate::reexports::serde_json::to_value(&view)
+                    .map_err(|err| ::std::string::ToString::to_string(&err))
+            }
+        }
+    };
+    (@entry $name:expr, $table:expr, [$($field:literal),*]) => {
+        $crate::reexports::inventory::submit! {
+            $crate::repl::ReplModel {
+                name: $name,
+                module_path: ::core::module_path!(),
+                table: $table,
+                fields: &[$($field),*],
+            }
+        }
+    };
+}
+
+/// No-op REPL model registration (internal): autumn-web is built without `repl`.
+#[cfg(not(feature = "repl"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_repl_model {
+    ($($tokens:tt)*) => {};
+}
+
+/// Register a repository with the console REPL (internal; invoked by
+/// `#[repository]`). Registers `find_all`, `find_by_id` and `count`.
+///
+/// It expands in the repository's own module, so it can set the private
+/// statement timeout: a call the prompt gives up on also stops on the server.
+#[cfg(feature = "repl")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_repl_repository {
+    ($repository:path, $pg:ty, $model:ty, $name:expr, $model_name:expr) => {
+        $crate::reexports::inventory::submit! {
+            $crate::repl::ReplRepository {
+                name: $name,
+                module_path: ::core::module_path!(),
+                model: $model_name,
+                find_all: |__pool, __timeout_ms| ::std::boxed::Box::pin(async move {
+                    let mut __repo =
+                        <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                    __repo.__autumn_statement_timeout_ms = __timeout_ms;
+                    $crate::repl::__project_all(
+                        <$pg as $repository>::find_all(&__repo).await,
+                        $crate::__autumn_repl_projector!($model),
+                    )
+                }),
+                find_by_id: |__pool, __timeout_ms, __id| ::std::boxed::Box::pin(async move {
+                    let mut __repo =
+                        <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                    __repo.__autumn_statement_timeout_ms = __timeout_ms;
+                    $crate::repl::__project_one(
+                        <$pg as $repository>::find_by_id(&__repo, __id).await,
+                        $crate::__autumn_repl_projector!($model),
+                    )
+                }),
+                count: |__pool, __timeout_ms| ::std::boxed::Box::pin(async move {
+                    let mut __repo =
+                        <$pg>::with_pool_untracked(::core::clone::Clone::clone(__pool));
+                    __repo.__autumn_statement_timeout_ms = __timeout_ms;
+                    $crate::repl::__count(<$pg as $repository>::count(&__repo).await)
+                }),
+            }
+        }
+    };
+}
+
+/// The row projection for a repository's model (internal): `ReplRow`, then
+/// `Serialize`, then an error.
+#[cfg(feature = "repl")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_repl_projector {
+    ($model:ty) => {{
+        #[allow(unused_imports)]
+        use $crate::repl::{__ViaNone as _, __ViaRow as _, __ViaSerde as _};
+        (&&&$crate::repl::__Probe::<$model>::new()).__projector()
+    }};
+}
+
+/// No-op REPL repository registration (internal): autumn-web is built without
+/// `repl`.
+#[cfg(not(feature = "repl"))]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __autumn_register_repl_repository {
+    ($($tokens:tt)*) => {};
+}
+
 /// Widget story gallery (issue #1526).
 ///
 /// Browsable `/_stories` UI plus a CI anti-rot registry of zero-arg widget
@@ -804,12 +982,38 @@ pub use nested_form::{
 };
 pub mod data;
 pub mod normalize;
+#[cfg(feature = "db")]
+pub mod outbox;
 pub mod validation;
 pub mod webhook;
 #[cfg(feature = "http-client")]
 pub mod webhook_outbound;
+/// Project tagged routes as `WebMCP` tools for the agent in the user's
+/// browser. Enable with the Cargo feature `webmcp` (it implies `mcp`).
+#[cfg(feature = "webmcp")]
+pub mod webmcp;
 #[cfg(feature = "ws")]
 pub mod ws;
+
+/// Keep the items only when the `postgres` feature is on (#2605).
+///
+/// Generated code that names a Postgres type uses this. Semver-exempt.
+#[cfg(feature = "postgres")]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __if_postgres {
+    ($($item:tt)*) => {
+        $($item)*
+    };
+}
+
+/// See the `postgres` variant. Without `postgres`, drop the items.
+#[cfg(not(feature = "postgres"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __if_postgres {
+    ($($item:tt)*) => {};
+}
 
 /// Private runtime helpers for code generated by Autumn proc macros.
 ///
@@ -821,9 +1025,13 @@ pub mod __private {
     #[cfg(feature = "db")]
     pub use crate::db::maybe_immediate_transaction;
     #[cfg(feature = "db")]
+    pub use crate::db::note_route_statement_timeout;
+    #[cfg(feature = "db")]
     pub use crate::db::scoped_immediate_transaction;
     #[cfg(feature = "db")]
     pub use crate::db::scoped_transaction;
+    #[cfg(feature = "db")]
+    pub use crate::ledger::LedgeredTableDescriptor;
     #[cfg(feature = "db")]
     pub use crate::repository::position_advisory_lock;
     #[cfg(all(feature = "db", feature = "ws"))]
@@ -857,6 +1065,48 @@ pub mod __private {
     // work-stealing runtime such as Tokio's multi-thread scheduler.
     tokio::task_local! {
         pub static FACTORY_DEPTH: u32;
+    }
+
+    /// Borrowed twin of [`crate::TransitionEffect`] for the `on_commit` job
+    /// payload.
+    ///
+    /// The `#[state_machine]` `on_commit` codegen (#1973) serializes this, so
+    /// firing an effect does not copy the literal model/field/state names into
+    /// owned `String`s only for `serde_json::to_value` to copy them again.
+    ///
+    /// Serializes to exactly the JSON `TransitionEffect` does (same field
+    /// names, same order), so the job still receives a `TransitionEffect`. The
+    /// `From` impl destructures `TransitionEffect` exhaustively: a field added
+    /// there fails to compile here until this twin carries it too.
+    #[derive(serde::Serialize)]
+    pub struct TransitionEffectRef<'a> {
+        pub model: &'a str,
+        pub field: &'a str,
+        pub record_id: &'a str,
+        pub from_state: &'a str,
+        pub to_state: &'a str,
+        pub idempotency_key: &'a str,
+    }
+
+    impl<'a> From<&'a crate::TransitionEffect> for TransitionEffectRef<'a> {
+        fn from(effect: &'a crate::TransitionEffect) -> Self {
+            let crate::TransitionEffect {
+                model,
+                field,
+                record_id,
+                from_state,
+                to_state,
+                idempotency_key,
+            } = effect;
+            Self {
+                model,
+                field,
+                record_id,
+                from_state,
+                to_state,
+                idempotency_key,
+            }
+        }
     }
 }
 
@@ -1414,6 +1664,11 @@ pub use autumn_macros::routes;
 /// ```
 pub use autumn_macros::cached;
 
+/// Scope every `#[cached]` method of an `impl` block by its type.
+///
+/// Keeps same-named associated functions in one module from sharing cache keys.
+pub use autumn_macros::cached_impl;
+
 /// Annotate an async function as a WebSocket route handler.
 ///
 /// The function follows the **two-function pattern**: it runs at HTTP
@@ -1473,13 +1728,13 @@ pub use auth::{
     list_api_tokens, rotate_api_token,
 };
 
-/// Postgres-backed API token store (requires `db` feature).
+/// Postgres-backed API token store (requires the `postgres` feature).
 ///
 /// Production replacement for [`auth::InMemoryApiTokenStore`]. Hashes tokens
 /// at rest and persists them across restarts. Use with [`API_TOKEN_MIGRATIONS`]
 /// for dev/test startup checks; `autumn migrate` applies the token-table
 /// framework migration in production.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub use auth::DbApiTokenStore;
 
 /// Embedded Diesel migrations for the `api_tokens` table (requires `db` feature).
@@ -2208,5 +2463,22 @@ mod tests {
         let builder = app::app();
         // Just verify it compiles and can accept routes
         let _builder = builder.routes(vec![]);
+    }
+
+    /// `PgFlagStore`, `PgExperimentStore` and `PgConfigStore` are a
+    /// documented clone class (see each struct's doc) that advertises the
+    /// same 1 s snapshot TTL. Nothing shares this constant, so a change to
+    /// one that forgets its siblings would otherwise drift silently.
+    #[cfg(feature = "db")]
+    #[test]
+    fn pg_store_cache_ttl_matches_across_clone_class_siblings() {
+        assert_eq!(
+            feature_flags::pg::PgFlagStore::DEFAULT_CACHE_TTL,
+            experiments::pg::PgExperimentStore::DEFAULT_CACHE_TTL,
+        );
+        assert_eq!(
+            feature_flags::pg::PgFlagStore::DEFAULT_CACHE_TTL,
+            runtime_config::pg::PgConfigStore::DEFAULT_CACHE_TTL,
+        );
     }
 }

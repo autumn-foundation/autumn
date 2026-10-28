@@ -807,13 +807,13 @@ fn the_decoder_sees_the_same_column_names_the_header_check_accepted() {
 fn the_discarded_column_probe_sees_the_same_column_names_the_decoder_accepted() {
     let (_tmp, project, _) = scaffold_project(
         "import-discarded-padded",
-        &["title:String", "blob:Option<Bytea>"],
+        &["title:String", "blob:Attachment"],
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(
         routes.contains(r#"const CSV_DISCARDED_COLUMNS: &[&str] = &["blob"];"#),
-        "the Bytea column must be the discarded one the probe watches:\n{routes}"
+        "the Attachment column must be the discarded one the probe watches:\n{routes}"
     );
     let import = handler_slice(&routes, "import");
     // The probe reads the row map, which is keyed by the header's RAW names —
@@ -830,62 +830,87 @@ fn the_discarded_column_probe_sees_the_same_column_names_the_decoder_accepted() 
     );
 }
 
-/// A `Bytea` column must not be importable, because the CSV cannot carry it
-/// back. The export renders it with `String::from_utf8_lossy`, so a byte that
-/// is not valid UTF-8 is ALREADY a U+FFFD replacement character in the file —
-/// and `into_new`'s `into_bytes()` would store those bytes, so importing this
-/// app's own export would silently replace a binary column with mojibake.
+/// A `Bytea` column round-trips as `\x` + hex: the export encodes it, the form
+/// decodes it, and the import sets it. The old `from_utf8_lossy` export turned
+/// every non-UTF-8 byte into U+FFFD (issue #2330).
 #[test]
-fn a_bytea_column_is_not_importable() {
+fn a_bytea_column_round_trips_as_hex() {
     let (_tmp, project, _) = scaffold_project(
         "import-bytea",
         &["title:String", "blob:Option<Bytea>"],
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
-    // Not settable — and not required either: the required set is the live
-    // schema minus the columns the import cannot set, so `blob` can never
-    // sneak into it.
+    // The export encodes. No lossy conversion may remain in the CSV record.
+    let schema = routes
+        .split("impl autumn_web::data::csv::CsvSchema for Post")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("the export must emit a CsvSchema impl");
     assert!(
-        routes.contains("fn csv_required_columns() -> Vec<&'static str>"),
-        "a Bytea column must not be one the import requires:
-{routes}"
+        schema.contains("bytea_to_hex"),
+        "the export must hex-encode the Bytea column:\n{schema}"
     );
-    // ...named on the upload page as a column the import cannot set...
     assert!(
-        routes.contains(r#"const CSV_IGNORED_COLUMNS: &[&str] = &["id", "blob", "created_at"];"#),
-        "a Bytea column must be named as unsettable:
-{routes}"
+        !schema.contains("from_utf8_lossy"),
+        "the export must not render a Bytea column lossily:\n{schema}"
     );
-    // ...and flagged in the report when a file actually supplies a value, since
-    // an operator editing that column would otherwise see nothing happen.
+    // Hex never starts with a formula character, so no formula guard.
     assert!(
-        routes.contains(r#"const CSV_DISCARDED_COLUMNS: &[&str] = &["blob"];"#),
-        "a supplied Bytea value must raise the discarded-column alert:
-{routes}"
+        !schema.contains("csv_text_cell(self.blob") && !schema.contains("csv_text_cell(bytea"),
+        "a hex cell needs no formula guard:\n{schema}"
     );
-    // The export still writes the column — this is an import-side exclusion, not
-    // a change to #1315's surface.
-    // (The nullable column exports through `map(|bytes| …)`, the non-nullable
-    // one through `&self.blob` — assert the parts common to both rather than
-    // one shape's exact expression.)
+    // The import settles the column: settable, not ignored, not discarded.
     assert!(
-        routes.contains("self.blob") && routes.contains("String::from_utf8_lossy"),
-        "the export must still carry the column:
-{routes}"
+        routes.contains(r#"const CSV_IGNORED_COLUMNS: &[&str] = &["id", "created_at"];"#),
+        "a Bytea column must no longer be ignored by the import:\n{routes}"
+    );
+    assert!(
+        !routes.contains("CSV_DISCARDED_COLUMNS"),
+        "a Bytea column must no longer raise the discarded-column alert:\n{routes}"
+    );
+    assert!(
+        routes.contains(r#"const SETTABLE: &[&str] = &["title", "blob"];"#),
+        "a Bytea column must be one the import can set:\n{routes}"
+    );
+    // The form decodes the same representation, rejecting bad input.
+    assert!(
+        routes.contains("fn bytea_from_hex(") && routes.contains("fn bytea_to_hex("),
+        "both hex helpers must be emitted:\n{routes}"
+    );
+    let into_new = fn_slice(&routes, "into_new");
+    assert!(
+        into_new.contains("bytea_from_hex") && !into_new.contains("into_bytes()"),
+        "the form must decode hex, not the lossy String round trip:\n{into_new}"
     );
 }
 
-/// Excluding a column from the LISTS is not enough — the decoder must never see
-/// it. `{Pascal}Form` still carries a `String` field for a `Bytea` column, so a
-/// pair that reaches `decode_form` is written back by `into_new` regardless of
-/// what the column lists say. This asserts the exclusion where it actually
-/// bites, which the list-level assertions cannot.
+/// The `\x` prefix is part of the contract: a bare digit string such as
+/// `0012` would lose its leading zeros if a spreadsheet read it as a number.
+#[test]
+fn the_hex_helpers_require_the_prefix_and_never_panic() {
+    let (_tmp, project, _) = scaffold_project(
+        "import-bytea-helpers",
+        &["title:String", "blob:Option<Bytea>"],
+        &["--import"],
+    );
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
+    let decode = fn_slice(&routes, "bytea_from_hex");
+    assert!(decode.contains(r#"strip_prefix("\\x")"#), "{decode}");
+    assert!(
+        !decode.contains("[..") && !decode.contains("from_str_radix"),
+        "byte-slicing and from_str_radix panic or accept `+`:\n{decode}"
+    );
+}
+
+/// The decoder must never see a column the import cannot set. The column lists
+/// alone do not stop it. This test checks the filter in the handler, which the
+/// list checks cannot reach.
 #[test]
 fn an_unsettable_column_never_reaches_the_form_decoder() {
     let (_tmp, project, _) = scaffold_project(
-        "import-bytea-decode",
-        &["title:String", "blob:Option<Bytea>"],
+        "import-ignored-decode",
+        &["title:String", "cover:Attachment"],
         &["--import"],
     );
     let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
@@ -895,50 +920,25 @@ fn an_unsettable_column_never_reaches_the_form_decoder() {
             && import.contains("return None;"),
         "an ignored column must be filtered out before decode_form sees it:\n{import}"
     );
-    // The premise the filter exists for: the form DOES still carry the column,
-    // so without the filter its exported mojibake would decode and be written.
-    assert!(
-        routes.contains("pub blob: Option<String>,"),
-        "the form still carries the Bytea column, which is why filtering matters:\n{routes}"
-    );
 }
 
-/// A NON-NULLABLE `Bytea` is refused outright. The import must filter the column
-/// out (it cannot round-trip), but the form declares it as a bare `String` with
-/// no default — so a filtered row fails "missing field" and the importer could
-/// never import anything. A nullable one is fine: the form declares
-/// `Option<String>`, so a filtered column decodes as `None`.
-///
-/// This is the general shape the `#[encrypted]` refusal is the other instance
-/// of: a column the import cannot set that the form nonetheless requires.
+/// A non-nullable `Bytea` keeps the import. The column is settable, so the
+/// file's hex cell fills the form's required `String` field.
 #[test]
-fn a_required_unsettable_column_refuses_the_import() {
+fn a_required_bytea_column_keeps_the_import() {
     let (_tmp, project, output) = scaffold_project(
         "import-bytea-required",
         &["title:String", "blob:Bytea"],
         &["--import"],
     );
-    assert_no_import_anywhere(&project);
-    assert!(
-        output.contains("non-nullable Bytea column"),
-        "the warning must name the shape:\n{output}"
-    );
-    assert!(
-        output.contains("blob:Option<Bytea>"),
-        "the warning must name the way out:\n{output}"
-    );
-
-    // CONTROL: the nullable form of the same column keeps the surface, because
-    // a filtered-out `Option<String>` decodes as `None` rather than failing.
-    let (_tmp2, nullable, _) = scaffold_project(
-        "import-bytea-nullable",
-        &["title:String", "blob:Option<Bytea>"],
-        &["--import"],
-    );
-    let routes = fs::read_to_string(nullable.join("src/routes/posts.rs")).unwrap();
+    let routes = fs::read_to_string(project.join("src/routes/posts.rs")).unwrap();
     assert!(
         routes.contains(r#"#[post("/posts/import")]"#),
-        "a nullable Bytea column must still get the import:\n{routes}"
+        "a required Bytea column must still get the import:\n{routes}"
+    );
+    assert!(
+        !output.contains("non-nullable Bytea column"),
+        "no refusal warning may remain:\n{output}"
     );
 }
 
@@ -1276,25 +1276,21 @@ fn assert_no_import_surface(project: &Path, expect_no_multipart: bool) {
     assert!(!test.contains("csv_import"), "{test}");
 }
 
-/// The strongest form of "additive": for a variant that cannot have the import,
-/// passing `--import` must change NOTHING. A grep only sees the strings it was
-/// told to look for; this compares the whole generated tree.
-/// A path relative to the project root, with a migration directory's 14-digit
-/// generation timestamp replaced by a fixed placeholder and `/` as the
-/// separator on every platform.
+/// The length of the migration version at the start of `name`: 14 or more
+/// digits, then `_`. A generator can add digits to the 14-digit stamp to set
+/// the order of two migrations (`{ts}1_`, `{ts}2_`). Only the first 14 digits
+/// come from the clock.
+fn version_len(name: &str) -> Option<usize> {
+    let len = name.bytes().take_while(u8::is_ascii_digit).count();
+    (len >= 14 && name.as_bytes().get(len) == Some(&b'_')).then_some(len)
+}
+
+/// The path of `path` under `root`, with `/` as the separator. In the
+/// directory directly under `migrations/`, the 14-digit stamp becomes
+/// `<timestamp>`. Digits after the stamp stay.
 ///
-/// Two things it must survive, both learned the hard way:
-///
-/// * the two scaffolds this compares are separate process runs, so they straddle
-///   a second boundary often enough to matter — hence the placeholder;
-/// * this runs on Windows too, where `Path::display()` writes `\` — hence
-///   walking COMPONENTS rather than stripping a `"migrations/"` string prefix,
-///   which silently never matched there and turned the flake into a hard
-///   failure on the slowest runner.
-///
-/// Deliberately narrow: it rewrites only a 14-digit component directly under
-/// `migrations/`, so a digit run anywhere else in a path — or in a file's
-/// contents — is untouched.
+/// The rule walks path components. A `"migrations/"` string match fails on
+/// Windows, where the separator is `\`.
 fn normalized_relative_path(path: &Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).expect("under root");
     let mut parts: Vec<String> = rel
@@ -1303,65 +1299,15 @@ fn normalized_relative_path(path: &Path, root: &Path) -> String {
         .collect();
     if parts.first().map(String::as_str) == Some("migrations")
         && let Some(dir) = parts.get_mut(1)
-        && let Some((stamp, tail)) = dir.clone().split_once('_')
-        && stamp.len() == 14
-        && stamp.bytes().all(|b| b.is_ascii_digit())
+        && version_len(dir).is_some()
     {
-        *dir = format!("<timestamp>_{tail}");
+        *dir = format!("<timestamp>{}", &dir[14..]);
     }
     parts.join("/")
 }
 
-/// `migrations/20260907011642_create_posts` → `migrations/<timestamp>_create_posts`
-/// wherever it appears in `line`. The body-side twin of
-/// [`normalized_relative_path`], for files that embed migration paths
-/// (`.autumn/generated.toml`'s digest table keys).
-fn normalize_migration_stamp(line: &str) -> String {
-    const PREFIX: &str = "migrations/";
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while let Some(i) = rest.find(PREFIX) {
-        let (head, tail) = rest.split_at(i + PREFIX.len());
-        out.push_str(head);
-        let stamp_len = tail.bytes().take_while(u8::is_ascii_digit).count();
-        if stamp_len == 14 && tail.as_bytes().get(14) == Some(&b'_') {
-            out.push_str("<timestamp>");
-            rest = &tail[14..];
-        } else {
-            rest = tail;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-#[test]
-fn normalize_migration_stamp_rewrites_only_full_stamps() {
-    assert_eq!(
-        normalize_migration_stamp(r#"[files."migrations/20260907011642_create_posts/up.sql"]"#),
-        r#"[files."migrations/<timestamp>_create_posts/up.sql"]"#
-    );
-    // Two paths on one line, both rewritten.
-    assert_eq!(
-        normalize_migration_stamp("migrations/20260907011642_a migrations/20260907011643_b"),
-        "migrations/<timestamp>_a migrations/<timestamp>_b"
-    );
-    // Not a 14-digit stamp, or no `_` after it: left alone.
-    assert_eq!(
-        normalize_migration_stamp("migrations/2026_x migrations/20260907011642x"),
-        "migrations/2026_x migrations/20260907011642x"
-    );
-    assert_eq!(
-        normalize_migration_stamp("digest = \"abc\""),
-        "digest = \"abc\""
-    );
-}
-
-/// The normalization above is what a Windows CI run caught: it used to strip a
-/// literal `"migrations/"` prefix, which never matched a `\`-separated path, so
-/// the timestamp survived and a second-boundary straddle became a hard failure
-/// on the slowest runner. `PathBuf` joining is separator-correct per platform,
-/// so building the fixture that way exercises the real shape on each one.
+/// The fixture uses `PathBuf::join`, so the test uses the separator of each
+/// platform.
 #[test]
 fn normalized_relative_path_is_separator_agnostic() {
     let root = PathBuf::from("root");
@@ -1393,16 +1339,20 @@ fn normalized_relative_path_is_separator_agnostic() {
         normalized_relative_path(&elsewhere, &root),
         "data/20260827030722_export.csv"
     );
+
+    // An order digit after the stamp stays.
+    let ordered = root.join("migrations").join("202608270307221_add_count");
+    assert_eq!(
+        normalized_relative_path(&ordered, &root),
+        "migrations/<timestamp>1_add_count"
+    );
 }
 
-/// Replace a 14-digit migration timestamp inside a generated file body with a
-/// fixed token.
+/// The body-side twin of [`normalized_relative_path`]: in each
+/// `migrations/<version>_` in `body`, the 14-digit stamp becomes `<timestamp>`.
 ///
-/// [`normalized_relative_path`] removes that timestamp from the path. The
-/// bodies carry it too: `.autumn/generated.toml` records every generated file
-/// by path, so it keys two tables on the migration directory. The manifest
-/// spells those keys with `/` on every platform, so one string rule serves all
-/// three.
+/// `.autumn/generated.toml` keys its tables on each generated path. It always
+/// writes `/`, so one string rule is correct on all platforms.
 fn normalized_timestamps(body: &str) -> String {
     const PREFIX: &str = "migrations/";
     let mut out = String::with_capacity(body.len());
@@ -1410,11 +1360,7 @@ fn normalized_timestamps(body: &str) -> String {
     while let Some(at) = rest.find(PREFIX) {
         let (head, tail) = rest.split_at(at + PREFIX.len());
         out.push_str(head);
-        let is_stamp = tail.len() >= 15
-            && tail.is_char_boundary(14)
-            && tail.as_bytes()[..14].iter().all(u8::is_ascii_digit)
-            && tail.as_bytes()[14] == b'_';
-        if is_stamp {
+        if version_len(tail).is_some() {
             out.push_str("<timestamp>");
             rest = &tail[14..];
         } else {
@@ -1425,11 +1371,8 @@ fn normalized_timestamps(body: &str) -> String {
     out
 }
 
-/// A second Windows CI failure found the same second-boundary straddle in the
-/// manifest BODY that the path normalization above already covered: two runs
-/// wrote `migrations/20260907015549_create_posts` and `…550_create_posts`, so
-/// the digest tables were keyed differently and the byte-identity gate failed
-/// for a reason the flag under test does not control.
+/// Two runs wrote `…549_create_posts` and `…550_create_posts` in the manifest
+/// (issue #2590). Both must normalize to one string.
 #[test]
 fn normalized_timestamps_rewrites_only_a_migration_stamp() {
     assert_eq!(
@@ -1470,6 +1413,16 @@ fn normalized_timestamps_rewrites_only_a_migration_stamp() {
         "data/20260907015549_export.csv"
     );
 
+    // An order digit after the stamp stays, so `{ts}1_` and `{ts}2_` differ.
+    assert_eq!(
+        normalized_timestamps("migrations/202609070155491_add_count/up.sql"),
+        "migrations/<timestamp>1_add_count/up.sql"
+    );
+    assert_ne!(
+        normalized_timestamps("migrations/202609070155491_a"),
+        normalized_timestamps("migrations/202609070155492_a")
+    );
+
     // A truncated tail must not panic or invent a token.
     assert_eq!(normalized_timestamps("migrations/"), "migrations/");
     assert_eq!(
@@ -1478,72 +1431,291 @@ fn normalized_timestamps_rewrites_only_a_migration_stamp() {
     );
 }
 
+/// The files and directories under `root` as sorted `(path, body)` pairs, for
+/// a comparison of two generated trees. A directory is a `"<path>/"` entry.
+///
+/// Each migration stamp in a path or a body becomes `<timestamp>`, because two
+/// runs can be in different seconds. The fresh secrets are skipped. In
+/// `.autumn/generated.toml`, the `invocation =` lines and the `[[runs.`
+/// headers are removed. All other bytes stay.
+fn tree_snapshot(root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("readable dir") {
+            let path = entry.expect("dir entry").path();
+            let rel = normalized_relative_path(&path, root);
+            if path.is_dir() {
+                // An empty dir is part of the tree shape too.
+                out.push((format!("{rel}/"), String::new()));
+                stack.push(path);
+                continue;
+            }
+            // `autumn new` writes new secrets on each run.
+            if rel == "config/master.key"
+                || (rel.starts_with("config/credentials/")
+                    && Path::new(&rel).extension().is_some_and(|ext| ext == "enc"))
+            {
+                continue;
+            }
+            let bytes = fs::read(&path).expect("readable file");
+            let body = match String::from_utf8(bytes) {
+                Ok(text) => normalized_timestamps(&text),
+                Err(e) => format!("<non-UTF-8 {:02x?}>", e.as_bytes()),
+            };
+            // The manifest records the command (issue #1835), and the run id
+            // is a hash of it. The two runs use different commands by design.
+            // The digests and the edits stay in the comparison (issue #2560).
+            let body = if rel == ".autumn/generated.toml" {
+                body.split_inclusive('\n')
+                    .filter(|line| {
+                        !line.starts_with("invocation = ") && !line.starts_with("[[runs.")
+                    })
+                    .collect()
+            } else {
+                body
+            };
+            out.push((rel, body));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Wait until the clock gives a stamp later than `stamp`. A generator run
+/// that starts after this call then writes a different stamp.
+///
+/// The wait compares with `stamp`, not with the start time, so a clock step
+/// back does not end the wait too early.
+fn wait_until_after(stamp: &str) {
+    use std::time::{Duration, Instant};
+    let now = || chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while now().as_str() <= stamp {
+        assert!(
+            Instant::now() < deadline || now().as_str() > stamp,
+            "the clock did not pass {stamp} in 30 s"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The sorted 14-digit stamps of the migration directories under `root`.
+fn migration_stamps(root: &Path) -> Vec<String> {
+    let mut stamps: Vec<String> = fs::read_dir(root.join("migrations"))
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            version_len(&name)?;
+            Some(name[..14].to_owned())
+        })
+        .collect();
+    stamps.sort();
+    stamps
+}
+
+/// Write `files` in a new temporary directory. A path uses `/`.
+fn fixture_tree(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    for (rel, body) in files {
+        let path = tmp.path().join(rel);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, body).expect("write");
+    }
+    tmp
+}
+
+const MANIFEST: &str = ".autumn/generated.toml";
+
+/// A scaffold-shaped tree whose migration has `stamp`.
+fn stamped_tree(stamp: &str, digest: &str) -> Vec<(String, Vec<u8>)> {
+    let manifest = format!(
+        "[files.\"migrations/{stamp}_create_posts/up.sql\"]\n\
+         digest = \"{digest}\"\n\
+         invocation = \"scaffold\"\n"
+    );
+    vec![
+        (
+            format!("migrations/{stamp}_create_posts/up.sql"),
+            b"CREATE TABLE posts ();".to_vec(),
+        ),
+        (MANIFEST.to_owned(), manifest.into_bytes()),
+        (
+            "src/routes/posts.rs".to_owned(),
+            b"pub fn index() {}".to_vec(),
+        ),
+    ]
+}
+
+fn snapshot_of(files: &[(String, Vec<u8>)]) -> Vec<(String, String)> {
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(rel, body)| (rel.as_str(), body.as_slice()))
+        .collect();
+    let tmp = fixture_tree(&refs);
+    tree_snapshot(tmp.path())
+}
+
+/// Two runs one second apart compare equal. A real change does not.
+#[test]
+fn tree_snapshot_ignores_only_the_migration_stamp() {
+    let at_49 = stamped_tree("20260907015549", "ab");
+    let at_50 = stamped_tree("20260907015550", "ab");
+    assert_eq!(snapshot_of(&at_49), snapshot_of(&at_50));
+
+    // A changed digest.
+    assert_ne!(
+        snapshot_of(&at_49),
+        snapshot_of(&stamped_tree("20260907015550", "cd"))
+    );
+
+    // A changed body.
+    let mut body = at_50.clone();
+    body[2].1 = b"pub fn index() { todo!() }".to_vec();
+    assert_ne!(snapshot_of(&at_49), snapshot_of(&body));
+
+    // A renamed migration.
+    let mut renamed = at_50.clone();
+    renamed[0].0 = "migrations/20260907015550_create_articles/up.sql".to_owned();
+    assert_ne!(snapshot_of(&at_49), snapshot_of(&renamed));
+
+    // An added file.
+    let mut added = at_50;
+    added.push(("src/routes/import.rs".to_owned(), b"".to_vec()));
+    assert_ne!(snapshot_of(&at_49), snapshot_of(&added));
+}
+
+/// An added empty dir changes the tree shape.
+#[test]
+fn tree_snapshot_sees_an_empty_dir() {
+    let files = stamped_tree("20260907015549", "ab");
+    let plain = snapshot_of(&files);
+    let refs: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(rel, body)| (rel.as_str(), body.as_slice()))
+        .collect();
+    let tmp = fixture_tree(&refs);
+    fs::create_dir_all(tmp.path().join("src/imports")).expect("mkdir");
+    assert_ne!(plain, tree_snapshot(tmp.path()));
+}
+
+/// The manifest filter drops only the command lines. A changed edit record
+/// under a run still fails the compare (issue #2560).
+#[test]
+fn tree_snapshot_compares_the_manifest_edits() {
+    let manifest = |invocation: &str, run: &str, revert: &str| {
+        let mut files = stamped_tree("20260907015549", "ab");
+        files[1].1 = format!(
+            "[files.\"src/routes/posts.rs\"]\n\
+             digest = \"ab\"\n\
+             invocation = \"{invocation}\"\n\
+             \n\
+             [[runs.{run}]]\n\
+             path = \"src/main.rs\"\n\
+             revert = \"{revert}\"\n"
+        )
+        .into_bytes();
+        snapshot_of(&files)
+    };
+    let base = manifest("scaffold --import", "h1", "MainRoute(a)");
+    assert_eq!(base, manifest("scaffold", "h2", "MainRoute(a)"));
+    assert_ne!(base, manifest("scaffold", "h2", "MainRoute(b)"));
+    assert!(
+        base.iter()
+            .any(|(_, body)| body.ends_with("revert = \"MainRoute(a)\"\n")),
+        "the manifest keeps its last newline: {base:?}"
+    );
+}
+
+/// A file that is not UTF-8 is part of the tree too.
+#[test]
+fn tree_snapshot_sees_a_non_utf8_file() {
+    let plain = stamped_tree("20260907015549", "ab");
+    let mut with_binary = plain.clone();
+    with_binary.push(("static/icon.bin".to_owned(), vec![0xff, 0xfe, 0x00]));
+    assert_ne!(
+        snapshot_of(&plain),
+        snapshot_of(&with_binary),
+        "an added non-UTF-8 file must change the snapshot"
+    );
+
+    let mut changed = with_binary.clone();
+    changed.last_mut().expect("binary").1 = vec![0xff, 0xfe, 0x01];
+    assert_ne!(
+        snapshot_of(&with_binary),
+        snapshot_of(&changed),
+        "a changed non-UTF-8 file must change the snapshot"
+    );
+}
+
+/// `autumn new` writes fresh secrets on each run. They are the only files the
+/// snapshot skips. The paths are the ones `autumn new` writes.
+#[test]
+fn tree_snapshot_skips_only_the_fresh_secrets() {
+    let mut a = stamped_tree("20260907015549", "ab");
+    let mut b = a.clone();
+    a.push(("config/master.key".to_owned(), b"aaaa".to_vec()));
+    b.push(("config/master.key".to_owned(), b"bbbb".to_vec()));
+    a.push((
+        "config/credentials/development.toml.enc".to_owned(),
+        vec![0xff, 0x01],
+    ));
+    b.push((
+        "config/credentials/development.toml.enc".to_owned(),
+        vec![0xff, 0x02],
+    ));
+    assert_eq!(snapshot_of(&a), snapshot_of(&b));
+
+    // A file that only looks like a secret is still compared.
+    let mut c = a.clone();
+    c.push(("docs/master.key.md".to_owned(), b"notes".to_vec()));
+    assert_ne!(snapshot_of(&a), snapshot_of(&c));
+}
+
+#[test]
+fn migration_stamps_reads_only_real_stamps() {
+    let tmp = fixture_tree(&[
+        ("migrations/20260907015550_create_posts/up.sql", b""),
+        ("migrations/20260907015549_create_users/up.sql", b""),
+        ("migrations/readme_notes/up.sql", b""),
+        ("migrations/2026090701554_short/up.sql", b""),
+        ("migrations/202609070155511_add_count/up.sql", b""),
+    ]);
+    assert_eq!(
+        migration_stamps(tmp.path()),
+        ["20260907015549", "20260907015550", "20260907015551"]
+    );
+    let empty = tempfile::tempdir().expect("tempdir");
+    assert!(migration_stamps(empty.path()).is_empty());
+}
+
+/// For a variant that cannot have the import, `--import` must not change the
+/// generated tree.
+///
+/// The two scaffolds always run in different seconds, so their migration stamps
+/// always differ. A stamp that the snapshot does not normalize then fails on
+/// every run, not only on a slow runner (issue #2600).
 fn assert_import_flag_changes_nothing(name: &str, extra: &[&str]) {
     let mut flags = vec!["--import"];
     flags.extend_from_slice(extra);
-    // The SAME project name for both, in their own tempdirs: `autumn new` stamps
-    // the name into `.env.example`, `Cargo.toml` and the README, so two names
-    // would differ for reasons that have nothing to do with the flag.
+    // The SAME project name for both: `autumn new` writes the name into
+    // `.env.example`, `Cargo.toml` and the README. Two names would differ for a
+    // reason other than the flag.
     let with_flag = scaffold_project(name, &default_cols(), &flags);
+    let stamps_a = migration_stamps(&with_flag.1);
+    let last = stamps_a
+        .last()
+        .expect("the scaffold must write a migration");
+    wait_until_after(last);
     let without = scaffold_project(name, &default_cols(), extra);
-    let files = |root: &Path| -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            for entry in fs::read_dir(&dir).expect("readable dir") {
-                let path = entry.expect("dir entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                } else if let Ok(body) = fs::read_to_string(&path) {
-                    // The migration directory embeds a generation timestamp to
-                    // the SECOND (`migrations/20260827030722_create_posts/`), and
-                    // the two scaffolds this compares are two separate process
-                    // runs — so they straddle a second boundary often enough to
-                    // matter, and the raw paths would then differ for a reason
-                    // that has nothing to do with the flag under test. Normalize
-                    // the timestamp away; the rest of the path (and every file
-                    // body) is still compared exactly.
-                    let rel = normalized_relative_path(&path, root);
-                    // Freshly generated secrets differ by construction; every
-                    // other file is the generator's own output.
-                    if rel.contains("master.key") || rel.contains("credentials.enc") {
-                        continue;
-                    }
-                    // The bodies carry the migration timestamp too — the
-                    // manifest keys a digest table on each generated path — so
-                    // they need the same normalization the path got.
-                    let body = normalized_timestamps(&body);
-                    // `.autumn/generated.toml` records the digest of each file
-                    // AND the command that wrote it (issue #1835). The two runs
-                    // type different commands by construction — that is the
-                    // flag under test — so the recorded command differs while
-                    // the digests, which describe the output this gate is
-                    // about, must not. Compare the digests, drop the command.
-                    //
-                    // Its table keys embed the migration directory too
-                    // (`[files."migrations/20260907011642_create_posts/up.sql"]`),
-                    // so the same second-boundary straddle the path
-                    // normalization above guards against would otherwise
-                    // survive inside this file's body — which is exactly what
-                    // a Windows CI run caught (issue #2590).
-                    let body = if rel.ends_with(".autumn/generated.toml") {
-                        body.lines()
-                            .filter(|line| !line.starts_with("invocation = "))
-                            .map(normalize_migration_stamp)
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    } else {
-                        body
-                    };
-                    out.push((rel, body));
-                }
-            }
-        }
-        out.sort();
-        out
-    };
-    let a = files(&with_flag.1);
-    let b = files(&without.1);
+    let stamps_b = migration_stamps(&without.1);
+    assert_ne!(
+        stamps_a, stamps_b,
+        "the two runs must be in different seconds, or this gate tests nothing"
+    );
+    let a = tree_snapshot(&with_flag.1);
+    let b = tree_snapshot(&without.1);
     assert_eq!(
         a.len(),
         b.len(),

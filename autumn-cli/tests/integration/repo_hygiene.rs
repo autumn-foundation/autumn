@@ -486,6 +486,13 @@ fn shell_release_scripts_are_lf_normalized() {
         attributes.contains("*.sh text eol=lf"),
         ".gitattributes must force LF checkout for shell scripts so release gates run under bash"
     );
+    // A `*.sh.tmpl` template does not match `*.sh`. `autumn release init`
+    // writes it out as a bash script, so a CRLF checkout on Windows would
+    // ship a script that bash cannot run (#2314).
+    assert!(
+        attributes.contains("autumn-cli/src/templates/**/*.sh.tmpl text eol=lf"),
+        ".gitattributes must force LF checkout for scaffolded shell script templates"
+    );
 
     let scripts_dir = root.join("scripts");
     for entry in std::fs::read_dir(&scripts_dir)
@@ -795,6 +802,66 @@ fn container_test_jobs_pre_pull_their_images() {
     assert!(
         root.join("scripts/ci-prepull-images.sh").is_file(),
         "scripts/ci-prepull-images.sh is missing"
+    );
+}
+
+/// Body of the top-level job `name` in ci.yml, up to the next job.
+fn ci_job<'a>(ci: &'a str, name: &str) -> &'a str {
+    let head = format!("\n  {name}:\n");
+    let start = ci
+        .find(&head)
+        .unwrap_or_else(|| panic!("ci.yml must define job `{name}`"));
+    let body = &ci[start + head.len()..];
+    let end = body
+        .lines()
+        .scan(0, |off, l| {
+            let at = *off;
+            *off += l.len() + 1;
+            Some((at, l))
+        })
+        .find(|(_, l)| {
+            l.starts_with("  ")
+                && !l.starts_with("   ")
+                && !l.trim_start().starts_with('#')
+                && l.trim_end().ends_with(':')
+        })
+        .map_or(body.len(), |(at, _)| at);
+    &body[..end]
+}
+
+/// `deploy_e2e` builds its own image on top of the sweep's images. This filled
+/// the runner disk (#2547). It must run in its own job on a fresh disk. The
+/// aggregate gate must wait for that job.
+#[test]
+fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
+    let root = workspace_root();
+    // A Windows checkout can turn LF into CRLF.
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace("\r\n", "\n");
+    let sweep = ci_job(&ci, "test-docker");
+    assert!(
+        !sweep.contains("--test deploy_e2e"),
+        "`test-docker` must not run deploy_e2e: its disk is already full (#2547)"
+    );
+    let job = ci_job(&ci, "test-docker-deploy");
+    assert!(
+        job.contains("cargo test -p autumn-cli --test deploy_e2e -- --ignored"),
+        "`test-docker-deploy` must run the deploy_e2e suite"
+    );
+    assert!(
+        job.contains("Free disk space") && job.contains("df -h"),
+        "`test-docker-deploy` must reclaim disk and report it"
+    );
+    assert!(
+        job.contains("openssh-client") && job.contains("ci-docker-hub-mirror.sh"),
+        "`test-docker-deploy` must install the ssh client and use the Docker Hub mirror"
+    );
+    let gate = ci_job(&ci, "test-gate");
+    assert!(
+        gate.lines()
+            .any(|l| l.trim_start().starts_with("needs:") && l.contains("test-docker-deploy")),
+        "`test-gate` must need `test-docker-deploy`"
     );
 }
 
@@ -1199,6 +1266,7 @@ fn cli_tests_cold_start_ignored_tests_are_ci_named() {
         "integration::scaffold_form_for::generated_form_for_scaffold_cargo_checks",
         "integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks",
         "integration::scaffold_validation::documented_scaffold_example_builds_without_warnings",
+        "integration::console::console_repl_runs_and_reports_errors_as_script_errors",
     ] {
         assert!(
             invocations.contains(&format!("{test_name} -- --ignored --exact")),
@@ -1800,6 +1868,48 @@ fn deployment_guide_references_build_and_boot_gate() {
         doc.contains("release-image-boot"),
         "deployment.md must reference the `release-image-boot` CI gate as the proof \
          behind the documented 10-minute deploy promise",
+    );
+}
+
+#[test]
+fn azure_walkthrough_runs_the_cutover_script_after_migrations() {
+    // #2314: main.tf keeps credentials off the placeholder app. The manual
+    // walkthrough must attach them with the scaffolded script, which sets
+    // them and the real image in one write.
+    let doc_path = workspace_root().join("docs/guide/deployment.md");
+    let doc = std::fs::read_to_string(&doc_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", doc_path.display()));
+    let section = |heading: &str| -> String {
+        doc.split(heading)
+            .nth(1)
+            .and_then(|rest| rest.split("\n## ").next())
+            .unwrap_or_else(|| panic!("deployment.md must have a `{heading}` section"))
+            .to_owned()
+    };
+    let azure = section("## Deploy to Azure Container Apps");
+    let migrate_at = azure
+        .find("az containerapp job start \\")
+        .expect("the Azure walkthrough must run the migration job");
+    let cutover_at = azure
+        .find("bash azure-cutover.sh")
+        .expect("the Azure walkthrough must run the cutover script");
+    assert!(
+        migrate_at < cutover_at,
+        "the Azure walkthrough must migrate before the cutover"
+    );
+    for split in [
+        "az containerapp identity assign",
+        "az containerapp secret set",
+        "az containerapp update \\",
+    ] {
+        assert!(
+            !azure.contains(split),
+            "the Azure walkthrough must not use the separate write `{split}`"
+        );
+    }
+    assert!(
+        !section("## Deploy to GCP Cloud Run").contains("az containerapp"),
+        "Azure commands must stay out of the GCP section"
     );
 }
 
@@ -9481,4 +9591,282 @@ fn capacity_contract_scheduled_probe_uses_declared_defaults() {
             rest = &after[name_len..];
         }
     }
+}
+
+/// CI lints the Kubernetes release templates and the golden SLO files with
+/// the real tools (issue #3069): `helm lint`, `kubeconform` and `promtool`.
+#[test]
+fn ci_lints_the_kubernetes_manifests_and_slo_files() {
+    let root = workspace_root();
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace("\r\n", "\n");
+    let commands = workflow_commands(&workflow);
+    assert!(
+        commands.iter().any(|c| c
+            == "./scripts/check-k8s-manifests.sh --self-test && ./scripts/check-k8s-manifests.sh"),
+        "ci.yml must run the Kubernetes manifest gate and its self-test: {commands:?}"
+    );
+    let script = std::fs::read_to_string(root.join("scripts/check-k8s-manifests.sh"))
+        .expect("read scripts/check-k8s-manifests.sh");
+    assert!(
+        script.contains("kubernetes-json-schema/${K8S_SCHEMA_COMMIT}/")
+            && script.contains("CRDs-catalog/${CRD_CATALOG_COMMIT}/"),
+        "schemas must come from the pinned commits"
+    );
+    for needle in [
+        "lint --strict",
+        "kubeconform",
+        "build \"${rendered}/kustomize\"",
+        "check rules",
+        "test rules",
+        "checksum mismatch",
+        "K8S_SCHEMA_COMMIT=",
+        "CRD_CATALOG_COMMIT=",
+        "-cache",
+    ] {
+        assert!(script.contains(needle), "the gate must run `{needle}`");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(root.join("scripts/check-k8s-manifests.sh"))
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "scripts/check-k8s-manifests.sh must be executable"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Example posture gate: acknowledgment reaches CI (issue #2502)
+// ---------------------------------------------------------------------------
+
+/// The `posture-gate` job of `publish-gate.yml`.
+fn posture_gate_job(root: &Path) -> String {
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/publish-gate.yml"))
+        .expect("read publish-gate.yml");
+    workflow
+        .split("\n  posture-gate:")
+        .nth(1)
+        .and_then(|job| job.split("\n  # ---").next())
+        .expect("publish-gate.yml must define a posture-gate job")
+        .to_owned()
+}
+
+#[test]
+fn posture_gate_job_harvests_pull_request_acknowledgments() {
+    let job = posture_gate_job(&workspace_root());
+    assert!(
+        job.contains("AUTUMN_POSTURE_ACK_DIR"),
+        "the job must hand the script an acknowledgment directory"
+    );
+    assert!(
+        job.contains("collaborators/") && job.contains("admin|write|maintain"),
+        "only commenters with admin, write or maintain permission may acknowledge"
+    );
+    assert!(
+        job.contains("pull-requests: read"),
+        "the job needs read access to pull request comments"
+    );
+    assert!(
+        job.contains("does not re-run") && job.contains("acknowledgment accepted from"),
+        "the job must explain the re-run path and log each accepted acknowledger"
+    );
+    let harvest = job
+        .split("- name: ")
+        .find(|step| step.contains("collaborators/"))
+        .expect("a harvest step");
+    assert!(
+        harvest.contains("github.event_name == 'pull_request'"),
+        "harvest runs on pull requests only: tag pushes and dispatch have no comments"
+    );
+}
+
+#[test]
+fn posture_gate_job_checks_the_reddit_clone_demo() {
+    let job = posture_gate_job(&workspace_root());
+    assert!(
+        job.contains("run: ./scripts/check-posture-demo.sh"),
+        "the golden diff in docs/guide/posture-gate.md is only real while CI checks it: {job}"
+    );
+}
+
+#[test]
+fn posture_gate_job_takes_a_dispatch_acknowledgment_through_env() {
+    let root = workspace_root();
+    let workflow = std::fs::read_to_string(root.join(".github/workflows/publish-gate.yml"))
+        .expect("read publish-gate.yml");
+    assert!(
+        workflow.contains("posture_ack:"),
+        "workflow_dispatch must have a posture_ack input"
+    );
+    let job = posture_gate_job(&root);
+    assert!(
+        job.contains("AUTUMN_POSTURE_ACK: ${{ inputs.posture_ack }}"),
+        "the input must reach the script through env"
+    );
+    let run_blocks_inline_input = job
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("AUTUMN_POSTURE_ACK:"))
+        .any(|line| line.contains("inputs.posture_ack"));
+    assert!(
+        !run_blocks_inline_input,
+        "never expand the input inside a shell script"
+    );
+}
+
+#[test]
+fn posture_gate_script_documents_the_acknowledgment_scope() {
+    let root = workspace_root();
+    let script = std::fs::read_to_string(root.join("scripts/check-posture-gate.sh"))
+        .expect("read check-posture-gate.sh");
+    let header = script.split("set -euo pipefail").next().expect("header");
+    assert!(
+        header.contains("AUTUMN_POSTURE_ACK_DIR")
+            && header.contains("tag")
+            && header.contains("workflow_dispatch"),
+        "the header must name the directory variable and the tag and dispatch scope"
+    );
+}
+
+/// The examples `scripts/check-posture-gate.sh` gates, in its `EXAMPLES` order.
+const POSTURE_EXAMPLES: [&str; 5] = ["hello", "flock", "invoice", "todo-app", "reddit-clone"];
+
+/// Run the posture script with a stub `cargo` and a stub `autumn`.
+/// Return the log of stub calls and the script output.
+#[cfg(unix)]
+fn run_posture_script_with_stubs(envs: &[(&str, &str)]) -> (String, String) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = workspace_root();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join("scripts")).expect("mkdir scripts");
+    std::fs::copy(
+        root.join("scripts/check-posture-gate.sh"),
+        repo.join("scripts/check-posture-gate.sh"),
+    )
+    .expect("copy script");
+    for example in POSTURE_EXAMPLES {
+        let dir = repo.join("examples").join(example);
+        std::fs::create_dir_all(&dir).expect("mkdir example");
+        std::fs::write(dir.join("security-posture.json"), "{}").expect("baseline");
+    }
+
+    let target = tmp.path().join("target");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir bin");
+    let log = tmp.path().join("calls.log");
+    let write_exec = |path: &Path, body: &str| {
+        std::fs::write(path, body).expect("write stub");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    // The stub CLI logs its arguments and writes an empty manifest on `audit`.
+    let cli_stub = r#"#!/usr/bin/env bash
+echo "$*" >> "$STUB_LOG"
+if [ "$1 $2" = "routes audit" ]; then
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "--manifest" ]; then echo '{}' > "$2"; fi
+    shift
+  done
+fi
+if [ "$1 $2" = "routes posture" ] && [ "$3" = "digest" ]; then echo digest; fi
+exit 0
+"#;
+    write_exec(
+        &bin.join("cargo"),
+        &format!(
+            "#!/usr/bin/env bash\nmkdir -p \"{t}/debug\"\ncat > \"{t}/debug/autumn\" <<'STUB'\n{cli_stub}STUB\nchmod +x \"{t}/debug/autumn\"\n",
+            t = target.display()
+        ),
+    );
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut cmd = bash_command();
+    cmd.arg(repo.join("scripts/check-posture-gate.sh"))
+        .current_dir(&repo)
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", &target)
+        .env("STUB_LOG", &log)
+        .env_remove("AUTUMN_POSTURE_ACK")
+        .env_remove("AUTUMN_POSTURE_ACK_DIR")
+        .env("POSTURE_BASE_REF", "refs/none")
+        .env_remove("GITHUB_BASE_REF");
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().expect("run script");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "script failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (std::fs::read_to_string(&log).unwrap_or_default(), stdout)
+}
+
+/// The stub harness builds one baseline per example. A list that lags the
+/// script fails it with "no committed baseline" instead of testing anything.
+#[test]
+fn posture_examples_match_the_script() {
+    let script = std::fs::read_to_string(workspace_root().join("scripts/check-posture-gate.sh"))
+        .expect("read check-posture-gate.sh");
+    let line = script
+        .lines()
+        .find(|l| l.starts_with("EXAMPLES=("))
+        .expect("the script declares EXAMPLES=(...)");
+    let listed: Vec<&str> = line
+        .trim_start_matches("EXAMPLES=(")
+        .trim_end_matches(')')
+        .split_whitespace()
+        .map(|w| w.trim_matches('"'))
+        .collect();
+    assert_eq!(listed, POSTURE_EXAMPLES);
+}
+
+#[cfg(unix)]
+#[test]
+fn posture_script_passes_the_ack_dir_to_the_diff_and_logs_it() {
+    let (calls, out) = run_posture_script_with_stubs(&[("AUTUMN_POSTURE_ACK_DIR", "/acks")]);
+    let diffs: Vec<_> = calls
+        .lines()
+        .filter(|l| l.starts_with("routes posture diff"))
+        .collect();
+    assert_eq!(
+        diffs.len(),
+        POSTURE_EXAMPLES.len(),
+        "one diff per example: {calls}"
+    );
+    assert!(
+        diffs.iter().all(|l| l.contains("--ack-dir /acks")),
+        "every diff must carry --ack-dir: {diffs:?}"
+    );
+    assert!(
+        out.contains("AUTUMN_POSTURE_ACK_DIR"),
+        "the job log must record the directory: {out}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn posture_script_passes_both_ack_forms_and_never_unprompted() {
+    let (calls, _) = run_posture_script_with_stubs(&[
+        ("AUTUMN_POSTURE_ACK", "abc ceiling=x"),
+        ("AUTUMN_POSTURE_ACK_DIR", "/acks"),
+    ]);
+    assert!(calls.contains("--ack abc ceiling=x") && calls.contains("--ack-dir /acks"));
+
+    let (calls, _) = run_posture_script_with_stubs(&[("AUTUMN_POSTURE_ACK_DIR", "")]);
+    assert!(
+        !calls.contains("--ack"),
+        "an empty directory variable must not acknowledge anything: {calls}"
+    );
 }

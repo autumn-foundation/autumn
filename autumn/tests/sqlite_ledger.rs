@@ -36,7 +36,7 @@ use autumn_web::config::DatabaseConfig;
 use autumn_web::current::with_actor;
 use autumn_web::db::{RuntimeConnection, create_pool};
 use autumn_web::hooks::Patch;
-use autumn_web::ledger::{LedgerAsOf, LedgerBreak};
+use autumn_web::ledger::{LedgerAsOf, LedgerBreak, LedgerPageRequest};
 use autumn_web::reexports::{chrono, diesel, diesel_async};
 use autumn_web::tenancy::with_tenant;
 use autumn_web::version_history::VersionOp;
@@ -66,6 +66,23 @@ mod schema {
             id -> Int8,
             body -> Text,
             effective_at -> Timestamp,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
+        lg_renamed_notes (id) {
+            id -> Int8,
+            title -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
+        lg_sealed_notes (id) {
+            id -> Int8,
+            body -> Text,
+            secret -> Text,
             deleted_at -> Nullable<Timestamp>,
         }
     }
@@ -112,11 +129,20 @@ mod schema {
             deleted_at -> Nullable<Timestamp>,
         }
     }
+
+    autumn_web::reexports::diesel::table! {
+        lg_movable_invoices (id) {
+            id -> Int8,
+            reference -> Text,
+            tenant_id -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
 }
 
 use schema::{
-    lg_cascade_children, lg_cascade_parents, lg_effective_notes, lg_invoices, lg_secret_notes,
-    lg_tenant_invoices, lg_vault_notes,
+    lg_cascade_children, lg_cascade_parents, lg_effective_notes, lg_invoices, lg_movable_invoices,
+    lg_renamed_notes, lg_sealed_notes, lg_secret_notes, lg_tenant_invoices, lg_vault_notes,
 };
 
 #[autumn_web::model(table = "lg_invoices")]
@@ -162,6 +188,27 @@ pub struct LgTenantInvoice {
 )]
 pub trait LgTenantInvoiceRepository {}
 
+/// A tenant-scoped model whose `tenant_id` is a writable field, so an
+/// across-tenants update can try to move the row (#2319).
+#[autumn_web::model(table = "lg_movable_invoices")]
+pub struct LgMovableInvoice {
+    #[id]
+    pub id: i64,
+    pub reference: String,
+    pub tenant_id: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(
+    LgMovableInvoice,
+    table = "lg_movable_invoices",
+    tenant_scoped,
+    soft_delete,
+    ledgered = true
+)]
+pub trait LgMovableInvoiceRepository {}
+
 /// A model whose valid time comes from its own column, so the two axes diverge.
 #[autumn_web::model(table = "lg_effective_notes")]
 #[derive(PartialEq, Eq)]
@@ -181,6 +228,76 @@ pub struct LgEffectiveNote {
     ledgered(valid_time = "effective_at")
 )]
 pub trait LgEffectiveNoteRepository {}
+
+/// A model at snapshot schema version 2. Version 1 called `title` `subject` (#2326).
+#[autumn_web::model(table = "lg_renamed_notes")]
+#[derive(PartialEq, Eq)]
+pub struct LgRenamedNote {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+/// Convert a version 1 snapshot. A `legacy_flag` marks a shape with no rule.
+fn upcast_lg_renamed_note(from: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+    if from < 2 {
+        let object = snapshot
+            .as_object_mut()
+            .ok_or("the snapshot is not an object")?;
+        if object.contains_key("legacy_flag") {
+            return Err("a legacy shape with no rule".to_string());
+        }
+        let subject = object
+            .remove("subject")
+            .ok_or("the snapshot has no `subject`")?;
+        object.insert("title".to_string(), subject);
+    }
+    Ok(())
+}
+
+#[autumn_web::repository(
+    LgRenamedNote,
+    table = "lg_renamed_notes",
+    soft_delete,
+    ledgered(schema_version = 2, upcast = upcast_lg_renamed_note)
+)]
+pub trait LgRenamedNoteRepository {}
+
+/// A model at snapshot schema version 2 with an encrypted column. Version 1
+/// called the column `hidden` (#2326).
+#[autumn_web::model(table = "lg_sealed_notes")]
+pub struct LgSealedNote {
+    #[id]
+    pub id: i64,
+    pub body: String,
+    #[encrypted]
+    pub secret: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+fn upcast_lg_sealed_note(from: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+    if from < 2 {
+        let object = snapshot
+            .as_object_mut()
+            .ok_or("the snapshot is not an object")?;
+        let hidden = object
+            .remove("hidden")
+            .ok_or("the snapshot has no `hidden`")?;
+        object.insert("secret".to_string(), hidden);
+    }
+    Ok(())
+}
+
+#[autumn_web::repository(
+    LgSealedNote,
+    table = "lg_sealed_notes",
+    soft_delete,
+    ledgered(schema_version = 2, upcast = upcast_lg_sealed_note)
+)]
+pub trait LgSealedNoteRepository {}
 
 // ── A hard-deleting parent cascading into a ledgered child ───────────
 //
@@ -349,6 +466,12 @@ async fn boot_pool_without_high_water(db_name: &str) -> SqlitePool {
                  tenant_id TEXT NOT NULL, \
                  deleted_at TIMESTAMP\
              )",
+            "CREATE TABLE lg_movable_invoices (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 reference TEXT NOT NULL, \
+                 tenant_id TEXT NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
             "CREATE TABLE lg_vault_notes (\
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
                  body TEXT NOT NULL, \
@@ -369,6 +492,17 @@ async fn boot_pool_without_high_water(db_name: &str) -> SqlitePool {
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
                  body TEXT NOT NULL, \
                  internal_note TEXT NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
+            "CREATE TABLE lg_renamed_notes (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 title TEXT NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
+            "CREATE TABLE lg_sealed_notes (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 body TEXT NOT NULL, \
+                 secret TEXT NOT NULL, \
                  deleted_at TIMESTAMP\
              )",
             "CREATE TABLE lg_effective_notes (\
@@ -2374,7 +2508,6 @@ async fn high_water_marks_are_per_tenant() {
                 created.id,
                 &UpdateLgTenantInvoice {
                     reference: Patch::Set(format!("A-1-{step}")),
-                    ..Default::default()
                 },
             )
             .await
@@ -2851,7 +2984,6 @@ async fn a_declared_valid_time_column_separates_the_two_axes() {
         &UpdateLgEffectiveNote {
             body: Patch::Set("v2".to_string()),
             effective_at: Patch::Set(earlier),
-            ..Default::default()
         },
     )
     .await
@@ -2911,6 +3043,275 @@ async fn a_declared_valid_time_column_separates_the_two_axes() {
     );
 }
 
+// ── #2326: snapshot fidelity ─────────────────────────────────────────
+
+#[tokio::test]
+async fn a_non_finite_float_cannot_be_written_to_a_ledgered_row() {
+    let pool = boot_pool("lg_non_finite").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+
+    let err = repo
+        .save(&NewLgInvoice {
+            reference: "INV-INF".to_string(),
+            amount_cents: 1,
+            amount_rate: f64::INFINITY,
+            metadata: "{}".to_string(),
+        })
+        .await
+        .expect_err("a snapshot cannot hold infinity");
+    let text = err.to_string();
+    assert!(
+        text.contains("amount_rate") && text.contains("lg_invoices"),
+        "the error names the table and the column: {text}"
+    );
+
+    let all = repo.find_all().await.expect("list");
+    assert!(all.is_empty(), "the refused write left no row behind");
+}
+
+#[tokio::test]
+async fn a_non_finite_update_is_refused_and_leaves_the_chain_intact() {
+    let pool = boot_pool("lg_non_finite_update").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let id = write_three_revisions(&repo).await;
+
+    repo.update(
+        id,
+        &UpdateLgInvoice {
+            amount_rate: Patch::Set(f64::NEG_INFINITY),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("infinity must be refused");
+
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 3, "no revision was appended");
+    let live = repo.find_by_id(id).await.expect("read").expect("row");
+    assert!(live.amount_rate.is_finite(), "the row kept its old value");
+}
+
+/// A trigger can write the float after the statement's `RETURNING` row was
+/// taken. The check reads the reloaded row (#2319).
+#[tokio::test]
+async fn a_trigger_written_infinity_is_refused_and_leaves_the_chain_intact() {
+    let pool = boot_pool("lg_non_finite_trigger").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_invoices_inf AFTER UPDATE OF reference ON lg_invoices \
+             WHEN NEW.reference = 'INV-INF' \
+             BEGIN UPDATE lg_invoices SET amount_rate = 9e999 WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+
+    let err = repo
+        .update(
+            id,
+            &UpdateLgInvoice {
+                reference: Patch::Set("INV-INF".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("the trigger wrote infinity");
+    assert!(err.to_string().contains("amount_rate"), "{err}");
+
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 3, "no revision was appended");
+    let live = repo.find_by_id(id).await.expect("read").expect("row");
+    assert!(live.amount_rate.is_finite(), "the update rolled back");
+}
+
+/// A restore writes no float, but a trigger can. The value was finite before
+/// the restore, so the restore is refused (#2319).
+#[tokio::test]
+async fn a_trigger_written_infinity_during_restore_is_refused() {
+    let pool = boot_pool("lg_non_finite_restore_trigger").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    repo.delete_by_id(id).await.expect("delete");
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_invoices_restore_inf AFTER UPDATE OF deleted_at ON lg_invoices \
+             WHEN NEW.deleted_at IS NULL \
+             BEGIN UPDATE lg_invoices SET amount_rate = 9e999 WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+
+    let err = repo
+        .restore(id)
+        .await
+        .expect_err("the trigger wrote infinity");
+    assert!(err.to_string().contains("amount_rate"), "{err}");
+    assert!(
+        repo.find_by_id(id).await.expect("read").is_none(),
+        "the restore rolled back"
+    );
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 4, "no revision was appended");
+}
+
+/// A row that already held infinity before the write (a legacy value) can
+/// still be deleted and restored: neither writes the float (#2326).
+#[tokio::test]
+async fn a_legacy_non_finite_row_can_still_be_deleted_and_restored() {
+    let pool = boot_pool("lg_non_finite_legacy").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query("UPDATE lg_invoices SET amount_rate = 9e999 WHERE id = ?")
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .execute(&mut *conn)
+            .await
+            .expect("a legacy value, written out of band");
+    }
+
+    repo.delete_by_id(id).await.expect("delete a legacy row");
+    repo.restore(id).await.expect("restore a legacy row");
+    let live = repo.find_by_id(id).await.expect("read").expect("row");
+    assert!(live.amount_rate.is_infinite());
+}
+
+/// A trigger that rewrites the valid-time column: the revision's `valid_from`
+/// and its snapshot both come from the reloaded row (#2319).
+#[tokio::test]
+async fn a_trigger_written_valid_time_is_the_revisions_valid_time() {
+    let pool = boot_pool("lg_valid_time_trigger").await;
+    let repo = PgLgEffectiveNoteRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save(&NewLgEffectiveNote {
+            body: "v1".to_string(),
+            effective_at: chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+                .expect("date")
+                .and_hms_opt(0, 0, 0)
+                .expect("time"),
+        })
+        .await
+        .expect("insert");
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_effective_touch AFTER UPDATE OF body ON lg_effective_notes \
+             WHEN NEW.body = 'v2' \
+             BEGIN UPDATE lg_effective_notes SET effective_at = '2024-03-01 00:00:00' \
+             WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+    repo.update(
+        created.id,
+        &UpdateLgEffectiveNote {
+            body: Patch::Set("v2".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("update");
+
+    let rewritten = chrono::NaiveDate::from_ymd_opt(2024, 3, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 0)
+        .expect("time");
+    let live = repo
+        .find_by_id(created.id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(live.effective_at, rewritten, "the trigger ran");
+    let head = repo
+        .ledger_revisions(created.id)
+        .await
+        .expect("revisions")
+        .pop()
+        .expect("head");
+    assert_eq!(head.valid_from, rewritten.and_utc());
+    let report = repo.ledger_verify(created.id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+}
+
+#[test]
+fn the_generated_check_names_the_first_non_finite_column() {
+    let mut invoice = LgInvoice {
+        id: 1,
+        reference: "R".to_string(),
+        amount_cents: 1,
+        amount_rate: 1.0,
+        metadata: "{}".to_string(),
+        deleted_at: None,
+    };
+    assert_eq!(invoice.__autumn_ledger_non_finite_column(), None);
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        invoice.amount_rate = bad;
+        assert_eq!(
+            invoice.__autumn_ledger_non_finite_column(),
+            Some("amount_rate")
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_and_restore_do_not_inherit_a_stale_valid_time() {
+    let pool = boot_pool("lg_valid_time_delete").await;
+    let repo = PgLgEffectiveNoteRepository::with_pool_untracked(pool);
+
+    let effective = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 0)
+        .expect("time");
+    let created = repo
+        .save(&NewLgEffectiveNote {
+            body: "v1".to_string(),
+            effective_at: effective,
+        })
+        .await
+        .expect("insert");
+    repo.delete_by_id(created.id).await.expect("soft delete");
+    repo.restore(created.id).await.expect("restore");
+
+    let revisions = repo.ledger_revisions(created.id).await.expect("revisions");
+    assert_eq!(revisions.len(), 3);
+    for revision in &revisions[1..] {
+        assert_eq!(
+            revision.valid_from, revision.recorded_at,
+            "a delete or restore is valid from the instant it was made"
+        );
+    }
+
+    let february = chrono::NaiveDate::from_ymd_opt(2026, 2, 1)
+        .expect("date")
+        .and_hms_opt(0, 0, 0)
+        .expect("time")
+        .and_utc();
+    let then = repo
+        .ledger_as_of_at(created.id, LedgerAsOf::valid(february))
+        .await
+        .expect("as-of")
+        .expect("state");
+    assert!(
+        then.deleted_at.is_none(),
+        "February was before the deletion, so the row was not deleted yet"
+    );
+    assert!(
+        repo.ledger_verify(created.id)
+            .await
+            .expect("verify")
+            .is_intact()
+    );
+}
+
 async fn write_three_revisions(repo: &PgLgInvoiceRepository) -> i64 {
     let created = repo
         .save(&NewLgInvoice {
@@ -2922,6 +3323,7 @@ async fn write_three_revisions(repo: &PgLgInvoiceRepository) -> i64 {
         .await
         .expect("insert");
     for amount in [2, 3] {
+        tick().await;
         repo.update(
             created.id,
             &UpdateLgInvoice {
@@ -2933,4 +3335,1172 @@ async fn write_three_revisions(repo: &PgLgInvoiceRepository) -> i64 {
         .expect("update");
     }
     created.id
+}
+
+// ── #2319: one tenant source, one read mode per chain ────────────────
+
+/// Moving a ledgered row to another tenant would split its chain: the old
+/// chain stays in tenant A with no live row, the new one starts in tenant B.
+/// The write is refused.
+#[tokio::test]
+async fn a_ledgered_row_cannot_move_between_tenants() {
+    let pool = boot_pool("lg_tenant_move").await;
+    let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool);
+
+    let id = with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewLgMovableInvoice {
+            reference: "A-1".to_string(),
+            tenant_id: "tenant-a".to_string(),
+        })
+        .await
+        .expect("insert as tenant-a")
+        .id
+    })
+    .await;
+
+    let err = repo
+        .across_tenants()
+        .update(
+            id,
+            &UpdateLgMovableInvoice {
+                tenant_id: Patch::Set("tenant-b".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a ledgered row must not change tenant");
+    match err.downcast_chain_ref::<autumn_web::ledger::LedgerError>() {
+        Some(autumn_web::ledger::LedgerError::TenantChange { table, record_id }) => {
+            assert_eq!(table, "lg_movable_invoices");
+            assert_eq!(*record_id, id);
+        }
+        other => panic!("expected TenantChange, got {other:?}"),
+    }
+
+    // An across-tenants update that keeps the tenant still records a revision.
+    repo.across_tenants()
+        .update(
+            id,
+            &UpdateLgMovableInvoice {
+                reference: Patch::Set("A-2".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("same-tenant update");
+
+    with_tenant("tenant-a".to_string(), async {
+        let live = repo
+            .find_by_id(id)
+            .await
+            .expect("read")
+            .expect("still tenant-a's");
+        assert_eq!(live.tenant_id, "tenant-a");
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 2);
+    })
+    .await;
+    with_tenant("tenant-b".to_string(), async {
+        assert!(repo.ledger_revisions(id).await.expect("read").is_empty());
+    })
+    .await;
+}
+
+fn assert_tenant_change(err: &autumn_web::AutumnError, id: i64) {
+    match err.downcast_chain_ref::<autumn_web::ledger::LedgerError>() {
+        Some(autumn_web::ledger::LedgerError::TenantChange { table, record_id }) => {
+            assert_eq!(table, "lg_movable_invoices");
+            assert_eq!(*record_id, id);
+        }
+        other => panic!("expected TenantChange, got {other:?}"),
+    }
+}
+
+async fn install_tenant_rewrite_trigger(pool: &SqlitePool, name: &str, event: &str, when: &str) {
+    let mut conn = pool.get().await.expect("conn");
+    conn.batch_execute(&format!(
+        "CREATE TRIGGER {name} AFTER {event} ON lg_movable_invoices \
+         WHEN {when} \
+         BEGIN UPDATE lg_movable_invoices SET tenant_id = 'tenant-b' WHERE id = NEW.id; END"
+    ))
+    .await
+    .expect("install trigger");
+}
+
+/// A trigger that moves the row to another tenant during a soft delete would
+/// split the chain. The delete is refused and rolled back.
+#[tokio::test]
+async fn a_trigger_cannot_move_a_ledgered_row_during_delete() {
+    let pool = boot_pool("lg_tenant_delete_trigger").await;
+    install_tenant_rewrite_trigger(
+        &pool,
+        "lg_move_on_delete",
+        "UPDATE OF deleted_at",
+        "NEW.deleted_at IS NOT NULL",
+    )
+    .await;
+    let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool);
+
+    with_tenant("tenant-a".to_string(), async {
+        let id = repo
+            .save(&NewLgMovableInvoice {
+                reference: "A-1".to_string(),
+                tenant_id: "tenant-a".to_string(),
+            })
+            .await
+            .expect("insert")
+            .id;
+        let err = repo
+            .delete_by_id(id)
+            .await
+            .expect_err("the delete moves the row");
+        assert_tenant_change(&err, id);
+
+        let live = repo
+            .find_by_id(id)
+            .await
+            .expect("read")
+            .expect("the delete rolled back");
+        assert_eq!(live.tenant_id, "tenant-a");
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 1);
+    })
+    .await;
+}
+
+/// The same for an update: its `RETURNING` row does not show the trigger's
+/// change, so the reloaded row is checked. Refused and rolled back.
+#[tokio::test]
+async fn a_trigger_cannot_move_a_ledgered_row_during_update() {
+    let pool = boot_pool("lg_tenant_update_trigger").await;
+    install_tenant_rewrite_trigger(
+        &pool,
+        "lg_move_on_update",
+        "UPDATE OF reference",
+        "NEW.reference = 'A-2'",
+    )
+    .await;
+    let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool);
+
+    with_tenant("tenant-a".to_string(), async {
+        let id = repo
+            .save(&NewLgMovableInvoice {
+                reference: "A-1".to_string(),
+                tenant_id: "tenant-a".to_string(),
+            })
+            .await
+            .expect("insert")
+            .id;
+        let err = repo
+            .update(
+                id,
+                &UpdateLgMovableInvoice {
+                    reference: Patch::Set("A-2".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the update moves the row");
+        assert_tenant_change(&err, id);
+
+        let live = repo
+            .find_by_id(id)
+            .await
+            .expect("read")
+            .expect("the update rolled back");
+        assert_eq!(
+            (live.reference.as_str(), live.tenant_id.as_str()),
+            ("A-1", "tenant-a")
+        );
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 1);
+    })
+    .await;
+}
+
+/// The same for an insert: a chain must not start in one tenant for a row
+/// that lands in another. Refused and rolled back.
+#[tokio::test]
+async fn a_trigger_cannot_move_a_ledgered_row_during_insert() {
+    let pool = boot_pool("lg_tenant_insert_trigger").await;
+    install_tenant_rewrite_trigger(&pool, "lg_move_on_insert", "INSERT", "1").await;
+    let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool);
+
+    let err = with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewLgMovableInvoice {
+            reference: "A-1".to_string(),
+            tenant_id: "tenant-a".to_string(),
+        })
+        .await
+        .expect_err("the insert moves the row")
+    })
+    .await;
+    assert!(
+        matches!(
+            err.downcast_chain_ref::<autumn_web::ledger::LedgerError>(),
+            Some(autumn_web::ledger::LedgerError::TenantChange { .. })
+        ),
+        "{err}"
+    );
+    assert!(
+        repo.across_tenants()
+            .find_all()
+            .await
+            .expect("list")
+            .is_empty(),
+        "the insert rolled back"
+    );
+}
+
+/// The same for a restore: the undelete is refused and rolled back.
+#[tokio::test]
+async fn a_trigger_cannot_move_a_ledgered_row_during_restore() {
+    let pool = boot_pool("lg_tenant_restore_trigger").await;
+    let repo = PgLgMovableInvoiceRepository::with_pool_untracked(pool.clone());
+
+    with_tenant("tenant-a".to_string(), async {
+        let id = repo
+            .save(&NewLgMovableInvoice {
+                reference: "A-1".to_string(),
+                tenant_id: "tenant-a".to_string(),
+            })
+            .await
+            .expect("insert")
+            .id;
+        repo.delete_by_id(id).await.expect("delete");
+        install_tenant_rewrite_trigger(
+            &pool,
+            "lg_move_on_restore",
+            "UPDATE OF deleted_at",
+            "NEW.deleted_at IS NULL",
+        )
+        .await;
+        let err = repo
+            .restore(id)
+            .await
+            .expect_err("the restore moves the row");
+        assert_tenant_change(&err, id);
+
+        assert!(
+            repo.find_by_id(id).await.expect("read").is_none(),
+            "the restore rolled back"
+        );
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "{report:?}");
+        assert_eq!(report.revisions_checked, 2);
+    })
+    .await;
+}
+
+/// No read mode interleaves two tenants' chains: every ledger read refuses
+/// `across_tenants()`.
+#[tokio::test]
+async fn every_ledger_read_refuses_across_tenants() {
+    let pool = boot_pool("lg_tenant_across").await;
+    let repo = PgLgTenantInvoiceRepository::with_pool_untracked(pool);
+    let id = with_tenant("tenant-a".to_string(), async {
+        repo.save(&NewLgTenantInvoice {
+            reference: "A-1".to_string(),
+        })
+        .await
+        .expect("insert")
+        .id
+    })
+    .await;
+
+    let across = repo.across_tenants();
+    let refused = |result: Result<(), autumn_web::AutumnError>, read: &str| {
+        let err = result.expect_err(read);
+        assert!(
+            err.to_string()
+                .contains("cross-tenant ledger reads are not supported"),
+            "{read}: {err}"
+        );
+    };
+    refused(across.ledger_revisions(id).await.map(drop), "revisions");
+    refused(
+        across
+            .ledger_revisions_page(id, LedgerPageRequest::first(10))
+            .await
+            .map(drop),
+        "page",
+    );
+    refused(across.ledger_verify(id).await.map(drop), "verify");
+    refused(across.ledger_pin(id).await.map(drop), "pin");
+    refused(across.ledger_head(id).await.map(drop), "head");
+    refused(across.ledger_high_water(id).await.map(drop), "high water");
+    refused(
+        across
+            .ledger_as_of_at(id, LedgerAsOf::default())
+            .await
+            .map(drop),
+        "as of",
+    );
+    let now = Utc::now();
+    refused(across.ledger_diff(id, now, now).await.map(drop), "diff");
+}
+
+// ── #2319: paginated chain reads ─────────────────────────────────────
+
+/// A keyset page walks the chain in `seq` order and joins up to the full read.
+#[tokio::test]
+async fn ledger_revisions_page_walks_the_chain_in_order() {
+    let pool = boot_pool("lg_page_walk").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let id = write_three_revisions(&repo).await;
+    for amount in [4, 5] {
+        repo.update(
+            id,
+            &UpdateLgInvoice {
+                amount_cents: Patch::Set(amount),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("update");
+    }
+
+    let mut seen = Vec::new();
+    let mut request = LedgerPageRequest::first(2);
+    let mut pages = 0;
+    loop {
+        let page = repo.ledger_revisions_page(id, request).await.expect("page");
+        pages += 1;
+        assert!(page.revisions.len() <= 2);
+        seen.extend(page.revisions);
+        match page.next {
+            Some(cursor) => request = LedgerPageRequest::after(cursor, 2),
+            None => break,
+        }
+    }
+    assert_eq!(pages, 3);
+    assert_eq!(
+        seen.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(seen, repo.ledger_revisions(id).await.expect("full read"));
+}
+
+/// A limit of zero is clamped to one, so a caller loop always advances.
+#[tokio::test]
+async fn ledger_revisions_page_clamps_a_zero_limit() {
+    let pool = boot_pool("lg_page_zero").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let id = write_three_revisions(&repo).await;
+
+    let page = repo
+        .ledger_revisions_page(id, LedgerPageRequest::first(0))
+        .await
+        .expect("page");
+    assert_eq!(page.revisions.len(), 1);
+    assert!(page.next.is_some());
+}
+
+/// A forged revision that repeats a `seq` is not skipped at a page edge, and
+/// `ledger_verify` still reports it.
+#[tokio::test]
+async fn a_duplicate_seq_on_a_page_edge_is_not_skipped() {
+    let pool = boot_pool("lg_page_dup").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        // A different tenant key slips past the chain's unique index.
+        diesel::sql_query(
+            "INSERT INTO _autumn_ledger_revisions \
+             (table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, \
+              valid_from, recorded_at, prev_hash, hash) \
+             SELECT table_name, 'forged', record_id, seq, op, actor, request_id, \
+                    snapshot, valid_from, recorded_at, prev_hash, hash \
+             FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 2",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("insert a duplicate seq");
+    }
+
+    let mut seqs = Vec::new();
+    let mut request = LedgerPageRequest::first(2);
+    loop {
+        let page = repo.ledger_revisions_page(id, request).await.expect("page");
+        seqs.extend(page.revisions.iter().map(|r| r.seq));
+        match page.next {
+            Some(cursor) => request = LedgerPageRequest::after(cursor, 2),
+            None => break,
+        }
+    }
+    assert_eq!(seqs, vec![1, 2, 2, 3]);
+
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a duplicate seq must be reported");
+    assert_eq!(broken.kind, LedgerBreak::DuplicateSeq);
+    assert_eq!(broken.seq, 2);
+}
+
+/// A forged revision at the lowest possible `(seq, id)` is on the first page,
+/// and `ledger_verify` reports it.
+#[tokio::test]
+async fn a_forged_revision_at_the_minimum_cursor_is_not_skipped() {
+    let pool = boot_pool("lg_page_min").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "INSERT INTO _autumn_ledger_revisions \
+             (id, table_name, tenant_id, record_id, seq, op, actor, request_id, snapshot, \
+              valid_from, recorded_at, prev_hash, hash) \
+             SELECT -9223372036854775808, table_name, 'forged', record_id, \
+                    -9223372036854775808, op, actor, request_id, snapshot, valid_from, \
+                    recorded_at, prev_hash, hash \
+             FROM _autumn_ledger_revisions \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = 1",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .execute(&mut *conn)
+        .await
+        .expect("insert a forged revision at the minimum cursor");
+    }
+
+    let page = repo
+        .ledger_revisions_page(id, LedgerPageRequest::first(10))
+        .await
+        .expect("page");
+    assert_eq!(
+        page.revisions.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![i64::MIN, 1, 2, 3]
+    );
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(!report.is_intact(), "{report:?}");
+    assert_eq!(report.revisions_checked, 4);
+}
+
+// ── #2326: delete snapshot, byte fidelity, schema drift ──────────────
+
+/// A database trigger rewrites a column during the soft-delete `UPDATE`.
+#[tokio::test]
+async fn a_delete_snapshots_the_row_a_trigger_rewrote() {
+    let pool = boot_pool("lg_delete_trigger").await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_invoices_touch AFTER UPDATE OF deleted_at ON lg_invoices \
+             WHEN NEW.deleted_at IS NOT NULL \
+             BEGIN UPDATE lg_invoices SET reference = reference || '-touched' \
+             WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let created = repo
+        .save(&NewLgInvoice {
+            reference: "INV-T".to_string(),
+            amount_cents: 1,
+            amount_rate: 1.0,
+            metadata: "{}".to_string(),
+        })
+        .await
+        .expect("insert");
+    repo.delete_by_id(created.id).await.expect("soft delete");
+
+    let report = repo.ledger_verify(created.id).await.expect("verify");
+    assert!(
+        report.is_intact(),
+        "no false positive after delete: {report:?}"
+    );
+    let then = repo
+        .ledger_as_of(created.id, now() + Duration::seconds(1))
+        .await
+        .expect("as-of")
+        .expect("state");
+    assert_eq!(then.reference, "INV-T-touched");
+}
+
+/// The same for a restore: its `RETURNING` row does not show what an AFTER
+/// trigger changed, so the revision snapshots the reloaded row (#2319).
+#[tokio::test]
+async fn a_restore_snapshots_the_row_a_trigger_rewrote() {
+    let pool = boot_pool("lg_restore_trigger").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save(&NewLgInvoice {
+            reference: "INV-R".to_string(),
+            amount_cents: 1,
+            amount_rate: 1.0,
+            metadata: "{}".to_string(),
+        })
+        .await
+        .expect("insert");
+    repo.delete_by_id(created.id).await.expect("soft delete");
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_invoices_restore_touch AFTER UPDATE OF deleted_at ON lg_invoices \
+             WHEN NEW.deleted_at IS NULL \
+             BEGIN UPDATE lg_invoices SET reference = reference || '-restored' \
+             WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+    repo.restore(created.id).await.expect("restore");
+
+    let report = repo.ledger_verify(created.id).await.expect("verify");
+    assert!(
+        report.is_intact(),
+        "no false positive after restore: {report:?}"
+    );
+    let head = repo
+        .ledger_revisions(created.id)
+        .await
+        .expect("revisions")
+        .pop()
+        .expect("head");
+    assert_eq!(head.snapshot["reference"], "INV-R-restored");
+}
+
+#[tokio::test]
+async fn a_re_encoded_snapshot_is_refused() {
+    let pool = boot_pool("lg_reencoded").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    let head = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .pop()
+        .expect("head");
+    let spaced = autumn_web::ledger::canonical_json(&head.snapshot).replacen(':', ": ", 1);
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET snapshot = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(spaced)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(head.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("re-encode");
+    }
+    let report = repo.ledger_verify(id).await.expect("verify reports it");
+    let broken = report.broken.expect("same meaning, different bytes");
+    assert_eq!(broken.kind, LedgerBreak::SnapshotNotCanonical);
+    assert_eq!(broken.seq, head.seq);
+}
+
+#[tokio::test]
+async fn a_snapshot_the_model_cannot_decode_reports_schema_drift() {
+    let pool = boot_pool("lg_schema_drift").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    let first = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .remove(0);
+    let mut old = first.snapshot.clone();
+    old.as_object_mut().expect("object").remove("amount_cents");
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET snapshot = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&old))
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(first.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("simulate an older schema");
+    }
+    let err = repo
+        .ledger_as_of(id, first.recorded_at)
+        .await
+        .expect_err("cannot decode");
+    let text = err.to_string();
+    assert!(
+        text.contains("current model schema") && !text.contains("unreadable"),
+        "must not read as tamper evidence: {text}"
+    );
+}
+
+/// Rewrites a stored snapshot to look like an older schema wrote it.
+async fn rewrite_snapshot(
+    pool: &SqlitePool,
+    id: i64,
+    seq: i64,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let mut snapshot = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .into_iter()
+        .find(|r| r.seq == seq)
+        .expect("revision")
+        .snapshot;
+    edit(snapshot.as_object_mut().expect("object"));
+    let mut conn = pool.get().await.expect("conn");
+    let changed = diesel::sql_query(
+        "UPDATE _autumn_ledger_revisions SET snapshot = ? \
+         WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&snapshot))
+    .bind::<diesel::sql_types::BigInt, _>(id)
+    .bind::<diesel::sql_types::BigInt, _>(seq)
+    .execute(&mut *conn)
+    .await
+    .expect("simulate an older schema");
+    assert_eq!(changed, 1, "exactly one stored revision is rewritten");
+}
+
+/// A field added later as `Option` is absent from older snapshots. They
+/// still reconstruct, with the field empty (#2326).
+#[tokio::test]
+async fn a_revision_written_before_an_optional_field_existed_reconstructs() {
+    let pool = boot_pool("lg_schema_old_ok").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    let first = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .remove(0);
+    rewrite_snapshot(&pool, id, first.seq, |m| {
+        assert!(m.remove("deleted_at").is_some(), "the key was present");
+    })
+    .await;
+
+    let then = repo
+        .ledger_as_of(id, first.recorded_at)
+        .await
+        .expect("old revision still reads")
+        .expect("state");
+    assert_eq!(then.amount_cents, 1, "revision 1, not a later one");
+    assert_eq!(then.deleted_at, None);
+}
+
+/// A diff across a schema change is defined. An absent `Option` field equals
+/// `null`. It is not a change and not an error (#2326).
+#[tokio::test]
+async fn a_diff_across_a_schema_boundary_ignores_an_absent_option() {
+    let pool = boot_pool("lg_schema_diff").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    rewrite_snapshot(&pool, id, 1, |m| {
+        assert!(m.remove("deleted_at").is_some(), "the key was present");
+    })
+    .await;
+
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let (from, to) = (revisions[0].recorded_at, revisions[2].recorded_at);
+    let diff = repo
+        .ledger_diff(id, from, to)
+        .await
+        .expect("diff is defined");
+    assert_eq!((diff.from_seq, diff.to_seq), (Some(1), Some(3)));
+    let fields: Vec<&str> = diff.changes.iter().map(|c| c.column.as_str()).collect();
+    assert!(fields.contains(&"amount_cents"), "{fields:?}");
+    assert!(
+        !fields.contains(&"deleted_at"),
+        "an absent Option equals null, not a change: {fields:?}"
+    );
+}
+
+/// The bulk soft-delete snapshots the row a trigger rewrote (#2326).
+#[tokio::test]
+async fn a_bulk_delete_snapshots_the_rows_a_trigger_rewrote() {
+    let pool = boot_pool("lg_bulk_delete_trigger").await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(
+            "CREATE TRIGGER lg_invoices_bulk_touch AFTER UPDATE OF deleted_at ON lg_invoices \
+             WHEN NEW.deleted_at IS NOT NULL \
+             BEGIN UPDATE lg_invoices SET reference = reference || '-touched' \
+             WHERE id = NEW.id; END",
+        )
+        .await
+        .expect("install trigger");
+    }
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let rows = ["A", "B"].map(|r| NewLgInvoice {
+        reference: r.to_string(),
+        amount_cents: 1,
+        amount_rate: 1.0,
+        metadata: "{}".to_string(),
+    });
+    let ids: Vec<i64> = repo
+        .save_many(&rows)
+        .await
+        .expect("insert")
+        .iter()
+        .map(|r| r.id)
+        .collect();
+    repo.delete_many(&ids).await.expect("bulk delete");
+    for id in ids {
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "record {id}: {report:?}");
+        let head = repo
+            .ledger_revisions(id)
+            .await
+            .expect("revisions")
+            .pop()
+            .expect("head");
+        let reference = head.snapshot["reference"].as_str().expect("reference");
+        assert!(reference.ends_with("-touched"), "{reference}");
+        assert!(!head.snapshot["deleted_at"].is_null());
+    }
+}
+
+/// A key that is gone must not leave ciphertext where plaintext belongs.
+/// The error names the column and the revision (#2326).
+#[tokio::test]
+async fn as_of_refuses_an_encrypted_column_that_cannot_be_recovered() {
+    install_encryption_keys();
+    let pool = boot_pool("lg_vault_lost_key").await;
+    let repo = PgLgVaultNoteRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save(&NewLgVaultNote {
+            body: "public".to_string(),
+            secret: "hidden".to_string(),
+        })
+        .await
+        .expect("insert");
+    let first = repo
+        .ledger_revisions(created.id)
+        .await
+        .expect("revisions")
+        .remove(0);
+    {
+        let mut conn = pool.get().await.expect("conn");
+        let mut damaged = first.snapshot.clone();
+        damaged["secret"] = serde_json::json!("not-a-recoverable-envelope");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET snapshot = ? \
+             WHERE table_name = 'lg_vault_notes' AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&damaged))
+        .bind::<diesel::sql_types::BigInt, _>(created.id)
+        .bind::<diesel::sql_types::BigInt, _>(first.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("damage the envelope");
+    }
+    let err = repo
+        .ledger_as_of(created.id, first.recorded_at)
+        .await
+        .expect_err("must not return ciphertext as plaintext");
+    let text = err.to_string();
+    assert!(text.contains("secret"), "names the column: {text}");
+    assert!(text.contains("revision 1"), "names the revision: {text}");
+}
+
+/// A duplicate key is a different byte string with the same meaning.
+/// `ledger_verify` reports it, and does not let the last key win (#2326).
+#[tokio::test]
+async fn a_duplicate_key_snapshot_is_reported_as_not_canonical() {
+    let pool = boot_pool("lg_duplicate_key").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let id = write_three_revisions(&repo).await;
+    let head = repo
+        .ledger_revisions(id)
+        .await
+        .expect("revisions")
+        .pop()
+        .expect("head");
+    let text = autumn_web::ledger::canonical_json(&head.snapshot);
+    let doubled = text.replacen('{', "{\"id\":0,", 1);
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET snapshot = ? \
+             WHERE table_name = 'lg_invoices' AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(doubled)
+        .bind::<diesel::sql_types::BigInt, _>(id)
+        .bind::<diesel::sql_types::BigInt, _>(head.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("plant a duplicate key");
+    }
+    let report = repo.ledger_verify(id).await.expect("verify reports it");
+    let broken = report.broken.expect("duplicate key");
+    assert_eq!(broken.kind, LedgerBreak::SnapshotNotCanonical);
+}
+
+// ── #2326: schema versions and upcasting ─────────────────────────────
+
+/// Rewrite a record's chain as an older writer would have written it.
+///
+/// `edit` changes each snapshot. Then every revision is re-linked and re-hashed,
+/// and the high-water mark follows. So `ledger_verify` sees a valid chain.
+async fn age_chain(
+    pool: &SqlitePool,
+    table: &str,
+    revisions: Vec<autumn_web::ledger::LedgerRevision>,
+    mut edit: impl FnMut(i64, &mut serde_json::Map<String, serde_json::Value>),
+) {
+    let record_id = revisions[0].record_id;
+    let mut previous: Option<String> = None;
+    for mut revision in revisions {
+        edit(
+            revision.seq,
+            revision.snapshot.as_object_mut().expect("object"),
+        );
+        revision.prev_hash.clone_from(&previous);
+        revision.hash = revision.compute_hash();
+        previous = Some(revision.hash.clone());
+        let mut conn = pool.get().await.expect("conn");
+        let changed = diesel::sql_query(
+            "UPDATE _autumn_ledger_revisions SET snapshot = ?, prev_hash = ?, hash = ? \
+             WHERE table_name = ? AND record_id = ? AND seq = ?",
+        )
+        .bind::<diesel::sql_types::Text, _>(autumn_web::ledger::canonical_json(&revision.snapshot))
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(revision.prev_hash)
+        .bind::<diesel::sql_types::Text, _>(revision.hash)
+        .bind::<diesel::sql_types::Text, _>(table)
+        .bind::<diesel::sql_types::BigInt, _>(record_id)
+        .bind::<diesel::sql_types::BigInt, _>(revision.seq)
+        .execute(&mut *conn)
+        .await
+        .expect("rewrite the revision");
+        assert_eq!(changed, 1, "exactly one stored revision is rewritten");
+    }
+    resync_high_water_mark(pool, table, record_id).await;
+}
+
+/// Version 2 wrote `title`. Make a snapshot look like version 1 wrote it.
+fn as_version_one(snapshot: &mut serde_json::Map<String, serde_json::Value>) {
+    snapshot.remove(autumn_web::ledger::SNAPSHOT_SCHEMA_KEY);
+    let title = snapshot.remove("title").expect("title");
+    snapshot.insert("subject".to_string(), title);
+}
+
+async fn write_note_chain(repo: &PgLgRenamedNoteRepository) -> i64 {
+    let created = repo
+        .save(&NewLgRenamedNote {
+            title: "a".to_string(),
+        })
+        .await
+        .expect("insert");
+    for title in ["b", "c"] {
+        tick().await;
+        repo.update(
+            created.id,
+            &UpdateLgRenamedNote {
+                title: Patch::Set(title.to_string()),
+            },
+        )
+        .await
+        .expect("update");
+    }
+    created.id
+}
+
+#[tokio::test]
+async fn a_versioned_model_stamps_its_schema_version_into_each_revision() {
+    let pool = boot_pool("lg_schema_stamp").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    assert_eq!(revisions.len(), 3);
+    for revision in &revisions {
+        assert_eq!(
+            revision.snapshot[autumn_web::ledger::SNAPSHOT_SCHEMA_KEY],
+            serde_json::json!(2),
+            "revision {}",
+            revision.seq
+        );
+    }
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+
+    // A model that never declared a version writes no marker.
+    let plain = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let plain_id = write_three_revisions(&plain).await;
+    let first = plain.ledger_revisions(plain_id).await.expect("revisions");
+    assert!(
+        first[0]
+            .snapshot
+            .get(autumn_web::ledger::SNAPSHOT_SCHEMA_KEY)
+            .is_none(),
+        "a version 1 model keeps its snapshots as they were"
+    );
+}
+
+#[tokio::test]
+async fn a_revision_written_under_an_older_schema_is_converted_by_the_hook() {
+    let pool = boot_pool("lg_schema_upcast").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let first_at = revisions[0].recorded_at;
+    age_chain(&pool, "lg_renamed_notes", revisions, |seq, snapshot| {
+        if seq == 1 {
+            as_version_one(snapshot);
+        }
+    })
+    .await;
+
+    let then = repo
+        .ledger_as_of(id, first_at)
+        .await
+        .expect("an old revision still reads")
+        .expect("state");
+    assert_eq!(then.title, "a", "the renamed field carries its value");
+    let latest = repo
+        .ledger_as_of(id, now())
+        .await
+        .expect("a current revision reads")
+        .expect("state");
+    assert_eq!(latest.title, "c");
+}
+
+#[tokio::test]
+async fn verify_does_not_accuse_a_record_whose_head_predates_a_schema_change() {
+    let pool = boot_pool("lg_schema_verify").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    // Every revision, the head too, was written by version 1.
+    age_chain(&pool, "lg_renamed_notes", revisions, |_, snapshot| {
+        as_version_one(snapshot);
+    })
+    .await;
+
+    // Note: this test alone does not prove that verify runs the hook.
+    // `verify_still_sees_a_changed_value_after_a_schema_change` does.
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "a deploy is not tampering: {report:?}");
+}
+
+/// A column the head never recorded is not compared, when the model declares a
+/// newer schema version than the head. A deploy then is not tampering.
+#[tokio::test]
+async fn verify_ignores_a_column_added_after_the_head_was_written() {
+    let pool = boot_pool("lg_schema_new_column").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    // Version 1 had no `deleted_at`. The live row has it.
+    age_chain(&pool, "lg_renamed_notes", revisions, |_, snapshot| {
+        as_version_one(snapshot);
+        assert!(snapshot.remove("deleted_at").is_some());
+    })
+    .await;
+
+    let report = repo.ledger_verify(id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+}
+
+/// Without a schema version bump, a column the head lacks is a difference. So an
+/// out-of-band edit to it is found. It must not hide behind the tolerance that a
+/// declared schema change earns.
+#[tokio::test]
+async fn verify_is_strict_for_a_head_at_the_current_schema_version() {
+    let pool = boot_pool("lg_schema_strict").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    // The marker stays at 2. Only `deleted_at` is missing from the snapshots.
+    age_chain(&pool, "lg_renamed_notes", revisions, |_, snapshot| {
+        assert!(snapshot.remove("deleted_at").is_some());
+    })
+    .await;
+
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("a column the head lacks is a difference at the current version");
+    assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+}
+
+/// Delete and restore revisions carry the schema version, like any other.
+#[tokio::test]
+async fn delete_and_restore_revisions_carry_the_schema_version() {
+    let pool = boot_pool("lg_schema_delete_restore").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool);
+    let id = write_note_chain(&repo).await;
+    repo.delete_by_id(id).await.expect("soft delete");
+    repo.restore(id).await.expect("restore");
+
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    assert_eq!(
+        revisions.iter().map(|r| r.op).collect::<Vec<_>>(),
+        vec![
+            VersionOp::Insert,
+            VersionOp::Update,
+            VersionOp::Update,
+            VersionOp::Delete,
+            VersionOp::Update,
+        ]
+    );
+    for revision in &revisions {
+        assert_eq!(
+            revision.snapshot[autumn_web::ledger::SNAPSHOT_SCHEMA_KEY],
+            serde_json::json!(2),
+            "revision {} ({:?})",
+            revision.seq,
+            revision.op
+        );
+    }
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+}
+
+/// The hook runs before the key check, so it can rename an encrypted column.
+/// The envelope moves as it is, and it still decrypts.
+#[tokio::test]
+async fn a_hook_can_rename_an_encrypted_column() {
+    let pool = boot_pool("lg_schema_sealed").await;
+    let repo = PgLgSealedNoteRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save(&NewLgSealedNote {
+            body: "public".to_string(),
+            secret: "the secret".to_string(),
+        })
+        .await
+        .expect("insert");
+    let revisions = repo.ledger_revisions(created.id).await.expect("revisions");
+    let first_at = revisions[0].recorded_at;
+    age_chain(&pool, "lg_sealed_notes", revisions, |_, snapshot| {
+        snapshot.remove(autumn_web::ledger::SNAPSHOT_SCHEMA_KEY);
+        let envelope = snapshot.remove("secret").expect("secret");
+        snapshot.insert("hidden".to_string(), envelope);
+    })
+    .await;
+
+    let then = repo
+        .ledger_as_of(created.id, first_at)
+        .await
+        .expect("the renamed column still decrypts")
+        .expect("state");
+    assert_eq!(then.secret, "the secret");
+    let report = repo.ledger_verify(created.id).await.expect("verify");
+    assert!(report.is_intact(), "{report:?}");
+}
+
+#[tokio::test]
+async fn verify_still_sees_a_changed_value_after_a_schema_change() {
+    let pool = boot_pool("lg_schema_still_sees").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    age_chain(&pool, "lg_renamed_notes", revisions, |_, snapshot| {
+        as_version_one(snapshot);
+    })
+    .await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query("UPDATE lg_renamed_notes SET title = 'edited' WHERE id = ?")
+            .bind::<diesel::sql_types::BigInt, _>(id)
+            .execute(&mut *conn)
+            .await
+            .expect("edit the live row out of band");
+    }
+
+    let broken = repo
+        .ledger_verify(id)
+        .await
+        .expect("verify")
+        .broken
+        .expect("an out-of-band edit is still found");
+    assert_eq!(broken.kind, LedgerBreak::LiveStateMismatch);
+}
+
+#[tokio::test]
+async fn a_hook_that_refuses_a_shape_is_a_schema_error_and_verify_stays_quiet() {
+    let pool = boot_pool("lg_schema_hook_refuses").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let first_at = revisions[0].recorded_at;
+    age_chain(&pool, "lg_renamed_notes", revisions, |seq, snapshot| {
+        as_version_one(snapshot);
+        if seq == 1 {
+            snapshot.insert("legacy_flag".to_string(), serde_json::json!(true));
+        }
+    })
+    .await;
+
+    let err = repo
+        .ledger_as_of(id, first_at)
+        .await
+        .expect_err("the hook refuses revision 1");
+    let text = err.to_string();
+    assert!(text.contains("a legacy shape with no rule"), "{text}");
+    assert!(text.contains("current model schema"), "{text}");
+    assert!(
+        !text.contains("unreadable"),
+        "schema trouble is not tamper evidence: {text}"
+    );
+    // The chain itself is sound.
+    assert!(repo.ledger_verify(id).await.expect("verify").is_intact());
+}
+
+#[tokio::test]
+async fn a_revision_from_a_newer_model_reports_both_versions() {
+    let pool = boot_pool("lg_schema_newer").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let first_at = revisions[0].recorded_at;
+    // A newer deploy renamed `title` again and wrote version 9.
+    age_chain(&pool, "lg_renamed_notes", revisions, |seq, snapshot| {
+        if seq == 1 {
+            snapshot.insert(
+                autumn_web::ledger::SNAPSHOT_SCHEMA_KEY.to_string(),
+                serde_json::json!(9),
+            );
+            let title = snapshot.remove("title").expect("title");
+            snapshot.insert("heading".to_string(), title);
+        }
+    })
+    .await;
+
+    let text = repo
+        .ledger_as_of(id, first_at)
+        .await
+        .expect_err("the model cannot read version 9")
+        .to_string();
+    assert!(text.contains("schema version 9"), "{text}");
+    assert!(text.contains("model is at 2"), "{text}");
+    assert!(text.contains("newer"), "{text}");
+}
+
+#[tokio::test]
+async fn a_diff_across_a_schema_boundary_compares_both_sides_in_the_current_shape() {
+    let pool = boot_pool("lg_schema_boundary_diff").await;
+    let repo = PgLgRenamedNoteRepository::with_pool_untracked(pool.clone());
+    let id = write_note_chain(&repo).await;
+    let revisions = repo.ledger_revisions(id).await.expect("revisions");
+    let (from, to) = (revisions[0].recorded_at, revisions[2].recorded_at);
+    // Revision 1 predates the rename. Revisions 2 and 3 do not.
+    age_chain(&pool, "lg_renamed_notes", revisions, |seq, snapshot| {
+        if seq == 1 {
+            as_version_one(snapshot);
+        }
+    })
+    .await;
+
+    let diff = repo
+        .ledger_diff(id, from, to)
+        .await
+        .expect("diff is defined");
+    assert_eq!((diff.from_seq, diff.to_seq), (Some(1), Some(3)));
+    let fields: Vec<&str> = diff.changes.iter().map(|c| c.column.as_str()).collect();
+    assert_eq!(fields, vec!["title"], "only the real change: {fields:?}");
 }

@@ -263,12 +263,13 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
     // and the SQL binds too. Recording raw and masking here (rather than at
     // each seam) keeps redaction's cost off requests that never fail.
     let mut effects = scope.effects_snapshot();
+    effects.state_cache = scope.had_state_cache();
     // A job capsule's entry point is a payload like any other: it is the job's
     // *arguments*, and they carry tokens and PII exactly the way a request body
     // does. Redacted alongside the effect tape, through the same filter and
     // into the same echo set.
     let mut job = scope.job_entry();
-    let mut effect_keys = std::collections::BTreeSet::new();
+    let mut effect_keys = literal_placeholder_keys(&effects);
     crate::capsule::redact::redact_effects(
         &mut effects,
         job.as_mut(),
@@ -408,7 +409,24 @@ fn assemble(scope: &CaptureScope, outcome: CapsuleOutcome) -> Option<Capsule> {
 /// it straight back into the capsule through the outcome. The outcome is
 /// free-form text, so this is a substring replacement rather than the
 /// whole-value comparison bind masking uses.
-fn scrub_outcome(outcome: CapsuleOutcome, redacted: &RedactedValues) -> CapsuleOutcome {
+/// The `redacted_keys` entries for compared effect data that held the
+/// placeholder text. Run it before redaction: here a placeholder can only be
+/// text the data held (#2351 item 5).
+fn literal_placeholder_keys(
+    effects: &crate::capsule::schema::CapsuleEffects,
+) -> std::collections::BTreeSet<String> {
+    crate::capsule::redact::literal_placeholder_locations(effects)
+        .into_iter()
+        .map(|location| {
+            format!(
+                "{location}{}",
+                crate::capsule::redact::LITERAL_PLACEHOLDER_SUFFIX
+            )
+        })
+        .collect()
+}
+
+pub(crate) fn scrub_outcome(outcome: CapsuleOutcome, redacted: &RedactedValues) -> CapsuleOutcome {
     use crate::capsule::redact::mask_echoes;
 
     match outcome {
@@ -787,6 +805,58 @@ mod tests {
             Some("private-tenant.example"),
             "and only the address — it feeds nothing else"
         );
+    }
+
+    /// #2351 item 5: compared effect data that held the placeholder text
+    /// before redaction is named in `redacted_keys`, so replay refuses it.
+    #[test]
+    fn a_literal_placeholder_in_an_effect_is_named_for_refusal() {
+        use std::sync::Arc;
+
+        use crate::capsule::CaptureSettings;
+        use crate::capsule::capture::CaptureScope;
+        use crate::capsule::redact::RawRequest;
+        use crate::log::filter::ParameterFilter;
+
+        let scope = CaptureScope::new(
+            "req-literal".to_owned(),
+            Arc::new(CaptureSettings::default()),
+            Arc::new(ParameterFilter::new(&[], &[])),
+        );
+        scope.set_request(RawRequest {
+            method: "GET".to_owned(),
+            uri: "/boom".parse().expect("uri parses"),
+            version: axum::http::Version::HTTP_11,
+            headers: axum::http::HeaderMap::new(),
+            route: None,
+        });
+        let slot = scope.reserve_job_enqueue().expect("slot");
+        scope.fill_job_enqueue(
+            slot,
+            crate::capsule::JobEffect {
+                name: "n".to_owned(),
+                payload: serde_json::json!({"note": "[FILTERED]"}),
+                ..Default::default()
+            },
+        );
+        let capsule = assemble(
+            &scope,
+            CapsuleOutcome::Status {
+                code: 500,
+                message: "boom".to_owned(),
+                problem_type: None,
+            },
+        )
+        .expect("capsule assembles");
+        assert!(
+            capsule.request.redacted_keys.contains(&format!(
+                "job[0].payload{}",
+                crate::capsule::redact::LITERAL_PLACEHOLDER_SUFFIX
+            )),
+            "{:?}",
+            capsule.request.redacted_keys
+        );
+        assert!(crate::capsule::replay::refusal_reason(&capsule).is_some());
     }
 
     /// Refusal is the price of suppressing a value that existed. Filtering a

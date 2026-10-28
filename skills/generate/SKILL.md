@@ -89,7 +89,7 @@ accept aliases like `Integer` or `Boolean`.
 | `{encrypted}` / `{encrypted:deterministic}` modifier **(trunk-dev)** | `api_token:String{encrypted}` → unbounded `TEXT NOT NULL` sized for the base64 ciphertext envelope | `String` (plaintext in Rust, ciphertext at rest). Emits `#[encrypted]` / `#[encrypted(deterministic)]` on the model (issue #1340); the deterministic mode keeps `find_by`/`exists_by` lookups and a real UNIQUE index, the randomized default keeps nothing queryable. `String`/`Text` and non-null only. Randomized + `:unique`/`--unique`/`--query`/`--index` is refused at generate time pointing at `deterministic`; `--searchable`, `--default`, `--shard-key`, `:states(...)` and `slug{from:<encrypted col>}` are refused in both modes. The generated index cell shows `••••••••` (unsorted), the CSV export omits the column, and the admin redacts it. Needs key material under `[active_record_encryption]` — run `autumn credentials edit`. Quote the token in bash/zsh (brace expansion) |
 | `{translatable}` modifier **(trunk-dev)** | `title:String{translatable}` → `TEXT NOT NULL DEFAULT '{}'` holding a JSON object of locale tag → value | `autumn_web::i18n::Translated`, a per-locale container (issue #1384). Emits `#[translatable]` on the model; `Display` renders the request's **active** locale so `html! { h1 { (post.title) } }` needs no `Locale` parameter, falling back through `I18nConfig::resolved_fallback_chain` and then to a single sentinel (`None` from `resolve()`, `""` from `Display`) — never a panic or 500. Generates per-field `<f>_localized()` / `<f>_in(locale)` / `set_<f>(locale, value)` / `<f>_locales()` / `<f>_is_translated(locale)` plus field-name-keyed `available_locales("title")` / `is_translated("title", "fr")` / `Post::translatable_fields()` for a "needs translation" badge. `String`/`Text` and non-null only. **`generate scaffold` refuses it** (its single-input CRUD form would replace the whole container on save) — use `generate model`, which also enables autumn-web's non-default `i18n` feature, and write the per-locale edit view yourself. `{encrypted}`, `:unique`/`--unique`, `--index`, `--searchable`, `--shard-key`, `:states(...)`, `Option<…>` and the `{min}`/`{max}`/`{email}`/`{url}` validation fan-out are all refused. Assigning a `Translated` **replaces** every locale — use `merge_from` for a partial update. A pre-existing plain-text column upgrades in place with no data migration. Quote the token in bash/zsh (brace expansion) |
 | `lock_version` (magic column name) **(trunk-dev)** | `INTEGER`/`BIGINT NOT NULL DEFAULT 0` | Declaring a non-nullable `i32`/`i64` column literally named `lock_version` opts the model into optimistic locking (issue #1318): the model gets `#[lock_version]`, so the column is DB-managed (out of `New{Model}`, carried on `Update{Model}` as the *expected* version, conflict-checked by `#[repository]`, and JSON `PUT`/`PATCH` clients must now send it). A scaffold hides it in the edit form, turns `update` into `WHERE lock_version = $expected` + `SET lock_version = lock_version + 1`, and re-renders the form at **409** with the author's input and an inline banner when a concurrent editor got there first. On HTML scaffolds, not supported with `--live`/`--sharded`/a `slug` column/an `Attachment` field, and never as a model's only insertable column or marked `:unique` — all refused at generation time (`--api` is exempt from the variant gates: it emits no form). `--live-validation` is supported. Rename the column if you wanted a plain counter |
-| `position` / `position{scope:col}` **(trunk-dev)** | `BIGINT NOT NULL DEFAULT 0` + an auto index (composite `(scope, position)` when scoped) + insert-assign/delete-compact triggers | `i64`. Declares a user-orderable list (issue #1358, Rails' `acts_as_list`): the column is DB-managed (`#[position]`, out of `New{Model}`/`Update{Model}` entirely — it's never hand-set), new rows append to the end of their scope on insert, and deleting (or soft-deleting) a row compacts the remaining live rows so no gap is left — all via database triggers, so the invariant holds for every insert/delete path, not just the generated repository's. `#[repository]` gains transaction-safe `move_to(id, n)` / `move_before(id, other)` / `move_after(id, other)` / `move_up(id)` / `move_down(id)`, each an `O(rows shifted)` shift-then-set inside one transaction, locking the scope's rows (ordered by id — a fixed lock order, so two concurrent movers on the same scope serialize rather than deadlock) before touching them. `position{scope:board_id}` keeps a separate contiguous `0..len-1` sequence per distinct value of a sibling `references` column instead of one sequence over the whole table; the scope column must already be declared as `references`. At most one `position` field per model. The HTML scaffold's index orders by it and adds no-JS Move up/down buttons (CSRF + one-time-submit-token protected, like the trash view's Restore button) — omitted for `--api`/`--live`/`--live-validation`/`--sharded`/owner-scoped scaffolds, though `--api`/`--live`/`--live-validation`/owner-scoped repositories still get the `move_*` methods (just no buttons); `--sharded` gets neither (`#[repository(..., sharded)]` rejects `position(...)` outright — a move only reaches the pool/shard it happens to be given). Not yet supported with `tenant_scoped`/`versioned = true`/`dependent(...)`. Quote the token in bash/zsh (brace expansion) |
+| `position` / `position{scope:col}` **(trunk-dev)** | `BIGINT NOT NULL DEFAULT 0` + an auto index (composite `(scope, position)` when scoped) + insert-assign/delete-compact triggers | `i64`. Declares a user-orderable list (issue #1358, Rails' `acts_as_list`): the column is DB-managed (`#[position]`, out of `New{Model}`/`Update{Model}` entirely — it's never hand-set), new rows append to the end of their scope on insert, and deleting (or soft-deleting) a row compacts the remaining live rows so no gap is left — all via database triggers, so the invariant holds for every insert/delete path, not just the generated repository's. `#[repository]` gains transaction-safe `move_to(id, n)` / `move_before(id, other)` / `move_after(id, other)` / `move_up(id)` / `move_down(id)`, each an `O(rows shifted)` shift-then-set inside one transaction, locking the scope's rows (ordered by id — a fixed lock order, so two concurrent movers on the same scope serialize rather than deadlock) before touching them. `position{scope:board_id}` keeps a separate contiguous `0..len-1` sequence per distinct value of a sibling `references` column instead of one sequence over the whole table; the scope column must already be declared as `references`. At most one `position` field per model. The HTML scaffold's index orders by it and adds no-JS Move up/down buttons (CSRF + one-time-submit-token protected, like the trash view's Restore button) — omitted for `--api`/`--live`/`--live-validation`/`--sharded`/owner-scoped scaffolds, though `--api`/`--live`/`--live-validation`/owner-scoped repositories still get the `move_*` methods (just no buttons); `--sharded` gets neither (`#[repository(..., sharded)]` rejects `position(...)` outright — a move only reaches the pool/shard it happens to be given). Not yet supported with `tenant_scoped`/`versioned = true`. Quote the token in bash/zsh (brace expansion) |
 
 **Foreign keys** (published 0.5.0 CLI only — no `references` token): scaffold
 an `i64` field and hand-edit the generated migration to add
@@ -130,9 +130,10 @@ bundled `libsqlite3-sys`, `autumn-web/sqlite`, no `pq-sys`), a generated
 newtypes that are `Copy`, deref to the wrapped type, and are
 `#[serde(transparent)]` (`uuid::Uuid` and `rust_decimal::Decimal` are foreign
 types no crate but their own can convert for SQLite). `--searchable` works via
-FTS5 (#1910); UUID primary keys and `--sharded` remain Postgres-only. A
-scaffolded SQLite app's `tests/<model>.rs` still uses the Postgres-only
-`TestDb`, so `cargo test` on it does not compile yet (#1905).
+FTS5 (#1910); `--id uuid` works too (#2555): the database fills the id with a
+`randomblob` default. `--sharded` remains Postgres-only. A scaffolded SQLite
+app's `tests/<model>.rs` uses the SQLite `TestDb` (a temp-file database), so it
+runs in a plain `cargo test` with no Docker.
 
 **Scaffold form behavior (trunk-dev)**: generated `create`/`update` handlers
 build a `Changeset` and, on a rejected submission, respond **422** and
@@ -188,7 +189,7 @@ three additive scaffold behaviors (issues #1388, #1146, #1718):
   --count/--model` resolves the model's factory; `autumn destroy` removes those
   links again. See `docs/guide/generators.md`.
 
-**Constrained-required numerics & `--live-validation` parity (unreleased — trunk-dev, issues #1748, #1750)**: two refinements to the `{…}` block above:
+**Constrained-required numerics & `--live-validation` parity (0.6.0, issues #1748, #1750)**: two refinements to the `{…}` block above:
 
 - **Blank-state for constrained required numerics** — a required numeric field
   with a `{min,max}` range (e.g. `age:i32{min=0,max=130}`) is emitted as
@@ -262,8 +263,12 @@ index list ships a no-JavaScript bulk-delete flow — a leading
 `bulk_select_checkbox` column, the list (and, with `--searchable`, the whole
 htmx-swapped results container) wrapped in a `bulk_actions_form`, and a
 `#[secured] POST /<plural>/bulk_delete` handler mounted right after `destroy`.
-The handler drops malformed ids and redirects on an empty selection (a
-list-write endpoint never 400s), per-row authorizes with the same `"delete"`
+The handler decodes the repeated `ids` checkboxes into a
+`BulkSelection { ids: Vec<i64> }` (the `ids[]` spelling works too) through
+`autumn_web::form::from_urlencoded`. A malformed selection flashes an error and
+deletes nothing, and an empty selection redirects (a list-write endpoint never
+400s). There is no generated `parse_bulk_ids` any more (issue #3394). It
+per-row authorizes with the same `"delete"`
 action `destroy` uses when policy wiring is on (an unauthorized row is dropped
 from the batch, not 403'd), and deletes through `repo.delete_many` so
 soft-delete, hooks and `dependent(...)` cascades all apply. Not emitted for
@@ -279,14 +284,16 @@ handler returning a `Download` (so `Content-Type: text/csv`,
 **Export CSV** link on the index carrying the current query string, and a
 database-free generated test. The planner auto-enables autumn-web's `csv`
 feature, so the scaffold compiles with no manual edits. The export honours the
-same allowlisted `?sort=`/`?filter[col]=` params as the index via the same
-`ListQuery` + `repo.list` pair (`?page=`/`?size=` are ignored — an export
-spans every page; `?q=` is NOT honoured, since `ListQuery` carries no
-full-text term), reads in `MAX_PAGE_SIZE` batches capped at `MAX_EXPORT_ROWS`
-(10 000), and mirrors the index's security posture exactly: an owner-scoped
-scaffold's export is `#[secured]` and goes through `list_scoped`, never the
-unscoped `list`. It additionally carries `#[throttle(limit = 6, per = "1m",
-key = "ip")]` the index does not — same row set, ~100x the cost per request.
+same allowlisted `?sort=`/`?filter[col]=` params as the index: it reads with
+`repo.list_rows`, which applies the same `ListQuery` allowlist as `repo.list`
+(`?page=`/`?size=` are ignored — an export spans every page; `?q=` is NOT
+honoured, since `ListQuery` carries no full-text term). It reads in ONE
+statement with no `COUNT(*)`, capped at `MAX_EXPORT_ROWS` (10 000), so the
+file comes from one snapshot (issue #2185). It mirrors the index's security
+posture exactly: an owner-scoped scaffold's export is `#[secured]` and goes
+through `list_scoped_rows`, never an unscoped read. It additionally carries
+`#[throttle(limit = 6, per = "1m", key = "ip")]` the index does not: one export
+loads up to 10 000 rows and builds the whole file in memory.
 `NULL` columns become empty cells, not the string `None`, and text columns
 pass through an emitted `csv_text_cell` guard against spreadsheet formula
 injection (numeric/date/bool/enum columns are not guarded — guarding them
@@ -323,6 +330,11 @@ handler. The upload is checked by extension **and** declared content type. Not e
 `--live-validation`, `--api`, or a model with an at-rest `{encrypted}` column
 (the export omits that column but the form requires it) — the generator warns
 and emits nothing, naming the reason and what to drop.
+
+A `Bytea` column is written as `\x` + lowercase hex (the Postgres text form) in
+the CSV export, the import and the edit form (issue #2330). The import decodes
+it byte-identically. A cell without the `\x` prefix, or with bad hex, fails its
+row. The index and show views still show the column as lossy text.
 
 **Scaffold Trash view (trunk-dev)**: a `--soft-delete` standard HTML scaffold
 also ships the recover-from-trash UI — a `#[secured] GET /<plural>/trash` page
@@ -538,9 +550,9 @@ Next steps:
    `magic_link_token`).
 ```
 
-**Magic-link account-lock recheck (trunk-dev)**: the generated `POST
-/login/magic/verify` handler re-checks the account lock **(unreleased —
-trunk-dev, issue #1777)** after consuming the single-use token and before
+**Magic-link account-lock recheck (0.6.0)**: the generated `POST
+/login/magic/verify` handler re-checks the account lock **(0.6.0,
+issue #1777)** after consuming the single-use token and before
 establishing a session, so a magic link minted before an account was locked can
 no longer complete a login after lockout. The recheck is a fresh guarded
 `UPDATE` on `locked_at` (same time-bounded `[auth.lockout]` cool-off semantics

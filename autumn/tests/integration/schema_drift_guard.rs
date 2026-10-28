@@ -308,6 +308,12 @@ fn deploy_child_keys_are_strictly_validated() {
         // `[deploy] hots = [...]` is silently ignored and the operator deploys to
         // nothing (or, worse, to the stale single `host`).
         "deploy.hosts",
+        // #3069: the post-cutover bake.
+        "deploy.bake.duration_secs",
+        "deploy.bake.interval_secs",
+        "deploy.bake.min_requests",
+        "deploy.bake.max_error_rate",
+        "deploy.bake.max_p99_ms",
     ] {
         assert!(
             leaves.contains(key),
@@ -474,6 +480,47 @@ fn shadow_child_keys_are_strictly_validated() {
     assert!(
         ok.is_empty(),
         "a well-formed [shadow] section must be accepted, got: {ok:?}"
+    );
+}
+
+/// Regression guard for the `[fault_injection]` field ordering (issue #3071).
+///
+/// A typo such as `allow_in_prodution` must fail strict validation. If
+/// `fault_injection` moves below `database`, this test fails.
+#[test]
+fn fault_injection_child_keys_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "fault_injection.enabled",
+        "fault_injection.allow_in_production",
+        "fault_injection.stop.objective",
+        "fault_injection.stop.max_burn_rate",
+        "fault_injection.stop.window_secs",
+        "fault_injection.stop.min_requests",
+    ] {
+        assert!(
+            leaves.contains(key),
+            "{key} must be a schema leaf, so strict validation checks [fault_injection]"
+        );
+    }
+
+    let schema = AutumnConfig::get_schema_keys();
+    let errors =
+        AutumnConfig::validate_toml("[fault_injection]\nallow_in_prodution = true\n", &schema);
+    assert!(
+        errors
+            .iter()
+            .any(|(path, _)| path == "fault_injection.allow_in_prodution"),
+        "a bad [fault_injection] key must fail strict validation, got: {errors:?}"
+    );
+
+    let ok = AutumnConfig::validate_toml(
+        "[fault_injection]\nenabled = true\n[fault_injection.stop]\nobjective = 99.9\n",
+        &schema,
+    );
+    assert!(
+        ok.is_empty(),
+        "a good [fault_injection] section must pass, got: {ok:?}"
     );
 }
 
@@ -644,5 +691,41 @@ fn http_client_base_urls_map_is_not_flagged() {
             .iter()
             .all(|(p, _)| !p.starts_with("http.client.base_urls")),
         "arbitrary base_urls map keys must not be flagged; got {errors:?}"
+    );
+}
+
+/// `[[slo]]` tables are known to strict validation (issue #3069).
+///
+/// The prod profile turns on `strict_config`. An unknown root stops the app at
+/// boot, so `slo` must be a schema root. Each table's keys must be leaves too,
+/// so a typo such as `objectiv = 99.9` is rejected.
+#[test]
+fn slo_tables_are_strictly_validated() {
+    let leaves = AutumnConfig::schema_leaf_paths();
+    for key in [
+        "slo.name",
+        "slo.objective",
+        "slo.sli",
+        "slo.route",
+        "slo.threshold_ms",
+        "slo.description",
+    ] {
+        assert!(leaves.contains(key), "{key} must be a schema leaf");
+    }
+
+    let schema = AutumnConfig::get_schema_keys();
+    let ok = AutumnConfig::validate_toml(
+        "[[slo]]\nname = \"a\"\nobjective = 99.9\nsli = \"availability\"\n",
+        &schema,
+    );
+    assert!(ok.is_empty(), "a valid [[slo]] table must pass: {ok:?}");
+
+    let typo = AutumnConfig::validate_toml(
+        "[[slo]]\nname = \"a\"\nobjectiv = 99.9\nsli = \"availability\"\n",
+        &schema,
+    );
+    assert!(
+        typo.iter().any(|(path, _)| path == "slo.objectiv"),
+        "a typo in [[slo]] must be rejected: {typo:?}"
     );
 }

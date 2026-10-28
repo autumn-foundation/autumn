@@ -310,12 +310,20 @@ combinations is also checked on every PR:
 | Combination | Rationale |
 |---|---|
 | `--no-default-features` (no flags) | bare-minimum compile |
-| each flag alone | isolation regression guard |
-| `db` | db-only API server |
+| each flag alone, except the `db` group below | isolation regression guard |
+| `db,postgres` | db-only API server on Postgres |
+| `db,sqlite` | db-only API server on SQLite |
 | `mail` | mail without the full default set |
-| `storage,db` | file storage backed by database |
+| `storage,db,postgres` | file storage backed by database |
 | `maud,htmx` | minimal web front-end |
 | `telemetry-otlp` | standalone telemetry |
+| `seed,repl,ledger-profile` + each backend | features that enable `db`, on each backend |
+| `offline-sync,reporting` + each backend | offline sync on each backend |
+
+`db` alone selects no backend, so it stops at a `compile_error!`. The sweep
+skips it and the features that enable `db` but no backend (`seed`, `repl`,
+`offline-sync`, `ledger-profile`). The combinations above build them with a
+backend.
 
 ### Unsupported feature combinations (CI excluded)
 
@@ -592,6 +600,9 @@ or external tooling with a stricter reader.
 | `StaticManifest::with_generated_at` | `autumn_web::static_gen` | Pins the build timestamp `new` stamped, for reproducible builds |
 | `StaticFileLayer::resolve_entry` → `ResolvedStatic` | `autumn_web::static_gen` | Returns the file path plus the ready-to-serve `Content-Type`; `resolve` remains the file-path-only shorthand |
 | `resolved_content_type` | `autumn_web::static_gen` | The decision function, public so an app serving `dist/` itself can match Autumn's behaviour exactly |
+| `resolved_entry_content_type` | `autumn_web::static_gen` | (#2403) Entry-aware `resolved_content_type`: serves a declared type as written. Use it, not `resolved_content_type`, to serve `dist/` yourself |
+| `StaticRouteMeta::content_type` | `autumn_web::static_gen` | `Option<&'static str>` (#2403). Set by `#[static_get(.., content_type = "..")]`. **Breaking:** a hand-built `StaticRouteMeta { .. }` must add the field |
+| `ManifestEntry::content_type_explicit` / `with_content_type_explicit` | `autumn_web::static_gen` | `bool` (#2403). `true` when the route declared the type. Absent in JSON means `false`, so old manifests load unchanged |
 
 `ResolvedStatic` is `#[non_exhaustive]` from the start, and has no public
 constructor — it is a return type, not something downstream code builds.
@@ -599,6 +610,41 @@ constructor — it is a return type, not something downstream code builds.
 `resolved_content_type` returns an `http::HeaderValue`, so `http` is now part of
 `autumn-web`'s public API surface here; it is re-exported as
 `autumn_web::reexports::http` (`autumn_web::http` is the HTTP *client* module).
+
+## WebMCP (issue #2619)
+
+The `webmcp` feature tracks the W3C WebMCP community-group draft of
+2026-04-23. The draft is **not** a standard, and its JavaScript API changes
+between revisions.
+
+- **Stable:** `#[api_doc(webmcp)]`, `#[api_doc(webmcp = false)]`,
+  `Route::webmcp`, `Route::webmcp_exclude`, `AppBuilder::mount_webmcp`,
+  `AppBuilder::expose_all_as_webmcp`, the `TestApp` and `SystemTest`
+  equivalents, `webmcp::derive_tools`, `webmcp::needs_confirmation`,
+  `webmcp::form_tool`, `webmcp::form_tool_confirm`, `webmcp::head_tags`,
+  `webmcp::WebMcpRuntime`, `webmcp::TOOLS_PATH`, `webmcp::SHIM_PATH`, and
+  the `data-webmcp-tool`, `data-webmcp-description` and
+  `data-webmcp-confirm` marker attributes. These follow the normal SemVer
+  rules.
+- **Not stable:** the page script (`js/autumn-webmcp.js`, `webmcp::SHIM_JS`)
+  and the shape of `/_autumn/webmcp/tools.json` (`webmcp::manifest_json`,
+  `webmcp::MANIFEST_VERSION`). A minor release can change them when the
+  draft changes. The document has a `version` field.
+
+### New public items
+
+| Item | Location | Notes |
+|------|----------|-------|
+| `ApiDoc::webmcp_tool`, `ApiDoc::webmcp_exclude` | `autumn_web::openapi` | Set by `#[api_doc(webmcp)]` |
+| `Route::webmcp`, `Route::webmcp_exclude` | `autumn_web` | Registration-time opt-in and opt-out |
+| `AppBuilder::mount_webmcp`, `AppBuilder::expose_all_as_webmcp` | `autumn_web::app` | `webmcp` feature |
+| `webmcp` module | `autumn_web::webmcp` | `webmcp` feature |
+| `McpToolInfo::path_params`, `has_body`, `has_query` | `autumn_web::mcp` | Read the dispatch shape of a tool |
+| `RouteSummary::webmcp_tool`, `webmcp_exposed_by` | `autumn_web::agent_authority::manifest` | **Breaking** for a hand-built `RouteSummary { .. }` literal |
+| `AgentAuthorityManifest::ungoverned_webmcp_tools`, `ungoverned_mutating_webmcp_tools` | same | The JSON omits the field when it is empty, so a committed manifest does not drift |
+| `RouteRef::webmcp_tool`, `UnregisteredAuthority::webmcp_tool` | same | The JSON omits the field when it is `false` |
+| `TestApp::mount_webmcp`, `TestApp::expose_all_as_webmcp`, `SystemTest::mount_webmcp` | `autumn_web::test`, `autumn_web::system_test` | `webmcp` feature |
+| `webmcp_exposure`, `WEBMCP_TOOL_EXPOSURE` | same | The exposure rule and the `"webmcp-tool"` row value |
 
 ## Pre-1.0 notes
 

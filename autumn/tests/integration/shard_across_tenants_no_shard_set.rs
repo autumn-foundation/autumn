@@ -17,6 +17,8 @@
 //! query binding a NULL tenant predicate (a silent PARTIAL result). They now
 //! reject under `across_tenants()` with no shard set, matching the count guard.
 //!
+//! #2185: `list_rows` / `list_scoped_rows` reject the same way.
+//!
 //! Both guards return before acquiring any database connection, so — like the
 //! read-routing test in `repository_find_in_batches.rs` — no live database is
 //! needed and these assertions run without Docker.
@@ -263,6 +265,26 @@ async fn find_by_borrowed_derived_across_tenants_without_shard_set_rejects() {
         err.to_string()
             .contains("cross-shard find_by_tenant_id requires a configured shard set"),
         "borrowed-param derived find_by_* guard must reject cross-shard read without a shard set, got: {err}"
+    );
+}
+
+/// #2185: `list_rows().across_tenants()` on a no-shard-set repo must reject.
+/// Without the guard it drops the tenant filter and reads one pool: a partial
+/// export with no error.
+#[tokio::test]
+async fn list_rows_across_tenants_without_shard_set_rejects() {
+    let pool = make_pool();
+    let repo = PgNoShardSetPostRepository::with_pool_untracked(pool).across_tenants();
+    assert!(repo.__autumn_shards.is_none());
+
+    let err = repo
+        .list_rows(&autumn_web::pagination::ListQuery::default(), 10)
+        .await
+        .expect_err("across_tenants list_rows without a shard set must reject");
+    assert!(
+        err.to_string()
+            .contains("cross-shard list_rows requires a configured shard set"),
+        "list_rows guard must reject cross-shard read without a shard set, got: {err}"
     );
 }
 

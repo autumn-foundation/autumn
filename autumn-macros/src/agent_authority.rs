@@ -44,21 +44,22 @@
 //! `spawn*`), a constructor, or on the **inert-async allowlist** — which is
 //! exactly:
 //!
-//! * `sleep`, `sleep_until`, `yield_now`, `timeout` (`tokio::time` /
-//!   `tokio::task`); `timeout` awaits the future it is handed, so that future
-//!   is judged at the `await` instead;
-//! * chains whose root binding is named `session`, `flash`, `cache`,
-//!   `cookies`, `cookie_jar` or `csrf`, or whose root parameter is typed
-//!   `Session`, `Flash`, `CookieJar`, `PrivateCookieJar`, `SignedCookieJar`,
-//!   `Csrf`, `CsrfToken` or `Cache…` (through any extractor wrapping it) —
-//!   request-local plumbing that stores no rows a grant governs;
-//! * `.commit()` / `.rollback()`, which end a transaction rather than acting
-//!   through it;
+//! * `tokio::time::sleep`, `sleep_until`, `timeout` and
+//!   `tokio::task::yield_now`. Write the `tokio` path, or import the name with
+//!   `use` in the handler. A bare name can be any function. `timeout` awaits
+//!   its argument, so Autumn judges that argument at the `await`;
+//! * chains whose root parameter is typed `Session`, `Flash`, `CookieJar`,
+//!   `PrivateCookieJar`, `SignedCookieJar`, `Csrf`, `CsrfToken` or `Cache…`
+//!   (even inside an extractor such as `Extension<…>`). They hold request-local
+//!   state and store no rows. The type decides, never the binding's name;
+//! * `.commit()` / `.rollback()` on a transaction (`db.begin()`, or the `tx`
+//!   or `tx_with` callback parameter). They end the transaction. They do not
+//!   act on data;
 //! * the guard prologue an attribute macro prepends — a call rooted at
 //!   `autumn_web` whose function is `__`-prefixed, which is what `#[secured]`,
 //!   `#[authorize]`, `#[step_up]` and `#[throttle]` emit ahead of the body.
 //!
-//! Everything else is discharged with `#[agent_effect(none, reason = "…")]`.
+//! Declare everything else with `#[agent_effect(none, reason = "…")]`.
 //!
 //! Statement-level escape hatches: `#[agent_effect(writes(Model), ...,
 //! reason = "…")]` declares a site's effects (they are still checked against
@@ -67,9 +68,10 @@
 //!
 //! See `docs/guide/agent-authority.md` for the user-facing guide.
 
+use autumn_macros_support::cascade::CASCADE_LEVELS;
 use std::collections::{HashMap, HashSet};
 
-use proc_macro2::{Span, TokenStream, TokenTree};
+use proc_macro2::{Delimiter, Span, TokenStream, TokenTree};
 use quote::{ToTokens as _, format_ident, quote, quote_spanned};
 use syn::parse::{Parse, ParseStream};
 use syn::spanned::Spanned;
@@ -354,6 +356,29 @@ const INERT_MACROS: &[&str] = &[
     "log",
     "html",
     "maud",
+    "bail",
+    "ensure",
+    "anyhow",
+];
+
+/// Macros that only build a value, so expression position may use them.
+const PURE_VALUE_MACROS: &[&str] = &[
+    "format",
+    "format_args",
+    "vec",
+    "json",
+    "matches",
+    "concat",
+    "stringify",
+    "line",
+    "file",
+    "column",
+    "module_path",
+    "env",
+    "option_env",
+    "cfg",
+    "include_str",
+    "include_bytes",
 ];
 
 /// The statement annotation that declares what the analysis cannot read.
@@ -609,12 +634,18 @@ impl Handle {
                     bounded: a,
                     insert,
                 },
-                Self::WriteBuilder { bounded: b, .. },
-            ) => Self::WriteBuilder {
+                Self::WriteBuilder {
+                    table: other_table,
+                    bounded: b,
+                    insert: other_insert,
+                },
+            ) if table == other_table && insert == other_insert => Self::WriteBuilder {
                 table,
                 bounded: a && b,
                 insert,
             },
+            // Two builders for different tables: which one runs is unknown.
+            (Self::WriteBuilder { .. }, Self::WriteBuilder { .. }) => Self::Ambiguous,
             // Two containers joined at a branch keep every element either side
             // can hold: an element written on one reachable path is written.
             (Self::Container(left), Self::Container(right)) => {
@@ -627,7 +658,16 @@ impl Handle {
                 }
                 Self::Container(merged)
             }
-            (handle, _) => handle,
+            (Self::Repository(a), Self::Repository(b)) => Self::Repository(match (a, b) {
+                (Some(a), Some(b)) if a.key() == b.key() => Some(a),
+                // A model that is unknown on one path stays unknown.
+                _ => None,
+            }),
+            (left, right) if std::mem::discriminant(&left) == std::mem::discriminant(&right) => {
+                left
+            }
+            // Different kinds of handle: unusable.
+            (_, _) => Self::Ambiguous,
         }
     }
 }
@@ -830,6 +870,10 @@ struct Analyzer {
     effects: Vec<Effect>,
     /// De-duplication keys for the above.
     seen: HashSet<(Kind, String)>,
+    /// Repositories whose cascading delete the handler calls: the repository
+    /// path, the model's human name, and the call's span. One entry per
+    /// repository.
+    cascades: Vec<(syn::Path, String, Span)>,
     /// Sites the author asserted effect-free with `#[agent_effect(none, ...)]`.
     ///
     /// The span carries the emitted `file!():line!()` (the same trick the
@@ -839,6 +883,9 @@ struct Analyzer {
     effect_free_sites: Vec<(proc_macro2::Span, String)>,
     /// Diagnostics for sites that cannot be proven.
     errors: Vec<syn::Error>,
+    /// Messages already reported, by message and span, so walking a closure
+    /// again at a call site does not report its refusals twice.
+    error_keys: HashSet<String>,
     /// Depth of enclosing transaction callbacks: a plain `enqueue` in here
     /// fires even when the transaction rolls back.
     in_transaction: u32,
@@ -858,12 +905,125 @@ struct Analyzer {
     /// Names bound to some other effect verb as a function item, and the path
     /// they were bound to (`let schedule = NotifyFinanceJob::enqueue;`).
     fn_aliases: HashMap<String, syn::Path>,
+    /// Names bound to different effect verbs on different paths.
+    ambiguous_fns: HashSet<String>,
     /// Parameter names whose async surface is request-local plumbing
     /// (`session`, a `CookieJar`, …), read off the signature.
     inert_roots: HashSet<String>,
     /// Names bound to a call the analysis could not read. Binding a future and
     /// awaiting the *name* is the same effect as awaiting the call.
     unread_futures: HashSet<String>,
+    /// Whether a walked block's tail was an unread future, keyed by the
+    /// block's address. Read before the block's own names are restored.
+    tail_unread: HashMap<usize, bool>,
+    /// The callable meaning of a block tail, `break` or `return` value, read
+    /// while its block's own names were bound. Keyed like `tail_unread`.
+    callable_snaps: HashMap<usize, CallableSnap>,
+    /// Names bound to a `<table>::table` value, and whether the value already
+    /// bounds the write (`let target = refunds::table;`).
+    tables: HashMap<String, (String, bool)>,
+    /// Names a `use` in the handler imported from `tokio::time` / `tokio::task`.
+    /// A `use` lasts until the end of its block.
+    tokio_imports: HashSet<String>,
+    /// Macro names the handler defines or imports. They are never read as the
+    /// standard macro of that name. A block restores it when it ends.
+    shadowed_macros: HashSet<String>,
+    /// Names that mean the `diesel` crate in this handler.
+    diesel_roots: HashSet<String>,
+    /// Write constructors a `use` brought in, by local name, with the verb.
+    diesel_fns: HashMap<String, String>,
+}
+
+/// All state of one name except `handles`. A scope saves it when it shadows
+/// the name.
+#[allow(clippy::struct_excessive_bools)]
+struct Shadow {
+    name: String,
+    handle: Option<Handle>,
+    closure: Option<syn::ExprClosure>,
+    spawn: bool,
+    alias: Option<syn::Path>,
+    ambiguous: bool,
+    unread: bool,
+    table: Option<(String, bool)>,
+    inert: bool,
+    diesel_fn: Option<String>,
+}
+
+/// What a value is, as a callable, read while the names it uses were bound.
+#[derive(Clone)]
+struct CallableSnap {
+    spawn: bool,
+    alias: Option<syn::Path>,
+    ambiguous: bool,
+}
+
+/// Per-name state. Autumn copies it at a branch and joins the copies after.
+#[derive(Clone)]
+struct Bindings {
+    handles: HashMap<String, Handle>,
+    closures: HashMap<String, syn::ExprClosure>,
+    spawn_aliases: HashSet<String>,
+    fn_aliases: HashMap<String, syn::Path>,
+    ambiguous_fns: HashSet<String>,
+    unread_futures: HashSet<String>,
+    tables: HashMap<String, (String, bool)>,
+}
+
+impl Bindings {
+    /// Join two paths. A name holds a value if either path holds it. A name
+    /// cleared on one path stays bound on the other.
+    fn join(mut self, other: Self) -> Self {
+        let mut handles = HashMap::new();
+        for name in self.handles.keys().chain(other.handles.keys()) {
+            let joined = join_handles(
+                self.handles.get(name).cloned(),
+                other.handles.get(name).cloned(),
+            );
+            handles.extend(joined.map(|handle| (name.clone(), handle)));
+        }
+        self.handles = handles;
+        self.spawn_aliases.extend(other.spawn_aliases);
+        self.unread_futures.extend(other.unread_futures);
+        for (name, closure) in other.closures {
+            match self.closures.get(&name) {
+                None => {
+                    self.closures.insert(name, closure);
+                }
+                // Two bodies on two paths: keep both, so a transaction walks
+                // the one that enqueues.
+                Some(kept)
+                    if kept.to_token_stream().to_string()
+                        != closure.to_token_stream().to_string() =>
+                {
+                    let (left, right) = (kept.body.clone(), closure.body);
+                    let mut merged = kept.clone();
+                    merged.body = syn::parse_quote!({ #left; #right });
+                    self.closures.insert(name, merged);
+                }
+                Some(_) => {}
+            }
+        }
+        // An effect verb on either path is an effect verb after the join.
+        // Two different verbs on two paths leave a name that no single path
+        // describes, so a later call through it is refused.
+        self.ambiguous_fns.extend(other.ambiguous_fns);
+        for (name, path) in other.fn_aliases {
+            match self.fn_aliases.get(&name) {
+                None => {
+                    self.fn_aliases.insert(name, path);
+                }
+                Some(kept) if path_string(kept) != path_string(&path) => {
+                    self.fn_aliases.remove(&name);
+                    self.ambiguous_fns.insert(name);
+                }
+                Some(_) => {}
+            }
+        }
+        self.tables
+            .retain(|name, table| other.tables.get(name) == Some(table));
+        self
+    }
 }
 
 impl Analyzer {
@@ -873,16 +1033,27 @@ impl Analyzer {
             action,
             inert_roots,
             unread_futures: HashSet::new(),
+            tail_unread: HashMap::new(),
+            callable_snaps: HashMap::new(),
+            tables: HashMap::new(),
+            // The `tokio` crate is in scope until a name hides it.
+            tokio_imports: HashSet::from(["tokio".to_string()]),
+            shadowed_macros: HashSet::new(),
+            diesel_roots: HashSet::from(["diesel".to_string()]),
+            diesel_fns: HashMap::new(),
             effects: Vec::new(),
             seen: HashSet::new(),
+            cascades: Vec::new(),
             effect_free_sites: Vec::new(),
             errors: Vec::new(),
+            error_keys: HashSet::new(),
             in_transaction: 0,
             tenant_declared: false,
             suppress: 0,
             closures: HashMap::new(),
             spawn_aliases: HashSet::new(),
             fn_aliases: HashMap::new(),
+            ambiguous_fns: HashSet::new(),
         }
     }
 
@@ -891,7 +1062,8 @@ impl Analyzer {
     fn record(&mut self, kind: Kind, subject: Subject, provenance: Provenance, span: Span) {
         // Effects are a SET: a write in both arms of an `if`, or in a loop
         // body, is one authority, not two.
-        if self.seen.insert((kind, subject.key())) {
+        let key = subject.key();
+        if self.seen.insert((kind, key.clone())) {
             self.effects.push(Effect {
                 kind,
                 subject,
@@ -899,7 +1071,146 @@ impl Analyzer {
                 span,
                 call: None,
             });
+        } else if provenance == Provenance::Declared
+            && let Some(kept) = self
+                .effects
+                .iter_mut()
+                .find(|e| e.kind == kind && e.subject.key() == key)
+        {
+            // Keep the `Declared` mark even when a proof recorded the effect first.
+            kept.provenance = Provenance::Declared;
         }
+    }
+
+    fn bindings(&self) -> Bindings {
+        Bindings {
+            handles: self.handles.clone(),
+            closures: self.closures.clone(),
+            spawn_aliases: self.spawn_aliases.clone(),
+            fn_aliases: self.fn_aliases.clone(),
+            ambiguous_fns: self.ambiguous_fns.clone(),
+            unread_futures: self.unread_futures.clone(),
+            tables: self.tables.clone(),
+        }
+    }
+
+    fn set_bindings(&mut self, bindings: Bindings) {
+        self.handles = bindings.handles;
+        self.closures = bindings.closures;
+        self.spawn_aliases = bindings.spawn_aliases;
+        self.fn_aliases = bindings.fn_aliases;
+        self.ambiguous_fns = bindings.ambiguous_fns;
+        self.unread_futures = bindings.unread_futures;
+        self.tables = bindings.tables;
+    }
+
+    /// Join the current state with another path's.
+    fn join_with(&mut self, other: Bindings) {
+        let joined = self.bindings().join(other);
+        self.set_bindings(joined);
+    }
+
+    fn shadow(&self, name: &str) -> Shadow {
+        Shadow {
+            name: name.to_string(),
+            handle: self.handles.get(name).cloned(),
+            closure: self.closures.get(name).cloned(),
+            spawn: self.spawn_aliases.contains(name),
+            alias: self.fn_aliases.get(name).cloned(),
+            ambiguous: self.ambiguous_fns.contains(name),
+            unread: self.unread_futures.contains(name),
+            table: self.tables.get(name).cloned(),
+            inert: self.inert_roots.contains(name),
+            diesel_fn: self.diesel_fns.get(name).cloned(),
+        }
+    }
+
+    fn unshadow(&mut self, saved: Shadow) {
+        let Shadow {
+            name,
+            handle,
+            closure,
+            spawn,
+            alias,
+            ambiguous,
+            unread,
+            table,
+            inert,
+            diesel_fn,
+        } = saved;
+        if ambiguous {
+            self.ambiguous_fns.insert(name.clone());
+        } else {
+            self.ambiguous_fns.remove(&name);
+        }
+        match handle {
+            Some(handle) => self.handles.insert(name.clone(), handle),
+            None => self.handles.remove(&name),
+        };
+        match closure {
+            Some(closure) => self.closures.insert(name.clone(), closure),
+            None => self.closures.remove(&name),
+        };
+        if spawn {
+            self.spawn_aliases.insert(name.clone());
+        } else {
+            self.spawn_aliases.remove(&name);
+        }
+        match alias {
+            Some(alias) => self.fn_aliases.insert(name.clone(), alias),
+            None => self.fn_aliases.remove(&name),
+        };
+        if unread {
+            self.unread_futures.insert(name.clone());
+        } else {
+            self.unread_futures.remove(&name);
+        }
+        match diesel_fn {
+            Some(verb) => self.diesel_fns.insert(name.clone(), verb),
+            None => self.diesel_fns.remove(&name),
+        };
+        if inert {
+            self.inert_roots.insert(name.clone());
+        } else {
+            self.inert_roots.remove(&name);
+        }
+        match table {
+            Some(table) => self.tables.insert(name, table),
+            None => self.tables.remove(&name),
+        };
+    }
+
+    /// A value item hides an imported function. It cannot hide the `tokio`
+    /// crate, which lives in the type namespace.
+    fn hide_import(&mut self, name: &syn::Ident) {
+        if name != "tokio" {
+            self.tokio_imports.remove(&name.to_string());
+        }
+        self.diesel_fns.remove(&name.to_string());
+    }
+
+    fn hide_crate(&mut self, name: &syn::Ident) {
+        let name = name.to_string();
+        self.tokio_imports.remove(&name);
+        self.diesel_roots.remove(&name);
+        self.shadowed_macros.insert(name);
+    }
+
+    /// Remove all state of a name except its handle.
+    fn forget(&mut self, name: &str) {
+        self.closures.remove(name);
+        self.spawn_aliases.remove(name);
+        self.fn_aliases.remove(name);
+        self.ambiguous_fns.remove(name);
+        self.unread_futures.remove(name);
+        self.tables.remove(name);
+        // `tokio` stays: a value binding cannot hide a crate path.
+        if name != "tokio" {
+            self.tokio_imports.remove(name);
+        }
+        // A rebound name is no longer the typed parameter or the import.
+        self.inert_roots.remove(name);
+        self.diesel_fns.remove(name);
     }
 
     /// A raw diesel `SELECT`/`UPDATE`/`DELETE` handed a `Db` or connection
@@ -932,14 +1243,16 @@ impl Analyzer {
             Some(SqlStatement::Read { table }) => {
                 self.record_raw_query(span, verb, table.as_deref().unwrap_or("sql_query"));
             }
-            Some(SqlStatement::Write { table }) => {
-                self.record_raw_query(span, verb, &table);
-                self.record(
-                    Kind::UnboundedWrite,
-                    Subject::Lit(table),
-                    Provenance::Syntactic,
-                    span,
-                );
+            Some(SqlStatement::Write { tables }) => {
+                for table in tables {
+                    self.record_raw_query(span, verb, &table);
+                    self.record(
+                        Kind::UnboundedWrite,
+                        Subject::Lit(table),
+                        Provenance::Syntactic,
+                        span,
+                    );
+                }
             }
             None => self.refuse_raw_sql(span, "names no statement this analysis can read"),
         }
@@ -982,7 +1295,9 @@ impl Analyzer {
         if self.suppress > 0 {
             return;
         }
-        self.errors.push(syn::Error::new(span, message));
+        if self.error_keys.insert(format!("{span:?}\n{message}")) {
+            self.errors.push(syn::Error::new(span, message));
+        }
     }
 
     /// Walk a site carrying an `#[agent_effect(...)]`, with the semantics the
@@ -1019,25 +1334,88 @@ impl Analyzer {
     fn block(&mut self, block: &Block) {
         // A block scopes the names its own `let`s introduce, but not an
         // assignment it makes to an outer name. Restore exactly the declared
-        // names (the lesson `query_budget` learned in review).
-        let outer = self.handles.clone();
+        // names.
+        // A `use` in this block ends with it. So does a local `fn`, whose name
+        // covers the whole block, so it hides an import before its own line.
+        let imports = self.tokio_imports.clone();
+        let spawn_before = self.spawn_aliases.clone();
+        let macros = self.shadowed_macros.clone();
+        let diesel = (self.diesel_roots.clone(), self.diesel_fns.clone());
+        // Every item in a block is in scope for the whole block, so the names
+        // items hide are settled before a `use` reads the roots they hide.
+        let mut uses: Vec<&syn::Item> = Vec::new();
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Item(syn::Item::Fn(item)) => self.hide_import(&item.sig.ident),
+                Stmt::Item(syn::Item::Const(item)) => self.hide_import(&item.ident),
+                Stmt::Item(syn::Item::Static(item)) => self.hide_import(&item.ident),
+                // A type-namespace item hides the crate path as well.
+                Stmt::Item(syn::Item::Mod(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::Struct(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::Enum(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::Union(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::Trait(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::Type(item)) => self.hide_crate(&item.ident),
+                Stmt::Item(syn::Item::ExternCrate(item)) => {
+                    let name = item.rename.as_ref().map_or(&item.ident, |(_, name)| name);
+                    self.hide_crate(name);
+                    // `extern crate diesel as orm;` is the crate under a new name.
+                    if item.ident == "diesel" {
+                        self.diesel_roots.insert(name.to_string());
+                    }
+                }
+                // A `use` also covers the whole block, whatever its line.
+                Stmt::Item(item @ syn::Item::Use(_)) => uses.push(item),
+                _ => {}
+            }
+        }
+        for item in uses {
+            self.nested_item(item);
+        }
+        // Save a name when its `let` is reached, not at block entry: an
+        // assignment made before the shadow belongs to the outer name.
+        let mut outer: Vec<Shadow> = Vec::new();
         let mut declared = HashSet::new();
         for stmt in &block.stmts {
             if let Stmt::Local(local) = stmt {
-                collect_pat_idents(&local.pat, &mut declared);
+                let mut names = HashSet::new();
+                collect_pat_idents(&local.pat, &mut names);
+                for name in names {
+                    if declared.insert(name.clone()) {
+                        outer.push(self.shadow(&name));
+                    }
+                }
             }
             self.stmt(stmt);
         }
-        for name in declared {
-            match outer.get(&name) {
-                Some(handle) => {
-                    self.handles.insert(name, handle.clone());
-                }
-                None => {
-                    self.handles.remove(&name);
-                }
+        // Judge the tail while the block's own names still exist.
+        let tail = self.compute_tail_unread(block);
+        self.tail_unread
+            .insert(std::ptr::from_ref(block) as usize, tail);
+        if let Some(Stmt::Expr(tail_expr, None)) = block.stmts.last() {
+            self.record_callable(tail_expr);
+        }
+        // Restore the block's names first. Their saved state may hold a
+        // block-local import, which the reset below then removes.
+        for saved in outer.into_iter().rev() {
+            self.unshadow(saved);
+        }
+        self.tokio_imports = imports;
+        // A `use tokio::spawn as detach;` ends with its block. A name that was
+        // already a spawn alias outside stays one.
+        let mut renamed = HashSet::new();
+        for stmt in &block.stmts {
+            if let Stmt::Item(syn::Item::Use(import)) = stmt {
+                spawn_renames(&import.tree, &mut renamed);
             }
         }
+        for name in renamed {
+            if !spawn_before.contains(&name) {
+                self.spawn_aliases.remove(&name);
+            }
+        }
+        self.shadowed_macros = macros;
+        (self.diesel_roots, self.diesel_fns) = diesel;
     }
 
     fn stmt(&mut self, stmt: &Stmt) {
@@ -1096,11 +1474,39 @@ impl Analyzer {
     /// it is invoked — and the invocation (`wipe!()`) mentions nothing the
     /// analysis can see.
     fn nested_item(&mut self, item: &syn::Item) {
+        if let syn::Item::Use(import) = item {
+            // Any imported name hides an earlier import of the same name.
+            let mut names = HashSet::new();
+            use_leaf_names(&import.tree, &mut names);
+            for name in &names {
+                self.tokio_imports.remove(name);
+            }
+            for name in &names {
+                self.diesel_roots.remove(name);
+                self.diesel_fns.remove(name);
+            }
+            self.shadowed_macros.extend(names);
+            // Only a `tokio` that still means the crate can lend its names.
+            if self.tokio_imports.contains("tokio") {
+                tokio_inert_imports(&import.tree, &mut Vec::new(), &mut self.tokio_imports);
+            }
+            spawn_renames(&import.tree, &mut self.spawn_aliases);
+            diesel_imports(
+                &import.tree,
+                &mut Vec::new(),
+                &mut self.diesel_roots,
+                &mut self.diesel_fns,
+            );
+            return;
+        }
         let syn::Item::Macro(m) = item else {
             return;
         };
         if !m.mac.path.is_ident("macro_rules") {
             return;
+        }
+        if let Some(name) = &m.ident {
+            self.shadowed_macros.insert(name.to_string());
         }
         if !self.tokens_mention_handle(&m.mac.tokens) {
             return;
@@ -1122,7 +1528,14 @@ impl Analyzer {
         match stmt {
             Stmt::Local(local) => self.local(local),
             Stmt::Expr(expr, _) => self.expr(expr),
-            Stmt::Macro(m) => self.mac(&m.mac),
+            Stmt::Macro(m) => {
+                self.mac(&m.mac);
+                // A statement macro expands into statements of this body.
+                // Refuse it even if no token names a handle.
+                if !self.macro_is_readable(&m.mac) {
+                    self.refuse_opaque_macro(&m.mac);
+                }
+            }
             Stmt::Item(_) => {}
         }
     }
@@ -1140,62 +1553,65 @@ impl Analyzer {
     /// Propagate handle identity from a `let`'s initialiser to its bindings.
     fn bind_handles(&mut self, local: &Local) {
         let Some(init) = &local.init else {
+            let mut names = HashSet::new();
+            collect_pat_idents(&local.pat, &mut names);
+            for name in &names {
+                self.forget(name);
+            }
             self.rebind(&local.pat, None);
             return;
         };
-        if let Pat::Ident(ident) = &local.pat {
-            let name = ident.ident.to_string();
-            match strip_transparent(&init.expr) {
-                // Remembered so a transaction handed this closure by name is
-                // still walked under the rollback rule (P2-1).
-                Expr::Closure(closure) => {
-                    self.closures.insert(name.clone(), closure.clone());
-                }
-                // `let s = tokio::spawn;` — an alias is still a detachment.
-                Expr::Path(path)
-                    if path
-                        .path
-                        .segments
-                        .last()
-                        .is_some_and(|s| SPAWN_FNS.contains(&s.ident.to_string().as_str())) =>
-                {
-                    self.spawn_aliases.insert(name.clone());
-                }
-                // `let schedule = NotifyFinanceJob::enqueue;` — a function
-                // item bound to a local name. The call site then mentions no
-                // verb the sweep can see, so the aliased *path* is remembered
-                // and the call is classified against it.
-                Expr::Path(path) if is_effect_verb_path(&path.path) => {
-                    self.fn_aliases.insert(name.clone(), path.path.clone());
-                }
-                _ => {
-                    self.closures.remove(&name);
-                    self.spawn_aliases.remove(&name);
-                    self.fn_aliases.remove(&name);
-                }
+        // `let fut: BoxFuture<R> = ..` binds the same name as `let fut = ..`.
+        let pat = match &local.pat {
+            Pat::Type(typed) => &*typed.pat,
+            other => other,
+        };
+        if !matches!(pat, Pat::Ident(_)) {
+            let mut names = HashSet::new();
+            collect_pat_idents(pat, &mut names);
+            for name in &names {
+                self.forget(name);
             }
+            // A tuple initialiser is paired element by element below.
+            let paired = matches!(
+                (pat, &*init.expr),
+                (Pat::Tuple(p), Expr::Tuple(t)) if p.elems.len() == t.elems.len()
+            );
+            if !paired {
+                self.mark_pattern_unread(pat, &init.expr);
+            }
+        }
+        if let Pat::Ident(ident) = pat {
+            let name = ident.ident.to_string();
+            // Read the old state first. `forget` clears it.
+            let unread = self.carries_unread(&init.expr);
+            let table = self.table_of(strip_transparent(&init.expr));
+            self.forget(&name);
+            if let Some(table) = table {
+                self.tables.insert(name.clone(), table);
+            }
+            self.bind_callable(&name, &init.expr);
             // `let fut = start_finance_job(); fut.await;` — binding the future
             // and awaiting the name is the same effect as awaiting the call,
             // spelled so the call site carries no `.await` to read.
-            match &*init.expr {
-                head @ (Expr::Call(_) | Expr::MethodCall(_)) if !self.awaited_is_readable(head) => {
-                    self.unread_futures.insert(name.clone());
-                }
-                _ => {
-                    self.unread_futures.remove(&name);
-                }
+            if unread {
+                self.unread_futures.insert(name);
             }
         }
         if let Some(handle) = self.expr_handle(&init.expr) {
             self.rebind(&local.pat, Some(&handle));
             return;
         }
-        if let (Pat::Tuple(pat), Expr::Tuple(tuple)) = (&local.pat, &*init.expr) {
+        if !matches!(pat, Pat::Ident(_)) {
+            self.bind_pattern_callables(pat, &init.expr);
+        }
+        if let (Pat::Tuple(pat), Expr::Tuple(tuple)) = (pat, &*init.expr) {
             // `let (store, key) = (repo, id);` — pair the pattern against the
             // initialiser so the handle keeps its identity under a new name.
             for (element_pat, element) in pat.elems.iter().zip(tuple.elems.iter()) {
                 let handle = self.expr_handle(element);
                 self.rebind(element_pat, handle.as_ref());
+                self.mark_pattern_unread(element_pat, element);
             }
             return;
         }
@@ -1210,6 +1626,233 @@ impl Analyzer {
         // Shadowing: `let repo = repo.find_all().await?;` rebinds the name to
         // a `Vec`, and the old identity has to go with it.
         self.rebind(&local.pat, None);
+    }
+
+    /// Pair a destructuring pattern with its initialiser, at any depth, so a
+    /// callable moved into a tuple or array keeps its meaning under the new
+    /// name: `let ((run,), n) = ((tokio::spawn,), 1);`.
+    fn bind_pattern_callables(&mut self, pat: &Pat, init: &Expr) {
+        match (pat, strip_transparent(init)) {
+            (Pat::Ident(ident), init) => self.bind_callable(&ident.ident.to_string(), init),
+            (Pat::Type(typed), init) => self.bind_pattern_callables(&typed.pat, init),
+            (Pat::Paren(p), init) => self.bind_pattern_callables(&p.pat, init),
+            (Pat::Tuple(p), Expr::Tuple(t)) if p.elems.len() == t.elems.len() => {
+                for (element_pat, element) in p.elems.iter().zip(t.elems.iter()) {
+                    self.bind_pattern_callables(element_pat, element);
+                }
+            }
+            (Pat::Slice(p), Expr::Array(a)) if p.elems.len() == a.elems.len() => {
+                for (element_pat, element) in p.elems.iter().zip(a.elems.iter()) {
+                    self.bind_pattern_callables(element_pat, element);
+                }
+            }
+            // `let [run] = [tokio::spawn; 1];` repeats one element.
+            (Pat::Slice(p), Expr::Repeat(rep)) => {
+                for element_pat in &p.elems {
+                    if !matches!(element_pat, Pat::Rest(_)) {
+                        self.bind_pattern_callables(element_pat, &rep.expr);
+                    }
+                }
+            }
+            // `let Holder { run } = Holder { run: tokio::spawn };`
+            (Pat::Struct(p), Expr::Struct(s)) => {
+                for field in &p.fields {
+                    if let Some(value) = s.fields.iter().find(|f| f.member == field.member) {
+                        self.bind_pattern_callables(&field.pat, &value.expr);
+                    }
+                }
+            }
+            // `let Wrap(run) = Wrap(tokio::spawn);`
+            (Pat::TupleStruct(p), Expr::Call(c)) if p.elems.len() == c.args.len() => {
+                for (element_pat, element) in p.elems.iter().zip(c.args.iter()) {
+                    self.bind_pattern_callables(element_pat, element);
+                }
+            }
+            // Nothing pairs the pattern with the initialiser, so every name in
+            // it takes what the source holds: `if let Some(run) = funcs`.
+            (pat, init) => {
+                let mut names = HashSet::new();
+                collect_pat_idents(pat, &mut names);
+                for name in names {
+                    self.bind_container_callables(&name, [init]);
+                }
+            }
+        }
+    }
+
+    /// Remember a name bound to a closure, `spawn` or an effect verb.
+    fn bind_callable(&mut self, name: &str, init: &Expr) {
+        // `async { tokio::spawn }.await` yields the block's tails and returns.
+        let peeled = peel_wrappers(init);
+        if let Expr::Await(awaited) = peeled
+            && let Expr::Async(block) = peel_wrappers(&awaited.base)
+        {
+            let yielded = block_tail(&block.block)
+                .into_iter()
+                .chain(block_return_values(&block.block));
+            self.bind_container_callables(name, yielded);
+            return;
+        }
+        match strip_transparent(init) {
+            // Remembered so a transaction handed this closure by name is
+            // still walked under the rollback rule (P2-1).
+            Expr::Closure(closure) => {
+                self.closures.insert(name.to_string(), closure.clone());
+            }
+            // `let s = tokio::spawn;` — an alias is still a detachment.
+            Expr::Path(path)
+                if path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| SPAWN_FNS.contains(&s.ident.to_string().as_str())) =>
+            {
+                self.spawn_aliases.insert(name.to_string());
+            }
+            // `let schedule = NotifyFinanceJob::enqueue;` — a function item
+            // bound to a local name. The call site then mentions no verb the
+            // sweep can see, so the aliased *path* is remembered and the call
+            // is classified against it.
+            Expr::Path(path) if is_effect_verb_path(&path.path) => {
+                self.fn_aliases.insert(name.to_string(), path.path.clone());
+            }
+            // `let second = first;` copies what `first` was bound to.
+            Expr::Path(path) if path.path.get_ident().is_some() => {
+                let source = path
+                    .path
+                    .get_ident()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                if self.spawn_aliases.contains(&source) {
+                    self.spawn_aliases.insert(name.to_string());
+                }
+                if let Some(alias) = self.fn_aliases.get(&source).cloned() {
+                    self.fn_aliases.insert(name.to_string(), alias);
+                }
+                if let Some(closure) = self.closures.get(&source).cloned() {
+                    self.closures.insert(name.to_string(), closure);
+                }
+                if self.ambiguous_fns.contains(&source) {
+                    self.ambiguous_fns.insert(name.to_string());
+                }
+            }
+            // A container of callables is named for them, so a member read
+            // out of it (`funcs.0`) or looped over keeps its meaning.
+            Expr::Tuple(t) => self.bind_container_callables(name, t.elems.iter()),
+            Expr::Array(a) => self.bind_container_callables(name, a.elems.iter()),
+            Expr::Repeat(rep) => self.bind_container_callables(name, [&*rep.expr]),
+            Expr::Struct(s) => {
+                self.bind_container_callables(name, s.fields.iter().map(|f| &f.expr));
+            }
+            // `(|| tokio::spawn)()` is whatever the closure body yields.
+            Expr::Call(call) if immediately_invoked_closure(&call.func).is_some() => {
+                if let Some(closure) = immediately_invoked_closure(&call.func) {
+                    let yielded = value_tails(&closure.body)
+                        .into_iter()
+                        .chain(return_values(&closure.body));
+                    self.bind_container_callables(name, yielded);
+                }
+            }
+            // `choose()` where `choose` is a closure bound earlier yields what
+            // that closure's body yields.
+            Expr::Call(call)
+                if matches!(strip_transparent(&call.func), Expr::Path(_))
+                    && callee_root(&call.func)
+                        .is_some_and(|root| self.closures.contains_key(&root)) =>
+            {
+                if let Some(closure) =
+                    callee_root(&call.func).and_then(|root| self.closures.get(&root).cloned())
+                {
+                    let yielded = value_tails(&closure.body)
+                        .into_iter()
+                        .chain(return_values(&closure.body));
+                    self.bind_container_callables(name, yielded);
+                }
+            }
+            Expr::Call(call) => self.bind_container_callables(name, call.args.iter()),
+            // `Some(tokio::spawn).unwrap()`, `f.clone()`: the same value.
+            Expr::MethodCall(mc)
+                if TRANSPARENT_BUILDERS.contains(&mc.method.to_string().as_str()) =>
+            {
+                self.bind_callable(name, &mc.receiver);
+            }
+            // `opt.unwrap_or(tokio::spawn)` is the option's value or the default.
+            Expr::MethodCall(mc)
+                if matches!(
+                    mc.method.to_string().as_str(),
+                    "unwrap_or" | "or" | "copied" | "cloned" | "into"
+                ) =>
+            {
+                self.bind_callable(name, &mc.receiver);
+                self.bind_container_callables(name, mc.args.iter());
+            }
+            // `&tokio::spawn` and `tokio::spawn as fn(..)` are the same item.
+            Expr::Reference(r) => self.bind_callable(name, &r.expr),
+            Expr::Cast(c) => self.bind_callable(name, &c.expr),
+            // A block, `if` or `match` is whatever its tails are.
+            Expr::Block(_) | Expr::If(_) | Expr::Match(_) | Expr::Unsafe(_) | Expr::Loop(_) => {
+                self.bind_container_callables(name, value_tails(init));
+            }
+            // `funcs.0` and `funcs[i]` are what `funcs` holds.
+            Expr::Field(f) => self.bind_callable(name, &f.base),
+            Expr::Index(i) => self.bind_callable(name, &i.expr),
+            _ => {}
+        }
+    }
+
+    /// Name a container for the callables inside it. Two different effect
+    /// verbs in one container leave the name ambiguous.
+    fn bind_container_callables<'a>(
+        &mut self,
+        name: &str,
+        elements: impl IntoIterator<Item = &'a Expr>,
+    ) {
+        for element in elements {
+            if let Some(snap) = self
+                .callable_snaps
+                .get(&(std::ptr::from_ref(element) as usize))
+                .cloned()
+            {
+                self.apply_snap(name, snap);
+                continue;
+            }
+            let kept = self.fn_aliases.get(name).cloned();
+            self.bind_callable(name, element);
+            if let (Some(kept), Some(now)) = (kept, self.fn_aliases.get(name).cloned())
+                && path_string(&kept) != path_string(&now)
+            {
+                self.fn_aliases.remove(name);
+                self.ambiguous_fns.insert(name.to_string());
+            }
+        }
+    }
+
+    /// `for run in [tokio::spawn] { run(..) }`: the loop names each element.
+    fn bind_loop_callables(&mut self, pat: &Pat, iterated: &Expr) {
+        let mut names = HashSet::new();
+        collect_pat_idents(pat, &mut names);
+        let sources = iteration_elements(iterated);
+        for name in names {
+            self.bind_container_callables(&name, sources.iter());
+        }
+    }
+
+    /// `schedule = other_fn;` replaces what the name was bound to.
+    fn assign_callable_to(&mut self, target: &Expr, right: Option<&Expr>) {
+        let Expr::Path(path) = target else {
+            return;
+        };
+        let Some(ident) = path.path.get_ident() else {
+            return;
+        };
+        let name = ident.to_string();
+        self.closures.remove(&name);
+        self.spawn_aliases.remove(&name);
+        self.fn_aliases.remove(&name);
+        self.ambiguous_fns.remove(&name);
+        if let Some(right) = right {
+            self.bind_callable(&name, right);
+        }
     }
 
     /// Propagate handle identity across an assignment, element-wise.
@@ -1230,17 +1873,78 @@ impl Analyzer {
                     self.assign_handles(target, value);
                 }
             }
-            // `(active, key) = pair;` — the shape of the right-hand side is
-            // not readable, so every target takes whatever it carries.
-            (Expr::Tuple(l), _) => {
-                let handle = self.container_handle(right);
-                for target in &l.elems {
-                    self.assign_handle_to(target, handle.as_ref());
+            (Expr::Array(l), Expr::Array(r)) if l.elems.len() == r.elems.len() => {
+                for (target, value) in l.elems.iter().zip(r.elems.iter()) {
+                    self.assign_handles(target, value);
                 }
+            }
+            // `Holder { fut } = Holder { fut: start() };`
+            (Expr::Struct(l), Expr::Struct(r)) => {
+                for field in &l.fields {
+                    if let Some(value) = r.fields.iter().find(|f| f.member == field.member) {
+                        self.assign_handles(&field.expr, &value.expr);
+                    }
+                }
+            }
+            // `Wrap(a) = Wrap(start());`
+            (Expr::Call(l), Expr::Call(r)) if l.args.len() == r.args.len() => {
+                for (target, value) in l.args.iter().zip(r.args.iter()) {
+                    self.assign_handles(target, value);
+                }
+            }
+            // Autumn cannot read the right-hand side. If it is an unread call,
+            // every target may hold its future.
+            (Expr::Tuple(_) | Expr::Array(_) | Expr::Struct(_) | Expr::Call(_), _) => {
+                let handle = self.container_handle(right);
+                let unread = self.carries_unread(right);
+                self.assign_all(left, handle.as_ref(), unread, Some(right));
             }
             (target, _) => {
                 let handle = self.expr_handle(right);
                 self.assign_handle_to(target, handle.as_ref());
+                let unread = self.carries_unread(right);
+                self.assign_future_to(target, unread);
+                self.assign_callable_to(target, Some(right));
+            }
+        }
+    }
+
+    /// Give every name in a destructuring target the same handle and future
+    /// state, descending through nested tuples and arrays.
+    fn assign_all(
+        &mut self,
+        target: &Expr,
+        handle: Option<&Handle>,
+        unread: bool,
+        source: Option<&Expr>,
+    ) {
+        match target {
+            Expr::Tuple(t) => {
+                for element in &t.elems {
+                    self.assign_all(element, handle, unread, source);
+                }
+            }
+            Expr::Array(a) => {
+                for element in &a.elems {
+                    self.assign_all(element, handle, unread, source);
+                }
+            }
+            Expr::Struct(s) => {
+                for field in &s.fields {
+                    self.assign_all(&field.expr, handle, unread, source);
+                }
+            }
+            Expr::Call(c) => {
+                for argument in &c.args {
+                    self.assign_all(argument, handle, unread, source);
+                }
+            }
+            Expr::Paren(p) => self.assign_all(&p.expr, handle, unread, source),
+            _ => {
+                self.assign_handle_to(target, handle);
+                self.assign_future_to(target, unread);
+                // The target holds what the source holds.
+                self.assign_callable_to(target, source);
             }
         }
     }
@@ -1264,41 +1968,300 @@ impl Analyzer {
         }
     }
 
-    /// Bind an `if let` / `while let` pattern to the handle its scrutinee
-    /// carries, for the duration of the guarded block.
-    fn bind_let_condition(&mut self, cond: &Expr) -> Vec<(String, Option<Handle>)> {
-        let Expr::Let(l) = cond else {
-            return Vec::new();
-        };
-        let handle = self.container_handle(&l.expr);
-        self.enter_binding_scope(&l.pat, handle.as_ref())
+    /// Is this a call whose awaited effect the analysis has not read?
+    fn is_unread_call(&self, expr: &Expr) -> bool {
+        // A bare async block is a future nothing has polled, so it holds no
+        // unread call. Awaiting it polls the block and yields its tail.
+        let peeled = peel_wrappers(expr);
+        match peeled {
+            Expr::Async(_) => return false,
+            Expr::Await(a) => {
+                if let Expr::Async(block) = peel_wrappers(&a.base) {
+                    return self.async_block_yields_unread(&block.block);
+                }
+            }
+            _ => {}
+        }
+        match strip_transparent(expr) {
+            // `(|| start())()` yields what the closure body yields.
+            Expr::Call(call) if immediately_invoked_closure(&call.func).is_some() => {
+                immediately_invoked_closure(&call.func).is_some_and(|closure| {
+                    self.is_unread_call(&closure.body)
+                        || return_values(&closure.body)
+                            .into_iter()
+                            .any(|value| self.value_unread(value))
+                })
+            }
+            Expr::Unsafe(u) => self.block_tail_is_unread(&u.block),
+            head @ (Expr::Call(_) | Expr::MethodCall(_) | Expr::Macro(_) | Expr::Path(_)) => {
+                !self.awaited_is_readable(head)
+            }
+            // A block, `if` or `match` yields the values of its tails.
+            Expr::Block(b) => self.block_tail_is_unread(&b.block),
+            Expr::If(i) => {
+                self.block_tail_is_unread(&i.then_branch)
+                    || i.else_branch
+                        .as_ref()
+                        .is_some_and(|(_, other)| self.is_unread_call(other))
+            }
+            Expr::Match(m) => m.arms.iter().any(|arm| {
+                self.tail_unread
+                    .get(&(std::ptr::from_ref(&*arm.body) as usize))
+                    .copied()
+                    .unwrap_or_else(|| self.carries_unread(&arm.body))
+            }),
+            _ => false,
+        }
     }
 
-    fn enter_binding_scope(
-        &mut self,
-        pat: &Pat,
-        handle: Option<&Handle>,
-    ) -> Vec<(String, Option<Handle>)> {
+    /// Does awaiting this async block yield an unread future, through its tail
+    /// or an explicit `return`?
+    fn async_block_yields_unread(&self, block: &Block) -> bool {
+        self.block_tail_is_unread(block)
+            || block_return_values(block)
+                .into_iter()
+                .any(|value| self.value_unread(value))
+    }
+
+    /// Note whether a `break` or `return` value is an unread future, while the
+    /// names it uses are still bound.
+    fn record_value(&mut self, value: &Expr) {
+        let unread = self.carries_unread(value);
+        self.tail_unread
+            .insert(std::ptr::from_ref(value) as usize, unread);
+        self.record_callable(value);
+    }
+
+    /// Note what `value` is as a callable, while the names it uses are still
+    /// bound: `{ let f = tokio::spawn; f }` yields a spawn after `f` is gone.
+    fn record_callable(&mut self, value: &Expr) {
+        const SCRATCH: &str = "<value>";
+        self.bind_callable(SCRATCH, value);
+        let snap = CallableSnap {
+            spawn: self.spawn_aliases.remove(SCRATCH),
+            alias: self.fn_aliases.remove(SCRATCH),
+            ambiguous: self.ambiguous_fns.remove(SCRATCH),
+        };
+        self.closures.remove(SCRATCH);
+        if snap.spawn || snap.alias.is_some() || snap.ambiguous {
+            // The reader may hold the value or the expression under it.
+            for expr in [value, strip_transparent(value)] {
+                self.callable_snaps
+                    .insert(std::ptr::from_ref(expr) as usize, snap.clone());
+            }
+        }
+    }
+
+    /// Give `name` the callable meaning a snapshot recorded.
+    fn apply_snap(&mut self, name: &str, snap: CallableSnap) {
+        if snap.spawn {
+            self.spawn_aliases.insert(name.to_string());
+        }
+        if snap.ambiguous {
+            self.ambiguous_fns.insert(name.to_string());
+        }
+        if let Some(path) = snap.alias {
+            match self.fn_aliases.get(name) {
+                Some(kept) if path_string(kept) != path_string(&path) => {
+                    self.fn_aliases.remove(name);
+                    self.ambiguous_fns.insert(name.to_string());
+                }
+                _ => {
+                    self.fn_aliases.insert(name.to_string(), path);
+                }
+            }
+        }
+    }
+
+    /// A recorded `break` or `return` value, or a fresh reading of it.
+    fn value_unread(&self, value: &Expr) -> bool {
+        self.tail_unread
+            .get(&(std::ptr::from_ref(value) as usize))
+            .copied()
+            .unwrap_or_else(|| self.carries_unread(value))
+    }
+
+    fn block_tail_is_unread(&self, block: &Block) -> bool {
+        self.tail_unread
+            .get(&(std::ptr::from_ref(block) as usize))
+            .copied()
+            .unwrap_or_else(|| self.compute_tail_unread(block))
+    }
+
+    fn compute_tail_unread(&self, block: &Block) -> bool {
+        matches!(block.stmts.last(), Some(Stmt::Expr(tail, None)) if self.carries_unread(tail))
+    }
+
+    /// `fut = start();` moves a future into a name, as a `let` does.
+    /// A later await of the name is the awaited call.
+    fn assign_future_to(&mut self, target: &Expr, unread: bool) {
+        // `jobs.0 = start();` and `jobs[i] = start();` write into `jobs`.
+        let mut place = target;
+        let mut inside = false;
+        loop {
+            match place {
+                Expr::Field(f) => place = &f.base,
+                Expr::Index(i) => place = &i.expr,
+                Expr::Paren(p) => place = &p.expr,
+                _ => break,
+            }
+            inside = true;
+        }
+        if inside {
+            if unread
+                && let Expr::Path(path) = place
+                && let Some(ident) = path.path.get_ident()
+            {
+                self.unread_futures.insert(ident.to_string());
+            }
+            return;
+        }
+        let Expr::Path(path) = target else {
+            return;
+        };
+        let Some(ident) = path.path.get_ident() else {
+            return;
+        };
+        if unread {
+            self.unread_futures.insert(ident.to_string());
+        } else {
+            self.unread_futures.remove(&ident.to_string());
+        }
+    }
+
+    /// Bind an `if let` / `while let` pattern to the handle its scrutinee
+    /// carries, for the duration of the guarded block.
+    fn bind_let_condition(&mut self, cond: &Expr) -> Vec<Shadow> {
+        match cond {
+            Expr::Let(l) => self.bind_let(l),
+            // `if let A = a && let B = b && ready`: every `let` in the chain
+            // binds for the guarded block.
+            Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
+                let mut saved = self.bind_let_condition(&b.left);
+                saved.extend(self.bind_let_condition(&b.right));
+                saved
+            }
+            Expr::Paren(p) => self.bind_let_condition(&p.expr),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Walk an `if` / `while` condition and bind its `let`s. Returns the state
+    /// the other path starts from, and what the binding scope must restore.
+    /// A let chain binds as it is walked, so its names are in the state the
+    /// other path starts from. That can only make a later use of the same
+    /// name more careful.
+    fn enter_condition(&mut self, cond: &Expr) -> (Bindings, Vec<Shadow>) {
+        if is_let_chain(cond) {
+            let saved = self.walk_let_chain(cond);
+            (self.bindings(), saved)
+        } else {
+            self.expr(cond);
+            let before = self.bindings();
+            (before, self.bind_let_condition(cond))
+        }
+    }
+
+    fn bind_let(&mut self, l: &syn::ExprLet) -> Vec<Shadow> {
+        let handle = self.container_handle(&l.expr);
+        let saved = self.enter_binding_scope(&l.pat, handle.as_ref());
+        self.mark_pattern_unread(&l.pat, &l.expr);
+        self.bind_pattern_callables(&l.pat, &l.expr);
+        saved
+    }
+
+    /// Walk a let chain left to right, binding each `let` before the operands
+    /// after it: `if let Some(run) = x && run(..)` calls the `run` it bound.
+    fn walk_let_chain(&mut self, cond: &Expr) -> Vec<Shadow> {
+        match cond {
+            Expr::Let(l) => {
+                self.expr(&l.expr);
+                self.bind_let(l)
+            }
+            Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
+                let mut saved = self.walk_let_chain(&b.left);
+                saved.extend(self.walk_let_chain(&b.right));
+                saved
+            }
+            Expr::Paren(p) => self.walk_let_chain(&p.expr),
+            other => {
+                self.expr(other);
+                Vec::new()
+            }
+        }
+    }
+
+    /// A pattern bound from an expression that holds an unread future may
+    /// bind that future: `if let Some(fut) = Some(start())`.
+    fn mark_pattern_unread(&mut self, pat: &Pat, source: &Expr) {
+        if !self.carries_unread(source) {
+            return;
+        }
         let mut names = HashSet::new();
         collect_pat_idents(pat, &mut names);
-        let saved: Vec<(String, Option<Handle>)> = names
-            .iter()
-            .map(|name| (name.clone(), self.handles.get(name).cloned()))
-            .collect();
+        self.unread_futures.extend(names);
+    }
+
+    /// Does this expression hold an unread future, directly or inside a
+    /// constructor, tuple, array or reference?
+    fn carries_unread(&self, expr: &Expr) -> bool {
+        if self.is_unread_call(expr) {
+            return true;
+        }
+        match strip_transparent(expr) {
+            Expr::Call(call) => call.args.iter().any(|arg| self.carries_unread(arg)),
+            Expr::MethodCall(mc) => {
+                self.carries_unread(&mc.receiver)
+                    || mc.args.iter().any(|arg| self.carries_unread(arg))
+            }
+            Expr::Tuple(t) => t.elems.iter().any(|e| self.carries_unread(e)),
+            Expr::Array(a) => a.elems.iter().any(|e| self.carries_unread(e)),
+            // `jobs.0` and `jobs[i]` read a member of the container.
+            Expr::Unary(u) => self.carries_unread(&u.expr),
+            Expr::Field(f) => self.carries_unread(&f.base),
+            Expr::Index(i) => self.carries_unread(&i.expr),
+            // `[start(); 1]` repeats one element.
+            Expr::Repeat(rep) => self.carries_unread(&rep.expr),
+            Expr::Reference(r) => self.carries_unread(&r.expr),
+            // `..old` keeps every field `old` held.
+            Expr::Struct(s) => {
+                s.fields.iter().any(|f| self.carries_unread(&f.expr))
+                    || s.rest
+                        .as_ref()
+                        .is_some_and(|rest| self.carries_unread(rest))
+            }
+            // `start() as Pin<Box<dyn Future>>` is the same future.
+            Expr::Cast(c) => self.carries_unread(&c.expr),
+            // `loop { break start(); }` and `'a: { break 'a start() }` yield
+            // their `break` values.
+            Expr::Loop(l) => break_values(&l.body)
+                .into_iter()
+                .any(|value| self.value_unread(value)),
+            Expr::Block(b) if b.label.is_some() => break_values(&b.block)
+                .into_iter()
+                .any(|value| self.value_unread(value)),
+            // `vec![start()]` builds a container of its elements.
+            Expr::Macro(m) if m.mac.path.is_ident("vec") => vec_elements(&m.mac)
+                .iter()
+                .any(|element| self.carries_unread(element)),
+            _ => false,
+        }
+    }
+
+    fn enter_binding_scope(&mut self, pat: &Pat, handle: Option<&Handle>) -> Vec<Shadow> {
+        let mut names = HashSet::new();
+        collect_pat_idents(pat, &mut names);
+        let saved: Vec<Shadow> = names.iter().map(|name| self.shadow(name)).collect();
+        for name in &names {
+            self.forget(name);
+        }
         self.rebind(pat, handle);
         saved
     }
 
-    fn leave_binding_scope(&mut self, saved: Vec<(String, Option<Handle>)>) {
-        for (name, handle) in saved {
-            match handle {
-                Some(handle) => {
-                    self.handles.insert(name, handle);
-                }
-                None => {
-                    self.handles.remove(&name);
-                }
-            }
+    fn leave_binding_scope(&mut self, saved: Vec<Shadow>) {
+        for shadow in saved {
+            self.unshadow(shadow);
         }
     }
 
@@ -1381,6 +2344,9 @@ impl Analyzer {
                 for (param, arg) in closure.inputs.iter().zip(call.args.iter()) {
                     let handle = self.container_handle(arg);
                     saved.extend(self.enter_binding_scope(param, handle.as_ref()));
+                    // The parameter holds what the argument held.
+                    self.mark_pattern_unread(param, arg);
+                    self.bind_pattern_callables(param, arg);
                 }
                 for param in closure.inputs.iter().skip(call.args.len()) {
                     saved.extend(self.enter_binding_scope(param, None));
@@ -1389,7 +2355,13 @@ impl Analyzer {
                 self.leave_binding_scope(saved);
             }
             Expr::Call(call) => self.call(call),
-            Expr::Macro(m) => self.mac(&m.mac),
+            Expr::Macro(m) => {
+                self.mac(&m.mac);
+                // The expansion runs here, so it is judged like a statement.
+                if !self.expr_macro_is_readable(&m.mac) {
+                    self.refuse_opaque_macro(&m.mac);
+                }
+            }
 
             Expr::Closure(closure) => {
                 // Effects are a set, so a closure body is walked exactly like
@@ -1406,30 +2378,42 @@ impl Analyzer {
 
             Expr::ForLoop(f) => {
                 self.expr(&f.expr);
+                let before = self.bindings();
                 let handle = self.container_handle(&f.expr);
                 let saved = self.enter_binding_scope(&f.pat, handle.as_ref());
+                self.mark_pattern_unread(&f.pat, &f.expr);
+                self.bind_loop_callables(&f.pat, &f.expr);
                 self.block(&f.body);
                 self.leave_binding_scope(saved);
+                self.join_with(before);
             }
             Expr::While(w) => {
-                self.expr(&w.cond);
                 // `while let Some(r) = opt { … }` — the binding *is* the
                 // handle the scrutinee carries, exactly as `for` already
                 // treats its pattern.
-                let saved = self.bind_let_condition(&w.cond);
+                let (before, saved) = self.enter_condition(&w.cond);
                 self.block(&w.body);
                 self.leave_binding_scope(saved);
+                self.join_with(before);
             }
-            Expr::Loop(l) => self.block(&l.body),
+            Expr::Loop(l) => {
+                let before = self.bindings();
+                self.block(&l.body);
+                self.join_with(before);
+            }
 
             Expr::If(i) => {
-                self.expr(&i.cond);
-                let saved = self.bind_let_condition(&i.cond);
+                // An assignment in one arm is not made on the other path, so
+                // each arm starts from the same state and the two are joined.
+                let (before, saved) = self.enter_condition(&i.cond);
                 self.block(&i.then_branch);
                 self.leave_binding_scope(saved);
+                let then_state = self.bindings();
+                self.set_bindings(before);
                 if let Some((_, els)) = &i.else_branch {
                     self.expr(els);
                 }
+                self.join_with(then_state);
             }
             Expr::Match(m) => {
                 self.expr(&m.expr);
@@ -1438,9 +2422,14 @@ impl Analyzer {
                 // an analysis that catches one and not the other is a bypass
                 // one keystroke wide.
                 let scrutinee = self.container_handle(&m.expr);
+                let before = self.bindings();
+                let mut joined: Option<Bindings> = None;
                 for arm in &m.arms {
+                    self.set_bindings(before.clone());
                     let (pat, guard) = crate::parse::arm_pat_and_guard(arm);
                     let saved = self.enter_binding_scope(pat, scrutinee.as_ref());
+                    self.mark_pattern_unread(pat, &m.expr);
+                    self.bind_pattern_callables(pat, &m.expr);
                     if let Some(guard) = guard {
                         self.expr(guard);
                     }
@@ -1449,8 +2438,19 @@ impl Analyzer {
                     } else {
                         self.expr(&arm.body);
                     }
+                    // Judge the arm's value while its own bindings exist.
+                    let yields = self.carries_unread(&arm.body);
+                    self.tail_unread
+                        .insert(std::ptr::from_ref(&*arm.body) as usize, yields);
+                    self.record_callable(&arm.body);
                     self.leave_binding_scope(saved);
+                    let arm_state = self.bindings();
+                    joined = Some(match joined {
+                        Some(state) => state.join(arm_state),
+                        None => arm_state,
+                    });
                 }
+                self.set_bindings(joined.unwrap_or(before));
             }
 
             Expr::Block(syn::ExprBlock { block, .. })
@@ -1472,6 +2472,7 @@ impl Analyzer {
             Expr::Break(b) => {
                 if let Some(e) = b.expr.as_deref() {
                     self.expr(e);
+                    self.record_value(e);
                 }
             }
             Expr::Cast(c) => self.expr(&c.expr),
@@ -1498,6 +2499,7 @@ impl Analyzer {
             Expr::Return(r) => {
                 if let Some(e) = r.expr.as_deref() {
                     self.expr(e);
+                    self.record_value(e);
                 }
             }
             Expr::Struct(s) => {
@@ -1675,6 +2677,7 @@ impl Analyzer {
                 _ => Provenance::Syntactic,
             };
             self.record(kind, model.clone(), provenance, method.method.span());
+            self.note_cascade(&name, model, method.method.span());
         }
     }
 
@@ -1909,7 +2912,9 @@ impl Analyzer {
                 // The repository codegen is what adds the tenant predicate;
                 // this query has none by construction, so it reaches across
                 // tenants and is recorded as that effect.
-                let target = table_name_of(root)
+                let target = self
+                    .table_of(root)
+                    .map(|(table, _)| table)
                     .or_else(|| method.args.iter().find_map(handle_arg_name))
                     .unwrap_or_else(|| "connection".to_string());
                 self.record_raw_query(method.span(), &name, &target);
@@ -1966,6 +2971,77 @@ impl Analyzer {
         true
     }
 
+    /// `invoke(tokio::spawn)` where `invoke` is a closure bound earlier: walk
+    /// its body again with the parameters bound to what this call hands it,
+    /// as an immediately invoked closure is walked.
+    fn enter_stored_closure(&mut self, call: &ExprCall) {
+        let Expr::Path(path) = strip_transparent(&call.func) else {
+            return;
+        };
+        let Some(closure) = path
+            .path
+            .get_ident()
+            .and_then(|ident| self.closures.get(&ident.to_string()).cloned())
+        else {
+            return;
+        };
+        let mut saved = Vec::new();
+        for (param, arg) in closure.inputs.iter().zip(call.args.iter()) {
+            let handle = self.container_handle(arg);
+            saved.extend(self.enter_binding_scope(param, handle.as_ref()));
+            self.mark_pattern_unread(param, arg);
+            self.bind_pattern_callables(param, arg);
+        }
+        self.expr(&closure.body);
+        self.leave_binding_scope(saved);
+    }
+
+    /// A call through a name an earlier binding made a `spawn`, an ambiguous
+    /// effect verb, or one effect verb. Returns whether it handled the call.
+    fn call_through_alias(&mut self, call: &ExprCall) -> bool {
+        let Some(root) = callee_root(&call.func) else {
+            return false;
+        };
+        // A name bound to `tokio::spawn` detaches exactly as the direct
+        // spelling does.
+        if self.spawn_aliases.contains(&root) {
+            self.spawn_error(call.span(), &root);
+            return true;
+        }
+        if self.refuse_ambiguous_call(call) {
+            return true;
+        }
+        // A name bound to an effect verb performs that verb; the alias is the
+        // only thing at this call site that names it.
+        if let Some(aliased) = self.fn_aliases.get(&root).cloned() {
+            self.aliased_effect(call, root.as_str(), &aliased);
+            return true;
+        }
+        false
+    }
+
+    /// A name bound to different effect verbs on different paths: which one
+    /// runs cannot be read, so a call through it is refused.
+    fn refuse_ambiguous_call(&mut self, call: &ExprCall) -> bool {
+        let Some(name) = callee_root(&call.func) else {
+            return false;
+        };
+        if !self.ambiguous_fns.contains(&name) {
+            return false;
+        }
+        let action = self.action.clone();
+        self.error(
+            call.span(),
+            format!(
+                "agent authority: `{name}` is bound to different effect functions on \
+                 different paths, so which one this call runs cannot be read, and \
+                 `{action}`'s effects cannot be proven.\n\nCall each effect directly, or \
+                 declare the site with `#[agent_effect(..., reason = \"...\")]`. {GUIDE}"
+            ),
+        );
+        true
+    }
+
     fn spawn_error(&mut self, span: Span, name: &str) {
         let action = self.action.clone();
         self.error(
@@ -1987,8 +3063,8 @@ impl Analyzer {
         // `opt.map(|r| r.delete_all())` — the closure parameter *is* the
         // handle `opt` carries. Binding it to nothing (the default for any
         // closure input) dropped the handle at the parameter list.
-        let carried = HANDLE_COMBINATORS
-            .contains(&name.as_str())
+        let combinator = HANDLE_COMBINATORS.contains(&name.as_str());
+        let carried = combinator
             .then(|| self.container_handle(&method.receiver))
             .flatten();
         for arg in &method.args {
@@ -1996,11 +3072,14 @@ impl Analyzer {
                 self.callback_arg(arg);
                 continue;
             }
-            if let (Some(handle), Expr::Closure(closure)) = (carried.as_ref(), arg) {
+            if combinator && let Expr::Closure(closure) = arg {
                 let mut saved = Vec::new();
                 let mut inputs = closure.inputs.iter();
                 if let Some(first) = inputs.next() {
-                    saved.extend(self.enter_binding_scope(first, Some(handle)));
+                    saved.extend(self.enter_binding_scope(first, carried.as_ref()));
+                    // The first parameter is what the receiver holds.
+                    self.mark_pattern_unread(first, &method.receiver);
+                    self.bind_pattern_callables(first, &method.receiver);
                 }
                 for input in inputs {
                     saved.extend(self.enter_binding_scope(input, None));
@@ -2057,6 +3136,15 @@ impl Analyzer {
     fn awaited(&mut self, base: &Expr) {
         self.expr(base);
         let head = strip_transparent(base);
+        // `(async { start() }.await).await`: the inner await yields the
+        // block's tail, and the outer one polls it.
+        if let Expr::Await(inner_await) = peel_wrappers(base)
+            && let Expr::Async(block) = strip_transparent(&inner_await.base)
+            && self.async_block_yields_unread(&block.block)
+        {
+            self.refuse_awaited(head.span());
+            return;
+        }
         if self.awaited_is_readable(head) {
             // A combinator awaits the future it is handed, so that future is
             // judged here, where the `await` actually is.
@@ -2064,18 +3152,51 @@ impl Analyzer {
                 && call_path_name(call)
                     .is_some_and(|name| ASYNC_COMBINATORS.contains(&name.as_str()))
             {
-                for arg in &call.args {
-                    let inner = strip_transparent(arg);
-                    if matches!(inner, Expr::Call(_) | Expr::MethodCall(_))
-                        && !self.awaited_is_readable(inner)
-                    {
-                        self.refuse_awaited(inner.span());
-                    }
+                // Only the future operand is awaited. The duration is not.
+                for arg in call.args.iter().skip(1) {
+                    self.refuse_unread_operand(arg);
                 }
             }
             return;
         }
-        self.refuse_awaited(head.span());
+        if let Expr::Macro(m) = head {
+            self.refuse_opaque_macro(&m.mac);
+        } else {
+            self.refuse_awaited(head.span());
+        }
+    }
+
+    /// Refuse an awaited operand the analysis cannot read. A block, `if` or
+    /// `match` is judged by the values it can produce.
+    fn refuse_unread_operand(&mut self, expr: &Expr) {
+        let expr = strip_transparent(expr);
+        match expr {
+            Expr::Call(_) | Expr::MethodCall(_) | Expr::Path(_)
+                if !self.awaited_is_readable(expr) =>
+            {
+                self.refuse_awaited(expr.span());
+            }
+            Expr::Macro(m) if !self.macro_is_readable(&m.mac) => self.refuse_opaque_macro(&m.mac),
+            Expr::Block(b) => self.refuse_unread_block_tail(&b.block),
+            Expr::If(i) => {
+                self.refuse_unread_block_tail(&i.then_branch);
+                if let Some((_, other)) = &i.else_branch {
+                    self.refuse_unread_operand(other);
+                }
+            }
+            Expr::Match(m) => {
+                for arm in &m.arms {
+                    self.refuse_unread_operand(&arm.body);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn refuse_unread_block_tail(&mut self, block: &Block) {
+        if let Some(Stmt::Expr(tail, None)) = block.stmts.last() {
+            self.refuse_unread_operand(tail);
+        }
     }
 
     /// Has the analysis already read what this awaited head does?
@@ -2088,8 +3209,19 @@ impl Analyzer {
                 .path
                 .get_ident()
                 .is_none_or(|ident| !self.unread_futures.contains(&ident.to_string())),
-            // `(async move { … }).await`, `if …{…}.await` — the block's own
-            // statements are walked, so there is nothing unread here.
+            Expr::Macro(m) => self.macro_is_readable(&m.mac),
+            // `jobs.0.await`, `futs[i].await`: as readable as the container.
+            Expr::Field(f) => self.awaited_is_readable(strip_transparent(&f.base)),
+            Expr::Index(i) => self.awaited_is_readable(strip_transparent(&i.expr)),
+            Expr::Unary(u) => self.awaited_is_readable(strip_transparent(&u.expr)),
+            Expr::Reference(r) => self.awaited_is_readable(strip_transparent(&r.expr)),
+            // `{ start() }.await`, `(if c { start() } else { other() }).await`
+            // polls whatever the tails yield.
+            Expr::Block(_) | Expr::If(_) | Expr::Match(_) | Expr::Unsafe(_) => {
+                !self.is_unread_call(head)
+            }
+            // `(async move { … }).await` — the block's own statements are
+            // walked, so there is nothing unread here.
             _ => true,
         }
     }
@@ -2104,14 +3236,94 @@ impl Analyzer {
         {
             return true;
         }
-        let Some(name) = call_path_name(call) else {
+        // A name bound to an effect verb is classified by `call()`, which
+        // records the effect or refuses it.
+        if let Expr::Path(path) = strip_transparent(&call.func)
+            && path
+                .path
+                .get_ident()
+                .is_some_and(|ident| self.fn_aliases.contains_key(&ident.to_string()))
+        {
             return true;
+        }
+        // A callee that is an expression (`(pick())()`, `table[0]()`) names
+        // nothing, and with no handle in its arguments nothing else reads it.
+        let Some(name) = call_path_name(call) else {
+            return false;
         };
         is_enqueue(&name)
             || SPAWN_FNS.contains(&name.as_str())
             || is_constructor_call(call)
-            || INERT_ASYNC_PATHS.contains(&name.as_str())
+            || self.is_inert_async_call(call, &name)
             || is_framework_prologue_call(call)
+    }
+
+    /// `tokio::time::sleep(..)`, or `sleep(..)` after `use tokio::time::sleep;`.
+    ///
+    /// A bare `sleep` is any function a module defines, so the name alone
+    /// proves nothing.
+    fn is_inert_async_call(&self, call: &ExprCall, name: &str) -> bool {
+        if !INERT_ASYNC_PATHS.contains(&name) {
+            return false;
+        }
+        let Expr::Path(path) = strip_transparent(&call.func) else {
+            return false;
+        };
+        let Some(first) = path.path.segments.first() else {
+            return false;
+        };
+        let first = first.ident.to_string();
+        self.tokio_imports.contains(&first)
+    }
+
+    /// Can the analysis read this macro? A macro naming a handle is already refused.
+    fn macro_is_readable(&self, mac: &syn::Macro) -> bool {
+        let name = mac
+            .path
+            .segments
+            .last()
+            .map(|s| s.ident.to_string())
+            .filter(|_| macro_path_is_standard(&mac.path, &self.shadowed_macros));
+        let inert = name
+            .as_ref()
+            .is_some_and(|name| !self.shadowed_macros.contains(name))
+            && name.is_some_and(|name| INERT_MACROS.contains(&name.as_str()))
+            && !tokens_contain_await(&mac.tokens)
+            && !tokens_contain_spawn(&mac.tokens);
+        inert || self.tokens_mention_handle(&mac.tokens)
+    }
+
+    /// Macros that only build a value. Expression position may use them when
+    /// no token awaits or spawns.
+    fn expr_macro_is_readable(&self, mac: &syn::Macro) -> bool {
+        let pure = macro_path_is_standard(&mac.path, &self.shadowed_macros)
+            && mac.path.segments.last().is_some_and(|s| {
+                let name = s.ident.to_string();
+                PURE_VALUE_MACROS.contains(&name.as_str()) && !self.shadowed_macros.contains(&name)
+            })
+            && !tokens_contain_await(&mac.tokens)
+            && !tokens_contain_spawn(&mac.tokens);
+        pure || self.macro_is_readable(mac)
+    }
+
+    /// Refuse a macro the analysis cannot read, when it is awaited or is a
+    /// statement. Its expansion can enqueue a job with no handle in its tokens.
+    fn refuse_opaque_macro(&mut self, mac: &syn::Macro) {
+        let name = mac
+            .path
+            .segments
+            .last()
+            .map_or_else(|| "macro".to_string(), |s| s.ident.to_string());
+        let action = self.action.clone();
+        self.error(
+            mac.span(),
+            format!(
+                "agent authority: `{name}!` expands to code the analysis cannot read, and the \
+                 expansion can enqueue a job or call out with no handle in its tokens — so \
+                 `{action}`'s effects cannot be proven.\n\nInline the effect into this handler, \
+                 or declare the site with `#[agent_effect(..., reason = \"...\")]`. {GUIDE}"
+            ),
+        );
     }
 
     /// An awaited method chain: readable when it is rooted at a tracked
@@ -2134,7 +3346,6 @@ impl Analyzer {
             let name = m.method.to_string();
             is_enqueue(&name)
                 || SPAWN_FNS.contains(&name.as_str())
-                || INERT_ASYNC_VERBS.contains(&name.as_str())
                 || Self::method_handle(m).is_some()
                 || m.args.iter().any(|arg| self.carries_handle(arg))
         }) {
@@ -2146,15 +3357,12 @@ impl Analyzer {
     /// Is this chain root the request-local plumbing the allowlist names?
     fn root_is_inert(&self, root: &Expr) -> bool {
         match strip_transparent(root) {
-            Expr::Path(path) => path.path.get_ident().is_some_and(|ident| {
-                let name = ident.to_string();
-                INERT_ASYNC_ROOT_NAMES.contains(&name.as_str()) || self.inert_roots.contains(&name)
-            }),
-            // `state.session`, `self.cache` — the field names the same thing.
-            Expr::Field(field) => {
-                let name = member_name(&field.member);
-                INERT_ASYNC_ROOT_NAMES.contains(&name.as_str())
-            }
+            // Typed in the signature, never judged by the binding's name:
+            // `let cache = FinanceService::new();` is not a cache.
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .is_some_and(|ident| self.inert_roots.contains(&ident.to_string())),
             _ => false,
         }
     }
@@ -2188,28 +3396,12 @@ impl Analyzer {
             }
             return;
         }
+        self.enter_stored_closure(call);
         for arg in &call.args {
             self.expr(arg);
         }
 
-        // A call through a name bound to `tokio::spawn` detaches exactly as
-        // the direct spelling does.
-        if let Expr::Path(path) = strip_transparent(&call.func)
-            && let Some(ident) = path.path.get_ident()
-            && self.spawn_aliases.contains(&ident.to_string())
-        {
-            let alias = ident.to_string();
-            self.spawn_error(call.span(), &alias);
-            return;
-        }
-
-        // A call through a name bound to an effect verb performs that verb;
-        // the alias is the only thing at this call site that names it.
-        if let Expr::Path(path) = strip_transparent(&call.func)
-            && let Some(ident) = path.path.get_ident()
-            && let Some(aliased) = self.fn_aliases.get(&ident.to_string()).cloned()
-        {
-            self.aliased_effect(call, ident.to_string().as_str(), &aliased);
+        if self.call_through_alias(call) {
             return;
         }
 
@@ -2260,7 +3452,10 @@ impl Analyzer {
         }
         // `diesel::insert_into(...)`, `diesel::update(...)` — the write is
         // recorded where the builder reaches an executor, not here.
-        if Self::write_builder_of(call).is_some() {
+        if self.write_builder_of(call).is_some() {
+            return;
+        }
+        if self.refuse_unresolved_diesel_write(call, &name) {
             return;
         }
         if call.args.iter().any(|a| self.carries_handle(a)) {
@@ -2285,7 +3480,7 @@ impl Analyzer {
             // A static finder on a `#[model]` really is a read — and it is
             // indistinguishable from `Billing::wipe`, so it is refused too and
             // discharged with `#[agent_effect(none, reason = "...")]`.
-            if is_constructor_call(call) || Self::call_handle(call).is_some() {
+            if is_constructor_call(call) || self.call_handle(call).is_some() {
                 return;
             }
             let action = self.action.clone();
@@ -2388,8 +3583,23 @@ impl Analyzer {
             Subject::ModelIdent(..) => Provenance::TypeResolved,
             _ => Provenance::Syntactic,
         };
-        self.record(kind, model, provenance, span);
+        self.record(kind, model.clone(), provenance, span);
+        self.note_cascade(name, &model, span);
         true
+    }
+
+    /// A delete that runs the `dependent(...)` cascade also writes the models
+    /// the cascade names. Remember the repository once, for the grant check.
+    fn note_cascade(&mut self, method: &str, model: &Subject, span: Span) {
+        if CASCADING_METHODS.contains(&method)
+            && let Subject::ModelIdent(path, human) = model
+            && !self
+                .cascades
+                .iter()
+                .any(|(seen, ..)| path_string(seen) == path_string(path))
+        {
+            self.cascades.push((path.clone(), human.clone(), span));
+        }
     }
 
     /// Record a job effect, or refuse a job whose name is not compile-known.
@@ -2562,11 +3772,17 @@ impl Analyzer {
                 if name == "checkout" && matches!(inner, Handle::LazyDb) {
                     return Some(Handle::Db);
                 }
+                // `db.begin()` opens a transaction on that connection. The
+                // transaction is a `Db`-rooted handle, which is what makes its
+                // `.commit()` / `.rollback()` readable.
+                if name == "begin" && matches!(inner, Handle::Db) {
+                    return Some(Handle::Db);
+                }
                 (TRANSPARENT_BUILDERS.contains(&name.as_str())
                     || CROSS_TENANT_METHODS.contains(&name.as_str()))
                 .then_some(inner)
             }
-            Expr::Call(call) => Self::call_handle(call),
+            Expr::Call(call) => self.call_handle(call),
             // A handle selected through a conditional is still a handle, and a
             // write builder joined at a branch takes the unsafe side.
             Expr::If(i) => {
@@ -2622,10 +3838,56 @@ impl Analyzer {
         None
     }
 
+    /// Refuse a `diesel::` write whose table cannot be read. Returns whether
+    /// it did.
+    fn refuse_unresolved_diesel_write(&mut self, call: &ExprCall, name: &str) -> bool {
+        let Some(arg) = self.unresolved_diesel_write(call) else {
+            return false;
+        };
+        let action = self.action.clone();
+        self.error(
+            call.span(),
+            format!(
+                "agent authority: `diesel::{name}` is handed `{arg}`, and the table that names \
+                     cannot be read, so what `{action}` writes cannot be proven.\n\nPass \
+                     `<table>::table` or a `let` bound to it, or declare the site with \
+                     `#[agent_effect(unbounded_writes(table), reason = \"...\")]`. {GUIDE}"
+            ),
+        );
+        true
+    }
+
+    /// Is this path rooted at the `diesel` crate, or a constructor a `use`
+    /// imported from it?
+    fn is_diesel_path(&self, path: &syn::Path) -> bool {
+        path.segments
+            .first()
+            .is_some_and(|segment| self.diesel_roots.contains(&segment.ident.to_string()))
+            || path
+                .get_ident()
+                .is_some_and(|ident| self.diesel_fns.contains_key(&ident.to_string()))
+    }
+
+    /// A `diesel::`-qualified write whose target table cannot be read.
+    ///
+    /// Returns the target as source text, for the diagnostic.
+    fn unresolved_diesel_write(&self, call: &ExprCall) -> Option<String> {
+        let Expr::Path(path) = &*call.func else {
+            return None;
+        };
+        let segments = &path.path.segments;
+        let last = segments.last()?.ident.to_string();
+        let verb = self.diesel_fns.get(&last).cloned().unwrap_or(last);
+        let write = matches!(verb.as_str(), "insert_into" | "update" | "delete");
+        let diesel = self.is_diesel_path(&path.path);
+        let arg = call.args.first()?;
+        (write && diesel && self.table_of(arg).is_none()).then(|| arg.to_token_stream().to_string())
+    }
+
     /// A call that produces an effect handle: an ad-hoc HTTP client, or a
     /// diesel write builder.
-    fn call_handle(call: &ExprCall) -> Option<Handle> {
-        if let Some(builder) = Self::write_builder_of(call) {
+    fn call_handle(&self, call: &ExprCall) -> Option<Handle> {
+        if let Some(builder) = self.write_builder_of(call) {
             return Some(builder);
         }
         let Expr::Path(path) = &*call.func else {
@@ -2646,22 +3908,43 @@ impl Analyzer {
             .then_some(Handle::Client)
     }
 
+    /// The table an expression names, directly (`refunds::table`) or through
+    /// a binding (`let target = refunds::table;`), and whether it already
+    /// bounds the write.
+    fn table_of(&self, expr: &Expr) -> Option<(String, bool)> {
+        match expr {
+            Expr::Path(path) => path
+                .path
+                .get_ident()
+                .and_then(|ident| self.tables.get(&ident.to_string()).cloned())
+                .or_else(|| table_name_of(expr).map(|table| (table, false))),
+            Expr::MethodCall(mc) => self
+                .table_of(&mc.receiver)
+                .map(|(table, bounded)| (table, bounded || argument_bounds_the_write(expr))),
+            Expr::Reference(r) => self.table_of(&r.expr),
+            Expr::Paren(p) => self.table_of(&p.expr),
+            Expr::Group(g) => self.table_of(&g.expr),
+            _ => None,
+        }
+    }
+
     /// `diesel::update(t)` / `delete(t)` / `insert_into(t)` — the start of a
     /// raw write, whose boundedness is then tracked on the binding.
-    fn write_builder_of(call: &ExprCall) -> Option<Handle> {
+    fn write_builder_of(&self, call: &ExprCall) -> Option<Handle> {
         let Expr::Path(path) = &*call.func else {
             return None;
         };
         let segments = &path.path.segments;
-        let name = segments.last()?.ident.to_string();
-        let qualified_by_diesel = segments.iter().any(|segment| segment.ident == "diesel");
-        let table = call.args.first().and_then(table_name_of);
+        let last = segments.last()?.ident.to_string();
+        let name = self.diesel_fns.get(&last).cloned().unwrap_or(last);
+        let qualified_by_diesel = self.is_diesel_path(&path.path);
+        let table = call.args.first().and_then(|arg| self.table_of(arg));
         // A bare `update(x)` is far too common to claim as a diesel write; a
         // `diesel::`-qualified call, or one handed a `<table>::table`, is not.
         if !qualified_by_diesel && table.is_none() {
             return None;
         }
-        let table = table?;
+        let (table, aliased_bound) = table?;
         match name.as_str() {
             "insert_into" => Some(Handle::WriteBuilder {
                 table,
@@ -2674,7 +3957,7 @@ impl Analyzer {
             // chain reported it as an unbounded write, which forces the widest
             // grant in the codebase for the commonest update there is.
             "update" | "delete" => Some(Handle::WriteBuilder {
-                bounded: call.args.first().is_some_and(argument_bounds_the_write),
+                bounded: aliased_bound || call.args.first().is_some_and(argument_bounds_the_write),
                 table,
                 insert: false,
             }),
@@ -2848,6 +4131,31 @@ fn literal_of(expr: &Expr) -> Option<String> {
 
 /// Peel the wrappers that do not change what an expression *is*, so a method
 /// chain split by `.await?` is still walked as one chain.
+/// Is this `a && let P = e && b`: an `&&` chain with a `let` in it?
+fn is_let_chain(cond: &Expr) -> bool {
+    match cond {
+        Expr::Binary(b) if matches!(b.op, syn::BinOp::And(_)) => {
+            matches!(&*b.left, Expr::Let(_))
+                || matches!(&*b.right, Expr::Let(_))
+                || is_let_chain(&b.left)
+                || is_let_chain(&b.right)
+        }
+        Expr::Paren(p) => is_let_chain(&p.expr),
+        _ => false,
+    }
+}
+
+/// Peel parentheses, groups and `?`, but not `.await`: the one wrapper that
+/// changes what a value is.
+fn peel_wrappers(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(p) => peel_wrappers(&p.expr),
+        Expr::Group(g) => peel_wrappers(&g.expr),
+        Expr::Try(t) => peel_wrappers(&t.expr),
+        other => other,
+    }
+}
+
 fn strip_transparent(expr: &Expr) -> &Expr {
     match expr {
         Expr::Await(a) => strip_transparent(&a.base),
@@ -2903,22 +4211,153 @@ fn url_defect(url: &str) -> Option<&'static str> {
 /// SQL text says what is executed.
 const RAW_SQL_FNS: &[&str] = &["sql_query", "sql", "execute_raw"];
 
-/// Leading keywords that only read.
-/// Awaited calls that cannot start an effect, matched on the call's last path
-/// segment. `timeout`/`select`-style combinators await the future they are
-/// handed, so that future is judged as if it were awaited at this site.
+/// Awaited calls that cannot start an effect. The path must start with
+/// `tokio`, or the name must come from a `use tokio::…` in the handler.
+/// `timeout` awaits its argument, so Autumn judges that argument at this site.
 const INERT_ASYNC_PATHS: &[&str] = &["sleep", "sleep_until", "yield_now", "timeout"];
+
+/// Paths a body-local `use` may import to make a bare `sleep(..)` the real one.
+const TOKIO_INERT_IMPORTS: &[&str] = &[
+    "tokio::time",
+    "tokio::task",
+    "tokio::time::sleep",
+    "tokio::time::sleep_until",
+    "tokio::time::timeout",
+    "tokio::task::yield_now",
+];
+
+/// Collect the names a `use` gives to the `diesel` crate and to its write
+/// constructors (`use diesel as orm;`, `use diesel::delete as remove;`).
+fn diesel_imports(
+    tree: &syn::UseTree,
+    prefix: &mut Vec<String>,
+    roots: &mut HashSet<String>,
+    fns: &mut HashMap<String, String>,
+) {
+    const VERBS: &[&str] = &["insert_into", "update", "delete"];
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            diesel_imports(&path.tree, prefix, roots, fns);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            let ident = name.ident.to_string();
+            if prefix.is_empty() && ident == "diesel" {
+                roots.insert(ident);
+            } else if prefix.as_slice() == ["diesel"] && VERBS.contains(&ident.as_str()) {
+                fns.insert(ident.clone(), ident);
+            }
+        }
+        syn::UseTree::Rename(rename) => {
+            let ident = rename.ident.to_string();
+            let local = rename.rename.to_string();
+            if prefix.is_empty() && ident == "diesel"
+                || prefix.as_slice() == ["diesel"] && ident == "self"
+            {
+                roots.insert(local);
+            } else if prefix.as_slice() == ["diesel"] && VERBS.contains(&ident.as_str()) {
+                fns.insert(local, ident);
+            }
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                diesel_imports(item, prefix, roots, fns);
+            }
+        }
+        // `use diesel::*;` brings every write constructor in under its own name.
+        syn::UseTree::Glob(_) if prefix.as_slice() == ["diesel"] => {
+            for verb in VERBS {
+                fns.insert((*verb).to_string(), (*verb).to_string());
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
+
+/// Every name a `use` tree binds, whatever its source.
+fn use_leaf_names(tree: &syn::UseTree, out: &mut HashSet<String>) {
+    match tree {
+        syn::UseTree::Path(path) => use_leaf_names(&path.tree, out),
+        syn::UseTree::Name(name) => {
+            out.insert(name.ident.to_string());
+        }
+        syn::UseTree::Rename(rename) => {
+            out.insert(rename.rename.to_string());
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                use_leaf_names(item, out);
+            }
+        }
+        syn::UseTree::Glob(_) => {}
+    }
+}
+
+/// Collect the names a `use` brings in from `tokio::time` / `tokio::task`.
+/// `use tokio::spawn as detach;` makes `detach` a detached task launcher.
+fn spawn_renames(tree: &syn::UseTree, out: &mut HashSet<String>) {
+    match tree {
+        syn::UseTree::Path(path) => spawn_renames(&path.tree, out),
+        syn::UseTree::Rename(rename) if SPAWN_FNS.contains(&rename.ident.to_string().as_str()) => {
+            out.insert(rename.rename.to_string());
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                spawn_renames(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tokio_inert_imports(tree: &syn::UseTree, prefix: &mut Vec<String>, out: &mut HashSet<String>) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            prefix.push(path.ident.to_string());
+            tokio_inert_imports(&path.tree, prefix, out);
+            prefix.pop();
+        }
+        syn::UseTree::Name(name) => {
+            // `use tokio::time::{self}` imports the module as `time`.
+            if name.ident != "self" {
+                prefix.push(name.ident.to_string());
+            }
+            let imported = prefix.last().cloned();
+            if TOKIO_INERT_IMPORTS.contains(&prefix.join("::").as_str())
+                && let Some(imported) = imported
+            {
+                out.insert(imported);
+            }
+            if name.ident != "self" {
+                prefix.pop();
+            }
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                tokio_inert_imports(item, prefix, out);
+            }
+        }
+        syn::UseTree::Glob(_) => {
+            let module = prefix.join("::");
+            for path in TOKIO_INERT_IMPORTS {
+                if let Some((owner, name)) = path.rsplit_once("::")
+                    && owner == module
+                {
+                    out.insert(name.to_string());
+                }
+            }
+        }
+        syn::UseTree::Rename(_) => {}
+    }
+}
 
 /// Combinators among the above that await a future given as an argument.
 const ASYNC_COMBINATORS: &[&str] = &["timeout"];
 
-/// Root *bindings* whose async surface is request-local plumbing: it stores no
+/// Root *types* whose async surface is request-local plumbing: it stores no
 /// rows an agent's grant governs, calls nothing out, and enqueues nothing.
-const INERT_ASYNC_ROOT_NAMES: &[&str] =
-    &["session", "flash", "cache", "cookies", "cookie_jar", "csrf"];
-
-/// The types behind those names, so a differently-named parameter is covered
-/// too. Matched on the last path segment; `Cache` matches by prefix.
+/// Matched on the signature, never on a binding's name.
 const INERT_ASYNC_ROOT_TYPES: &[&str] = &[
     "Session",
     "Flash",
@@ -2928,11 +4367,6 @@ const INERT_ASYNC_ROOT_TYPES: &[&str] = &[
     "Csrf",
     "CsrfToken",
 ];
-
-/// Chain-terminal methods that end a transaction rather than acting through
-/// it. `db.tx(..)` is the shape this codebase uses, but a hand-rolled
-/// `tx.commit().await` is not an unread effect.
-const INERT_ASYNC_VERBS: &[&str] = &["commit", "rollback"];
 
 /// `dispatch(&state, topic, payload)` — the topic's argument index
 /// (`autumn/src/webhook_outbound.rs`, the one arity there is).
@@ -2945,6 +4379,10 @@ const WEBHOOK_TOPIC_ARG: usize = 1;
 /// `enqueue_at_after_commit`, `enqueue_tracked*`) and the `JobClient` methods,
 /// whose receiver syn keeps out of the argument list.
 const JOB_NAME_ARG: usize = 0;
+
+/// Repository methods that run the `dependent(...)` cascade: they also write
+/// every model a non-`restrict` dependent names.
+const CASCADING_METHODS: &[&str] = &["delete_by_id", "delete_many"];
 
 const SQL_READ_STATEMENTS: &[&str] = &["SELECT", "WITH"];
 
@@ -2959,8 +4397,9 @@ const SQL_WRITE_STATEMENTS: &[&str] = &[
 enum SqlStatement {
     /// A query. The table is only for the tenant effect's subject.
     Read { table: Option<String> },
-    /// A statement that writes, and the table it writes.
-    Write { table: String },
+    /// A statement that writes, and every table it writes: a data-changing
+    /// CTE writes its own table beside the main statement's.
+    Write { tables: Vec<String> },
 }
 
 /// The raw-statement constructor a chain is rooted at, if it is one.
@@ -2974,48 +4413,142 @@ fn raw_sql_call(root: &Expr) -> Option<&ExprCall> {
 
 /// Read a raw SQL statement's kind and table. `None` when neither can be read.
 fn classify_sql(sql: &str) -> Option<SqlStatement> {
-    let words = sql_words(sql);
+    let tokens = sql_tokens(sql);
+    let words = words_of(&tokens);
     let first = words.first()?.to_ascii_uppercase();
+    // `ON CONFLICT DO UPDATE` and `FOR [NO KEY] UPDATE` repeat a keyword
+    // without naming a second table.
     let write_at = |from: usize| {
-        words.iter().enumerate().skip(from).find_map(|(at, word)| {
-            SQL_WRITE_STATEMENTS
-                .contains(&word.to_ascii_uppercase().as_str())
-                .then_some(at)
-        })
+        words
+            .iter()
+            .enumerate()
+            .skip(from)
+            .filter(|(at, word)| {
+                let upper = word.to_ascii_uppercase();
+                SQL_WRITE_STATEMENTS.contains(&upper.as_str())
+                    && !is_lock_upsert_or_merge_action(&words, *at)
+            })
+            .map(|(at, _)| at)
+            .collect::<Vec<_>>()
     };
     if SQL_READ_STATEMENTS.contains(&first.as_str()) {
         // A CTE is a read only until it is not: `WITH x AS (...) DELETE FROM
         // payouts` is spelled like a query and erases a table. Quoting keeps a
         // `'DELETE'` *value* out of this — the token still carries its quotes.
-        if let Some(at) = write_at(1) {
-            return sql_table(&words, at).map(|table| SqlStatement::Write { table });
+        // Every data-changing body counts: the CTE's table and the main one.
+        let writes = write_at(1);
+        if !writes.is_empty() {
+            let mut tables = Vec::new();
+            for at in writes {
+                for table in sql_write_tables(&tokens, &words, at)? {
+                    if !tables.contains(&table) {
+                        tables.push(table);
+                    }
+                }
+            }
+            return Some(SqlStatement::Write { tables });
         }
         return Some(SqlStatement::Read {
             table: sql_table(&words, 0),
         });
     }
     if SQL_WRITE_STATEMENTS.contains(&first.as_str()) {
-        return sql_table(&words, 0).map(|table| SqlStatement::Write { table });
+        return sql_write_tables(&tokens, &words, 0).map(|tables| SqlStatement::Write { tables });
     }
     None
+}
+
+/// Is this keyword part of `ON CONFLICT DO UPDATE`, `FOR UPDATE`,
+/// `FOR NO KEY UPDATE` or a `MERGE` action (`WHEN MATCHED THEN UPDATE`)?
+/// Those name no table. A column called `key` or `share` before a real
+/// `UPDATE` must not match.
+fn is_lock_upsert_or_merge_action(words: &[String], at: usize) -> bool {
+    let word = |back: usize| {
+        at.checked_sub(back)
+            .and_then(|i| words.get(i))
+            .map(|w| w.to_ascii_uppercase())
+    };
+    match word(1).as_deref() {
+        Some("THEN") => true,
+        Some("DO" | "FOR") => words[at].eq_ignore_ascii_case("UPDATE"),
+        Some("KEY") => {
+            words[at].eq_ignore_ascii_case("UPDATE")
+                && word(2).as_deref() == Some("NO")
+                && word(3).as_deref() == Some("FOR")
+        }
+        _ => false,
+    }
+}
+
+/// Modifiers that sit between a keyword and the table name.
+const SQL_NAME_MODIFIERS: &[&str] = &[
+    "IF",
+    "EXISTS",
+    "NOT",
+    "ONLY",
+    "CONCURRENTLY",
+    "TEMP",
+    "TEMPORARY",
+    "UNLOGGED",
+    "TABLE",
+];
+
+/// Every table the write keyword at word `at` changes. `TRUNCATE a, b` and
+/// `DROP TABLE a, b` name a list; every other write names one table.
+fn sql_write_tables(tokens: &[String], words: &[String], at: usize) -> Option<Vec<String>> {
+    let first = sql_table(words, at)?;
+    let keyword = words[at].to_ascii_uppercase();
+    if !matches!(keyword.as_str(), "TRUNCATE" | "DROP") {
+        return Some(vec![first]);
+    }
+    // Map the word index back to its token, then walk `, name` pairs.
+    let mut seen = 0;
+    let start = tokens.iter().position(|token| {
+        let hit = token != "," && seen == at;
+        seen += usize::from(token != ",");
+        hit
+    })?;
+    let mut tables = vec![first];
+    let mut rest = tokens.iter().skip(start + 1).peekable();
+    while rest
+        .next_if(|t| SQL_NAME_MODIFIERS.contains(&t.to_ascii_uppercase().as_str()))
+        .is_some()
+    {}
+    rest.next();
+    rest.next_if(|t| t.as_str() == "*");
+    while rest.next_if(|t| t.as_str() == ",").is_some() {
+        while rest
+            .next_if(|t| SQL_NAME_MODIFIERS.contains(&t.to_ascii_uppercase().as_str()))
+            .is_some()
+        {}
+        // A list entry that is not a plain name cannot be read: fail closed.
+        tables.push(normalise_table(rest.next()?)?);
+        // `name *` includes the descendants; it names no further table.
+        rest.next_if(|t| t.as_str() == "*");
+    }
+    // Only option words may follow the list. Anything else is a name the
+    // reader did not understand, or a second statement: refuse. `TRUNCATE ..
+    // CASCADE` also empties every table that references the list, so it is
+    // refused too.
+    for token in rest {
+        let word = token.to_ascii_uppercase();
+        let cascade_ok = keyword == "DROP" && word == "CASCADE";
+        if !cascade_ok
+            && !matches!(
+                word.as_str(),
+                "RESTART" | "CONTINUE" | "IDENTITY" | "RESTRICT"
+            )
+        {
+            return None;
+        }
+    }
+    Some(tables)
 }
 
 /// The table a statement acts on, read forward from its governing keyword.
 fn sql_table(words: &[String], from: usize) -> Option<String> {
     /// The keywords a table name follows.
     const ANCHORS: &[&str] = &["INTO", "UPDATE", "FROM", "TABLE"];
-    /// Modifiers that sit between the anchor and the name.
-    const SKIP: &[&str] = &[
-        "IF",
-        "EXISTS",
-        "NOT",
-        "ONLY",
-        "CONCURRENTLY",
-        "TEMP",
-        "TEMPORARY",
-        "UNLOGGED",
-        "TABLE",
-    ];
     let mut index = words
         .iter()
         .enumerate()
@@ -3028,7 +4561,7 @@ fn sql_table(words: &[String], from: usize) -> Option<String> {
         .unwrap_or(from + 1);
     while words
         .get(index)
-        .is_some_and(|word| SKIP.contains(&word.to_ascii_uppercase().as_str()))
+        .is_some_and(|word| SQL_NAME_MODIFIERS.contains(&word.to_ascii_uppercase().as_str()))
     {
         index += 1;
     }
@@ -3048,21 +4581,28 @@ fn normalise_table(word: &str) -> Option<String> {
     .then(|| name.to_string())
 }
 
-/// Split a statement into words, with comments removed and punctuation that
-/// can abut a table name treated as a separator.
-fn sql_words(sql: &str) -> Vec<String> {
-    strip_sql_comments(sql)
-        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ',' | ';'))
-        .filter(|word| !word.is_empty())
+/// Split a statement into tokens, with comments removed. Punctuation that can
+/// abut a table name is a separator; a comma stays as its own `,` token.
+fn sql_tokens(sql: &str) -> Vec<String> {
+    let text = strip_sql_comments(sql).replace(',', " , ");
+    text.split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ';'))
+        .filter(|token| !token.is_empty())
         .map(ToString::to_string)
         .collect()
 }
 
+/// The tokens without commas.
+fn words_of(tokens: &[String]) -> Vec<String> {
+    tokens.iter().filter(|t| *t != ",").cloned().collect()
+}
+
 /// Remove `--` line comments and `/* … */` blocks, so neither can hide the
-/// leading keyword.
+/// leading keyword, and empty every string literal, so a keyword inside one
+/// is not read as a statement. A quoted identifier is kept as written.
 fn strip_sql_comments(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
+    let mut previous_word_char = None::<char>;
     while let Some(current) = chars.next() {
         match (current, chars.peek()) {
             ('-', Some('-')) => {
@@ -3084,8 +4624,61 @@ fn strip_sql_comments(sql: &str) -> String {
                 }
                 out.push(' ');
             }
+            // `'text'`: an `E'..'` string also treats a backslash as escape.
+            ('\'', _) => {
+                let escapes = matches!(previous_word_char, Some('e' | 'E'));
+                while let Some(c) = chars.next() {
+                    if escapes && c == '\\' {
+                        chars.next();
+                    } else if c == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                out.push_str("''");
+            }
+            // `$$text$$` and `$tag$text$tag$`. A `$1` parameter is no quote.
+            ('$', _) if !previous_word_char.is_some_and(|c| c.is_alphanumeric() || c == '_') => {
+                let mut tag = String::new();
+                let mut ahead = chars.clone();
+                let opened = loop {
+                    match ahead.next() {
+                        Some('$') => break true,
+                        Some(c) if c.is_alphanumeric() || c == '_' => tag.push(c),
+                        _ => break false,
+                    }
+                };
+                if opened && !tag.starts_with(|c: char| c.is_ascii_digit()) {
+                    let close: Vec<char> = format!("${tag}$").chars().collect();
+                    chars = ahead;
+                    let mut tail: Vec<char> = Vec::new();
+                    for c in chars.by_ref() {
+                        tail.push(c);
+                        if tail.ends_with(&close) {
+                            break;
+                        }
+                    }
+                    out.push_str("''");
+                } else {
+                    out.push(current);
+                }
+            }
+            // `"quoted identifier"`: keep it, comment markers and all.
+            ('"', _) => {
+                out.push('"');
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if c == '"' {
+                        break;
+                    }
+                }
+            }
             _ => out.push(current),
         }
+        previous_word_char = (!matches!(current, '\'' | '"')).then_some(current);
     }
     out
 }
@@ -3187,8 +4780,13 @@ fn job_type_path(expr: &Expr) -> Option<syn::Path> {
         return None;
     };
     let ident = path.path.segments.last()?.ident.to_string();
-    (path.path.segments.len() == 1 && ident.starts_with(char::is_uppercase))
-        .then(|| path.path.clone())
+    looks_like_type(&ident).then(|| path.path.clone())
+}
+
+/// A type name starts upper-case and has a lower-case letter, so `JOB_CLIENT`
+/// (a const) is not one.
+fn looks_like_type(ident: &str) -> bool {
+    ident.starts_with(char::is_uppercase) && ident.chars().any(char::is_lowercase)
 }
 
 /// The type a `Type::enqueue(...)` call names, when the receiver is one.
@@ -3197,7 +4795,7 @@ fn type_ident_of(expr: &Expr) -> Option<String> {
         return None;
     };
     let ident = path.path.segments.last()?.ident.to_string();
-    (path.path.segments.len() == 1 && ident.starts_with(char::is_uppercase)).then_some(ident)
+    looks_like_type(&ident).then_some(ident)
 }
 
 /// The qualifier of a path call, as an expression, so `NotifyFinance::enqueue`
@@ -3206,14 +4804,7 @@ fn path_qualifier(call: &ExprCall) -> Option<Expr> {
     let Expr::Path(path) = &*call.func else {
         return None;
     };
-    let mut segments = path.path.segments.clone();
-    segments.pop();
-    let last = segments.pop()?;
-    Some(Expr::Path(syn::ExprPath {
-        attrs: Vec::new(),
-        qself: None,
-        path: syn::Path::from(last),
-    }))
+    path_prefix_expr(&path.path)
 }
 
 fn path_string(path: &syn::Path) -> String {
@@ -3230,15 +4821,16 @@ fn path_string(path: &syn::Path) -> String {
 // comment), and most of what looks like a sibling function below has since
 // diverged on purpose: `pattern_bindings`/`container_bindings`/`select_part`,
 // `type_handle`, `is_constructor_call`, `signature_handles` and friends carry
-// this analyser's richer `Handle` enum, where `query_budget` only needs a
-// flat set of handle names. `INERT_MACROS` looks identical but is not — see
-// the comment on `mac()` below for why `vec!`/`format!` are excluded here.
+// this analyser's `Handle` enum, where `query_budget` keeps a scoped
+// environment of its own `Kind` lattice. `INERT_MACROS` looks identical but
+// is not — see the comment on `mac()` below for why `vec!`/`format!` are
+// excluded here.
 //
 // A handful of items *are* still byte-for-byte copies, because they just
 // enumerate `syn`'s own `Expr`/`Item` variants or do generic token-tree
 // plumbing that owes nothing to either analyser's rules: `expr_attrs`,
 // `expr_attrs_mut`, `item_attrs_mut`, `immediately_invoked_closure`,
-// `call_path_name`, `tokens_contain_await`, `collect_pat_idents`, and the
+// `call_path_name`, `tokens_contain_await`, and the
 // `StripAnnotations`/`VisitMut` impl, plus the `EXECUTORS` list above. Fix a
 // bug in one of *those* and fix it in the other — `shared_helpers_match_query_budget`
 // below fails the build if they drift. Two instances is not enough to extract
@@ -3480,6 +5072,177 @@ fn tokens_contain_await(tokens: &TokenStream) -> bool {
     tokens.clone().into_iter().any(|tt| match tt {
         TokenTree::Ident(ident) => ident == "await",
         TokenTree::Group(group) => tokens_contain_await(&group.stream()),
+        _ => false,
+    })
+}
+
+/// The name a callee starts from: `run` for `run(..)`, and `funcs` for
+/// `(funcs.0)(..)` or `funcs[i](..)`.
+fn callee_root(func: &Expr) -> Option<String> {
+    match strip_transparent(func) {
+        Expr::Path(path) => path.path.get_ident().map(ToString::to_string),
+        Expr::Field(f) => callee_root(&f.base),
+        Expr::Index(i) => callee_root(&i.expr),
+        _ => None,
+    }
+}
+
+/// What a `for` loop hands its pattern, one expression per possible element.
+fn iteration_elements(iterated: &Expr) -> Vec<Expr> {
+    match strip_transparent(iterated) {
+        Expr::Array(a) => a.elems.iter().cloned().collect(),
+        Expr::Repeat(rep) => vec![(*rep.expr).clone()],
+        Expr::Reference(r) => iteration_elements(&r.expr),
+        Expr::MethodCall(mc)
+            if matches!(
+                mc.method.to_string().as_str(),
+                "iter" | "iter_mut" | "into_iter" | "drain" | "copied" | "cloned" | "rev"
+            ) =>
+        {
+            iteration_elements(&mc.receiver)
+        }
+        Expr::Macro(m) if m.mac.path.is_ident("vec") => vec_elements(&m.mac),
+        other => vec![other.clone()],
+    }
+}
+
+/// The values a `break` hands out of a block, at any depth. Deeper loops'
+/// breaks are included, which only makes the callers more careful.
+fn break_values(block: &Block) -> Vec<&Expr> {
+    struct Breaks<'ast>(Vec<&'ast Expr>);
+    impl<'ast> syn::visit::Visit<'ast> for Breaks<'ast> {
+        fn visit_expr_break(&mut self, node: &'ast syn::ExprBreak) {
+            if let Some(value) = &node.expr {
+                self.0.push(value);
+            }
+            syn::visit::visit_expr_break(self, node);
+        }
+    }
+    let mut breaks = Breaks(Vec::new());
+    syn::visit::Visit::visit_block(&mut breaks, block);
+    breaks.0
+}
+
+/// The values `return` hands out of an expression, at any depth.
+fn return_values(body: &Expr) -> Vec<&Expr> {
+    struct Returns<'ast>(Vec<&'ast Expr>);
+    impl<'ast> syn::visit::Visit<'ast> for Returns<'ast> {
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            if let Some(value) = &node.expr {
+                self.0.push(value);
+            }
+            syn::visit::visit_expr_return(self, node);
+        }
+    }
+    let mut returns = Returns(Vec::new());
+    syn::visit::Visit::visit_expr(&mut returns, body);
+    returns.0
+}
+
+/// The tail of a block, followed through nested blocks, `if`s and `match`es.
+fn block_tail(block: &Block) -> Vec<&Expr> {
+    match block.stmts.last() {
+        Some(Stmt::Expr(tail, None)) => value_tails(tail),
+        _ => Vec::new(),
+    }
+}
+
+/// The values `return` hands out of a block, at any depth.
+fn block_return_values(block: &Block) -> Vec<&Expr> {
+    struct Returns<'ast>(Vec<&'ast Expr>);
+    impl<'ast> syn::visit::Visit<'ast> for Returns<'ast> {
+        fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+            if let Some(value) = &node.expr {
+                self.0.push(value);
+            }
+            syn::visit::visit_expr_return(self, node);
+        }
+    }
+    let mut returns = Returns(Vec::new());
+    syn::visit::Visit::visit_block(&mut returns, block);
+    returns.0
+}
+
+/// The expressions a block, `if` or `match` can evaluate to.
+fn value_tails(expr: &Expr) -> Vec<&Expr> {
+    match strip_transparent(expr) {
+        Expr::Block(b) if b.label.is_some() => {
+            let mut values = block_tail(&b.block);
+            values.extend(break_values(&b.block));
+            values
+        }
+        Expr::Block(b) => block_tail(&b.block),
+        Expr::Unsafe(u) => block_tail(&u.block),
+        Expr::Loop(l) => break_values(&l.body),
+        Expr::If(i) => {
+            let mut tails = block_tail(&i.then_branch);
+            if let Some((_, other)) = &i.else_branch {
+                tails.extend(value_tails(other));
+            }
+            tails
+        }
+        Expr::Match(m) => m
+            .arms
+            .iter()
+            .flat_map(|arm| value_tails(&arm.body))
+            .collect(),
+        other => vec![other],
+    }
+}
+
+/// The element expressions of a `vec![a, b]` or `vec![x; n]`. Empty when the
+/// body does not parse as either.
+fn vec_elements(mac: &syn::Macro) -> Vec<Expr> {
+    use syn::parse::Parser as _;
+    let list = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated;
+    if let Ok(elements) = list.parse2(mac.tokens.clone()) {
+        return elements.into_iter().collect();
+    }
+    let repeat = |input: ParseStream| -> syn::Result<Expr> {
+        let element: Expr = input.parse()?;
+        input.parse::<syn::Token![;]>()?;
+        let _len: Expr = input.parse()?;
+        Ok(element)
+    };
+    repeat.parse2(mac.tokens.clone()).into_iter().collect()
+}
+
+/// A bare macro name, or one under a crate whose macros are known.
+fn macro_path_is_standard(path: &syn::Path, shadowed: &HashSet<String>) -> bool {
+    const CRATES: &[&str] = &[
+        "std",
+        "core",
+        "alloc",
+        "tracing",
+        "log",
+        "serde_json",
+        "maud",
+        "anyhow",
+    ];
+    path.segments.len() == 1
+        || path.segments.first().is_some_and(|s| {
+            let root = s.ident.to_string();
+            CRATES.contains(&root.as_str()) && !shadowed.contains(&root)
+        })
+}
+
+/// Does a macro body name a `spawn`-family function?
+fn tokens_contain_spawn(tokens: &TokenStream) -> bool {
+    let trees: Vec<TokenTree> = tokens.clone().into_iter().collect();
+    trees.iter().enumerate().any(|(at, tt)| match tt {
+        // Only a call counts: `spawn(..)` or `spawn::<T>(..)`. A bare `spawn`
+        // is data, as in `let spawn = 1;`, and a lone `:` is a field or a type.
+        TokenTree::Ident(ident) if SPAWN_FNS.contains(&ident.to_string().as_str()) => {
+            match trees.get(at + 1) {
+                Some(TokenTree::Group(group)) => group.delimiter() == Delimiter::Parenthesis,
+                Some(TokenTree::Punct(punct)) if punct.as_char() == ':' => {
+                    matches!(trees.get(at + 2), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+                        && matches!(trees.get(at + 3), Some(TokenTree::Punct(p)) if p.as_char() == '<')
+                }
+                _ => false,
+            }
+        }
+        TokenTree::Group(group) => tokens_contain_spawn(&group.stream()),
         _ => false,
     })
 }
@@ -3954,8 +5717,34 @@ pub fn agent_operable_macro(attr: TokenStream, item: TokenStream) -> TokenStream
         effects,
         errors,
         effect_free_sites,
+        cascades,
         ..
     } = analyzer;
+
+    // A delete through a generated repository also writes the models its
+    // `dependent(...)` cascade names. Each must be in the grant. The list is a
+    // const the repository publishes, so the check holds across crates.
+    let cascade_assertions = cascades.iter().map(|(repo, human, span)| {
+        let message = format!(
+            "agent authority: `{action}` deletes through the `{human}` repository, whose \
+             `dependent(...)` cascade also writes models grant `{grant_name}` does not \
+             allow.\n\nAdd every dependent model to the grant's `writes: [...]`, make the \
+             association `restrict`, or move the delete out of the agent-operable handler. {GUIDE}"
+        );
+        let too_deep = format!(
+            "agent authority: `{action}` deletes through the `{human}` repository, whose \
+             `dependent(...)` cascade is deeper than {CASCADE_LEVELS} levels, or loops.\n\n\
+             Grant `{grant_name}` cannot cover what Autumn cannot list. Make a leg \
+             `restrict`, or move the delete out of the agent-operable handler. {GUIDE}"
+        );
+        quote_spanned! { *span=>
+            const _: () = ::core::assert!(
+                #grant.allows_writes_all(#repo::__AUTUMN_CASCADE_3.models),
+                #message
+            );
+            const _: () = ::core::assert!(!#repo::__AUTUMN_CASCADE_3.more, #too_deep);
+        }
+    });
 
     // One respanned const assertion per proved effect: const-eval sees the
     // linked `Grant`, so the check holds even when the grant is declared in
@@ -4149,6 +5938,8 @@ pub fn agent_operable_macro(attr: TokenStream, item: TokenStream) -> TokenStream
 
         #(#assertions)*
 
+        #(#cascade_assertions)*
+
         #floor_assertion
 
         #(#errors)*
@@ -4212,7 +6003,7 @@ mod tests {
 
     /// `expr_attrs`, `expr_attrs_mut`, `item_attrs_mut`,
     /// `immediately_invoked_closure`, `call_path_name`, `tokens_contain_await`,
-    /// `collect_pat_idents`, `StripAnnotations`'s `VisitMut` impl, and
+    /// `StripAnnotations`'s `VisitMut` impl, and
     /// `EXECUTORS` are a deliberate copy of `query_budget.rs`, modulo
     /// comments (see the comment above `expr_attrs` in this file, and its
     /// mirror in `query_budget.rs`) — everything else nearby has since
@@ -4231,7 +6022,6 @@ mod tests {
             "fn immediately_invoked_closure(func: &Expr) -> Option<&syn::ExprClosure> {",
             "fn call_path_name(call: &ExprCall) -> Option<String> {",
             "fn tokens_contain_await(tokens: &TokenStream) -> bool {",
-            "fn collect_pat_idents(pat: &Pat, out: &mut HashSet<String>) {",
             "impl VisitMut for StripAnnotations {",
         ];
         for sig in braced_items {
@@ -5543,6 +7333,1282 @@ mod tests {
                 Ok(())
             }",
         ),
+        // ── #2451: escape shapes found after the first corpus ──────────
+        (
+            "future assigned after declaration and awaited later",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut;
+                fut = start_finance_job();
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "future assigned through a destructuring target and awaited later",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut;
+                let n;
+                (fut, n) = (start_finance_job(), 1);
+                fut.await?;
+                Ok(n)
+            }",
+        ),
+        (
+            "awaited opaque macro with no handle",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in statement position with no handle",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro bound by let with no handle",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let x = schedule!();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as the tail expression",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!()
+            }",
+        ),
+        (
+            "opaque macro under the try operator",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!()?;
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as a call argument",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                keep(schedule!());
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as a method receiver",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                schedule!().ok();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a return",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                return schedule!();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in an if condition",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                if schedule!() { noop(); }
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a match scrutinee",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                match schedule!() { _ => {} }
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a struct field",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let v = Wrapper { f: schedule!() };
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a closure body",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let c = || schedule!(); c();
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a block tail",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let v = { schedule!() };
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro as a reference",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                keep(&schedule!());
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in a let else",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let Some(v) = schedule!() else { return Ok(()) };
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in an array",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h() -> R {
+                let v = [schedule!()];
+                Ok(())
+            }",
+        ),
+        (
+            "raw truncate of two tables",
+            ExpectedKind::UnboundedWrite,
+            "ledger",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("TRUNCATE allowed, ledger").execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "raw truncate with an inheritance marker",
+            ExpectedKind::UnboundedWrite,
+            "ledger",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("TRUNCATE allowed *, ledger").execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "raw drop of two tables",
+            ExpectedKind::UnboundedWrite,
+            "ledger",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("DROP TABLE allowed, ledger").execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "unread future handed to timeout",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                let fut = start_finance_job();
+                tokio::time::timeout(d, fut).await??;
+                Ok(())
+            }",
+        ),
+        (
+            "commit spelled on a receiver that is not a transaction",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(billing: BillingService) -> R {
+                billing.commit().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "custom sleep function",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                sleep(d).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "binding named cache with an unrelated type",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(cache: FinanceService) -> R {
+                cache.refresh().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "field named session on an unrelated value",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(svc: FinanceService) -> R {
+                svc.session.flush().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future shadowed in a nested block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = start_finance_job();
+                { let fut = (); }
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "CTE that writes two tables: the CTE",
+            ExpectedKind::UnboundedWrite,
+            "allowed",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("WITH x AS (DELETE FROM allowed RETURNING id) DELETE FROM forbidden")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "CTE that writes two tables: the main statement",
+            ExpectedKind::UnboundedWrite,
+            "forbidden",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("WITH x AS (DELETE FROM allowed RETURNING id) DELETE FROM forbidden")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "awaited callee produced by a call, no handle",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                (choose_callback())().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "awaited callee indexed from a table, no handle",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                callbacks[0]().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel delete through an aliased table",
+            ExpectedKind::UnboundedWrite,
+            "refunds",
+            r"async fn h(mut db: Db) -> R {
+                let target = refunds::table;
+                diesel::delete(target).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel update on an unresolvable target",
+            ExpectedKind::Rejected,
+            "chosen_table",
+            r"async fn h(mut db: Db) -> R {
+                diesel::update(chosen_table).set(x).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "write builder cleared on one branch and executed on the other",
+            ExpectedKind::UnboundedWrite,
+            "refunds",
+            r"async fn h(mut db: Db, skip: bool) -> R {
+                let mut q = Some(diesel::delete(refunds::table));
+                if skip { q = None; }
+                if let Some(q) = q { q.execute(&mut *db).await?; }
+                Ok(())
+            }",
+        ),
+        (
+            "different tables joined at a branch",
+            ExpectedKind::Rejected,
+            "set",
+            r"async fn h(mut db: Db, c: bool) -> R {
+                let mut q = diesel::update(allowed::table.find(1));
+                if c { q = diesel::update(forbidden::table.find(1)); }
+                q.set(x).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "UPDATE hidden behind a column named key",
+            ExpectedKind::UnboundedWrite,
+            "payouts",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("WITH k AS (SELECT 1 AS key) UPDATE payouts SET status = 'x'")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "future bound with a type ascription",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut: BoxFuture<R> = start_finance_job();
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "future bound through a tuple pattern",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let (fut, n) = (start_finance_job(), 1);
+                fut.await?;
+                Ok(n)
+            }",
+        ),
+        (
+            "inert parameter name rebound to another value",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(session: Session) -> R {
+                let session = FinanceService::new();
+                session.refresh().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "write builder cleared in one match arm",
+            ExpectedKind::UnboundedWrite,
+            "refunds",
+            r"async fn h(mut db: Db, mode: u8) -> R {
+                let mut q = Some(diesel::delete(refunds::table));
+                match mode { 0 => { q = None; } _ => {} }
+                if let Some(q) = q { q.execute(&mut *db).await?; }
+                Ok(())
+            }",
+        ),
+        (
+            "table alias rebound with a type ascription",
+            ExpectedKind::UnboundedWrite,
+            "refunds",
+            r"async fn h(mut db: Db, id: i64) -> R {
+                let t = refunds::table.find(id);
+                let t: refunds::table = refunds::table;
+                diesel::delete(t).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "dbg! wrapped around an unread future",
+            ExpectedKind::Rejected,
+            "dbg",
+            r"async fn h() -> R {
+                dbg!(start_finance_job()).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "tokio import ended with its block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                { use tokio::time::sleep; sleep(d).await; }
+                sleep(d).await;
+                Ok(())
+            }",
+        ),
+        (
+            "future assigned before an inner shadow in the same block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut;
+                { fut = start_finance_job(); let fut = 0; }
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "tokio import shadowed by a local function",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                use tokio::time::sleep;
+                {
+                    async fn sleep(d: Duration) { start_finance_job().await; }
+                    sleep(d).await;
+                }
+                Ok(())
+            }",
+        ),
+        (
+            "tokio import shadowed by another use",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                use tokio::time::sleep;
+                { use crate::jobs::sleep; sleep(d).await; }
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro future handed to timeout",
+            ExpectedKind::Rejected,
+            "schedule",
+            r"async fn h(d: Duration) -> R {
+                tokio::time::timeout(d, schedule!()).await??;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future in a block handed to timeout",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                tokio::time::timeout(d, { start_finance_job() }).await??;
+                Ok(())
+            }",
+        ),
+        (
+            "crate aliased as tokio",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                use crate::jobs as tokio;
+                tokio::time::sleep(d).await;
+                Ok(())
+            }",
+        ),
+        (
+            "effect alias reassigned to another function",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let mut schedule = NotifyFinanceJob::enqueue;
+                schedule = start_finance_job;
+                schedule(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "use item later in the block hides the tokio import",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                use tokio::time::sleep;
+                { sleep(d).await; use crate::jobs::sleep; }
+                Ok(())
+            }",
+        ),
+        (
+            "tokio import shadowed by a local const",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                use tokio::time::sleep;
+                { const sleep: fn() -> BoxFuture<R> = start_finance_job; sleep().await; }
+                Ok(())
+            }",
+        ),
+        (
+            "future returned through a block initialiser",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = { start_finance_job() };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "future returned through an if initialiser",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(c: bool) -> R {
+                let fut = if c { start_a() } else { start_b() };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future moved to a second name",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = start_finance_job();
+                let g = fut;
+                g.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "opaque macro in expression position",
+            ExpectedKind::Rejected,
+            "detach",
+            r"async fn h() -> R {
+                let _task = detach!();
+                Ok(())
+            }",
+        ),
+        (
+            "effect alias that differs between branches",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(c: bool) -> R {
+                let mut s = ForbiddenJob::enqueue;
+                if c { s = AllowedJob::enqueue; }
+                s(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "callback that differs between branches",
+            ExpectedKind::Rejected,
+            "enqueue",
+            r#"async fn h(mut db: Db, c: bool) -> R {
+                let mut cb = |conn| async move { Ok(()) };
+                if c { cb = |conn| async move { autumn_web::job::enqueue("x", p).await?; Ok(()) }; }
+                db.tx(cb).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "pure macro name shadowed by a local macro",
+            ExpectedKind::Rejected,
+            "format",
+            r"async fn h() -> R {
+                macro_rules! format { () => { tokio::spawn(async {}) }; }
+                let _task = format!();
+                Ok(())
+            }",
+        ),
+        (
+            "unread future bound by an if let pattern",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                if let Some(fut) = Some(start_finance_job()) { fut.await?; }
+                Ok(())
+            }",
+        ),
+        (
+            "tokio path hidden by a local module",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                tokio::time::sleep(d).await;
+                mod tokio { pub mod time { pub async fn sleep(d: Duration) { start_finance_job().await; } } }
+                Ok(())
+            }",
+        ),
+        (
+            "unread future stored in a tuple",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let jobs = (start_finance_job(),);
+                jobs.0.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "qualified application macro with a standard name",
+            ExpectedKind::Rejected,
+            "format",
+            r"async fn h() -> R {
+                let _ = crate::format!();
+                Ok(())
+            }",
+        ),
+        (
+            "diesel renamed by a use",
+            ExpectedKind::Rejected,
+            "select_target",
+            r"async fn h(mut db: Db) -> R {
+                use diesel as orm;
+                orm::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel delete renamed by a use",
+            ExpectedKind::UnboundedWrite,
+            "refunds",
+            r"async fn h(mut db: Db) -> R {
+                use diesel::delete as remove;
+                remove(refunds::table).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "standard macro root shadowed by a use",
+            ExpectedKind::Rejected,
+            "format",
+            r"async fn h() -> R {
+                use crate::evil as std;
+                let _ = std::format!();
+                Ok(())
+            }",
+        ),
+        (
+            "container future reassigned to another container",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let mut jobs = (start_finance_job(),);
+                jobs = (start_finance_job(),);
+                jobs.0.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "standard macro root shadowed by a local module",
+            ExpectedKind::Rejected,
+            "format",
+            r"async fn h() -> R {
+                let _ = std::format!();
+                mod std { pub use crate::evil as format; }
+                Ok(())
+            }",
+        ),
+        (
+            "standard macro root shadowed by extern crate",
+            ExpectedKind::Rejected,
+            "format",
+            r"async fn h() -> R {
+                let _ = std::format!();
+                extern crate evil as std;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future assigned into a tuple field",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                let mut jobs = (tokio::time::sleep(d), 1);
+                jobs.0 = start_finance_job();
+                jobs.0.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel renamed through a grouped self",
+            ExpectedKind::Rejected,
+            "select_target",
+            r"async fn h(mut db: Db) -> R {
+                use diesel::{self as orm};
+                orm::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias copied to a second name",
+            ExpectedKind::Rejected,
+            "second",
+            r"async fn h() -> R {
+                let first = tokio::spawn;
+                let second = first;
+                second(async { work().await });
+                Ok(())
+            }",
+        ),
+        (
+            "unread future stored by vec!",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let jobs = vec![start_finance_job()];
+                jobs[0].await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future in a repeated array",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let [fut] = [start_finance_job(); 1];
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future named inside a block tail",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = { let inner = start_finance_job(); inner };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future moved in by an array destructuring assignment",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                let mut fut = tokio::time::sleep(d);
+                [fut] = [start_finance_job()];
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future extracted from a tuple member",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let jobs = (start_finance_job(),);
+                let fut = jobs.0;
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel renamed by extern crate",
+            ExpectedKind::Rejected,
+            "select_target",
+            r"async fn h(mut db: Db) -> R {
+                extern crate diesel as orm;
+                orm::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "diesel constructors imported by a glob",
+            ExpectedKind::Rejected,
+            "select_target",
+            r"async fn h(mut db: Db) -> R {
+                use diesel::*;
+                delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future passed to an invoked closure",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                (|fut| async move { fut.await?; Ok(()) })(start_finance_job()).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn passed to an invoked closure",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                (|run| { run(async { work().await }); })(tokio::spawn);
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through a tuple pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let (run,) = (tokio::spawn,);
+                run(async { work().await });
+                Ok(())
+            }",
+        ),
+        (
+            "unread future extracted by a dereference",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let boxed = Box::new(start_finance_job());
+                let fut = *boxed;
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through an array pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let [run] = [tokio::spawn];
+                run(async { work().await });
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through a nested pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let ((run,), n) = ((tokio::spawn,), 1);
+                run(async { work().await });
+                Ok(n)
+            }",
+        ),
+        (
+            "spawn inside an argument of an inert macro",
+            ExpectedKind::Rejected,
+            "assert_eq",
+            r"async fn h() -> R {
+                assert_eq!({ tokio::spawn(work()); 1 }, 1);
+                Ok(())
+            }",
+        ),
+        (
+            "unread future built by a qualified vec macro",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let jobs = std::vec![start_finance_job()];
+                jobs[0].await?;
+                Ok(())
+            }",
+        ),
+        (
+            "effect alias set on one branch only",
+            ExpectedKind::Job,
+            "ForbiddenJob",
+            r"async fn h(c: bool, job: Job) -> R {
+                let mut f = make_fn();
+                if c { f = ForbiddenJob::enqueue; }
+                f(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias passed to a destructured closure parameter",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                (|(run,)| run(async {}))((tokio::spawn,));
+                Ok(())
+            }",
+        ),
+        (
+            "unread future yielded by an awaited async block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = async { start_finance_job() }.await;
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future returned by an invoked closure",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = (|| start_finance_job())();
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future coerced by a cast",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = Box::pin(start_finance_job()) as Pin<Box<dyn Future<Output = ()>>>;
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future kept by a struct update",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let old = Holder { future: start_finance_job() };
+                let new = Holder { flag: true, ..old };
+                new.future.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future yielded by a loop break",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = loop { break start_finance_job(); };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future yielded by an unsafe block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = unsafe { start_finance_job() };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through a struct pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let Holder { run } = Holder { run: tokio::spawn };
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through a tuple struct pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let Wrap(run) = Wrap(tokio::spawn);
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias moved through a repeated array pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let [run] = [tokio::spawn; 1];
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias bound by a match pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                match (tokio::spawn,) { (run,) => { run(async {}); } }
+                Ok(())
+            }",
+        ),
+        (
+            "awaited if whose branches yield an opaque future",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(flag: bool) -> R {
+                (if flag { start_finance_job() } else { start_finance_job() }).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future returned through a match binding",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = match start_finance_job() { inner => inner };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias extracted from a tuple",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let funcs = (tokio::spawn,);
+                let run = funcs.0;
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias called through a tuple member",
+            ExpectedKind::Rejected,
+            "funcs",
+            r"async fn h() -> R {
+                let funcs = (tokio::spawn,);
+                (funcs.0)(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias bound by a for loop",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                for run in [tokio::spawn] { run(async {}); }
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias bound by an if let",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                if let Some(run) = Some(tokio::spawn) { run(async {}); }
+                Ok(())
+            }",
+        ),
+        (
+            "async block awaited twice",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                (async { start_finance_job() }.await).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future moved in by a struct destructuring assignment",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                let mut fut = tokio::time::sleep(d);
+                Holder { fut } = Holder { fut: start_finance_job() };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future returned by an explicit closure return",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = (|| { return start_finance_job(); })();
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias yielded by an if",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h(flag: bool) -> R {
+                let run = if flag { tokio::spawn } else { tokio::spawn };
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "unread future broken out by name",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = loop { let inner = start_finance_job(); break inner; };
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias borrowed before binding",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = &tokio::spawn;
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias yielded by a loop break",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = loop { break tokio::spawn; };
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias returned by an invoked closure",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = (|| tokio::spawn)();
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "unread future bound in a let chain",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(ready: bool) -> R {
+                if let Some(fut) = Some(start_finance_job()) && ready { fut.await?; }
+                Ok(())
+            }",
+        ),
+        (
+            "spawn imported under another name",
+            ExpectedKind::Rejected,
+            "detach",
+            r"async fn h() -> R {
+                use tokio::spawn as detach;
+                detach(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias yielded by an awaited async block",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = async { tokio::spawn }.await;
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "unread future returned from an awaited async block",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = async { return start_finance_job(); }.await;
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "tokio import through a shadowing local module",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h(d: Duration) -> R {
+                use tokio::time::sleep;
+                mod tokio { pub mod time { pub async fn sleep(d: Duration) {} } }
+                sleep(d).await;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias coerced by a cast",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = tokio::spawn as fn(F) -> H;
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "unread future inside a tuple at a block tail",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let pair = { (start_finance_job(), 0) };
+                pair.0.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias bound earlier in the same let chain",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                if let Some(run) = Some(tokio::spawn) && run(async {}).is_finished() {}
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias broken out by a local name",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = loop { let inner = tokio::spawn; break inner; };
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "unread future returned through an awaited async block and a question mark",
+            ExpectedKind::Rejected,
+            "awaited call",
+            r"async fn h() -> R {
+                let fut = async { return Ok::<_, E>(start_finance_job()); }.await?;
+                fut.await?;
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias taken out of an Option",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let run = Some(tokio::spawn).unwrap();
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias returned by a bound closure",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let choose = || tokio::spawn;
+                let run = choose();
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias kept by a destructuring assignment from a container",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let funcs = (tokio::spawn,);
+                let mut run = tokio::spawn;
+                (run,) = funcs;
+                run(async {});
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias passed into a combinator closure",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                Some(tokio::spawn).map(|run| run(async {}));
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias passed as an argument to a stored closure",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let invoke = |run| run(async {});
+                invoke(tokio::spawn);
+                Ok(())
+            }",
+        ),
+        (
+            "spawn alias read out of a named container by a pattern",
+            ExpectedKind::Rejected,
+            "run",
+            r"async fn h() -> R {
+                let funcs = Some(tokio::spawn);
+                if let Some(run) = funcs { run(async {}); }
+                Ok(())
+            }",
+        ),
         (
             "#[agent_effect] with a blank reason",
             ExpectedKind::Rejected,
@@ -5798,6 +8864,154 @@ mod tests {
             }",
         ),
         (
+            "job enqueued through a function-item alias and awaited",
+            r"async fn h() -> R {
+                let schedule = NotifyFinanceJob::enqueue;
+                schedule(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "job enqueued through a fully qualified type path",
+            r"async fn h() -> R {
+                crate::jobs::NotifyFinanceJob::enqueue(&payload).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "immediately invoked async closure, awaited",
+            r"async fn h() -> R {
+                (async || { Ok(()) })().await?;
+                Ok(())
+            }",
+        ),
+        (
+            "tokio::task::yield_now is qualified",
+            r"async fn h() -> R {
+                tokio::task::yield_now().await;
+                Ok(())
+            }",
+        ),
+        (
+            "unread future shadowed by a plain value then awaited as a value",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                let n = 1;
+                { let n = start_unrelated(); let _ = n; }
+                Ok((repo.find_all().await?, n))
+            }",
+        ),
+        (
+            "write builder bounded on both branches",
+            r"async fn h(mut db: Db, id: i64, skip: bool) -> R {
+                let mut q = diesel::delete(refunds::table.find(id));
+                if skip { q = diesel::delete(refunds::table.find(0)); }
+                q.execute(&mut *db).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "bare sleep after a use in the handler",
+            r"async fn h(d: Duration) -> R {
+                use tokio::time::sleep;
+                sleep(d).await;
+                Ok(())
+            }",
+        ),
+        (
+            "time::sleep after use tokio::time::{self}",
+            r"async fn h(d: Duration) -> R {
+                use tokio::time::{self, timeout};
+                time::sleep(d).await;
+                Ok(())
+            }",
+        ),
+        (
+            "commit on a transaction callback parameter",
+            r"async fn h(mut db: Db) -> R {
+                db.tx(|tx| async move { tx.commit().await?; Ok(()) }.scope_boxed()).await?;
+                Ok(())
+            }",
+        ),
+        (
+            "inert macros in statement position",
+            r#"async fn h() -> R {
+                tracing::info!("start");
+                ensure!(true, "bad");
+                if false { bail!("no"); }
+                Ok(())
+            }"#,
+        ),
+        (
+            "SELECT FOR UPDATE and ON CONFLICT DO UPDATE are one statement each",
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("SELECT * FROM payouts FOR UPDATE").load::<P>(&mut *db).await?;
+                Ok(())
+            }"#,
+        ),
+        (
+            "timeout with a computed duration",
+            r"async fn h(repo: PgRefundRepository) -> R {
+                let delay = retry_delay();
+                tokio::time::timeout(delay, repo.find_all()).await??;
+                Ok(())
+            }",
+        ),
+        (
+            "plain value macros in expression position",
+            r#"async fn h() -> R {
+                let label = format!("{}-{}", 1, 2);
+                let rows = vec![1, 2, 3];
+                Ok(json!({ "label": label, "rows": rows }))
+            }"#,
+        ),
+        (
+            "a data identifier named spawn inside an inert macro",
+            r"async fn h() -> R {
+                let spawn = 1;
+                assert_eq!(spawn, 1);
+                Ok(())
+            }",
+        ),
+        (
+            "a bare async block is a future nothing has polled",
+            r"async fn h() -> R {
+                let outer = async { start_finance_job() };
+                outer.await;
+                Ok(())
+            }",
+        ),
+        (
+            "a struct field named spawn inside an inert macro",
+            r"async fn h() -> R {
+                assert_eq!(Config { spawn: 1 }.spawn, 1);
+                Ok(())
+            }",
+        ),
+        (
+            "a let named tokio does not hide the crate path",
+            r"async fn h(d: Duration) -> R {
+                let tokio = 1;
+                tokio::time::sleep(d).await;
+                Ok(tokio)
+            }",
+        ),
+        (
+            "a use of format ends with its block",
+            r#"async fn h() -> R {
+                { use crate::macros::format; }
+                let label = format!("ok");
+                Ok(label)
+            }"#,
+        ),
+        (
+            "an inert future in a tuple beside an unread one",
+            r"async fn h(d: Duration) -> R {
+                let (delay, n) = (tokio::time::sleep(d), 1);
+                delay.await;
+                Ok(n)
+            }",
+        ),
+        (
             "no handles at all",
             r"async fn h() -> R { Ok(render_static()) }",
         ),
@@ -5997,6 +9211,326 @@ mod tests {
             expansion.contains("\"Refund\""),
             "expected the syntactic model subject: {expansion}"
         );
+    }
+
+    // ── #2451 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn a_qualified_job_type_keeps_its_whole_path() {
+        let expansion = expand(
+            GRANT,
+            r"async fn h() -> R {
+                crate::jobs::NotifyFinanceJob::enqueue(&payload).await?;
+                Ok(())
+            }",
+        );
+        assert!(
+            expansion.contains("crate :: jobs :: NotifyFinanceJob :: __AUTUMN_JOB_NAME"),
+            "the job name constant lost its path prefix: {expansion}"
+        );
+    }
+
+    #[test]
+    fn a_proved_effect_that_is_also_declared_is_recorded_as_declared() {
+        let expansion = expand(
+            GRANT,
+            r#"async fn h(repo: RefundRepository) -> R {
+                repo.create(&b).await?;
+                #[agent_effect(writes(Refund), reason = "helper also writes a refund")]
+                let r = opaque_helper(&b);
+                Ok(r)
+            }"#,
+        );
+        assert!(
+            expansion.contains("EffectProvenance :: Declared"),
+            "the declared site was lost on de-duplication: {expansion}"
+        );
+    }
+
+    #[test]
+    fn a_declared_effect_stays_declared_when_proved_later() {
+        let expansion = expand(
+            GRANT,
+            r#"async fn h(repo: RefundRepository) -> R {
+                #[agent_effect(writes(Refund), reason = "helper also writes a refund")]
+                let r = opaque_helper(&b);
+                repo.create(&b).await?;
+                Ok(r)
+            }"#,
+        );
+        assert!(
+            expansion.contains("EffectProvenance :: Declared")
+                && !expansion.contains("EffectProvenance :: Syntactic"),
+            "a proof must not demote a declaration: {expansion}"
+        );
+    }
+
+    fn cascade_assertions(handler: &str) -> usize {
+        expand(GRANT, handler).matches("allows_writes_all").count()
+    }
+
+    #[test]
+    fn a_repository_delete_is_checked_against_its_cascade() {
+        for call in ["repo.delete_by_id(1)", "repo.delete_many(&ids)"] {
+            let handler =
+                format!("async fn h(repo: PgRefundRepository) -> R {{ {call}.await?; Ok(()) }}");
+            let expansion = expand(GRANT, &handler);
+            assert!(
+                expansion.contains("PgRefundRepository :: __AUTUMN_CASCADE_3 . models"),
+                "{call}: {expansion}"
+            );
+            assert!(
+                expansion.contains("allows_writes_all"),
+                "{call}: {expansion}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_ufcs_delete_is_checked_against_its_cascade() {
+        for call in [
+            "PgRefundRepository::delete_by_id(&repo, 1)",
+            "PgRefundRepository::delete_many(&repo, &ids)",
+        ] {
+            let handler =
+                format!("async fn h(repo: PgRefundRepository) -> R {{ {call}.await?; Ok(()) }}");
+            let expansion = expand(GRANT, &handler);
+            assert!(
+                expansion.contains("PgRefundRepository :: __AUTUMN_CASCADE_3 . models"),
+                "{call}: {expansion}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cascade_is_checked_once_per_repository() {
+        assert_eq!(
+            cascade_assertions(
+                r"async fn h(repo: PgRefundRepository) -> R {
+                    repo.delete_by_id(1).await?;
+                    repo.delete_many(&ids).await?;
+                    Ok(())
+                }"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_write_that_cascades_nothing_adds_no_cascade_check() {
+        for call in ["repo.create(&b)", "repo.save(&b)", "repo.find_by_id(1)"] {
+            let handler =
+                format!("async fn h(repo: PgRefundRepository) -> R {{ {call}.await?; Ok(()) }}");
+            assert_eq!(cascade_assertions(&handler), 0, "{call}");
+        }
+    }
+
+    #[test]
+    fn a_table_list_records_every_table() {
+        let tables = |sql: &str| match classify_sql(sql) {
+            Some(SqlStatement::Write { tables }) => Some(tables),
+            _ => None,
+        };
+        let two = Some(vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(tables("TRUNCATE TABLE ONLY a, b RESTART IDENTITY"), two);
+        assert_eq!(tables("DROP TABLE IF EXISTS a, \"b\" CASCADE"), two);
+        assert_eq!(
+            tables("TRUNCATE a RESTART IDENTITY"),
+            Some(vec!["a".into()])
+        );
+        assert_eq!(tables("TRUNCATE a *, b *"), two);
+        assert_eq!(tables("DROP TABLE a, b CASCADE"), two);
+        // `TRUNCATE .. CASCADE` reaches tables it does not name.
+        assert_eq!(tables("TRUNCATE a CASCADE"), None);
+        // A name the reader does not understand, or a second statement.
+        assert_eq!(tables("TRUNCATE public . a, secrets"), None);
+        assert_eq!(tables("TRUNCATE \"my table\", secrets"), None);
+        assert_eq!(tables("TRUNCATE temp, payouts"), None);
+        assert_eq!(tables("DROP TABLE a; DROP TABLE b"), None);
+        // An entry that is not a plain name cannot be read: refuse.
+        assert_eq!(tables("TRUNCATE a, $1"), None);
+    }
+
+    #[test]
+    fn a_sql_string_literal_names_no_write() {
+        let expansion = expand(
+            GRANT,
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("SELECT ' UPDATE payouts' AS note, '--' AS dashes FROM t")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        );
+        assert!(
+            !expansion.contains("\"payouts\""),
+            "a string literal was read as a write: {expansion}"
+        );
+    }
+
+    #[test]
+    fn a_dollar_quoted_literal_names_no_write() {
+        for literal in ["$$ UPDATE payouts $$", "$q$ UPDATE payouts $q$"] {
+            let expansion = expand(
+                GRANT,
+                &format!(
+                    r#"async fn h(mut db: Db) -> R {{
+                        diesel::sql_query("SELECT {literal} AS note")
+                            .execute(&mut *db).await?;
+                        Ok(())
+                    }}"#
+                ),
+            );
+            assert!(
+                !expansion.contains("\"payouts\""),
+                "{literal} was read as a write: {expansion}"
+            );
+        }
+        // A positional parameter is not a quote: the write stays visible.
+        let write = expand(
+            GRANT,
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("UPDATE payouts SET x = $1 WHERE y = $2")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        );
+        assert!(write.contains("\"payouts\""), "{write}");
+    }
+
+    #[test]
+    fn a_local_fn_hides_an_imported_diesel_constructor() {
+        let out = expand(
+            GRANT,
+            r"async fn h(mut db: Db) -> R {
+                use diesel::delete as remove;
+                {
+                    fn remove(t: Table) -> Custom { custom(t) }
+                    remove(refunds::table).execute(&mut *db).await?;
+                }
+                Ok(())
+            }",
+        );
+        assert!(!out.contains("allows_unbounded_write"), "{out}");
+    }
+
+    #[test]
+    fn a_renamed_spawn_import_ends_with_its_block() {
+        let after_block = error_of(
+            GRANT,
+            r"async fn h(detach: Callback) -> R {
+                { use tokio::spawn as detach; }
+                detach(async {});
+                Ok(())
+            }",
+        );
+        assert!(after_block.is_none(), "{after_block:?}");
+        let inside = error_of(
+            GRANT,
+            r"async fn h() -> R {
+                { use tokio::spawn as detach; detach(async {}); }
+                Ok(())
+            }",
+        );
+        assert!(inside.is_some_and(|e| e.contains("detach")));
+    }
+
+    #[test]
+    fn a_merge_action_names_no_second_table() {
+        let expansion = expand(
+            GRANT,
+            r#"async fn h(mut db: Db) -> R {
+                diesel::sql_query("WITH s AS (SELECT 1 AS id) MERGE INTO payouts p USING s ON p.id = s.id WHEN MATCHED THEN UPDATE SET x = 1 WHEN NOT MATCHED THEN INSERT (id) VALUES (1)")
+                    .execute(&mut *db).await?;
+                Ok(())
+            }"#,
+        );
+        assert!(
+            expansion.contains("\"payouts\"") && !expansion.contains("\"SET\""),
+            "a MERGE action was read as a second table: {expansion}"
+        );
+    }
+
+    #[test]
+    fn a_diesel_import_ends_with_its_block() {
+        // Inside the block `remove` is `diesel::delete`. After it, `remove`
+        // is an application function, not a diesel write.
+        let inside = expand(
+            GRANT,
+            r"async fn h(mut db: Db) -> R {
+                { use diesel::delete as remove; remove(refunds::table).execute(&mut *db).await?; }
+                Ok(())
+            }",
+        );
+        let outside = expand(
+            GRANT,
+            r"async fn h(mut db: Db) -> R {
+                { use diesel::delete as remove; }
+                remove(refunds::table).execute(&mut *db).await?;
+                Ok(())
+            }",
+        );
+        assert!(inside.contains("allows_unbounded_write"), "{inside}");
+        assert!(!outside.contains("allows_unbounded_write"), "{outside}");
+    }
+
+    #[test]
+    fn only_the_crate_root_named_diesel_is_diesel() {
+        // An unresolved target is refused only for the real crate.
+        let refused = |handler: &str| {
+            error_of(GRANT, handler).is_some_and(|e| e.contains("`diesel::delete`"))
+        };
+        // An interior module named `diesel` is application code.
+        assert!(!refused(
+            r"async fn h(mut db: Db) -> R {
+                crate::jobs::diesel::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }"
+        ));
+        // So is a name a local `use` rebinds.
+        assert!(!refused(
+            r"async fn h(mut db: Db) -> R {
+                use crate::jobs as diesel;
+                diesel::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }"
+        ));
+        assert!(refused(
+            r"async fn h(mut db: Db) -> R {
+                diesel::delete(select_target()).execute(&mut *db).await?;
+                Ok(())
+            }"
+        ));
+    }
+
+    #[test]
+    fn a_let_hides_an_imported_diesel_constructor() {
+        let handler = |binding: &str| {
+            format!(
+                "async fn h(mut db: Db) -> R {{
+                    use diesel::delete as remove;
+                    {binding}
+                    remove(refunds::table).execute(&mut *db).await?;
+                    Ok(())
+                }}"
+            )
+        };
+        let imported = expand(GRANT, &handler(""));
+        let rebound = expand(GRANT, &handler("let remove = custom_delete;"));
+        assert!(imported.contains("allows_unbounded_write"), "{imported}");
+        assert!(!rebound.contains("allows_unbounded_write"), "{rebound}");
+    }
+
+    #[test]
+    fn a_block_local_diesel_alias_does_not_outlive_its_block() {
+        let out = expand(
+            GRANT,
+            r"async fn h(mut db: Db) -> R {
+                { use diesel::delete as remove; let remove = custom_delete; }
+                remove(refunds::table).execute(&mut *db).await?;
+                Ok(())
+            }",
+        );
+        assert!(!out.contains("allows_unbounded_write"), "{out}");
     }
 
     #[test]

@@ -342,8 +342,10 @@ fn every_referenced_key_is_defined_in_the_generated_en_ftl() {
     // Nothing is defined that nothing references, either — that is what
     // `autumn i18n check --strict` fails on, and a translator should never be
     // handed a key the app can never show them.
+    // One key is an exception: the framework looks it up (#2439). `i18n check`
+    // exempts it.
     let unused: Vec<_> = defined.difference(&referenced).collect();
-    assert!(unused.is_empty(), "unused keys {unused:?}:\n{routes}");
+    assert_eq!(unused, ["common.error.nul_character"], "{routes}");
     // The English values are the exact strings the plain scaffold renders, so an
     // `en` app is visually identical to a non-`--i18n` one.
     assert!(ftl.contains("common.create = Create"), "{ftl}");

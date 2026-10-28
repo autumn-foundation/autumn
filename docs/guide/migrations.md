@@ -142,6 +142,90 @@ For the `autumn migrate` CLI the timeout is always the default.
 
 ---
 
+## Table lock timeout and retry
+
+A DDL statement such as `ALTER TABLE` needs a strong table lock. If a long
+transaction holds a lock on that table, the DDL waits. Every new query on the
+table then waits behind the DDL, and the app stalls (issue #3057).
+
+To prevent this, each transactional migration starts with
+`SET LOCAL lock_timeout`. A migration that waits longer fails, and its
+transaction rolls back. The migrator then tries again after a delay. The
+delay starts at `500ms` and doubles each time, to at most `10s`. A random
+factor of 50–100% scales each delay. The retries happen under the advisory
+lock.
+
+```toml
+[database]
+migration_lock_timeout = "5s"   # default; "0s" = no limit
+migration_lock_retries = 5      # default; 0 = no retry
+```
+
+The env vars are `AUTUMN_DATABASE__MIGRATION_LOCK_TIMEOUT` and
+`AUTUMN_DATABASE__MIGRATION_LOCK_RETRIES`. When every attempt times out, the
+run fails with `MigrationError::LockContention`. Find the blocking session:
+
+```sql
+SELECT pid, state, xact_start, query
+FROM pg_stat_activity
+WHERE pid IN (SELECT pid FROM pg_locks WHERE relation = 'users'::regclass);
+```
+
+Only a lock timeout is retried. A migration with `run_in_transaction = false`
+(for example `CREATE INDEX CONCURRENTLY`) runs with `lock_timeout = 0`. It must
+wait for older transactions, and a timeout would leave an INVALID index. The
+value is always set explicitly, so a role or database default does not apply.
+`"0s"` turns such a default off too.
+
+The check reads the English Postgres message. The migrator sets
+`lc_messages = 'C'` on its session. `autumn migrate` adds `-c lc_messages=C`
+to `PGOPTIONS`, but only after a check shows that the role may set it. When the role may not set it, a
+non-English lock timeout still stops the migration, but it is not retried.
+
+The Rust API takes the policy explicitly:
+
+```rust
+use autumn_web::migrate::{run_pending_locked_with_policy, MigrationLockPolicy};
+use std::time::Duration;
+
+let policy = MigrationLockPolicy::new(Duration::from_secs(2), 3);
+run_pending_locked_with_policy(database_url, MIGRATIONS, None, policy)?;
+```
+
+`autumn migrate` passes the timeout to its `diesel` subprocess as
+`PGOPTIONS=-c lock_timeout=<ms>`. This sets it for the whole session, so:
+
+- When a pending migration has `run_in_transaction = false`, the CLI runs the
+  pending set in batches of one kind. Transactional batches get the timeout.
+  Non-transactional batches get `lock_timeout=0`.
+- When the server refuses the option (`PgBouncer` can), the CLI runs again
+  with only the `PGOPTIONS` it inherited, unchanged. Transactional migrations
+  then run from a copy whose `up.sql` starts with
+  `SET LOCAL lock_timeout = <ms>;`, which a transaction pooler keeps. A
+  non-transactional batch runs again only when the server default
+  `lock_timeout` is already `0`; otherwise the run stops, because a role or
+  database default would cancel `CREATE INDEX CONCURRENTLY` and leave an
+  INVALID index.
+- Before it splits the pending set into batches, the CLI reads it with the
+  same `lock_timeout` and retries, so a lock on `__diesel_schema_migrations`
+  cannot block it.
+- Through a transaction pooler, `diesel` reads `__diesel_schema_migrations`
+  before the first migration's `SET LOCAL` runs, and no session setting
+  reaches that read. A lock held on that table can make this read wait. Run
+  migrations against Postgres directly to keep every step bounded.
+- libpq ignores `PGOPTIONS` when `DATABASE_URL` has an `options` parameter,
+  in a `postgres://` URI or a keyword/value string (`host=db options='…'`).
+  So the CLI takes that parameter out of the connection string and uses its
+  value in place of the inherited `PGOPTIONS`, with the timeout added after
+  it.
+
+`autumn migrate down` does not use the lock timeout yet: a rollback waits for
+its locks as before.
+
+Run migrations against Postgres directly.
+
+---
+
 ## Wrapping an external migration process
 
 If you invoke an external migration tool (e.g. a raw `diesel` subprocess) and

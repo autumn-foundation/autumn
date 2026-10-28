@@ -1,0 +1,7 @@
+error[E0080]: evaluation panicked: agent authority: the generated delete tool of this repository also writes the models its `dependent(...)` cascade names, and grant `PostOnly` does not allow all of them.
+
+              Add every dependent model to the grant's `writes: [...]`, make the association `restrict`, or drop `grant = ...` from the repository. See docs/guide/agent-authority.md.
+  --> tests/compile-fail/agent_authority_repository_grant_cascade_unlisted_child.rs:49:1
+   |
+49 | #[autumn_web::repository(AaGcPost, api = "/api/aa-gc-posts", mcp, grant = PostOnly)]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_` failed here

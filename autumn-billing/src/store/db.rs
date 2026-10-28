@@ -79,6 +79,7 @@ diesel::table! {
         last_event_at -> Timestamp,
         created_at -> Timestamp,
         updated_at -> Timestamp,
+        provider_subscription_id -> Nullable<Text>,
     }
 }
 
@@ -153,6 +154,8 @@ struct InvoiceRow {
     last_event_at: NaiveDateTime,
     created_at: NaiveDateTime,
     updated_at: NaiveDateTime,
+    // Keep last. The migration appends this column, and `Queryable` reads by position.
+    provider_subscription_id: Option<String>,
 }
 
 #[derive(Debug, Queryable, Selectable, Insertable, AsChangeset)]
@@ -253,6 +256,7 @@ impl InvoiceRow {
         id: String,
         created_at: DateTime<Utc>,
         subscription_id: Option<String>,
+        provider_subscription_id: Option<String>,
         upsert: InvoiceUpsert,
     ) -> Result<Self, BillingError> {
         let currency = upsert.amount_due.currency();
@@ -275,6 +279,7 @@ impl InvoiceRow {
             last_event_at: to_naive(upsert.occurred_at),
             created_at: to_naive(created_at),
             updated_at: to_naive(upsert.now),
+            provider_subscription_id,
         })
     }
 
@@ -286,6 +291,7 @@ impl InvoiceRow {
             id: self.id,
             customer_id: self.customer_id,
             subscription_id: self.subscription_id,
+            provider_subscription_id: self.provider_subscription_id.map(ProviderId::new),
             provider_invoice_id: ProviderId::new(self.provider_invoice_id),
             status,
             amount_due: Money::from_minor(self.amount_due_minor, currency),
@@ -411,6 +417,88 @@ fn stale_cutoff(now: DateTime<Utc>, stale_after: Duration) -> Option<NaiveDateTi
         .ok()
         .and_then(|d| now.checked_sub_signed(d))
         .map(to_naive)
+}
+
+/// Tries before `upsert_subscription` gives up on concurrent writers.
+const SUBSCRIPTION_WRITE_ATTEMPTS: usize = 8;
+
+impl DbBillingStore {
+    /// One guarded subscription write. `None` means a concurrent writer won
+    /// the row between the read and the write, so the caller reads again.
+    ///
+    /// The write is a compare-and-set on the row it read, and an insert
+    /// that loses the unique key. The guard and the tie check always run
+    /// against the row that is in the database at write time.
+    async fn try_upsert_subscription(
+        &self,
+        upsert: SubscriptionUpsert,
+    ) -> Result<Option<Write<SubscriptionRow>>, BillingError> {
+        let mut conn = self.conn().await?;
+        let result = conn
+            .transaction(
+                async move |conn| -> Result<Option<Write<SubscriptionRow>>, TxError> {
+                    let existing: Option<SubscriptionRow> = billing_subscriptions::table
+                        .filter(
+                            billing_subscriptions::provider_subscription_id
+                                .eq(upsert.provider_subscription_id.as_str()),
+                        )
+                        .select(SubscriptionRow::as_select())
+                        .first(conn)
+                        .await
+                        .optional()?;
+                    let Some(current) = existing else {
+                        let row =
+                            SubscriptionRow::from_upsert(upsert.new_id.clone(), upsert.now, upsert);
+                        diesel::insert_into(billing_subscriptions::table)
+                            .values(&row)
+                            .execute(conn)
+                            .await?;
+                        return Ok(Some(Write::Applied(row)));
+                    };
+                    let current_status = SubscriptionStatus::parse(&current.status)
+                        .ok_or_else(|| bad_stored("subscription status", &current.status))?;
+                    match guard_subscription(
+                        to_utc(current.last_event_at),
+                        current_status,
+                        upsert.occurred_at,
+                        upsert.status,
+                        upsert.authoritative,
+                        upsert.check_ties,
+                    ) {
+                        Guard::Apply => {}
+                        Guard::Unchanged => return Ok(Some(Write::Unchanged(current))),
+                        Guard::Stale => return Ok(Some(Write::Stale(current))),
+                        Guard::Tie => return Ok(Some(Write::Tie(current))),
+                    }
+                    let mut row = SubscriptionRow::from_upsert(
+                        current.id.clone(),
+                        to_utc(current.created_at),
+                        upsert,
+                    );
+                    // A snapshot without these fields keeps the stored values.
+                    row.provider_price_id = row.provider_price_id.or(current.provider_price_id);
+                    row.plan_id = row.plan_id.or(current.plan_id);
+                    row.current_period_end = row.current_period_end.or(current.current_period_end);
+                    let changed = diesel::update(
+                        billing_subscriptions::table
+                            .find(&row.id)
+                            .filter(billing_subscriptions::status.eq(&current.status))
+                            .filter(billing_subscriptions::last_event_at.eq(current.last_event_at))
+                            .filter(billing_subscriptions::updated_at.eq(current.updated_at)),
+                    )
+                    .set(&row)
+                    .execute(conn)
+                    .await?;
+                    Ok((changed == 1).then_some(Write::Applied(row)))
+                },
+            )
+            .await;
+        match result {
+            // The insert lost the unique key to a concurrent writer.
+            Err(TxError::Db(err)) if is_unique_violation(&err) => Ok(None),
+            other => other.map_err(|err| err.into_billing("upsert_subscription")),
+        }
+    }
 }
 
 impl BillingStore for DbBillingStore {
@@ -740,65 +828,14 @@ impl BillingStore for DbBillingStore {
         upsert: SubscriptionUpsert,
     ) -> StoreFuture<'_, Write<Subscription>> {
         Box::pin(async move {
-            let mut conn = self.conn().await?;
-            let write: Write<SubscriptionRow> = conn
-                .transaction(
-                    async move |conn| -> Result<Write<SubscriptionRow>, TxError> {
-                        let existing: Option<SubscriptionRow> = billing_subscriptions::table
-                            .filter(
-                                billing_subscriptions::provider_subscription_id
-                                    .eq(upsert.provider_subscription_id.as_str()),
-                            )
-                            .select(SubscriptionRow::as_select())
-                            .first(conn)
-                            .await
-                            .optional()?;
-                        let Some(current) = existing else {
-                            let row = SubscriptionRow::from_upsert(
-                                upsert.new_id.clone(),
-                                upsert.now,
-                                upsert,
-                            );
-                            diesel::insert_into(billing_subscriptions::table)
-                                .values(&row)
-                                .execute(conn)
-                                .await?;
-                            return Ok(Write::Applied(row));
-                        };
-                        let current_status = SubscriptionStatus::parse(&current.status)
-                            .ok_or_else(|| bad_stored("subscription status", &current.status))?;
-                        match guard_subscription(
-                            to_utc(current.last_event_at),
-                            current_status.rank(),
-                            current_status.is_terminal(),
-                            upsert.occurred_at,
-                            upsert.status.rank(),
-                            upsert.authoritative,
-                        ) {
-                            Guard::Apply => {}
-                            Guard::Unchanged => return Ok(Write::Unchanged(current)),
-                            Guard::Stale => return Ok(Write::Stale(current)),
-                        }
-                        let mut row = SubscriptionRow::from_upsert(
-                            current.id.clone(),
-                            to_utc(current.created_at),
-                            upsert,
-                        );
-                        // A snapshot without these fields keeps the stored values.
-                        row.provider_price_id = row.provider_price_id.or(current.provider_price_id);
-                        row.plan_id = row.plan_id.or(current.plan_id);
-                        row.current_period_end =
-                            row.current_period_end.or(current.current_period_end);
-                        diesel::update(billing_subscriptions::table.find(&row.id))
-                            .set(&row)
-                            .execute(conn)
-                            .await?;
-                        Ok(Write::Applied(row))
-                    },
-                )
-                .await
-                .map_err(|err| err.into_billing("upsert_subscription"))?;
-            write.try_map(SubscriptionRow::into_model)
+            for _ in 0..SUBSCRIPTION_WRITE_ATTEMPTS {
+                if let Some(write) = self.try_upsert_subscription(upsert.clone()).await? {
+                    return write.try_map(SubscriptionRow::into_model);
+                }
+            }
+            Err(BillingError::store(
+                "upsert_subscription: too many concurrent writers",
+            ))
         })
     }
 
@@ -905,6 +942,10 @@ impl BillingStore for DbBillingStore {
                             upsert.new_id.clone(),
                             upsert.now,
                             upsert.subscription_id.clone(),
+                            upsert
+                                .provider_subscription_id
+                                .as_ref()
+                                .map(|id| id.as_str().to_owned()),
                             upsert,
                         )?;
                         diesel::insert_into(billing_invoices::table)
@@ -924,15 +965,21 @@ impl BillingStore for DbBillingStore {
                     ) {
                         Guard::Apply => {}
                         Guard::Unchanged => return Ok(Write::Unchanged(current)),
-                        Guard::Stale => return Ok(Write::Stale(current)),
+                        Guard::Stale | Guard::Tie => return Ok(Write::Stale(current)),
                     }
                     // `None` keeps the stored link.
                     let subscription_id =
                         upsert.subscription_id.clone().or(current.subscription_id);
+                    let provider_subscription_id = upsert
+                        .provider_subscription_id
+                        .as_ref()
+                        .map(|id| id.as_str().to_owned())
+                        .or(current.provider_subscription_id);
                     let row = InvoiceRow::from_upsert(
                         current.id.clone(),
                         to_utc(current.created_at),
                         subscription_id,
+                        provider_subscription_id,
                         upsert,
                     )?;
                     diesel::update(billing_invoices::table.find(&row.id))
@@ -944,6 +991,65 @@ impl BillingStore for DbBillingStore {
                 .await
                 .map_err(|err| err.into_billing("upsert_invoice"))?;
             write.try_map(InvoiceRow::into_model)
+        })
+    }
+
+    fn link_subscription<'a>(
+        &'a self,
+        provider_subscription_id: &'a ProviderId,
+        subscription_id: &'a str,
+        now: DateTime<Utc>,
+    ) -> StoreFuture<'a, ()> {
+        Box::pin(async move {
+            let mut conn = self.conn().await?;
+            let now = to_naive(now);
+            conn.transaction(async move |conn| -> Result<(), TxError> {
+                // Invoices already linked here are candidates too: their
+                // dunning row may have been opened after the link.
+                let candidates = billing_invoices::table
+                    .filter(
+                        billing_invoices::subscription_id
+                            .is_null()
+                            .or(billing_invoices::subscription_id.eq(subscription_id)),
+                    )
+                    .filter(
+                        billing_invoices::provider_subscription_id
+                            .eq(provider_subscription_id.as_str()),
+                    );
+                let ids: Vec<String> = candidates.select(billing_invoices::id).load(conn).await?;
+                if ids.is_empty() {
+                    return Ok(());
+                }
+                diesel::update(
+                    billing_invoices::table
+                        .filter(billing_invoices::id.eq_any(&ids))
+                        .filter(billing_invoices::subscription_id.is_null()),
+                )
+                .set((
+                    billing_invoices::subscription_id.eq(subscription_id),
+                    billing_invoices::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await?;
+                diesel::update(
+                    billing_dunning::table
+                        .filter(billing_dunning::invoice_id.eq_any(&ids))
+                        .filter(billing_dunning::subscription_id.is_null())
+                        .filter(billing_dunning::state.eq_any([
+                            DunningState::Pending.as_str(),
+                            DunningState::Running.as_str(),
+                        ])),
+                )
+                .set((
+                    billing_dunning::subscription_id.eq(subscription_id),
+                    billing_dunning::updated_at.eq(now),
+                ))
+                .execute(conn)
+                .await?;
+                Ok(())
+            })
+            .await
+            .map_err(|err| err.into_billing("link_subscription"))
         })
     }
 
@@ -1104,17 +1210,28 @@ impl BillingStore for DbBillingStore {
             let states: Vec<&'static str> = from.iter().map(|state| state.as_str()).collect();
             let row = DunningRow::from_model(row);
             // One conditional update is the compare-and-set.
-            let updated = diesel::update(
-                billing_dunning::table.filter(
-                    billing_dunning::invoice_id
-                        .eq(invoice_id)
-                        .and(billing_dunning::state.eq_any(states))
-                        .and(billing_dunning::attempt.eq(expected_attempt)),
-                ),
-            )
-            .set(&row)
-            .execute(&mut conn)
-            .await
+            let target = billing_dunning::table.filter(
+                billing_dunning::invoice_id
+                    .eq(invoice_id)
+                    .and(billing_dunning::state.eq_any(states))
+                    .and(billing_dunning::attempt.eq(expected_attempt)),
+            );
+            // A settle built before a link was added must not erase it, so
+            // a row with no link leaves the stored link alone.
+            let updated = if row.subscription_id.is_some() {
+                diesel::update(target).set(&row).execute(&mut conn).await
+            } else {
+                diesel::update(target)
+                    .set((
+                        billing_dunning::customer_id.eq(&row.customer_id),
+                        billing_dunning::attempt.eq(row.attempt),
+                        billing_dunning::next_attempt_at.eq(row.next_attempt_at),
+                        billing_dunning::state.eq(&row.state),
+                        billing_dunning::updated_at.eq(row.updated_at),
+                    ))
+                    .execute(&mut conn)
+                    .await
+            }
             .map_err(|err| db_err("settle_dunning", &err))?;
             Ok(updated == 1)
         })

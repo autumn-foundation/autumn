@@ -14,11 +14,10 @@
 //! thread that last polled it, misattributing one tenant's job to another's
 //! `#[repository(tenant_scoped)]` reads and writes.
 //!
-//! It does not happen. `autumn/src/job.rs`, `autumn/src/scheduler.rs` and
-//! `autumn-macros/src/job.rs` contain zero references to `CURRENT_TENANT` or
-//! `tenancy` (`grep -ni tenant` across all three returns nothing): nothing in
-//! the job runtime ever reads the enqueuing request's tenant, and nothing
-//! ever establishes one before a handler runs.
+//! It does not happen. Nothing in the job runtime establishes a tenant before
+//! a handler runs. The local backend reads the enqueuing tenant only to
+//! attribute cost (`autumn_web::cost`, issue #1720). It does not scope the
+//! handler with it.
 //!
 //! Two independent proofs, run in sequence rather than concurrently:
 //!

@@ -132,6 +132,14 @@ pub const URL_ATTRS: &[&str] = &["href", "src", "action", "formaction", "poster"
 /// URL schemes a document may link to or load from.
 pub const ALLOWED_URL_SCHEMES: &[&str] = &["http", "https", "mailto", "tel"];
 
+/// The longest portal `target` validation accepts, in bytes.
+///
+/// A target is `body`, `head`, or a CSS selector that names a place in the
+/// host layout. Upstream allows any selector, so there is no allowlist. No
+/// real layout uses a selector this long. Each rendered portal keeps a copy
+/// of its target.
+pub const MAX_PORTAL_TARGET_BYTES: usize = 256;
+
 /// Attributes whose value is an element id (or a space-separated list of them)
 /// and is therefore rewritten with the render's id prefix.
 ///

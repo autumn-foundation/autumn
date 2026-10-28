@@ -16,7 +16,7 @@ use std::sync::Arc;
 use autumn_web::AppState;
 use autumn_web::audit::{AuditError, AuditEvent, AuditLogger, AuditSink, AuditStatus};
 use autumn_web::config::AutumnConfig;
-use autumn_web::data_retention::{RetentionRunOptions, run_retention};
+use autumn_web::data_retention::{RetentionRunOptions, framework_retention_task, run_retention};
 use autumn_web::gdpr::{GdprRegistry, ModelRegistration};
 use diesel::Connection as _;
 use diesel::PgConnection;
@@ -31,6 +31,8 @@ use tokio::sync::Mutex;
 const JOBS_DDL: &str = include_str!("../../migrations/20260513000000_create_job_queue/up.sql");
 const JOB_TRACKING_DDL: &str =
     include_str!("../../migrations/20260702000000_create_job_tracking/up.sql");
+const JOB_TRACKING_VERSION_DDL: &str =
+    include_str!("../../migrations/20261022120000_add_version_to_job_tracking/up.sql");
 const EXPERIMENTS_DDL: &str =
     include_str!("../../migrations/20260530300000_create_experiments/up.sql");
 const COMMIT_HOOKS_DDL: &str =
@@ -97,6 +99,7 @@ async fn start_pg() -> (
         JOBS_DDL,
         UNIQUENESS_DDL,
         JOB_TRACKING_DDL,
+        JOB_TRACKING_VERSION_DDL,
         EXPERIMENTS_DDL,
         COMMIT_HOOKS_DDL,
         RETENTION_INDEX_DDL,
@@ -245,6 +248,8 @@ fn config_with_windows() -> AutumnConfig {
     // The job-tracking window competes with this knob; keep it wide so the
     // policy window is the bound under test.
     config.jobs.tracking.ttl_secs = 365 * 86_400;
+    // Both jobs datasets are swept only on the Postgres jobs backend.
+    "postgres".clone_into(&mut config.jobs.backend);
     config
 }
 
@@ -943,6 +948,10 @@ async fn a_failing_dataset_is_reported_without_aborting_the_run() {
         .find(|r| r.dataset == "job_history")
         .expect("reported");
     assert!(job_history.error.is_some(), "{job_history:?}");
+    assert_eq!(
+        job_history.eligible_rows, None,
+        "the pass failed before the count: {job_history:?}"
+    );
     assert!(
         job_history.truncated,
         "a failed pass certainly did not drain the table: {job_history:?}"
@@ -966,6 +975,78 @@ async fn a_failing_dataset_is_reported_without_aborting_the_run() {
         .expect("a failed sweep must still be audited");
     assert_eq!(failure.status, AuditStatus::Failure);
     assert!(failure.metadata.contains_key("error"), "{failure:?}");
+}
+
+/// An audit sink whose every write fails, like a full archive disk.
+struct UnwritableAuditSink;
+
+impl AuditSink for UnwritableAuditSink {
+    fn write(
+        &self,
+        _event: AuditEvent,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AuditError>> + Send + '_>>
+    {
+        Box::pin(async { Err(AuditError::new("archive disk full")) })
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_unwritable_audit_sink_fails_the_report_after_rows_are_removed() {
+    // Rows are deleted before the audit write, so a lost record must reach
+    // the report (and so the CLI exit code), not only a log line.
+    let (pool, _url, _container) = start_pg().await;
+    insert_job(&pool, "old", "completed", 400).await;
+
+    let state = state_with(&pool, config_with_windows());
+    state.insert_extension(AuditLogger::new().with_sink(Arc::new(UnwritableAuditSink)));
+
+    let reports = run_retention(
+        &state,
+        &RetentionRunOptions {
+            dry_run: false,
+            dataset: Some("job_history"),
+        },
+    )
+    .await
+    .expect("the run itself must not fail");
+
+    let report = &reports[0];
+    assert_eq!(report.rows_removed, 1, "{report:?}");
+    let error = report.error.as_deref().expect("audit failure in report");
+    assert!(error.starts_with("audit record not written"), "{error}");
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_scheduled_task_fails_when_a_dataset_fails_but_still_sweeps_the_rest() {
+    let (pool, _url, _container) = start_pg().await;
+    insert_assignment(&pool, "old-actor", 400).await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query("DROP TABLE autumn_jobs")
+            .execute(&mut conn)
+            .await
+            .expect("drop autumn_jobs");
+    }
+    let config = config_with_windows();
+    let state = state_with(&pool, config.clone());
+    let task = framework_retention_task(&config.retention).expect("windows are configured");
+
+    let error = (task.handler)(state)
+        .await
+        .expect_err("a failed dataset must fail the task");
+
+    assert!(error.to_string().contains("job_history"), "{error}");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) AS count FROM autumn_experiment_assignments"
+        )
+        .await,
+        0,
+        "the sibling dataset must still be swept"
+    );
 }
 
 #[tokio::test]

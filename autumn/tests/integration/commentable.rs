@@ -38,7 +38,7 @@ use autumn_web::tenancy::CURRENT_TENANT;
 use diesel::sql_types::{BigInt, Text};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::deadpool::Pool;
-use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 
@@ -314,6 +314,36 @@ pub struct CmtAuditSoft {
 pub trait CmtAuditSoftRepository {}
 
 diesel::table! {
+    cmt_duals (id) {
+        id -> Int8,
+        title -> Text,
+        comment_count -> Int8,
+        deleted_at -> Nullable<Timestamp>,
+    }
+}
+
+/// #2284: one model, two repositories. Only the first soft-deletes. Each
+/// repository's helpers apply that repository's own rule. The router has no
+/// repository. It uses the registry rule: filter if one repository
+/// soft-deletes.
+#[autumn_web::model(table = "cmt_duals")]
+#[commentable(by = CmtUser, table = cmt_comments)]
+pub struct CmtDual {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    #[default]
+    pub comment_count: i64,
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+#[autumn_web::repository(CmtDual, table = "cmt_duals", soft_delete)]
+pub trait CmtDualRepository {}
+
+#[autumn_web::repository(CmtDual, table = "cmt_duals")]
+pub trait CmtDualAdminRepository {}
+
+diesel::table! {
     cmt_hards (id) {
         id -> Int8,
         title -> Text,
@@ -386,6 +416,9 @@ const DDL: &[&str] = &[
      (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, tenant_id TEXT NOT NULL, \
       comment_count BIGINT NOT NULL DEFAULT 0)",
     "CREATE TABLE cmt_audit_softs \
+     (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
+      comment_count BIGINT NOT NULL DEFAULT 0, deleted_at TIMESTAMP)",
+    "CREATE TABLE cmt_duals \
      (id BIGSERIAL PRIMARY KEY, title TEXT NOT NULL, \
       comment_count BIGINT NOT NULL DEFAULT 0, deleted_at TIMESTAMP)",
     "CREATE TABLE cmt_hards \
@@ -609,7 +642,7 @@ fn commentable_spec_uses_the_documented_conventions() {
 #[test]
 fn every_commentable_model_registers_itself() {
     let types = registered_commentable_types();
-    for expected in ["CmtPost", "CmtPhoto", "CmtShallow", "CmtCapped"] {
+    for expected in ["CmtPost", "CmtPhoto", "CmtShallow", "CmtCapped", "CmtDual"] {
         assert!(
             types.contains(&expected),
             "{expected} missing from the commentable registry: {types:?}"
@@ -650,6 +683,12 @@ fn repository_opt_in_not_column_presence_decides_tenant_and_soft_delete_scope() 
     // `CmtSoft` is the correctly-configured case: still a tombstone.
     assert_eq!(
         model_soft_deletes(core::any::type_name::<CmtSoft>()),
+        Some(true)
+    );
+    // #2284: `CmtDual` has a `soft_delete` repository and a plain one. The
+    // registry rule (used by the router) filters if one soft-deletes.
+    assert_eq!(
+        model_soft_deletes(core::any::type_name::<CmtDual>()),
         Some(true)
     );
 }
@@ -1326,6 +1365,71 @@ async fn a_soft_deleted_parent_refuses_comments_and_reports_no_thread() {
     assert_eq!(counter(&mut conn, "cmt_softs", target).await, 1);
 }
 
+/// #2284: each repository's helpers apply that repository's own soft-delete
+/// rule. Before, any `soft_delete` repository made every helper filter
+/// `deleted_at`, so the plain repository got `404` for rows its own finders
+/// return.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn each_repository_applies_its_own_soft_delete_rule() {
+    let (pool, _container) = setup_pool().await;
+    let soft = PgCmtDualRepository::with_pool_untracked(pool.clone());
+    let plain = PgCmtDualAdminRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_duals", "title", "t").await;
+    diesel::sql_query("UPDATE cmt_duals SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("soft delete the parent");
+
+    // The plain repository sees the row, so its helpers do too.
+    let comment = plain
+        .add_comment(target, author, "still here", None)
+        .await
+        .expect("the plain repository comments on its own row");
+    let thread = plain
+        .comment_thread(target)
+        .await
+        .expect("the plain repository reads the thread");
+    assert_eq!(thread.len(), 1);
+    assert_eq!(
+        plain
+            .recompute_comment_count(target)
+            .await
+            .expect("recompute"),
+        1
+    );
+
+    // The soft-deleting repository does not see the row: every helper is 404.
+    let hidden = "the soft-deleting repository does not see the row";
+    let errors = [
+        soft.add_comment(target, author, "x", None)
+            .await
+            .expect_err(hidden),
+        soft.comment_thread(target).await.expect_err(hidden),
+        soft.delete_comment(target, comment.id)
+            .await
+            .expect_err(hidden),
+        soft.recompute_comment_count(target)
+            .await
+            .expect_err(hidden),
+    ];
+    for err in errors {
+        assert_eq!(err.status().as_u16(), 404, "{err}");
+    }
+
+    assert_eq!(
+        plain
+            .delete_comment(target, comment.id)
+            .await
+            .expect("the plain repository deletes"),
+        1
+    );
+    assert_eq!(counter(&mut conn, "cmt_duals", target).await, 0);
+}
+
 /// Issue #2263: `cmt_audit_softs.deleted_at` is audit history, not a
 /// tombstone — `CmtAuditSoftRepository` never declares `soft_delete`. A
 /// non-null value must not hide the parent, or the comment thread would
@@ -1372,6 +1476,84 @@ async fn an_audit_deleted_at_column_does_not_hide_the_parent() {
         vec![(0, "before".to_owned()), (0, "after".to_owned())]
     );
     assert_eq!(counter(&mut conn, "cmt_audit_softs", target).await, 2);
+}
+
+/// Issue #2286: the public helpers must accept a copy of the registered
+/// spec. The copy has a new address, but it must still find the repository
+/// facts, so an audit `deleted_at` does not hide the parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_copied_spec_keeps_the_repository_soft_delete_rule() {
+    use autumn_web::commentable::{
+        add_comment, comment_thread, delete_comment, recompute_comment_count,
+    };
+
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_audit_softs", "title", "t").await;
+    diesel::sql_query("UPDATE cmt_audit_softs SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp the audit column");
+
+    let spec = *CmtAuditSoft::commentable_spec();
+    let kind = CmtAuditSoft::COMMENTABLE_TYPE;
+
+    let comment = add_comment(
+        &mut conn, &spec, kind, target, author, "hi", None, None, None,
+    )
+    .await
+    .expect("add_comment: an audit deleted_at must not hide the parent");
+    let thread = comment_thread(&mut conn, &spec, kind, target, None, None)
+        .await
+        .expect("comment_thread");
+    assert_eq!(flatten(&thread), vec![(0, "hi".to_owned())]);
+    assert_eq!(
+        recompute_comment_count(&mut conn, &spec, kind, target, None, None)
+            .await
+            .expect("recompute_comment_count"),
+        1
+    );
+    assert_eq!(
+        delete_comment(&mut conn, &spec, kind, target, comment.id, None, None)
+            .await
+            .expect("delete_comment"),
+        1
+    );
+}
+
+/// Issue #2286, the other side: a copy of the spec of a `soft_delete`
+/// repository must still hide a soft-deleted parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_copied_spec_still_hides_a_soft_deleted_parent() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let target = seed_one_col(&mut conn, "cmt_softs", "title", "gone").await;
+    diesel::sql_query("UPDATE cmt_softs SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("soft delete the parent");
+
+    let spec = *CmtSoft::commentable_spec();
+    let err = autumn_web::commentable::add_comment(
+        &mut conn,
+        &spec,
+        CmtSoft::COMMENTABLE_TYPE,
+        target,
+        author,
+        "hi",
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect_err("a soft-deleted parent accepts no comment");
+    assert_eq!(err.status().as_u16(), 404, "{err}");
 }
 
 /// The two 404s on the delete path: an unknown comment, and a comment that
@@ -1597,6 +1779,178 @@ async fn a_denormalized_tenant_column_does_not_require_a_tenant_context() {
         .expect("reads must not require a tenant context either");
     assert_eq!(flatten(&thread), vec![(0, "no tenant needed".to_owned())]);
     assert_eq!(counter(&mut conn, "cmt_denorm_tenants", target).await, 1);
+}
+
+// ── #2287: a parent change between the probe and the read ───────────────────
+
+/// Read a thread across a parent change that occurs after the probe.
+///
+/// The holder locks `cmt_comments`. The probe reads only the parent table, so
+/// the lock does not stop it. The read then waits on the lock. The holder
+/// applies `change` to the parent and commits. Under read-committed, the read
+/// takes its snapshot after it gets the lock, so it sees the change. Thus the
+/// race of issue #2287 occurs on each run.
+async fn read_across_a_parent_change<T: std::fmt::Debug + Send + 'static>(
+    pool: &Pool<AsyncPgConnection>,
+    read: impl std::future::Future<Output = T> + Send + 'static,
+    change: &str,
+    parent: i64,
+) -> T {
+    use std::time::Duration;
+
+    let mut holder = pool.get().await.expect("holder conn");
+    holder
+        .batch_execute("BEGIN; LOCK TABLE cmt_comments IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock the comments table");
+
+    let task = tokio::spawn(read);
+
+    // When the read waits on the lock, the probe is complete.
+    let mut observer = pool.get().await.expect("observer conn");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM pg_locks l \
+             JOIN pg_class r ON r.oid = l.relation \
+             WHERE r.relname = 'cmt_comments' AND NOT l.granted",
+        )
+        .get_result::<CountRow>(&mut observer)
+        .await
+        .expect("read pg_locks")
+        .count;
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            !task.is_finished(),
+            "the read did not wait on the lock: {:?}",
+            task.await
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the read did not reach the comments table"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    diesel::sql_query(change)
+        .bind::<BigInt, _>(parent)
+        .execute(&mut holder)
+        .await
+        .expect("change the parent");
+    holder.batch_execute("COMMIT").await.expect("commit");
+
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the read continues after the commit")
+        .expect("join the read")
+}
+
+/// The thread of `CmtTenanted` record `parent`, read as tenant `acme`.
+fn read_as_acme(
+    pool: &Pool<AsyncPgConnection>,
+    parent: i64,
+) -> impl std::future::Future<Output = autumn_web::AutumnResult<Vec<CommentNode>>> + Send + 'static
+{
+    let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
+    CURRENT_TENANT.scope(Some("acme".to_owned()), async move {
+        repo.comment_thread(parent).await
+    })
+}
+
+/// Control: a change that keeps the parent visible keeps the thread. This
+/// shows that the lock alone does not empty the thread.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_parent_change_that_keeps_visibility_keeps_the_thread() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let acme = seed_tenanted(&mut conn, "cmt_tenanted", "acme", "kept").await;
+    CURRENT_TENANT
+        .scope(Some("acme".to_owned()), async {
+            repo.add_comment(acme, author, "ours", None).await
+        })
+        .await
+        .expect("same-tenant comment");
+
+    let thread = read_across_a_parent_change(
+        &pool,
+        read_as_acme(&pool, acme),
+        "UPDATE cmt_tenanted SET title = 'renamed' WHERE id = $1",
+        acme,
+    )
+    .await
+    .expect("the parent is still visible");
+    assert_eq!(flatten(&thread), vec![(0, "ours".to_owned())]);
+}
+
+/// Issue #2287: the parent moves to another tenant after the probe passes.
+/// The read must not return the thread to the old tenant.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_parent_moved_to_another_tenant_after_the_probe_serves_no_thread() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtTenantedRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let moved = seed_tenanted(&mut conn, "cmt_tenanted", "acme", "moved").await;
+    // A second `acme` parent. If the check does not compare the parent id, it
+    // finds this row and returns the thread.
+    seed_tenanted(&mut conn, "cmt_tenanted", "acme", "stays").await;
+    CURRENT_TENANT
+        .scope(Some("acme".to_owned()), async {
+            repo.add_comment(moved, author, "private", None).await
+        })
+        .await
+        .expect("same-tenant comment");
+
+    let thread = read_across_a_parent_change(
+        &pool,
+        read_as_acme(&pool, moved),
+        "UPDATE cmt_tenanted SET tenant_id = 'globex' WHERE id = $1",
+        moved,
+    )
+    .await
+    .expect("the probe passed, so the result is an empty thread, not a 404");
+    assert!(
+        thread.is_empty(),
+        "acme read globex's thread: {:?}",
+        flatten(&thread)
+    );
+}
+
+/// Issue #2287: the parent is soft-deleted after the probe passes. The read
+/// must not return the thread.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_parent_soft_deleted_after_the_probe_serves_no_thread() {
+    let (pool, _container) = setup_pool().await;
+    let repo = PgCmtSoftRepository::with_pool_untracked(pool.clone());
+    let mut conn = pool.get().await.expect("conn");
+    let author = seed_user(&mut conn, "ada").await;
+    let deleted = seed_one_col(&mut conn, "cmt_softs", "title", "deleted").await;
+    // A second live parent, for the same reason as in the tenant test.
+    seed_one_col(&mut conn, "cmt_softs", "title", "live").await;
+    repo.add_comment(deleted, author, "gone", None)
+        .await
+        .expect("live parent accepts comments");
+
+    let thread = read_across_a_parent_change(
+        &pool,
+        async move { repo.comment_thread(deleted).await },
+        "UPDATE cmt_softs SET deleted_at = NOW() WHERE id = $1",
+        deleted,
+    )
+    .await
+    .expect("the probe passed, so the result is an empty thread, not a 404");
+    assert!(
+        thread.is_empty(),
+        "a soft-deleted parent served its thread: {:?}",
+        flatten(&thread)
+    );
 }
 
 // ── The generic router ──────────────────────────────────────────────────────
@@ -1829,6 +2183,36 @@ async fn router_reports_not_found_for_a_soft_deleted_parent() {
 
     let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
     let (status, _) = call(app, get(&format!("/comments/CmtSoft/{target}"))).await;
+    assert_eq!(status, 404);
+}
+
+/// #2284: the router has no repository. For a model with a `soft_delete`
+/// repository and a plain one, it uses the registry rule and hides the
+/// soft-deleted parent.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn router_hides_a_soft_deleted_parent_when_any_repository_soft_deletes() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    let target = seed_one_col(&mut conn, "cmt_duals", "title", "gone").await;
+    let app = comment_app(
+        pool.clone(),
+        autumn_web::commentable::CommentsConfig::default(),
+    );
+    let path = format!("/comments/CmtDual/{target}");
+
+    // A live parent is served, so the `404` below is not "unknown type".
+    let (status, body) = call(app.clone(), get(&path)).await;
+    assert_eq!(status, 200, "{body}");
+
+    diesel::sql_query("UPDATE cmt_duals SET deleted_at = NOW() WHERE id = $1")
+        .bind::<BigInt, _>(target)
+        .execute(&mut *conn)
+        .await
+        .expect("soft delete the parent");
+    drop(conn);
+
+    let (status, _) = call(app, get(&path)).await;
     assert_eq!(status, 404);
 }
 

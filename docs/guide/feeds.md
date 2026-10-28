@@ -32,7 +32,7 @@ pulls in `chrono`:
 
 ```toml
 [dependencies]
-autumn-web = "0.8"
+autumn-web = "0.9"
 chrono = "0.4"
 ```
 
@@ -107,6 +107,14 @@ When an entry sets both `content` and `summary`, RSS prefers `content` for its
 `<updated>` / `lastBuildDate` falls back to the newest dated entry, and finally
 to a deterministic epoch timestamp so the rendered bytes stay stable across
 renders.
+
+The feed clamps each date to the limits of its format. Rendering does not
+panic.
+
+| Format | Earliest date | Latest date |
+| --- | --- | --- |
+| Atom (RFC 3339) | `0000-01-01T00:00:00Z` | `9999-12-31T23:59:59Z` |
+| RSS (RFC 2822) and `Last-Modified` | `1900-01-01T00:00:00Z` | `9999-12-31T23:59:59Z` |
 
 ## Serving a feed from a handler
 

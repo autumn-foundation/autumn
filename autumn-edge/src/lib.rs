@@ -37,9 +37,9 @@
 //! | any pure rendering | the `Clock`/`Rng` extractors, outbound HTTP |
 //!
 //! Ambient time and randomness (`SystemTime::now()`, `getrandom`) *compile* at
-//! the edge but return whatever the host decides — the reference host pins
-//! them for determinism, a real edge host will not — so keep them out of
-//! handlers (see `docs/guide/edge.md`).
+//! the edge but return whatever the host decides — Autumn's two hosts pin them
+//! for determinism, a third-party host may not — so keep them out of handlers
+//! (see `docs/guide/edge.md`).
 //!
 //! The restriction is enforced by the type system: an edge handler must be an
 //! `axum` handler over the unit [`EdgeState`], so a native-only extractor
@@ -88,6 +88,7 @@ pub mod extract;
 pub mod handler;
 pub mod identity;
 pub mod kv;
+pub mod paths;
 pub mod prelude;
 pub mod reexports;
 pub mod route;
@@ -98,6 +99,17 @@ pub mod wire;
 #[cfg(feature = "host")]
 #[cfg_attr(docsrs, doc(cfg(feature = "host")))]
 pub mod host;
+
+#[cfg(feature = "host")]
+#[cfg_attr(docsrs, doc(cfg(feature = "host")))]
+pub mod gateway;
+
+#[cfg(feature = "node")]
+#[cfg_attr(docsrs, doc(cfg(feature = "node")))]
+pub mod node;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod js;
 
 /// The route macros an edge-safe handler module needs.
 ///
@@ -110,6 +122,12 @@ pub mod host;
 /// The dependency runs one way only. `autumn-macros` emits `::autumn_edge::…`
 /// paths as text and does not depend on this crate.
 pub use autumn_macros::{edge, edge_routes, get};
+
+/// Collect typed path helpers into a `pub mod paths`. See `autumn_web::paths!`.
+///
+/// An `#[edge]` route's helper compiles for `wasm32-wasip1`. An edge-safe
+/// module can use `autumn_edge::paths![]`.
+pub use autumn_macros::paths;
 
 pub use extract::{EdgeCache, EdgeCacheUnavailable};
 pub use handler::{EdgeExtract, EdgeHandler, EdgeLeaf, edge_get};
@@ -170,6 +188,12 @@ mod manifest_guard {
     fn no_native_only_runtime_is_a_dependency() {
         for line in dependency_lines() {
             let name = line.split('=').next().unwrap_or_default().trim();
+            // The `node` feature uses tokio, hyper and reqwest. They must
+            // stay optional: a capsule never enables `node`.
+            if matches!(name, "tokio" | "reqwest" | "hyper" | "hyper-util") {
+                assert!(line.contains("optional = true"), "{line}");
+                continue;
+            }
             assert!(
                 !matches!(
                     name,
@@ -178,6 +202,38 @@ mod manifest_guard {
                 "`{name}` cannot compile for wasm32-wasip1; the edge crate must stay free of it"
             );
         }
+    }
+
+    #[test]
+    fn only_the_native_node_feature_enables_a_runtime() {
+        let features: Vec<&str> = MANIFEST
+            .lines()
+            .skip_while(|line| line.trim() != "[features]")
+            .skip(1)
+            .take_while(|line| !line.trim_start().starts_with('['))
+            .filter(|line| {
+                [
+                    "dep:tokio",
+                    "dep:reqwest",
+                    "dep:hyper",
+                    "tokio/",
+                    "reqwest/",
+                    "hyper",
+                    "\"node\"",
+                ]
+                .iter()
+                .any(|needle| line.contains(needle))
+            })
+            .collect();
+        assert_eq!(features.len(), 1, "{features:?}");
+        assert!(
+            features[0].trim_start().starts_with("node = "),
+            "{features:?}"
+        );
+        assert!(
+            MANIFEST.contains("default = []"),
+            "no default feature may pull in a runtime"
+        );
     }
 
     #[test]

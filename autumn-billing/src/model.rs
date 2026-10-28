@@ -353,6 +353,11 @@ pub struct Invoice {
     pub customer_id: String,
     /// Local subscription id, when the invoice belongs to one.
     pub subscription_id: Option<String>,
+    /// Provider subscription id. Kept when the subscription is not yet
+    /// mirrored, so mirroring it can link this invoice later. Absent in
+    /// JSON from older versions.
+    #[serde(default)]
+    pub provider_subscription_id: Option<ProviderId>,
     /// Provider invoice id.
     pub provider_invoice_id: ProviderId,
     /// Status.
@@ -395,6 +400,7 @@ impl Invoice {
             id: id.into(),
             customer_id: customer_id.into(),
             subscription_id: None,
+            provider_subscription_id: None,
             provider_invoice_id: provider_invoice_id.into(),
             status,
             amount_due,
@@ -411,6 +417,13 @@ impl Invoice {
     #[must_use]
     pub fn with_subscription(mut self, subscription_id: impl Into<String>) -> Self {
         self.subscription_id = Some(subscription_id.into());
+        self
+    }
+
+    /// Set the provider subscription id.
+    #[must_use]
+    pub fn with_provider_subscription(mut self, id: impl Into<ProviderId>) -> Self {
+        self.provider_subscription_id = Some(id.into());
         self
     }
 

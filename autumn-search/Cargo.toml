@@ -12,15 +12,16 @@ keywords = ["web", "search", "vector", "embeddings", "axum"]
 categories = ["web-programming", "database"]
 
 [dependencies]
-autumn-web = { version = "0.8.0", path = "../autumn" }
+autumn-web = { version = "0.9.0", path = "../autumn" }
 # Diesel is used ONLY by the Postgres `SearchBackend` and the Postgres
 # `DocumentSource`. Backend selection (postgres / sqlite) is inherited from
 # autumn-web's `db` feature via cargo feature unification — this crate never
 # enables a backend (or the `sqlite` runtime lane) itself, so the
 # FEATURE-UNIFICATION HAZARD in `autumn/src/db.rs` does not apply. Queries are
 # written against autumn-web's `RuntimeConnection` / `RuntimeBackend` aliases
-# so both lanes compile, and the Postgres-only SQL sits behind
-# `autumn_web::backend_select!`.
+# so both lanes compile. On a SQLite build, boot refuses
+# `SearchPlugin::postgres()` and the store refuses every query. Its one
+# Postgres-only bind sits behind `autumn_web::backend_select!` (#2539 §5).
 diesel = { workspace = true }
 diesel-async = { workspace = true }
 serde = { workspace = true }

@@ -45,11 +45,16 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/route_seo_duplicate_key.rs");
     t.compile_fail("tests/compile-fail/route_seo_empty_group.rs");
 
+    // Route `criticality` (#3068): a value other than "critical", "default"
+    // or "sheddable" is a compile error, not a silent `default`.
+    t.compile_fail("tests/compile-fail/route_criticality_invalid.rs");
+
     // Static route macro failures
     t.compile_fail("tests/compile-fail/static_get_path_params.rs");
     t.compile_fail("tests/compile-fail/static_get_non_async.rs");
     t.compile_fail("tests/compile-fail/static_get_params_no_placeholders.rs");
     t.compile_fail("tests/compile-fail/static_get_seo_unknown_key.rs");
+    t.compile_fail("tests/compile-fail/static_get_content_type_empty.rs");
 
     // Edge-lane refusals (#1790). Always available: `#[edge]` is re-exported
     // unconditionally (a route can be *marked* without the `edge` feature), and
@@ -89,6 +94,12 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/repository_ledgered_purge_rejected.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/repository_ledgered_sensitive_columns.rs");
+    // #2319: a NULL-tenant chain is unreachable by every read mode.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_ledgered_nullable_tenant.rs");
+    // #2319: a derived `delete_by_*` records no revision.
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/repository_ledgered_derived_delete.rs");
 
     // Warden security review, 2026-09-13: `owner = <column>` only emits
     // opt-in `list_scoped`/`search_page_scoped` methods for a hand-written
@@ -231,8 +242,9 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/model_dependent_on_through.rs");
 
     // Declarative-schema markers (#1975, slice 3.5): the `#[model]` macro
-    // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` but
-    // rejects malformed shapes with a clear, actionable `compile_error!`.
+    // ACCEPTS `#[model(managed)]` / `#[unique]` / `#[references(...)]` /
+    // `#[renamed_from("...")]` but rejects malformed shapes with a clear,
+    // actionable `compile_error!`.
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_bogus_arg.rs");
     #[cfg(feature = "db")]
@@ -243,6 +255,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/model_references_bad_key.rs");
     #[cfg(feature = "db")]
     t.compile_fail("tests/compile-fail/model_references_namevalue.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_references_set_null_required.rs");
+    #[cfg(feature = "db")]
+    t.compile_fail("tests/compile-fail/model_renamed_from_bad_name.rs");
 
     // #1911: `#[state_machine(lifecycle = T)]` where `T` is not a `#[lifecycle]`
     // enum fails with an unsatisfied `T: Lifecycle` trait bound.
@@ -344,6 +360,10 @@ fn compile_fail_tests() {
     t.compile_fail("tests/compile-fail/a11y_radiogroup_unlabeled.rs");
     #[cfg(feature = "maud")]
     t.compile_fail("tests/compile-fail/a11y_radiooption_missing_label.rs");
+    // Field wrapper v2 (#3395): `FieldOptions` has no label setter, so a field
+    // with options and no label still does not build.
+    #[cfg(feature = "maud")]
+    t.compile_fail("tests/compile-fail/form_field_unlabeled.rs");
 }
 
 /// The `state_migration!` fixtures get their own `TestCases` for the same
@@ -483,6 +503,17 @@ const AGENT_AUTHORITY_FIXTURES: &[(&str, bool)] = &[
     // The same unlisted write against the real generated repository surface,
     // where the model subject is resolved through the repository type.
     ("agent_authority_repository_unlisted_write", true),
+    // `#[repository(.., mcp, grant = X)]` checks the generated writes too.
+    ("agent_authority_repository_grant_unlisted_model", true),
+    // A delete also writes the models its `dependent(...)` cascade names.
+    ("agent_authority_repository_cascade_unlisted_child", true),
+    // The generated delete tool is checked against the cascade too.
+    (
+        "agent_authority_repository_grant_cascade_unlisted_child",
+        true,
+    ),
+    // A cascade that loops cannot be listed, so a governed delete is refused.
+    ("agent_authority_repository_cascade_cycle", true),
 ];
 
 /// The `#[agent_operable]` fixtures get their own `TestCases` for the same
@@ -518,6 +549,12 @@ fn agent_authority_compile_pass_tests() {
     // the attribute stacked in both orders and under `#[secured]`.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/agent_authority_route.rs");
+    // `#[repository(.., mcp, grant = X)]` governs the generated tools.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/agent_authority_repository_grant.rs");
+    // A delete is checked against its cascade; restrict and self-cascades pass.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/agent_authority_repository_cascade.rs");
 }
 
 /// Build-time cache coherence (#1716). Its own `TestCases` for the same
@@ -607,6 +644,7 @@ fn compile_pass_tests_a() {
     t.pass("tests/compile-pass/main_runtime_args.rs");
     t.pass("tests/compile-pass/main_runtime_current_thread.rs");
     t.pass("tests/compile-pass/static_get_basic.rs");
+    t.pass("tests/compile-pass/static_get_content_type.rs");
     t.pass("tests/compile-pass/static_routes_basic.rs");
     t.pass("tests/compile-pass/static_get_parameterized.rs");
 
@@ -898,6 +936,76 @@ fn query_budget_guide_matches_the_real_diagnostics() {
         assert!(
             root.join(fixture).exists(),
             "guide references a fixture that does not exist: {fixture}"
+        );
+    }
+}
+
+/// The compile-fail fixtures that `docs/guide/accessibility.md` quotes in its
+/// "Red build" block (#2666).
+const A11Y_GUIDE_FIXTURES: [&str; 5] = [
+    "a11y_img_missing_alt",
+    "a11y_link_missing_text",
+    "a11y_menuitem_missing_name",
+    "a11y_textfield_unlabeled",
+    "a11y_radiogroup_unlabeled",
+];
+
+/// The accessibility guide quotes the errors of an inaccessible primitive. Each
+/// quote must be the error rustc prints (#2666). Pins the guide against the
+/// trybuild goldens, and against the fixtures it names.
+#[test]
+fn a11y_guide_matches_the_real_diagnostics() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+    let guide = std::fs::read_to_string(root.join("docs/guide/accessibility.md"))
+        .expect("docs/guide/accessibility.md exists");
+    let collapse = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let guide_flat = collapse(&guide);
+    // Two fixtures can share one error line, so the guide quotes it once per
+    // fixture.
+    let mut quotes: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+
+    for fixture in A11Y_GUIDE_FIXTURES {
+        let path = format!("autumn/tests/compile-fail/{fixture}.rs");
+        assert!(guide.contains(&path), "the guide does not name {path}");
+        assert!(
+            root.join(&path).exists(),
+            "the guide names a missing fixture: {path}"
+        );
+
+        let golden = std::fs::read_to_string(
+            root.join(format!("autumn/tests/compile-fail/{fixture}.stderr")),
+        )
+        .unwrap_or_else(|_| panic!("{fixture} has a golden"));
+        let header = golden
+            .lines()
+            .find(|line| line.starts_with("error"))
+            .unwrap_or_else(|| panic!("{fixture}'s golden opens with an error"));
+        *quotes.entry(collapse(header)).or_default() += 1;
+        assert!(
+            guide_flat.contains(&collapse(header)),
+            "docs/guide/accessibility.md has drifted from {fixture}.\n\n\
+             expected the guide to contain:\n{header}\n\n\
+             Regenerate with TRYBUILD=overwrite and copy the message into the guide."
+        );
+        // For E0599, the error line shows the generic type `State`. The label
+        // line shows the typestate (`NoLabel`). Check both lines.
+        if let Some(at) = golden.find("method not found in `") {
+            let label = golden[at..].lines().next().expect("label line");
+            assert!(
+                guide_flat.contains(&collapse(label)),
+                "docs/guide/accessibility.md is missing {fixture}'s label:\n{label}\n\n\
+                 Regenerate with TRYBUILD=overwrite and copy the label into the guide."
+            );
+        }
+    }
+    for (header, fixtures) in quotes {
+        let found = guide_flat.matches(&header).count();
+        assert!(
+            found >= fixtures,
+            "docs/guide/accessibility.md quotes `{header}` {found} times, \
+             but {fixtures} fixtures emit it"
         );
     }
 }

@@ -271,7 +271,7 @@ use crate::state::AppState;
 // `AsyncPgConnection` by its short name now; the `TestClient` pool fields use the
 // `RuntimeConnection` alias, and the transactional establish path uses the fully
 // qualified path — so without `test-support` this import would be unused.
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 use diesel_async::AsyncPgConnection;
 // Used by the Postgres transactional establish path (the `.get_result()` on
 // `TransactionalDbInterceptor`), which is itself gated `not(feature = "sqlite")`;
@@ -732,10 +732,15 @@ pub struct TestApp {
     openapi: Option<crate::openapi::OpenApiConfig>,
     #[cfg(feature = "mcp")]
     mcp: Option<crate::mcp::McpRuntime>,
+    #[cfg(feature = "webmcp")]
+    webmcp: Option<crate::webmcp::WebMcpRuntime>,
     #[cfg(feature = "db")]
     pool: Option<Pool<crate::db::RuntimeConnection>>,
     #[cfg(feature = "db")]
     replica_pool: Option<Pool<crate::db::RuntimeConnection>>,
+    /// A `SQLite` fleet that becomes the app's shard set (ADR 0019).
+    #[cfg(feature = "sqlite")]
+    fleet: Option<crate::db::fleet::DatabaseFleet>,
     #[cfg(feature = "db")]
     transactional: bool,
     #[cfg(feature = "db")]
@@ -782,6 +787,8 @@ pub struct TestApp {
     jobs: Vec<crate::job::JobInfo>,
     tasks: Vec<crate::task::TaskInfo>,
     listeners: Vec<crate::events::ListenerInfo>,
+    #[cfg(feature = "db")]
+    outbox_handlers: crate::outbox::OutboxHandlers,
     exception_filters: Vec<std::sync::Arc<dyn crate::middleware::ExceptionFilter>>,
     #[cfg(feature = "mail")]
     suppression_store: Option<crate::mail::SuppressionStoreHandle>,
@@ -797,6 +804,8 @@ pub struct TestApp {
     /// to [`crate::time::TickingClock`] at runtime.
     clock_as_any: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     api_versions: Vec<crate::app::ApiVersion>,
+    agent_skills: Vec<crate::aeo::AgentSkill>,
+    commerce_docs: crate::aeo::RegisteredCommerceDocs,
     /// Plugin-contributed metrics sources registered via [`AppBuilder::metrics_source`].
     metrics_sources: Vec<(String, std::sync::Arc<dyn crate::actuator::MetricsSource>)>,
     /// Plugin-contributed health indicators registered via [`AppBuilder::health_indicator`].
@@ -835,10 +844,14 @@ impl TestApp {
             openapi: None,
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
             #[cfg(feature = "db")]
             pool: None,
             #[cfg(feature = "db")]
             replica_pool: None,
+            #[cfg(feature = "sqlite")]
+            fleet: None,
             #[cfg(feature = "db")]
             transactional: false,
             #[cfg(feature = "db")]
@@ -868,6 +881,8 @@ impl TestApp {
             jobs: Vec::new(),
             tasks: Vec::new(),
             listeners: Vec::new(),
+            #[cfg(feature = "db")]
+            outbox_handlers: crate::outbox::OutboxHandlers::default(),
             exception_filters: Vec::new(),
             #[cfg(feature = "mail")]
             suppression_store: None,
@@ -879,6 +894,8 @@ impl TestApp {
             entropy: None,
             clock_as_any: None,
             api_versions: Vec::new(),
+            agent_skills: Vec::new(),
+            commerce_docs: crate::aeo::RegisteredCommerceDocs::default(),
             metrics_sources: Vec::new(),
             health_indicators: Vec::new(),
             #[cfg(feature = "inbound-mail")]
@@ -969,6 +986,26 @@ impl TestApp {
         self
     }
 
+    /// Serve the `WebMCP` tool list, as
+    /// [`AppBuilder::mount_webmcp`](crate::app::AppBuilder::mount_webmcp)
+    /// does.
+    #[cfg(feature = "webmcp")]
+    #[must_use]
+    pub fn mount_webmcp(mut self) -> Self {
+        self.webmcp.get_or_insert_with(Default::default);
+        self
+    }
+
+    /// Make each eligible `GET` a `WebMCP` tool, as
+    /// [`AppBuilder::expose_all_as_webmcp`](crate::app::AppBuilder::expose_all_as_webmcp)
+    /// does.
+    #[cfg(feature = "webmcp")]
+    #[must_use]
+    pub fn expose_all_as_webmcp(mut self) -> Self {
+        self.webmcp.get_or_insert_with(Default::default).expose_all = true;
+        self
+    }
+
     /// Enable the whole-API MCP hatch, mirroring
     /// [`AppBuilder::expose_all_as_mcp`](crate::app::AppBuilder::expose_all_as_mcp).
     ///
@@ -1017,6 +1054,45 @@ impl TestApp {
         self
     }
 
+    /// Set the limits for MCP task tools, mirroring
+    /// [`AppBuilder::mcp_tasks`](crate::app::AppBuilder::mcp_tasks).
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_tasks(mut self, config: crate::mcp::McpTaskConfig) -> Self {
+        self.mcp
+            .get_or_insert_with(|| crate::mcp::McpRuntime::new("/mcp"))
+            .tasks = config;
+        self
+    }
+
+    /// Set the MCP server instructions, mirroring
+    /// [`AppBuilder::mcp_instructions`](crate::app::AppBuilder::mcp_instructions).
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_instructions(mut self, text: impl Into<String>) -> Self {
+        self.mcp
+            .get_or_insert_with(|| crate::mcp::McpRuntime::new("/mcp"))
+            .instructions = Some(text.into());
+        self
+    }
+
+    /// Select the MCP tool catalog, mirroring
+    /// [`AppBuilder::mcp_catalog`](crate::app::AppBuilder::mcp_catalog).
+    ///
+    /// Gated behind the `mcp` Cargo feature.
+    #[cfg(feature = "mcp")]
+    #[must_use]
+    pub fn mcp_catalog(mut self, catalog: crate::mcp::McpCatalog) -> Self {
+        self.mcp
+            .get_or_insert_with(|| crate::mcp::McpRuntime::new("/mcp"))
+            .catalog = catalog;
+        self
+    }
+
     /// Merge a router into the internal application state.
     ///
     /// This is useful when testing modular route definitions without building
@@ -1047,6 +1123,7 @@ impl TestApp {
             prefix: prefix.to_owned(),
             routes,
             source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
             apply_layer: Box::new(move |router| router.layer(layer)),
         });
         self
@@ -1227,13 +1304,21 @@ impl TestApp {
     ///
     /// Mirrors [`crate::app::AppBuilder::with_flag_store`].
     #[must_use]
-    pub fn with_flag_store<S>(mut self, store: S) -> Self
+    pub fn with_flag_store<S>(self, store: S) -> Self
     where
         S: crate::feature_flags::FlagStore,
     {
         use std::sync::Arc;
         let service = crate::feature_flags::FeatureFlagService::new(Arc::new(store) as Arc<_>);
+        self.with_flag_service(service)
+    }
+
+    /// Mirrors [`crate::app::AppBuilder::with_flag_service`]. The build
+    /// preloads the store before the first request.
+    #[must_use]
+    pub fn with_flag_service(mut self, service: crate::feature_flags::FeatureFlagService) -> Self {
         self.state_initializers.push(Box::new(move |state| {
+            crate::feature_flags::preload_blocking(&service, crate::feature_flags::PRELOAD_WAIT);
             state.insert_extension(service);
         }));
         self
@@ -1317,6 +1402,8 @@ impl TestApp {
         self.jobs.extend(app_builder.jobs);
         self.tasks.extend(app_builder.tasks);
         self.listeners.extend(app_builder.listeners);
+        #[cfg(feature = "db")]
+        self.outbox_handlers.extend(app_builder.outbox_handlers);
         self.exception_filters.extend(app_builder.exception_filters);
         self.metrics_sources.extend(app_builder.metrics_sources);
         self.health_indicators.extend(app_builder.health_indicators);
@@ -1565,6 +1652,39 @@ impl TestApp {
         self
     }
 
+    /// Enable the outbox relay with `config` (it sets `enabled = true`).
+    ///
+    /// `build` cannot create the tables. Call
+    /// [`crate::outbox::ensure_schema`] in the test first.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub const fn with_outbox(mut self, config: crate::config::OutboxConfig) -> Self {
+        self.config.outbox = config;
+        self.config.outbox.enabled = true;
+        self
+    }
+
+    /// Set the outbox handler of `topic`, as `AppBuilder::outbox_handler`.
+    ///
+    /// The test app runs no relay worker. Drain the outbox with
+    /// [`crate::outbox::drain`] or [`crate::sim::Sim::run_to_idle`]. Set
+    /// `outbox.enabled = true` in the config, and create the tables with
+    /// [`crate::outbox::ensure_schema`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when `topic` is empty or starts with `autumn.`.
+    #[cfg(feature = "db")]
+    #[must_use]
+    pub fn outbox_handler<F, Fut>(mut self, topic: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(AppState, crate::outbox::OutboxMessage) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = crate::AutumnResult<()>> + Send + 'static,
+    {
+        self.outbox_handlers.insert(topic, handler);
+        self
+    }
+
     #[cfg(feature = "db")]
     #[must_use]
     pub fn with_db_interceptor(
@@ -1607,6 +1727,18 @@ impl TestApp {
         interceptor: impl crate::interceptor::HttpInterceptor,
     ) -> Self {
         self.http_interceptor = Some(std::sync::Arc::new(interceptor));
+        self
+    }
+
+    /// Trust `host` as a request host, so a sim replica serves calls that
+    /// other replicas send to it by name (issue #3067).
+    #[cfg(feature = "http-client")]
+    pub(crate) fn trust_host(mut self, host: &str) -> Self {
+        self.config
+            .security
+            .trusted_hosts
+            .hosts
+            .push(host.to_owned());
         self
     }
 
@@ -1694,6 +1826,27 @@ impl TestApp {
         self
     }
 
+    /// Publish an agent skill, as [`AppBuilder::agent_skill`](crate::app::AppBuilder::agent_skill).
+    #[must_use]
+    pub fn agent_skill(mut self, skill: crate::aeo::AgentSkill) -> Self {
+        self.agent_skills.push(skill);
+        self
+    }
+
+    /// Serve a UCP profile, as [`AppBuilder::ucp_profile`](crate::app::AppBuilder::ucp_profile).
+    #[must_use]
+    pub fn ucp_profile(mut self, profile: crate::aeo::commerce::UcpProfile) -> Self {
+        self.commerce_docs.ucp = Some(profile);
+        self
+    }
+
+    /// Serve an ACP document, as [`AppBuilder::acp_discovery`](crate::app::AppBuilder::acp_discovery).
+    #[must_use]
+    pub fn acp_discovery(mut self, document: crate::aeo::commerce::AcpDiscovery) -> Self {
+        self.commerce_docs.acp = Some(document);
+        self
+    }
+
     /// Register multiple API versions for testing.
     #[must_use]
     pub fn api_versions(
@@ -1757,6 +1910,18 @@ impl TestApp {
     #[must_use]
     pub fn with_shards(mut self, shards: Vec<crate::config::ShardConfig>) -> Self {
         self.config.database.shards = shards;
+        self
+    }
+
+    /// Route tenant data through a `SQLite` fleet (ADR 0019): the fleet
+    /// becomes the app's shard set, so [`ShardedDb`](crate::sharding::ShardedDb),
+    /// [`Shards`](crate::sharding::Shards) and `#[repository(sharded)]` open
+    /// each tenant's (or slot's) own database. Needs a control pool
+    /// ([`with_db`](Self::with_db)), which seeds cross-shard repositories.
+    #[cfg(feature = "sqlite")]
+    #[must_use]
+    pub fn with_fleet(mut self, fleet: crate::db::fleet::DatabaseFleet) -> Self {
+        self.fleet = Some(fleet);
         self
     }
 
@@ -2004,6 +2169,15 @@ impl TestApp {
                 (false, _) => std::sync::Arc::new(crate::sharding::HashShardRouter),
             };
 
+        #[cfg(feature = "sqlite")]
+        let fleet_shards = self.fleet.take().map(|fleet| {
+            crate::sharding::ShardSet::from_fleet(
+                fleet,
+                pool.clone()
+                    .expect("TestApp::with_fleet needs a control pool: call with_db"),
+            )
+        });
+
         let probes = crate::probe::ProbeState::ready_for_test();
         #[cfg(feature = "ws")]
         let test_channels = crate::channels::Channels::new(32);
@@ -2059,8 +2233,13 @@ impl TestApp {
             // `begin_test_transaction` isolation); under the `sqlite` feature the
             // harness always uses the plain builder (no shard rollback isolation).
             #[cfg(all(feature = "db", feature = "sqlite"))]
-            shards: crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
-                .expect("test shard pools should build from config"),
+            shards: match fleet_shards {
+                Some(shards) => Some(shards),
+                None => {
+                    crate::sharding::create_shard_set(&self.config.database, shard_router.clone())
+                        .expect("test shard pools should build from config")
+                }
+            },
             // The test harness attaches pools directly (`with_pool`), without
             // a topology to carry a capture gap; a DB test that needs the gap
             // noted asserts through the production seam instead.
@@ -2091,8 +2270,6 @@ impl TestApp {
             #[cfg(feature = "ws")]
             channels: test_channels,
 
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: self
                 .forbidden_response_override
@@ -2132,11 +2309,15 @@ impl TestApp {
             register(state.policy_registry());
         }
         state.insert_extension(crate::app::RegisteredApiVersions(self.api_versions));
+        state.insert_extension(crate::aeo::RegisteredAgentSkills(self.agent_skills));
+        state.insert_extension(self.commerce_docs);
         crate::app::install_webhook_registry(&state, &self.config);
 
         // Install AutumnConfig so DbState::statement_timeout / slow_query_threshold
         // and HTTP Client resilience can read the test-supplied config.
         state.insert_extension(self.config.clone());
+        // A sim kill stops the app's background tasks through this (#3067).
+        state.insert_extension(crate::sim::AppTasks::default());
 
         #[cfg(feature = "mail")]
         let mail_recorder_for_client = {
@@ -2255,6 +2436,15 @@ impl TestApp {
             state.insert_extension(interceptor);
         }
 
+        // Before the mailer: with `outbox.enabled`, `deliver_later` goes
+        // through the outbox queue the relay installs.
+        #[cfg(feature = "db")]
+        crate::outbox::install(
+            &state,
+            &self.config.outbox,
+            std::mem::take(&mut self.outbox_handlers),
+        );
+
         #[cfg(feature = "mail")]
         {
             if let Some(handle) = self.suppression_store.clone() {
@@ -2281,6 +2471,8 @@ impl TestApp {
             client: crate::http_client::Client::build_inner(&self.config.http.client),
             timeout_secs: self.config.http.client.timeout_secs,
         });
+        #[cfg(feature = "http-client")]
+        crate::http_client::install_shared_throttle(&state, &self.config.http.client);
 
         // Install mock registry when http_mock() was called.
         #[cfg(feature = "http-client")]
@@ -2307,7 +2499,9 @@ impl TestApp {
                 tracing::warn!("{e}");
             }
         }
-
+        // Mirror production `build_state`: the `[health]` cache TTL, ping
+        // time limit and database readiness gate.
+        state.apply_health_config(&self.config.health);
         // Mirror production `AppBuilder` wiring: surface each configured shard's
         // replica readiness as a `db:shard:<name>` indicator so `/ready`
         // refreshes shard replica health (gating `fail_readiness` shards and
@@ -2317,12 +2511,14 @@ impl TestApp {
             crate::sharding::register_shard_health_indicators(
                 set,
                 &state.health_indicator_registry,
+                self.config.health.ping_timeout(),
             );
         }
 
         for initializer in self.state_initializers {
             initializer(&state);
         }
+        crate::cost::install(&state, &self.config);
 
         // Register the fault plan's 5xx projector alongside the app's own
         // reporters (which keep receiving every event). It goes FIRST in the
@@ -2361,6 +2557,22 @@ impl TestApp {
         for job in &self.jobs {
             state.job_registry.register(&job.name);
         }
+
+        // Mirror production `AppBuilder` wiring: one `redis:<subsystem>`
+        // PING indicator per Redis-backed subsystem (#3059). Here, the job set
+        // is final (durable listeners are jobs too). `TestApp` always uses
+        // in-process channels, and with no jobs no job runtime starts.
+        #[cfg(feature = "redis")]
+        crate::redis_health::register_redis_health_indicators(
+            &self.config,
+            &state.health_indicator_registry,
+            &crate::redis_health::app_pingers(&state),
+            if self.jobs.is_empty() {
+                &["channels", "jobs"]
+            } else {
+                &["channels"]
+            },
+        );
 
         let job_runtime = if self.jobs.is_empty() {
             None
@@ -2496,6 +2708,8 @@ impl TestApp {
                 openapi: self.openapi,
                 #[cfg(feature = "mcp")]
                 mcp: self.mcp,
+                #[cfg(feature = "webmcp")]
+                webmcp: self.webmcp,
             },
         )
         .expect("failed to build test router");
@@ -2690,6 +2904,12 @@ impl Drop for TestJobRuntime {
 }
 
 impl TestClient {
+    /// The app router, for a sim replica that serves other replicas (#3067).
+    #[cfg(feature = "http-client")]
+    pub(crate) fn router(&self) -> axum::Router {
+        self.router.clone()
+    }
+
     /// Returns a reference to the [`AppState`] wired into this test app's router.
     #[must_use]
     pub const fn state(&self) -> &AppState {
@@ -3236,6 +3456,20 @@ impl TestClient {
         RequestBuilder::new(
             self.router.clone(),
             Method::GET,
+            uri,
+            self.cookie_jar.clone(),
+            Some(self.state.clock.clone()),
+            self.n_plus_one_threshold(),
+            self.fault_error_counter(),
+        )
+    }
+
+    /// Start building a HEAD request.
+    #[must_use]
+    pub fn head(&self, uri: &str) -> RequestBuilder {
+        RequestBuilder::new(
+            self.router.clone(),
+            Method::HEAD,
             uri,
             self.cookie_jar.clone(),
             Some(self.state.clock.clone()),
@@ -4458,6 +4692,9 @@ impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
 
 /// Shared Postgres testcontainer for database integration tests.
 ///
+/// Under `--features sqlite` this type is a tempfile `SQLite` database instead
+/// (issue #2555); the API is the same.
+///
 /// Rather than spinning up a new container per test (slow!), `TestDb`
 /// provides a shared container that all tests in a binary can reuse.
 /// This mirrors Spring Boot's `@Testcontainers` with `@Container` +
@@ -4488,14 +4725,14 @@ impl crate::interceptor::DbConnectionInterceptor for ComposedDbInterceptor {
 ///     client.get("/data").send().await.assert_ok();
 /// }
 /// ```
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 pub struct TestDb {
     _container: testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
     pool: Pool<AsyncPgConnection>,
     url: String,
 }
 
-#[cfg(all(feature = "db", feature = "test-support"))]
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 impl TestDb {
     /// Start a new Postgres testcontainer and create a connection pool.
     ///
@@ -4583,6 +4820,189 @@ impl TestDb {
             .await
             .unwrap_or_else(|e| panic!("SQL execution failed: {e}\nSQL: {sql}"));
     }
+
+    /// Empty `table` and restart its id sequence (`TRUNCATE … RESTART IDENTITY`).
+    ///
+    /// `table` must match `[A-Za-z0-9_]+`. Schema-qualified names are not allowed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `table` is not a plain identifier, or if the SQL fails.
+    pub async fn reset_table(&self, table: &str) {
+        assert_plain_identifier(table);
+        self.execute_sql(&format!("TRUNCATE \"{table}\" RESTART IDENTITY"))
+            .await;
+    }
+}
+
+/// Throwaway `SQLite` database for integration tests (issue #2555).
+///
+/// This is the `--features sqlite` counterpart of the Postgres `TestDb`. It has
+/// the same API and needs no Docker. Each instance owns a tempfile database.
+/// [`TestDb::shared`] reuses one per test binary.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// use autumn_web::test::{TestApp, TestDb};
+///
+/// #[tokio::test]
+/// async fn db_test() {
+///     let db = TestDb::shared().await;
+///     db.execute_sql("CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY)").await;
+///     let client = TestApp::new().routes(routes![h]).with_db(db.pool()).build();
+///     client.get("/t").send().await.assert_ok();
+/// }
+/// ```
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+pub struct TestDb {
+    pool: Pool<crate::db::RuntimeConnection>,
+    url: String,
+    path: std::path::PathBuf,
+}
+
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+impl TestDb {
+    /// Create a new tempfile database and a connection pool for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool cannot be built.
+    pub async fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "autumn-testdb-{}-{}.db",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        // A file from a crashed run can share this name (the process id is
+        // reused). Remove it so the database starts empty.
+        remove_sqlite_files(&path);
+        let url = format!("sqlite://{}", path.display());
+        let config = crate::config::DatabaseConfig {
+            primary_url: Some(url.clone()),
+            ..Default::default()
+        };
+        let pool = crate::db::create_pool(&config)
+            .expect("failed to build SQLite test pool")
+            .expect("SQLite test URL did not yield a pool");
+        // Create the file now so a failure shows up here, not in a later test.
+        drop(
+            pool.get()
+                .await
+                .expect("failed to open SQLite test database"),
+        );
+        Self { pool, url, path }
+    }
+
+    /// Get a shared `TestDb`, created on first use.
+    ///
+    /// The database is created once per test binary. Rust never drops a
+    /// static, so its file stays in the temp directory. Use [`TestDb::new`] when
+    /// the file must be removed.
+    pub async fn shared() -> &'static Self {
+        use std::sync::OnceLock;
+        use tokio::sync::OnceCell;
+
+        static CELL: OnceLock<OnceCell<TestDb>> = OnceLock::new();
+        let once = CELL.get_or_init(OnceCell::new);
+        once.get_or_init(Self::new).await
+    }
+
+    /// Get the database connection pool.
+    #[must_use]
+    pub fn pool(&self) -> Pool<crate::db::RuntimeConnection> {
+        self.pool.clone()
+    }
+
+    /// Get the `sqlite://` connection URL.
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Execute raw SQL against the test database.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the SQL fails.
+    pub async fn execute_sql(&self, sql: &str) {
+        use diesel_async::SimpleAsyncConnection as _;
+        let mut conn = self.pool.get().await.expect("failed to get connection");
+        conn.batch_execute(sql)
+            .await
+            .unwrap_or_else(|e| panic!("SQL execution failed: {e}\nSQL: {sql}"));
+    }
+
+    /// Empty `table` and restart its id counter.
+    ///
+    /// `SQLite` has no `TRUNCATE`. This deletes every row, then clears the
+    /// `AUTOINCREMENT` counter in `sqlite_sequence`. `table` must match
+    /// `[A-Za-z0-9_]+`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `table` is not a plain identifier, or if the SQL fails.
+    pub async fn reset_table(&self, table: &str) {
+        use diesel_async::RunQueryDsl as _;
+        use diesel_async::SimpleAsyncConnection as _;
+
+        #[derive(diesel::QueryableByName)]
+        struct Found {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+
+        assert_plain_identifier(table);
+        // One connection for all steps, so no other writer slips in between.
+        let mut conn = self.pool.get().await.expect("failed to get connection");
+        conn.batch_execute(&format!("DELETE FROM \"{table}\""))
+            .await
+            .unwrap_or_else(|e| panic!("failed to empty {table}: {e}"));
+        // `sqlite_sequence` exists only after the first AUTOINCREMENT table.
+        let found = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'sqlite_sequence'",
+        )
+        .get_result::<Found>(&mut *conn)
+        .await
+        .expect("failed to probe sqlite_sequence");
+        if found.n > 0 {
+            conn.batch_execute(&format!(
+                "DELETE FROM sqlite_sequence WHERE name = '{table}'"
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("failed to reset the id counter of {table}: {e}"));
+        }
+    }
+}
+
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+impl Drop for TestDb {
+    fn drop(&mut self) {
+        self.pool.close();
+        remove_sqlite_files(&self.path);
+    }
+}
+
+/// Remove a `SQLite` database file and its `-wal` and `-shm` files.
+#[cfg(all(feature = "db", feature = "test-support", feature = "sqlite"))]
+fn remove_sqlite_files(path: &std::path::Path) {
+    for suffix in ["", "-wal", "-shm"] {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        let _ = std::fs::remove_file(name);
+    }
+}
+
+/// Reject anything but `[A-Za-z0-9_]+`: table names go into SQL text.
+#[cfg(all(feature = "db", feature = "test-support"))]
+fn assert_plain_identifier(name: &str) {
+    assert!(
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "table name must be a plain identifier: {name:?}"
+    );
 }
 
 /// Deterministically claims and runs up to `max_rows` ready durable repository
@@ -4677,7 +5097,10 @@ pub async fn drain_ready_repository_commit_hooks(
         .await;
     #[cfg(feature = "sqlite")]
     crate::repository_commit_hooks::sqlite_drain_ready_repository_commit_hooks(
-        pool, &worker_id, max_rows,
+        pool,
+        &worker_id,
+        max_rows,
+        &tokio_util::sync::CancellationToken::new(),
     )
     .await;
 
@@ -4686,6 +5109,27 @@ pub async fn drain_ready_repository_commit_hooks(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    fn plain_identifiers_are_accepted() {
+        super::assert_plain_identifier("posts");
+        super::assert_plain_identifier("Post_2");
+    }
+
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    #[should_panic(expected = "plain identifier")]
+    fn an_empty_identifier_is_rejected() {
+        super::assert_plain_identifier("");
+    }
+
+    #[cfg(all(feature = "db", feature = "test-support"))]
+    #[test]
+    #[should_panic(expected = "plain identifier")]
+    fn sql_in_an_identifier_is_rejected() {
+        super::assert_plain_identifier("t; DROP TABLE x");
+    }
+
     use super::*;
 
     fn cleanup_probe_job(
@@ -4710,6 +5154,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: cleanup_probe_job,
+                timeout: None,
             }])
         }
     }
@@ -4747,6 +5192,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -4766,6 +5212,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -4785,6 +5232,7 @@ mod tests {
                 repository: None,
                 idempotency: crate::route::RouteIdempotency::Direct,
                 timeout: crate::route::RouteTimeout::Inherit,
+                criticality: crate::admission::Criticality::Default,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
@@ -4958,6 +5406,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,

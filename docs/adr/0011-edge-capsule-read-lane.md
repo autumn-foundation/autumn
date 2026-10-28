@@ -98,7 +98,8 @@ unprovided capability, a trap, a version mismatch — becomes a single
 request upstream. The origin still mounts every edge route, so there is nothing
 for the author to wire (AC-3). Autumn ships **no reverse proxy and no origin
 fetch**: forwarding is the host's responsibility, which is exactly the
-responsibility a CDN already has.
+responsibility a CDN already has. (Changed on 2026-10-05: see the amendment
+below.)
 
 ### Byte-identity is defined, then proven
 
@@ -172,8 +173,9 @@ unfiltered CI job.
 - **An edge-safe module is a real constraint on layout.** Authors must split
   handlers by substrate, and a plain `#[get]` in the wrong module fails the wasm
   build with an error about `::autumn_web` rather than about the rule it broke.
-- **`paths::*` helpers are unavailable inside a capsule** — they live in the
-  cfg-gated native companion.
+- ~~**`paths::*` helpers are unavailable inside a capsule.**~~ Fixed
+  (2026-10-08): an `#[edge]` route's helper uses `autumn_edge::paths` and is
+  not gated. A test keeps its encoders equal to `autumn_web::paths`.
 - **`autumn-macros` emits `::autumn_edge::…` paths** for edge routes, so an app
   that marks a route must depend on `autumn-edge`. The macro crate itself does
   not.
@@ -252,6 +254,41 @@ Rejected for this slice. A vendor binding would couple Autumn's release cadence
 to a CDN SDK and would have to be maintained per vendor. The reference host in
 `autumn-edge` is a worked specification instead: a shim author has one file to
 read and a protocol to implement.
+
+(Amended on 2026-10-22 by [ADR-0024](0024-web-standard-js-edge-host.md).
+A *vendor binding* is still rejected. A host written to the web-standard
+APIs only — `WebAssembly` and the Fetch API — is not one, and Autumn now
+ships one, with `autumn edge bundle`.)
+
+## Amendment (2026-10-05): a runnable reference edge node
+
+The decision above says "Autumn ships no reverse proxy and no origin fetch".
+That is now changed. No CDN speaks the NDJSON protocol. Thus an author had
+to write a shim to deploy. That is the glue AC-3 forbids. The issue also
+keeps "a single reference target" in scope.
+
+Autumn now ships one reference target: `autumn edge serve`
+(`autumn_edge::node`, feature `node`, native only). It is an HTTP server
+that runs the capsule and sends each fallthrough to the origin over HTTP. It
+is not a vendor binding. Alternative 6 (vendor bindings) is still rejected.
+
+Rules for the node:
+
+- It does not follow redirects and does not use `HTTP(S)_PROXY`.
+- It removes hop-by-hop headers in both directions.
+- It sets the forwarded headers before both lanes. It keeps them only from a
+  `--trusted-proxy` peer (a TLS terminator); for any other peer it is the
+  first proxy. It removes `forwarded`.
+- It refuses a path with a dot segment or a `\`.
+- It tunnels an `upgrade` request (WebSocket) to the origin.
+- It streams bodies to and from the origin. It runs the capsule on a
+  blocking thread, at most one for each CPU at the same time.
+- It copies the origin's static security and CSP headers at start. CORS
+  headers can differ per route, so the operator sets them explicitly.
+
+`autumn edge ttfb` measures the success metric from any client. CI proves it
+in Tier E with a simulated origin round trip, because CI cannot put a client
+far from the origin.
 
 ## Non-Goals
 

@@ -345,7 +345,7 @@ mod tests {
         // not an artifact of averaging across many seeds.
         let strategy = tiny_op_strategy();
         let outcome = sweep_proptest(0..1, &strategy, |_sim, ops| {
-            let has_inc = ops.iter().any(|op| *op == TinyOp::Inc);
+            let has_inc = ops.contains(&TinyOp::Inc);
             crate::sometimes!(has_inc, "case-contained-an-inc");
         });
         match outcome {

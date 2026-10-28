@@ -30,9 +30,9 @@
 //! [`SchemaDiagnostic`](crate::schema::parse::SchemaDiagnostic)) is likewise not
 //! dropped. The **accepted trade-off** is that the diff is intentionally
 //! conservative and will *miss* a genuine removal of one of those facets; that is
-//! preferable to ever destroying parser-invisible or hand-written state, and the
-//! genuine-removal case is recovered by later slices (`#[renamed_from]`, richer
-//! parsing, a shadow-DB oracle).
+//! preferable to ever destroying parser-invisible or hand-written state. A
+//! rename is not a removal: `#[renamed_from]` turns it into a `Rename*` change
+//! (see [`crate::schema::rename`]).
 //!
 //! # Invisible `#[belongs_to(...)]` association foreign keys (offline limitation)
 //!
@@ -67,8 +67,8 @@
 //!    `Column.references` and no diagnostic, so it cannot be detected offline —
 //!    the resulting `DROP TABLE` (already `--allow-destructive`-gated) may fail to
 //!    apply because the real `<retained>_<col>_fkey` constraint still depends on
-//!    the dropped table. A precise guard is impossible without schema introspection
-//!    (a future slice's shadow-DB / `--dev-url` oracle); a blanket "refuse every
+//!    the dropped table. A precise guard needs schema introspection (the
+//!    `--dev-url` replay gives a baseline that has these FKs); a blanket "refuse every
 //!    table drop" would make the common case useless and is deliberately **not**
 //!    done. Instead every emitted `DROP TABLE` carries an advisory
 //!    `-- autumn-safety:` comment naming this exact gap so the operator verifies
@@ -128,7 +128,7 @@
 //! check, so all three always agree on the emitted name. A short FK name (the
 //! common case) is returned unchanged, so Postgres output is byte-stable.
 //!
-//! Parser-provided index names (`idx_<table>_<field>`) are **not** renamed — the
+//! Parser-provided index names (`idx_<table>_<field>`) are **not** truncated — the
 //! app spells them elsewhere — so [`guard_plan`] still refuses (no override — the
 //! SQL is unappliable, not merely lossy) any Postgres plan that generates an index
 //! identifier **longer than 63 bytes**, plus (defensively) any pair of generated
@@ -156,8 +156,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use autumn_schema_core::{
-    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, IdKind, Index, SerialKind,
-    SqliteAffinity, Table,
+    Backend, CheckConstraint, Column, ColumnDefault, ColumnType, ForeignKey, ForeignKeyAction,
+    IdKind, Index, SerialKind, SqliteAffinity, Table,
 };
 
 use crate::schema::parse::ParsedSchema;
@@ -192,6 +192,41 @@ impl MigrationPlan {
 /// not an oversight (see the module docs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaChange {
+    // ---- renames (`#[renamed_from]`, see [`crate::schema::rename`]) ----
+    /// A managed table renamed by a `#[renamed_from]` hint. Not destructive.
+    RenameTable {
+        /// The old table name.
+        from: String,
+        /// The new table name.
+        to: String,
+    },
+    /// A column renamed by a `#[renamed_from]` hint. Not destructive.
+    RenameColumn {
+        /// The table name (after any table rename).
+        table: String,
+        /// The old column name.
+        from: String,
+        /// The new column name.
+        to: String,
+    },
+    /// A convention-named index renamed to follow a table or column rename.
+    RenameIndex {
+        /// The table name (after any table rename).
+        table: String,
+        /// The old index name.
+        from: String,
+        /// The index with its new name (`SQLite` recreates it from this shape).
+        index: Index,
+    },
+    /// A `#[renamed_from]` hint that the engine cannot apply safely. A
+    /// non-emittable marker: [`guard_plan`] refuses it, with no override.
+    RenameConflict {
+        /// The table the hint is on.
+        table: String,
+        /// Why the hint cannot apply.
+        reason: String,
+    },
+
     // ---- table level ----
     /// A managed table present in the desired state but not the baseline.
     CreateTable(Table),
@@ -311,9 +346,10 @@ pub enum SchemaChange {
         table: String,
     },
 
-    /// A same-named column whose **existing** explicit foreign key changed target
-    /// (e.g. `author_id` from `users(id)` to `accounts(id)`). A non-emittable
-    /// marker: [`guard_plan`] refuses any plan containing it (with no override).
+    /// A column whose existing foreign key changed its target or its
+    /// `ON DELETE` / `ON UPDATE` action. For example, `author_id` changes from
+    /// `users(id)` to `accounts(id)`. [`guard_plan`] refuses each plan that
+    /// contains this marker. No flag overrides it.
     ///
     /// It exists because a conservative engine cannot safely retarget an FK: it
     /// has no `DropForeignKey` variant to remove the baseline constraint (whose
@@ -326,6 +362,10 @@ pub enum SchemaChange {
         table: String,
         /// The column whose FK target changed.
         column: String,
+        /// The baseline key, for example `users(id) ON DELETE CASCADE`.
+        from: String,
+        /// The desired key.
+        to: String,
     },
 
     /// A same-named column whose `GENERATED … AS IDENTITY` clause changed between
@@ -475,10 +515,20 @@ pub enum DiffError {
         ops: Vec<DestructiveOp>,
     },
 
+    /// A `#[renamed_from]` hint cannot apply (no override).
+    #[error("cannot apply #[renamed_from] on table `{table}`: {reason}")]
+    RenameConflict {
+        /// The table the hint is on.
+        table: String,
+        /// Why the hint cannot apply.
+        reason: String,
+    },
+
     /// A single table both dropped and added column(s) — possibly a rename.
     #[error(
         "ambiguous change on table `{table}`: column(s) [{}] disappeared and [{}] appeared. \
-         If this is a rename, use #[renamed_from] (not yet supported — slice 5+); \
+         If this is a rename, put #[renamed_from] on the new field \
+         (for example #[renamed_from(\"old_name\")]); \
          refusing to emit a drop+add. Re-run with --allow-destructive to treat them \
          as independent drop/add.",
         .dropped.join(", "),
@@ -501,20 +551,27 @@ pub enum DiffError {
         table: String,
     },
 
-    /// An existing explicit foreign key changed its target (unsupported this
-    /// slice, no override — see [`SchemaChange::ForeignKeyChange`]).
+    /// An existing foreign key changed its target or its `ON DELETE` /
+    /// `ON UPDATE` action. No flag overrides it. See
+    /// [`SchemaChange::ForeignKeyChange`].
     #[error(
-        "foreign-key retarget on `{table}.{column}` is not supported in this slice: \
-         the baseline already has a foreign key on this column, and this engine has no \
-         way to drop it before adding the new one without colliding on the \
-         `{table}_{column}_fkey` constraint name. Retargeting a foreign key is deferred \
-         to a later slice."
+        "foreign-key change on `{table}.{column}` is not supported: the baseline has \
+         `REFERENCES {from}`, the model has `REFERENCES {to}`. The engine cannot drop \
+         the `{table}_{column}_fkey` constraint before it adds the new one. If the \
+         database is correct, change the model to agree with it (for example \
+         `#[references(on_delete = \"cascade\")]`). If the model is correct, write a \
+         manual migration (`autumn generate migration`), apply it, then run \
+         `autumn schema pull`."
     )]
     ForeignKeyChange {
         /// The owning table name.
         table: String,
         /// The column whose FK target changed.
         column: String,
+        /// The baseline key.
+        from: String,
+        /// The desired key.
+        to: String,
     },
 
     /// A column's `GENERATED … AS IDENTITY` clause changed between two authoritative
@@ -801,7 +858,11 @@ pub enum EmitError {
 #[must_use]
 pub fn diff_schema(baseline: &[Table], desired: &ParsedSchema, opts: DiffOptions) -> MigrationPlan {
     let backend = plan_backend(baseline, desired);
-    let mut changes = Vec::new();
+    // `#[renamed_from]` hints: emit the renames first, then diff the renamed
+    // baseline so a renamed table or column is not a drop + add.
+    let mut changes = crate::schema::rename::rename_changes(baseline, desired);
+    let renamed = crate::schema::rename::renamed_baseline(baseline, &changes);
+    let baseline = renamed.as_slice();
 
     let baseline_by_name: BTreeMap<&str, &Table> =
         baseline.iter().map(|t| (t.name.as_str(), t)).collect();
@@ -1158,10 +1219,18 @@ fn diff_table(
 /// with no clean class) or the ambiguous [`Numeric`](SqliteAffinity::Numeric)
 /// catch-all falls back to exact equality so distinct verbatim types are never
 /// conflated. Beyond the `Attachment`/`Json` exception above, this rule is
-/// strictly `SQLite`-gated and never affects the pg lane.
+/// strictly `SQLite`-gated and never affects the pg lane. Two
+/// [`Decimal`](ColumnType::Decimal)s with a different precision or scale are not
+/// equivalent: their `SQLite` `CHECK`s are different (issue #2598).
 fn column_types_equivalent(base: &ColumnType, want: &ColumnType, backend: Backend) -> bool {
     if base == want {
         return true;
+    }
+    if matches!(
+        (base, want),
+        (ColumnType::Decimal { .. }, ColumnType::Decimal { .. })
+    ) {
+        return false;
     }
     if matches!(
         (base, want),
@@ -1238,8 +1307,8 @@ fn diff_column(
     //   * baseline had none → the FK may already exist invisibly → the refused
     //     `AddForeignKeyToExistingColumn` marker, with no override.
     //   * baseline had the same FK → no change.
-    //   * baseline had a different FK → a retarget we cannot safely emit, since there is
-    //     no `DropForeignKey` and re-`ADD CONSTRAINT`-ing the default
+    //   * baseline had a different FK (target or action) → a change we cannot safely
+    //     emit, since there is no `DropForeignKey` and re-`ADD CONSTRAINT`-ing the default
     //     `<table>_<column>_fkey` name would collide → the refused `ForeignKeyChange`
     //     marker, mirroring `PrimaryKeyChange`.
     //
@@ -1252,9 +1321,11 @@ fn diff_column(
                 column: want.name.clone(),
             }),
             Some(existing) if existing == fk => {}
-            Some(_) => changes.push(SchemaChange::ForeignKeyChange {
+            Some(existing) => changes.push(SchemaChange::ForeignKeyChange {
                 table: table.to_owned(),
                 column: want.name.clone(),
+                from: describe_foreign_key(existing),
+                to: describe_foreign_key(fk),
             }),
         }
     }
@@ -1708,6 +1779,24 @@ fn plan_backend(baseline: &[Table], desired: &ParsedSchema) -> Backend {
 // Policy guard
 // ---------------------------------------------------------------------------
 
+/// The refusal for the first [`SchemaChange::ForeignKeyChange`] in `plan`.
+fn foreign_key_change_error(plan: &MigrationPlan) -> Option<DiffError> {
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::ForeignKeyChange {
+            table,
+            column,
+            from,
+            to,
+        } => Some(DiffError::ForeignKeyChange {
+            table: table.clone(),
+            column: column.clone(),
+            from: from.clone(),
+            to: to.clone(),
+        }),
+        _ => None,
+    })
+}
+
 /// Policy guard, run AFTER [`diff_schema`] by the command. Refuses a plan that is
 /// structurally computable but unsafe to emit unless permitted.
 ///
@@ -1722,6 +1811,9 @@ fn plan_backend(baseline: &[Table], desired: &ParsedSchema) -> Backend {
 /// Returns a [`DiffError`] describing the first refusal; `Ok(())` for an
 /// emittable plan (including the empty no-op plan).
 pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffError> {
+    // 0. An unsafe `#[renamed_from]` hint — no override.
+    find_rename_conflict(plan).map_or(Ok(()), Err)?;
+
     // 1. Primary-key change — no override.
     if let Some(table) = plan.changes.iter().find_map(|c| match c {
         SchemaChange::PrimaryKeyChange { table } => Some(table.clone()),
@@ -1730,12 +1822,9 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
         return Err(DiffError::PrimaryKeyChange { table });
     }
 
-    // 2. Foreign-key retarget — no override (there is no safe drop+recreate).
-    if let Some((table, column)) = plan.changes.iter().find_map(|c| match c {
-        SchemaChange::ForeignKeyChange { table, column } => Some((table.clone(), column.clone())),
-        _ => None,
-    }) {
-        return Err(DiffError::ForeignKeyChange { table, column });
+    // 2. Foreign-key change — no override (there is no safe drop+recreate).
+    if let Some(err) = foreign_key_change_error(plan) {
+        return Err(err);
     }
 
     // 2a. Identity-generation change — no override (needs ADD/DROP/SET GENERATED,
@@ -1902,6 +1991,18 @@ pub fn guard_plan(plan: &MigrationPlan, opts: DiffOptions) -> Result<(), DiffErr
     Ok(())
 }
 
+/// The [`DiffError::RenameConflict`] refusal for the first
+/// [`SchemaChange::RenameConflict`] marker in `plan`, if any.
+fn find_rename_conflict(plan: &MigrationPlan) -> Option<DiffError> {
+    plan.changes.iter().find_map(|c| match c {
+        SchemaChange::RenameConflict { table, reason } => Some(DiffError::RenameConflict {
+            table: table.clone(),
+            reason: reason.clone(),
+        }),
+        _ => None,
+    })
+}
+
 /// The [`DiffError::IdentityChange`] refusal for the first
 /// [`SchemaChange::IdentityChange`] marker in `plan`, if any.
 fn find_identity_change_block(plan: &MigrationPlan) -> Option<DiffError> {
@@ -2011,7 +2112,9 @@ fn generated_identifiers(plan: &MigrationPlan) -> Vec<String> {
                 // over-limit one is truncate+hashed — so this never trips the guard.
                 names.push(bounded_pg_identifier(&format!("{table}_{column}_fkey")));
             }
-            SchemaChange::AddIndex { index, .. } => names.push(index.name.clone()),
+            SchemaChange::AddIndex { index, .. } | SchemaChange::RenameIndex { index, .. } => {
+                names.push(index.name.clone());
+            }
             SchemaChange::CreateTable(table) => {
                 names.extend(table.indexes.iter().map(|i| i.name.clone()));
             }
@@ -2094,6 +2197,17 @@ fn bounded_pg_identifier(raw: &str) -> String {
 fn find_identifier_limit_violation(plan: &MigrationPlan) -> Option<DiffError> {
     if plan.backend != Backend::Postgres {
         return None;
+    }
+    // A rename target comes from the models, so it has no length limit there.
+    if let Some(name) = plan.changes.iter().find_map(|c| match c {
+        SchemaChange::RenameTable { to, .. } | SchemaChange::RenameColumn { to, .. }
+            if to.len() > PG_MAX_IDENTIFIER_BYTES =>
+        {
+            Some(to.clone())
+        }
+        _ => None,
+    }) {
+        return Some(DiffError::GeneratedIdentifierTooLong { name });
     }
     let mut by_truncated: BTreeMap<String, String> = BTreeMap::new();
     for name in generated_identifiers(plan) {
@@ -2212,6 +2326,9 @@ pub struct SchemaContext {
     pub desired: BTreeMap<String, Table>,
     /// Baseline (pre-migration) tables, by name — the "new shape" for a down rebuild.
     pub baseline: BTreeMap<String, Table>,
+    /// `(table, column)` of each decimal column that the parser skipped (a bad
+    /// `#[decimal_shape]`, issue #2598). A `SQLite` rebuild of its table refuses.
+    pub skipped_decimals: BTreeSet<(String, String)>,
 }
 
 impl SchemaContext {
@@ -2228,7 +2345,26 @@ impl SchemaContext {
                 .iter()
                 .map(|t| (t.name.clone(), t.clone()))
                 .collect(),
+            skipped_decimals: BTreeSet::new(),
         }
+    }
+
+    /// Record the decimal columns that the parser skipped in `desired` (issue
+    /// #2598). The rebuild cannot write their `CHECK`.
+    #[must_use]
+    pub fn with_skipped_decimals(mut self, desired: &ParsedSchema) -> Self {
+        self.skipped_decimals = desired
+            .diagnostics
+            .iter()
+            .filter(|d| {
+                matches!(
+                    ColumnType::from_rust_type(&d.rust_type),
+                    Some(ColumnType::Decimal { .. })
+                )
+            })
+            .map(|d| (d.table.clone(), d.field.clone()))
+            .collect();
+        self
     }
 }
 
@@ -2342,11 +2478,18 @@ fn emit_down_sql_pg(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String,
     // gathered so a multi-column retained index is recreated only after ALL its
     // dependent dropped columns are back.
     let mut dropped_by_table: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // The reversed renames run last, after the retained-index recreations below:
+    // those use the new (renamed) names.
+    let mut renames = Vec::new();
     for change in ordered {
         let sql = emit_change_down(change, plan.backend)?;
         let sql = sql.trim_end();
         if !sql.is_empty() {
-            groups.push(sql.to_owned());
+            if is_rename(change) {
+                renames.push(sql.to_owned());
+            } else {
+                groups.push(sql.to_owned());
+            }
         }
         if let SchemaChange::DropColumn { table, column } = change {
             dropped_by_table
@@ -2364,6 +2507,7 @@ fn emit_down_sql_pg(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<String,
             groups.push(index_sql(table, idx).trim_end().to_owned());
         }
     }
+    groups.extend(renames);
     Ok(join_groups(&groups))
 }
 
@@ -2434,7 +2578,11 @@ fn fk_type_change_columns(changes: &[&SchemaChange], table: &str) -> Vec<String>
 const fn change_table_name(change: &SchemaChange) -> &str {
     match change {
         SchemaChange::CreateTable(t) | SchemaChange::DropTable(t) => t.name.as_str(),
-        SchemaChange::AddColumn { table, .. }
+        SchemaChange::RenameTable { to, .. } => to.as_str(),
+        SchemaChange::RenameColumn { table, .. }
+        | SchemaChange::RenameIndex { table, .. }
+        | SchemaChange::RenameConflict { table, .. }
+        | SchemaChange::AddColumn { table, .. }
         | SchemaChange::DropColumn { table, .. }
         | SchemaChange::AlterColumnType { table, .. }
         | SchemaChange::SetNotNull { table, .. }
@@ -2466,7 +2614,9 @@ fn emit_up_sql_sqlite(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<Strin
     let mut groups = Vec::new();
     for change in &ordered {
         let table = change_table_name(change);
-        if rebuild.contains(table) {
+        // A rename runs as its own statement, before (up) or after (down) any
+        // rebuild: the rebuild copies columns by their new names.
+        if rebuild.contains(table) && !is_rename(change) {
             if emitted.insert(table.to_owned()) {
                 let block = emit_sqlite_rebuild(table, ctx, &ordered, RebuildLeg::Up)?;
                 let block = block.trim_end();
@@ -2495,7 +2645,9 @@ fn emit_down_sql_sqlite(plan: &MigrationPlan, ctx: &SchemaContext) -> Result<Str
     let mut groups = Vec::new();
     for change in &ordered {
         let table = change_table_name(change);
-        if rebuild.contains(table) {
+        // A rename runs as its own statement, before (up) or after (down) any
+        // rebuild: the rebuild copies columns by their new names.
+        if rebuild.contains(table) && !is_rename(change) {
             if emitted.insert(table.to_owned()) {
                 let block = emit_sqlite_rebuild(table, ctx, &ordered, RebuildLeg::Down)?;
                 let block = block.trim_end();
@@ -2542,7 +2694,8 @@ enum RebuildLeg {
 /// shape (`baseline` + this table's diff deltas — the same value the up leg builds
 /// as its target), **not** the parser's partial `ctx.desired`, so a
 /// retained-but-parser-invisible column is copied back on rollback rather than
-/// dropped.
+/// dropped. Both legs take the decimal precision and scale from `ctx.desired`
+/// ([`with_desired_decimal_shapes`]), so the decimal `CHECK` stays.
 fn emit_sqlite_rebuild(
     table: &str,
     ctx: &SchemaContext,
@@ -2563,10 +2716,23 @@ fn emit_sqlite_rebuild(
             ),
         });
     }
-    // Fetched as a validated precondition (a missing desired shape is a directed
-    // error, exercised by the up leg's missing-context path); neither leg copies
-    // from the parser's partial desired table any more.
-    let _desired = ctx
+    if let Some((child, action)) = rebuild_fires_child_action(table, ctx) {
+        return Err(EmitError::SqliteRebuildUnsupported {
+            table: table.to_owned(),
+            kind: "table rebuild",
+            reason: format!(
+                "`{child}` references it with ON DELETE {}. The migration runs in a \
+                 transaction, where `PRAGMA foreign_keys=OFF` has no effect, so the \
+                 rebuild's DROP TABLE would change the rows of `{child}`. Write this \
+                 change as a manual migration",
+                action.sql()
+            ),
+        });
+    }
+    // A missing desired table is an error. Neither leg copies columns from the
+    // desired table. The desired table supplies only the decimal precision and
+    // scale.
+    let desired = ctx
         .desired
         .get(table)
         .ok_or_else(|| missing_rebuild_shape(table, "desired"))?;
@@ -2574,16 +2740,39 @@ fn emit_sqlite_rebuild(
         .baseline
         .get(table)
         .ok_or_else(|| missing_rebuild_shape(table, "baseline"))?;
+    let post_migration = baseline_with_changes_applied(baseline, changes, table);
+    // #2598: a decimal column that the parser skipped has no desired precision
+    // and scale. A `CHECK` from the baseline values can be wrong, and a `TEXT`
+    // baseline gives no `CHECK`, so refuse.
+    if let Some(column) = post_migration.columns.iter().find(|c| {
+        ctx.skipped_decimals
+            .contains(&(table.to_owned(), c.name.clone()))
+            || (matches!(c.ty, ColumnType::Decimal { .. })
+                && !desired.columns.iter().any(|d| d.name == c.name))
+    }) {
+        return Err(EmitError::SqliteRebuildUnsupported {
+            table: table.to_owned(),
+            kind: "table rebuild",
+            reason: format!(
+                "the model does not give the precision and scale of the decimal column \
+                 `{}`, so the rebuild cannot write its `CHECK`. Correct the \
+                 `#[decimal_shape]` of the field, or write this change as a manual migration",
+                column.name
+            ),
+        });
+    }
+    let fk_cols = fk_type_change_columns(changes, table);
     match leg {
         // Build the up-leg target from the rich baseline with this table's explicit
         // diff deltas applied, preserving every unchanged baseline facet the parser
         // could not observe; the source (INSERT..SELECT) columns are the baseline's,
         // i.e. the actual existing table.
         RebuildLeg::Up => {
-            let new_shape = baseline_with_changes_applied(baseline, changes, table);
-            let fk_cols = fk_type_change_columns(changes, table);
+            let mut new_shape = post_migration;
+            let mut added = with_desired_decimal_shapes(&mut new_shape, desired);
+            added.extend(decimal_type_changes(changes, table, leg));
             Ok(render_sqlite_rebuild(
-                table, &new_shape, baseline, leg, &fk_cols,
+                table, &new_shape, baseline, leg, &fk_cols, &added,
             ))
         }
         // The down leg rolls back to the rich baseline shape. Its copy SOURCE is the
@@ -2595,17 +2784,45 @@ fn emit_sqlite_rebuild(
         // post-migration source copies back every baseline column the up migration did
         // not drop, in baseline order.
         RebuildLeg::Down => {
-            let post_migration = baseline_with_changes_applied(baseline, changes, table);
-            let fk_cols = fk_type_change_columns(changes, table);
+            let mut old_shape = baseline.clone();
+            let mut added = with_desired_decimal_shapes(&mut old_shape, desired);
+            added.extend(decimal_type_changes(changes, table, leg));
             Ok(render_sqlite_rebuild(
                 table,
-                baseline,
+                &old_shape,
                 &post_migration,
                 leg,
                 &fk_cols,
+                &added,
             ))
         }
     }
+}
+
+/// A foreign key as SQL, for example `users(id) ON DELETE CASCADE`.
+fn describe_foreign_key(fk: &ForeignKey) -> String {
+    format!("{}({}){}", fk.table, fk.column, fk.action_clauses())
+}
+
+/// The first column in `ctx` whose foreign key to `table` deletes or changes
+/// rows on delete (`CASCADE`, `SET NULL`, `SET DEFAULT`). A rebuild drops
+/// `table`, so it would fire that action. This includes a self-reference: the
+/// staging table's rows reference the old table too.
+fn rebuild_fires_child_action(
+    table: &str,
+    ctx: &SchemaContext,
+) -> Option<(String, ForeignKeyAction)> {
+    ctx.baseline
+        .values()
+        .chain(ctx.desired.values())
+        .flat_map(|t| t.columns.iter().map(move |c| (t, c)))
+        .find_map(|(t, c)| {
+            let fk = c.references.as_ref().filter(|fk| fk.table == table)?;
+            match fk.on_delete? {
+                ForeignKeyAction::Restrict => None,
+                action => Some((format!("{}.{}", t.name, c.name), action)),
+            }
+        })
 }
 
 /// Apply the table's own plan changes to its baseline shape, preserving every
@@ -2688,6 +2905,62 @@ fn baseline_with_changes_applied(
     shape
 }
 
+/// Copy the desired decimal precision and scale into a `SQLite` rebuild table,
+/// for each baseline column that lost its decimal type (issue #2598).
+///
+/// The renderer builds the decimal `CHECK` from the precision and scale.
+/// `--dev-url` and `schema pull` read a decimal column as `TEXT`. Without this
+/// function, a rebuild removes the `CHECK`. A baseline decimal keeps its
+/// precision and scale: a different value is a type change in the plan. A
+/// column with a different storage class keeps its baseline type: that is a
+/// real type change too.
+///
+/// Returns the names of the columns it changes. The rebuild writes a new
+/// `CHECK` for each of them.
+fn with_desired_decimal_shapes(shape: &mut Table, desired: &Table) -> Vec<String> {
+    let mut changed = Vec::new();
+    for column in &mut shape.columns {
+        if let Some(want) = desired.columns.iter().find(|c| c.name == column.name)
+            && matches!(want.ty, ColumnType::Decimal { .. })
+            && !matches!(column.ty, ColumnType::Decimal { .. })
+            && column_types_equivalent(&column.ty, &want.ty, Backend::Sqlite)
+        {
+            column.ty = want.ty.clone();
+            changed.push(column.name.clone());
+        }
+    }
+    changed
+}
+
+/// The columns of `table` with a type change to a decimal in the `leg` target:
+/// `to` for the up leg, `from` for the down leg (issue #2598). The rebuild
+/// writes a new decimal `CHECK` for each.
+fn decimal_type_changes(changes: &[&SchemaChange], table: &str, leg: RebuildLeg) -> Vec<String> {
+    changes
+        .iter()
+        .filter_map(|change| match change {
+            SchemaChange::AlterColumnType {
+                table: t,
+                column,
+                from,
+                to,
+            } if t == table
+                && matches!(
+                    if matches!(leg, RebuildLeg::Up) {
+                        to
+                    } else {
+                        from
+                    },
+                    ColumnType::Decimal { .. }
+                ) =>
+            {
+                Some(column.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The [`EmitError::SqliteRebuildUnsupported`] for a rebuild whose `which`
 /// (`"desired"` / `"baseline"`) table shape is absent from the context.
 fn missing_rebuild_shape(table: &str, which: &'static str) -> EmitError {
@@ -2711,6 +2984,7 @@ fn render_sqlite_rebuild(
     source_shape: &Table,
     leg: RebuildLeg,
     fk_type_change_cols: &[String],
+    new_decimal_checks: &[String],
 ) -> String {
     let new_table = format!("{table}__autumn_new");
     let source_cols: BTreeSet<&str> = source_shape
@@ -2757,17 +3031,7 @@ fn render_sqlite_rebuild(
         out,
         "-- autumn-safety: `PRAGMA foreign_key_check` below only REPORTS violation rows (it does not raise); the recreate copies existing values verbatim and introduces no new orphans, but the migration runner must inspect the pragma's output to treat any pre-existing orphan as an error."
     );
-    // When an FK-bound column's type is changed by this recreate, warn that SQLite
-    // (unlike Postgres, which refuses the change outright) does not enforce that the
-    // column still matches the referenced key's type — that consistency is now the
-    // author's responsibility.
-    if !fk_type_change_cols.is_empty() {
-        let cols = fk_type_change_cols.join(", ");
-        let _ = writeln!(
-            out,
-            "-- autumn-safety: foreign-key column(s) {cols} have their type changed by this recreate; SQLite does not enforce that they still match the referenced key's type, so ensure the referenced column stays type-compatible (Postgres rejects this change outright, which is why it is emitted only for SQLite)."
-        );
-    }
+    push_rebuild_advisories(&mut out, fk_type_change_cols, new_decimal_checks);
     // Preserve the AUTOINCREMENT high-water mark only when both the copy source and the
     // target shape's single PK are `BigSerial` — an `INTEGER PRIMARY KEY AUTOINCREMENT`
     // column. Such a source table has a `sqlite_sequence` row that `DROP TABLE` would
@@ -2837,6 +3101,33 @@ fn render_sqlite_rebuild(
     out
 }
 
+/// Write the optional `-- autumn-safety:` lines of a `SQLite` rebuild.
+fn push_rebuild_advisories(
+    out: &mut String,
+    fk_type_change_cols: &[String],
+    new_decimal_checks: &[String],
+) {
+    // When an FK-bound column's type is changed by this recreate, warn that SQLite
+    // (unlike Postgres, which refuses the change outright) does not enforce that the
+    // column still matches the referenced key's type — that consistency is now the
+    // author's responsibility.
+    if !fk_type_change_cols.is_empty() {
+        let cols = fk_type_change_cols.join(", ");
+        let _ = writeln!(
+            out,
+            "-- autumn-safety: foreign-key column(s) {cols} have their type changed by this recreate; SQLite does not enforce that they still match the referenced key's type, so ensure the referenced column stays type-compatible (Postgres rejects this change outright, which is why it is emitted only for SQLite)."
+        );
+    }
+    // #2598: the table can have rows that a new decimal `CHECK` rejects.
+    if !new_decimal_checks.is_empty() {
+        let cols = new_decimal_checks.join(", ");
+        let _ = writeln!(
+            out,
+            "-- autumn-safety: this recreate writes a new decimal CHECK for column(s) {cols}. If a row does not agree with the CHECK, the copy fails. Correct the rows first."
+        );
+    }
+}
+
 /// Join statement groups with a blank line and a trailing newline (empty for an
 /// empty plan).
 fn join_groups(groups: &[String]) -> String {
@@ -2870,6 +3161,10 @@ fn join_groups(groups: &[String]) -> String {
 fn up_ordered(changes: &[SchemaChange]) -> Result<Vec<&SchemaChange>, EmitError> {
     let replaced = replaced_index_names(changes);
 
+    // Renames go before everything, in plan order (tables, then columns, then
+    // indexes). The down leg reverses the plan, so it undoes them last.
+    let renames: Vec<&SchemaChange> = changes.iter().filter(|c| is_rename(c)).collect();
+
     // `CreateTable`s are the first bucket; order them topologically so referenced
     // tables precede their referencers.
     let mut creates: Vec<&SchemaChange> = changes
@@ -2893,14 +3188,27 @@ fn up_ordered(changes: &[SchemaChange]) -> Result<Vec<&SchemaChange>, EmitError>
     // through so a replaced index drops before its re-add.
     let mut rest: Vec<&SchemaChange> = changes
         .iter()
-        .filter(|c| !matches!(c, SchemaChange::CreateTable(_) | SchemaChange::DropTable(_)))
+        .filter(|c| {
+            !is_rename(c) && !matches!(c, SchemaChange::CreateTable(_) | SchemaChange::DropTable(_))
+        })
         .collect();
     rest.sort_by_key(|c| up_sort_key(c, &replaced));
 
-    let mut ordered = creates;
+    let mut ordered = renames;
+    ordered.extend(creates);
     ordered.extend(rest);
     ordered.extend(drops);
     Ok(ordered)
+}
+
+/// Whether `change` is an emittable rename (table, column or index).
+const fn is_rename(change: &SchemaChange) -> bool {
+    matches!(
+        change,
+        SchemaChange::RenameTable { .. }
+            | SchemaChange::RenameColumn { .. }
+            | SchemaChange::RenameIndex { .. }
+    )
 }
 
 /// The set of index names that appear in **both** an `AddIndex` and a `DropIndex`
@@ -3074,7 +3382,11 @@ fn topo_sort_drops(drops: &mut [&SchemaChange]) -> Result<(), EmitError> {
 /// The canonical up-order bucket for a change (lower = earlier).
 const fn up_bucket(change: &SchemaChange) -> u8 {
     match change {
-        SchemaChange::CreateTable(_) => 0,
+        // Renames never reach here: `up_ordered` puts them first.
+        SchemaChange::RenameTable { .. }
+        | SchemaChange::RenameColumn { .. }
+        | SchemaChange::RenameIndex { .. }
+        | SchemaChange::CreateTable(_) => 0,
         SchemaChange::AddColumn { .. } => 1,
         SchemaChange::AlterColumnType { .. }
         | SchemaChange::SetNotNull { .. }
@@ -3086,7 +3398,8 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
         SchemaChange::DropColumn { .. } => 6,
         SchemaChange::DropTable(_) => 7,
         // Non-emittable markers; the guard refuses them before emission is reached.
-        SchemaChange::PrimaryKeyChange { .. }
+        SchemaChange::RenameConflict { .. }
+        | SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
@@ -3099,6 +3412,15 @@ const fn up_bucket(change: &SchemaChange) -> u8 {
 /// Render a single change's forward SQL.
 fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, EmitError> {
     match change {
+        SchemaChange::RenameTable { from, to } => {
+            Ok(format!("ALTER TABLE {from} RENAME TO {to};\n"))
+        }
+        SchemaChange::RenameColumn { table, from, to } => Ok(format!(
+            "ALTER TABLE {table} RENAME COLUMN {from} TO {to};\n"
+        )),
+        SchemaChange::RenameIndex { table, from, index } => {
+            Ok(emit_rename_index(table, from, index, backend))
+        }
         SchemaChange::CreateTable(table) => Ok(emit_create_table(table, backend)),
         SchemaChange::DropTable(table) => Ok(format!(
             "-- autumn-safety: this DROP TABLE is not checked against generated \
@@ -3167,13 +3489,16 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
             let constraint = bounded_pg_identifier(&format!("{table}_{column}_fkey"));
             Ok(format!(
                 "ALTER TABLE {table} ADD CONSTRAINT {constraint} \
-                 FOREIGN KEY ({column}) REFERENCES {}({});\n",
-                foreign_key.table, foreign_key.column
+                 FOREIGN KEY ({column}) REFERENCES {}({}){};\n",
+                foreign_key.table,
+                foreign_key.column,
+                foreign_key.action_clauses()
             ))
         }
         // Non-emittable markers: the guard refuses them, so they never reach here
         // in the command flow. Render nothing defensively rather than panicking.
-        SchemaChange::PrimaryKeyChange { .. }
+        SchemaChange::RenameConflict { .. }
+        | SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
@@ -3187,6 +3512,20 @@ fn emit_change_up(change: &SchemaChange, backend: Backend) -> Result<String, Emi
 /// marker where the round-trip is not clean.
 fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, EmitError> {
     match change {
+        SchemaChange::RenameTable { from, to } => {
+            Ok(format!("ALTER TABLE {to} RENAME TO {from};\n"))
+        }
+        SchemaChange::RenameColumn { table, from, to } => Ok(format!(
+            "ALTER TABLE {table} RENAME COLUMN {to} TO {from};\n"
+        )),
+        SchemaChange::RenameIndex { table, from, index } => {
+            let old = crate::schema::rename::renamed_index(index, from).unwrap_or_else(|| {
+                let mut old = index.clone();
+                old.name.clone_from(from);
+                old
+            });
+            Ok(emit_rename_index(table, &index.name, &old, backend))
+        }
         SchemaChange::CreateTable(table) => Ok(format!("DROP TABLE {};\n", table.name)),
         SchemaChange::DropTable(table) => {
             let recreate = emit_create_table(table, backend);
@@ -3261,7 +3600,8 @@ fn emit_change_down(change: &SchemaChange, backend: Backend) -> Result<String, E
                 "ALTER TABLE {table} DROP CONSTRAINT {constraint};\n"
             ))
         }
-        SchemaChange::PrimaryKeyChange { .. }
+        SchemaChange::RenameConflict { .. }
+        | SchemaChange::PrimaryKeyChange { .. }
         | SchemaChange::ForeignKeyChange { .. }
         | SchemaChange::IdentityChange { .. }
         | SchemaChange::DropTableBlockedByInboundFk { .. }
@@ -3277,6 +3617,16 @@ const fn require_pg(backend: Backend, kind: &'static str) -> Result<(), EmitErro
     match backend {
         Backend::Postgres => Ok(()),
         Backend::Sqlite => Err(EmitError::UnsupportedOnBackend { kind, backend }),
+    }
+}
+
+/// Rename index `from` to `index.name`. Postgres uses `ALTER INDEX`. `SQLite`
+/// has no index rename, so it drops the index and creates it again. The data
+/// already satisfies the index, so this is safe.
+fn emit_rename_index(table: &str, from: &str, index: &Index, backend: Backend) -> String {
+    match backend {
+        Backend::Postgres => format!("ALTER INDEX {from} RENAME TO {};\n", index.name),
+        Backend::Sqlite => format!("DROP INDEX {from};\n{}\n", index_sql(table, index)),
     }
 }
 
@@ -3389,8 +3739,9 @@ fn emit_add_column(table: &str, column: &Column, backend: Backend) -> Result<Str
 }
 
 /// Render a column definition body: `{name} {type} {NOT NULL|NULL} [REFERENCES
-/// t(c)] [DEFAULT d]`. Shared by `CREATE TABLE` (non-PK columns) and `ADD
-/// COLUMN`.
+/// t(c) [ON DELETE a] [ON UPDATE a]] [DEFAULT d] [CHECK (…)]`. Shared by `CREATE
+/// TABLE` (non-PK columns) and `ADD COLUMN`. The `CHECK` is the `SQLite` decimal
+/// `CHECK` only.
 fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> String {
     let mut def = format!(
         "{} {} {}",
@@ -3409,10 +3760,29 @@ fn render_column_def(column: &Column, backend: Backend, render_unique: bool) -> 
         def.push_str(" UNIQUE");
     }
     if let Some(fk) = &column.references {
-        let _ = write!(def, " REFERENCES {}({})", fk.table, fk.column);
+        let _ = write!(
+            def,
+            " REFERENCES {}({}){}",
+            fk.table,
+            fk.column,
+            fk.action_clauses()
+        );
     }
     if let Some(default) = &column.default {
         let _ = write!(def, " DEFAULT {}", default_sql(default, backend));
+    }
+    // #2598: a `SQLite` decimal is `TEXT`. A `CHECK` enforces its precision and
+    // scale. The generator uses the same builder, so the two lanes write the
+    // same `CHECK`.
+    if backend == Backend::Sqlite
+        && let ColumnType::Decimal { precision, scale } = column.ty
+    {
+        let check = crate::generate::schema_edit::sqlite_decimal_check(
+            &column.name,
+            u32::from(precision),
+            u32::from(scale),
+        );
+        let _ = write!(def, " {check}");
     }
     def
 }
@@ -3460,6 +3830,14 @@ fn default_sql(default: &ColumnDefault, backend: Backend) -> String {
             Backend::Postgres => "NOW()".to_owned(),
             Backend::Sqlite => "CURRENT_TIMESTAMP".to_owned(),
         },
+        // `SQLite` takes an expression default only inside parentheses, and its
+        // catalog returns this one without them.
+        ColumnDefault::Sql(sql)
+            if backend == Backend::Sqlite
+                && sql.trim() == autumn_schema_core::SQLITE_UUID_V4_SQL =>
+        {
+            format!("({})", sql.trim())
+        }
         ColumnDefault::Sql(sql) => sql.clone(),
     }
 }
@@ -3560,13 +3938,17 @@ fn pk_kind_for(column: &Column) -> Option<IdKind> {
         ColumnType::Int64 if column.default.is_none() => Some(IdKind::BigSerial),
         ColumnType::Int32 if is_nextval_default(column) => Some(IdKind::Serial),
         ColumnType::Uuid if is_convention_uuid_default(column) => Some(IdKind::Uuid),
+        // `SQLite` introspection reads the generated UUID key as `TEXT`. Its
+        // default is the one marker that tells it from a plain text key.
+        ColumnType::Text if is_sqlite_uuid_default(column) => Some(IdKind::Uuid),
         _ => None,
     }
 }
 
 /// Whether a UUID primary-key column's stored default is *exactly* the Autumn model
-/// convention `gen_random_uuid()` — the value `parse::convention_default` records for
-/// a Postgres UUID `#[id]` and the string introspection preserves verbatim
+/// convention `gen_random_uuid()` (Postgres) or the `SQLite` `randomblob` v4
+/// expression — the value `parse::convention_default` records for
+/// a UUID `#[id]` and the string introspection preserves verbatim
 /// (`normalize_default` keeps it as-is). Only then may the DDL emitter collapse the
 /// column into the `IdKind::Uuid` shape (`UUID PRIMARY KEY DEFAULT
 /// gen_random_uuid()`); a UUID PK with any other default — or none — is rendered as an
@@ -3574,7 +3956,18 @@ fn pk_kind_for(column: &Column) -> Option<IdKind> {
 fn is_convention_uuid_default(column: &Column) -> bool {
     matches!(
         &column.default,
-        Some(ColumnDefault::Sql(sql)) if sql.trim() == "gen_random_uuid()"
+        Some(ColumnDefault::Sql(sql))
+            if sql.trim() == "gen_random_uuid()"
+                || sql.trim() == autumn_schema_core::SQLITE_UUID_V4_SQL
+    )
+}
+
+/// Whether a column's default is exactly the `SQLite` `randomblob` v4 UUID
+/// expression (issue #2555).
+fn is_sqlite_uuid_default(column: &Column) -> bool {
+    matches!(
+        &column.default,
+        Some(ColumnDefault::Sql(sql)) if sql.trim() == autumn_schema_core::SQLITE_UUID_V4_SQL
     )
 }
 
@@ -3612,6 +4005,16 @@ pub fn describe_plan(plan: &MigrationPlan) -> String {
 /// A one-line description of a single change.
 fn describe_change(change: &SchemaChange) -> String {
     match change {
+        SchemaChange::RenameTable { from, to } => format!("~ RENAME TABLE {from} TO {to}"),
+        SchemaChange::RenameColumn { table, from, to } => {
+            format!("~ RENAME COLUMN {table}.{from} TO {to}")
+        }
+        SchemaChange::RenameIndex { table, from, index } => {
+            format!("~ RENAME INDEX {from} TO {} ON {table}", index.name)
+        }
+        SchemaChange::RenameConflict { table, reason } => {
+            format!("! RENAME on {table}: {reason} (refused)")
+        }
         SchemaChange::CreateTable(t) => format!("+ CREATE TABLE {}", t.name),
         SchemaChange::DropTable(t) => format!("- DROP TABLE {}", t.name),
         SchemaChange::AddColumn { table, column } => {
@@ -3655,8 +4058,13 @@ fn describe_change(change: &SchemaChange) -> String {
         SchemaChange::PrimaryKeyChange { table } => {
             format!("! PRIMARY KEY CHANGE on {table} (refused)")
         }
-        SchemaChange::ForeignKeyChange { table, column } => {
-            format!("! FOREIGN KEY RETARGET on {table}.{column} (refused)")
+        SchemaChange::ForeignKeyChange {
+            table,
+            column,
+            from,
+            to,
+        } => {
+            format!("! FOREIGN KEY CHANGE on {table}.{column}: {from} -> {to} (refused)")
         }
         SchemaChange::IdentityChange { table, column } => {
             format!("! IDENTITY CHANGE on {table}.{column} (refused)")
@@ -3689,7 +4097,7 @@ fn describe_change(change: &SchemaChange) -> String {
 #[allow(clippy::needless_raw_string_hashes)]
 mod tests {
     use super::*;
-    use autumn_schema_core::{ForeignKey, Table};
+    use autumn_schema_core::{ForeignKey, ForeignKeyAction, Table};
 
     use crate::schema::parse::SchemaDiagnostic;
 
@@ -3724,8 +4132,8 @@ mod tests {
 
     fn parsed(tables: Vec<Table>, diagnostics: Vec<SchemaDiagnostic>) -> ParsedSchema {
         ParsedSchema {
-            tables,
             diagnostics,
+            ..ParsedSchema::from_tables(tables)
         }
     }
 
@@ -5135,6 +5543,8 @@ mod tests {
             vec![SchemaChange::ForeignKeyChange {
                 table: "posts".to_owned(),
                 column: "author_id".to_owned(),
+                from: "users(id)".to_owned(),
+                to: "accounts(id)".to_owned(),
             }],
             "an FK retarget is the refused marker, not an AddForeignKey: {plan:?}"
         );
@@ -5745,6 +6155,67 @@ mod tests {
             up.contains("id UUID PRIMARY KEY DEFAULT gen_random_uuid()"),
             "uuid PK: {up}"
         );
+    }
+
+    #[test]
+    fn create_table_uuid_pk_renders_the_v4_expression_on_sqlite() {
+        let mut t = Table::new("posts", Backend::Sqlite);
+        let mut id = col("id", ColumnType::Uuid);
+        id.primary_key = true;
+        id.default = Some(ColumnDefault::Sql(
+            autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned(),
+        ));
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::CreateTable(t)],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("id TEXT PRIMARY KEY NOT NULL DEFAULT (lower(hex(randomblob(4)))"),
+            "uuid PK: {up}"
+        );
+        // The shape owns the default: it is not appended a second time.
+        assert_eq!(up.matches("randomblob(4)").count(), 1, "{up}");
+    }
+
+    /// `SQLite` introspection reads the generated UUID key as `TEXT`, not `Uuid`.
+    /// A table rebuild from that shape must still write the key as the shape does,
+    /// with the default in parentheses. A bare function call is a syntax error.
+    #[test]
+    fn rebuild_from_an_introspected_sqlite_uuid_key_keeps_the_parenthesized_default() {
+        let mut t = Table::new("posts", Backend::Sqlite);
+        let mut id = col("id", ColumnType::Text);
+        id.primary_key = true;
+        id.default = Some(ColumnDefault::Sql(
+            autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned(),
+        ));
+        t.primary_key.push("id".to_owned());
+        t.columns.push(id);
+        assert_eq!(single_pk_column(&t).map(|(_, k)| k), Some(IdKind::Uuid));
+        let body = render_create_table_body("posts", &t, Backend::Sqlite);
+        assert!(
+            body.contains("id TEXT PRIMARY KEY NOT NULL DEFAULT (lower(hex(randomblob(4)))"),
+            "{body}"
+        );
+        // A non-key column with the same default is parenthesized too.
+        let mut other = col("ref", ColumnType::Text);
+        other.default = Some(ColumnDefault::Sql(
+            autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned(),
+        ));
+        let def = render_column_def(&other, Backend::Sqlite, false);
+        assert!(def.contains("DEFAULT (lower(hex(randomblob(4)))"), "{def}");
+    }
+
+    #[test]
+    fn pk_kind_for_uuid_accepts_the_sqlite_convention_default() {
+        let mut conv = col("id", ColumnType::Uuid);
+        conv.primary_key = true;
+        conv.default = Some(ColumnDefault::Sql(
+            autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned(),
+        ));
+        assert_eq!(pk_kind_for(&conv), Some(IdKind::Uuid));
     }
 
     #[test]
@@ -7416,7 +7887,7 @@ PRAGMA foreign_keys=ON;
             "a default-less UUID PK is not the IdKind::Uuid convention shape"
         );
         for leg in [RebuildLeg::Up, RebuildLeg::Down] {
-            let sql = render_sqlite_rebuild("posts", &desired, &baseline, leg, &[]);
+            let sql = render_sqlite_rebuild("posts", &desired, &baseline, leg, &[], &[]);
             assert!(
                 !sql.contains("sqlite_sequence"),
                 "no sqlite_sequence statements for a Uuid PK ({leg:?}): {sql}"
@@ -7620,6 +8091,313 @@ PRAGMA foreign_keys=ON;
             "sqlite PK: {up}"
         );
         assert!(up.contains("ADD COLUMN bio TEXT NULL"), "{up}");
+    }
+
+    // -- #2598: the SQLite decimal CHECK on the declarative lane -------------
+
+    const PRICE: ColumnType = ColumnType::Decimal {
+        precision: 10,
+        scale: 2,
+    };
+
+    /// The generator's `CHECK` for `price decimal{10,2}`: the one builder both
+    /// lanes share.
+    fn price_check() -> String {
+        crate::generate::schema_edit::sqlite_decimal_check("price", 10, 2)
+    }
+
+    /// `CREATE TABLE` and `ADD COLUMN` on `SQLite` put the generator's decimal
+    /// `CHECK` on the column, byte for byte. Postgres gets `NUMERIC` and no
+    /// `CHECK`.
+    #[test]
+    fn sqlite_decimal_column_renders_the_generator_check() {
+        let table = sqlite_table("products", vec![col("price", PRICE)], vec![]);
+        let mut cost = col("cost", PRICE);
+        cost.nullable = true;
+        let plan = MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![
+                SchemaChange::CreateTable(table.clone()),
+                SchemaChange::AddColumn {
+                    table: "products".to_owned(),
+                    column: cost,
+                },
+            ],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains(&format!("    price TEXT NOT NULL {}", price_check())),
+            "CREATE TABLE carries the generator CHECK: {up}"
+        );
+        let cost_check = crate::generate::schema_edit::sqlite_decimal_check("cost", 10, 2);
+        assert!(
+            up.contains(&format!("ADD COLUMN cost TEXT NULL {cost_check};")),
+            "ADD COLUMN carries the generator CHECK: {up}"
+        );
+
+        let mut pg_table = table;
+        pg_table.backend = Backend::Postgres;
+        let pg = emit_create_table(&pg_table, Backend::Postgres);
+        assert!(pg.contains("price NUMERIC(10,2) NOT NULL"), "{pg}");
+        assert!(!pg.contains("CHECK"), "Postgres needs no CHECK: {pg}");
+    }
+
+    /// The baseline and the model for the rebuild tests. `DROP NOT NULL` on
+    /// `views` is the change: `SQLite` applies it only with a rebuild. `price`
+    /// and the nullable `cost` are decimals with different shapes.
+    fn decimal_rebuild_tables(price: ColumnType, cost: ColumnType) -> (Table, Table) {
+        let mut cost_col = col("cost", cost);
+        cost_col.nullable = true;
+        let baseline = sqlite_table(
+            "products",
+            vec![
+                col("views", ColumnType::Int64),
+                col("price", price),
+                cost_col,
+            ],
+            vec![],
+        );
+        let mut views = col("views", ColumnType::Int64);
+        views.nullable = true;
+        let mut cost_want = col(
+            "cost",
+            ColumnType::Decimal {
+                precision: 5,
+                scale: 0,
+            },
+        );
+        cost_want.nullable = true;
+        let desired = sqlite_table(
+            "products",
+            vec![views, col("price", PRICE), cost_want],
+            vec![],
+        );
+        (baseline, desired)
+    }
+
+    /// The up SQL and the down SQL of the plan from `baseline` to `desired`.
+    fn rebuild_legs(
+        baseline: &Table,
+        desired: &Table,
+        changes: usize,
+    ) -> [(&'static str, String); 2] {
+        let plan = diff_schema(
+            std::slice::from_ref(baseline),
+            &parsed(vec![desired.clone()], vec![]),
+            DiffOptions::default(),
+        );
+        assert_eq!(plan.changes.len(), changes, "{:?}", plan.changes);
+        let ctx = SchemaContext::from_tables(
+            std::slice::from_ref(desired),
+            std::slice::from_ref(baseline),
+        );
+        [
+            (
+                "up",
+                emit_up_sql_with_context(&plan, &ctx).expect("emit up"),
+            ),
+            (
+                "down",
+                emit_down_sql_with_context(&plan, &ctx).expect("emit down"),
+            ),
+        ]
+    }
+
+    /// A rebuild for a different change keeps the decimal `CHECK` of each
+    /// column. `--dev-url` and `schema pull` read a decimal column as `TEXT`.
+    /// Then the model gives the precision and scale, and the SQL tells the user
+    /// that the rebuild adds the `CHECK`.
+    #[test]
+    fn sqlite_rebuild_keeps_the_desired_decimal_check() {
+        let cost = ColumnType::Decimal {
+            precision: 5,
+            scale: 0,
+        };
+        let cost_check = crate::generate::schema_edit::sqlite_decimal_check("cost", 5, 0);
+        for (price, cost, text_baseline) in [
+            (PRICE, cost, false),
+            (ColumnType::Text, ColumnType::Text, true),
+        ] {
+            let (baseline, desired) = decimal_rebuild_tables(price, cost.clone());
+            for (leg, sql) in rebuild_legs(&baseline, &desired, 1) {
+                assert!(
+                    sql.contains(&format!("    price TEXT NOT NULL {}", price_check())),
+                    "the {leg} rebuild keeps the `price` CHECK: {sql}"
+                );
+                assert!(
+                    sql.contains(&format!("    cost TEXT NULL {cost_check}")),
+                    "the {leg} rebuild keeps the `cost` CHECK: {sql}"
+                );
+                assert_eq!(
+                    sql.contains(
+                        "-- autumn-safety: this recreate writes a new decimal CHECK for column(s) price, cost."
+                    ),
+                    text_baseline,
+                    "the {leg} rebuild tells the user only when it adds a CHECK: {sql}"
+                );
+            }
+        }
+    }
+
+    /// On `SQLite`, a different decimal precision or scale is a type change.
+    /// Both are `TEXT`, but the `CHECK` is different. The up leg writes the new
+    /// `CHECK`, and the down leg writes the old `CHECK` again.
+    #[test]
+    fn sqlite_decimal_shape_change_is_a_type_change() {
+        let old = ColumnType::Decimal {
+            precision: 12,
+            scale: 2,
+        };
+        let old_check = crate::generate::schema_edit::sqlite_decimal_check("price", 12, 2);
+        let baseline = sqlite_table("products", vec![col("price", old)], vec![]);
+        let desired = sqlite_table("products", vec![col("price", PRICE)], vec![]);
+        let [(_, up), (_, down)] = rebuild_legs(&baseline, &desired, 1);
+        assert!(up.contains(&price_check()), "{up}");
+        assert!(!up.contains(&old_check), "{up}");
+        assert!(down.contains(&old_check), "{down}");
+        assert!(!down.contains(&price_check()), "{down}");
+        for sql in [&up, &down] {
+            assert!(
+                sql.contains("writes a new decimal CHECK for column(s) price."),
+                "the SQL does not tell the user about the new CHECK: {sql}"
+            );
+        }
+    }
+
+    /// A decimal column that the parser skipped (a bad `#[decimal_shape]`) has
+    /// no desired precision and scale. The rebuild refuses: a `CHECK` from the
+    /// baseline values can be wrong, and a `TEXT` baseline gives no `CHECK`.
+    #[test]
+    fn sqlite_rebuild_refuses_a_skipped_decimal_column() {
+        let stale = ColumnType::Decimal {
+            precision: 12,
+            scale: 2,
+        };
+        let skipped = SchemaDiagnostic {
+            rust_type: "rust_decimal::Decimal".to_owned(),
+            ..diag("Product", "products", "price")
+        };
+        for baseline_ty in [stale, ColumnType::Text] {
+            let baseline = sqlite_table(
+                "products",
+                vec![col("views", ColumnType::Int64), col("price", baseline_ty)],
+                vec![],
+            );
+            let mut views = col("views", ColumnType::Int64);
+            views.nullable = true;
+            let desired = parsed(
+                vec![sqlite_table("products", vec![views], vec![])],
+                vec![skipped.clone()],
+            );
+            let plan = diff_schema(
+                std::slice::from_ref(&baseline),
+                &desired,
+                DiffOptions::default(),
+            );
+            let ctx = SchemaContext::from_tables(&desired.tables, std::slice::from_ref(&baseline))
+                .with_skipped_decimals(&desired);
+            for result in [
+                emit_up_sql_with_context(&plan, &ctx),
+                emit_down_sql_with_context(&plan, &ctx),
+            ] {
+                let err = result.expect_err("the rebuild did not refuse");
+                assert!(
+                    matches!(err, EmitError::SqliteRebuildUnsupported { .. }),
+                    "{err:?}"
+                );
+                assert!(err.to_string().contains("`price`"), "{err}");
+            }
+        }
+    }
+
+    /// A column that the parser skipped for a different reason (an enum) does
+    /// not block the rebuild.
+    #[test]
+    fn sqlite_rebuild_allows_a_skipped_non_decimal_column() {
+        let baseline = sqlite_table(
+            "products",
+            vec![
+                col("views", ColumnType::Int64),
+                col("status", ColumnType::Text),
+            ],
+            vec![],
+        );
+        let mut views = col("views", ColumnType::Int64);
+        views.nullable = true;
+        let desired = parsed(
+            vec![sqlite_table("products", vec![views], vec![])],
+            vec![SchemaDiagnostic {
+                rust_type: "ProductStatus".to_owned(),
+                ..diag("Product", "products", "status")
+            }],
+        );
+        let plan = diff_schema(
+            std::slice::from_ref(&baseline),
+            &desired,
+            DiffOptions::default(),
+        );
+        let ctx = SchemaContext::from_tables(&desired.tables, std::slice::from_ref(&baseline))
+            .with_skipped_decimals(&desired);
+        emit_up_sql_with_context(&plan, &ctx).expect("emit up");
+        emit_down_sql_with_context(&plan, &ctx).expect("emit down");
+    }
+
+    /// The model precision and scale replace only a baseline type of the same
+    /// storage class. A real type change (`INTEGER` to `TEXT`) keeps the
+    /// baseline type in the down leg.
+    #[test]
+    fn sqlite_rebuild_down_leg_keeps_a_changed_column_type() {
+        let baseline = sqlite_table("products", vec![col("price", ColumnType::Int64)], vec![]);
+        let desired = sqlite_table("products", vec![col("price", PRICE)], vec![]);
+        let [(_, up), (_, down)] = rebuild_legs(&baseline, &desired, 1);
+        assert!(up.contains(&price_check()), "the up leg has no CHECK: {up}");
+        assert!(up.contains("writes a new decimal CHECK"), "{up}");
+        assert!(down.contains("    price INTEGER NOT NULL"), "{down}");
+        assert!(!down.contains("CHECK"), "the down leg has a CHECK: {down}");
+    }
+
+    /// `ADD COLUMN` with the decimal `CHECK` applies to a table with rows, and
+    /// the new column then rejects what the `CHECK` rejects.
+    #[test]
+    fn sqlite_add_decimal_column_applies_on_real_sqlite() {
+        use diesel::connection::SimpleConnection as _;
+        use diesel::prelude::*;
+
+        let mut conn = SqliteConnection::establish(":memory:").expect("in-memory sqlite");
+        conn.batch_execute(
+            "CREATE TABLE products (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL);\n\
+             INSERT INTO products (title) VALUES ('a'), ('b');",
+        )
+        .expect("seed");
+        let mut price = col("price", PRICE);
+        price.nullable = true;
+        let up = emit_up_sql(&MigrationPlan {
+            backend: Backend::Sqlite,
+            changes: vec![SchemaChange::AddColumn {
+                table: "products".to_owned(),
+                column: price,
+            }],
+        })
+        .expect("emit");
+        conn.batch_execute(&up).expect("apply ADD COLUMN");
+        let insert = |conn: &mut SqliteConnection, value: &str| {
+            conn.batch_execute(&format!(
+                "INSERT INTO products (title, price) VALUES ('c', {value});"
+            ))
+            .is_ok()
+        };
+        assert!(insert(&mut conn, "'19.99'"), "the CHECK rejects '19.99'");
+        assert!(insert(&mut conn, "NULL"), "the CHECK rejects NULL");
+        for value in crate::generate::schema_edit::SQLITE_DECIMAL_10_2_REJECTS {
+            assert!(
+                !insert(&mut conn, &format!("'{value}'")),
+                "the CHECK accepts '{value}'"
+            );
+        }
+        assert!(
+            !insert(&mut conn, "x'31392e3939'"),
+            "the CHECK accepts a blob"
+        );
     }
 
     #[test]
@@ -8607,5 +9385,261 @@ PRAGMA foreign_keys=ON;
             email_at < index_at && tenant_at < index_at,
             "both dependent columns must be re-added BEFORE the index is recreated: {down}"
         );
+    }
+    // -- foreign-key actions (#1975) -------------------------------------------
+
+    fn cascade_fk() -> ForeignKey {
+        ForeignKey::new("users", "id")
+            .with_on_delete(Some(ForeignKeyAction::Cascade))
+            .with_on_update(Some(ForeignKeyAction::Restrict))
+    }
+
+    #[test]
+    fn fk_actions_render_on_add_column() {
+        for (backend, ty) in [(Backend::Postgres, "BIGINT"), (Backend::Sqlite, "INTEGER")] {
+            let mut author = col("author_id", ColumnType::Int64);
+            author.nullable = true;
+            author.references = Some(cascade_fk());
+            let plan = MigrationPlan {
+                backend,
+                changes: vec![SchemaChange::AddColumn {
+                    table: "posts".to_owned(),
+                    column: author,
+                }],
+            };
+            let up = emit_up_sql(&plan).expect("emit");
+            assert!(
+                up.contains(&format!(
+                    "ADD COLUMN author_id {ty} NULL REFERENCES users(id) \
+                     ON DELETE CASCADE ON UPDATE RESTRICT;"
+                )),
+                "{backend:?}: {up}"
+            );
+        }
+    }
+
+    #[test]
+    fn fk_actions_render_on_create_table() {
+        let mut author = col("author_id", ColumnType::Int64);
+        author.references =
+            Some(ForeignKey::new("users", "id").with_on_delete(Some(ForeignKeyAction::SetDefault)));
+        let plan = diff_schema(
+            &[],
+            &parsed(vec![posts_with(vec![author])], vec![]),
+            DEFAULT_OPTS,
+        );
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains("author_id BIGINT NOT NULL REFERENCES users(id) ON DELETE SET DEFAULT"),
+            "{up}"
+        );
+    }
+
+    #[test]
+    fn fk_actions_render_on_add_foreign_key() {
+        let plan = MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![SchemaChange::AddForeignKey {
+                table: "posts".to_owned(),
+                column: "author_id".to_owned(),
+                foreign_key: cascade_fk(),
+            }],
+        };
+        let up = emit_up_sql(&plan).expect("emit");
+        assert!(
+            up.contains(
+                "FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE ON UPDATE RESTRICT;"
+            ),
+            "{up}"
+        );
+    }
+
+    #[test]
+    fn fk_actions_are_restored_by_the_down_of_a_drop_table() {
+        let mut author = col("author_id", ColumnType::Int64);
+        author.references = Some(cascade_fk());
+        let base = vec![posts_with(vec![author])];
+        let plan = diff_schema(&base, &parsed(vec![], vec![]), ALLOW);
+        guard_plan(&plan, ALLOW).expect("drop allowed");
+        let down = emit_down_sql(&plan).expect("emit down");
+        assert!(
+            down.contains("REFERENCES users(id) ON DELETE CASCADE ON UPDATE RESTRICT"),
+            "{down}"
+        );
+    }
+
+    #[test]
+    fn fk_action_change_is_refused_with_no_override() {
+        // The engine has no step that drops the old constraint, so it refuses.
+        let mut base_author = col("author_id", ColumnType::Int64);
+        base_author.references = Some(ForeignKey::new("users", "id"));
+        let mut want_author = col("author_id", ColumnType::Int64);
+        want_author.references = Some(cascade_fk());
+        let plan = diff_schema(
+            &[posts_with(vec![base_author])],
+            &parsed(vec![posts_with(vec![want_author])], vec![]),
+            DEFAULT_OPTS,
+        );
+        assert_eq!(
+            plan.changes,
+            vec![SchemaChange::ForeignKeyChange {
+                table: "posts".to_owned(),
+                column: "author_id".to_owned(),
+                from: "users(id)".to_owned(),
+                to: "users(id) ON DELETE CASCADE ON UPDATE RESTRICT".to_owned(),
+            }]
+        );
+        let err = guard_plan(&plan, ALLOW).unwrap_err();
+        assert!(matches!(err, DiffError::ForeignKeyChange { .. }), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`REFERENCES users(id) ON DELETE CASCADE ON UPDATE RESTRICT`"),
+            "{msg}"
+        );
+        assert!(msg.contains("on_delete = \"cascade\""), "{msg}");
+        assert!(
+            describe_change(&plan.changes[0]).contains("FOREIGN KEY CHANGE"),
+            "the plan label names a change, not a retarget"
+        );
+    }
+
+    #[test]
+    fn sqlite_recreate_keeps_fk_actions() {
+        let mut base_posts = sqlite_posts_with_author(ColumnType::Int64);
+        base_posts.columns[1].references = Some(cascade_fk());
+        let mut want_posts = base_posts.clone();
+        // A NOT NULL -> NULL change forces a recreate on SQLite.
+        let mut body = col("body", ColumnType::Text);
+        base_posts.columns.push(body.clone());
+        body.nullable = true;
+        want_posts.columns.push(body);
+        let baseline = vec![sqlite_users_table(), base_posts];
+        let desired = vec![sqlite_users_table(), want_posts];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), DEFAULT_OPTS);
+        guard_plan(&plan, DEFAULT_OPTS).expect("drop not null is safe");
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let up = emit_up_sql_with_context(&plan, &ctx).expect("emit sqlite rebuild");
+        assert!(
+            up.contains(
+                "author_id INTEGER NULL REFERENCES users(id) ON DELETE CASCADE ON UPDATE RESTRICT"
+            ),
+            "{up}"
+        );
+    }
+    /// The migration runs in a transaction, where `PRAGMA foreign_keys=OFF` has
+    /// no effect. So `DROP TABLE users` in a rebuild of `users` fires the child
+    /// actions. The emitter must refuse when a child cascades or sets values.
+    #[test]
+    fn sqlite_rebuild_of_a_cascade_target_is_refused() {
+        for action in [
+            ForeignKeyAction::Cascade,
+            ForeignKeyAction::SetNull,
+            ForeignKeyAction::SetDefault,
+        ] {
+            let mut posts = sqlite_posts_with_author(ColumnType::Int64);
+            posts.columns[1].references =
+                Some(ForeignKey::new("users", "id").with_on_delete(Some(action)));
+            let mut base_users = sqlite_users_table();
+            base_users.columns.push(col("name", ColumnType::Text));
+            let mut want_users = sqlite_users_table();
+            let mut name = col("name", ColumnType::Text);
+            name.nullable = true;
+            want_users.columns.push(name);
+            let baseline = vec![base_users, posts.clone()];
+            let desired = vec![want_users, posts];
+            let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), DEFAULT_OPTS);
+            guard_plan(&plan, DEFAULT_OPTS).expect("drop not null is safe");
+            let ctx = SchemaContext::from_tables(&desired, &baseline);
+            for result in [
+                emit_up_sql_with_context(&plan, &ctx),
+                emit_down_sql_with_context(&plan, &ctx),
+            ] {
+                let err = result.expect_err("a rebuild must not fire child actions");
+                assert!(
+                    matches!(err, EmitError::SqliteRebuildUnsupported { .. }),
+                    "{err:?}"
+                );
+                assert!(err.to_string().contains("posts.author_id"), "{err}");
+                assert!(err.to_string().contains(action.sql()), "{err}");
+            }
+        }
+    }
+
+    /// A `NO ACTION` or `RESTRICT` child does not change rows. The rebuild
+    /// stays as before.
+    #[test]
+    fn sqlite_rebuild_of_a_restrict_target_is_emitted() {
+        let mut posts = sqlite_posts_with_author(ColumnType::Int64);
+        posts.columns[1].references =
+            Some(ForeignKey::new("users", "id").with_on_delete(Some(ForeignKeyAction::Restrict)));
+        let mut base_users = sqlite_users_table();
+        base_users.columns.push(col("name", ColumnType::Text));
+        let mut want_users = sqlite_users_table();
+        let mut name = col("name", ColumnType::Text);
+        name.nullable = true;
+        want_users.columns.push(name);
+        let baseline = vec![base_users, posts.clone()];
+        let desired = vec![want_users, posts];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), DEFAULT_OPTS);
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        emit_up_sql_with_context(&plan, &ctx).expect("a RESTRICT child does not block");
+    }
+
+    /// A typo in an action skips the column. The diff then keeps the column,
+    /// its foreign key and its index as they are.
+    #[test]
+    fn a_bad_action_keeps_the_existing_column() {
+        let src = r#"
+            #[model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[references(table = "users", on_delete = "casade")]
+                pub author_id: i64,
+                #[default]
+                pub created_at: chrono::NaiveDateTime,
+            }
+        "#;
+        let desired =
+            crate::schema::parse::parse_model_source(src, Backend::Postgres).expect("parse");
+        assert_eq!(desired.diagnostics.len(), 1, "{:?}", desired.diagnostics);
+        // The baseline is the same model with a valid FK.
+        let valid = src.replace(", on_delete = \"casade\"", "");
+        let baseline = crate::schema::parse::parse_model_source(&valid, Backend::Postgres)
+            .expect("parse baseline")
+            .tables;
+        assert!(
+            baseline[0]
+                .indexes
+                .iter()
+                .any(|i| i.name == "idx_posts_author_id"),
+            "{baseline:?}"
+        );
+        let plan = diff_schema(&baseline, &desired, DEFAULT_OPTS);
+        assert!(
+            plan.is_empty(),
+            "the skipped column must not change: {plan:?}"
+        );
+    }
+
+    /// A self-reference is a child too. The staging table's rows reference
+    /// the old table, so its `DROP TABLE` would fire the action on them.
+    #[test]
+    fn sqlite_rebuild_of_a_self_cascade_table_is_refused() {
+        let mut base = sqlite_users_table();
+        let mut parent = col("parent_id", ColumnType::Int64);
+        parent.nullable = true;
+        parent.references =
+            Some(ForeignKey::new("users", "id").with_on_delete(Some(ForeignKeyAction::Cascade)));
+        base.columns.push(parent);
+        base.columns.push(col("name", ColumnType::Text));
+        let mut want = base.clone();
+        want.columns[2].nullable = true;
+        let baseline = vec![base];
+        let desired = vec![want];
+        let plan = diff_schema(&baseline, &parsed(desired.clone(), vec![]), DEFAULT_OPTS);
+        let ctx = SchemaContext::from_tables(&desired, &baseline);
+        let err = emit_up_sql_with_context(&plan, &ctx).expect_err("a self cascade must refuse");
+        assert!(err.to_string().contains("users.parent_id"), "{err}");
     }
 }

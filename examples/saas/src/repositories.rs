@@ -13,8 +13,7 @@
 //! `invalidates(cached_project_count)` clause on the repository is what
 //! discharges that obligation: it declares the edge, resolves — at compile
 //! time — to the identity constant `#[cached]` generates beside the function,
-//! and generates [`PgProjectRepository::invalidate_declared_caches`] for the
-//! write paths to call.
+//! and makes each generated write drop the cached read after it commits.
 //!
 //! Delete that one clause and `autumn cache audit` fails the build, naming the
 //! read, the write and the `Project` model they share. `tests/cache_coherence.rs`

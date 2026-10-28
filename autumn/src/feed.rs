@@ -10,6 +10,10 @@
 //! machinery so feed pollers get a `304 Not Modified` on the unchanged-content
 //! path instead of re-downloading an unchanged feed.
 //!
+//! The feed clamps each date to the nearest limit its format allows: years
+//! 0000–9999 for Atom (RFC 3339), and 1900–9999 for RSS (RFC 2822) and
+//! `Last-Modified`.
+//!
 //! ```
 //! use autumn_web::feed::{Feed, FeedEntry};
 //! use chrono::{TimeZone, Utc};
@@ -191,6 +195,9 @@ impl Feed {
 
     /// The newest timestamp across the feed: the explicit channel `updated` if
     /// set, otherwise the maximum `updated`/`published` across entries.
+    ///
+    /// The value is not clamped. [`Feed::conditional`] clamps the
+    /// `Last-Modified` header to years 1900–9999.
     #[must_use]
     pub fn last_updated(&self) -> Option<DateTime<Utc>> {
         if let Some(updated) = self.updated {
@@ -235,7 +242,7 @@ impl Feed {
         let content_type = self.content_type();
         let body = self.render();
         let etag = hash_etag(&body);
-        let last_modified = self.last_updated();
+        let last_modified = self.last_updated().map(clamp_rfc2822);
         let mut headers = request_headers.clone();
         headers.remove(http::header::IF_MODIFIED_SINCE);
         fresh_when(&headers, etag)
@@ -258,42 +265,42 @@ impl Feed {
         let mut s = String::new();
         s.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
         s.push_str("<feed xmlns=\"http://www.w3.org/2005/Atom\">\n");
-        writeln!(s, "  <title>{}</title>", escape(&self.title)).unwrap();
-        writeln!(s, "  <id>{}</id>", escape(&self.self_link)).unwrap();
-        writeln!(s, "  <link href=\"{}\"/>", escape(&self.site_link)).unwrap();
-        writeln!(
-            s,
-            "  <link href=\"{}\" rel=\"self\" type=\"application/atom+xml\"/>",
-            escape(&self.self_link)
-        )
-        .unwrap();
+        push_escaped(&mut s, "  <title>", &self.title, "</title>\n");
+        push_escaped(&mut s, "  <id>", &self.self_link, "</id>\n");
+        push_escaped(&mut s, "  <link href=\"", &self.site_link, "\"/>\n");
+        push_escaped(
+            &mut s,
+            "  <link href=\"",
+            &self.self_link,
+            "\" rel=\"self\" type=\"application/atom+xml\"/>\n",
+        );
         writeln!(s, "  <updated>{}</updated>", rfc3339(updated)).unwrap();
         // Atom requires a feed-level author unless every entry has one; default
         // to the feed title so the feed is always valid.
         let author = self.author.as_deref().unwrap_or(&self.title);
         s.push_str("  <author>\n");
-        writeln!(s, "    <name>{}</name>", escape(author)).unwrap();
+        push_escaped(&mut s, "    <name>", author, "</name>\n");
         s.push_str("  </author>\n");
         for e in &self.entries {
             s.push_str("  <entry>\n");
-            writeln!(s, "    <title>{}</title>", escape(&e.title)).unwrap();
-            writeln!(s, "    <id>{}</id>", escape(&e.id)).unwrap();
-            writeln!(s, "    <link href=\"{}\"/>", escape(&e.link)).unwrap();
+            push_escaped(&mut s, "    <title>", &e.title, "</title>\n");
+            push_escaped(&mut s, "    <id>", &e.id, "</id>\n");
+            push_escaped(&mut s, "    <link href=\"", &e.link, "\"/>\n");
             let entry_updated = e.updated.or(e.published).unwrap_or(updated);
             writeln!(s, "    <updated>{}</updated>", rfc3339(entry_updated)).unwrap();
             if let Some(published) = e.published {
                 writeln!(s, "    <published>{}</published>", rfc3339(published)).unwrap();
             }
             if let Some(summary) = &e.summary {
-                writeln!(s, "    <summary>{}</summary>", escape(summary)).unwrap();
+                push_escaped(&mut s, "    <summary>", summary, "</summary>\n");
             }
             if let Some(content) = &e.content {
-                writeln!(
-                    s,
-                    "    <content type=\"html\">{}</content>",
-                    escape(content)
-                )
-                .unwrap();
+                push_escaped(
+                    &mut s,
+                    "    <content type=\"html\">",
+                    content,
+                    "</content>\n",
+                );
             }
             s.push_str("  </entry>\n");
         }
@@ -308,32 +315,32 @@ impl Feed {
         s.push_str("<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
         s.push_str("<rss version=\"2.0\" xmlns:atom=\"http://www.w3.org/2005/Atom\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\n");
         s.push_str("  <channel>\n");
-        writeln!(s, "    <title>{}</title>", escape(&self.title)).unwrap();
-        writeln!(s, "    <link>{}</link>", escape(&self.site_link)).unwrap();
-        writeln!(s, "    <description>{}</description>", escape(description)).unwrap();
+        push_escaped(&mut s, "    <title>", &self.title, "</title>\n");
+        push_escaped(&mut s, "    <link>", &self.site_link, "</link>\n");
+        push_escaped(&mut s, "    <description>", description, "</description>\n");
         if let Some(author) = &self.author {
-            writeln!(s, "    <dc:creator>{}</dc:creator>", escape(author)).unwrap();
+            push_escaped(&mut s, "    <dc:creator>", author, "</dc:creator>\n");
         }
-        writeln!(
-            s,
-            "    <atom:link href=\"{}\" rel=\"self\" type=\"application/rss+xml\"/>",
-            escape(&self.self_link)
-        )
-        .unwrap();
+        push_escaped(
+            &mut s,
+            "    <atom:link href=\"",
+            &self.self_link,
+            "\" rel=\"self\" type=\"application/rss+xml\"/>\n",
+        );
         writeln!(s, "    <lastBuildDate>{}</lastBuildDate>", rfc2822(updated)).unwrap();
         for e in &self.entries {
             s.push_str("    <item>\n");
-            writeln!(s, "      <title>{}</title>", escape(&e.title)).unwrap();
-            writeln!(s, "      <link>{}</link>", escape(&e.link)).unwrap();
-            writeln!(
-                s,
-                "      <guid isPermaLink=\"false\">{}</guid>",
-                escape(&e.id)
-            )
-            .unwrap();
+            push_escaped(&mut s, "      <title>", &e.title, "</title>\n");
+            push_escaped(&mut s, "      <link>", &e.link, "</link>\n");
+            push_escaped(
+                &mut s,
+                "      <guid isPermaLink=\"false\">",
+                &e.id,
+                "</guid>\n",
+            );
             let body = e.content.as_deref().or(e.summary.as_deref());
             if let Some(body) = body {
-                writeln!(s, "      <description>{}</description>", escape(body)).unwrap();
+                push_escaped(&mut s, "      <description>", body, "</description>\n");
             }
             if let Some(published) = e.published.or(e.updated) {
                 writeln!(s, "      <pubDate>{}</pubDate>", rfc2822(published)).unwrap();
@@ -408,12 +415,29 @@ const fn fallback_timestamp() -> DateTime<Utc> {
     DateTime::from_timestamp(0, 0).expect("unix epoch is a valid timestamp")
 }
 
+/// 0000-01-01T00:00:00Z: the earliest RFC 3339 date.
+const RFC3339_MIN: DateTime<Utc> =
+    DateTime::from_timestamp(-62_167_219_200, 0).expect("year 0 is valid");
+/// 1900-01-01T00:00:00Z: RFC 5322 §3.3 and HTTP dates need year 1900 or later.
+const RFC2822_MIN: DateTime<Utc> =
+    DateTime::from_timestamp(-2_208_988_800, 0).expect("year 1900 is valid");
+/// 9999-12-31T23:59:59Z: the last date with a 4-digit year.
+const DATE_MAX: DateTime<Utc> =
+    DateTime::from_timestamp(253_402_300_799, 0).expect("year 9999 is valid");
+
+/// Clamp an RSS or HTTP date to years 1900–9999. `to_rfc2822` panics outside
+/// years 0000–9999 (issue #3093).
+fn clamp_rfc2822(dt: DateTime<Utc>) -> DateTime<Utc> {
+    dt.clamp(RFC2822_MIN, DATE_MAX)
+}
+
 fn rfc3339(dt: DateTime<Utc>) -> String {
-    dt.to_rfc3339_opts(SecondsFormat::Secs, true)
+    dt.clamp(RFC3339_MIN, DATE_MAX)
+        .to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn rfc2822(dt: DateTime<Utc>) -> String {
-    dt.to_rfc2822()
+    clamp_rfc2822(dt).to_rfc2822()
 }
 
 /// XML-escape a text value: `&`, `<`, `>`, `"`, `'`. Characters outside the
@@ -422,47 +446,117 @@ fn rfc2822(dt: DateTime<Utc>) -> String {
 /// XML document even when escaped. Escaping `>` also neutralises any `]]>`
 /// sequence so untrusted titles/bodies cannot break out of the document.
 ///
-/// Real titles/bodies are overwhelmingly plain ASCII text containing none of
-/// the five special characters, but the byte-by-byte `chars()` loop below
-/// pays a full UTF-8 decode + 5-way match per character even for that common
-/// case. `needs_escaping` does one cheap byte scan to detect it and returns
-/// the input unchanged (one allocation, one memcpy) instead of rebuilding it
-/// one `char` at a time. Any non-ASCII byte falls straight through to the
-/// per-`char` path unconditionally, so `is_xml_char`'s
-/// `U+FFFE`/`U+FFFF`-filtering — which only matters for non-ASCII code
-/// points — is never bypassed.
-fn escape(s: &str) -> String {
-    if !needs_escaping(s) {
-        return s.to_owned();
+/// Scans bytes against a lookup table rather than decoding every `char`: in
+/// valid UTF-8 every special ASCII byte is its own character, and the only
+/// non-ASCII characters outside the XML 1.0 `Char` set are `U+FFFE`/`U+FFFF`
+/// (`EF BF BE` / `EF BF BF`). Input with nothing to change is appended with
+/// one memcpy and no allocation of its own.
+fn escape_into(out: &mut String, s: &str) {
+    let bytes = s.as_bytes();
+    let mut i = skip_clean(bytes, 0);
+    if i == bytes.len() {
+        out.push_str(s);
+        return;
     }
-    let mut out = String::with_capacity(s.len());
-    // Copy maximal runs of characters that pass through unchanged with one
+    out.reserve(s.len());
+    // Copy maximal runs of bytes that pass through unchanged with one
     // `push_str` each, flushing only around a dropped or escaped character.
     let mut run_start = 0;
-    for (i, c) in s.char_indices() {
-        let replacement = match c {
-            '&' => "&amp;",
-            '<' => "&lt;",
-            '>' => "&gt;",
-            '"' => "&quot;",
-            '\'' => "&apos;",
-            _ if is_xml_char(c) => continue,
-            _ => "",
+    while i < bytes.len() {
+        if !NEEDS_ATTENTION[bytes[i] as usize] {
+            i = skip_clean(bytes, i + 1);
+            continue;
+        }
+        let (replacement, len) = match bytes[i] {
+            b'&' => ("&amp;", 1),
+            b'<' => ("&lt;", 1),
+            b'>' => ("&gt;", 1),
+            b'"' => ("&quot;", 1),
+            b'\'' => ("&apos;", 1),
+            0xEF if bytes[i + 1] == 0xBF && matches!(bytes[i + 2], 0xBE | 0xBF) => ("", 3),
+            0xEF => {
+                i += 1;
+                continue;
+            }
+            _ => ("", 1),
         };
         out.push_str(&s[run_start..i]);
         out.push_str(replacement);
-        run_start = i + c.len_utf8();
+        i += len;
+        run_start = i;
     }
     out.push_str(&s[run_start..]);
+}
+
+/// Index of the first byte at or after `from` that [`NEEDS_ATTENTION`] flags
+/// (`bytes.len()` if none). Whole 16-byte blocks are rejected with branchless
+/// compares that vectorize on baseline SSE2; the block test is conservative
+/// (it flags every byte below `0x20`, tab/newline/CR included), so a flagged
+/// block just falls through to the exact per-byte table scan.
+fn skip_clean(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while let Some(block) = bytes.get(i..i + 16) {
+        // Accumulating into a `u8` (not a `bool`) is what lets LLVM vectorize
+        // the loop. `b | 1 == 0x27` matches `&`/`'`, `b | 2 == 0x3E` matches `<`/`>`;
+        // both are exact for the two characters they name and may over-flag
+        // others, which only sends the block to the exact table scan below.
+        let mut flagged = 0u8;
+        for &b in block {
+            // Non-short-circuit `|` on purpose: branch-free is what vectorizes.
+            #[allow(clippy::needless_bitwise_bool)]
+            let hit = (b < 0x20) | (b | 1 == 0x27) | (b | 2 == 0x3E) | (b == b'"') | (b == 0xEF);
+            flagged |= u8::from(hit);
+        }
+        if flagged != 0
+            && let Some(off) = block.iter().position(|&b| NEEDS_ATTENTION[b as usize])
+        {
+            return i + off;
+        }
+        i += 16;
+    }
+    while i < bytes.len() && !NEEDS_ATTENTION[bytes[i] as usize] {
+        i += 1;
+    }
+    i
+}
+
+/// Append `prefix`, the escaped `text`, then `suffix` to `out`. Escaping in
+/// place avoids a temporary `String` per text field.
+fn push_escaped(out: &mut String, prefix: &str, text: &str, suffix: &str) {
+    out.push_str(prefix);
+    escape_into(out, text);
+    out.push_str(suffix);
+}
+
+/// Owned form of [`escape_into`] (test oracle).
+#[cfg(test)]
+fn escape(s: &str) -> String {
+    let mut out = String::new();
+    escape_into(&mut out, s);
     out
 }
 
-/// Whether `s` contains anything `escape` would change: a byte outside the
-/// ASCII range (conservatively routed to the full per-`char` path, since only
-/// non-ASCII code points can be `U+FFFE`/`U+FFFF` or otherwise need
-/// `is_xml_char`'s multi-byte-aware filtering), one of the five characters
-/// `escape` turns into an entity, or an ASCII control byte `is_xml_char`
-/// drops (below `0x20`, excluding tab/newline/carriage return).
+/// Bytes `escape` must look at: the five entity characters, ASCII control
+/// bytes `is_xml_char` drops (below `0x20`, excluding tab/newline/carriage
+/// return), and `0xEF`, the lead byte of `U+FFFE`/`U+FFFF`.
+const NEEDS_ATTENTION: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = 0;
+    while b < 0x20 {
+        t[b] = !matches!(b, 0x9 | 0xA | 0xD);
+        b += 1;
+    }
+    t[b'&' as usize] = true;
+    t[b'<' as usize] = true;
+    t[b'>' as usize] = true;
+    t[b'"' as usize] = true;
+    t[b'\'' as usize] = true;
+    t[0xEF] = true;
+    t
+};
+
+/// Whether `s` contains anything `escape` would change (test oracle).
+#[cfg(test)]
 fn needs_escaping(s: &str) -> bool {
     s.bytes().any(|b| {
         !b.is_ascii()
@@ -474,6 +568,7 @@ fn needs_escaping(s: &str) -> bool {
 /// Whether `c` is a valid XML 1.0 character (XML 1.0 §2.2 `Char` production).
 /// Rust `char` already excludes surrogates, so only the low control range and
 /// the two non-characters `U+FFFE`/`U+FFFF` need filtering here.
+#[cfg(test)]
 const fn is_xml_char(c: char) -> bool {
     matches!(
         c,
@@ -489,6 +584,7 @@ mod proptests {
     //! Property-based invariants for XML escaping and feed rendering. `escape`
     //! is private, so it is exercised in-crate here.
     use super::*;
+    use chrono::TimeZone as _;
     use proptest::prelude::*;
 
     /// Reverse the five entities `escape` emits. `&amp;` is decoded LAST so a
@@ -499,6 +595,36 @@ mod proptests {
             .replace("&quot;", "\"")
             .replace("&apos;", "'")
             .replace("&amp;", "&")
+    }
+
+    #[test]
+    fn escape_agrees_with_the_oracle_across_block_boundaries() {
+        // Specials at every offset around the 16-byte block size, plus tab /
+        // newline (flagged by the block test, clean per the table).
+        for len in 0..40 {
+            for special in [
+                '&', '<', '>', '"', '\'', '\u{1}', '\t', '\n', '\u{FFFE}', 'é',
+            ] {
+                for at in 0..len {
+                    let mut chars: Vec<char> = vec!['a'; len];
+                    chars[at] = special;
+                    let input: String = chars.into_iter().collect();
+                    let expected: String = input
+                        .chars()
+                        .filter(|&c| is_xml_char(c))
+                        .map(|c| match c {
+                            '&' => "&amp;".to_owned(),
+                            '<' => "&lt;".to_owned(),
+                            '>' => "&gt;".to_owned(),
+                            '"' => "&quot;".to_owned(),
+                            '\'' => "&apos;".to_owned(),
+                            c => c.to_string(),
+                        })
+                        .collect();
+                    assert_eq!(escape(&input), expected, "{input:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -580,6 +706,47 @@ mod proptests {
             // (RSS) — the injected copy in the body must not add another.
             let expected_close = usize::from(!rss);
             prop_assert_eq!(out.matches("</feed>").count(), expected_close);
+        }
+
+        /// Issue #3093: any `DateTime<Utc>` renders without a panic, and each
+        /// date parses back as the input clamped to years 0000–9999 (Atom) or
+        /// 1900–9999 (RSS).
+        #[test]
+        fn render_clamps_any_date(
+            // Half the cases stay in years 0000–9999, where the date must not change.
+            secs in prop_oneof![
+                -62_167_219_200_i64..=253_402_300_799,
+                DateTime::<Utc>::MIN_UTC.timestamp()..=DateTime::<Utc>::MAX_UTC.timestamp(),
+            ],
+            rss in any::<bool>(),
+        ) {
+            let dt = DateTime::from_timestamp(secs, 0).unwrap();
+            let feed = if rss {
+                Feed::rss("t", "https://example.com/", "https://example.com/feed.xml")
+            } else {
+                Feed::atom("t", "https://example.com/", "https://example.com/feed.xml")
+            }
+            .entry(FeedEntry::new("i", "t", "https://example.com/1").published(dt));
+
+            let out = feed.render();
+            let min_year = if rss { 1900 } else { 0 };
+            let expected = dt.clamp(
+                Utc.with_ymd_and_hms(min_year, 1, 1, 0, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(9999, 12, 31, 23, 59, 59).unwrap(),
+            );
+            let (open, close) = if rss {
+                ("<pubDate>", "</pubDate>")
+            } else {
+                ("<published>", "</published>")
+            };
+            let start = out.find(open).unwrap() + open.len();
+            let text = &out[start..start + out[start..].find(close).unwrap()];
+            let parsed = if rss {
+                DateTime::parse_from_rfc2822(text)
+            } else {
+                DateTime::parse_from_rfc3339(text)
+            };
+            prop_assert_eq!(parsed.map(|d| d.to_utc()), Ok(expected), "{}", text);
         }
     }
 }

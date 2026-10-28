@@ -144,7 +144,7 @@ anything that must be shared has to live *outside* the hosts.
 | Rate limiting | Redis rate-limit backend, or an N-host fleet permits N× your configured rate. | [rate-limiting.md](rate-limiting.md) |
 | Uploaded files | Object storage (`[storage] backend = "s3"`). Local disk is per host, and a release dir is wiped by pruning. | [storage.md](storage.md) |
 | Background jobs | A durable queue every host shares: `[jobs] backend = "postgres"` or `"redis"`. The default `local` backend is an in-process queue, so N hosts means N independent queues. | [below](#background-jobs-the-default-queue-is-per-host) |
-| Scheduled tasks | `[scheduler] backend = "postgres"` — advisory-lock coordination so a `#[scheduled]` task runs once per fleet, not once per host. The default is a per-process timer. | [scheduled-multi-replica.md](scheduled-multi-replica.md) |
+| Scheduled tasks | `[scheduler] backend = "postgres"` — a Postgres tick table so a `#[scheduled]` task runs once per fleet, not once per host. The default is a per-process timer. | [scheduled-multi-replica.md](scheduled-multi-replica.md) |
 | Migrations at boot | `[database] auto_migrate` **off**. Every host would apply migrations at boot and race the others. | below |
 
 The [Multi-replica setup](deployment.md#multi-replica-setup) section of the
@@ -763,7 +763,7 @@ Stated plainly so you can plan around it:
   session, rate-limit and secret configuration every fleet needs.
 - **[Background jobs](jobs.md#backend-selection-autumntoml)** and
   **[Multi-replica scheduled tasks](scheduled-multi-replica.md)** — the durable
-  queue and the advisory-lock scheduler a fleet needs instead of the per-process
+  queue and the tick-table scheduler a fleet needs instead of the per-process
   defaults.
 - **Alert on drift** — wire `autumn deploy status --strict` into cron so a fleet
   that quietly stopped converging pages someone.

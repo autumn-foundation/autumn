@@ -222,6 +222,15 @@ autumn config history max_upload_mb
 
 ---
 
+## Framework keys
+
+`ConfigRegistry::define_cost_signal()` declares `autumn_cost_signal`, a
+`Float` that must be `>= 0`. Insert the service as an
+`Arc<RuntimeConfigService>` app-state extension, and the app copies the key
+into its `CostSignal`. See [Request Cost and Carbon-Aware Deferral](cost.md).
+
+---
+
 ## What runtime config is NOT for
 
 - **Secrets** (API keys, passwords): use the [credentials store](credentials.md).

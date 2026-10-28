@@ -43,9 +43,6 @@ pub const LIMITS: &[&str] = &[
      and a model whose name matches a common type is linked wherever that name appears.",
     "Raw SQL is matched by identifier, and only inside string literals that contain a SQL \
      keyword; SQL assembled at runtime from fragments is invisible.",
-    "The served-surface census does not yet reach the OpenAPI JSON and Swagger routes an app \
-     enables with `.openapi(...)`, nor a worker replica\'s own probe and actuator mounts: those \
-     are served but appear in no section.",
     "A router mounted with `merge`/`nest` is opaque: its endpoints cannot be enumerated at all, \
      so `completeness.opaque_mounted_routers` counts them rather than naming them. The \
      `AUTUMN_DUMP_GRAPH` count covers the routers the *builder* declares; a router the \
@@ -62,9 +59,29 @@ pub const LIMITS: &[&str] = &[
      followed by a bare `posts.filter(…)` in the body names no candidate and produces no edge. \
      Write the table module (`posts::table`) or the model in the handler to be linked.",
     "A route's access is its declared HTTP method (safe methods read, everything else writes); a \
-     job's is whether its tokens carry mutation evidence. Either way it is the declared intent, \
+     job's is set per edge: a write when the edge's symbol names a mutating SQL statement, or when \
+     the job calls `.update`/`.create`/`.delete`/`.insert` on a repository parameter, or when \
+     mutation evidence names no symbol (then every edge). Either way it is the declared intent, \
      not an executed statement.",
+    "Node ids come from `module_path!()`. When a binary links two versions of one crate, each \
+     id they share ends in `@<version>`. A mounted route records only its module and handler, \
+     so the route node of each version shows the mounts of both versions. An auto-API route \
+     links to the repository of each version. Two copies of one version (from two sources) \
+     still share one node.",
 ];
+
+/// Whether a schedule is a fixed delay such as `15m`, `1h30m` or `1h 30m`.
+///
+/// A delay is a few letters-and-digits words. A cron expression has five or
+/// more fields, or a symbol such as `*`, `/` or `(`.
+fn is_fixed_delay(schedule: &str) -> bool {
+    schedule.split_whitespace().count() < 5
+        && schedule
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace())
+        && schedule.chars().any(|c| c.is_ascii_alphabetic())
+        && schedule.chars().any(|c| c.is_ascii_digit())
+}
 
 // ── Node facts ───────────────────────────────────────────────────────
 
@@ -172,16 +189,53 @@ pub struct GraphNode {
 }
 
 impl GraphNode {
+    /// The crate version at the end of the id, when two versions of one
+    /// crate share the base id (#2520 item 14).
+    ///
+    /// An auto-API id holds a URL path, which can contain `@`. Such an id
+    /// never has a version.
+    #[must_use]
+    pub fn crate_version(&self) -> Option<&str> {
+        if self.id.starts_with(AUTO_API_ID_PREFIX) {
+            return None;
+        }
+        self.id.split_once('@').map(|(_, version)| version)
+    }
+
+    /// The id without its crate version.
+    #[must_use]
+    pub fn base_id(&self) -> &str {
+        self.crate_version().map_or(self.id.as_str(), |version| {
+            &self.id[..self.id.len() - version.len() - 1]
+        })
+    }
+
     /// A one-line rendering of the node, for the human report.
     #[must_use]
     pub fn label(&self) -> String {
+        let label = self.unversioned_label();
+        match self.crate_version() {
+            Some(version) => format!("{label} @{version}"),
+            None => label,
+        }
+    }
+
+    fn unversioned_label(&self) -> String {
         match (&self.route, &self.model, &self.repository, &self.job) {
             (Some(r), ..) => format!("{} {}", r.method, r.path),
             (_, Some(m), ..) => format!("{} (table {})", self.name, m.table),
             (_, _, Some(r), _) => format!("{} over {}", self.name, r.model),
             (.., Some(j)) => j.schedule.as_ref().map_or_else(
                 || self.name.clone(),
-                |s| format!("{} (every {s})", self.name),
+                // Only a fixed delay reads as "every". Each part of a delay is
+                // a number with a unit (`15m`, `1h 30m`); a cron field is not.
+                |s| {
+                    if is_fixed_delay(s) {
+                        format!("{} (every {s})", self.name)
+                    } else {
+                        format!("{} ({s})", self.name)
+                    }
+                },
             ),
             _ => self.name.clone(),
         }
@@ -241,6 +295,25 @@ pub struct Completeness {
     /// cannot quietly under-report the served surface.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmodelled_mounted_routes: Vec<String>,
+    /// Plugin mounts the app declared with `declare_plugin_routes`, sorted.
+    ///
+    /// These have no `#[route]` node, but their auth is known, so they are
+    /// listed here with it and not as a bare name in
+    /// [`Self::unmodelled_mounted_routes`]. A change from gated to public with
+    /// the same method and path then changes the document. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_mounts: Vec<DeclaredMount>,
+}
+
+/// A declared plugin mount with its known auth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredMount {
+    /// Uppercase HTTP method.
+    pub method: String,
+    /// Full mounted path.
+    pub path: String,
+    /// The auth the plugin declared for the mount.
+    pub auth: RouteAuth,
 }
 
 /// The application's architecture, as its macros declare it.
@@ -348,6 +421,16 @@ impl ArchitectureGraph {
                 let _ = writeln!(out, "  {id}");
             }
         }
+        if !c.declared_mounts.is_empty() {
+            let _ = writeln!(
+                out,
+                "\nDeclared plugin mounts ({}):",
+                c.declared_mounts.len()
+            );
+            for m in &c.declared_mounts {
+                let _ = writeln!(out, "  {} {} (auth {})", m.method, m.path, m.auth.label());
+            }
+        }
         if !c.unmodelled_mounted_routes.is_empty() {
             let _ = writeln!(
                 out,
@@ -384,29 +467,136 @@ fn repository_id(module_path: &str, repository: &str) -> String {
     format!("repository:{module_path}::{repository}")
 }
 
+/// The id prefix of a route a `#[repository(api = "...")]` generated.
+const AUTO_API_ID_PREFIX: &str = "route:auto-api:";
+
 /// The id of a job node.
 fn job_id(module_path: &str, handler: &str) -> String {
     format!("job:{module_path}::{handler}")
 }
 
-/// A `file:line` location string, with a dependency's registry path shortened.
+/// The first segment of a module path: the crate name.
+fn crate_root(module_path: &str) -> &str {
+    module_path.split("::").next().unwrap_or(module_path)
+}
+
+/// The node ids of one build.
+///
+/// A base id comes from `module_path!()`, so two versions of one crate give the
+/// same base id. Such an id ends in `@<version>` (#2520 item 14). An id that no
+/// other version shares stays the same after a dependency update.
+struct NodeIds {
+    /// Base ids that descriptors of two or more crate versions give.
+    shared: BTreeSet<String>,
+}
+
+impl NodeIds {
+    fn new(
+        routes: &[RouteGraphDescriptor],
+        models: &[ModelGraphDescriptor],
+        repositories: &[RepositoryGraphDescriptor],
+        jobs: &[JobGraphDescriptor],
+    ) -> Self {
+        let bases = routes
+            .iter()
+            .map(|r| (route_id(r.module_path, r.handler), r.crate_version))
+            .chain(
+                models
+                    .iter()
+                    .map(|m| (model_id(m.model_path), m.crate_version)),
+            )
+            .chain(
+                repositories
+                    .iter()
+                    .map(|r| (repository_id(r.module_path, r.repository), r.crate_version)),
+            )
+            .chain(
+                jobs.iter()
+                    .map(|j| (job_id(j.module_path, j.handler), j.crate_version)),
+            );
+        let mut versions: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+        for (base, version) in bases {
+            versions.entry(base).or_default().insert(version);
+        }
+        Self {
+            shared: versions
+                .into_iter()
+                .filter(|(_, versions)| versions.len() > 1)
+                .map(|(base, _)| base)
+                .collect(),
+        }
+    }
+
+    fn versioned(&self, base: String, version: &str) -> String {
+        if !version.is_empty() && self.shared.contains(&base) {
+            format!("{base}@{version}")
+        } else {
+            base
+        }
+    }
+
+    fn route(&self, route: &RouteGraphDescriptor) -> String {
+        self.versioned(
+            route_id(route.module_path, route.handler),
+            route.crate_version,
+        )
+    }
+
+    fn model(&self, model: &ModelGraphDescriptor) -> String {
+        self.versioned(model_id(model.model_path), model.crate_version)
+    }
+
+    fn repository(&self, repo: &RepositoryGraphDescriptor) -> String {
+        self.versioned(
+            repository_id(repo.module_path, repo.repository),
+            repo.crate_version,
+        )
+    }
+
+    fn job(&self, job: &JobGraphDescriptor) -> String {
+        self.versioned(job_id(job.module_path, job.handler), job.crate_version)
+    }
+}
+
+/// A `file:line` location string, with a dependency's checkout path shortened.
 ///
 /// `file!()` for an element declared in a non-path dependency is the absolute
-/// checkout path — `/home/<user>/.cargo/registry/src/index.crates.io-<hash>/
-/// plugin-0.1.0/src/routes.rs`. Left whole it puts the build machine's username
-/// and layout into a document served over HTTP, and makes the committed graph
-/// differ between two developers for reasons that have nothing to do with the
-/// app. The crate-relative tail is the part that identifies anything.
+/// checkout path. A registry crate is
+/// `/home/<user>/.cargo/registry/src/index.crates.io-<hash>/plugin-0.1.0/src/routes.rs`.
+/// A git crate is `/home/<user>/.cargo/git/checkouts/<name>-<hash>/<rev>/src/lib.rs`.
+/// Left whole it puts the build machine's username and layout into a document
+/// served over HTTP, and makes the committed graph differ between two
+/// developers for reasons that have nothing to do with the app. The
+/// crate-relative tail is the part that identifies anything. For git, the
+/// `-<hash>` suffix and the `<rev>` are dropped too: the rev changes at every
+/// dependency update.
 fn location(file: &str, line: u32) -> String {
     // Separators first: on Windows `file!()` yields backslashes, so a graph
     // committed from Linux would otherwise read as drift on every node, and the
     // registry shortening below would not match at all.
     let file = file.replace('\\', "/");
-    let normalized = file
-        .split_once("/registry/src/")
-        .and_then(|(_, tail)| tail.split_once('/'))
-        .map_or(file.as_str(), |(_, crate_relative)| crate_relative);
+    let normalized = shorten_dependency_path(&file);
     format!("{normalized}:{line}")
+}
+
+/// The crate-relative tail of a registry or git checkout path.
+///
+/// A path in neither layout is returned whole.
+fn shorten_dependency_path(file: &str) -> String {
+    if let Some((_, tail)) = file.split_once("/registry/src/")
+        && let Some((_, crate_relative)) = tail.split_once('/')
+    {
+        return crate_relative.to_owned();
+    }
+    if let Some((_, tail)) = file.split_once("/git/checkouts/") {
+        let mut parts = tail.splitn(3, '/');
+        if let (Some(dir), Some(_rev), Some(rest)) = (parts.next(), parts.next(), parts.next()) {
+            // `<name>-<hash>`: the hash is the last dash-separated part.
+            let name = dir.rsplit_once('-').map_or(dir, |(name, _)| name);
+            return format!("{name}/{rest}");
+        }
+    }
+    file.to_owned()
 }
 
 /// The access a declared HTTP method states.
@@ -424,12 +614,13 @@ fn method_access(method: &str) -> Access {
 /// crates that each declare a `Post` produce two edges, which is the honest
 /// answer to a name-based derivation and keeps recall total.
 fn symbol_index(
+    ids: &NodeIds,
     models: &[ModelGraphDescriptor],
     repositories: &[RepositoryGraphDescriptor],
 ) -> BTreeMap<String, BTreeSet<String>> {
     let mut index: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for model in models {
-        let id = model_id(model.model_path);
+        let id = ids.model(model);
         index
             .entry(model.model.to_owned())
             .or_default()
@@ -437,7 +628,7 @@ fn symbol_index(
         index.entry(model.table.to_owned()).or_default().insert(id);
     }
     for repo in repositories {
-        let id = repository_id(repo.module_path, repo.repository);
+        let id = ids.repository(repo);
         index
             .entry(repo.repository.to_owned())
             .or_default()
@@ -457,13 +648,16 @@ fn symbol_index(
 /// table — but a Rust type name is not, and folding everything made a DTO
 /// called `Posts` resolve to that table (Codex round 5). Only candidates that
 /// came from a SQL literal are looked up here.
-fn sql_table_index(models: &[ModelGraphDescriptor]) -> BTreeMap<String, BTreeSet<String>> {
+fn sql_table_index(
+    ids: &NodeIds,
+    models: &[ModelGraphDescriptor],
+) -> BTreeMap<String, BTreeSet<String>> {
     let mut index: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for model in models {
         index
             .entry(model.table.to_ascii_lowercase())
             .or_default()
-            .insert(model_id(model.model_path));
+            .insert(ids.model(model));
     }
     index
 }
@@ -487,7 +681,7 @@ struct Candidates<'a> {
 fn resolve_edges(
     from: &str,
     candidates: Candidates<'_>,
-    access: Access,
+    access: impl Fn(&str) -> Access,
     index: &BTreeMap<String, BTreeSet<String>>,
     sql_tables: &BTreeMap<String, BTreeSet<String>>,
     edges: &mut BTreeMap<(String, String), GraphEdge>,
@@ -512,19 +706,31 @@ fn resolve_edges(
             };
             for target in targets {
                 let key = (from.to_owned(), target.clone());
-                let candidate = GraphEdge {
+                let mut candidate = GraphEdge {
                     from: from.to_owned(),
                     to: target.clone(),
-                    access,
+                    access: access(symbol),
                     provenance,
                     symbol: (*symbol).to_owned(),
                 };
-                match edges.get(&key) {
+                match edges.get_mut(&key) {
                     // A signature edge outranks a body edge for the same pair:
                     // an extractor is a stronger statement than a name in the
-                    // body, and the report should say the stronger one.
-                    Some(existing) if existing.provenance <= candidate.provenance => {}
-                    _ => {
+                    // body, and the report should say the stronger one. The
+                    // access still merges: a write through any symbol is a
+                    // write to the target.
+                    Some(existing) if existing.provenance <= candidate.provenance => {
+                        if candidate.access == Access::Write {
+                            existing.access = Access::Write;
+                        }
+                    }
+                    Some(existing) => {
+                        if existing.access == Access::Write {
+                            candidate.access = Access::Write;
+                        }
+                        *existing = candidate;
+                    }
+                    None => {
                         edges.insert(key, candidate);
                     }
                 }
@@ -547,17 +753,26 @@ pub fn build(
     repositories: &[RepositoryGraphDescriptor],
     jobs: &[JobGraphDescriptor],
 ) -> ArchitectureGraph {
-    let index = symbol_index(models, repositories);
-    let sql_tables = sql_table_index(models);
+    let ids = NodeIds::new(routes, models, repositories, jobs);
+    let index = symbol_index(&ids, models, repositories);
+    let sql_tables = sql_table_index(&ids, models);
     let mut nodes: BTreeMap<String, GraphNode> = BTreeMap::new();
     let mut edges: BTreeMap<(String, String), GraphEdge> = BTreeMap::new();
 
-    add_model_nodes(models, &mut nodes);
-    add_repository_nodes(repositories, models, &index, &mut nodes, &mut edges);
-    let route_totals =
-        add_route_nodes(routes, mounted, &index, &sql_tables, &mut nodes, &mut edges);
-    add_job_nodes(jobs, &index, &sql_tables, &mut nodes, &mut edges);
+    add_model_nodes(&ids, models, &mut nodes);
+    add_repository_nodes(&ids, repositories, models, &mut nodes, &mut edges);
+    let route_totals = add_route_nodes(
+        &ids,
+        routes,
+        mounted,
+        &index,
+        &sql_tables,
+        &mut nodes,
+        &mut edges,
+    );
+    add_job_nodes(&ids, jobs, &index, &sql_tables, &mut nodes, &mut edges);
     let surface = add_auto_api_nodes(
+        &ids,
         mounted,
         repositories,
         &route_totals.matched,
@@ -581,6 +796,7 @@ pub fn build(
             opaque_mounted_routers,
             unmounted_routes: unmounted,
             unmodelled_mounted_routes: surface.unmodelled,
+            declared_mounts: surface.declared,
         },
         nodes: nodes.into_values().collect(),
         edges: edges.into_values().collect(),
@@ -589,9 +805,13 @@ pub fn build(
 }
 
 /// One model node per `#[model]`.
-fn add_model_nodes(models: &[ModelGraphDescriptor], nodes: &mut BTreeMap<String, GraphNode>) {
+fn add_model_nodes(
+    ids: &NodeIds,
+    models: &[ModelGraphDescriptor],
+    nodes: &mut BTreeMap<String, GraphNode>,
+) {
     for model in models {
-        let id = model_id(model.model_path);
+        let id = ids.model(model);
         nodes.insert(
             id.clone(),
             GraphNode {
@@ -613,15 +833,15 @@ fn add_model_nodes(models: &[ModelGraphDescriptor], nodes: &mut BTreeMap<String,
 }
 
 /// One repository node per `#[repository]`, with its declared model edges.
-fn add_repository_nodes(
+fn add_repository_nodes<'a>(
+    ids: &NodeIds,
     repositories: &[RepositoryGraphDescriptor],
-    models: &[ModelGraphDescriptor],
-    index: &BTreeMap<String, BTreeSet<String>>,
+    models: &'a [ModelGraphDescriptor],
     nodes: &mut BTreeMap<String, GraphNode>,
     edges: &mut BTreeMap<(String, String), GraphEdge>,
 ) {
     for repo in repositories {
-        let id = repository_id(repo.module_path, repo.repository);
+        let id = ids.repository(repo);
         nodes.insert(
             id.clone(),
             GraphNode {
@@ -650,29 +870,62 @@ fn add_repository_nodes(
         // and at the same strength: `#[votable]` and `#[commentable]` put their
         // generated methods on this repository, so a route holding it reaches
         // those edge tables too — without ever naming them.
-        let relation_tables: Vec<&str> = models
-            .iter()
-            .filter(|m| m.model == repo.model)
-            .flat_map(|m| m.relations.iter().copied())
-            .collect();
-        for name in std::iter::once(repo.model).chain(relation_tables) {
-            for target in index
-                .get(name)
+        //
+        // The repository carries its resolved table, so the model is picked by
+        // (name, table). Name alone also picked up another crate's model of the
+        // same name (#2520). Only a repository that overrides the table finds
+        // no such pair; it falls back to the name, so no edge is lost.
+        //
+        // Two versions of one crate can each declare the model. The repository
+        // uses the model of its own crate and crate version. If no model
+        // matches, it keeps all of them (#2520 item 14). This step comes
+        // before the table step, so a table of the other version cannot hide
+        // the own model.
+        let mine = |m: &ModelGraphDescriptor| {
+            crate_root(m.module_path) == crate_root(repo.module_path)
+                && m.crate_version == repo.crate_version
+        };
+        // A model of the repository's crate in another version is dropped,
+        // also when that version moved it to another module. A model of
+        // another crate stays.
+        let own_version = |found: Vec<&'a ModelGraphDescriptor>| {
+            let has_mine = found.iter().any(|m| mine(m));
+            found
                 .into_iter()
-                .flatten()
-                .filter(|t| t.starts_with("model:"))
-            {
-                edges.insert(
-                    (id.clone(), target.clone()),
-                    GraphEdge {
-                        from: id.clone(),
-                        to: target.clone(),
-                        access: Access::ReadWrite,
-                        provenance: Provenance::Declaration,
-                        symbol: String::new(),
-                    },
-                );
-            }
+                .filter(|m| {
+                    !has_mine
+                        || mine(m)
+                        || crate_root(m.module_path) != crate_root(repo.module_path)
+                })
+                .collect::<Vec<_>>()
+        };
+        let named = own_version(models.iter().filter(|m| m.model == repo.model).collect());
+        let exact = named.iter().any(|m| m.table == repo.table);
+        let own: Vec<&ModelGraphDescriptor> = named
+            .into_iter()
+            .filter(|m| !exact || m.table == repo.table)
+            .collect();
+        let mut targets: BTreeSet<String> = own.iter().map(|m| ids.model(m)).collect();
+        // A relation table is a table name: it resolves to each model that
+        // maps that table, with the same version step.
+        for relation in own.iter().flat_map(|m| m.relations.iter().copied()) {
+            let mapping = models
+                .iter()
+                .filter(|m| m.table == relation || m.model == relation)
+                .collect();
+            targets.extend(own_version(mapping).into_iter().map(|m| ids.model(m)));
+        }
+        for target in &targets {
+            edges.insert(
+                (id.clone(), target.clone()),
+                GraphEdge {
+                    from: id.clone(),
+                    to: target.clone(),
+                    access: Access::ReadWrite,
+                    provenance: Provenance::Declaration,
+                    symbol: String::new(),
+                },
+            );
         }
     }
 }
@@ -689,6 +942,7 @@ struct RouteTotals {
 
 /// One route node per `#[route]`/`#[static_get]`, with its resolved edges.
 fn add_route_nodes(
+    ids: &NodeIds,
     routes: &[RouteGraphDescriptor],
     mounted: &[MountedRoute],
     index: &BTreeMap<String, BTreeSet<String>>,
@@ -700,7 +954,7 @@ fn add_route_nodes(
     let mut unmounted: Vec<String> = Vec::new();
     let mut matched_mounted: BTreeSet<(String, String)> = BTreeSet::new();
     for route in routes {
-        let id = route_id(route.module_path, route.handler);
+        let id = ids.route(route);
         // Every mount of this handler, not just the first: a handler passed to
         // both a top-level `routes![]` and a scoped group is served at both,
         // and claiming only one leaves the other looking undeclared.
@@ -768,7 +1022,7 @@ fn add_route_nodes(
                 body: route.body_symbols,
                 sql: route.sql_symbols,
             },
-            access,
+            |_| access,
             index,
             sql_tables,
             edges,
@@ -781,8 +1035,34 @@ fn add_route_nodes(
     }
 }
 
+/// The symbols a job writes through.
+///
+/// Two sources. The macro names the symbols of each mutating SQL statement.
+/// A receiver of `.create`, `.delete`, `.insert` or `.update` counts only when
+/// it is a parameter whose type resolves to a declared repository. The macro
+/// cannot know repositories, so a bare `.update` is no evidence here: it would
+/// also match `HashMap::insert`.
+fn job_write_symbols<'a>(
+    job: &'a JobGraphDescriptor,
+    index: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<&'a str> {
+    let mut writes: BTreeSet<&str> = job.mutating_symbols.iter().copied().collect();
+    for receiver in job.dot_mutation_receivers {
+        for (param, ty) in job.signature_bindings {
+            let is_repository = index
+                .get(*ty)
+                .is_some_and(|ids| ids.iter().any(|id| id.starts_with("repository:")));
+            if param == receiver && is_repository {
+                writes.insert(ty);
+            }
+        }
+    }
+    writes
+}
+
 /// One node per `#[job]`/`#[scheduled]`/`#[task]`, with its resolved edges.
 fn add_job_nodes(
+    ids: &NodeIds,
     jobs: &[JobGraphDescriptor],
     index: &BTreeMap<String, BTreeSet<String>>,
     sql_tables: &BTreeMap<String, BTreeSet<String>>,
@@ -790,7 +1070,7 @@ fn add_job_nodes(
     edges: &mut BTreeMap<(String, String), GraphEdge>,
 ) {
     for job in jobs {
-        let id = job_id(job.module_path, job.handler);
+        let id = ids.job(job);
         nodes.insert(
             id.clone(),
             GraphNode {
@@ -812,11 +1092,7 @@ fn add_job_nodes(
                 }),
             },
         );
-        let access = if job.mutating {
-            Access::Write
-        } else {
-            Access::Read
-        };
+        let writes = job_write_symbols(job, index);
         resolve_edges(
             &id,
             Candidates {
@@ -824,7 +1100,13 @@ fn add_job_nodes(
                 body: job.body_symbols,
                 sql: job.sql_symbols,
             },
-            access,
+            |symbol| {
+                if job.mutating || writes.contains(symbol) {
+                    Access::Write
+                } else {
+                    Access::Read
+                }
+            },
             index,
             sql_tables,
             edges,
@@ -836,12 +1118,16 @@ fn add_job_nodes(
 struct MountedSurface {
     /// Mounted routes attributed to a repository auto-API.
     generated: usize,
-    /// Mounted routes no declaration and no auto-API accounts for.
+    /// Mounted routes no declaration and no auto-API accounts for, and whose
+    /// auth is unknown.
     unmodelled: Vec<String>,
+    /// Declared plugin mounts: no node, but a known auth.
+    declared: Vec<DeclaredMount>,
 }
 
 /// One node per mounted route a `#[repository(api = "...")]` generated.
 fn add_auto_api_nodes(
+    ids: &NodeIds,
     mounted: &[MountedRoute],
     repositories: &[RepositoryGraphDescriptor],
     matched_mounted: &BTreeSet<(String, String)>,
@@ -854,6 +1140,7 @@ fn add_auto_api_nodes(
     // routes touching a table would miss its entire REST surface.
     let mut generated_routes = 0usize;
     let mut unmodelled: BTreeSet<String> = BTreeSet::new();
+    let mut declared: BTreeMap<(String, String), RouteAuth> = BTreeMap::new();
     for route in mounted {
         if matched_mounted.contains(&(route.method.clone(), route.path.clone())) {
             continue;
@@ -864,28 +1151,36 @@ fn add_auto_api_nodes(
         // inside `.scoped("/v1", …)` no longer starts with the declared prefix
         // and was dropped, and a hand-written route under an API prefix was
         // claimed as generated (Codex round 5).
-        let owner = route.repository_api.as_ref().and_then(|api| {
-            repositories
-                .iter()
-                .filter(|repo| repo.api == api)
-                // Ties break on node id, so the answer never depends on link
-                // order. They are not impossible, though: two repositories CAN
-                // declare the same raw `api = "..."` prefix as long as their
-                // generated routes are mounted under different `.scoped(...)`
-                // prefixes, because then the effective paths do not collide and
-                // the router has nothing to refuse. In that case this picks the
-                // lexicographically first and can attribute a CRUD route to the
-                // wrong model. Carrying a repository-specific identity rather
-                // than the prefix alone is the fix — see #2520.
-                .min_by_key(|repo| repository_id(repo.module_path, repo.repository))
-        });
-        let Some(repo) = owner else {
-            unmodelled.insert(format!("{} {}", route.method, route.path));
+        // The route carries the prefix and the model name, so two repositories
+        // that share a prefix but sit over different models are told apart
+        // (#2520). Two that share both (two versions of one crate, say) tie.
+        // Each one gets an edge, so no `impact` answer loses the route. The
+        // first by node id names the node.
+        let mut owners: Vec<(String, &RepositoryGraphDescriptor)> = route
+            .repository_api
+            .as_ref()
+            .map(|identity| {
+                repositories
+                    .iter()
+                    .filter(|repo| repo.api == identity.api && repo.model == identity.model)
+                    .map(|repo| (ids.repository(repo), repo))
+                    .collect()
+            })
+            .unwrap_or_default();
+        owners.sort_by(|a, b| a.0.cmp(&b.0));
+        let Some(&(_, repo)) = owners.first() else {
+            if route.auth_declared {
+                declared.insert(
+                    (route.method.clone(), route.path.clone()),
+                    route.auth.clone(),
+                );
+            } else {
+                unmodelled.insert(format!("{} {}", route.method, route.path));
+            }
             continue;
         };
         generated_routes += 1;
-        let repo_node = repository_id(repo.module_path, repo.repository);
-        let id = format!("route:auto-api:{} {}", route.method, route.path);
+        let id = format!("{AUTO_API_ID_PREFIX}{} {}", route.method, route.path);
         let access = method_access(&route.method);
         nodes.insert(
             id.clone(),
@@ -908,21 +1203,27 @@ fn add_auto_api_nodes(
                 job: None,
             },
         );
-        edges.insert(
-            (id.clone(), repo_node.clone()),
-            GraphEdge {
-                from: id,
-                to: repo_node,
-                access,
-                provenance: Provenance::Declaration,
-                symbol: String::new(),
-            },
-        );
+        for (repo_node, _) in owners {
+            edges.insert(
+                (id.clone(), repo_node.clone()),
+                GraphEdge {
+                    from: id.clone(),
+                    to: repo_node,
+                    access,
+                    provenance: Provenance::Declaration,
+                    symbol: String::new(),
+                },
+            );
+        }
     }
 
     MountedSurface {
         generated: generated_routes,
         unmodelled: unmodelled.into_iter().collect(),
+        declared: declared
+            .into_iter()
+            .map(|((method, path), auth)| DeclaredMount { method, path, auth })
+            .collect(),
     }
 }
 
@@ -991,6 +1292,7 @@ pub fn parse_manifest_dump(stdout: &str) -> Option<ArchitectureGraph> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::RepositoryApiOwner;
 
     fn model(name: &'static str, path: &'static str, table: &'static str) -> ModelGraphDescriptor {
         ModelGraphDescriptor {
@@ -1001,6 +1303,7 @@ mod tests {
             module_path: "app::models",
             file: "src/models.rs",
             line: 10,
+            crate_version: "0.1.0",
         }
     }
 
@@ -1019,6 +1322,7 @@ mod tests {
             module_path: "app::repositories",
             file: "src/repositories.rs",
             line: 20,
+            crate_version: "0.1.0",
         }
     }
 
@@ -1050,6 +1354,7 @@ mod tests {
             static_route: false,
             file: "src/routes/posts.rs",
             line: 30,
+            crate_version: "0.1.0",
             signature_symbols,
             body_symbols,
             sql_symbols: &[],
@@ -1068,9 +1373,13 @@ mod tests {
             module_path: "app::jobs",
             schedule: "",
             mutating: false,
+            mutating_symbols: &[],
             file: "src/jobs.rs",
             line: 40,
+            crate_version: "0.1.0",
             signature_symbols: &[],
+            signature_bindings: &[],
+            dot_mutation_receivers: &[],
             body_symbols,
             sql_symbols: &[],
         }
@@ -1088,15 +1397,36 @@ mod tests {
                 ..RouteAuth::default()
             },
             repository_api: None,
+            auth_declared: false,
         }
     }
 
     /// A mounted route a `#[repository(api = ...)]` generated, carrying the
     /// declared ownership the real `Route` does.
     fn mounted_by_repository(method: &str, path: &str, api: &str) -> MountedRoute {
+        mounted_by_model(method, path, api, "Post")
+    }
+
+    fn mounted_by_model(method: &str, path: &str, api: &str, model: &str) -> MountedRoute {
         MountedRoute {
-            repository_api: Some(api.to_owned()),
+            repository_api: Some(RepositoryApiOwner {
+                api: api.to_owned(),
+                model: model.to_owned(),
+            }),
             ..mounted(method, path, "auto")
+        }
+    }
+
+    /// A plugin mount the app declared, so its auth is known.
+    fn declared_mount(method: &str, path: &str, public: bool) -> MountedRoute {
+        MountedRoute {
+            auth: RouteAuth {
+                secured: !public,
+                public,
+                ..RouteAuth::default()
+            },
+            auth_declared: true,
+            ..mounted(method, path, "plugin")
         }
     }
 
@@ -1445,6 +1775,156 @@ mod tests {
             &[writer],
         );
         assert_eq!(graph.edges[0].access, Access::Write);
+    }
+
+    fn edge_access(graph: &ArchitectureGraph, to_suffix: &str) -> Access {
+        graph
+            .edges
+            .iter()
+            .find(|e| e.to.ends_with(to_suffix) && e.provenance != Provenance::Declaration)
+            .unwrap_or_else(|| panic!("no edge to {to_suffix}: {:?}", graph.edges))
+            .access
+    }
+
+    #[test]
+    fn a_job_that_reads_one_table_and_writes_another_has_two_accesses() {
+        // #2520 item 11: loading `users`, then inserting into `audit_events`.
+        let mut writer = job("audit", JobKind::Job, &["audit_events", "users"]);
+        writer.mutating_symbols = &["audit_events"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                model("User", "app::models::User", "users"),
+                model("AuditEvent", "app::models::AuditEvent", "audit_events"),
+            ],
+            &[],
+            &[writer],
+        );
+        assert_eq!(edge_access(&graph, "AuditEvent"), Access::Write);
+        assert_eq!(edge_access(&graph, "User"), Access::Read);
+    }
+
+    #[test]
+    fn unattributed_mutation_evidence_still_writes_every_edge() {
+        let mut writer = job("audit", JobKind::Job, &["audit_events", "users"]);
+        writer.mutating = true;
+        writer.mutating_symbols = &["audit_events"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                model("User", "app::models::User", "users"),
+                model("AuditEvent", "app::models::AuditEvent", "audit_events"),
+            ],
+            &[],
+            &[writer],
+        );
+        assert_eq!(edge_access(&graph, "AuditEvent"), Access::Write);
+        assert_eq!(edge_access(&graph, "User"), Access::Write);
+    }
+
+    #[test]
+    fn a_write_through_one_symbol_beats_a_read_through_another_for_one_target() {
+        // `Post` (a read) and `posts` (a write) reach the same model node.
+        let mut writer = job("rank", JobKind::Job, &["Post", "posts"]);
+        writer.mutating_symbols = &["posts"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[],
+            &[writer],
+        );
+        assert_eq!(edge_access(&graph, "Post"), Access::Write);
+    }
+
+    fn repo_job(
+        bindings: &'static [(&'static str, &'static str)],
+        receivers: &'static [&'static str],
+    ) -> JobGraphDescriptor {
+        JobGraphDescriptor {
+            signature_symbols: &["PgPostRepository"],
+            signature_bindings: bindings,
+            dot_mutation_receivers: receivers,
+            ..job("edit", JobKind::Job, &[])
+        }
+    }
+
+    fn post_graph(job: JobGraphDescriptor) -> ArchitectureGraph {
+        build(
+            &[],
+            0,
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
+            &[job],
+        )
+    }
+
+    #[test]
+    fn a_dot_call_on_a_repository_parameter_is_a_write() {
+        // #2520 item 8: `repo.update(id, &patch)`.
+        let graph = post_graph(repo_job(&[("repo", "PgPostRepository")], &["repo"]));
+        assert_eq!(edge_access(&graph, "PostRepository"), Access::Write);
+    }
+
+    #[test]
+    fn a_repository_parameter_with_no_dot_mutation_stays_a_read() {
+        let graph = post_graph(repo_job(&[("repo", "PgPostRepository")], &[]));
+        assert_eq!(edge_access(&graph, "PostRepository"), Access::Read);
+    }
+
+    #[test]
+    fn a_dot_call_on_a_name_that_is_not_a_repository_parameter_is_a_read() {
+        // `HashMap::insert`: `cache` is a local, not a parameter.
+        let unbound = post_graph(repo_job(&[("repo", "PgPostRepository")], &["cache"]));
+        assert_eq!(edge_access(&unbound, "PostRepository"), Access::Read);
+        // A parameter whose type is no declared repository.
+        let other = JobGraphDescriptor {
+            signature_symbols: &["PgPostRepository", "Cache"],
+            signature_bindings: &[("repo", "PgPostRepository"), ("cache", "Cache")],
+            dot_mutation_receivers: &["cache"],
+            ..job("edit", JobKind::Job, &[])
+        };
+        assert_eq!(
+            edge_access(&post_graph(other), "PostRepository"),
+            Access::Read
+        );
+    }
+
+    #[test]
+    fn a_repository_receiver_makes_only_its_own_repository_a_write() {
+        let both = JobGraphDescriptor {
+            signature_symbols: &["PgPostRepository", "PgUserRepository"],
+            signature_bindings: &[("posts", "PgPostRepository"), ("users", "PgUserRepository")],
+            dot_mutation_receivers: &["posts"],
+            ..job("edit", JobKind::Job, &[])
+        };
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                model("Post", "app::models::Post", "posts"),
+                model("User", "app::models::User", "users"),
+            ],
+            &[
+                repository("PostRepository", "PgPostRepository", "Post", "posts"),
+                repository("UserRepository", "PgUserRepository", "User", "users"),
+            ],
+            &[both],
+        );
+        assert_eq!(edge_access(&graph, "PostRepository"), Access::Write);
+        assert_eq!(edge_access(&graph, "UserRepository"), Access::Read);
     }
 
     #[test]
@@ -1829,5 +2309,558 @@ mod tests {
         assert!(summary.contains("Post (table posts)"), "{summary}");
         assert!(summary.contains("PostRepository over Post"), "{summary}");
         assert!(summary.contains("Limits of this derivation"), "{summary}");
+    }
+
+    // ── #2520 follow-ups ─────────────────────────────────────────────
+
+    fn plugin_post() -> ModelGraphDescriptor {
+        ModelGraphDescriptor {
+            model_path: "plugin::models::Post",
+            table: "plugin_posts",
+            relations: &["plugin_votes"],
+            ..model("Post", "plugin::models::Post", "plugin_posts")
+        }
+    }
+
+    #[test]
+    fn a_repository_edge_requires_the_model_name_and_table_to_match() {
+        let mut app_post = model("Post", "app::models::Post", "posts");
+        app_post.relations = &["votes"];
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[
+                app_post,
+                plugin_post(),
+                model("Vote", "app::models::Vote", "votes"),
+                model("PluginVote", "plugin::models::PluginVote", "plugin_votes"),
+            ],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
+            &[],
+        );
+        let targets: Vec<&str> = graph.edges.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["model:app::models::Post", "model:app::models::Vote"],
+            "the other crate's Post and its relations must not be claimed"
+        );
+    }
+
+    #[test]
+    fn a_repository_over_an_overridden_table_still_finds_its_model_by_name() {
+        // No model matches (name, table) when the repository overrides the
+        // table. Dropping the edge would lose recall, so fall back to the name.
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "archive",
+            )],
+            &[],
+        );
+        assert_eq!(graph.edges.len(), 1, "{:?}", graph.edges);
+    }
+
+    #[test]
+    fn a_git_checkout_path_is_shortened_to_its_crate_relative_tail() {
+        assert_eq!(
+            location(
+                "/home/someone/.cargo/git/checkouts/plug-1a2b3c4d5e6f7a8b/9f8e7d6/src/lib.rs",
+                4
+            ),
+            "plug/src/lib.rs:4"
+        );
+        assert_eq!(
+            location(
+                r"C:\Users\dev\.cargo\git\checkouts\plug-1a2b3c4d5e6f7a8b\9f8e7d6\crates\x\src\lib.rs",
+                4
+            ),
+            "plug/crates/x/src/lib.rs:4"
+        );
+    }
+
+    #[test]
+    fn the_same_prefix_under_two_models_keeps_each_route_with_its_own_repository() {
+        let mut other = repository_with_api(
+            "ArticleRepository",
+            "PgArticleRepository",
+            "Article",
+            "articles",
+            "/api/items",
+        );
+        other.module_path = "app::other";
+        let graph = build(
+            &[
+                mounted_by_model("GET", "/a/api/items", "/api/items", "Post"),
+                mounted_by_model("GET", "/b/api/items", "/api/items", "Article"),
+            ],
+            0,
+            &[],
+            &[
+                model("Post", "app::models::Post", "posts"),
+                model("Article", "app::models::Article", "articles"),
+            ],
+            &[
+                repository_with_api(
+                    "PostRepository",
+                    "PgPostRepository",
+                    "Post",
+                    "posts",
+                    "/api/items",
+                ),
+                other,
+            ],
+            &[],
+        );
+        let owner_of = |path: &str| {
+            graph
+                .nodes
+                .iter()
+                .find(|n| n.route.as_ref().is_some_and(|r| r.path == path))
+                .and_then(|n| n.route.as_ref()?.generated_by.clone())
+        };
+        assert_eq!(owner_of("/a/api/items").as_deref(), Some("PostRepository"));
+        assert_eq!(
+            owner_of("/b/api/items").as_deref(),
+            Some("ArticleRepository")
+        );
+    }
+
+    /// Item 17 is fixed, so the limit about one graph per process is gone.
+    #[test]
+    fn the_limits_do_not_claim_a_process_global_graph() {
+        let graph = build(&[], 0, &[], &[], &[], &[]);
+        assert!(
+            !graph.limits.iter().any(|l| l.contains("process-global")),
+            "{:?}",
+            graph.limits
+        );
+        assert!(
+            graph.limits.iter().any(|l| l.contains("@<version>")),
+            "{:?}",
+            graph.limits
+        );
+    }
+
+    // ── #2520 item 14: two versions of one crate ─────────────────────
+
+    fn post_at(version: &'static str) -> ModelGraphDescriptor {
+        ModelGraphDescriptor {
+            crate_version: version,
+            module_path: "plugin::models",
+            ..model("Post", "plugin::models::Post", "plugin_posts")
+        }
+    }
+
+    fn repository_at(version: &'static str) -> RepositoryGraphDescriptor {
+        RepositoryGraphDescriptor {
+            crate_version: version,
+            module_path: "plugin::repositories",
+            ..repository("PostRepository", "PgPostRepository", "Post", "plugin_posts")
+        }
+    }
+
+    fn ids(graph: &ArchitectureGraph) -> Vec<&str> {
+        graph.nodes.iter().map(|n| n.id.as_str()).collect()
+    }
+
+    #[test]
+    fn two_versions_of_one_crate_keep_a_node_each() {
+        let route_at = |version| RouteGraphDescriptor {
+            crate_version: version,
+            ..route("show", "GET", "/p", &[], &[])
+        };
+        let job_at = |version| JobGraphDescriptor {
+            crate_version: version,
+            ..job("prune", JobKind::Job, &[])
+        };
+        let graph = build(
+            &[],
+            0,
+            &[route_at("1.0.0"), route_at("2.0.0")],
+            &[post_at("1.0.0"), post_at("2.0.0")],
+            &[repository_at("1.0.0"), repository_at("2.0.0")],
+            &[job_at("1.0.0"), job_at("2.0.0")],
+        );
+        assert_eq!(
+            ids(&graph),
+            vec![
+                "job:app::jobs::prune@1.0.0",
+                "job:app::jobs::prune@2.0.0",
+                "model:plugin::models::Post@1.0.0",
+                "model:plugin::models::Post@2.0.0",
+                "repository:plugin::repositories::PostRepository@1.0.0",
+                "repository:plugin::repositories::PostRepository@2.0.0",
+                "route:app::routes::posts::show@1.0.0",
+                "route:app::routes::posts::show@2.0.0",
+            ]
+        );
+    }
+
+    /// The version is in an id only on a collision, so a dependency update
+    /// does not change the ids of a normal graph.
+    #[test]
+    fn an_id_that_collides_with_nothing_has_no_version() {
+        let graph = build(&[], 0, &[], &[post_at("1.0.0")], &[], &[]);
+        assert_eq!(ids(&graph), vec!["model:plugin::models::Post"]);
+    }
+
+    #[test]
+    fn a_repository_binds_the_model_of_its_own_crate_version() {
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[post_at("1.0.0"), post_at("2.0.0")],
+            &[repository_at("1.0.0"), repository_at("2.0.0")],
+            &[],
+        );
+        let pairs: Vec<(&str, &str)> = graph
+            .edges
+            .iter()
+            .map(|e| (e.from.as_str(), e.to.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "repository:plugin::repositories::PostRepository@1.0.0",
+                    "model:plugin::models::Post@1.0.0"
+                ),
+                (
+                    "repository:plugin::repositories::PostRepository@2.0.0",
+                    "model:plugin::models::Post@2.0.0"
+                ),
+            ]
+        );
+    }
+
+    /// A bare name cannot say which version it means, so both get an edge.
+    #[test]
+    fn a_route_naming_a_model_of_two_versions_links_both() {
+        let graph = build(
+            &[],
+            0,
+            &[route("show", "GET", "/p", &[], &["Post"])],
+            &[post_at("1.0.0"), post_at("2.0.0")],
+            &[],
+            &[],
+        );
+        let targets: Vec<&str> = graph.edges.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec![
+                "model:plugin::models::Post@1.0.0",
+                "model:plugin::models::Post@2.0.0"
+            ]
+        );
+    }
+
+    /// The route cannot say which version generated it, so every version
+    /// that ties gets an edge. One edge would lose the other version's REST
+    /// surface in `impact`.
+    #[test]
+    fn an_auto_api_route_of_two_versions_links_both_repositories() {
+        let at = |version| RepositoryGraphDescriptor {
+            api: "/api/posts",
+            ..repository_at(version)
+        };
+        let graph = build(
+            &[mounted_by_repository("GET", "/api/posts", "/api/posts")],
+            0,
+            &[],
+            &[post_at("1.0.0"), post_at("2.0.0")],
+            &[at("1.0.0"), at("2.0.0")],
+            &[],
+        );
+        let targets: Vec<&str> = graph
+            .edges
+            .iter()
+            .filter(|e| e.from.starts_with("route:auto-api:"))
+            .map(|e| e.to.as_str())
+            .collect();
+        assert_eq!(
+            targets,
+            vec![
+                "repository:plugin::repositories::PostRepository@1.0.0",
+                "repository:plugin::repositories::PostRepository@2.0.0",
+            ]
+        );
+    }
+
+    /// The other version moved the model to another module. It is still the
+    /// other version of the repository's own crate, so it gets no edge.
+    #[test]
+    fn a_moved_model_of_the_other_version_is_not_linked() {
+        let moved = ModelGraphDescriptor {
+            model_path: "plugin::model::Post",
+            module_path: "plugin::model",
+            ..post_at("2.0.0")
+        };
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[post_at("1.0.0"), moved],
+            &[repository_at("1.0.0")],
+            &[],
+        );
+        let targets: Vec<&str> = graph.edges.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(targets, vec!["model:plugin::models::Post"]);
+    }
+
+    /// A relation table resolves to the relation model of the repository's
+    /// own version too, not to every version of it.
+    #[test]
+    fn a_relation_table_links_the_own_version_only() {
+        let post = |version| ModelGraphDescriptor {
+            relations: &["plugin_votes"],
+            ..post_at(version)
+        };
+        let vote = |version| ModelGraphDescriptor {
+            crate_version: version,
+            module_path: "plugin::models",
+            ..model("Vote", "plugin::models::Vote", "plugin_votes")
+        };
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[post("1.0.0"), post("2.0.0"), vote("1.0.0"), vote("2.0.0")],
+            &[repository_at("1.0.0")],
+            &[],
+        );
+        let targets: Vec<&str> = graph.edges.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec![
+                "model:plugin::models::Post@1.0.0",
+                "model:plugin::models::Vote@1.0.0"
+            ]
+        );
+    }
+
+    /// A model of another crate is not a version of the repository's crate,
+    /// so it keeps its edge.
+    #[test]
+    fn a_model_of_another_crate_keeps_its_edge() {
+        let app_post = ModelGraphDescriptor {
+            crate_version: "9.0.0",
+            module_path: "app::models",
+            ..model("Post", "app::models::Post", "plugin_posts")
+        };
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[post_at("1.0.0"), app_post],
+            &[repository_at("1.0.0")],
+            &[],
+        );
+        assert_eq!(graph.edges.len(), 2, "{:?}", graph.edges);
+    }
+
+    /// The version narrows the candidates before the table does. Else a table
+    /// that only the other version maps hides this version's model.
+    #[test]
+    fn the_own_version_wins_before_the_table_match() {
+        let v2 = ModelGraphDescriptor {
+            table: "posts",
+            ..post_at("2.0.0")
+        };
+        let repo = RepositoryGraphDescriptor {
+            table: "posts",
+            ..repository_at("1.0.0")
+        };
+        let graph = build(&[], 0, &[], &[post_at("1.0.0"), v2], &[repo], &[]);
+        let targets: Vec<&str> = graph.edges.iter().map(|e| e.to.as_str()).collect();
+        assert_eq!(targets, vec!["model:plugin::models::Post@1.0.0"]);
+    }
+
+    /// A version that is empty (a build outside Cargo) keeps the base id. The
+    /// other version still gets its own node.
+    #[test]
+    fn a_collision_with_an_empty_version_keeps_two_nodes() {
+        let graph = build(&[], 0, &[], &[post_at(""), post_at("1.0.0")], &[], &[]);
+        assert_eq!(
+            ids(&graph),
+            vec![
+                "model:plugin::models::Post",
+                "model:plugin::models::Post@1.0.0"
+            ]
+        );
+    }
+
+    /// No model is of the repository's own version, so every version stays.
+    /// A lost edge is the worst failure here.
+    #[test]
+    fn a_repository_with_no_model_of_its_version_links_every_version() {
+        let graph = build(
+            &[],
+            0,
+            &[],
+            &[post_at("1.0.0"), post_at("2.0.0")],
+            &[repository_at("3.0.0")],
+            &[],
+        );
+        assert_eq!(graph.edges.len(), 2, "{:?}", graph.edges);
+    }
+
+    /// The report shows the version, so the two nodes read differently.
+    #[test]
+    fn a_versioned_node_shows_its_version_in_the_label() {
+        let graph = build(&[], 0, &[], &[post_at("1.0.0"), post_at("2.0.0")], &[], &[]);
+        let labels: Vec<String> = graph.nodes.iter().map(GraphNode::label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Post (table plugin_posts) @1.0.0",
+                "Post (table plugin_posts) @2.0.0"
+            ]
+        );
+    }
+
+    /// An `@` in an auto-API path is part of the path, not a version.
+    #[test]
+    fn an_at_sign_in_an_auto_api_path_is_not_a_version() {
+        let graph = build(
+            &[mounted_by_repository("GET", "/api/@me", "/api")],
+            0,
+            &[],
+            &[model("Post", "app::models::Post", "posts")],
+            &[RepositoryGraphDescriptor {
+                api: "/api",
+                ..repository("PostRepository", "PgPostRepository", "Post", "posts")
+            }],
+            &[],
+        );
+        let node = graph
+            .node("route:auto-api:GET /api/@me")
+            .expect("auto-API node");
+        assert_eq!(node.crate_version(), None);
+        assert_eq!(node.base_id(), "route:auto-api:GET /api/@me");
+        assert_eq!(node.label(), "GET /api/@me");
+    }
+
+    /// An auto-API route goes to the repository node with the version suffix.
+    #[test]
+    fn an_auto_api_route_edge_points_at_a_node_that_exists() {
+        let at = |version| RepositoryGraphDescriptor {
+            api: "/api/posts",
+            ..repository_at(version)
+        };
+        let graph = build(
+            &[mounted_by_repository("GET", "/api/posts", "/api/posts")],
+            0,
+            &[],
+            &[post_at("1.0.0"), post_at("2.0.0")],
+            &[at("1.0.0"), at("2.0.0")],
+            &[],
+        );
+        for edge in &graph.edges {
+            assert!(graph.node(&edge.to).is_some(), "dangling edge: {edge:?}");
+        }
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from.starts_with("route:auto-api:"))
+        );
+    }
+
+    #[test]
+    fn a_declared_plugin_mount_keeps_its_auth_in_a_structured_entry() {
+        let graph = build(
+            &[
+                declared_mount("GET", "/admin/plugins", false),
+                mounted("GET", "/health", "probe"),
+            ],
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let c = &graph.completeness;
+        assert_eq!(c.declared_mounts.len(), 1, "{:?}", c.declared_mounts);
+        assert_eq!(c.declared_mounts[0].method, "GET");
+        assert_eq!(c.declared_mounts[0].path, "/admin/plugins");
+        assert!(c.declared_mounts[0].auth.secured);
+        assert_eq!(
+            c.unmodelled_mounted_routes,
+            vec!["GET /health"],
+            "a mount with known auth is not also a name-only string"
+        );
+    }
+
+    #[test]
+    fn flipping_a_declared_mounts_auth_changes_the_document() {
+        let secured = build(&[declared_mount("GET", "/p", false)], 0, &[], &[], &[], &[]);
+        let public = build(&[declared_mount("GET", "/p", true)], 0, &[], &[], &[], &[]);
+        assert_ne!(secured.completeness, public.completeness);
+    }
+
+    #[test]
+    fn declared_mounts_are_omitted_when_there_are_none_and_sorted_otherwise() {
+        let none = build(&[], 0, &[], &[], &[], &[]);
+        assert!(!none.to_json().contains("declared_mounts"));
+        let graph = build(
+            &[
+                declared_mount("POST", "/z", false),
+                declared_mount("GET", "/a", false),
+            ],
+            0,
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        let paths: Vec<&str> = graph
+            .completeness
+            .declared_mounts
+            .iter()
+            .map(|m| m.path.as_str())
+            .collect();
+        assert_eq!(paths, vec!["/a", "/z"]);
+        assert_eq!(graph.schema_version, 1);
+        assert!(graph.summary().contains("GET /a"), "{}", graph.summary());
+    }
+
+    #[test]
+    fn a_cron_schedule_is_not_labelled_as_every() {
+        let node = |schedule: &str| GraphNode {
+            id: "job:x".to_owned(),
+            kind: NodeKind::ScheduledTask,
+            name: "digest".to_owned(),
+            module: String::new(),
+            location: String::new(),
+            route: None,
+            model: None,
+            repository: None,
+            job: Some(JobFacts {
+                kind: JobKind::Scheduled,
+                schedule: Some(schedule.to_owned()),
+            }),
+        };
+        assert_eq!(node("15m").label(), "digest (every 15m)");
+        assert_eq!(node("1h 30m").label(), "digest (every 1h 30m)");
+        assert_eq!(node("1h30m").label(), "digest (every 1h30m)");
+        assert_eq!(node("1 h").label(), "digest (every 1 h)");
+        assert_eq!(node("0 0 1 1 1").label(), "digest (0 0 1 1 1)");
+        assert_eq!(
+            node("0 3 * * * (America/New_York)").label(),
+            "digest (0 3 * * * (America/New_York))"
+        );
     }
 }

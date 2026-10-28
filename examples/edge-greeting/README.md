@@ -19,7 +19,11 @@ narrative is `docs/guide/edge.md`, the design record is
 | `EdgeCache` | `src/handlers.rs` | One extractor, two implementations — the app's cache at the origin, a host round trip at the edge |
 | `AppBuilder::with_edge_kv` | `src/main.rs` | Puts a store behind that seam at the origin |
 | Origin-only code | `src/origin.rs` | A `POST` route the edge declines and the origin answers, with no glue |
-| Conformance | `tests/conformance.rs` | Runs one request corpus through the native lane, a real wasm artifact, and the full origin app |
+| Conformance | `tests/conformance.rs` | Runs one request corpus through the native lane, a real wasm artifact, the full origin app, and a gateway |
+| `EdgeGateway` | `tests/conformance.rs` | The capsule in front of the origin: a declined request goes to the origin unchanged |
+| `autumn edge serve` / `EdgeNode` | `tests/conformance.rs` | The edge node over real HTTP; Tier E measures TTFB |
+| The JS edge host | `tests/conformance.rs` | Tier J: `autumn-edge/js` runs the capsule to the reference host's outcome for every request |
+| `autumn edge bundle` | below | A Cloudflare Worker from this capsule; CI runs it in workerd |
 
 The module split is the whole trick:
 
@@ -63,7 +67,7 @@ curl http://localhost:3000/note/greeting
 # => greeting: the origin published this note to the edge
 
 curl "http://localhost:3000/stats?tag=one&tag=two"
-# => routes=5 tags=[tag=one tag=two] ratio=0.666667
+# => routes=7 tags=[tag=one tag=two] ratio=0.666667
 
 curl -X POST http://localhost:3000/feedback -d 'nice'
 # => Thanks — the origin recorded 4 byte(s) of feedback.
@@ -83,10 +87,9 @@ autumn build --edge     # force the edge step in a debug build
 🍂 Edge capsule: 5 route(s) (greet, note, stats, count, boom) → target/wasm32-wasip1/release/edge-capsule.wasm (553 KB)
 ```
 
-(This app registers no `#[static_get]` routes, so the static-render step that
-runs *after* the edge step reports "No static routes registered" and `autumn
-build` exits non-zero — the same thing it does for any app without pre-rendered
-pages. The capsule above is already written by then.)
+This app registers no `#[static_get]` routes. The static-render step reports
+"No static routes registered", and `autumn build` exits 0: the capsule is the
+build's output.
 
 The equivalent by hand, which is exactly what the CLI runs:
 
@@ -98,6 +101,63 @@ ls -la target/wasm32-wasip1/release/edge-capsule.wasm
 The artifact is **never** copied into `dist/` or `static/`. It is not an asset a
 browser fetches; it is a program the CDN runs.
 
+## Running the edge node
+
+Start the origin, then the edge node in front of it. From this directory:
+
+```bash
+cargo run -p edge-greeting &                     # the origin, on :3000
+autumn edge serve \
+  --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
+  --origin http://127.0.0.1:3000 \
+  --response-header 'access-control-allow-origin: *' &   # the edge node, on :8787
+
+curl http://127.0.0.1:8787/greet/ada             # served by the capsule
+curl -X POST http://127.0.0.1:8787/feedback -d x # sent to the origin
+```
+
+The dev profile of the origin allows every CORS origin. The node does not
+copy CORS headers, so the command sets the same one.
+
+The node writes one line for each request, with the lane:
+
+```text
+GET /greet/ada 200 edge 3.1ms
+POST /feedback 200 origin (method_not_edge_eligible) 4.1ms
+```
+
+Compare the bytes of both sides:
+
+```bash
+autumn edge ttfb --divergence-only --edge http://127.0.0.1:8787 \
+  --origin http://127.0.0.1:3000 --path /greet/ada --path '/stats?tag=a'
+```
+
+On one machine there is no distance, so the edge is not faster. Run
+`autumn edge ttfb` without `--divergence-only` from a client far from the
+origin to measure the speed-up.
+
+## Running it in a Cloudflare Worker
+
+`autumn edge bundle` writes a Worker for this capsule. `wrangler dev` runs it
+locally in workerd, Cloudflare's runtime, in front of the same origin:
+
+```bash
+cargo run -p edge-greeting &                     # the origin, on :3000
+autumn edge bundle \
+  --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
+  --origin http://127.0.0.1:3000 \
+  --response-header 'access-control-allow-origin: *'
+cd edge/cloudflare && npx wrangler dev --port 8788
+
+curl http://127.0.0.1:8788/greet/ada             # served by the capsule, in the Worker
+curl -X POST http://127.0.0.1:8788/feedback -d x # sent to the origin
+```
+
+`npx wrangler deploy` deploys the same directory. Bind a KV namespace as
+`EDGE_KV` in `wrangler.toml` to give `/note/{key}` its store; without
+one, `/note/{key}` falls through to the origin.
+
 ## Running the conformance suite
 
 This is the interesting part. Every test builds a real capsule from these
@@ -105,6 +165,13 @@ sources and compares it against both the native edge lane and the full origin
 app over a shared request corpus — percent-encoding, `%2F` inside a segment,
 trailing slashes, repeated query keys, float and integer rendering, a stripped
 credential, and each of the four ways the edge can decline.
+
+Three more tiers follow. The gateway tier puts the capsule in front of the
+origin and checks that the client gets the origin's bytes from either lane.
+The generated tier sends 10,000 seeded requests through every lane and
+requires zero divergence. The edge node tier runs the node over real HTTP
+against an origin that waits 150 ms, and requires an at least 50% lower
+median TTFB.
 
 ```bash
 cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture
@@ -123,5 +190,7 @@ handler, and a panic hook is process-global.
 | GET | `/note/{key}` | edge (`needs(kv)`) + origin | the cached note, or a miss message |
 | GET | `/stats` | edge + origin | route count, the query tags in order, a formatted float |
 | GET | `/stats/count` | edge + origin | a bare `usize` |
+| GET | `/whoami` | edge + origin | which credential headers the handler sees (none, on both lanes) |
+| GET | `/link/{name}` | edge + origin | a link from the typed path helper `paths::greet`, with a query |
 | GET | `/boom` | edge + origin | panics on purpose: a trap at the edge, a 500 at the origin |
 | POST | `/feedback` | origin only | the write path — declined at the edge with `method_not_edge_eligible` |

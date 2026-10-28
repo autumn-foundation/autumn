@@ -226,6 +226,17 @@ impl TurnstileProvider {
 impl CaptchaProvider for TurnstileProvider {
     fn verify<'a>(&'a self, token: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
+            // This client is not the recorded outbound seam (#2351 item 1).
+            #[cfg(feature = "reporting")]
+            if crate::capsule::guard_egress(
+                "captcha",
+                "POST",
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            )
+            .is_err()
+            {
+                return false;
+            }
             let params = [("secret", self.secret_key.as_str()), ("response", token)];
             match self
                 .client
@@ -290,6 +301,17 @@ impl HCaptchaProvider {
 impl CaptchaProvider for HCaptchaProvider {
     fn verify<'a>(&'a self, token: &'a str) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> {
         Box::pin(async move {
+            // This client is not the recorded outbound seam (#2351 item 1).
+            #[cfg(feature = "reporting")]
+            if crate::capsule::guard_egress(
+                "captcha",
+                "POST",
+                "https://api.hcaptcha.com/siteverify",
+            )
+            .is_err()
+            {
+                return false;
+            }
             let params = [("secret", self.secret_key.as_str()), ("response", token)];
             match self
                 .client
@@ -620,10 +642,9 @@ async fn extract_token_from_form(
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(str::to_ascii_lowercase)
         .unwrap_or_default();
 
-    if !content_type.starts_with("application/x-www-form-urlencoded") {
+    if !crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded") {
         return None;
     }
 
@@ -687,7 +708,7 @@ where
 
     fn call(&mut self, mut req: Request<axum::body::Body>) -> Self::Future {
         // Safe methods (GET, HEAD, OPTIONS, TRACE) are always exempt.
-        if is_safe_method(req.method()) {
+        if is_safe_method(req.method()) || crate::security::is_websocket_connect(&req) {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
@@ -716,14 +737,12 @@ where
 
         // Only enforce CAPTCHA on application/x-www-form-urlencoded requests.
         // JSON APIs, multipart uploads, and external webhooks pass through unchallenged.
-        // Use ASCII lowercase comparison — HTTP media types are case-insensitive.
         let content_type = req
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(str::to_ascii_lowercase)
             .unwrap_or_default();
-        if !content_type.starts_with("application/x-www-form-urlencoded") {
+        if !crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded") {
             let mut inner = self.inner.clone();
             std::mem::swap(&mut self.inner, &mut inner);
             return Box::pin(async move { inner.call(req).await });
@@ -1205,6 +1224,53 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mixed_case_urlencoded_post_still_requires_captcha_token() {
+        let layer = BotProtectionLayer::new(Arc::new(TestCaptchaProvider::new("required")));
+        let app = router_with_layer(layer);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Content-Type", " Application/X-WWW-Form-Urlencoded")
+                    .body(Body::from("field=value"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn extract_token_reads_mixed_case_urlencoded_body() {
+        let mut req = Request::builder()
+            .method("POST")
+            .header(
+                "Content-Type",
+                "APPLICATION/X-WWW-FORM-URLENCODED; charset=UTF-8",
+            )
+            .body(Body::from("captcha=abc&x=1"))
+            .unwrap();
+        let token = extract_token_from_form(&mut req, "captcha", 1024).await;
+        assert_eq!(token.as_deref(), Some("abc"));
+    }
+
+    #[tokio::test]
+    async fn extract_token_ignores_other_content_types() {
+        let mut req = Request::builder()
+            .method("POST")
+            .header("Content-Type", "text/plain")
+            .body(Body::from("captcha=abc"))
+            .unwrap();
+        assert_eq!(
+            extract_token_from_form(&mut req, "captcha", 1024).await,
+            None
+        );
     }
 
     #[test]

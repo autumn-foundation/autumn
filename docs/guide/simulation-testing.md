@@ -8,12 +8,15 @@ run. A failure prints a copy-pasteable line that reproduces it exactly, and a
 seed-sweep runner (`sweep_proptest`, see below) lets you drive *your own*
 workload against many seeds looking for rare-interleaving bugs a single-seed
 test would never stumble into. **This sweeping is opt-in, not automatic**:
-autumn's own CI runs a built-in `sim-sweep` job as a smoke check of the
-harness mechanism itself (a small, fixed toy scenario over a few hundred
-seeds) — it does not explore your application's interleavings. Wiring
+autumn's own CI runs a built-in `sim-sweep` job over a few hundred seeds, and
+sweeps one example app each night (see "The reddit-clone nightly"). It
+sweeps a toy scenario (a smoke check of the harness) and three framework
+scenarios: jobs, scheduler and lock across replicas (see "Multiple
+replicas"). It does not explore your application's interleavings. Wiring
 `sweep_proptest` against your own scenario, in your own CI, is how you get
 that coverage for your app; see "Property-based op-driving + the seed sweep"
-below.
+below. For a complete app sweep to copy, see "The reddit-clone nightly"
+below: 4,000,000 seeds each night.
 
 ```
 ┌──────────────────┐
@@ -309,8 +312,9 @@ enforces the parts it can:
 - **Only two effect classes**: database connection checkout and job execution.
   Mail, outbound HTTP and channels have no `FaultPlan` lane — for SMTP use
   `Chaos::smtp_faults`, which already takes an explicit 1-based schedule.
-- **Test-only.** `FaultPlan` attaches to a `TestApp`; there is no production
-  fault injection, by design.
+- **Test-only.** `FaultPlan` attaches to a `TestApp`. For a running staging
+  app, use [`[fault_injection]`](fault-injection.md). It is refused in `prod`
+  by default.
 - **`perform_enqueued_jobs` bypasses it.** `TestClient::perform_enqueued_jobs`
   invokes handlers directly and never crosses the `intercept_execute` seam, so
   job faults never fire under it. Drain with `sim.run_to_idle()` — plus
@@ -373,19 +377,43 @@ fixed, deliberately-correct toy account scenario as a smoke check that the
 sweep mechanism itself works (`sim_sweep_driver`'s DoD test proves it catches
 a real invariant break using a deliberately-buggy variant of the same toy
 scenario). Autumn's own CI runs that binary as its own job (`Sim sweep`,
-structured like the `loom` job, 512 seeds) on every push and
-PR — but that job exercises the harness, not your application. To get this
+structured like the `loom` job, 512 seeds) on every push and PR. To get this
 coverage for your own app, write a `[[bin]]` following the same shape against
 your own scenario and wire it into your own CI.
 
+Built with `--features sqlite`, the binary also sweeps three framework
+scenarios (issue #3067). Each one mounts two or three replicas on one
+database and injects seeded faults:
+
+| Scenario | What runs | Faults | Invariant |
+|---|---|---|---|
+| `jobs` | the durable `SQLite` job queue, with some jobs longer than the visibility timeout | crash and restart, session loss, mid-query errors and commit ambiguity on `autumn_jobs`, clock skew | no job runs on two replicas at once; every job finishes |
+| `scheduler` | the `SQLite` lease scheduler, one cron and one fixed-delay task | late boots, clock offset, drift and steps, crash and restart, session loss, faults on the lease table | each tick runs at most once |
+| `lock` | the `SQLite` `Lock` | session loss (also aimed at the holder), commit ambiguity on `autumn_locks` | two holders overlap only after the first one lost its session long enough for its lease to lapse |
+
+The first seeds also run twice, and their traces must match (see "Same-seed
+trace check").
+
+The sweep found one contract limit on its first run: each replica reaps
+`SQLite` scheduler leases with its own clock. If one clock is ahead by more than
+`scheduler.lease_ttl_secs`, that replica reaps a live lease, and a second
+replica runs the tick again. Processes on one host use one clock. Only
+processes with their own clocks can have this skew. The scenario keeps its
+skew below the TTL. See `docs/guide/scheduled-multi-replica.md`.
+
 ```bash
-AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release --features sim-testing --bin sim-sweep
+AUTUMN_SIM_SEEDS=1000 cargo run -p autumn-web --release --features "sim-testing,sqlite" --bin sim-sweep
 ```
 
-`AUTUMN_SIM_SEED_START` sets the first seed (default `0`). On a failure the
-binary prints a replay command that sets both variables to rerun only the
-failing seed, for example
-`AUTUMN_SIM_SEED_START=300 AUTUMN_SIM_SEEDS=1 cargo run …`.
+- `AUTUMN_SIM_SEED_START` sets the first seed (default `0`).
+- `AUTUMN_SIM_SCENARIOS` selects scenarios, for example `jobs,lock` (default:
+  all that the build has).
+- `AUTUMN_SIM_TRACE_CHECKS` sets how many of the first seeds run twice
+  (default `16`).
+
+On a failure the binary prints a replay command for only the failing seed and
+scenario, for example
+`AUTUMN_SIM_SCENARIOS=lock AUTUMN_SIM_SEED_START=300 AUTUMN_SIM_SEEDS=1 cargo run …`.
 
 ### Catching a deadlock
 
@@ -474,8 +502,8 @@ let log = net.events(); // one NetEvent per attempt
 ```
 
 - Latency is seeded, in virtual time. A drop fails the attempt after its
-  latency. The client's retry policy applies: attempts, backoff, 429
-  `Retry-After`, 502-504 retries and `request_timeout`.
+  latency. The client's retry policy applies: attempts, jittered backoff,
+  `Retry-After` on 429 and 503, 502-504 retries and `request_timeout`.
 - A host with no router falls back to the app's `http_mock`s. A host with
   neither is an error. No call reaches the real network.
 - The same seed records the same `events()`.
@@ -484,6 +512,121 @@ Only a `Client` built from the app state (the `Client` extractor or
 `Client::from_state`) uses the network, and only after `sim.net(..)`. It needs
 the `http-client` feature. Like http mocks, a sim call skips the process-global
 circuit breaker, the SSRF checks, `pin_to` and redirect following.
+
+### Multiple replicas
+
+A `Sim` can run several apps on one clock (issue #3067). Each replica is its
+own app: its own state, job runtime and scheduled tasks. Give each replica its
+own pool on one `SQLite` database, so they share data as a fleet does:
+
+```rust
+use autumn_web::sim::substrate::SqliteSubstrate;
+use autumn_web::sim::{Replica, Sim};
+
+#[sim_test]
+async fn two_replicas(mut sim: Sim) {
+    let substrate = SqliteSubstrate::new().unwrap();
+    for spec in [Replica::named("a"), Replica::named("b").clock_behind(Duration::from_secs(2))] {
+        let name = spec.name().to_owned();
+        let pool = substrate.replica_pool(&sim.db_link(&name)).unwrap();
+        sim.mount_replica(spec, TestApp::new().config(config(&name)).with_db(pool).jobs(jobs![work]));
+    }
+    sim.run_for(Duration::from_secs(60)).await;
+    sim.replica("a").get("/status").send().await.assert_ok();
+}
+```
+
+- `sim.replica(name)` returns the replica's client. `sim.replica_names()`
+  lists the live replicas.
+- `sim.kill_replica(name)` stops the replica's tasks and drops the app, as a
+  process crash does. A job handler that was running stops and does not
+  settle its claim. `sim.restart_replica(name, app)` mounts it again with the
+  same clock.
+- With `sim.net(..)`, each replica is also a `SimNet` host under its name:
+  `http://b/` reaches the replica `b`. A killed replica is unreachable.
+- Process-wide state is not per replica. The cache, the event bus and the
+  global job client belong to the replica mounted last. Enqueue through the
+  replica's own `JobClient` extension, not `job::enqueue`.
+
+#### Advance time with `run_for`
+
+Use `sim.run_for(duration)` with replicas on `SQLite`. Tokio moves its paused
+clock to the next timer only when all tasks wait and no blocking work is
+queued, such as a `SQLite` query. So database work ends before time moves on,
+and a seed replays the same order. `sim.advance` and `sim.run_to_idle` move or
+drain immediately. They do this also while a query runs, so they do not fix
+the order of database work.
+
+`#[sim_test]` runs on `sim::runtime()`: a paused current-thread runtime with
+one blocking thread. A blocking task that waits for a second blocking task
+therefore never ends. Do not nest blocking work in a sim test.
+
+#### Clocks per replica
+
+Each replica reads its own clock: the sim's elapsed time, scaled by a drift
+rate, plus an offset.
+
+| Call | Effect |
+|---|---|
+| `Replica::named("b").clock_ahead(d)` / `.clock_behind(d)` | a fixed offset |
+| `.clock_drift_ppm(ppm)` | the clock runs `ppm` parts per million fast (negative: slow), from the mount |
+| `.seeded_clock(max_offset, max_drift_ppm)` | offset and drift drawn from the seed and the name |
+| `sim.step_replica_clock("b", TimeDelta::seconds(5))` | an NTP step: the wall clock jumps, the monotonic clock does not |
+| `sim.replica_clock("b")` | the offset (with steps) and drift in use |
+
+The drift changes what the replica's clock reads, not its tokio timers: a
+replica that sleeps 60 s wakes 60 s of sim time later.
+
+#### Database faults per replica
+
+`sim.db_link(name)` is the fault switch between one replica and the shared
+database. The replica's pool must come from
+`substrate.replica_pool(&sim.db_link(name))`.
+
+| Call | Effect |
+|---|---|
+| `link.lose_session()` / `restore_session()` | the replica loses its session: its idle connection closes and each checkout fails. A lease it holds cannot renew. |
+| `link.mid_query_errors("autumn_jobs", p)` | a write to the table fails part way, with probability `p` per row. It does not apply. |
+| `link.commit_ambiguity("autumn_jobs", p)` | a write applies, then the caller gets an error |
+| `link.clear_faults()` | remove the table faults |
+| `link.events()` | each fault decision, in order |
+
+The faults hit only this replica. The write faults use `TEMP` triggers on the
+replica's own connection: `RAISE(ABORT)` before the write, `RAISE(FAIL)`
+after it. So only writes fault, not reads. Inside an explicit transaction,
+the caller rolls back on the error, so an ambiguous fault acts as a mid-query
+error. Each link draws from its own seeded stream.
+
+#### Regression tests for the P0 bugs
+
+`autumn/tests/sim_replicas.rs` holds the two-replica regressions for #3050:
+
+- `sim_cron_tick_runs_once_when_a_replica_clock_steps_forward` and
+  `sim_fixed_delay_tick_runs_once_across_staggered_replicas` (#3052). With the
+  lease held only for its TTL (the code before the fix) both fail: the late
+  replica runs the tick again.
+- `sim_long_job_runs_once_across_two_replicas` (#3051): a 6 s job with a 2 s
+  visibility timeout. Before the claim heartbeat (#3135) it ran five times.
+  Now it runs once.
+- `sim_lock_session_loss_past_the_lease_lets_the_peer_in`: the `SQLite` `Lock`
+  has no loss signal, so a session loss longer than the lease lets a second
+  holder in. The test proves the harness finds that overlap.
+
+### Same-seed trace check
+
+`sim::trace::capture(future)` records every framework `tracing` event that a
+run logs, down to `TRACE`, with its sim time. Run one seed twice and compare:
+
+```rust
+let (_, first) = autumn_web::sim::trace::capture(scenario(Sim::from_seed(7))).await;
+let (_, second) = autumn_web::sim::trace::capture(scenario(Sim::from_seed(7))).await;
+assert_eq!(first.diff(&second), None);
+```
+
+A difference is nondeterminism in the app, the framework or the harness. Use
+`capture_targets(&["autumn_web", "my_app"], ..)` to record your own crate too.
+`tracing` caches callsite interest for the whole process, so a test on another
+thread can hide events. Run trace checks in their own test binary.
 
 ### Fuzzing the shared scenario
 
@@ -558,14 +701,14 @@ async fn retries_are_not_synchronized_under_load(mut sim: Sim) {
 ```
 
 Before the fix, this `always!` fired on every seed: every retry landed in the
-same checkpoint. The fix draws an *equal-jitter* spread — a random delay in
-`[ceil(base_delay / 2), base_delay]` — from the framework's injected `Entropy`
-seam, so the herd spreads out using real OS entropy in production while
-staying bit-for-bit reproducible under a fixed sim seed (the ceiling keeps a
-small configured backoff, like `backoff_ms = 1`, from rounding down to an
-immediate 0ms retry). See
-`autumn/tests/integration/sim_retry_storm.rs` for the full test and
-`jittered_retry_delay_ms` in `autumn/src/job.rs` for the fix.
+same checkpoint. The fix draws a *full-jitter* delay, a random value in
+`[0, min(cap, base_delay)]`, from the framework's injected `Entropy` seam. The
+herd spreads out with real OS entropy in production, and replays bit for bit
+under a fixed sim seed. Issue #3054 moved the helper to `autumn_web::backoff`
+and applied it to every job backend and to the HTTP client. See
+`autumn/tests/integration/sim_retry_storm.rs` and
+`autumn/tests/integration/sim_retry_storm_http.rs` for the tests, and
+`job_retry_delay_ms` in `autumn/src/job.rs` for the job side.
 
 ---
 
@@ -581,6 +724,94 @@ arranges two deliberately-separated input bands so that
 holds at every seed — the pattern to copy when you want a single-run
 non-vacuity check rather than a sweep.
 
+## The reddit-clone nightly
+
+`examples/reddit-clone/tests/sim_nightly.rs` is a seed sweep over the whole
+reddit-clone app. The `sim-nightly.yml` workflow runs it each night.
+
+### What one seed does
+
+Each seed mounts the app on a new sim runtime and runs these phases:
+
+| Phase | DST API |
+|---|---|
+| Setup: the plan, the faults and the network | `rng`, `gen_ops`, `gen_ops_with`, `Chaos`, `FaultPlan`, `SimNet`, `SeededLlm` |
+| Sign-ups; the welcome mail retries with full jitter | `Chaos::smtp_faults`, `smtp_transient_errors`, `backoff::*`, `advance` |
+| Posts enqueue a rank job, an auto-mod job and a webhook job | `Chaos::job_duplicate_delivery`, the `FaultPlan` job faults |
+| Votes race through the real vote rule (`src/vote_core.rs`) | `interleave`, `record_broadcasts` |
+| The real `PostPolicy` and the feed experiment | plain requests |
+| Posts age; the scheduled rank sweep runs; the fault ledger | `advance`, `advance_to`, `advance_to_local`, `try_run_to_idle`, `time::ambient_*`, `fault_outcome` |
+| Replicas with skewed clocks, and a vote worker task | `mount_replica`, `Replica`, `step_replica_clock`, `run_for`, `spawn`, `kill_replica`, `restart_replica` |
+| A crash at a seeded await, then a restart on the same store | `crash_point`, `crash_at`, `crash_and_restart`, `kill`, `restart` |
+| End checks | `SimNet::events`, `SeededLlm::calls` |
+
+An in-memory store is the database of all apps of one seed. It lives longer
+than a crashed app. Each step that is a database round trip
+in the real app yields a seeded number of times, so the races of the real app
+can occur. The checks include:
+
+- Subscribers never get an older vote score after a newer one, per process.
+- The score of a post is the sum of its votes.
+- Ranks are finite, in order, and fall as a post ages.
+- Each post is ranked, has its verdict and has its webhook at the end, after
+  the faults, the partition and the crash.
+
+### The guards
+
+- **The planted bug.** `sim_nightly_catches_unordered_publish` runs the vote
+  rule without `PublishOrder`. The sweep must fail, and the failing seed must
+  fail again alone.
+- **The trace check.** The first `AUTUMN_SIM_TRACE_CHECKS` seeds of each
+  process (2 by default, 8 in the nightly) run twice. The two traces must be
+  the same.
+- **Not vacuous.** Each `sometimes!` label that a seed reaches must be true in
+  at least one seed of the same process. A window of fewer than 32 seeds, such
+  as a one-seed replay, skips this check. A failure also prints a second
+  replay that runs the earlier seeds of the process too.
+- **No leak.** Each 1,000 seeds, the sweep reads the memory of its process.
+  If the process grew by more than 256 MiB since the first 1,000 seeds, the
+  sweep fails with a memory-leak message. Without this check, a leak fills
+  the runner, and the runner stops with no report.
+- **The API surface gate.** `dst_api_surface_is_fully_exercised` reads the
+  public `fn` items of the sim files that do not need `sqlite`. The nightly
+  must call each one, or `EXCLUDED` lists it with a reason. The check is
+  textual: it shows that a call exists, not what the call asserts. The `SQLite`
+  parts (`Sim::db_link`, `DbLink`, the substrate, the fleet scenarios) are left
+  out. reddit-clone cannot enable `sqlite`, because `backend_select!` then
+  compiles the whole app for `SQLite`. The `sim-sweep` job covers them.
+
+### Cost and scale
+
+One process runs one seed at a time: the framework keeps the job runtime and
+the event bus per process. A release build runs about 45 seeds/s on one core,
+and about 150 seeds/s with 4 processes on a 4-vCPU runner. So 4,000,000 seeds
+take about 7.5 runner-hours: about 25 minutes on 20 runners. Each night sweeps
+a new window (`start = UTC day number × seeds`), so each night tests new
+seeds.
+
+```bash
+# The default: 8 seeds and the guard tests. CI runs this on each PR, in debug.
+cargo test -p reddit-clone --release --test sim_nightly
+# One shard of a large window, with a JSON report.
+AUTUMN_SIM_SEED_START=0 AUTUMN_SIM_SEEDS=4000000 AUTUMN_SIM_SHARD=3/64 \
+AUTUMN_SIM_REPORT=report.json \
+  cargo test -p reddit-clone --release --test sim_nightly -- --nocapture sim_nightly_sweep
+```
+
+<!-- config-key-allow: AUTUMN_SIM_SHARD — a sweep variable read by examples/reddit-clone/tests/sim_nightly/sweep.rs, not an app config key -->
+<!-- config-key-allow: AUTUMN_SIM_REPORT — a sweep variable read by examples/reddit-clone/tests/sim_nightly/sweep.rs, not an app config key -->
+
+A failure prints the seed and a replay command for only that seed.
+
+### What it found
+
+On its first sweep the nightly found a bug in reddit-clone. A replica clock
+that was more than 2 hours slow saw a new post "from the future". The rank
+formula `score / (age + 2)^1.5` then gave NaN. Postgres raised an error on the
+same `POWER` in the scheduled rank `UPDATE`. Thus one such post stopped the
+rank update for all posts. `calculate_hot_rank` and its SQL now keep the age at
+0 or more.
+
 ## What's virtualized (and what isn't)
 
 | Source | Sim treatment |
@@ -590,7 +821,10 @@ non-vacuity check rather than a sweep.
 | Elapsed / monotonic time (`state.monotonic()`, the `Clock` extractor's `.monotonic()`) | Virtual, driven by `Sim::advance` — but a raw `std::time::Instant` is **not** (see below) |
 | Scheduling of autumn's own background work (jobs, scheduler, commit hooks) | Deterministic, drained by `Sim::run_to_idle` |
 | Framework-minted IDs (job IDs, request IDs, idempotency keys, sessions) | Seeded from `sim.seed` via the `Entropy` seam |
-| Database | **Boundary** — real in-process SQLite, fault-injected at the connection level via `Chaos` (by probability) or `FaultPlan` (by checkout ordinal), not simulated at the SQL-dialect level |
+| Database | **Boundary** — real in-process SQLite, fault-injected at the connection level via `Chaos` (by probability) or `FaultPlan` (by checkout ordinal), and per replica via `DbLink` (session loss, mid-query errors, commit ambiguity), not simulated at the SQL-dialect level |
+| Database work order | Fixed: one blocking thread, and a gate that runs each query only while every task waits |
+| Several replicas | `Sim::mount_replica`: one clock, a clock per replica (offset, drift, steps), one database, `SimNet` between them |
+| Redis, Postgres | **Not simulated.** Redis and Postgres lanes need Docker; `LeaseLock` and the Postgres tick table use the database clock |
 | Framework code with no clock in scope | Virtual, through the ambient clock (`time::ambient_now` and its siblings) |
 | Outbound HTTP through `http_client::Client` | Simulated by `SimNet` after `sim.net(..)`: in-process hosts, seeded latency and drops, partitions |
 | Task-poll order | Tokio's order, or seeded with `Sim::interleave` / `Sim::spawn` |
@@ -623,6 +857,23 @@ where the nested one stopped, so on one thread an ambient instant never goes
 back. Instants from code outside the sim, or from a `Sim` on another thread, are
 not ordered this way: do not share state that stores ambient instants (a cache,
 a presence map) with those.
+
+Three more rules hold for code that a sim drives:
+
+- **Use `biased;` in `tokio::select!`.** Without it, tokio selects the branch
+  order at random. A stable build cannot set the seed for this order. Two
+  branches that are ready at once then run in a different order per run.
+- **Do not use the database's `random()`.** Draw from `state.entropy()` and
+  pass the value in.
+- **Do not drop a `SQLite` query in flight.** diesel-async panics when it
+  drops one on a current-thread runtime, such as the sim's. A `select!` drops
+  the futures it owns when another branch wins. Pin the query outside the
+  `select!` and poll it by reference. If another branch wins, spawn the query.
+  The job worker still drops a handler on a lost claim or a timeout, so a
+  handler query in flight at that time panics in a sim.
+
+The `sim-sweep` found all three in the framework's own job, scheduler, lock
+and heartbeat code (issue #3067); they now follow these rules.
 
 If you write a custom `impl ClockSource` whose `now()` is virtual, you **must**
 also override `monotonic()`. The trait ships a default body that reads the real

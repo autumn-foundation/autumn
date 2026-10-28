@@ -171,6 +171,16 @@ pub struct LiveStateFrozen;
 pub struct LiveStateHandle<T> {
     inner: Arc<std::sync::RwLock<T>>,
     frozen: Arc<AtomicBool>,
+    journal: Arc<std::sync::OnceLock<Journal<T>>>,
+}
+
+/// Records the state after each write, so a predecessor can take it back.
+struct Journal<T>(Box<dyn Fn(&T) + Send + Sync>);
+
+impl<T> std::fmt::Debug for Journal<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Journal")
+    }
 }
 
 impl<T> Clone for LiveStateHandle<T> {
@@ -178,6 +188,7 @@ impl<T> Clone for LiveStateHandle<T> {
         Self {
             inner: Arc::clone(&self.inner),
             frozen: Arc::clone(&self.frozen),
+            journal: Arc::clone(&self.journal),
         }
     }
 }
@@ -204,6 +215,7 @@ impl<T> LiveStateHandle<T> {
         Self {
             inner: Arc::new(std::sync::RwLock::new(value)),
             frozen: Arc::new(AtomicBool::new(frozen)),
+            journal: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -227,10 +239,17 @@ impl<T> LiveStateHandle<T> {
 
     /// Mutate the state under an exclusive lock.
     ///
+    /// During an in-place upgrade, a successor also journals the whole state to
+    /// disk under this lock, so a large block makes each write slower.
+    ///
     /// # Errors
     ///
     /// [`LiveStateFrozen`] once the state has been snapshotted for an in-place
     /// upgrade: this process is draining and the write would be lost.
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the journal must run under the write lock to keep write order"
+    )]
     pub fn write<R>(&self, f: impl FnOnce(&mut T) -> R) -> Result<R, LiveStateFrozen> {
         // The freeze flag is both set and read under the *write* lock, so a
         // write can never interleave with the snapshot that supersedes it:
@@ -242,7 +261,13 @@ impl<T> LiveStateHandle<T> {
         if self.frozen.load(Ordering::Acquire) {
             return Err(LiveStateFrozen);
         }
-        Ok(f(&mut guard))
+        let result = f(&mut guard);
+        // Still under the write lock, so the journal follows write order and
+        // holds this write before the caller can acknowledge it.
+        if let Some(journal) = self.journal.get() {
+            (journal.0)(&guard);
+        }
+        Ok(result)
     }
 
     /// Whether the state has been snapshotted and is refusing writes.
@@ -280,6 +305,16 @@ impl<T> LiveStateHandle<T> {
     /// Undo [`freeze_for_test`](Self::freeze_for_test).
     pub fn unfreeze_for_test(&self) {
         self.unfreeze();
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code, reason = "the journal is Unix-only"))]
+    /// Replace the value, frozen or not. A predecessor takes back what its
+    /// successor wrote.
+    fn replace(&self, value: T) {
+        *self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
     }
 
     /// Release the freeze (an aborted upgrade, or a failed snapshot).
@@ -370,14 +405,20 @@ pub enum UpgradeError {
     ReadyTimeout(std::time::Duration),
 }
 
+/// Puts a decoded envelope back into the live-state block.
+type Restore = Box<dyn Fn(&StateEnvelope) -> Result<(), AdoptError> + Send + Sync>;
+
 /// Type-erased registration of the app's designated live-state block.
 ///
 /// Installed into the [`AppState`](crate::AppState) extension map by
 /// [`AppBuilder::with_live_state`](crate::app::AppBuilder::with_live_state) so
 /// the upgrade path can snapshot the block without knowing its type.
+#[cfg_attr(not(unix), allow(dead_code, reason = "the journal is Unix-only"))]
 pub(crate) struct LiveStateRegistry {
     freeze_and_snapshot: Box<dyn Fn(u64) -> Result<StateEnvelope, UpgradeError> + Send + Sync>,
     unfreeze: Box<dyn Fn() + Send + Sync>,
+    start_journal: Box<dyn Fn(std::path::PathBuf) + Send + Sync>,
+    restore: Restore,
     type_name: &'static str,
 }
 
@@ -389,12 +430,15 @@ impl std::fmt::Debug for LiveStateRegistry {
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code, reason = "the journal is Unix-only"))]
 impl LiveStateRegistry {
     /// Register `handle` as the app's designated live-state block.
     #[must_use]
     pub(crate) fn new<T: LiveState>(handle: &LiveStateHandle<T>) -> Self {
         let for_snapshot = handle.clone();
         let for_unfreeze = handle.clone();
+        let for_journal = handle.clone();
+        let for_restore = handle.clone();
         Self {
             freeze_and_snapshot: Box::new(move |generation| {
                 for_snapshot
@@ -408,6 +452,14 @@ impl LiveStateRegistry {
                     .map_err(|error| UpgradeError::Snapshot(error.to_string()))
             }),
             unfreeze: Box::new(move || for_unfreeze.unfreeze()),
+            start_journal: Box::new(move |path| {
+                let _ = for_journal
+                    .journal
+                    .set(Journal(Box::new(journal_writer::<T>(path))));
+            }),
+            restore: Box::new(move |envelope| {
+                decode::<T>(envelope).map(|value| for_restore.replace(value))
+            }),
             type_name: std::any::type_name::<T>(),
         }
     }
@@ -430,11 +482,103 @@ impl LiveStateRegistry {
         (self.unfreeze)();
     }
 
+    /// Journal every later write to `path`, until the first failure.
+    ///
+    /// The successor calls this before it unfreezes. A write is then on disk
+    /// before it is acknowledged, so a predecessor can take it back.
+    pub(crate) fn start_journal(&self, path: std::path::PathBuf) {
+        (self.start_journal)(path);
+    }
+
+    /// Take back the state a successor journaled, if it left any.
+    ///
+    /// Returns whether a journal was applied. A journal this build cannot read
+    /// is logged and skipped: the snapshot still stands.
+    pub(crate) fn restore_journal(&self, path: &std::path::Path) -> bool {
+        if !path.exists() {
+            return false;
+        }
+        match read_snapshot(path).and_then(|envelope| (self.restore)(&envelope)) {
+            Ok(()) => {
+                tracing::warn!(
+                    state = self.type_name,
+                    "in-place upgrade: the successor died after it took over; \
+                     resumed from the state it journaled"
+                );
+                true
+            }
+            Err(error) => {
+                tracing::error!(
+                    state = self.type_name,
+                    %error,
+                    "in-place upgrade: the successor journaled writes this build cannot read; \
+                     resumed from the pre-upgrade snapshot, so those writes are lost"
+                );
+                false
+            }
+        }
+    }
+
     /// Rust type name of the designated block, for diagnostics.
     #[must_use]
     pub(crate) const fn type_name(&self) -> &'static str {
         self.type_name
     }
+}
+
+/// Build the closure that journals a state to `path`.
+///
+/// Written to a sibling and renamed, so a reader never sees half a file. It
+/// stops at the first failure. The usual cause is that the predecessor removed
+/// the handoff directory. The handoff is then over, so the journal stops.
+fn journal_writer<T: LiveState>(path: std::path::PathBuf) -> impl Fn(&T) + Send + Sync {
+    let live = AtomicBool::new(true);
+    move |value| {
+        if !live.load(Ordering::Acquire) {
+            return;
+        }
+        let mut tmp = path.clone();
+        tmp.as_mut_os_string().push(".tmp");
+        let envelope = StateEnvelope {
+            generation: generation(),
+            version: T::VERSION,
+            type_name: std::any::type_name::<T>().to_owned(),
+            payload: match serde_json::to_value(value) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    live.store(false, Ordering::Release);
+                    tracing::warn!(
+                        %error,
+                        "live-state journal stopped: the state does not serialize. A later \
+                         successor crash can lose writes made after this point"
+                    );
+                    return;
+                }
+            },
+        };
+        let written = write_snapshot(&tmp, &envelope)
+            .map_err(|error| error.to_string())
+            .and_then(|()| std::fs::rename(&tmp, &path).map_err(|error| error.to_string()));
+        if let Err(error) = written {
+            live.store(false, Ordering::Release);
+            let _ = std::fs::remove_file(&tmp);
+            // A missing directory is the normal end: the predecessor finished.
+            if path.parent().is_some_and(std::path::Path::exists) {
+                tracing::warn!(
+                    %error,
+                    "live-state journal stopped. A later successor crash can lose writes made \
+                     after this point"
+                );
+            }
+        }
+    }
+}
+
+/// Where a successor journals its writes: beside the readiness file.
+#[cfg(unix)]
+pub(crate) fn journal_path() -> Option<std::path::PathBuf> {
+    let ready = std::env::var_os(READY_FILE_ENV).filter(|value| !value.is_empty())?;
+    Some(std::path::Path::new(&ready).parent()?.join(JOURNAL_FILE))
 }
 
 /// This process's upgrade generation: `0` on a cold start, incremented by each
@@ -820,20 +964,31 @@ pub(crate) fn upgrade_binary() -> Result<std::path::PathBuf, UpgradeError> {
 /// Written to a temporary sibling and renamed into place, so the predecessor —
 /// which polls for the path — can never observe a half-written file.
 ///
+/// The handoff lock is held from before the rename until `on_published`
+/// returns. `on_published` makes the adopted state writable. The predecessor
+/// takes the same lock before it decides to kill this process. It sees
+/// either neither event or both: readiness and a writable state.
+///
 /// Returns whether there was a predecessor to tell: `false` on an ordinary
 /// cold start, where nothing is waiting.
 ///
 /// # Errors
 ///
-/// Any IO error from writing or renaming the file. The caller must treat this
+/// An IO error from the lock, the write or the rename. The caller must treat this
 /// as a failed handover and refuse to go on: readiness that never reached the
 /// predecessor means the predecessor will time out and kill this process, so
 /// anything this process acknowledged in the meantime would be discarded.
-pub(crate) fn publish_upgrade_readiness() -> Result<bool, std::io::Error> {
+pub(crate) fn publish_upgrade_readiness(
+    on_published: impl FnOnce(),
+) -> Result<bool, std::io::Error> {
     let Some(path) = std::env::var_os(READY_FILE_ENV).filter(|value| !value.is_empty()) else {
         return Ok(false);
     };
     let path = std::path::PathBuf::from(path);
+    // Held until `on_published` returns, so the predecessor never decides
+    // between the rename and the unfreeze.
+    #[cfg(unix)]
+    let _lock = lock_for_publish(&path)?;
     let mut tmp = path.clone();
     tmp.as_mut_os_string().push(".tmp");
     write_owner_only(&tmp, generation().to_string().as_bytes())
@@ -841,7 +996,96 @@ pub(crate) fn publish_upgrade_readiness() -> Result<bool, std::io::Error> {
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })?;
+    on_published();
     Ok(true)
+}
+
+/// Take the handoff lock beside `ready`, waiting as long as it takes.
+///
+/// The predecessor holds it only for a stat and a kill, so the wait is short.
+/// Returns `None` when there is no lock file: a predecessor built before the
+/// lock existed never made one. If the directory is gone too, the rename that
+/// follows fails and the handover is refused.
+#[cfg(unix)]
+fn lock_for_publish(
+    ready: &std::path::Path,
+) -> Result<Option<nix::fcntl::Flock<std::fs::File>>, std::io::Error> {
+    use nix::fcntl::{Flock, FlockArg};
+
+    let dir = ready.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the readiness path has no directory",
+        )
+    })?;
+    let mut file = match std::fs::File::open(dir.join(LOCK_FILE)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    loop {
+        match Flock::lock(file, FlockArg::LockExclusive) {
+            Ok(lock) => return Ok(Some(lock)),
+            Err((back, nix::errno::Errno::EINTR)) => file = back,
+            Err((_, errno)) => return Err(errno.into()),
+        }
+    }
+}
+
+/// Create the handoff lock file, owner-only, and keep it open.
+#[cfg(unix)]
+fn create_lock_file(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Take the handoff lock for the predecessor's decision, or `None`.
+///
+/// `Drop` must not hang a drain, so the wait is bounded. A holder that outlasts
+/// it is stuck. If it has not published readiness it cannot be writable yet:
+/// kill it so the kernel drops its lock, then try again. If it has published,
+/// it may be writable, so return `None` and let the caller leave it alone.
+#[cfg(unix)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bounds a real OS file-lock wait; a simulated clock would never end it"
+)]
+fn lock_for_decision(
+    lock: Option<std::fs::File>,
+    ready: &std::path::Path,
+    child: &mut Option<std::process::Child>,
+) -> Option<nix::fcntl::Flock<std::fs::File>> {
+    use nix::errno::Errno;
+    use nix::fcntl::{Flock, FlockArg};
+
+    let mut file = lock?;
+    for round in 0..2 {
+        let give_up = std::time::Instant::now() + LOCK_WAIT;
+        while std::time::Instant::now() < give_up {
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => return Some(lock),
+                Err((back, Errno::EWOULDBLOCK | Errno::EINTR)) => {
+                    file = back;
+                    std::thread::sleep(LOCK_RETRY);
+                }
+                Err(_) => return None,
+            }
+        }
+        if round == 0 {
+            if ready.exists() {
+                return None;
+            }
+            let child = child.as_mut()?;
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    None
 }
 
 /// What an upgrade handed over, once the successor is serving.
@@ -892,9 +1136,20 @@ pub(crate) async fn upgrade_in_place(plan: UpgradePlan<'_>) -> Result<Handover, 
         child: None,
         registry: plan.registry.clone(),
         completed: false,
+        lock: None,
+        settled: None,
     };
+    handoff.lock = Some(create_lock_file(&handoff.dir.join(LOCK_FILE))?);
     let successor_pid =
-        spawn_and_await_successor(&plan, &binary, &mut handoff, next_generation).await?;
+        match spawn_and_await_successor(&plan, &binary, &mut handoff, next_generation).await {
+            Ok(pid) => pid,
+            // The successor can publish after the wait gave up. If it took
+            // over, report a handover: the caller must drain, not carry on.
+            Err(error) => match handoff.child.as_ref().map(std::process::Child::id) {
+                Some(pid) if handoff.settle() => pid,
+                _ => return Err(error),
+            },
+        };
     handoff.completed = true;
 
     Ok(Handover {
@@ -914,7 +1169,7 @@ pub(crate) async fn upgrade_in_place(plan: UpgradePlan<'_>) -> Result<Handover, 
 /// and leave the live state frozen for the rest of the drain.
 #[cfg(unix)]
 struct Handoff {
-    /// Private directory holding this handoff's snapshot and ready file.
+    /// Private directory holding this handoff's snapshot, lock and ready file.
     dir: std::path::PathBuf,
     /// The successor, from the moment it is spawned.
     child: Option<std::process::Child>,
@@ -923,11 +1178,21 @@ struct Handoff {
     /// Set once the successor is serving and the handover is this process's to
     /// walk away from.
     completed: bool,
+    /// The handoff lock file, opened at creation so `Drop` cannot fail to open
+    /// it (`EMFILE`, say) and fall back to deciding without the lock.
+    lock: Option<std::fs::File>,
+    /// The outcome of [`settle`](Self::settle), once made.
+    settled: Option<bool>,
 }
 
 #[cfg(unix)]
-impl Drop for Handoff {
-    fn drop(&mut self) {
+impl Handoff {
+    /// Decide, once, whether the successor took over. If it did not, kill it
+    /// and hand the state back.
+    fn settle(&mut self) -> bool {
+        if let Some(taken_over) = self.settled {
+            return taken_over;
+        }
         // `completed` is this process's *observation* that the successor took
         // over, and it lags the fact by up to one poll interval. A successor
         // that has already published readiness and is still running owns the
@@ -937,7 +1202,12 @@ impl Drop for Handoff {
         // hand this process's state back: the successor is writable, and two
         // writable copies of one block is exactly the divergence the freeze
         // exists to prevent.
+        //
+        // The lock makes that decision atomic with the successor's
+        // "publish + unfreeze": a successor mid-publish finishes first, so
+        // this process never kills one that has become writable.
         let ready_path = self.dir.join("ready");
+        let _lock = lock_for_decision(self.lock.take(), &ready_path, &mut self.child);
         let taken_over = self.completed
             || self
                 .child
@@ -950,14 +1220,49 @@ impl Drop for Handoff {
                 let _ = child.wait();
             }
             // The successor never took over, so this process still owns the
-            // state's future: let it be written again.
+            // state's future. One that published and then died may have
+            // acknowledged writes first: take those back, then resume.
             if let Some(registry) = &self.registry {
+                if ready_path.exists() {
+                    registry.restore_journal(&self.dir.join(JOURNAL_FILE));
+                }
                 registry.unfreeze();
             }
         }
+        self.settled = Some(taken_over);
+        taken_over
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Handoff {
+    fn drop(&mut self) {
+        self.settle();
         // The handoff directory carries application state; it never outlives
         // the handoff, completed or abandoned.
-        let _ = std::fs::remove_dir_all(&self.dir);
+        remove_handoff_dir(&self.dir);
+    }
+}
+
+/// Remove the handoff directory, and make the successor's journal stop.
+///
+/// The directory is renamed first. The journal's paths then vanish at once, so
+/// its next write fails and it stops. A write already in flight can still land
+/// in the renamed directory, so the removal is tried a few times.
+#[cfg(unix)]
+fn remove_handoff_dir(dir: &std::path::Path) {
+    let mut gone = dir.as_os_str().to_owned();
+    gone.push(".gone");
+    let gone = std::path::PathBuf::from(gone);
+    let target = if std::fs::rename(dir, &gone).is_ok() {
+        &gone
+    } else {
+        dir
+    };
+    for _ in 0..3 {
+        if std::fs::remove_dir_all(target).is_ok() {
+            return;
+        }
     }
 }
 
@@ -1058,6 +1363,22 @@ async fn spawn_and_await_successor(
         tokio::time::sleep(READY_POLL_INTERVAL).await;
     }
 }
+
+/// Name of the successor's write journal in the handoff directory.
+#[cfg(unix)]
+const JOURNAL_FILE: &str = "journal";
+
+/// Name of the lock file in the handoff directory.
+#[cfg(unix)]
+const LOCK_FILE: &str = "lock";
+
+/// Longest the predecessor waits for the handoff lock, per round.
+#[cfg(unix)]
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Wait between tries.
+#[cfg(unix)]
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// How often the predecessor checks whether its successor is serving.
 #[cfg(unix)]
@@ -1557,14 +1878,17 @@ mod tests {
 
         // The directory deliberately does not exist.
         temp_env::with_var(READY_FILE_ENV, Some(dir.join("ready")), || {
-            publish_upgrade_readiness().expect_err("an unwritable readiness path must be an error");
+            publish_upgrade_readiness(|| ())
+                .expect_err("an unwritable readiness path must be an error");
         });
 
         std::fs::create_dir_all(&dir).expect("temp dir");
+        #[cfg(unix)]
+        std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
         let path = dir.join("ready");
         temp_env::with_var(READY_FILE_ENV, Some(&path), || {
             assert!(
-                publish_upgrade_readiness().expect("publishes"),
+                publish_upgrade_readiness(|| ()).expect("publishes"),
                 "a successor with a waiting predecessor reports that it released it"
             );
         });
@@ -1577,7 +1901,7 @@ mod tests {
         // A cold start has nobody to tell.
         temp_env::with_vars_unset([READY_FILE_ENV], || {
             assert!(
-                !publish_upgrade_readiness().expect("a cold start publishes nothing"),
+                !publish_upgrade_readiness(|| ()).expect("a cold start publishes nothing"),
                 "a cold start has no predecessor to release"
             );
         });
@@ -1588,20 +1912,23 @@ mod tests {
     /// Build a `Handoff` around a live child process, for the drop-guard tests.
     #[cfg(unix)]
     fn handoff_for_test(dir: std::path::PathBuf, registry: Arc<LiveStateRegistry>) -> Handoff {
-        // Long enough to outlive the drop under test, short enough that a
-        // panic before the explicit kill cannot leave it behind for long.
+        // Long enough to outlive a drop that waits out the lock timeout on a
+        // slow runner, short enough that a panic cannot leave it behind long.
         let child = std::process::Command::new("sleep")
-            .arg("5")
+            .arg("30")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("a stand-in successor process");
+        let lock = std::fs::File::open(dir.join(LOCK_FILE)).ok();
         Handoff {
             dir,
             child: Some(child),
             registry: Some(registry),
             completed: false,
+            lock,
+            settled: None,
         }
     }
 
@@ -1695,6 +2022,285 @@ mod tests {
             .status();
     }
 
+    /// Hold the handoff lock the way a mid-publish successor does.
+    #[cfg(unix)]
+    fn hold_handoff_lock(dir: &std::path::Path) -> nix::fcntl::Flock<std::fs::File> {
+        let file = std::fs::File::open(dir.join(LOCK_FILE)).expect("lock file");
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive).expect("locks")
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_drop_waits_for_a_successor_that_is_publishing() {
+        // Case 1 of #2350: the successor holds the lock while it publishes and
+        // unfreezes. A drop that decides without the lock sees "no readiness"
+        // and kills a successor that is about to be writable.
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
+        let handle = LiveStateHandle::new(StatsV1::default());
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let handoff = handoff_for_test(dir.clone(), registry);
+        let pid = handoff.child.as_ref().expect("child").id();
+
+        let lock = hold_handoff_lock(&dir);
+        let dropper = std::thread::spawn(move || drop(handoff));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        std::fs::write(dir.join("ready"), "1").expect("publishes");
+        drop(lock);
+        dropper.join().expect("drop finishes");
+
+        assert!(
+            process_is_alive(pid),
+            "a successor that published under the lock must survive the drop"
+        );
+        assert!(handle.is_frozen(), "the successor owns the state");
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn readiness_is_published_only_while_the_predecessor_is_not_deciding() {
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
+        let ready = dir.join("ready");
+        let lock = hold_handoff_lock(&dir);
+
+        let ready_env = ready.clone();
+        let publisher = std::thread::spawn(move || {
+            temp_env::with_var(READY_FILE_ENV, Some(&ready_env), || {
+                publish_upgrade_readiness(|| ()).expect("publishes")
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            !ready.exists(),
+            "no readiness while the predecessor decides"
+        );
+        drop(lock);
+        assert!(publisher.join().expect("publisher finishes"));
+        assert!(ready.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_state_is_unfrozen_while_the_lock_is_still_held() {
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
+        let ready = dir.join("ready");
+        let mut probed = false;
+        temp_env::with_var(READY_FILE_ENV, Some(&ready), || {
+            publish_upgrade_readiness(|| {
+                probed = true;
+                assert!(ready.exists(), "unfreeze follows the rename");
+                let file = std::fs::File::open(dir.join(LOCK_FILE)).expect("lock file");
+                assert!(
+                    nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                        .is_err(),
+                    "the lock must cover the unfreeze"
+                );
+            })
+            .expect("publishes");
+        });
+        assert!(probed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_predecessor_from_before_the_lock_still_hands_over() {
+        // An older build creates no lock file. Refusing would block the
+        // first upgrade into this build.
+        let dir = scratch_dir(line!());
+        let ready = dir.join("ready");
+        let mut unfroze = false;
+        temp_env::with_var(READY_FILE_ENV, Some(&ready), || {
+            publish_upgrade_readiness(|| unfroze = true).expect("publishes without a lock");
+        });
+        assert!(unfroze);
+        assert!(ready.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_stuck_lock_holder_is_killed_instead_of_stalling_the_drop() {
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
+        let handle = LiveStateHandle::new(StatsV1::default());
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let handoff = handoff_for_test(dir.clone(), registry);
+        let pid = handoff.child.as_ref().expect("child").id();
+
+        let _stuck = hold_handoff_lock(&dir);
+        drop(handoff);
+
+        assert!(!process_is_alive(pid), "the stuck successor is killed");
+        assert!(!handle.is_frozen(), "this process resumes");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_publisher_stalled_after_readiness_is_not_killed() {
+        // Readiness is renamed before the unfreeze, so a stalled holder with
+        // readiness published may already be writable.
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
+        std::fs::write(dir.join("ready"), "1").expect("published");
+        let handle = LiveStateHandle::new(StatsV1::default());
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let handoff = handoff_for_test(dir.clone(), registry);
+        let pid = handoff.child.as_ref().expect("child").id();
+
+        let _stuck = hold_handoff_lock(&dir);
+        drop(handoff);
+
+        assert!(process_is_alive(pid), "a published successor must live");
+        assert!(handle.is_frozen(), "the successor owns the state");
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_late_publication_is_reported_as_a_takeover() {
+        // The deadline passed, then the successor published. The caller must
+        // learn that it took over, not get the timeout error.
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join(LOCK_FILE), "").expect("lock file");
+        std::fs::write(dir.join("ready"), "1").expect("published");
+        let handle = LiveStateHandle::new(StatsV1::default());
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let mut handoff = handoff_for_test(dir, registry);
+        let pid = handoff.child.as_ref().expect("child").id();
+
+        assert!(handoff.settle(), "a published, running successor took over");
+        assert!(handle.is_frozen());
+        drop(handoff);
+        assert!(process_is_alive(pid));
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
+    }
+
+    /// An executable shell script that stands in for the new build.
+    #[cfg(unix)]
+    fn fake_successor(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("successor.sh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("writes the script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    /// Run `upgrade_in_place` against `binary` with a live-state block.
+    #[cfg(unix)]
+    fn run_upgrade(
+        dir: &std::path::Path,
+        binary: &std::path::Path,
+        timeout: std::time::Duration,
+        handle: &LiveStateHandle<StatsV1>,
+    ) -> Result<Handover, UpgradeError> {
+        let registry = Arc::new(LiveStateRegistry::new(handle));
+        temp_env::with_vars([(BINARY_ENV, Some(binary)), (DIR_ENV, Some(dir))], || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(async {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("binds");
+                    let socket = HandoffSocket::from_listener(&listener).expect("dup");
+                    upgrade_in_place(UpgradePlan {
+                        socket: &socket,
+                        registry: Some(registry),
+                        ready_timeout: timeout,
+                        clock: Arc::new(crate::time::SystemClock),
+                        entropy: Arc::new(crate::entropy::SeededEntropy::new(2350)),
+                    })
+                    .await
+                })
+        })
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successor_that_publishes_is_a_handover_and_keeps_the_state_frozen() {
+        let dir = scratch_dir(line!());
+        let binary = fake_successor(&dir, "touch \"$AUTUMN_UPGRADE_READY_FILE\"\nexec sleep 30");
+        let handle = LiveStateHandle::new(StatsV1::default());
+
+        let handover = run_upgrade(&dir, &binary, std::time::Duration::from_secs(20), &handle)
+            .expect("the successor published");
+
+        assert!(handle.is_frozen(), "the successor owns the state now");
+        assert!(process_is_alive(handover.successor_pid));
+        let _ = std::process::Command::new("kill")
+            .arg("-9")
+            .arg(handover.successor_pid.to_string())
+            .status();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successor_that_never_publishes_is_killed_and_the_state_is_handed_back() {
+        let dir = scratch_dir(line!());
+        let pid_file = dir.join("pid");
+        let binary = fake_successor(
+            &dir,
+            &format!("echo $$ > {}\nexec sleep 30", pid_file.display()),
+        );
+        let handle = LiveStateHandle::new(StatsV1::default());
+
+        let error = run_upgrade(
+            &dir,
+            &binary,
+            std::time::Duration::from_millis(300),
+            &handle,
+        )
+        .expect_err("nothing was published");
+
+        assert!(matches!(error, UpgradeError::ReadyTimeout(_)), "{error}");
+        assert!(!handle.is_frozen(), "this process keeps the state");
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the script ran")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            !process_is_alive(pid),
+            "the unpublished successor is killed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successor_that_exits_is_reported_and_the_state_is_handed_back() {
+        let dir = scratch_dir(line!());
+        let binary = fake_successor(&dir, "exit 3");
+        let handle = LiveStateHandle::new(StatsV1::default());
+
+        let error = run_upgrade(&dir, &binary, std::time::Duration::from_secs(20), &handle)
+            .expect_err("the successor exited");
+
+        assert!(matches!(error, UpgradeError::SuccessorExited(_)), "{error}");
+        assert!(!handle.is_frozen());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_ordinary_cold_start_has_no_handover_to_complete() {
         temp_env::with_vars_unset([LISTEN_FD_ENV, STATE_FILE_ENV], || {
@@ -1769,5 +2375,201 @@ mod tests {
         let err = read_snapshot(&path).expect_err("must not silently succeed");
 
         assert!(matches!(err, AdoptError::Read { .. }), "{err}");
+    }
+
+    /// A handle that journals its writes into `dir`.
+    #[cfg(unix)]
+    fn journaled_handle(dir: &std::path::Path) -> LiveStateHandle<StatsV1> {
+        let handle = LiveStateHandle::new(StatsV1::default());
+        LiveStateRegistry::new(&handle).start_journal(dir.join(JOURNAL_FILE));
+        handle
+    }
+
+    #[cfg(unix)]
+    fn stats(hits: u64) -> StatsV1 {
+        StatsV1 {
+            hits,
+            note: String::new(),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_write_is_journaled_before_it_is_acknowledged() {
+        let dir = scratch_dir(line!());
+        let handle = journaled_handle(&dir);
+
+        handle.write(|s| s.hits = 7).expect("writes");
+
+        let envelope = read_snapshot(&dir.join(JOURNAL_FILE)).expect("the journal exists");
+        assert_eq!(decode::<StatsV1>(&envelope).expect("decodes"), stats(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_refused_write_is_not_journaled() {
+        let dir = scratch_dir(line!());
+        let handle = journaled_handle(&dir);
+        handle.freeze_for_test();
+
+        handle.write(|s| s.hits = 7).expect_err("frozen");
+
+        assert!(!dir.join(JOURNAL_FILE).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_journal_stops_when_the_handoff_directory_is_gone() {
+        let dir = scratch_dir(line!());
+        let handle = journaled_handle(&dir);
+        std::fs::remove_dir_all(&dir).expect("the predecessor cleaned up");
+
+        handle.write(|s| s.hits = 1).expect("still writable");
+        std::fs::create_dir_all(&dir).expect("a new directory appears");
+        handle.write(|s| s.hits = 2).expect("still writable");
+
+        assert!(
+            !dir.join(JOURNAL_FILE).exists(),
+            "a window that ended stays ended"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successor_that_dies_after_an_acknowledged_write_hands_it_back() {
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join("ready"), "1").expect("published");
+        let successor_handle = LiveStateHandle::new(stats(7));
+        LiveStateRegistry::new(&successor_handle).start_journal(dir.join(JOURNAL_FILE));
+        successor_handle
+            .write(|s| s.hits += 1)
+            .expect("acknowledged");
+
+        let handle = LiveStateHandle::new(stats(0));
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let mut handoff = handoff_for_test(dir.clone(), registry);
+        let child = handoff.child.as_mut().expect("child");
+        child.kill().expect("the successor dies");
+        child.wait().expect("reaped");
+        drop(handoff);
+
+        assert!(!handle.is_frozen());
+        assert_eq!(
+            handle.read(|s| s.hits),
+            8,
+            "the acknowledged write survives"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_journal_in_a_shape_this_build_cannot_read_falls_back_to_the_snapshot() {
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join("ready"), "1").expect("published");
+        let mut envelope = envelope_of(&stats(9), 1);
+        envelope.version = 99;
+        write_snapshot(&dir.join(JOURNAL_FILE), &envelope).expect("writes");
+
+        let handle = LiveStateHandle::new(stats(3));
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let mut handoff = handoff_for_test(dir.clone(), registry);
+        let child = handoff.child.as_mut().expect("child");
+        child.kill().expect("dies");
+        child.wait().expect("reaped");
+        drop(handoff);
+
+        assert!(!handle.is_frozen(), "the service still resumes");
+        assert_eq!(handle.read(|s| s.hits), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_journal_write_leaves_no_temporary_file_and_stops_the_journal() {
+        let dir = scratch_dir(line!());
+        let handle = journaled_handle(&dir);
+        // A non-empty directory in the way makes the rename fail.
+        let blocker = dir.join(JOURNAL_FILE);
+        std::fs::create_dir_all(blocker.join("x")).expect("blocker");
+
+        handle.write(|s| s.hits = 1).expect("the write still works");
+
+        assert!(!dir.join("journal.tmp").exists(), "no temporary file stays");
+        std::fs::remove_dir_all(&blocker).expect("clear");
+        handle.write(|s| s.hits = 2).expect("still writable");
+        assert!(!blocker.exists(), "a stopped journal stays stopped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removing_the_handoff_directory_stops_the_journal_and_leaves_nothing() {
+        let dir = scratch_dir(line!());
+        let handle = journaled_handle(&dir);
+        handle.write(|s| s.hits = 1).expect("writes");
+
+        remove_handoff_dir(&dir);
+        handle.write(|s| s.hits = 2).expect("still writable");
+
+        let mut gone = dir.as_os_str().to_owned();
+        gone.push(".gone");
+        assert!(!dir.exists(), "the directory is gone");
+        assert!(
+            !std::path::Path::new(&gone).exists(),
+            "no copy of the state stays"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_successor_without_a_journal_leaves_the_snapshot_in_place() {
+        let dir = scratch_dir(line!());
+        std::fs::write(dir.join("ready"), "1").expect("published");
+
+        let handle = LiveStateHandle::new(stats(3));
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        let mut handoff = handoff_for_test(dir.clone(), registry);
+        let child = handoff.child.as_mut().expect("child");
+        child.kill().expect("dies");
+        child.wait().expect("reaped");
+        drop(handoff);
+
+        assert!(!handle.is_frozen());
+        assert_eq!(handle.read(|s| s.hits), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_journal_sits_beside_the_readiness_file() {
+        temp_env::with_var(READY_FILE_ENV, Some("/run/x/ready"), || {
+            assert_eq!(
+                journal_path(),
+                Some(std::path::PathBuf::from("/run/x/journal"))
+            );
+        });
+        temp_env::with_var_unset(READY_FILE_ENV, || assert_eq!(journal_path(), None));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_journal_without_readiness_is_ignored() {
+        let dir = scratch_dir(line!());
+        write_snapshot(&dir.join(JOURNAL_FILE), &envelope_of(&stats(9), 1)).expect("writes");
+
+        let handle = LiveStateHandle::new(stats(3));
+        let registry = Arc::new(LiveStateRegistry::new(&handle));
+        registry.freeze_and_snapshot(1).expect("snapshots");
+        drop(handoff_for_test(dir.clone(), registry));
+
+        assert_eq!(handle.read(|s| s.hits), 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -92,7 +92,7 @@ const DEV_SHUTDOWN_SIGNAL_ENV: &str = "AUTUMN_SHUTDOWN_SIGNAL_FILE";
 
 /// Filename parts of the cooperative-shutdown file, written beside the
 /// live-reload state. The dev-loop process id goes between them — see
-/// [`resolve_dev_shutdown_signal_path`].
+/// [`child_paths_in`].
 #[cfg_attr(
     unix,
     allow(
@@ -140,14 +140,11 @@ const DEV_READY_FILE_PREFIX: &str = "dev-ready.";
 )]
 const DEV_READY_FILE_SUFFIX: &str = ".state";
 
-/// Headroom added to the app's own drain budget before `autumn dev` escalates
-/// to a hard kill.
+/// Longest time a managed-Postgres stop can take.
 ///
-/// `on_shutdown` hooks run **after** the drain completes, so this — not the
-/// drain budget — is what has to cover them. Sized to the managed-Postgres stop
-/// ceiling (`STARTUP_TIMEOUT` in `autumn_web::managed_pg`, 60s, which
-/// `postgresql_embedded` applies to `pg_ctl stop` as well as start): that hook
-/// is the one this whole mechanism exists to let run.
+/// This value equals `STARTUP_TIMEOUT` in `autumn_web::managed_pg`.
+/// `postgresql_embedded` uses that limit for `pg_ctl stop` too.
+/// The CLI cannot import the constant. A test checks that both values match.
 #[cfg_attr(
     unix,
     allow(
@@ -155,7 +152,52 @@ const DEV_READY_FILE_SUFFIX: &str = ".state";
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-const COOPERATIVE_STOP_HOOK_HEADROOM: Duration = Duration::from_secs(60);
+const MANAGED_PG_STOP_CEILING: Duration = Duration::from_secs(60);
+
+/// Extra time on top of the stop ceiling.
+///
+/// The app polls for the stop signal every 100 ms. The app must also exit
+/// after the stop ends. A busy machine adds more delay.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const DELIVERY_AND_EXIT_MARGIN: Duration = Duration::from_secs(15);
+
+/// Extra time added to the app's drain budget before `autumn dev` kills the app.
+///
+/// The `on_shutdown` hooks run inside the drain budget.
+/// `emergency_stop_async` runs after the drain and has no time limit.
+/// Its worst case is a full managed-Postgres stop.
+/// The headroom is that stop limit plus a margin. A slow stop can then finish.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const COOPERATIVE_STOP_HOOK_HEADROOM: Duration =
+    MANAGED_PG_STOP_CEILING.saturating_add(DELIVERY_AND_EXIT_MARGIN);
+
+/// The longest a stop waits for an app that is still starting.
+///
+/// The app reads the signal file only after it starts. Startup includes
+/// managed Postgres `initdb` and migrations. An early stop waits for the app
+/// to start, then runs its normal budget. The CI cold start budget is eight
+/// minutes. This cap is higher. At the cap, the stop runs its normal budget
+/// anyway.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const COOPERATIVE_STOP_BOOT_CAP: Duration = Duration::from_secs(15 * 60);
 
 /// The cooperative-stop budget for an app whose configured graceful-drain
 /// budget is `drain_secs` (`prestop_grace_secs + shutdown_timeout_secs`).
@@ -247,6 +289,73 @@ fn stop_budget_for_running_child(
     reported.or(recorded).unwrap_or_else(resolve_now)
 }
 
+/// The selected package's directory, resolved once per run.
+///
+/// `find_manifest_dir` runs `cargo metadata`, which contends with the
+/// dependency audit for Cargo's package-cache lock. The package never changes
+/// during a run, so a restart reuses the first answer.
+fn selected_member_dir(package: Option<&str>) -> Option<PathBuf> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| package.and_then(find_manifest_dir))
+        .clone()
+}
+
+/// The directory the app reads its config from: the selected package, else
+/// `AUTUMN_MANIFEST_DIR`, else `.`. This is the order the app itself uses.
+fn package_dir(package: Option<&str>) -> PathBuf {
+    package_dir_from(selected_member_dir(package))
+}
+
+/// [`package_dir`] for a member directory that is already resolved.
+fn package_dir_from(member_dir: Option<PathBuf>) -> PathBuf {
+    member_dir
+        .or_else(|| {
+            std::env::var_os("AUTUMN_MANIFEST_DIR")
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from)
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The directories `autumn dev` watches: the project root, and the selected
+/// member when it is elsewhere.
+static WATCH_ROOTS: std::sync::OnceLock<Vec<PathBuf>> = std::sync::OnceLock::new();
+
+/// Record the watched roots, in the plain and the canonical form: the watcher
+/// may report either.
+fn register_watch_roots(cwd: &Path, member_dir: Option<&Path>) {
+    let mut roots = Vec::new();
+    for dir in std::iter::once(cwd).chain(member_dir) {
+        roots.push(dir.to_path_buf());
+        if let Ok(canonical) = dir.canonicalize() {
+            roots.push(canonical);
+        }
+    }
+    roots.dedup();
+    let _ = WATCH_ROOTS.set(roots);
+}
+
+/// `path` without the most specific of `roots` that contains it, or `path`
+/// itself. When roots nest, the member under the workspace, the longest one
+/// wins: it leaves the shortest remainder.
+fn strip_watch_root<'a>(path: &'a Path, roots: &[PathBuf]) -> &'a Path {
+    roots
+        .iter()
+        .filter_map(|root| path.strip_prefix(root).ok())
+        .min_by_key(|rest| rest.components().count())
+        .unwrap_or(path)
+}
+
+/// The member directory to watch for `.env` edits, if it is not the project
+/// root, which is already watched.
+fn member_dir_to_watch(member_dir: &Path, cwd: &Path) -> Option<PathBuf> {
+    let same = match (member_dir.canonicalize(), cwd.canonicalize()) {
+        (Ok(member), Ok(root)) => member == root,
+        _ => false,
+    };
+    (!same).then(|| member_dir.to_path_buf())
+}
+
 /// This app's cooperative-stop budget, resolved from its own configuration.
 ///
 /// Delegates to the same profile-aware resolver `autumn serve stop` uses, so the
@@ -259,27 +368,40 @@ fn stop_budget_for_running_child(
     )
 )]
 fn resolve_cooperative_stop_budget(package: Option<&str>) -> Duration {
-    let base_dir = package
-        .and_then(find_manifest_dir)
-        .unwrap_or_else(|| PathBuf::from("."));
-    // `autumn dev` is always a debug build, so the build-mode default is `dev`;
-    // an explicit `AUTUMN_ENV`/`AUTUMN_PROFILE` still wins, which is exactly the
-    // case (a prod-profile dev run) that the old fixed budget got wrong.
+    let base_dir = package_dir(package);
+    // `autumn dev` always builds in debug, so the default profile is `dev`.
+    // `AUTUMN_ENV` or `AUTUMN_PROFILE` still wins.
     let profile = crate::serve::effective_profile(None, false);
-    // Resolve through the SAME `.env` overlay `start_server` injects into the
-    // child. The CLI deliberately never mutates its own environment, so a budget
-    // read from `std::env` alone would miss an `AUTUMN_SERVER__*` override the
-    // child does honor — and the parent would then force-kill the app in the
-    // middle of a valid shutdown, skipping exactly the managed-Postgres teardown
-    // this mechanism exists to protect. Real shell variables still win over
-    // `.env`, which is what `DotenvOsEnv` implements; a malformed `.env` falls
-    // back to the plain environment rather than failing the stop.
-    let denv: Box<dyn autumn_web::config::Env> = match autumn_web::dotenv::os_env_with_dotenv() {
-        Ok(env) => Box::new(env),
-        Err(_) => Box::new(autumn_web::config::OsEnv),
-    };
+    stop_budget_in(&base_dir, &profile)
+}
+
+/// The stop budget for the app whose manifest is in `base_dir`.
+///
+/// Reads `.env` from `base_dir`, as the app does. The CLI does not change its
+/// own environment. A plain `std::env` read would miss an `AUTUMN_SERVER__*`
+/// value that is set only in `.env`. Then the CLI would kill an app that is
+/// still draining. Shell variables win over `.env`. If `.env` is bad, use the
+/// plain environment. Do not fail the stop.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn stop_budget_in(base_dir: &Path, profile: &str) -> Duration {
+    // The app normalizes aliases and case (`development`, `DEV`), and `.env`
+    // loads by the normalized name. Do the same, or `.env` is skipped here.
+    let profile =
+        autumn_web::config::normalize_profile_name(profile).unwrap_or_else(|| "dev".to_owned());
+    let profile = profile.as_str();
+    let denv: Box<dyn autumn_web::config::Env> =
+        match autumn_web::dotenv::os_env_with_dotenv_in(base_dir, profile) {
+            Ok(env) => Box::new(env),
+            Err(_) => Box::new(autumn_web::config::OsEnv),
+        };
     let (prestop, shutdown) =
-        crate::serve::resolve_shutdown_budget_from(&base_dir, Some(&profile), &|key| {
+        crate::serve::resolve_shutdown_budget_from(base_dir, Some(profile), &|key| {
             denv.var(key).ok().filter(|value| !value.trim().is_empty())
         });
     cooperative_stop_budget(prestop.saturating_add(shutdown))
@@ -306,8 +428,73 @@ enum StopOutcome {
     /// distinct from [`Self::Escalated`] so the warning blames the dev setup
     /// rather than accusing the app of ignoring a request it never received.
     Unreachable,
+    /// The app's `autumn-web` predates the signal file (#2458), so it was
+    /// force-killed at once. Waiting could not have helped.
+    Unsupported,
     /// There was no child to stop.
     NotRunning,
+}
+
+/// Whether the running child watches the shutdown-signal file.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownSupport {
+    /// The child's ready file carries the capability marker.
+    Supported,
+    /// The child wrote a budget-only ready file: an `autumn-web` that predates
+    /// the signal file.
+    Unsupported,
+    /// No report yet. A slow boot looks the same as an old child, so the caller
+    /// keeps the cooperative wait.
+    Unknown,
+}
+
+/// Read the child's shutdown support from its ready-file contents.
+///
+/// The marker proves support. Without it, only a budget-only file proves an old
+/// child: the signal file shipped in the same release as the endpoint line, so
+/// a file with an endpoint line is an app that drains, only one that predates
+/// the marker. Anything else is `Unknown`, which keeps the safe cooperative wait.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn shutdown_support_from_ready(contents: Option<&str>) -> ShutdownSupport {
+    let Some(text) = contents else {
+        return ShutdownSupport::Unknown;
+    };
+    if autumn_web::app::serve_ready_advertises_shutdown_signal(text) {
+        return ShutdownSupport::Supported;
+    }
+    let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
+    let budget_only =
+        lines.next().is_some_and(|l| l.parse::<u64>().is_ok()) && lines.next().is_none();
+    if budget_only {
+        ShutdownSupport::Unsupported
+    } else {
+        ShutdownSupport::Unknown
+    }
+}
+
+/// [`shutdown_support_from_ready`] for the ready file on disk.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn child_shutdown_support(ready_file: &Path) -> ShutdownSupport {
+    shutdown_support_from_ready(std::fs::read_to_string(ready_file).ok().as_deref())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,7 +706,10 @@ impl DevReloadState {
 /// beside the build makes its `cargo metadata` contend with Cargo's
 /// package-cache lock and slow the build itself — and the watch loop then polls
 /// for the result without blocking. A verdict that has not arrived by this
-/// deadline is dropped and the dev loop says nothing.
+/// deadline is dropped, its auditor process is killed, and the dev loop says
+/// nothing. A watchdog thread enforces the deadline, so it holds while the
+/// loop is busy in a rebuild. The process is not killed before the deadline,
+/// except when the dev session ends.
 const DEPENDENCY_AUDIT_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Startup lines for an evaluation that may not have finished in time.
@@ -533,14 +723,17 @@ fn dependency_startup_lines(eval: Option<&crate::deps::Evaluation>) -> Vec<Strin
 /// or not a verdict has arrived, so the watch loop never stalls on the auditor.
 struct DependencyAudit {
     receiver: mpsc::Receiver<crate::deps::Evaluation>,
+    stop: crate::deps::StopHandle,
     deadline: std::time::Instant,
     done: bool,
 }
 
 impl DependencyAudit {
     fn start(root: &Path) -> Self {
+        let running = crate::deps::spawn_evaluation_with_deadline(root, DEPENDENCY_AUDIT_DEADLINE);
         Self {
-            receiver: crate::deps::spawn_evaluation(root),
+            receiver: running.receiver,
+            stop: running.stop,
             deadline: std::time::Instant::now() + DEPENDENCY_AUDIT_DEADLINE,
             done: false,
         }
@@ -562,8 +755,21 @@ impl DependencyAudit {
             // Still running. Give up once the deadline passes so a wedged
             // auditor cannot keep this poll alive for the whole session.
             Err(mpsc::TryRecvError::Empty) => {
-                self.done = std::time::Instant::now() >= self.deadline;
+                if std::time::Instant::now() >= self.deadline {
+                    self.done = true;
+                    // Do not leave the auditor to contend with the next build.
+                    self.stop.stop();
+                }
             }
+        }
+    }
+}
+
+impl Drop for DependencyAudit {
+    /// Ending the dev session ends an audit still in flight.
+    fn drop(&mut self) {
+        if !self.done {
+            self.stop.stop();
         }
     }
 }
@@ -628,11 +834,14 @@ pub fn run(package: Option<&str>, show_config: bool) {
     // contend for Cargo's package-cache lock. From here it is only polled,
     // never awaited, so nothing delays startup or the rebuild loop. Quiet by
     // default: an advisory-clean, policy-clean tree adds nothing.
+    // Resolve the member directory first: `cargo metadata` contends with the audit.
+    let member_dir = selected_member_dir(package);
     let mut dependency_audit = DependencyAudit::start(Path::new("."));
 
     let normalized_dirs = sanitize_custom_watch_dirs(load_dev_config(Path::new(AUTUMN_TOML)));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let custom_watch_dirs = resolve_custom_watch_dirs(&normalized_dirs, &cwd);
+    register_watch_roots(&cwd, member_dir.as_deref());
 
     // Set up file watcher
     let (tx, rx) = mpsc::channel();
@@ -664,6 +873,14 @@ pub fn run(package: Option<&str>, show_config: bool) {
     // Watch the project root for config and build script changes.
     if let Err(e) = watcher.watch(Path::new("."), notify::RecursiveMode::NonRecursive) {
         eprintln!("  Warning: could not watch project root: {e}");
+    }
+
+    // A selected workspace member keeps its `.env` in its own directory, which
+    // the app and the stop budget both read.
+    if let Some(dir) = member_dir.and_then(|dir| member_dir_to_watch(&dir, &cwd))
+        && let Err(e) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive)
+    {
+        eprintln!("  Warning: could not watch {}: {e}", dir.display());
     }
 
     eprintln!("  Watching for changes... (press Ctrl+C to stop)\n");
@@ -1154,6 +1371,7 @@ fn cargo_build_capturing(package: Option<&str>) -> (bool, Vec<BuildDiagnostic>) 
     let diagnostics = parse_build_diagnostics(buffer.as_bytes());
     match child.wait() {
         Ok(status) if status.success() => {
+            crate::built_artifact::record(&crate::built_artifact::parse_executables(&buffer));
             eprintln!("  \u{2713} Build succeeded");
             (true, diagnostics)
         }
@@ -1195,7 +1413,7 @@ pub fn cargo_build(package: Option<&str>, release: bool) -> bool {
     let mut cmd = build_cargo_command(package, release);
 
     eprintln!("  Compiling...");
-    match cmd.status() {
+    match crate::built_artifact::run_build(&mut cmd) {
         Ok(status) if status.success() => {
             eprintln!("  \u{2713} Build succeeded");
             true
@@ -1215,12 +1433,10 @@ fn start_server(
     reload_state_path: Option<&Path>,
     show_config: bool,
 ) -> Option<Child> {
-    // Only the non-Unix stop path consults the recorded budget; on Unix the
-    // parameter is carried for a uniform signature.
-    #[cfg(unix)]
-    let _ = package;
     eprintln!("  Starting server...\n");
 
+    let member_dir = selected_member_dir(package);
+    // Read `.env` from the selected package, as the app and the stop budget do.
     // Resolve `.env` fresh right before each spawn so a hot-reload restart
     // picks up an edited `.env`. Values are injected explicitly into the child
     // process (rather than mutating this process's environment); the child also
@@ -1228,7 +1444,9 @@ fn start_server(
     // makes a bare `DATABASE_URL` visible to the child. A malformed `.env`
     // fails loudly. Applied BEFORE the explicit `.env(...)` calls below so those
     // win on any key overlap.
-    let dotenv_vars = match autumn_web::dotenv::resolve_process_dotenv() {
+    let dotenv_vars = match autumn_web::dotenv::resolve_process_dotenv_in(&package_dir_from(
+        member_dir.clone(),
+    )) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("  \u{274C} .env: {e}");
@@ -1238,6 +1456,11 @@ fn start_server(
 
     let mut command = Command::new(binary);
     command.envs(dotenv_vars);
+    // The app reads its config from the selected package. An inherited
+    // `AUTUMN_MANIFEST_DIR` would win over the app's own manifest directory.
+    if let Some(dir) = &member_dir {
+        command.env("AUTUMN_MANIFEST_DIR", dir);
+    }
     // See `serve::base_command`: these one-shot modes are dispatched before the
     // server starts, so an inherited flag would turn every hot-reload restart
     // into a manifest dump that exits cleanly and never serves.
@@ -1249,6 +1472,8 @@ fn start_server(
     // every hot-reload restart enforce the retention policy and exit -- deleting
     // data on each save rather than merely failing to serve.
     crate::db::retention::clear_inherited_one_shot_env(&mut command);
+    // Same for `autumn data capsule` (#1811).
+    crate::data_capsule::clear_inherited_one_shot_env(&mut command);
     // Inherit stdio so tracing output (including --show-config) is visible.
     // Previously used Stdio::null(), but server logs are valuable during dev.
     command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
@@ -1259,30 +1484,21 @@ fn start_server(
     if show_config {
         command.env("AUTUMN_SHOW_CONFIG", "1");
     }
-    // Hand the app the cooperative-shutdown file so a stop can run its
-    // `on_shutdown` hooks on a platform with no `SIGTERM` (#1616). Clear any
-    // stale request first: a file left by a crashed `autumn dev` would drain
-    // this child the moment it boots. Only wired where it is the stop
-    // mechanism — on Unix `stop_server` signals, and an unset variable keeps
-    // the runtime's watcher inert.
+    // Hand the app its own shutdown and ready files so a stop can run its
+    // `on_shutdown` hooks on a platform with no `SIGTERM` (#1616), and so the
+    // app can report its drain budget and when it is up. Fresh paths for each
+    // child: an old file can never drain this child at boot or pass for its
+    // ready file. Only wired where it is the stop mechanism: on Unix
+    // `stop_server` signals, and an unset variable keeps the watcher inert.
     #[cfg(not(unix))]
-    if let Some(signal_path) = dev_shutdown_signal_path() {
-        clear_cooperative_shutdown(signal_path);
-        command.env(DEV_SHUTDOWN_SIGNAL_ENV, signal_path);
+    if let Some(paths) = begin_child_paths() {
+        command.env(DEV_SHUTDOWN_SIGNAL_ENV, &paths.signal);
+        command.env(SERVE_READY_FILE_ENV, &paths.ready);
         // Resolve the child's stop budget from the config it is about to boot
         // with, and keep it for the stop. `autumn.toml` is watched, so by the
-        // time this child is stopped the file may say something different — and
+        // time this child is stopped the file may say something different, and
         // the child would still be draining on these numbers.
         record_child_stop_budget(resolve_cooperative_stop_budget(package));
-    }
-    // Let the app tell us its own resolved drain budget rather than making the
-    // CLI guess — the seam `autumn serve` already uses, and the only way to see
-    // a budget a custom `with_config_loader` produced. Clear any stale file
-    // first so this child cannot be stopped on its predecessor's number.
-    #[cfg(not(unix))]
-    if let Some(ready) = dev_ready_file_path() {
-        let _ = std::fs::remove_file(ready);
-        command.env(SERVE_READY_FILE_ENV, ready);
     }
 
     match command.spawn() {
@@ -1333,27 +1549,38 @@ fn stop_server_unix(child: &mut Option<Child>) {
 /// through the file it watches, and force-kill only if it will not.
 #[cfg(not(unix))]
 fn stop_server_cooperative(child: &mut Option<Child>, package: Option<&str>) {
-    let Some(signal_path) = dev_shutdown_signal_path() else {
-        // `start_server` sets `AUTUMN_SHUTDOWN_SIGNAL_FILE` from this same
-        // cached value, so with no path the child was never told to watch
-        // anything. Waiting out the full budget for a request nobody can
-        // receive would make every rebuild slower than the hard kill this
-        // replaced — so kill directly, and say why.
+    let Some(paths) = current_child_paths() else {
+        // `start_server` sets `AUTUMN_SHUTDOWN_SIGNAL_FILE` from the same
+        // paths, so with none the child was never told to watch anything.
+        // Waiting out the full budget for a request nobody can receive would
+        // make every rebuild slower than the hard kill this replaced. So kill
+        // directly, and say why.
         if let Some(proc) = child.as_mut() {
             let _ = proc.kill();
             let _ = proc.wait();
-            eprintln!("{}", unreachable_warning("cargo metadata is unreadable"));
+            eprintln!(
+                "{}",
+                unreachable_warning(
+                    "cargo metadata is unreadable, or the target directory is not writable"
+                )
+            );
         }
         *child = None;
         return;
     };
-    let budget = stop_budget_for_running_child(
-        dev_ready_file_path().and_then(child_reported_stop_budget),
-        recorded_child_stop_budget(),
-        || resolve_cooperative_stop_budget(package),
-    );
-    match stop_child_cooperatively(child, signal_path, budget) {
-        StopOutcome::Escalated => eprintln!("{}", escalation_warning(budget)),
+    let budget = std::cell::Cell::new(Duration::ZERO);
+    let outcome = stop_booted_child(child, &paths, COOPERATIVE_STOP_BOOT_CAP, || {
+        let resolved = stop_budget_for_running_child(
+            child_reported_stop_budget(&paths.ready),
+            recorded_child_stop_budget(),
+            || resolve_cooperative_stop_budget(package),
+        );
+        budget.set(resolved);
+        resolved
+    });
+    match outcome {
+        StopOutcome::Unsupported => eprintln!("{}", unsupported_warning()),
+        StopOutcome::Escalated => eprintln!("{}", escalation_warning(budget.get())),
         StopOutcome::Unreachable => eprintln!(
             "{}",
             unreachable_warning("the target directory is not writable")
@@ -1376,9 +1603,25 @@ fn classify_change(
     kind: DebouncedEventKind,
     custom_watch_dirs: &[CustomWatchDir],
 ) -> ChangeEffect {
+    let roots = WATCH_ROOTS.get().map_or(&[][..], Vec::as_slice);
+    classify_change_in(path, kind, custom_watch_dirs, roots)
+}
+
+/// [`classify_change`] for an explicit set of watch roots.
+fn classify_change_in(
+    path: &Path,
+    kind: DebouncedEventKind,
+    custom_watch_dirs: &[CustomWatchDir],
+    watch_roots: &[PathBuf],
+) -> ChangeEffect {
     if !matches!(kind, DebouncedEventKind::Any) {
         return ChangeEffect::Ignore;
     }
+    // Judge the path inside the project, not the directories above it. A
+    // workspace under `~/.worktrees/` is not a hidden project. The original
+    // path stays for the custom watch directories, which match full paths.
+    let original = path;
+    let path = strip_watch_root(path, watch_roots);
 
     // A root-level dotenv file the config loader reads (`.env`, `.env.local`,
     // `.env.<profile>`, `.env.<profile>.local`) must restart the server so an
@@ -1445,7 +1688,7 @@ fn classify_change(
     // The relative form is also tried so events emitted as relative paths
     // (rare but possible on some platforms) still match.
     for dir in custom_watch_dirs {
-        if dir.matches(path) {
+        if dir.matches(original) {
             return ChangeEffect::RestartOnly;
         }
     }
@@ -1671,23 +1914,16 @@ fn resolve_dev_reload_state_path() -> Result<PathBuf, String> {
         .join(DEV_RELOAD_STATE_FILE))
 }
 
-/// Where the cooperative-shutdown file lives: beside the live-reload state,
-/// inside the target directory, so it is swept by `cargo clean`.
-///
-/// Two properties matter and neither is incidental.
+/// The directory for this session's shutdown and ready files: beside the
+/// live-reload state, inside the target directory, so `cargo clean` sweeps it.
 ///
 /// **Tolerant.** This resolves through [`try_cargo_metadata`], not
-/// [`resolve_target_directory`], which `exit(1)`s on unreadable metadata.
-/// `Cargo.toml` is a watched file, so a half-saved manifest is an ordinary
-/// dev-loop event — and on Windows the stop happens *before* the rebuild. An
-/// exit from inside the stop path would leave the app, and the managed Postgres
-/// cluster it owns, running with nobody left to reap them: the exact orphan this
-/// mechanism exists to prevent, through a new door.
+/// [`resolve_target_directory`], which `exit(1)`s on unreadable metadata. A
+/// half-saved `Cargo.toml` is an ordinary dev-loop event, and on Windows the
+/// stop runs before the rebuild. An exit there would leave the app and its
+/// managed Postgres running with nobody to stop them.
 ///
-/// **Unique per dev-loop process.** Two `autumn dev` instances in one workspace
-/// (`-p api` and `-p admin`) share a target directory. A shared signal file
-/// would let one instance's rebuild drain the other instance's app, and let one
-/// instance's cleanup delete the request the other is still waiting on.
+/// **Cached.** A stop must be cheap and must not run `cargo metadata`.
 #[cfg_attr(
     unix,
     allow(
@@ -1695,42 +1931,179 @@ fn resolve_dev_reload_state_path() -> Result<PathBuf, String> {
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-fn resolve_dev_shutdown_signal_path() -> Option<PathBuf> {
-    let metadata = try_cargo_metadata()?;
-    let target = metadata["target_directory"].as_str()?;
-    Some(Path::new(target).join("autumn").join(format!(
-        "{DEV_SHUTDOWN_SIGNAL_PREFIX}{}{DEV_SHUTDOWN_SIGNAL_SUFFIX}",
-        std::process::id()
-    )))
-}
-
-/// This dev-loop session's ready file, resolved once — the path the app writes
-/// its resolved drain budget to.
-#[cfg_attr(
-    unix,
-    allow(
-        dead_code,
-        reason = "the non-Unix stop path, compiled and tested everywhere"
-    )
-)]
-fn dev_ready_file_path() -> Option<&'static Path> {
-    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| {
+fn dev_state_dir() -> Option<&'static Path> {
+    static DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
         let metadata = try_cargo_metadata()?;
         let target = metadata["target_directory"].as_str()?;
-        Some(Path::new(target).join("autumn").join(format!(
-            "{DEV_READY_FILE_PREFIX}{}{DEV_READY_FILE_SUFFIX}",
-            std::process::id()
-        )))
+        Some(Path::new(target).join("autumn"))
     })
     .as_deref()
+}
+
+/// The shutdown and ready files of one child.
+///
+/// Each child gets its own pair, so a file left by an earlier child, such as one
+/// that could not be deleted, can never pass for this child's.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChildPaths {
+    /// The app watches this file. Creating it asks the app to drain.
+    signal: PathBuf,
+    /// The app writes its drain budget here once it is up.
+    ready: PathBuf,
+}
+
+/// The file names for child number `generation` of one dev-loop run.
+///
+/// The process id keeps two `autumn dev` runs in one workspace (`-p api` and
+/// `-p admin`) apart. A shared file would let one run drain the other's app.
+/// The run nonce keeps a later run apart that got the same process id, because
+/// the OS reuses ids and an unclean exit can leave files behind.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn child_paths_in(dir: &Path, pid: u32, nonce: u128, generation: u64) -> ChildPaths {
+    ChildPaths {
+        signal: dir.join(format!(
+            "{DEV_SHUTDOWN_SIGNAL_PREFIX}{pid}.{nonce}.{generation}{DEV_SHUTDOWN_SIGNAL_SUFFIX}"
+        )),
+        ready: dir.join(format!(
+            "{DEV_READY_FILE_PREFIX}{pid}.{nonce}.{generation}{DEV_READY_FILE_SUFFIX}"
+        )),
+    }
+}
+
+/// A value that differs between runs: the start time in nanoseconds.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn run_nonce() -> u128 {
+    static NONCE: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    *NONCE.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    })
+}
+
+/// Whether `dir` can hold the marker files: it exists, or can be made, and the
+/// steps the protocol uses all work in it. The app writes its ready file as a
+/// temporary file, renames it into place, and the CLI later removes it. Live
+/// reload only warns when its own setup in the same directory fails, so this is
+/// checked before the app is told to use the directory.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn state_dir_is_usable(dir: &Path, pid: u32, nonce: u128) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    // The run nonce keeps a later run that got the same process id away from a
+    // probe file an earlier run left behind.
+    let temporary = dir.join(format!("dev-probe.{pid}.{nonce}.tmp"));
+    let renamed = dir.join(format!("dev-probe.{pid}.{nonce}"));
+    let usable = std::fs::File::create(&temporary).is_ok()
+        && std::fs::rename(&temporary, &renamed).is_ok()
+        && std::fs::remove_file(&renamed).is_ok();
+    let _ = std::fs::remove_file(&temporary);
+    let _ = std::fs::remove_file(&renamed);
+    usable
+}
+
+/// The paths of the running child, if one was started.
+static CHILD_PATHS: std::sync::Mutex<Option<ChildPaths>> = std::sync::Mutex::new(None);
+
+/// How many children this run has started.
+static CHILD_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Pick fresh paths for the child about to start, and remove the last child's
+/// files. The removal is best-effort: a file that stays is harmless.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn begin_child_paths() -> Option<ChildPaths> {
+    next_child_paths(
+        &CHILD_PATHS,
+        &CHILD_GENERATION,
+        dev_state_dir(),
+        std::process::id(),
+        run_nonce(),
+    )
+}
+
+/// [`begin_child_paths`] over explicit state, so it can be tested.
+///
+/// The last child is forgotten first. If setup fails below, the new child gets
+/// no marker paths, and a stop must not use the old child's.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn next_child_paths(
+    slot: &std::sync::Mutex<Option<ChildPaths>>,
+    generation: &std::sync::atomic::AtomicU64,
+    dir: Option<&Path>,
+    pid: u32,
+    nonce: u128,
+) -> Option<ChildPaths> {
+    let previous = slot.lock().ok()?.take();
+    if let Some(previous) = previous {
+        let _ = std::fs::remove_file(previous.signal);
+        let _ = std::fs::remove_file(previous.ready);
+    }
+    let dir = dir?;
+    if !state_dir_is_usable(dir, pid, nonce) {
+        return None;
+    }
+    let number = generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let paths = child_paths_in(dir, pid, nonce, number);
+    *slot.lock().ok()? = Some(paths.clone());
+    Some(paths)
+}
+
+/// The paths of the running child.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn current_child_paths() -> Option<ChildPaths> {
+    CHILD_PATHS.lock().ok()?.clone()
 }
 
 /// The stop budget the running child reported for itself, if it has booted.
 ///
 /// The app writes its resolved *drain* budget (`prestop_grace_secs +
-/// shutdown_timeout_secs`) to this file at startup-complete; hooks run after the
-/// drain, so the same headroom still applies. A missing, blank, or unparseable
+/// shutdown_timeout_secs`) to this file at startup-complete. The same headroom
+/// still applies after the drain. A missing, blank, or unparseable
 /// file means "no report" — never a zero budget, which would hard-kill instantly.
 #[cfg_attr(
     unix,
@@ -1752,24 +2125,6 @@ fn child_reported_stop_budget(ready_file: &Path) -> Option<Duration> {
         .parse::<u64>()
         .ok()?;
     Some(cooperative_stop_budget(secs))
-}
-
-/// This dev-loop session's cooperative-shutdown file, resolved once.
-///
-/// Cached so the stop path never shells out to `cargo metadata`: a stop must be
-/// cheap, and must never fail for a reason unrelated to the child it is
-/// stopping.
-#[cfg_attr(
-    unix,
-    allow(
-        dead_code,
-        reason = "the non-Unix stop path, compiled and tested everywhere"
-    )
-)]
-fn dev_shutdown_signal_path() -> Option<&'static Path> {
-    static PATH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    PATH.get_or_init(resolve_dev_shutdown_signal_path)
-        .as_deref()
 }
 
 /// Ask the running app to shut down gracefully by creating the file it watches.
@@ -1851,6 +2206,150 @@ fn unreachable_warning(error: &str) -> String {
     )
 }
 
+/// How a wait for a booting app ended.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootWait {
+    /// The app is up (or no ready file is tracked): the stop budget can start.
+    Ready,
+    /// The app exited while booting.
+    Exited,
+    /// The app was still booting at the cap. The caller treats it as up.
+    TimedOut,
+}
+
+/// Wait until the app finishes booting, exits, or `cap` passes.
+///
+/// The app watches the signal file only after startup. Its ready file marks
+/// that point. With no ready file to track, the app is assumed up.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn wait_until_booted(proc: &mut Child, ready_file: Option<&Path>, cap: Duration) -> BootWait {
+    let Some(ready_file) = ready_file else {
+        return BootWait::Ready;
+    };
+    let start = std::time::Instant::now();
+    let mut told = false;
+    loop {
+        if ready_file.exists() {
+            return BootWait::Ready;
+        }
+        match proc.try_wait() {
+            Ok(Some(_)) => return BootWait::Exited,
+            Ok(None) if start.elapsed() < cap => {
+                // A long wait with no output looks like a hang.
+                if !told && start.elapsed() >= BOOT_WAIT_NOTICE_AFTER {
+                    eprintln!("{}", boot_wait_notice(cap));
+                    told = true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => return BootWait::TimedOut,
+        }
+    }
+}
+
+/// How long a stop waits for a booting app before it says what it is doing.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+const BOOT_WAIT_NOTICE_AFTER: Duration = Duration::from_secs(10);
+
+/// What a stop tells the developer while it waits for a booting app.
+///
+/// An `autumn-web` that is too old to report when it is up never ends the wait
+/// early, so the notice also says how to fix that.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn boot_wait_notice(cap: Duration) -> String {
+    format!(
+        "  The app is still starting. Waiting for it before it is stopped, up to {} \
+         minutes. If this app uses an old autumn-web that never reports it is up, \
+         run `cargo update -p autumn-web`.",
+        cap.as_secs().div_ceil(60)
+    )
+}
+
+/// The warning printed when the app was force-stopped because its `autumn-web`
+/// does not watch the shutdown-signal file.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn unsupported_warning() -> String {
+    "  Warning: this app's autumn-web is older than the CLI and cannot drain on \
+     request, so it was force-stopped. Its shutdown hooks did not run. A managed \
+     Postgres cluster may still be running. The next start recovers it through \
+     crash recovery. To fix this, run `cargo update -p autumn-web`."
+        .to_owned()
+}
+
+/// Force-kill a child that cannot drain on request. Sends no signal file and
+/// does not wait: the child would never read it.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn stop_unsupported_child(child: &mut Option<Child>, signal_path: &Path) -> StopOutcome {
+    let Some(proc) = child.as_mut() else {
+        return StopOutcome::NotRunning;
+    };
+    let _ = proc.kill();
+    let _ = proc.wait();
+    clear_cooperative_shutdown(signal_path);
+    *child = None;
+    StopOutcome::Unsupported
+}
+
+/// Stop `child` the way its `support` allows: at once when it cannot drain on
+/// request, otherwise through the signal file.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn stop_with_support(
+    child: &mut Option<Child>,
+    signal_path: &Path,
+    support: ShutdownSupport,
+    budget: Duration,
+) -> StopOutcome {
+    match support {
+        ShutdownSupport::Unsupported => stop_unsupported_child(child, signal_path),
+        ShutdownSupport::Supported | ShutdownSupport::Unknown => {
+            stop_child_cooperatively(child, signal_path, budget)
+        }
+    }
+}
+
 /// Stop `child` cooperatively: request a graceful shutdown via the signal file,
 /// wait up to `timeout` for it to drain, then force-kill if it has not.
 ///
@@ -1891,6 +2390,44 @@ fn stop_child_cooperatively(
     // a stale signal and drain at boot.
     clear_cooperative_shutdown(signal_path);
     *child = None;
+    outcome
+}
+
+/// Stop `child` after it has finished booting, through the signal file.
+///
+/// The app reads the signal file only after it starts, so the stop first waits
+/// for the ready file, the app's own mark that it is up. That file also says
+/// whether the app can drain on request, so it is read after the wait. A child
+/// that exits during boot has stopped on its own. If the file never comes, the
+/// app is treated as up at `boot_cap`: the write is best-effort.
+///
+/// `budget` runs after the wait, so it sees the budget the app wrote.
+#[cfg_attr(
+    unix,
+    allow(
+        dead_code,
+        reason = "the non-Unix stop path, compiled and tested everywhere"
+    )
+)]
+fn stop_booted_child(
+    child: &mut Option<Child>,
+    paths: &ChildPaths,
+    boot_cap: Duration,
+    budget: impl FnOnce() -> Duration,
+) -> StopOutcome {
+    let Some(proc) = child.as_mut() else {
+        return StopOutcome::NotRunning;
+    };
+    let outcome = if wait_until_booted(proc, Some(&paths.ready), boot_cap) == BootWait::Exited {
+        clear_cooperative_shutdown(&paths.signal);
+        *child = None;
+        StopOutcome::Graceful
+    } else {
+        let support = child_shutdown_support(&paths.ready);
+        stop_with_support(child, &paths.signal, support, budget())
+    };
+    // Clear the ready file too, so the next stop cannot read this child's state.
+    let _ = std::fs::remove_file(&paths.ready);
     outcome
 }
 
@@ -2073,10 +2610,11 @@ pub fn find_binary(package: Option<&str>, release: bool) -> PathBuf {
         if let (Some(target_dir), Some(bin)) =
             (path.parent().and_then(Path::parent), path.file_name())
         {
-            return target_dir.join("release").join(bin);
+            return crate::built_artifact::prefer_built(target_dir.join("release").join(bin));
         }
     }
-    path
+    // `build.target` moves the artifact under `<triple>/`; use Cargo's own path.
+    crate::built_artifact::prefer_built(path)
 }
 
 #[cfg(test)]
@@ -2204,6 +2742,212 @@ mod tests {
         assert!(child.is_none(), "the child must still be stopped");
     }
 
+    const BOOT_CAP: Duration = Duration::from_secs(30);
+
+    // ── A booting app is not yet watching (#2444) ──────────────────────────
+    //
+    // The app reads the signal file only after it starts (Postgres `initdb`,
+    // migrations). The stop deadline must start when the app is up. If it
+    // starts earlier, the stop kills the app and leaves the postmaster.
+
+    /// The ready file of an app that can drain on request: the budget, the
+    /// endpoint, and the capability marker, as the runtime writes them.
+    fn capable_ready_payload() -> String {
+        autumn_web::app::serve_ready_payload(30, "tcp 127.0.0.1:3000")
+    }
+
+    fn child_paths(dir: &Path) -> ChildPaths {
+        ChildPaths {
+            signal: signal_path(dir),
+            ready: dir.join("dev-ready.state"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_during_boot_waits_for_ready_before_it_starts_the_deadline() {
+        // Stand-in app: boots for 1s, writes the ready file, then obeys the
+        // signal. The deadline must start at ready, not at the stop.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = child_paths(tmp.path());
+        let payload = tmp.path().join("payload");
+        std::fs::write(&payload, capable_ready_payload()).unwrap();
+        let script = format!(
+            "sleep 1; cp {p} {r}; while [ ! -f {s} ]; do sleep 0.05; done; exit 0",
+            p = payload.display(),
+            r = paths.ready.display(),
+            s = paths.signal.display()
+        );
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .spawn()
+                .expect("spawn booting app"),
+        );
+        let outcome = stop_booted_child(&mut child, &paths, BOOT_CAP, || Duration::from_secs(5));
+        assert_eq!(outcome, StopOutcome::Graceful);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_during_boot_is_graceful_when_the_app_exits_before_ready() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = child_paths(tmp.path());
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 0.5; exit 0")
+                .spawn()
+                .expect("spawn app"),
+        );
+        let outcome =
+            stop_booted_child(&mut child, &paths, BOOT_CAP, || Duration::from_millis(100));
+        assert_eq!(outcome, StopOutcome::Graceful);
+        assert!(child.is_none(), "a stopped child must be dropped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_old_app_is_stopped_at_once_when_it_finishes_booting() {
+        // An old `autumn-web` writes a budget-only ready file and never watches
+        // the signal file. The stop waits for that file, which is the only proof
+        // of the app's age, then kills it at once. It does not wait the budget.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = child_paths(tmp.path());
+        let script = format!("sleep 0.5; echo 30 > {}; sleep 30", paths.ready.display());
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .spawn()
+                .expect("spawn old app"),
+        );
+        let started = std::time::Instant::now();
+        let outcome = stop_booted_child(&mut child, &paths, BOOT_CAP, || Duration::from_secs(20));
+        assert_eq!(outcome, StopOutcome::Unsupported);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(child.is_none(), "the child must be reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_ready_file_does_not_stall_a_stop_past_cap_plus_budget() {
+        // The ready write is best-effort. A live app that never writes it must
+        // still be stopped, after the cap and then the normal budget.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = child_paths(tmp.path());
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' TERM; sleep 30")
+                .spawn()
+                .expect("spawn app"),
+        );
+        let started = std::time::Instant::now();
+        let outcome = stop_booted_child(&mut child, &paths, Duration::from_millis(300), || {
+            Duration::from_millis(300)
+        });
+        assert_eq!(outcome, StopOutcome::Escalated);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(child.is_none(), "the child must be reaped");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_ready_file_is_fine_when_the_app_obeys_the_signal() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = child_paths(tmp.path());
+        let script = format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; exit 0",
+            paths.signal.display()
+        );
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg(script)
+                .spawn()
+                .expect("spawn app"),
+        );
+        let outcome = stop_booted_child(&mut child, &paths, Duration::from_millis(200), || {
+            Duration::from_secs(10)
+        });
+        assert_eq!(outcome, StopOutcome::Graceful);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stop_clears_the_ready_file_for_the_next_child() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = child_paths(tmp.path());
+        std::fs::write(&paths.ready, capable_ready_payload()).unwrap();
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("exit 0")
+                .spawn()
+                .expect("spawn app"),
+        );
+        stop_booted_child(&mut child, &paths, BOOT_CAP, || Duration::from_secs(5));
+        assert!(!paths.ready.exists());
+    }
+
+    // ── `.env` comes from the selected package (#2444) ─────────────────────
+
+    /// Whether the shell would hide a `.env` effect in these tests. A real
+    /// shell variable wins over `.env`, and `AUTUMN_DOTENV` can turn loading off.
+    fn the_shell_hides_dotenv_effects() -> bool {
+        ["AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS", "AUTUMN_DOTENV"]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some())
+    }
+
+    fn dotenv_dir_with_a_300s_timeout() -> tempfile::TempDir {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".env"),
+            "AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS=300\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn the_stop_budget_reads_dotenv_from_the_package_dir_not_the_cli_cwd() {
+        if the_shell_hides_dotenv_effects() {
+            return;
+        }
+        let tmp = dotenv_dir_with_a_300s_timeout();
+        let budget = stop_budget_in(tmp.path(), "dev");
+        assert!(
+            budget >= cooperative_stop_budget(300),
+            "package .env must set the budget, got {budget:?}"
+        );
+    }
+
+    #[test]
+    fn the_stop_budget_loads_dotenv_for_a_profile_alias() {
+        // The app treats `development` and `DEV` as `dev` and loads `.env`.
+        if the_shell_hides_dotenv_effects() {
+            return;
+        }
+        let tmp = dotenv_dir_with_a_300s_timeout();
+        for alias in ["development", "DEV", " dev "] {
+            let budget = stop_budget_in(tmp.path(), alias);
+            assert!(
+                budget >= cooperative_stop_budget(300),
+                "`{alias}` must load .env, got {budget:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_boot_wait_notice_names_the_limit_and_the_fix() {
+        let notice = boot_wait_notice(COOPERATIVE_STOP_BOOT_CAP);
+        assert!(notice.contains("15 minutes"), "{notice}");
+        assert!(notice.contains("cargo update -p autumn-web"), "{notice}");
+    }
+
     #[test]
     fn unreachable_warning_blames_the_signal_file_not_the_app() {
         let warning = unreachable_warning("permission denied");
@@ -2247,9 +2991,8 @@ mod tests {
 
     #[test]
     fn the_stop_budget_covers_the_managed_postgres_stop_ceiling() {
-        // `on_shutdown` hooks run AFTER the drain, so the headroom — not the
-        // drain budget — is what has to cover a `pg_ctl stop`. autumn-web's
-        // provider gives that operation a 60s ceiling.
+        // After the drain, `emergency_stop_async` can run a full `pg_ctl stop`.
+        // The headroom must cover it. The provider limit for that stop is 60s.
         assert!(
             cooperative_stop_budget(0) >= Duration::from_secs(60),
             "the headroom must cover a managed-Postgres stop"
@@ -2320,9 +3063,8 @@ mod tests {
 
     #[test]
     fn the_reported_budget_gets_the_same_hook_headroom() {
-        // The app reports its DRAIN budget (prestop + shutdown). Hooks run after
-        // the drain, so the headroom still applies — otherwise honouring the
-        // report would reintroduce the very orphan it prevents.
+        // The app reports its drain budget (prestop + shutdown). The headroom
+        // still applies. Without it, a slow Postgres stop is killed.
         let tmp = tempfile::TempDir::new().unwrap();
         let ready = tmp.path().join("dev-ready.state");
         std::fs::write(&ready, "300\n").unwrap();
@@ -2408,6 +3150,34 @@ mod tests {
         assert!(resolve_cooperative_stop_budget(None) >= COOPERATIVE_STOP_HOOK_HEADROOM);
     }
 
+    /// Reads `STARTUP_TIMEOUT` from the framework source.
+    /// The CLI does not enable `managed-pg`. It cannot import the constant.
+    fn managed_pg_stop_ceiling_from_source() -> Duration {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../autumn/src/managed_pg.rs");
+        let source = std::fs::read_to_string(&path).expect("read managed_pg.rs");
+        let secs = source
+            .lines()
+            .find(|l| l.contains("const STARTUP_TIMEOUT: Duration"))
+            .and_then(|l| l.split("from_secs(").nth(1))
+            .and_then(|l| l.split(')').next())
+            .and_then(|n| n.trim().parse::<u64>().ok())
+            .expect("parse STARTUP_TIMEOUT");
+        Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn the_ceiling_constant_matches_the_framework() {
+        assert_eq!(
+            MANAGED_PG_STOP_CEILING,
+            managed_pg_stop_ceiling_from_source()
+        );
+    }
+
+    #[test]
+    fn the_headroom_exceeds_the_managed_pg_stop_ceiling() {
+        assert!(COOPERATIVE_STOP_HOOK_HEADROOM > managed_pg_stop_ceiling_from_source());
+    }
+
     #[test]
     fn escalation_warning_names_the_consequence_not_just_the_timeout() {
         // "silent degradation" is the thing #1616 forbids: if hooks were
@@ -2419,39 +3189,124 @@ mod tests {
     }
 
     #[test]
-    fn dev_shutdown_signal_path_sits_beside_the_live_reload_state() {
-        let path = resolve_dev_shutdown_signal_path().expect("shutdown signal path");
-        assert!(
-            path.parent()
-                .is_some_and(|p| p.ends_with(Path::new("target").join("autumn"))),
-            "unexpected directory: {}",
-            path.display()
-        );
+    fn child_paths_sit_in_the_given_directory() {
+        let dir = Path::new("target").join("autumn");
+        let paths = child_paths_in(&dir, 7, 1, 1);
+        assert_eq!(paths.signal.parent(), Some(dir.as_path()));
+        assert_eq!(paths.ready.parent(), Some(dir.as_path()));
     }
 
     #[test]
-    fn dev_shutdown_signal_path_is_unique_per_dev_loop_process() {
-        // Two `autumn dev` instances in one workspace share a target directory.
-        // A shared file would let one instance's rebuild drain the other's app.
-        let path = resolve_dev_shutdown_signal_path().expect("shutdown signal path");
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("a file name");
+    fn child_paths_carry_the_process_id_and_the_generation() {
+        // Two `autumn dev` runs in one workspace share a target directory. A
+        // shared file would let one run drain the other's app.
+        let dir = Path::new("d");
+        let first = child_paths_in(dir, 42, 5, 1);
+        let name = first.signal.file_name().and_then(|n| n.to_str()).unwrap();
         assert!(name.starts_with(DEV_SHUTDOWN_SIGNAL_PREFIX), "{name}");
         assert!(name.ends_with(DEV_SHUTDOWN_SIGNAL_SUFFIX), "{name}");
-        assert!(
-            name.contains(&std::process::id().to_string()),
-            "the file name must carry this process's id: {name}"
+        assert!(name.contains("42"), "{name}");
+        assert_ne!(first, child_paths_in(dir, 43, 5, 1), "other process");
+        // The OS reuses process ids. A later run with the same id must not
+        // reach the files an unclean exit left behind.
+        assert_ne!(first, child_paths_in(dir, 42, 6, 1), "same id, later run");
+    }
+
+    #[test]
+    fn a_writable_state_dir_is_usable_and_is_created_when_missing() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("target").join("autumn");
+        assert!(state_dir_is_usable(&dir, 7, 1));
+        assert!(dir.is_dir());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "the probe file must not stay"
         );
     }
 
     #[test]
-    fn dev_shutdown_signal_path_is_cached_across_calls() {
-        // The stop path reads this; resolving per stop would shell out to
-        // `cargo metadata` on every rebuild and could fail on a half-saved
-        // Cargo.toml — inside the stop, where a failure orphans the app.
-        assert_eq!(dev_shutdown_signal_path(), dev_shutdown_signal_path());
+    fn a_probe_file_left_by_an_earlier_run_does_not_block_this_one() {
+        // A run that died mid-probe leaves its file. A later run with the same
+        // process id has another nonce, so it uses other names.
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("dev-probe.7.1"), b"left behind").unwrap();
+        assert!(state_dir_is_usable(tmp.path(), 7, 2));
+        assert!(
+            tmp.path().join("dev-probe.7.1").exists(),
+            "the other run's file is not touched"
+        );
+    }
+
+    #[test]
+    fn a_state_dir_that_cannot_exist_is_not_usable() {
+        // `<target>/autumn` is a regular file, so nothing can live in it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("autumn");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        assert!(!state_dir_is_usable(&blocker, 7, 1));
+        assert!(!state_dir_is_usable(&blocker.join("nested"), 7, 1));
+    }
+
+    #[test]
+    fn a_failed_setup_forgets_the_last_childs_paths() {
+        // The next child gets no marker paths. A stop must then use the hard
+        // stop, not wait on the last child's removed ready file.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("autumn");
+        let slot = std::sync::Mutex::new(None);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+
+        let first = next_child_paths(&slot, &generation, Some(&dir), 7, 1).expect("first child");
+        assert_eq!(*slot.lock().unwrap(), Some(first.clone()));
+        std::fs::write(&first.signal, b"").unwrap();
+        std::fs::write(&first.ready, b"30\n").unwrap();
+
+        // The directory stops being usable: a regular file takes its place.
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+        assert_eq!(next_child_paths(&slot, &generation, Some(&dir), 7, 1), None);
+        assert_eq!(*slot.lock().unwrap(), None, "the old paths must be gone");
+
+        // With no state directory at all, the result is the same.
+        assert_eq!(next_child_paths(&slot, &generation, None, 7, 1), None);
+        assert_eq!(*slot.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn a_new_child_removes_the_last_childs_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dir = tmp.path().join("autumn");
+        let slot = std::sync::Mutex::new(None);
+        let generation = std::sync::atomic::AtomicU64::new(0);
+
+        let first = next_child_paths(&slot, &generation, Some(&dir), 7, 1).unwrap();
+        std::fs::write(&first.signal, b"").unwrap();
+        std::fs::write(&first.ready, b"30\n").unwrap();
+        let second = next_child_paths(&slot, &generation, Some(&dir), 7, 1).unwrap();
+
+        assert_ne!(first, second);
+        assert!(!first.signal.exists() && !first.ready.exists());
+        assert_eq!(*slot.lock().unwrap(), Some(second));
+    }
+
+    #[test]
+    fn each_child_gets_paths_no_earlier_child_used() {
+        // An old file that could not be deleted must not pass for the new
+        // child's shutdown request or ready file.
+        let dir = Path::new("d");
+        let first = child_paths_in(dir, 42, 5, 1);
+        let second = child_paths_in(dir, 42, 5, 2);
+        assert_ne!(first.signal, second.signal);
+        assert_ne!(first.ready, second.ready);
+    }
+
+    #[test]
+    fn the_state_dir_is_cached_across_calls() {
+        // The stop path reads this. Resolving per stop would run `cargo
+        // metadata` on every rebuild, and could fail on a half-saved
+        // Cargo.toml, inside the stop, where a failure orphans the app.
+        assert_eq!(dev_state_dir(), dev_state_dir());
     }
 
     #[test]
@@ -2461,6 +3316,188 @@ mod tests {
             autumn_web::app::SHUTDOWN_SIGNAL_FILE_ENV,
             "the CLI and the runtime must agree on the wire name"
         );
+    }
+
+    // ── Negotiate the shutdown signal (#2458) ──────────────────────────────
+    //
+    // A project can keep an `autumn-web` that predates the signal file. It never
+    // watches the file, so waiting out the budget stalls every edit. The ready
+    // file says which kind of child is running.
+
+    #[test]
+    fn a_ready_file_with_the_marker_means_the_child_will_drain() {
+        let payload = autumn_web::app::serve_ready_payload(1, "tcp 127.0.0.1:3000");
+        assert_eq!(
+            shutdown_support_from_ready(Some(&payload)),
+            ShutdownSupport::Supported
+        );
+    }
+
+    #[test]
+    fn a_budget_only_ready_file_means_the_child_cannot_drain() {
+        for old in ["1", "1\n", " 1 \n\n"] {
+            assert_eq!(
+                shutdown_support_from_ready(Some(old)),
+                ShutdownSupport::Unsupported,
+                "{old:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_release_with_an_endpoint_line_but_no_marker_still_drains() {
+        // 0.8.0 watches the signal file and reports an endpoint, but has no
+        // marker. Killing it would skip its hooks and orphan Postgres.
+        assert_eq!(
+            shutdown_support_from_ready(Some("1\ntcp 127.0.0.1:3000")),
+            ShutdownSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn an_unreadable_ready_file_is_not_proof_of_an_old_child() {
+        for junk in ["garbage", "x\ny", "1 2"] {
+            assert_eq!(
+                shutdown_support_from_ready(Some(junk)),
+                ShutdownSupport::Unknown,
+                "{junk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_ready_file_means_the_child_is_still_booting() {
+        // Cannot tell a slow boot from an old child. Keep the cooperative wait.
+        assert_eq!(shutdown_support_from_ready(None), ShutdownSupport::Unknown);
+    }
+
+    #[test]
+    fn a_blank_ready_file_is_not_proof_of_an_old_child() {
+        // The app writes the file atomically, so a blank file is not its work.
+        assert_eq!(
+            shutdown_support_from_ready(Some("  \n")),
+            ShutdownSupport::Unknown
+        );
+    }
+
+    #[test]
+    fn the_ready_file_support_is_read_from_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ready = tmp.path().join("dev-ready.state");
+        assert_eq!(child_shutdown_support(&ready), ShutdownSupport::Unknown);
+        std::fs::write(&ready, "1\n").unwrap();
+        assert_eq!(child_shutdown_support(&ready), ShutdownSupport::Unsupported);
+        std::fs::write(&ready, autumn_web::app::serve_ready_payload(1, "")).unwrap();
+        assert_eq!(child_shutdown_support(&ready), ShutdownSupport::Supported);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsupported_child_is_killed_at_once_without_a_signal_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' TERM; sleep 30")
+                .spawn()
+                .expect("spawn old app"),
+        );
+        let start = std::time::Instant::now();
+        let outcome = stop_unsupported_child(&mut child, &path);
+        assert_eq!(outcome, StopOutcome::Unsupported);
+        assert!(start.elapsed() < Duration::from_secs(10), "must not wait");
+        assert!(child.is_none(), "the child must be reaped");
+        assert!(
+            !path.exists(),
+            "no request is sent to a child that ignores it"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unsupported_child_is_never_sent_a_request() {
+        // A path under a regular file cannot be created. A request would turn
+        // the outcome into `Unreachable`, so `Unsupported` proves none was made.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let path = blocker.join("nested").join("stop.signal");
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 30")
+                .spawn()
+                .expect("spawn old app"),
+        );
+        assert_eq!(
+            stop_unsupported_child(&mut child, &path),
+            StopOutcome::Unsupported
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stop_plan_kills_an_unsupported_child_without_waiting_out_the_budget() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let mut child = Some(
+            Command::new("/bin/sh")
+                .arg("-c")
+                .arg("trap '' TERM; sleep 30")
+                .spawn()
+                .expect("spawn old app"),
+        );
+        let start = std::time::Instant::now();
+        let outcome = stop_with_support(
+            &mut child,
+            &path,
+            ShutdownSupport::Unsupported,
+            Duration::from_secs(300),
+        );
+        assert_eq!(outcome, StopOutcome::Unsupported);
+        assert!(start.elapsed() < Duration::from_secs(10), "must not wait");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stop_plan_keeps_the_cooperative_wait_when_support_is_unknown() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = signal_path(tmp.path());
+        let script = format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; exit 0",
+            path.display()
+        );
+        for support in [ShutdownSupport::Unknown, ShutdownSupport::Supported] {
+            let mut child = Some(
+                Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(&script)
+                    .spawn()
+                    .expect("spawn app"),
+            );
+            let outcome = stop_with_support(&mut child, &path, support, Duration::from_secs(10));
+            assert_eq!(outcome, StopOutcome::Graceful, "{support:?}");
+        }
+    }
+
+    #[test]
+    fn an_unsupported_stop_with_no_child_is_not_running() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut child = None;
+        assert_eq!(
+            stop_unsupported_child(&mut child, &signal_path(tmp.path())),
+            StopOutcome::NotRunning
+        );
+    }
+
+    #[test]
+    fn the_unsupported_warning_names_the_cause_and_the_fix() {
+        let warning = unsupported_warning();
+        assert!(warning.contains("autumn-web"), "{warning}");
+        assert!(warning.contains("cargo update"), "{warning}");
+        assert!(warning.contains("Postgres"), "{warning}");
+        assert!(!warning.contains("did not shut down within"), "{warning}");
     }
 
     use super::*;
@@ -2574,6 +3611,90 @@ mod tests {
             classify_change(Path::new(".git/.env"), DebouncedEventKind::Any, &[]),
             ChangeEffect::Ignore
         );
+    }
+
+    #[test]
+    fn a_member_dir_outside_the_root_is_watched() {
+        let root = tempfile::TempDir::new().unwrap();
+        let member = root.path().join("api");
+        std::fs::create_dir(&member).unwrap();
+        assert_eq!(member_dir_to_watch(&member, root.path()), Some(member));
+    }
+
+    #[test]
+    fn a_dotenv_under_a_hidden_ancestor_is_judged_inside_the_watch_root() {
+        // The workspace lives under a dot-prefixed directory. Judged by its
+        // full path, the member `.env` would be ignored as a hidden file.
+        let member = PathBuf::from("/home/alice/.worktrees/project/api");
+        let roots = vec![member.clone()];
+        let event = member.join(".env");
+        assert!(
+            !is_watched_dotenv_file(&event),
+            "the full path is rejected, which is the bug"
+        );
+        let inside = strip_watch_root(&event, &roots);
+        assert_eq!(inside, Path::new(".env"));
+        assert!(is_watched_dotenv_file(inside));
+    }
+
+    #[test]
+    fn the_most_specific_watch_root_wins_when_roots_nest() {
+        // The member sits under a hidden directory inside the workspace. Strip
+        // the member root, not the workspace root, or `.env` looks hidden.
+        let workspace = PathBuf::from("/work");
+        let member = workspace.join(".apps").join("api");
+        let event = member.join(".env");
+        for roots in [
+            vec![workspace.clone(), member.clone()],
+            vec![member, workspace],
+        ] {
+            let inside = strip_watch_root(&event, &roots);
+            assert_eq!(inside, Path::new(".env"), "roots: {roots:?}");
+            assert!(is_watched_dotenv_file(inside));
+        }
+    }
+
+    #[test]
+    fn a_custom_watch_dir_still_matches_by_the_full_event_path() {
+        // The member is nested in the workspace, and the workspace config lists
+        // a directory inside it. Stripping the watch root for the hidden-file
+        // checks must not stop the full-path match.
+        let workspace = PathBuf::from("/work");
+        let member = workspace.join("crates").join("api");
+        let views = member.join("views");
+        let custom = vec![CustomWatchDir {
+            relative: PathBuf::from("crates/api/views"),
+            absolute: views.clone(),
+        }];
+        let roots = vec![workspace, member];
+        let effect = classify_change_in(
+            &views.join("page.html"),
+            DebouncedEventKind::Any,
+            &custom,
+            &roots,
+        );
+        assert_eq!(effect, ChangeEffect::RestartOnly);
+    }
+
+    #[test]
+    fn a_hidden_directory_inside_the_watch_root_is_still_ignored() {
+        let root = PathBuf::from("/home/alice/.worktrees/project");
+        let event = root.join(".git").join(".env");
+        assert!(!is_watched_dotenv_file(strip_watch_root(&event, &[root])));
+    }
+
+    #[test]
+    fn a_path_outside_every_watch_root_is_left_alone() {
+        let roots = vec![PathBuf::from("/work/api")];
+        let event = Path::new("/elsewhere/.env");
+        assert_eq!(strip_watch_root(event, &roots), event);
+        assert_eq!(strip_watch_root(event, &[]), event);
+    }
+
+    #[test]
+    fn the_project_root_is_not_watched_twice() {
+        let root = tempfile::TempDir::new().unwrap();
+        assert_eq!(member_dir_to_watch(root.path(), root.path()), None);
     }
 
     #[test]
@@ -3976,30 +5097,56 @@ watch_dirs = ["views", "locales"]
     #[test]
     fn a_dependency_audit_that_never_answers_stops_being_polled() {
         let (sender, receiver) = mpsc::channel();
+        let stop = crate::deps::StopHandle::default();
         let mut audit = DependencyAudit {
             receiver,
+            stop: stop.clone(),
             deadline: std::time::Instant::now(),
             done: false,
         };
         audit.report();
         assert!(audit.done, "an expired deadline must end the polling");
+        assert!(
+            stop.is_stopped(),
+            "an expired deadline must kill the auditor"
+        );
         drop(sender);
     }
 
     #[test]
     fn a_dependency_audit_reports_its_verdict_once() {
         let (sender, receiver) = mpsc::channel();
+        let stop = crate::deps::StopHandle::default();
         let mut audit = DependencyAudit {
             receiver,
+            stop: stop.clone(),
             deadline: std::time::Instant::now() + Duration::from_secs(60),
             done: false,
         };
         audit.report();
         assert!(!audit.done, "a pending audit stays pending");
+        assert!(!stop.is_stopped(), "a pending audit is not killed early");
         sender
             .send(crate::deps::Evaluation::NoPolicy)
             .expect("send");
         audit.report();
         assert!(audit.done, "a delivered verdict ends the polling");
+        assert!(!stop.is_stopped(), "a delivered verdict is never killed");
+        drop(audit);
+        assert!(!stop.is_stopped(), "a finished audit is not killed on drop");
+    }
+
+    #[test]
+    fn dropping_an_unfinished_audit_stops_it() {
+        let (_sender, receiver) = mpsc::channel();
+        let stop = crate::deps::StopHandle::default();
+        let audit = DependencyAudit {
+            receiver,
+            stop: stop.clone(),
+            deadline: std::time::Instant::now() + Duration::from_secs(60),
+            done: false,
+        };
+        drop(audit);
+        assert!(stop.is_stopped());
     }
 }

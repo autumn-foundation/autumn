@@ -140,7 +140,7 @@ async fn job_and_scheduler_drain_end_to_end_on_sqlite_substrate() {
     assert_eq!(
         coordinator.backend(),
         "in_process",
-        "the sim exercises the in-process scheduler, not the Postgres advisory-lock coordinator"
+        "the sim exercises the in-process scheduler, not the Postgres tick-table coordinator"
     );
     let lease = coordinator
         .try_acquire("sim_tick", "sim_tick:0", TaskCoordination::Fleet)

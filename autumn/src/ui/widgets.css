@@ -90,7 +90,7 @@
    test in tests/integration/widget_css_coverage.rs. */
 .wizard-step--upcoming .wizard-step__number {
     background-color: var(--border);
-    color: var(--text-muted);
+    color: var(--text);
 }
 
 .wizard-step--upcoming .wizard-step__label {
@@ -127,11 +127,11 @@
     line-height: 1.5;
     color: var(--text);
     background-color: var(--surface);
-    outline: none;
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .autumn-field__input:focus {
+    outline: 2px solid transparent;
     border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--primary-light);
 }
@@ -155,6 +155,54 @@
     font-size: 0.8125rem;
     color: var(--danger);
     margin: 0;
+}
+
+/* Field wrapper v2 — issue #3395. The hint is between the label and the
+   control. The marker has aria-hidden="true": aria-required gives the state
+   to a screen reader. */
+.autumn-field__hint {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+    margin: 0;
+}
+
+.autumn-field__required {
+    color: var(--danger);
+    margin-left: 0.25rem;
+}
+
+/* A checkbox shows the box, then the label, on one line. */
+.autumn-field--checkbox {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.autumn-field--checkbox .autumn-field__input {
+    width: auto;
+}
+
+.autumn-field__input:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.autumn-field--checkbox .autumn-field__hint,
+.autumn-field--checkbox .autumn-field__errors {
+    flex-basis: 100%;
+}
+
+/* Client-side state: :user-invalid matches only after the user changes the
+   field or submits the form. Plain :invalid matches an empty required field
+   when the page loads. Server errors use the --invalid class above. */
+.autumn-field__input:user-invalid {
+    border-color: var(--danger);
+}
+
+.autumn-field__input:user-invalid:focus {
+    border-color: var(--danger);
+    box-shadow: 0 0 0 3px var(--danger-light);
 }
 
 /* Currently stored file shown above an attachment column's file input, and the
@@ -290,7 +338,7 @@
 }
 
 .autumn-submit:focus {
-    outline: none;
+    outline: 2px solid transparent;
     box-shadow: 0 0 0 3px var(--primary-light);
 }
 
@@ -326,11 +374,11 @@
     background-repeat: no-repeat;
     background-position: 0.625rem center;
     background-size: 1rem 1rem;
-    outline: none;
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .autumn-search__input:focus {
+    outline: 2px solid transparent;
     border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--primary-light);
 }
@@ -359,11 +407,11 @@
     font-size: 0.875rem;
     color: var(--text);
     background-color: var(--surface);
-    outline: none;
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
 .autumn-autocomplete__input:focus {
+    outline: 2px solid transparent;
     border-color: var(--primary);
     box-shadow: 0 0 0 3px var(--primary-light);
 }
@@ -978,7 +1026,8 @@
 
 .autumn-job-status__success {
     font-size: 0.875rem;
-    color: var(--success);
+    color: #065f46;
+    color: color-mix(in srgb, var(--success, #059669) 60%, var(--text, #111827));
 }
 
 .autumn-job-status__error {
@@ -1015,19 +1064,21 @@
 
 .badge--success {
     background: var(--success-light, #ecfdf5);
-    color: var(--success);
+    color: #065f46;
+    color: var(--success-text, color-mix(in srgb, var(--success, #059669) 60%, #111827));
     border-color: var(--success);
 }
 
 .badge--warning {
     background: var(--warning-light, #fffbeb);
-    color: var(--warning, #92400e);
+    color: #92400e;
+    color: var(--warning-text, color-mix(in srgb, var(--warning, #d97706) 60%, #111827));
     border-color: var(--warning, #fcd34d);
 }
 
 .badge--danger {
     background: var(--danger-light, #fef2f2);
-    color: var(--danger);
+    color: var(--danger-hover);
     border-color: var(--danger);
 }
 
@@ -1177,19 +1228,21 @@
 
 .alert-success {
     background: var(--success-light, #ecfdf5);
-    color: var(--success);
+    color: #065f46;
+    color: var(--success-text, color-mix(in srgb, var(--success, #059669) 60%, #111827));
     border-color: var(--success);
 }
 
 .alert-warning {
     background: var(--warning-light, #fffbeb);
-    color: var(--warning, #92400e);
+    color: #92400e;
+    color: var(--warning-text, color-mix(in srgb, var(--warning, #d97706) 60%, #111827));
     border-color: var(--warning, #fcd34d);
 }
 
 .alert-error {
     background: var(--danger-light, #fef2f2);
-    color: var(--danger);
+    color: var(--danger-hover);
     border-color: var(--danger);
 }
 

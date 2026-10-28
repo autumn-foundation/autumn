@@ -1,13 +1,12 @@
 //! Docker-gated integration tests for the Redis/Postgres tracked-job stores
-//! (issue #1373): prove `enqueue_tracked` actually persists through the
-//! backend selected by `jobs.backend`, not silently through the in-memory
-//! fallback, and that the configured TTL expires records on each backend.
+//! (issue #1373): prove `enqueue_tracked` persists through the backend that
+//! `jobs.backend` selects, not the in-memory fallback, and that the TTL
+//! expires records on each backend.
 //!
-//! Both tests require Docker and are marked `#[ignore]`. Run them explicitly
-//! with:
+//! The tests need Docker and are `#[ignore]`. Run them with:
 //!
 //! ```text
-//! cargo test -p autumn-web --features redis,db --test job_tracking_stores_integration -- --ignored
+//! cargo test -p autumn-web --features redis,db --test integration_tests job_tracking_stores -- --ignored
 //! ```
 
 use std::future::Future;
@@ -36,6 +35,7 @@ fn noop_job_info() -> JobInfo {
         uniqueness: None,
         concurrency: None,
         handler: noop_handler,
+        timeout: None,
     }
 }
 
@@ -120,6 +120,56 @@ async fn redis_backend_persists_tracked_job_and_expires_it() {
     job::clear_global_job_client();
 }
 
+#[cfg(feature = "redis")]
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn redis_retry_reset_is_a_no_op_after_a_later_write() {
+    use autumn_web::job_tracking::{
+        JobTrackingStore as _, RedisJobTrackingStore, TrackedJobOwner, TrackedJobStatus,
+    };
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers_modules::redis::Redis as RedisImage;
+
+    let container = RedisImage::default()
+        .start()
+        .await
+        .expect("start Redis container");
+    let port = container
+        .get_host_port_ipv4(6379)
+        .await
+        .expect("redis port");
+    let client = autumn_web::redis_tls::open_client(&format!("redis://127.0.0.1:{port}"))
+        .expect("open redis client");
+    let connection = redis::aio::ConnectionManager::new(client)
+        .await
+        .expect("connect to redis");
+    let store = RedisJobTrackingStore::new(connection, "t", 60);
+
+    store
+        .create("k", TrackedJobOwner::Anonymous)
+        .await
+        .expect("create");
+    store.fail("k", "boom".to_owned()).await.expect("fail");
+    let (_, token) = store.get_with_token("k").await.expect("get").expect("live");
+
+    store.mark_running("k").await.expect("mark_running");
+    store
+        .reset_for_retry("k", TrackedJobOwner::Anonymous, token)
+        .await
+        .expect("reset");
+    let after = store.get("k").await.expect("get").expect("live");
+    assert_eq!(after.status, TrackedJobStatus::Failed);
+
+    // A fresh token applies the reset.
+    let (_, fresh) = store.get_with_token("k").await.expect("get").expect("live");
+    store
+        .reset_for_retry("k", TrackedJobOwner::Anonymous, fresh)
+        .await
+        .expect("reset");
+    let after = store.get("k").await.expect("get").expect("live");
+    assert_eq!(after.status, TrackedJobStatus::Pending);
+}
+
 #[cfg(feature = "db")]
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
@@ -150,6 +200,8 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
         include_str!("../../migrations/20260628000000_add_queue_to_jobs/up.sql");
     const CREATE_JOB_TRACKING: &str =
         include_str!("../../migrations/20260702000000_create_job_tracking/up.sql");
+    const ADD_TRACKING_VERSION: &str =
+        include_str!("../../migrations/20261022120000_add_version_to_job_tracking/up.sql");
 
     #[derive(diesel::QueryableByName)]
     struct RecordRow {
@@ -217,6 +269,9 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
         conn.batch_execute(CREATE_JOB_TRACKING)
             .await
             .expect("apply create_job_tracking migration");
+        conn.batch_execute(ADD_TRACKING_VERSION)
+            .await
+            .expect("apply add_version_to_job_tracking migration");
     }
 
     // 10s, not 1s: `PgJobTrackingStore::update` (see the comment below) only
@@ -336,4 +391,169 @@ async fn postgres_backend_persists_tracked_job_and_expires_it() {
 
     shutdown.cancel();
     job::clear_global_job_client();
+}
+
+/// Clock skew between replicas (#2875). Only the database clock decides
+/// expiry. A writer's clock must not change a record's TTL.
+#[cfg(feature = "db")]
+mod pg_clock_skew {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use autumn_web::job_tracking::{JobTrackingStore as _, PgJobTrackingStore, TrackedJobOwner};
+    use autumn_web::time::FixedClock;
+    use chrono::Utc;
+    use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+    use diesel_async::pooled_connection::deadpool::Pool;
+    use diesel_async::{AsyncPgConnection, SimpleAsyncConnection as _};
+    use testcontainers::ContainerAsync;
+    use testcontainers::runners::AsyncRunner as _;
+    use testcontainers_modules::postgres::Postgres;
+
+    type PgPool = Pool<AsyncPgConnection>;
+
+    const CREATE_JOB_TRACKING: &str =
+        include_str!("../../migrations/20260702000000_create_job_tracking/up.sql");
+    const ADD_TRACKING_VERSION: &str =
+        include_str!("../../migrations/20261022120000_add_version_to_job_tracking/up.sql");
+
+    async fn start_pool() -> (ContainerAsync<Postgres>, PgPool) {
+        let container = Postgres::default().start().await.expect("start Postgres");
+        let port = container.get_host_port_ipv4(5432).await.expect("port");
+        let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+        let pool = Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new(url))
+            .max_size(4)
+            .build()
+            .expect("build pool");
+        pool.get()
+            .await
+            .expect("connection")
+            .batch_execute(CREATE_JOB_TRACKING)
+            .await
+            .expect("apply create_job_tracking migration");
+        pool.get()
+            .await
+            .expect("connection")
+            .batch_execute(ADD_TRACKING_VERSION)
+            .await
+            .expect("apply add_version_to_job_tracking migration");
+        (container, pool)
+    }
+
+    fn skewed(pool: &PgPool, ttl_secs: u64, skew: chrono::TimeDelta) -> PgJobTrackingStore {
+        PgJobTrackingStore::new(pool.clone(), ttl_secs)
+            .with_clock(Arc::new(FixedClock::at(Utc::now() + skew)))
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn lagging_writer_clock_does_not_expire_a_record_early() {
+        let (_container, pool) = start_pool().await;
+        let writer = skewed(&pool, 60, -chrono::TimeDelta::hours(1));
+        writer
+            .create("lag", TrackedJobOwner::Anonymous)
+            .await
+            .expect("create");
+        writer.mark_running("lag").await.expect("mark_running");
+
+        let reader = PgJobTrackingStore::new(pool.clone(), 60);
+        let record = reader.get("lag").await.expect("get");
+        assert!(
+            record.is_some_and(|r| r.status == autumn_web::job_tracking::TrackedJobStatus::Running),
+            "a 60s record written by a clock 1h behind must still be live and updated"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn leading_writer_clock_does_not_extend_a_record() {
+        let (_container, pool) = start_pool().await;
+        let writer = skewed(&pool, 1, chrono::TimeDelta::hours(1));
+        writer
+            .create("lead", TrackedJobOwner::Anonymous)
+            .await
+            .expect("create");
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        let reader = PgJobTrackingStore::new(pool.clone(), 1);
+        assert!(
+            reader.get("lead").await.expect("get").is_none(),
+            "a 1s record written by a clock 1h ahead must expire after 1s"
+        );
+        assert!(
+            writer.get("lead").await.expect("get").is_none(),
+            "the writer's own clock must not keep the record alive either"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn retry_reset_is_a_no_op_after_a_write_under_a_frozen_clock() {
+        let (_container, pool) = start_pool().await;
+        let store = skewed(&pool, 60, chrono::TimeDelta::zero());
+        store
+            .create("frozen", TrackedJobOwner::Anonymous)
+            .await
+            .expect("create");
+        let (_, token) = store
+            .get_with_token("frozen")
+            .await
+            .expect("get")
+            .expect("live");
+
+        // Same frozen instant: `updated_at` does not move, the token must.
+        store.mark_running("frozen").await.expect("mark_running");
+        store
+            .reset_for_retry("frozen", TrackedJobOwner::Anonymous, token)
+            .await
+            .expect("reset");
+
+        let after = store.get("frozen").await.expect("get").expect("live");
+        assert_eq!(
+            after.status,
+            autumn_web::job_tracking::TrackedJobStatus::Running,
+            "a reset holding a stale token must not overwrite a later write"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn retry_reset_uses_the_database_clock_for_expiry() {
+        let (_container, pool) = start_pool().await;
+        let writer = skewed(&pool, 60, -chrono::TimeDelta::hours(1));
+        writer
+            .create("retry", TrackedJobOwner::Anonymous)
+            .await
+            .expect("create");
+        writer.mark_running("retry").await.expect("mark_running");
+        let (_, token) = writer
+            .get_with_token("retry")
+            .await
+            .expect("get")
+            .expect("live");
+        writer
+            .reset_for_retry("retry", TrackedJobOwner::Anonymous, token)
+            .await
+            .expect("reset");
+
+        let reader = PgJobTrackingStore::new(pool.clone(), 60);
+        let after = reader.get("retry").await.expect("get").expect("live");
+        assert_eq!(
+            after.status,
+            autumn_web::job_tracking::TrackedJobStatus::Pending,
+            "the reset must apply and leave a live record"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn extreme_ttl_neither_errors_nor_expires() {
+        let (_container, pool) = start_pool().await;
+        let store = PgJobTrackingStore::new(pool.clone(), u64::MAX);
+        store
+            .create("forever", TrackedJobOwner::Anonymous)
+            .await
+            .expect("an extreme TTL must clamp");
+        assert!(store.get("forever").await.expect("get").is_some());
+    }
 }

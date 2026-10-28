@@ -315,38 +315,43 @@ pub fn negotiate<'a>(requested: &str, supported: &'a [String]) -> Option<&'a str
 
 /// Pick the best locale from an `Accept-Language` header value.
 ///
-/// Parses comma-separated `lang;q=0.9` pairs, sorts by descending `q`, and
-/// negotiates each against `supported`. Returns `None` if no entry matches.
+/// Parses comma-separated `lang;q=0.9` pairs and negotiates each against
+/// `supported`, picking the matching entry with the highest `q` — the earliest
+/// in the header among equal `q`. Returns `None` if no entry matches.
 #[must_use]
 pub fn parse_accept_language<'a>(header: &str, supported: &'a [String]) -> Option<&'a str> {
-    let mut entries: Vec<(f32, &str)> = header
-        .split(',')
-        .filter_map(|raw| {
-            let mut parts = raw.split(';');
-            let tag = parts.next()?.trim();
-            if tag.is_empty() || tag == "*" {
-                return None;
-            }
-            let q = parts
-                .find_map(|p| {
-                    let p = p.trim();
-                    p.strip_prefix("q=").and_then(|v| v.parse::<f32>().ok())
-                })
-                .unwrap_or(1.0);
-            if q.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
-                return None;
-            }
-            Some((q, tag))
-        })
-        .collect();
-    // Stable sort by q descending so equal-q entries preserve header order.
-    entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    for (_, tag) in entries {
+    // One pass, no buffer: the answer is the supported match with the highest
+    // `q`, and among equal `q` the earliest in the header — exactly what a
+    // stable descending sort followed by a first-match scan picks. This runs
+    // on most first-visit requests, so it should not allocate.
+    let mut best: Option<(f32, &'a str)> = None;
+    for raw in header.split(',') {
+        let mut parts = raw.split(';');
+        let Some(tag) = parts.next().map(str::trim) else {
+            continue;
+        };
+        if tag.is_empty() || tag == "*" {
+            continue;
+        }
+        let q = parts
+            .find_map(|p| {
+                let p = p.trim();
+                p.strip_prefix("q=").and_then(|v| v.parse::<f32>().ok())
+            })
+            .unwrap_or(1.0);
+        if q.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+            continue;
+        }
+        // Strictly greater only: an equal `q` later in the header loses the
+        // tie, so it need not even be negotiated.
+        if best.is_some_and(|(best_q, _)| q <= best_q) {
+            continue;
+        }
         if let Some(matched) = negotiate(tag, supported) {
-            return Some(matched);
+            best = Some((q, matched));
         }
     }
-    None
+    best.map(|(_, matched)| matched)
 }
 
 /// Runtime translation store. Loaded once at startup and stored as an
@@ -361,8 +366,10 @@ pub struct Bundle {
     /// Configured supported locales (for the [`Locale`] extractor).
     supported_locales: Vec<String>,
     /// Per-key warn de-duplication so a missing key on a hot path doesn't
-    /// flood the log. Stored alongside last-warned timestamp.
-    miss_warnings: std::sync::Mutex<HashMap<(String, String), Instant>>,
+    /// flood the log. Stored alongside last-warned timestamp, as
+    /// `locale -> key -> last warned`, so a repeat miss is found with the
+    /// borrowed `&str`s it arrived with.
+    miss_warnings: std::sync::Mutex<HashMap<String, HashMap<String, Instant>>>,
     /// How frequently the same `(locale, key)` miss is allowed to warn.
     warn_dedup_window: Duration,
     /// Total number of misses observed (test instrumentation).
@@ -579,6 +586,17 @@ impl Bundle {
         format!("{{${key}}}")
     }
 
+    /// Returns the message for `key` in `locale`, or `None` if no locale in the
+    /// fallback chain has it.
+    ///
+    /// Unlike [`Bundle::translate`], a miss records nothing and returns no
+    /// marker. The caller can use its own text.
+    #[must_use]
+    pub fn lookup(&self, locale: &str, key: &str) -> Option<String> {
+        self.lookup_template(locale, key)
+            .map(|template| interpolate(template, &[]))
+    }
+
     fn lookup_template(&self, locale: &str, key: &str) -> Option<&str> {
         if let Some(found) = self.messages.get(locale).and_then(|m| m.get(key)) {
             return Some(found.as_str());
@@ -605,12 +623,17 @@ impl Bundle {
             let stale = now
                 .checked_sub(self.warn_dedup_window + Duration::from_secs(1))
                 .unwrap_or(now);
-            let miss_key = (locale.to_owned(), key.to_owned());
             let mut guard = match self.miss_warnings.lock() {
                 Ok(g) => g,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let last_warned = guard.get(&miss_key).copied().unwrap_or(stale);
+            // Probe by borrow: a repeat miss — the case this window exists to
+            // throttle — is answered without copying the locale or the key.
+            let last_warned = guard
+                .get(locale)
+                .and_then(|keys| keys.get(key))
+                .copied()
+                .unwrap_or(stale);
             // A `last_warned` later than `now` comes from another clock
             // domain (a bundle reused across `Sim`s, or into and out of one).
             // Treat it as stale, so the warning is not silenced.
@@ -618,7 +641,16 @@ impl Bundle {
                 .checked_duration_since(last_warned)
                 .is_none_or(|since| since >= self.warn_dedup_window)
             {
-                guard.insert(miss_key, now);
+                // Copy the locale and key only the first time this pair warns.
+                #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+                if let Some(slot) = guard.get_mut(locale).and_then(|keys| keys.get_mut(key)) {
+                    *slot = now;
+                } else {
+                    guard
+                        .entry(locale.to_owned())
+                        .or_default()
+                        .insert(key.to_owned(), now);
+                }
                 true
             } else {
                 false
@@ -762,11 +794,16 @@ where
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        // Negotiation only reads the request, and every source it consults
+        // lives as long as the request does: borrow them instead of copying
+        // the supported list and the default on every extraction (this runs
+        // once in `AmbientLocaleLayer` and again per handler `Locale`).
+        let parts: &Parts = parts;
         // Pull bundle from request extensions if a previous middleware
         // installed one. (Bundles are normally registered as an AppState
         // extension and threaded through via a layer; for tests we build
         // [`Locale`] directly via [`Locale::new`] / [`Locale::with_bundle`].)
-        let bundle = parts.extensions.get::<Arc<Bundle>>().cloned();
+        let bundle = parts.extensions.get::<Arc<Bundle>>();
         // Read the router's `LocaleRoutingConfig` (issue #1251) regardless of
         // whether a bundle is installed: when locale-prefix routing is on,
         // the router's nests/redirects are built entirely from `I18nConfig`,
@@ -774,17 +811,15 @@ where
         // be authoritative for which locales are actually reachable and
         // what the fallback default is. The bundle stays authoritative only
         // for `t()`/`t_with()` translation lookups (see `with_bundle` below).
-        let routing_config = parts.extensions.get::<LocaleRoutingConfig>().cloned();
-        let supported: Vec<String> = routing_config
-            .as_ref()
-            .map(|c| c.supported_locales.clone())
-            .or_else(|| bundle.as_ref().map(|b| b.supported_locales.clone()))
+        let routing_config = parts.extensions.get::<LocaleRoutingConfig>();
+        let supported: &[String] = routing_config
+            .map(|c| c.supported_locales.as_slice())
+            .or_else(|| bundle.map(|b| b.supported_locales.as_slice()))
             .unwrap_or_default();
-        let default = routing_config
-            .as_ref()
-            .map(|c| c.default_locale.clone())
-            .or_else(|| bundle.as_ref().map(|b| b.default_locale.clone()))
-            .unwrap_or_else(|| "en".to_owned());
+        let default: &str = routing_config
+            .map(|c| c.default_locale.as_str())
+            .or_else(|| bundle.map(|b| b.default_locale.as_str()))
+            .unwrap_or("en");
 
         // Resolution order: URL locale prefix (issue #1251, when the router's
         // locale-prefix nesting matched) → query → session (signed cookie) →
@@ -792,19 +827,18 @@ where
         let mut resolved = parts
             .extensions
             .get::<UriPrefixedLocale>()
-            .and_then(|url_locale| negotiate(&url_locale.0, &supported))
-            .map(str::to_owned);
+            .and_then(|url_locale| negotiate(&url_locale.0, supported));
         if resolved.is_none() {
-            resolved = resolve_query_override(parts, &supported);
+            resolved = resolve_query_override(parts, supported);
         }
         if resolved.is_none() {
-            resolved = resolve_from_session(parts, &supported).await;
+            resolved = resolve_from_session(parts, supported).await;
         }
         if resolved.is_none() {
-            resolved = resolve_from_plain_cookie(parts, &supported);
+            resolved = resolve_from_plain_cookie(parts, supported);
         }
         if resolved.is_none() {
-            resolved = resolve_from_accept_language(parts, &supported);
+            resolved = resolve_from_accept_language(parts, supported);
         }
         let resolved = resolved.unwrap_or(default);
 
@@ -815,11 +849,11 @@ where
         // outside the static-first middleware and so outside `SessionLayer`.
         // Refining here keeps a `#[translatable]` field and a hand-taken
         // `Locale` parameter from ever disagreeing. A no-op outside a scope.
-        publish_ambient_locale(&resolved);
+        publish_ambient_locale(resolved);
 
         let mut locale = Self::new(resolved);
         if let Some(bundle) = bundle {
-            locale = locale.with_bundle(bundle);
+            locale = locale.with_bundle(Arc::clone(bundle));
         }
         Ok(locale)
     }
@@ -940,8 +974,10 @@ where
             let (mut parts, body) = req.into_parts();
             // Infallible rejection: the extractor always yields a locale.
             let Ok(locale) = Locale::from_request_parts(&mut parts, &()).await;
-            let scope =
-                LocaleScope::with_default_locale(locale.tag(), chain.to_vec(), &default_locale);
+            // Move the negotiated tag in and hand over the chain and default
+            // locale this layer snapshotted at construction: nothing is copied,
+            // and the process-wide defaults are not read.
+            let scope = LocaleScope::from_shared(locale.tag, chain, default_locale);
             let req = axum::http::Request::from_parts(parts, body);
             // Build the inner future INSIDE the scope as well as polling it
             // there (the `HttpInterceptorService` pattern), so a nested layer
@@ -1097,15 +1133,17 @@ where
         Box::pin(async move {
             if let Some(scope) = ambient_locale_scope() {
                 // Refine in place: the app-wide layer's chain is authoritative,
-                // and the prefix outranks whatever it negotiated.
-                scope.set_tag(&*locale);
+                // and the prefix outranks whatever it negotiated. Copied into
+                // the scope's existing buffer rather than a fresh `String`.
+                scope.refine_tag(&locale);
                 let response = inner.call(req).await?;
                 return Ok(
                     response.map(|body| axum::body::Body::new(AmbientLocaleBody::new(body, scope)))
                 );
             }
-            // No app-wide layer: locale-prefix routing without a bundle.
-            let scope = LocaleScope::with_default_locale(&*locale, chain.to_vec(), &default_locale);
+            // No app-wide layer: locale-prefix routing without a bundle. The
+            // chain and default are this layer's snapshots, shared as-is.
+            let scope = LocaleScope::from_shared(String::from(&*locale), chain, default_locale);
             let inner_future = with_locale_scope_sync(scope.clone(), || inner.call(req));
             let response = with_locale_scope(scope.clone(), inner_future).await?;
             Ok(response.map(|body| axum::body::Body::new(AmbientLocaleBody::new(body, scope))))
@@ -1160,29 +1198,33 @@ pub struct LocaleRoutingConfig {
 /// request extensions.
 pub const LOCALE_SESSION_KEY: &str = "autumn_locale";
 
-fn resolve_query_override(parts: &Parts, supported: &[String]) -> Option<String> {
+// The resolvers below hand back a borrow of `supported` — every match is one
+// of its entries — so a negotiated locale is copied once, into the `Locale`,
+// rather than once per step that produced it.
+
+fn resolve_query_override<'a>(parts: &Parts, supported: &'a [String]) -> Option<&'a str> {
     let query = parts.uri.query()?;
     for pair in query.split('&') {
         if let Some(value) = pair.strip_prefix("locale=")
             && let Some(matched) = negotiate(value, supported)
         {
-            return Some(matched.to_owned());
+            return Some(matched);
         }
     }
     None
 }
 
-async fn resolve_from_session(parts: &Parts, supported: &[String]) -> Option<String> {
+async fn resolve_from_session<'a>(parts: &Parts, supported: &'a [String]) -> Option<&'a str> {
     // Session is published into request extensions by SessionLayer. When it
     // isn't (e.g. session feature disabled or layer not installed), this
     // simply falls through. Reading is async because the session uses an
     // RwLock under the hood — but no I/O happens here.
     let session = parts.extensions.get::<crate::session::Session>().cloned()?;
     let value = session.get(LOCALE_SESSION_KEY).await?;
-    negotiate(&value, supported).map(str::to_owned)
+    negotiate(&value, supported)
 }
 
-fn resolve_from_plain_cookie(parts: &Parts, supported: &[String]) -> Option<String> {
+fn resolve_from_plain_cookie<'a>(parts: &Parts, supported: &'a [String]) -> Option<&'a str> {
     let cookie_header = parts
         .headers
         .get(axum::http::header::COOKIE)
@@ -1192,18 +1234,18 @@ fn resolve_from_plain_cookie(parts: &Parts, supported: &[String]) -> Option<Stri
         if let Some(value) = cookie.strip_prefix("autumn_locale=")
             && let Some(matched) = negotiate(value, supported)
         {
-            return Some(matched.to_owned());
+            return Some(matched);
         }
     }
     None
 }
 
-fn resolve_from_accept_language(parts: &Parts, supported: &[String]) -> Option<String> {
+fn resolve_from_accept_language<'a>(parts: &Parts, supported: &'a [String]) -> Option<&'a str> {
     let header = parts
         .headers
         .get(axum::http::header::ACCEPT_LANGUAGE)
         .and_then(|h| h.to_str().ok())?;
-    parse_accept_language(header, supported).map(str::to_owned)
+    parse_accept_language(header, supported)
 }
 
 /// Persist a locale choice into the signed session cookie.
@@ -1330,19 +1372,99 @@ mod tests {
     /// A `last_warned` from another clock domain (later than `now`) is stale,
     /// so the miss warns again instead of staying silent (issue #2967).
     #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions read the table under the one lock they inspect"
+    )]
     fn a_future_last_warned_does_not_silence_the_miss_warning() {
         let cfg = cfg("en", &["en"]);
         let bundle = bundle_with(&[("en", &[])], &cfg);
-        let key = ("en".to_owned(), "missing.key".to_owned());
         let future = crate::time::ambient_instant() + Duration::from_secs(3600);
         bundle
             .miss_warnings
             .lock()
             .unwrap()
-            .insert(key.clone(), future);
+            .entry("en".to_owned())
+            .or_default()
+            .insert("missing.key".to_owned(), future);
         bundle.record_miss("en", "missing.key");
-        let recorded = bundle.miss_warnings.lock().unwrap()[&key];
-        assert!(recorded < future, "the miss warned and reset the timestamp");
+        let table = bundle.miss_warnings.lock().unwrap();
+        assert!(
+            table["en"]["missing.key"] < future,
+            "the miss warned and reset the timestamp"
+        );
+        assert_eq!(table.len(), 1);
+        assert_eq!(table["en"].len(), 1, "re-stamped in place, not re-inserted");
+    }
+
+    /// A repeat miss inside the window is answered by a borrowed probe and
+    /// leaves the first warning's timestamp, and the table, as it was.
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions read the table under the one lock they inspect"
+    )]
+    fn a_repeat_miss_inside_the_window_keeps_its_first_timestamp() {
+        let cfg = cfg("en", &["en"]);
+        let bundle = bundle_with(&[("en", &[])], &cfg);
+        let earlier = crate::time::ambient_instant();
+        bundle
+            .miss_warnings
+            .lock()
+            .unwrap()
+            .entry("en".to_owned())
+            .or_default()
+            .insert("missing.key".to_owned(), earlier);
+        bundle.record_miss("en", "missing.key");
+        bundle.record_miss("en", "missing.key");
+        assert_eq!(bundle.miss_count(), 2, "every miss is still counted");
+        let table = bundle.miss_warnings.lock().unwrap();
+        assert_eq!(table.len(), 1);
+        assert_eq!(table["en"].len(), 1);
+        assert_eq!(
+            table["en"]["missing.key"], earlier,
+            "suppressed misses do not re-stamp"
+        );
+    }
+
+    /// A first miss for a new key under a locale that already has entries joins
+    /// that locale's table and leaves the other key's timestamp alone; a miss
+    /// in another locale is tracked separately, so dedup stays per pair.
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions read the table under the one lock they inspect"
+    )]
+    fn a_first_miss_is_recorded_per_locale_and_key_pair() {
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = bundle_with(&[("en", &[]), ("es", &[])], &cfg);
+        let future = crate::time::ambient_instant() + Duration::from_secs(3600);
+        bundle
+            .miss_warnings
+            .lock()
+            .unwrap()
+            .entry("en".to_owned())
+            .or_default()
+            .insert("other.key".to_owned(), future);
+        bundle.record_miss("en", "missing.key");
+        bundle.record_miss("es", "missing.key");
+        // A first miss warns, and so is recorded, unless `now` sits too close
+        // to the clock's origin for a stale default to exist — the edge
+        // `record_miss` documents, in which it neither warns nor records.
+        let first_misses_warn = crate::time::ambient_instant()
+            .checked_sub(Duration::from_secs(61))
+            .is_some();
+        let table = bundle.miss_warnings.lock().unwrap();
+        assert_eq!(
+            table["en"]["other.key"], future,
+            "another key's timestamp is untouched"
+        );
+        if first_misses_warn {
+            assert_eq!(table.len(), 2, "one table per locale");
+            assert_eq!(table["en"].len(), 2);
+            assert!(table["en"].contains_key("missing.key"));
+            assert!(table["es"].contains_key("missing.key"));
+        }
     }
 
     // ── Config ────────────────────────────────────────────────────
@@ -1596,6 +1718,137 @@ mod tests {
         assert_eq!(parse_accept_language("es;q=0, en;q=0", &supported), None);
     }
 
+    #[test]
+    fn parse_accept_language_keeps_header_order_among_equal_q() {
+        let supported = vec!["en".to_owned(), "es".to_owned(), "fr".to_owned()];
+        assert_eq!(
+            parse_accept_language("fr;q=0.8, es;q=0.8, en;q=0.5", &supported),
+            Some("fr")
+        );
+        assert_eq!(
+            parse_accept_language("en;q=0.5, ja, es;q=0.9", &supported),
+            Some("es")
+        );
+        assert_eq!(
+            parse_accept_language("ja, de;q=0.9, en;q=0.1", &supported),
+            Some("en")
+        );
+        assert_eq!(
+            parse_accept_language("es;q=0.9, fr", &supported),
+            Some("fr")
+        );
+        // A tie on an implicit `q=1` is still won by the earlier entry.
+        assert_eq!(parse_accept_language("es, fr, en", &supported), Some("es"));
+    }
+
+    #[test]
+    fn parse_accept_language_edge_cases() {
+        let supported = vec!["en".to_owned(), "es".to_owned()];
+        assert_eq!(parse_accept_language("", &supported), None, "empty header");
+        assert_eq!(
+            parse_accept_language(" , ;, ;q=1", &supported),
+            None,
+            "no tags"
+        );
+        assert_eq!(parse_accept_language("ja, de-DE;q=0.9", &supported), None);
+        assert_eq!(parse_accept_language("es;q=nan", &supported), None, "NaN q");
+        assert_eq!(parse_accept_language("es;q=-1, en", &supported), Some("en"));
+        assert_eq!(
+            parse_accept_language(" ES-mx ;q=0.5 ", &supported),
+            Some("es")
+        );
+        assert_eq!(
+            parse_accept_language("es;q=abc", &supported),
+            Some("es"),
+            "an unparseable q is ignored, leaving the implicit q=1"
+        );
+        assert_eq!(parse_accept_language("es", &[]), None, "nothing supported");
+    }
+
+    /// The previous implementation — collect, stable-sort by descending `q`,
+    /// take the first entry that negotiates — kept as the oracle the one-pass
+    /// version must agree with on every input.
+    fn sorted_reference_parse_accept_language<'a>(
+        header: &str,
+        supported: &'a [String],
+    ) -> Option<&'a str> {
+        let mut entries: Vec<(f32, &str)> = header
+            .split(',')
+            .filter_map(|raw| {
+                let mut parts = raw.split(';');
+                let tag = parts.next()?.trim();
+                if tag.is_empty() || tag == "*" {
+                    return None;
+                }
+                let q = parts
+                    .find_map(|p| {
+                        let p = p.trim();
+                        p.strip_prefix("q=").and_then(|v| v.parse::<f32>().ok())
+                    })
+                    .unwrap_or(1.0);
+                if q.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
+                    return None;
+                }
+                Some((q, tag))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        entries
+            .into_iter()
+            .find_map(|(_, tag)| negotiate(tag, supported))
+    }
+
+    #[test]
+    fn parse_accept_language_matches_the_sorting_implementation() {
+        let headers = [
+            "",
+            " ",
+            ",",
+            ",;,",
+            "*",
+            "*;q=0.5, en;q=0.1",
+            "es",
+            "ES",
+            " es-MX ",
+            "es-MX,es;q=0.9,en;q=0.8",
+            "fr;q=0.9, es;q=0.8, en;q=0.7",
+            "fr;q=0.8, es;q=0.8, en;q=0.5",
+            "en;q=0.5, ja, es;q=0.9",
+            "ja, de;q=0.9, en;q=0.1",
+            "es;q=0.9, fr",
+            "es;q=0, en;q=0",
+            "es;q=-1, en",
+            "es;q=nan, en;q=0.1",
+            "es;q=inf, fr;q=inf, en",
+            "es;q=abc, fr;q=0.5",
+            "es;level=1;q=0.4, en;q=0.4",
+            "en;q=1.0, es;q=1",
+            "pt-BR;q=0.9, pt;q=0.9, en;q=0.9",
+            "zh-Hant-TW, zh;q=0.8, en;q=0.8",
+            "de, fr;q=2, en;q=2",
+            "en;q=0.5,en;q=0.9,es;q=0.9",
+            "x;q=0.1,y;q=0.2,es;q=0.3,fr;q=0.3,en;q=0.29",
+        ];
+        let lists: [&[&str]; 6] = [
+            &[],
+            &["en"],
+            &["en", "es", "fr"],
+            &["fr", "es", "en"],
+            &["pt", "en"],
+            &["zh", "en", "es"],
+        ];
+        for list in lists {
+            let supported: Vec<String> = list.iter().map(|s| (*s).to_owned()).collect();
+            for header in headers {
+                assert_eq!(
+                    parse_accept_language(header, &supported),
+                    sorted_reference_parse_accept_language(header, &supported),
+                    "header {header:?} against {supported:?}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn locale_extractor_uses_query_override() {
         let cfg = cfg("en", &["en", "es"]);
@@ -1795,6 +2048,147 @@ mod tests {
         let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(locale.tag(), "es");
         assert_eq!(locale.t("greeting"), "Hola");
+    }
+
+    #[tokio::test]
+    async fn locale_extractor_defaults_to_en_with_no_bundle_or_routing_config() {
+        // Nothing to negotiate against: every source falls through, even one
+        // naming a real locale, and the hard-coded last resort applies.
+        let mut parts = build_parts(
+            "/?locale=es",
+            &[
+                (header::COOKIE.as_str(), "autumn_locale=es"),
+                (header::ACCEPT_LANGUAGE.as_str(), "es"),
+            ],
+        );
+        parts.extensions.insert(UriPrefixedLocale("es".to_owned()));
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(locale.tag(), "en");
+        assert!(locale.bundle().is_none());
+    }
+
+    #[tokio::test]
+    async fn locale_extractor_attaches_the_requests_own_bundle() {
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
+        let mut parts = build_parts("/", &[(header::ACCEPT_LANGUAGE.as_str(), "es")]);
+        parts.extensions.insert(Arc::clone(&bundle));
+        let locale = Locale::from_request_parts(&mut parts, &()).await.unwrap();
+        assert_eq!(locale.tag(), "es");
+        assert!(
+            Arc::ptr_eq(locale.bundle().expect("bundle attached"), &bundle),
+            "the request's bundle is shared, not rebuilt"
+        );
+    }
+
+    #[tokio::test]
+    async fn locale_extractor_refines_an_enclosing_scope() {
+        let cfg = cfg("en", &["en", "es"]);
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
+        let mut parts = build_parts("/?locale=es", &[]);
+        parts.extensions.insert(bundle);
+        let scope = LocaleScope::with_default_locale("en", vec!["en".to_owned()], "en");
+        let extracted = with_locale_scope(scope.clone(), async {
+            Locale::from_request_parts(&mut parts, &()).await.unwrap()
+        })
+        .await;
+        assert_eq!(extracted.tag(), "es");
+        assert_eq!(
+            scope.tag(),
+            "es",
+            "the extractor publishes its answer onto the scope"
+        );
+    }
+
+    // ── Ambient / locale-prefix scope layers (issue #1384) ───────
+
+    /// Test handler: hands the scope it ran under back in the response's
+    /// extensions, so a test can inspect exactly what the layer published.
+    async fn echo_ambient_scope(
+        _req: Request<Body>,
+    ) -> Result<axum::response::Response, std::convert::Infallible> {
+        let scope = ambient_locale_scope().expect("the handler runs inside a locale scope");
+        let mut response = axum::response::Response::new(Body::empty());
+        response.extensions_mut().insert(scope);
+        Ok(response)
+    }
+
+    #[tokio::test]
+    async fn ambient_layer_scopes_the_handler_to_its_snapshotted_chain_and_default() {
+        use tower::{Layer as _, ServiceExt as _};
+        let mut cfg = cfg("en", &["en", "es"]);
+        cfg.fallback_chain = vec!["es".to_owned()];
+        let bundle = Arc::new(bundle_with(&[("en", &[]), ("es", &[])], &cfg));
+        let layer = AmbientLocaleLayer::new(&bundle);
+        let svc = layer.layer(tower::service_fn(echo_ambient_scope));
+        let mut req = Request::builder()
+            .uri("/?locale=es")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(Arc::clone(&bundle));
+        let response = svc.oneshot(req).await.unwrap();
+        let scope = response
+            .extensions()
+            .get::<LocaleScope>()
+            .expect("the handler saw a scope");
+        assert_eq!(scope.tag(), "es");
+        assert_eq!(scope.chain(), ["es".to_owned(), "en".to_owned()].as_slice());
+        assert_eq!(scope.default_locale(), "en");
+        assert!(
+            std::ptr::eq(scope.chain().as_ptr(), layer.chain.as_ptr()),
+            "the layer's chain snapshot is shared, not copied per request"
+        );
+        assert!(
+            std::ptr::eq(
+                scope.default_locale().as_ptr(),
+                layer.default_locale.as_ptr()
+            ),
+            "the layer's default locale is shared, not copied per request"
+        );
+    }
+
+    #[tokio::test]
+    async fn locale_prefix_layer_without_an_outer_scope_shares_its_snapshots() {
+        use tower::{Layer as _, ServiceExt as _};
+        let layer = LocalePrefixScopeLayer::new("es", vec!["es".to_owned(), "en".to_owned()], "en");
+        let svc = layer.layer(tower::service_fn(echo_ambient_scope));
+        let req = Request::builder().uri("/es/").body(Body::empty()).unwrap();
+        let response = svc.oneshot(req).await.unwrap();
+        let scope = response
+            .extensions()
+            .get::<LocaleScope>()
+            .expect("the handler saw a scope");
+        assert_eq!(scope.tag(), "es");
+        assert_eq!(scope.chain(), ["es".to_owned(), "en".to_owned()].as_slice());
+        assert_eq!(scope.default_locale(), "en");
+        assert!(std::ptr::eq(scope.chain().as_ptr(), layer.chain.as_ptr()));
+        assert!(std::ptr::eq(
+            scope.default_locale().as_ptr(),
+            layer.default_locale.as_ptr()
+        ));
+    }
+
+    #[tokio::test]
+    async fn locale_prefix_layer_refines_the_outer_scope_in_place() {
+        use tower::{Layer as _, ServiceExt as _};
+        let layer = LocalePrefixScopeLayer::new("es", vec!["es".to_owned()], "es");
+        let svc = layer.layer(tower::service_fn(echo_ambient_scope));
+        let outer = LocaleScope::with_default_locale("en-GB", vec!["en".to_owned()], "en");
+        let req = Request::builder().uri("/es/").body(Body::empty()).unwrap();
+        let response = with_locale_scope(outer.clone(), svc.oneshot(req))
+            .await
+            .unwrap();
+        assert_eq!(outer.tag(), "es", "the prefix refines the outer scope");
+        let seen = response
+            .extensions()
+            .get::<LocaleScope>()
+            .expect("the handler saw a scope");
+        assert_eq!(seen.tag(), "es");
+        assert!(
+            std::ptr::eq(seen.chain(), outer.chain()),
+            "the outer scope's chain stays authoritative"
+        );
+        assert_eq!(seen.default_locale(), "en");
     }
 
     #[test]

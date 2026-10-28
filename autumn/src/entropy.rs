@@ -94,6 +94,17 @@ pub trait Entropy: std::fmt::Debug + Send + Sync + 'static {
         self.fill_bytes(&mut rand_bytes);
         uuid_v7_from_parts(unix_millis, rand_bytes)
     }
+
+    /// The source under a capsule recording wrapper, or `None` when this is
+    /// not one.
+    ///
+    /// The framework uses it for draws that a capsule replay does not make
+    /// again (HTTP retry jitter, an automatic `Idempotency-Key`). Those draws
+    /// then stay off the capsule's random tape (issue #3054).
+    #[doc(hidden)]
+    fn unrecorded(&self) -> Option<Arc<dyn Entropy>> {
+        None
+    }
 }
 
 /// Build a version-4 [`Uuid`] from 16 raw bytes by stamping the RFC 4122
@@ -180,6 +191,10 @@ impl Entropy for std::sync::Arc<dyn Entropy> {
     fn uuid_v7(&self, unix_millis: u64) -> Uuid {
         (**self).uuid_v7(unix_millis)
     }
+
+    fn unrecorded(&self) -> Option<Arc<dyn Entropy>> {
+        (**self).unrecorded()
+    }
 }
 
 // ── OS (real) entropy ─────────────────────────────────────────────────────────
@@ -195,12 +210,12 @@ pub struct OsEntropy;
 impl Entropy for OsEntropy {
     fn next_u64(&self) -> u64 {
         let mut buf = [0u8; 8];
-        getrandom::getrandom(&mut buf).expect("OS RNG must not fail on supported platforms");
+        getrandom::fill(&mut buf).expect("OS RNG must not fail on supported platforms");
         u64::from_le_bytes(buf)
     }
 
     fn fill_bytes(&self, dest: &mut [u8]) {
-        getrandom::getrandom(dest).expect("OS RNG must not fail on supported platforms");
+        getrandom::fill(dest).expect("OS RNG must not fail on supported platforms");
     }
 }
 

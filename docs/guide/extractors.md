@@ -277,11 +277,17 @@ sees a nested object and reports a decode error naming the fix: type the field
 as a nested struct, or as `HashMap<String, serde_json::Value>` to accept either
 shape.
 
-### Bodies are unchanged
+### Bodies use other rules
 
-This is the **query string only**. `Form<T>` and
-`NestedChangesetForm` still decode request *bodies* through `serde_urlencoded`
-and the nested-row parser respectively. See [nested forms](./nested-forms.md).
+This is the **query string only**. Bodies have their own rules:
+
+- `Form<T>` decodes through `serde_urlencoded`. A repeated key on a struct
+  field is an error.
+- `ChangesetForm<T>`, `NestedChangesetForm` and
+  `autumn_web::form::from_urlencoded` put a repeated key into a `Vec<T>`
+  field. Brackets stay part of the key. See
+  [forms](./forms.md#multi-value-fields) and
+  [nested forms](./nested-forms.md).
 
 ### Why MCP tools care
 

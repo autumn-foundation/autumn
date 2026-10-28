@@ -57,12 +57,28 @@ use serde::{Deserialize, Serialize};
 /// | 1 | request, clock, database tape, outcome (#1598) |
 /// | 2 | [`Capsule::db_roles`] |
 /// | 3 | [`Capsule::effects`] (outbound HTTP, jobs, cache, mail, tenancy, randomness) and [`Capsule::job`] (#1634) |
+/// | 4 | cache removals and untyped reads, failed tenant lookups, entropy draw widths (#2351) |
 ///
 /// Version 3 is the same kind of semantic bump version 2 was, one seam wider:
 /// a v2 reader would skip `effects` entirely, replay a handler whose outbound
 /// call, cache read or minted identifier is nowhere in the document, and
 /// report a verdict on a run that never met the recording's effects.
-pub const CAPSULE_FORMAT_VERSION: u32 = 3;
+///
+/// A new enum value (for example [`HttpErrorKind::FaultInjected`]) does not
+/// bump the version: this build reads every v3 capsule, and a bump would make
+/// each committed corpus unreadable. An older reader rejects a capsule that
+/// holds the new value as malformed. A reader checks the version before the
+/// rest, so from this build on a later bump reports as a version mismatch.
+///
+/// Version 4 records more than version 3. A v3 capsule has no entry for a
+/// cache removal, an untyped cache read or a failed tenant lookup, and its
+/// draw widths can be off by an enqueue's job id. This build still reads a v3
+/// capsule ([`OLDEST_READABLE_FORMAT_VERSION`]), and replays it with the v3
+/// rules for those seams, so a committed corpus keeps its verdicts.
+pub const CAPSULE_FORMAT_VERSION: u32 = 4;
+
+/// The oldest capsule format this build reads. See [`CAPSULE_FORMAT_VERSION`].
+pub const OLDEST_READABLE_FORMAT_VERSION: u32 = 3;
 
 /// Errors surfaced when reading a capsule back from disk.
 #[derive(Debug)]
@@ -183,15 +199,24 @@ impl Capsule {
     /// schema and [`CapsuleError::VersionMismatch`] when the document was
     /// written by an incompatible build.
     pub fn from_json(json: &str) -> Result<Self, CapsuleError> {
-        let capsule: Self = serde_json::from_str(json).map_err(CapsuleError::Malformed)?;
-        if capsule.format_version == CAPSULE_FORMAT_VERSION {
-            Ok(capsule)
-        } else {
-            Err(CapsuleError::VersionMismatch {
-                found: capsule.format_version,
-                expected: CAPSULE_FORMAT_VERSION,
-            })
+        /// The version alone. Read first, so a document from another build
+        /// reports its version, also when it holds a value this build does
+        /// not know (#3071).
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            format_version: u32,
         }
+
+        let probe: VersionProbe = serde_json::from_str(json).map_err(CapsuleError::Malformed)?;
+        if !(OLDEST_READABLE_FORMAT_VERSION..=CAPSULE_FORMAT_VERSION)
+            .contains(&probe.format_version)
+        {
+            return Err(CapsuleError::VersionMismatch {
+                found: probe.format_version,
+                expected: CAPSULE_FORMAT_VERSION,
+            });
+        }
+        serde_json::from_str(json).map_err(CapsuleError::Malformed)
     }
 }
 
@@ -435,6 +460,16 @@ pub struct CapsuleEffects {
     /// in draw order.
     #[serde(default)]
     pub random: Vec<RandomEffect>,
+    /// Whether the app state had a cache when the run started (from the
+    /// builder, a state initializer or a startup hook such as
+    /// `RedisCachePlugin`). A cache call can take a different path without
+    /// one. Replay builds no cache backend and runs no startup hook, so it
+    /// installs a cache that stores nothing in the global cache and the app
+    /// state: before the state initializers for a builder's cache, after
+    /// them for a startup hook's, as production did. A state initializer
+    /// that installs its own cache runs again, with its backend offline.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub state_cache: bool,
 }
 
 impl CapsuleEffects {
@@ -522,6 +557,8 @@ pub enum HttpErrorKind {
     NoMock,
     /// The outbound circuit breaker was open.
     CircuitBreakerOpen,
+    /// The client-side adaptive throttle rejected the call (issue #3068).
+    ThrottledLocally,
     /// The SSRF policy blocked the address.
     SsrfBlocked,
     /// A redirect chain exceeded the hop limit.
@@ -530,6 +567,8 @@ pub enum HttpErrorKind {
     RedirectRejected,
     /// A URL could not be parsed or resolved.
     InvalidUrl,
+    /// Staging fault injection failed the call (issue #3071).
+    FaultInjected,
 }
 
 impl Default for HttpEffect {
@@ -600,6 +639,14 @@ pub struct JobEffect {
     /// terms is what lets a changed deadline be noticed at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub due_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The absolute instant the caller asked for, when it was already past.
+    ///
+    /// An enqueue runs a past deadline at once, so capture records `due_at:
+    /// None` and keeps the deadline here. Replay compares the deadline the
+    /// caller gave against this field. An `*_after_commit` registration keeps
+    /// its deadline in `due_at`, and leaves this field empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_due_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The error the backend returned, when the enqueue **failed**.
     ///
     /// A handler whose recorded 500 was caused by `enqueue(..).await?` — the
@@ -608,6 +655,11 @@ pub struct JobEffect {
     /// down the success path the failing run never took.
     #[serde(default)]
     pub error: Option<String>,
+    /// The HTTP status of [`error`](Self::error). Replay gives the error this
+    /// status, so a handler that branches on it takes the same path. `None`
+    /// (and a capsule from before this field) replays as a 500.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_status: Option<u16>,
 }
 
 impl Default for JobEffect {
@@ -618,7 +670,9 @@ impl Default for JobEffect {
             payload: serde_json::Value::Null,
             delay_secs: None,
             due_at: None,
+            requested_due_at: None,
             error: None,
+            error_status: None,
         }
     }
 }
@@ -633,7 +687,9 @@ impl JobEffect {
             payload: serde_json::Value::Null,
             delay_secs: None,
             due_at: None,
+            requested_due_at: None,
             error: Some(PENDING_EFFECT.to_owned()),
+            error_status: None,
         }
     }
 }
@@ -682,15 +738,69 @@ pub enum CacheEffect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ttl_secs: Option<u64>,
     },
+    /// A removal of one key ([`Cache::invalidate`](crate::cache::Cache::invalidate)
+    /// or [`Cache::invalidate_async`](crate::cache::Cache::invalidate_async)).
+    Invalidate {
+        /// Cache key removed.
+        key: String,
+        /// The failure the async form returned, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<CacheInvalidationError>,
+    },
+    /// A removal of one namespace
+    /// ([`Cache::invalidate_namespace`](crate::cache::Cache::invalidate_namespace)
+    /// or its async form).
+    InvalidateNamespace {
+        /// Namespace removed.
+        namespace: String,
+        /// The failure the backend returned, if any. The sync form maps
+        /// `false` to a failure.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<CacheInvalidationError>,
+    },
+    /// A removal of all entries ([`Cache::clear`](crate::cache::Cache::clear)).
+    Clear,
+}
+
+/// A recorded [`InvalidationError`](crate::cache::InvalidationError).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheInvalidationError {
+    /// Attempts the backend made.
+    pub attempts: u32,
+    /// Why it failed.
+    pub reason: String,
 }
 
 impl CacheEffect {
-    /// The key this interaction touched.
+    /// The key (or namespace) this interaction touched. Empty for
+    /// [`Clear`](Self::Clear).
     #[must_use]
     pub fn key(&self) -> &str {
         match self {
-            Self::Get { key, .. } | Self::Insert { key, .. } => key,
+            Self::Get { key, .. } | Self::Insert { key, .. } | Self::Invalidate { key, .. } => key,
+            Self::InvalidateNamespace { namespace, .. } => namespace,
+            Self::Clear => "",
         }
+    }
+
+    /// The placeholder a reserved-but-unfinished tape slot holds; see
+    /// [`HttpEffect::pending`].
+    #[must_use]
+    pub fn pending() -> Self {
+        Self::Invalidate {
+            key: String::new(),
+            error: Some(CacheInvalidationError {
+                attempts: 0,
+                reason: PENDING_EFFECT.to_owned(),
+            }),
+        }
+    }
+
+    /// Whether replay hands this entry to the code as input. Only a read
+    /// is input; every other entry is a write that replay compares.
+    #[must_use]
+    pub const fn is_read(&self) -> bool {
+        matches!(self, Self::Get { .. })
     }
 }
 
@@ -783,6 +893,8 @@ pub enum MailErrorKind {
     AllRecipientsSuppressed,
     /// CSS inlining failed.
     CssInline,
+    /// `deliver_later` in production had no durable queue.
+    NoDurableQueueInProduction,
     /// Anything else; only the recorded text survives.
     Other,
 }
@@ -1031,7 +1143,9 @@ mod tests {
             payload: serde_json::json!({"order": 7}),
             delay_secs: Some(30),
             due_at: None,
+            requested_due_at: None,
             error: None,
+            error_status: None,
         });
         capsule.effects.cache.push(CacheEffect::Get {
             key: "user:7".to_owned(),
@@ -1126,6 +1240,32 @@ mod tests {
             message.contains("older") || message.contains("re-record"),
             "the refusal must be actionable: {message}"
         );
+    }
+
+    /// #2351: a v3 capsule still loads, so a committed corpus stays readable.
+    #[test]
+    fn a_v3_capsule_still_loads() {
+        let mut capsule = sample();
+        capsule.format_version = 3;
+        let json = serde_json::to_string(&capsule).expect("capsule serializes");
+        let parsed = Capsule::from_json(&json).expect("a v3 capsule loads");
+        assert_eq!(parsed.format_version, 3);
+    }
+
+    /// A reader checks the version before the rest, so a capsule from a
+    /// newer build reports a version mismatch, not a malformed document,
+    /// also when it holds a value this build does not know.
+    #[test]
+    fn a_newer_capsule_is_a_version_mismatch_even_with_unknown_values() {
+        let mut json = serde_json::to_value(sample()).expect("capsule serializes");
+        json["format_version"] = serde_json::json!(CAPSULE_FORMAT_VERSION + 1);
+        json["outcome"] = serde_json::json!("a_value_from_the_future");
+        match Capsule::from_json(&json.to_string()) {
+            Err(CapsuleError::VersionMismatch { found, .. }) => {
+                assert_eq!(found, CAPSULE_FORMAT_VERSION + 1);
+            }
+            other => panic!("expected a version mismatch, got {other:?}"),
+        }
     }
 
     #[test]

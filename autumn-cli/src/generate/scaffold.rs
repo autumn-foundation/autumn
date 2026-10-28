@@ -25,7 +25,7 @@ use super::model::{
 use super::naming::{humanize_label, pascal, pluralize, snake};
 use super::scaffold_i18n;
 use super::schema_edit::{
-    add_mod_declaration, create_table_sql_with_metadata_and_id, ensure_autumn_web_feature,
+    add_mod_declaration, create_table_sql_with_metadata_and_id_for, ensure_autumn_web_feature,
     ensure_dependency_feature, ensure_dev_dependency_test_support,
     ensure_dev_dependency_tokio_test_features, unique_index_name, update_main_rs,
 };
@@ -1227,6 +1227,12 @@ fn plan_scaffold_with_options_impl(
         // rather than a runtime miss. `labels.used_keys()` is the exact set the render
         // emitted — no more, which `autumn i18n check` would flag as unused, and no fewer.
         let autumn_toml_path_for_i18n = project_root.join("autumn.toml");
+        // #2439: `ChangesetForm` looks up this key. It is the same key as
+        // `autumn_web::form::NUL_CHARACTER_MESSAGE_KEY`.
+        labels.framework_key(
+            scaffold_i18n::NUL_MESSAGE_KEY,
+            scaffold_i18n::NUL_MESSAGE_ENGLISH,
+        );
         let referenced_keys = labels.used_keys();
         if labels.enabled() && !referenced_keys.is_empty() {
             // Write to the bundle the app actually resolves through, not a
@@ -1660,27 +1666,14 @@ fn plan_scaffold_with_options_impl(
     // failure the header check exists to stop, in the one shape where there is
     // no header to check. Refuse the surface rather than emit one whose only
     // possible output is junk. Reached for a model whose every column is an
-    // `Attachment`, a `Bytea`, or `--default`ed.
+    // `Attachment` or `--default`ed.
     let settable_import_columns = form_fields
         .iter()
-        .filter(|f| !f.kind.is_attachment() && f.kind != FieldKind::Bytea)
+        .filter(|f| !f.kind.is_attachment())
         .count();
-    // The general shape both this and the `#[encrypted]` refusal above are instances of:
-    // a column the import cannot set, which the form nonetheless requires. Filtering such
-    // a column out of the decoded row — which the import must do, see the `Bytea`
-    // reasoning at `form_carried` — then makes every row fail with "missing field", so
-    // the surface would exist and never import anything. A non-nullable `Bytea` is the
-    // case that reaches here: the form declares it as a bare `String`. A nullable one is
-    // fine, since the form declares `Option<String>` and a filtered-out column decodes as
-    // `None`.
-    let unsatisfiable_form_column = form_fields
-        .iter()
-        .find(|f| f.kind == FieldKind::Bytea && !f.nullable)
-        .map(|f| f.name.clone());
     let import_enabled = options_with_key.import
         && export_enabled
         && encrypted_form_column.is_none()
-        && unsatisfiable_form_column.is_none()
         && settable_import_columns > 0;
     // A `--import` that lands on a gated-off variant would otherwise be silent:
     // no upload form, no route, no explanation. Say so at generation time with
@@ -1696,19 +1689,10 @@ fn plan_scaffold_with_options_impl(
         let reason =
             if export_enabled && encrypted_form_column.is_none() && settable_import_columns == 0 {
                 "no column on this model can be set from a CSV — every column is an \
-             Attachment, a Bytea, or `--default`ed — so an import could only ever \
+             Attachment or `--default`ed — so an import could only ever \
              create rows of database defaults, and a file with any header at all \
              would decode into them. Add a column the form carries, or drop \
              --import."
-            } else if let Some(column) = unsatisfiable_form_column.as_deref() {
-                &format!(
-                    "`{column}` is a non-nullable Bytea column. The CSV export renders it \
-                 with `String::from_utf8_lossy`, so it cannot be imported back without \
-                 corrupting non-UTF-8 bytes — but the generated form requires it, so \
-                 skipping it would fail every row with \"missing field\". Make it \
-                 nullable (`{column}:Option<Bytea>`), drop the column, or import it \
-                 through a hand-written route."
-                )
             } else if let Some(column) = encrypted_form_column.as_deref() {
                 &format!(
                     "`{column}` is an at-rest #[encrypted] column, which the CSV export \
@@ -1842,6 +1826,7 @@ fn plan_scaffold_with_options_impl(
     let smoke_test_fields =
         augment_fields_for_soft_delete(&fields, options_with_key.model.soft_delete)?;
     let mut smoke_test = render_smoke_test(
+        backend,
         &pascal_name,
         &plural,
         options_with_key.api,
@@ -2223,18 +2208,6 @@ fn plan_scaffold_with_options_impl(
             feature: "sqlite".to_owned(),
             owner_dir: Some(project_root.join("src/models")),
         });
-        // The one file this scaffold writes that is known not to compile here.
-        // Say so at generate time rather than let `cargo test` be the messenger.
-        if !for_revert {
-            plan.warn(format!(
-                "tests/{snake_name}.rs uses `autumn_web::test::TestDb`, a Postgres-only \
-                 testcontainer, so `cargo test` will not compile on this SQLite app. The app \
-                 itself is unaffected — `cargo run`, `cargo build` and `autumn migrate` all \
-                 work. A SQLite `TestDb` lands with the runtime slice, \
-                 https://github.com/autumn-foundation/autumn/issues/1905 — until then, delete \
-                 that file or gate it behind a Postgres-only cargo feature."
-            ));
-        }
     }
 
     // The generated HTML routes render through `autumn_web::form::*` helpers
@@ -2674,6 +2647,37 @@ fn plan_scaffold_with_options_impl(
                 }
             }
         }
+    }
+
+    // Issue #2328: when a run drops a flag, the scaffold no longer emits that code.
+    // Remove the feature that the code needed. `destroy` uses its own reverts.
+    // Keep `i18n` and `maud`. `.i18n_auto()` and the shared layout use them.
+    // Only a feature that the files this run overwrites used before is released.
+    // A first run, a hand-made model, or a controller keeps every feature.
+    let released_routes_dir = project_root.join("src").join("routes");
+    let released_own_routes = released_routes_dir.join(format!("{plural}.rs"));
+    if !for_revert {
+        let cargo_path = project_root.join("Cargo.toml");
+        let attachments = has_attachment_fields(&fields);
+        let htmx_needed = (search_enabled && !options_with_key.api)
+            || options_with_key.live
+            || options_with_key.live_validation;
+        // Only `htmx` has no source marker, so only it names an owner.
+        let htmx_owner = Some((released_routes_dir, released_own_routes));
+        let released = [
+            ("csv", !export_enabled, None),
+            ("multipart", !import_enabled && !attachments, None),
+            ("storage", !attachments, None),
+            ("markdown", !rich_text_views, None),
+            ("ws", !options_with_key.live, None),
+            ("htmx", !htmx_needed, htmx_owner),
+        ];
+        for (feature, unused, owner) in released {
+            if unused {
+                plan.release_feature(cargo_path.clone(), feature, owner);
+            }
+        }
+        plan.settle_released_features();
     }
 
     Ok(plan)
@@ -3306,33 +3310,31 @@ fn render_model_form(
         } else if f.kind == FieldKind::Bytea {
             // `Vec<u8>` cannot deserialize from a single url-encoded value at
             // all: `serde_urlencoded` hands each field's value to `serde` as a
-            // plain string, and `Vec<u8>`'s `Deserialize` impl expects a sequence,
-            // so a native-typed Bytea field would fail to decode any submission,
-            // not just an untouched one. There is no raw-bytes HTML input widget
-            // anyway, so it is represented as a lossy-UTF8 `String` on the form —
-            // matching what the old hand-rolled edit form showed via
-            // `String::from_utf8_lossy` — and converted back to bytes in
-            // `into_new`.
+            // plain string, and `Vec<u8>`'s `Deserialize` impl expects a sequence.
+            // There is no raw-bytes HTML input widget either, so the form carries
+            // a `String` in `\x` + hex (issue #2330). UTF-8 is lossy for binary
+            // data: an edit-and-save would rewrite every non-UTF-8 byte. Hex is
+            // the same text the CSV export and import use.
+            let bad_hex = format!(
+                ".map_err(|err| autumn_web::AutumnError::bad_request_msg(format!(\"{name}: {{err}}\")))?"
+            );
             if f.nullable {
                 let _ = writeln!(struct_fields, "    pub {name}: Option<String>,");
                 let _ = writeln!(
                     into_new,
-                    "        {name}: form.{name}.as_ref().map(|value| value.clone().into_bytes()),"
+                    "        {name}: form.{name}.as_deref().filter(|value| !value.trim().is_empty()).map(bytea_from_hex).transpose(){bad_hex},"
                 );
                 let _ = writeln!(
                     from_row,
-                    "            {name}: row.{name}.as_ref().map(|value| String::from_utf8_lossy(value).into_owned()),"
+                    "            {name}: row.{name}.as_deref().map(bytea_to_hex),"
                 );
             } else {
                 let _ = writeln!(struct_fields, "    pub {name}: String,");
                 let _ = writeln!(
                     into_new,
-                    "        {name}: form.{name}.clone().into_bytes(),"
+                    "        {name}: bytea_from_hex(&form.{name}){bad_hex},"
                 );
-                let _ = writeln!(
-                    from_row,
-                    "            {name}: String::from_utf8_lossy(&row.{name}).into_owned(),"
-                );
+                let _ = writeln!(from_row, "            {name}: bytea_to_hex(&row.{name}),");
             }
         } else if matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime) {
             // Represented as a `String` on the form (the browser's wire shape),
@@ -3984,9 +3986,11 @@ fn render_routes_file(
     let owner_scoped_standard = owner_scoped_index && !sharded && !live && !live_validation;
     // #1315: the `GET /{plural}/export.csv` download and the index's "Export CSV" link.
     // Emitted exactly where the index's row set is a repository call the export can reuse
-    // verbatim — `repo.list_scoped` on the owner-scoped standard index, `repo.list` on the
-    // plain one. That is the whole security argument for AC5: the export never re-derives
-    // a row set of its own, so it cannot widen past what the index already shows.
+    // — `repo.list_scoped` on the owner-scoped standard index, `repo.list` on the plain
+    // one. The export calls their count-free siblings, `list_scoped_rows`/`list_rows`
+    // (#2185), which the macro builds from the same filters. That is the whole security
+    // argument for AC5: the export never re-derives a row set of its own, so it cannot
+    // widen past what the index already shows.
     //
     // Gated off for `--live`, an SSE `<ul>` on `repo.page` with no `ListQuery` to honour;
     // for `--sharded`, where `from_shard` pins the query to one shard so an "export
@@ -4019,14 +4023,7 @@ fn render_routes_file(
     let import_enabled = import
         && export_enabled
         && !fields.iter().any(Field::is_encrypted)
-        // A non-nullable `Bytea` is a column the import must filter out but the
-        // form requires, so every row would fail "missing field".
-        && !fields
-            .iter()
-            .any(|f| f.kind == FieldKind::Bytea && !f.nullable)
-        && fields
-            .iter()
-            .any(|f| !f.kind.is_attachment() && f.kind != FieldKind::Bytea);
+        && fields.iter().any(|f| !f.kind.is_attachment());
     // #1349: the export link's text, registered only where the export is actually
     // emitted, so a non-exporting scaffold defines no unused key.
     //
@@ -4188,11 +4185,15 @@ fn render_routes_file(
     } else {
         String::new()
     };
-    let (flash_none_selected, flash_bulk_deleted) = if bulk_delete_enabled {
+    let (flash_none_selected, flash_bad_selection, flash_bulk_deleted) = if bulk_delete_enabled {
         (
             labels.lit(
                 &format!("{snake_name}.flash.none_selected"),
                 &format!("No {plural} selected"),
+            ),
+            labels.lit(
+                &format!("{snake_name}.flash.bad_selection"),
+                &format!("That is not a valid selection of {plural}"),
             ),
             labels.expr(
                 &format!("{snake_name}.flash.bulk_deleted"),
@@ -4202,7 +4203,7 @@ fn render_routes_file(
             ),
         )
     } else {
-        (String::new(), String::new())
+        (String::new(), String::new(), String::new())
     };
     let (flash_restored, flash_purged) = if trash_enabled {
         (
@@ -5987,9 +5988,9 @@ mod attachment_read_back_tests {{
 
     // ── issue #1312: bulk-select + delete-selected ─────────────────────────
     //
-    // The repeated-checkbox body parser. Emitted next to `csrf_input` /
-    // `submit_token_input` (the routes module's other private form helpers) and
-    // only when the bulk gate is on, so the `--live`/`--sharded` output is
+    // The bulk-select form struct (issue #3394 retired the hand-written
+    // `parse_bulk_ids`). Emitted next to `csrf_input` / `submit_token_input`
+    // and only when the bulk gate is on, so the `--live`/`--sharded` output is
     // byte-identical.
     let bulk_ids_parser = if bulk_delete_enabled {
         "\n/// Most rows one bulk submit may touch.\n\
@@ -6003,40 +6004,14 @@ mod attachment_read_back_tests {{
          /// no rows at all.\n\
          const MAX_BULK_IDS: usize = 5000;\n\
          \n\
-         /// Parse the bulk-select checkboxes out of a URL-encoded form body.\n\
+         /// The bulk-select checkboxes of the index list.\n\
          ///\n\
-         /// Accepts both the plain `ids=1&ids=2` spelling the generated checkboxes\n\
-         /// submit and the `ids[]=1&ids[]=2` spelling some clients send. A value\n\
-         /// that isn't an integer is dropped rather than rejected — a list-write\n\
-         /// endpoint never 400s on a hand-edited form — and repeats are collapsed\n\
-         /// so the same row is never queued for deletion twice.\n\
-         ///\n\
-         /// Dedup goes through a `HashSet` rather than a linear `Vec::contains`\n\
-         /// scan: this parses the raw body, not a page-sized selection, so a\n\
-         /// hand-crafted POST can carry as many distinct `ids` as the request body\n\
-         /// limit allows. A linear scan per value would make that Θ(n²) — a cheap\n\
-         /// request burning real CPU before the handler ever reaches the database.\n\
-         /// The `Vec` still carries insertion order; the set only answers \"seen?\".\n\
-         fn parse_bulk_ids(body: &Bytes) -> Vec<i64> {\n    \
-         let mut ids: Vec<i64> = Vec::new();\n    \
-         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();\n    \
-         for (key, value) in url::form_urlencoded::parse(body.as_ref()) {\n        \
-         if key == \"ids\" || key == \"ids[]\" {\n            \
-         if let Ok(id) = value.parse::<i64>() {\n                \
-         if seen.insert(id) {\n                    \
-         ids.push(id);\n                    \
-         // Stop one past the cap. The handler refuses anything longer, so\n                    \
-         // parsing the rest would burn CPU on a body already destined for\n                    \
-         // rejection — and collecting it would let the request size alone\n                    \
-         // decide how much memory this allocates.\n                    \
-         if ids.len() > MAX_BULK_IDS {\n                        \
-         break;\n                    \
-         }\n                \
-         }\n            \
-         }\n        \
-         }\n    \
-         }\n    \
-         ids\n\
+         /// The checkboxes submit `ids=1&ids=2`. Some clients send `ids[]=1`.\n\
+         /// The framework form decoder puts each repeated key into the `Vec`.\n\
+         #[derive(serde::Deserialize)]\n\
+         struct BulkSelection {\n    \
+         #[serde(default, alias = \"ids[]\")]\n    \
+         ids: Vec<i64>,\n\
          }\n"
     } else {
         ""
@@ -6082,10 +6057,10 @@ mod attachment_read_back_tests {{
         format!(
             "\n\n/// `POST /{plural}/bulk_delete` — delete every selected row in one submit.\n\
              ///\n\
-             /// Reads the index list's repeated `ids` checkboxes (see `parse_bulk_ids`,\n\
-             /// which also accepts the `ids[]` spelling). Malformed ids are dropped and an\n\
-             /// empty selection just redirects back with an informational flash — a\n\
-             /// list-write endpoint never 400s on bad params. The delete itself routes\n\
+             /// Reads the index list's repeated `ids` checkboxes into `BulkSelection`\n\
+             /// (the `ids[]` spelling works too). A malformed body and an empty\n\
+             /// selection each redirect back with a flash — a list-write endpoint\n\
+             /// never 400s on bad params. The delete itself routes\n\
              /// through the repository's `delete_many`, so soft-delete, model hooks, and\n\
              /// `dependent(...)` cascades all apply exactly as they do for the single-row\n\
              /// `destroy`; a `dependent(restrict)` violation aborts the whole batch with a\n\
@@ -6098,18 +6073,36 @@ mod attachment_read_back_tests {{
              mut db: {db_ty},\n    \
              body: Bytes,\n\
              ) -> AutumnResult<autumn_web::Redirect> {{\n    \
-             let ids = parse_bulk_ids(&body);\n    \
-             if ids.is_empty() {{\n        \
-             flash.info({flash_none_selected}).await;\n        \
-             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
-             }}\n    \
              // Refuse an oversized selection outright rather than truncating it: a\n    \
              // silently partial destructive batch is worse than a refused one. Like\n    \
-             // the empty case this redirects with a flash instead of 400ing.\n    \
-             if ids.len() > MAX_BULK_IDS {{\n        \
+             // the empty case this redirects with a flash instead of 400ing. The\n    \
+             // count runs before the decode and stops one past the cap, so a\n    \
+             // crafted body never allocates a body's worth of ids.\n    \
+             let submitted = url::form_urlencoded::parse(&body)\n        \
+             .filter(|(key, _)| key == \"ids\" || key == \"ids[]\")\n        \
+             .take(MAX_BULK_IDS + 1)\n        \
+             .count();\n    \
+             if submitted > MAX_BULK_IDS {{\n        \
              flash\n            \
              .error({flash_bulk_cap})\n            \
              .await;\n        \
+             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
+             }}\n    \
+             // A body that does not decode (a non-integer id, a mixed `ids` and\n    \
+             // `ids[]` spelling) gets a flash, not a 400: a list-write endpoint\n    \
+             // never 400s on bad params.\n    \
+             let Ok(BulkSelection {{ mut ids }}) =\n        \
+             autumn_web::form::from_urlencoded::<BulkSelection>(&body)\n    \
+             else {{\n        \
+             flash.error({flash_bad_selection}).await;\n        \
+             return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
+             }};\n    \
+             // Collapse repeats so the same row is never queued twice. A\n    \
+             // `HashSet` keeps this O(n); the `Vec` keeps the submitted order.\n    \
+             let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();\n    \
+             ids.retain(|id| seen.insert(*id));\n    \
+             if ids.is_empty() {{\n        \
+             flash.info({flash_none_selected}).await;\n        \
              return Ok(autumn_web::Redirect::to(&paths::index()));\n    \
              }}\n    \
              // Chunk the pre-flight the way the repository chunks its own id\n    \
@@ -6155,6 +6148,23 @@ mod attachment_read_back_tests {{
     let into_new_fn = &model_form.into_new_fn;
     let from_row_impl = &model_form.from_row_impl;
     let parse_datetime_helper = &model_form.datetime_helper;
+    // `\x` + hex helpers (issue #2330). The encoder serves the form and the
+    // export; the decoder only the form. Each is emitted only where used: an
+    // unused `fn` is a `dead_code` warning in the generated app.
+    let form_has_bytea = fields.iter().any(|f| f.kind == FieldKind::Bytea);
+    let export_has_bytea = export_enabled
+        && all_fields
+            .iter()
+            .any(|f| f.kind == FieldKind::Bytea && !f.is_encrypted());
+    let mut bytea_helpers = String::new();
+    if form_has_bytea || export_has_bytea {
+        bytea_helpers.push('\n');
+        bytea_helpers.push_str(BYTEA_HEX_TO_FN);
+    }
+    if form_has_bytea {
+        bytea_helpers.push('\n');
+        bytea_helpers.push_str(BYTEA_HEX_FROM_FN);
+    }
 
     // The `index` handler. When sharded, use `from_shard` explicitly so the generated code
     // shows the canonical sharding pattern.
@@ -6209,16 +6219,34 @@ mod attachment_read_back_tests {{
         // AC5: mirror the index's posture exactly. The owner-scoped index is
         // `#[secured]` and resolves its owner from the same `PolicyContext` the
         // mutating handlers authorize against; the plain index carries neither.
-        let (secured_attr, authz_params, owner_let, list_call) = if owner_scoped_standard {
+        // #2185: one count-free read, so the file comes from one snapshot.
+        let (secured_attr, authz_params, owner_let, rows_call) = if owner_scoped_standard {
             (
                 "#[secured]\n",
                 format!("{authz_params_full},"),
                 "    let ctx = autumn_web::authorization::PolicyContext::from_request(&state, &session).await;\n    \
                  let owner_id = ctx.user_id_i64().unwrap_or(-1);\n",
-                "repo.list_scoped(owner_id, &list_query, &page_req)",
+                "list_scoped_rows(owner_id, &list_query, MAX_EXPORT_ROWS + 1)",
             )
         } else {
-            ("", String::new(), "", "repo.list(&list_query, &page_req)")
+            (
+                "",
+                String::new(),
+                "",
+                "list_rows(&list_query, MAX_EXPORT_ROWS + 1)",
+            )
+        };
+        // Laid out as rustfmt lays it out. The scoped chain is longer than
+        // `chain_width` (60), so it always breaks at each call. The plain chain is
+        // shorter: it stays on one line when that fits in 100 columns, and else
+        // moves below the `=`.
+        let head = format!("let mut rows: Vec<{pascal_name}> =");
+        let rows_let = if owner_scoped_standard {
+            format!("{head} repo\n        .{rows_call}\n        .await?;")
+        } else if 4 + head.len() + " repo.".len() + rows_call.len() + ".await?;".len() <= 100 {
+            format!("{head} repo.{rows_call}.await?;")
+        } else {
+            format!("{head}\n        repo.{rows_call}.await?;")
         };
         // Issue #1319's search box swaps results in via htmx WITHOUT pushing a
         // URL, so the index's query string — and therefore this export's — never
@@ -6254,9 +6282,10 @@ mod attachment_read_back_tests {{
         };
         let scope_note = if owner_scoped_standard {
             "///\n\
-             /// Rows are read through the repository's OWNER-SCOPED `list_scoped`, the\n\
-             /// same method the index uses. This handler never calls the unscoped\n\
-             /// `list`/`page`, so the download can never contain another user's rows.\n"
+             /// Rows are read through the repository's OWNER-SCOPED `list_scoped_rows`,\n\
+             /// which applies the same owner filter as the index's `list_scoped`. This\n\
+             /// handler never calls an unscoped read, so the download can never contain\n\
+             /// another user's rows.\n"
         } else {
             ""
         };
@@ -6264,15 +6293,14 @@ mod attachment_read_back_tests {{
             "{schema_impl}\n\
              /// The most rows one `GET /{plural}/export.csv` will return.\n\
              ///\n\
-             /// The handler reads up to one batch PAST this so it can tell a full\n\
-             /// export from a truncated one; the surplus is trimmed before the CSV is\n\
-             /// written.\n\
+             /// The handler reads one row PAST this, so it can tell a full export\n\
+             /// from a truncated one. It removes that row before it writes the CSV.\n\
              ///\n\
              /// This bounds the ROW COUNT, which bounds memory only as far as your\n\
              /// widest row: the response is collected in memory before it is sent, so\n\
              /// a model with an unbounded `Text` column can still build a large body\n\
              /// here. Put a `{{max}}` length on such columns, lower this constant, or —\n\
-             /// for a genuinely unbounded export — stream the batches straight into\n\
+             /// for a genuinely unbounded export — stream the rows straight into\n\
              /// the response body with `Download::from_stream` instead of collecting\n\
              /// them first.\n\
              const MAX_EXPORT_ROWS: usize = 10_000;\n\n\
@@ -6284,34 +6312,19 @@ mod attachment_read_back_tests {{
              /// table. `?page=`/`?size=` are ignored on purpose: an export spans every\n\
              /// page of the current filter.\n\
              ///\n\
-             /// Rows are read in `MAX_PAGE_SIZE` batches (so no single query loads the\n\
-             /// table) and capped at `MAX_EXPORT_ROWS`, plus one batch past the cap to\n\
-             /// detect truncation. `Content-Type`,\n\
-             /// `Content-Disposition` and `Content-Length` come from `Download`, which\n\
-             /// infers `text/csv` from the `.csv` filename and sanitizes the name.\n\
-             ///\n\
-             /// CONSISTENCY is per batch, not per export. Each batch is an independent\n\
-             /// `LIMIT`/`OFFSET` query on its own pooled connection, so a row inserted\n\
-             /// or deleted mid-export shifts the offsets under the batches still to\n\
-             /// come: a row can land in the file twice, or not at all. The index has\n\
-             /// the same property — an export just spans more pages, and more\n\
-             /// wall-clock, so it is likelier to notice. For a point-in-time exact\n\
-             /// download, read the batches by hand inside\n\
-             /// `Db::tx_with(TxOptions::repeatable_read().read_only(), ..)`; the\n\
-             /// repository's pooled reads cannot be routed through a caller's\n\
-             /// transaction today, so that path means writing the query yourself —\n\
-             /// including this one's sort/filter allowlist and any owner scoping.\n\
+             /// Rows come from ONE repository read, capped at `MAX_EXPORT_ROWS` plus\n\
+             /// one row to detect truncation. One statement reads one snapshot, so a\n\
+             /// row inserted or deleted during the export cannot appear twice or go\n\
+             /// missing. If you set `database.statement_timeout`, the whole read must\n\
+             /// finish in that time. `Content-Type`, `Content-Disposition` and\n\
+             /// `Content-Length` come from `Download`, which infers `text/csv` from the\n\
+             /// `.csv` filename and sanitizes the name.\n\
              ///\n\
              /// COST, not row-set, is why this carries a `#[throttle]` the index does\n\
-             /// not, and the cost is worse than the row count suggests. `list` runs a\n\
-             /// filtered `COUNT(*)` before each page, so a full export is ~100 page\n\
-             /// queries AND ~100 whole-result-set counts — ~200 round trips where one\n\
-             /// index page costs two. The counts are pure waste here: this loop never\n\
-             /// reads `total_elements`, it stops on a short batch. They are paid\n\
-             /// anyway because `list` is also what applies the sort/filter allowlist,\n\
-             /// and the repository exposes no count-free equivalent. On a large or\n\
-             /// poorly indexed table budget accordingly: lower `MAX_EXPORT_ROWS`,\n\
-             /// tighten this throttle, or put the route behind auth.\n\
+             /// not. One export loads up to `MAX_EXPORT_ROWS` rows and builds the whole\n\
+             /// file in memory. One index page loads up to `MAX_PAGE_SIZE` rows. On a\n\
+             /// large table, lower `MAX_EXPORT_ROWS`, tighten this throttle, or put the\n\
+             /// route behind auth.\n\
              ///\n\
              /// The limit applies per client address and is independent of\n\
              /// `security.rate_limit.enabled` (that flag governs the GLOBAL limiter);\n\
@@ -6331,24 +6344,9 @@ mod attachment_read_back_tests {{
              ) -> AutumnResult<autumn_web::reexports::axum::response::Response> {{\n    \
              use autumn_web::reexports::axum::response::IntoResponse as _;\n\
              {default_sort_let}{owner_let}    \
-             let batch_size = autumn_web::pagination::MAX_PAGE_SIZE;\n    \
-             let mut rows: Vec<{pascal_name}> = Vec::new();\n    \
-             let mut page: u32 = 1;\n    \
-             loop {{\n        \
-             let page_req = PageRequest::new(page, batch_size);\n        \
-             let batch: Page<{pascal_name}> = {list_call}.await?;\n        \
-             // A short batch is the last one: nothing after it to ask for.\n        \
-             let exhausted = batch.content.len() < batch_size as usize;\n        \
-             rows.extend(batch.content);\n        \
-             // `>`, not `>=`: stopping the moment the cap is FILLED cannot tell a\n        \
-             // result set of exactly MAX_EXPORT_ROWS from a larger one, so the\n        \
-             // truncation warning below would never fire and over-cap exports would\n        \
-             // drop rows silently. Read past the cap and trim the surplus off.\n        \
-             if exhausted || rows.len() > MAX_EXPORT_ROWS {{\n            \
-             break;\n        \
-             }}\n        \
-             page += 1;\n    \
-             }}\n    \
+             // One row past the cap: a set of exactly MAX_EXPORT_ROWS rows then does\n    \
+             // not look truncated, and a larger set does.\n    \
+             {rows_let}\n    \
              // Truncate rather than fail: a partial spreadsheet beats a 500. But a\n    \
              // SILENTLY partial one is a trap for anyone exporting to reconcile, so\n    \
              // say so twice — once in the log for the operator, once in a response\n    \
@@ -6419,23 +6417,17 @@ mod attachment_read_back_tests {{
         // such as a `--default`ed one. Computed as the difference rather than listed by
         // kind, so it stays right whatever the form's own exclusions become.
         //
-        // Columns `{Pascal}Form` carries and the import can faithfully set. `Attachment`
-        // is excluded because a storage key in a cell is not a file. `Bytea` is excluded
-        // because the CSV cannot carry it back: the export renders it with
-        // `String::from_utf8_lossy`, so any byte that is not valid UTF-8 is already a
-        // U+FFFD replacement character in the file, and `into_new`'s `into_bytes()` would
-        // store those bytes — an import of this app's own export silently replacing a
-        // binary column with mojibake. The lossy rendering is the export's, and the
-        // browser form's, pre-existing behaviour; what must not happen is writing it back.
-        // Excluded rather than base64-encoded because a reversible encoding would have to
-        // change the export too, which is #1315's surface, not this slice's.
+        // Columns `{Pascal}Form` carries and the import can faithfully set.
+        // `Attachment` is excluded because a storage key in a cell is not a file.
+        // `Bytea` is settable: the export writes `\x` + hex and the form decodes it
+        // (issue #2330).
         //
         // Excluded means: named on the upload page as a column the import cannot set,
         // listed in `CSV_DISCARDED_COLUMNS` so the report says so when a file supplies
         // one, and absent from `csv_required_columns()` so a file that omits it is accepted.
         let form_carried: BTreeSet<&str> = fields
             .iter()
-            .filter(|f| !f.kind.is_attachment() && f.kind != FieldKind::Bytea)
+            .filter(|f| !f.kind.is_attachment())
             .map(|f| f.name.as_str())
             .collect();
         let mut ignored_columns: Vec<&str> = vec!["id"];
@@ -8331,7 +8323,7 @@ pub async fn destroy(
 }}
 
 {form_struct}
-{parse_datetime_helper}
+{parse_datetime_helper}{bytea_helpers}
 {into_new_fn}
 
 {from_row_impl}
@@ -9495,16 +9487,25 @@ fn render_reference_option_loaders(
             // raw id. A nullable display column coalesces to the id string.
             Some(display) => {
                 let column = &display.column;
+                // A blank label gives an option with no accessible name, and
+                // trips the `SelectOption::new` debug assert (#2666): use the
+                // id instead.
                 let (load_ty, label_expr) = if display.column_nullable {
-                    ("Option<String>", "label.unwrap_or_else(|| id.to_string())")
+                    (
+                        "Option<String>",
+                        "label.filter(|label| !autumn_web::a11y::is_blank(label)).unwrap_or_else(|| id.to_string())",
+                    )
                 } else {
-                    ("String", "label")
+                    (
+                        "String",
+                        "if autumn_web::a11y::is_blank(&label) { id.to_string() } else { label }",
+                    )
                 };
                 let _ = write!(
                     out,
                     "/// Load the `(value, label)` select options for the `{name}` reference —\n\
-                     /// one option per `{table}` row (value = id, label = `{column}`), ordered\n\
-                     /// by id (issues #1135, #1146).\n\
+                     /// one option per `{table}` row (value = id, label = `{column}`, or the\n\
+                     /// id when `{column}` is blank), ordered by id (issues #1135, #1146).\n\
                      async fn {name}_select_options(db: &mut {db_ty}) -> AutumnResult<Vec<(String, String)>> {{\n    \
                      let rows: Vec<(i64, {load_ty})> = {table}::table\n        \
                      .select(({table}::id, {table}::{column}))\n        \
@@ -10216,7 +10217,8 @@ fn cell_value_expr(field: &Field) -> String {
         }
         // Nullable: Option<T> — no Render impl; unwrap to String.
         (true, _) => format!("row.{name}.as_ref().map(ToString::to_string).unwrap_or_default()"),
-        // Non-nullable Bytea: Cow<str> does implement Render.
+        // Index and show view only. Non-nullable Bytea shows as lossy UTF-8;
+        // `Cow<str>` implements `Render`.
         (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&row.{name})"),
         // String/Text/RichText: &String implements Render via deref coercion.
         (false, FieldKind::String | FieldKind::Text | FieldKind::RichText) => {
@@ -10256,12 +10258,13 @@ fn csv_value_expr(field: &Field) -> String {
         (_, FieldKind::Attachment) => {
             format!("self.{name}.as_ref().map(|blob| blob.key.clone()).unwrap_or_default()")
         }
-        // `Vec<u8>` has no `Display` either. Lossy UTF-8 matches what the index
-        // and show views already render for the column.
-        (true, FieldKind::Bytea) => format!(
-            "self.{name}.as_ref().map(|bytes| String::from_utf8_lossy(bytes).into_owned()).unwrap_or_default()"
-        ),
-        (false, FieldKind::Bytea) => format!("String::from_utf8_lossy(&self.{name}).into_owned()"),
+        // `Vec<u8>` has no `Display` either. `\x` + hex loses no byte and imports
+        // back unchanged (issue #2330). The index and show views stay lossy
+        // because they only display.
+        (true, FieldKind::Bytea) => {
+            format!("self.{name}.as_deref().map(bytea_to_hex).unwrap_or_default()")
+        }
+        (false, FieldKind::Bytea) => format!("bytea_to_hex(&self.{name})"),
         // Already a `String`: clone rather than round-trip through `Display`.
         // `Enum` is excluded — its Rust type is the generated enum, not a
         // `String` (see `Field::rust_type`) — and so falls to the arms below.
@@ -10291,9 +10294,9 @@ fn csv_value_expr(field: &Field) -> String {
 /// cannot begin with `=`/`+`/`@` — and guarding it anyway would prefix a
 /// legitimate negative number (`-5` → `'-5`) and break the spreadsheet's own
 /// parsing. `Enum` is a generated Rust enum whose variants are compile-time
-/// idents, so it is closed-set too. `Bytea` and `Attachment` are included: the
-/// first is lossy UTF-8 of arbitrary bytes, and the second is a store key whose
-/// tail is a browser-supplied filename. `Json` is included defensively too
+/// idents, so it is closed-set too. `Bytea` is closed-set as well: it is `\x` +
+/// hex (issue #2330), which never starts with a formula character. `Attachment`
+/// is included: it is a store key whose tail is a browser-supplied filename. `Json` is included defensively too
 /// (issue #1341): its rendered text is *usually* self-quoting JSON (an
 /// object/array/string literal always starts with `{`/`[`/`"`, never
 /// `=`/`+`/`@`), except a bare top-level negative number (`-5`), which — like
@@ -10308,11 +10311,62 @@ const fn csv_kind_is_text(kind: FieldKind) -> bool {
             | FieldKind::Text
             | FieldKind::RichText
             | FieldKind::Slug
-            | FieldKind::Bytea
             | FieldKind::Attachment
             | FieldKind::Json
     )
 }
+
+/// `bytea_to_hex`, spliced into the routes module wherever a `Bytea` column
+/// is shown in a form or exported (issue #2330).
+const BYTEA_HEX_TO_FN: &str = r#"/// Render bytes as `\x` + lowercase hex, the Postgres `bytea` text form.
+///
+/// Used by the edit form and the CSV export. UTF-8 would lose every
+/// non-UTF-8 byte; hex does not. The `\x` prefix keeps a spreadsheet from
+/// reading the cell as a number. It then keeps the leading zeros.
+fn bytea_to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(2 + bytes.len() * 2);
+    text.push_str("\\x");
+    for byte in bytes {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+"#;
+
+/// `bytea_from_hex`, the inverse of [`BYTEA_HEX_TO_FN`]. Spliced in only where
+/// a form field uses it.
+const BYTEA_HEX_FROM_FN: &str = r#"/// Parse `\x` + hex into bytes. Both letter cases are valid.
+///
+/// A blank value is empty bytes. A nullable column maps blank to NULL
+/// before this call. Other bad input is an error, for example a missing
+/// prefix or an odd number of digits. It never panics.
+fn bytea_from_hex(text: &str) -> Result<Vec<u8>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let digits = text
+        .strip_prefix("\\x")
+        .ok_or_else(|| String::from("must start with `\\x` and hex digits"))?;
+    if digits.len() & 1 == 1 {
+        return Err(String::from("must have an even number of hex digits"));
+    }
+    digits
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let high = char::from(pair[0]).to_digit(16);
+            let low = char::from(pair[1]).to_digit(16);
+            match (high, low) {
+                (Some(high), Some(low)) => u8::try_from(high * 16 + low)
+                    .map_err(|_| String::from("is not a valid byte")),
+                _ => Err(String::from("has a character that is not a hex digit")),
+            }
+        })
+        .collect()
+}
+"#;
 
 /// The `csv_text_cell` helper the generated `to_csv_record` wraps every
 /// text-backed column in (issue #1315).
@@ -10359,14 +10413,14 @@ const CSV_TEXT_CELL_HELPER: &str = "\n\n\
 /// The VALUES can differ from `show`'s for two kinds, deliberately: a
 /// `references` column exports the raw foreign key rather than the parent label
 /// the view resolves (an id round-trips back through `import_csv`; a label does
-/// not, and resolving one per row would be an N+1 inside the export loop), and
+/// not, and resolving one per row would be an N+1 inside the export), and
 /// an `Attachment` exports the blob's storage key rather than a signed URL that
 /// would have expired by the time anyone opened the file.
 ///
 /// `fields` must be the model's DECLARED columns — the list before
 /// [`augment_fields_for_soft_delete`] appends `deleted_at`. Under
 /// `--soft-delete` the model struct does carry a `deleted_at` field, but the
-/// export deliberately omits it: `list`/`list_scoped` filter
+/// export deliberately omits it: `list_rows`/`list_scoped_rows` filter
 /// `deleted_at IS NULL`, so the column is NULL for every row that can reach the
 /// export, and a column that is always blank is noise in a spreadsheet.
 fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
@@ -10398,6 +10452,17 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
     } else {
         ""
     };
+    // The encoding is user-editable code's contract, so the doc comment names it.
+    let bytea_note = if exported.iter().any(|f| f.kind == FieldKind::Bytea) {
+        "         /// A `Bytea` column is written as `\\x` + lowercase hex (the Postgres\n\
+         /// text form), so no byte is lost. The import decodes it back. A\n\
+         /// spreadsheet can cut a cell that is too long. If you change one\n\
+         /// side, change the other.\n\
+         ///\n\
+"
+    } else {
+        ""
+    };
     format!(
         "{text_cell_helper}\n\n/// CSV column schema for the `GET /…/export.csv` download (issue #1315).\n\
          ///\n\
@@ -10422,6 +10487,7 @@ fn render_csv_schema_impl(pascal_name: &str, fields: &[Field]) -> String {
          /// use for a URL that expires. Drop the column here if those keys should\n\
          /// not leave the app.\n\
          ///\n\
+         {bytea_note}\
          /// An at-rest `#[encrypted]` column is OMITTED entirely (issue #1340):\n\
          /// the model holds plaintext in memory, so exporting it would write the\n\
          /// decrypted secret of every listed row into a file that leaves the app.\n\
@@ -11031,14 +11097,9 @@ __HEADER_CHECK__    if autumn_web::data::csv::count_data_rows(&uploaded[..]) > M
                 // then breaks. A column whose name is genuinely padded cannot
                 // exist here — form fields are Rust identifiers.
                 let key = key.trim();
-                // A column this import cannot set must never reach the decoder.
-                // For most of them that is belt-and-braces — serde ignores a
-                // field the form does not have — but a `Bytea` column DOES have
-                // a form field (a lossy `String`, see `{Pascal}Form`), so its
-                // exported mojibake would decode and `into_new` would write
-                // those replacement bytes back over the real binary value.
-                // Excluding it from the column LISTS is not enough on its own;
-                // this is where the exclusion actually bites.
+                // A column the import cannot set never reaches the decoder.
+                // Serde ignores a field the form does not have, so this is a
+                // second guard.
                 if CSV_IGNORED_COLUMNS.contains(&key) {
                     return None;
                 }
@@ -12321,6 +12382,76 @@ fn escape_sql_for_rust_literal(sql: &str) -> String {
     sql.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// The database name the generated smoke test names in its doc comments.
+const fn smoke_db_label(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Postgres => "Postgres",
+        DatabaseBackend::Sqlite => "SQLite",
+    }
+}
+
+/// The `#[ignore]` line (with its newline) for a database-backed smoke test.
+///
+/// Postgres needs Docker, so those tests are opt-in. `SQLite` needs only a
+/// temp file, so its tests run in a plain `cargo test`.
+const fn smoke_ignore_attr(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Postgres => {
+            "#[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n"
+        }
+        DatabaseBackend::Sqlite => "",
+    }
+}
+
+/// The doc lines that tell the reader how to run the smoke test.
+const fn smoke_run_note(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Postgres => {
+            "//! `cargo test` reports this test as `ignored` (Docker is not assumed to\n\
+             //! be available in every environment); run it for real with:\n\
+             //!\n\
+             //!     cargo test -- --ignored\n"
+        }
+        DatabaseBackend::Sqlite => {
+            "//! The test uses a temp-file `SQLite` database, so a plain run covers it:\n\
+             //!\n\
+             //!     cargo test\n"
+        }
+    }
+}
+
+/// The `TestDb` constructor a generated smoke test calls.
+///
+/// Postgres shares one container per binary, because a container is slow to
+/// start. `SQLite` makes a new temp-file database per test, because that is
+/// cheap and it keeps parallel tests apart.
+const fn smoke_db_ctor(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Postgres => "shared",
+        DatabaseBackend::Sqlite => "new",
+    }
+}
+
+/// The statement that empties the table under test.
+///
+/// Postgres keeps its `TRUNCATE`. `SQLite` has none, so it calls `reset_table`.
+fn smoke_reset_call(backend: DatabaseBackend, plural: &str) -> String {
+    match backend {
+        DatabaseBackend::Postgres => {
+            format!("db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;")
+        }
+        DatabaseBackend::Sqlite => format!("db.reset_table(\"{plural}\").await;"),
+    }
+}
+
+/// The SQL expression that casts the `id` column to text.
+const fn smoke_id_to_text(backend: DatabaseBackend) -> &'static str {
+    match backend {
+        DatabaseBackend::Postgres => "id::text",
+        DatabaseBackend::Sqlite => "CAST(id AS TEXT)",
+    }
+}
+
 /// Render the `tests/<snake>.rs` smoke test's HTML (non-`--api`) shape: an
 /// in-process, real-database read of the scaffolded index route.
 ///
@@ -12331,17 +12462,23 @@ fn escape_sql_for_rust_literal(sql: &str) -> String {
 /// `docs/guide/tutorial/11-testing.md`, which documents this exact
 /// constraint and the same "redeclare the handler under test" workaround.
 fn render_index_smoke_test(
+    backend: DatabaseBackend,
     pascal_name: &str,
     plural: &str,
     id_schema_type: &str,
     setup_calls: &str,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
+    let db_ctor = smoke_db_ctor(backend);
+    let db_label = smoke_db_label(backend);
+    let ignore_attr = smoke_ignore_attr(backend);
+    let run_note = smoke_run_note(backend);
     format!(
         "//! Smoke test generated by `autumn generate scaffold`.\n\
          //!\n\
          //! Boots a stand-in for the scaffolded `GET /{plural}` route in-process\n\
          //! via `autumn_web::test::{{TestApp, TestClient, TestDb}}` and asserts a\n\
-         //! real response against a real (throwaway) Postgres database -- no\n\
+         //! real response against a real (throwaway) {db_label} database -- no\n\
          //! running server, no hard-coded server base URL env var, no silent skip.\n\
          //!\n\
          //! The handler below is NOT the generated `routes::{plural}::index`\n\
@@ -12355,10 +12492,7 @@ fn render_index_smoke_test(
          //! coverage of that, add unit tests inside `src/routes/{plural}.rs`\n\
          //! itself (it's part of the binary crate, so it can call the real code).\n\
          //!\n\
-         //! `cargo test` reports this test as `ignored` (Docker is not assumed to\n\
-         //! be available in every environment); run it for real with:\n\
-         //!\n\
-         //!     cargo test -- --ignored\n\
+         {run_note}\
          \n\
          use autumn_web::prelude::*;\n\
          use autumn_web::test::{{TestApp, TestClient, TestDb}};\n\
@@ -12381,11 +12515,11 @@ fn render_index_smoke_test(
          }}\n\
          \n\
          #[tokio::test]\n\
-         #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+         {ignore_attr}\
          async fn {plural}_index_renders_scaffolded_rows() {{\n\
-         let db = TestDb::shared().await;\n\
+         let db = TestDb::{db_ctor}().await;\n\
          {setup_calls}\
-         db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+         {reset_call}\n\
          \n\
          let client: TestClient = TestApp::new().routes(routes![index]).with_db(db.pool()).build();\n\
          \n\
@@ -12403,25 +12537,33 @@ fn render_index_smoke_test(
 /// stand-in rather than a literal re-export of the generated
 /// `{snake}_api_list` repository handler.
 fn render_api_smoke_test(
+    backend: DatabaseBackend,
     plural: &str,
     id_schema_type: &str,
     setup_calls: &str,
     fields: &[Field],
     defaults: &BTreeMap<String, String>,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
+    let db_ctor = smoke_db_ctor(backend);
+    let db_label = smoke_db_label(backend);
+    let ignore_attr = smoke_ignore_attr(backend);
+    let run_note = smoke_run_note(backend);
+    let id_to_text = smoke_id_to_text(backend);
     // Route the seed through `render_execute_sql_calls` so a multi-statement
     // seed (the no-required-column branch emits one `INSERT ... DEFAULT VALUES`
     // per row) becomes one `db.execute_sql(...)` call apiece -- diesel-async's
     // `execute` uses the extended protocol, which rejects several `;`-separated
     // statements in a single call. The single-statement required-column branch
     // is unaffected (it renders exactly one call).
-    let seed_calls = render_execute_sql_calls(&render_api_seed_sql(plural, fields, defaults));
+    let seed_calls =
+        render_execute_sql_calls(&render_api_seed_sql(backend, plural, fields, defaults));
     format!(
         "//! Smoke test generated by `autumn generate scaffold --api`.\n\
          //!\n\
          //! Boots a stand-in for the scaffolded `GET /api/{plural}` route\n\
          //! in-process via `autumn_web::test::{{TestApp, TestClient, TestDb}}`\n\
-         //! and asserts a real response against a real (throwaway) Postgres\n\
+         //! and asserts a real response against a real (throwaway) {db_label}\n\
          //! database -- no running server, no hard-coded server base URL env\n\
          //! var, no silent skip.\n\
          //!\n\
@@ -12434,10 +12576,7 @@ fn render_api_smoke_test(
          //! self-describing envelope shape and that pages advance -- but it does\n\
          //! NOT exercise the real repository handler's serialization or filtering.\n\
          //!\n\
-         //! `cargo test` reports this test as `ignored` (Docker is not assumed to\n\
-         //! be available in every environment); run it for real with:\n\
-         //!\n\
-         //!     cargo test -- --ignored\n\
+         {run_note}\
          \n\
          use autumn_web::prelude::*;\n\
          use autumn_web::test::{{TestApp, TestClient, TestDb}};\n\
@@ -12459,7 +12598,7 @@ fn render_api_smoke_test(
          async fn api_list(page: PageRequest, mut db: Db) -> AutumnResult<Page<String>> {{\n\
          let total: i64 = {plural}::table.count().get_result(&mut db).await?;\n\
          let ids: Vec<String> = {plural}::table\n\
-         .select(sql::<Text>(\"id::text\"))\n\
+         .select(sql::<Text>(\"{id_to_text}\"))\n\
          .order({plural}::id.asc())\n\
          .limit(page.limit())\n\
          .offset(page.offset())\n\
@@ -12469,11 +12608,11 @@ fn render_api_smoke_test(
          }}\n\
          \n\
          #[tokio::test]\n\
-         #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+         {ignore_attr}\
          async fn {plural}_api_list_paginates_against_a_real_database() {{\n\
-         let db = TestDb::shared().await;\n\
+         let db = TestDb::{db_ctor}().await;\n\
          {setup_calls}\
-         db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+         {reset_call}\n\
          // Seed 25 rows -- more than one page at size = 2, and more than the\n\
          // default page size (20). Every required (NOT NULL, no DEFAULT) column\n\
          // gets a valid, per-row-varying sample value, so this works for an\n\
@@ -12528,7 +12667,11 @@ fn render_api_smoke_test(
 /// statement. Postgres allows a self-referential FK within the same
 /// `CREATE TABLE`, so no stub is needed there; emitting one anyway would
 /// collide with the real (non-`IF NOT EXISTS`) `CREATE TABLE` that follows.
-fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String {
+fn render_reference_stub_tables_sql(
+    backend: DatabaseBackend,
+    fields: &[Field],
+    own_table: &str,
+) -> String {
     let mut out = String::new();
     let mut seen = BTreeSet::new();
     for f in fields {
@@ -12538,7 +12681,8 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
         {
             let _ = writeln!(
                 out,
-                "CREATE TABLE IF NOT EXISTS {target} (id BIGSERIAL PRIMARY KEY);"
+                "CREATE TABLE IF NOT EXISTS {target} (id {});",
+                IdType::BigSerial.pk_sql_for(backend)
             );
             // Seed two rows — ids 1 and 2, since BIGSERIAL starts there — so a NOT
             // NULL `references` column pointing at this stub has a real id to
@@ -12567,7 +12711,7 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
 /// Delegates to [`render_index_smoke_test`] or [`render_api_smoke_test`]
 /// depending on `api`, after computing the exact `CREATE TABLE`/`CREATE
 /// INDEX` SQL the generated migration also emits (see
-/// [`create_table_sql_with_metadata_and_id`]), so the throwaway table the
+/// [`create_table_sql_with_metadata_and_id_for`]), so the throwaway table the
 /// test creates in `TestDb` matches the real schema. Any `references` field
 /// also gets a stub target table created first — see
 /// [`render_reference_stub_tables_sql`].
@@ -12578,6 +12722,7 @@ fn render_reference_stub_tables_sql(fields: &[Field], own_table: &str) -> String
 // decision.
 #[allow(clippy::fn_params_excessive_bools)]
 fn render_smoke_test(
+    backend: DatabaseBackend,
     pascal_name: &str,
     plural: &str,
     api: bool,
@@ -12589,21 +12734,36 @@ fn render_smoke_test(
     authorize: bool,
     bulk_delete: bool,
 ) -> String {
-    let stub_tables_sql = render_reference_stub_tables_sql(fields, plural);
-    let create_table_sql =
-        create_table_sql_with_metadata_and_id(plural, fields, indexes, defaults, id_type);
+    let stub_tables_sql = render_reference_stub_tables_sql(backend, fields, plural);
+    let create_table_sql = create_table_sql_with_metadata_and_id_for(
+        backend, plural, fields, indexes, defaults, id_type,
+    );
     let mut setup_calls = render_execute_sql_calls(&stub_tables_sql);
     setup_calls.push_str(&render_execute_sql_calls(&create_table_sql));
-    let id_schema_type = id_type.schema_type();
+    let id_schema_type = id_type.schema_type_for(backend);
 
     let base = if api {
-        render_api_smoke_test(plural, id_schema_type, &setup_calls, fields, defaults)
+        render_api_smoke_test(
+            backend,
+            plural,
+            id_schema_type,
+            &setup_calls,
+            fields,
+            defaults,
+        )
     } else {
-        render_index_smoke_test(pascal_name, plural, id_schema_type, &setup_calls)
+        render_index_smoke_test(backend, pascal_name, plural, id_schema_type, &setup_calls)
     };
 
     let base = if fields.iter().any(Field::is_enum) {
-        base + &render_enum_rejection_smoke_test(plural, fields, defaults, &setup_calls, api)
+        base + &render_enum_rejection_smoke_test(
+            backend,
+            plural,
+            fields,
+            defaults,
+            &setup_calls,
+            api,
+        )
     } else {
         base
     };
@@ -12613,6 +12773,7 @@ fn render_smoke_test(
         base
     } else {
         base + &render_unique_violation_smoke_test(
+            backend,
             plural,
             fields,
             &unique_fields,
@@ -13763,22 +13924,22 @@ async fn __PLURAL___write_path_crud() {
     const BULK_HANDLER: &str = r#"
 
     // Issue #1312: the index list's bulk form posts the checked rows here as
-    // repeated `ids` pairs. Malformed values are dropped and an empty selection
-    // is a no-op — a list-write endpoint never 400s on bad params.
+    // repeated `ids` pairs. They decode into a `Vec<i64>` (issue #3394). A
+    // malformed body and an empty selection are each a no-op — a list-write
+    // endpoint never 400s on bad params.
+    #[derive(serde::Deserialize)]
+    struct BulkSelection {
+        #[serde(default, alias = "ids[]")]
+        ids: Vec<i64>,
+    }
+
     #[post("/__PLURAL__/bulk_delete")]
     async fn bulk_delete(
         body: autumn_web::reexports::axum::body::Bytes,
     ) -> impl IntoResponse {
-        let mut ids: Vec<i64> = Vec::new();
-        for (key, value) in url::form_urlencoded::parse(body.as_ref()) {
-            if (key == "ids" || key == "ids[]")
-                && let Ok(id) = value.parse::<i64>()
-                && !ids.contains(&id)
-            {
-                ids.push(id);
-            }
+        if let Ok(BulkSelection { ids }) = autumn_web::form::from_urlencoded(&body) {
+            STORE.lock().unwrap().retain(|(i, _)| !ids.contains(i));
         }
-        STORE.lock().unwrap().retain(|(i, _)| !ids.contains(i));
         Redirect::to("/__PLURAL__")
     }"#;
     const BULK_STEPS: &str = r#"
@@ -14518,7 +14679,8 @@ async fn __PLURAL___cross_user_mutations_are_forbidden() {
 /// test needs *some* valid value so the `INSERT`'s failure is attributable to
 /// the target enum column's `CHECK` constraint rather than some other
 /// required column being left out.
-fn sql_sample_literal(kind: FieldKind) -> String {
+fn sql_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
+    let sqlite = backend == DatabaseBackend::Sqlite;
     match kind {
         // `Enum`'s "'sample'" here is never actually used: `enum_rejection_insert_sql`
         // special-cases every enum column (the field under test gets the
@@ -14548,12 +14710,16 @@ fn sql_sample_literal(kind: FieldKind) -> String {
         // like `decimal{1,1}` (valid range `(-1,1)`) would reject a literal
         // "1.0" with a numeric field overflow — see `decimal_literal_at_scale`.
         FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 1),
+        FieldKind::Uuid if sqlite => format!("({})", super::dsl::SQLITE_UUID_V4_SQL),
         FieldKind::Uuid => "gen_random_uuid()".to_owned(),
+        FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => "CURRENT_TIMESTAMP".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()".to_owned(),
+        FieldKind::Bytea if sqlite => "X'00'".to_owned(),
         FieldKind::Bytea => "'\\x00'::bytea".to_owned(),
         // Always nullable (see `FieldKind::Attachment`'s doc comment), so it
         // never needs a sample literal to satisfy a `NOT NULL` constraint.
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json if sqlite => "'{}'".to_owned(),
         FieldKind::Json => "'{}'::jsonb".to_owned(),
     }
 }
@@ -14579,7 +14745,8 @@ const API_SMOKE_TEST_SEED_ROWS: usize = 25;
 /// seeding strategy could satisfy the constraint. `uuid` needs no special
 /// case: its `sql_sample_literal` is `gen_random_uuid()`, already distinct
 /// per row.
-fn sql_seed_value_expr(f: &Field) -> String {
+fn sql_seed_value_expr(backend: DatabaseBackend, f: &Field) -> String {
+    let sqlite = backend == DatabaseBackend::Sqlite;
     match f.kind {
         // A slug field is always `unique` (issue #1260) -- it MUST vary per
         // row here, or the seeded rows collide on the very first re-insert.
@@ -14587,7 +14754,11 @@ fn sql_seed_value_expr(f: &Field) -> String {
             "'sample-' || g".to_owned()
         }
         FieldKind::I32 | FieldKind::I64 => "g".to_owned(),
+        FieldKind::F32 | FieldKind::F64 if sqlite => "CAST(g AS REAL)".to_owned(),
         FieldKind::F32 | FieldKind::F64 => "g::double precision".to_owned(),
+        FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => {
+            "datetime('now', '+' || g || ' seconds')".to_owned()
+        }
         FieldKind::NaiveDateTime | FieldKind::DateTime => {
             "NOW() + (g || ' seconds')::interval".to_owned()
         }
@@ -14598,8 +14769,9 @@ fn sql_seed_value_expr(f: &Field) -> String {
         // A constant `'{}'::jsonb` for every row (issue #1341 review) would
         // collide on the very first re-insert for a `unique` json column —
         // vary it with `g`, same as the text/numeric arms above.
+        FieldKind::Json if sqlite => "'{\"seed\": ' || g || '}'".to_owned(),
         FieldKind::Json => "('{\"seed\": ' || g || '}')::jsonb".to_owned(),
-        _ => sql_sample_literal(f.kind),
+        _ => sql_sample_literal(backend, f.kind),
     }
 }
 
@@ -14624,6 +14796,7 @@ fn sql_seed_value_expr(f: &Field) -> String {
 /// and fails at runtime with a column-count mismatch rather than inserting N
 /// default rows.
 fn render_api_seed_sql(
+    backend: DatabaseBackend,
     plural: &str,
     fields: &[Field],
     defaults: &BTreeMap<String, String>,
@@ -14633,7 +14806,7 @@ fn render_api_seed_sql(
     for f in fields {
         if !f.nullable && !defaults.contains_key(&f.name) {
             columns.push(f.name.clone());
-            values.push(sql_seed_value_expr(f));
+            values.push(sql_seed_value_expr(backend, f));
         }
     }
     let n = API_SMOKE_TEST_SEED_ROWS;
@@ -14643,8 +14816,18 @@ fn render_api_seed_sql(
         // into one `db.execute_sql(...)` call per statement.
         vec![format!("INSERT INTO {plural} DEFAULT VALUES"); n].join(";\n")
     } else {
+        let (with, source) = match backend {
+            DatabaseBackend::Postgres => (String::new(), format!("generate_series(1, {n}) AS g")),
+            // `SQLite` has no `generate_series`; a recursive CTE gives the same index.
+            DatabaseBackend::Sqlite => (
+                format!(
+                    "WITH RECURSIVE g(g) AS (SELECT 1 UNION ALL SELECT g + 1 FROM g WHERE g < {n}) "
+                ),
+                "g".to_owned(),
+            ),
+        };
         format!(
-            "INSERT INTO {plural} ({}) SELECT {} FROM generate_series(1, {n}) AS g",
+            "{with}INSERT INTO {plural} ({}) SELECT {} FROM {source}",
             columns.join(", "),
             values.join(", ")
         )
@@ -14656,6 +14839,7 @@ fn render_api_seed_sql(
 /// and every other required (`NOT NULL`, no `DEFAULT`) column to a valid
 /// sample value — see [`sql_sample_literal`].
 fn enum_rejection_insert_sql(
+    backend: DatabaseBackend,
     plural: &str,
     fields: &[Field],
     target: &Field,
@@ -14677,7 +14861,7 @@ fn enum_rejection_insert_sql(
             let value = if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                sql_sample_literal(f.kind)
+                sql_sample_literal(backend, f.kind)
             };
             values.push(value);
         }
@@ -14703,12 +14887,16 @@ fn enum_rejection_insert_sql(
 ///    `tests/*.rs` binary cannot import the project's own handler code).
 /// 3. Either way, the table ends up with zero rows.
 fn render_enum_rejection_smoke_test(
+    backend: DatabaseBackend,
     plural: &str,
     fields: &[Field],
     defaults: &BTreeMap<String, String>,
     setup_calls: &str,
     api: bool,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
+    let db_ctor = smoke_db_ctor(backend);
+    let ignore_attr = smoke_ignore_attr(backend);
     // `setup_calls` is shared with, and identical to, the base index/api smoke test's own
     // setup, which issues a plain, non-idempotent `CREATE TABLE {plural} (...)` and, for
     // any `--index`/`references` field, a plain `CREATE INDEX idx_{plural}_{field} ...`
@@ -14729,7 +14917,7 @@ fn render_enum_rejection_smoke_test(
     let mut out = String::new();
     for target in fields.iter().filter(|f| f.is_enum()) {
         let field_name = &target.name;
-        let insert_sql = enum_rejection_insert_sql(plural, fields, target, defaults);
+        let insert_sql = enum_rejection_insert_sql(backend, plural, fields, target, defaults);
         let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
         let allowed_values = target
             .variants
@@ -14770,11 +14958,11 @@ fn render_enum_rejection_smoke_test(
         let _ = write!(
             out,
             "\n#[tokio::test]\n\
-             #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+             {ignore_attr}\
              async fn {plural}_rejects_out_of_set_{field_name}() {{\n\
-             \x20\x20\x20\x20let db = TestDb::shared().await;\n\
+             \x20\x20\x20\x20let db = TestDb::{db_ctor}().await;\n\
              {setup_calls}\
-             \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+             \x20\x20\x20\x20{reset_call}\n\
              \n\
              {request_boundary_check}\
              \n\
@@ -14796,7 +14984,8 @@ fn render_enum_rejection_smoke_test(
 /// this deliberately avoids non-deterministic SQL (`gen_random_uuid()`,
 /// `NOW()`) — two evaluations of either would almost certainly differ and
 /// the duplicate-insert assertion would never trip.
-fn unique_sample_literal(kind: FieldKind) -> String {
+fn unique_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
+    let sqlite = backend == DatabaseBackend::Sqlite;
     match kind {
         FieldKind::String
         | FieldKind::Text
@@ -14822,11 +15011,17 @@ fn unique_sample_literal(kind: FieldKind) -> String {
         // Scale-derived, distinct from `sql_sample_literal`'s digit-1 value
         // for the same field — see `decimal_literal_at_scale`.
         FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 2),
+        FieldKind::Uuid if sqlite => "'00000000-0000-0000-0000-000000000001'".to_owned(),
         FieldKind::Uuid => "'00000000-0000-0000-0000-000000000001'::uuid".to_owned(),
+        FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => {
+            "'2024-01-01 00:00:00'".to_owned()
+        }
         FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp".to_owned(),
         FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz".to_owned(),
+        FieldKind::Bytea if sqlite => "X'DEADBEEF'".to_owned(),
         FieldKind::Bytea => "'\\xDEADBEEF'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json if sqlite => "'{\"seed\": 1}'".to_owned(),
         FieldKind::Json => "'{\"seed\": 1}'::jsonb".to_owned(),
     }
 }
@@ -14839,7 +15034,8 @@ fn unique_sample_literal(kind: FieldKind) -> String {
 /// exact same value for a non-target unique column on both inserts would
 /// trip *that* column's own UNIQUE index too, racing against the target's
 /// to decide which violation Postgres actually reports.
-fn unique_sample_literal_variant(kind: FieldKind) -> String {
+fn unique_sample_literal_variant(backend: DatabaseBackend, kind: FieldKind) -> String {
+    let sqlite = backend == DatabaseBackend::Sqlite;
     match kind {
         FieldKind::String
         | FieldKind::Text
@@ -14862,11 +15058,17 @@ fn unique_sample_literal_variant(kind: FieldKind) -> String {
         // and `unique_sample_literal`'s digit-2 value — see
         // `decimal_literal_at_scale`.
         FieldKind::Decimal { scale, .. } => decimal_literal_at_scale(scale, 3),
+        FieldKind::Uuid if sqlite => "'00000000-0000-0000-0000-000000000002'".to_owned(),
         FieldKind::Uuid => "'00000000-0000-0000-0000-000000000002'::uuid".to_owned(),
+        FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => {
+            "'2024-01-02 00:00:00'".to_owned()
+        }
         FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp".to_owned(),
         FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz".to_owned(),
+        FieldKind::Bytea if sqlite => "X'BEEFDEAD'".to_owned(),
         FieldKind::Bytea => "'\\xBEEFDEAD'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
+        FieldKind::Json if sqlite => "'{\"seed\": 2}'".to_owned(),
         FieldKind::Json => "'{\"seed\": 2}'::jsonb".to_owned(),
     }
 }
@@ -14885,6 +15087,7 @@ fn unique_sample_literal_variant(kind: FieldKind) -> String {
 /// one `unique` field doesn't also duplicate a *different* column's value
 /// and race it against `target`'s for which violation Postgres reports.
 fn unique_violation_insert_sql(
+    backend: DatabaseBackend,
     plural: &str,
     fields: &[Field],
     target: &Field,
@@ -14899,7 +15102,7 @@ fn unique_violation_insert_sql(
             let value = if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                unique_sample_literal(f.kind)
+                unique_sample_literal(backend, f.kind)
             };
             values.push(value);
         } else if !f.nullable && !defaults.contains_key(&f.name) {
@@ -14908,11 +15111,11 @@ fn unique_violation_insert_sql(
                 let variant = f.variants.get(1).unwrap_or(&f.variants[0]);
                 format!("'{variant}'")
             } else if is_duplicate_insert && f.unique {
-                unique_sample_literal_variant(f.kind)
+                unique_sample_literal_variant(backend, f.kind)
             } else if f.is_enum() {
                 format!("'{}'", f.variants.first().expect("enum field has variants"))
             } else {
-                sql_sample_literal(f.kind)
+                sql_sample_literal(backend, f.kind)
             };
             values.push(value);
         }
@@ -14925,7 +15128,7 @@ fn unique_violation_insert_sql(
 }
 
 /// Render one `#[ignore]`d `#[tokio::test]` per `unique` field (issue #1032)
-/// that proves, against a real (throwaway) Postgres database:
+/// that proves, against a real (throwaway) Postgres or `SQLite` database:
 ///
 /// 1. A raw duplicate `INSERT` (bypassing the app entirely) violates the
 ///    migration's `CREATE UNIQUE INDEX` — the constraint is real, not just
@@ -14943,7 +15146,12 @@ fn unique_violation_insert_sql(
 ///    the full request-boundary path (issue #1032's success metric: a
 ///    second POST with the same value gets a field-level error, not a
 ///    `500`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one generated test template; splitting it would scatter one format string"
+)]
 fn render_unique_violation_smoke_test(
+    backend: DatabaseBackend,
     plural: &str,
     fields: &[Field],
     unique_fields: &[&Field],
@@ -14951,6 +15159,10 @@ fn render_unique_violation_smoke_test(
     setup_calls: &str,
     api: bool,
 ) -> String {
+    let reset_call = smoke_reset_call(backend, plural);
+    let db_ctor = smoke_db_ctor(backend);
+    let db_label = smoke_db_label(backend);
+    let ignore_attr = smoke_ignore_attr(backend);
     // Same idempotency treatment as `render_enum_rejection_smoke_test` (see
     // its comment) — this test's own setup must tolerate running alongside
     // the base index/api smoke test and/or the enum-rejection smoke test in
@@ -14977,7 +15189,8 @@ fn render_unique_violation_smoke_test(
             continue;
         }
         let field_name = &target.name;
-        let insert_sql = unique_violation_insert_sql(plural, fields, target, defaults, false);
+        let insert_sql =
+            unique_violation_insert_sql(backend, plural, fields, target, defaults, false);
         let escaped_insert = escape_sql_for_rust_literal(&insert_sql);
         // A scaffold with more than one `unique` field needs a *second*,
         // distinct insert for the DB-level duplicate-insert check below: if
@@ -14989,7 +15202,8 @@ fn render_unique_violation_smoke_test(
         // single compiled function invoked via two separate HTTP calls, so
         // it has no way to distinguish "first call" from "second call" and
         // keeps using `escaped_insert` for both, same as before.
-        let insert_sql_dup = unique_violation_insert_sql(plural, fields, target, defaults, true);
+        let insert_sql_dup =
+            unique_violation_insert_sql(backend, plural, fields, target, defaults, true);
         let escaped_insert_dup = escape_sql_for_rust_literal(&insert_sql_dup);
         let constraint_name = unique_index_name(plural, field_name, fields);
 
@@ -15033,7 +15247,7 @@ fn render_unique_violation_smoke_test(
                  \x20\x20\x20\x20Ok(autumn_web::reexports::http::StatusCode::OK.into_response())\n\
                  }}\n\
                  \n\
-                 \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+                 \x20\x20\x20\x20{reset_call}\n\
                  \x20\x20\x20\x20let client: TestClient = TestApp::new().routes(routes![create]).with_db(db.pool()).build();\n\
                  \n\
                  \x20\x20\x20\x20client.post(\"/{plural}\").send().await.assert_status(200);\n\
@@ -15046,11 +15260,11 @@ fn render_unique_violation_smoke_test(
         let _ = write!(
             out,
             "\n#[tokio::test]\n\
-             #[ignore = \"requires Docker (testcontainers) via TestDb; run `cargo test -- --ignored`\"]\n\
+             {ignore_attr}\
              async fn {plural}_rejects_duplicate_{field_name}() {{\n\
-             \x20\x20\x20\x20let db = TestDb::shared().await;\n\
+             \x20\x20\x20\x20let db = TestDb::{db_ctor}().await;\n\
              {setup_calls}\
-             \x20\x20\x20\x20db.execute_sql(\"TRUNCATE {plural} RESTART IDENTITY\").await;\n\
+             \x20\x20\x20\x20{reset_call}\n\
              \n\
              \x20\x20\x20\x20let mut conn = db.pool().get().await.expect(\"failed to get db connection\");\n\
              \x20\x20\x20\x20diesel::sql_query(\"{escaped_insert}\").execute(&mut *conn).await.expect(\"first insert must succeed\");\n\
@@ -15062,7 +15276,7 @@ fn render_unique_violation_smoke_test(
              \x20\x20\x20\x20let (field, _message) = autumn_web::error::unique_violation_field(\n\
              \x20\x20\x20\x20\x20\x20\x20\x20&mapped_err,\n\
              \x20\x20\x20\x20\x20\x20\x20\x20&[(\"{constraint_name}\", \"{field_name}\", \"has already been taken\")],\n\
-             \x20\x20\x20\x20).expect(\"a real Postgres unique_violation error must be classified by field\");\n\
+             \x20\x20\x20\x20).expect(\"a real {db_label} unique_violation error must be classified by field\");\n\
              \x20\x20\x20\x20assert_eq!(field, \"{field_name}\");\n\
              \n\
              {request_boundary_check}\
@@ -15861,6 +16075,33 @@ async fn main() {
         assert!(
             !routes.contains(".override_field(\"post_id\""),
             "the missing target's column must keep the derived number input: {routes}"
+        );
+    }
+
+    #[test]
+    fn commentable_scaffold_hints_an_audit_clean_comment_router_mount() {
+        // The generic comment router is a `nest`, which `autumn routes audit`
+        // cannot see into. The hint must pair it with the declaration that
+        // makes the mount enumerable, or the app it scaffolds fails its own
+        // CI audit step.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into(), "comments:commentable".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let hint = plan
+            .warnings
+            .iter()
+            .find(|w| w.contains("commentable::router"))
+            .unwrap_or_else(|| panic!("no comment-router hint: {:?}", plan.warnings));
+        assert!(
+            hint.contains(
+                ".declare_plugin_routes(autumn_web::commentable::route_infos(\"/comments\"))"
+            ),
+            "{hint}"
         );
     }
 
@@ -18301,10 +18542,8 @@ async fn main() {
     #[test]
     fn execute_writes_required_bytea_field_as_string_on_form() {
         // `Vec<u8>` cannot deserialize from a single url-encoded value at all
-        // (issue #1124 review) — represented as a lossy-UTF8 `String` on the
-        // form instead, matching what the old hand-rolled edit form already
-        // displayed via `String::from_utf8_lossy`, and converted back with
-        // `.into_bytes()` on the success path.
+        // (issue #1124 review), so the form carries a `String`. That string
+        // is `\x` + hex (issue #2330): lossless, unlike UTF-8.
         let tmp = project_with_main(default_main());
         let plan = plan_scaffold(
             tmp.path(),
@@ -18318,13 +18557,14 @@ async fn main() {
         let routes = fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap();
         assert!(routes.contains("pub payload: String,"), "{routes}");
         assert!(
-            routes.contains("payload: form.payload.clone().into_bytes(),"),
+            routes.contains("payload: bytea_from_hex(&form.payload).map_err("),
             "{routes}"
         );
         assert!(
-            routes.contains("payload: String::from_utf8_lossy(&row.payload).into_owned(),"),
+            routes.contains("payload: bytea_to_hex(&row.payload),"),
             "{routes}"
         );
+        assert!(!routes.contains("into_bytes()"), "{routes}");
     }
 
     #[test]
@@ -18343,15 +18583,81 @@ async fn main() {
         assert!(routes.contains("pub payload: Option<String>,"), "{routes}");
         assert!(
             routes.contains(
-                "payload: form.payload.as_ref().map(|value| value.clone().into_bytes()),"
+                "payload: form.payload.as_deref().filter(|value| !value.trim().is_empty()).map(bytea_from_hex).transpose()"
             ),
             "{routes}"
         );
         assert!(
-            routes.contains(
-                "payload: row.payload.as_ref().map(|value| String::from_utf8_lossy(value).into_owned()),"
-            ),
+            routes.contains("payload: row.payload.as_deref().map(bytea_to_hex),"),
             "{routes}"
+        );
+    }
+
+    #[test]
+    fn bytea_helpers_are_emitted_only_where_used() {
+        // An unused `fn` is a `dead_code` warning in the generated app.
+        let routes_for = |cols: &[&str]| {
+            let tmp = project_with_main(default_main());
+            let cols: Vec<String> = cols.iter().map(|c| (*c).to_owned()).collect();
+            plan_scaffold(tmp.path(), "Post", &cols, "20260427000000")
+                .unwrap()
+                .execute(Flags::default())
+                .unwrap();
+            fs::read_to_string(tmp.path().join("src/routes/posts.rs")).unwrap()
+        };
+        let none = routes_for(&["title:String"]);
+        assert!(!none.contains("fn bytea_to_hex("), "{none}");
+        assert!(!none.contains("fn bytea_from_hex("), "{none}");
+
+        let used = routes_for(&["title:String", "payload:Bytea"]);
+        assert!(used.contains("fn bytea_to_hex("), "{used}");
+        assert!(used.contains("fn bytea_from_hex("), "{used}");
+    }
+
+    #[test]
+    fn the_bytea_hex_helpers_round_trip_non_utf8_bytes() {
+        // Compile the emitted helpers and run them. Use bytes that are not
+        // valid UTF-8. A UTF-8-safe fixture also passes with the lossy code.
+        let program = format!(
+            "{BYTEA_HEX_TO_FN}\n{BYTEA_HEX_FROM_FN}\n\
+             fn main() {{\n\
+                 let raw: &[u8] = &[0xFF, 0xFE, 0x00, 0xC0, 0x80, 0xED, 0xA0, 0x80, 0x41];\n\
+                 let text = bytea_to_hex(raw);\n\
+                 assert_eq!(text, \"\\\\xfffe00c080eda08041\");\n\
+                 assert_eq!(bytea_from_hex(&text).unwrap(), raw);\n\
+                 assert_eq!(bytea_from_hex(\"\\\\xFFFE\").unwrap(), [0xFF, 0xFE]);\n\
+                 assert_eq!(bytea_from_hex(\" \\\\x00ff \").unwrap(), [0x00, 0xFF]);\n\
+                 assert_eq!(bytea_from_hex(\"\\\\x\").unwrap(), Vec::<u8>::new());\n\
+                 assert_eq!(bytea_to_hex(&[]), \"\\\\x\");\n\
+                 assert_eq!(bytea_from_hex(\"  \").unwrap(), Vec::<u8>::new());\n\
+                 for bad in [\"00ff\", \"\\\\x0\", \"\\\\xzz\", \"\\\\x+f\", \"\\\\xé0\", \"\\\\x0é\", \"0x00\"] {{\n\
+                     assert!(bytea_from_hex(bad).is_err(), \"{{bad:?}} must be rejected\");\n\
+                 }}\n\
+             }}\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("hex.rs");
+        let bin = dir
+            .path()
+            .join("hex_bin")
+            .with_extension(std::env::consts::EXE_EXTENSION);
+        fs::write(&src, program).unwrap();
+        let build = std::process::Command::new("rustc")
+            .args(["--edition", "2021", "-D", "warnings", "-o"])
+            .arg(&bin)
+            .arg(&src)
+            .output()
+            .expect("rustc must be on PATH");
+        assert!(
+            build.status.success(),
+            "helpers must compile warning-free:\n{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let run = std::process::Command::new(&bin).output().unwrap();
+        assert!(
+            run.status.success(),
+            "helper round trip failed:\n{}",
+            String::from_utf8_lossy(&run.stderr)
         );
     }
 
@@ -18751,6 +19057,161 @@ async fn main() {
                 );
             },
         );
+    }
+
+    /// Plan a scaffold for a `SQLite` app and return the smoke test source.
+    fn sqlite_smoke_test(args: &[&str], api: bool) -> (Vec<String>, String) {
+        let mut out = (Vec::new(), String::new());
+        temp_env::with_vars(
+            [
+                ("AUTUMN_DATABASE__PRIMARY_URL", None::<&str>),
+                ("AUTUMN_DATABASE__URL", None::<&str>),
+                ("DATABASE_URL", None::<&str>),
+            ],
+            || {
+                let tmp = project_with_main(default_main());
+                fs::write(
+                    tmp.path().join("autumn.toml"),
+                    "[database]\nprimary_url = \"sqlite://app.db\"\n",
+                )
+                .unwrap();
+                let fields: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+                let options = ScaffoldOptions {
+                    api,
+                    ..Default::default()
+                };
+                let plan = plan_scaffold_with_options(
+                    tmp.path(),
+                    "Post",
+                    &fields,
+                    "20260427000000",
+                    &options,
+                )
+                .unwrap();
+                let test = plan
+                    .actions
+                    .iter()
+                    .find_map(|a| match a {
+                        Action::Create { path, contents } if path.ends_with("tests/post.rs") => {
+                            Some(contents.clone())
+                        }
+                        _ => None,
+                    })
+                    .expect("smoke test is planned");
+                out = (plan.warnings, test);
+            },
+        );
+        out
+    }
+
+    /// A `SQLite` scaffold has a `SQLite`-native smoke test (issue #2555). It
+    /// needs no Docker, so it is not `#[ignore]`d, and the generator no longer
+    /// warns that `cargo test` cannot compile.
+    #[test]
+    fn sqlite_scaffold_smoke_test_is_native() {
+        let (warnings, test) = sqlite_smoke_test(&["title:String"], false);
+        assert!(
+            !warnings.iter().any(|w| w.contains("TestDb")),
+            "no TestDb warning on SQLite: {warnings:?}"
+        );
+        assert!(test.contains("db.reset_table(\"posts\")"), "{test}");
+        assert!(!test.contains("TRUNCATE"), "{test}");
+        assert!(!test.contains("#[ignore"), "{test}");
+        assert!(!test.contains("Docker"), "{test}");
+        assert!(!test.contains("Postgres"), "{test}");
+        assert!(!test.contains("BIGSERIAL"), "{test}");
+        assert!(test.contains("INTEGER PRIMARY KEY AUTOINCREMENT"), "{test}");
+    }
+
+    /// Each `SQLite` smoke test gets its own database. The tests are not
+    /// `#[ignore]`d, so they run in parallel in one binary. A shared database
+    /// would let one test's `CREATE TABLE` or `reset_table` break another's.
+    #[test]
+    fn sqlite_scaffold_smoke_tests_each_get_their_own_database() {
+        let (_, test) = sqlite_smoke_test(
+            &["name:String:unique", "status:enum{draft,published}"],
+            false,
+        );
+        assert!(test.contains("TestDb::new().await"), "{test}");
+        assert!(!test.contains("TestDb::shared()"), "{test}");
+    }
+
+    /// Every Postgres-only construct in the smoke SQL has a `SQLite` form.
+    #[test]
+    fn sqlite_scaffold_smoke_sql_has_no_postgres_syntax() {
+        let (_, test) = sqlite_smoke_test(
+            &[
+                "title:String:unique",
+                "owner:Uuid",
+                "at:DateTime",
+                "blob:Bytea",
+                "payload:json",
+                "ratio:f64",
+                "status:enum{draft,published}",
+            ],
+            false,
+        );
+        for banned in [
+            "::jsonb",
+            "::uuid",
+            "::bytea",
+            "::timestamp",
+            "::double",
+            "::interval",
+            "NOW()",
+            "gen_random_uuid",
+            "generate_series",
+            "BIGSERIAL",
+            "TRUNCATE",
+        ] {
+            assert!(
+                !test.contains(banned),
+                "`{banned}` in SQLite smoke test:\n{test}"
+            );
+        }
+        assert!(test.contains("rejects_duplicate_title"), "{test}");
+        assert!(test.contains("rejects_out_of_set_status"), "{test}");
+        assert!(test.contains("a real SQLite unique_violation"), "{test}");
+    }
+
+    /// The `--api` smoke test seeds rows with a recursive CTE on `SQLite`.
+    #[test]
+    fn sqlite_api_scaffold_smoke_test_seeds_with_a_recursive_cte() {
+        let (_, test) = sqlite_smoke_test(&["title:String"], true);
+        assert!(test.contains("WITH RECURSIVE g(g)"), "{test}");
+        assert!(test.contains("CAST(id AS TEXT)"), "{test}");
+        assert!(!test.contains("id::text"), "{test}");
+        assert!(!test.contains("#[ignore"), "{test}");
+    }
+
+    /// Postgres keeps its Docker-gated smoke test.
+    #[test]
+    fn postgres_scaffold_smoke_test_stays_ignored() {
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260427000000",
+        )
+        .unwrap();
+        let test = plan
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                Action::Create { path, contents } if path.ends_with("tests/post.rs") => {
+                    Some(contents.clone())
+                }
+                _ => None,
+            })
+            .expect("smoke test is planned");
+        assert!(test.contains("#[ignore = \"requires Docker"), "{test}");
+        assert!(test.contains("TestDb::shared().await"), "{test}");
+        assert!(
+            test.contains("db.execute_sql(\"TRUNCATE posts RESTART IDENTITY\")"),
+            "{test}"
+        );
+        assert!(test.contains("BIGSERIAL PRIMARY KEY"), "{test}");
     }
 
     #[test]
@@ -19515,9 +19976,9 @@ async fn main() {
         // `Blob` and `Vec<u8>` have no `Display`, so a bare `.to_string()`
         // would not compile. Attachment is ALWAYS `Option<Blob>`, hence the
         // same expression whether or not the field was declared nullable.
-        // Both carry the `csv_text_cell` guard: a blob key ends in a
-        // browser-supplied filename, and lossy UTF-8 of a `Bytea` is arbitrary
-        // user bytes — either can begin with `=`.
+        // The attachment key carries the `csv_text_cell` guard: it ends in a
+        // browser-supplied filename and can begin with `=`. A `Bytea` is
+        // `\x` + hex (issue #2330), which cannot, so it takes no guard.
         let attachment = csv_value_expr(&csv_test_field("cover", FieldKind::Attachment, false));
         assert_eq!(
             attachment,
@@ -19529,7 +19990,11 @@ async fn main() {
         );
         assert_eq!(
             csv_value_expr(&csv_test_field("payload", FieldKind::Bytea, false)),
-            "csv_text_cell(String::from_utf8_lossy(&self.payload).into_owned())"
+            "bytea_to_hex(&self.payload)"
+        );
+        assert_eq!(
+            csv_value_expr(&csv_test_field("payload", FieldKind::Bytea, true)),
+            "self.payload.as_deref().map(bytea_to_hex).unwrap_or_default()"
         );
         // An `Enum` column's Rust type is the generated enum, NOT `String`
         // (see `Field::rust_type`), so it must take the `Display` arm rather
@@ -21261,7 +21726,8 @@ async fn main() {
             fields[1].reference_table(),
             "test setup: both fields must target the same table"
         );
-        let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
+        let sql =
+            render_reference_stub_tables_sql(DatabaseBackend::Postgres, &fields, "unrelated_table");
         assert_eq!(
             sql.matches("CREATE TABLE IF NOT EXISTS").count(),
             1,
@@ -21281,7 +21747,7 @@ async fn main() {
         // non-target `unique references` column in the duplicate insert)
         // distinction; see that function's doc comment.
         let fields = super::super::dsl::parse_fields(&["author:references".into()]).unwrap();
-        let sql = render_reference_stub_tables_sql(&fields, "posts");
+        let sql = render_reference_stub_tables_sql(DatabaseBackend::Postgres, &fields, "posts");
         assert_eq!(
             sql,
             "CREATE TABLE IF NOT EXISTS authors (id BIGSERIAL PRIMARY KEY);\n\
@@ -21313,7 +21779,8 @@ async fn main() {
                 state_machine: None,
             },
         ];
-        let sql = render_reference_stub_tables_sql(&fields, "unrelated_table");
+        let sql =
+            render_reference_stub_tables_sql(DatabaseBackend::Postgres, &fields, "unrelated_table");
         assert_eq!(
             sql.matches("CREATE TABLE IF NOT EXISTS authors").count(),
             1,
@@ -21335,7 +21802,8 @@ async fn main() {
         // stubbing it first would collide with that statement.
         let fields = super::super::dsl::parse_fields(&["category:references".into()]).unwrap();
         assert_eq!(fields[0].reference_table().as_deref(), Some("categories"));
-        let sql = render_reference_stub_tables_sql(&fields, "categories");
+        let sql =
+            render_reference_stub_tables_sql(DatabaseBackend::Postgres, &fields, "categories");
         assert!(sql.is_empty(), "must not stub the model's own table: {sql}");
     }
 
@@ -21382,27 +21850,36 @@ async fn main() {
     #[test]
     fn decimal_sample_literals_are_pairwise_distinct_at_every_scale() {
         for scale in 0..=6 {
-            let a = sql_sample_literal(FieldKind::Decimal {
-                precision: scale.max(1) + 1,
-                scale,
-            });
-            let b = unique_sample_literal(FieldKind::Decimal {
-                precision: scale.max(1) + 1,
-                scale,
-            });
-            let c = unique_sample_literal_variant(FieldKind::Decimal {
-                precision: scale.max(1) + 1,
-                scale,
-            });
+            let a = sql_sample_literal(
+                DatabaseBackend::Postgres,
+                FieldKind::Decimal {
+                    precision: scale.max(1) + 1,
+                    scale,
+                },
+            );
+            let b = unique_sample_literal(
+                DatabaseBackend::Postgres,
+                FieldKind::Decimal {
+                    precision: scale.max(1) + 1,
+                    scale,
+                },
+            );
+            let c = unique_sample_literal_variant(
+                DatabaseBackend::Postgres,
+                FieldKind::Decimal {
+                    precision: scale.max(1) + 1,
+                    scale,
+                },
+            );
             assert!(a != b && b != c && a != c, "scale {scale}: {a}, {b}, {c}");
         }
     }
 
     #[test]
     fn json_sample_literals_are_pairwise_distinct_and_valid_jsonb() {
-        let a = sql_sample_literal(FieldKind::Json);
-        let b = unique_sample_literal(FieldKind::Json);
-        let c = unique_sample_literal_variant(FieldKind::Json);
+        let a = sql_sample_literal(DatabaseBackend::Postgres, FieldKind::Json);
+        let b = unique_sample_literal(DatabaseBackend::Postgres, FieldKind::Json);
+        let c = unique_sample_literal_variant(DatabaseBackend::Postgres, FieldKind::Json);
         assert!(a != b && b != c && a != c, "{a}, {b}, {c}");
         for literal in [&a, &b, &c] {
             assert!(
@@ -21427,7 +21904,7 @@ async fn main() {
         // 25-row (`API_SMOKE_TEST_SEED_ROWS`) seed — must vary with `g`, same
         // as the text/numeric/timestamp arms.
         let f = csv_test_field("config", FieldKind::Json, false);
-        let expr = sql_seed_value_expr(&f);
+        let expr = sql_seed_value_expr(DatabaseBackend::Postgres, &f);
         assert!(
             expr.contains(" g "),
             "must vary per row via the generate_series index: {expr}"
@@ -21472,7 +21949,13 @@ async fn main() {
             state_machine: None,
         };
         let fields = vec![status.clone(), weight];
-        let sql = enum_rejection_insert_sql("items", &fields, &status, &BTreeMap::new());
+        let sql = enum_rejection_insert_sql(
+            DatabaseBackend::Postgres,
+            "items",
+            &fields,
+            &status,
+            &BTreeMap::new(),
+        );
         assert!(
             sql.contains("weight) VALUES ('__not_a_real_variant__', 0.1)"),
             "expected a scale-fitting 0.1 literal for NUMERIC(1,1), got: {sql}"
@@ -22737,42 +23220,61 @@ exempt_paths = [
         );
     }
 
+    /// Issue #3394: the ids decode into a `Vec<i64>` field through the
+    /// framework form decoder. No generated parser remains.
     #[test]
-    fn bulk_ids_parser_accepts_bracket_form() {
+    fn bulk_selection_is_a_vec_field_that_accepts_bracket_form() {
         let routes = bulk_routes_default();
-        assert!(routes.contains("fn parse_bulk_ids("), "{routes}");
-        let Some((_, rest)) = routes.split_once("fn parse_bulk_ids(") else {
-            panic!("routes must emit a parse_bulk_ids helper:\n{routes}");
+        assert!(!routes.contains("parse_bulk_ids"), "{routes}");
+        let Some((_, rest)) = routes.split_once("struct BulkSelection") else {
+            panic!("routes must emit a BulkSelection form struct:\n{routes}");
         };
-        let parser = rest.split("\npub ").next().unwrap_or(rest);
-        assert!(parser.contains("url::form_urlencoded::parse"), "{parser}");
-        assert!(parser.contains("\"ids\""), "{parser}");
-        assert!(parser.contains("\"ids[]\""), "{parser}");
+        let selection = rest.split("\n}").next().unwrap_or(rest);
+        assert!(selection.contains("ids: Vec<i64>"), "{selection}");
+        assert!(selection.contains("alias = \"ids[]\""), "{selection}");
+        assert!(selection.contains("default"), "{selection}");
+        let bulk = handler_slice(&routes, "bulk_delete");
         assert!(
-            parser.contains("seen.insert("),
-            "the parser must dedupe selected ids: {parser}"
+            bulk.contains("autumn_web::form::from_urlencoded::<BulkSelection>(&body)"),
+            "{bulk}"
         );
     }
 
-    /// The parser reads the raw body, not a page-sized selection, so a crafted
-    /// POST can carry as many distinct ids as the body limit allows. Dedup must
-    /// stay O(1) per value — a `Vec::contains` scan would make it Θ(n²) and let
-    /// a small request burn real CPU before the handler reaches the database.
+    /// A crafted POST can carry as many distinct ids as the body limit
+    /// allows. Dedup must stay O(1) per value — a `Vec::contains` scan would
+    /// make it Θ(n²) and let a small request burn real CPU before the handler
+    /// reaches the database.
     #[test]
-    fn bulk_ids_parser_dedupes_in_linear_time() {
+    fn bulk_selection_dedupes_in_linear_time() {
         let routes = bulk_routes_default();
-        let Some((_, rest)) = routes.split_once("fn parse_bulk_ids(") else {
-            panic!("routes must emit a parse_bulk_ids helper:\n{routes}");
-        };
-        let parser = rest.split("\npub ").next().unwrap_or(rest);
+        let bulk = handler_slice(&routes, "bulk_delete");
         assert!(
-            parser.contains("HashSet"),
-            "dedup must go through a hash set, not a linear scan: {parser}"
+            bulk.contains("HashSet") && bulk.contains("seen.insert("),
+            "dedup must go through a hash set, not a linear scan: {bulk}"
         );
         assert!(
-            !parser.contains("ids.contains(&"),
-            "a per-value Vec::contains scan makes parsing quadratic: {parser}"
+            !bulk.contains("ids.contains(&"),
+            "a per-value Vec::contains scan makes dedup quadratic: {bulk}"
         );
+    }
+
+    /// A malformed or repeated-scalar body flashes and redirects. It never
+    /// 400s (see `bulk_delete_never_returns_bad_request`).
+    #[test]
+    fn bulk_delete_malformed_selection_flashes_and_redirects() {
+        let routes = bulk_routes_default();
+        let bulk = handler_slice(&routes, "bulk_delete");
+        let decode_at = bulk
+            .find("from_urlencoded::<BulkSelection>")
+            .unwrap_or_else(|| panic!("bulk delete must decode a BulkSelection:\n{bulk}"));
+        let after = &bulk[decode_at..];
+        let else_at = after
+            .find("else {")
+            .unwrap_or_else(|| panic!("a decode failure must take an else branch:\n{bulk}"));
+        let branch = &after[else_at..];
+        assert!(branch.contains("flash"), "{branch}");
+        assert!(branch.contains("Redirect::to(&paths::index())"), "{branch}");
+        assert!(bulk.contains("not a valid selection"), "{bulk}");
     }
 
     #[test]
@@ -26334,6 +26836,28 @@ exempt_paths = [
         assert!(routes.contains("const UNIQUE_CONSTRAINTS"), "{routes}");
     }
 
+    /// #2439: the framework reads the NUL field error from the bundle. An
+    /// `--i18n` scaffold ships the catalog entry. No view uses it.
+    #[test]
+    fn i18n_scaffold_ships_the_nul_message_key() {
+        let tmp = project_with_main(default_main());
+        plan_scaffold_with_options(
+            tmp.path(),
+            "Post",
+            &["title:String".into()],
+            "20260503000000",
+            &i18n_options(),
+        )
+        .unwrap()
+        .execute(Flags::default())
+        .unwrap();
+        let ftl = fs::read_to_string(tmp.path().join("i18n/en.ftl")).unwrap();
+        assert!(
+            ftl.contains("common.error.nul_character = Cannot contain the NUL character (0x00)"),
+            "{ftl}"
+        );
+    }
+
     /// Without the flag the whole path is byte-for-byte as it was, including
     /// the binding name.
     #[test]
@@ -26439,7 +26963,7 @@ exempt_paths = [
 
     /// AC4/AC7: every referenced key exists in the emitted `en.ftl`, and the
     /// file carries no key the views never reference (which `autumn i18n check`
-    /// would report as unused).
+    /// would report as unused), except the one key that the framework looks up.
     #[test]
     fn i18n_en_ftl_matches_the_referenced_key_set_exactly() {
         let tmp = project_with_main(default_main());
@@ -26464,10 +26988,12 @@ exempt_paths = [
             missing.is_empty(),
             "keys referenced but not defined in en.ftl: {missing:?}\n{ftl}"
         );
+        // The framework looks up this key. No view names it (#2439).
         let unused: Vec<_> = defined.difference(&referenced).collect();
-        assert!(
-            unused.is_empty(),
-            "keys defined in en.ftl but never referenced: {unused:?}\n{routes}"
+        assert_eq!(
+            unused,
+            ["common.error.nul_character"],
+            "keys defined in en.ftl but never referenced:\n{routes}"
         );
         // English values, so an `en` app reads exactly like the plain scaffold.
         assert!(ftl.contains("common.create = Create"), "{ftl}");
@@ -26861,6 +27387,618 @@ exempt_paths = [
             routes.matches("\"post.field.author_name\"").count() >= 3,
             "the field key must serve index, show, and form:\n{routes}"
         );
+    }
+
+    /// Regenerating a scaffold without a flag releases the `autumn-web`
+    /// feature that flag enabled (issue #2328).
+    mod feature_release {
+        use super::*;
+
+        const CARGO: &str = "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = \"0.7.0\"\n";
+
+        fn project() -> TempDir {
+            let tmp = project_with_main(default_main());
+            fs::write(tmp.path().join("Cargo.toml"), CARGO).unwrap();
+            tmp
+        }
+
+        fn run(tmp: &TempDir, name: &str, fields: &[&str], options: &ScaffoldOptions) {
+            let tokens: Vec<String> = fields.iter().map(|f| (*f).to_owned()).collect();
+            plan_scaffold_with_options(tmp.path(), name, &tokens, "20260827000000", options)
+                .unwrap()
+                .execute(Flags {
+                    force: true,
+                    ..Flags::default()
+                })
+                .unwrap();
+        }
+
+        fn autumn_web_line(tmp: &TempDir) -> String {
+            fs::read_to_string(tmp.path().join("Cargo.toml"))
+                .unwrap()
+                .lines()
+                .find(|l| l.starts_with("autumn-web"))
+                .unwrap()
+                .to_owned()
+        }
+
+        fn searchable() -> ScaffoldOptions {
+            ScaffoldOptions {
+                model: ModelOptions {
+                    searchable: vec!["title".to_owned()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        fn importing() -> ScaffoldOptions {
+            ScaffoldOptions {
+                import: true,
+                ..Default::default()
+            }
+        }
+
+        const POST: &[&str] = &["title:String", "body:Text"];
+
+        #[test]
+        fn dropping_searchable_releases_htmx() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            assert!(autumn_web_line(&tmp).contains("htmx"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                !autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn dropping_import_releases_multipart_and_keeps_csv() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &importing());
+            assert!(autumn_web_line(&tmp).contains("multipart"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let line = autumn_web_line(&tmp);
+            assert!(!line.contains("multipart"), "{line}");
+            assert!(line.contains("csv"), "the export still needs csv: {line}");
+        }
+
+        #[test]
+        fn dropping_attachment_releases_storage_and_multipart() {
+            let tmp = project();
+            run(
+                &tmp,
+                "Post",
+                &["title:String", "cover:attachment"],
+                &ScaffoldOptions::default(),
+            );
+            assert!(autumn_web_line(&tmp).contains("storage"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let line = autumn_web_line(&tmp);
+            assert!(
+                !line.contains("storage") && !line.contains("multipart"),
+                "{line}"
+            );
+        }
+
+        #[test]
+        fn dropping_richtext_releases_markdown() {
+            let tmp = project();
+            run(
+                &tmp,
+                "Post",
+                &["title:String", "body:richtext"],
+                &ScaffoldOptions::default(),
+            );
+            assert!(autumn_web_line(&tmp).contains("markdown"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                !autumn_web_line(&tmp).contains("markdown"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn going_live_releases_csv() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(autumn_web_line(&tmp).contains("csv"));
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            assert!(
+                !autumn_web_line(&tmp).contains("csv"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_feature_a_sibling_scaffold_uses() {
+            let tmp = project();
+            run(&tmp, "Note", POST, &importing());
+            run(&tmp, "Post", POST, &importing());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_when_a_sibling_route_exists() {
+            let tmp = project();
+            run(&tmp, "Note", POST, &searchable());
+            run(&tmp, "Post", POST, &searchable());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_feature_hand_written_code_uses() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &importing());
+            fs::write(
+                tmp.path().join("src/upload.rs"),
+                "pub async fn up(_m: autumn_web::extract::Multipart) {}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn plan_edits_cargo_toml_but_leaves_the_disk_alone() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            let plan = plan_scaffold_with_options(
+                tmp.path(),
+                "Post",
+                &POST.iter().map(|f| (*f).to_owned()).collect::<Vec<_>>(),
+                "20260827000000",
+                &ScaffoldOptions::default(),
+            )
+            .unwrap();
+            let edit = plan.actions.iter().find_map(|a| match a {
+                Action::Modify { path, contents } if path.ends_with("Cargo.toml") => Some(contents),
+                _ => None,
+            });
+            assert!(!edit.expect("a Cargo.toml edit").contains("htmx"));
+            assert!(autumn_web_line(&tmp).contains("htmx"));
+        }
+
+        #[test]
+        fn keeps_storage_for_a_sibling_attachment_scaffold() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Note", &with_file, &ScaffoldOptions::default());
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_markdown_and_csv_for_hand_written_code() {
+            let tmp = project();
+            run(
+                &tmp,
+                "Post",
+                &["title:String", "body:richtext"],
+                &ScaffoldOptions::default(),
+            );
+            fs::write(
+                tmp.path().join("src/hand.rs"),
+                "use autumn_web::extract::Csv;\n\
+                 pub fn a(_c: Csv<Vec<u8>>) { let _ = autumn_web::markdown::render(\"x\"); }\n",
+            )
+            .unwrap();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            let kept = autumn_web_line(&tmp);
+            assert!(kept.contains("markdown") && kept.contains("csv"), "{kept}");
+        }
+
+        #[test]
+        fn keeps_multipart_when_only_the_import_is_dropped() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &importing());
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_code_outside_the_routes_dir() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::create_dir_all(tmp.path().join("src/channels")).unwrap();
+            fs::write(
+                tmp.path().join("src/channels/chat.rs"),
+                "pub const J: &str = autumn_web::htmx::HTMX_JS_PATH;\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn dropping_live_releases_ws() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            assert!(autumn_web_line(&tmp).contains("ws"));
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                !autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn a_hand_made_model_is_not_a_scaffold_to_regenerate() {
+            let tmp = project();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                CARGO.replace(
+                    "autumn-web = \"0.7.0\"",
+                    "autumn-web = { version = \"0.7.0\", features = [\"htmx\"] }",
+                ),
+            )
+            .unwrap();
+            fs::create_dir_all(tmp.path().join("src/models")).unwrap();
+            fs::write(tmp.path().join("src/models/post.rs"), "// by hand\n").unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_a_feature_an_example_uses() {
+            let tmp = project();
+            fs::create_dir_all(tmp.path().join("examples")).unwrap();
+            fs::write(
+                tmp.path().join("examples/demo.rs"),
+                "use autumn_web::storage::Blob;\nfn main() {}\n",
+            )
+            .unwrap();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_a_sibling_route_that_names_no_marker() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::write(
+                tmp.path().join("src/routes/hand.rs"),
+                "pub fn a() { let _ = autumn_web::htmx::OobSwap::default(); }\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_ws_for_code_that_uses_the_prelude_types() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "use autumn_web::prelude::*;\npub fn a(_c: Channels) {}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_when_default_features_are_off() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                cargo.replace("features = [", "default-features = false, features = ["),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn dropping_an_attachment_from_an_api_scaffold_releases_storage() {
+            let tmp = project();
+            let api = ScaffoldOptions {
+                api: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", &["title:String", "cover:attachment"], &api);
+            assert!(autumn_web_line(&tmp).contains("storage"));
+            run(&tmp, "Post", POST, &api);
+            let line = autumn_web_line(&tmp);
+            assert!(
+                !line.contains("storage") && !line.contains("multipart"),
+                "{line}"
+            );
+        }
+
+        #[test]
+        fn keeps_ws_for_a_resumable_sse_route() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "pub use autumn_web::sse::stream_resumable;\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn another_dependency_with_default_features_off_does_not_pin_htmx() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                format!("{cargo}serde = {{ version = \"1\", default-features = false }}\n"),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                !autumn_web_line(&tmp).contains("htmx"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn a_feature_the_old_files_never_used_is_not_released() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                cargo.replace("features = [", "features = [\"multipart\", "),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_a_multiline_autumn_web_entry_without_defaults() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                "[package]\nname = \"x\"\n\n[dependencies]\nautumn-web = {\n    version = \"0.7.0\",\n    \
+                 default-features = false,\n    features = [\"maud\", \"csv\", \"htmx\"],\n}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(cargo.contains("htmx"), "{cargo}");
+        }
+
+        #[test]
+        fn keeps_a_feature_a_pathed_cargo_target_uses() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                format!("{cargo}\n[[bin]]\nname = \"srv\"\npath = \"cmd/server.rs\"\n"),
+            )
+            .unwrap();
+            fs::create_dir_all(tmp.path().join("cmd")).unwrap();
+            fs::write(
+                tmp.path().join("cmd/server.rs"),
+                "use autumn_web::storage::Blob;\nfn main() {}\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(cargo.contains("storage"), "{cargo}");
+        }
+
+        #[test]
+        fn keeps_storage_while_autumn_toml_configures_it() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            fs::write(
+                tmp.path().join("autumn.toml"),
+                "[storage]\nbackend = \"local\"\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_storage_while_dot_env_configures_it() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            fs::write(tmp.path().join(".env"), "AUTUMN_STORAGE__BACKEND=local\n").unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_ws_for_a_channels_module_use() {
+            let tmp = project();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "use autumn_web::channels::Sender;\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("\"ws\""),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_storage_while_a_profile_overlay_configures_it() {
+            let tmp = project();
+            let with_file = ["title:String", "cover:attachment"];
+            run(&tmp, "Post", &with_file, &ScaffoldOptions::default());
+            fs::write(
+                tmp.path().join("autumn-prod.toml"),
+                "[storage]\nbackend = \"s3\"\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("storage"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn keeps_htmx_for_a_workspace_inherited_autumn_web() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                "[package]\nname = \"x\"\n\n[dependencies]\n\
+                 autumn-web = { workspace = true, features = [\"maud\", \"csv\", \"htmx\"] }\n",
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(cargo.contains("htmx"), "{cargo}");
+        }
+
+        #[test]
+        fn keeps_csv_for_the_root_reexport() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            fs::write(
+                tmp.path().join("src/support.rs"),
+                "pub fn a(r: Vec<u8>) { let _ = autumn_web::Csv(r); }\n",
+            )
+            .unwrap();
+            let live = ScaffoldOptions {
+                live: true,
+                ..Default::default()
+            };
+            run(&tmp, "Post", POST, &live);
+            assert!(
+                autumn_web_line(&tmp).contains("csv"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn a_first_run_keeps_a_hand_added_feature() {
+            let tmp = project();
+            fs::write(
+                tmp.path().join("Cargo.toml"),
+                CARGO.replace(
+                    "autumn-web = \"0.7.0\"",
+                    "autumn-web = { version = \"0.7.0\", features = [\"multipart\"] }",
+                ),
+            )
+            .unwrap();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            assert!(
+                autumn_web_line(&tmp).contains("multipart"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
     }
 
     /// The scaffold reuses the model plan, and the model plan already adds the

@@ -10,6 +10,11 @@ behaviour lives in is the fastest way to find the right hook.
 This guide names the three tiers, shows which subsystems live where, and
 points you at the per-tier how-tos.
 
+To see the tiers in one app, each with a real reason, read
+[`examples/escape-hatches`](../../examples/escape-hatches/README.md). It starts
+from `#[model]` and `#[repository]`, and uses a hatch only where they cannot do
+the job.
+
 ---
 
 ## The three tiers at a glance
@@ -199,7 +204,7 @@ fn contract(&self) -> Option<autumn_web::plugin_contract::PluginContract> {
     Some(
         autumn_web::plugin_contract::PluginContract::new(env!("CARGO_PKG_NAME"))
             .plugin_version(env!("CARGO_PKG_VERSION"))
-            .autumn_web("0.8"),
+            .autumn_web("0.9"),
     )
 }
 ```

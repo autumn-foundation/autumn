@@ -1853,8 +1853,10 @@ mod tests {
         // real, complete page — a large report/streamed page without the
         // banner is far better than an empty one — so the response body must
         // come through byte-for-byte intact, not truncated or dropped.
-        let oversized =
-            "<html><body>".to_owned() + &"x".repeat(MAX_SPLICE_BODY_BYTES + 1) + "</body></html>";
+        let oversized = format!(
+            "<html><body>{}</body></html>",
+            "x".repeat(MAX_SPLICE_BODY_BYTES + 1)
+        );
         let expected_len = oversized.len();
         let app = Router::new()
             .route(
@@ -2717,8 +2719,10 @@ mod tests {
         // on the same Consent cookie, so a shared cache must not conflate
         // this undecided visitor's oversized representation with a decided
         // visitor's.
-        let oversized =
-            "<html><body>".to_owned() + &"x".repeat(MAX_SPLICE_BODY_BYTES + 1) + "</body></html>";
+        let oversized = format!(
+            "<html><body>{}</body></html>",
+            "x".repeat(MAX_SPLICE_BODY_BYTES + 1)
+        );
         let app = Router::new()
             .route(
                 "/",

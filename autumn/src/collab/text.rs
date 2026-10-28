@@ -123,12 +123,29 @@ pub const EMPTY_DOCUMENT: &str = r#"{"elems":[]}"#;
 /// Ordering is `(counter, actor)`. The counter is a Lamport clock, so a
 /// character always sorts above the character it was typed after; RGA's
 /// integration rule depends on that.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OpId {
     /// Lamport counter, unique per actor.
     pub counter: u64,
     /// Replica that minted the id.
     pub actor: String,
+}
+
+impl std::hash::Hash for OpId {
+    /// Two `write`s instead of the derive's three. The derived `str` hash
+    /// appends a `0xff` terminator, one more `SipHash` absorb per lookup, and
+    /// `index` is probed on every applied operation. The counter and the
+    /// actor's length go out together as one fixed-width 16-byte write, so
+    /// the byte stream stays prefix-free (`("ab", "c")` and `("a", "bc")`
+    /// cannot alias when an `OpId` sits inside a compound key). `Hash` only
+    /// has to agree with `Eq`, which it does.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut head = [0u8; 16];
+        head[..8].copy_from_slice(&self.counter.to_le_bytes());
+        head[8..].copy_from_slice(&(self.actor.len() as u64).to_le_bytes());
+        state.write(&head);
+        state.write(self.actor.as_bytes());
+    }
 }
 
 impl OpId {
@@ -684,7 +701,8 @@ impl CollabText {
         let wanted = text.chars().count();
         let mut ops = Vec::with_capacity(wanted);
         let mut left = after.cloned();
-        for ch in text.chars() {
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
             // Stop below the reserved ceiling, not at it. `apply` refuses a
             // counter of `MAX_COUNTER` or more, so minting one would return
             // an operation this very replica rejects — and the hub would
@@ -701,14 +719,20 @@ impl CollabText {
             }
             self.clock = next;
             let id = OpId::new(self.clock, actor);
+            // The next character anchors on this one and needs its own copy
+            // of the id, if there is a next character. The last one (for a
+            // keystroke, the only one) moves its id into the operation.
+            let anchor = chars.peek().is_some().then(|| id.clone());
             let op = CollabOp::Insert {
-                id: id.clone(),
+                id,
                 after: left,
                 ch,
             };
-            self.apply(op.clone());
+            // Borrowed: `ops` keeps the operation, so an owned copy for
+            // `apply` was dropped as soon as it integrated.
+            self.apply_ref(&op);
             ops.push(op);
-            left = Some(id);
+            left = anchor;
         }
         ops
     }
@@ -778,7 +802,8 @@ impl CollabText {
             let op = CollabOp::Delete {
                 target: target.clone(),
             };
-            self.apply(op.clone());
+            // Borrowed, as in `mint`: `ops` keeps the operation.
+            self.apply_ref(&op);
             ops.push(op);
         }
         ops
@@ -853,6 +878,36 @@ impl CollabText {
     /// until the character it refers to arrives. A buffered operation is
     /// never lost: every later integration retries the buffer.
     pub fn apply(&mut self, op: CollabOp) -> bool {
+        if let Some(taken) = self.try_integrate(&op) {
+            return taken;
+        }
+        if self.buffered.insert(op.clone()) {
+            self.pending.push(op);
+        }
+        false
+    }
+
+    /// [`apply`](Self::apply) for an operation the caller keeps.
+    ///
+    /// The minting paths return every operation they apply, and the hub
+    /// merges operations it goes on to broadcast or already holds, so handing
+    /// `apply` an owned copy cost one clone (two actor strings for an insert)
+    /// per character, dropped as soon as it integrated. This copies only an
+    /// operation that has to wait in the buffer.
+    pub(crate) fn apply_ref(&mut self, op: &CollabOp) -> bool {
+        if let Some(taken) = self.try_integrate(op) {
+            return taken;
+        }
+        if self.buffered.insert(op.clone()) {
+            self.pending.push(op.clone());
+        }
+        false
+    }
+
+    /// Everything [`apply`](Self::apply) does short of buffering:
+    /// `Some(true)` integrated, `Some(false)` refused, `None` waiting for
+    /// its cause, for the caller to buffer.
+    fn try_integrate(&mut self, op: &CollabOp) -> Option<bool> {
         // Refuse an id at or past the ceiling before the clock can adopt it.
         // Drop it rather than buffer it: it can never become valid, and a
         // buffered copy would just sit in the document forever.
@@ -863,7 +918,7 @@ impl CollabText {
         // counter for this replica keeps minting possible after any
         // operation a peer can send.
         if op.minted_counter() >= MAX_COUNTER {
-            return false;
+            return Some(false);
         }
         // Drop for the same reason as the ceiling above: an id no replica
         // could hold can never become valid, so buffering it would only park
@@ -874,7 +929,7 @@ impl CollabText {
                 "collab: refused an operation carrying an id no replica can hold \
                  (empty or overlong actor, or a counter past the ceiling)"
             );
-            return false;
+            return Some(false);
         }
         // An id names one character typed in one place. The same id carrying
         // different text or a different anchor means a replica minted it
@@ -888,8 +943,12 @@ impl CollabText {
         // so both variants could sit in `pending` at once, each waiting to
         // integrate and each spreading to every other replica on the next
         // snapshot.
-        if let CollabOp::Insert { id, after, ch } = &op
-            && let Some((held_after, held_ch)) = self.held_variant(id)
+        //
+        // The `index` probe is made once here and handed on to `integrate`,
+        // which would otherwise repeat it for the same id.
+        let indexed = op.insert_id().map(|id| self.index.contains(id));
+        if let CollabOp::Insert { id, after, ch } = op
+            && let Some((held_after, held_ch)) = self.held_variant(id, indexed == Some(true))
             && (held_after != after || held_ch != *ch)
         {
             tracing::warn!(
@@ -897,17 +956,14 @@ impl CollabText {
                 "collab: an id was reused for a different character; \
                  keeping the copy this replica already holds"
             );
-            return false;
+            return Some(false);
         }
         self.clock = self.clock.max(op.minted_counter());
-        if self.integrate(&op) {
+        if self.integrate(op, indexed) {
             self.drain_pending();
-            true
+            Some(true)
         } else {
-            if self.buffered.insert(op.clone()) {
-                self.pending.push(op);
-            }
-            false
+            None
         }
     }
 
@@ -955,10 +1011,10 @@ impl CollabText {
     // ── integration ──────────────────────────────────────────────────────
 
     /// Apply one operation if its cause is present. `false` means "not yet".
-    fn integrate(&mut self, op: &CollabOp) -> bool {
+    fn integrate(&mut self, op: &CollabOp, indexed: Option<bool>) -> bool {
         match op {
             CollabOp::Insert { id, after, ch } => {
-                if self.index.contains(id) {
+                if indexed.unwrap_or_else(|| self.index.contains(id)) {
                     // A genuine idempotent replay: `apply` has already turned
                     // back anything reusing this id for a different character,
                     // so reaching here means the same operation twice.
@@ -1004,7 +1060,7 @@ impl CollabText {
             let mut blocked = Vec::new();
             let mut progressed = false;
             for op in std::mem::take(&mut self.pending) {
-                if self.integrate(&op) {
+                if self.integrate(&op, None) {
                     self.buffered.remove(&op);
                     progressed = true;
                 } else {
@@ -1021,8 +1077,8 @@ impl CollabText {
     /// Index of the character `id` names.
     /// The `(after, ch)` this replica already holds for `id`, integrated or
     /// buffered, or `None` when the id is new here.
-    fn held_variant(&self, id: &OpId) -> Option<(&Option<OpId>, char)> {
-        if let Some(pos) = self.position_of(id) {
+    fn held_variant(&self, id: &OpId, indexed: bool) -> Option<(&Option<OpId>, char)> {
+        if indexed && let Some(pos) = self.elems.iter().position(|e| &e.id == id) {
             let held = &self.elems[pos];
             return Some((&held.after, held.ch));
         }
@@ -1490,6 +1546,7 @@ mod db {
         }
     }
 
+    #[cfg(feature = "postgres")]
     impl ToSql<Text, diesel::pg::Pg> for CollabText {
         fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, diesel::pg::Pg>) -> serialize::Result {
             use std::io::Write as _;
@@ -1544,6 +1601,77 @@ mod tests {
             target.apply(op);
         }
         assert_eq!(target.text(), "abc", "buffered ops integrate on arrival");
+    }
+
+    /// `mint` moves the last character's id into its operation instead of
+    /// cloning it for an anchor nobody reads. Every earlier character must
+    /// still anchor its successor, and an insert after an unknown character
+    /// must still wait in the buffer through the borrowed apply.
+    #[test]
+    fn minted_inserts_chain_and_an_unknown_anchor_still_buffers() {
+        let mut doc = CollabText::new();
+        let ops = doc
+            .insert_after("ada", None, "abc")
+            .expect("collab edit refused");
+        let ids: Vec<&OpId> = ops.iter().filter_map(CollabOp::insert_id).collect();
+        let afters: Vec<Option<&OpId>> = ops
+            .iter()
+            .map(|op| match op {
+                CollabOp::Insert { after, .. } => after.as_ref(),
+                CollabOp::Delete { .. } => None,
+            })
+            .collect();
+        assert_eq!(afters, vec![None, Some(ids[0]), Some(ids[1])]);
+        assert_eq!(doc.text(), "abc");
+
+        let ghost = OpId::new(99, "bob");
+        let waiting = doc
+            .insert_after("ada", Some(&ghost), "x")
+            .expect("an unknown anchor buffers");
+        assert_eq!(doc.pending_ops(), waiting.as_slice());
+        assert_eq!(doc.text(), "abc", "nothing lands until the anchor does");
+    }
+
+    /// `apply_ref` is `apply` for a borrowed operation: the same verdict for
+    /// every outcome — waiting, integrated, replayed, refused — and the same
+    /// document after, buffer and clock included.
+    #[test]
+    fn apply_ref_gives_the_same_verdicts_and_document_as_apply() {
+        let mut source = CollabText::new();
+        let mut ops = source.insert("a", 0, "abc").expect("collab edit refused");
+        // Last-to-first: the first two wait for their anchors, the third
+        // lands and drains them.
+        ops.reverse();
+        // An idempotent replay of an integrated operation.
+        ops.push(ops[0].clone());
+        // A delete whose target never arrives: it waits.
+        ops.push(CollabOp::Delete {
+            target: OpId::new(7, "ghost"),
+        });
+        // An id at the ceiling: refused outright.
+        ops.push(CollabOp::Insert {
+            id: OpId::new(MAX_COUNTER, "a"),
+            after: None,
+            ch: 'x',
+        });
+        // An integrated id reused for a different character: refused.
+        let CollabOp::Insert { id, after, .. } = ops[0].clone() else {
+            panic!("the reversed batch starts with an insert");
+        };
+        ops.push(CollabOp::Insert { id, after, ch: 'z' });
+
+        let mut owned = CollabText::new();
+        let mut borrowed = CollabText::new();
+        let by_value: Vec<bool> = ops.iter().map(|op| owned.apply(op.clone())).collect();
+        let by_ref: Vec<bool> = ops.iter().map(|op| borrowed.apply_ref(op)).collect();
+
+        assert_eq!(by_value, [false, false, true, true, false, false, false]);
+        assert_eq!(by_ref, by_value);
+        assert_eq!(owned.text(), "abc");
+        assert_eq!(borrowed.text(), owned.text());
+        assert_eq!(borrowed.pending_ops(), owned.pending_ops());
+        assert_eq!(borrowed.ops(), owned.ops());
+        assert_eq!(borrowed.clock(), owned.clock());
     }
 
     /// Applying the same op twice does not duplicate the character.

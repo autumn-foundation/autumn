@@ -17,7 +17,7 @@ use crate::schema::users;
 use autumn_web::widgets::{CommentThread, CommentView, comment_thread};
 use autumn_web::{contains_letter_or_number, slugify};
 
-use super::layout::{layout, layout_with_seo, time_ago};
+use super::layout::{field_errors, form_error_summary, layout, layout_with_seo, time_ago};
 
 // ── List all communities ───────────────────────────────────────
 
@@ -25,6 +25,7 @@ use super::layout::{layout, layout_with_seo, time_ago};
 ///
 /// Every meta value is fixed text, so the `seo(...)` argument carries all of
 /// them and the handler only adds the canonical URL. See `docs/guide/seo.md`.
+#[public]
 #[get(
     "/r",
     seo(
@@ -117,19 +118,6 @@ pub struct CreateSubredditForm {
     pub description: String,
 }
 
-/// Render one field's validation messages, in the element its control points
-/// at with `aria-describedby`. Same shape as `posts::field_errors`.
-fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
-    let errors = form.errors_for(field);
-    html! {
-        div id=(format!("{field}-error")) {
-            @for message in errors {
-                p class="text-red-600 text-xs mb-1" role="alert" { (message) }
-            }
-        }
-    }
-}
-
 /// The create-community form's markup — rendered by the GET route and
 /// re-rendered verbatim by the POST route when validation, or a duplicate
 /// name, rejects the submission. Mirrors `posts::submit_form_markup`'s
@@ -154,6 +142,7 @@ fn create_form_markup(form: &ChangesetForm<CreateSubredditForm>) -> Markup {
     html! {
         div class="max-w-lg mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Create a Community" }
+            (form_error_summary(form, &["name", "description"]))
             (form.form_tag(&paths::create(), "post", html! {
                 div {
                     label for="name" class="block text-sm font-medium text-gray-700 mb-1" {
@@ -324,6 +313,7 @@ pub async fn create(
 /// front page's live feed. `PageRequest` clamps `?page=` and `?size=` rather
 /// than rejecting them, so a hand-edited or stale URL renders the list instead
 /// of a 400.
+#[public]
 #[get("/r/{slug}", seo(og_type = "website"))]
 // Every argument is a distinct extractor: path, SEO defaults, session, CSRF
 // token, CSRF field name, page request, repository, connection, flash.
@@ -588,6 +578,18 @@ autumn_web::paths![list, create_form, create, show];
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_create_form_leads_with_a_focused_error_summary() {
+        let rejected =
+            ChangesetForm::from_changeset(CreateSubredditForm::default().into_changeset());
+        let rendered = create_form_markup(&rejected).into_string();
+        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
+        let blank =
+            create_form_markup(&ChangesetForm::without_csrf(CreateSubredditForm::default()))
+                .into_string();
+        assert!(!blank.contains("error-summary"), "{blank}");
+    }
 
     #[test]
     fn a_community_name_with_no_letter_or_number_is_rejected() {

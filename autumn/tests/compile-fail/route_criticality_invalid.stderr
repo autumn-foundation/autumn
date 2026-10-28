@@ -1,0 +1,5 @@
+error: invalid `criticality` value "urgent". Use "critical", "default" or "sheddable".
+ --> tests/compile-fail/route_criticality_invalid.rs:3:31
+  |
+3 | #[get("/batch", criticality = "urgent")]
+  |                               ^^^^^^^^

@@ -46,9 +46,126 @@ quarantine, per the rule above.
 
 ## Open entries
 
-None.
+### `Trybuild rest`: runner shutdown signal (observed, infra, not quarantined)
+
+- **Observed**: 2026-10-26, trunk-dev run 40364710727 (head `900dd93c`), job
+  `Trybuild rest`, step "Run the trybuild shard", 17:58Z. Nothing was skipped.
+- **Owner**: Semaphore (CI-health routine) - triage only.
+- **Diagnose-by**: 2026-11-09. Close as "runner infra" if it does not recur.
+- **Rerun-rate baseline**: 1 occurrence, no same-commit rerun. The job was
+  still compiling example crates (last line `Compiling collab-notes`) when
+  it died, so no trybuild case had a verdict. Four newer trunk pushes
+  cancelled the sibling runs in the same minutes, so this was not a test
+  result.
+- **Failure signature**: `##[error]The runner has received a shutdown
+  signal` / `Process completed with exit code 143`.
+- **Mechanism (if known)**: runner loss (infra), unpinned external service.
+  The `Test suite` gate failed only because this shard did.
+- **Linked issue/PR**: none.
+- **Skip mechanism**: none; the test still runs.
+
+### `postgresql_embedded` build script: `version not found for '*'` (observed, not quarantined)
+
+- **Observed**: 2026-10-22, trunk-dev run 39808879528 (head `84cd1e7f`), job
+  `Test (Docker)`, step "Run Docker-dependent tests", 16:35Z. Nothing was
+  skipped or ignored; this entry exists so the signature is on record before
+  it recurs.
+- **Owner**: Semaphore (CI-health routine) — triage only, no fix yet.
+- **Diagnose-by**: 2026-11-06. If still n=1 by then, close as "transient,
+  unreproduced"; if it recurs, root-cause before touching `ci.yml`.
+- **Rerun-rate baseline**: 1 occurrence in the 40 most recent `ci.yml` runs
+  (2026-10-22 13:10Z to 2026-10-23 04:02Z). Not a same-commit rerun rate:
+  the identical commit was not rerun, and trunk-dev `69ea7fe1` (next
+  non-cancelled run) passed the same job. Other failures in the window
+  (Windows `SQLite fleet`, a Dependabot `getrandom` bump failing
+  clippy/MSRV/sqlite build, a `Test (Docker)` failure on run 39812278823
+  whose signature I could not read from the log tail) are NOT shown to share
+  it.
+- **Failure signature**: `failed to run custom build command for
+  `postgresql_embedded v0.19.0``, stderr `Error: version not found for '*'`
+  (`stage_postgresql_archive`), after the build script printed
+  `PostgreSQL version: *`.
+- **Mechanism (if known)**: undiagnosed. It is NOT the 403 rate limit closed
+  below (#2833): `GITHUB_TOKEN` is already set on this step and the error text
+  differs. Hypotheses to test: the GitHub releases listing for
+  `theseus-rs/postgresql-binaries` returned a page with no release matching
+  `x86_64-unknown-linux-gnu`, or a truncated/empty listing; both are an
+  unpinned external service. Pinning `POSTGRESQL_VERSION` (the build script
+  reads it via `rerun-if-env-changed`) would make the build deterministic but
+  was not applied here, since one occurrence is not enough to justify a CI
+  change.
+- **Linked issue/PR**: none.
+- **Skip mechanism**: none; the test still runs.
+
+### `db::fleet::tests::close_if_unused_spares_a_leased_or_used_database`: `block_in_place` panic on Windows (observed, not quarantined)
+
+- **Observed**: 2026-10-26, trunk-dev run 40272176482 (head `8ecc0ca0`), job
+  `SQLite fleet (windows-latest)`, step "Fleet unit tests". Nothing was
+  skipped or ignored. The other 181 fleet tests in that job passed.
+- **Owner**: Semaphore (CI-health routine) - triage only, no fix yet.
+- **Diagnose-by**: 2026-11-09. If still n=1, close as "transient,
+  unreproduced". If it recurs, root-cause before touching the test.
+- **Rerun-rate baseline**: 0/70 on Linux (50 plain + 20 pinned to one CPU
+  with `taskset -c 0`; binary built with `--features "sqlite,test-support"`),
+  2026-10-26. Windows: 1 failure seen, no same-commit rerun possible from
+  the routine, so no Windows rate exists yet.
+- **Failure signature**: `FleetError::Unavailable { name: "slot:00001",
+  detail: "open task failed: task 622 panicked with message \"can call
+  blocking only when running on the multi-threaded runtime\"" }` at
+  `fleet.rs:4389`, inside a `#[tokio::test]` (current-thread runtime).
+- **Mechanism (if known)**: hypothesis, not proven. The only
+  `block_in_place` reachable from the open path is diesel-async 0.9.2
+  `SyncConnectionWrapper`'s `CancelWrapper::drop`
+  (`sync_connection_wrapper/mod.rs:552`). It runs when a wrapped connection
+  future is dropped before it finishes, and panics on a current-thread
+  runtime. That would mean something in `open_now` dropped an unfinished
+  connection future under Windows timing. If so, the test is not at fault:
+  production uses a multi-threaded runtime, where the same early drop blocks
+  a worker thread instead of panicking. Do not make the test tolerant of it.
+  To test: log which future is dropped early (pool build, migration run, or
+  `quiesce_workers`).
+- **Recurrence 2026-10-27 (n=2)**: trunk-dev run 40438942405 (head
+  `49732691`), job `SQLite fleet (windows-latest)`, step "Fleet integration
+  tests": `sqlite_fleet::a_slot_fleet_shares_one_file_per_slot_and_isolates_by_tenant_id`
+  (`tests/sqlite_fleet.rs:366`, `#[tokio::test]`, current-thread) failed with
+  the same panic text at diesel-async 0.9.2
+  `sync_connection_wrapper/mod.rs:552`. 5 other tests in the binary passed.
+  A different test and a different step from the first sighting, same job
+  family, same OS. The full backtrace now names the dropped future, so the
+  hypothesis above is narrowed: the drop comes from deadpool's
+  `create_timeout` (`deadpool_runtime::timeout` -> `Timeout<create>`) firing
+  while `custom_setup` was inside `apply_sqlite_pragmas` -> `batch_execute`
+  (`db.rs:2109`, `db.rs:2179`). Pool creation exceeded `connect_timeout_secs`
+  (default 5s) on the Windows runner; the test then ran 15s before failing.
+  Category: resource contention (slow first-open I/O on Windows), with the
+  panic as a current-thread-only symptom: on the production multi-thread
+  runtime the same drop would call `block_in_place` and succeed. Verdict:
+  not made tolerant. Raising `connect_timeout_secs` or switching the tests to
+  a multi-thread flavor would hide the stall, so neither is applied. Still
+  open: why a SQLite open plus pragmas takes more than 5s on that runner, and
+  whether the `CancelWrapper` drop is also what turns the timeout into a
+  panic in the unit-test lane. Next step is a Windows-only timing log around
+  `RuntimeConnection::establish` and `apply_sqlite_pragmas`. Linux cannot
+  reproduce it (0/70 above), so the rate has to come from Windows trunk runs:
+  2 Windows fleet failures in the 7 non-cancelled `ci.yml` trunk runs from 2026-10-23 onward.
+  Diagnose-by stays 2026-11-09.
+
+- **Linked issue/PR**: none.
+- **Skip mechanism**: none; the test still runs.
 
 ## Closed entries
+
+### RUSTSEC-2026-0385 (`ctutils` 0.4.2) fails the advisory gates on every branch
+
+- **Not a flake — a deterministic external-advisory outage.** Published
+  between 2026-10-23 04:03Z (Dependabot run 39898208365, `Supply chain
+  (cargo-deny)`) and 10:10Z (this PR, runs 39937184909 / 39937184851); every
+  branch with the old lock fails `Dependency advisory gate`.
+- **Mechanism**: `ctutils` 0.4.2 reaches the tree via `digest` 0.11.3
+  (`postgres-protocol`, `lopdf`, `tungstenite`). Fixed in >= 0.4.4.
+- **Fix**: `cargo update -p ctutils --precise 0.4.4` in `Cargo.lock` and
+  `fuzz/Cargo.lock`; `cargo check -p autumn-web --locked` passes.
+- **Closed**: 2026-10-23, this PR (🚦 Semaphore).
 
 ### `distributed_lock::cancelled_release_does_not_leak_lock`
 
@@ -159,6 +276,8 @@ None.
   the new escape entry immediately below for a coordination defect this
   fix's merge timing collided with (independent, not a defect in the fix
   itself).
+  Update 2026-10-15 (#2454): the `Test (Docker)` job now runs the
+  `reddit-clone` ignored tests, this one included.
 
 ### Escape: four independent fixes for the same MinIO/Docker-Hub outage collided at merge, needing two reconciliation commits — ~8.3h of spurious Lint failures (two disjoint intervals) on 5 branches
 

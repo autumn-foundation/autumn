@@ -11,7 +11,7 @@ endpoints, profile-aware configuration, and a project CLI behind a Spring
 Boot-style developer experience.
 
 > **Version note:** This guide tracks the published `autumn-web` and
-> `autumn-cli` **0.8.x** release line. If you are working from a source
+> `autumn-cli` **0.9.x** release line. If you are working from a source
 > checkout of the Autumn repository, the workspace may be ahead of the
 > published crates — see [local development](#local-development) below.
 
@@ -27,7 +27,7 @@ around Rust web frameworks and just want CRUD on screen, jump straight to
 
 - **Rust 1.88.0+** (edition 2024) — install via [rustup](https://rustup.rs/)
 - **The PostgreSQL client library (`libpq`)** — required to *build*, not just
-  to run. The `db` feature is on by default, so a fresh project links `libpq`
+  to run. The `postgres` feature is on by default, so a fresh project links `libpq`
   even before you configure a database. Install `libpq-dev` (Debian/Ubuntu),
   `libpq` (Homebrew), or `postgresql-devel` (Fedora/RHEL).
 - **A reachable PostgreSQL server** — needed from
@@ -85,7 +85,7 @@ directory.
 To build it from crates.io instead:
 
 ```bash
-cargo install autumn-cli --version 0.8.0
+cargo install autumn-cli --version 0.9.0
 ```
 
 ### Local development
@@ -103,8 +103,8 @@ work, only for a release. So `autumn new` pins whatever `autumn-web` version
 your source-built CLI was compiled with, and that number is normally already
 on crates.io; it is the *code* behind it that has moved on. That means
 `autumn doctor`'s `version_compat` check, which compares version strings, will
-print a reassuring `✅ version_compat — autumn-cli 0.8.0 matches autumn-web
-0.8.0` even when your checkout and the published crate have diverged — it has
+print a reassuring `✅ version_compat — autumn-cli 0.9.0 matches autumn-web
+0.9.0` even when your checkout and the published crate have diverged — it has
 no way to see API drift that the version number doesn't carry.
 
 The real symptom is a `cargo build` failure right after `autumn new`, usually
@@ -220,7 +220,7 @@ On a fresh project, before `autumn setup`, you will see something like:
 🍂 autumn doctor
 
 ✅ rust_toolchain — rustc 1.88.0 ≥ MSRV 1.88.0
-✅ version_compat — autumn-cli 0.8.0 matches autumn-web 0.8.0
+✅ version_compat — autumn-cli 0.9.0 matches autumn-web 0.9.0
 ✅ autumn_toml — autumn.toml and profile configurations are valid
 ✅ database_topology — database not configured
 ✅ port_bindable — port 3000 is available
@@ -302,7 +302,7 @@ routes are live immediately:
 `/health` responds with:
 
 ```json
-{ "status": "ok", "version": "0.8.0" }
+{ "status": "ok", "version": "0.9.0" }
 ```
 
 Press **Ctrl+C** to stop the server. Shutdown is graceful, draining in-flight
@@ -758,7 +758,7 @@ your code referred to Diesel's traits:
 
 ```toml
 [dependencies]
-autumn-web = "0.8"
+autumn-web = "0.9"
 chrono = { version = "0.4", features = ["serde"] }
 diesel = { version = "2", features = ["postgres", "chrono"] }
 diesel-async = { version = "0.9", features = ["postgres"] }
@@ -1225,8 +1225,9 @@ Autumn resolves configuration in five layers, each overriding the last:
 [server]
 host = "127.0.0.1"           # default
 port = 3000                  # default
-shutdown_timeout_secs = 30   # default, seconds to drain in-flight requests
-# max_concurrent_requests = 256 # unset by default; sheds excess with a 503
+shutdown_timeout_secs = 30   # default (prod: 35), seconds to drain in-flight requests
+# max_concurrent_requests = 256 # prod: pool size × 32 (min 256); 0 = off; excess gets a 503
+# strict_config = true       # prod default: an unknown key stops the boot
 
 [server.timeouts]
 # Per-request wall-clock deadline. The prod profile enables 30s automatically.
@@ -1234,15 +1235,27 @@ shutdown_timeout_secs = 30   # default, seconds to drain in-flight requests
 # `#[get("/slow", timeout_ms = 120000)]` or `timeout = "off"`.
 # request_timeout_ms = 30000
 
+[server.http]
+# Connection limits. The prod profile sets these and more.
+# See docs/guide/connection-limits.md.
+# header_read_timeout_ms = 10000
+# keep_alive_timeout_ms = 75000
+# max_connections = 10000
+
 [database]
 primary_url = "postgres://user:pass@localhost:5432/my_app"
 # url = "postgres://…"       # single-primary alias for primary_url
 # replica_url = "postgres://user:pass@localhost:5433/my_app"
+# replica_max_lag_ms = 5000  # reads use the primary above this lag
 pool_size = 10               # default, max connections per role
 # primary_pool_size = 10
 # replica_pool_size = 5
 replica_fallback = "fail_readiness"  # or "primary"
 connect_timeout_secs = 5     # default
+# statement_timeout = "30s"  # prod default; "0s" = off
+# idle_in_transaction_timeout = "60s" # prod default; "0s" = off
+# migration_lock_timeout = "5s"       # default; "0s" = off
+# migration_lock_retries = 5          # default
 # auto_migrate = false       # dev auto-applies; other profiles opt in
 
 [log]

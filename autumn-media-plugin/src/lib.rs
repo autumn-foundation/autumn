@@ -9,13 +9,20 @@
 //! - **Room** — a small (mesh, no SFU) multi-participant call capped at
 //!   [`config::DEFAULT_ROOM_MAX_PARTICIPANTS`] participants.
 //!
-//! # Status: skeleton (slice 0)
+//! Both primitives are off by default. Enable each one on the builder:
 //!
-//! This slice ships the crate skeleton, the [`MediaPlugin`] builder, the
-//! [`MediaConfig`](config::MediaConfig) surface + `[media]` parsing, and the
-//! [`from_arroyo_env`](config::MediaConfig::from_arroyo_env) compatibility shim.
-//! It has **no runtime behavior beyond configuration and registration** —
-//! storage, encode, transport, and rooms land in later slices.
+//! | Builder call | Installs |
+//! |---|---|
+//! | [`with_broadcast`](MediaPlugin::with_broadcast) | [`MediaMtxClient`] and [`MediaUrls`] extensions |
+//! | [`with_rooms`](MediaPlugin::with_rooms) | Room routes, [`RoomService`] and the room reaper |
+//! | Either one | [`MediaStorage`], [`MediaWorkflows`] and the encode jobs |
+//!
+//! The retention sweep also starts if you set
+//! [`recordings_root`](MediaPlugin::recordings_root). If the storage config is
+//! not valid, the plugin installs no storage, workflows, jobs or sweep.
+//!
+//! If you enable neither primitive, the plugin installs no routes, extensions or
+//! jobs. It logs a warning.
 //!
 //! Because Autumn resolves config *after* [`Plugin::build`] runs, the plugin
 //! cannot read `[media]` from inside `build`; the application loads a
@@ -69,8 +76,8 @@ pub use rooms::{
     HeartbeatRequest, HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinRequest, JoinResponse,
     LeaveRequest, ParticipantView, PublishTarget, ReapFuture, ReapStats, RoomError,
     RoomLeaveResponse, RoomService, RoomSnapshot, RoomStore, RoomStoreFuture, SessionToken,
-    SubscribeTarget, room_participant_path, room_route_infos, room_router, spawn_room_reaper_loop,
-    validate_room_segment,
+    SubscribeTarget, renewed_expiry, room_participant_path, room_route_infos, room_router,
+    spawn_room_reaper_loop, validate_room_segment,
 };
 pub use rooms_db::DbRoomStore;
 pub use sink::{
@@ -108,8 +115,9 @@ pub mod prelude {
     };
     pub use crate::{
         HeartbeatResponse, InMemoryRoomStore, JoinRecord, JoinResponse, ParticipantView, ReapStats,
-        RoomError, RoomService, RoomSnapshot, RoomStore, SessionToken, room_participant_path,
-        room_route_infos, room_router, spawn_room_reaper_loop, validate_room_segment,
+        RoomError, RoomService, RoomSnapshot, RoomStore, SessionToken, renewed_expiry,
+        room_participant_path, room_route_infos, room_router, spawn_room_reaper_loop,
+        validate_room_segment,
     };
     pub use crate::{
         IngestStatus, MediaMtxClient, MediaUrls, StreamQualityStats, StreamStatus, ViewerCount,
@@ -139,10 +147,7 @@ use crate::workflows::MediaWorkflowDelegate as MediaWorkflowDelegateHook;
 /// [`MediaConfig`](config::MediaConfig) with [`config`](Self::config), then
 /// install with `app.plugin(...)`.
 ///
-/// When [`with_rooms`](Self::with_rooms) is enabled, [`build`](Plugin::build)
-/// nests the [`rooms::room_router`] under the API prefix and installs a
-/// [`rooms::RoomService`] extension; the broadcast surface installs the storage
-/// / encode wiring.
+/// See the crate docs for what each primitive installs.
 pub struct MediaPlugin {
     /// Resolved `[media]` configuration.
     config: MediaConfig,
@@ -154,7 +159,7 @@ pub struct MediaPlugin {
     room_max_participants: usize,
     /// Job queue name the built-in media encode jobs are registered on.
     queue: String,
-    /// URL prefix for the plugin's API routes (later slices).
+    /// URL prefix for the plugin's API routes.
     api_prefix: String,
     /// App-supplied artifact completion callback (parallels the
     /// `OutboundWebhookHandler` store).
@@ -250,6 +255,10 @@ impl MediaPlugin {
     }
 
     /// Enable the broadcast primitive (ingest → fan-out playback → VOD).
+    ///
+    /// Installs [`MediaMtxClient`] and [`MediaUrls`] extensions, built from
+    /// `config.mediamtx`. The plugin installs them even if the storage config
+    /// is not valid.
     #[must_use]
     pub const fn with_broadcast(mut self) -> Self {
         self.enable_broadcast = true;
@@ -257,6 +266,9 @@ impl MediaPlugin {
     }
 
     /// Enable the rooms primitive (small mesh calls).
+    ///
+    /// Mounts the room routes, installs [`RoomService`] and starts the room
+    /// reaper.
     #[must_use]
     pub const fn with_rooms(mut self) -> Self {
         self.enable_rooms = true;
@@ -275,6 +287,14 @@ impl MediaPlugin {
     #[must_use]
     pub const fn room_token_ttl_seconds(mut self, seconds: u32) -> Self {
         self.config.room_token_ttl_seconds = seconds;
+        self
+    }
+
+    /// Override the maximum room session length, in seconds (shortcut for
+    /// `config.room_session_max_seconds`). It must be at least the token TTL.
+    #[must_use]
+    pub const fn room_session_max_seconds(mut self, seconds: u32) -> Self {
+        self.config.room_session_max_seconds = seconds;
         self
     }
 
@@ -377,14 +397,14 @@ impl Plugin for MediaPlugin {
 
     /// Applies the plugin to the [`AppBuilder`].
     ///
-    /// Declares the plugin-owned `[media]` top-level config section (via
-    /// [`AppBuilder::config_section`]) so a host app with
-    /// `server.strict_config = true` boots without core rejecting `[media]` as
-    /// an unknown key, then mounts the room/broadcast routers, installs the
-    /// service extensions, and spawns the retention/background loops.
+    /// Declares the `[media]` config section (via
+    /// [`AppBuilder::config_section`]). Then `server.strict_config = true` does
+    /// not reject `[media]`. Then installs the parts of each enabled primitive
+    /// (see the crate docs).
     // `build` is a long, linear plugin-assembly routine (config validation,
-    // room wiring + reaper, storage/workflow install, retention loop); it reads
-    // best as one top-to-bottom sequence rather than fragmented across helpers.
+    // room wiring + reaper, broadcast transport, storage/workflow install,
+    // retention loop); it reads best as one top-to-bottom sequence rather than
+    // fragmented across helpers.
     #[allow(clippy::too_many_lines)]
     fn build(self, app: AppBuilder) -> AppBuilder {
         let Self {
@@ -434,18 +454,16 @@ impl Plugin for MediaPlugin {
         // another config that can never serve a request. It fails fast here too,
         // via the same `on_startup` abort but its own specific message.
         // The storage backend keeps its own degrade path below (unchanged), so
-        // this only fails fast on the room cap and room namespace.
+        // this fails fast only on the room cap, the room namespace and the
+        // session limit.
         //
         // Gated on `enable_rooms`: a broadcast-only plugin (`with_broadcast()`
         // without `with_rooms()`) mounts no room router / `RoomService`, so a
         // stray/irrelevant room setting — or a room env override — must never
         // abort boot and take the broadcast path down with it. The rooms path
         // keeps the existing fail-fast (see `room_config_boot_error`).
-        if let Some(message) = room_config_boot_error(
-            enable_rooms,
-            room_max_participants,
-            config.room_namespace.as_deref(),
-        ) {
+        if let Some(message) = room_config_boot_error(enable_rooms, room_max_participants, &config)
+        {
             tracing::error!(
                 room_max_participants,
                 ceiling = DEFAULT_ROOM_MAX_PARTICIPANTS,
@@ -470,6 +488,16 @@ impl Plugin for MediaPlugin {
             retention_days,
             "🍂 Autumn Media configured"
         );
+
+        // Both primitives are off by default. With neither, install nothing.
+        if !enable_broadcast && !enable_rooms {
+            tracing::warn!(
+                recordings_root_ignored = recordings_root.is_some(),
+                "🍂 Autumn Media: no primitive enabled; call `with_broadcast()` or \
+                 `with_rooms()`. The plugin installs nothing, and no retention sweep starts."
+            );
+            return app;
+        }
 
         // Rooms are storage-independent, so mount the room signaling router and
         // install the `RoomService` extension up front — they must stay
@@ -503,6 +531,9 @@ impl Plugin for MediaPlugin {
             let room_namespace = config.room_namespace.clone().unwrap_or_default();
             let room_token_ttl =
                 chrono::Duration::seconds(i64::from(config.room_token_ttl_seconds));
+            let room_max_session =
+                chrono::Duration::seconds(i64::from(config.room_session_max_seconds));
+            let room_rate_limit = config.room_rate_limit_per_minute;
 
             let init_store = shared_memory_store.clone();
             app = app
@@ -518,7 +549,9 @@ impl Plugin for MediaPlugin {
                         room_namespace.clone(),
                         room_token_ttl,
                         room_max_participants,
-                    );
+                    )
+                    .with_session_max(room_max_session)
+                    .with_rate_limit_per_minute(room_rate_limit);
                     state.insert_extension(room_service);
                 })
                 // Spawn from `on_startup` so the reaper shares the running app's
@@ -536,9 +569,21 @@ impl Plugin for MediaPlugin {
                 });
         }
 
+        // The broadcast transport does not need storage, so install it before
+        // the storage check below.
+        if enable_broadcast {
+            let mtx_client = transport::MediaMtxClient::new(&config.mediamtx);
+            let urls = transport::MediaUrls::from_config(&config.mediamtx);
+            app = app.state_initializer(move |state| {
+                state.insert_extension(mtx_client);
+                state.insert_extension(urls);
+            });
+        }
+
         // Resolve the storage backend up front so a misconfiguration surfaces
-        // as one error line here rather than inside a job. On failure the plugin
-        // still serves any mounted room routes, but installs no encode wiring.
+        // as one error line here rather than inside a job. If storage fails, the
+        // plugin keeps the room routes and broadcast transport. It installs no
+        // storage, workflows, encode jobs or retention sweep.
         let storage = match storage::MediaStorage::from_config(&config.storage) {
             Ok(storage) => storage,
             Err(error) => {
@@ -656,13 +701,29 @@ fn room_namespace_error(namespace: Option<&str>) -> Option<String> {
 fn room_config_boot_error(
     enable_rooms: bool,
     room_max_participants: usize,
-    room_namespace: Option<&str>,
+    config: &MediaConfig,
 ) -> Option<String> {
     if !enable_rooms {
         return None;
     }
     room_max_participants_error(room_max_participants)
-        .or_else(|| room_namespace_error(room_namespace))
+        .or_else(|| room_namespace_error(config.room_namespace.as_deref()))
+        .or_else(|| room_session_max_error(config))
+}
+
+/// Reject a session limit shorter than the token TTL.
+///
+/// A join mints a token that lives `room_token_ttl_seconds`. A shorter session
+/// limit ends the session before that token expires.
+fn room_session_max_error(config: &MediaConfig) -> Option<String> {
+    let session_max = config.room_session_max_seconds;
+    let token_ttl = config.room_token_ttl_seconds;
+    (session_max < token_ttl).then(|| {
+        format!(
+            "media.room_session_max_seconds ({session_max}) must be at least \
+             media.room_token_ttl_seconds ({token_ttl})"
+        )
+    })
 }
 
 /// Build a shared, database-backed [`rooms_db::DbRoomStore`] from the running
@@ -946,7 +1007,14 @@ mod room_namespace_tests {
 
 #[cfg(test)]
 mod room_config_gate_tests {
-    use super::{MediaPlugin, room_config_boot_error};
+    use super::{MediaConfig, MediaPlugin, room_config_boot_error};
+
+    fn with_namespace(namespace: &str) -> MediaConfig {
+        MediaConfig {
+            room_namespace: Some(namespace.to_owned()),
+            ..MediaConfig::default()
+        }
+    }
 
     #[test]
     fn broadcast_only_ignores_invalid_room_config() {
@@ -954,9 +1022,14 @@ mod room_config_gate_tests {
         // room cap (0) or namespace ("bad/ns") is irrelevant and must NOT abort
         // boot, so no failing startup hook is installed and broadcast stays up.
         assert!(!MediaPlugin::new().with_broadcast().enable_rooms);
-        assert!(room_config_boot_error(false, 0, None).is_none());
-        assert!(room_config_boot_error(false, 50, Some("bad/ns")).is_none());
-        assert!(room_config_boot_error(false, 4, Some("tenant-a")).is_none());
+        assert!(room_config_boot_error(false, 0, &MediaConfig::default()).is_none());
+        assert!(room_config_boot_error(false, 50, &with_namespace("bad/ns")).is_none());
+        assert!(room_config_boot_error(false, 4, &with_namespace("tenant-a")).is_none());
+        let short_session = MediaConfig {
+            room_session_max_seconds: 1,
+            ..MediaConfig::default()
+        };
+        assert!(room_config_boot_error(false, 4, &short_session).is_none());
     }
 
     #[test]
@@ -966,11 +1039,11 @@ mod room_config_gate_tests {
         // preserving the pre-existing fail-fast (naming the offending value).
         assert!(MediaPlugin::new().with_rooms().enable_rooms);
 
-        let bad_cap = room_config_boot_error(true, 0, None)
+        let bad_cap = room_config_boot_error(true, 0, &MediaConfig::default())
             .expect("rooms-enabled must fail fast on room_max_participants = 0");
         assert!(bad_cap.contains('0'), "names the offending cap: {bad_cap}");
 
-        let bad_ns = room_config_boot_error(true, 4, Some("bad/ns"))
+        let bad_ns = room_config_boot_error(true, 4, &with_namespace("bad/ns"))
             .expect("rooms-enabled must fail fast on an invalid room_namespace");
         assert!(
             bad_ns.contains("bad/ns"),
@@ -978,7 +1051,20 @@ mod room_config_gate_tests {
         );
 
         // A valid room config on the rooms path boots cleanly (no abort).
-        assert!(room_config_boot_error(true, 4, Some("tenant-a")).is_none());
+        assert!(room_config_boot_error(true, 4, &with_namespace("tenant-a")).is_none());
+    }
+
+    #[test]
+    fn rooms_enabled_fails_fast_on_a_session_max_less_than_the_token_ttl() {
+        let short_session = MediaConfig {
+            room_token_ttl_seconds: 300,
+            room_session_max_seconds: 60,
+            ..MediaConfig::default()
+        };
+        let message = room_config_boot_error(true, 4, &short_session)
+            .expect("a session shorter than its token must abort boot");
+        assert!(message.contains("60"), "names the session limit: {message}");
+        assert!(message.contains("300"), "names the token TTL: {message}");
     }
 }
 
@@ -1142,5 +1228,236 @@ mod config_section_tests {
             builder.has_config_section("media"),
             "MediaPlugin::build must declare the [media] config section for strict_config"
         );
+    }
+}
+
+// Each primitive installs only its own surface (#1974).
+#[cfg(test)]
+mod primitive_surface_tests {
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, SystemTime};
+
+    use autumn_web::AppState;
+    use autumn_web::test::TestApp;
+
+    use super::MediaPlugin;
+    use crate::config::{MediaConfig, MediaStorageBackend};
+    use crate::{
+        MediaMtxClient, MediaStorage, MediaUrls, MediaWorkflows, RetentionDefer, RoomService,
+        media_job_infos,
+    };
+
+    /// The extensions a built app holds.
+    #[allow(clippy::struct_excessive_bools)] // one flag per extension
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct Installed {
+        storage: bool,
+        workflows: bool,
+        mtx_client: bool,
+        urls: bool,
+        rooms: bool,
+    }
+
+    const NOTHING: Installed = Installed {
+        storage: false,
+        workflows: false,
+        mtx_client: false,
+        urls: false,
+        rooms: false,
+    };
+
+    /// Build `plugin` in a test app and return what `read` sees in its state.
+    fn probe<T: Send + 'static>(
+        plugin: MediaPlugin,
+        read: impl Fn(&AppState) -> T + Send + Sync + 'static,
+    ) -> T {
+        let seen = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let _client = TestApp::new()
+            .plugin(plugin)
+            .state_initializer(move |state| *sink.lock().unwrap() = Some(read(state)))
+            .build();
+        seen.lock().unwrap().take().expect("probe ran")
+    }
+
+    #[tokio::test]
+    async fn rooms_take_the_session_limit_and_rate_limit_from_config() {
+        let config = MediaConfig {
+            room_session_max_seconds: 3600,
+            room_rate_limit_per_minute: 30,
+            ..MediaConfig::default()
+        };
+        let (rate, session) = probe(MediaPlugin::new().config(config).with_rooms(), |state| {
+            let rooms = state.extension::<RoomService>().expect("rooms installed");
+            (rooms.rate_limit_per_minute(), rooms.session_max())
+        });
+        assert_eq!(rate, 30);
+        assert_eq!(session, chrono::Duration::hours(1));
+    }
+
+    /// The extensions `plugin` installs.
+    fn installed(plugin: MediaPlugin) -> Installed {
+        probe(plugin, |state| Installed {
+            storage: state.extension::<MediaStorage>().is_some(),
+            workflows: state.extension::<MediaWorkflows>().is_some(),
+            mtx_client: state.extension::<MediaMtxClient>().is_some(),
+            urls: state.extension::<MediaUrls>().is_some(),
+            rooms: state.extension::<RoomService>().is_some(),
+        })
+    }
+
+    #[tokio::test]
+    async fn no_primitive_installs_nothing() {
+        assert_eq!(installed(MediaPlugin::new()), NOTHING);
+    }
+
+    #[tokio::test]
+    async fn broadcast_installs_transport_and_encode() {
+        let got = installed(MediaPlugin::new().with_broadcast());
+        assert_eq!(
+            got,
+            Installed {
+                storage: true,
+                workflows: true,
+                mtx_client: true,
+                urls: true,
+                rooms: false,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn rooms_install_rooms_and_encode_but_no_broadcast_transport() {
+        let got = installed(MediaPlugin::new().with_rooms());
+        assert_eq!(
+            got,
+            Installed {
+                storage: true,
+                workflows: true,
+                mtx_client: false,
+                urls: false,
+                rooms: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn both_primitives_install_everything() {
+        let got = installed(MediaPlugin::new().with_broadcast().with_rooms());
+        assert_eq!(
+            got,
+            Installed {
+                storage: true,
+                workflows: true,
+                mtx_client: true,
+                urls: true,
+                rooms: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn arroyo_shim_installs_broadcast_transport() {
+        let got = installed(MediaPlugin::from_arroyo_env_pairs(&HashMap::new()));
+        assert!(got.mtx_client && got.urls, "{got:?}");
+        assert!(!got.rooms, "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn broadcast_transport_survives_a_storage_error() {
+        // S3 without a bucket fails `MediaStorage::from_config`.
+        let mut config = MediaConfig::default();
+        config.storage.backend = MediaStorageBackend::S3;
+        let got = installed(MediaPlugin::new().config(config).with_broadcast());
+        assert!(got.mtx_client && got.urls, "{got:?}");
+        assert!(!got.storage && !got.workflows, "{got:?}");
+    }
+
+    #[tokio::test]
+    async fn transport_uses_the_configured_api_base() {
+        let mut config = MediaConfig::default();
+        config.mediamtx.api_base = "http://mediamtx.internal:9997".to_owned();
+        let api_base = probe(
+            MediaPlugin::new().config(config).with_broadcast(),
+            |state| {
+                state
+                    .extension::<MediaMtxClient>()
+                    .map(|client| client.api_base().to_owned())
+            },
+        );
+        assert_eq!(api_base.as_deref(), Some("http://mediamtx.internal:9997"));
+    }
+
+    /// The media job names `plugin` registers.
+    fn media_jobs(plugin: MediaPlugin) -> HashSet<String> {
+        // Jobs register after the probe runs. The registry clone shares state,
+        // so read it after `build`.
+        let state = probe(plugin, AppState::clone);
+        let registered = state.job_registry().snapshot();
+        media_job_infos("media")
+            .into_iter()
+            .map(|info| info.name)
+            .filter(|name| registered.contains_key(name))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn encode_jobs_register_only_with_a_primitive() {
+        let all: HashSet<String> = media_job_infos("media")
+            .into_iter()
+            .map(|info| info.name)
+            .collect();
+        assert!(media_jobs(MediaPlugin::new()).is_empty());
+        assert_eq!(media_jobs(MediaPlugin::new().with_broadcast()), all);
+        assert_eq!(media_jobs(MediaPlugin::new().with_rooms()), all);
+    }
+
+    #[test]
+    fn only_rooms_declare_routes() {
+        let routes = |plugin| {
+            autumn_web::app()
+                .plugin(plugin)
+                .plugin_route_infos()
+                .expect("route infos")
+        };
+        assert!(routes(MediaPlugin::new()).is_empty());
+        assert!(routes(MediaPlugin::new().with_broadcast()).is_empty());
+        assert!(!routes(MediaPlugin::new().with_rooms()).is_empty());
+    }
+
+    /// Build `plugin` over a root with one expired file. Return `true` if the
+    /// retention sweep looks at the file within `wait`.
+    async fn sweep_runs(plugin: MediaPlugin, wait: Duration) -> bool {
+        let root = tempfile::tempdir().expect("tempdir");
+        let old = root.path().join("old.mp4");
+        std::fs::write(&old, b"old").expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .and_then(|file| file.set_modified(SystemTime::now() - Duration::from_secs(3 * 86_400)))
+            .expect("set_modified");
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Keep the file; only report that the sweep saw it.
+        let defer: RetentionDefer = Arc::new(move |path| {
+            let _ = tx.send(path);
+            Box::pin(async { true })
+        });
+        let plugin = plugin
+            .recordings_root(root.path())
+            .retention_days(1)
+            .retention_defer(defer);
+        let _client = TestApp::new().plugin(plugin).build();
+        let seen = tokio::time::timeout(wait, rx.recv()).await;
+        assert!(Path::new(&old).exists(), "the defer hook keeps the file");
+        matches!(seen, Ok(Some(_)))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retention_sweep_starts_only_with_a_primitive() {
+        assert!(sweep_runs(MediaPlugin::new().with_rooms(), Duration::from_secs(5)).await);
+        assert!(!sweep_runs(MediaPlugin::new(), Duration::from_millis(300)).await);
     }
 }

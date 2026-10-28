@@ -1,0 +1,93 @@
+# The shutdown timing must stay in step:
+#   terminationGracePeriodSeconds (50) = preStop sleep (5)
+#     + AUTUMN_SERVER__PRESTOP_GRACE_SECS (5)
+#     + AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS (30) + buffer (10)
+# If you change one value, change the grace period too.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{k8s_name}}
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{k8s_name}}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{k8s_name}}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port: "3000"
+    spec:
+      terminationGracePeriodSeconds: 50
+      # The app does not call the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: app
+          image: {{k8s_name}}
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+          env:
+            - name: AUTUMN_SERVER__HOST
+              value: "0.0.0.0"
+            # The prod profile does not start without trusted hosts. Set your
+            # public host names in your overlay. The pod IP is trusted too, so
+            # Prometheus can scrape the pod by its IP.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: AUTUMN_SECURITY__TRUSTED_HOSTS__HOSTS
+              value: "{{k8s_name}}.example.com,$(POD_IP)"
+            - name: AUTUMN_SERVER__PORT
+              value: "3000"
+            - name: AUTUMN_SERVER__PRESTOP_GRACE_SECS
+              value: "5"
+            - name: AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS
+              value: "30"
+          # Put AUTUMN_DATABASE__PRIMARY_URL and AUTUMN_SECURITY__SIGNING_SECRET
+          # in a Secret, then add it here in your overlay:
+          # envFrom:
+          #   - secretRef:
+          #       name: {{k8s_name}}-secrets
+          startupProbe:
+            httpGet:
+              path: /startup
+              port: http
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 2
+            failureThreshold: 1
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]

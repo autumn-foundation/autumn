@@ -43,6 +43,7 @@ pub mod templates {
     pub const RUST_TOOLCHAIN: &str = include_str!("templates/rust-toolchain.toml.tmpl");
     pub const RUSTFMT: &str = include_str!("templates/rustfmt.toml.tmpl");
     pub const CLIPPY: &str = include_str!("templates/clippy.toml.tmpl");
+    pub const CARGO_CONFIG: &str = include_str!("templates/cargo-config.toml.tmpl");
 }
 
 /// Variables substituted into project and starter template files.
@@ -138,6 +139,27 @@ pub struct GenerateOptions {
     /// and vendored JS/static assets are not scaffolded. Keeps `db`/migrations so
     /// database features still work. Mutually exclusive with the daemon flavors.
     pub with_api: bool,
+}
+
+/// Reject `--with` on the DB-free daemon starter.
+///
+/// Plugins depend on `autumn-web` with default features. Cargo unifies them,
+/// so the database stack returns to a daemon that must not have it.
+///
+/// # Errors
+///
+/// [`NewError::IncompatibleOptions`] when `plugins` is not zero and the
+/// starter is the DB-free daemon.
+pub fn check_with_plugins(opts: GenerateOptions, plugins: usize) -> Result<(), NewError> {
+    if plugins > 0 && opts.with_daemon && !opts.with_bundled_pg {
+        return Err(NewError::IncompatibleOptions(
+            "--daemon scaffolds a database-free app, so --with is not supported. \
+             Plugins enable the database features again. Use --bundled-pg for a \
+             daemon with a managed Postgres, or remove --with"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Generate a new Autumn project under `parent_dir/name` with default options.
@@ -275,6 +297,14 @@ fn generate_inner(
     fs::write(
         project_dir.join("deny.toml"),
         render_deny_toml(&render(templates::DENY_TOML), opts),
+    )?;
+
+    // Linker remedy for the Windows PDB symbol limit (issue #2448). Written
+    // here, not as a framework-owned file: the app author may extend it.
+    fs::create_dir_all(project_dir.join(".cargo"))?;
+    fs::write(
+        project_dir.join(".cargo/config.toml"),
+        templates::CARGO_CONFIG,
     )?;
 
     let main_template = if opts.with_api {
@@ -455,6 +485,61 @@ pub fn framework_owned_files(
         "application source is out of bounds for scaffold reconciliation"
     );
     files
+}
+
+/// Rewrite a rendered workflow for one workspace member.
+///
+/// `dir` is the member path from the git root, with `/` separators. `ci.yml`
+/// runs in `dir`, so `cargo` selects the member. `posture-gate.yml` runs from
+/// the git root, so it gets the member path and `-p <package>`.
+///
+/// Returns `None` for any other file. Returns `None` too if a value is not
+/// plain, or if a template anchor is missing or not unique. The caller then
+/// plans no file. A wrong workflow is worse than none.
+#[must_use]
+pub fn member_workflow(path: &str, rendered: &str, package: &str, dir: &str) -> Option<String> {
+    let plain = |text: &str| {
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+    };
+    if !plain(package) || !plain(dir) {
+        return None;
+    }
+    let swap = |text: &str, from: &str, to: &str| {
+        (text.matches(from).count() == 1).then(|| text.replace(from, to))
+    };
+    match path {
+        ".github/workflows/ci.yml" => {
+            let with_dir = swap(
+                rendered,
+                "\njobs:\n",
+                &format!(
+                    "\n# Set by `autumn upgrade`: this app is a workspace member.\n\
+                     defaults:\n  run:\n    # Quoted, so a name such as `null` stays a string.\n    working-directory: \"{dir}\"\n\njobs:\n"
+                ),
+            )?;
+            swap(
+                &with_dir,
+                "cargo fmt --all -- --check",
+                &format!("cargo fmt -p {package} -- --check"),
+            )
+        }
+        ".github/workflows/posture-gate.yml" => {
+            let with_manifest = swap(
+                rendered,
+                "POSTURE_MANIFEST: security-posture.json\n",
+                &format!("POSTURE_MANIFEST: {dir}/security-posture.json\n"),
+            )?;
+            swap(
+                &with_manifest,
+                "POSTURE_AUDIT_FLAGS: --release\n",
+                &format!("POSTURE_AUDIT_FLAGS: --release -p {package}\n"),
+            )
+        }
+        _ => None,
+    }
 }
 
 /// Anchors around the waiver that only a `--bundled-pg` app's tree can reach.
@@ -832,9 +917,16 @@ fn strip_migrations(main_rs: &str) -> String {
 const DAEMON_NO_DB_FEATURES: &[&str] = &["maud", "htmx", "tailwind", "reporting"];
 
 /// Default `autumn-web` features minus the HTML view stack (`maud`/`htmx`/
-/// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` so
-/// migrations and database features still work.
-const API_FEATURES: &[&str] = &["db", "cache-moka", "http-client", "reporting", "flash"];
+/// `tailwind`) — the JSON-first API (`--api`) feature set. Keeps `db` and its
+/// `postgres` backend so migrations and database features still work.
+const API_FEATURES: &[&str] = &[
+    "db",
+    "postgres",
+    "cache-moka",
+    "http-client",
+    "reporting",
+    "flash",
+];
 
 /// Anchor: first line of the DB-specific prerequisites/steps block in
 /// `README.md.tmpl` (the `- **A reachable Postgres**` bullet). Everything from
@@ -2039,6 +2131,95 @@ mod tests {
         }
     }
 
+    /// Windows PDB files cap public symbols (LNK4319, issue #2448). Every
+    /// starter shape must set a reduced dev profile, for the app and for its
+    /// dependencies.
+    #[test]
+    fn every_generated_shape_scaffolds_reduced_dev_debug_info() {
+        let shapes = [
+            ("shape-default", GenerateOptions::default()),
+            ("shape-bundled", bundled_pg_opts()),
+            ("shape-daemon", daemon_opts()),
+            (
+                "shape-seed",
+                GenerateOptions {
+                    with_seed: true,
+                    ..GenerateOptions::default()
+                },
+            ),
+            (
+                "shape-api-i18n",
+                GenerateOptions {
+                    with_api: true,
+                    with_i18n: true,
+                    ..GenerateOptions::default()
+                },
+            ),
+            (
+                "shape-api",
+                GenerateOptions {
+                    with_api: true,
+                    ..GenerateOptions::default()
+                },
+            ),
+        ];
+        for (name, opts) in shapes {
+            let tmp = TempDir::new().unwrap();
+            generate_with(name, tmp.path(), opts).unwrap();
+            let raw = fs::read_to_string(tmp.path().join(name).join("Cargo.toml")).unwrap();
+            let doc: toml::Table = raw.parse().unwrap();
+            let dev = doc
+                .get("profile")
+                .and_then(|p| p.get("dev"))
+                .unwrap_or_else(|| panic!("{name}: no [profile.dev]: {raw}"));
+            assert_eq!(
+                dev["debug"].as_str(),
+                Some("line-tables-only"),
+                "{name}: {raw}"
+            );
+            assert_eq!(
+                dev["package"]["*"]["debug"].as_str(),
+                Some("line-tables-only"),
+                "{name}: dependencies need their own setting: {raw}"
+            );
+        }
+    }
+
+    /// The profile alone does not clear LNK4319 on Windows (issue #2448).
+    /// Every shape also needs the linker's own remedy for MSVC targets.
+    #[test]
+    fn every_generated_shape_scaffolds_long_symbol_truncate() {
+        let shapes = [
+            ("lst-default", GenerateOptions::default()),
+            ("lst-bundled", bundled_pg_opts()),
+            ("lst-daemon", daemon_opts()),
+            (
+                "lst-api",
+                GenerateOptions {
+                    with_api: true,
+                    ..GenerateOptions::default()
+                },
+            ),
+        ];
+        for (name, opts) in shapes {
+            let tmp = TempDir::new().unwrap();
+            generate_with(name, tmp.path(), opts).unwrap();
+            let path = tmp.path().join(name).join(".cargo/config.toml");
+            let raw = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{name}: no .cargo/config.toml: {e}"));
+            let doc: toml::Table = raw.parse().unwrap();
+            for triple in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+                let flags = doc["target"][triple]["rustflags"].as_array().unwrap();
+                assert!(
+                    flags
+                        .iter()
+                        .any(|f| f.as_str() == Some("-Clink-arg=/DEBUG:LongSymbolTruncate")),
+                    "{name}: {triple} lacks LongSymbolTruncate: {raw}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn daemon_with_seed_is_rejected() {
         let tmp = TempDir::new().unwrap();
@@ -2055,6 +2236,28 @@ mod tests {
         assert!(matches!(err, NewError::IncompatibleOptions(_)));
         // Nothing should be scaffolded on rejection.
         assert!(!tmp.path().join("daemon-seed-app").exists());
+    }
+
+    #[test]
+    fn daemon_with_plugins_is_rejected() {
+        let err = check_with_plugins(daemon_opts(), 1).unwrap_err();
+        assert!(matches!(err, NewError::IncompatibleOptions(_)));
+    }
+
+    #[test]
+    fn daemon_without_plugins_is_accepted() {
+        assert!(check_with_plugins(daemon_opts(), 0).is_ok());
+    }
+
+    #[test]
+    fn plugins_with_a_database_flavor_are_accepted() {
+        let bundled = GenerateOptions {
+            with_bundled_pg: true,
+            with_daemon: true,
+            ..GenerateOptions::default()
+        };
+        assert!(check_with_plugins(bundled, 2).is_ok());
+        assert!(check_with_plugins(GenerateOptions::default(), 2).is_ok());
     }
 
     #[test]
@@ -2087,6 +2290,10 @@ mod tests {
         assert!(
             !cargo.contains("\"db\""),
             "daemon starter must not enable db"
+        );
+        assert!(
+            !cargo.contains("\"postgres\""),
+            "daemon starter must not enable postgres"
         );
         assert!(
             !cargo.contains("diesel_migrations"),
@@ -2834,6 +3041,65 @@ mod tests {
         framework_owned_files(&vars, opts)
     }
 
+    /// A workflow rendered for the member `demo` at `apps/demo`.
+    fn member(path: &str) -> String {
+        let files = owned(GenerateOptions::default());
+        member_workflow(path, &files[path], "demo", "apps/demo").expect("a workflow")
+    }
+
+    #[test]
+    fn a_member_ci_workflow_runs_in_the_member_directory() {
+        let ci = member(".github/workflows/ci.yml");
+        assert!(
+            ci.contains("working-directory: \"apps/demo\"\n\njobs:"),
+            "{ci}"
+        );
+        assert!(ci.contains("cargo fmt -p demo -- --check"), "{ci}");
+        assert!(!ci.contains("cargo fmt --all"), "{ci}");
+    }
+
+    #[test]
+    fn a_member_posture_gate_names_its_manifest_and_package() {
+        let gate = member(".github/workflows/posture-gate.yml");
+        assert!(
+            gate.contains("POSTURE_MANIFEST: apps/demo/security-posture.json"),
+            "{gate}"
+        );
+        assert!(
+            gate.contains("POSTURE_AUDIT_FLAGS: --release -p demo"),
+            "{gate}"
+        );
+    }
+
+    #[test]
+    fn a_member_rewrite_refuses_values_yaml_could_misread() {
+        let files = owned(GenerateOptions::default());
+        let ci = &files[".github/workflows/ci.yml"];
+        assert_eq!(
+            member_workflow(".github/workflows/ci.yml", ci, "demo", "a b: c"),
+            None
+        );
+        assert_eq!(
+            member_workflow(".github/workflows/ci.yml", ci, "de mo", "apps"),
+            None
+        );
+        // An anchor that is not unique is a template bug, not a guess.
+        let doubled = format!("{ci}\njobs:\n");
+        assert_eq!(
+            member_workflow(".github/workflows/ci.yml", &doubled, "demo", "apps"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_member_rewrite_leaves_other_files_alone() {
+        let files = owned(GenerateOptions::default());
+        assert_eq!(
+            member_workflow("Dockerfile", &files["Dockerfile"], "demo", "apps/demo"),
+            None
+        );
+    }
+
     #[test]
     fn framework_owned_set_covers_the_fullstack_scaffold() {
         let files = owned(GenerateOptions::default());
@@ -2873,19 +3139,19 @@ mod tests {
             .get(".github/workflows/posture-gate.yml")
             .expect("scaffolded by default");
 
-        assert!(workflow.contains("autumn routes audit --manifest"));
+        assert!(workflow.contains("autumn routes audit $POSTURE_AUDIT_FLAGS --manifest"));
         assert!(workflow.contains("autumn routes posture diff"));
         assert!(
             workflow.contains("--allow-missing-base"),
             "first run must not break a repo"
         );
-        assert!(workflow.contains("--ack-file \"$RUNNER_TEMP/acks.txt\""));
+        assert!(workflow.contains("--ack-dir \"$RUNNER_TEMP/acks\""));
         // Every scratch path lives outside the PR-controlled checkout, so a
         // committed symlink cannot redirect one write onto another file.
         for scratch in [
             "base-posture.json",
             "committed-posture.json",
-            "acks.txt",
+            "acks/",
             "posture-diff.md",
             "head-posture/posture-manifest.json",
         ] {
@@ -3037,14 +3303,11 @@ mod tests {
         );
     }
 
-    /// The boundary between harvested comment bodies must not be forgeable. A
-    /// reviewer pasting the separator inside a fenced sample would otherwise
-    /// reset the parser's state mid-body and make a following marker live —
-    /// so the harvest neutralizes any occurrence in a body before writing it,
-    /// which keeps the boundary out of reviewer-controlled text without giving
-    /// up the fence isolation the separator exists for.
+    /// The boundary between harvested comment bodies must not be forgeable
+    /// (#2472). Each body goes to its own file, so the file boundary is the
+    /// comment boundary and no text in a body can fake one.
     #[test]
-    fn the_harvest_neutralizes_a_separator_inside_a_comment_body() {
+    fn the_harvest_writes_one_file_per_comment() {
         let files = owned(GenerateOptions::default());
         let workflow = files
             .get(".github/workflows/posture-gate.yml")
@@ -3053,20 +3316,63 @@ mod tests {
         let harvest = workflow
             .split("- name: Harvest acknowledgments")
             .nth(1)
+            .and_then(|rest| rest.split("- name:").next())
             .expect("the harvest step");
         let after_decode = harvest
             .split_once("base64 -d")
             .expect("bodies are decoded")
             .1;
-        let neutralized = after_decode
-            .split("acks.txt")
-            .next()
-            .expect("the decode is redirected into the file");
         assert!(
-            neutralized.contains("autumn:ack-source"),
-            "a decoded body must have the separator neutralized between the \
-             decode and the file: {neutralized}"
+            after_decode
+                .trim_start_matches(|c: char| c.is_whitespace() || c == '\\')
+                .starts_with("> \"$RUNNER_TEMP/acks/$(printf '%06d' \"$n\").md\""),
+            "each decoded body must go to its own file: {harvest}"
         );
+        assert!(
+            !workflow.contains("autumn:ack-source"),
+            "no in-band separator is left to forge: {workflow}"
+        );
+    }
+
+    /// The gate audits the build that ships (#2472). Both scaffolded
+    /// Dockerfiles build `--release`, so the gate audits `--release`. Every
+    /// `routes audit` the workflow runs, or tells a user to run, uses the
+    /// same flags, so the staleness check compares the same build.
+    #[test]
+    fn the_gate_audits_the_build_that_ships() {
+        let files = owned(GenerateOptions::default());
+        let workflow = files
+            .get(".github/workflows/posture-gate.yml")
+            .expect("scaffolded");
+
+        for dockerfile in [
+            include_str!("templates/Dockerfile.tmpl"),
+            include_str!("templates/Dockerfile.api.tmpl"),
+        ] {
+            // `lines()` drops the `\r` of a CRLF checkout on Windows.
+            assert!(
+                dockerfile
+                    .lines()
+                    .any(|line| line == "RUN cargo build --release"),
+                "the image build changed; change POSTURE_AUDIT_FLAGS with it"
+            );
+        }
+        assert!(
+            workflow.contains("\n  POSTURE_AUDIT_FLAGS: --release\n"),
+            "{workflow}"
+        );
+        let commands: Vec<&str> = workflow
+            .match_indices("autumn routes audit ")
+            .map(|(at, _)| &workflow[at..])
+            .collect();
+        assert!(commands.len() >= 3, "{workflow}");
+        for command in commands {
+            assert!(
+                command.starts_with("autumn routes audit $POSTURE_AUDIT_FLAGS "),
+                "every audit must select the shipped build: {}",
+                &command[..command.len().min(80)]
+            );
+        }
     }
 
     /// The job that compiles the pull request holds no write permission and
@@ -3085,7 +3391,7 @@ mod tests {
             .expect("two jobs: the build and the verdict");
 
         assert!(
-            build_job.contains("autumn routes audit --manifest"),
+            build_job.contains("autumn routes audit $POSTURE_AUDIT_FLAGS --manifest"),
             "the build job is the one that compiles: {build_job}"
         );
         assert!(
@@ -3162,8 +3468,9 @@ mod tests {
         );
         // One comment per pull request, not one per concurrent push.
         assert!(workflow.contains("cancel-in-progress: true"));
-        // One comment's unbalanced code fence swallowing another's marker.
-        assert!(workflow.contains("<!-- autumn:ack-source -->"));
+        // One comment's unbalanced code fence swallowing another's marker:
+        // each comment is its own file.
+        assert!(workflow.contains("--ack-dir \"$RUNNER_TEMP/acks\""));
     }
 
     /// It is a workflow of its own, not another job on `ci.yml`: `ci.yml` must

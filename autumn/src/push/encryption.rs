@@ -144,10 +144,10 @@ pub fn encrypt_with(
     let mut record = Vec::with_capacity(plaintext.len() + 1);
     record.extend_from_slice(plaintext);
     record.push(LAST_RECORD_DELIMITER);
-    let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&cek));
+    let cipher = Aes128Gcm::new(<&Key<Aes128Gcm>>::from(cek.as_slice()));
     let ciphertext = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            <&Nonce<_>>::from(nonce.as_slice()),
             Payload {
                 msg: &record,
                 // `aes128gcm` binds the header through the key derivation, not

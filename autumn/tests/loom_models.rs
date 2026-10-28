@@ -1,4 +1,8 @@
-//! Loom model-checks of four concurrency-sensitive production algorithms.
+//! Loom model-checks of concurrency-sensitive production algorithms.
+//!
+//! The `real_code` module at the end drives the shipped types through
+//! `src/sync_shim.rs`; the modules before it re-implement an algorithm with
+//! loom primitives.
 //!
 //! This binary is EMPTY under a normal build (`#![cfg(loom_models)]`), so
 //! `cargo test` compiles it instantly and runs nothing. It only compiles/runs
@@ -561,6 +565,217 @@ mod tracking_store_first_init {
                     "a value-write landed in a non-canonical slot -> lost update (get-then-set race)"
                 );
             }
+        });
+    }
+}
+
+/// Loom over the SHIPPED code, not a copy of it.
+///
+/// Under `--cfg loom_models`, `src/sync_shim.rs` gives `RetryBudget`,
+/// `RetryBudgets`, `TenantBulkhead`, `CircuitBreaker` and `AdaptiveLimiter`
+/// loom's locks and atomics. Thus loom explores every interleaving of the
+/// real compare-exchange loop, the real map updates and the real half-open
+/// accounting. `tests/shuttle_models.rs` runs the same code with more threads
+/// under random and PCT schedules; `verification/*.rs` proves each step in
+/// Verus.
+mod real_code {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use autumn_web::__concurrency_models::{RetryBudget, RetryBudgets, RetryKind};
+    use autumn_web::admission::{AdaptiveLimiter, Aimd, LimitAlgorithm, LimitBounds, Sample};
+    use autumn_web::bulkhead::TenantBulkhead;
+    use autumn_web::circuit_breaker::{CircuitBreaker, CircuitBreakerPolicy, CircuitState};
+    use autumn_web::config::RetryBudgetConfig;
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    use loom::thread;
+
+    /// 10 tokens, a transient retry costs 6: one retry fits, two do not.
+    fn one_retry_config() -> RetryBudgetConfig {
+        RetryBudgetConfig {
+            enabled: true,
+            capacity: 10,
+            transient_cost: 6,
+            throttling_cost: 4,
+            retry_ratio: 0.0,
+        }
+    }
+
+    /// Two threads race for the one retry the bucket holds. The real
+    /// compare-exchange loop grants it to exactly one of them.
+    #[test]
+    fn retry_budget_grants_the_last_retry_once() {
+        loom::model(|| {
+            let budget = Arc::new(RetryBudget::new(&one_retry_config()));
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let budget = Arc::clone(&budget);
+                    thread::spawn(move || budget.try_acquire(RetryKind::Transient))
+                })
+                .collect();
+            let granted = workers
+                .into_iter()
+                .map(|w| w.join().unwrap())
+                .filter(|&ok| ok)
+                .count();
+            assert_eq!(granted, 1, "the last retry was granted {granted} times");
+        });
+    }
+
+    /// A take-and-give-back races a refill. The bucket ends full: neither
+    /// write overwrites the other.
+    #[test]
+    fn retry_budget_release_races_a_refill() {
+        loom::model(|| {
+            let config = RetryBudgetConfig {
+                retry_ratio: 1.0,
+                ..one_retry_config()
+            };
+            let budget = Arc::new(RetryBudget::new(&config));
+            let retrier = {
+                let budget = Arc::clone(&budget);
+                thread::spawn(move || {
+                    assert!(budget.try_acquire(RetryKind::Transient));
+                    budget.release(RetryKind::Transient);
+                })
+            };
+            let refiller = {
+                let budget = Arc::clone(&budget);
+                thread::spawn(move || budget.record_request())
+            };
+            retrier.join().unwrap();
+            refiller.join().unwrap();
+            // Full again: one transient retry, then nothing.
+            assert!(budget.try_acquire(RetryKind::Transient));
+            assert!(!budget.try_acquire(RetryKind::Transient));
+        });
+    }
+
+    /// Two first lookups of one host share one bucket.
+    #[test]
+    fn retry_budgets_share_one_bucket_per_host() {
+        loom::model(|| {
+            let budgets = Arc::new(RetryBudgets::new(&one_retry_config()));
+            let a = {
+                let budgets = Arc::clone(&budgets);
+                thread::spawn(move || budgets.for_host("api.example"))
+            };
+            let b = {
+                let budgets = Arc::clone(&budgets);
+                thread::spawn(move || budgets.for_host("API.EXAMPLE"))
+            };
+            let (a, b) = (a.join().unwrap(), b.join().unwrap());
+            assert!(Arc::ptr_eq(&a, &b), "one host got two buckets");
+        });
+    }
+
+    /// With a cap of one, two threads never hold the tenant's permit at once,
+    /// and the map forgets the tenant when both are done.
+    #[test]
+    fn bulkhead_cap_holds_and_the_map_drains() {
+        loom::model(|| {
+            let bulkhead = TenantBulkhead::new(1);
+            let holding = Arc::new(AtomicUsize::new(0));
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let bulkhead = Arc::clone(&bulkhead);
+                    let holding = Arc::clone(&holding);
+                    thread::spawn(move || {
+                        if let Some(permit) = bulkhead.try_acquire("acme") {
+                            assert_eq!(holding.fetch_add(1, Ordering::SeqCst), 0);
+                            holding.fetch_sub(1, Ordering::SeqCst);
+                            drop(permit);
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(
+                bulkhead.tracked_tenants(),
+                0,
+                "a released tenant kept its entry"
+            );
+        });
+    }
+
+    /// Two callers race into a half-open breaker that allows one trial. At
+    /// most one trial runs at a time, and the breaker never reaches a state
+    /// where it refuses everything for ever.
+    #[test]
+    fn circuit_breaker_half_open_single_trial() {
+        loom::model(|| {
+            let breaker = CircuitBreaker::new(
+                "loom",
+                CircuitBreakerPolicy {
+                    failure_ratio_threshold: 0.5,
+                    minimum_sample_count: 1,
+                    open_duration: Duration::ZERO,
+                    half_open_trial_count: 1,
+                    ..CircuitBreakerPolicy::default()
+                },
+            );
+            let tripped = loom::future::block_on(breaker.run(async { Err::<(), ()>(()) }));
+            assert!(tripped.is_err());
+            let running = Arc::new(AtomicUsize::new(0));
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let breaker = breaker.clone();
+                    let running = Arc::clone(&running);
+                    thread::spawn(move || {
+                        let _ = loom::future::block_on(breaker.run(async {
+                            assert_eq!(
+                                running.fetch_add(1, Ordering::SeqCst),
+                                0,
+                                "two trials at once"
+                            );
+                            running.fetch_sub(1, Ordering::SeqCst);
+                            Ok::<(), ()>(())
+                        }));
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            assert_eq!(breaker.state(), CircuitState::Closed);
+        });
+    }
+
+    /// Two completed requests race to update an AIMD limit. `record_with`
+    /// takes the lock with `try_lock`, so one sample may be dropped, but the
+    /// published limit always matches the algorithm's and stays in bounds.
+    #[test]
+    fn adaptive_limiter_publishes_the_algorithm_limit() {
+        loom::model(|| {
+            let bounds = LimitBounds::new(2, 8, 4).unwrap();
+            let limiter = AdaptiveLimiter::new(LimitAlgorithm::Aimd(Aimd::new(
+                bounds,
+                Duration::from_secs(1),
+            )));
+            let workers: Vec<_> = [true, false]
+                .into_iter()
+                .map(|dropped| {
+                    let limiter = Arc::clone(&limiter);
+                    thread::spawn(move || {
+                        limiter.record(Sample {
+                            rtt: Duration::from_millis(1),
+                            in_flight: 4,
+                            dropped,
+                            at: Duration::ZERO,
+                        })
+                    })
+                })
+                .collect();
+            let updates: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+            let limit = limiter.limit();
+            assert!((2..=8).contains(&limit), "limit {limit} left 2..=8");
+            // The last update to take the lock is the published limit.
+            assert!(
+                updates.iter().flatten().any(|&u| u == limit),
+                "published {limit}, but the updates were {updates:?}"
+            );
         });
     }
 }

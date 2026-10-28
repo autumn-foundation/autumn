@@ -52,7 +52,9 @@ fn posts_per_page() -> i64 {
         .unwrap_or(25)
 }
 
-use super::layout::{layout, layout_with_seo, time_ago, vote_controls};
+use super::layout::{
+    field_errors, form_error_summary, layout, layout_with_seo, time_ago, vote_controls,
+};
 
 // ── Front page — hot posts across all subreddits ───────────────
 
@@ -64,6 +66,7 @@ use super::layout::{layout, layout_with_seo, time_ago, vote_controls};
 /// URL, which needs `[seo] base_url` from `autumn.toml` at run time.
 ///
 /// See `docs/guide/seo.md`.
+#[public]
 #[get(
     "/",
     seo(
@@ -98,7 +101,7 @@ pub async fn front_page(
     // A/B experiment: compact list (control) vs. card layout (treatment).
     // The Experiments extractor resolves the actor from the session automatically
     // (logged-in users → user_id; anonymous → stable per-session key).
-    let compact_layout = exps.assign("feed_layout").unwrap_or_default() == "compact";
+    let compact_layout = exps.assign_async("feed_layout").await.unwrap_or_default() == "compact";
 
     // Hot posts across all subreddits. Instead of a hand-written two-way join,
     // load the page of posts, then `preload` their author + subreddit. This is
@@ -500,6 +503,10 @@ fn submit_form_markup(
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { (heading) }
+            (form_error_summary(
+                form,
+                if fixed_sub.is_some() { &["title", "url", "body"] } else { &["subreddit_id", "title", "url", "body"] },
+            ))
             (form.form_tag(&paths::submit(), "post", html! {
                 @if let Some(sub) = fixed_sub {
                     input type="hidden" name="subreddit_id" value=(sub.id);
@@ -591,21 +598,32 @@ fn submit_form_markup(
     }
 }
 
-/// Render one field's validation messages, in the element its control points
-/// at with `aria-describedby`.
-///
-/// `role="alert"` makes the message announced when it appears after an htmx
-/// swap; the stable `{field}-error` id is what makes it announced on focus for
-/// a full-page 422 too.
-fn field_errors<T>(field: &str, form: &ChangesetForm<T>) -> Markup {
-    let errors = form.errors_for(field);
+/// A tag's name without a leading `#`. Older rows kept the `#` the author typed.
+fn tag_label(tag: &Tag) -> &str {
+    tag.name.trim_start_matches('#').trim_start()
+}
+
+/// Render tag chips. Show `name`, the spelling the author typed.
+/// The `slug` is a URL key only. For a name with no Latin text, it is a hash.
+fn tag_chips<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> Markup {
     html! {
-        div id=(format!("{field}-error")) {
-            @for message in errors {
-                p class="text-red-600 text-xs mb-1" role="alert" { (message) }
+        div class="flex flex-wrap gap-2 mt-3" {
+            @for tag in tags {
+                span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
+                    "#" (tag_label(tag))
+                }
             }
         }
     }
+}
+
+/// Build the manage-tags input value from names.
+/// A re-save then keeps the author's spelling.
+fn tag_input_value<'a>(tags: impl IntoIterator<Item = &'a Tag>) -> String {
+    tags.into_iter()
+        .map(tag_label)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The submit form's shape.
@@ -906,6 +924,7 @@ pub async fn submit(
 
 /// Redirects `/posts/{post_id}` to the canonical `/r/{sub_slug}/posts/{post_slug}`.
 /// Used by live OOB fragments that only have a post id in scope.
+#[public]
 #[get("/posts/{post_id}")]
 pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Redirect> {
     let (post_slug, subreddit_id): (String, i64) = posts::table
@@ -938,6 +957,7 @@ pub async fn show_by_id(Path(post_id): Path<i64>, mut db: Db) -> AutumnResult<Re
 ///
 /// See `docs/guide/seo.md`.
 #[allow(clippy::too_many_lines)] // Template-heavy function
+#[public]
 #[get(
     "/r/{sub_slug}/posts/{post_slug}",
     // `og_type = "article"` is the right Open Graph type for a post. The card
@@ -1137,13 +1157,7 @@ pub async fn show(
                         // reads the batched `post_tags` join loaded above, no
                         // per-tag query.
                         @if !post_tags.is_empty() {
-                            div class="flex flex-wrap gap-2 mt-3" {
-                                @for tag in &post_tags {
-                                    span class="px-2 py-0.5 rounded-full bg-orange-50 text-orange-700 text-xs" {
-                                        "#" (tag.slug)
-                                    }
-                                }
-                            }
+                            (tag_chips(post_tags.iter().map(|tag| &***tag)))
                         }
                         @if is_author {
                             div class="flex gap-3 mt-4 pt-4 border-t border-gray-100 text-sm" {
@@ -1161,7 +1175,7 @@ pub async fn show(
                                 input type="hidden" name="_csrf" value=(csrf.token());
                                 input type="text" name="tags"
                                       aria-label="Post tags"
-                                      value=(post_tags.iter().map(|t| t.slug.clone()).collect::<Vec<_>>().join(", "))
+                                      value=(tag_input_value(post_tags.iter().map(|tag| &***tag)))
                                       placeholder="tags, comma separated"
                                       class="flex-1 border border-gray-300 rounded px-2 py-1 text-xs \
                                              focus:outline-none focus:ring-2 focus:ring-orange-400" {}
@@ -1279,6 +1293,7 @@ fn edit_form_markup(form: &ChangesetForm<EditPostForm>, sub_slug: &str, post_slu
     html! {
         div class="max-w-2xl mx-auto" {
             h1 class="text-2xl font-bold mb-6" { "Edit Post" }
+            (form_error_summary(form, &["title", "body"]))
             (form.form_tag(&paths::update(sub_slug, post_slug), "post", html! {
                 div {
                     (field_errors("title", form))
@@ -1383,7 +1398,7 @@ pub async fn update(
     let mut new_slug =
         unique_slug_excluding(&base_slug, post.subreddit_id, post.id, &mut db).await?;
     let mut attempt = 0u32;
-    loop {
+    let updated = loop {
         let changes = crate::models::UpdatePost {
             title: Patch::Set(title.clone()),
             slug: Patch::Set(new_slug.clone()),
@@ -1403,7 +1418,7 @@ pub async fn update(
             .await;
 
         match attempt_result {
-            Ok(_) => break,
+            Ok(updated) => break updated,
             Err(err) if is_post_slug_conflict(&err) && attempt < MAX_SLUG_CONFLICT_RETRIES => {
                 attempt += 1;
                 new_slug =
@@ -1411,10 +1426,12 @@ pub async fn update(
             }
             Err(err) => return Err(err),
         }
-    }
+    };
 
     flash.success("Post updated.").await;
-    Ok(Redirect::to(&paths::show(&sub_slug, &new_slug)).into_response())
+    // The `posts_resolve_slug` trigger can change the slug (#2573). Link to the
+    // stored one, not the one proposed above.
+    Ok(Redirect::to(&paths::show(&sub_slug, &updated.slug)).into_response())
 }
 
 // ── Manage tags (#1324 many-to-many demo) ───────────────────────
@@ -1463,7 +1480,8 @@ fn parse_tag_names(raw: &str) -> ParsedTags {
     let mut dropped_no_letter_or_number = 0_usize;
     let mut dropped_too_long = 0_usize;
     for piece in raw.split([',', '\n']) {
-        let name = piece.trim();
+        // The chip adds its own `#`, so a typed one is not part of the name.
+        let name = piece.trim().trim_start_matches('#').trim_start();
         if name.is_empty() {
             continue;
         }
@@ -1717,6 +1735,8 @@ fn is_post_slug_conflict(err: &AutumnError) -> bool {
 /// obvious slug in one query, not to enforce uniqueness by itself — that is
 /// [`POSTS_SLUG_UNIQUE_CONSTRAINT`]'s job, with the caller retrying this
 /// function (via [`is_post_slug_conflict`]) when the database disagrees.
+/// The `posts_resolve_slug` trigger (#2573) also suffixes a taken slug. A route
+/// must use the slug that the database stored.
 async fn unique_slug(
     base: &str,
     subreddit_id: i64,
@@ -1780,6 +1800,58 @@ autumn_web::paths![
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tag(name: &str, slug: &str) -> Tag {
+        Tag {
+            id: 1,
+            name: name.to_owned(),
+            slug: slug.to_owned(),
+        }
+    }
+
+    #[test]
+    fn tag_chips_show_the_name_not_the_slug() {
+        let out = tag_chips(&[tag("日本語", "n1a3b86"), tag("Web Dev", "web-dev")]).into_string();
+        assert!(out.contains("#日本語"), "{out}");
+        assert!(out.contains("#Web Dev"), "{out}");
+        assert!(!out.contains("n1a3b86"), "{out}");
+    }
+
+    #[test]
+    fn a_stored_name_with_a_hash_prefix_shows_one_hash() {
+        // Older rows kept the `#` the author typed.
+        let old = [tag("#rust", "rust")];
+        let out = tag_chips(&old).into_string();
+        assert!(out.contains("#rust") && !out.contains("##"), "{out}");
+        assert_eq!(tag_input_value(&old), "rust");
+    }
+
+    #[test]
+    fn a_typed_hash_prefix_is_not_stored_in_the_name() {
+        let parsed = parse_tag_names("#rust, ##Web Dev, #");
+        assert_eq!(parsed.slug_order, ["rust", "web-dev"]);
+        assert_eq!(parsed.name_by_slug["rust"], "rust");
+        assert_eq!(parsed.name_by_slug["web-dev"], "Web Dev");
+        assert_eq!(parsed.dropped_no_letter_or_number, 0);
+    }
+
+    #[test]
+    fn the_tag_input_keeps_the_authors_spelling() {
+        let tags = [tag("Web Dev", "web-dev"), tag("日本語", "n1a3b86")];
+        assert_eq!(tag_input_value(&tags), "Web Dev, 日本語");
+        // Saving the value again must not change a tag.
+        let parsed = parse_tag_names(&tag_input_value(&tags));
+        assert_eq!(parsed.name_by_slug["web-dev"], "Web Dev");
+        assert_eq!(parsed.name_by_slug[&slugify("日本語")], "日本語");
+    }
+
+    #[test]
+    fn a_rejected_submit_form_leads_with_a_focused_error_summary() {
+        let rendered = submit_form_markup(&rejected_submit_form(), &[], None).into_string();
+        assert!(rendered.contains(r#"id="error-summary""#), "{rendered}");
+        let blank = submit_form_markup(&blank_submit_form(), &[], None).into_string();
+        assert!(!blank.contains("error-summary"), "{blank}");
+    }
 
     #[tokio::test]
     async fn post_publication_enqueue_failure_is_returned_to_submit() {

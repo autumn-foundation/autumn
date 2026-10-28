@@ -733,6 +733,7 @@ async fn test_manual_route_registered_through_routes_fails_closed_without_replay
         repository: None,
         idempotency: RouteIdempotency::Direct,
         timeout: autumn_web::RouteTimeout::Inherit,
+        criticality: autumn_web::Criticality::Default,
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
@@ -780,6 +781,7 @@ async fn test_manual_route_with_openapi_method_fails_closed_without_replay_stop(
         repository: None,
         idempotency: RouteIdempotency::Direct,
         timeout: autumn_web::RouteTimeout::Inherit,
+        criticality: autumn_web::Criticality::Default,
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
@@ -820,6 +822,7 @@ async fn test_manual_scoped_route_registered_through_routes_fails_closed_without
         repository: None,
         idempotency: RouteIdempotency::Direct,
         timeout: autumn_web::RouteTimeout::Inherit,
+        criticality: autumn_web::Criticality::Default,
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
@@ -1292,39 +1295,47 @@ impl SecondSetFailsStore {
 }
 
 impl IdempotencyStore for SecondSetFailsStore {
-    fn get(&self, key: &str) -> Option<autumn_web::idempotency::IdempotencyEntry> {
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> autumn_web::idempotency::IdempotencyFuture<
+        'a,
+        Option<autumn_web::idempotency::IdempotencyEntry>,
+    > {
         self.inner.get(key)
     }
 
-    fn set(
-        &self,
-        key: &str,
+    fn set<'a>(
+        &'a self,
+        key: &'a str,
+        owner: &'a str,
         record: autumn_web::idempotency::IdempotencyRecord,
         body_hash: Vec<u8>,
         ttl: Duration,
-    ) {
-        self.inner.set(key, record, body_hash, ttl);
-    }
-
-    fn try_set(
-        &self,
-        key: &str,
-        record: autumn_web::idempotency::IdempotencyRecord,
-        body_hash: Vec<u8>,
-        ttl: Duration,
-    ) -> Result<(), IdempotencyStoreError> {
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
         if self.sets.fetch_add(1, Ordering::SeqCst) == 1 {
-            return Err(IdempotencyStoreError::backend("forced alias write failure"));
+            return Box::pin(async {
+                Err(IdempotencyStoreError::backend("forced alias write failure"))
+            });
         }
-        self.inner.try_set(key, record, body_hash, ttl)
+        self.inner.set(key, owner, record, body_hash, ttl)
     }
 
-    fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
-        self.inner.try_lock(key, lock_ttl)
+    fn try_lock<'a>(
+        &'a self,
+        key: &'a str,
+        owner: &'a str,
+        lock_ttl: Duration,
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
+        self.inner.try_lock(key, owner, lock_ttl)
     }
 
-    fn unlock(&self, key: &str) {
-        self.inner.unlock(key);
+    fn unlock<'a>(
+        &'a self,
+        key: &'a str,
+        owner: &'a str,
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, ()> {
+        self.inner.unlock(key, owner)
     }
 
     fn default_ttl(&self) -> Duration {
@@ -1471,6 +1482,7 @@ async fn test_manual_layered_route_can_check_access_before_replay_stop() {
         repository: None,
         idempotency: RouteIdempotency::ReplayThroughInner,
         timeout: autumn_web::RouteTimeout::Inherit,
+        criticality: autumn_web::Criticality::Default,
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
@@ -1522,6 +1534,7 @@ async fn test_manual_layered_direct_route_fails_closed_instead_of_stale_replay()
         repository: None,
         idempotency: RouteIdempotency::Direct,
         timeout: autumn_web::RouteTimeout::Inherit,
+        criticality: autumn_web::Criticality::Default,
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
@@ -1940,8 +1953,8 @@ fn test_config_default_ttl_is_24h() {
 }
 
 /// Entries past their TTL are not replayed.
-#[test]
-fn test_ttl_eviction() {
+#[tokio::test]
+async fn test_ttl_eviction() {
     use autumn_web::idempotency::{IdempotencyRecord, IdempotencyStore};
 
     let store = MemoryIdempotencyStore::new(Duration::from_millis(1));
@@ -1951,13 +1964,22 @@ fn test_ttl_eviction() {
         body: b"ok".to_vec(),
         metadata: vec![],
     };
-    store.set("evict-key", record, vec![0u8; 8], Duration::from_millis(1));
+    store
+        .set(
+            "evict-key",
+            "",
+            record,
+            vec![0u8; 8],
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
 
     // Sleep long enough for the entry to expire.
     std::thread::sleep(Duration::from_millis(20));
 
     assert!(
-        store.get("evict-key").is_none(),
+        store.get("evict-key").await.unwrap().is_none(),
         "expired entry should not be returned"
     );
 }
@@ -1979,10 +2001,14 @@ async fn test_concurrent_duplicate_returns_409() {
     // Pre-lock the scoped storage key to simulate an in-flight request.
     // The middleware namespaces by method and path, so we replicate the same
     // format here.
-    store.try_lock(
-        &storage_key("POST", "/ping", "inflight-key"),
-        Duration::from_secs(3600),
-    );
+    store
+        .try_lock(
+            &storage_key("POST", "/ping", "inflight-key"),
+            "other-request",
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap();
 
     let req = axum::http::Request::builder()
         .method("POST")
@@ -2149,8 +2175,8 @@ fn test_config_fields() {
     );
     assert_eq!(config.ttl_secs, 86_400, "default TTL is 24 hours");
     assert_eq!(
-        config.in_flight_ttl_secs, 86_400,
-        "default in-flight lock TTL is long enough for supported request durations"
+        config.in_flight_ttl_secs, 60,
+        "default in-flight lock TTL is one minute, separate from the response TTL"
     );
     assert!(
         !config.allow_memory_in_production,
@@ -2177,20 +2203,26 @@ fn test_store_ttl_propagates_to_layer() {
     );
 }
 
-#[test]
-fn test_memory_in_flight_lock_expires_after_lock_ttl() {
+#[tokio::test]
+async fn test_memory_in_flight_lock_expires_after_lock_ttl() {
     use autumn_web::idempotency::IdempotencyStore;
 
     let store = MemoryIdempotencyStore::new(Duration::from_secs(3600));
     assert!(
-        store.try_lock("stale-lock", Duration::from_millis(10)),
+        store
+            .try_lock("stale-lock", "owner", Duration::from_millis(10))
+            .await
+            .unwrap(),
         "first acquisition should succeed"
     );
 
     std::thread::sleep(Duration::from_millis(30));
 
     assert!(
-        store.try_lock("stale-lock", Duration::from_millis(10)),
+        store
+            .try_lock("stale-lock", "owner", Duration::from_millis(10))
+            .await
+            .unwrap(),
         "memory in-flight locks must honor lock_ttl instead of leaking forever"
     );
 }
@@ -2480,31 +2512,43 @@ async fn test_large_response_not_cached_and_streamed_through() {
 struct FailingLookupStore;
 
 impl autumn_web::idempotency::IdempotencyStore for FailingLookupStore {
-    fn get(&self, _key: &str) -> Option<autumn_web::idempotency::IdempotencyEntry> {
-        None
+    fn get<'a>(
+        &'a self,
+        _key: &'a str,
+    ) -> autumn_web::idempotency::IdempotencyFuture<
+        'a,
+        Option<autumn_web::idempotency::IdempotencyEntry>,
+    > {
+        Box::pin(async { Err(IdempotencyStoreError::backend("forced lookup failure")) })
     }
 
-    fn try_get(
-        &self,
-        _key: &str,
-    ) -> Result<Option<autumn_web::idempotency::IdempotencyEntry>, IdempotencyStoreError> {
-        Err(IdempotencyStoreError::backend("forced lookup failure"))
-    }
-
-    fn set(
-        &self,
-        _key: &str,
+    fn set<'a>(
+        &'a self,
+        _key: &'a str,
+        _owner: &'a str,
         _record: autumn_web::idempotency::IdempotencyRecord,
         _body_hash: Vec<u8>,
         _ttl: Duration,
-    ) {
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
     }
 
-    fn try_lock(&self, _key: &str, _lock_ttl: Duration) -> bool {
-        true
+    fn try_lock<'a>(
+        &'a self,
+        _key: &'a str,
+        _owner: &'a str,
+        _lock_ttl: Duration,
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
     }
 
-    fn unlock(&self, _key: &str) {}
+    fn unlock<'a>(
+        &'a self,
+        _key: &'a str,
+        _owner: &'a str,
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[tokio::test]
@@ -2541,35 +2585,43 @@ struct FailingPersistenceStore {
 }
 
 impl autumn_web::idempotency::IdempotencyStore for FailingPersistenceStore {
-    fn get(&self, _key: &str) -> Option<autumn_web::idempotency::IdempotencyEntry> {
-        None
+    fn get<'a>(
+        &'a self,
+        _key: &'a str,
+    ) -> autumn_web::idempotency::IdempotencyFuture<
+        'a,
+        Option<autumn_web::idempotency::IdempotencyEntry>,
+    > {
+        Box::pin(async { Ok(None) })
     }
 
-    fn set(
-        &self,
-        _key: &str,
+    fn set<'a>(
+        &'a self,
+        _key: &'a str,
+        _owner: &'a str,
         _record: autumn_web::idempotency::IdempotencyRecord,
         _body_hash: Vec<u8>,
         _ttl: Duration,
-    ) {
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
+        Box::pin(async { Err(IdempotencyStoreError::backend("forced persistence failure")) })
     }
 
-    fn try_set(
-        &self,
-        _key: &str,
-        _record: autumn_web::idempotency::IdempotencyRecord,
-        _body_hash: Vec<u8>,
-        _ttl: Duration,
-    ) -> Result<(), IdempotencyStoreError> {
-        Err(IdempotencyStoreError::backend("forced persistence failure"))
+    fn try_lock<'a>(
+        &'a self,
+        _key: &'a str,
+        _owner: &'a str,
+        _lock_ttl: Duration,
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
+        Box::pin(async { Ok(true) })
     }
 
-    fn try_lock(&self, _key: &str, _lock_ttl: Duration) -> bool {
-        true
-    }
-
-    fn unlock(&self, _key: &str) {
+    fn unlock<'a>(
+        &'a self,
+        _key: &'a str,
+        _owner: &'a str,
+    ) -> autumn_web::idempotency::IdempotencyFuture<'a, ()> {
         self.unlocks.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -2621,14 +2673,37 @@ fn test_default_store_ttl_trait_impl() {
 
     struct BareStore;
     impl IdempotencyStore for BareStore {
-        fn get(&self, _: &str) -> Option<IdempotencyEntry> {
-            None
+        fn get<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> autumn_web::idempotency::IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+            Box::pin(async { Ok(None) })
         }
-        fn set(&self, _: &str, _: IdempotencyRecord, _: Vec<u8>, _: Duration) {}
-        fn try_lock(&self, _: &str, _: Duration) -> bool {
-            true
+        fn set<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: IdempotencyRecord,
+            _: Vec<u8>,
+            _: Duration,
+        ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
+            Box::pin(async { Ok(true) })
         }
-        fn unlock(&self, _: &str) {}
+        fn try_lock<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: Duration,
+        ) -> autumn_web::idempotency::IdempotencyFuture<'a, bool> {
+            Box::pin(async { Ok(true) })
+        }
+        fn unlock<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> autumn_web::idempotency::IdempotencyFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
         // default_ttl() deliberately not overridden — tests the trait default.
     }
 
@@ -2728,56 +2803,90 @@ async fn test_storage_key_delimits_path_principal_and_client_key() {
     assert_eq!(body2, "plain-path");
 }
 
-/// Raw `Authorization` is a request header, not a trusted principal scope.
-/// Changing or removing it on retry must not turn a completed mutation into a
-/// fresh miss.
+/// Without a cookie-backed session, raw `Authorization` is the only thing
+/// that tells two token clients apart, so it scopes the key. Dropping the
+/// header on a retry is a different caller as far as the cache can tell: it
+/// must run the handler again rather than be served the bearer client's
+/// stored response.
 #[tokio::test]
-async fn test_authorization_header_does_not_split_idempotency_scope() {
+async fn test_authorization_header_splits_idempotency_scope_without_a_session() {
     use tower::ServiceExt;
 
-    VOLATILE_HEADER_HANDLER_CALLS.store(0, Ordering::SeqCst);
+    // A counter of its own: the shared static is reset by other tests running
+    // in parallel.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let handler_calls = Arc::clone(&calls);
     let store = make_store(Duration::from_secs(3600));
     let layer = IdempotencyLayer::new(store);
 
     let app = axum::Router::new()
         .route(
             "/auth-header-action",
-            axum::routing::post(volatile_header_create_handler),
+            axum::routing::post(move || {
+                let handler_calls = Arc::clone(&handler_calls);
+                async move {
+                    handler_calls.fetch_add(1, Ordering::SeqCst);
+                    "created"
+                }
+            }),
         )
         .layer(layer);
 
-    let req_a = axum::http::Request::builder()
-        .method("POST")
-        .uri("/auth-header-action")
-        .header("idempotency-key", "shared-auth-key")
-        .header("authorization", "Bearer token-user-a")
-        .body(axum::body::Body::from("same"))
+    let request = |authorization: Option<&str>| {
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/auth-header-action")
+            .header("idempotency-key", "shared-auth-key");
+        if let Some(authorization) = authorization {
+            builder = builder.header("authorization", authorization);
+        }
+        builder.body(axum::body::Body::from("same")).unwrap()
+    };
+
+    let resp_a = app
+        .clone()
+        .oneshot(request(Some("Bearer token-user-a")))
+        .await
         .unwrap();
-    let resp_a = app.clone().oneshot(req_a).await.unwrap();
     assert_eq!(resp_a.status(), StatusCode::OK);
     assert!(resp_a.headers().get("x-idempotent-replayed").is_none());
 
-    let req_b = axum::http::Request::builder()
-        .method("POST")
-        .uri("/auth-header-action")
-        .header("idempotency-key", "shared-auth-key")
-        .body(axum::body::Body::from("same"))
+    let resp_anonymous = app.clone().oneshot(request(None)).await.unwrap();
+    assert_eq!(resp_anonymous.status(), StatusCode::OK);
+    assert!(
+        resp_anonymous
+            .headers()
+            .get("x-idempotent-replayed")
+            .is_none(),
+        "a request without the bearer credential must not replay the bearer client's response"
+    );
+
+    let resp_b = app
+        .clone()
+        .oneshot(request(Some("Bearer token-user-b")))
+        .await
         .unwrap();
-    let resp_b = app.clone().oneshot(req_b).await.unwrap();
     assert_eq!(resp_b.status(), StatusCode::OK);
+    assert!(
+        resp_b.headers().get("x-idempotent-replayed").is_none(),
+        "a second bearer client must not replay the first client's response"
+    );
+
+    let retry_a = app
+        .clone()
+        .oneshot(request(Some("Bearer token-user-a")))
+        .await
+        .unwrap();
+    assert_eq!(retry_a.status(), StatusCode::OK);
     assert_eq!(
-        resp_b
+        retry_a
             .headers()
             .get("x-idempotent-replayed")
             .and_then(|value| value.to_str().ok()),
         Some("true"),
-        "raw Authorization must not be able to force a fresh miss for the same completed mutation"
+        "the same bearer client's retry must replay"
     );
-    assert_eq!(
-        VOLATILE_HEADER_HANDLER_CALLS.load(Ordering::SeqCst),
-        1,
-        "changing raw Authorization must not rerun the mutating handler"
-    );
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

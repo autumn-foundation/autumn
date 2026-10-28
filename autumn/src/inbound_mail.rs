@@ -297,6 +297,10 @@ mod sns_verify {
             .map_err(|_| StatusCode::UNAUTHORIZED)?;
         let canonical = canonical_string(json, msg_type).ok_or(StatusCode::BAD_REQUEST)?;
 
+        // This client is not the recorded outbound seam (#2351 item 1).
+        #[cfg(feature = "reporting")]
+        crate::capsule::guard_egress("inbound mail", "GET", cert_url)
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let cert_pem = http_client
             .get(cert_url)
             .send()
@@ -2052,10 +2056,7 @@ fn decode_mailgun_body(
     body: &[u8],
     content_type: &str,
 ) -> (HashMap<String, String>, Vec<Attachment>) {
-    if content_type
-        .to_ascii_lowercase()
-        .starts_with("multipart/form-data")
-    {
+    if crate::media_type::is_media_type(content_type, "multipart/form-data") {
         parse_mailgun_form_data(body, content_type)
     } else {
         (url_decode_form(body), Vec::new())
@@ -2190,6 +2191,12 @@ fn build_ses_route(
             match parse_ses(&body) {
                 #[cfg(feature = "inbound-ses")]
                 Ok(SnsParseResult::SubscriptionConfirmation { url }) => {
+                    // This client is not the recorded outbound seam (#2351
+                    // item 1).
+                    #[cfg(feature = "reporting")]
+                    if crate::capsule::guard_egress("inbound mail", "GET", &url).is_err() {
+                        return StatusCode::SERVICE_UNAVAILABLE;
+                    }
                     match http_client
                         .get(&url)
                         .send()

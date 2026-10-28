@@ -433,6 +433,12 @@ pub enum LedgerBreak {
     /// Either the head revision was replaced by a re-hashed forgery, or the mark
     /// itself was rewritten to match one.
     HighWaterMismatch,
+    /// A revision's stored text is not its canonical form (#2326).
+    ///
+    /// The text may still mean the same thing. The hash covers the canonical
+    /// form, so a re-encoded snapshot would pass a hash check. Someone changed
+    /// the stored bytes.
+    SnapshotNotCanonical,
 }
 
 impl LedgerBreak {
@@ -448,6 +454,7 @@ impl LedgerBreak {
             Self::UnusableSeq => "unusable_seq",
             Self::LiveStateMismatch => "live_state_mismatch",
             Self::RecordedAtRegression => "recorded_at_regression",
+            Self::SnapshotNotCanonical => "snapshot_not_canonical",
             Self::HighWaterMissing => "high_water_missing",
             Self::HighWaterBehind => "high_water_behind",
             Self::HighWaterMismatch => "high_water_mismatch",
@@ -733,21 +740,138 @@ pub fn verify_chain_with_high_water(
     live: LedgerLiveState,
     high_water: LedgerHighWaterState<'_>,
 ) -> LedgerVerification {
-    let checked = revisions.len();
-    let broken = first_break(revisions)
-        .or_else(|| high_water_break(revisions, high_water))
-        .or_else(|| live_state_break(revisions, live))
-        .or_else(|| recorded_at_break(revisions));
-    let head_hash = if broken.is_none() {
-        revisions.last().map(|r| r.hash.clone())
-    } else {
+    let mut verifier = LedgerChainVerifier::new(record_id);
+    for revision in revisions {
+        verifier.push(revision);
+    }
+    verifier.finish(live, high_water)
+}
+
+/// The fields of a revision that verification keeps after it moves on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainTip {
+    id: i64,
+    seq: i64,
+    hash: String,
+    recorded_at: DateTime<Utc>,
+}
+
+impl ChainTip {
+    fn of(revision: &LedgerRevision) -> Self {
+        Self {
+            id: revision.id,
+            seq: revision.seq,
+            hash: revision.hash.clone(),
+            recorded_at: revision.recorded_at,
+        }
+    }
+}
+
+/// Verify a chain one revision at a time (#2319).
+///
+/// Gives the same report as [`verify_chain_with_high_water`]. It keeps only
+/// the id, `seq`, hash and transaction time of the last revision, so a long
+/// chain can be read in pages. Push the revisions in `(seq, id)` order. Then
+/// call [`finish`](Self::finish).
+#[derive(Debug, Clone)]
+pub struct LedgerChainVerifier {
+    record_id: i64,
+    checked: usize,
+    expected_seq: i64,
+    head: Option<ChainTip>,
+    chain_break: Option<LedgerBreakReport>,
+    time_break: Option<LedgerBreakReport>,
+}
+
+impl LedgerChainVerifier {
+    /// Start verifying `record_id`'s chain.
+    #[must_use]
+    pub const fn new(record_id: i64) -> Self {
+        Self {
+            record_id,
+            checked: 0,
+            expected_seq: 1,
+            head: None,
+            chain_break: None,
+            time_break: None,
+        }
+    }
+
+    /// Check the next revision of the chain.
+    pub fn push(&mut self, revision: &LedgerRevision) {
+        self.checked += 1;
+        if self.chain_break.is_none() {
+            self.chain_break = self.structural_break(revision);
+        }
+        if self.time_break.is_none() {
+            self.time_break = self
+                .head
+                .as_ref()
+                .and_then(|previous| recorded_at_break(previous, revision));
+        }
+        self.head = Some(ChainTip::of(revision));
+    }
+
+    /// Finish the walk and report the first broken link.
+    ///
+    /// See [`verify_chain_with_high_water`] for the order of the checks.
+    #[must_use]
+    pub fn finish(
+        self,
+        live: LedgerLiveState,
+        high_water: LedgerHighWaterState<'_>,
+    ) -> LedgerVerification {
+        let Self {
+            record_id,
+            checked,
+            head,
+            chain_break,
+            time_break,
+            ..
+        } = self;
+        let broken = chain_break
+            .or_else(|| high_water_break(head.as_ref(), high_water))
+            .or_else(|| live_state_break(head.as_ref(), live))
+            .or(time_break);
+        let head_hash = if broken.is_none() {
+            head.map(|tip| tip.hash)
+        } else {
+            None
+        };
+        LedgerVerification {
+            record_id,
+            revisions_checked: checked,
+            head_hash,
+            broken,
+        }
+    }
+
+    /// The first sequence or link break at `revision`, if any.
+    fn structural_break(&mut self, revision: &LedgerRevision) -> Option<LedgerBreakReport> {
+        if revision.seq != self.expected_seq {
+            return Some(sequence_break(
+                revision,
+                self.expected_seq,
+                self.head.is_none(),
+            ));
+        }
+        if let Some(report) = link_break(revision, self.head.as_ref()) {
+            return Some(report);
+        }
+        let Some(next_seq) = revision.seq.checked_add(1) else {
+            // Saturating here would make two consecutive `i64::MAX` rows look
+            // contiguous, hiding an inserted revision behind an overflow.
+            return Some(LedgerBreakReport {
+                seq: revision.seq,
+                revision_id: Some(revision.id),
+                kind: LedgerBreak::UnusableSeq,
+                detail: "sequence number is at i64::MAX and cannot be followed; \
+                         the chain cannot be continued or checked past this revision"
+                    .to_owned(),
+            });
+        };
+        self.expected_seq = next_seq;
         None
-    };
-    LedgerVerification {
-        record_id,
-        revisions_checked: checked,
-        head_hash,
-        broken,
     }
 }
 
@@ -763,7 +887,7 @@ pub fn verify_chain_with_high_water(
 /// which. That is what keeps the mark from being a second thing to forge
 /// silently.
 fn high_water_break(
-    revisions: &[LedgerRevision],
+    head: Option<&ChainTip>,
     high_water: LedgerHighWaterState<'_>,
 ) -> Option<LedgerBreakReport> {
     let high_water = match high_water {
@@ -772,7 +896,7 @@ fn high_water_break(
         LedgerHighWaterState::Absent => None,
         LedgerHighWaterState::Present(mark) => Some(mark),
     };
-    match (revisions.last(), high_water) {
+    match (head, high_water) {
         // No chain and no mark: a record that was never written, or one that
         // predates the day its model was ledgered. Not an accusation — see
         // `live_state_break` for why that false positive matters.
@@ -805,9 +929,9 @@ fn high_water_break(
 }
 
 /// Compare a non-empty chain's head revision with its mark.
-fn head_versus_mark(head: &LedgerRevision, mark: &LedgerHighWater) -> Option<LedgerBreakReport> {
+fn head_versus_mark(head: &ChainTip, mark: &LedgerHighWater) -> Option<LedgerBreakReport> {
     if mark.seq > head.seq {
-        // Saturating is safe: `first_break` already refused a chain whose head
+        // Saturating is safe: `structural_break` already refused a chain whose head
         // sits at `i64::MAX`, so `head.seq + 1` cannot wrap here.
         let absent = head.seq.saturating_add(1);
         return Some(LedgerBreakReport {
@@ -853,10 +977,7 @@ fn head_versus_mark(head: &LedgerRevision, mark: &LedgerHighWater) -> Option<Led
 ///
 /// Runs only after the chain itself verifies, so a mismatch here always means
 /// the *end* of the history is missing rather than its middle being edited.
-fn live_state_break(
-    revisions: &[LedgerRevision],
-    live: LedgerLiveState,
-) -> Option<LedgerBreakReport> {
+fn live_state_break(head: Option<&ChainTip>, live: LedgerLiveState) -> Option<LedgerBreakReport> {
     // An empty chain is never a break, whatever the live row says.
     //
     // A record may simply never have been written, or may predate the day its model was
@@ -871,7 +992,7 @@ fn live_state_break(
     // outside the deletable rows and survives the erasure, so a chain with a mark and no
     // revisions is reported while one with neither stays silent. `revisions_checked == 0`
     // on the report is still what makes the empty case visible to a caller that cares.
-    let head = revisions.last()?;
+    let head = head?;
 
     match live {
         LedgerLiveState::NotChecked | LedgerLiveState::Matches => None,
@@ -899,7 +1020,7 @@ fn live_state_break(
     }
 }
 
-/// Report the first link along which transaction time moves backwards.
+/// Report a step where transaction time moves backwards between two neighbours.
 ///
 /// Reported **last**, after the structural, high-water and live-state checks,
 /// and that ordering is deliberate. A chain written by a pre-#2323 writer — from
@@ -912,52 +1033,18 @@ fn live_state_break(
 ///
 /// Valid time is deliberately not checked: a back-dated correction is the whole
 /// point of the second axis.
-fn recorded_at_break(revisions: &[LedgerRevision]) -> Option<LedgerBreakReport> {
-    revisions.windows(2).find_map(|pair| {
-        let [previous, revision] = pair else {
-            return None;
-        };
-        (revision.recorded_at < previous.recorded_at).then(|| LedgerBreakReport {
-            seq: revision.seq,
-            revision_id: Some(revision.id),
-            kind: LedgerBreak::RecordedAtRegression,
-            detail: format!(
-                "revision {} was recorded before revision {}, which precedes it in the \
-                 chain; transaction time cannot move backwards along a chain a post-#2323 \
-                 writer produced",
-                revision.seq, previous.seq
-            ),
-        })
+fn recorded_at_break(previous: &ChainTip, revision: &LedgerRevision) -> Option<LedgerBreakReport> {
+    (revision.recorded_at < previous.recorded_at).then(|| LedgerBreakReport {
+        seq: revision.seq,
+        revision_id: Some(revision.id),
+        kind: LedgerBreak::RecordedAtRegression,
+        detail: format!(
+            "revision {} was recorded before revision {}, which precedes it in the \
+             chain; transaction time cannot move backwards along a chain a post-#2323 \
+             writer produced",
+            revision.seq, previous.seq
+        ),
     })
-}
-
-fn first_break(revisions: &[LedgerRevision]) -> Option<LedgerBreakReport> {
-    let mut expected_seq: i64 = 1;
-    let mut prev: Option<&LedgerRevision> = None;
-
-    for revision in revisions {
-        if revision.seq != expected_seq {
-            return Some(sequence_break(revision, expected_seq, prev.is_none()));
-        }
-        if let Some(report) = link_break(revision, prev) {
-            return Some(report);
-        }
-        let Some(next_seq) = revision.seq.checked_add(1) else {
-            // Saturating here would make two consecutive `i64::MAX` rows look
-            // contiguous, hiding an inserted revision behind an overflow.
-            return Some(LedgerBreakReport {
-                seq: revision.seq,
-                revision_id: Some(revision.id),
-                kind: LedgerBreak::UnusableSeq,
-                detail: "sequence number is at i64::MAX and cannot be followed; \
-                         the chain cannot be continued or checked past this revision"
-                    .to_owned(),
-            });
-        };
-        expected_seq = next_seq;
-        prev = Some(revision);
-    }
-    None
 }
 
 /// Classify a sequence number that is not the one the chain expected.
@@ -999,10 +1086,7 @@ fn sequence_break(
 }
 
 /// Check one revision's own hash and its link to `prev`.
-fn link_break(
-    revision: &LedgerRevision,
-    prev: Option<&LedgerRevision>,
-) -> Option<LedgerBreakReport> {
+fn link_break(revision: &LedgerRevision, prev: Option<&ChainTip>) -> Option<LedgerBreakReport> {
     if revision.compute_hash() != revision.hash {
         return Some(LedgerBreakReport {
             seq: revision.seq,
@@ -1335,6 +1419,251 @@ pub fn diff_as_of(
     }
 }
 
+// ── Paginated chain reads (#2319) ────────────────────────────────────
+
+/// Position after a revision, for keyset pagination.
+///
+/// Holds `seq` and `id`: a forged revision can repeat a `seq`, and a cursor on
+/// `seq` alone would skip it at a page edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LedgerCursor {
+    /// Sequence number of the last revision read.
+    pub seq: i64,
+    /// Primary key of the last revision read.
+    pub id: i64,
+}
+
+impl LedgerCursor {
+    /// The cursor at `revision`.
+    #[must_use]
+    pub const fn of(revision: &LedgerRevision) -> Self {
+        Self {
+            seq: revision.seq,
+            id: revision.id,
+        }
+    }
+}
+
+/// One page request for `ledger_revisions_page`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct LedgerPageRequest {
+    /// Read the revisions after this cursor. `None` starts at the first one.
+    pub after: Option<LedgerCursor>,
+    /// Maximum revisions in the page. See
+    /// [`effective_limit`](Self::effective_limit).
+    pub limit: u32,
+}
+
+impl LedgerPageRequest {
+    /// Page size of [`Default::default`].
+    pub const DEFAULT_LIMIT: u32 = 100;
+    /// Largest page size a request can get.
+    pub const MAX_LIMIT: u32 = 1000;
+    /// Page size that `ledger_verify` reads with.
+    pub const VERIFY_LIMIT: u32 = 256;
+
+    /// The first page.
+    #[must_use]
+    pub const fn first(limit: u32) -> Self {
+        Self { after: None, limit }
+    }
+
+    /// The page after `cursor`.
+    #[must_use]
+    pub const fn after(cursor: LedgerCursor, limit: u32) -> Self {
+        Self {
+            after: Some(cursor),
+            limit,
+        }
+    }
+
+    /// The page size this request gets: `limit`, clamped to
+    /// `1..=MAX_LIMIT`.
+    #[must_use]
+    pub fn effective_limit(&self) -> u32 {
+        self.limit.clamp(1, Self::MAX_LIMIT)
+    }
+}
+
+impl Default for LedgerPageRequest {
+    fn default() -> Self {
+        Self::first(Self::DEFAULT_LIMIT)
+    }
+}
+
+/// One page of a record's chain, oldest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct LedgerRevisionPage {
+    /// The revisions in this page, in `(seq, id)` order.
+    pub revisions: Vec<LedgerRevision>,
+    /// Cursor for the next page. `None` when this page is the last.
+    pub next: Option<LedgerCursor>,
+}
+
+impl LedgerRevisionPage {
+    /// Make a page from up to `limit + 1` rows. The extra row shows that a
+    /// next page exists. This function removes it.
+    pub(crate) fn from_rows(mut rows: Vec<LedgerRevision>, limit: u32) -> Self {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let next = if rows.len() > limit {
+            rows.truncate(limit);
+            rows.last().map(LedgerCursor::of)
+        } else {
+            None
+        };
+        Self {
+            revisions: rows,
+            next,
+        }
+    }
+
+    /// The request for the next page, or `None` when this page is the last.
+    #[must_use]
+    pub fn next_request(&self, limit: u32) -> Option<LedgerPageRequest> {
+        self.next
+            .map(|cursor| LedgerPageRequest::after(cursor, limit))
+    }
+}
+
+/// The page query of [`read_revisions_page`].
+///
+/// The first page binds `(i64::MIN, i64::MIN)` and takes `id >= $5`, so a row
+/// at exactly that pair is still read. Later pages take `id > $5`.
+#[cfg(feature = "db")]
+const fn revisions_page_sql(first: bool) -> &'static str {
+    macro_rules! page_sql {
+        ($tenant:literal, $id_cmp:literal) => {
+            concat!(
+                "SELECT id, table_name, tenant_id, record_id, seq, op, actor, \
+                 request_id, snapshot, valid_from, recorded_at, prev_hash, hash \
+                 FROM _autumn_ledger_revisions \
+                 WHERE table_name = $1 AND record_id = $2 AND (",
+                $tenant,
+                " IS NULL OR tenant_id = $3) AND seq >= $4 AND (seq > $4 OR id ",
+                $id_cmp,
+                " $5) ORDER BY seq ASC, id ASC LIMIT $6"
+            )
+        };
+    }
+    #[cfg(not(feature = "sqlite"))]
+    let sql = if first {
+        page_sql!("$3::text", ">=")
+    } else {
+        page_sql!("$3::text", ">")
+    };
+    #[cfg(feature = "sqlite")]
+    let sql = if first {
+        page_sql!("$3", ">=")
+    } else {
+        page_sql!("$3", ">")
+    };
+    sql
+}
+
+/// Read one keyset page of a record's chain (#2319).
+///
+/// The generated `ledger_revisions_page` calls this. The filter
+/// `seq >= $4 AND (seq > $4 OR id > $5)` gives the index on
+/// `(table_name, record_id, seq)` a start bound, so each page reads only its
+/// own rows. The first page binds `i64::MIN` for both and takes `id >= $5`,
+/// so it starts at the lowest `(seq, id)`, a forged one too.
+///
+/// Like `$3` in [`read_chain_state`], `$4` occurs twice. `SQLite` numbers
+/// `$N` by first occurrence, so the first occurrences stay in order.
+///
+/// # Errors
+///
+/// The database error when the read fails, or
+/// [`LedgerError::ChainUnreadable`] when a stored snapshot is not JSON.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn read_revisions_page(
+    conn: &mut crate::db::RuntimeConnection,
+    table_name: &str,
+    tenant_id: Option<&str>,
+    record_id: i64,
+    page: LedgerPageRequest,
+) -> crate::AutumnResult<LedgerRevisionPage> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    use diesel_async::RunQueryDsl;
+
+    #[derive(diesel::QueryableByName)]
+    struct Row {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+        #[diesel(sql_type = Text)]
+        table_name: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        tenant_id: Option<String>,
+        #[diesel(sql_type = BigInt)]
+        record_id: i64,
+        #[diesel(sql_type = BigInt)]
+        seq: i64,
+        #[diesel(sql_type = Text)]
+        op: String,
+        #[diesel(sql_type = Text)]
+        actor: String,
+        #[diesel(sql_type = Nullable<Text>)]
+        request_id: Option<String>,
+        #[diesel(sql_type = Text)]
+        snapshot: String,
+        #[diesel(sql_type = Instant)]
+        valid_from: DateTime<Utc>,
+        #[diesel(sql_type = Instant)]
+        recorded_at: DateTime<Utc>,
+        #[diesel(sql_type = Nullable<Text>)]
+        prev_hash: Option<String>,
+        #[diesel(sql_type = Text)]
+        hash: String,
+    }
+
+    let limit = page.effective_limit();
+    let (after_seq, after_id) = page.after.map_or((i64::MIN, i64::MIN), |c| (c.seq, c.id));
+    // One extra row shows whether a next page exists.
+    let fetch = i64::from(limit) + 1;
+
+    let rows: Vec<Row> = diesel::sql_query(revisions_page_sql(page.after.is_none()))
+        .bind::<Text, _>(table_name)
+        .bind::<BigInt, _>(record_id)
+        .bind::<Nullable<Text>, _>(tenant_id)
+        .bind::<BigInt, _>(after_seq)
+        .bind::<BigInt, _>(after_id)
+        .bind::<BigInt, _>(fetch)
+        .get_results(conn)
+        .await
+        .map_err(crate::AutumnError::from)?;
+
+    let mut revisions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let op = match row.op.as_str() {
+            "insert" => VersionOp::Insert,
+            "delete" => VersionOp::Delete,
+            _ => VersionOp::Update,
+        };
+        // A snapshot that does not parse, or is not its canonical text, is
+        // evidence of tampering (#2326). It is an error, not an empty record.
+        let snapshot = parse_stored_snapshot(table_name, record_id, row.seq, &row.snapshot)?;
+        revisions.push(LedgerRevision {
+            id: row.id,
+            table_name: row.table_name,
+            tenant_id: row.tenant_id,
+            record_id: row.record_id,
+            seq: row.seq,
+            op,
+            actor: row.actor,
+            request_id: row.request_id,
+            snapshot,
+            valid_from: row.valid_from,
+            recorded_at: row.recorded_at,
+            prev_hash: row.prev_hash,
+            hash: row.hash,
+        });
+    }
+    Ok(LedgerRevisionPage::from_rows(revisions, limit))
+}
+
 // ── Repository-seam guardrails ───────────────────────────────────────
 
 /// Marker proving a model tolerates hard deletion.
@@ -1390,13 +1719,102 @@ pub enum LedgerError {
          would destroy the record its ledger reconstructs, and keeping it would leave \
          a foreign key pointing at a deleted parent. Make the parent repository \
          `soft_delete` (a soft parent delete soft-deletes this child and records a \
-         revision), or change the association to `on_delete = nullify`"
+         revision), or remove the `dependent(...)` clause"
     )]
     HardDeleteCascade {
         /// Table of the ledgered child.
         table: String,
         /// Primary key of the child the cascade reached.
         record_id: i64,
+    },
+    /// A framework write path that records no revision reached a ledgered table.
+    ///
+    /// Counter-cache upkeep, `dependent(.., delete_all | nullify)` cascades,
+    /// `#[votable]` and `#[commentable]` writes, `has_many(through)` link
+    /// writes and portability imports run raw SQL. On a ledgered table, that
+    /// SQL would change or erase rows and record no revision. Autumn refuses
+    /// the write (#2319).
+    #[error(
+        "{path} cannot write to ledgered table {table}. The write records no \
+         revision, so the ledger would disagree with the table. Write through the \
+         ledgered repository of {table} (for a dependent, use \
+         `on_delete = destroy`), or stop ledgering {table}"
+    )]
+    OutOfBandWrite {
+        /// The ledgered table the write targeted.
+        table: String,
+        /// The write path, for example `counter cache` or
+        /// `dependent delete_all`.
+        path: &'static str,
+    },
+    /// A ledgered write moved a record to another tenant (#2319).
+    ///
+    /// A chain belongs to one `(tenant, record)`. A move would leave the old
+    /// chain without a live row and start a new chain in the other tenant.
+    #[error(
+        "cannot ledger {table}#{record_id}: the write changes its tenant. A revision \
+         chain belongs to one tenant, so the move would split it. Create a new record \
+         in the other tenant instead"
+    )]
+    TenantChange {
+        /// Table of the ledgered model.
+        table: String,
+        /// Primary key of the record being written.
+        record_id: i64,
+    },
+    /// A ledgered write carried a `NaN` or infinite float (#2326).
+    ///
+    /// JSON cannot hold either value. A snapshot would store `null` and could not
+    /// be read back. The write is refused before the hash.
+    #[error(
+        "cannot ledger {table}#{record_id}: column `{column}` holds NaN or an infinite \
+         float, which a snapshot cannot store. Write a finite value, or stop ledgering \
+         {table}"
+    )]
+    NonFiniteValue {
+        /// Table of the ledgered model.
+        table: String,
+        /// Primary key of the record being written.
+        record_id: i64,
+        /// The offending column.
+        column: String,
+    },
+    /// A stored snapshot is not the canonical text that was hashed (#2326).
+    ///
+    /// The text parses, but it is not byte-identical to its canonical form.
+    /// Someone re-encoded it, reordered its keys, or added a duplicate key.
+    #[error(
+        "ledger revision {seq} of {table}#{record_id} is not in canonical form: the stored \
+         snapshot text was re-encoded, reordered or holds a duplicate key"
+    )]
+    SnapshotNotCanonical {
+        /// Table of the ledgered model.
+        table: String,
+        /// Primary key of the record.
+        record_id: i64,
+        /// Sequence number of the revision.
+        seq: i64,
+    },
+    /// A stored snapshot does not decode into the model's current shape (#2326).
+    ///
+    /// The model schema probably changed after the revision was written. This is
+    /// not proof of an edit: `ledger_verify` shows the difference.
+    #[error(
+        "ledger revision {seq} of {table}#{record_id} does not match the current model \
+         schema: {detail}. The model changed after this revision was written. Add \
+         `#[serde(default)]` to a new field. To convert a renamed or retyped field, \
+         set `ledgered(schema_version = N, upcast = path)`. To check for an edit, \
+         run `ledger_verify`"
+    )]
+    SnapshotSchemaMismatch {
+        /// Table of the ledgered model.
+        table: String,
+        /// Primary key of the record.
+        record_id: i64,
+        /// Sequence number of the revision.
+        seq: i64,
+        /// The decode failure.
+        detail: String,
     },
     /// A record's stored chain is broken, so its past state cannot be trusted.
     #[error("ledger chain for {table}#{record_id} is broken at revision {seq}: {detail}")]
@@ -1430,6 +1848,83 @@ pub trait LedgeredRecord: crate::version_history::VersionedRecord {
     fn ledger_valid_from(&self) -> Option<DateTime<Utc>> {
         None
     }
+
+    /// Tenant that owns this record's chain.
+    ///
+    /// `None` for a model that is not `tenant_scoped`. A `tenant_scoped`
+    /// repository reads it through [`LedgerTenantColumn`], so the writer and the
+    /// reader key the chain on the same non-null column (#2319).
+    fn ledger_tenant_id(&self) -> Option<&str> {
+        None
+    }
+
+    /// Version of the snapshot shape this model writes (#2326).
+    ///
+    /// Raise the version when you rename or retype a snapshot field, or add a
+    /// column. A model at version 2 or more writes the version into each new
+    /// snapshot, inside the hash. A snapshot with no version is version 1.
+    const LEDGER_SCHEMA_VERSION: u32 = 1;
+
+    /// Convert a snapshot written at `from_version` to the current shape (#2326).
+    ///
+    /// The ledger calls it only for a snapshot older than
+    /// [`LEDGER_SCHEMA_VERSION`](Self::LEDGER_SCHEMA_VERSION). The default does
+    /// nothing. To use your own function, declare
+    /// `ledgered(schema_version = N, upcast = path)`. Your function must handle
+    /// every version below `N`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message that says why the snapshot cannot be converted.
+    fn ledger_upcast(_from_version: u32, _snapshot: &mut serde_json::Value) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// A tenant column that can own a ledger chain (#2319).
+///
+/// Only `String` implements this trait. A tenant-scoped read cannot see a NULL
+/// tenant. A cross-tenant ledger read is refused. Thus no read can get a chain
+/// with a NULL tenant, and a ledgered `tenant_scoped` repository on an
+/// `Option<String>` column does not compile.
+#[diagnostic::on_unimplemented(
+    message = "a ledgered `tenant_scoped` repository needs `tenant_id: String`, not `{Self}`",
+    label = "the tenant column of a ledgered model must not be nullable",
+    note = "a revision with a NULL tenant is not visible to a tenant-scoped read, and a \
+            cross-tenant ledger read is refused, so no read can reach its chain. Make the \
+            field `String` and the column `NOT NULL`, or remove `ledgered`"
+)]
+pub trait LedgerTenantColumn {
+    /// The tenant this column holds.
+    fn ledger_tenant_id(&self) -> &str;
+}
+
+impl LedgerTenantColumn for String {
+    fn ledger_tenant_id(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// Refuse a ledgered update that changes the record's tenant (#2319).
+///
+/// # Errors
+///
+/// [`LedgerError::TenantChange`], as a conflict, when `before` and `after`
+/// differ.
+#[doc(hidden)]
+pub fn refuse_tenant_change(
+    table: &str,
+    record_id: i64,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> crate::AutumnResult<()> {
+    if before == after {
+        return Ok(());
+    }
+    Err(crate::AutumnError::conflict(LedgerError::TenantChange {
+        table: table.to_string(),
+        record_id,
+    }))
 }
 
 /// Extract a valid-time instant from the column shapes a model may use.
@@ -1465,6 +1960,391 @@ impl LedgerValidTimeValue for Option<chrono::NaiveDateTime> {
     fn ledger_valid_from(&self) -> Option<DateTime<Utc>> {
         self.as_ref().map(chrono::NaiveDateTime::and_utc)
     }
+}
+
+// ── Snapshot fidelity (#2326) ────────────────────────────────────────
+
+/// Probe wrapper for the generated non-finite float check.
+///
+/// Call it as `(&NonFiniteProbe(&field)).autumn_has_non_finite()`. A float, or
+/// an `Option` or `Vec` of one, resolves to [`NonFiniteViaFloat`]; any other
+/// type falls back to `false`. Same autoref pattern as `MaybeValidate`.
+#[doc(hidden)]
+pub struct NonFiniteProbe<'a, T: ?Sized>(pub &'a T);
+
+/// A value that may hold a `NaN` or infinite float.
+#[doc(hidden)]
+pub trait FloatContent {
+    /// `true` when any float inside is not finite.
+    fn has_non_finite(&self) -> bool;
+}
+
+impl FloatContent for f64 {
+    fn has_non_finite(&self) -> bool {
+        !self.is_finite()
+    }
+}
+
+impl FloatContent for f32 {
+    fn has_non_finite(&self) -> bool {
+        !self.is_finite()
+    }
+}
+
+impl<T: FloatContent> FloatContent for Option<T> {
+    fn has_non_finite(&self) -> bool {
+        self.as_ref().is_some_and(FloatContent::has_non_finite)
+    }
+}
+
+impl<T: FloatContent> FloatContent for Vec<T> {
+    fn has_non_finite(&self) -> bool {
+        self.iter().any(FloatContent::has_non_finite)
+    }
+}
+
+/// Preferred branch: the field holds floats.
+#[doc(hidden)]
+pub trait NonFiniteViaFloat {
+    /// `true` when the field holds a non-finite float.
+    fn autumn_has_non_finite(&self) -> bool;
+}
+
+impl<T: FloatContent> NonFiniteViaFloat for NonFiniteProbe<'_, T> {
+    fn autumn_has_non_finite(&self) -> bool {
+        self.0.has_non_finite()
+    }
+}
+
+/// Fallback branch (one autoref further): every other type.
+#[doc(hidden)]
+pub trait NonFiniteFallback {
+    /// Always `false`.
+    fn autumn_has_non_finite(&self) -> bool;
+}
+
+impl<T: ?Sized> NonFiniteFallback for &NonFiniteProbe<'_, T> {
+    fn autumn_has_non_finite(&self) -> bool {
+        false
+    }
+}
+
+/// Refuse a ledgered write whose record holds a non-finite float (#2326).
+///
+/// `column` is what the model's generated check found, if anything.
+///
+/// # Errors
+///
+/// [`LedgerError::NonFiniteValue`] naming the column.
+#[doc(hidden)]
+pub fn refuse_non_finite(
+    table: &str,
+    record_id: i64,
+    column: Option<&'static str>,
+) -> crate::AutumnResult<()> {
+    column.map_or(Ok(()), |column| {
+        Err(crate::AutumnError::internal_server_error(
+            LedgerError::NonFiniteValue {
+                table: table.to_string(),
+                record_id,
+                column: column.to_string(),
+            },
+        ))
+    })
+}
+
+/// Parse a stored snapshot, refusing text that is not its canonical form (#2326).
+///
+/// The hash covers `canonical_json` of the parsed value. Without this check,
+/// `{ "a": 1 }` or `{"a":1,"a":2}` would verify as the canonical `{"a":2}`.
+///
+/// # Errors
+///
+/// [`LedgerError::ChainUnreadable`] for invalid JSON.
+/// [`LedgerError::SnapshotNotCanonical`] for any other encoding.
+#[doc(hidden)]
+pub fn parse_stored_snapshot(
+    table: &str,
+    record_id: i64,
+    seq: i64,
+    text: &str,
+) -> crate::AutumnResult<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|err| {
+        crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: table.to_string(),
+            record_id,
+            detail: format!("revision {seq} has an unreadable snapshot: {err}"),
+        })
+    })?;
+    if canonical_json(&value) != text {
+        return Err(crate::AutumnError::internal_server_error(
+            LedgerError::SnapshotNotCanonical {
+                table: table.to_string(),
+                record_id,
+                seq,
+            },
+        ));
+    }
+    Ok(value)
+}
+
+/// Replace each quoted value in a decode error with `"…"`.
+///
+/// A decode error can quote the value that failed. In a snapshot, that value
+/// can be a private column or ciphertext.
+#[doc(hidden)]
+#[must_use]
+pub fn redact_quoted(detail: &str) -> String {
+    let mut out = String::with_capacity(detail.len());
+    let mut in_quote = false;
+    let mut escaped = false;
+    for ch in detail.chars() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quote = false;
+                out.push_str("…\"");
+            }
+        } else {
+            out.push(ch);
+            in_quote = ch == '"';
+        }
+    }
+    out
+}
+
+/// The error for a snapshot that does not decode into the current model.
+#[doc(hidden)]
+#[must_use]
+pub fn schema_mismatch(table: &str, record_id: i64, seq: i64, detail: &str) -> crate::AutumnError {
+    crate::AutumnError::internal_server_error(LedgerError::SnapshotSchemaMismatch {
+        table: table.to_string(),
+        record_id,
+        seq,
+        detail: redact_quoted(detail),
+    })
+}
+
+/// Turn a chain read error into a verification report where it is a finding (#2326).
+///
+/// A non-canonical snapshot is evidence of a change, not a read fault. Other
+/// errors pass through. The read stops at this revision, so no other break in the
+/// chain is reported with it.
+///
+/// # Errors
+///
+/// Returns `err` unchanged for any other error.
+#[doc(hidden)]
+pub fn verification_from_read_error(
+    record_id: i64,
+    err: crate::AutumnError,
+) -> crate::AutumnResult<LedgerVerification> {
+    let Some(LedgerError::SnapshotNotCanonical { seq, .. }) = err.downcast_ref::<LedgerError>()
+    else {
+        return Err(err);
+    };
+    Ok(LedgerVerification {
+        record_id,
+        revisions_checked: 0,
+        head_hash: None,
+        broken: Some(LedgerBreakReport {
+            seq: *seq,
+            revision_id: None,
+            kind: LedgerBreak::SnapshotNotCanonical,
+            detail: format!("revision {seq} is stored in a form other than its canonical text"),
+        }),
+    })
+}
+
+/// Snapshot key that holds the schema version a revision was written at (#2326).
+///
+/// The key sits inside the hashed snapshot, so an edit to it breaks the chain.
+/// A model at version 1 writes no marker. A snapshot without one counts as
+/// version 1, so chains written before versions existed keep their hashes.
+/// No column name starts with `$`, so the key cannot clash with a column.
+pub const SNAPSHOT_SCHEMA_KEY: &str = "$schema_version";
+
+/// The function type of an `upcast` hook (#2326).
+#[doc(hidden)]
+pub type SnapshotUpcast = fn(u32, &mut serde_json::Value) -> Result<(), String>;
+
+/// Add the schema version marker to a new snapshot, when the model is past version 1.
+#[doc(hidden)]
+pub fn stamp_schema_version(snapshot: &mut serde_json::Value, current: u32) {
+    if current > 1
+        && let Some(object) = snapshot.as_object_mut()
+    {
+        object.insert(SNAPSHOT_SCHEMA_KEY.to_string(), serde_json::json!(current));
+    }
+}
+
+/// Bring a stored snapshot to the current model shape (#2326).
+///
+/// Returns the converted snapshot and the version it was written at. The
+/// snapshot has no marker. Runs `hook` only for a snapshot older than `current`.
+/// A snapshot from a newer model comes back unchanged. If the model cannot
+/// decode it, the caller reports the error.
+///
+/// # Errors
+///
+/// [`LedgerError::SnapshotSchemaMismatch`] for a damaged marker, a failing
+/// hook, or a hook that panics. None of them is tamper evidence. Use
+/// `ledger_verify` to find an edit.
+#[doc(hidden)]
+pub fn upcast_snapshot(
+    table: &str,
+    record_id: i64,
+    seq: i64,
+    snapshot: &serde_json::Value,
+    current: u32,
+    hook: SnapshotUpcast,
+) -> crate::AutumnResult<(serde_json::Value, u32)> {
+    let mut value = snapshot.clone();
+    let Some(object) = value.as_object_mut() else {
+        return Ok((value, 1));
+    };
+    let stored = match object.remove(SNAPSHOT_SCHEMA_KEY) {
+        None => 1,
+        Some(marker) => marker
+            .as_u64()
+            .and_then(|version| u32::try_from(version).ok())
+            .filter(|version| *version >= 1)
+            .ok_or_else(|| {
+                schema_mismatch(
+                    table,
+                    record_id,
+                    seq,
+                    "the snapshot has a damaged schema version marker",
+                )
+            })?,
+    };
+    if stored < current {
+        // A hook is app code. A panic in it must not stop an audit.
+        let ran =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(stored, &mut value)))
+                .unwrap_or_else(|_| Err("the hook panicked".to_string()));
+        ran.map_err(|message| {
+            schema_mismatch(
+                table,
+                record_id,
+                seq,
+                &format!("the upcast hook failed for schema version {stored}: {message}"),
+            )
+        })?;
+    }
+    Ok((value, stored))
+}
+
+/// [`schema_mismatch`] with the two schema versions in the detail (#2326).
+#[doc(hidden)]
+#[must_use]
+pub fn schema_mismatch_at(
+    table: &str,
+    record_id: i64,
+    seq: i64,
+    stored: u32,
+    current: u32,
+    detail: &str,
+) -> crate::AutumnError {
+    let origin = if stored > current {
+        " This revision was written by a newer model."
+    } else {
+        ""
+    };
+    schema_mismatch(
+        table,
+        record_id,
+        seq,
+        &format!(
+            "{detail} (the revision is at schema version {stored}, the model is at \
+             {current}.{origin})"
+        ),
+    )
+}
+
+/// Whether the stored head and the live row agree (#2326).
+///
+/// With `tolerate_new_columns` set, this compares the columns both have. Set it
+/// only when the head was written under an older schema version than the
+/// model's. A column that only one side has comes from that schema change. The
+/// head cannot say what a new column held, and the next write records it.
+///
+/// With the flag clear, the two must be equal. Then a column that the head lacks
+/// is a difference. This keeps the check strict for a head at the current
+/// version, so an out-of-band edit to such a column is found.
+#[doc(hidden)]
+#[must_use]
+pub fn snapshots_agree(
+    head: &serde_json::Value,
+    live: &serde_json::Value,
+    tolerate_new_columns: bool,
+) -> bool {
+    match (head.as_object(), live.as_object()) {
+        (Some(head), Some(live)) if tolerate_new_columns => head.iter().all(|(column, value)| {
+            live.get(column)
+                .is_none_or(|other| canonical_json(value) == canonical_json(other))
+        }),
+        _ => canonical_json(head) == canonical_json(live),
+    }
+}
+
+/// Log that `ledger_verify` skipped the live-row check for a record (#2326).
+///
+/// The head could not be converted to the current schema. The hash chain is
+/// still verified. The skip is not tamper evidence, but a quiet skip would hide
+/// a broken upcast function.
+#[doc(hidden)]
+pub fn note_live_check_skipped(table: &str, record_id: i64, error: &crate::AutumnError) {
+    tracing::warn!(
+        table,
+        record_id,
+        %error,
+        "ledger_verify skipped the live-row check: the head revision could not be converted"
+    );
+}
+
+/// Refuse to reconstruct a model from a snapshot whose `#[encrypted]` column
+/// cannot be decrypted (#2326).
+///
+/// The model codec leaves an undecryptable envelope in place. This suits
+/// commit-hook replay. In as-of reconstruction, it would return ciphertext as
+/// plaintext.
+///
+/// # Errors
+///
+/// [`LedgerError::ChainUnreadable`] naming the columns and the revision.
+#[doc(hidden)]
+pub fn ensure_snapshot_recoverable(
+    table: &str,
+    record_id: i64,
+    seq: i64,
+    snapshot: &serde_json::Value,
+) -> crate::AutumnResult<()> {
+    if !crate::encryption::registered_encrypted_columns()
+        .iter()
+        .any(|d| d.table == table)
+    {
+        return Ok(());
+    }
+    let mut probe = snapshot.clone();
+    let lost = crate::encryption::decrypt_snapshot_columns(table, &mut probe);
+    if lost.is_empty() {
+        return Ok(());
+    }
+    Err(crate::AutumnError::internal_server_error(
+        LedgerError::ChainUnreadable {
+            table: table.to_string(),
+            record_id,
+            detail: format!(
+                "revision {seq}: encrypted column(s) `{}` cannot be decrypted. The key \
+                 is missing, the key ring is not set, or the envelope is damaged",
+                lost.join("`, `")
+            ),
+        },
+    ))
 }
 
 // ── Runtime append (#2309 follow-up) ─────────────────────────────────
@@ -1975,6 +2855,53 @@ pub async fn append_revision(
         .await
         .map_err(crate::AutumnError::from)?;
 
+    Ok(())
+}
+
+/// Link-time marker for a ledgered table. Emitted by `#[repository]`.
+#[doc(hidden)]
+pub struct LedgeredTableDescriptor {
+    /// The ledgered table.
+    pub table: &'static str,
+}
+
+inventory::collect!(LedgeredTableDescriptor);
+
+/// Whether a linked repository ledgers `table`.
+///
+/// Matches the bare table name. The check cannot see a repository that is not
+/// linked into the binary.
+#[doc(hidden)]
+#[must_use]
+pub fn is_ledgered_table(table: &str) -> bool {
+    static TABLES: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    TABLES
+        .get_or_init(|| {
+            inventory::iter::<LedgeredTableDescriptor>
+                .into_iter()
+                .map(|descriptor| descriptor.table)
+                .collect()
+        })
+        .contains(table)
+}
+
+/// Refuse a raw write to `table` when it is ledgered.
+///
+/// Call before framework SQL that changes rows outside the owning repository.
+/// Public for macro-generated code only.
+///
+/// # Errors
+///
+/// [`LedgerError::OutOfBandWrite`], as a conflict, when `table` is ledgered.
+#[doc(hidden)]
+pub fn refuse_out_of_band_write(table: &str, path: &'static str) -> crate::AutumnResult<()> {
+    if is_ledgered_table(table) {
+        return Err(crate::AutumnError::conflict(LedgerError::OutOfBandWrite {
+            table: table.to_string(),
+            path,
+        }));
+    }
     Ok(())
 }
 
@@ -3311,5 +4238,562 @@ mod tests {
             LedgerValidTimeValue::ledger_valid_from(&None::<chrono::NaiveDateTime>),
             None
         );
+    }
+    // ── #2326: snapshot fidelity ──────────────────────────────────
+
+    inventory::submit! {
+        crate::encryption::EncryptedColumnDescriptor {
+            model: "LedgerFidelityModel",
+            table: "ledger_fidelity_table",
+            column: "secret",
+            deterministic: false,
+            admin_visible: false,
+            versioned_ciphertext: false,
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::needless_borrow,
+        reason = "the extra borrow selects the fallback impl"
+    )]
+    fn non_finite_probe_flags_floats_the_snapshot_would_null() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!((&NonFiniteProbe(&bad)).autumn_has_non_finite());
+            assert!((&NonFiniteProbe(&Some(bad))).autumn_has_non_finite());
+            assert!((&NonFiniteProbe(&vec![1.0, bad])).autumn_has_non_finite());
+        }
+        assert!((&NonFiniteProbe(&f32::NAN)).autumn_has_non_finite());
+    }
+
+    #[test]
+    #[allow(
+        clippy::needless_borrow,
+        reason = "the extra borrow selects the fallback impl"
+    )]
+    fn non_finite_probe_accepts_finite_and_foreign_types() {
+        assert!(!(&NonFiniteProbe(&1.5_f64)).autumn_has_non_finite());
+        assert!(!(&NonFiniteProbe(&None::<f64>)).autumn_has_non_finite());
+        assert!(!(&NonFiniteProbe(&"NaN".to_string())).autumn_has_non_finite());
+        assert!(!(&NonFiniteProbe(&7_i64)).autumn_has_non_finite());
+    }
+
+    #[test]
+    fn unrecovered_envelope_is_chain_unreadable_and_names_column_and_revision() {
+        let snapshot = serde_json::json!({"id": 1, "secret": "not-a-real-envelope"});
+        let err = ensure_snapshot_recoverable("ledger_fidelity_table", 1, 4, &snapshot)
+            .expect_err("an unrecovered envelope must not reconstruct");
+        let text = err.to_string();
+        assert!(text.contains("secret"), "names the column: {text}");
+        assert!(text.contains("revision 4"), "names the revision: {text}");
+    }
+
+    #[test]
+    fn snapshot_without_encrypted_columns_is_recoverable() {
+        let snapshot = serde_json::json!({"id": 1, "secret": "plain"});
+        ensure_snapshot_recoverable("some_other_table", 1, 1, &snapshot).unwrap();
+        let null_secret = serde_json::json!({"id": 1, "secret": null});
+        ensure_snapshot_recoverable("ledger_fidelity_table", 1, 1, &null_secret).unwrap();
+    }
+
+    #[test]
+    fn refuse_non_finite_passes_none_and_refuses_a_column() {
+        refuse_non_finite("t", 1, None).unwrap();
+        let err = refuse_non_finite("t", 9, Some("score")).expect_err("must refuse");
+        let text = err.to_string();
+        assert!(text.contains("t#9") && text.contains("score"), "{text}");
+    }
+
+    #[test]
+    fn non_finite_error_names_table_record_and_column() {
+        let text = LedgerError::NonFiniteValue {
+            table: "t".into(),
+            record_id: 9,
+            column: "score".into(),
+        }
+        .to_string();
+        assert!(text.contains("t#9") && text.contains("score"), "{text}");
+    }
+
+    // ── streaming verification (#2319) ───────────────────────────────
+
+    /// Tampered chains that each trip a different rule.
+    fn tamper_cases() -> Vec<Vec<LedgerRevision>> {
+        let mut cases = vec![Vec::new(), chain(1), chain(5), chain(6)];
+
+        let mut mutated = chain(5);
+        mutated[2].snapshot = json!({ "id": 7, "title": "tampered" });
+        cases.push(mutated);
+
+        let mut relinked = chain(5);
+        relinked[2].snapshot = json!({ "id": 7, "title": "tampered" });
+        relinked[2].hash = relinked[2].compute_hash();
+        cases.push(relinked);
+
+        let mut gap = chain(5);
+        gap.remove(2);
+        cases.push(gap);
+
+        let mut no_start = chain(5);
+        no_start.remove(0);
+        cases.push(no_start);
+
+        let mut duplicate = chain(5);
+        let forged = LedgerRevision {
+            id: 99,
+            ..duplicate[1].clone()
+        };
+        duplicate.insert(2, forged);
+        cases.push(duplicate);
+
+        let mut regression = chain(5);
+        regression[3].recorded_at = regression[2].recorded_at - chrono::Duration::seconds(1);
+        regression[3].hash = regression[3].compute_hash();
+        regression[4].prev_hash = Some(regression[3].hash.clone());
+        regression[4].hash = regression[4].compute_hash();
+        cases.push(regression);
+
+        let mut saturated = chain(2);
+        saturated[1].seq = i64::MAX;
+        saturated[1].hash = saturated[1].compute_hash();
+        cases.push(saturated);
+
+        cases
+    }
+
+    /// The pre-#2319 slice algorithm, kept as an oracle for the streaming
+    /// verifier.
+    fn oracle_verify(
+        record_id: i64,
+        revisions: &[LedgerRevision],
+        live: LedgerLiveState,
+        high_water: LedgerHighWaterState<'_>,
+    ) -> LedgerVerification {
+        fn first_break(revisions: &[LedgerRevision]) -> Option<LedgerBreakReport> {
+            let mut expected_seq: i64 = 1;
+            let mut prev: Option<ChainTip> = None;
+            for revision in revisions {
+                if revision.seq != expected_seq {
+                    return Some(sequence_break(revision, expected_seq, prev.is_none()));
+                }
+                if let Some(report) = link_break(revision, prev.as_ref()) {
+                    return Some(report);
+                }
+                let Some(next_seq) = revision.seq.checked_add(1) else {
+                    return Some(LedgerBreakReport {
+                        seq: revision.seq,
+                        revision_id: Some(revision.id),
+                        kind: LedgerBreak::UnusableSeq,
+                        detail: "sequence number is at i64::MAX and cannot be followed; \
+                                 the chain cannot be continued or checked past this revision"
+                            .to_owned(),
+                    });
+                };
+                expected_seq = next_seq;
+                prev = Some(ChainTip::of(revision));
+            }
+            None
+        }
+        let head = revisions.last().map(ChainTip::of);
+        let broken = first_break(revisions)
+            .or_else(|| high_water_break(head.as_ref(), high_water))
+            .or_else(|| live_state_break(head.as_ref(), live))
+            .or_else(|| {
+                revisions
+                    .windows(2)
+                    .find_map(|pair| recorded_at_break(&ChainTip::of(&pair[0]), &pair[1]))
+            });
+        LedgerVerification {
+            record_id,
+            revisions_checked: revisions.len(),
+            head_hash: if broken.is_none() {
+                head.map(|tip| tip.hash)
+            } else {
+                None
+            },
+            broken,
+        }
+    }
+
+    /// The streaming verifier gives the oracle's report for every tamper
+    /// case, live state and mark state.
+    #[test]
+    fn the_streaming_verifier_matches_the_slice_oracle() {
+        let full = chain(6);
+        let marks = [None, Some(mark_for(&full[..5])), Some(mark_for(&full))];
+        let lives = [
+            LedgerLiveState::NotChecked,
+            LedgerLiveState::Absent,
+            LedgerLiveState::Matches,
+            LedgerLiveState::Diverged,
+        ];
+        let mut broken_kinds = std::collections::BTreeSet::new();
+        for revisions in tamper_cases() {
+            for live in lives {
+                for mark in &marks {
+                    let states = [
+                        LedgerHighWaterState::NotChecked,
+                        mark.as_ref()
+                            .map_or(LedgerHighWaterState::Absent, LedgerHighWaterState::Present),
+                    ];
+                    for high_water in states {
+                        let expected = oracle_verify(7, &revisions, live, high_water);
+                        let mut verifier = LedgerChainVerifier::new(7);
+                        for revision in &revisions {
+                            verifier.push(revision);
+                        }
+                        assert_eq!(verifier.finish(live, high_water), expected);
+                        if let Some(broken) = &expected.broken {
+                            broken_kinds.insert(broken.kind.as_str());
+                        }
+                    }
+                }
+            }
+        }
+        // The cases reach every rule, so the comparison means something.
+        for kind in [
+            "hash_mismatch",
+            "prev_hash_mismatch",
+            "missing_revision",
+            "duplicate_seq",
+            "recorded_at_regression",
+            "live_state_mismatch",
+            "high_water_missing",
+            "high_water_behind",
+        ] {
+            assert!(
+                broken_kinds.contains(kind),
+                "no case reaches {kind}: {broken_kinds:?}"
+            );
+        }
+    }
+
+    // ── page requests (#2319) ────────────────────────────────────────
+
+    #[test]
+    fn a_page_request_clamps_its_limit() {
+        assert_eq!(LedgerPageRequest::first(0).effective_limit(), 1);
+        assert_eq!(LedgerPageRequest::first(10).effective_limit(), 10);
+        assert_eq!(
+            LedgerPageRequest::first(u32::MAX).effective_limit(),
+            LedgerPageRequest::MAX_LIMIT
+        );
+        assert_eq!(
+            LedgerPageRequest::default().effective_limit(),
+            LedgerPageRequest::DEFAULT_LIMIT
+        );
+        let cursor = LedgerCursor { seq: 3, id: 30 };
+        assert_eq!(LedgerPageRequest::after(cursor, 5).after, Some(cursor));
+    }
+
+    #[test]
+    fn a_page_carries_a_cursor_only_when_more_rows_exist() {
+        let revisions = chain(3);
+        let full = LedgerRevisionPage::from_rows(revisions.clone(), 3);
+        assert!(full.next.is_none());
+        assert_eq!(full.revisions.len(), 3);
+
+        let more = LedgerRevisionPage::from_rows(revisions, 2);
+        assert_eq!(more.revisions.len(), 2);
+        assert_eq!(more.next, Some(LedgerCursor { seq: 2, id: 2 }));
+        assert_eq!(
+            more.next_request(5),
+            Some(LedgerPageRequest::after(LedgerCursor { seq: 2, id: 2 }, 5))
+        );
+        assert_eq!(full.next_request(5), None);
+    }
+
+    // ── tenant column (#2319) ────────────────────────────────────────
+
+    #[test]
+    fn a_tenant_change_is_refused() {
+        refuse_tenant_change("t", 1, Some("tenant-alpha"), Some("tenant-alpha")).unwrap();
+        refuse_tenant_change("t", 1, None, None).unwrap();
+        let err = refuse_tenant_change("t", 9, Some("tenant-alpha"), Some("tenant-beta"))
+            .expect_err("refused");
+        let text = err.to_string();
+        assert!(text.contains("t#9"), "{text}");
+        // The message does not name a tenant.
+        assert!(
+            !text.contains("tenant-alpha") && !text.contains("tenant-beta"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_string_tenant_column_is_a_ledger_tenant() {
+        let tenant = String::from("acme");
+        assert_eq!(LedgerTenantColumn::ledger_tenant_id(&tenant), "acme");
+    }
+
+    // ── #2326: stored snapshot bytes ──────────────────────────────
+
+    #[test]
+    fn stored_snapshot_accepts_canonical_text() {
+        let text = r#"{"a":1,"b":[1,2]}"#;
+        let value = parse_stored_snapshot("t", 1, 1, text).unwrap();
+        assert_eq!(value, json!({"a": 1, "b": [1, 2]}));
+    }
+
+    #[test]
+    fn stored_snapshot_refuses_re_encoded_text() {
+        for text in [r#"{ "a": 1 }"#, r#"{"b":1,"a":2}"#, r#"{"a":1,"a":2}"#] {
+            let err = parse_stored_snapshot("t", 1, 3, text).expect_err(text);
+            let shown = err.to_string();
+            assert!(
+                shown.contains("canonical") && shown.contains('3'),
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn stored_snapshot_refuses_invalid_json() {
+        let err = parse_stored_snapshot("t", 1, 2, "{").expect_err("invalid");
+        assert!(err.to_string().contains("unreadable"), "{err}");
+    }
+
+    #[test]
+    fn stored_snapshot_accepts_floats_the_writer_produced() {
+        // These parse one ULP off without serde_json's `float_roundtrip`.
+        for x in [4.536_315_785_538_721e-181_f64, 4.138_526_855_143_091e260] {
+            let text = canonical_json(&json!({ "x": x }));
+            parse_stored_snapshot("t", 1, 1, &text).expect(&text);
+        }
+    }
+
+    #[test]
+    fn schema_detail_hides_quoted_values() {
+        let shown = redact_quoted(r#"invalid type: string "sk-secret", expected i64"#);
+        assert!(!shown.contains("sk-secret"), "{shown}");
+        assert!(shown.contains("expected i64"), "{shown}");
+    }
+
+    #[test]
+    fn a_non_canonical_read_error_becomes_a_break() {
+        let err = crate::AutumnError::internal_server_error(LedgerError::SnapshotNotCanonical {
+            table: "t".into(),
+            record_id: 4,
+            seq: 2,
+        });
+        let report = verification_from_read_error(4, err).unwrap();
+        let broken = report.broken.expect("a break");
+        assert_eq!(broken.kind, LedgerBreak::SnapshotNotCanonical);
+        assert_eq!(broken.seq, 2);
+        assert_eq!(
+            LedgerBreak::SnapshotNotCanonical.as_str(),
+            "snapshot_not_canonical"
+        );
+    }
+
+    #[test]
+    fn other_read_errors_pass_through() {
+        let err = crate::AutumnError::internal_server_error(LedgerError::ChainUnreadable {
+            table: "t".into(),
+            record_id: 4,
+            detail: "x".into(),
+        });
+        assert!(verification_from_read_error(4, err).is_err());
+    }
+
+    // ── Schema versions and upcasting (#2326) ────────────────────────
+
+    /// A v1 snapshot named a field `subject`. v2 calls it `title`.
+    fn rename_subject(from: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+        if from < 2 {
+            let object = snapshot.as_object_mut().ok_or("not an object")?;
+            if let Some(subject) = object.remove("subject") {
+                object.insert("title".into(), subject);
+            }
+        }
+        Ok(())
+    }
+
+    fn refuse_upcast(_: u32, _: &mut serde_json::Value) -> Result<(), String> {
+        Err("no rule for this shape".into())
+    }
+
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the signature must match `SnapshotUpcast`"
+    )]
+    fn note_from_version(from: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+        snapshot["seen"] = json!(from);
+        Ok(())
+    }
+
+    fn mismatch(err: &crate::AutumnError) -> (i64, i64, String) {
+        match err.downcast_ref::<LedgerError>() {
+            Some(LedgerError::SnapshotSchemaMismatch {
+                record_id,
+                seq,
+                detail,
+                ..
+            }) => (*record_id, *seq, detail.clone()),
+            other => panic!("expected SnapshotSchemaMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_version_one_model_adds_no_marker() {
+        // Chains written before versions existed must keep their hashes.
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 1);
+        assert_eq!(snapshot, json!({ "title": "a" }));
+    }
+
+    #[test]
+    fn a_later_schema_version_is_stamped_into_the_snapshot() {
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 3);
+        assert_eq!(snapshot[SNAPSHOT_SCHEMA_KEY], json!(3));
+        // The marker sits inside the hashed snapshot, so an edit shows as a break.
+        assert!(canonical_json(&snapshot).contains(SNAPSHOT_SCHEMA_KEY));
+    }
+
+    #[test]
+    fn an_unmarked_snapshot_is_version_one() {
+        let snapshot = json!({ "title": "a" });
+        let (value, stored) = upcast_snapshot("t", 1, 1, &snapshot, 1, refuse_upcast).unwrap();
+        assert_eq!((value, stored), (snapshot, 1));
+    }
+
+    #[test]
+    fn an_older_snapshot_is_converted_by_the_hook() {
+        let snapshot = json!({ "subject": "a", "amount": 1 });
+        let (value, stored) = upcast_snapshot("t", 1, 1, &snapshot, 2, rename_subject).unwrap();
+        assert_eq!(stored, 1);
+        assert_eq!(value, json!({ "title": "a", "amount": 1 }));
+    }
+
+    #[test]
+    fn the_marker_is_removed_before_the_model_reads_the_snapshot() {
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 2);
+        let (value, stored) = upcast_snapshot("t", 1, 1, &snapshot, 2, refuse_upcast).unwrap();
+        assert_eq!(stored, 2);
+        assert_eq!(value, json!({ "title": "a" }));
+    }
+
+    #[test]
+    fn a_snapshot_at_the_current_version_skips_the_hook() {
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 2);
+        upcast_snapshot("t", 1, 1, &snapshot, 2, refuse_upcast).expect("the hook is not called");
+    }
+
+    #[test]
+    fn the_hook_receives_the_stored_version() {
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 2);
+        let (value, _) = upcast_snapshot("t", 1, 1, &snapshot, 3, note_from_version).unwrap();
+        assert_eq!(value["seen"], json!(2));
+    }
+
+    #[test]
+    fn a_failing_hook_is_a_schema_error_and_not_tamper_evidence() {
+        let err =
+            upcast_snapshot("t", 7, 4, &json!({ "subject": "a" }), 2, refuse_upcast).unwrap_err();
+        let (record_id, seq, detail) = mismatch(&err);
+        assert_eq!((record_id, seq), (7, 4));
+        assert!(detail.contains("no rule for this shape"), "{detail}");
+        assert!(detail.contains("schema version 1"), "{detail}");
+    }
+
+    #[test]
+    fn a_snapshot_from_a_newer_model_is_flagged_and_not_converted() {
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 5);
+        let (value, stored) = upcast_snapshot("t", 1, 1, &snapshot, 2, refuse_upcast).unwrap();
+        assert_eq!(stored, 5);
+        assert_eq!(value, json!({ "title": "a" }));
+        let shown = schema_mismatch_at("t", 1, 1, stored, 2, "cannot decode").to_string();
+        assert!(shown.contains("schema version 5"), "{shown}");
+        assert!(shown.contains("newer"), "{shown}");
+    }
+
+    #[test]
+    fn a_damaged_marker_is_a_schema_error() {
+        for bad in [json!("x"), json!(0), json!(-1), json!(1.5), json!(null)] {
+            let snapshot = json!({ "title": "a", SNAPSHOT_SCHEMA_KEY: bad });
+            let err = upcast_snapshot("t", 1, 1, &snapshot, 2, rename_subject).unwrap_err();
+            let (_, _, detail) = mismatch(&err);
+            assert!(detail.contains("schema version marker"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn a_snapshot_that_is_not_an_object_passes_through() {
+        let (value, stored) = upcast_snapshot("t", 1, 1, &json!([1, 2]), 2, refuse_upcast).unwrap();
+        assert_eq!((value, stored), (json!([1, 2]), 1));
+    }
+
+    #[test]
+    fn the_schema_error_names_the_versions_and_the_remedies() {
+        let shown = schema_mismatch_at("t", 1, 2, 1, 3, "cannot decode").to_string();
+        assert!(shown.contains("schema version 1"), "{shown}");
+        assert!(shown.contains("model is at 3"), "{shown}");
+        assert!(shown.contains("upcast"), "{shown}");
+        assert!(shown.contains("serde(default)"), "{shown}");
+    }
+
+    #[test]
+    fn the_live_check_ignores_columns_only_one_side_has_after_a_schema_change() {
+        // A column added since the head was written is not tamper evidence.
+        let head = json!({ "title": "a" });
+        let live = json!({ "title": "a", "region": "eu" });
+        assert!(snapshots_agree(&head, &live, true));
+        // Nor is a column the model dropped.
+        assert!(snapshots_agree(&live, &head, true));
+    }
+
+    #[test]
+    fn the_live_check_is_strict_when_no_schema_change_is_declared() {
+        // Without a version bump, a column the head lacks is a difference. An
+        // out-of-band edit to it must not pass.
+        let head = json!({ "title": "a" });
+        let live = json!({ "title": "a", "role": "admin" });
+        assert!(!snapshots_agree(&head, &live, false));
+        assert!(!snapshots_agree(&live, &head, false));
+        assert!(snapshots_agree(&live, &live, false));
+    }
+
+    #[test]
+    fn the_live_check_still_sees_a_changed_value() {
+        let head = json!({ "title": "a", "amount": 1 });
+        let live = json!({ "title": "a", "amount": 2, "region": "eu" });
+        assert!(!snapshots_agree(&head, &live, true));
+        assert!(!snapshots_agree(&head, &live, false));
+    }
+
+    #[test]
+    fn the_live_check_compares_non_objects_whole() {
+        assert!(snapshots_agree(&json!(1), &json!(1), true));
+        assert!(!snapshots_agree(&json!(1), &json!(2), true));
+        assert!(!snapshots_agree(&json!({}), &json!(2), true));
+    }
+
+    fn panic_upcast(_: u32, _: &mut serde_json::Value) -> Result<(), String> {
+        panic!("the hook has a bug")
+    }
+
+    #[test]
+    fn a_hook_that_panics_is_a_schema_error() {
+        let err =
+            upcast_snapshot("t", 3, 2, &json!({ "subject": "a" }), 2, panic_upcast).unwrap_err();
+        let (record_id, seq, detail) = mismatch(&err);
+        assert_eq!((record_id, seq), (3, 2));
+        assert!(detail.contains("the hook panicked"), "{detail}");
+    }
+
+    #[test]
+    fn a_marked_snapshot_read_by_a_version_one_model_loses_the_marker() {
+        // A rollback: the model is older than the revision. The hook is skipped.
+        let mut snapshot = json!({ "title": "a" });
+        stamp_schema_version(&mut snapshot, 2);
+        let (value, stored) = upcast_snapshot("t", 1, 1, &snapshot, 1, refuse_upcast).unwrap();
+        assert_eq!((value, stored), (json!({ "title": "a" }), 2));
+        let shown = schema_mismatch_at("t", 1, 1, stored, 1, "cannot decode").to_string();
+        assert!(shown.contains("newer"), "{shown}");
     }
 }

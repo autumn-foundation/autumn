@@ -1,0 +1,381 @@
+//! The offline HTML viewer of a capsule.
+//!
+//! The viewer uses the `static_gen` layout: route `/` is `viewer/index.html`
+//! and route `/<table>` is `viewer/<table>/index.html`, with a
+//! `viewer/manifest.json` [`StaticManifest`]. A browser opens the pages from
+//! the disk. The pages have no script and load nothing from a network.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
+
+use crate::static_gen::{ManifestEntry, StaticManifest, url_to_file_path};
+
+use super::model::{CapsuleManifest, ModelManifest, Record, value_key};
+
+const HTML_TYPE: &str = "text/html; charset=utf-8";
+const CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'";
+const STYLE: &str = "body{font:15px/1.5 system-ui,sans-serif;margin:2rem;max-width:72rem}\
+table{border-collapse:collapse;margin:.5rem 0 1.5rem}\
+th,td{border:1px solid #ccc;padding:.25rem .5rem;text-align:left;vertical-align:top}\
+th{background:#f4f4f4}section{margin-bottom:2rem}em{color:#888}\
+@media(prefers-color-scheme:dark){body{background:#111;color:#eee}th{background:#222}\
+a{color:#8cf}}";
+
+/// Make the viewer files: `(path relative to the capsule root, bytes)`.
+pub(super) fn render(
+    manifest: &CapsuleManifest,
+    records: &BTreeMap<String, Vec<Record>>,
+) -> Vec<(String, Vec<u8>)> {
+    let index = KeyIndex::new(manifest, records);
+    let mut files = Vec::new();
+    let mut routes = HashMap::new();
+
+    let mut page = |route: String, html: String| {
+        let file = url_to_file_path(&route);
+        routes.insert(
+            route,
+            ManifestEntry::new(file.clone()).with_content_type(Some(HTML_TYPE.to_owned())),
+        );
+        files.push((format!("viewer/{file}"), html.into_bytes()));
+    };
+    page("/".to_owned(), render_index(manifest));
+    for model in &manifest.models {
+        let rows = records.get(&model.table).map_or(&[][..], Vec::as_slice);
+        page(
+            format!("/{}", model.table),
+            render_model(manifest, model, rows, &index),
+        );
+    }
+
+    let static_manifest = StaticManifest::new(routes).with_generated_at(&manifest.generated_at);
+    let json = serde_json::to_vec_pretty(&static_manifest).unwrap_or_default();
+    files.push(("viewer/manifest.json".to_owned(), json));
+    files
+}
+
+/// Lookups that the pages need, made one time.
+struct KeyIndex {
+    /// For each `(table, column)` that a link targets: the column value of
+    /// each row, to the primary key of that row. A link to a column that is
+    /// not the key (a unique slug, say) then finds the anchor of its row. A
+    /// value on two rows has no single row, so it maps to `None`.
+    rows: HashMap<(String, String), HashMap<String, Option<String>>>,
+    /// For each `(table, key)`, the "Referenced by" list items.
+    back: HashMap<(String, String), Vec<String>>,
+}
+
+impl KeyIndex {
+    fn new(manifest: &CapsuleManifest, records: &BTreeMap<String, Vec<Record>>) -> Self {
+        let mut rows: HashMap<(String, String), HashMap<String, Option<String>>> = HashMap::new();
+        for rel in manifest.models.iter().flat_map(|m| &m.relationships) {
+            let Some(target) = manifest.model(&rel.target) else {
+                continue;
+            };
+            let entry = (rel.target.clone(), rel.target_column.clone());
+            if rows.contains_key(&entry) {
+                continue;
+            }
+            let mut values: HashMap<String, Option<String>> = HashMap::new();
+            for row in records.get(&target.table).into_iter().flatten() {
+                let (Some(value), Some(key)) = (
+                    row.get(&rel.target_column).and_then(value_key),
+                    row.get(&target.primary_key).and_then(value_key),
+                ) else {
+                    continue;
+                };
+                values
+                    .entry(value)
+                    .and_modify(|found| {
+                        if found.as_ref() != Some(&key) {
+                            *found = None;
+                        }
+                    })
+                    .or_insert(Some(key));
+            }
+            rows.insert(entry, values);
+        }
+        let mut index = Self {
+            rows,
+            back: HashMap::new(),
+        };
+        for other in &manifest.models {
+            for rel in &other.relationships {
+                for row in records.get(&other.table).into_iter().flatten() {
+                    let (Some(key), Some(other_key)) = (
+                        row.get(&rel.column)
+                            .and_then(value_key)
+                            .and_then(|v| index.resolve(&rel.target, &rel.target_column, &v)),
+                        row.get(&other.primary_key).and_then(value_key),
+                    ) else {
+                        continue;
+                    };
+                    index
+                        .back
+                        .entry((rel.target.clone(), key))
+                        .or_default()
+                        .push(format!(
+                            "<li><a href=\"../{}/index.html#{}\">{} {}</a> ({})</li>",
+                            esc(&other.table),
+                            esc(&anchor(&other_key)),
+                            esc(&other.table),
+                            esc(&other_key),
+                            esc(&rel.column)
+                        ));
+                }
+            }
+        }
+        index
+    }
+
+    /// The primary key of the row of `table` whose `column` is `value`, when
+    /// the capsule has exactly one such row.
+    fn resolve(&self, table: &str, column: &str, value: &str) -> Option<String> {
+        self.rows
+            .get(&(table.to_owned(), column.to_owned()))?
+            .get(value)?
+            .clone()
+    }
+
+    /// The "Referenced by" list of one record, or nothing.
+    fn backlinks(&self, table: &str, key: &str) -> String {
+        self.back
+            .get(&(table.to_owned(), key.to_owned()))
+            .map_or_else(String::new, |links| {
+                format!("<p>Referenced by:</p><ul>{}</ul>", links.concat())
+            })
+    }
+}
+
+/// Escape text for HTML content and attribute values.
+fn esc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The anchor id of a record key. The same function makes ids and links.
+fn anchor(key: &str) -> String {
+    let mut out = String::from("r-");
+    for b in key.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'.' {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "_{b:02x}");
+        }
+    }
+    out
+}
+
+fn shell(title: &str, body: &str) -> String {
+    format!(
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}\">\
+<title>{}</title><style>{STYLE}</style></head><body>{body}</body></html>\n",
+        esc(title)
+    )
+}
+
+fn render_index(manifest: &CapsuleManifest) -> String {
+    let mut body = format!(
+        "<h1>Data capsule</h1><p>Subject: <strong>{}</strong><br>Exported: {}<br>\
+Autumn {}</p><table><tr><th>Model</th><th>Records</th></tr>",
+        esc(&manifest.subject),
+        esc(&manifest.generated_at),
+        esc(&manifest.framework_version),
+    );
+    for model in &manifest.models {
+        let _ = write!(
+            body,
+            "<tr><td><a href=\"{}/index.html\">{}</a></td><td>{}</td></tr>",
+            esc(&model.table),
+            esc(&model.table),
+            model.record_count
+        );
+    }
+    body.push_str("</table>");
+    shell("Data capsule", &body)
+}
+
+fn display(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "<em>null</em>".to_owned(),
+        serde_json::Value::String(s) => esc(s),
+        other => esc(&other.to_string()),
+    }
+}
+
+/// The blob key in a blob column: a `storage::Blob` object or
+/// a plain key string.
+pub(super) fn blob_key(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Object(o) => o.get("key").and_then(serde_json::Value::as_str),
+        _ => None,
+    }
+}
+
+fn render_model(
+    manifest: &CapsuleManifest,
+    model: &ModelManifest,
+    rows: &[Record],
+    index: &KeyIndex,
+) -> String {
+    let mut body = format!(
+        "<p><a href=\"../index.html\">All models</a></p><h1>{}</h1>",
+        esc(&model.table)
+    );
+    let columns: Vec<&str> = if model.fields.is_empty() {
+        rows.first()
+            .map(|r| r.keys().map(String::as_str).collect())
+            .unwrap_or_default()
+    } else {
+        model.fields.iter().map(|f| f.name.as_str()).collect()
+    };
+    for row in rows {
+        let key = row.get(&model.primary_key).and_then(value_key);
+        let id = key.as_deref().map(anchor).unwrap_or_default();
+        let _ = write!(
+            body,
+            "<section id=\"{}\"><h2>{} {}</h2><table>",
+            esc(&id),
+            esc(&model.table),
+            esc(key.as_deref().unwrap_or("?"))
+        );
+        for column in &columns {
+            let value = row.get(*column).unwrap_or(&serde_json::Value::Null);
+            let cell = cell(manifest, model, column, value, index);
+            let _ = write!(body, "<tr><th>{}</th><td>{cell}</td></tr>", esc(column));
+        }
+        body.push_str("</table>");
+        if let Some(key) = key.as_deref() {
+            body.push_str(&index.backlinks(&model.table, key));
+        }
+        body.push_str("</section>");
+    }
+    shell(&model.table, &body)
+}
+
+fn cell(
+    manifest: &CapsuleManifest,
+    model: &ModelManifest,
+    column: &str,
+    value: &serde_json::Value,
+    index: &KeyIndex,
+) -> String {
+    if model.blob_columns.iter().any(|c| c == column)
+        && let Some(blob) = blob_key(value).and_then(|k| manifest.blob(k))
+    {
+        return format!(
+            "<a href=\"../../{}\" download>{}</a> ({}, {} bytes)",
+            esc(&blob.file()),
+            esc(&blob.key),
+            esc(&blob.content_type),
+            blob.byte_size
+        );
+    }
+    let link = model
+        .relationships
+        .iter()
+        .filter(|r| r.column == column)
+        .find_map(|r| {
+            let key = index.resolve(&r.target, &r.target_column, &value_key(value)?)?;
+            Some((r.target.as_str(), key))
+        });
+    match link {
+        Some((target, key)) => format!(
+            "<a href=\"../{}/index.html#{}\">{}</a>",
+            esc(target),
+            esc(&anchor(&key)),
+            display(value)
+        ),
+        None => display(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::model::Relationship;
+    use super::*;
+
+    #[test]
+    fn esc_escapes_markup_and_quotes() {
+        assert_eq!(
+            esc("<a href=\"x\">'&'</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;"
+        );
+    }
+
+    #[test]
+    fn anchor_is_safe_for_ids_and_fragments() {
+        assert_eq!(anchor("10"), "r-10");
+        assert_eq!(anchor("a b\"<"), "r-a_20b_22_3c");
+        assert_eq!(anchor("é"), "r-_c3_a9");
+    }
+
+    #[test]
+    fn links_follow_a_reference_to_a_column_that_is_not_the_key() {
+        let model = |table: &str, relationships: Vec<Relationship>| ModelManifest {
+            table: table.to_owned(),
+            primary_key: "id".to_owned(),
+            subject_column: "id".to_owned(),
+            fields: Vec::new(),
+            relationships,
+            blob_columns: Vec::new(),
+            record_count: 1,
+            file: format!("records/{table}.json"),
+        };
+        let mut manifest = CapsuleManifest::new("1");
+        manifest.models = vec![
+            model("users", Vec::new()),
+            model(
+                "posts",
+                vec![Relationship {
+                    column: "author_slug".to_owned(),
+                    target: "users".to_owned(),
+                    target_column: "slug".to_owned(),
+                }],
+            ),
+        ];
+        let row = |v: serde_json::Value| v.as_object().unwrap().clone();
+        let records = BTreeMap::from([
+            (
+                "users".to_owned(),
+                vec![row(serde_json::json!({"id": 1, "slug": "ada"}))],
+            ),
+            (
+                "posts".to_owned(),
+                vec![row(serde_json::json!({"id": 7, "author_slug": "ada"}))],
+            ),
+        ]);
+        let files: BTreeMap<_, _> = render(&manifest, &records).into_iter().collect();
+        let page = |name: &str| String::from_utf8(files[name].clone()).unwrap();
+        // The slug links to the anchor of the user's key, and back.
+        assert!(
+            page("viewer/posts/index.html").contains("href=\"../users/index.html#r-1\""),
+            "{}",
+            page("viewer/posts/index.html")
+        );
+        assert!(
+            page("viewer/users/index.html").contains("href=\"../posts/index.html#r-7\""),
+            "{}",
+            page("viewer/users/index.html")
+        );
+    }
+
+    #[test]
+    fn blob_key_reads_objects_and_strings() {
+        assert_eq!(blob_key(&serde_json::json!("k/1")), Some("k/1"));
+        assert_eq!(blob_key(&serde_json::json!({"key": "k/2"})), Some("k/2"));
+        assert_eq!(blob_key(&serde_json::json!(3)), None);
+    }
+}

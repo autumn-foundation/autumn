@@ -64,10 +64,10 @@ before setting those three.
 
 | Dataset | What it is | Where it lives | Default (unset) | Enforced by |
 |---|---|---|---|---|
-| `job_history` | Finished job rows (`completed`/`failed`/`discarded`) | `autumn_jobs` | **forever** | sweep |
+| `job_history` | Finished job rows (`completed`/`failed`/`discarded`) | `autumn_jobs` (`postgres` and `sqlite` jobs backends) | **forever** | sweep on `postgres` and `sqlite` (the `sqlite` job runtime also prunes it); **not enforced** on `redis` or `local` |
 | `commit_hooks` | Finished `#[after_commit]` hook rows (`completed`/`failed`/`after_hook_failed`) | `autumn_repository_commit_hooks` | **forever** | sweep |
 | `job_tracking` | Tracked-job progress/result records | `autumn_job_tracking`, or Redis — follows `jobs.backend` | jobs.tracking.ttl_secs (24h by default) | sweep on `postgres`, backend TTL otherwise |
-| `idempotency` | Stored `Idempotency-Key` responses | memory / Redis | idempotency.ttl_secs (24h by default) | backend TTL |
+| `idempotency` | Stored `Idempotency-Key` responses | memory / Redis / `autumn_idempotency_keys` | idempotency.ttl_secs (24h by default) | backend TTL; the database store deletes expired rows as it writes |
 | `experiment_assignments` | Sticky actor → variant assignments | `autumn_experiment_assignments` | **forever** | sweep |
 | `webhook_replay` | Inbound webhook replay markers | memory / Redis | the endpoint's replay_window_secs (24h by default) | backend TTL |
 | `sessions` | Server-side session records | memory / Redis | session.max_age_secs (the session cookie's lifetime) | backend TTL |
@@ -107,8 +107,8 @@ side effect of a job-history window.
 The datasets are genuinely heterogeneous, and the report says so per row
 rather than pretending they all work the same way.
 
-**`sweep`** — a scheduled batched `DELETE` against a framework-owned Postgres
-table. Rows are deleted in batches of 500, up to 1000 batches per dataset per
+**`sweep`** — a scheduled batched `DELETE` against a framework-owned Postgres or
+SQLite table. Rows are deleted in batches of 500, up to 1000 batches per dataset per
 run, so one run never holds a long lock or spikes replication lag; a first
 sweep of a years-old table finishes over several ticks. Completeness is
 established by re-counting the stale rows at the end of the run, not inferred
@@ -168,6 +168,21 @@ one guards an invariant another subsystem depends on:
   applied by capping the record's TTL instead. The report names whichever
   applies rather than claiming a sweep that would find nothing.
 
+  A GDPR legal hold on `autumn_job_tracking` protects the rows in the
+  database (`postgres` and `sqlite`). Under `redis` or `local`, the window
+  still shortens the record TTL. The report then says `NOT preserved` next to
+  the hold. Keep job tracking on a database backend if you need the hold.
+
+  `job_history` is a sweep over `autumn_jobs`, so it needs a database jobs
+  backend. `postgres` and `sqlite` use the sweep. On `sqlite` the job runtime
+  also prunes it on its own. Under `redis` or `local`, the report says
+  `NOT enforced`. Redis keeps finished jobs in lists that a count limit bounds.
+
+  On `sqlite` the sweeps run in the app's database file. The cutoff comes from
+  the SQLite clock. The sweep covers `job_history`, `commit_hooks` and
+  `experiment_assignments` only. A dataset whose table is not in the file is skipped, and the
+  report names the table.
+
 **`backend ttl`** — the storage backend expires the record itself, so there is
 nothing for a sweep to delete and the report shows `—` rather than a fake
 zero. For `idempotency` and `sessions` the window is applied by *capping the
@@ -206,10 +221,12 @@ already guarantees the marker's own window is within the retention window.
 
 **`archive rewrite`** — the JSONL audit archive is rewritten without the stale
 entries: filtered into a sibling temp file that inherits the archive's
-permissions, `fsync`ed, then atomically renamed over the original. A crash
-mid-purge leaves the original intact. A line that cannot be decoded as an
-audit event is **kept**, never discarded — a retention sweep must not be the
-thing that silently drops a record it merely failed to parse.
+permissions and owner, `fsync`ed, then atomically renamed over the original.
+A crash mid-purge leaves the original intact. If `audit.path` is a symlink,
+the purge rewrites the file it points to, and the link stays a link. If the
+process cannot keep the file's owner, the purge fails and the archive stays as
+it was. A line that cannot be decoded as an audit event is **kept**. A
+retention sweep must not drop a record it only failed to parse.
 
 Append-only is the *write* contract for audit sinks; retention is a separate,
 operator-declared bound that GDPR's storage-limitation principle can require.
@@ -217,15 +234,18 @@ Custom `AuditSink` implementations inherit a default `purge_before` that
 reports "unsupported", so a sink that forwards to a SIEM says so in the report
 instead of implying an empty archive.
 
-> Two limits of the archive rewrite: it reads the archive into memory (peak
-> roughly twice its size), so keep a very large archive rotated by external
-> tooling; the rewritten file must be able to keep the archive's own
-> permissions, so a purge refuses rather than renaming a default-mode file
-> over an archive you hardened to `0600`; and its lock is per-process, so
-> running `autumn db retention
-> --purge --dataset audit_archives` *against a live server writing the same
-> file* can drop events appended during the rewrite. Let the in-process
-> scheduled sweep handle this dataset in a live deployment.
+> Limits of the archive rewrite:
+>
+> - It reads the archive into memory. Peak use is about twice its size. Keep a
+>   very large archive rotated by external tooling.
+> - The new file must keep the archive's permissions and owner. If it cannot,
+>   the purge fails. It does not rename a default-mode file over a `0600`
+>   archive. It does not re-own a `root:auditors` archive. ACLs and extended
+>   attributes are not copied.
+> - The lock is per process. Two writers on one file can lose events. This
+>   includes `autumn db retention --purge --dataset audit_archives` against a
+>   live server, and two replicas that share one `audit.path`. Give each
+>   replica its own archive path. Let the in-process sweep purge it.
 
 With several sinks installed, a purge can partly succeed. Entries a working
 sink removed stay removed, so the report carries that count *and* the failing
@@ -263,6 +283,13 @@ bound is applied by shortening the record's TTL at write time; for
 `job_tracking` it is applied by the sweep, so `jobs.tracking.ttl_secs` keeps
 the literal value you configured (a legal hold can then stop the sweep — the
 independent `expires_at` cleanup could not have been stopped).
+
+The built-in in-memory stores (`webhook_replay`, `idempotency`, and
+`job_tracking` on the `local` jobs backend) and the database `idempotency` store
+stop serving expired records at the window. They remove them only on later
+writes. A quiet process can keep expired records past the window. Use `redis` to
+remove them on time. The report says so. An app that installs its own store
+must check that store itself.
 
 ### One exception: webhook replay protection
 
@@ -314,13 +341,20 @@ and its reason appear in the report:
 ```
 
 Only sweep-enforced datasets have a backing table a hold can name; the
-TTL-native ones cannot be held this way.
+TTL-native ones cannot be held this way, except the database idempotency
+store (below).
 
 A hold on `autumn_job_tracking` also suppresses the job runner's own
 independent `expires_at` cleanup, which predates this policy and is not part
 of it. Without that, a hold would be honoured by `autumn db retention` and
 quietly violated five minutes later by the maintenance loop — worse than
 having no hold at all.
+
+The database idempotency store (`[idempotency] backend = "database"`) keeps
+its records in `autumn_idempotency_keys` and expires them itself. A hold on
+that table works the same way: the store stops deleting and overwriting
+expired rows. A request that reuses a held, expired `Idempotency-Key` gets
+`409` rather than replacing the held response.
 
 ## The CLI
 
@@ -366,6 +400,13 @@ production needs an on-demand purge — the configured policy already runs
 inside the app on its own schedule — so the flag exists for the deliberate
 case, not the routine one.
 
+The app checks the profile too. It uses the profile its own config loader
+resolved, not the name the CLI passed. A custom loader that picks another
+profile is refused unless you pass `--force`.
+
+`autumn db retention --purge --dataset audit_archives` purges the archive of
+the one process it starts. It does not reach the archives of other replicas.
+
 ## Observability and the Audit Trail
 
 Every real sweep of a bounded dataset emits an audit record through your
@@ -385,6 +426,14 @@ a claim a reviewer needs evidence for:
 | `metadata.truncated` | `true` when the run stopped at its per-run batch cap with rows still stale |
 | `metadata.skipped` | present when a legal hold blocked the sweep |
 | `metadata.error` | present when the sweep failed |
+
+If Autumn cannot write the audit record, the dataset report sets `error`. The
+text starts with `audit record not written`. Rows can already be gone, so
+`autumn db retention` exits non-zero.
+
+If any dataset reports an `error`, the task that ran it fails. The
+task runs all datasets first. `/actuator/tasks` shows the task as failed, and
+it raises a [task failure alert](operator-alerts.md).
 
 A dataset held back by a legal hold is recorded even though nothing was
 deleted — "the policy wanted to delete this and did not" is exactly what a
@@ -453,15 +502,26 @@ restoring today's behavior for that one dataset without editing the file.
 
 ## Multi-Replica Behavior
 
-The sweep is registered as a
-[`coordination = "fleet"` scheduled task](scheduled-multi-replica.md) named
-`autumn-retention-sweep`. Under the `postgres` scheduler backend only one
-replica executes it per tick, however many replicas are running; the `sqlite`
-backend gives the same guarantee across the processes on one host. It runs in
-the `worker` and `combined` process roles, not `web`, like every other
-scheduled task.
+The policy runs as two scheduled tasks. Each one matches where its data lives.
 
-Avoid naming a hand-written `#[scheduled]` task `autumn-retention-sweep`: the
+| Task | Coordination | Datasets |
+|---|---|---|
+| `autumn-retention-sweep` | [`fleet`](scheduled-multi-replica.md) | Every shared dataset (database and shared stores) |
+| `autumn-retention-archive-sweep` | `per_replica` | `audit_archives` |
+
+Under the `postgres` scheduler backend only one replica executes the fleet
+task per tick, however many replicas are running; the `sqlite` backend gives
+the same guarantee across the processes on one host. The archive is a file on
+each replica's own disk, so every replica purges its own copy. Each task is
+registered only when one of its datasets has a window.
+
+Both tasks run in the `worker` and `combined` process roles, not `web`, like
+every other scheduled task. A `web` replica never purges its own archive. Run
+the archive on a role that runs tasks, or rotate that file with external
+tooling.
+
+Avoid naming a hand-written `#[scheduled]` task `autumn-retention-sweep` or
+`autumn-retention-archive-sweep`: the
 app refuses to boot on the collision rather than spawning two loops competing
 for one coordination lock.
 

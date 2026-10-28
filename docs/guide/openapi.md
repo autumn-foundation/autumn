@@ -23,7 +23,7 @@ The spec types and the served endpoints live behind the `openapi` feature:
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-web = { version = "0.8", features = ["openapi"] }
+autumn-web = { version = "0.9", features = ["openapi"] }
 ```
 
 Then hand `AppBuilder` an `OpenApiConfig`:
@@ -116,6 +116,7 @@ an `ApiDoc` at compile time from the path and the handler signature:
 | `Vec<T>` in either position | `type: array` with `items` from `T` |
 | `Option<T>` in either position | Nullable — `type: ["string", "null"]` for primitives, `oneOf: [{$ref}, {type: "null"}]` for refs |
 | `String`/`str`, `bool`, `i8`–`i64`, `u8`–`u64`, `isize`/`usize`, `f32`/`f64` | Inline primitive schemas, never a `$ref`. **`i128`/`u128` are not in the list** — they fall through to a named `$ref` and land on the object placeholder |
+| `Uuid`, `DateTime<Utc>`, `NaiveDate`, `NaiveDateTime`, `Decimal`, `SqliteUuid`, `SqliteDecimal` | Inline schema, never a `$ref`. `Uuid` has `format: uuid`. `DateTime<Utc>` has `date-time`. `NaiveDate` has `date`. `NaiveDateTime` has no `format`. `Decimal` is `string` with `format: decimal`, or `number` if serde writes a number. This holds for model fields and `#[derive(OpenApiSchema)]` fields, not for a bare `Json<Uuid>` |
 | Anything else named | A `$ref` into `#/components/schemas/…` (see [§4](#4-component-schemas)) |
 
 Only these shapes are recognized deliberately: an unknown wrapper type is left
@@ -171,6 +172,21 @@ will not accept. None of them fails the build:
 > `/files/a/b`. (The MCP projection strips the `*`; the OpenAPI side does not.)
 > Treat catch-all routes as undocumentable — `#[api_doc(hidden)]` if the noise
 > matters.
+
+### Two copies of `autumn-web`
+
+The derive finds the `autumn-web` crate name by itself, even if you rename the
+dependency. If one crate holds two copies of `autumn-web`, the derive cannot
+choose one. Name the correct copy with a helper attribute. The derive path
+selects the macro. The attribute selects the crate for the generated code:
+
+```rust
+#[derive(web_new::openapi::OpenApiSchema)]
+#[openapi_schema(crate = "web_new")]
+struct SearchParams { q: String }
+```
+
+Only `crate` is a valid argument. Any other argument is a compile error.
 
 ### A worked example
 
@@ -296,6 +312,8 @@ Everything a signature cannot express goes in `#[api_doc(...)]`:
 | `hidden` | flag / bool | Omit the route from the spec entirely |
 | `mcp` | flag / bool | Also expose the endpoint as an MCP tool (`mcp = false` force-excludes) — see [the MCP guide](./mcp.md) |
 | `stream` | flag / bool | Mark an `Sse`-returning MCP tool as streaming |
+| `task` | flag / bool | Let an MCP tool return a task handle (MCP Tasks extension) — see [the MCP guide](./mcp.md) §6 |
+| `core` | flag / bool | Mark a core MCP tool: a client loads it before any tool search — see [the MCP guide](./mcp.md#large-catalogs-core-tools-and-search) |
 
 Unknown keys are a compile error naming the supported set, so a typo never
 silently produces an undocumented operation.
@@ -419,29 +437,22 @@ guessed at because serde's representation for them depends on
 `#[serde(tag/content/untagged)]`, so an inferred shape could confidently
 advertise a contract the handler does not accept.
 
-The rename handling is exact for the ordinary symmetric attributes. The **split
-form** — `#[serde(rename_all(serialize = "kebab-case", deserialize =
-"camelCase"))]`, and its field-level equivalent — is the exception: the schema
-takes the *serialize* side, while `Query<T>` and `Json<T>` accept the
-*deserialize* side. On a request type that would advertise a key the handler
-will not accept, so name request fields with a symmetric `rename` /
-`rename_all`, or register the schema by hand.
+The derive handles these serde attributes:
 
-> **"Field-accurate" means the fields, not every serde attribute.** Renaming is
-> the only serde behavior the derive interprets. It emits *every* named field
-> and marks *every* non-`Option` field `required`, so these diverge from the
-> real wire shape:
->
-> | Attribute | What the schema says | What actually happens |
-> |---|---|---|
-> | `#[serde(default)]` | `required` | The field may be omitted |
-> | `#[serde(skip)]` / `skip_deserializing` | Present as a property | Never read from the wire |
-> | `#[serde(skip_serializing_if = "…")]` | Always present | May be absent from the response |
-> | `#[serde(flatten)]` | A nested object property | The inner fields are inlined |
->
-> Reach for `register_schema` when a type uses these — and note that a manual
-> registration is only as accurate as the JSON you hand it; nothing checks it
-> against the type.
+| Attribute | Schema |
+|---|---|
+| `rename` / `rename_all` (symmetric) | The renamed property |
+| `skip` | No property |
+| `default` (field or container) | The property is not `required` |
+| `skip_serializing_if` with a `default` | The property is not `required` |
+
+It refuses, with a compile error, the attributes that one schema cannot
+describe: `transparent`, `into`, `from`, `try_from`, `tag`, `untagged`,
+`flatten`, `with`, `serialize_with`, `deserialize_with`, `alias`, a one-way
+`skip_serializing` / `skip_deserializing`, a split `rename` / `rename_all`, and
+`skip_serializing_if` without a `default`. Register the schema by hand for
+those. A manual registration is only as accurate as the JSON you give it.
+Nothing checks it against the type.
 
 For a type you cannot annotate (a foreign type, or a payload whose JSON shape
 differs from its Rust shape):
@@ -479,6 +490,34 @@ unambiguous, and wrong the moment it isn't — if `create::Args` and
 while your hand-written `#/components/schemas/Args` keeps pointing at a key
 nothing defines. **In a manually registered schema, write the
 collision-resolved key you actually want.**
+
+### Request and response components
+
+A type can have two wire shapes. `#[private]`, `#[classified]` and a hidden
+`#[encrypted]` field are skipped on serialize only. As a result, a request has
+these fields and a response does not. See
+[ADR-0025](../adr/0025-direction-aware-openapi-schemas.md).
+
+The generator picks the schema by position. A request body and a `Query<T>`
+use the shape the type deserializes from. A response body uses the shape it
+serializes to. A nested `$ref` has the position of the schema it is in. A
+`$ref` in a schema you register always uses the response key.
+
+| How the type is used | Components |
+|---|---|
+| In one position only | One, with the schema of that position |
+| In both positions, one shape | One (`Widget`) |
+| In both positions, two shapes | Two: `Widget` (response) and `WidgetRequest` |
+
+When `WidgetRequest` is already a key, the request component is
+`WidgetRequest-2`. Your own registrations keep their keys. When you register
+the main key (`Widget`), both positions use your schema. MCP tool
+`inputSchema` uses the request shape.
+
+A `#[model]` with a field attribute `with`, `deserialize_with`, `flatten` or
+`alias`, or a container attribute `from`, `try_from`, `transparent` or `tag`,
+has no accurate request schema. Its request component is the opaque
+placeholder. `autumn openapi export` names it, and `--strict` fails.
 
 ---
 

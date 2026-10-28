@@ -37,7 +37,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::MatchedPath;
 use axum::http::{Request, Response};
@@ -88,6 +88,23 @@ struct MetricsInner {
     /// because `server.max_concurrent_requests` was at its ceiling.
     /// Exposed as `autumn_requests_shed_total`.
     requests_shed_total: AtomicU64,
+    /// Time spent waiting for a database pool connection.
+    /// Exposed as `autumn_db_pool_wait_seconds`.
+    db_pool_wait: AtomicHistogram,
+    /// The current admission limit, or 0 without a limiter.
+    /// Exposed as `autumn_admission_limit`.
+    admission_limit: AtomicU64,
+    /// Shed requests per criticality.
+    /// Exposed as `autumn_admission_shed_total{criticality=...}`.
+    shed_critical: AtomicU64,
+    shed_default: AtomicU64,
+    shed_sheddable: AtomicU64,
+    /// Requests over `tenancy.max_concurrent_requests` (#3072).
+    /// Exposed as `autumn_tenant_bulkhead_rejections_total{kind="request"}`.
+    tenant_request_rejections: AtomicU64,
+    /// Checkouts over `tenancy.max_db_connections` (#3072).
+    /// Exposed as `autumn_tenant_bulkhead_rejections_total{kind="db"}`.
+    tenant_db_rejections: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -103,6 +120,8 @@ struct StatusBuckets {
 struct RouteMetrics {
     count: u64,
     latencies_ms: VecDeque<u64>,
+    /// One latency histogram per status class (see [`STATUS_CLASSES`]).
+    durations: [Histogram; STATUS_CLASSES.len()],
 }
 
 impl Default for RouteMetrics {
@@ -110,8 +129,176 @@ impl Default for RouteMetrics {
         Self {
             count: 0,
             latencies_ms: VecDeque::with_capacity(MAX_LATENCY_SAMPLES),
+            durations: Default::default(),
         }
     }
+}
+
+impl RouteMetrics {
+    fn observe(&mut self, latency_ms: u64, status_class: usize, elapsed: Duration) {
+        self.count = self.count.saturating_add(1);
+        if self.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
+            self.latencies_ms.pop_front();
+        }
+        self.latencies_ms.push_back(latency_ms);
+        if let Some(histogram) = self.durations.get_mut(status_class) {
+            histogram.observe(elapsed);
+        }
+    }
+
+    /// Count one database query and keep its latency sample. A query series
+    /// records no per-status-class histogram, so `durations` is untouched.
+    fn observe_query(&mut self, latency_ms: u64) {
+        self.count = self.count.saturating_add(1);
+        if self.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
+            self.latencies_ms.pop_front();
+        }
+        self.latencies_ms.push_back(latency_ms);
+    }
+}
+
+// ── Latency histograms ──────────────────────────────────────────
+
+/// Upper bounds of the latency histogram buckets, in microseconds.
+/// The last (`+Inf`) bucket is implicit.
+const BUCKET_BOUNDS_MICROS: [u64; 12] = [
+    1_000, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000,
+    5_000_000, 10_000_000,
+];
+
+/// Prometheus `le` label values for [`BUCKET_BOUNDS_MICROS`], then `+Inf`.
+pub const BUCKET_LABELS: [&str; 13] = [
+    "0.001", "0.005", "0.01", "0.025", "0.05", "0.1", "0.25", "0.5", "1", "2.5", "5", "10", "+Inf",
+];
+
+/// `status_class` label values. Index 5 holds codes outside 100..=599.
+pub const STATUS_CLASSES: [&str; 6] = ["1xx", "2xx", "3xx", "4xx", "5xx", "other"];
+
+/// `method` label values. All other methods use [`OTHER_METHOD`].
+const KNOWN_METHODS: [&str; 9] = [
+    "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "CONNECT", "TRACE",
+];
+
+/// `method` label for an extension method. This keeps the label set bounded.
+pub const OTHER_METHOD: &str = "_other";
+
+/// Map a method to a bounded label value.
+fn method_label(method: &str) -> &'static str {
+    KNOWN_METHODS
+        .iter()
+        .find(|known| **known == method)
+        .copied()
+        .unwrap_or(OTHER_METHOD)
+}
+
+/// Map a status code to an index in [`STATUS_CLASSES`].
+const fn status_class_index(status: u16) -> usize {
+    match status / 100 {
+        1 => 0,
+        2 => 1,
+        3 => 2,
+        4 => 3,
+        5 => 4,
+        _ => 5,
+    }
+}
+
+/// Index of the first bucket that holds `micros`.
+fn bucket_index(micros: u64) -> usize {
+    BUCKET_BOUNDS_MICROS
+        .iter()
+        .position(|bound| micros <= *bound)
+        .unwrap_or(BUCKET_BOUNDS_MICROS.len())
+}
+
+fn duration_micros(elapsed: Duration) -> u64 {
+    u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Non-cumulative bucket counts. The caller holds a lock.
+#[derive(Debug, Clone, Copy, Default)]
+struct Histogram {
+    counts: [u64; BUCKET_LABELS.len()],
+    sum_micros: u64,
+}
+
+impl Histogram {
+    fn observe(&mut self, elapsed: Duration) {
+        let micros = duration_micros(elapsed);
+        if let Some(count) = self.counts.get_mut(bucket_index(micros)) {
+            *count = count.saturating_add(1);
+        }
+        self.sum_micros = self.sum_micros.saturating_add(micros);
+    }
+
+    fn snapshot(&self) -> HistogramSnapshot {
+        HistogramSnapshot::from_counts(self.counts, self.sum_micros)
+    }
+}
+
+/// Lock-free histogram for a path that runs on each request and has no lock.
+#[derive(Debug, Default)]
+struct AtomicHistogram {
+    counts: [AtomicU64; BUCKET_LABELS.len()],
+    sum_micros: AtomicU64,
+}
+
+impl AtomicHistogram {
+    fn observe(&self, elapsed: Duration) {
+        let micros = duration_micros(elapsed);
+        if let Some(count) = self.counts.get(bucket_index(micros)) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> HistogramSnapshot {
+        let counts = std::array::from_fn(|i| {
+            self.counts
+                .get(i)
+                .map_or(0, |count| count.load(Ordering::Relaxed))
+        });
+        HistogramSnapshot::from_counts(counts, self.sum_micros.load(Ordering::Relaxed))
+    }
+}
+
+/// A point-in-time histogram, ready for Prometheus.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HistogramSnapshot {
+    /// Cumulative count per bucket, in [`BUCKET_LABELS`] order.
+    pub cumulative: [u64; BUCKET_LABELS.len()],
+    /// Sum of all observations, in seconds.
+    pub sum_seconds: f64,
+}
+
+impl HistogramSnapshot {
+    fn from_counts(counts: [u64; BUCKET_LABELS.len()], sum_micros: u64) -> Self {
+        let mut running = 0u64;
+        let cumulative = counts.map(|count| {
+            running = running.saturating_add(count);
+            running
+        });
+        #[allow(clippy::cast_precision_loss, reason = "Prometheus samples are f64")]
+        let sum_seconds = sum_micros as f64 / 1_000_000.0;
+        Self {
+            cumulative,
+            sum_seconds,
+        }
+    }
+
+    /// Total number of observations (the `+Inf` bucket).
+    pub fn count(&self) -> u64 {
+        self.cumulative.last().copied().unwrap_or_default()
+    }
+}
+
+/// One histogram series of `autumn_http_request_duration_seconds`.
+#[derive(Debug, Clone)]
+pub struct DurationSeries {
+    pub method: String,
+    pub route: String,
+    pub status_class: &'static str,
+    pub histogram: HistogramSnapshot,
 }
 
 /// Maximum number of latency samples to keep per route.
@@ -157,6 +344,13 @@ impl MetricsCollector {
                 request_timeouts_total: AtomicU64::new(0),
                 read_your_writes_pins_total: AtomicU64::new(0),
                 requests_shed_total: AtomicU64::new(0),
+                db_pool_wait: AtomicHistogram::default(),
+                admission_limit: AtomicU64::new(0),
+                shed_critical: AtomicU64::new(0),
+                shed_default: AtomicU64::new(0),
+                shed_sheddable: AtomicU64::new(0),
+                tenant_request_rejections: AtomicU64::new(0),
+                tenant_db_rejections: AtomicU64::new(0),
             }),
         }
     }
@@ -187,6 +381,39 @@ impl MetricsCollector {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one shed request of class `criticality`. Also increments
+    /// `autumn_requests_shed_total`.
+    pub(crate) fn record_request_shed_for(&self, criticality: crate::admission::Criticality) {
+        self.record_request_shed();
+        let counter = match criticality {
+            crate::admission::Criticality::Critical => &self.inner.shed_critical,
+            crate::admission::Criticality::Default => &self.inner.shed_default,
+            crate::admission::Criticality::Sheddable => &self.inner.shed_sheddable,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a request over its tenant's request cap (#3072).
+    pub(crate) fn record_tenant_request_rejection(&self) {
+        self.inner
+            .tenant_request_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a checkout over its tenant's connection cap (#3072).
+    pub(crate) fn record_tenant_db_rejection(&self) {
+        self.inner
+            .tenant_db_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the current admission limit (`autumn_admission_limit`).
+    pub(crate) fn set_admission_limit(&self, limit: usize) {
+        self.inner
+            .admission_limit
+            .store(u64::try_from(limit).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
     /// Increment the read-your-own-writes pin redirect counter.
     pub fn record_read_your_writes_pin(&self) {
         self.inner
@@ -214,11 +441,68 @@ impl MetricsCollector {
     }
 
     /// Record a completed request.
+    ///
+    /// `method` is mapped to a bounded label: an extension method is
+    /// recorded as `_other`.
     pub fn record(&self, method: &str, route: &str, status: u16, latency_ms: u64) {
+        self.record_duration(method, route, status, Duration::from_millis(latency_ms));
+    }
+
+    /// Record a completed request with its exact duration.
+    pub(crate) fn record_duration(
+        &self,
+        method: &str,
+        route: &str,
+        status: u16,
+        elapsed: Duration,
+    ) {
+        let latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         self.inner.requests_total.fetch_add(1, Ordering::Relaxed);
         self.record_status(status);
         self.record_global_latency(latency_ms);
-        self.record_route(method, route, latency_ms);
+        self.record_route(method_label(method), route, status, elapsed);
+    }
+
+    /// Record the time one database checkout waited for a pool connection.
+    /// Exposed as the `autumn_db_pool_wait_seconds` histogram.
+    pub fn record_db_pool_wait(&self, elapsed: Duration) {
+        self.inner.db_pool_wait.observe(elapsed);
+    }
+
+    /// Histogram of database pool wait time.
+    pub(crate) fn db_pool_wait(&self) -> HistogramSnapshot {
+        self.inner.db_pool_wait.snapshot()
+    }
+
+    /// One histogram series per (route, method, status class) seen so far,
+    /// sorted by route, then method, then status class.
+    pub(crate) fn duration_series(&self) -> Vec<DurationSeries> {
+        let mut series = Vec::new();
+        for shard_lock in &self.inner.shards {
+            let Ok(shard) = shard_lock.read() else {
+                continue;
+            };
+            for (key, metrics) in &shard.by_route {
+                let Some((method, route)) = key.split_once(' ') else {
+                    continue;
+                };
+                for (status_class, histogram) in STATUS_CLASSES.iter().zip(&metrics.durations) {
+                    let histogram = histogram.snapshot();
+                    if histogram.count() > 0 {
+                        series.push(DurationSeries {
+                            method: method.to_owned(),
+                            route: route.to_owned(),
+                            status_class,
+                            histogram,
+                        });
+                    }
+                }
+            }
+        }
+        series.sort_by(|a, b| {
+            (&a.route, &a.method, a.status_class).cmp(&(&b.route, &b.method, b.status_class))
+        });
+        series
     }
 
     fn record_status(&self, status: u16) {
@@ -256,8 +540,10 @@ impl MetricsCollector {
         }
     }
 
-    fn record_route(&self, method: &str, route: &str, latency_ms: u64) {
+    fn record_route(&self, method: &str, route: &str, status: u16, elapsed: Duration) {
         let shard_idx = shard_index(route);
+        let latency_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let status_class = status_class_index(status);
 
         // ⚡ Bolt Optimization:
         // Format the key into a stack-allocated buffer to avoid a heap allocation
@@ -286,11 +572,7 @@ impl MetricsCollector {
             && let Ok(mut shard) = lock.write()
         {
             if let Some(entry) = shard.by_route.get_mut(key_str) {
-                entry.count = entry.count.saturating_add(1);
-                if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
-                    entry.latencies_ms.pop_front();
-                }
-                entry.latencies_ms.push_back(latency_ms);
+                entry.observe(latency_ms, status_class, elapsed);
             } else {
                 is_new = true;
             }
@@ -305,12 +587,11 @@ impl MetricsCollector {
             if let Some(lock) = self.inner.shards.get(shard_idx)
                 && let Ok(mut shard) = lock.write()
             {
-                let entry = shard.by_route.entry(key).or_default();
-                entry.count = entry.count.saturating_add(1);
-                if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
-                    entry.latencies_ms.pop_front();
-                }
-                entry.latencies_ms.push_back(latency_ms);
+                shard
+                    .by_route
+                    .entry(key)
+                    .or_default()
+                    .observe(latency_ms, status_class, elapsed);
             }
         }
     }
@@ -322,13 +603,50 @@ impl MetricsCollector {
         if let Some(lock) = self.inner.shards.get(shard_idx)
             && let Ok(mut shard) = lock.write()
         {
-            let entry = shard.by_query.entry(key.to_owned()).or_default();
-            entry.count = entry.count.saturating_add(1);
-            if entry.latencies_ms.len() >= MAX_LATENCY_SAMPLES {
-                entry.latencies_ms.pop_front();
+            // Probe by borrow first: every query after a key's first sighting
+            // finds its entry without building an owned key just to drop it.
+            if let Some(entry) = shard.by_query.get_mut(key) {
+                entry.observe_query(latency_ms);
+            } else {
+                shard
+                    .by_query
+                    .entry(key.to_owned())
+                    .or_default()
+                    .observe_query(latency_ms);
             }
-            entry.latencies_ms.push_back(latency_ms);
         }
+    }
+
+    /// [`record_db_query`](Self::record_db_query) under the key `key` formats
+    /// to, composed into a stack buffer rather than a fresh `String` per query
+    /// (the `Db` extractor records one per request). A key longer than the
+    /// buffer falls back to an owned `String`; the recorded key is
+    /// byte-identical either way.
+    #[cfg(feature = "db")]
+    pub(crate) fn record_db_query_fmt(&self, key: std::fmt::Arguments<'_>, latency_ms: u64) {
+        // Same stack-buffer composition as `record_route`: `Cursor::position`
+        // reports the bytes written, so the filled prefix is read back without
+        // deriving a length from the remaining slice.
+        let mut buf = [0u8; 256];
+        let written = {
+            let mut cursor = std::io::Cursor::new(buf.as_mut_slice());
+            if std::io::Write::write_fmt(&mut cursor, key).is_ok() {
+                usize::try_from(cursor.position()).unwrap_or_default()
+            } else {
+                0
+            }
+        };
+        // A write that overflowed the buffer leaves `written == 0`. An empty
+        // prefix therefore takes the owned path, which records the same text.
+        let composed = buf
+            .get(..written)
+            .and_then(|filled| std::str::from_utf8(filled).ok())
+            .filter(|composed| !composed.is_empty());
+        if let Some(composed) = composed {
+            self.record_db_query(composed, latency_ms);
+            return;
+        }
+        self.record_db_query(&std::fmt::format(key), latency_ms);
     }
 
     fn increment_active(&self) {
@@ -402,6 +720,17 @@ impl MetricsCollector {
                     .load(Ordering::Relaxed),
                 request_timeouts_total: self.inner.request_timeouts_total.load(Ordering::Relaxed),
                 requests_shed_total: self.inner.requests_shed_total.load(Ordering::Relaxed),
+                admission: AdmissionSnapshot {
+                    limit: self.inner.admission_limit.load(Ordering::Relaxed),
+                    shed_critical: self.inner.shed_critical.load(Ordering::Relaxed),
+                    shed_default: self.inner.shed_default.load(Ordering::Relaxed),
+                    shed_sheddable: self.inner.shed_sheddable.load(Ordering::Relaxed),
+                    tenant_request_rejections: self
+                        .inner
+                        .tenant_request_rejections
+                        .load(Ordering::Relaxed),
+                    tenant_db_rejections: self.inner.tenant_db_rejections.load(Ordering::Relaxed),
+                },
             },
             idempotency: IdempotencyMetricsSnapshot {
                 hits: self.inner.idempotency_hits.load(Ordering::Relaxed),
@@ -481,6 +810,27 @@ pub struct HttpMetrics {
     /// because `server.max_concurrent_requests` was at its ceiling
     /// (`autumn_requests_shed_total`).
     pub requests_shed_total: u64,
+    /// Admission limit and shed counts per criticality (issue #3068).
+    pub admission: AdmissionSnapshot,
+}
+
+/// Admission-control metrics (issue #3068).
+#[derive(Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AdmissionSnapshot {
+    /// The current admission limit, or 0 without a limiter
+    /// (`autumn_admission_limit`).
+    pub limit: u64,
+    /// Shed `critical` requests.
+    pub shed_critical: u64,
+    /// Shed `default` requests.
+    pub shed_default: u64,
+    /// Shed `sheddable` requests.
+    pub shed_sheddable: u64,
+    /// Requests over their tenant's request cap (#3072).
+    pub tenant_request_rejections: u64,
+    /// Checkouts over their tenant's connection cap (#3072).
+    pub tenant_db_rejections: u64,
 }
 
 /// Percentiles for latency measurements.
@@ -681,19 +1031,22 @@ where
         match this.inner.poll(cx) {
             Poll::Ready(Ok(response)) => {
                 if let Some(collector) = this.collector.take() {
-                    let latency_ms = u64::try_from(
-                        crate::time::ambient_instant()
-                            .saturating_duration_since(*this.start)
-                            .as_millis(),
-                    )
-                    .unwrap_or(u64::MAX);
+                    let elapsed =
+                        crate::time::ambient_instant().saturating_duration_since(*this.start);
                     let method_str = this.method.as_str();
-                    let route_str = this.route.as_ref().map_or(
-                        super::access_log::UNMATCHED_ROUTE,
+                    let route_str = this.route.as_ref().map_or_else(
+                        || {
+                            response
+                                .extensions()
+                                .get::<super::access_log::ResponseRoute>()
+                                .map_or(super::access_log::UNMATCHED_ROUTE, |route| {
+                                    route.0.as_str()
+                                })
+                        },
                         axum::extract::MatchedPath::as_str,
                     );
                     let status = response.status().as_u16();
-                    collector.record(method_str, route_str, status, latency_ms);
+                    collector.record_duration(method_str, route_str, status, elapsed);
                     collector.decrement_active();
                 }
                 Poll::Ready(Ok(response))
@@ -712,6 +1065,88 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn method_label_is_bounded() {
+        assert_eq!(method_label("GET"), "GET");
+        assert_eq!(method_label("PATCH"), "PATCH");
+        assert_eq!(method_label("PROPFIND"), OTHER_METHOD);
+        assert_eq!(method_label("get"), OTHER_METHOD);
+    }
+
+    #[test]
+    fn status_class_covers_every_code() {
+        assert_eq!(STATUS_CLASSES[status_class_index(101)], "1xx");
+        assert_eq!(STATUS_CLASSES[status_class_index(204)], "2xx");
+        assert_eq!(STATUS_CLASSES[status_class_index(308)], "3xx");
+        assert_eq!(STATUS_CLASSES[status_class_index(404)], "4xx");
+        assert_eq!(STATUS_CLASSES[status_class_index(503)], "5xx");
+        assert_eq!(STATUS_CLASSES[status_class_index(999)], "other");
+    }
+
+    #[test]
+    fn bucket_bounds_are_inclusive() {
+        assert_eq!(bucket_index(0), 0);
+        assert_eq!(bucket_index(1_000), 0);
+        assert_eq!(bucket_index(1_001), 1);
+        assert_eq!(bucket_index(10_000_000), 11);
+        assert_eq!(bucket_index(10_000_001), 12, "+Inf bucket");
+        assert_eq!(BUCKET_LABELS.len(), BUCKET_BOUNDS_MICROS.len() + 1);
+    }
+
+    #[test]
+    fn histogram_snapshot_is_cumulative() {
+        let mut histogram = Histogram::default();
+        histogram.observe(Duration::from_micros(500));
+        histogram.observe(Duration::from_millis(30));
+        histogram.observe(Duration::from_secs(60));
+        let snap = histogram.snapshot();
+        assert_eq!(snap.cumulative[0], 1);
+        assert_eq!(snap.cumulative[4], 2, "le=0.05 holds 30ms");
+        assert_eq!(snap.cumulative[11], 2, "le=10 excludes 60s");
+        assert_eq!(snap.count(), 3);
+        assert!((snap.sum_seconds - 60.0305).abs() < 1e-9);
+    }
+
+    #[test]
+    fn duration_series_split_by_method_route_and_status_class() {
+        let collector = MetricsCollector::new();
+        collector.record("GET", "/a", 200, 3);
+        collector.record("GET", "/a", 500, 3);
+        collector.record("FOO", "/a", 405, 3);
+        collector.record("GET", "/b", 200, 3);
+        let series = collector.duration_series();
+        let keys: Vec<(&str, &str, &str, u64)> = series
+            .iter()
+            .map(|s| {
+                (
+                    s.route.as_str(),
+                    s.method.as_str(),
+                    s.status_class,
+                    s.histogram.count(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                ("/a", "GET", "2xx", 1),
+                ("/a", "GET", "5xx", 1),
+                ("/a", "_other", "4xx", 1),
+                ("/b", "GET", "2xx", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn db_pool_wait_is_a_histogram() {
+        let collector = MetricsCollector::new();
+        collector.record_db_pool_wait(Duration::from_micros(200));
+        collector.record_db_pool_wait(Duration::from_millis(400));
+        let snap = collector.db_pool_wait();
+        assert_eq!(snap.cumulative[0], 1);
+        assert_eq!(snap.count(), 2);
+    }
 
     #[test]
     fn collector_records_request() {
@@ -751,10 +1186,10 @@ mod tests {
         // `u64::MAX`; the bump must stick there rather than overflow-panic the
         // request path in a debug build.
         let collector = MetricsCollector::new();
-        collector.record_route("GET", "/saturating", 5);
+        collector.record_route("GET", "/saturating", 200, Duration::from_millis(5));
         pin_counter_at_ceiling(&collector, "/saturating", "GET /saturating");
 
-        collector.record_route("GET", "/saturating", 5);
+        collector.record_route("GET", "/saturating", 200, Duration::from_millis(5));
 
         let snap = collector.snapshot();
         assert_eq!(snap.http.by_route["GET /saturating"].count, u64::MAX);
@@ -770,6 +1205,95 @@ mod tests {
 
         let snap = collector.snapshot();
         assert_eq!(snap.db_queries["SELECT 1"].count, u64::MAX);
+    }
+
+    /// A key seen before is found by borrow and updated in place: one entry,
+    /// every sample counted, the latency ring still capped, and no duration
+    /// histogram touched (a query series has no status class).
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions read the shard under the one lock they inspect"
+    )]
+    fn db_query_with_a_seen_key_updates_its_one_entry() {
+        let collector = MetricsCollector::new();
+        let key = "GET /users/{id} SELECT";
+        let total = MAX_LATENCY_SAMPLES + 5;
+        for latency_ms in 0..u64::try_from(total).expect("fits in u64") {
+            collector.record_db_query(key, latency_ms);
+        }
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.db_queries.len(), 1, "one key, one series");
+        assert_eq!(
+            snap.db_queries[key].count,
+            u64::try_from(total).expect("fits in u64")
+        );
+
+        let lock = collector
+            .inner
+            .shards
+            .get(shard_index(key))
+            .expect("shard_index always yields an in-bounds shard");
+        let (samples, oldest, durations_untouched) = {
+            let shard = lock.read().expect("shard lock is not poisoned");
+            let entry = &shard.by_query[key];
+            (
+                entry.latencies_ms.len(),
+                entry.latencies_ms.front().copied(),
+                entry.durations.iter().all(|h| h.snapshot().count() == 0),
+            )
+        };
+        assert_eq!(samples, MAX_LATENCY_SAMPLES);
+        assert_eq!(oldest, Some(5), "the oldest samples are evicted first");
+        assert!(
+            durations_untouched,
+            "a query series records no per-status-class histogram"
+        );
+    }
+
+    /// `record_db_query_fmt` records under exactly the text its arguments
+    /// format to, whether the key fits the stack buffer or not, and lands in
+    /// the same entry as a plain `record_db_query` of that text.
+    #[cfg(feature = "db")]
+    #[test]
+    fn db_query_fmt_records_under_the_formatted_key() {
+        let collector = MetricsCollector::new();
+        let route = "GET /users/{id}";
+        collector.record_db_query_fmt(format_args!("{route} SELECT"), 5);
+        collector.record_db_query("GET /users/{id} SELECT", 7);
+        // Past the stack buffer: the owned fallback, same key text.
+        let long_route = format!("GET /{}", "a".repeat(300));
+        collector.record_db_query_fmt(format_args!("{long_route} INSERT"), 9);
+        let snap = collector.snapshot();
+        assert_eq!(snap.db_queries.len(), 2);
+        assert_eq!(snap.db_queries["GET /users/{id} SELECT"].count, 2);
+        assert_eq!(
+            snap.db_queries[format!("{long_route} INSERT").as_str()].count,
+            1
+        );
+    }
+
+    /// The buffer boundary: a key of exactly 256 bytes fits, and a key whose
+    /// last character straddles the boundary is never truncated mid-way.
+    #[cfg(feature = "db")]
+    #[test]
+    fn db_query_fmt_keeps_keys_at_the_buffer_boundary_whole() {
+        let collector = MetricsCollector::new();
+        // "GET /" + 244 + " SELECT" = 256 bytes.
+        let exact = format!("/{}", "b".repeat(244));
+        let exact_key = format!("GET {exact} SELECT");
+        assert_eq!(exact_key.len(), 256);
+        collector.record_db_query_fmt(format_args!("GET {exact} SELECT"), 1);
+        // 255 ASCII bytes then a 2-byte `é`: the write overflows inside it.
+        let straddle = format!("{}é", "c".repeat(255));
+        assert_eq!(straddle.len(), 257);
+        collector.record_db_query_fmt(format_args!("{straddle}"), 2);
+
+        let snap = collector.snapshot();
+        assert_eq!(snap.db_queries.len(), 2);
+        assert_eq!(snap.db_queries[exact_key.as_str()].count, 1);
+        assert_eq!(snap.db_queries[straddle.as_str()].count, 1);
     }
 
     #[test]
@@ -943,6 +1467,22 @@ mod tests {
     }
 
     #[test]
+    fn collector_records_tenant_bulkhead_rejections_by_kind() {
+        let collector = MetricsCollector::new();
+        collector.record_tenant_request_rejection();
+        collector.record_tenant_db_rejection();
+        collector.record_tenant_db_rejection();
+        let admission = collector.snapshot().http.admission;
+        assert_eq!(admission.tenant_request_rejections, 1);
+        assert_eq!(admission.tenant_db_rejections, 2);
+        assert_eq!(
+            collector.snapshot().http.requests_shed_total,
+            0,
+            "a tenant cap is not an admission shed"
+        );
+    }
+
+    #[test]
     fn requests_shed_total_independent_of_regular_requests() {
         let collector = MetricsCollector::new();
         collector.record("GET", "/api", 200, 5);
@@ -950,5 +1490,32 @@ mod tests {
         let snap = collector.snapshot();
         assert_eq!(snap.http.requests_total, 1);
         assert_eq!(snap.http.requests_shed_total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_response_route_names_the_series_when_the_request_had_none() {
+        use tower::ServiceExt as _;
+
+        let collector = MetricsCollector::new();
+        let service = MetricsLayer::new(collector.clone()).layer(tower::service_fn(
+            |_request: http::Request<axum::body::Body>| async {
+                let mut response = http::Response::new(axum::body::Body::empty());
+                response
+                    .extensions_mut()
+                    .insert(super::super::access_log::ResponseRoute("/p/x".to_owned()));
+                Ok::<_, std::convert::Infallible>(response)
+            },
+        ));
+        let request = http::Request::builder()
+            .uri("/p/x")
+            .body(axum::body::Body::empty())
+            .expect("request");
+        service.oneshot(request).await.expect("infallible");
+        let routes: Vec<String> = collector
+            .duration_series()
+            .iter()
+            .map(|series| series.route.clone())
+            .collect();
+        assert_eq!(routes, ["/p/x"]);
     }
 }

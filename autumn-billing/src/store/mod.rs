@@ -42,6 +42,7 @@ pub enum EventClaim {
 
 /// Result of a guarded upsert.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Write<T> {
     /// The row was inserted or updated.
     Applied(T),
@@ -51,6 +52,11 @@ pub enum Write<T> {
     /// A newer event was already applied. Nothing was written. `T` is the
     /// stored row.
     Stale(T),
+    /// A subscription write with [`SubscriptionUpsert::with_tie_check`] met a
+    /// stored row at the same instant with a different live status. Nothing
+    /// was written. `T` is the stored row. Only subscription writes return
+    /// this.
+    Tie(T),
 }
 
 impl<T> Write<T> {
@@ -58,7 +64,15 @@ impl<T> Write<T> {
     #[must_use]
     pub fn into_inner(self) -> T {
         match self {
-            Self::Applied(row) | Self::Unchanged(row) | Self::Stale(row) => row,
+            Self::Applied(row) | Self::Unchanged(row) | Self::Stale(row) | Self::Tie(row) => row,
+        }
+    }
+
+    /// The stored row after the call, by reference.
+    #[must_use]
+    pub const fn as_inner(&self) -> &T {
+        match self {
+            Self::Applied(row) | Self::Unchanged(row) | Self::Stale(row) | Self::Tie(row) => row,
         }
     }
 
@@ -75,12 +89,19 @@ impl<T> Write<T> {
         matches!(self, Self::Unchanged(_))
     }
 
+    /// `true` when the write found a same-instant tie and wrote nothing.
+    #[must_use]
+    pub const fn is_tie(&self) -> bool {
+        matches!(self, Self::Tie(_))
+    }
+
     /// The row wrapped in the same variant, or the first error.
     pub(crate) fn try_map<U, E>(self, f: impl FnOnce(T) -> Result<U, E>) -> Result<Write<U>, E> {
         Ok(match self {
             Self::Applied(row) => Write::Applied(f(row)?),
             Self::Unchanged(row) => Write::Unchanged(f(row)?),
             Self::Stale(row) => Write::Stale(f(row)?),
+            Self::Tie(row) => Write::Tie(f(row)?),
         })
     }
 }
@@ -94,6 +115,9 @@ pub(crate) enum Guard {
     Unchanged,
     /// The stored snapshot is newer. Do not write.
     Stale,
+    /// Same instant, different live status, and the caller asked to be told.
+    /// Do not write. Subscriptions only.
+    Tie,
 }
 
 /// Ordering guard shared by every store.
@@ -122,35 +146,44 @@ pub(crate) fn guard(
     }
 }
 
-/// [`guard`] for a subscription write that may carry the provider's own
-/// current state (see [`SubscriptionUpsert::authoritative`]).
+/// [`guard`] for a subscription write.
 ///
-/// An authoritative write replaces the stored row at the SAME instant, which
-/// is how two events that tie to the second are settled by the provider's
-/// answer rather than by ranking them. That includes an equal status: the
-/// lookup may differ in quantity, price, period end or cancellation, and those
-/// fields must not be discarded as a redelivery. It never leaves a terminal status and
-/// never goes back in time, and it does not move the stored instant, so no
-/// timestamp is invented and a provider event created after the tie still
-/// compares against a real provider time.
+/// An authoritative write (see [`SubscriptionUpsert::authoritative`]) replaces
+/// the stored row at the SAME instant. The provider's answer then settles a
+/// tie, not the ranking. That includes an equal status: the lookup may differ
+/// in quantity, price, period end or cancellation. It never leaves a terminal
+/// status, never goes back in time, and does not move the stored instant.
+///
+/// With `check_ties`, a non-authoritative write at the stored instant with a
+/// different live status is a [`Guard::Tie`] and not ranked. The check and the
+/// write are one atomic step, so two concurrent writers cannot both miss it.
 #[must_use]
 pub(crate) fn guard_subscription(
     existing_at: DateTime<Utc>,
-    existing_rank: u8,
-    existing_terminal: bool,
+    existing_status: SubscriptionStatus,
     incoming_at: DateTime<Utc>,
-    incoming_rank: u8,
+    incoming_status: SubscriptionStatus,
     authoritative: bool,
+    check_ties: bool,
 ) -> Guard {
+    let existing_terminal = existing_status.is_terminal();
     if authoritative && !existing_terminal && incoming_at == existing_at {
         return Guard::Apply;
     }
+    if check_ties
+        && incoming_at == existing_at
+        && incoming_status != existing_status
+        && !existing_terminal
+        && !incoming_status.is_terminal()
+    {
+        return Guard::Tie;
+    }
     guard(
         existing_at,
-        existing_rank,
+        existing_status.rank(),
         existing_terminal,
         incoming_at,
-        incoming_rank,
+        incoming_status.rank(),
     )
 }
 
@@ -234,6 +267,9 @@ pub struct SubscriptionUpsert {
     /// it settles a same-instant tie instead of being ranked against it. See
     /// [`SubscriptionUpsert::with_authoritative`].
     pub authoritative: bool,
+    /// Report a same-instant tie as [`Write::Tie`] instead of ranking it. See
+    /// [`SubscriptionUpsert::with_tie_check`].
+    pub check_ties: bool,
     /// App clock.
     pub now: DateTime<Utc>,
 }
@@ -261,6 +297,7 @@ impl SubscriptionUpsert {
             cancel_at_period_end: false,
             occurred_at,
             authoritative: false,
+            check_ties: false,
             now,
         }
     }
@@ -271,6 +308,16 @@ impl SubscriptionUpsert {
     #[must_use]
     pub const fn with_authoritative(mut self) -> Self {
         self.authoritative = true;
+        self
+    }
+
+    /// Ask the store to report a tie. At the same `occurred_at` as the stored
+    /// row, a different live status writes nothing and returns [`Write::Tie`].
+    /// The store decides this inside the write, so it holds for concurrent
+    /// writers. Without it, the ranking decides, as before.
+    #[must_use]
+    pub const fn with_tie_check(mut self) -> Self {
+        self.check_ties = true;
         self
     }
 
@@ -320,6 +367,8 @@ pub struct InvoiceUpsert {
     pub customer_id: String,
     /// Local subscription id.
     pub subscription_id: Option<String>,
+    /// Provider subscription id. `None` keeps the stored value.
+    pub provider_subscription_id: Option<ProviderId>,
     /// Provider invoice id (the key).
     pub provider_invoice_id: ProviderId,
     /// Status.
@@ -356,6 +405,7 @@ impl InvoiceUpsert {
             new_id: new_id.into(),
             customer_id: customer_id.into(),
             subscription_id: None,
+            provider_subscription_id: None,
             provider_invoice_id: provider_invoice_id.into(),
             status,
             amount_due,
@@ -371,6 +421,13 @@ impl InvoiceUpsert {
     #[must_use]
     pub fn with_subscription(mut self, subscription_id: impl Into<String>) -> Self {
         self.subscription_id = Some(subscription_id.into());
+        self
+    }
+
+    /// Set the provider subscription id.
+    #[must_use]
+    pub fn with_provider_subscription(mut self, id: impl Into<ProviderId>) -> Self {
+        self.provider_subscription_id = Some(id.into());
         self
     }
 
@@ -512,6 +569,23 @@ pub trait BillingStore: Send + Sync + 'static {
         &'a self,
         provider_invoice_id: &'a ProviderId,
     ) -> StoreFuture<'a, Option<Invoice>>;
+
+    /// Link the invoices of `provider_subscription_id` that have no local
+    /// subscription to `subscription_id`. Link the unlinked `Pending` or
+    /// `Running` dunning rows of those invoices, and of invoices already
+    /// linked to `subscription_id`. Other links stay. Idempotent.
+    ///
+    /// The default is a no-op. An older store still compiles and keeps the
+    /// old behavior. A custom store must override this method to get the fix.
+    fn link_subscription<'a>(
+        &'a self,
+        provider_subscription_id: &'a ProviderId,
+        subscription_id: &'a str,
+        now: DateTime<Utc>,
+    ) -> StoreFuture<'a, ()> {
+        let _ = (provider_subscription_id, subscription_id, now);
+        Box::pin(std::future::ready(Ok(())))
+    }
 
     // ── Dunning ─────────────────────────────────────────────────────────
 

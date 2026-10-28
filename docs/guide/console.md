@@ -12,13 +12,22 @@ That's the whole usage. The first invocation scaffolds
 `src/bin/playground.rs`, wires your `Cargo.toml` for it, then builds and runs
 it. Every invocation after that just builds and runs whatever you last edited.
 
-## Why it isn't a REPL
+## Two modes: edit-and-run, or a prompt
 
-Rust has no stable `eval`, so there is no honest way to offer a line-by-line
-interactive shell the way Ruby, Python, and Elixir do. Autumn follows the model
-loco.rs uses instead: **edit and run**. You get a real Rust file, with your real
-types, your real models, and your editor's autocompletion — and `autumn console`
-handles the compile-and-run loop.
+Rust has no stable `eval`. Each console mode has a cost. Autumn gives you two
+modes on the same scaffolded binary:
+
+| | `autumn console` (edit and run) | `autumn console --repl` (prompt) |
+| --- | --- | --- |
+| Cost of one question | A compile | A keystroke |
+| What you call | All of Rust: your real types, every API | Reads only: `find_all`, `find_by_id`, `count` |
+| What you see | Real model values | A JSON projection of each row |
+| Editor support | Autocompletion, type checks | None |
+| History | Your file | Line history, kept between sessions |
+
+Use the prompt for "what is in this row?" questions. Use the playground for
+everything else. The edit-and-run mode follows loco.rs. The prompt uses
+[Rhai](https://rhai.rs), a scripting language for Rust.
 
 ## What's already wired
 
@@ -57,6 +66,80 @@ Then:
 autumn console
 ```
 
+## The REPL (`--repl`)
+
+```bash
+autumn console --repl
+```
+
+This builds the playground one time, then opens a prompt. Each repository is a
+Rhai module:
+
+```text
+autumn> PostRepository::count()
+2
+autumn> PostRepository::find_by_id(1)
+{
+  "body": "Hello",
+  "id": 1,
+  "title": "First"
+}
+autumn> PostRepository::find_all().len()
+2
+autumn> let p = PostRepository::find_by_id(2); p.title
+Second
+```
+
+- `help()` lists the commands and the repositories.
+- `models()` and `repositories()` return what is registered.
+- `exit`, `quit`, `:q` or Ctrl-D stops the prompt. At the prompt, Ctrl-C
+  clears the line. While a line runs, Ctrl-C stops the process.
+- Variables stay between lines.
+- History is in `target/autumn/repl_history.txt`, in the package directory.
+
+### How it works
+
+- `--repl` builds with `--features playground,autumn-web/repl`. It does
+  **not** change `Cargo.toml`. A normal `cargo build` never gets Rhai.
+- `#[model]` and `#[repository]` register themselves through `inventory`.
+  You write no glue for each model.
+- Only the modules that the playground declares with `#[path]` are compiled
+  in: `schema`, `models`, `repositories` and `policies`. A repository in a
+  different module is not at the prompt. Add a `#[path]` line for it.
+- `--repl` also sets `AUTUMN_CONSOLE_REPL=1`. Then `SeedContext::build()`
+  opens the prompt and ends the process when you exit. The playground code
+  after it never runs. Any playground works, also one from before `--repl`.
+- The playground is your code, so code you put before `SeedContext::build()`
+  still runs. A playground that never calls `SeedContext::build()` cannot
+  open the prompt: `autumn console --repl` then fails and says so.
+- Repository methods are `async`. Rhai is synchronous. Each call blocks on the
+  runtime handle, with a 30-second limit. The database server stops the
+  statement at that limit too.
+- On SQLite there is no limit. SQLite cannot stop a running statement, so the
+  prompt waits for each call to finish.
+- A failed call, a time-out, or a panic is a script error. The prompt stays
+  open. A panic also prints the Rust panic message first.
+
+### What you see
+
+A row is the JSON that `Json(model)` sends. `#[private]` and `#[serde(skip)]`
+fields do not show. A model with `#[classified]` columns shows its other
+columns only, with their serde attributes. A repository over a hand-written
+model uses that model's `Serialize` impl.
+
+### Limits
+
+- Reads only: `find_all`, `find_by_id` and `count`. Writes, derived finders and
+  your own functions are not available.
+- `find_by_id` returns `()` when no row has that id.
+- A tenant-scoped or sharded repository needs request context. At the prompt,
+  its reads can return a script error.
+- If two modules declare a repository with the same name, the prompt registers
+  neither. The banner names them.
+- With `--repl`, `String + &String` in your app code does not compile. Write
+  `s + other.as_str()` or use `format!`. (Rhai uses `smartstring`, which adds
+  `impl Add<SmartString> for String`.)
+
 ## Flags
 
 | Flag | Effect |
@@ -65,6 +148,7 @@ autumn console
 | `-p, --package <name>` | Target a workspace member instead of the current directory. |
 | `--force` | Overwrite the playground with a fresh copy of the template. |
 | `--scaffold-only` | Scaffold and wire the playground, then stop — don't build or run it. |
+| `--repl` | Open an interactive Rhai prompt instead of running the playground code. See [The REPL](#the-repl---repl). |
 
 `--profile` also selects which `[profile.<name>.database]` section of
 `autumn.toml` supplies the URL, so `autumn console --profile demo` talks to the
@@ -173,9 +257,11 @@ console` proceeds normally.
 
 ## Not included
 
-- A line-by-line eval REPL (see above).
+- A REPL over arbitrary Rust. `--repl` evaluates Rhai over registered
+  repositories only (see above).
+- Writes from the prompt.
 - Remote or production console attach.
-- Readline history or pretty-printing helpers.
+- Pretty-printing helpers in the edit-and-run playground.
 - An auto-imported prelude of every model — the modules are declared for you,
   but you add the `use` lines you want.
 

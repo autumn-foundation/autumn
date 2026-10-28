@@ -113,22 +113,31 @@ codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
 ## Plugin authors
 
+**Required whenever this release changes the declared stable plugin surface**
+(`autumn_web::plugin_contract::PLUGIN_SURFACES`) — `scripts/check-plugin-surface.sh`
+fails a surface change that leaves this section empty or unwritten. Delete the
+section entirely when the plugin surface did not change.
+
 Everything here is addressed to someone maintaining an `autumn-plugin-*` /
 `autumn-*-plugin` crate, not to an application author. See
 [`docs/plugins.md`](../plugins.md#the-plugin-api-contract) for the tiers.
 
-- **Stable surface changed:** none.
-- **Experimental surface changed:** none.
-- **New stable surface:** none.
+- **Stable surface changed:** {the API, what changed, and the replacement — or
+  "none". Every entry here is a `**Breaking:**` change in the changelog and
+  needs its own section under *Breaking changes* above.}
+- **Experimental surface changed:** {the API and what changed — or "none".
+  Experimental surface may change in any release, so this is a courtesy, not a
+  promise. Plugins that declared it with `uses_experimental` are the audience.}
+- **New stable surface:** {additive APIs plugin authors can now rely on — or
+  "none". These are not breaking; they are why a plugin author reads this
+  section for the good news too.}
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
   lockstep with the framework) and re-run
-  `autumn plugin-check --plugin-name <your-plugin>`. A range that excludes the
-  host makes `AppBuilder::plugin` panic at registration unless
-  `AUTUMN_PLUGIN_CONTRACT=warn` demotes it. The examples in the `Plugin::contract`
-  and `plugin_contract` rustdoc and the reference plugin's note name the series
-  under development; copy the shape, not the literal.
+  `autumn plugin-check --plugin-name <your-plugin>`. The examples in the
+  `Plugin::contract` and `plugin_contract` rustdoc now name `"0.9"`, the
+  series 0.9.0 opened; copy the shape, not the literal.
 
 ## Compiler error cheat sheet
 

@@ -118,6 +118,9 @@ REQUEST_PATH_MODULES=(
   autumn/src/middleware/maintenance.rs:default
   autumn/src/middleware/error_page_filter.rs:default
   autumn/src/middleware/load_shed.rs:default
+  autumn/src/middleware/criticality.rs:default
+  autumn/src/admission.rs:default
+  autumn/src/bulkhead.rs:default
   autumn/src/middleware/short_circuit.rs:default
   autumn/src/capsule/capture.rs:reporting
   autumn/src/capsule/wire.rs:db
@@ -125,6 +128,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/capsule/clock.rs:reporting
   autumn/src/capsule/entropy.rs:reporting
   autumn/src/capsule/effects.rs:reporting
+  autumn/src/capsule/boundary.rs:reporting
   autumn/src/capsule/persist.rs:reporting
   autumn/src/capsule/redact.rs:reporting
   autumn/src/capsule/schema.rs:reporting
@@ -147,12 +151,15 @@ REQUEST_PATH_MODULES=(
   autumn/src/shadow/transport.rs:default
   autumn/src/shadow/layer.rs:default
   autumn/src/shadow/registry.rs:default
+  autumn/src/fault_injection/mod.rs:default
+  autumn/src/fault_injection/layer.rs:default
   autumn/src/plugin_sandbox/host.rs:plugin-sandbox
   autumn/src/plugin_sandbox/wire.rs:plugin-sandbox
   autumn/src/plugin_sandbox/plugin.rs:plugin-sandbox
   autumn/src/plugin_sandbox/capability/mod.rs:plugin-sandbox
   autumn/src/plugin_sandbox/grants.rs:plugin-sandbox
   autumn/src/plugin_sandbox/slots.rs:plugin-sandbox
+  autumn/src/plugin_sandbox/dynamic.rs:plugin-sandbox
   autumn-search/src/lib.rs:default
   autumn/src/replication/wal.rs:db
   autumn/src/replication/segment.rs:db
@@ -172,6 +179,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/constela/validate.rs:constela
   autumn/src/constela/render.rs:constela
   autumn/src/constela/dispatch.rs:constela
+  autumn/src/constela/budget.rs:constela
   autumn-billing/src/money.rs:default
   autumn-billing/src/reconcile.rs:default
   autumn-billing/src/gate.rs:default
@@ -183,7 +191,7 @@ REQUEST_PATH_MODULES=(
 # cannot quietly shrink the gate's surface. It tracks the manifest's length, so
 # it moves with every addition too — otherwise a one-entry revert would shrink
 # the manifest back under the floor while the gate still passed.
-MODULE_COUNT_FLOOR=84
+MODULE_COUNT_FLOOR=91
 
 # Gated modules whose feature is KNOWINGLY not enabled by any enforcing CI clippy
 # lane, as `<path>:<feature>`. Their headers are real but unenforced: the deny

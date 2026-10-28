@@ -40,6 +40,7 @@ Looking for the API reference instead? That is
 - [Rate Limiting](rate-limiting.md) — capping how often a caller can hit a route
 - [Outbound HTTP Client](outbound-http.md) — calling another service from a handler
 - [Resilience and Circuit Breakers](resilience.md) — timeouts, retries and breakers on outbound calls
+- [Timeouts, Deadlines and Retry Budgets](timeouts-and-budgets.md) — sending the request deadline to outbound calls and capping retries
 
 ## Templates, forms and the browser UI
 
@@ -79,6 +80,7 @@ Looking for the API reference instead? That is
 - [Threaded Comments on Anything](commentable.md) — attaching a comment thread to any record
 - [Horizontal Sharding](sharding.md) — splitting one logical database across several physical ones
 - [SQLite in Production](sqlite-in-production.md) — when SQLite is a reasonable production database, and how to run it
+- [SQLite Database Fleet](sqlite-fleet.md) — one SQLite database per tenant or per slot, replicated to object storage
 
 ## Files, media and storage
 
@@ -113,6 +115,7 @@ Looking for the API reference instead? That is
 - [Bot Protection and CAPTCHA](bot-protection.md) — keeping automated traffic off a form or route
 - [TLS and HTTPS](tls.md) — certificates, ACME, and terminating TLS
 - [CORS and Cross-Origin Requests](cors.md) — letting a browser on another origin read your responses
+- [Portable Data Capsules](data-capsules.md) — a signed export of one subject's data, with a viewer and import
 - [Data Retention for Framework-Owned Data](data-retention.md) — bounding the tables Autumn itself creates
 - [Data-Retention Sweeps](retention-sweeps.md) — auto-purging your own tables on a schedule
 - [Data Scrubbing](data-scrubbing.md) — turning a production backup into an anonymized staging copy
@@ -127,6 +130,7 @@ Looking for the API reference instead? That is
 - [One-Off Tasks](tasks.md) — `#[task]` and `autumn task`, for work you run by hand
 - [Multi-Replica Scheduled Tasks](scheduled-multi-replica.md) — running a cron job exactly once across several replicas
 - [Events and Listeners](events.md) — `#[event]` / `#[listener]`, for decoupling one action from its consequences
+- [Transactional Outbox and Inbox](outbox.md) — sending work after commit without losing it, and dropping the copies
 - [Distributed Locks](distributed-locks.md) — making sure only one process does a thing at a time
 
 ## Realtime and messaging
@@ -147,6 +151,7 @@ Looking for the API reference instead? That is
 
 - [OpenAPI Spec Generation](openapi.md) — the spec Autumn derives from your handlers, and Swagger UI
 - [Exposing Your API as MCP Tools](mcp.md) — projecting typed endpoints into a Model Context Protocol server
+- [WebMCP](webmcp.md) — routes and forms as tools for the agent in the user's browser, with the user's own session
 - [The Agent Authority Envelope](agent-authority.md) — bounding what an agent-callable handler is allowed to do
 - [Wire Contracts](wire-contracts.md) — failing a caller's build when a request or response field stops matching
 - [Signed Webhook Intake](signed-webhooks.md) — verifying a sender's signature on webhooks arriving in
@@ -165,6 +170,7 @@ Looking for the API reference instead? That is
 ## Content, SEO and localization
 
 - [SEO](seo.md) — canonical URLs, `robots` directives, and the auto-mounted `sitemap.xml` and `robots.txt`
+- [AEO](aeo.md) — agent readiness by default: Markdown for agents, `llms.txt`, AI crawler rules, MCP server card, agent skills, WebMCP, Web Bot Auth, x402
 - [Atom and RSS Feeds](feeds.md) — publishing a feed from your own models
 - [Internationalization (i18n)](i18n.md) — translating an app and serving it per locale
 - [Per-User Time Zones](time-zones.md) — rendering every timestamp in the reader's own zone
@@ -176,6 +182,7 @@ Looking for the API reference instead? That is
 - [Compile-Time Query Budgets](query-budgets.md) — `#[query_budget(N)]`: catching N+1 regressions at build time
 - [Capacity Contracts](capacity-contracts.md) — declaring what a route is allowed to consume
 - [Server-Timing](observability/server-timing.md) — per-phase request timings the browser shows in devtools
+- [Overload Signals](observability/overload-signals.md) — latency histograms, queue and pool metrics, request IDs and trace IDs
 - [Dev-Loop Latency Budget](dev-loop-latency.md) — the p50/p95 budgets for `autumn dev`, and how they are measured
 
 ## Testing
@@ -188,7 +195,7 @@ Looking for the API reference instead? That is
 
 ## Developer tools
 
-- [The Data Playground](console.md) — `autumn console`, the pre-wired edit-and-run REPL
+- [The Data Playground](console.md) — `autumn console`, the pre-wired edit-and-run playground, and `--repl`, an interactive Rhai prompt
 - [Dev Request Inspector](dev-inspector.md) — the in-browser view of recent requests
 - [Dev Error Overlay](dev-error-overlay.md) — the error page that shows the failing source line
 - [The Architecture Graph](architecture-graph.md) — `autumn graph impact Post`: what a change touches, as a query
@@ -202,12 +209,19 @@ Looking for the API reference instead? That is
 - [Daemon Mode](daemon.md) — `autumn serve` as a long-running service
 - [Maintenance Mode](maintenance-mode.md) — taking the app offline deliberately, with probes still answering
 - [Cloud-Native Autumn](cloud-native.md) — containers, Kubernetes, liveness/readiness probes, and the twelve-factor surface
+- [Kubernetes](kubernetes.md) — the generated Helm chart and Kustomize base, and Argo Rollouts or Flagger canaries
+- [SLOs as Code](slo.md) — `[[slo]]` objectives, burn-rate alerts, a Grafana dashboard, canary analysis, and the deploy bake
+- [Staging Fault Injection](fault-injection.md) — latency and errors on routes, the database, Redis and outbound HTTP, with a burn-rate stop
+- [Server Connection Limits](connection-limits.md) — header-read and idle timeouts, header size and connection caps
+- [Running behind PgBouncer / RDS Proxy](connection-poolers.md) — which features work behind a connection pooler
 - [Embedded Clustering](clustering.md) — two-node clustering with no external dependency
 - [Per-Tenant Memory Cells](tenant-cells.md) — bounding per-tenant memory, with deterministic eviction
+- [Cell and Shuffle-Shard Isolation](cell-isolation.md) — per-tenant bulkheads, tenant job lanes, shard-local jobs, the cell router, and the multi-region stance
 - [Runtime Configuration](runtime-config.md) — `autumn.toml`, profiles, and environment overrides
 - [Health Indicators](health-indicators.md) — what `/health` and `/ready` report, and adding your own check
 - [App Metrics](metrics.md) — the metrics Autumn exports, and recording your own
 - [Plugin Metrics Sources](metrics-sources.md) — exporting metrics from a plugin
+- [Request Cost and Carbon-Aware Deferral](cost.md) — per-request CPU, allocation and DB cost by tenant, and deferring background work while a cost signal is high
 - [Error Reporting](error-reporting.md) — sending exceptions to an external tracker
 - [Operator Alerts](operator-alerts.md) — getting paged when the framework detects trouble
 

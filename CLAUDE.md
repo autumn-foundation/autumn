@@ -10,6 +10,14 @@ version, folding the changelog fragments in, dating the changelog section,
 updating install instructions) is a separate, deliberate step the user asks for
 by name.
 
+## Performance agents (Bolt)
+
+**Do not profile or optimize the `request_pipeline` workload**
+(`autumn/benches/request_pipeline.rs`). It is exhausted: repeated callgrind +
+dhat passes have taken it to the floor, and the remainder is allocator cost
+driven by the tower layer-clone cascade (tracked in #2830). Pick another
+`autumn/benches/*` target instead, and skip building that bench.
+
 ## Changelog
 
 **Never edit `CHANGELOG.md` in a feature PR**, and never create a new
@@ -56,7 +64,7 @@ release time.
 
 ## CI test sharding
 
-`.github/workflows/ci.yml` runs the suite as four sibling job families rather
+`.github/workflows/ci.yml` runs the suite as five sibling job families rather
 than one job per OS. Which one a test lands in follows from how it is written,
 so it is usually automatic:
 
@@ -66,6 +74,7 @@ so it is usually automatic:
 | `trybuild` | Linux | `compile_fail::*` only, split into four shards |
 | `test-features` | Linux | one job per non-default feature set (markdown, i18n, tls, …) |
 | `test-docker` | Linux | the `#[ignore]`d Docker/testcontainer sweep |
+| `test-docker-deploy` | Linux | `deploy_e2e` alone, on a fresh disk (#2547) |
 
 Only `test` runs on all three OSes. `trybuild` and `test-features` are Linux
 only: a trybuild golden is pinned to the rustc *version*, not the OS (the same
@@ -217,6 +226,15 @@ respectively. `autumn-cli/tests/integration/repo_hygiene.rs`'s
 `cli_tests_cold_start_ignored_tests_are_ci_named` test enforces the
 generator-conformance.yml half for the tests #1945 added; extend its list
 when adding another.
+
+##### `examples/reddit-clone` Docker tests
+
+The same CI step runs
+`cargo test -p reddit-clone --lib --tests -- --ignored --test-threads=1`.
+A new `#[ignore]`d Docker test in this app runs in CI. No workflow edit is needed.
+The tests run one at a time. They share one job runtime.
+Put a browser test behind `system-tests`.
+`examples/reddit-clone/tests/docker_sweep_ci.rs` fails when ci.yml has no such step.
 
 ##### The sweep guarantee stops at `tests/` binaries
 

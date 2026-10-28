@@ -13,7 +13,7 @@ categories = ["web-programming", "web-programming::http-server"]
 autotests = false
 
 [features]
-default = ["maud", "htmx", "tailwind", "db", "cache-moka", "http-client", "reporting", "flash"]
+default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
 # Conflict-free collaborative editing (issue #1806). Adds
@@ -38,11 +38,14 @@ tailwind = []
 http-client = ["dep:reqwest", "dep:sha1"]
 oauth2 = ["http-client"]
 webauthn = ["dep:webauthn-rs"]
-openapi = ["dep:serde_yaml"]
+openapi = ["dep:serde-saphyr"]
 # Project typed JSON endpoints as MCP (Model Context Protocol) tools so AI
 # agents can call the real, authenticated handler pipeline. Builds on the
 # same `ApiDoc` registry that drives `openapi`, so it implies that feature.
 mcp = ["openapi"]
+# WebMCP (issue #2619): route tools for the agent in the user's browser.
+# Implies `mcp` (one tool derivation) and `htmx` (the framework script bundle).
+webmcp = ["mcp", "htmx"]
 # Optional Markdown rendering with frontmatter parsing and SSG integration,
 # plus the safe *user-submitted* rich-text path (issue #1255): `ammonia` is the
 # allowlist HTML sanitizer `markdown::render_user_content` runs its output
@@ -70,6 +73,9 @@ constela = ["maud"]
 # runtime at all, so a blocking client is the one shape both can share. It is
 # constructed, used and dropped only on those threads, never inside the async
 # runtime.
+#
+# `db` is the shared database layer. It has no Postgres client (#2605). Enable
+# a backend with it: `postgres` (on by default) or `sqlite`.
 db = [
     "dep:autumn-macros-model",
     "dep:autumn-macros-repository",
@@ -79,23 +85,31 @@ db = [
     "dep:diesel-async",
     "dep:diesel_migrations",
     "dep:libsqlite3-sys",
+    "dep:scoped-futures",
+    "diesel/chrono",
+    "diesel/serde_json",
+]
+# The Postgres backend (#2605): the Postgres client, its rustls TLS connector
+# and diesel's Postgres backend. On by default. A SQLite app turns default
+# features off and enables `sqlite`, so it compiles none of this.
+postgres = [
+    "db",
     "dep:pq-sys",
     "dep:pq-src",
-    "dep:scoped-futures",
     "dep:tokio-postgres",
     "dep:tokio-postgres-rustls",
     "dep:rustls",
     "dep:rustls-pki-types",
     "dep:webpki-roots",
     "diesel/postgres",
-    "diesel/chrono",
-    "diesel/serde_json",
+    "diesel-async/postgres",
 ]
 # Offline-first local store + background sync engine for occasionally-
 # connected apps (e.g. Tauri mobile, issue #1508). Local state lives in an
 # in-process SQLite database (`sync::SyncStore`, change-tracked with
 # tombstones); a `sync::SyncEngine` pushes/pulls changes to a remote Autumn
-# app that mounts `sync::server::router()` over Postgres shadow tables.
+# app that mounts `sync::server::router()` over Postgres shadow tables
+# (`PgSyncBackend` needs `postgres`).
 # Builds entirely on dependencies the `db` + `http-client` features already
 # compile (diesel's sqlite backend and the bundled libsqlite3-sys are
 # already in the graph) — zero new dependencies.
@@ -134,18 +148,21 @@ offline-sync = ["db", "http-client"]
 # `diesel_migrations` — which the SQLite migration path (`app.rs`
 # `apply_pending_sqlite_or_exit`, gated on `#[cfg(feature = "sqlite")]`) calls
 # directly. Without this edge, `--no-default-features --features sqlite` fails to
-# compile (`crate::migrate` configured out). This is NOT a second backend: the
-# `RuntimeConnection` alias (see `src/db.rs`) flips to SQLite purely on
-# `#[cfg(feature = "sqlite")]` regardless of `db`, so enabling `db` alongside
-# does not resurrect the Postgres runtime — it only supplies the plumbing. This
-# mirrors the ratified verification lane `--features "db test-support sqlite"`.
+# compile (`crate::migrate` configured out). `db` has no Postgres client
+# (#2605), so `--no-default-features --features sqlite` compiles no `pq-sys`,
+# `tokio-postgres` or diesel Postgres backend. With default features on,
+# `postgres` is on too: the runtime is still SQLite, but the Postgres client
+# compiles. A SQLite-only app turns default features off.
 # The bundled SQLite amalgamation (`libsqlite3-sys` workspace dep pins
 # `features = ["bundled"]`, which `db` already pulls in) compiles with
 # `SQLITE_ENABLE_FTS5` defined, so FTS5 full-text search (issue #1910:
 # searchable repositories emit FTS5 virtual tables + bm25 ranking) is always
 # available. Adding `db` here changes nothing for the Postgres/default lane,
 # which never enables `sqlite`.
-sqlite = ["db", "diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper"]
+# `dep:fd-lock`: the fleet takes a cross-process lock around publishing or
+# removing a database path (issue #3228). The crate is in the lock file already
+# (through `rustyline`), so this adds no crate to the graph.
+sqlite = ["db", "diesel/sqlite", "diesel/returning_clauses_for_sqlite_3_35", "diesel-async/sync-connection-wrapper", "dep:fd-lock"]
 test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
 telemetry-otlp = [
     "dep:opentelemetry",
@@ -159,6 +176,9 @@ telemetry-otlp = [
 # `[[bin]]` (W6 PR3), which is a binary and therefore cannot use dev-deps, can
 # depend on it too. `proptest` itself stays out of default builds.
 sim-testing = ["dep:proptest"]
+# Ledger profiling harnesses (`docs/perf/`). Off by default and not part of any
+# CI feature set, so the harness module is only compiled when asked for.
+ledger-profile = ["db"]
 # `dep:rustls` is not optional flavouring: `redis`'s `tokio-rustls-comp`
 # feature makes `rediss://` URLs reachable, and those panic inside
 # `rustls::ClientConfig::builder()` unless a process-level
@@ -204,6 +224,9 @@ inbound-ses = ["inbound-mail", "http-client", "dep:rsa", "dep:sha1"]
 # Enables `autumn_web::seed::SeedContext` for use in `src/bin/seed.rs`.
 # Depends on `db`; off by default so apps that don't seed pay zero compile cost.
 seed = ["db"]
+# Interactive Rhai prompt for `autumn console --repl` (issue #2148). Off by
+# default: the CLI turns it on for the playground run only.
+repl = ["db", "dep:rhai", "dep:rustyline"]
 system-info = []
 # First-class CSV import and export for `#[repository]` models.
 # Adds `autumn_web::data::csv` (streaming export, row-by-row import with
@@ -226,8 +249,8 @@ system-tests = ["dep:chromiumoxide"]
 # Managed local Postgres: a `ManagedPostgresPoolProvider` that provisions
 # (initdb) and supervises a local `postgres` child in the app's data dir,
 # surfaced through the pluggable pool-provider seam. Postgres binaries are
-# downloaded on first run. Implies `db`.
-managed-pg = ["db", "dep:postgresql_embedded"]
+# downloaded on first run. Implies `postgres`.
+managed-pg = ["postgres", "dep:postgresql_embedded"]
 # Bundled single-binary mode: embed the Postgres binaries into the app
 # executable at build time (no first-run download). Per-target build, large
 # binary (tens-to-~150MB), still a supervised child process with an on-disk
@@ -291,7 +314,7 @@ edge = ["dep:autumn-edge"]
 plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]
-autumn-edge = { version = "0.8.0", path = "../autumn-edge", optional = true }
+autumn-edge = { version = "0.9.0", path = "../autumn-edge", optional = true }
 # Pure-Rust WebAssembly interpreter behind the `plugin-sandbox` feature. Already
 # resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
 # new crate to the workspace graph. MSRV 1.86 (below this workspace's 1.88
@@ -303,11 +326,11 @@ wasmi = { version = "0.40", optional = true }
 # could never reach those macros anyway (their re-exports are `#[cfg(feature =
 # "db")]` in `src/lib.rs`), and skipping them cuts macro compile time by ~90%
 # on the no-DB onboarding path (issue #2309).
-autumn-macros = { version = "0.8.0", path = "../autumn-macros", default-features = false }
+autumn-macros = { version = "0.9.0", path = "../autumn-macros", default-features = false }
 # Database-layer proc macros, split out of `autumn-macros` so a no-database
 # build never compiles their codegen. Optional: enabled by the `db` feature.
-autumn-macros-model = { version = "0.8.0", path = "../autumn-macros-model", optional = true }
-autumn-macros-repository = { version = "0.8.0", path = "../autumn-macros-repository", optional = true }
+autumn-macros-model = { version = "0.9.0", path = "../autumn-macros-model", optional = true }
+autumn-macros-repository = { version = "0.9.0", path = "../autumn-macros-repository", optional = true }
 axum.workspace = true
 # 1.9 for `Bytes::from_owner`, which is what lets a response buffer own the
 # sandbox concurrency permit and release it exactly when the last handle drops.
@@ -317,12 +340,16 @@ bytes = "1.9"
 # SCRAM-auth crate), so this adds no new entry to the dependency graph.
 unicode-normalization = "0.1"
 http-body = "1"
+# Own serve loop for `[server.http]` limits (issue #3065). axum::serve gives
+# no access to the hyper builder. Same versions axum already resolves.
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util.workspace = true
 http-body-util = "0.1"
 # Both already resolved transitively via tower-http's compression-gzip/
 # compression-br features (used to precompute static CSS encodings once
 # instead of recompressing on every request — see `static_css_response`).
 flate2 = "1"
-brotli = "8"
+brotli = "9"
 bcrypt.workspace = true
 deadpool = { version = "0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
 diesel = { workspace = true, optional = true }
@@ -382,7 +409,7 @@ moka = { workspace = true, optional = true }
 multer = { workspace = true }
 pin-project-lite = "0.2"
 serde.workspace = true
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
 # Version-requirement matching for the plugin API stability contract
 # (issue #1601). `semver` has no transitive dependencies.
 semver.workspace = true
@@ -423,17 +450,30 @@ chrono = { workspace = true }
 chrono-tz.workspace = true
 # `serde` is a default feature, named here because `SqliteDecimal` depends on it.
 rust_decimal = { workspace = true, features = ["serde"] }
-croner = "3.0.1"
+croner = "4.0.2"
 testcontainers = { workspace = true, optional = true }
 testcontainers-modules = { workspace = true, optional = true }
 proptest = { version = "1.4", optional = true }
 serde_urlencoded = "0.7"
+# Form bodies (issue #3394): a fork of `serde_urlencoded` that puts a repeated
+# key into a `Vec<T>` field. Decode only.
+serde_html_form = { version = "0.4.1", default-features = false, features = ["de", "ser", "std"] }
 serde_path_to_error = "0.1"
-serde_yaml = { version = "0.9", optional = true }
+# Writes `openapi.yaml` next to `openapi.json`. Safe-Rust YAML (no
+# `unsafe-libyaml`, whose RUSTSEC-2024-0449 unmaintained notice `serde_yaml`
+# carried). The resolver picks 1.1.x: 1.2 raised its MSRV to 1.89, above this
+# workspace's 1.88 floor.
+serde-saphyr = { version = "1.1", optional = true }
+fd-lock = { version = "4", optional = true }
 pulldown-cmark = { workspace = true, optional = true }
 ammonia = { workspace = true, optional = true }
+rhai = { workspace = true, optional = true }
+rustyline = { workspace = true, optional = true }
 subtle = "2.6.1"
 base64 = "0.23"
+# Ed25519 signing for Web Bot Auth (`aeo::web_bot_auth`). Adds NO new crate:
+# `jsonwebtoken`'s `rust_crypto` backend already compiles ed25519-dalek 2.
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 url = "2.5.8"
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
@@ -460,8 +500,11 @@ zeroize = "1"
 # direct edge plus the `ecdh` feature, which is a feature flag on the
 # already-compiled `elliptic-curve`, not a new dependency.
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "std"] }
-getrandom = "0.2"
+getrandom = "0.4"
 hex = "0.4"
+# Public Suffix List for custom-domain apex detection (issue #2643, ADR 0026).
+# The crate contains the list as code. It shares `psl-types` with `publicsuffix`.
+psl = "2.1"
 include_dir = { version = "0.7", optional = true }
 csv = { workspace = true, optional = true }
 # Pure-Rust PDF writer for `autumn_web::pdf` (issue #1317). `default-features
@@ -475,15 +518,36 @@ lettre = { version = "0.11.21", default-features = false, features = ["builder",
 # optional network (`http`/reqwest) and local-file stylesheet fetchers — Autumn
 # only inlines embedded `<style>` blocks, never remote CSS — keeping the added
 # graph to the html5ever/selectors parsing stack. Gated behind the `mail` feature.
-css-inline = { version = "0.21", default-features = false, optional = true }
+css-inline = { version = "0.23", default-features = false, optional = true }
 chromiumoxide = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # `umask` (via the safe `nix` wrapper) for binding `server.unix_socket` with
 # owner-only permissions from creation, closing the bind→chmod race on
-# user-configured socket paths in shared directories.
-nix = { version = "0.31.2", features = ["fs"] }
+# user-configured socket paths in shared directories. `time` gives the safe
+# thread CPU clock that `cost` reads for each request poll (issue #1720).
+# `dir` (no extra crate): the data-capsule reader lists a directory through
+# an open handle, so a swapped link cannot redirect it (#1811).
+nix = { version = "0.31.2", features = ["fs", "dir", "time"] }
+
+# The loom and Shuttle model checks (`tests/loom_models.rs`,
+# `tests/shuttle_models.rs`) build the library with `--cfg loom_models` or
+# `--cfg shuttle_models`. `src/sync_shim.rs` then gives the checked modules
+# the checker's locks and atomics, so the checks run the shipped code. A
+# normal build never sets these cfgs and never compiles either crate.
+[target.'cfg(loom_models)'.dependencies]
+# `futures` adds `loom::future::block_on`, which drives the async circuit
+# breaker inside a model.
+loom = { version = "0.7.2", features = ["futures"] }
+
+[target.'cfg(shuttle_models)'.dependencies]
+shuttle = "0.9.6"
+
+[target.'cfg(unix)'.dev-dependencies]
+# `getrusage` for the process CPU time that `tests/cost_reconcile.rs` checks
+# the per-tenant cost against (issue #1720).
+nix = { version = "0.31.2", features = ["resource", "time"] }
 
 [dev-dependencies]
 # Counting global allocator behind a safe API, used by the isolated
@@ -493,6 +557,11 @@ nix = { version = "0.31.2", features = ["fs"] }
 # cannot lift a forbid (E0453). The crate installs its `#[global_allocator]` on
 # link, so only binaries that actually reference it are affected.
 allocation-counter = "0.8.1"
+# The SQLite UUID default shared with the generator (tests/sqlite_uuid_primary_key.rs).
+autumn-schema-core = { path = "../autumn-schema-core" }
+# Criterion benches (issue #3068, `benches/admission.rs`). No plots: only the
+# statistics and the `cargo bench` harness.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 diesel = { version = "2", features = ["chrono", "postgres"] }
 # `rust_decimal`'s diesel impls (`AsExpression<Numeric>`, `ToSql`/`FromSql` on
 # the Pg backend) back the `#[model]` Postgres-`Decimal` integration test
@@ -504,10 +573,6 @@ rust_decimal = { workspace = true, features = ["db-diesel2-postgres"] }
 filetime = "0.2"
 futures.workspace = true
 http.workspace = true
-# Compile-probe behind `serve_stack_speaks_http2` (see tls.rs): pins the
-# `axum/http2` feature the ALPN `h2` advertisement depends on. Deliberately
-# without `http2` — see the workspace dependency comment.
-hyper-util.workspace = true
 serde_json = "1"
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
@@ -524,6 +589,8 @@ redis.workspace = true
 proptest = "1.4"
 time = { workspace = true }
 tokio-tungstenite = "0.30.0"
+# HTTP/2 client for the `tls_alpn` suite (#2321); already in the lockfile.
+h2 = "0.4"
 loom = "0.7.2"
 temp-env = { version = "0.3.6", features = ["async_closure"] }
 rustversion = "1"
@@ -539,9 +606,9 @@ rustls-pki-types = { version = "1", features = ["std"] }
 #   test-support   — only meaningful in test binary contexts
 [package.metadata.docs.rs]
 features = [
-  "maud", "htmx", "tailwind", "db", "cache-moka",
+  "maud", "htmx", "tailwind", "db", "postgres", "cache-moka",
   "ws", "flash", "multipart", "http-client", "oauth2", "openapi", "mcp",
-  "redis", "i18n", "storage", "variants", "mail", "seed", "system-info", "markdown",
+  "redis", "i18n", "storage", "variants", "mail", "seed", "repl", "system-info", "markdown",
   "reporting", "csv", "embed-assets", "offline-sync", "pdf", "edge",
   "plugin-sandbox",
   # Generated UI. Pure Rust over dependencies already in the graph, so it
@@ -579,6 +646,19 @@ harness = false
 # the exact commands.
 [[bench]]
 name = "request_pipeline"
+harness = false
+
+# Criterion benches for admission control (issue #3068): static vs adaptive
+# admission cost through `LoadShedService`, and the cost of one limit update.
+[[bench]]
+name = "admission"
+harness = false
+
+# Criterion benches for recording through the app-metrics facade: a held,
+# labeled handle vs the per-call `counter(..).with_label(..)` idiom. The
+# allocation half is pinned by `tests/metrics_alloc_gate.rs`.
+[[bench]]
+name = "metrics_record"
 harness = false
 
 [[bench]]
@@ -631,6 +711,11 @@ required-features = ["markdown"]
 # `security::CsrfLayer` with HMAC signing active so the verification cost is
 # attributable in a profiler. Asserts nothing — see the file header for the
 # exact commands.
+[[bench]]
+name = "mcp_search"
+harness = false
+required-features = ["mcp"]
+
 [[bench]]
 name = "csrf_verify"
 harness = false
@@ -697,6 +782,13 @@ path = "tests/integration_tests.rs"
 name = "config_alloc_gate"
 path = "tests/config_alloc_gate.rs"
 
+# Per-tenant cost reconciles with process CPU (issue #1720). Own binary: it
+# reads process-wide CPU time, and it installs the `allocation-counter`
+# global allocator for its allocation probe.
+[[test]]
+name = "cost_reconcile"
+path = "tests/cost_reconcile.rs"
+
 # Allocation gate for `auth::validate_password` on a realistic signup-form
 # workload (Bolt follow-up to #2198/#2205/#2214/#2232, looking at the password
 # path). Own binary for the same `allocation-counter` global-allocator reason
@@ -704,6 +796,20 @@ path = "tests/config_alloc_gate.rs"
 [[test]]
 name = "password_policy_alloc_gate"
 path = "tests/password_policy_alloc_gate.rs"
+
+# Constela: a hostile document uses bounded peak memory (issue #2626). Own
+# binary for the `allocation-counter` global-allocator reason above.
+[[test]]
+name = "constela_memory"
+path = "tests/constela_memory.rs"
+required-features = ["constela"]
+
+# Adaptive admission adds no allocations to an admitted request (issue #3068).
+# Own binary for the same `allocation-counter` global-allocator reason as
+# `config_alloc_gate` above.
+[[test]]
+name = "admission_alloc_gate"
+path = "tests/admission_alloc_gate.rs"
 
 # Allocation gate for the sandbox's request-header canonicalisation: a header
 # the allowlist drops must not be cloned on its way to being discarded. The
@@ -758,6 +864,49 @@ path = "tests/form_render_alloc_gate.rs"
 [[test]]
 name = "version_history_alloc_gate"
 path = "tests/version_history_alloc_gate.rs"
+
+# Allocation gate for recording through the app-metrics facade: a label set the
+# registry has already seen is found with a borrowed lookup, not a fresh owned
+# copy of every label per sample. Own binary for the same `allocation-counter`
+# global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "metrics_alloc_gate"
+path = "tests/metrics_alloc_gate.rs"
+
+# Allocation gate for trusted-proxy resolution: a request behind a proxy must
+# not copy its one-line `X-Forwarded-For` chain to read it (the addr, host and
+# scheme resolvers each re-read it in hop-count mode). Own binary for the same
+# `allocation-counter` global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "trusted_proxies_alloc_gate"
+path = "tests/trusted_proxies_alloc_gate.rs"
+
+# Allocation gate for the layers that carry a request's matched route and
+# request id (the access log, primary and fallback, and the log context): they
+# keep axum's shared `MatchedPath` and the `RequestId` itself, not a per-request
+# `String` copy. Own binary for the same `allocation-counter` global-allocator
+# reason as `config_alloc_gate` above.
+[[test]]
+name = "request_meta_alloc_gate"
+path = "tests/request_meta_alloc_gate.rs"
+
+# Allocation gate for recording a DB query sample: a query key the collector
+# already holds is found with a borrowed lookup, and `run_instrumented` composes
+# its `"{route} {verb}"` key on the stack instead of a `String` per query. Own
+# binary for the same `allocation-counter` global-allocator reason as
+# `config_alloc_gate` above.
+[[test]]
+name = "db_metrics_alloc_gate"
+path = "tests/db_metrics_alloc_gate.rs"
+
+# Allocation gate for the `#[throttle]` per-route check on a warm route: the
+# limiter registry and the per-client bucket map are probed by borrowed key, so
+# a request to a route that already has its limiter, from a client that already
+# has its bucket, copies neither key. Own binary for the same
+# `allocation-counter` global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "throttle_alloc_gate"
+path = "tests/throttle_alloc_gate.rs"
 
 # SQLite runtime-lane boot+serve proof (issue #1614, PR2). Only meaningful under
 # `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
@@ -950,6 +1099,13 @@ path = "tests/sqlite_money_ledger.rs"
 name = "sqlite_derivation"
 path = "tests/sqlite_derivation.rs"
 
+# SQLite proof that a `sum` derivation's repair paths accept partial sums
+# that leave `i64` (issue #2663). Own binary: the backfill runs every
+# registered derivation, so this binary registers only one.
+[[test]]
+name = "sqlite_derivation_wide_sum"
+path = "tests/sqlite_derivation_wide_sum.rs"
+
 # SQLite version-history end-to-end proof (issue #1996). Drives a
 # `versioned = true` repository against an in-memory SQLite pool: a create +
 # update + delete each append a `_autumn_version_history` row, `version_history()`
@@ -977,6 +1133,12 @@ path = "tests/sqlite_version_history.rs"
 name = "sqlite_ledger"
 path = "tests/sqlite_ledger.rs"
 
+# Separate binary: `inventory` descriptors are per binary, and the fixtures
+# register their own ledgered `lgo_*` tables (#2319). Runs in the sqlite lane.
+[[test]]
+name = "sqlite_ledger_out_of_band"
+path = "tests/sqlite_ledger_out_of_band.rs"
+
 # SQLite durable commit-hook worker end-to-end proof (issue #1996 item 5). Drives
 # the ported worker (BEGIN IMMEDIATE claim + in-process Notify kick + retry/backoff
 # + dead-letter + graceful drain) and the real enqueue surface against an in-memory
@@ -992,6 +1154,18 @@ path = "tests/sqlite_ledger.rs"
 [[test]]
 name = "sqlite_commit_hook_worker"
 path = "tests/sqlite_commit_hook_worker.rs"
+
+# The unified retention sweeps against a SQLite-backed app (issue #2553). Runs the
+# real `run_retention` engine over a file database built by the real framework
+# migrations: aged rows go, newer and live rows stay, a dry run only counts, the
+# cutoff comes from the database clock, a legal hold vetoes a dataset, and a
+# 1200-row backlog drains in batches. No Docker. Only meaningful under
+# `--features sqlite`; the file is `#![cfg(feature = "sqlite")]` so a default
+# `cargo test` compiles it to an empty (passing) binary. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_framework_retention`.
+[[test]]
+name = "sqlite_framework_retention"
+path = "tests/sqlite_framework_retention.rs"
 
 # SQLite durable-jobs + single-host scheduler e2e proof (issue #1907). On a real
 # SQLite pool/app it (1) starts the default in-process `local` job runtime and
@@ -1068,6 +1242,20 @@ path = "tests/sqlite_searchable_repository.rs"
 name = "sqlite_immediate_transaction"
 path = "tests/sqlite_immediate_transaction.rs"
 
+# `TestDb` on the SQLite backend (issue #2555): a throwaway tempfile database with
+# the Postgres harness API, so a scaffolded SQLite app can run its smoke test.
+# Run: `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_test_db`.
+[[test]]
+name = "sqlite_test_db"
+path = "tests/sqlite_test_db.rs"
+
+# UUID primary keys on SQLite (issue #2555): the generator's `randomblob` default
+# builds canonical v4 ids through a `#[model]` + `#[repository]`.
+# Run: `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_uuid_primary_key`.
+[[test]]
+name = "sqlite_uuid_primary_key"
+path = "tests/sqlite_uuid_primary_key.rs"
+
 # SQLite `statement_timeout` fail-closed boot guard (issue #1996, item 4). SQLite
 # cannot enforce a per-statement wall-clock timeout through the async connection
 # wrapper (diesel's SqliteConnection exposes no interrupt/progress-handler hook),
@@ -1097,7 +1285,8 @@ path = "tests/sqlite_statement_timeout_fail_closed.rs"
 name = "sqlite_dependent_destroy"
 path = "tests/sqlite_dependent_destroy.rs"
 
-# `#[commentable]` hard-delete on SQLite (Snag charter, issue #2275 follow-up).
+# `#[commentable]` on SQLite: hard-delete (Snag charter, issue #2275
+# follow-up), and a copied spec that finds its repository (issue #2286).
 # `docs/guide/commentable.md` claims "Both backends are supported", but the
 # feature's only live-DB suite is Postgres-only (testcontainers). Runs
 # explicitly: `cargo test -p autumn-web --features sqlite --test
@@ -1146,6 +1335,25 @@ path = "tests/sqlite_tracked_sessions.rs"
 [[test]]
 name = "sqlite_transactional_url_pool"
 path = "tests/sqlite_transactional_url_pool.rs"
+
+# SQLite fleet end to end (ADR 0019): `ShardedDb`, `Shards`, `CrossShard` and a
+# `#[repository(tenant_scoped, sharded)]` repository served by a per-tenant /
+# per-slot `DatabaseFleet`. The file is
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]`, so other builds
+# compile it to an empty binary. Run explicitly:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet`.
+[[test]]
+name = "sqlite_fleet"
+path = "tests/sqlite_fleet.rs"
+
+# The fleet sweeper (issue 3234): an outbox row, a commit hook and a
+# derivation backfill in a closed fleet database are done without a request.
+# Its own binary: it declares a `#[derivation]`, which is process-global.
+# `#![cfg(all(feature = "sqlite", feature = "test-support"))]`. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_sweeper`.
+[[test]]
+name = "sqlite_fleet_sweeper"
+path = "tests/sqlite_fleet_sweeper.rs"
 
 # Sim-testing W4 SQLite DB lane (issue #1797): proves the job/scheduler drain
 # runs end-to-end against a fresh, migrated, in-process in-memory SQLite substrate
@@ -1196,6 +1404,50 @@ path = "tests/sim_fault_plan_db.rs"
 [[test]]
 name = "sim_chaos_crash"
 path = "tests/sim_chaos_crash.rs"
+
+# Issue #3061 AC1: a crash between the handler commit and the response write.
+# The handler commits its response in its own `Db::tx`; a retry replays it.
+# Over the in-memory SQLite sim substrate, so no Docker. Same isolated-binary
+# rationale as `sim_chaos_crash` above. Run:
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_idempotency_db`.
+[[test]]
+name = "sim_idempotency_db"
+path = "tests/sim_idempotency_db.rs"
+
+# Issue #3067: several replicas on one sim clock and one SQLite database.
+# SQLite-only (the sim substrate), so a standalone target like the others.
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_replicas`.
+[[test]]
+name = "sim_replicas"
+path = "tests/sim_replicas.rs"
+
+# Issue #3233: a partitioned old fleet owner, in virtual time. Runs in the
+# single-threaded multi-replica sim step.
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fleet_ownership`.
+[[test]]
+name = "sim_fleet_ownership"
+path = "tests/sim_fleet_ownership.rs"
+
+# Issue #3067: the same-seed trace check. Its own binary, because `tracing`
+# caches callsite interest for the whole process.
+# `cargo test -p autumn-web --features "sqlite,test-support" --test sim_fleet_trace`.
+[[test]]
+name = "sim_fleet_trace"
+path = "tests/sim_fleet_trace.rs"
+
+# Issue #3062: transactional outbox crash sweep and `deliver_later` restart.
+# SQLite-only (the sim substrate), so a standalone target like the others.
+[[test]]
+name = "sim_outbox_crash"
+path = "tests/sim_outbox_crash.rs"
+
+[[test]]
+name = "sim_outbox_mail"
+path = "tests/sim_outbox_mail.rs"
+
+[[test]]
+name = "sqlite_outbox_writers"
+path = "tests/sqlite_outbox_writers.rs"
 
 # W5.a (item 5, issue #1797): deterministic per-send SMTP transport fault
 # schedule ("send #7 fails, #8 times out") over the in-memory SQLite sim
@@ -1333,6 +1585,11 @@ path = "tests/cache_global_integration.rs"
 name = "cached_global_backend"
 path = "tests/cached_global_backend.rs"
 
+# Isolated: installs the process-global cache backend (#2358).
+[[test]]
+name = "cached_impl_global_scope"
+path = "tests/cached_impl_global_scope.rs"
+
 # Isolated: reads/writes the process-global cache backend via
 # `cache_fragment_global`, which `TestApp::build` clears unconditionally and
 # which a concurrently running consolidated-binary test could otherwise
@@ -1359,6 +1616,14 @@ path = "tests/capsule_cache_effect.rs"
 name = "loom_models"
 path = "tests/loom_models.rs"
 
+# Isolated: Shuttle checking binary. Empty under a normal build
+# (`#![cfg(shuttle_models)]`); only compiles/runs under
+# `RUSTFLAGS="--cfg shuttle_models"`, in the `shuttle` CI job. That cfg also
+# swaps the sync primitives of the checked modules (`src/sync_shim.rs`).
+[[test]]
+name = "shuttle_models"
+path = "tests/shuttle_models.rs"
+
 [lints]
 workspace = true
 
@@ -1369,3 +1634,10 @@ workspace = true
 [[test]]
 name = "tls_client_auth_metrics"
 path = "tests/tls_client_auth_metrics.rs"
+
+# Query-string decode workload for profilers: `from_query_str`, the function
+# behind every `Query<T>` extraction. Asserts nothing beyond output shape — see
+# the file header for the exact commands.
+[[bench]]
+name = "query_decode"
+harness = false

@@ -229,6 +229,84 @@ const APP_MODULES: &[&str] = &["schema", "models", "repositories", "policies"];
 
 const PLAYGROUND_TEMPLATE: &str = include_str!("templates/playground.rs.tmpl");
 
+/// The autumn-web feature `--repl` adds to the playground run (issue #2148).
+/// It goes on the command line only, so `Cargo.toml` does not change.
+pub const REPL_FEATURE: &str = "autumn-web/repl";
+
+/// Tells `SeedContext::build()` to open the REPL and not return. autumn-web
+/// reads it only when it has the `repl` feature.
+const REPL_ENV: &str = "AUTUMN_CONSOLE_REPL";
+
+/// A file path autumn-web creates when it opens the prompt. A run that exits
+/// without creating it never reached `SeedContext::build()`.
+const REPL_ACK_ENV: &str = "AUTUMN_CONSOLE_REPL_ACK";
+
+/// The `cargo run` command for the playground. `repl_ack` is set for
+/// `--repl`: the file the prompt creates when it opens.
+#[must_use]
+pub fn playground_command(
+    project_dir: &Path,
+    package: Option<&str>,
+    profile: &str,
+    repl_ack: Option<&Path>,
+) -> Command {
+    let mut cmd = Command::new("cargo");
+    cmd.args(playground_cargo_args(package, repl_ack.is_some()));
+    cmd.env("AUTUMN_ENV", profile);
+    cmd.env("AUTUMN_PROFILE", profile);
+    // Run from the project directory so the playground's `SeedContext` reads
+    // `autumn.toml` from the package root, not the workspace root.
+    cmd.current_dir(project_dir);
+    if let Some(ack) = repl_ack {
+        cmd.env(REPL_ENV, "1");
+        cmd.env(REPL_ACK_ENV, ack);
+    }
+    cmd
+}
+
+/// Checks that a `--repl` run opened the prompt.
+///
+/// The prompt opens from `SeedContext::build()`. A playground that never
+/// calls it runs its own code to the end instead, which must not look like a
+/// finished REPL session.
+///
+/// # Errors
+///
+/// Returns the message to show when the prompt was never opened.
+pub fn repl_handshake(ack: &Path) -> Result<(), String> {
+    if ack.exists() {
+        return Ok(());
+    }
+    Err(
+        "the playground exited without opening the REPL. `--repl` opens it \
+         from `SeedContext::build()`, and this playground never reached that \
+         call, so its own code ran instead. Restore the `SeedContext::build()` \
+         call, or regenerate the playground with `autumn console --force`."
+            .to_owned(),
+    )
+}
+
+/// The `cargo` arguments that build and run the playground.
+#[must_use]
+pub fn playground_cargo_args(package: Option<&str>, repl: bool) -> Vec<String> {
+    // `--features playground` lifts the target's `required-features` gate;
+    // without it Cargo skips the bin, which keeps a broken playground out of
+    // `autumn dev`'s builds.
+    let features = if repl {
+        format!("{PLAYGROUND_FEATURE},{REPL_FEATURE}")
+    } else {
+        PLAYGROUND_FEATURE.to_owned()
+    };
+    let mut args: Vec<String> = ["run", "--bin", PLAYGROUND_BIN_NAME, "--features"]
+        .map(str::to_owned)
+        .into();
+    args.push(features);
+    if let Some(pkg) = package {
+        args.extend(["--package".to_owned(), pkg.to_owned()]);
+    }
+    args
+}
+
 /// Decide what to do with the playground source file.
 ///
 /// AC5: an existing, possibly user-edited playground is never overwritten;
@@ -1119,7 +1197,7 @@ fn commit_playground(
 }
 
 /// Entry point for `autumn console`.
-pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: bool) {
+pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: bool, repl: bool) {
     eprintln!("\u{1F342} autumn console\n");
     eprintln!("  Profile: {profile}");
 
@@ -1214,35 +1292,55 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
     }
 
     if scaffold_only {
-        eprintln!("\n\u{2713} Playground ready. Edit {playground_rel}, then run `autumn console`.");
+        let next = if repl {
+            "autumn console --repl"
+        } else {
+            "autumn console"
+        };
+        eprintln!("\n\u{2713} Playground ready. Edit {playground_rel}, then run `{next}`.");
         return;
     }
 
-    eprintln!("\n  Building and running the playground...\n");
-
-    let mut cmd = Command::new("cargo");
-    // `--features playground` is what lifts the target's `required-features`
-    // gate; without it Cargo skips the bin — which is exactly the property that
-    // keeps a broken playground out of `autumn dev`'s builds.
-    cmd.args([
-        "run",
-        "--bin",
-        PLAYGROUND_BIN_NAME,
-        "--features",
-        PLAYGROUND_FEATURE,
-    ]);
-    if let Some(pkg) = package {
-        cmd.args(["--package", pkg]);
+    let code = run_playground(&project_dir, package, profile, repl);
+    if code != 0 {
+        std::process::exit(code);
     }
-    cmd.env("AUTUMN_ENV", profile);
-    cmd.env("AUTUMN_PROFILE", profile);
-    // Run from the project directory so the playground's `SeedContext` reads
-    // `autumn.toml` from the package root, not the workspace root.
-    cmd.current_dir(&project_dir);
+}
+
+/// Builds and runs the playground and reports the result. Returns the exit
+/// code for the CLI.
+fn run_playground(project_dir: &Path, package: Option<&str>, profile: &str, repl: bool) -> i32 {
+    if repl {
+        eprintln!("\n  Building the playground and opening the REPL...\n");
+    } else {
+        eprintln!("\n  Building and running the playground...\n");
+    }
+
+    // The prompt creates a file here when it opens (see `repl_handshake`).
+    let ack_dir = if repl {
+        match tempfile::TempDir::new() {
+            Ok(dir) => Some(dir),
+            Err(e) => {
+                eprintln!("\u{2717} Failed to create a temporary directory: {e}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    let ack = ack_dir.as_ref().map(|dir| dir.path().join("repl-opened"));
+    let mut cmd = playground_command(project_dir, package, profile, ack.as_deref());
 
     match cmd.status() {
         Ok(status) if status.success() => {
+            if let Some(ack) = &ack
+                && let Err(msg) = repl_handshake(ack)
+            {
+                eprintln!("\n\u{2717} {msg}");
+                return 1;
+            }
             eprintln!("\n\u{2713} Playground finished.");
+            0
         }
         Ok(status) => {
             eprintln!(
@@ -1251,11 +1349,11 @@ pub fn run(profile: &str, package: Option<&str>, force: bool, scaffold_only: boo
                     .code()
                     .map_or_else(|| "signal".to_owned(), |c| c.to_string())
             );
-            std::process::exit(status.code().unwrap_or(1));
+            status.code().unwrap_or(1)
         }
         Err(e) => {
             eprintln!("\u{2717} Failed to run cargo: {e}");
-            std::process::exit(1);
+            1
         }
     }
 }
@@ -1285,6 +1383,69 @@ mod tests {
     #[test]
     fn scaffold_outcome_regenerated_when_present_with_force() {
         assert_eq!(scaffold_outcome(true, true), ScaffoldOutcome::Regenerated);
+    }
+
+    // ── --repl (issue #2148) ───────────────────────────────────────────────
+
+    #[test]
+    fn cargo_args_without_repl_are_unchanged() {
+        assert_eq!(
+            playground_cargo_args(None, false),
+            ["run", "--bin", "playground", "--features", "playground"]
+        );
+    }
+
+    #[test]
+    fn cargo_args_with_repl_add_only_the_autumn_web_feature() {
+        assert_eq!(
+            playground_cargo_args(None, true),
+            [
+                "run",
+                "--bin",
+                "playground",
+                "--features",
+                "playground,autumn-web/repl"
+            ]
+        );
+    }
+
+    fn env_of(cmd: &Command, key: &str) -> Option<String> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == key)
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn repl_mode_is_chosen_by_the_environment_not_the_source() {
+        let dir = Path::new("/tmp/app");
+        let ack = Path::new("/tmp/ack/opened");
+        let repl = playground_command(dir, None, "dev", Some(ack));
+        assert_eq!(env_of(&repl, "AUTUMN_CONSOLE_REPL").as_deref(), Some("1"));
+        assert_eq!(
+            env_of(&repl, "AUTUMN_CONSOLE_REPL_ACK").as_deref(),
+            Some(ack.to_string_lossy().as_ref())
+        );
+        let plain = playground_command(dir, None, "dev", None);
+        assert_eq!(env_of(&plain, "AUTUMN_CONSOLE_REPL"), None);
+        assert_eq!(env_of(&plain, "AUTUMN_CONSOLE_REPL_ACK"), None);
+        assert_eq!(env_of(&plain, "AUTUMN_ENV").as_deref(), Some("dev"));
+        assert_eq!(plain.get_current_dir(), Some(dir));
+    }
+
+    #[test]
+    fn a_repl_run_that_never_opened_the_prompt_is_a_failure() {
+        let dir = TempDir::new().unwrap();
+        let ack = dir.path().join("opened");
+        let err = repl_handshake(&ack).expect_err("no prompt was opened");
+        assert!(err.contains("SeedContext::build()"), "{err}");
+        std::fs::write(&ack, b"").unwrap();
+        assert_eq!(repl_handshake(&ack), Ok(()));
+    }
+
+    #[test]
+    fn cargo_args_forward_the_package() {
+        let args = playground_cargo_args(Some("my-app"), true);
+        assert!(args.ends_with(&["--package".to_owned(), "my-app".to_owned()]));
     }
 
     // ── template contents (AC2, AC4) ───────────────────────────────────────

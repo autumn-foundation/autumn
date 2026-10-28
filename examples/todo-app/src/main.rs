@@ -87,7 +87,8 @@ async fn main() {
         // App migrations (todos table) + framework migrations (api_tokens table).
         .migrations(MIGRATIONS)
         .migrations(API_TOKEN_MIGRATIONS)
-        // HTML routes (session-auth) + open token-issuance endpoint.
+        // HTML routes + open token-issuance endpoint. All are `#[public]`: this
+        // demo has no login.
         .routes(routes![
             routes::todos::index,
             routes::todos::list,
@@ -102,6 +103,8 @@ async fn main() {
             // browser and JSON to an API client based on `Accept`. Mounted here
             // (not under the `/api` bearer-token scope) so a browser reaches it.
             routes::api::summary,
+            // WebMCP (#2619): a tool for the agent in the user's browser.
+            routes::api::list_for_page,
         ])
         // Tracked background job powering the async CSV export (#1373):
         // enqueue_tracked -> ctx.set_progress -> a polled download link.
@@ -110,7 +113,8 @@ async fn main() {
         // (rather than a merged raw router) keeps these routes in the route
         // registry, so their `#[api_doc(mcp)]` tags project them as MCP tools
         // while `RequireApiToken` still guards every call — agent or HTTP.
-        .scoped(
+        // `scoped_guarded` tells `routes audit` that this layer is the guard.
+        .scoped_guarded(
             "/api",
             RequireApiToken::new(Arc::new(deferred.clone())),
             routes![
@@ -125,6 +129,9 @@ async fn main() {
         // dispatches through the real pipeline above, so the bearer token an
         // agent presents to `/mcp` is enforced by `RequireApiToken`.
         .mount_mcp("/mcp")
+        // Serve the WebMCP tool list. The page script calls each tool with the
+        // user's own session, so the route pipeline applies as for the page.
+        .mount_webmcp()
         // Wire the real DbApiTokenStore once the pool is ready.
         .on_startup(move |state| {
             let deferred = deferred_for_startup.clone();

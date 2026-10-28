@@ -487,6 +487,36 @@ pub(crate) fn to_line<T: Serialize>(frame: &T) -> Result<String, WireError> {
     Ok(line)
 }
 
+/// Like [`to_line`], but the buffer has no spare capacity.
+///
+/// Used for the request frame only. It is the one large line, and it stays
+/// resident for the whole request, so doubling slack would be memory the
+/// footprint does not count. It serialises twice (count, then write), and
+/// `encoding_fuel` charges for both passes.
+///
+/// # Errors
+///
+/// Returns [`WireError::Json`] if the frame cannot be serialized.
+pub(crate) fn to_exact_line<T: Serialize>(frame: &T) -> Result<String, WireError> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, frame)?;
+    let mut line = Vec::with_capacity(count.0.saturating_add(1));
+    serde_json::to_writer(&mut line, frame)?;
+    line.push(b'\n');
+    // JSON output is UTF-8, so this cannot fail.
+    String::from_utf8(line).map_err(|err| WireError::Json(serde::ser::Error::custom(err)))
+}
+
 /// Parse one NDJSON line into a frame.
 ///
 /// # Errors
@@ -498,13 +528,85 @@ pub(crate) fn from_line<T: serde::de::DeserializeOwned>(line: &str) -> Result<T,
     Ok(serde_json::from_str(line)?)
 }
 
+/// The most values and containers a legal guest frame holds.
+///
+/// A fragment of 512 nodes with 32 attributes each holds about 51,000.
+pub(crate) const MAX_FRAME_VALUES: usize = 65_536;
+
+/// The deepest JSON nesting a legal guest frame has.
+///
+/// A fragment at its depth limit nests about 21 levels.
+pub(crate) const MAX_FRAME_DEPTH: usize = 32;
+
+/// Count a line's containers, separators and nesting without allocating.
+///
+/// A serde derive on a tagged enum copies the whole frame before any
+/// `deserialize_with` limit runs. This scan refuses a frame that no legal
+/// guest sends, before that copy exists.
+fn check_frame_shape(line: &str) -> Result<(), WireError> {
+    let (mut depth, mut values) = (0_usize, 0_usize);
+    let (mut in_string, mut escaped) = (false, false);
+    for byte in line.bytes() {
+        if in_string {
+            match (escaped, byte) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                if depth > MAX_FRAME_DEPTH {
+                    return Err(shape_error(format!(
+                        "a frame nests deeper than {MAX_FRAME_DEPTH} levels"
+                    )));
+                }
+                values = values.saturating_add(1);
+            }
+            b'}' | b']' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| shape_error("a frame closes more than it opens".to_owned()))?;
+            }
+            b',' => values = values.saturating_add(1),
+            _ => continue,
+        }
+        if values > MAX_FRAME_VALUES {
+            return Err(shape_error(format!(
+                "a frame holds more than {MAX_FRAME_VALUES} values"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn shape_error(message: String) -> WireError {
+    WireError::Json(serde::de::Error::custom(message))
+}
+
+/// Parse one line a guest wrote. See [`check_frame_shape`].
+///
+/// # Errors
+///
+/// As [`from_line`], and when the line is more complex than any legal frame.
+pub(crate) fn from_guest_line(line: &str) -> Result<GuestFrame, WireError> {
+    check_frame_shape(line)?;
+    from_line(line)
+}
+
 mod body_b64 {
     use super::BASE64;
     use base64::Engine as _;
     use serde::{Deserialize as _, Deserializer, Serializer};
 
     pub(super) fn serialize<S: Serializer>(bytes: &[u8], ser: S) -> Result<S::Ok, S::Error> {
-        ser.serialize_str(&BASE64.encode(bytes))
+        // Streamed, not encoded to a `String` first: that copy is 4/3 of the
+        // body and lives as long as the output line does.
+        ser.collect_str(&base64::display::Base64Display::new(bytes, &BASE64))
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<u8>, D::Error> {
@@ -1524,6 +1626,97 @@ mod tests {
         assert!(matches!(frame, GuestFrame::Error { .. }), "{frame:?}");
     }
 
+    fn guest_err(line: &str) -> String {
+        from_guest_line(line)
+            .expect_err("the frame must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn a_frame_with_too_many_values_is_refused_before_it_is_parsed() {
+        let nodes = vec![r#"{"node":"text","text":""}"#; 100_000].join(",");
+        let message = guest_err(&format!(r#"{{"op":"fragment","nodes":[{nodes}]}}"#));
+        assert!(message.contains("values"), "{message}");
+
+        let columns = (0..100_000)
+            .map(|i| format!(r#""c{i}":1"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let message = guest_err(&format!(
+            r#"{{"op":"call","call":"job-enqueue","id":1,"job_type":"x","payload":{{{columns}}}}}"#
+        ));
+        assert!(message.contains("values"), "{message}");
+
+        let headers = vec![r#"["",""]"#; 100_000].join(",");
+        let message = guest_err(&format!(
+            r#"{{"op":"call","call":"http-fetch","id":1,"method":"GET","url":"http://a/","headers":[{headers}]}}"#
+        ));
+        assert!(message.contains("values"), "{message}");
+    }
+
+    #[test]
+    fn a_frame_nested_deeper_than_any_legal_frame_is_refused() {
+        let deep = format!("{}{}", "[".repeat(40), "]".repeat(40));
+        let message = guest_err(&format!(r#"{{"op":"fragment","nodes":{deep}}}"#));
+        assert!(message.contains("deep"), "{message}");
+    }
+
+    #[test]
+    fn the_largest_legal_fragment_still_parses() {
+        let attributes = vec![r#"["a","b"]"#; 32].join(",");
+        let node = format!(r#"{{"node":"element","tag":"p","attributes":[{attributes}]}}"#);
+        let nodes = vec![node; 512].join(",");
+        let line = format!(r#"{{"op":"fragment","nodes":[{nodes}]}}"#);
+        assert!(from_guest_line(&line).is_ok());
+    }
+
+    #[test]
+    fn the_value_ceiling_is_exact() {
+        // `[` counts one and each `,` counts one: n items hold n values.
+        let frame = |items: usize| {
+            let nodes = vec!["0"; items].join(",");
+            format!(r#"{{"op":"fragment","nodes":[{nodes}]}}"#)
+        };
+        // The frame, the array and the comma after `"op"` hold three.
+        let at_limit = MAX_FRAME_VALUES - 2;
+        assert!(check_frame_shape(&frame(at_limit)).is_ok());
+        let message = guest_err(&frame(at_limit + 1));
+        assert!(message.contains("values"), "{message}");
+    }
+
+    #[test]
+    fn the_depth_ceiling_is_exact() {
+        let nest = |levels: usize| format!("{}{}", "[".repeat(levels), "]".repeat(levels));
+        assert!(check_frame_shape(&nest(MAX_FRAME_DEPTH)).is_ok());
+        let message = guest_err(&nest(MAX_FRAME_DEPTH + 1));
+        assert!(message.contains("deep"), "{message}");
+    }
+
+    #[test]
+    fn a_frame_that_closes_more_than_it_opens_is_refused() {
+        let message = guest_err("]]]]");
+        assert!(message.contains("closes"), "{message}");
+    }
+
+    #[test]
+    fn a_backslash_before_the_closing_quote_ends_the_string() {
+        // `"a\\"` is a string holding one backslash. The scan must leave the
+        // string there, or it skips the `[` that follows.
+        let deep = "[".repeat(MAX_FRAME_DEPTH + 1);
+        let line = format!(r#"{{"a":"x\\","b":{deep}}}"#);
+        assert!(guest_err(&line).contains("deep"));
+        // An escaped quote does not end the string.
+        let line = r#"{"a":"x\"[[[[","b":0}"#;
+        assert!(check_frame_shape(line).is_ok());
+    }
+
+    #[test]
+    fn structure_characters_inside_a_string_are_not_counted() {
+        let text = r#",[{\"\\"#.repeat(50_000);
+        let line = format!(r#"{{"op":"error","detail":"{text}"}}"#);
+        assert!(from_guest_line(&line).is_ok());
+    }
+
     #[test]
     fn an_unknown_op_is_refused() {
         let err = from_line::<GuestFrame>(r#"{"op":"exec","cmd":"sh"}"#)
@@ -1781,6 +1974,55 @@ mod tests {
         let line = format!(r#"{{"status":200,"headers":[{headers}],"body_b64":""}}"#);
         let parsed = from_line::<SandboxResponse>(&line).expect("a frame at the cap parses");
         assert_eq!(parsed.headers.len(), MAX_RESPONSE_HEADERS);
+    }
+
+    /// Records the largest single `write` it was given.
+    struct WidestWrite(usize);
+
+    impl std::io::Write for WidestWrite {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.max(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_body_is_encoded_into_the_line_without_a_whole_body_temporary() {
+        // A base64 `String` of the whole body handed to serde reaches the
+        // writer as one piece. Streaming the encoding never does.
+        const BODY: usize = 1 << 20;
+        let mut big = request();
+        big.body = vec![0xA5; BODY];
+        let frame = HostFrame::request(&big, &[]);
+
+        let mut widest = WidestWrite(0);
+        serde_json::to_writer(&mut widest, &frame).expect("serializes");
+
+        assert!(
+            widest.0 < BODY / 16,
+            "one write carried {} bytes of a {BODY}-byte body",
+            widest.0
+        );
+        // And the output is unchanged: the same line decodes to the same body.
+        let line = to_line(&frame).expect("serializes");
+        let HostFrame::Request { body, .. } = from_line(line.trim_end()).expect("parses") else {
+            panic!("a request frame must parse back as a request");
+        };
+        assert_eq!(body, big.body);
+    }
+
+    #[test]
+    fn a_line_holds_no_spare_capacity() {
+        // The line stays resident for the whole request. A buffer that grew by
+        // doubling would keep up to twice its length, which the footprint does
+        // not count.
+        let mut big = request();
+        big.body = vec![0x5A; (1 << 20) + 17];
+        let line = to_exact_line(&HostFrame::request(&big, &[])).expect("serializes");
+        assert_eq!(line.capacity(), line.len());
     }
 
     #[test]

@@ -318,7 +318,11 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 method: ::autumn_web::reexports::http::Method::from_bytes(b"WS")
                     .expect("WS is a valid method token"),
                 path: #path,
-                handler: ::autumn_web::reexports::axum::routing::get(#upgrade_name),
+                // `GET` is the HTTP/1.1 upgrade. `CONNECT` is the HTTP/2
+                // upgrade (RFC 8441), which browsers use once `h2` is
+                // negotiated (#2321).
+                handler: ::autumn_web::reexports::axum::routing::get(#upgrade_name)
+                    .connect(#upgrade_name),
                 name: ::core::stringify!(#fn_name),
                 // WebSocket upgrades don't have a meaningful JSON body, so
                 // they are excluded from the generated OpenAPI spec by
@@ -370,6 +374,7 @@ pub fn ws_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // handler (e.g. wrap the async auth/setup in
                 // `tokio::time::timeout`).
                 timeout: ::autumn_web::RouteTimeout::Inherit,
+                criticality: ::autumn_web::Criticality::Default,
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
                 // A WebSocket upgrade serves no crawlable HTML document, so

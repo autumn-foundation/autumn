@@ -1422,9 +1422,41 @@ mod write_guard_tests {
 /// a writable `update` that `--apply` then refuses. A preview that does not
 /// predict its own apply is worse than no preview, and this is the one file
 /// that can be in both halves at once.
+///
+/// The plan also carries each file's planned text. The scaffold diff uses that
+/// text, so preview and apply show the same diff.
 fn plan_scaffold(root: &Path, target: &str, report: &Report) -> Option<scaffold::ScaffoldReport> {
-    let migrated: BTreeSet<String> = report.files.iter().map(|file| file.path.clone()).collect();
+    let migrated = scaffold_plans(report);
     scaffold::is_project(root).then(|| scaffold::plan_after(root, target, &migrated))
+}
+
+/// What the codemods plan for each file, as the scaffold half sees it.
+///
+/// A preview trusts the text the codemods read and the text they write. After
+/// an apply, a written file is trusted only as written. A file past a failed
+/// write is trusted only as read, so the disk decides.
+fn scaffold_plans(report: &Report) -> BTreeMap<String, scaffold::Planned> {
+    let written = match report.outcome {
+        Outcome::Partial { written } => written,
+        Outcome::Preview | Outcome::Applied => usize::MAX,
+    };
+    report
+        .files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            let (original, updated) = match report.outcome {
+                Outcome::Preview => (&file.original, &file.updated),
+                _ if index < written => (&file.updated, &file.updated),
+                _ => (&file.original, &file.original),
+            };
+            let plan = scaffold::Planned {
+                original: original.clone(),
+                updated: updated.clone(),
+            };
+            (file.path.clone(), plan)
+        })
+        .collect()
 }
 
 /// Reject flag combinations whose meanings contradict each other.
@@ -1825,6 +1857,44 @@ mod tests {
             manual: Vec::new(),
             skipped: Vec::new(),
         }
+    }
+
+    fn rewrite(path: &str, original: &str, updated: &str) -> FileReport {
+        FileReport {
+            path: path.into(),
+            sites: Vec::new(),
+            diff: String::new(),
+            updated: updated.into(),
+            original: original.into(),
+            absolute: PathBuf::from(path),
+        }
+    }
+
+    #[test]
+    fn a_partial_apply_plans_only_the_files_it_wrote() {
+        let mut report = empty(Outcome::Partial { written: 1 });
+        report.files = vec![
+            rewrite("a.rs", "a\n", "A\n"),
+            rewrite("build.rs", "b\n", "B\n"),
+        ];
+        let plans = scaffold_plans(&report);
+        assert_eq!(plans["a.rs"].updated, "A\n");
+        // Not written, so the disk text is still the one to judge.
+        assert_eq!(plans["build.rs"].updated, "b\n");
+
+        report.outcome = Outcome::Preview;
+        assert_eq!(scaffold_plans(&report)["build.rs"].updated, "B\n");
+        assert_eq!(scaffold_plans(&report)["build.rs"].original, "b\n");
+    }
+
+    #[test]
+    fn a_written_file_is_trusted_only_as_written() {
+        let mut report = empty(Outcome::Applied);
+        report.files = vec![rewrite("build.rs", "b\n", "B\n")];
+        let plan = &scaffold_plans(&report)["build.rs"];
+        // The old text on disk now means someone reverted the write.
+        assert_eq!(plan.original, "B\n");
+        assert_eq!(plan.updated, "B\n");
     }
 
     #[test]

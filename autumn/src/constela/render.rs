@@ -54,16 +54,17 @@
     )
 )]
 
-use std::cell::Cell;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
+use std::rc::Rc;
 
 use maud::{Markup, PreEscaped};
 use serde_json::{Map, Value};
 
-use super::ast::{EventHandler, Node, PayloadSpec, Prop};
-use super::error::{ConstelaError, Diagnostic, codes};
-use super::eval::{Env, EvalCtx, RouteValues, eval, text_of, truthy};
+use super::ast::{EventHandler, Expr, Node, PayloadSpec, Prop};
+use super::budget::{Budget, ChargingWriter, Output};
+use super::error::{ConstelaError, Diagnostic, codes, excerpt};
+use super::eval::{Bound, Env, EvalCtx, RouteValues, eval_ref, text_coerce, truthy};
 use super::policy;
 
 /// Bounds on how much work one render may do.
@@ -89,6 +90,11 @@ pub struct RenderLimits {
     /// string in state and render that field from a 5 000-iteration `each` —
     /// a few dozen nodes, well inside every other bound, and about 2.4 GiB of
     /// output. Counting nodes does not see that; counting bytes does.
+    ///
+    /// The same number also bounds the bytes one render may build, copy or
+    /// keep outside its markup: values that expressions build or copy, route
+    /// metadata, handler payloads, portal targets and rendered ids. A
+    /// dispatch uses the default for its own budget.
     pub max_output_bytes: usize,
 }
 
@@ -201,6 +207,19 @@ fn escape_text(input: &str) -> String {
     out
 }
 
+/// The length of `escape_text(input)`, measured without building it.
+fn escaped_len(input: &str) -> usize {
+    input
+        .bytes()
+        .map(|byte| match byte {
+            b'&' | b'\'' => 5,
+            b'<' | b'>' => 4,
+            b'"' => 6,
+            _ => 1,
+        })
+        .fold(0usize, usize::saturating_add)
+}
+
 /// HTML-escape an attribute value. Identical to [`escape_text`]; named
 /// separately so call sites read as the context they are in.
 fn escape_attr(input: &str) -> String {
@@ -212,10 +231,12 @@ fn escape_attr(input: &str) -> String {
 /// A linked list rather than a single value: a component invocation nested
 /// inside another component's slot content needs the *outer* invocation's
 /// children when its own view reaches a `slot`.
-struct SlotCtx<'a> {
-    children: &'a [Node],
-    env: Env,
-    outer: Option<&'a Self>,
+///
+/// `'d` is the document, which the children borrow. `'s` is the scope.
+struct SlotCtx<'d, 's> {
+    children: &'d [Node],
+    env: Env<'s>,
+    outer: Option<&'s Self>,
 }
 
 /// Carries the render state that is not per-node.
@@ -224,24 +245,18 @@ pub struct Renderer<'a> {
     pub ctx: &'a RenderContext,
     nodes: usize,
     portals: Vec<RenderedPortal>,
-    /// Bytes an expression may still allocate, for the **whole render**.
+    /// Bytes the **whole render** may build, copy or keep outside its markup.
     ///
-    /// Render-scoped, not per expression, and that distinction is the entire
-    /// point. A per-expression allowance bounds each value on its own and
-    /// nothing in aggregate, so a document with a few thousand expressions —
-    /// handler payload entries, `route.meta` keys, attributes — each get the
-    /// full allowance and together retain gigabytes. Every expression in the
-    /// render draws from this one pool, so the aggregate is what is bounded.
-    budget: Cell<usize>,
-    /// Bytes of output that are not in the buffer currently being written:
-    /// finished portals, plus — while a portal is being rendered — the caller's
-    /// body up to that point.
-    ///
-    /// The live buffer's own length is added at each check, so the two together
-    /// cover all output. Counting the caller's body during a portal is what
-    /// stops a 3 MiB body followed by a 3 MiB portal from passing a 4 MiB cap
-    /// twice over, each buffer measured as if it were alone.
-    committed_bytes: usize,
+    /// One pool for every expression, every portal target, every id, and the
+    /// route metadata. A pool per expression bounds each value and not the
+    /// sum. See [`Budget`].
+    budget: &'a Budget,
+    /// Markup bytes, for the body and every portal together. Each write goes
+    /// through it. See [`Output`].
+    output: &'a Output,
+    /// Each element id this render wrote, prefixed, and the path of its first
+    /// use. See [`Self::record_id`].
+    ids: BTreeMap<String, String>,
 }
 
 /// Render `document` against `ctx`.
@@ -249,19 +264,22 @@ pub struct Renderer<'a> {
 /// # Errors
 ///
 /// [`ConstelaError::Render`] when the render exceeds a [`RenderLimits`] bound,
-/// or when a computed URL turns out to use a scheme
-/// [`policy::is_allowed_url`] rejects.
+/// when a computed URL turns out to use a scheme [`policy::is_allowed_url`]
+/// rejects, or when two elements get the same id.
 pub fn render(
     document: &super::Document,
     ctx: &RenderContext,
 ) -> Result<RenderedUi, ConstelaError> {
+    let budget = Budget::new(ctx.limits.max_output_bytes);
+    let output = Output::new(ctx.limits.max_output_bytes);
     let mut renderer = Renderer {
         document,
         ctx,
         nodes: 0,
         portals: Vec::new(),
-        budget: Cell::new(ctx.limits.max_output_bytes),
-        committed_bytes: 0,
+        budget: &budget,
+        output: &output,
+        ids: BTreeMap::new(),
     };
     let env = Env::default();
 
@@ -285,44 +303,43 @@ pub fn render(
     })
 }
 
-impl Renderer<'_> {
-    /// An evaluation context for the current environment.
-    const fn eval_ctx<'e>(
-        &'e self,
-        env: &'e Env,
-        depth: usize,
-        budget: &'e Cell<usize>,
-    ) -> EvalCtx<'e> {
-        EvalCtx {
-            state: &self.ctx.state,
-            env,
-            route: &self.ctx.route,
-            styles: &self.document.program().styles,
-            depth,
-            budget,
-        }
-    }
-
-    fn eval(
+impl<'a> Renderer<'a> {
+    /// Evaluate `expr` without a copy where possible. See [`eval_ref`].
+    ///
+    /// The result borrows the document, the state and `env`, never `self`,
+    /// so the caller can keep it across a `&mut self` call.
+    fn eval_ref<'c>(
         &self,
-        expr: &super::ast::Expr,
-        env: &Env,
+        expr: &'c Expr,
+        env: &'c Env<'c>,
         path: &str,
         depth: usize,
-    ) -> Result<Value, ConstelaError> {
-        // `&self.budget`, deliberately: the pool is shared by every expression
-        // in the render, so a thousand expressions cannot each spend the whole
-        // allowance. Values that are built and dropped (an attribute that
-        // evaluates to `false`, say) still consume from it — an approximation
-        // that errs toward refusing work, which is the right direction on a
-        // hostile path.
-        eval(expr, &self.eval_ctx(env, depth, &self.budget), path)
+    ) -> Result<Cow<'c, Value>, ConstelaError>
+    where
+        'a: 'c,
+    {
+        let ctx: &'a RenderContext = self.ctx;
+        let document: &'a super::Document = self.document;
+        let eval_ctx = EvalCtx {
+            state: &ctx.state,
+            env,
+            route: &ctx.route,
+            styles: &document.program().styles,
+            depth,
+            budget: self.budget,
+        };
+        eval_ref(expr, &eval_ctx, path)
+    }
+
+    /// The text of `value`, without a copy for a string.
+    fn text<'v>(&self, value: &'v Value, path: &str) -> Result<Cow<'v, str>, ConstelaError> {
+        text_coerce(value, self.budget, path)
     }
 
     /// Evaluate `route.title` and `route.meta`.
     fn route_metadata(
         &self,
-        env: &Env,
+        env: &Env<'_>,
     ) -> Result<(Option<String>, BTreeMap<String, String>), ConstelaError> {
         let Some(route) = &self.document.program().route else {
             return Ok((None, BTreeMap::new()));
@@ -330,93 +347,44 @@ impl Renderer<'_> {
         let depth = self.ctx.limits.max_depth;
         let title = match &route.title {
             Some(expr) => {
-                let text = text_of(&self.eval(expr, env, "route.title", depth)?);
-                self.charge_budget(text.len(), "route.title")?;
-                Some(text)
+                let value = self.eval_ref(expr, env, "route.title", depth)?;
+                let text = self.text(&value, "route.title")?;
+                // Kept and handed back, so charged like any other value kept.
+                Some(self.budget.own_str(text, "route.title")?)
             }
             None => None,
         };
         let mut meta = BTreeMap::new();
         for (key, expr) in &route.meta {
-            let value = self.eval(expr, env, &format!("route.meta.{key}"), depth)?;
-            let text = text_of(&value);
-            // `meta` is retained and handed back, so it is output like any
-            // other — but it never passes through a buffer, so `reserve` would
-            // never see it. Charge it here.
-            self.charge_budget(text.len(), &format!("route.meta.{key}"))?;
-            meta.insert(key.clone(), text);
+            let path = format!("route.meta.{key}");
+            let value = self.eval_ref(expr, env, &path, depth)?;
+            let text = self.text(&value, &path)?;
+            self.budget.charge(key.len(), &path)?;
+            meta.insert(key.clone(), self.budget.own_str(text, &path)?);
         }
         Ok((title, meta))
     }
 
-    /// Refuse a write *before* making it, if it would push the output past
-    /// [`RenderLimits::max_output_bytes`].
-    ///
-    /// Checking on node entry alone is not enough, and the reasoning that said
-    /// it was does not hold: it assumed one node's emission is bounded by the
-    /// document, but a node renders `RenderContext::state`, which the **app**
-    /// owns and can fill from a database. A single text node can therefore emit
-    /// arbitrarily much, and a one-node document would sail past the budget and
-    /// allocate the escaped copy on the way. Reserving the projected length
-    /// first bounds both the output and the allocation.
-    fn reserve(&self, emitted: usize, extra: usize, path: &str) -> Result<(), ConstelaError> {
-        let projected = emitted
-            .saturating_add(self.committed_bytes)
-            .saturating_add(extra);
-        if projected > self.ctx.limits.max_output_bytes {
-            return Err(ConstelaError::Render(Diagnostic::new(
-                path,
-                codes::RENDER_LIMIT,
-                format!(
-                    "render would produce more than {} bytes of markup",
-                    self.ctx.limits.max_output_bytes
-                ),
-            )));
-        }
-        Ok(())
-    }
-
-    /// Spend `bytes` from the render-wide allocation budget.
-    ///
-    /// For output that is retained rather than written to a buffer — route
-    /// metadata, an event payload — which `reserve` therefore never sees.
-    fn charge_budget(&self, bytes: usize, path: &str) -> Result<(), ConstelaError> {
-        let remaining = self.budget.get();
-        if bytes > remaining {
-            return Err(ConstelaError::Render(Diagnostic::new(
-                path,
-                codes::RENDER_LIMIT,
-                format!(
-                    "render would allocate more than {} bytes",
-                    self.ctx.limits.max_output_bytes
-                ),
-            )));
-        }
-        self.budget.set(remaining.saturating_sub(bytes));
-        Ok(())
+    /// Append fixed or already-escaped markup to `out`, through the output
+    /// meter.
+    fn write(&self, out: &mut String, markup: &str, path: &str) -> Result<(), ConstelaError> {
+        self.output.write(out, markup, path)
     }
 
     /// Append `text` to `out`, escaped, refusing the write if it would breach
     /// the byte budget.
     ///
-    /// Reserves twice on purpose: once on the raw length, which stops the
-    /// escaped copy from being allocated at all when the value is already
-    /// oversized, and once on the escaped length, which is what actually lands
-    /// in the buffer and can be up to six times larger.
+    /// The escaped length is measured first, so an oversized value is refused
+    /// before its escaped copy, which can be six times larger, is allocated.
     fn push_escaped(&self, out: &mut String, text: &str, path: &str) -> Result<(), ConstelaError> {
-        self.reserve(out.len(), text.len(), path)?;
-        let escaped = escape_text(text);
-        self.reserve(out.len(), escaped.len(), path)?;
-        out.push_str(&escaped);
-        Ok(())
+        self.output.check(escaped_len(text), path)?;
+        self.write(out, &escape_text(text), path)
     }
 
-    /// Charge one node, and the output produced so far, against the budgets.
+    /// Count one node against [`RenderLimits::max_nodes`].
     ///
-    /// `emitted` is the live buffer's length; the bytes already committed to
-    /// finished portals are added here. This catches accumulation across many
-    /// small nodes; [`Self::reserve`] catches a single large one.
-    fn charge(&mut self, path: &str, emitted: usize) -> Result<(), ConstelaError> {
+    /// Bytes are not checked here: [`Output`] sees each write as it happens.
+    fn count_node(&mut self, path: &str) -> Result<(), ConstelaError> {
         self.nodes = self.nodes.saturating_add(1);
         if self.nodes > self.ctx.limits.max_nodes {
             return Err(ConstelaError::Render(Diagnostic::new(
@@ -428,32 +396,20 @@ impl Renderer<'_> {
                 ),
             )));
         }
-
-        let produced = emitted.saturating_add(self.committed_bytes);
-        if produced > self.ctx.limits.max_output_bytes {
-            return Err(ConstelaError::Render(Diagnostic::new(
-                path,
-                codes::RENDER_LIMIT,
-                format!(
-                    "render produced more than {} bytes of markup",
-                    self.ctx.limits.max_output_bytes
-                ),
-            )));
-        }
         Ok(())
     }
 
     /// Render one node into `out`.
     fn node(
         &mut self,
-        node: &Node,
-        env: &Env,
-        slot: Option<&SlotCtx<'_>>,
+        node: &'a Node,
+        env: &Env<'_>,
+        slot: Option<&SlotCtx<'a, '_>>,
         path: &str,
         depth: usize,
         out: &mut String,
     ) -> Result<(), ConstelaError> {
-        self.charge(path, out.len())?;
+        self.count_node(path)?;
         let Some(depth) = depth.checked_sub(1) else {
             return Err(ConstelaError::Render(Diagnostic::new(
                 path,
@@ -467,8 +423,9 @@ impl Renderer<'_> {
 
         match node {
             Node::Text { value } => {
-                let value = self.eval(value, env, &format!("{path}.value"), depth)?;
-                self.push_escaped(out, &text_of(&value), path)?;
+                let value = self.eval_ref(value, env, &format!("{path}.value"), depth)?;
+                let text = self.text(&value, path)?;
+                self.push_escaped(out, &text, path)?;
             }
             Node::Element {
                 tag,
@@ -491,7 +448,7 @@ impl Renderer<'_> {
                 then,
                 otherwise,
             } => {
-                let test = self.eval(condition, env, &format!("{path}.condition"), depth)?;
+                let test = self.eval_ref(condition, env, &format!("{path}.condition"), depth)?;
                 let (branch, label) = if truthy(&test) {
                     (Some(&**then), "then")
                 } else {
@@ -525,25 +482,20 @@ impl Renderer<'_> {
             } => self.component(name, props, children, env, slot, path, depth, out)?,
             Node::Slot { .. } => self.fill_slot(slot, path, depth, out)?,
             Node::Code { language, content } => {
-                let language = self.eval(language, env, &format!("{path}.language"), depth)?;
-                let content = self.eval(content, env, &format!("{path}.content"), depth)?;
-                open_code_block(&text_of(&language), out);
-                self.push_escaped(out, &text_of(&content), path)?;
-                out.push_str("</code></pre>");
+                self.code(language, content, env, path, depth, out)?;
             }
             Node::Markdown { content } => {
-                let content = self.eval(content, env, &format!("{path}.content"), depth)?;
-                let source = text_of(&content);
-                // Reserved on the source before rendering: the sanitizer would
+                let content = self.eval_ref(content, env, &format!("{path}.content"), depth)?;
+                let source = self.text(&content, path)?;
+                // Checked on the source before rendering: the sanitizer would
                 // otherwise build the whole HTML string first.
-                self.reserve(out.len(), source.len(), path)?;
+                self.output.check(source.len(), path)?;
                 let mut rendered = String::new();
                 render_markdown(&source, &mut rendered);
-                self.reserve(out.len(), rendered.len(), path)?;
-                out.push_str(&rendered);
+                self.write(out, &rendered, path)?;
             }
             Node::Portal { target, children } => {
-                self.portal(target, children, env, slot, path, depth, out.len())?;
+                self.portal(target, children, env, slot, path, depth)?;
             }
             Node::Island {
                 id,
@@ -576,22 +528,20 @@ impl Renderer<'_> {
         &mut self,
         id: &str,
         strategy: super::ast::IslandStrategy,
-        content: &Node,
-        env: &Env,
-        slot: Option<&SlotCtx<'_>>,
+        content: &'a Node,
+        env: &Env<'_>,
+        slot: Option<&SlotCtx<'a, '_>>,
         path: &str,
         depth: usize,
         out: &mut String,
     ) -> Result<(), ConstelaError> {
-        let _ = write!(
-            out,
-            "<div data-constela-island=\"{}\" data-constela-strategy=\"{}\">",
-            escape_attr(id),
-            strategy.as_str()
-        );
+        self.write(out, "<div data-constela-island=\"", path)?;
+        self.push_escaped(out, id, path)?;
+        self.write(out, "\" data-constela-strategy=\"", path)?;
+        self.write(out, strategy.as_str(), path)?;
+        self.write(out, "\">", path)?;
         self.node(content, env, slot, &format!("{path}.content"), depth, out)?;
-        out.push_str("</div>");
-        Ok(())
+        self.write(out, "</div>", path)
     }
 
     /// Render the slot content in scope.
@@ -602,7 +552,7 @@ impl Renderer<'_> {
     /// loop inside the component it was passed to.
     fn fill_slot(
         &mut self,
-        slot: Option<&SlotCtx<'_>>,
+        slot: Option<&SlotCtx<'a, '_>>,
         path: &str,
         depth: usize,
         out: &mut String,
@@ -631,54 +581,35 @@ impl Renderer<'_> {
     /// Deliberately not written into `out`: a portal names a destination in
     /// the host page, which only the host layout knows how to reach. See
     /// [`RenderedUi::portals`].
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "the portal's own parts plus the render state threaded \
-                  through every node, and the caller's buffer length the \
-                  budget needs; see `element`"
-    )]
+    ///
+    /// The target and the record are kept, so they charge the budget. An
+    /// `each` of empty portals writes no markup, but each one keeps its
+    /// target.
     fn portal(
         &mut self,
         target: &str,
-        children: &[Node],
-        env: &Env,
-        slot: Option<&SlotCtx<'_>>,
+        children: &'a [Node],
+        env: &Env<'_>,
+        slot: Option<&SlotCtx<'a, '_>>,
         path: &str,
         depth: usize,
-        caller_bytes: usize,
     ) -> Result<(), ConstelaError> {
-        // The portal renders into its own buffer, so the caller's body would
-        // drop out of every budget check made inside it. Fold it in for the
-        // duration, and restore afterwards so it is not counted twice — the
-        // caller's own checks add its live length back.
-        let outer = self.committed_bytes;
-        let entry = outer.saturating_add(caller_bytes);
-        self.committed_bytes = entry;
-
+        self.budget.charge(
+            target.len().saturating_add(size_of::<RenderedPortal>()),
+            &format!("{path}.target"),
+        )?;
+        // Its own buffer, but the same output meter as the body.
         let mut inner = String::new();
-        let rendered = (|renderer: &mut Self| {
-            for (i, child) in children.iter().enumerate() {
-                renderer.node(
-                    child,
-                    env,
-                    slot,
-                    &format!("{path}.children[{i}]"),
-                    depth,
-                    &mut inner,
-                )?;
-            }
-            Ok::<(), ConstelaError>(())
-        })(self);
-        // Restore by *delta*, not by absolute value. A nested portal inside
-        // this one commits its own bytes while the render runs, and assigning
-        // `outer` back would discard them — an `each` over a portal-wrapping-a-
-        // portal would then forget the inner content on every iteration and
-        // emit unbounded output under a bounded-looking counter.
-        let nested = self.committed_bytes.saturating_sub(entry);
-        self.committed_bytes = outer.saturating_add(nested);
-        rendered?;
-
-        self.committed_bytes = self.committed_bytes.saturating_add(inner.len());
+        for (i, child) in children.iter().enumerate() {
+            self.node(
+                child,
+                env,
+                slot,
+                &format!("{path}.children[{i}]"),
+                depth,
+                &mut inner,
+            )?;
+        }
         self.portals.push(RenderedPortal {
             target: target.to_string(),
             content: PreEscaped(inner),
@@ -688,6 +619,9 @@ impl Renderer<'_> {
 
     /// Render an `each`: evaluate the list, then render the body once per
     /// element with the loop bindings added to the environment.
+    ///
+    /// A borrowed list binds borrowed items, and a built list gives its items
+    /// up, so no pass copies an item.
     #[expect(
         clippy::too_many_arguments,
         reason = "the loop's own parts plus the render state threaded through \
@@ -695,40 +629,53 @@ impl Renderer<'_> {
     )]
     fn each(
         &mut self,
-        items: &super::ast::Expr,
-        binding: &str,
-        index: Option<&str>,
-        body: &Node,
-        env: &Env,
-        slot: Option<&SlotCtx<'_>>,
+        items: &'a Expr,
+        binding: &'a str,
+        index: Option<&'a str>,
+        body: &'a Node,
+        env: &Env<'_>,
+        slot: Option<&SlotCtx<'a, '_>>,
         path: &str,
         depth: usize,
         out: &mut String,
     ) -> Result<(), ConstelaError> {
-        let items = self.eval(items, env, &format!("{path}.items"), depth)?;
-        // A non-list renders nothing. Upstream's client runtime would throw
-        // here; rendering an empty list is the behaviour that degrades a
-        // generated page rather than losing it.
-        let Value::Array(items) = items else {
-            return Ok(());
+        let items = self.eval_ref(items, env, &format!("{path}.items"), depth)?;
+        let passes: Box<dyn Iterator<Item = Bound<'_>> + '_> = match items {
+            Cow::Borrowed(Value::Array(list)) => {
+                self.check_iterations(list.len(), path)?;
+                Box::new(list.iter().map(Bound::Borrowed))
+            }
+            Cow::Owned(Value::Array(list)) => {
+                self.check_iterations(list.len(), path)?;
+                Box::new(list.into_iter().map(|item| Bound::Shared(Rc::new(item))))
+            }
+            // A non-list renders nothing. Upstream's client runtime would
+            // throw here; rendering an empty list is the behaviour that
+            // degrades a generated page rather than losing it.
+            _ => return Ok(()),
         };
-        if items.len() > self.ctx.limits.max_each_items {
+        for (i, item) in passes.enumerate() {
+            let mut inner = env.with_var(binding, item);
+            if let Some(index_name) = index {
+                inner = inner.with_var(index_name, Bound::Shared(Rc::new(Value::from(i))));
+            }
+            self.node(body, &inner, slot, &format!("{path}.body[{i}]"), depth, out)?;
+        }
+        Ok(())
+    }
+
+    /// Fail if an `each` would run more than [`RenderLimits::max_each_items`]
+    /// passes.
+    fn check_iterations(&self, len: usize, path: &str) -> Result<(), ConstelaError> {
+        if len > self.ctx.limits.max_each_items {
             return Err(ConstelaError::Render(Diagnostic::new(
                 path,
                 codes::RENDER_LIMIT,
                 format!(
-                    "`each` would iterate {} times, over the {} limit",
-                    items.len(),
+                    "`each` would iterate {len} times, over the {} limit",
                     self.ctx.limits.max_each_items
                 ),
             )));
-        }
-        for (i, item) in items.into_iter().enumerate() {
-            let mut inner = env.with_var(binding, item);
-            if let Some(index_name) = index {
-                inner = inner.with_var(index_name, Value::from(i));
-            }
-            self.node(body, &inner, slot, &format!("{path}.body[{i}]"), depth, out)?;
         }
         Ok(())
     }
@@ -747,10 +694,10 @@ impl Renderer<'_> {
     fn component(
         &mut self,
         name: &str,
-        props: &BTreeMap<String, super::ast::Expr>,
-        children: &[Node],
-        env: &Env,
-        slot: Option<&SlotCtx<'_>>,
+        props: &'a BTreeMap<String, Expr>,
+        children: &'a [Node],
+        env: &Env<'_>,
+        slot: Option<&SlotCtx<'a, '_>>,
         path: &str,
         depth: usize,
         out: &mut String,
@@ -759,7 +706,8 @@ impl Renderer<'_> {
         // the same: a panic here is a 500 on a request carrying a document
         // someone generated, so the one place that reasoning could be wrong is
         // an error, not a crash.
-        let Some(component) = self.document.program().components.get(name) else {
+        let document: &'a super::Document = self.document;
+        let Some(component) = document.program().components.get(name) else {
             return Err(ConstelaError::Render(Diagnostic::new(
                 format!("{path}.name"),
                 codes::UNKNOWN_REF,
@@ -768,11 +716,11 @@ impl Renderer<'_> {
         };
         let mut params = BTreeMap::new();
         for (key, expr) in props {
-            let value = self.eval(expr, env, &format!("{path}.props.{key}"), depth)?;
-            params.insert(key.clone(), value);
+            let value = self.eval_ref(expr, env, &format!("{path}.props.{key}"), depth)?;
+            params.insert(key.as_str(), Bound::from(value));
         }
         let inner = Env {
-            params,
+            params: Rc::new(params),
             vars: Vec::new(),
         };
         let nested = SlotCtx {
@@ -801,10 +749,10 @@ impl Renderer<'_> {
         &mut self,
         tag: &str,
         element_ref: Option<&str>,
-        props: &BTreeMap<String, Prop>,
-        children: &[Node],
-        env: &Env,
-        slot: Option<&SlotCtx<'_>>,
+        props: &'a BTreeMap<String, Prop>,
+        children: &'a [Node],
+        env: &Env<'_>,
+        slot: Option<&SlotCtx<'a, '_>>,
         path: &str,
         depth: usize,
         out: &mut String,
@@ -823,6 +771,10 @@ impl Renderer<'_> {
 
         let mut attrs: Vec<(String, Option<String>)> = Vec::new();
         let mut handlers: Vec<(&str, &EventHandler)> = Vec::new();
+        // Escaped attribute bytes not yet written. Each value is checked with
+        // these added, so many large attributes cannot pile up in `attrs`
+        // before the element is written.
+        let mut pending = 0usize;
 
         for (raw_name, prop) in props {
             match prop {
@@ -839,13 +791,15 @@ impl Renderer<'_> {
                             format!("attribute {name:?} is not on the allowlist"),
                         )));
                     }
-                    let value = self.eval(expr, env, &format!("{path}.props.{raw_name}"), depth)?;
-                    if let Some(rendered) = self.attribute_value(
-                        &name,
-                        &value,
-                        out.len(),
-                        &format!("{path}.props.{raw_name}"),
-                    )? {
+                    let attr_path = format!("{path}.props.{raw_name}");
+                    let value = self.eval_ref(expr, env, &attr_path, depth)?;
+                    if name == "id" && !self.record_id(&value, &attr_path)? {
+                        continue;
+                    }
+                    if let Some(rendered) =
+                        self.attribute_value(&name, &value, pending, &attr_path)?
+                    {
+                        pending = pending.saturating_add(rendered.len());
                         attrs.push((name, Some(rendered)));
                     }
                 }
@@ -856,7 +810,7 @@ impl Renderer<'_> {
             attrs.push(("data-constela-ref".to_string(), Some(escape_attr(name))));
         }
         for (_, handler) in &handlers {
-            self.push_handler_attrs(handler, env, path, depth, &mut attrs)?;
+            self.push_handler_attrs(handler, env, path, depth, &mut attrs, &mut pending)?;
         }
         harden_blank_target(&mut attrs);
 
@@ -867,10 +821,12 @@ impl Renderer<'_> {
                     .saturating_add(value.as_ref().map_or(0, String::len))
                     .saturating_add(4) // ` name=""`
             })
-            .sum();
-        self.reserve(out.len(), attr_bytes.saturating_add(tag.len()), path)?;
+            .fold(0usize, usize::saturating_add);
+        self.output
+            .check(attr_bytes.saturating_add(tag.len()).saturating_add(2), path)?;
 
-        let _ = write!(out, "<{tag}");
+        self.write(out, "<", path)?;
+        self.write(out, &tag, path)?;
         for (name, value) in &attrs {
             match value {
                 // An empty value is written as the bare attribute name. That
@@ -879,15 +835,20 @@ impl Renderer<'_> {
                 // (`alt=""` on a decorative image) — HTML parses an attribute
                 // with no value as the empty string, so the two coincide.
                 Some(value) if value.is_empty() => {
-                    let _ = write!(out, " {name}");
+                    self.write(out, " ", path)?;
+                    self.write(out, name, path)?;
                 }
                 Some(value) => {
-                    let _ = write!(out, " {name}=\"{value}\"");
+                    self.write(out, " ", path)?;
+                    self.write(out, name, path)?;
+                    self.write(out, "=\"", path)?;
+                    self.write(out, value, path)?;
+                    self.write(out, "\"", path)?;
                 }
                 None => {}
             }
         }
-        out.push('>');
+        self.write(out, ">", path)?;
 
         if policy::is_void_tag(&tag) {
             return Ok(());
@@ -903,8 +864,61 @@ impl Renderer<'_> {
                 out,
             )?;
         }
-        let _ = write!(out, "</{tag}>");
-        Ok(())
+        self.write(out, "</", path)?;
+        self.write(out, &tag, path)?;
+        self.write(out, ">", path)
+    }
+
+    /// Check an element id, and record it for the whole render. Returns
+    /// whether to write the attribute.
+    ///
+    /// `false`, `null`, `true` and `""` name no element, so the attribute is
+    /// omitted. An id with whitespace is an error: an id is one token. A
+    /// second element with the same id is an error: HTML ids are unique, and a
+    /// `<label for>` finds only the first. Ids are not renamed per call; see
+    /// ADR 0025.
+    ///
+    /// The map is kept for the whole render, so each entry charges the
+    /// budget.
+    fn record_id(&mut self, value: &Value, path: &str) -> Result<bool, ConstelaError> {
+        let id = match value {
+            Value::Bool(_) | Value::Null => return Ok(false),
+            other => self.text(other, path)?,
+        };
+        if id.is_empty() {
+            return Ok(false);
+        }
+        if id.chars().any(char::is_whitespace) {
+            return Err(ConstelaError::Render(Diagnostic::new(
+                path,
+                codes::EVAL,
+                format!("id {:?} has whitespace; an id is one token", excerpt(&id)),
+            )));
+        }
+        let prefix = &self.ctx.id_prefix;
+        self.budget.charge(
+            prefix
+                .len()
+                .saturating_add(id.len())
+                .saturating_add(path.len())
+                .saturating_add(size_of::<String>().saturating_mul(2)),
+            path,
+        )?;
+        let rendered = format!("{prefix}{id}");
+        if let Some(first) = self.ids.get(&rendered) {
+            return Err(ConstelaError::Render(Diagnostic::new(
+                path,
+                codes::DUPLICATE,
+                format!(
+                    "id {:?} (rendered {:?}) is already used at {}; give each use its own id: pass a different param value to each use, or build it from the loop index",
+                    excerpt(&id),
+                    excerpt(&rendered),
+                    excerpt(first)
+                ),
+            )));
+        }
+        self.ids.insert(rendered, path.to_string());
+        Ok(true)
     }
 
     /// Turn an evaluated prop into an escaped attribute value, or `None` to
@@ -913,18 +927,21 @@ impl Renderer<'_> {
     /// Follows the upstream client renderer: `true` is a bare boolean
     /// attribute, `false`/`null` removes it, and `data-*` always renders even
     /// when nullish.
+    ///
+    /// `pending` is the escaped bytes of this element's earlier attributes,
+    /// which are not written yet.
     fn attribute_value(
         &self,
         name: &str,
         value: &Value,
-        emitted: usize,
+        pending: usize,
         path: &str,
     ) -> Result<Option<String>, ConstelaError> {
         let is_data = name.starts_with("data-");
         let text = match value {
             Value::Bool(true) => return Ok(Some(String::new())),
             Value::Bool(false) | Value::Null if !is_data => return Ok(None),
-            other => text_of(other),
+            other => self.text(other, path)?,
         };
 
         if policy::is_url_attr(name) && !policy::is_allowed_url(&text) {
@@ -933,36 +950,45 @@ impl Renderer<'_> {
             return Err(ConstelaError::Render(Diagnostic::new(
                 path,
                 codes::URL_SCHEME,
-                format!("computed URL {text:?} uses a scheme that is not allowed"),
+                format!(
+                    "computed URL {:?} uses a scheme that is not allowed",
+                    excerpt(&text)
+                ),
             )));
         }
 
-        // The raw value, before escaping allocates a copy of it. `emitted` is
-        // the buffer length as it stands before this element is written, which
-        // is the right baseline: the attributes are assembled first and
-        // written together, and that assembled total is reserved separately in
-        // `element`.
-        self.reserve(emitted, text.len(), path)?;
+        // The raw value, before the id prefix allocates a copy of it.
+        self.output
+            .check(pending.saturating_add(text.len()), path)?;
 
         let text = if policy::is_id_ref_attr(name) {
-            prefix_id_refs(&self.ctx.id_prefix, &text)
+            let prefix = &self.ctx.id_prefix;
+            // Measured first: a value of many short ids grows by one prefix
+            // per id.
+            self.output
+                .check(pending.saturating_add(prefixed_len(prefix, &text)), path)?;
+            Cow::Owned(prefix_id_refs(prefix, &text))
         } else if policy::is_url_attr(name) {
-            prefix_fragment_link(&self.ctx.id_prefix, &text)
+            prefix_fragment_link(&self.ctx.id_prefix, text)
         } else {
             text
         };
 
+        // Measured before escaping allocates a copy.
+        self.output
+            .check(pending.saturating_add(escaped_len(&text)), path)?;
         Ok(Some(escape_attr(&text)))
     }
 
     /// Emit the `data-constela-*` attributes describing one event binding.
     fn push_handler_attrs(
         &self,
-        handler: &EventHandler,
-        env: &Env,
+        handler: &'a EventHandler,
+        env: &Env<'_>,
         path: &str,
         depth: usize,
         attrs: &mut Vec<(String, Option<String>)>,
+        pending: &mut usize,
     ) -> Result<(), ConstelaError> {
         let event = policy::canonical_event(&handler.event);
         if event.is_empty() {
@@ -973,26 +999,29 @@ impl Renderer<'_> {
             Some(escape_attr(&handler.action)),
         ));
         if let Some(payload) = &handler.payload {
-            let value = match payload {
+            let payload_path = format!("{path}.payload");
+            // Serialized from borrowed values, so no value is copied. The text
+            // is kept, so it charges the budget for each chunk as it is
+            // written.
+            let writer = ChargingWriter::new(self.budget, &payload_path);
+            let serialized = match payload {
                 PayloadSpec::Single(expr) => {
-                    self.eval(expr, env, &format!("{path}.payload"), depth)?
+                    let value = self.eval_ref(expr, env, &payload_path, depth)?;
+                    writer.serialize(&value)?
                 }
                 PayloadSpec::Map(props) => {
-                    let mut map = Map::new();
+                    let mut map = BTreeMap::new();
                     for (key, expr) in props {
-                        map.insert(
-                            key.clone(),
-                            self.eval(expr, env, &format!("{path}.payload.{key}"), depth)?,
-                        );
+                        let entry_path = format!("{payload_path}.{key}");
+                        map.insert(key.as_str(), self.eval_ref(expr, env, &entry_path, depth)?);
                     }
-                    Value::Object(map)
+                    writer.serialize(&map)?
                 }
             };
-            let serialized = value.to_string();
-            // The map above is assembled here, not inside the evaluator, so
-            // only the individual entries were charged. The serialized whole
-            // is what is retained.
-            self.charge_budget(serialized.len(), &format!("{path}.payload"))?;
+            let escaped_bytes = escaped_len(&serialized);
+            self.output
+                .check(pending.saturating_add(escaped_bytes), &payload_path)?;
+            *pending = pending.saturating_add(escaped_bytes);
             attrs.push((
                 format!("data-constela-payload-{event}"),
                 Some(escape_attr(&serialized)),
@@ -1012,22 +1041,36 @@ impl Renderer<'_> {
         }
         Ok(())
     }
-}
 
-/// Write the opening `<pre><code …>` of a code block, with the language hint
-/// reduced to something safe to put in a class name.
-///
-/// The content is appended separately, through the budget-checked path: it
-/// comes from state and is the unbounded part.
-fn open_code_block(language: &str, out: &mut String) {
-    out.push_str("<pre><code");
-    let language = sanitize_language(language);
-    if !language.is_empty() {
-        // The class is derived from a document value, so it is escaped like
-        // any other attribute.
-        let _ = write!(out, " class=\"language-{}\"", escape_attr(&language));
+    /// Render a code block: `<pre><code>`, with the language hint reduced to
+    /// something safe to put in a class name.
+    ///
+    /// The content comes from state and is the unbounded part, so it goes
+    /// through the checked, escaping write.
+    fn code(
+        &self,
+        language: &Expr,
+        content: &Expr,
+        env: &Env<'_>,
+        path: &str,
+        depth: usize,
+        out: &mut String,
+    ) -> Result<(), ConstelaError> {
+        let language = self.eval_ref(language, env, &format!("{path}.language"), depth)?;
+        let content = self.eval_ref(content, env, &format!("{path}.content"), depth)?;
+        self.write(out, "<pre><code", path)?;
+        let language = sanitize_language(&self.text(&language, path)?);
+        if !language.is_empty() {
+            // The class is derived from a document value, so it is escaped like
+            // any other attribute.
+            self.write(out, " class=\"language-", path)?;
+            self.push_escaped(out, &language, path)?;
+            self.write(out, "\"", path)?;
+        }
+        self.write(out, ">", path)?;
+        self.push_escaped(out, &self.text(&content, path)?, path)?;
+        self.write(out, "</code></pre>", path)
     }
-    out.push('>');
 }
 
 /// Render a Markdown node through the sanitizing user-content path — the same
@@ -1067,20 +1110,34 @@ fn sanitize_language(language: &str) -> String {
 /// Only a *pure* fragment is rewritten. `href="/other#section"` points into a
 /// different document whose ids this render did not write, and `href="#"` has
 /// no target to prefix.
-fn prefix_fragment_link(prefix: &str, value: &str) -> String {
+fn prefix_fragment_link<'t>(prefix: &str, value: Cow<'t, str>) -> Cow<'t, str> {
     match value.strip_prefix('#') {
-        Some(fragment) if !fragment.is_empty() => format!("#{prefix}{fragment}"),
-        _ => value.to_string(),
+        Some(fragment) if !fragment.is_empty() => Cow::Owned(format!("#{prefix}{fragment}")),
+        _ => value,
     }
 }
 
-/// Prefix each whitespace-separated id in `value`.
-fn prefix_id_refs(prefix: &str, value: &str) -> String {
+/// The length of `prefix_id_refs(prefix, value)`, measured without building
+/// it.
+fn prefixed_len(prefix: &str, value: &str) -> usize {
     value
         .split_whitespace()
-        .map(|id| format!("{prefix}{id}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+        .map(|id| prefix.len().saturating_add(id.len()).saturating_add(1))
+        .fold(0usize, usize::saturating_add)
+        .saturating_sub(1)
+}
+
+/// Prefix each whitespace-separated id in `value`, into one buffer.
+fn prefix_id_refs(prefix: &str, value: &str) -> String {
+    let mut out = String::with_capacity(prefixed_len(prefix, value));
+    for id in value.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(prefix);
+        out.push_str(id);
+    }
+    out
 }
 
 /// Give every `target="_blank"` link `rel="noopener noreferrer"`.
@@ -1124,6 +1181,13 @@ mod tests {
     }
 
     #[test]
+    fn escaped_len_matches_the_escaped_text() {
+        for input in ["", "plain", r#"<a href="x">&'"#, "€ & <€>"] {
+            assert_eq!(escaped_len(input), escape_text(input).len(), "{input}");
+        }
+    }
+
+    #[test]
     fn language_hints_are_reduced_to_class_safe_text() {
         assert_eq!(sanitize_language("rust"), "rust");
         assert_eq!(sanitize_language("c++"), "c++");
@@ -1135,20 +1199,25 @@ mod tests {
         assert_eq!(prefix_id_refs("c-", "a"), "c-a");
         assert_eq!(prefix_id_refs("c-", "a  b"), "c-a c-b");
         assert_eq!(prefix_id_refs("c-", ""), "");
+        for value in ["", "a", "a  b", " a b c "] {
+            assert_eq!(
+                prefixed_len("c-", value),
+                prefix_id_refs("c-", value).len(),
+                "{value:?}"
+            );
+        }
     }
 
     #[test]
     fn same_document_fragment_links_are_prefixed_like_the_ids_they_target() {
-        assert_eq!(prefix_fragment_link("c-", "#section"), "#c-section");
+        let link = |value: &'static str| prefix_fragment_link("c-", Cow::Borrowed(value));
+        assert_eq!(link("#section"), "#c-section");
         // A bare `#` has no target, and a cross-document fragment points at a
         // document whose ids this render did not write.
-        assert_eq!(prefix_fragment_link("c-", "#"), "#");
-        assert_eq!(
-            prefix_fragment_link("c-", "/other#section"),
-            "/other#section"
-        );
-        assert_eq!(prefix_fragment_link("c-", "https://x/y#z"), "https://x/y#z");
-        assert_eq!(prefix_fragment_link("c-", ""), "");
+        assert_eq!(link("#"), "#");
+        assert_eq!(link("/other#section"), "/other#section");
+        assert_eq!(link("https://x/y#z"), "https://x/y#z");
+        assert_eq!(link(""), "");
     }
 
     #[test]

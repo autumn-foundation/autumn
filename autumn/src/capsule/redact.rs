@@ -178,6 +178,13 @@ impl RedactedValues {
 /// has no length rule at all.
 const MIN_ECHO_LEN: usize = 4;
 
+/// Most `Cookie:` pairs recorded from one header.
+///
+/// [`mask_echoes`] costs O(text × needles), so the echo set must stay bounded.
+/// Real requests carry far fewer. The cap applies to each header line. Only
+/// named `name=value` segments count. The whole header value is always recorded.
+const MAX_COOKIE_PAIRS: usize = 256;
+
 /// Build the capsule's request record, masking every sensitive value.
 ///
 /// Takes the request head and the body separately, because the capture layer
@@ -275,10 +282,24 @@ pub fn mask_echoes(text: &str, redacted: &RedactedValues) -> String {
     let mut masked = String::with_capacity(text.len());
     let mut cursor = 0_usize;
     while let Some(rest) = text.get(cursor..).filter(|rest| !rest.is_empty()) {
+        // A placeholder an earlier pass wrote is not a secret to hide: with
+        // `FILTER` in the set it would be rewritten to `[[FILTERED]ED]`, which
+        // no longer matches the live text on replay.
+        let at_placeholder = rest.starts_with(FILTERED_PLACEHOLDER);
+        // ...unless a retained value itself begins with it (a decoded
+        // `[FILTERED]hunter2`), which has to be masked whole.
         let matched = needles.iter().find(|(needle, whole_token_only)| {
             rest.starts_with(*needle)
+                && (!at_placeholder
+                    || (needle.len() > FILTERED_PLACEHOLDER.len()
+                        && needle.starts_with(FILTERED_PLACEHOLDER)))
                 && (!*whole_token_only || stands_alone(text, cursor, needle, rest))
         });
+        if at_placeholder && matched.is_none() {
+            masked.push_str(FILTERED_PLACEHOLDER);
+            cursor = cursor.saturating_add(FILTERED_PLACEHOLDER.len());
+            continue;
+        }
         if let Some((needle, _)) = matched {
             masked.push_str(FILTERED_PLACEHOLDER);
             cursor = cursor.saturating_add(needle.len());
@@ -343,6 +364,122 @@ fn is_identifier_char(character: char) -> bool {
 }
 
 // ── Effect tape redaction (#1634) ───────────────────────────────────────────
+
+/// Suffix of a `redacted_keys` entry that marks compared effect data which
+/// held the placeholder text before redaction ran (#2351 item 5).
+pub const LITERAL_PLACEHOLDER_SUFFIX: &str = ":<literal placeholder>";
+
+/// The compared effect fields that already hold the placeholder text.
+///
+/// Replay reads the placeholder in a compared field as a wildcard. Text that
+/// held it before redaction is not a redaction, so the capsule is refused.
+///
+/// Only compared fields are scanned. A response body, a cache hit and the
+/// tenant are served to the code, never matched as a wildcard. Run it on the
+/// effects as recorded, before [`redact_effects`].
+#[must_use]
+pub fn literal_placeholder_locations(
+    effects: &crate::capsule::schema::CapsuleEffects,
+) -> Vec<String> {
+    compared_fields_where(effects, &|text: &str| {
+        text.contains(FILTERED_PLACEHOLDER) || text.contains("%5BFILTERED%5D")
+    })
+}
+
+/// The compared effect fields where two placeholders touch.
+///
+/// Replay cannot tell where one masked value ends and the next begins, so it
+/// learns only their joined value. An outcome that echoes one of them could
+/// not be scrubbed, so the capsule is refused. Run it on the persisted
+/// effects.
+#[must_use]
+pub fn adjacent_placeholder_locations(
+    effects: &crate::capsule::schema::CapsuleEffects,
+) -> Vec<String> {
+    compared_fields_where(effects, &crate::capsule::effects::has_adjacent_placeholders)
+}
+
+/// The compared effect fields whose text `holds` accepts.
+fn compared_fields_where(
+    effects: &crate::capsule::schema::CapsuleEffects,
+    holds: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    use crate::capsule::schema::CacheEffect;
+
+    // String values only: replay compares object keys exactly, so a key is
+    // never a wildcard.
+    fn json_holds(value: &serde_json::Value, holds: &dyn Fn(&str) -> bool) -> bool {
+        match value {
+            serde_json::Value::String(text) => holds(text),
+            serde_json::Value::Array(items) => items.iter().any(|item| json_holds(item, holds)),
+            serde_json::Value::Object(fields) => {
+                fields.values().any(|field| json_holds(field, holds))
+            }
+            _ => false,
+        }
+    }
+    let body_holds = |body: &CapsuleBody| -> bool {
+        match body {
+            CapsuleBody::Text(text) => holds(text),
+            CapsuleBody::Base64(encoded) => STANDARD
+                .decode(encoded.as_bytes())
+                // Only text: replay compares a binary body exactly, so a
+                // placeholder there is no wildcard.
+                .is_ok_and(|bytes| std::str::from_utf8(&bytes).is_ok_and(holds)),
+            CapsuleBody::Absent | CapsuleBody::Skipped { .. } => false,
+        }
+    };
+    let headers_hold = |headers: &[(String, String)]| headers.iter().any(|(_, value)| holds(value));
+
+    let mut found = Vec::new();
+    for (index, exchange) in effects.http.iter().enumerate() {
+        if holds(&exchange.url) {
+            found.push(format!("http[{index}].url"));
+        }
+        if headers_hold(&exchange.request_headers) {
+            found.push(format!("http[{index}].request_header"));
+        }
+        if body_holds(&exchange.request_body) {
+            found.push(format!("http[{index}].request_body"));
+        }
+    }
+    for (index, job) in effects.jobs.iter().enumerate() {
+        if json_holds(&job.payload, holds) {
+            found.push(format!("job[{index}].payload"));
+        }
+    }
+    for (index, mail) in effects.mail.iter().enumerate() {
+        let text_fields = mail
+            .to
+            .iter()
+            .map(String::as_str)
+            .chain([mail.subject.as_str()])
+            .chain(mail.from.as_deref())
+            .chain(mail.reply_to.as_deref())
+            .chain(mail.list_unsubscribe.as_deref())
+            .chain(mail.attachments.iter().map(|a| a.filename.as_str()));
+        if text_fields.into_iter().any(holds)
+            || body_holds(&mail.body)
+            || body_holds(&mail.alternate_body)
+            || headers_hold(&mail.extra_headers)
+        {
+            found.push(format!("mail[{index}]"));
+        }
+    }
+    for (index, entry) in effects.cache.iter().enumerate() {
+        let key_holds = holds(entry.key());
+        let value_holds = match entry {
+            CacheEffect::Insert { value, .. } => STANDARD
+                .decode(value.as_bytes())
+                .is_ok_and(|bytes| std::str::from_utf8(&bytes).is_ok_and(holds)),
+            _ => false,
+        };
+        if key_holds || value_holds {
+            found.push(format!("cache[{index}]"));
+        }
+    }
+    found
+}
 
 /// Redact everything the effect tape recorded, in place.
 ///
@@ -465,6 +602,9 @@ pub fn redact_effects(
                 *value =
                     scrub_encoded_json(value, filter, &format!("cache[{index}]"), values, keys);
             }
+            crate::capsule::schema::CacheEffect::Invalidate { .. }
+            | crate::capsule::schema::CacheEffect::InvalidateNamespace { .. }
+            | crate::capsule::schema::CacheEffect::Clear => {}
         }
     }
 
@@ -497,22 +637,49 @@ pub fn redact_effects(
     }
 
     // Echo pass — everything free-form, with the fully-seeded set.
-    for exchange in &mut effects.http {
-        exchange.url = mask_echoes(&exchange.url, values);
+    //
+    // A field replay hands to the code (a response body or header, a cache
+    // hit, the job entry payload) records a key when this pass changes it, as
+    // the filter pass does. Replay refuses a capsule with masked input
+    // (#2351 item 8).
+    for (index, exchange) in effects.http.iter_mut().enumerate() {
+        let (masked_url, host_masked) = mask_url_echoes(&exchange.url, values);
+        if host_masked {
+            keys.insert(format!("http[{index}].url:<host-echo>"));
+        }
+        exchange.url = masked_url;
+        if let Some(final_url) = exchange.final_url.as_mut() {
+            let (masked, _) = mask_url_echoes(final_url, values);
+            if masked != *final_url {
+                keys.insert(format!("http[{index}].final_url:<echo>"));
+            }
+            *final_url = masked;
+        }
         mask_body_echoes(&mut exchange.request_body, values);
-        mask_body_echoes(&mut exchange.response_body, values);
-        for (_, value) in exchange
-            .request_headers
-            .iter_mut()
-            .chain(exchange.response_headers.iter_mut())
-        {
+        if mask_body_echoes(&mut exchange.response_body, values) {
+            keys.insert(format!("http[{index}].response_body:<echo>"));
+        }
+        for (_, value) in &mut exchange.request_headers {
             *value = mask_echoes(value, values);
         }
+        for (name, value) in &mut exchange.response_headers {
+            let masked = mask_echoes(value, values);
+            if masked != *value {
+                keys.insert(format!("http[{index}].response_header:{name}"));
+            }
+            *value = masked;
+        }
+        // Replay hands a recorded error back to the code too. Its key is not
+        // a refusal: error text compares like the outcome does.
         if let Some(error) = exchange.error.as_mut() {
-            *error = mask_echoes(error, values);
+            let masked = mask_echoes(error, values);
+            if masked != *error {
+                keys.insert(format!("http[{index}].error:<echo>"));
+            }
+            *error = masked;
         }
     }
-    for entry in &mut effects.cache {
+    for (index, entry) in effects.cache.iter_mut().enumerate() {
         match entry {
             crate::capsule::schema::CacheEffect::Get { key, .. }
             | crate::capsule::schema::CacheEffect::Insert { key, .. } => {
@@ -522,9 +689,24 @@ pub fn redact_effects(
                 // that can quote a secret back.
                 *key = mask_echoes(key, values);
             }
+            crate::capsule::schema::CacheEffect::Invalidate { key, error }
+            | crate::capsule::schema::CacheEffect::InvalidateNamespace {
+                namespace: key,
+                error,
+            } => {
+                *key = mask_echoes(key, values);
+                if let Some(error) = error.as_mut() {
+                    let masked = mask_echoes(&error.reason, values);
+                    if masked != error.reason {
+                        keys.insert(format!("cache[{index}].error:<echo>"));
+                    }
+                    error.reason = masked;
+                }
+            }
+            crate::capsule::schema::CacheEffect::Clear => {}
         }
     }
-    for mail in &mut effects.mail {
+    for (index, mail) in effects.mail.iter_mut().enumerate() {
         mail.subject = mask_echoes(&mail.subject, values);
         mask_body_echoes(&mut mail.body, values);
         mask_body_echoes(&mut mail.alternate_body, values);
@@ -556,35 +738,54 @@ pub fn redact_effects(
             *from = mask_echoes(from, values);
         }
         if let Some(error) = mail.error.as_mut() {
-            *error = mask_echoes(error, values);
+            let masked = mask_echoes(error, values);
+            if masked != *error {
+                keys.insert(format!("mail[{index}].error:<echo>"));
+            }
+            *error = masked;
         }
     }
     // Job payloads and cache values are structured, so the filter pass masked
     // them *by key*; this catches the other half — a value the request already
     // had masked that reappears under a key the filter does not name.
-    for effect in &mut effects.jobs {
+    for (index, effect) in effects.jobs.iter_mut().enumerate() {
         effect.payload = mask_json_echoes(&effect.payload, values);
         // A rejection's text is free-form and written by whatever refused the
         // enqueue — a `JobInterceptor` can quote the payload field or the
         // credential it rejected — so it can carry a value masked everywhere
         // else in the capsule.
         if let Some(error) = effect.error.as_mut() {
-            *error = mask_echoes(error, values);
+            let masked = mask_echoes(error, values);
+            if masked != *error {
+                keys.insert(format!("job[{index}].error:<echo>"));
+            }
+            *error = masked;
         }
     }
     if let Some(job) = job.as_mut() {
-        job.payload = mask_json_echoes(&job.payload, values);
+        let masked = mask_json_echoes(&job.payload, values);
+        if masked != job.payload {
+            keys.insert("job_entry.<echo>".to_owned());
+        }
+        job.payload = masked;
     }
-    for entry in &mut effects.cache {
+    for (index, entry) in effects.cache.iter_mut().enumerate() {
         match entry {
             crate::capsule::schema::CacheEffect::Get { value, .. } => {
                 if let Some(encoded) = value.as_mut() {
-                    *encoded = mask_encoded_json_echoes(encoded, values);
+                    let masked = mask_encoded_json_echoes(encoded, values);
+                    if masked != *encoded {
+                        keys.insert(format!("cache[{index}]:<echo>"));
+                    }
+                    *encoded = masked;
                 }
             }
             crate::capsule::schema::CacheEffect::Insert { value, .. } => {
                 *value = mask_encoded_json_echoes(value, values);
             }
+            crate::capsule::schema::CacheEffect::Invalidate { .. }
+            | crate::capsule::schema::CacheEffect::InvalidateNamespace { .. }
+            | crate::capsule::schema::CacheEffect::Clear => {}
         }
     }
     if let Some(tenant) = effects.tenant.as_mut()
@@ -603,6 +804,164 @@ pub fn redact_effects(
     }
 }
 
+/// Blank the `user:password@` of an absolute URL's authority.
+///
+/// The whole userinfo goes: a username is as often the credential (an API key
+/// sent as the user) as the password is. Both spellings (raw and
+/// percent-decoded) are retained so an echo elsewhere in the capsule is masked
+/// and so replay can match the placeholder against the live URL.
+fn mask_url_userinfo(
+    url: &str,
+    values: &mut RedactedValues,
+    keys: &mut BTreeSet<String>,
+    location: &str,
+) -> String {
+    let Some((head, userinfo, host)) = split_userinfo(url) else {
+        return url.to_owned();
+    };
+    keys.insert(format!("{location}:userinfo"));
+    record_userinfo_components(&userinfo, values);
+    format!("{head}{FILTERED_PLACEHOLDER}@{host}")
+}
+
+/// Byte range of an absolute URL's authority (`userinfo@host:port`) within `url`.
+///
+/// A special scheme (`http`, `https`, `ws`, `wss`, `ftp`) is read the way the
+/// HTTP client's URL parser reads it: leading control characters and spaces are
+/// skipped, and `https:user:secret@host`, `https:/user:…` and backslash
+/// spellings all reach the wire as credentialed URLs, so a literal `://` is
+/// only required of other schemes.
+fn authority_bounds(url: &str) -> Option<(usize, usize)> {
+    let lead = url
+        .len()
+        .checked_sub(url.trim_start_matches(|c: char| c <= ' ').len())?;
+    let from_scheme = url.get(lead..)?;
+    let colon = from_scheme.find(':')?;
+    let scheme = from_scheme.get(..colon)?;
+    let mut chars = scheme.chars();
+    if !chars.next()?.is_ascii_alphabetic()
+        || !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    let special = ["http", "https", "ws", "wss", "ftp"]
+        .iter()
+        .any(|name| scheme.eq_ignore_ascii_case(name));
+    let after_scheme = from_scheme.get(colon.checked_add(1)?..)?;
+    let slashes = after_scheme
+        .find(|c: char| !(c == '/' || (special && c == '\\')))
+        .unwrap_or(after_scheme.len());
+    if !special && slashes < 2 {
+        return None;
+    }
+    let start = lead
+        .checked_add(colon)?
+        .checked_add(1)?
+        .checked_add(slashes)?;
+    let rest = url.get(start..)?;
+    let len = rest
+        .find(|c: char| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
+        .unwrap_or(rest.len());
+    Some((start, start.checked_add(len)?))
+}
+
+/// `url` as the URL parser reads it: ASCII tab and newline characters are
+/// removed wherever they appear, so `https:\t//user:secret@host` is the
+/// credentialed URL it looks like. Text this returns is what gets recorded.
+pub(crate) fn parser_view(url: &str) -> Cow<'_, str> {
+    if url.contains(['\t', '\n', '\r']) {
+        Cow::Owned(
+            url.chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(url)
+    }
+}
+
+/// Split an absolute URL into what precedes its userinfo, the userinfo, and
+/// the rest (`host…`), read through [`parser_view`].
+fn split_userinfo(url: &str) -> Option<(String, String, String)> {
+    let url = parser_view(url);
+    let (start, end) = authority_bounds(&url)?;
+    let authority = url.get(start..end)?;
+    let (userinfo, _) = authority.rsplit_once('@')?;
+    if userinfo.is_empty() {
+        return None;
+    }
+    let head = url.get(..start)?;
+    let host_and_tail = url.get(start.checked_add(userinfo.len())?.checked_add(1)?..)?;
+    Some((
+        head.to_owned(),
+        userinfo.to_owned(),
+        host_and_tail.to_owned(),
+    ))
+}
+
+/// [`mask_echoes`] over a whole URL, and whether it reached the host.
+///
+/// A secret seeded from elsewhere in the request can appear in a hostname
+/// (`https://tenant-secret.example/`); it is masked there like anywhere else.
+/// The host then stops being a literal destination, so the caller records a
+/// redaction key that makes the capsule non-replayable instead of letting the
+/// placeholder act as a wildcard that matches any host.
+fn mask_url_echoes(url: &str, redacted: &RedactedValues) -> (String, bool) {
+    let host_masked = authority_bounds(url).is_some_and(|(start, end)| {
+        let authority = url.get(start..end).unwrap_or_default();
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        mask_echoes(host, redacted) != host
+    });
+    (mask_echoes(url, redacted), host_masked)
+}
+
+/// The `user:password` of an absolute URL's authority, if it has one.
+pub(crate) fn url_userinfo(url: &str) -> Option<String> {
+    split_userinfo(url).map(|(_, userinfo, _)| userinfo)
+}
+
+/// `url` with its userinfo replaced by the placeholder, for text that reaches
+/// replay output (divergence reports, blocked-call errors).
+pub(crate) fn hide_url_userinfo(url: &str) -> String {
+    split_userinfo(url).map_or_else(
+        || url.to_owned(),
+        |(head, _, host)| format!("{head}{FILTERED_PLACEHOLDER}@{host}"),
+    )
+}
+
+/// Retain a URL's userinfo, its user and its password, in the raw spelling and
+/// the percent-decoded *bytes* (a decoded credential need not be UTF-8), plus
+/// the lossy text spelling free-form messages quote. Capture and replay both
+/// call this so they agree on what was masked.
+pub(crate) fn record_userinfo_components(userinfo: &str, values: &mut RedactedValues) {
+    let mut retain = |part: &str| {
+        if part.is_empty() {
+            return;
+        }
+        values.insert(part.as_bytes());
+        let decoded: Vec<u8> = percent_encoding::percent_decode_str(part).collect();
+        if decoded != part.as_bytes() {
+            values.insert(&decoded);
+            let lossy = String::from_utf8_lossy(&decoded);
+            if lossy.as_bytes() != decoded.as_slice() {
+                values.insert(lossy.as_bytes());
+            }
+        }
+    };
+    retain(userinfo);
+    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    retain(user);
+    retain(password);
+    // The spelling the URL parser serialises (`p w` -> `p%20w`), which is what
+    // an error message quoting the normalised URL carries.
+    if let Ok(parsed) = url::Url::parse(&format!("http://{userinfo}@host/")) {
+        retain(parsed.username());
+        retain(parsed.password().unwrap_or_default());
+    }
+}
+
 /// Mask the query string of a recorded outbound URL by parameter name.
 ///
 /// Splices the masked query back onto the original prefix rather than
@@ -616,6 +975,12 @@ fn redact_url_query(
     keys: &mut BTreeSet<String>,
     location: &str,
 ) -> String {
+    // Userinfo (`https://user:secret@host/..`) is the same downstream
+    // credential an `Authorization: Basic` header carries — the HTTP client
+    // turns it into one — so it is masked like that header, not left in the
+    // clear because it lives in the authority instead of a header or query.
+    let url = mask_url_userinfo(url, values, keys, location);
+    let url = url.as_str();
     let Some(split) = url.find('?') else {
         return url.to_owned();
     };
@@ -708,7 +1073,7 @@ fn redact_effect_headers(
 /// the *application's*, the operator never sees these headers in a log to
 /// notice them, and the spellings are conventional rather than app-specific.
 /// Masking a header that turns out to hold nothing secret costs a replay
-/// nothing: outbound matching is on method and URL.
+/// nothing: a masked header value matches any value.
 const OUTBOUND_SENSITIVE_HEADERS: &[&str] = &[
     "authorization",
     "proxy-authorization",
@@ -773,10 +1138,15 @@ fn redact_effect_body(
 }
 
 /// Sweep a recorded body for values redaction removed elsewhere.
-fn mask_body_echoes(body: &mut CapsuleBody, values: &RedactedValues) {
-    if let CapsuleBody::Text(text) = body {
-        *text = mask_echoes(text, values);
-    }
+/// Returns whether the body changed.
+fn mask_body_echoes(body: &mut CapsuleBody, values: &RedactedValues) -> bool {
+    let CapsuleBody::Text(text) = body else {
+        return false;
+    };
+    let masked = mask_echoes(text, values);
+    let changed = masked != *text;
+    *text = masked;
+    changed
 }
 
 /// Scrub base64-encoded JSON (the form cache values are recorded in) by key,
@@ -833,7 +1203,9 @@ pub fn mask_binds(binds: &mut [BindValue], redacted: &RedactedValues) {
 /// `proxyauthorization` ≠ `authorization`), so an exact-match filter would
 /// copy them verbatim. A capsule is a production-data artifact; a standard
 /// credential header must never depend on app configuration to be masked.
-const ALWAYS_SENSITIVE_HEADERS: &[&str] = &["proxy-authorization"];
+/// `payment-signature` is an x402 payment: until it is settled or expires,
+/// anyone holding it can spend it.
+const ALWAYS_SENSITIVE_HEADERS: &[&str] = &["proxy-authorization", "payment-signature"];
 
 /// Whether a header must be masked out of the capsule.
 fn header_is_sensitive(name: &str, filter: &ParameterFilter) -> bool {
@@ -916,13 +1288,12 @@ fn redact_headers(
 /// the one place valid UTF-8 is genuinely required, and a value that is not
 /// UTF-8 cannot appear in a message to be masked out of anyway.
 ///
-/// What this still does **not** read: a `token68`-style credential separated
-/// from its scheme by HTAB rather than SP (RFC 7235 says `1*SP`, and the split
-/// below follows it), and the pre-trim spelling of an RFC 6265 quoted cookie
-/// value (`session="abc"` records `abc`, not `"abc"`). Both are spellings a
-/// sloppy handler could hold; both predate this function's byte port and are
-/// tracked separately rather than widened into it.
-fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
+/// RFC 7235 says the scheme ends at `1*SP`. A sloppy handler splits on any
+/// whitespace, so this does too.
+///
+/// A quoted cookie value records the quoted and the unquoted spelling. A
+/// `Cookie:` line records at most [`MAX_COOKIE_PAIRS`] values.
+pub(crate) fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedValues) {
     let trimmed = trim_ows(value);
     // Only headers whose *syntax* this understands. A custom sensitive header
     // named by `filter_parameters` carries whatever its application likes, and
@@ -945,7 +1316,7 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
     // read as one. The rest of the value is kept whole, so a credential that
     // itself contains spaces (`AWS4-HMAC-SHA256 Credential=…, Signature=…`)
     // stays intact.
-    if is_authorization && let Some((scheme, credential)) = split_once_byte(trimmed, b' ') {
+    if is_authorization && let Some((scheme, credential)) = split_scheme(trimmed) {
         let credential = trim_ows(credential);
         if is_auth_scheme(scheme) && !credential.is_empty() {
             values.insert(credential);
@@ -979,22 +1350,35 @@ fn record_credential_components(name: &str, value: &[u8], values: &mut RedactedV
     // with the same set but produces the static message, would call that a
     // mismatch.
     if is_cookie && trimmed.contains(&b'=') {
-        let pairs: Vec<&[u8]> = if name == "set-cookie" {
-            trimmed.split(|byte| *byte == b';').take(1).collect()
-        } else {
-            trimmed.split(|byte| *byte == b';').collect()
-        };
-        for pair in pairs {
-            if let Some((_, cookie_value)) = split_once_byte(pair, b'=') {
-                let cookie_value = trim_matches_byte(trim_ows(cookie_value), b'"');
-                record_cookie_value(cookie_value, values);
+        // `Set-Cookie` holds one cookie, first: later segments are attributes.
+        let segments = if name == "set-cookie" { 1 } else { usize::MAX };
+        // Count only segments with a cookie name. Handlers skip the others, so
+        // they must not use up the cap and hide a real cookie behind them.
+        let cookie_values = trimmed
+            .split(|byte| *byte == b';')
+            .take(segments)
+            .filter_map(|pair| split_once_byte(pair, b'='))
+            .filter(|(cookie_name, _)| !trim_ows(cookie_name).is_empty())
+            .take(MAX_COOKIE_PAIRS);
+        for (_, cookie_value) in cookie_values {
+            let spelled = trim_ows(cookie_value);
+            let unquoted = trim_matches_byte(spelled, b'"');
+            record_cookie_value(unquoted, values);
+            // A handler that splits on `=` holds the quotes too. That is an
+            // inferred spelling, so it gets the same floor as a decoded one,
+            // measured on the value without its quotes.
+            if unquoted.len() != spelled.len()
+                && unquoted.len() >= MIN_ECHO_LEN
+                && !unquoted.iter().all(u8::is_ascii_whitespace)
+            {
+                record_cookie_value(spelled, values);
             }
         }
     }
 }
 
-/// Retain both spellings of a cookie value: the one on the wire, and the one
-/// a handler that percent-decodes holds.
+/// Retain a cookie value as sent, and as a handler that percent-decodes holds
+/// it.
 ///
 /// Percent-encoding a cookie value is a common convention, and **Autumn
 /// itself follows it** — `time_zone.rs` percent-decodes its own
@@ -1215,27 +1599,66 @@ fn record_basic_credentials(credential: &[u8], values: &mut RedactedValues) {
 /// `&str` literals (`is_auth_scheme("Negotiate")`).
 fn is_auth_scheme(word: impl AsRef<[u8]>) -> bool {
     let word = word.as_ref();
-    !word.is_empty()
-        && word.iter().copied().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
+    !word.is_empty() && word.iter().copied().all(is_token_byte)
+}
+
+/// Whether `byte` is an RFC 7230 `tchar`.
+const fn is_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Split `<scheme><whitespace><rest>` at the end of the leading token.
+///
+/// A token holds no whitespace, so the first non-token byte must start the
+/// separator: SP, HTAB or a Unicode space. Anything else is not a scheme.
+/// The separator is removed here, because the rest need not be UTF-8.
+fn split_scheme(value: &[u8]) -> Option<(&[u8], &[u8])> {
+    let end = value
+        .iter()
+        .copied()
+        .position(|byte| !is_token_byte(byte))?;
+    let scheme = value.get(..end).filter(|scheme| !scheme.is_empty())?;
+    let rest = value.get(end..)?;
+    let credential = strip_leading_whitespace(rest);
+    (credential.len() != rest.len()).then_some((scheme, credential))
+}
+
+/// Strip leading ASCII and Unicode whitespace. Only the whitespace itself must
+/// be valid UTF-8, not the bytes after it.
+fn strip_leading_whitespace(mut bytes: &[u8]) -> &[u8] {
+    loop {
+        let width = match bytes.first() {
+            Some(byte) if byte.is_ascii_whitespace() => 1,
+            // Decode one code point (4 bytes at most), not the whole suffix.
+            Some(_) => match bytes
+                .get(..bytes.len().min(4))
+                .and_then(|window| window.utf8_chunks().next())
+                .and_then(|chunk| chunk.valid().chars().next().filter(|c| c.is_whitespace()))
+            {
+                Some(space) => space.len_utf8(),
+                None => return bytes,
+            },
+            None => return bytes,
+        };
+        bytes = bytes.get(width..).unwrap_or_default();
+    }
 }
 
 // ── Byte equivalents of the `str` methods the parse above needs ─────────────
@@ -1302,7 +1725,7 @@ fn trim_end_matches_byte(bytes: &[u8], byte: u8) -> &[u8] {
 /// `HeaderValue` rejects only the C0 controls and `DEL`, so a non-breaking
 /// space is a legal (if malformed) pad *anywhere*, and `Bearer <U+00A0>hunter2`
 /// pads the credential from the inside, where trimming the whole value never
-/// reaches. A handler splits on the space and trims what it gets, holding
+/// reaches. A handler splits on whitespace and trims what it gets, holding
 /// `hunter2`; recording `\xc2\xa0hunter2` masks neither its echo nor its bind.
 /// The same goes for a padded auth-param name (which [`is_auth_scheme`] would
 /// then reject, losing the value with it), a padded param value, and a padded
@@ -1655,7 +2078,7 @@ fn scrub_value(
 }
 
 /// Retain the bytes of a masked JSON leaf so a bind echoing it is masked too.
-fn record_masked_value(value: &serde_json::Value, values: &mut RedactedValues) {
+pub(crate) fn record_masked_value(value: &serde_json::Value, values: &mut RedactedValues) {
     match value {
         serde_json::Value::String(text) => values.insert(text.as_bytes()),
         serde_json::Value::Null => {}
@@ -1875,6 +2298,127 @@ mod tests {
         }
 
         #[test]
+        fn url_userinfo_is_masked_and_echoed_in_the_redirect_target() {
+            let mut hit = exchange("https://svc:hunter2pw@api.example/start");
+            hit.final_url = Some("https://api.example/error/hunter2pw".to_owned());
+            let mut effects = CapsuleEffects {
+                http: vec![hit],
+                ..CapsuleEffects::default()
+            };
+            let keys = redact(&mut effects);
+            let hit = effects.http.first().expect("one exchange");
+            assert_eq!(hit.url, "https://[FILTERED]@api.example/start");
+            let final_url = hit.final_url.as_deref().expect("final url");
+            assert!(!final_url.contains("hunter2pw"), "{final_url}");
+            assert!(keys.contains("http[0].url:userinfo"), "{keys:?}");
+            assert!(keys.contains("http[0].final_url:<echo>"), "{keys:?}");
+        }
+
+        #[test]
+        fn a_credential_inside_the_placeholder_does_not_corrupt_the_masked_url() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://svc:FILTER@api.example/start")],
+                ..CapsuleEffects::default()
+            };
+            redact(&mut effects);
+            let url = &effects.http.first().expect("one exchange").url;
+            assert_eq!(url, "https://[FILTERED]@api.example/start");
+        }
+
+        #[test]
+        fn a_credential_that_begins_with_the_placeholder_is_masked_whole() {
+            let mut values = RedactedValues::default();
+            values.insert(b"[FILTERED]hunter2");
+            assert_eq!(
+                mask_echoes("rejected [FILTERED]hunter2 and [FILTERED]", &values),
+                "rejected [FILTERED] and [FILTERED]"
+            );
+        }
+
+        #[test]
+        fn url_userinfo_is_found_in_the_authority_only() {
+            assert_eq!(
+                hide_url_userinfo("https:\t//a:b@h/p"),
+                "https://[FILTERED]@h/p"
+            );
+            assert_eq!(url_userinfo("https://a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(url_userinfo("https://h/p?x=a@b"), None);
+            assert_eq!(url_userinfo("https://@h/p"), None);
+            assert_eq!(url_userinfo("no-scheme"), None);
+            // Spellings the HTTP client's URL parser also accepts.
+            assert_eq!(url_userinfo("https:a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(url_userinfo("HTTPS:/a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(url_userinfo("https:\\\\a:b@h\\p"), Some("a:b".to_owned()));
+            assert_eq!(url_userinfo("mailto:a@b"), None);
+            assert_eq!(url_userinfo("postgres://a:b@h/db"), Some("a:b".to_owned()));
+            assert_eq!(
+                hide_url_userinfo("https:a:b@h/p?q=1"),
+                "https:[FILTERED]@h/p?q=1"
+            );
+        }
+
+        #[test]
+        fn url_userinfo_retains_user_password_and_decoded_forms() {
+            let mut values = RedactedValues::default();
+            record_userinfo_components("svc%40x:p%20w", &mut values);
+            for expected in [
+                &b"svc%40x:p%20w"[..],
+                b"svc%40x",
+                b"p%20w",
+                b"svc@x",
+                b"p w",
+            ] {
+                assert!(values.contains(expected), "{expected:?}");
+            }
+        }
+
+        #[test]
+        fn a_credential_equal_to_a_host_label_masks_the_host_and_blocks_replay() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://payments:secret@payments.example/x")],
+                ..CapsuleEffects::default()
+            };
+            let keys = redact(&mut effects);
+            let url = &effects.http.first().expect("one exchange").url;
+            assert_eq!(url, "https://[FILTERED]@[FILTERED].example/x");
+            assert!(keys.contains("http[0].url:<host-echo>"), "{keys:?}");
+        }
+
+        #[test]
+        fn userinfo_behind_leading_control_characters_is_still_found() {
+            assert_eq!(url_userinfo("\n https://a:b@h/p"), Some("a:b".to_owned()));
+            assert_eq!(hide_url_userinfo("\nhttps:a:b@h/p"), "https:[FILTERED]@h/p");
+        }
+
+        #[test]
+        fn url_userinfo_retains_the_parser_serialised_spelling() {
+            let mut values = RedactedValues::default();
+            record_userinfo_components("svc:p w", &mut values);
+            assert!(values.contains(b"p w"));
+            assert!(values.contains(b"p%20w"));
+        }
+
+        #[test]
+        fn a_url_without_credentials_is_recorded_verbatim_even_with_control_characters() {
+            let mut effects = CapsuleEffects {
+                http: vec![exchange("https://host/a\tb?x=1")],
+                ..CapsuleEffects::default()
+            };
+            redact(&mut effects);
+            assert_eq!(
+                effects.http.first().expect("one exchange").url,
+                "https://host/a\tb?x=1"
+            );
+        }
+
+        #[test]
+        fn url_userinfo_retains_the_decoded_bytes_of_a_non_utf8_credential() {
+            let mut values = RedactedValues::default();
+            record_userinfo_components("svc:%FFsecret", &mut values);
+            assert!(values.contains(b"\xffsecret"));
+        }
+
+        #[test]
         fn an_outbound_url_query_is_masked_by_parameter_name() {
             let mut effects = CapsuleEffects {
                 http: vec![exchange(
@@ -1923,7 +2467,9 @@ mod tests {
                     payload: serde_json::json!({"api_key": "sk-live-42", "order": 7}),
                     delay_secs: None,
                     due_at: None,
+                    requested_due_at: None,
                     error: None,
+                    error_status: None,
                 }],
                 cache: vec![CacheEffect::Insert {
                     key: "creds".to_owned(),
@@ -1965,6 +2511,136 @@ mod tests {
             );
         }
 
+        /// #2351 item 8: an echo mask over data replay hands to the code
+        /// records a key, so the refusal for masked input fires.
+        #[test]
+        fn an_echo_masked_consumed_field_records_a_key() {
+            let mut values = RedactedValues::default();
+            values.insert(b"hunter2secret");
+            let mut effects = CapsuleEffects {
+                http: vec![HttpEffect {
+                    response_headers: vec![("x-echo".to_owned(), "hunter2secret".to_owned())],
+                    response_body: CapsuleBody::Text(r#"{"note":"hunter2secret"}"#.to_owned()),
+                    ..exchange("https://api.example/charge")
+                }],
+                cache: vec![
+                    CacheEffect::Get {
+                        key: "k".to_owned(),
+                        value: Some(STANDARD.encode(br#"{"pw":"hunter2secret"}"#)),
+                    },
+                    CacheEffect::Insert {
+                        key: "w".to_owned(),
+                        value: STANDARD.encode(br#"{"pw":"hunter2secret"}"#),
+                        ttl_secs: None,
+                    },
+                ],
+                ..CapsuleEffects::default()
+            };
+            let mut entry = CapsuleJob {
+                name: "n".to_owned(),
+                payload: serde_json::json!({"pw": "hunter2secret"}),
+            };
+            let mut keys = BTreeSet::new();
+            redact_effects(
+                &mut effects,
+                Some(&mut entry),
+                &filter(),
+                &mut values,
+                &mut keys,
+            );
+            assert!(
+                keys.iter().any(|k| k.starts_with("http[0].response_body")),
+                "{keys:?}"
+            );
+            assert!(
+                keys.iter()
+                    .any(|k| k.starts_with("http[0].response_header:x-echo")),
+                "{keys:?}"
+            );
+            assert!(keys.iter().any(|k| k.starts_with("cache[0]")), "{keys:?}");
+            assert!(
+                !keys.iter().any(|k| k.starts_with("cache[1]")),
+                "a cache write is compared, not consumed: {keys:?}"
+            );
+            assert!(keys.iter().any(|k| k.starts_with("job_entry.")), "{keys:?}");
+        }
+
+        /// #2351 item 5: compared data that already held the placeholder text
+        /// is found before redaction runs.
+        #[test]
+        fn a_literal_placeholder_in_compared_data_is_found() {
+            let effects = CapsuleEffects {
+                http: vec![HttpEffect {
+                    request_body: CapsuleBody::Text(r#"{"note":"[FILTERED]"}"#.to_owned()),
+                    ..exchange("https://api.example/charge?q=%5BFILTERED%5D")
+                }],
+                jobs: vec![JobEffect {
+                    name: "n".to_owned(),
+                    payload: serde_json::json!({"note": "[FILTERED]"}),
+                    ..JobEffect::default()
+                }],
+                cache: vec![CacheEffect::Get {
+                    key: "k".to_owned(),
+                    value: Some(STANDARD.encode(br#""[FILTERED]""#)),
+                }],
+                ..CapsuleEffects::default()
+            };
+            let found = literal_placeholder_locations(&effects);
+            assert!(found.contains(&"http[0].url".to_owned()), "{found:?}");
+            assert!(
+                found.contains(&"http[0].request_body".to_owned()),
+                "{found:?}"
+            );
+            assert!(found.contains(&"job[0].payload".to_owned()), "{found:?}");
+            assert!(
+                !found.iter().any(|f| f.starts_with("cache[0]")),
+                "a read value is served, never a wildcard: {found:?}"
+            );
+            assert!(literal_placeholder_locations(&CapsuleEffects::default()).is_empty());
+        }
+
+        /// Codex review on #3222: replay compares a binary body exactly, so
+        /// placeholder bytes in one are not a wildcard and are not reported.
+        #[test]
+        fn placeholder_bytes_in_a_binary_body_are_not_reported() {
+            let mut bytes = vec![0xff, 0xfe];
+            bytes.extend_from_slice(b"[FILTERED][FILTERED]");
+            let effects = CapsuleEffects {
+                http: vec![HttpEffect {
+                    request_body: CapsuleBody::Base64(STANDARD.encode(&bytes)),
+                    ..exchange("https://api.example/upload")
+                }],
+                ..CapsuleEffects::default()
+            };
+            assert!(literal_placeholder_locations(&effects).is_empty());
+            assert!(adjacent_placeholder_locations(&effects).is_empty());
+        }
+
+        /// Codex review on #3222: a job payload is compared value by value,
+        /// and its object keys exactly. A key that holds the placeholder text
+        /// is not a wildcard.
+        #[test]
+        fn a_placeholder_in_a_job_payload_key_is_not_a_literal() {
+            let effects = CapsuleEffects {
+                jobs: vec![JobEffect {
+                    name: "n".to_owned(),
+                    payload: serde_json::json!({"[FILTERED]": {"list": ["plain"]}}),
+                    ..JobEffect::default()
+                }],
+                ..CapsuleEffects::default()
+            };
+            assert!(literal_placeholder_locations(&effects).is_empty());
+            let nested = CapsuleEffects {
+                jobs: vec![JobEffect {
+                    name: "n".to_owned(),
+                    payload: serde_json::json!({"a": [{"b": "x [FILTERED]"}]}),
+                    ..JobEffect::default()
+                }],
+                ..CapsuleEffects::default()
+            };
+            assert_eq!(literal_placeholder_locations(&nested), ["job[0].payload"]);
+        }
+
         #[test]
         fn a_value_masked_out_of_the_request_is_masked_wherever_an_effect_echoes_it() {
             // The two-pass design: the filter pass seeds the echo set, the echo
@@ -1979,7 +2655,9 @@ mod tests {
                     payload: serde_json::json!({"pw": "hunter2secret"}),
                     delay_secs: None,
                     due_at: None,
+                    requested_due_at: None,
                     error: None,
+                    error_status: None,
                 }],
                 mail: vec![MailEffect {
                     to: vec!["hunter2secret@example.com".to_owned()],
@@ -2143,6 +2821,21 @@ mod tests {
             "the 123rd attempt",
             "substring masking keeps its length floor"
         );
+    }
+
+    #[test]
+    fn an_x402_payment_is_masked_unconditionally() {
+        let (request, values) = redact(
+            Request::get("/x").header("payment-signature", "eyJ4NDAyVmVyc2lvbiI6Mn0"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert_eq!(
+            header_value(&request, "payment-signature"),
+            FILTERED_PLACEHOLDER,
+            "an unspent payment must never be stored in a capsule"
+        );
+        assert!(values.contains(b"eyJ4NDAyVmVyc2lvbiI6Mn0"));
     }
 
     #[test]
@@ -2598,7 +3291,7 @@ mod tests {
     ///
     /// Padding *inside* the value is the case trimming the whole value never
     /// reaches: `Bearer <U+00A0>hunter2` pads the credential, not the header,
-    /// and a handler that splits on the space and trims what it gets holds
+    /// and a handler that splits on whitespace and trims what it gets holds
     /// `hunter2`. Every component split out of a header value therefore trims
     /// through `trim_ows`, not `trim_ascii`.
     #[test]
@@ -2660,6 +3353,220 @@ mod tests {
             cookie.contains(b"sess-abcdef"),
             "a padded cookie value is recorded as the handler holds it"
         );
+    }
+
+    /// A sloppy client may separate scheme and credential with HTAB, or with
+    /// Unicode space only. A handler that splits on whitespace holds the bare
+    /// credential, so it must join the echo set.
+    #[test]
+    fn any_whitespace_after_the_scheme_still_yields_the_credential() {
+        for separated in [
+            "Bearer\thunter2secret",
+            "Bearer \t hunter2secret",
+            "Bearer\u{a0}hunter2secret",
+        ] {
+            let (_request, values) = redact(
+                Request::get("/").header(header::AUTHORIZATION, separated),
+                CapturedBody::Absent,
+                &filter_with(&[]),
+            );
+            assert!(
+                values.contains(b"hunter2secret"),
+                "the credential must survive this separator ({separated:?})"
+            );
+        }
+
+        // The split stays at the first separator: later whitespace belongs to
+        // the credential, so auth-params still parse.
+        let (_request, params) = redact(
+            Request::get("/").header(
+                header::AUTHORIZATION,
+                "Digest\tresponse=deadbeef,\tnonce=cafebabe",
+            ),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(params.contains(b"deadbeef"), "first param value");
+        assert!(params.contains(b"cafebabe"), "param after an HTAB");
+
+        // Non-whitespace after the token, an empty credential and a stray
+        // non-UTF-8 byte record nothing and do not panic.
+        for odd in [
+            &b"Bearer\xc3\xa9tok1234"[..],
+            b"Bearer\t",
+            b"Bearer\xfftok1234",
+        ] {
+            let mut odd_values = RedactedValues::default();
+            record_credential_components("authorization", odd, &mut odd_values);
+            assert!(!odd_values.contains(b"tok1234"), "{odd:?}");
+        }
+
+        // The wide separator leaves no leading space on the credential.
+        let (_request, wide) = redact(
+            Request::get("/").header(header::AUTHORIZATION, "Bearer\u{3000}\u{a0}tok1234"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(wide.contains(b"tok1234"));
+
+        // A non-token head is still not a scheme.
+        let (_request, not_scheme) = redact(
+            Request::get("/").header(header::AUTHORIZATION, "a=b\tvalue1234"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(
+            !not_scheme.contains(b"value1234"),
+            "a head holding `=` is not a scheme"
+        );
+    }
+
+    /// A handler that splits on `=` holds the wire spelling, quotes and all.
+    /// One that uses a cookie parser holds the unquoted form. Record both.
+    #[test]
+    fn a_quoted_cookie_value_records_both_spellings() {
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, "session=\"abcdef\"; theme=\"x\"; e=\"\""),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(values.contains(b"abcdef"), "the unquoted spelling");
+        assert!(values.contains(b"\"abcdef\""), "the wire spelling");
+        assert!(
+            !values.contains(b"\"x\""),
+            "a quoted spelling under the floor is not recorded"
+        );
+        assert!(
+            !values.contains(b"\"\""),
+            "an empty quoted value is nothing"
+        );
+
+        // `Set-Cookie` takes the same spelling rule on its one cookie.
+        let (_request, set_cookie) = redact(
+            Request::get("/").header("set-cookie", "s=\"abcdef\"; Path=\"/admin\""),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(set_cookie.contains(b"\"abcdef\""));
+        assert!(!set_cookie.contains(b"\"/admin\""));
+
+        let mut binds = vec![BindValue::Value(b"\"abcdef\"".to_vec())];
+        mask_binds(&mut binds, &values);
+        assert_eq!(binds.first(), Some(&BindValue::Masked));
+
+        // The quoted form also decodes, as the unquoted one does.
+        let (_request, encoded) = redact(
+            Request::get("/").header(header::COOKIE, "session=\"abc%2Fdef\""),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(encoded.contains(b"\"abc%2Fdef\""));
+        assert!(encoded.contains(b"abc/def"));
+        assert!(encoded.contains(b"\"abc/def\""));
+    }
+
+    /// A `Cookie:` header with many pairs must not grow the echo set without
+    /// bound.
+    #[test]
+    fn cookie_pairs_beyond_the_cap_are_not_recorded() {
+        let header_value = (0..MAX_COOKIE_PAIRS + 10)
+            .map(|i| format!("k{i}=value{i:05}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, header_value),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(values.contains(b"value00000"), "first pair");
+        assert!(
+            values.contains(format!("value{:05}", MAX_COOKIE_PAIRS - 1).as_bytes()),
+            "last pair under the cap"
+        );
+        assert!(
+            !values.contains(format!("value{MAX_COOKIE_PAIRS:05}").as_bytes()),
+            "first pair over the cap"
+        );
+    }
+
+    /// Empty and `=`-less segments must not use up the cap and push a real
+    /// cookie out of the echo set.
+    #[test]
+    fn junk_segments_do_not_use_up_the_cookie_cap() {
+        let junk = "; ".repeat(MAX_COOKIE_PAIRS + 10);
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, format!("a{junk}session=secretvalue")),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(values.contains(b"secretvalue"), "real cookie after junk");
+    }
+
+    /// A segment with no cookie name is not a cookie. Handlers skip it, so it
+    /// must not use up the cap.
+    #[test]
+    fn nameless_segments_do_not_use_up_the_cookie_cap() {
+        let junk = "=junk; ".repeat(MAX_COOKIE_PAIRS + 10);
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, format!("{junk}session=secretvalue")),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(values.contains(b"secretvalue"), "real cookie after junk");
+    }
+
+    /// A long run of Unicode spaces after the scheme is trimmed in linear time.
+    #[test]
+    fn a_long_unicode_separator_run_is_trimmed_in_linear_time() {
+        let mut header = b"Bearer ".to_vec();
+        header.extend("\u{a0}".repeat(100_000).as_bytes());
+        header.extend_from_slice(b"hunter2secret");
+        let mut values = RedactedValues::default();
+        let started = std::time::Instant::now();
+        record_credential_components("authorization", &header, &mut values);
+        assert!(values.contains(b"hunter2secret"));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "trimming took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `Set-Cookie` holds one cookie, first. A malformed first segment must not
+    /// promote an attribute to a cookie.
+    #[test]
+    fn a_set_cookie_attribute_is_never_read_as_the_cookie() {
+        let (_request, values) = redact(
+            Request::get("/").header("set-cookie", "junk; Path=/admin"),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(!values.contains(b"/admin"));
+    }
+
+    /// A Unicode separator is found even when the credential is not UTF-8.
+    #[test]
+    fn a_unicode_separator_survives_a_non_utf8_credential() {
+        let mut values = RedactedValues::default();
+        record_credential_components(
+            "authorization",
+            b"Digest\xc2\xa0username=\xff, response=deadbeef",
+            &mut values,
+        );
+        assert!(values.contains(b"deadbeef"));
+        assert!(values.contains(b"username=\xff, response=deadbeef"));
+    }
+
+    /// The quote floor counts the value, not its quotes.
+    #[test]
+    fn a_quoted_cookie_value_under_the_floor_keeps_only_its_bare_form() {
+        let (_request, values) = redact(
+            Request::get("/").header(header::COOKIE, "a=\"no\""),
+            CapturedBody::Absent,
+            &filter_with(&[]),
+        );
+        assert!(values.contains(b"no"));
+        assert!(!values.contains(b"\"no\""));
     }
 
     /// The same bytes can arrive both ways — a filtered body password the

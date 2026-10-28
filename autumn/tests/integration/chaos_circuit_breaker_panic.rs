@@ -6,13 +6,14 @@ use autumn_web::circuit_breaker::{
 };
 use std::time::Duration;
 
-const fn huge_open_duration_policy() -> CircuitBreakerPolicy {
+fn huge_open_duration_policy() -> CircuitBreakerPolicy {
     CircuitBreakerPolicy {
         failure_ratio_threshold: 0.5,
         sample_window: Duration::from_secs(10),
         minimum_sample_count: 1,
         open_duration: Duration::MAX,
         half_open_trial_count: 2,
+        ..CircuitBreakerPolicy::default()
     }
 }
 

@@ -50,6 +50,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "_autumn_ledger_revisions",
     "_autumn_ledger_high_water",
     "_autumn_derivations",
+    "autumn_idempotency_keys",
 ];
 
 /// Tables owned by another bootstrap and never created by

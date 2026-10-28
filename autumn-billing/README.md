@@ -22,7 +22,7 @@ Or add the dependency by hand:
 
 ```toml
 [dependencies]
-autumn-billing = "0.8.0"
+autumn-billing = "0.9.0"
 ```
 
 ## Mount
@@ -150,7 +150,9 @@ async fn reports(_pro: Entitled<Pro>) -> &'static str { "ok" }
 ```
 
 `Entitled<R>` runs before the body is read. It answers `401` without a
-session user and `403` without an entitled subscription.
+session user and `403` when no entitled subscription satisfies `R`. The gate
+checks every subscription of the customer, not only the one that
+`Billing::current_subscription` shows.
 
 For a decision inside a handler, `Billing::current_user` reads the user id
 with the app's configured auth session key:
@@ -196,6 +198,14 @@ retry runs 1 day after the failure, the second 3 days after that, the third
 5 days after that (days 1, 4 and 9). After the last failed retry the plugin
 cancels the subscription. Every retry goes through the store row, so a
 duplicate or early job run is a no-op.
+
+A failure can arrive before its subscription event. The invoice keeps the
+provider subscription id. When the plugin stores the subscription, it links the
+invoice and its open dunning row.
+
+A custom `BillingStore` must override `link_subscription` to get this link.
+The default does nothing. Invoices stored before the upgrade have no provider
+subscription id. The link does not cover them.
 
 ```rust
 let billing = BillingConfig::from_env()

@@ -8,6 +8,9 @@ you want to expose and mount one server; Autumn derives the tool schemas,
 speaks JSON-RPC over Streamable HTTP, and dispatches each tool call through
 your **real, authenticated handler pipeline**.
 
+For the agent in the user's own browser, see [WebMCP](webmcp.md). It uses
+the same derivation, with a separate `#[api_doc(webmcp)]` opt-in.
+
 No second app. No hand-written protocol, transport, or tool schemas. The tool
 catalog is derived from the same `ApiDoc` metadata that drives `generate_spec`,
 so it **cannot drift** from your handlers — change a handler's types and the
@@ -23,7 +26,7 @@ The `mcp` feature builds on the OpenAPI schema machinery, so it implies the
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-web = { version = "0.8", features = ["mcp"] }
+autumn-web = { version = "0.9", features = ["mcp"] }
 ```
 
 ---
@@ -78,13 +81,66 @@ methods an MCP client needs:
 
 | Method | Purpose |
 |--------|---------|
-| `initialize` | Handshake; returns `serverInfo` and `capabilities.tools`. |
+| `initialize` | Handshake; returns `serverInfo`, `capabilities.tools` and the optional `instructions`. |
 | `tools/list` | The derived tool catalog. |
 | `tools/call` | Invoke a tool by name; dispatched through the real pipeline. |
 
 `ping` and JSON-RPC notifications (messages with no `id`, e.g.
 `notifications/initialized`) are handled too — notifications get an empty
 `202 Accepted`, per the spec.
+
+### Protocol versions
+
+The endpoint serves two protocol eras on the same path:
+
+- **Legacy** (`2025-06-18`, `2025-03-26`, `2024-11-05`). The client opens
+  with `initialize`. The methods above apply.
+- **Modern** (`2026-07-28`). There is no handshake. Each request carries
+  its version and client capabilities in `params._meta`, and the
+  `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers mirror the
+  body. `initialize` and `ping` are not part of this revision.
+
+A request whose `_meta` has `io.modelcontextprotocol/protocolVersion` uses
+the modern era:
+
+```jsonc
+// POST /mcp
+// MCP-Protocol-Version: 2026-07-28
+// Mcp-Method: tools/call
+// Mcp-Name: create_todo
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+  "params": { "name": "create_todo", "arguments": { "body": { "title": "buy milk" } },
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {} } } }
+```
+
+In the modern era:
+
+| Method | Result |
+| --- | --- |
+| `server/discover` | `supportedVersions`, `capabilities`, the optional `instructions`, and the caching hints `ttlMs` and `cacheScope`. |
+| `tools/list` | The catalog, with `ttlMs` and `cacheScope`. |
+| `tools/call` | As in the legacy era. |
+
+Each result has `resultType` (`"complete"`, or `"task"` for a task handle)
+and `_meta["io.modelcontextprotocol/serverInfo"]`. `cacheScope` is always
+`"private"`: the endpoint can sit behind auth, so a shared cache must not
+serve the catalog to another caller.
+
+Errors:
+
+| Code | HTTP | When |
+| --- | --- | --- |
+| `-32602` | 400 | `_meta` has no `protocolVersion` or no `clientCapabilities`. |
+| `-32020` | 400 | A standard header is missing, repeated, or does not match the body. `Mcp-Name` can use the `=?base64?…?=` form. |
+| `-32022` | 400 | The version is not served. `data.supported` lists the served versions. |
+| `-32601` | 404 | The method is not served (for example `ping`, `resources/list`, `subscriptions/listen`). |
+| `-32600` | 400 | The body is a JSON-RPC batch, or the id is not a string or an integer. |
+| `-32700` | 400 | The body is not JSON (with a modern `MCP-Protocol-Version` header). |
+
+An error with no known id has no `id` field. An `initialize` request always
+uses the legacy era, also with a modern header.
 
 A `tools/list` entry looks like this — `name`, `description`, `inputSchema`,
 and `annotations` are all derived from the handler's `ApiDoc`:
@@ -236,16 +292,99 @@ follow for MCP specifically:
   `agent.tool.<name>.refused` (status Failure, with a `refused_reason` and no
   `http_status`) records the refusal. Note the attempt is written *before* the
   request is dispatched, and so before route-level authorization — once a sink
-  is installed, gate the endpoint with `secure_mcp(...)` (§6) and rate-limit
+  is installed, gate the endpoint with `secure_mcp(...)` (§7) and rate-limit
   it.
 - **`autumn agents manifest --check`** lists every MCP-exposed tool: governed
   ones with their envelope, and every mutating tool that has *no* envelope —
   the one gap the compiler cannot catch, because a tool with no grant has no
-  assertion to fail. Generated `#[repository(api, mcp)]` CRUD tools (§9) have
+  assertion to fail. Generated `#[repository(api, mcp)]` CRUD tools (§10) have
   no annotation site in this slice, so they surface there.
 
 See [The Agent Authority Envelope](agent-authority.md) for the grant grammar,
 the effect table, the escape hatches, the manifest and the audit record.
+
+### Large catalogs: core tools and search
+
+Each tool in `tools/list` costs the agent context before it does any work.
+Tool choice also gets worse past about 30 to 50 tools. Three settings help.
+
+**Core tools.** Mark the tools that most tasks need:
+
+```rust
+#[get("/api/todos")]
+#[api_doc(mcp, core, summary = "List all todos")]
+async fn list_todos() -> AutumnResult<Json<Vec<Todo>>> { /* ... */ }
+```
+
+A core tool carries `_meta: {"anthropic/alwaysLoad": true}`. A client that
+defers tools (Claude Code, for example) loads a core tool before any search.
+`Route::mcp_core()` does the same for a route built in code. `core` does not
+opt a route in. Use it with `mcp`, or under the whole-API hatch.
+
+**Instructions.** Tell the model what the server does and when to search:
+
+```rust
+autumn_web::app()
+    .routes(routes![list_todos])
+    .mcp_instructions("Todo and calendar tools. Search for calendar tools.")
+    .mount_mcp("/mcp")
+```
+
+`initialize` and `server/discover` return the text as `instructions`. Do not
+repeat the tool descriptions.
+
+**The progressive catalog.** For a large catalog, send only the core tools:
+
+```rust
+use autumn_web::mcp::McpCatalog;
+
+autumn_web::app()
+    .routes(routes![list_todos, create_todo])
+    .mcp_catalog(McpCatalog::Progressive)
+    .mount_mcp("/mcp")
+```
+
+Then `tools/list` holds two meta-tools and the core tools:
+
+| Tool | Arguments | Result |
+| --- | --- | --- |
+| `search_tools` | `query`, `detail` (`name`, `summary` or `full`), `limit` (1 to 50, default 10), `offset` (default 0) | `total` hits, and `tools`, one page of the best hits. `full` adds each `inputSchema`. |
+| `call_tool` | `name`, `arguments` | The result of the named tool. |
+
+- `search_tools` matches words against tool names, descriptions, tags and
+  argument names. An exact name word counts most. Equal scores keep the
+  catalog order. An empty query lists the tools in catalog order. Use
+  `offset` to get the next page. A query has at most 128 characters and 16
+  distinct words.
+- The `search_tools` description gives the tool count and the route tags, so
+  the model knows what it can find.
+- `call_tool` runs the tool through the same path as a direct `tools/call`.
+  Auth, guards, rate caps, the audit record, tasks and streaming all apply.
+  The audit record names the inner tool and adds `via = "call_tool"`.
+  `call_tool` refuses an unknown name and a meta-tool name with `-32602`.
+- A direct `tools/call` of a tool that the list does not show still works.
+- The server adds a short guidance text to the instructions.
+- The catalog does not change during a session, as revision `2026-07-28`
+  requires. `McpCatalog::Full`, the default, lists every tool.
+- In progressive mode, the server skips a route tool named `search_tools` or
+  `call_tool`, and logs a warning. Give the route a different
+  `operation_id`. The `autumn agents manifest` listing does not apply this
+  rule.
+
+The progressive catalog is not access control. An agent can find and call
+each tool. Know these limits of `call_tool`:
+
+- A client approves a tool call by its tool name. A rule that allows
+  `call_tool` allows each tool behind it.
+- `call_tool` has `destructiveHint: true`, because it can run any tool. A
+  client can then ask the user before the call. The annotations of the inner
+  tool do not reach the client.
+- A gateway that routes or authorizes on the `Mcp-Name` header sees
+  `call_tool`, not the inner tool. Such a gateway must read
+  `params.arguments.name`, or refuse `call_tool`.
+
+Mark a destructive tool `core`. It then keeps its own name and annotations in
+`tools/list`, and the client approves it on its own.
 
 ---
 
@@ -309,7 +448,7 @@ wearing an MCP hat**. You write zero JSON-RPC or SSE framing.
 
 Add the `stream` flag to `#[api_doc(mcp, stream)]` and return an `Sse` stream
 of `Event`s. Because an `Sse` handler has no JSON response schema, `stream` also
-exempts the tool from the JSON-out eligibility gate (see §8):
+exempts the tool from the JSON-out eligibility gate (see §9):
 
 ```rust
 use std::convert::Infallible;
@@ -401,7 +540,166 @@ proxies don't drop a slow stream.
 
 ---
 
-## 6. Authentication: reuse your bearer tokens
+## 6. Long-running tools as tasks
+
+A blocking `tools/call` keeps the `POST /mcp` open until the handler returns,
+and the global request deadline can stop it. A **task tool** can return a task
+handle instead. The client polls for the result. This is the MCP
+[Tasks extension](https://modelcontextprotocol.io/extensions/tasks/overview)
+(`io.modelcontextprotocol/tasks`).
+
+### Opt in with `task`
+
+```rust
+#[post("/api/reports", timeout = "off")]
+#[api_doc(mcp, task, summary = "Build the monthly report")]
+async fn build_report(Json(req): Json<ReportRequest>) -> AutumnResult<Json<Report>> {
+    // Slow work.
+}
+```
+
+`Route::mcp_task()` does the same for a route that a plugin builds. A task
+tool must return JSON, like other tools. `task` without `mcp` does nothing.
+You can use `stream` and `task` together: a task buffers the stream into its
+final result.
+
+When one or more tools are task tools, `server/discover` (modern) and
+`initialize` (legacy) advertise the extension:
+
+```json
+{ "capabilities": { "tools": { "listChanged": false },
+                    "extensions": { "io.modelcontextprotocol/tasks": {} } } }
+```
+
+### The flow
+
+The server decides per request. A call becomes a task only when the tool is a
+task tool **and** the request declares the extension:
+
+```jsonc
+// client → server
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+  "params": { "name": "build_report", "arguments": { "body": { "month": "2026-09" } },
+    "_meta": { "io.modelcontextprotocol/clientCapabilities":
+               { "extensions": { "io.modelcontextprotocol/tasks": {} } } } } }
+
+// server → client, at once
+{ "jsonrpc": "2.0", "id": 1, "result": {
+    "resultType": "task", "taskId": "9f0c…e1", "status": "working",
+    "createdAt": "2026-10-11T10:30:00.000Z", "lastUpdatedAt": "2026-10-11T10:30:00.000Z",
+    "ttlMs": 3600000, "pollIntervalMs": 1000 } }
+```
+
+The client then calls `tasks/get` with the `taskId` (and the same `_meta`).
+When the status is `completed`, `result` holds the `CallToolResult` that a
+blocking call gives, with `"resultType": "complete"` added. Other methods:
+
+| Method | Result |
+| --- | --- |
+| `tasks/get` | The task. `result` when `completed`, `error` when `failed`. |
+| `tasks/cancel` | `{ "resultType": "complete" }`. A running task stops and becomes `cancelled`. A terminal task does not change. |
+| `tasks/update` | `{ "resultType": "complete" }`. Autumn never asks for input, so it ignores `inputResponses`. |
+
+Status rules:
+
+- A handler error (4xx/5xx) is `completed` with `isError: true`, as the spec
+  requires.
+- A handler panic gives HTTP 500, as for a blocking call. The task is
+  `completed` with `isError: true`.
+- A panic outside the handler pipeline is `failed` with error `-32603`.
+- When the TTL ends, a running task is `failed` with error `-32603`.
+- Bad arguments or an unknown tool give the normal JSON-RPC error. The server
+  does not make a task.
+
+Errors on `tasks/*`:
+
+| Code | When |
+| --- | --- |
+| `-32021` | The request does not declare the extension. |
+| `-32602` | Unknown task, expired task, or a task of another caller. |
+| `-32601` | The app has no task tool. |
+| `-32600` | `tasks/*` is in a JSON-RPC batch. |
+
+### Blocking fallbacks
+
+A task tool runs as a normal blocking call when:
+
+- the client does not declare the extension, or
+- the task store is full (`max_tasks`), or the client has
+  `max_tasks_per_caller` tasks. The server logs a warning.
+
+### Timeouts and limits
+
+A task runs outside the `POST /mcp` request, so the global request deadline
+does not stop it. The route's own timeout applies. Set `timeout = "off"` or
+`timeout_ms = …` on the route for long work.
+
+```rust
+use std::time::Duration;
+use autumn_web::mcp::McpTaskConfig;
+
+autumn_web::app()
+    .routes(routes![build_report])
+    .mount_mcp("/mcp")
+    .mcp_tasks(
+        McpTaskConfig::default()
+            .ttl(Duration::from_secs(600))        // default: 1 hour
+            .poll_interval(Duration::from_secs(2)) // default: 1 second
+            .max_tasks(256)                        // default: 1024
+            .max_tasks_per_caller(16)              // default: 64
+            .max_stored_bytes(64 * 1024 * 1024),   // default: 256 MiB
+    )
+    .run()
+    .await;
+```
+
+The TTL starts when the server makes the task. The minimum is 1 second. When
+the TTL ends, the server stops a running task and deletes the task.
+
+### Security
+
+- **Task IDs** are 256 bits from the app's entropy source.
+- **Owner binding.** Each task keeps a SHA-256 digest of the caller's
+  credentials: `Authorization`, the session cookie, the tenant header and the
+  mTLS certificate fingerprint. `tasks/*` with other credentials gets
+  `-32602`, the same error as an unknown ID. A caller with no credentials is
+  anonymous. Only the task ID protects such a task.
+- **Token refresh.** The digest uses the raw credential. If a client changes
+  its token while a task runs, it cannot read the task.
+- **Authentication.** `tasks/*` does not run the route's auth again. Use
+  `secure_mcp(...)` (§7) to check the credential on each `tasks/*` request,
+  for example to stop a revoked token.
+- **Quota.** One client can hold at most `max_tasks_per_caller` tasks. The
+  key is the client IP that the trusted-proxy policy resolves. A caller
+  cannot get a new quota with a new credential. Clients behind one NAT share
+  a quota.
+- **Memory.** All stored results together use at most `max_stored_bytes`. If
+  a result does not fit, the task completes with a tool error. The same
+  budget limits how many task results buffer at one time (one per 10 MiB, at
+  least one).
+- **Audit.** A task call writes the same `attempt` and outcome records as a
+  blocking call (see "Proving what an agent can do"). A cancelled or expired
+  task writes an outcome with `result = task_aborted`. A panic outside the
+  pipeline writes `task_panicked`.
+- **Load shedding.** A task takes its own slot while it runs. With a very low
+  `server.max_concurrent_requests`, a task can start while its `POST /mcp`
+  still holds a slot. Then the task is shed and completes with an HTTP 503
+  tool error.
+
+### Limits of this version
+
+- The store is **in memory and per process**. Tasks do not survive a restart.
+  With more than one replica, route `tasks/*` on the `Mcp-Name` header (the
+  client sets it to the task ID) so that polls reach the same replica.
+- A task has no HTTP response. The server drops `Set-Cookie` and
+  `Server-Timing` from the handler.
+- The server does not send `notifications/tasks`. Clients poll.
+- Autumn does not serve the `2025-11-25` core tasks (`task` request
+  parameter, `tasks/result`, `tasks/list`).
+
+---
+
+## 7. Authentication: reuse your bearer tokens
 
 `tools/call` runs through the **real handler pipeline** — the same in-process
 path Autumn's [test client](testing.md) uses. That means `#[secured]`,
@@ -510,7 +808,7 @@ agent client both need no configuration.
 
 ---
 
-## 7. The whole-API hatch
+## 8. The whole-API hatch
 
 For internal tools or trusted agents you can expose every eligible **read**
 endpoint at once, without tagging each one, via `expose_all_as_mcp()`:
@@ -534,7 +832,7 @@ conservative:
 
 ---
 
-## 8. Eligibility: JSON in, JSON out
+## 9. Eligibility: JSON in, JSON out
 
 Only JSON endpoints are eligible. Autumn detects this structurally: a route is
 eligible when its handler has a JSON **response schema** (it returns
@@ -563,7 +861,7 @@ handler tagged `status = 204`) cannot leak its response body to agents.
 
 ---
 
-## 9. Repository CRUD tools
+## 10. Repository CRUD tools
 
 The `#[repository(Model, api = "/path")]` macro generates five CRUD routes.
 Add the `mcp` key to expose them as tools — no hand-written handlers or
@@ -586,6 +884,10 @@ pub trait PostRepository {}
 - **`mcp = "read"`** opts in only `list` and `get`.
 - `mcp` requires `api = "/path"` (there are no routes to derive tools from
   otherwise) — the macro rejects it at compile time.
+- **`grant = X`** governs the generated tools with an
+  [authority grant](agent-authority.md#generated-repository-tools). It
+  needs `mcp`. The build fails if the grant does not list the model in
+  `writes`.
 - Every tool call still dispatches through the real pipeline, so a
   `policy = ...` repository enforces the same record-level checks for an
   agent as for any HTTP client.
@@ -598,7 +900,7 @@ agents fully-typed inputs.
 
 ---
 
-## 10. Plugins and route-level opt-in
+## 11. Plugins and route-level opt-in
 
 Typed routes registered by a [plugin](../plugins.md) — via
 `AppBuilder::routes()` or `scoped()` inside `Plugin::build` — flow into the
@@ -606,8 +908,8 @@ same route registry as your own, so a plugin route tagged `#[api_doc(mcp)]`
 becomes a tool exactly like a user route.
 
 More often, a plugin author doesn't want to hard-wire the decision. The
-chainable `Route` toggles — `Route::mcp()`, `Route::mcp_exclude()`, and
-`Route::mcp_stream()` — mirror the attribute forms at registration time, so
+chainable `Route` toggles — `Route::mcp()`, `Route::mcp_exclude()`,
+`Route::mcp_stream()`, `Route::mcp_task()` and `Route::mcp_core()` — mirror the attribute forms at registration time, so
 a plugin can offer a fluent switch and let the **host** decide at install
 time:
 
@@ -648,8 +950,10 @@ autumn_web::app()
 
 The toggles follow the same semantics as the attributes: an explicit
 `mcp()` exposes any verb, `mcp_exclude()` always wins (even over
-`expose_all_as_mcp()`), and `mcp_stream()` implies the opt-in while
-exempting an `Sse` route from the JSON-out gate. The flags are plain
+`expose_all_as_mcp()`), `mcp_stream()` implies the opt-in while
+exempting an `Sse` route from the JSON-out gate, and `mcp_task()` implies the
+opt-in and makes the tool a task tool (§6). `mcp_core()` implies the opt-in
+and marks a core tool (§3). The flags are plain
 `ApiDoc` metadata, so a plugin crate can set them while compiling against
 base `autumn-web` — they take effect only when the host enables the `mcp`
 feature and calls `mount_mcp`.
@@ -675,7 +979,7 @@ feature and calls `mount_mcp`.
 
 ---
 
-## 11. End-to-end example
+## 12. End-to-end example
 
 `examples/todo-app` ships an `/mcp` endpoint. Its bearer-token JSON API is
 mounted in a `scoped("/api", RequireApiToken, …)` group and tagged
@@ -703,7 +1007,7 @@ header to watch progress frames arrive as the scan runs.
 
 ---
 
-## 12. How a tool call is dispatched (and why it can't loop)
+## 13. How a tool call is dispatched (and why it can't loop)
 
 When a `tools/call` arrives, the MCP handler reconstructs an ordinary HTTP
 request — filling the path template, building the query string, and attaching
@@ -735,11 +1039,11 @@ that from convention to a structural guarantee.)
 
 ---
 
-## 13. Scope and roadmap
+## 14. Scope and roadmap
 
 This slice is **tools-only**. Tool results are buffered by default, with
-**opt-in progressive streaming over SSE** (§5). The following remain **out of
-scope** and are tracked as follow-ups:
+**opt-in progressive streaming over SSE** (§5) and **opt-in tasks** (§6). The
+following remain **out of scope** and are tracked as follow-ups:
 
 - **Daemon lifetime** for long-running, session-surviving work —
   [#1119](https://github.com/autumn-foundation/autumn/issues/1119).
@@ -747,11 +1051,14 @@ scope** and are tracked as follow-ups:
   start/status/signal MCP tools on top of this layer
   ([autumn-harvest#597](https://github.com/madmax983/autumn-harvest)); the
   management API itself can already be exposed via the plugin route toggles
-  (§10).
+  (§11).
 - **Tool declarations for raw `nest()`/`merge()` routers** — opaque routers
   carry no `ApiDoc`, so plugins must register typed routes to be
-  MCP-exposable (§10).
+  MCP-exposable (§11).
 - **MCP resources, prompts, and sampling** — this slice is tools-only.
+- **A catalog per client** — `mcp_catalog` sets one catalog for the endpoint.
+  The endpoint does not serve `tools/list` pagination or
+  `notifications/tools/list_changed`.
 - **stdio transport** — agents target deployed apps, so HTTP only for v1.
 - **Non-JSON endpoints** (file upload/download, HTML).
 - **LLM-assisted tool descriptions** — descriptions come from `#[api_doc]`;

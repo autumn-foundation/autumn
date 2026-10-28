@@ -206,11 +206,13 @@ Every one of these is a hard error, not a warning:
 | a zero or oversized limit | a zero ceiling means "cannot run", not "no limit" |
 | `memory_bytes × max_concurrency` over 1 GiB | that product, not its factors, is what the plugin can cost the host |
 | a route path the router would refuse — `:id`, `*rest`, `{id`, `{*rest}/more` | `axum::Router::route` *panics* on one, so a manifest that passed would take the app down at boot |
+| a route on a path the app already serves, or on the configured OpenAPI, Swagger UI or MCP path | `Router::nest` would panic. The build returns a `RouterBuildError` that names the path. |
 | a module importing an allowlisted WASI name with the wrong signature, or exporting a `_start` that is not `() -> ()` | it would load and then fail on every request, as a gateway error nobody can explain from outside |
 | a module with more than 4096 data + element segments, or more than 16 MiB of them | every request re-instantiates the module, and that copying happens before the first guest instruction — so it is bounded at load rather than discovered per request |
 | a module that exports no linear memory named `memory`, or whose *initial* memory is already over the manifest's ceiling | every host function reads and writes through that export, so without it the plugin loads and then fails every request |
 | two routes that are one route to the router (`/{a}` and `/{b}`) | same |
 | a route path with a second spelling — `/a/./b`, `/a/%2e/b`, `/a%2Fb`, `/%74ransfer`, lower-case hex like `%c3%a9` | a client or proxy normalises it to another path, so the router's collision check would not see that it names an app route (#2463) |
+| a literal non-ASCII route path — `/café` | a client sends `/caf%C3%A9`, so the literal route is unreachable while the consent screen lists it. Write `/caf%C3%A9` (#2481). |
 | a version or route path carrying a control character | both are printed on the consent screen, where an escape sequence can rewrite what you read |
 | a digest that is not 64 lowercase hex characters | it is the only thing binding manifest to bytes |
 
@@ -333,11 +335,13 @@ would the GET and the host discards the body for you.
 
 | Ceiling | What it bounds | What happens at the edge |
 |---|---|---|
-| `fuel` | instructions executed for one request, **and** the host-side bytes copied on the guest's behalf — the module's data and element segments, which every request re-instantiates, and the request frame itself, which is cloned and base64-expanded into the guest's stdin — at 64 bytes per unit | 504 on the plugin's prefix |
+| `fuel` | instructions executed for one request, **and** the host-side bytes copied on the guest's behalf — the module's data and element segments, which every request re-instantiates, and the request frame itself, which is cloned and base64-expanded into the guest's stdin — at 64 bytes per unit. Each byte the guest writes to stdout also costs one unit, because the host parses it | 504 on the plugin's prefix |
 | `memory_bytes` | one instance's linear memory | the guest's `memory.grow` fails; usually a trap, then 502 |
 | `max_request_body_bytes` | the body forwarded in | 413, guest never started |
-| `max_response_bytes` | the frame accepted back | 502 for an oversized frame; 504 for one that never ends |
+| `max_response_bytes` | the frame accepted back. It also limits each frame the guest writes. The host refuses at load a manifest when a call frame is larger than `2 × max_response_bytes + 4096`. The frame is `outbound_request_bytes` × 6, `kv_value_bytes`, or a full row (`db`, `jobs`), plus 4096 | 502 for an oversized frame; 504 for one that never ends |
+| frame shape | the host counts the containers and commas of each guest frame before it parses the frame. It refuses a frame with more than 65,536, or nesting deeper than 32 levels. No legal frame comes near either | 502 |
 | `max_concurrency` | instances alive at once | 503 with `Retry-After`; requests are shed, not queued |
+| shared guest pool | guests that run at once in the whole process, all plugins together. Default 128. Set it with `plugin_sandbox::set_guest_slots` before you build any plugin, to at most a quarter of `max_blocking_threads` | 503 with `Retry-After`. It can refuse a request that `max_concurrency` allows. The first request to arrive gets the slot, so keep each `max_concurrency` well under the limit |
 | `request_body_timeout_ms` | how long a request may take to send its body | 408, and the permit goes back |
 
 The number worth reviewing is `max_concurrency × the per-request footprint`,
@@ -540,6 +544,21 @@ appended to the guest's stdin; the `id` is the guest's to choose and is echoed
 back. **Read each answer before making the next call**: a guest that writes calls
 and never reads them fills a bounded queue and the request is ended.
 
+**A write keeps fuel to read its answer.** A call that changes state —
+`kv-set`, `kv-delete`, `db-insert`, `db-update`, `db-delete`, `job-enqueue`, or
+an outbound call that is not `GET` or `HEAD` — runs only when the fuel left can
+also read its largest reply and the replies not yet read, at 128 units per byte.
+If it cannot, the call comes back `quota-exceeded` and nothing changes. This
+stops a known failure: the write occurs, the guest uses all its fuel to read the
+reply, the request fails, and a retry does the write again.
+
+With the default `fuel` (200 million) and `outbound_response_bytes`, an outbound
+write needs about 74 million units. A plugin with less `fuel` left cannot make
+one. A smaller `outbound_response_bytes` needs less: 4096 needs about 10
+million. A KV, DB or job write needs about 0.6 million. After a write has run,
+every later call keeps this fuel too. Before that, a read does not keep it,
+because a read that fails changes nothing.
+
 A `call_result` carries one of six value kinds: `done` (a write or delete),
 `value` (from `kv-get`, with a `found` flag so a stored `null` is not a miss),
 `row-id` (from `db-insert`), `rows` (from `db-get` and `db-query`), `http`, and
@@ -574,7 +593,8 @@ A refusal comes back as a `call_result` the guest can read, not as a trap. A
 plugin that hits a ceiling should degrade — render the panel without the live
 number — and its author needs to see *which* rule refused:
 `capability-not-granted`, `not-in-grant`, `quota-exceeded`, `malformed`,
-`unavailable` or `backend-error`.
+`unavailable`, `backend-error`, `response-too-large` or `result-rejected`.
+The last two mean the call ran. Do not retry it.
 
 ### Why cross-tenant access is unspellable
 
@@ -584,7 +604,7 @@ The guest names a **logical** thing; the host derives the physical one:
 | --- | --- |
 | `key: "cart"` | `plugin-kv:<plugin>:<tenant>:cart`, every segment escaped |
 | `table: "orders"` | `plugin_<escaped plugin>__orders`, filtered by the active tenant |
-| `job_type: "reindex"` | a `PluginJob` stamped with this plugin and this tenant |
+| `job_type: "reindex"` | a `PluginJob` stamped with this plugin, this tenant and this artifact's sha256 |
 
 The plugin half is hex-escaped rather than tidied, so
 `autumn-plugin-shop` owning `orders` is `plugin_autumn_2dplugin_2dshop__orders` —
@@ -716,6 +736,45 @@ middleware, because one compiled plugin serves every tenant.
 
 ---
 
+## Mount and unmount at runtime
+
+Give the app a `PluginMounts` and keep a clone:
+
+```rust,ignore
+let mounts = PluginMounts::new();
+let app = autumn_web::app().plugin_mounts(mounts.clone());
+// Later, with the app running:
+mounts.mount(&SandboxedPlugin::from_file(path)?)?;
+mounts.unmount("/hello");
+```
+
+Rules:
+
+- The app does not swap its router. The 404 fallback serves mounted plugins.
+  A request that matches a static route never reads the table.
+- A static route wins over a mounted prefix. Use a prefix that no static route
+  uses.
+- A framework prefix is refused with `MountError::Reserved`. `/static` and
+  `/_autumn` always count. `plugin_mounts` adds the configured actuator prefix,
+  the probe paths (if enabled) and the dev inspector path. A prefix that
+  contains a reserved one is refused too. Add more, such as a custom MCP path, with `PluginMounts::reserve`.
+- One plugin holds a prefix. A prefix that contains, or is inside, a held
+  prefix is refused with `MountError::PrefixTaken`.
+- **Unmount drains.** New requests get 404 immediately. A running request
+  finishes. It keeps its concurrency permit until it ends.
+- A new plugin instance at a reused prefix has its own permits. While the old
+  instance drains, both can run requests.
+- Each mount logs the capability grant and a new `generation`.
+- `PluginMounts::list` shows what is mounted now. `PluginMounts::routes` shows
+  the routes of those plugins.
+- The access log and metrics name a plugin route from its response. A request
+  that middleware rejects first, such as a bad CSRF token or a rate limit, is
+  logged as `_unmatched`.
+- `autumn routes` and `autumn plugin-check` read the build. They do not show
+  runtime mounts.
+
+---
+
 ## Limits of this slice
 
 - Sessions, mail and file storage are not "not granted" — they do not exist as
@@ -729,10 +788,11 @@ middleware, because one compiled plugin serves every tenant.
   `localhost` and `127.0.0.1` cannot appear in `[grants].hosts` and a plugin
   cannot be pointed at a local upstream in development. IP-range (SSRF) guarding
   for the app-level client is #1627's.
-- The `jobs` capability **enqueues**; nothing in this slice runs the result. The
-  record carries the enqueuing plugin and tenant, so a runner built on it cannot
-  widen the grant — but there is no wire frame for delivering a job back into a
-  guest, and adding one is a later slice.
+- The `jobs` capability **enqueues**. Nothing in this slice runs the job. The
+  record carries the plugin, the tenant and the artifact sha256. A runner must
+  refuse a job when its sha256 is not the installed artifact's. Drain the queue
+  before an upgrade. No wire frame sends a job back to a guest. A later slice
+  adds one.
 - The shipped `PluginStore`, `JobSink` and `OutboundHttp` implementations are
   in-process: `MemoryPluginStore` and `MemoryJobSink` are bounded — the job
   queue holds `DEFAULT_JOB_DEPTH` and there is no unbounded spelling, because
@@ -740,7 +800,8 @@ middleware, because one compiled plugin serves every tenant.
   `RecordingHttp` answers from a fixed table and is a test double. Wiring a real
   upstream means implementing `OutboundHttp` against the framework client and
   honouring the contract on the trait.
-- Upgrading a sandboxed plugin needs an app restart.
+- A plugin loaded at boot cannot be unmounted. To upgrade or remove a plugin
+  without a restart, mount it at runtime (see above).
 - There is no registry; you get artifacts the same way you get any other file.
 - An interpreter is slower than native code. For a hello-world route the
   overhead is sub-millisecond, but a sandboxed plugin is not where compute-heavy

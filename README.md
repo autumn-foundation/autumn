@@ -33,7 +33,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 
 ```bash
 # Install the published CLI
-cargo install autumn-cli --version 0.8.0
+cargo install autumn-cli --version 0.9.0 --locked
 
 # Local development only, from an Autumn checkout:
 # cargo install --path autumn-cli
@@ -61,6 +61,7 @@ app (see the [data playground guide](docs/guide/console.md)):
 
 ```bash
 autumn console
+autumn console --repl   # interactive Rhai prompt, no compile per query
 ```
 
 Visit <http://localhost:3000>. Autumn also auto-mounts `/health`,
@@ -81,7 +82,7 @@ Prefer a manual download? Grab the tarball plus its `.sha256`:
 - Latest: `https://github.com/autumn-foundation/autumn/releases/latest/download/autumn-<target>.tar.gz`
 - Pinned: `https://github.com/autumn-foundation/autumn/releases/download/<tag>/autumn-<target>.tar.gz`
 
-where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.8.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
+where `<target>` is one of `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, or `aarch64-apple-darwin` (Linux binaries are static musl — no glibc version dependency). Binaries track tagged crate releases (e.g. `v0.9.0`); `latest` is the most recent released version — there are no rolling trunk-dev builds.
 
 ### Install a prebuilt binary (Windows)
 
@@ -177,8 +178,10 @@ instead of forming a circular release dependency.
 
 Use built-in `#[scheduled]` tasks and `#[job]` handlers for lightweight app-local
 background work. Reach for Harvest when the work needs workflow durability or a
-dedicated runner. See the [Harvest architecture notes](docs/autumn-workflow-architecture.md)
-for the model and roadmap.
+dedicated runner. See the [Harvest pointer page](docs/autumn-workflow-architecture.md)
+and the [Autumn Harvest repository](https://github.com/autumn-foundation/autumn-harvest)
+for the engine itself, and [ADR-0016](docs/adr/0016-durable-workflows-live-in-harvest.md)
+for why durable workflows stay out of Autumn core.
 
 ## Example
 
@@ -238,12 +241,14 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 | [`examples/collab-notes`](examples/collab-notes) | Conflict-free collaborative editing: a `#[collaborative]` text field backed by an in-tree CRDT, live merge and presence over `#[ws]` + channels, and a thin browser replica — no external real-time service (see the [collaboration guide](docs/guide/collaboration.md)) |
 | [`examples/invoice`](examples/invoice) | Renders one Maud view as both an on-screen detail page and a downloadable PDF via `autumn_web::pdf::Pdf` (see the [PDF downloads guide](docs/guide/pdf-downloads.md)) |
 | [`examples/react-graphql`](examples/react-graphql) | TypeScript React SPA on an Autumn backend, talking GraphQL through a generic `GraphqlPlugin`: resolvers built on a `#[model]` + `#[repository]` with `#[normalize]`, `#[validate]` and `MutationHooks`, generated REST CRUD over the same rows, `Plugin` + `nest` + `declare_plugin_routes`, `PluginContract`, and a committed Vite bundle served under the default CSP |
+| [`examples/escape-hatches`](examples/escape-hatches) | Each escape hatch in one stockroom app, each with a real reason: the convention first (`#[model]`, `#[repository]`, `with_lock`), then `Db::tx` with guarded Diesel writes, `sql_query` for a window function, `#[intercept]`/`.scoped`/`.layer` tower layers, raw Axum routers via `nest` and a `Plugin`, `error_pages`, `exception_filter`, and a custom pool provider |
 
 ## Documentation
 
 - [**Guide index — every guide page, grouped by task**](docs/guide/index.md) — the
   full table of contents for `docs/guide/`; the list below is a selection of
   highlights, not the whole guide
+- [**What's new in 0.9.0**](docs/releases/0.9.0.md) — a walkthrough of the release: load shedding, retry budgets and deadlines on by default, adaptive admission control, a transactional outbox and fenced leases, SQLite fleets with one database per tenant, and MCP Tasks
 - [**What's new in 0.8.0**](docs/releases/0.8.0.md) — a walkthrough of the release: simulated networks and build-time query budgets, SQLite as a full backend, `Money` and ledgered data, mTLS and DNS-01 certificates, shadow deploys, and capability-sandboxed plugins
 - [**What's new in 0.7.0**](docs/releases/0.7.0.md) — a walkthrough of the release: host-preparing deploys and fleets, deterministic simulation testing, the new model attributes, failure-capsule replay, and a request path that allocates ~59% less
 - [Getting Started Guide](docs/guide/getting-started.md)
@@ -267,9 +272,10 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Data Playground](docs/guide/console.md) — `autumn console`, the pre-wired edit-and-run answer to `rails console`
 - [One-Off Tasks](docs/guide/tasks.md) - `#[task]`, `one_off_tasks![]`, and `autumn task`
 - [Embedded Clustering](docs/guide/clustering.md) — zero-dependency two-node clustering: `[cluster]` config, authenticated gossip membership, the cluster-wide CRDT counter via `ClusterHandle`, and the `cluster:membership` health indicator
-- [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres advisory-lock coordination
+- [Multi-Replica Scheduled Tasks](docs/guide/scheduled-multi-replica.md) - `#[scheduled]` with Postgres tick-table coordination
 - [Fleet Deploys](docs/guide/fleet-deploys.md) — `[deploy] hosts`: `autumn deploy up` rolls a release across several VPS hosts one at a time (per-host blue/green, migrations exactly once, halt-and-roll-back on failure), plus `deploy status` drift detection, fleet maintenance, and the load-balancer contract
 - [Data-Retention Sweeps](docs/guide/retention-sweeps.md) — `retention(...)` on `#[repository(...)]`: batched, soft-delete-aware, fleet-coordinated auto-purge, plus `autumn retention --dry-run`
+- [Portable Data Capsules](docs/guide/data-capsules.md) — `autumn data capsule export|import|verify`: one signed directory with all data of a subject, a manifest, the blobs, and an offline HTML viewer; import has no loss of data
 - [Data Retention for Framework-Owned Data](docs/guide/data-retention.md) — one `[retention]` section that bounds every table Autumn creates (job history, tracking, idempotency, experiment assignments, webhook replay, sessions, audit archives), enforced by an in-process fleet-coordinated sweep, GDPR legal-hold aware, with `autumn db retention --dry-run`
 - [Data Scrubbing](docs/guide/data-scrubbing.md) — `autumn db scrub`: turn a production backup into an anonymized staging copy, with fail-closed PII classification driven by `#[encrypted]` columns, GDPR anonymize registrations, and a checked-in `scrub.toml`
 - [Horizontal Sharding](docs/guide/sharding.md) — `[[database.shards]]`, slot-based routing, `ShardedDb`/`Shards` extractors, per-shard health and migrations
@@ -290,7 +296,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Wire Contracts](docs/guide/wire-contracts.md) — `#[endpoint]` turns a typed handler into a contract, `wire_client!` generates the caller's typed client from it, and `#[contract_checked]` fails the caller's build at the call site when a request or response field the caller actually reads or sets stops matching — including the two breaks the type checker cannot see, a new required field behind `..Default::default()` and a serde-skipped field (experimental)
 - [Sandboxed Plugins](docs/guide/sandboxed-plugins.md) — install an unaudited third-party plugin as a capability-sandboxed `wasm32-wasip1` artifact: one declared prefix, no filesystem/network/env/database, hard CPU and memory ceilings, and a trap that is a 5xx on its own prefix instead of a dead process (experimental)
 - [Todo Tutorial](docs/guide/tutorial/index.md)
-- [Autumn Harvest Architecture Notes](docs/autumn-workflow-architecture.md)
+- [Autumn Harvest](docs/autumn-workflow-architecture.md) — when to reach for the companion durable workflow engine, and where it lives
 - [API Reference](https://docs.rs/autumn-web)
 - [Pre-rendering Design Notes](docs/design/hybrid-rendering.md)
 - [Stability Policy](STABILITY.md) — SemVer, MSRV, and migration commitments
@@ -300,6 +306,7 @@ See [EXAMPLES.md](EXAMPLES.md) for the full catalog with personas, journeys, pre
 - [Maintained Derived Read Models](docs/guide/derivations.md) — `#[derivation(Post, column = "published_comment_count", filter = published)]` keeps a filtered count or weighted `sum(field)` on the parent current in the same transaction, with a content-addressed definition hash, a resumable backfill and `/actuator/derivations` for state and drift
 - [Votes, Likes and Reactions](docs/guide/votable.md) — `#[votable(by = ..., aggregate = sum|count)]`, the race-safe `react()` / `reaction_of()` helpers, and the no-JS `reaction_controls` widget
 - [SEO](docs/guide/seo.md) — `seo(...)` on any route macro plus the `SeoMeta` extractor, canonical URLs, `robots = "noindex"` and its sitemap exclusion, `SitemapSource`, and the auto-mounted `/sitemap.xml` + `/robots.txt`
+- [AEO](docs/guide/aeo.md) — agent readiness by default: `Accept: text/markdown` pages, `llms.txt`, AI crawler rules and `Content-Signal`, the MCP server card, agent skills, the ARD manifest, WebMCP, Web Bot Auth, and x402 payments
 - [Forms, Validation and Normalization](docs/guide/forms.md) — the `ChangesetForm` round-trip that re-renders a rejected submission with the user's input and inline errors, `Valid<T>` / `Validated<T>` for API endpoints, model-level `#[validate(...)]`, `#[normalize(trim, downcase, …)]` and where it runs on the write path, htmx inline validation and its automatic no-JavaScript fallback
 - [Extractors](docs/guide/extractors.md) — the full extractor catalog, the two ordering rules, writing your own, and `Query<T>`'s structured decoding: repeated keys, `tags[]`, `tags[0]`, `filter[status]` and `items[0][sku]` all decode into typed sequences and nested structs
 - [Cookie Consent](docs/guide/cookie-consent.md) — the `Consent` gate that is the actual compliance (not the banner), `inject_consent_banner`, the strictly-necessary exemption, policy-version re-prompting, and the GDPR Art. 7(3) withdraw flow
@@ -341,4 +348,8 @@ how to run the Tier 2 commands under WSL2.
 
 ## License
 
-MIT OR Apache-2.0
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT) at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.

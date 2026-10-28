@@ -388,6 +388,26 @@ pub fn resolve_process_dotenv() -> Result<Vec<(String, String)>, DotenvError> {
     resolve_dotenv_vars(&dir, &profile, &base)
 }
 
+/// Like [`resolve_process_dotenv`], but reads `.env` from `dir`.
+///
+/// Use this when a CLI starts another package. The app reads `.env` next to its
+/// own manifest. The CLI must pass the values from that same file.
+///
+/// # Errors
+/// Returns a [`DotenvError`] on a malformed or unreadable `.env` file.
+pub fn resolve_process_dotenv_in(dir: &Path) -> Result<Vec<(String, String)>, DotenvError> {
+    resolve_process_dotenv_in_using(dir, &OsEnv)
+}
+
+/// [`resolve_process_dotenv_in`] against a caller-supplied `base` environment.
+fn resolve_process_dotenv_in_using(
+    dir: &Path,
+    base: &dyn Env,
+) -> Result<Vec<(String, String)>, DotenvError> {
+    let profile = resolve_profile(base);
+    resolve_dotenv_vars(dir, &profile, base)
+}
+
 /// The real OS environment overlaid with `.env` values, for CLI resolution that
 /// must consult `.env` (e.g. DB URL resolution in `autumn migrate`).
 ///
@@ -424,6 +444,31 @@ pub fn os_env_with_dotenv_for_profile(profile: &str) -> Result<DotenvOsEnv, Dote
     })
 }
 
+/// Like [`os_env_with_dotenv_for_profile`], but reads `.env` from `dir`.
+///
+/// Use this when a CLI runs another package. The app reads `.env` next to its
+/// own manifest. The CLI must read that file, not the one in its own working
+/// directory.
+///
+/// # Errors
+/// Returns a [`DotenvError`] if a `.env` file in `dir` cannot be read or parsed.
+pub fn os_env_with_dotenv_in(dir: &Path, profile: &str) -> Result<DotenvOsEnv, DotenvError> {
+    os_env_with_dotenv_in_using(dir, profile, &OsEnv)
+}
+
+/// [`os_env_with_dotenv_in`] against a caller-supplied `base` environment.
+fn os_env_with_dotenv_in_using(
+    dir: &Path,
+    profile: &str,
+    base: &dyn Env,
+) -> Result<DotenvOsEnv, DotenvError> {
+    Ok(DotenvOsEnv {
+        overlay: resolve_dotenv_vars(dir, profile, base)?
+            .into_iter()
+            .collect(),
+    })
+}
+
 /// Like [`os_env_with_dotenv_for_profile`] but resolves dotenv gating against
 /// a caller-supplied `base`.
 ///
@@ -453,6 +498,43 @@ mod tests {
     use super::*;
     use crate::config::MockEnv;
     use std::path::PathBuf;
+
+    // These go through the `_using` seams with a `MockEnv`, so the result does
+    // not depend on `AUTUMN_DOTENV`, `AUTUMN_ENV` or `AUTUMN_PROFILE` in the
+    // shell that runs the suite.
+
+    #[test]
+    fn os_env_with_dotenv_in_reads_the_given_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "AUTUMN_TEST_2444_KEY=from-dir\n").unwrap();
+        let env = os_env_with_dotenv_in_using(dir.path(), "dev", &MockEnv::new()).unwrap();
+        assert_eq!(env.var("AUTUMN_TEST_2444_KEY").as_deref(), Ok("from-dir"));
+    }
+
+    #[test]
+    fn resolve_process_dotenv_in_reads_the_given_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "AUTUMN_TEST_2444_PAIR=v\n").unwrap();
+        let vars = resolve_process_dotenv_in_using(dir.path(), &MockEnv::new()).unwrap();
+        assert!(vars.contains(&("AUTUMN_TEST_2444_PAIR".to_owned(), "v".to_owned())));
+    }
+
+    #[test]
+    fn os_env_with_dotenv_in_skips_a_gated_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "AUTUMN_TEST_2444_GATED=x\n").unwrap();
+        let env = os_env_with_dotenv_in_using(dir.path(), "prod", &MockEnv::new()).unwrap();
+        assert!(env.var("AUTUMN_TEST_2444_GATED").is_err());
+    }
+
+    #[test]
+    fn the_real_env_wrappers_accept_a_directory_with_no_dotenv_file() {
+        // An empty directory loads nothing whatever the shell sets, so this
+        // exercises the wrappers without depending on the environment.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_process_dotenv_in(dir.path()).is_ok());
+        assert!(os_env_with_dotenv_in(dir.path(), "dev").is_ok());
+    }
 
     #[test]
     fn dotenv_profile_selection_reproduces_offsite_wrong_profile_bug() {

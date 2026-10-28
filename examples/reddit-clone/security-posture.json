@@ -1,0 +1,1417 @@
+{
+  "schema_version": 6,
+  "build": {
+    "profile": "release",
+    "features": [],
+    "all_features": false,
+    "no_default_features": false
+  },
+  "dimensions": {
+    "routes": {
+      "provenance": "declared",
+      "source": "macro:#[secured]/#[authorize]/#[public]; declared:scoped_guarded",
+      "entries": [
+        {
+          "path": "/",
+          "method": "GET",
+          "name": "front_page",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/posts.rs:70",
+          "provenance": "provable"
+        },
+        {
+          "path": "/_autumn/jobs/{token}",
+          "method": "GET",
+          "name": "job_status",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/_partials/nav-auth",
+          "method": "GET",
+          "name": "nav_auth",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/partials.rs:18",
+          "provenance": "provable"
+        },
+        {
+          "path": "/about",
+          "method": "GET",
+          "name": "about",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/about.rs:26",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/a11y",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/health",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/info",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/metrics",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/prometheus",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/ui",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/actuator/ui/metrics",
+          "method": "GET",
+          "name": "actuator",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/api/live/relay/health",
+          "method": "GET",
+          "name": "live_feed_health",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/live.rs:58",
+          "provenance": "provable"
+        },
+        {
+          "path": "/api/posts",
+          "method": "GET",
+          "name": "post_api_list",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "provenance": "provable"
+        },
+        {
+          "path": "/api/posts/{id}",
+          "method": "GET",
+          "name": "post_api_get",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "provenance": "provable"
+        },
+        {
+          "path": "/api/r/{slug}/viewers",
+          "method": "GET",
+          "name": "subreddit_viewers",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/live.rs:120",
+          "provenance": "provable"
+        },
+        {
+          "path": "/api/subreddits",
+          "method": "GET",
+          "name": "subreddit_api_list",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "provenance": "provable"
+        },
+        {
+          "path": "/api/subreddits/{id}",
+          "method": "GET",
+          "name": "subreddit_api_get",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "provenance": "provable"
+        },
+        {
+          "path": "/comments/{commentable_type}/{parent_id}",
+          "method": "GET",
+          "name": "autumn_web::commentable::show_thread",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "provenance": "provable"
+        },
+        {
+          "path": "/comments/{commentable_type}/{parent_id}",
+          "method": "POST",
+          "name": "autumn_web::commentable::post_comment",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "provenance": "declared"
+        },
+        {
+          "path": "/consent/accept",
+          "method": "POST",
+          "name": "accept",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/consent.rs:47",
+          "provenance": "provable"
+        },
+        {
+          "path": "/consent/manage",
+          "method": "GET",
+          "name": "manage",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/consent.rs:81",
+          "provenance": "provable"
+        },
+        {
+          "path": "/consent/reject",
+          "method": "POST",
+          "name": "reject",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/consent.rs:55",
+          "provenance": "provable"
+        },
+        {
+          "path": "/consent/withdraw",
+          "method": "POST",
+          "name": "withdraw",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/consent.rs:67",
+          "provenance": "provable"
+        },
+        {
+          "path": "/dev/trigger-404",
+          "method": "GET",
+          "name": "trigger_404",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/errors.rs:45",
+          "provenance": "provable"
+        },
+        {
+          "path": "/dev/trigger-error",
+          "method": "GET",
+          "name": "trigger_error",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/errors.rs:23",
+          "provenance": "provable"
+        },
+        {
+          "path": "/dev/trigger-panic",
+          "method": "GET",
+          "name": "trigger_panic",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/errors.rs:36",
+          "provenance": "provable"
+        },
+        {
+          "path": "/health",
+          "method": "GET",
+          "name": "health",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/live",
+          "method": "GET",
+          "name": "live",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/login",
+          "method": "GET",
+          "name": "login_form",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/auth.rs:546",
+          "provenance": "provable"
+        },
+        {
+          "path": "/login",
+          "method": "POST",
+          "name": "login",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/auth.rs:558",
+          "provenance": "provable"
+        },
+        {
+          "path": "/logout",
+          "method": "POST",
+          "name": "logout",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/auth.rs:618",
+          "provenance": "provable"
+        },
+        {
+          "path": "/posts/stream",
+          "method": "GET",
+          "name": "posts_stream",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/live.rs:214",
+          "provenance": "provable"
+        },
+        {
+          "path": "/posts/{post_id}",
+          "method": "GET",
+          "name": "show_by_id",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/posts.rs:928",
+          "provenance": "provable"
+        },
+        {
+          "path": "/posts/{post_id}/downvote",
+          "method": "POST",
+          "name": "downvote",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/votes.rs:45",
+          "provenance": "provable"
+        },
+        {
+          "path": "/posts/{post_id}/upvote",
+          "method": "POST",
+          "name": "upvote",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/votes.rs:30",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r",
+          "method": "GET",
+          "name": "list",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/subreddits.rs:29",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/create",
+          "method": "GET",
+          "name": "create_form",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/subreddits.rs:91",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/create",
+          "method": "POST",
+          "name": "create",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/subreddits.rs:224",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/{slug}",
+          "method": "GET",
+          "name": "show",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/subreddits.rs:317",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/{slug}/posts/stream",
+          "method": "GET",
+          "name": "subreddit_posts_stream",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/live.rs:223",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/{slug}/submit",
+          "method": "GET",
+          "name": "submit_to_sub_form",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/posts.rs:415",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/{slug}/viewers/stream",
+          "method": "GET",
+          "name": "subreddit_viewer_stream",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/live.rs:136",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}",
+          "method": "DELETE",
+          "name": "delete_post",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/posts.rs:1655",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}",
+          "method": "GET",
+          "name": "show",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/posts.rs:961",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}",
+          "method": "POST",
+          "name": "update",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/posts.rs:1352",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}/edit",
+          "method": "GET",
+          "name": "edit_form",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/posts.rs:1250",
+          "provenance": "provable"
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}/tags",
+          "method": "POST",
+          "name": "manage_tags",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/posts.rs:1625",
+          "provenance": "provable"
+        },
+        {
+          "path": "/ready",
+          "method": "GET",
+          "name": "ready",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/register",
+          "method": "GET",
+          "name": "register_form",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/auth.rs:136",
+          "provenance": "provable"
+        },
+        {
+          "path": "/register",
+          "method": "POST",
+          "name": "register",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/auth.rs:150",
+          "provenance": "provable"
+        },
+        {
+          "path": "/settings/avatar",
+          "method": "GET",
+          "name": "avatar_form",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/avatars.rs:39",
+          "provenance": "provable"
+        },
+        {
+          "path": "/settings/avatar",
+          "method": "POST",
+          "name": "upload_avatar",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/avatars.rs:117",
+          "provenance": "provable"
+        },
+        {
+          "path": "/startup",
+          "method": "GET",
+          "name": "startup",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/css/autumn-flash.css",
+          "method": "GET",
+          "name": "flash_css",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/css/autumn-widgets.css",
+          "method": "GET",
+          "name": "widgets_css",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/autumn-htmx-csrf.ba2cd05f.js",
+          "method": "GET",
+          "name": "htmx_csrf",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/autumn-htmx-csrf.js",
+          "method": "GET",
+          "name": "htmx_csrf",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/autumn-widgets.3dc97cf9.js",
+          "method": "GET",
+          "name": "autumn_widgets",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/autumn-widgets.js",
+          "method": "GET",
+          "name": "autumn_widgets",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/htmx.min.e209dda5.js",
+          "method": "GET",
+          "name": "htmx",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/htmx.min.js",
+          "method": "GET",
+          "name": "htmx",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/idiomorph.min.2d1bbb2d.js",
+          "method": "GET",
+          "name": "idiomorph",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/idiomorph.min.js",
+          "method": "GET",
+          "name": "idiomorph",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/sse.83eca6fa.js",
+          "method": "GET",
+          "name": "htmx_sse",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/js/sse.js",
+          "method": "GET",
+          "name": "htmx_sse",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/static/{*path}",
+          "method": "GET",
+          "name": "static_files",
+          "classification": "framework",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "framework",
+          "provenance": "provable"
+        },
+        {
+          "path": "/submit",
+          "method": "GET",
+          "name": "submit_form",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/posts.rs:376",
+          "provenance": "provable"
+        },
+        {
+          "path": "/submit",
+          "method": "POST",
+          "name": "submit",
+          "classification": "gated",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/posts.rs:726",
+          "provenance": "provable"
+        },
+        {
+          "path": "/u/{username}",
+          "method": "GET",
+          "name": "profile",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/auth.rs:654",
+          "provenance": "provable"
+        },
+        {
+          "path": "/webhooks/stripe",
+          "method": "POST",
+          "name": "stripe_webhook",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/webhooks.rs:26",
+          "provenance": "provable"
+        },
+        {
+          "path": "/ws/feed",
+          "method": "WS",
+          "name": "live_feed",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/live.rs:20",
+          "provenance": "provable"
+        },
+        {
+          "path": "/ws/r/{slug}",
+          "method": "WS",
+          "name": "subreddit_feed",
+          "classification": "public",
+          "roles": [],
+          "scopes": [],
+          "policy": false,
+          "source": "user",
+          "location": "examples/reddit-clone/src/routes/live.rs:76",
+          "provenance": "provable"
+        }
+      ]
+    },
+    "csrf": {
+      "provenance": "declared",
+      "source": "config:security.csrf",
+      "exempt_paths": [
+        "/webhooks/stripe"
+      ],
+      "entries": [
+        {
+          "path": "/comments/{commentable_type}/{parent_id}",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/consent/accept",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/consent/reject",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/consent/withdraw",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/login",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/logout",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/posts/{post_id}/downvote",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/posts/{post_id}/upvote",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/r/create",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}",
+          "method": "DELETE",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}/tags",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/register",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/settings/avatar",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/submit",
+          "method": "POST",
+          "csrf_enforced": true,
+          "exempt": false
+        },
+        {
+          "path": "/webhooks/stripe",
+          "method": "POST",
+          "csrf_enforced": false,
+          "exempt": true
+        }
+      ]
+    },
+    "security_headers": {
+      "provenance": "declared",
+      "source": "config:security.headers",
+      "entries": [
+        {
+          "header": "content_security_policy",
+          "value": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'self'",
+          "emitted": true
+        },
+        {
+          "header": "permissions_policy",
+          "value": "",
+          "emitted": false
+        },
+        {
+          "header": "referrer_policy",
+          "value": "strict-origin-when-cross-origin",
+          "emitted": true
+        },
+        {
+          "header": "strict_transport_security",
+          "value": "max-age=31536000; includeSubDomains",
+          "emitted": true
+        },
+        {
+          "header": "x_content_type_options",
+          "value": "nosniff",
+          "emitted": true
+        },
+        {
+          "header": "x_frame_options",
+          "value": "DENY",
+          "emitted": true
+        },
+        {
+          "header": "xss_protection",
+          "value": "1; mode=block",
+          "emitted": true
+        }
+      ]
+    },
+    "authorization_policies": {
+      "provenance": "provable",
+      "source": "macro:#[authorize]",
+      "runtime_caveat": "the route→action→resource binding is proven from macro-expanded code; which impl Policy<Resource> serves it is resolved from the PolicyRegistry at boot (AppBuilder::policy::<R, _>(...)). A missing registration is not visible at build time — see the policy_registration entry in `excluded`.",
+      "entries": []
+    },
+    "mtls": {
+      "provenance": "declared",
+      "source": "config:server.tls.client_auth",
+      "mode": "off",
+      "required_paths": [],
+      "entries": [
+        {
+          "path": "/",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/_autumn/jobs/{token}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/_partials/nav-auth",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/about",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/a11y",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/health",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/info",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/metrics",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/prometheus",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/ui",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/actuator/ui/metrics",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/api/live/relay/health",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/api/posts",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/api/posts/{id}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/api/r/{slug}/viewers",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/api/subreddits",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/api/subreddits/{id}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/comments/{commentable_type}/{parent_id}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/comments/{commentable_type}/{parent_id}",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/consent/accept",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/consent/manage",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/consent/reject",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/consent/withdraw",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/dev/trigger-404",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/dev/trigger-error",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/dev/trigger-panic",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/health",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/live",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/login",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/login",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/logout",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/posts/stream",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/posts/{post_id}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/posts/{post_id}/downvote",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/posts/{post_id}/upvote",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/r",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/create",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/create",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/{slug}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/{slug}/posts/stream",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/{slug}/submit",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/{slug}/viewers/stream",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}",
+          "method": "DELETE",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}/edit",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/r/{sub_slug}/posts/{post_slug}/tags",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/ready",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/register",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/register",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/settings/avatar",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/settings/avatar",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/startup",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/css/autumn-flash.css",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/css/autumn-widgets.css",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/autumn-htmx-csrf.ba2cd05f.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/autumn-htmx-csrf.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/autumn-widgets.3dc97cf9.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/autumn-widgets.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/htmx.min.e209dda5.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/htmx.min.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/idiomorph.min.2d1bbb2d.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/idiomorph.min.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/sse.83eca6fa.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/js/sse.js",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/static/{*path}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/submit",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/submit",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/u/{username}",
+          "method": "GET",
+          "mtls_required": false
+        },
+        {
+          "path": "/webhooks/stripe",
+          "method": "POST",
+          "mtls_required": false
+        },
+        {
+          "path": "/ws/feed",
+          "method": "WS",
+          "mtls_required": false
+        },
+        {
+          "path": "/ws/r/{slug}",
+          "method": "WS",
+          "mtls_required": false
+        }
+      ]
+    }
+  },
+  "excluded": [
+    {
+      "dimension": "repository_policy_bindings",
+      "eventual_provenance": "provable",
+      "reason": "#[repository(api = ..., policy = ...)] auto-API handlers enforce fixed show/create/update/delete policy actions, but the macro discards the policy type at expansion and RepositoryApiMeta carries only a type-erased probe; their presence still shows as routes.entries[].policy"
+    },
+    {
+      "dimension": "sessions",
+      "eventual_provenance": "declared",
+      "reason": "later phase"
+    },
+    {
+      "dimension": "secrets",
+      "eventual_provenance": "declared",
+      "reason": "later phase"
+    },
+    {
+      "dimension": "encryption",
+      "eventual_provenance": "provable",
+      "reason": "later phase (#[encrypted] fields provable; key config declared)"
+    },
+    {
+      "dimension": "rate_limit",
+      "eventual_provenance": "declared",
+      "reason": "later phase"
+    },
+    {
+      "dimension": "submit_token",
+      "eventual_provenance": "declared",
+      "reason": "later phase"
+    },
+    {
+      "dimension": "outbound_http",
+      "eventual_provenance": "declared",
+      "reason": "later phase; named-client base_urls allowlist is config, nothing proves every outbound call routes through a named client"
+    },
+    {
+      "dimension": "policy_registration",
+      "eventual_provenance": "runtime-only",
+      "reason": "boot-time fact; excluded from a build-time manifest by design — the authorization_policies dimension proves bindings and carries this as its runtime_caveat"
+    },
+    {
+      "dimension": "serve_path_routers",
+      "eventual_provenance": "provable",
+      "reason": "opt-in serve-path HTTP surfaces (MCP, inbound-mail, storage, SEO) are injected only on the serve path, after the dump early-exit, so they are not enumerated by `autumn routes` at build time; their mutating POSTs (MCP, inbound-mail) run outside the framework CSRF layer and self-protect (MCP: origin + csrf_header + trusted-host; inbound-mail: provider signature verification). Enumerating them is deferred to a dump-plumbing follow-up"
+    }
+  ]
+}

@@ -419,6 +419,39 @@ fn generate_model_with_the_token_also_emits_the_shared_table() {
     assert!(model.contains("pub comment_count: i64"), "{model}");
 }
 
+/// A `Comment` model that is itself `comments:commentable` owns the table name
+/// the shared table needs. Generation refuses, and writes nothing.
+#[test]
+fn a_comment_model_cannot_be_commentable_itself() {
+    for verb in ["scaffold", "model"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        run_autumn_ok(tmp.path(), &["new", "cmt-self-app"]);
+        let project = tmp.path().join("cmt-self-app");
+
+        let (ok, output) = run_autumn(
+            &project,
+            &[
+                "generate",
+                verb,
+                "Comment",
+                "body:Text",
+                "comments:commentable",
+            ],
+        );
+        assert!(!ok, "{verb} must refuse");
+        assert!(
+            output.contains("the shared table of `comments:commentable` uses that name"),
+            "{verb}: {output}"
+        );
+        assert!(!project.join("src/models/comment.rs").exists(), "{verb}");
+        assert!(
+            !project.join("migrations").exists()
+                || count_migrations_ending_in(&project, "_create_comments") == 0,
+            "{verb}: a refusal writes no migration"
+        );
+    }
+}
+
 /// Issue #2283: a `Comment` scaffold makes a plain `comments` table. The shared
 /// table has the same name, so a second `CREATE TABLE comments` stops
 /// `migrate`. Generation must refuse, write no file, and name the remedy. The

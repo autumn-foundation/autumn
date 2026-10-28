@@ -47,7 +47,6 @@
 //!   and its drift from the source of truth. `/actuator/derivations` serves it.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 
 use diesel::sql_types::{BigInt, Nullable, Text};
 use diesel_async::RunQueryDsl as _;
@@ -198,7 +197,7 @@ impl DerivationDef {
             "tenant_column",
             self.tenant_column.unwrap_or("").as_bytes(),
         );
-        hex_lower(hasher.finalize())
+        hex::encode(hasher.finalize())
     }
 
     /// The derivation as the SQL builders in `counter_cache` see it.
@@ -236,16 +235,6 @@ fn push_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
     hasher.update(b":");
     hasher.update(value);
     hasher.update(b";");
-}
-
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
-        |mut out, byte| {
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
 }
 
 // ── Registry ────────────────────────────────────────────────────────────────
@@ -348,6 +337,51 @@ pub fn registered_derivations() -> Vec<&'static DerivationDef> {
         .collect();
     defs.sort_unstable_by_key(|def| def.name);
     defs
+}
+
+/// A fingerprint of the registered derivations: each name and definition
+/// hash. It changes when a derivation is added, removed, renamed or changed.
+/// `None` when this binary registers none. The fleet sweeper's.
+#[cfg(feature = "sqlite")]
+pub(crate) fn registry_fingerprint() -> Option<String> {
+    use sha2::Digest as _;
+
+    let defs = registered_derivations();
+    if defs.is_empty() {
+        return None;
+    }
+    let mut hasher = sha2::Sha256::new();
+    for def in defs {
+        push_component(&mut hasher, "name", def.name.as_bytes());
+        push_component(&mut hasher, "hash", def.definition_hash().as_bytes());
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+/// Whether the backfill of every registered derivation is complete on this
+/// database, under the definition this binary has. Reads only.
+///
+/// # Errors
+///
+/// Returns an error when the state table cannot be read for a reason other
+/// than its absence.
+#[cfg(feature = "sqlite")]
+pub(crate) async fn derivations_settled(conn: &mut RuntimeConnection) -> AutumnResult<bool> {
+    let defs = registered_derivations();
+    if defs.is_empty() {
+        return Ok(true);
+    }
+    let state = match load_state(conn).await {
+        Ok(state) => state,
+        Err(error) if is_missing_state_table(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    Ok(defs.iter().all(|def| {
+        state.get(def.name).is_some_and(|row| {
+            row.definition_hash == def.definition_hash()
+                && BackfillState::parse(&row.backfill_state) == Some(BackfillState::Complete)
+        })
+    }))
 }
 
 /// Whether this binary links any `#[derivation]` at all.
@@ -1561,6 +1595,18 @@ mod tests {
         assert_ne!(count_def().definition_hash(), sum_def().definition_hash());
     }
 
+    /// Characterization for the Echo clone class: `definition_hash` renders
+    /// its digest through this file's own `hex_lower`, one of six
+    /// byte-identical copies across the crate. Pinned before `hex_lower` is
+    /// replaced by the `hex` crate (already a dependency) at its call site.
+    #[test]
+    fn definition_hash_is_pinned_hex() {
+        assert_eq!(
+            count_def().definition_hash(),
+            "ec7890d9c13320917bd7ed3fddc72dafa9e7bd265dd598014bc4236895b53875"
+        );
+    }
+
     #[test]
     fn the_definition_hash_tracks_every_part_of_the_lowered_shape() {
         let base = count_def().definition_hash();
@@ -1631,12 +1677,13 @@ mod tests {
     #[test]
     fn a_sum_recompute_sums_the_contribution() {
         let sql = crate::counter_cache::recompute_update_sql(&sum_def().sql_view(), "5");
+        let score_sum = crate::counter_cache::sum_expr("__autumn_cc_child.\"score\"");
         assert!(
-            sql.starts_with(
+            sql.starts_with(&format!(
                 "UPDATE \"dv_posts\" SET \"visible_score\" = \
-                 (SELECT COALESCE(SUM(__autumn_cc_child.\"score\"), 0) \
+                 (SELECT {score_sum} \
                   FROM \"dv_comments\" AS __autumn_cc_child"
-            ),
+            )),
             "{sql}"
         );
         assert!(

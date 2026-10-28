@@ -146,7 +146,7 @@ per-file verdict. Here is a real run in an app scaffolded before this feature
 existed — which is every app that exists today:
 
 ```text
-Scaffold files (unknown -> 0.8.0)
+Scaffold files (unknown -> 0.9.0)
   This project predates scaffold provenance, so there is no record of
   what Autumn originally wrote. Files it is missing are offered; every
   file that differs is a conflict for you to review.
@@ -176,12 +176,12 @@ Nothing was written. Re-run with `--apply` to take the writable ones.
 Each file's diff is above; `git status` and `git diff` show what is yours.
 Conflicts are never overwritten. Take what you want from this release's
 version, or `autumn upgrade --accept <path>` to keep yours for good.
-Upgrade guide: https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.8.0.md
+Upgrade guide: https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.9.0.md
 ```
 
 Once the project has a baseline — see [How it knows you edited a
 file](#how-it-knows-you-edited-a-file) — the header names the release it was
-last reconciled to (`Scaffold files (0.7.0 -> 0.8.0)`), the banner goes away,
+last reconciled to (`Scaffold files (0.8.0 -> 0.9.0)`), the banner goes away,
 and an edited file is reported as `you changed this since it was scaffolded`
 rather than as an unprovable one.
 
@@ -248,7 +248,7 @@ A `conflict` says which of four things it is:
 | `you changed this since it was scaffolded` | The file no longer matches the digest Autumn recorded for it. |
 | `no recorded baseline, so an edit cannot be ruled out` | Nothing was recorded for this file — see [Projects older than this feature](#projects-older-than-this-feature). |
 | `on disk but unreadable as text, so its contents are unknown` | It is not UTF-8, it is a directory, or the process cannot open it. What it holds is unknown, so it is untouchable. |
-| `a symlink; writing through it could write outside the project` | The path is a symbolic link. Writing through it would write wherever it points, which need not be inside the project — so the link is reported and left exactly as it is. |
+| `a symlink; writing through it could write outside the project` | The path is a symbolic link. Writing through it would write wherever it points, which need not be inside the project — so the link is reported and left exactly as it is. A link is a conflict even when its target matches this release. The verdict must not depend on a file outside the project. To keep a deliberate link, run `autumn upgrade --accept <path>`. |
 
 ### Finishing a conflict
 
@@ -287,8 +287,8 @@ contents nor its timestamp can answer that. So `autumn new` records a digest of
 every framework-owned file as it writes it, in `.autumn/scaffold.toml`:
 
 ```toml
-version = "0.8.0"
-written_by = "0.8.0"
+version = "0.9.0"
+written_by = "0.9.0"
 flavor = "fullstack"
 i18n = false
 seed = false
@@ -382,21 +382,56 @@ hatch.
 
 ### Inside a Cargo workspace
 
-If the project is a crate inside an enclosing workspace — meaning its own
-`Cargo.toml` has no `[workspace]` table of its own — the files that workspace
-owns at *its* root are out of scope here, and the report says so:
+Your crate may sit inside an enclosing workspace. Then its own `Cargo.toml`
+has no `[workspace]` table. Some files belong to the workspace, not to the
+member. These are the root files. `autumn upgrade` plans them at their owner,
+as `../` paths:
 
-- `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are resolved from the
-  nearest ancestor of the crate being built, so a crate-local copy does not add
-  to the workspace's — it **shadows** it, silently dropping its lints and its
-  MSRV pin with no diagnostic.
-- GitHub only runs workflows from the repository root, so a member's
-  `.github/workflows/ci.yml` never runs at all.
+- `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` go to the
+  **workspace root**. Cargo reads them from the nearest ancestor. A copy in the
+  member **shadows** the workspace's copy and drops its lints and MSRV pin with
+  no diagnostic.
+- `ci.yml` and `posture-gate.yml` go to the **git root**. GitHub runs
+  workflows from there only. The command writes them for this member. `ci.yml`
+  runs in the member directory. `posture-gate.yml` sets `POSTURE_MANIFEST` to
+  the member path, and `-p <member>` in `POSTURE_AUDIT_FLAGS`.
 
-Everything genuinely per-crate — `autumn.toml`, `Dockerfile`, `.dockerignore`,
-`build.rs`, `.gitignore`, `.env.example`, and the CSS pipeline — is reconciled as
-usual. Reconcile the workspace-level files by running the command at the
-workspace root, if that root is itself an Autumn project.
+The command plans a root file only inside the member's own git repository:
+
+- With no git repository, it plans no root file.
+- If the workspace root is outside the repository, it plans no root file.
+- If the workspace root is below the git root, it plans the three Cargo files
+  only. The posture gate runs from the git root and cannot build the member
+  there.
+- If Cargo does not count the crate as a workspace member (an excluded
+  crate), it plans the three Cargo files only. `-p` cannot select the crate.
+  The command asks `cargo metadata --no-deps`, so it needs `cargo` on the path.
+- If the member path has a space or other special character, it plans no
+  workflow.
+- A nested git repository or submodule is its own git root. Its workflows stay
+  in the member, and the three Cargo files are out of scope.
+
+A member may still hold its own copy of a Cargo file, for example one that
+`autumn new` wrote. That copy shadows the root file. The report shows it as a
+conflict. The command does not delete it. Delete it yourself.
+
+The report says which files it plans. `--json` marks each root file with
+`"outside_project": true`.
+
+A repository holds one copy of each root file. If another member, or you,
+already wrote the file, it is a **conflict**. The command does not write it. A
+workspace that already has these files sees conflicts in every member on the
+first run. Run `autumn upgrade --accept ../clippy.toml` to leave a file as it
+is. The member then has no copy to keep current. A workflow names one member,
+so it serves one member only.
+
+The digests of root files are in the member's own `.autumn/scaffold.toml`. The
+keys are paths from the member. If you move the member, the digests no longer
+match, and the files show as conflicts.
+
+Everything per-member — `autumn.toml`, `Dockerfile`, `.dockerignore`,
+`build.rs`, `.gitignore`, `.env.example`, and the CSS pipeline — is reconciled
+as before.
 
 `autumn new` writes a bare `[workspace]` table into every generated
 `Cargo.toml`, so a scaffolded project is its own workspace root wherever you
@@ -435,7 +470,7 @@ same `scaffold` key, so one `jq '.scaffold.drift'` works against either:
 {
   "scaffold": {
     "baseline": "0.7.0",
-    "target": "0.8.0",
+    "target": "0.9.0",
     "named": true,
     "has_manifest": true,
     "workspace_member": false,
@@ -445,7 +480,7 @@ same `scaffold` key, so one `jq '.scaffold.drift'` works against either:
     "written": 0,
     "conflicts": 1,
     "pinned": 0,
-    "guide": "https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.8.0.md",
+    "guide": "https://github.com/autumn-foundation/autumn/blob/trunk-dev/docs/migrations/0.9.0.md",
     "files": [
       { "path": "clippy.toml", "status": "add", "reason": "…", "applied": true }
     ]
@@ -506,7 +541,7 @@ autumn upgrade --check
 
 # 8. Now bump the library and build.
 #    (The codemods migrate FROM the version Cargo.toml records, so this is last.)
-cargo add autumn-web@0.8.0
+cargo add autumn-web@0.9.0
 cargo check
 
 # 9. Read the release's migration guide for anything mechanical rewriting

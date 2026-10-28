@@ -1,0 +1,46 @@
+# The TLC checks that scripts/verify-tla.sh runs. One check per line:
+#
+#   <expect>  <spec>  <variant>  <property> [<property> ...]
+#
+# holds     TLC checks every reachable state, and every property holds.
+#           The run also fails when it visits MAX_STATES or more states.
+# violates  TLC must find a counterexample for each property (one run each).
+#           A seeded bug that gives no counterexample fails the check.
+# reaches   Each property must be true in some reachable state (one run
+#           each). A correct model that never reaches it is vacuous.
+#
+# verification/models/tests/tla_checks.rs fails when a seeded bug of a
+# Stateright twin has no line here.
+
+holds     JobClaim            Correct                  TypeOK StaleSettleRejected OneExecutionAtATime
+reaches   JobClaim            Correct                  JobIsRecovered JobIsReclaimed LateSettleArrives JobCompletes
+violates  JobClaim            SettleWithoutOwnerFence  StaleSettleRejected
+violates  JobClaim            NoGiveUp                 OneExecutionAtATime
+violates  JobClaim            RecoverLiveClaim         OneExecutionAtATime
+
+holds     TickElection        Correct                  TypeOK TickRunsAtMostOnce
+reaches   TickElection        Correct                  TickRuns FreedTickIsReclaimed RowIsPruned
+violates  TickElection        OverwriteOnConflict      TickRunsAtMostOnce
+violates  TickElection        HoldShorterThanPeriod    TickRunsAtMostOnce
+violates  TickElection        HoldIsMax                TickRunsAtMostOnce
+violates  TickElection        NoLatenessCheck          TickRunsAtMostOnce
+violates  TickElection        FreeWithoutGeneration    TickRunsAtMostOnce
+
+holds     LeaseLock           Correct                  TypeOK StaleWriteRejected TokensAreUnique LiveHoldersExclusive
+reaches   LeaseLock           Correct                  StaleWriteIsTried ExpiredLeaseIsTaken
+violates  LeaseLock           ResourceIgnoresToken     StaleWriteRejected
+violates  LeaseLock           AcquireKeepsGeneration   TokensAreUnique StaleWriteRejected
+violates  LeaseLock           ReleaseDeletesRow        TokensAreUnique
+violates  LeaseLock           RenewIgnoresGeneration   LiveHoldersExclusive
+# ADR 0015: fencing makes an overlap of holders safe. An acquire that takes a
+# live lease is a bug, but the resource still rejects the stale write.
+holds     LeaseLock           AcquireWhileHeld         StaleWriteRejected
+violates  LeaseLock           AcquireWhileHeld         LiveHoldersExclusive
+
+holds     FleetSlotOwnership  Correct                  TypeOK ServingExclusive ServingHostIsAdmitted EpochsUnique RestoreTakesNewestEpoch CurrentOwnerNeverFenced
+reaches   FleetSlotOwnership  Correct                  LeaseIsTakenOver ReplicatorIsFenced StaleGenerationLandsLate RestoreOrderMatters
+violates  FleetSlotOwnership  TrustFullTtl             ServingExclusive ServingHostIsAdmitted
+violates  FleetSlotOwnership  ClaimIgnoresLiveLease    ServingExclusive ServingHostIsAdmitted
+violates  FleetSlotOwnership  TakeoverKeepsEpoch       EpochsUnique
+violates  FleetSlotOwnership  RestoreByTime            RestoreTakesNewestEpoch
+violates  FleetSlotOwnership  FenceOnAnyOtherEpoch     CurrentOwnerNeverFenced

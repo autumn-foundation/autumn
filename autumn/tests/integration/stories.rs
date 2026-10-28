@@ -232,6 +232,8 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "comment-thread",
     "confirm-action",
     "data-table",
+    // Form field wrapper (`autumn_web::form`, #3395), not a `widgets.rs` fn.
+    "field",
     "hero",
     "infinite-feed",
     "locale-switcher",

@@ -298,6 +298,15 @@ fn write_contract(
     admission_limit: usize,
     host: autumn_web::capacity::HostProfile,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
+    write_contract_under(admission_limit, host, "test")
+}
+
+/// [`write_contract`] calibrated under `profile`.
+fn write_contract_under(
+    admission_limit: usize,
+    host: autumn_web::capacity::HostProfile,
+    profile: &str,
+) -> (tempfile::TempDir, std::path::PathBuf) {
     let routes = vec![autumn_web::capacity::RouteShape {
         method: "GET".to_owned(),
         path: "/block".to_owned(),
@@ -321,7 +330,11 @@ fn write_contract(
             saturation_concurrency: admission_limit,
             admission_limit,
         },
-        calibration: autumn_web::capacity::Calibration::default(),
+        // Calibrated under the profile the test app runs as (#2418).
+        calibration: autumn_web::capacity::Calibration {
+            profile: profile.to_owned(),
+            ..autumn_web::capacity::Calibration::default()
+        },
         routes,
     };
 
@@ -417,6 +430,90 @@ async fn a_contract_from_another_host_class_does_not_throttle_this_process() {
     second.await.unwrap().assert_ok();
 }
 
+static GATE_PROFILE: LazyLock<Notify> = LazyLock::new(Notify::new);
+static ENTERED_PROFILE: AtomicUsize = AtomicUsize::new(0);
+
+#[get("/block")]
+async fn block_other_profile_contract() -> &'static str {
+    ENTERED_PROFILE.fetch_add(1, Ordering::SeqCst);
+    GATE_PROFILE.notified().await;
+    "released"
+}
+
+/// A contract calibrated under another profile must not throttle this one
+/// (#2418). A profile change moves the pool and middleware, so the measured
+/// envelope does not describe this process.
+#[tokio::test]
+async fn a_contract_calibrated_under_another_profile_does_not_throttle() {
+    let _guard = install_capture().1;
+    let (_dir, path) =
+        write_contract_under(1, autumn_web::capacity::HostProfile::detect(), "staging");
+
+    let client = Arc::new(
+        TestApp::new()
+            .config(config_with_contract(&path))
+            .routes(routes![block_other_profile_contract])
+            .build(),
+    );
+
+    let held = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get("/block").send().await })
+    };
+    wait_for_entered(&ENTERED_PROFILE, 1).await;
+
+    let second = {
+        let client = Arc::clone(&client);
+        tokio::spawn(async move { client.get("/block").send().await })
+    };
+    wait_for_entered(&ENTERED_PROFILE, 2).await;
+
+    GATE_PROFILE.notify_waiters();
+    held.await.unwrap().assert_ok();
+    second.await.unwrap().assert_ok();
+}
+
+/// The public resolvers agree on the profile rule.
+#[test]
+fn the_public_resolvers_check_the_calibrated_profile() {
+    use autumn_web::capacity::{
+        AdmissionLimit, HostProfile, resolve_admission_limit_for_profile,
+        resolve_admission_limit_with_default, resolve_configured_admission_limit,
+        resolve_configured_admission_limit_for_profile,
+        resolve_configured_admission_limit_with_default,
+    };
+    let _guard = install_capture().1;
+    let host = HostProfile::detect();
+    let (_dir, path) = write_contract_under(7, host.clone(), "staging");
+    let text = path.to_str().expect("utf-8 path");
+
+    assert_eq!(
+        resolve_admission_limit_for_profile(None, Some(&path), &host, Some(9), Some("prod")),
+        AdmissionLimit::ProfileDefault(9)
+    );
+    assert_eq!(
+        resolve_admission_limit_for_profile(None, Some(&path), &host, Some(9), Some("staging")),
+        AdmissionLimit::Contract(7)
+    );
+    assert_eq!(
+        resolve_configured_admission_limit_for_profile(None, Some(text), Some(9), Some("prod")),
+        AdmissionLimit::ProfileDefault(9)
+    );
+    // The unchecked entry points keep their old behavior.
+    assert_eq!(
+        resolve_admission_limit_with_default(None, Some(&path), &host, Some(9)),
+        AdmissionLimit::Contract(7)
+    );
+    assert_eq!(
+        resolve_configured_admission_limit_with_default(None, Some(text), Some(9)),
+        AdmissionLimit::Contract(7)
+    );
+    assert_eq!(
+        resolve_configured_admission_limit(None, Some(text)),
+        AdmissionLimit::Contract(7)
+    );
+}
+
 #[tokio::test]
 async fn default_config_never_sheds() {
     // See install_capture's doc: every test needs a real subscriber.
@@ -480,6 +577,164 @@ mod mcp_admission {
 
         GATE_MCP.notify_waiters();
         held.await.unwrap().assert_ok();
+    }
+
+    // ── #3068: an MCP tool call is admitted at its tool route's class ──
+
+    static GATE_CLASS: LazyLock<Notify> = LazyLock::new(Notify::new);
+    static ENTERED_CLASS: AtomicUsize = AtomicUsize::new(0);
+
+    #[get("/hold")]
+    async fn hold_class() -> &'static str {
+        ENTERED_CLASS.fetch_add(1, Ordering::SeqCst);
+        GATE_CLASS.notified().await;
+        "released"
+    }
+
+    static GATE_SHED: LazyLock<Notify> = LazyLock::new(Notify::new);
+    static ENTERED_SHED: AtomicUsize = AtomicUsize::new(0);
+
+    #[get("/hold-shed")]
+    async fn hold_shed() -> &'static str {
+        ENTERED_SHED.fetch_add(1, Ordering::SeqCst);
+        GATE_SHED.notified().await;
+        "released"
+    }
+
+    #[autumn_web::api_doc(mcp, summary = "Critical tool (#3068)")]
+    #[get("/critical-tool", criticality = "critical")]
+    async fn critical_tool() -> autumn_web::Json<serde_json::Value> {
+        autumn_web::Json(serde_json::json!({"ok": true}))
+    }
+
+    #[autumn_web::api_doc(mcp, summary = "Sheddable tool (#3068)")]
+    #[get("/sheddable-tool", criticality = "sheddable")]
+    async fn sheddable_tool() -> autumn_web::Json<serde_json::Value> {
+        autumn_web::Json(serde_json::json!({"ok": true}))
+    }
+
+    fn tools_call(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": {}}
+        })
+    }
+
+    /// With `default = 0.5` and a limit of 2, one held request fills the
+    /// `default` share. A `critical` tool must still be admitted through
+    /// `/mcp`: the envelope admits up to the full limit.
+    #[tokio::test]
+    async fn mcp_critical_tool_is_admitted_past_the_default_share() {
+        let mut config = config_with_ceiling(2);
+        config.server.admission.partitions.default = 0.5;
+        let client = Arc::new(
+            TestApp::new()
+                .config(config)
+                .routes(routes![hold_class, critical_tool])
+                .mount_mcp("/mcp")
+                .build(),
+        );
+        let held = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.get("/hold").send().await })
+        };
+        wait_for_entered(&ENTERED_CLASS, 1).await;
+
+        let resp = client
+            .post("/mcp")
+            .json(&tools_call("critical_tool"))
+            .send()
+            .await;
+        resp.assert_ok();
+        let body: serde_json::Value = resp.json();
+        assert_ne!(
+            body["result"]["isError"], true,
+            "a critical tool must not be shed at the default share: {body}"
+        );
+
+        GATE_CLASS.notify_waiters();
+        held.await.unwrap().assert_ok();
+    }
+
+    /// With a limit of 2, `sheddable = 0.5` gives one slot. One held
+    /// request takes it, so the replay of a `sheddable` tool is shed.
+    #[tokio::test]
+    async fn mcp_sheddable_tool_is_shed_at_its_share() {
+        let client = Arc::new(
+            TestApp::new()
+                .config(config_with_ceiling(2))
+                .routes(routes![hold_shed, sheddable_tool])
+                .mount_mcp("/mcp")
+                .build(),
+        );
+        let held = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { client.get("/hold-shed").send().await })
+        };
+        wait_for_entered(&ENTERED_SHED, 1).await;
+
+        let resp = client
+            .post("/mcp")
+            .json(&tools_call("sheddable_tool"))
+            .send()
+            .await;
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["result"]["isError"], true,
+            "a sheddable tool over its share must be shed: {body}"
+        );
+
+        GATE_SHED.notify_waiters();
+        held.await.unwrap().assert_ok();
+    }
+
+    static GATE_BURST: LazyLock<Notify> = LazyLock::new(Notify::new);
+    static ENTERED_BURST: AtomicUsize = AtomicUsize::new(0);
+
+    #[autumn_web::api_doc(mcp, summary = "Blocking sheddable tool (#3186)")]
+    #[get("/burst-tool", criticality = "sheddable")]
+    async fn burst_tool() -> autumn_web::Json<serde_json::Value> {
+        ENTERED_BURST.fetch_add(1, Ordering::SeqCst);
+        GATE_BURST.notified().await;
+        autumn_web::Json(serde_json::json!({"ok": true}))
+    }
+
+    /// With a limit of 10, `sheddable = 0.5` gives five slots. Six
+    /// concurrent `sheddable` calls shed exactly one (#3186).
+    #[tokio::test]
+    async fn mcp_sheddable_burst_sheds_only_the_excess() {
+        let client = Arc::new(
+            TestApp::new()
+                .config(config_with_ceiling(10))
+                .routes(routes![burst_tool])
+                .mount_mcp("/mcp")
+                .build(),
+        );
+        let calls: Vec<_> = (0..6)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    let resp = client
+                        .post("/mcp")
+                        .json(&tools_call("burst_tool"))
+                        .send()
+                        .await;
+                    resp.json::<serde_json::Value>()
+                })
+            })
+            .collect();
+        wait_for_entered(&ENTERED_BURST, 5).await;
+        // The shed call answers at once; the five others wait on the gate.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(ENTERED_BURST.load(Ordering::SeqCst), 5);
+        GATE_BURST.notify_waiters();
+        let mut shed = 0;
+        for call in calls {
+            if call.await.unwrap()["result"]["isError"] == true {
+                shed += 1;
+            }
+        }
+        assert_eq!(shed, 1, "exactly one call is over the share");
     }
 
     #[autumn_web::api_doc(mcp, summary = "Ping (MCP double-count regression, #1577)")]

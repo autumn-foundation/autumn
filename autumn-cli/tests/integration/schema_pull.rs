@@ -2018,3 +2018,56 @@ fn schema_pull_refuses_sqlite_backend() {
         "a refused SQLite pull must not create a snapshot file"
     );
 }
+
+/// #1975: `#[references]` actions go through the full Postgres loop. `schema
+/// diff` writes them, `schema pull` reads `confdeltype` / `confupdtype` back,
+/// and the next diff and `doctor` are clean.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers); run with -- --ignored"]
+async fn schema_pull_round_trips_fk_actions() {
+    let (_container, host, port) = start_postgres().await;
+    let url = format!("postgres://postgres:{SECRET_PW}@{host}:{port}/postgres");
+    let envs = [("AUTUMN_DATABASE__URL", url.as_str())];
+
+    let (_tmp, project) = fresh_project("pull_fk_actions_app");
+    let snapshot_path = project.join(".autumn/schema-snapshot.json");
+
+    write_models(
+        &project,
+        r#"
+#[autumn_web::model(managed)]
+pub struct Author {
+    #[id]
+    pub id: i64,
+}
+
+#[autumn_web::model(managed)]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[references(on_delete = "cascade")]
+    pub author_id: i64,
+    #[references(table = "authors", on_delete = "set_null", on_update = "restrict")]
+    pub editor_id: Option<i64>,
+}
+"#,
+    );
+    build_schema_into_db(&project, &envs);
+
+    run_autumn_ok(&project, &["schema", "pull"], &envs);
+    let snap = std::fs::read_to_string(&snapshot_path).expect("pulled snapshot");
+    assert!(snap.contains("\"on_delete\": \"Cascade\""), "{snap}");
+    assert!(snap.contains("\"on_delete\": \"SetNull\""), "{snap}");
+    assert!(snap.contains("\"on_update\": \"Restrict\""), "{snap}");
+
+    let (diff_out, _) = run_autumn_ok(&project, &["schema", "diff"], &envs);
+    assert!(
+        diff_out.contains("No schema changes"),
+        "the actions round-trip clean:\n{diff_out}"
+    );
+    let (doc_out, _) = run_autumn_ok(&project, &["schema", "doctor"], &envs);
+    assert!(
+        doc_out.contains("database schema matches the snapshot baseline"),
+        "doctor sees no drift:\n{doc_out}"
+    );
+}

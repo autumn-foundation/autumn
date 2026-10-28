@@ -11,7 +11,8 @@ runtime. Reading the manifest starts with reading these tags.
 
 ```json
 {
-  "schema_version": 4,
+  "schema_version": 6,
+  "build": { "profile": "release", "features": [], "all_features": false, "no_default_features": false },
   "dimensions": {
     "routes":           { "provenance": "provable",  "source": "macro:#[secured]/#[authorize]/#[public]", "entries": [ … ] },
     "csrf":             { "provenance": "declared",  "source": "config:security.csrf",     "entries": [ … ] },
@@ -139,6 +140,17 @@ Nothing about this can drift: the classification *is* the expansion of the
 macro. An unannotated mutating handler classifies `unclassified`, and the audit
 gate fails and names it.
 
+**Exception — a declared layer guard.** A route can be `gated` only because the
+app mounted its group with `AppBuilder::scoped_guarded`. The macros did not prove
+that guard. Its entry says `"provenance": "declared"`. When any entry is
+declared, the `routes` dimension is `declared` too, and its `source` ends with
+`declared:scoped_guarded`. See [Route Auth Coverage](route-auth-coverage.md).
+
+The per-entry `provenance` is schema v6. An older `autumn` CLI would read a
+declared guard as a proven one, so it refuses a v6 manifest and asks you to
+upgrade. A v3 to v5 manifest has no per-entry `provenance`: every guard in it
+was proven.
+
 **Example — an `#[authorize]` binding in the `authorization_policies`
 dimension.** Where `routes` answers "is this endpoint guarded at all?", this
 dimension answers "guarded *to do what, to which resource?*". A record-level
@@ -261,6 +273,24 @@ Reading a v3 manifest stays correct: v4 only *adds* this dimension, so an older
 document reads as "no route requires mTLS" rather than failing the gate. An app
 with client auth off projects no `mtls` lines at all, so its posture digest is
 unchanged by the bump.
+
+## The `build` object (schema v5)
+
+The manifest describes one binary. Two builds can mount different routes. A
+route behind `#[cfg(not(debug_assertions))]` is only in a release build. A
+route behind a feature is only in a build with that feature. Thus the manifest
+records the Cargo build that `routes audit` made:
+
+- `profile`: `dev`, `release`, or a custom profile name.
+- `features`: the `--features` values, split, sorted and deduplicated.
+- `all_features`, `no_default_features`: the Cargo flags.
+
+A v3 or v4 manifest has no `build`. It reads as the dev profile with default
+features, because that was the only build those versions made. The default
+build adds nothing to the posture digest, so an older manifest keeps its
+digest. Any other build is part of the digest. `autumn routes posture diff`
+reports `build_changed` (**widening**) when the two manifests come from
+different builds, because a diff across builds can hide a widening.
 
 ## `runtime-only`
 

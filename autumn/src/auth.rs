@@ -82,10 +82,11 @@ pub use password::{
 pub mod impersonation;
 pub use impersonation::{
     BEGIN_AUDIT_ACTION, END_AUDIT_ACTION, IMPERSONATED_SESSION_KEY, IMPERSONATION_SESSION_ID_KEY,
-    IMPERSONATOR_ROLE_SESSION_KEY, IMPERSONATOR_SESSION_KEY, IMPERSONATOR_STEP_UP_SESSION_KEY,
-    Impersonation, ImpersonationGate, ImpersonationPolicy, ImpersonationState, ImpersonationTarget,
-    RESERVED_SESSION_KEYS, audit_actor_id, begin_impersonation, end_impersonation,
-    impersonation_state, impersonator_id, is_impersonating, is_reserved_session_key,
+    IMPERSONATOR_IDENTITY_SESSION_KEY, IMPERSONATOR_ROLE_SESSION_KEY, IMPERSONATOR_SESSION_KEY,
+    IMPERSONATOR_STEP_UP_SESSION_KEY, Impersonation, ImpersonationGate, ImpersonationPolicy,
+    ImpersonationState, ImpersonationTarget, RESERVED_SESSION_KEYS, audit_actor_id,
+    begin_impersonation, end_impersonation, impersonation_state, impersonator_id, is_impersonating,
+    is_reserved_session_key,
 };
 
 pub mod remember;
@@ -434,8 +435,13 @@ where
             if let Some(user_id) = user_id {
                 // Fulfil the RateLimitPrincipal contract so key_strategy =
                 // "authenticated_principal" works without an extra middleware shim.
+                // Keyed on the operator while impersonating (issue #2347).
+                let throttle_id = match session.as_ref() {
+                    Some(session) => impersonation::audit_actor_id(session, &user_id).await,
+                    None => user_id.clone(),
+                };
                 req.extensions_mut()
-                    .insert(crate::security::RateLimitPrincipal(user_id.clone()));
+                    .insert(crate::security::RateLimitPrincipal(throttle_id));
                 // Publish the authenticated principal as the request's current
                 // actor (#1383) and tag the request-scoped log context (#1169)
                 // so handler logs for middleware-authenticated requests carry
@@ -1101,7 +1107,7 @@ pub async fn oauth2_authorize_url(
 
     // PKCE S256: generate a 32-byte random verifier, base64url-encode it.
     let mut verifier_bytes = [0u8; 32];
-    getrandom::getrandom(&mut verifier_bytes).map_err(|e| {
+    getrandom::fill(&mut verifier_bytes).map_err(|e| {
         crate::AutumnError::service_unavailable_msg(format!("pkce rng failed: {e}"))
     })?;
     let code_verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(verifier_bytes);
@@ -1691,9 +1697,30 @@ fn run_http_chain(
             let fut = interceptor.intercept(req, &next_fn);
             fut.await
         } else {
+            // This client is not the recorded outbound seam (#2351 item 1).
+            // The guard sits at the network call: a request that an
+            // interceptor answers, or that fails to build, sends nothing.
+            #[cfg(feature = "reporting")]
+            if let Err(refused) =
+                crate::capsule::guard_egress("oauth2", req.method().as_str(), req.url().as_str())
+            {
+                return refused_oauth_request(&refused);
+            }
             client.execute(req).await
         }
     })
+}
+
+/// The error a replay gives for an `OAuth2` call it refuses: a 503 response
+/// made here, so nothing reaches the network.
+#[cfg(all(feature = "oauth2", feature = "reporting"))]
+fn refused_oauth_request(
+    refused: &crate::capsule::UnrecordedEgress,
+) -> Result<reqwest::Response, reqwest::Error> {
+    tracing::warn!("{refused}");
+    let mut response = http::Response::new(reqwest::Body::from(refused.to_string()));
+    *response.status_mut() = http::StatusCode::SERVICE_UNAVAILABLE;
+    reqwest::Response::from(response).error_for_status()
 }
 
 #[cfg(feature = "oauth2")]
@@ -2315,8 +2342,12 @@ pub async fn rotate_api_token(
 
 /// Private marker inserted into request extensions by [`RequireApiToken`] after
 /// a bearer token is successfully verified.
+///
+/// Crate-visible so the idempotency layer can scope its cache by the verified
+/// principal (see `idempotency::bearer_scope_for_parts`). Only
+/// [`RequireApiToken`] constructs it, so a client cannot forge one.
 #[derive(Clone)]
-struct ApiTokenPrincipal(String);
+pub(crate) struct ApiTokenPrincipal(pub(crate) String);
 
 /// Scopes granted to the authenticating service token, inserted into request
 /// extensions by [`RequireApiToken`] after a bearer token is verified.
@@ -2633,7 +2664,8 @@ fn api_token_problem_context(req: &axum::extract::Request) -> (Option<String>, O
 pub const API_TOKEN_MIGRATIONS: diesel_migrations::EmbeddedMigrations =
     diesel_migrations::embed_migrations!("migrations");
 
-#[cfg(feature = "db")]
+// The store is typed on `AsyncPgConnection`, so it needs the Postgres client.
+#[cfg(feature = "postgres")]
 mod db_store {
     use std::future::Future;
     use std::pin::Pin;
@@ -2649,7 +2681,7 @@ mod db_store {
 
     use super::{
         ApiTokenStore, IssueTokenSpec, TokenMetadata, VerifiedToken, generate_raw_token,
-        hash_api_token,
+        hash_api_token, scopes_from_json,
     };
     use crate::error::AutumnError;
     use crate::time::{ClockSource, SystemClock};
@@ -2702,18 +2734,6 @@ mod db_store {
                 .map(|s| serde_json::Value::String(s.clone()))
                 .collect(),
         )
-    }
-
-    #[must_use]
-    pub fn scopes_from_json(value: &serde_json::Value) -> Vec<String> {
-        value
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// Postgres-backed [`ApiTokenStore`].
@@ -3000,16 +3020,26 @@ mod db_store {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub use db_store::DbApiTokenStore;
 /// Convert a JSONB `serde_json::Value` (array of strings) to a flat scope list.
 ///
 /// Returns an empty `Vec` for non-array values; non-string array elements are
 /// silently skipped. This is the canonical deserializer for the `scopes` JSONB
-/// column shared by [`DbApiTokenStore`] and the admin panel.
+/// column shared by `DbApiTokenStore` and the admin panel.
 #[cfg(feature = "db")]
 #[doc(hidden)]
-pub use db_store::scopes_from_json;
+#[must_use]
+pub fn scopes_from_json(value: &serde_json::Value) -> Vec<String> {
+    value
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 #[cfg(test)]
 mod tests {
@@ -5618,5 +5648,93 @@ mod oauth2_unit_tests {
             ),
             "default linking policy must be CreateAccount"
         );
+    }
+}
+
+/// #2351 item 1, Codex review on #3222: the `OAuth2` egress guard sits at the
+/// network call, not at the client.
+#[cfg(all(feature = "oauth2", feature = "reporting"))]
+#[cfg(test)]
+mod oauth_egress_guard_tests {
+    use crate::interceptor::{ACTIVE_HTTP_INTERCEPTORS, HttpInterceptor, HttpInterceptorFuture};
+    use std::sync::Arc;
+
+    /// Answers every request with a canned 200 and sends nothing.
+    struct CannedInterceptor;
+
+    impl HttpInterceptor for CannedInterceptor {
+        fn intercept<'a>(
+            &'a self,
+            _req: reqwest::Request,
+            _next: &'a dyn Fn(reqwest::Request) -> HttpInterceptorFuture<'a>,
+        ) -> HttpInterceptorFuture<'a> {
+            Box::pin(async {
+                Ok(reqwest::Response::from(http::Response::new(
+                    reqwest::Body::from("{}"),
+                )))
+            })
+        }
+    }
+
+    fn scope() -> Arc<crate::capsule::CaptureScope> {
+        Arc::new(crate::capsule::CaptureScope::new(
+            "oauth".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_request_an_interceptor_answers_keeps_the_capsule_complete() {
+        let scope = scope();
+        let client = super::oauth_http_client().expect("client");
+        let sent = crate::capsule::capture::with_capture_scope(Arc::clone(&scope), async {
+            ACTIVE_HTTP_INTERCEPTORS
+                .scope(
+                    vec![Arc::new(CannedInterceptor) as Arc<dyn HttpInterceptor>],
+                    async { client.get("http://127.0.0.1:54321/token").send().await },
+                )
+                .await
+        })
+        .await;
+        assert!(sent.expect("canned response").status().is_success());
+        assert!(!scope.is_truncated(), "nothing reached the network");
+    }
+
+    #[tokio::test]
+    async fn a_request_sent_to_the_network_marks_the_capsule_incomplete() {
+        let scope = scope();
+        let client = super::oauth_http_client().expect("client");
+        crate::capsule::capture::with_capture_scope(Arc::clone(&scope), async {
+            let _ = client.get("http://127.0.0.1:54321/token").send().await;
+        })
+        .await;
+        assert!(scope.is_truncated());
+    }
+
+    #[tokio::test]
+    async fn a_replay_refuses_the_network_call_but_not_an_answered_one() {
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let client = super::oauth_http_client().expect("client");
+        let (refused, answered) = crate::capsule::with_effect_tape(tape, async {
+            let refused = client.get("http://127.0.0.1:54321/token").send().await;
+            let answered = ACTIVE_HTTP_INTERCEPTORS
+                .scope(
+                    vec![Arc::new(CannedInterceptor) as Arc<dyn HttpInterceptor>],
+                    async { client.get("http://127.0.0.1:54321/token").send().await },
+                )
+                .await;
+            (refused, answered)
+        })
+        .await;
+        let refused = refused.expect_err("a replay refuses the network call");
+        assert_eq!(
+            refused.status(),
+            Some(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            "refused before the network: {refused}"
+        );
+        assert!(answered.expect("canned response").status().is_success());
     }
 }

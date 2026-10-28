@@ -26,6 +26,10 @@ There are three sources of truth the commands reconcile:
    engine compares against.
 3. **The database** — the live schema, evolved by applying migration files.
 
+For a managed model (see [below](#adopt-a-model-modelmanaged)), you write
+only (1). The CLI derives the migration, the snapshot, and the
+`diesel::table!` block in `src/schema.rs` from it.
+
 `autumn schema diff` compares (1) against (2) and emits the migration that
 converges the database on (1). `autumn schema migrate` applies pending migration
 files to (3). `autumn schema pull` reads (3) back into (2). `autumn schema
@@ -40,6 +44,94 @@ the backend from that profile's database URL. The snapshot is
 **provider-locked**: a command targeting one backend refuses to act on a snapshot
 tagged for another, so a SQLite snapshot can never be diffed or overwritten as
 Postgres by accident.
+
+---
+
+## Adopt a model: `#[model(managed)]`
+
+You select the declarative workflow for each model.
+
+- The CLI controls the table of a **managed** model, `#[model(managed)]`.
+  `schema diff` writes its migrations and its `src/schema.rs` block.
+- An **unmanaged** model, plain `#[model]`, is the default. You write its
+  migrations by hand (`autumn generate migration`). `schema diff` does not
+  change its table or its `src/schema.rs` block.
+
+Managed and unmanaged models can be in one app. `schema doctor` reports drift
+for both kinds (see [below](#autumn-schema-doctor)).
+
+To adopt a model:
+
+1. Add `managed` to its `#[model]` attribute.
+2. If the project has no snapshot, run `autumn schema snapshot`.
+3. Run `autumn schema diff --write-migration`. The command records the model
+   as managed in the snapshot and writes its `src/schema.rs` block.
+
+These field attributes change the table of a managed model:
+
+| Attribute | Table effect |
+| --- | --- |
+| `#[id]` | The primary key column. |
+| `#[indexed]` | An index `idx_<table>_<column>`. |
+| `#[unique]` | A `UNIQUE` column and an index `idx_<table>_<column>_unique`. |
+| `#[references]` | A foreign key. The field name gives the target table (`author_id` → `authors`). Use `#[references(table = "users")]` for another table. The column also gets an index. See [Foreign-key actions](#foreign-key-actions). |
+| `#[renamed_from("old")]` | A rename. See [Renames](#renames-renamed_from). |
+| `#[diesel(column_name = "...")]` | The SQL name of the column. |
+
+`Option<T>` makes a column nullable. The `#[model]` macro accepts `managed`,
+`#[unique]`, `#[references]` and `#[renamed_from]`. It rejects an incorrect
+attribute at compile time.
+
+### Foreign-key actions
+
+Add `on_delete` or `on_update` to `#[references]` to set the referential
+action of the foreign key:
+
+```rust
+#[references(table = "users", on_delete = "cascade")]
+pub author_id: i64,
+#[references(table = "users", on_delete = "set_null", on_update = "restrict")]
+pub editor_id: Option<i64>,
+```
+
+| Value | SQL |
+| --- | --- |
+| `cascade` | `CASCADE` |
+| `restrict` | `RESTRICT` |
+| `set_null` | `SET NULL` |
+| `set_default` | `SET DEFAULT` |
+| `no_action` | `NO ACTION` (the default) |
+
+- The diff writes the action after `REFERENCES`. It does this in
+  `CREATE TABLE`, `ADD COLUMN` and a SQLite table-recreate. When `down.sql`
+  creates a dropped table again, it writes the action too.
+- `set_null` and `set_default` need an `Option<_>` field. A reference column
+  has no default, so `SET DEFAULT` writes `NULL`.
+- The macro rejects an unknown value and a bad `set_null` / `set_default`.
+  For these, the parser skips the column with a warning. The diff then does
+  not change that column.
+- `schema pull` reads the actions on both backends. `schema doctor` reports a
+  different action in the database as drift.
+- The diff refuses to change the action of an existing foreign key, as it
+  refuses a new target. `--allow-destructive` does not override this. The
+  error shows the two keys:
+  - If the database is correct, change the model to agree with it.
+  - If the model is correct, write a manual migration
+    (`autumn generate migration`) and apply it. Then run `autumn schema pull`.
+- On SQLite, the diff refuses a table-recreate of a table that a table
+  (also the same table) references with `ON DELETE CASCADE`, `SET NULL` or
+  `SET DEFAULT`. The
+  migration runs in a transaction, where `PRAGMA foreign_keys=OFF` has no
+  effect. Thus the `DROP TABLE` of the recreate would delete or change the
+  child rows. Write that change as a manual migration.
+- A snapshot from `schema pull` before this release has no actions. Run
+  `autumn schema pull` again to record them.
+- A snapshot with an action has `snapshot_version` 2. An older CLI refuses
+  it. A snapshot without an action stays at version 1.
+
+A table stays managed in the snapshot after you remove `managed` from its
+model. If you then delete the model, `schema diff --allow-destructive` drops
+the table.
 
 ---
 
@@ -100,6 +192,7 @@ autumn schema diff --write-migration --name add_body
 | `--write-migration` | Write `migrations/<timestamp>_<name>/{up,down}.sql` instead of printing. |
 | `--name <NAME>` | Migration directory suffix when writing. Defaults to `schema_update`. |
 | `--allow-destructive` | Permit destructive drops / an independent drop+add (a tier-2 guard; otherwise refused). |
+| `--dev-url <URL>` | Use an empty dev database as the baseline, not the snapshot. See [below](#shadow-database-baseline---dev-url). |
 
 **The snapshot advances at generation time (#2042).** When you pass
 `--write-migration`, the snapshot is moved forward to the state the generated
@@ -115,6 +208,150 @@ plan the guards actually allowed. Two consequences:
 The migration files and the snapshot advance together: if the snapshot write
 fails after the migration is on disk, the migration directory is rolled back so a
 retry regenerates a single migration rather than a duplicate.
+
+### The diesel schema: `src/schema.rs`
+
+`--write-migration` also writes `src/schema.rs`. For each managed model, the
+command:
+
+- writes the `diesel::table!` block when it is missing or stale;
+- keeps a block that has the same columns, types and key. The comparison
+  ignores type aliases (`BigInt` for `Int8`), type paths and column order;
+- removes the block of a dropped table;
+- gives the block of a renamed table the new name, and keeps its attributes;
+- removes or renames the table in `joinable!` and
+  `allow_tables_to_appear_in_same_query!`. A changed call loses its comments;
+- renames the column of a `joinable!` when you rename a foreign key column,
+  and removes a `joinable!` whose column the managed table no longer has.
+
+The command does not add a `joinable!` for a new foreign key. Write it by
+hand.
+
+The command does not change the block of an unmanaged model.
+
+The command also updates `src/schema.rs` when the plan has no changes. Thus,
+after you add `managed` to a model, `schema diff --write-migration` writes its
+block with no migration.
+
+The command does not write a block in these conditions. It shows a warning:
+
+- The model has a field that the parser cannot read (for example an enum).
+- A name is not a Rust identifier, or a column type has no diesel type.
+- The block has attributes (for example `#[sql_name]`) and is different. Edit
+  that block by hand.
+- The command cannot read the block (for example a header with no key,
+  `posts {`). Edit that block by hand.
+
+Before it writes, the command parses the new `src/schema.rs`. If the result is
+not valid Rust, or declares a table twice, the command does not change the
+file and shows a warning. Edit the file by hand.
+
+Without `src/schema.rs`, the command does not make one. If `src/schema.rs`
+exists but the command cannot read it, the command stops before it writes
+anything. If the command cannot write `src/schema.rs`, it removes the new migration and restores the
+snapshot. The command writes the file through a temporary file, so a failed
+write does not change it.
+
+### Renames: `#[renamed_from]`
+
+Without a hint, the diff sees a renamed field as a drop and an add. It refuses
+this change, because it can be a rename.
+
+- To rename a column, put `#[renamed_from("old_name")]` on the field.
+- To rename a table, put it on the model, after `#[model]`. Before `#[model]`,
+  the compiler cannot find the attribute.
+
+```rust
+#[autumn_web::model(managed)]
+#[renamed_from("articles")]
+pub struct Post {
+    #[id]
+    pub id: i64,
+    #[renamed_from("title")]
+    pub headline: String,
+}
+```
+
+```sql
+-- up.sql
+ALTER TABLE articles RENAME TO posts;
+
+ALTER TABLE posts RENAME COLUMN title TO headline;
+```
+
+- A rename keeps the data, so it does not need `--allow-destructive`.
+- `down.sql` renames back.
+- A hint has an effect only on a `#[model(managed)]` model.
+- The diff also renames each index that has a convention name
+  (`idx_<table>_<field>` or `idx_<table>_<field>_unique`) and the same shape.
+  Postgres uses `ALTER INDEX ... RENAME`. SQLite drops the index and creates
+  it again. An index with `COLLATE` or `DESC` keeps its SQL.
+- The diff uses a hint only when the old name is in the baseline and the new
+  name is not. After the migration, the hint has no effect. You can keep it or
+  remove it.
+- The macro accepts one `snake_case` name only, and removes the hint from the
+  generated code.
+
+The diff refuses a hint in these conditions. `--allow-destructive` does not
+override this.
+
+- The old name is still declared.
+- Two hints use the same old name.
+- The parser cannot read the field (an unsupported type).
+- The hints make a chain or a swap. Do each rename in its own migration.
+- An index definition or a `CHECK` names the old column in a position that is
+  not clearly a column (for example an operator class or an `EXTRACT` field
+  with the same name). Write that rename as a manual migration.
+- A new name is a table or index name that is already in use.
+
+On Postgres, a new name longer than 63 bytes is refused too. The offline
+snapshot does not know views or sequences; use `--dev-url` to check a new name
+against them.
+
+### Shadow-database baseline: `--dev-url`
+
+`--dev-url <URL>` uses a database, not the snapshot, as the baseline. You can
+also set the URL in `AUTUMN_DEV_URL`, which keeps the password out of the
+process list.
+
+```sh
+AUTUMN_DEV_URL=postgres://localhost/postgres autumn schema diff
+```
+
+1. On Postgres, the command creates a scratch database on the server of the
+   URL. The role in the URL needs the `CREATEDB` privilege. On SQLite, the
+   command uses an in-memory database; the URL only selects SQLite.
+2. It applies every migration in `migrations/` to the scratch database, as
+   `autumn schema migrate` does. On Postgres, the migrations write to the
+   `public` schema.
+3. It reads the schema back and drops the scratch database. The database in
+   the URL does not change.
+4. It diffs the models against that schema.
+
+Use it when the snapshot cannot see the full schema, for example after a
+hand-written migration or with a `#[belongs_to]` foreign key.
+
+- The snapshot is optional. When it is present and does not match the
+  migrations, the command writes a warning to stderr.
+- A replayed table is managed only when the snapshot records it as managed,
+  or when a managed model declares it. The diff never drops a table that only
+  a hand-written migration made. With no snapshot, the diff never drops a
+  table.
+- `--write-migration` writes the migration and the snapshot, as usual.
+- The command refuses a new or renamed table or index whose name is already a
+  table, an index, a view, a sequence, a data type or another relation in the
+  migrated schema.
+- On SQLite, a replayed table or column name that differs from the model name
+  only in case (`Users` and `users`) is read as the model name, as SQLite
+  does.
+- The URL backend must match the schema backend. A `sqlite:` URL needs a CLI
+  built with `--features sqlite`.
+- The replay applies your migrations only, not the framework migrations.
+- A migration with `run_in_transaction = false` (for example
+  `CREATE INDEX CONCURRENTLY`) replays as it applies.
+- Like `schema pull`, the command connects to Postgres without TLS.
+- Errors never show the password. A connection error shows only the host and
+  port.
 
 ### SQLite ALTER support via table-recreate (#2035)
 
@@ -159,6 +396,30 @@ closed on: instead of refusing, the emitted migration carries an
 hand-written triggers or dependent views you must re-create the triggers and
 repair the views in a manual migration after applying the rebuild.
 
+**A decimal column keeps its `CHECK` (#2598).** SQLite stores `decimal{p,s}`
+as `TEXT`. A `CHECK` enforces the precision and scale. `schema diff` writes the
+same `CHECK` as `autumn generate`, in `CREATE TABLE`, `ADD COLUMN` and the
+table-recreate. The parser reads the precision and scale from the
+`#[decimal_shape(precision = p, scale = s)]` attribute that `autumn generate`
+writes on the field. The precision is 1 to 28, and the scale is 0 to the
+precision. A bad attribute skips the column with a diagnostic. A decimal field
+without the attribute is `{12, 2}`. `autumn generate` 0.8.0 does not write the
+attribute. Add it to such a field, with the declared precision and scale,
+before the next `schema diff`.
+
+- A change of precision or scale is a type change. On SQLite, `schema diff`
+  writes a table-recreate with the new `CHECK`. The `down.sql` writes the old
+  `CHECK` again.
+- `--dev-url` and `schema pull` read a decimal column as plain `TEXT`. Then the
+  table-recreate takes the precision and scale from the model, in `up.sql` and
+  in `down.sql`.
+- A table-recreate that writes a new decimal `CHECK` has an `-- autumn-safety:`
+  line, because the table can have rows that the `CHECK` rejects.
+- If a row does not agree with the `CHECK`, the copy into the new table fails
+  and the migration stops.
+- If the parser skipped a decimal column, `schema diff` refuses a
+  table-recreate of its table. Correct the attribute first.
+
 ---
 
 ## `autumn schema migrate`
@@ -197,21 +458,21 @@ autumn schema migrate --profile prod
 > `autumn migrate` up/down CLI documented in [Migrations](./migrations.md). The
 > classic verb is currently Postgres-only; `autumn schema migrate` can apply on
 > both backends, but — as noted above — the SQLite path needs a CLI built
-> `--features sqlite` (the default binary is Postgres-only). `schema pull` remains
-> Postgres-only in this slice, and `schema doctor`'s database-touching checks
-> (pending-migrations, database-schema-drift) are likewise Postgres-only.
+> `--features sqlite` (the default binary is Postgres-only). For SQLite, `schema pull`
+> and the database-schema-drift check of `schema doctor` also need a
+> `--features sqlite` build. The pending-migrations check is Postgres-only.
 
 ---
 
 ## `autumn schema pull`
 
-Introspect a live **Postgres** database and write (or, with `--dry-run`,
-describe) a snapshot of its actual shape — the DB-derived counterpart to
-`schema snapshot`. Use it to adopt a brownfield schema, or to re-baseline a
-snapshot that drifted from the database.
+Read the schema of a live **Postgres** or **SQLite** database, and write it as
+a snapshot. With `--dry-run`, show the changes and write nothing. This is the
+DB-derived counterpart to `schema snapshot`. Use it to adopt a brownfield
+schema, or to re-baseline a snapshot that drifted from the database.
 
 ```sh
-# Introspect the profile-resolved Postgres DB into .autumn/schema-snapshot.json.
+# Introspect the profile-resolved DB into .autumn/schema-snapshot.json.
 autumn schema pull
 
 # Show what pulling would change without writing anything.
@@ -228,12 +489,14 @@ autumn schema pull --dry-run
 `pull` is read-only with respect to the database (catalog reads only). It
 introspects tables, columns (types, nullability, defaults), primary keys, foreign
 keys, unique constraints, and indexes into the **same** IR the model parser
-produces. Before overwriting, a **provider-lock** guard refuses to clobber a
+produces. It records the `ON DELETE` and `ON UPDATE` action of each foreign
+key. On SQLite, `pull` skips virtual tables and their shadow tables (for
+example FTS5 and rtree). Before overwriting, a **provider-lock** guard refuses to clobber a
 snapshot tagged for another backend.
 
-> **Postgres only in this slice.** A resolved SQLite URL is **refused loudly** —
-> SQLite database introspection is a future slice of #1975, so no partial
-> snapshot is written. A `--dry-run` reports bidirectionally so a manually-dropped
+> **SQLite needs the `sqlite` build.** A CLI built with `--features sqlite`
+> introspects a SQLite database. The default binary refuses a SQLite URL and
+> writes no snapshot. A `--dry-run` reports bidirectionally so a manually-dropped
 > default / FK / CHECK in the live DB (which the forward pass cannot express) is
 > still surfaced as a removal.
 
@@ -262,14 +525,32 @@ checks are:
 - **project-root** — the command is running inside an Autumn project.
 - **snapshot-present** — `.autumn/schema-snapshot.json` exists and is readable.
 - **snapshot-drift** — the declared models match the snapshot baseline.
+- **schema-rs-drift** — each managed model has a matching block in
+  `src/schema.rs`. A missing or stale block is a **WARN**, and so is a
+  `joinable!` that names a column the managed table does not have. To fix it, run
+  `autumn schema diff --write-migration`. A table that the row cannot compare
+  (for example a model with an enum field) is also a **WARN**, and the row
+  names it. Without a managed
+  model, the row is **OK**.
 - **provider-lock** — the snapshot's backend tag matches the detected backend.
 - **snapshot-dialect-vs-db** — the snapshot dialect matches the configured
   database URL's backend.
 - **pending-migrations** — whether generated migration files are still unapplied
   (Postgres).
-- **database-schema-drift** (#2045) — when a Postgres database is reachable, the
+- **database-schema-drift** (#2045) — when the database is reachable, the
   snapshot is introspected against the live schema bidirectionally; drift is an
-  actionable **WARN**. Offline, it stays a non-failing WARN.
+  actionable **WARN**. Offline, it stays a non-failing WARN. SQLite needs the
+  `sqlite` build.
+- **unmanaged-drift** — each unmanaged model matches its table in the live
+  database. The check finds a missing table, a model column that the table
+  does not have, a different primary key, and a different type or `NULL`
+  rule. It does not compare columns that only the table has, indexes,
+  defaults or constraints. It does not compare a type that the CLI keeps as
+  an opaque type (for example `VARCHAR(40)`, or `BOOLEAN` on SQLite). A model
+  with a field that the parser cannot read (for example an enum) is also a
+  **WARN**, and the row names it: the check cannot compare that column.
+  Drift is a **WARN**. To fix it, write a migration with
+  `autumn generate migration`, or change the model.
 
 ---
 
@@ -279,7 +560,8 @@ checks are:
 # One-time: capture the current models as the baseline (or `pull` an existing DB).
 autumn schema snapshot
 
-# Edit your #[model] structs, then generate the migration + advance the snapshot.
+# Edit your #[model] structs, then generate the migration, advance the
+# snapshot, and update src/schema.rs.
 autumn schema diff --write-migration --name add_published_at
 
 # Apply it (and later, on other environments / profiles).
@@ -289,7 +571,8 @@ autumn schema migrate --profile prod
 autumn schema doctor
 ```
 
-Commit the snapshot and the generated migration directory together.
+Commit the snapshot, `src/schema.rs`, and the generated migration directory
+together.
 
 ---
 

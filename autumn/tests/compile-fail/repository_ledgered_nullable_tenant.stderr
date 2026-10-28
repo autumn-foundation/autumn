@@ -1,0 +1,20 @@
+error[E0277]: a ledgered `tenant_scoped` repository needs `tenant_id: String`, not `std::option::Option<std::string::String>`
+  --> tests/compile-fail/repository_ledgered_nullable_tenant.rs:30:1
+   |
+30 | / #[autumn_web::repository(
+31 | |     LedgeredNullableTenantNote,
+32 | |     table = "ledgered_nullable_tenant_notes",
+33 | |     tenant_scoped,
+34 | |     soft_delete,
+35 | |     ledgered = true
+36 | | )]
+   | |__^ the tenant column of a ledgered model must not be nullable
+   |
+   = help: the trait `LedgerTenantColumn` is not implemented for `std::option::Option<std::string::String>`
+   = note: a revision with a NULL tenant is not visible to a tenant-scoped read, and a cross-tenant ledger read is refused, so no read can reach its chain. Make the field `String` and the column `NOT NULL`, or remove `ledgered`
+help: the trait `LedgerTenantColumn` is implemented for `std::string::String`
+  --> src/ledger.rs
+   |
+   | impl LedgerTenantColumn for String {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: this error originates in the attribute macro `autumn_web::repository` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -144,8 +144,8 @@ docker compose -f examples/bookmarks-sharded/docker-compose.yml start postgres-s
 
 ## What stays on the control database
 
-Framework state is **never sharded**: the `autumn_jobs` queue, Postgres
-scheduler advisory locks, sessions, and feature flags all live on the
+Framework state is **never sharded**: the `autumn_jobs` queue, the Postgres
+scheduler tick table, sessions, and feature flags all live on the
 control role (`database.primary_url`). Only tenant data routes across
 shards. There are **no cross-shard transactions** — a write spans exactly
 one shard, and `/api/stats` aggregates independent per-shard snapshots.

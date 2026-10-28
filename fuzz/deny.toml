@@ -34,9 +34,20 @@ ignore = [
     # autumn-web JWT surface the main workspace does). No patched rsa release
     # exists; Autumn exposes no network-reachable attacker-timed RSA
     # private-key decryption oracle. None of the fuzz targets exercise the
-    # JWT sign/verify path specifically. Review-by: 2026-10-01, matching the
+    # JWT sign/verify path specifically. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05), matching the
     # root policy's own review-by for this same advisory.
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken, same as root deny.toml; not exercised by any fuzz target; review-by 2026-10-01" },
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken, same as root deny.toml; not exercised by any fuzz target; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # RUSTSEC-2026-0387 — crypto-bigint secret-dependent branches in nominally
+    # constant-time operations. Fixed only in >=0.7.6; no 0.4.x/0.5.x release
+    # carries it. Two copies: 0.4.9 via aws-sigv4 -> p256 0.11 (SigV4a ECDSA
+    # signing, which Autumn does not use; it signs with HMAC SigV4), and 0.5.5
+    # via elliptic-curve 0.13 <- p256/p384 <- jsonwebtoken (ES256/ES384 JWT) and
+    # aws-sigv4. The jsonwebtoken copy IS on autumn-web's JWT path, so this is a
+    # real if low-practicality exposure (microarchitectural timing on ECDSA
+    # secrets; no network-reachable signing oracle). Remediation needs the
+    # RustCrypto elliptic-curve stack to move to crypto-bigint >=0.7.6.
+    # Review-by: 2026-11-08.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.4.9/0.5.5 only, via aws-sigv4 (SigV4a ECDSA path, unused by Autumn HMAC SigV4) and jsonwebtoken ES256/ES384 -> p256/p384 -> elliptic-curve 0.13; no patched 0.4.x/0.5.x; review-by 2026-11-08" },
 ]
 
 [sources]

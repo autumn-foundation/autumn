@@ -99,6 +99,8 @@ die() {
 GATED_MODULES=(
   autumn/src/time.rs:default
   autumn/src/entropy.rs:default
+  # Retry jitter for the HTTP client and every job backend (#3054).
+  autumn/src/backoff.rs:default
   autumn/src/state.rs:default
   autumn/src/scheduler.rs:default
   autumn/src/app.rs:default
@@ -107,6 +109,12 @@ GATED_MODULES=(
   # The durable SQLite job backend (#1907): a submodule of the gated job.rs,
   # listed on its own because its enforcing clippy lane is the sqlite one.
   autumn/src/job/sqlite.rs:sqlite
+  # The SQLite database fleet (ADR 0019): sqlite-only modules, so their
+  # enforcing clippy lane is the sqlite one.
+  autumn/src/db/fleet.rs:sqlite
+  autumn/src/db/fleet_ownership.rs:sqlite
+  autumn/src/db/fleet_replication.rs:sqlite
+  autumn/src/db/fleet_sweeper.rs:sqlite
   # The ratified W3 identifier sites. They carry no off-seam production call at
   # all — every id they mint already comes from the injected `Entropy` — so
   # gating them costs nothing and is what makes the `Uuid::new_v4` clause of the
@@ -166,8 +174,11 @@ GATED_MODULES=(
   autumn/src/experiments.rs:default
   autumn/src/fake.rs:default
   autumn/src/feature_flags.rs:default
-  autumn/src/gdpr.rs:default
+  autumn/src/gdpr/mod.rs:default
+  autumn/src/gdpr/portability/mod.rs:default
   autumn/src/http_client.rs:default
+  # Request deadlines (#3058): tokio time only.
+  autumn/src/deadline.rs:default
   autumn/src/idempotency.rs:default
   autumn/src/inspector.rs:default
   autumn/src/job_tracking.rs:default
@@ -177,9 +188,13 @@ GATED_MODULES=(
   autumn/src/middleware/access_log.rs:default
   autumn/src/middleware/metrics.rs:default
   autumn/src/middleware/server_timing.rs:default
+  # Cost metering (#1720). Its one wall-clock read is a reasoned allow: it
+  # times a poll on the CPU, which the injected clock cannot see.
+  autumn/src/cost.rs:default
   autumn/src/migrate.rs:default
   autumn/src/notifications.rs:default
   autumn/src/openapi.rs:default
+  autumn/src/outbox.rs:default
   autumn/src/push/store.rs:default
   autumn/src/read_your_writes.rs:default
   autumn/src/replication/engine.rs:default
@@ -211,7 +226,7 @@ GATED_MODULES=(
 )
 
 # The manifest is a ratchet: it may grow, never shrink.
-MODULE_COUNT_FLOOR=76
+MODULE_COUNT_FLOOR=77
 
 # Every lint the gate header must deny.
 REQUIRED_GATE_LINTS=(

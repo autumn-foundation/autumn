@@ -37,6 +37,7 @@ mod agent_authority;
 mod api_doc;
 mod authorize;
 mod cached;
+mod cached_impl;
 mod collect;
 mod edge;
 mod edge_routes_macro;
@@ -137,14 +138,10 @@ use proc_macro::TokenStream;
 /// declares.
 #[proc_macro_attribute]
 pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(route::route_macro("GET", "get", attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        route::route_macro("GET", "get", attr, item)
+    })
+    .into()
 }
 
 /// Annotate an async function as a POST route handler.
@@ -167,18 +164,9 @@ pub fn get(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn post(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(route::route_macro(
-        "POST",
-        "post",
-        attr,
-        item.into(),
-    ))
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        route::route_macro("POST", "post", attr, item)
+    })
     .into()
 }
 
@@ -202,14 +190,10 @@ pub fn post(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(route::route_macro("PUT", "put", attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        route::route_macro("PUT", "put", attr, item)
+    })
+    .into()
 }
 
 /// Annotate an async function as a PATCH route handler.
@@ -229,18 +213,9 @@ pub fn put(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn patch(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(route::route_macro(
-        "PATCH",
-        "patch",
-        attr,
-        item.into(),
-    ))
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        route::route_macro("PATCH", "patch", attr, item)
+    })
     .into()
 }
 
@@ -264,18 +239,9 @@ pub fn patch(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(route::route_macro(
-        "DELETE",
-        "delete",
-        attr,
-        item.into(),
-    ))
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        route::route_macro("DELETE", "delete", attr, item)
+    })
     .into()
 }
 
@@ -285,16 +251,9 @@ pub fn delete(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// callback endpoints such as `/auth/github/callback`.
 #[proc_macro_attribute]
 pub fn oauth2_callback(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(oauth2_callback::oauth2_callback_macro(
-        attr,
-        item.into(),
-    ))
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        oauth2_callback::oauth2_callback_macro(attr, item)
+    })
     .into()
 }
 
@@ -396,13 +355,10 @@ pub fn paths(input: TokenStream) -> TokenStream {
 /// not name.
 #[proc_macro_attribute]
 pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(main_macro::main_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        main_macro::main_macro(attr, item)
+    })
+    .into()
 }
 
 /// Annotate an async function as a deterministic simulation test (S-1797, W1).
@@ -429,13 +385,10 @@ pub fn main(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn sim_test(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(sim_test::sim_test_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        sim_test::sim_test_macro(attr, item)
+    })
+    .into()
 }
 
 /// Annotate an async inbound mail handler function.
@@ -466,41 +419,27 @@ pub fn sim_test(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn inbound_mail(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(inbound_mail::inbound_mail_macro(attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        inbound_mail::inbound_mail_macro(attr, item)
+    })
+    .into()
 }
 
 /// Generate `send_*` and `deliver_later_*` helpers for a mailer impl block.
 #[proc_macro_attribute]
 pub fn mailer(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(mailer::mailer_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        mailer::mailer_macro(attr, item)
+    })
+    .into()
 }
 
 /// Register zero-argument mail preview methods for the dev mail preview UI.
 #[proc_macro_attribute]
 pub fn mailer_preview(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(mailer_preview::mailer_preview_macro(
-        attr,
-        item.into(),
-    ))
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        mailer_preview::mailer_preview_macro(attr, item)
+    })
     .into()
 }
 
@@ -551,6 +490,10 @@ pub fn story(input: TokenStream) -> TokenStream {
 /// inferred shape could confidently advertise a contract the handler does not
 /// accept. Write the impl by hand and register it for that case.
 ///
+/// **Two copies of `autumn-web`**: use `#[openapi_schema(crate = "name")]` to
+/// name the copy that the generated code must use. A derive cannot take
+/// arguments, so a helper attribute carries the override.
+///
 /// # Examples
 ///
 /// ```ignore
@@ -570,11 +513,9 @@ pub fn story(input: TokenStream) -> TokenStream {
 ///     InProgress,
 /// }
 /// ```
-#[proc_macro_derive(OpenApiSchema)]
+#[proc_macro_derive(OpenApiSchema, attributes(openapi_schema))]
 pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
-    let _guard = autumn_macros_support::crate_path::set_target(None);
-    autumn_macros_support::crate_path::finalize(openapi_schema::derive_openapi_schema(input).into())
-        .into()
+    openapi_schema::derive_openapi_schema(input.into()).into()
 }
 
 /// Declare a scheduled background task.
@@ -588,16 +529,22 @@ pub fn derive_openapi_schema(input: TokenStream) -> TokenStream {
 /// #[scheduled(cron = "0 0 0 * * *", name = "nightly")]
 /// async fn nightly(state: AppState) -> AutumnResult<()> { Ok(()) }
 /// ```
+///
+/// Add `deferrable` to let a task wait while the cost signal is high
+/// (`[cost] defer_threshold`). The tick takes its lease, then waits. It runs
+/// when the signal falls. Later ticks fold into that run. See
+/// `docs/guide/cost.md`.
+///
+/// ```ignore
+/// #[scheduled(every = "15m", deferrable)]
+/// async fn compact(state: AppState) -> AutumnResult<()> { Ok(()) }
+/// ```
 #[proc_macro_attribute]
 pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(scheduled::scheduled_macro(attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        scheduled::scheduled_macro(attr, item)
+    })
+    .into()
 }
 
 /// Declare an on-demand background job.
@@ -635,15 +582,25 @@ pub fn scheduled(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// let handle = ExportOrdersJob::enqueue_tracked(ExportArgs { account_id: 1 }).await?;
 /// println!("poll at {}", handle.status_path());
 /// ```
+///
+/// Add `deferrable` to let a job wait while the cost signal is high
+/// (`[cost] defer_threshold`). The job runs when the signal falls. The runtime
+/// never drops it. It uses no attempt while it waits. Only the `local` jobs
+/// backend defers jobs. Other backends run the job and log a warning at boot.
+/// See `docs/guide/cost.md`.
+///
+/// ```ignore
+/// #[job(deferrable)]
+/// async fn rebuild_search_index(state: AppState, args: RebuildArgs) -> AutumnResult<()> {
+///     Ok(())
+/// }
+/// ```
 #[proc_macro_attribute]
 pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(job::job_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        job::job_macro(attr, item)
+    })
+    .into()
 }
 
 /// Declare a typed domain event.
@@ -658,13 +615,10 @@ pub fn job(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(event::event_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        event::event_macro(attr, item)
+    })
+    .into()
 }
 
 /// Declare an event listener that reacts to a typed `#[event]`.
@@ -678,13 +632,10 @@ pub fn event(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn listener(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(listener::listener_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        listener::listener_macro(attr, item)
+    })
+    .into()
 }
 
 /// Collect `#[listener]` handlers into a `Vec<ListenerInfo>`.
@@ -698,13 +649,10 @@ pub fn listeners(input: TokenStream) -> TokenStream {
 /// Declare a one-off operational task runnable with `autumn task <name>`.
 #[proc_macro_attribute]
 pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(one_off_task::task_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        one_off_task::task_macro(attr, item)
+    })
+    .into()
 }
 
 /// Annotate an async function as a statically pre-rendered GET route.
@@ -740,16 +688,33 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     html! { head { (seo.render()) } }
 /// }
 /// ```
+///
+/// # Declared Content-Type
+///
+/// `content_type = "..."` sets the media type of the pre-rendered page:
+///
+/// ```ignore
+/// #[static_get("/logo.png", content_type = "application/octet-stream")]
+/// async fn logo() -> Vec<u8> {
+///     logo_bytes()
+/// }
+/// ```
+///
+/// Build records the value as written. It replaces any header the handler
+/// sets. Autumn does not swap it for the route extension type. Without the
+/// argument, Autumn records the handler header, and replaces the axum
+/// return-type defaults (`text/plain; charset=utf-8`, `application/octet-stream`)
+/// with the extension type.
+///
+/// The value must be a non-empty media type in visible ASCII. The type only
+/// applies to the page served from `dist/`. A live request that reaches the
+/// handler gets the handler header. Compression follows the declared type.
 #[proc_macro_attribute]
 pub fn static_get(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(static_route::static_get_macro(attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        static_route::static_get_macro(attr, item)
+    })
+    .into()
 }
 
 /// Collect `#[scheduled]` task handlers into a `Vec<TaskInfo>`.
@@ -809,13 +774,10 @@ pub fn one_off_tasks(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(secured::secured_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        secured::secured_macro(attr, item)
+    })
+    .into()
 }
 
 /// Declare a route handler as deliberately public (unauthenticated).
@@ -838,13 +800,10 @@ pub fn secured(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(public::public_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        public::public_macro(attr, item)
+    })
+    .into()
 }
 
 /// Declare a read-path route as eligible to run in the edge capsule (#1790).
@@ -896,13 +855,10 @@ pub fn public(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn edge(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(edge::edge_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        edge::edge_macro(attr, item)
+    })
+    .into()
 }
 
 /// Collect `#[edge]` handlers into a `Vec<EdgeRoute>` (#1790).
@@ -971,13 +927,10 @@ pub fn edge_routes(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(step_up::step_up_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        step_up::step_up_macro(attr, item)
+    })
+    .into()
 }
 
 /// Apply a per-route rate limit to a handler.
@@ -1030,13 +983,10 @@ pub fn step_up(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// inference does not depend on expansion order (#1677).
 #[proc_macro_attribute]
 pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(throttle::throttle_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        throttle::throttle_macro(attr, item)
+    })
+    .into()
 }
 
 /// Bound the number of database queries a handler can issue — at compile time.
@@ -1070,14 +1020,17 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///   **maximum** (the worst reachable path).
 /// * A loop whose body issues a query is **unbounded**, unless the iterable
 ///   has a literal compile-time bound (`for _ in 0..3`), in which case the
-///   body cost is multiplied.
+///   body cost is multiplied. A path that leaves the loop is paid once.
 /// * A method chain rooted at a `Db` / repository handle is **one** query,
 ///   however many builder methods (`on_primary()`, `scoped()`, …) it carries.
 /// * `.preload(rows, Post::preload().author().tags())` costs **one query per
 ///   association** — the batched `WHERE ... IN (...)` loads.
-/// * Anything opaque — a helper function handed the handle, a macro body that
-///   names it, a closure that may run per element — is **reported**, never
-///   assumed query-free.
+/// * A path that leaves early (`return`, `break`, `continue`) does not include
+///   the cost of the code it skips.
+/// * Anything opaque — a helper function or associated function handed the
+///   handle (`Post::published(&mut db)`), a macro body that names it, a
+///   closure that may run per element — is **reported**, never assumed
+///   query-free.
 ///
 /// # Escape hatches
 ///
@@ -1089,14 +1042,10 @@ pub fn throttle(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// rustc. See `docs/guide/query-budgets.md` for the full guide.
 #[proc_macro_attribute]
 pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(query_budget::query_budget_macro(attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        query_budget::query_budget_macro(attr, item)
+    })
+    .into()
 }
 
 /// Declare a handler agent-operable, under a named authority grant.
@@ -1179,16 +1128,9 @@ pub fn query_budget(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// See `docs/guide/agent-authority.md` for the full guide.
 #[proc_macro_attribute]
 pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(agent_authority::agent_operable_macro(
-        attr,
-        item.into(),
-    ))
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        agent_authority::agent_operable_macro(attr, item)
+    })
     .into()
 }
 
@@ -1221,14 +1163,10 @@ pub fn agent_operable(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///
 #[proc_macro_attribute]
 pub fn feature_flag(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(feature_flag::feature_flag_macro(attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        feature_flag::feature_flag_macro(attr, item)
+    })
+    .into()
 }
 
 /// Enforce a record-level authorization policy on a route handler.
@@ -1254,14 +1192,10 @@ pub fn feature_flag(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn authorize(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(authorize::authorize_macro(attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        authorize::authorize_macro(attr, item)
+    })
+    .into()
 }
 
 /// Collect `#[static_get]` handlers into a `Vec<StaticRouteMeta>`.
@@ -1316,14 +1250,10 @@ pub fn static_routes(input: TokenStream) -> TokenStream {
 /// | `name` | no | Endpoint name; defaults to the handler's function name |
 #[proc_macro_attribute]
 pub fn endpoint(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(wire::endpoint::endpoint_macro(attr, &item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        wire::endpoint::endpoint_macro(attr, &item)
+    })
+    .into()
 }
 
 /// Generate a typed client for another Autumn service's endpoints (issue #1755).
@@ -1374,16 +1304,9 @@ pub fn wire_client(input: TokenStream) -> TokenStream {
 /// can never pass by checking nothing.
 #[proc_macro_attribute]
 pub fn contract_checked(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(wire::checked::contract_checked_macro(
-        attr,
-        &item.into(),
-    ))
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        wire::checked::contract_checked_macro(attr, &item)
+    })
     .into()
 }
 
@@ -1428,6 +1351,13 @@ pub fn derive_wire_shape(input: TokenStream) -> TokenStream {
 /// | `key` | `key(tenant_id)` | Build the key from *these* parameters only |
 /// | `reads` | `reads(Post, Comment)` | Declared cache-coherence dependency set |
 /// | `acknowledge_stale` | `"5s TTL is tight enough"` | Opt out of the coherence gate |
+/// | `scope` | `"Products"` | Enclosing type; keeps same-named associated functions apart |
+///
+/// # Associated functions
+///
+/// The cache key holds the module and function name. Two impls in one module
+/// with a same-named `#[cached]` function would share keys. Put
+/// [`cached_impl`] on each `impl` block, or set `scope` by hand.
 ///
 /// # Cache coherence (issue #1716)
 ///
@@ -1468,13 +1398,38 @@ pub fn derive_wire_shape(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        cached::cached_macro(attr, item)
+    })
+    .into()
+}
+
+/// Scope every `#[cached]` method of an `impl` block by its type.
+///
+/// Adds `scope = "<Type>"` to each `#[cached]` method, so `Products::get` and
+/// `Reviews::get` in one module get different cache keys.
+///
+/// ```ignore
+/// #[autumn_web::cached_impl]
+/// impl Products {
+///     #[cached]
+///     async fn get(id: i64) -> String { /* .. */ }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn cached_impl(attr: TokenStream, item: TokenStream) -> TokenStream {
     let (crate_override, attr) =
         match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
             Ok(pair) => pair,
             Err(err) => return err.into(),
         };
     let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(cached::cached_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::finalize(cached_impl::cached_impl_macro(
+        attr,
+        item.into(),
+        crate_override.as_deref(),
+    ))
+    .into()
 }
 
 /// Enrich a route handler's auto-generated `OpenAPI` documentation.
@@ -1500,6 +1455,10 @@ pub fn cached(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// | `status` | integer | Success HTTP status code (defaults to `200`) |
 /// | `hidden` | flag / bool | Exclude the route from the generated spec |
 /// | `mcp` | flag / bool | Expose this endpoint as an MCP tool (`mcp = false` force-excludes it). Requires the `mcp` feature and a `mount_mcp` call. |
+/// | `stream` | flag / bool | With `mcp`: the tool returns an `Sse` stream, sent as MCP progress. |
+/// | `task` | flag / bool | With `mcp`: the tool can return a task handle (MCP Tasks extension). |
+/// | `core` | flag / bool | With `mcp`: a core tool. A client that defers tools loads it first. |
+/// | `webmcp` | flag / bool | Expose this endpoint as a `WebMCP` tool in the page (`webmcp = false` force-excludes it). `mcp` does not imply it. Requires the `webmcp` feature and a `mount_webmcp` call. |
 ///
 /// # Examples
 ///
@@ -1645,13 +1604,10 @@ fn api_doc_standalone(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn ws(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(ws::ws_macro(attr, item.into())).into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        ws::ws_macro(attr, item)
+    })
+    .into()
 }
 
 /// Translate an i18n key, with **compile-time validation** that the key
@@ -1729,14 +1685,10 @@ pub fn t(input: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(lifecycle::lifecycle_macro(attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        lifecycle::lifecycle_macro(attr, item)
+    })
+    .into()
 }
 
 /// Declare a business-time obligation on a struct (issue #1826).
@@ -1772,14 +1724,10 @@ pub fn lifecycle(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// ```
 #[proc_macro_attribute]
 pub fn obligation(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(obligation::obligation_macro(attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        obligation::obligation_macro(attr, item)
+    })
+    .into()
 }
 
 #[cfg(test)]

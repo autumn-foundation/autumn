@@ -173,7 +173,7 @@ docker run -d \
   -v /etc/letsencrypt:/etc/letsencrypt:ro \
   -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/letsencrypt/live/app.example.com/fullchain.pem \
   -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/letsencrypt/live/app.example.com/privkey.pem \
-  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/startup \
   -e AUTUMN_HEALTHCHECK_INSECURE=1 \
   -p 443:3000 \
   my-app
@@ -197,14 +197,14 @@ docker run -d \
   -v /srv/tls:/etc/autumn/tls:ro \
   -e AUTUMN_SERVER__TLS__CERT_PATH=/etc/autumn/tls/fullchain.pem \
   -e AUTUMN_SERVER__TLS__KEY_PATH=/etc/autumn/tls/privkey.pem \
-  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health \
+  -e AUTUMN_HEALTHCHECK_URL=https://localhost:3000/startup \
   -e AUTUMN_HEALTHCHECK_INSECURE=1 \
   -p 443:3000 \
   my-app
 ```
 
 Both health-check variables matter. `AUTUMN_HEALTHCHECK_URL` re-points the
-generated `HEALTHCHECK`, which defaults to `http://localhost:3000/health`: a
+generated `HEALTHCHECK`, which defaults to `http://localhost:3000/startup`: a
 plain-HTTP probe against an HTTPS listener marks the container **unhealthy**
 forever — and in the generated `docker-compose.yml`, anything waiting on
 `condition: service_healthy` then never starts.
@@ -352,9 +352,9 @@ Fields:
 | Field | Default | Meaning |
 |---|---|---|
 | `domains` | required | One or more non-wildcard domains to issue for. Each entry is used **verbatim** as the certificate's SAN and as the ACME order's DNS identifier, so an entry with leading or trailing whitespace is rejected at startup rather than requested as-is. |
-| `contact_email` | required | Contact address registered with the ACME account. |
+| `contact_email` | required | Contact address registered with the ACME account (a quoted string). |
 | `directory` | Let's Encrypt **staging** | ACME directory. Built-in endpoints are the bare strings `"staging"` (default) and `"production"`. A private CA / Pebble uses the inline table `{ custom = { url = "https://your-ca.example/dir" } }` — a bare URL string is **not** accepted (see below). |
-| `cache_dir` | `config/acme` | Where the account key and issued certificate are cached. |
+| `cache_dir` | `config/acme` | Where the account key and issued certificate are cached (a quoted path). |
 | `http_challenge_port` | `80` | Port the HTTP-01 challenge (and HTTP→HTTPS redirect) listens on. |
 | `renew_before_days` | `30` | Renew this many days before expiry (a whole number, unquoted, and `< 90`). |
 | `ca_root_path` | unset | PEM root that signs the **ACME directory's own HTTPS certificate**. Only needed for a private CA / Pebble; see below. |
@@ -748,6 +748,16 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 (`clientco.com`) cannot carry a CNAME, so it needs `ingress_ipv4` /
 `ingress_ipv6` instead; set both kinds if you accept both.
 
+Autumn finds an apex with the [Public Suffix List](https://publicsuffix.org)
+([ADR-0026](../adr/0026-public-suffix-apex-detection.md)), so `clientco.co.uk`
+is an apex and `app.clientco.co.uk` is not. A TLD that is not on the list uses
+the two-label rule. `autumn doctor` warns when a registered domain gets no DNS
+instructions.
+
+The hourly budget survives a restart. Autumn keeps a ledger of recent orders
+in `store_dir` (`attempts.ledger`, `0600`). An order for an offboarded domain
+still counts. One process owns the ledger. Replicas do not share it.
+
 `resolvers` are the recursive resolvers autumn asks for each domain's
 ownership TXT record. The server must reach them on UDP/53.
 
@@ -932,7 +942,7 @@ the store and restart.
 
 | Check | What it catches |
 |---|---|
-| `custom_domains` | The section loads, has somewhere for tenants to point, and its cap is not already exceeded. **Fail** on anything the server would exit at boot on. |
+| `custom_domains` | The section loads, has somewhere for tenants to point, and its cap is not already exceeded. **Warn** when a registered domain gets no DNS instructions. **Fail** on anything the server would exit at boot on. |
 | `custom_domain_dns` | (`--online`) Each registered domain still points here. **Fail** for an `active` or `verified` domain whose DNS has moved away or vanished — it is serving a certificate nobody can reach and will fail its next renewal. **Warn** for one still `pending_dns`. Probes the first 25 domains and says so. |
 | `custom_domain_txt` | (`--online`) Each `pending_dns` domain's `_autumn-challenge` TXT record carries its token. **Warn** when the record is missing, or carries only other values (for example a token from an earlier registration). A separate check from `custom_domain_dns`, so a wrong address and a missing token read differently. |
 | `custom_domain_http01` | (`--online`) Port 80 is reachable on **every address** each configured ingress target resolves to — one member of a load-balancer record set that drops it fails HTTP-01 for whatever share of tenants lands there. **Fail** when any is unreachable — tenant certificates are always issued over HTTP-01, so a closed port 80 blocks every one of them **even under a DNS-01 deployment**, where `acme_ports` rightly calls it optional for the deployment's own certificate. |

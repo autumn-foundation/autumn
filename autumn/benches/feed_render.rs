@@ -13,9 +13,17 @@
 //! benchmark toward one path.
 //!
 //! Marginal per-render baseline (callgrind `--iterations 1000` minus
-//! `--iterations 0`; dhat likewise): 382,993 instructions, 336 allocations,
-//! 77.7 KB per `Feed::render` of the 30-entry feed. `feed::escape` is 53.8% of
-//! self instructions.
+//! `--iterations 0`; dhat likewise), re-measured 2026-10-20, rustc 1.97,
+//! valgrind 3.22.0 (`escape` already has the byte-table scan):
+//! 254,441 instructions per iteration (267,683,513 - 13,241,957 over 1000),
+//! 336 allocations and 77.7 KB per iteration (352,818 - 16,818 blocks;
+//! 81,611,002 - 3,889,996 bytes), of which 147 allocations are
+//! `feed::escape`'s returned `String`s and ~120 are `sample_feed()`'s own
+//! construction inside the loop. `feed::escape` self cost is 79.6M Ir of
+//! 267.7M (29.8%) at `--iterations 1000`.
+//!
+//! After escaping straight into the output buffer (`escape_into`), same
+//! method: 197,727 instructions, 196 allocations and 61.0 KB per iteration.
 //!
 //! Like the other benches in this crate it is `harness = false` and asserts
 //! nothing: it is a workload to point a profiler at.

@@ -29,7 +29,7 @@
 //! A green run proves the orchestration / timing / ordering of the **local**
 //! scheduler + job paths (the in-process scheduler coordinator and the local
 //! `JobAdminMemoryBackend`, which are what a single-node `SQLite` app really runs).
-//! It does **not** validate the Postgres advisory-lock scheduler leasing or the
+//! It does **not** validate the Postgres tick-table scheduler leasing or the
 //! durable Postgres `LISTEN`/`NOTIFY` + `SKIP LOCKED` job-queue claim/lock
 //! semantics — both are compiled out under `--features sqlite` and remain the
 //! province of the Postgres integration tests. See `autumn/src/sim/substrate.rs`.

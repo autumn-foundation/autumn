@@ -181,6 +181,9 @@ all** (drops the `db` feature and the migration wiring), so the binary links no
 Postgres client. This is the recommended shape for a local-first tool that
 doesn't need persistence.
 
+`--daemon` does not accept `--with`. Plugins enable the `db` feature again.
+Use `--bundled-pg` if you need plugins.
+
 ### Managed local Postgres (opt-in)
 
 For apps that use `#[model]` / `#[repository]`, `autumn new --bundled-pg`
@@ -191,7 +194,7 @@ Postgres) into the generated `Cargo.toml` for you. Wiring the provider into an
 existing app means adding it yourself:
 
 ```toml
-autumn-web = { version = "0.8", features = ["managed-pg"] }
+autumn-web = { version = "0.9", features = ["managed-pg"] }
 ```
 
 It wires a `ManagedPostgresPoolProvider` through the existing

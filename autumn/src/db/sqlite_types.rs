@@ -199,6 +199,25 @@ pub struct SqliteUuid(pub uuid::Uuid);
 #[serde(transparent)]
 pub struct SqliteDecimal(pub rust_decimal::Decimal);
 
+// The wrappers are `#[serde(transparent)]`, so they document as the wrapped type.
+impl crate::openapi::OpenApiSchema for SqliteUuid {
+    fn schema_name() -> &'static str {
+        <uuid::Uuid as crate::openapi::OpenApiSchema>::schema_name()
+    }
+    fn schema() -> serde_json::Value {
+        <uuid::Uuid as crate::openapi::OpenApiSchema>::schema()
+    }
+}
+
+impl crate::openapi::OpenApiSchema for SqliteDecimal {
+    fn schema_name() -> &'static str {
+        <rust_decimal::Decimal as crate::openapi::OpenApiSchema>::schema_name()
+    }
+    fn schema() -> serde_json::Value {
+        <rust_decimal::Decimal as crate::openapi::OpenApiSchema>::schema()
+    }
+}
+
 text_backed_newtype_impls!(SqliteUuid(uuid::Uuid), encode = |value| value.to_string());
 text_backed_newtype_impls!(
     SqliteDecimal(rust_decimal::Decimal),
@@ -208,6 +227,43 @@ text_backed_newtype_impls!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openapi::OpenApiSchema as _;
+
+    #[derive(crate::openapi::OpenApiSchema)]
+    #[allow(dead_code)]
+    struct Row {
+        id: SqliteUuid,
+        price: SqliteDecimal,
+    }
+
+    #[test]
+    fn wrappers_document_the_same_scalars_as_their_wrapped_types() {
+        let props = Row::schema()["properties"].clone();
+        assert!(props["id"].get("$ref").is_none(), "{props}");
+        assert!(props["price"].get("$ref").is_none(), "{props}");
+        assert_eq!(props["id"], uuid::Uuid::schema());
+        assert_eq!(props["price"], rust_decimal::Decimal::schema());
+        assert_eq!(props["id"]["format"], "uuid");
+    }
+
+    #[test]
+    fn macro_identity_literals_match_the_real_type_names() {
+        // `autumn-macros-support` matches these paths as text.
+        assert_eq!(
+            std::any::type_name::<SqliteUuid>(),
+            "autumn_web::db::sqlite_types::SqliteUuid"
+        );
+        assert_eq!(
+            std::any::type_name::<SqliteDecimal>(),
+            "autumn_web::db::sqlite_types::SqliteDecimal"
+        );
+    }
+
+    #[test]
+    fn wrappers_implement_the_schema_trait() {
+        assert_eq!(SqliteUuid::schema(), uuid::Uuid::schema());
+        assert_eq!(SqliteDecimal::schema(), rust_decimal::Decimal::schema());
+    }
 
     #[test]
     fn uuid_newtype_round_trips_through_text() {

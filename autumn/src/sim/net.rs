@@ -191,6 +191,16 @@ impl SimNet {
         self.lock().stream = SeededEntropy::shared(seed ^ NET_STREAM_SALT);
     }
 
+    /// Serve `host` with `router` from now on (a mounted replica, #3067).
+    pub(crate) fn insert_host(&self, host: &str, router: axum::Router) {
+        self.lock().hosts.insert(canonical_host(host), router);
+    }
+
+    /// Stop serving `host` (a killed replica). Calls to it then fail.
+    pub(crate) fn remove_host(&self, host: &str) {
+        self.lock().hosts.remove(&canonical_host(host));
+    }
+
     /// The router that serves `host`, if any.
     pub(crate) fn service(&self, host: &str) -> Option<axum::Router> {
         self.lock().hosts.get(&canonical_host(host)).cloned()
@@ -269,7 +279,7 @@ fn sample_latency((min, max): (Duration, Duration), draw: u64) -> Duration {
 /// `host` as a URL writes it: lower case, with an international name in
 /// punycode and an IPv6 address in brackets. A request's host is always in
 /// this form, so a name registered any other way would never match.
-fn canonical_host(host: &str) -> String {
+pub(crate) fn canonical_host(host: &str) -> String {
     url::Host::parse(host).map_or_else(|_| host.to_ascii_lowercase(), |parsed| parsed.to_string())
 }
 

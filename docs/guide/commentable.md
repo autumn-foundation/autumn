@@ -154,8 +154,9 @@ CREATE TRIGGER posts_delete_comments
 
 This runs for **every** hard delete of a `posts` row: through the
 repository, a raw `DELETE`, or an admin tool. An ordinary soft delete does
-not fire it — the row is only marked deleted, not removed. `add_comment`'s
-own check already refuses a soft-deleted parent. A later `purge`, though,
+not fire it — the row is only marked deleted, not removed. Through a
+`soft_delete` repository, `add_comment` refuses a soft-deleted parent (see
+[Soft-deleted parents](#soft-deleted-parents)). A later `purge`, though,
 issues a real hard `DELETE`. It fires the trigger, and the parent's
 comments go with it.
 
@@ -276,6 +277,7 @@ offer a reply the server would refuse.
 ```rust,ignore
 AppBuilder::new()
     .nest("/comments", autumn_web::commentable::router(Default::default()))
+    .declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
 ```
 
 mounts **one** pair of routes for the whole binary:
@@ -288,6 +290,11 @@ mounts **one** pair of routes for the whole binary:
 `commentable_type` is matched against the registry, so an unregistered type is
 a `404` — the router can only ever reach a model that really declared
 `#[commentable]`. Adding a third commentable model changes nothing here.
+
+`autumn routes audit` cannot see inside a `nest`ed router, and fails closed on
+one. `commentable::route_infos` declares the two routes so the audit can
+classify them: reading a thread is `public`, and posting is `gated` with
+`provenance: "declared"`, because the session check lives in the handler body.
 
 **Mount it behind whatever authentication and CSRF middleware your app already
 uses.** The `POST` handler reads the author's id from the session key named by
@@ -426,6 +433,14 @@ parent's own repository opts into `#[repository(…, soft_delete)]`. A
 tombstone. The row stays commentable. The repository's own finders still
 return it. As with tenancy, the repository's opt-in decides — never the
 column's presence alone.
+
+A model can have a `soft_delete` repository and a plain one. The helpers then
+follow the repository you call them on. Through the `soft_delete` repository,
+a soft-deleted parent is `404`. Through the plain repository, it accepts
+comments. This agrees with the finders of that repository.
+
+The generic router has no repository. It hides a soft-deleted parent if any
+repository of the model soft-deletes.
 
 ## What this deliberately does not do
 

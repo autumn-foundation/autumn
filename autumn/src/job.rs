@@ -30,7 +30,8 @@
 // The durable Postgres job backend (queue claiming, worker/maintenance loops,
 // lifecycle recording, admin paging — everything reachable only from the
 // `start_postgres_runtime` entry point) is Postgres-only and is refused under
-// the `sqlite` feature (SQLite has no LISTEN/NOTIFY or advisory-lock queue).
+// the `sqlite` feature (SQLite has no `FOR UPDATE SKIP LOCKED` or advisory
+// locks).
 // Those helpers therefore become dead in a `--features sqlite` build while the
 // local/redis backends stay live; silence dead-code just for that build rather
 // than cfg-gating dozens of individual pg-only items. No effect on the default
@@ -48,11 +49,12 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::job_tracking::PendingSettle;
 use crate::{AppState, AutumnError, AutumnResult};
 
 pub use crate::job_tracking::{
-    JobContext, JobTrackingStore, JobTrackingStoreEntry, TrackedJobHandle, TrackedJobOwner,
-    TrackedJobRecord, TrackedJobStatus, enqueue_tracked, enqueue_tracked_for,
+    JobContext, JobTrackingStore, JobTrackingStoreEntry, RetryToken, TrackedJobHandle,
+    TrackedJobOwner, TrackedJobRecord, TrackedJobStatus, enqueue_tracked, enqueue_tracked_for,
 };
 
 /// The asynchronous function signature for a background job.
@@ -64,6 +66,8 @@ pub type JobHandler =
 /// Durable job queue for the `SQLite` backend (issue #1907).
 #[cfg(feature = "sqlite")]
 pub(crate) mod sqlite;
+
+mod tenant_lanes;
 
 const DEFAULT_JOB_ADMIN_HISTORY_LIMIT: usize = 1_000;
 const DEFAULT_JOB_ADMIN_PER_PAGE: u64 = 25;
@@ -137,6 +141,10 @@ pub struct JobInfo {
     /// chokepoints (including the transactional free functions) can wrap by
     /// looking the version up from the registry.
     pub version: u32,
+    /// Maximum duration of one run (issue #3051). A slower run fails and
+    /// retries like any other failure. `None` uses `jobs.default_timeout_ms`.
+    /// When that is `0`, there is no limit.
+    pub timeout: Option<std::time::Duration>,
     /// The async function that executes the job logic.
     pub handler: JobHandler,
 }
@@ -158,6 +166,7 @@ impl JobInfo {
             uniqueness: None,
             concurrency: None,
             version: 1,
+            timeout: None,
             handler,
         }
     }
@@ -168,11 +177,17 @@ pub(crate) const DEFAULT_QUEUE: &str = "default";
 
 /// Normalize a declared queue name, mapping empty/whitespace to `"default"`.
 pub(crate) fn normalize_queue_name(name: &str) -> String {
+    normalized_queue_name(name).to_owned()
+}
+
+/// [`normalize_queue_name`] without the copy, for callers that only look the
+/// queue up (slot accounting, bucket probes, list keys).
+pub(crate) fn normalized_queue_name(name: &str) -> &str {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        DEFAULT_QUEUE.to_string()
+        DEFAULT_QUEUE
     } else {
-        trimmed.to_string()
+        trimmed
     }
 }
 
@@ -265,11 +280,16 @@ impl QueueSchedule {
 
     /// A per-worker cursor producing each claim iteration's attempt order.
     pub(crate) fn cursor(&self) -> QueueCursor {
+        let names: Arc<Vec<String>> =
+            Arc::new(self.queues.iter().map(|(n, _)| n.clone()).collect());
+        let order = Arc::clone(&names);
         QueueCursor {
-            names: Arc::new(self.queues.iter().map(|(n, _)| n.clone()).collect()),
+            names,
             weights: self.queues.iter().map(|(_, w)| *w).collect(),
             current: vec![0_i64; self.queues.len()],
             strict: self.strict,
+            order,
+            rest_scratch: Vec::new(),
         }
     }
 }
@@ -283,6 +303,11 @@ pub(crate) struct QueueCursor {
     weights: Vec<u32>,
     current: Vec<i64>,
     strict: bool,
+    /// The weighted order handed out last. The next call refills it in
+    /// place once the caller has dropped it. It starts out sharing `names`.
+    order: Arc<Vec<String>>,
+    /// Scratch for the non-chosen queue indices, reused across calls.
+    rest_scratch: Vec<usize>,
 }
 
 impl QueueCursor {
@@ -312,12 +337,24 @@ impl QueueCursor {
         }
         self.current[best] = self.current[best].saturating_sub(total);
         // Chosen queue first, then the rest by descending remaining credit.
-        let mut rest: Vec<usize> = (0..self.names.len()).filter(|&i| i != best).collect();
+        let mut rest = std::mem::take(&mut self.rest_scratch);
+        rest.clear();
+        rest.extend((0..self.names.len()).filter(|&i| i != best));
         rest.sort_by(|&a, &b| self.current[b].cmp(&self.current[a]));
-        let mut order = Vec::with_capacity(self.names.len());
-        order.push(self.names[best].clone());
-        order.extend(rest.into_iter().map(|i| self.names[i].clone()));
-        Arc::new(order)
+        // Refill last iteration's buffer: once the caller has dropped the
+        // previous order this `Arc` is unique, so `make_mut` returns it without
+        // copying and `clone_from` reuses each slot's capacity. A caller still
+        // holding an earlier order keeps it intact (copy-on-write). `order`
+        // always has `names.len()` slots.
+        let order = Arc::make_mut(&mut self.order);
+        for (slot, i) in order
+            .iter_mut()
+            .zip(std::iter::once(best).chain(rest.iter().copied()))
+        {
+            slot.clone_from(&self.names[i]);
+        }
+        self.rest_scratch = rest;
+        Arc::clone(&self.order)
     }
 }
 
@@ -531,40 +568,70 @@ impl QueueSlots {
 
     /// Filter `order` down to the queues that may claim right now, preserving
     /// the input order. A no-op passthrough when no limits are configured.
-    #[allow(clippy::significant_drop_tightening)]
+    ///
+    /// The owned form of [`Self::claimable_borrowed`], kept for the `SQLite`
+    /// poll loop, which iterates the result by value.
+    #[cfg_attr(not(any(test, feature = "sqlite")), allow(dead_code))]
     pub(crate) fn claimable(&self, order: &[String]) -> Vec<String> {
+        self.claimable_borrowed(order).into_owned()
+    }
+
+    /// [`Self::claimable`] without the passthrough copy: with no limits the
+    /// order comes back borrowed, so the default claim loops copy nothing.
+    #[allow(clippy::significant_drop_tightening)]
+    pub(crate) fn claimable_borrowed<'a>(
+        &self,
+        order: &'a [String],
+    ) -> std::borrow::Cow<'a, [String]> {
         if self.limits.is_empty() {
-            return order.to_vec();
+            return std::borrow::Cow::Borrowed(order);
         }
         let guard = self
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (running, total) = &*guard;
-        order
-            .iter()
-            .filter(|q| queue_may_claim(q, running, *total, &self.limits, self.total_slots))
-            .cloned()
-            .collect()
+        std::borrow::Cow::Owned(
+            order
+                .iter()
+                .filter(|q| queue_may_claim(q, running, *total, &self.limits, self.total_slots))
+                .cloned()
+                .collect(),
+        )
     }
 
     /// Record that a job on `queue` has started; the returned guard releases the
     /// slot when dropped.
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn acquire(self: &Arc<Self>, queue: &str) -> QueueSlotGuard {
+        // No caps/reservations: the running counts are read only by
+        // `queue_may_claim`, which never runs without limits (`claimable` and
+        // `try_reserve` both return early, and limits are fixed at
+        // construction). Skip the bookkeeping, its lock and its key copies.
+        if self.limits.is_empty() {
+            return QueueSlotGuard {
+                slots: Arc::clone(self),
+                queue: None,
+            };
+        }
         {
             let mut guard = self
                 .running
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let (running, total) = &mut *guard;
-            let slot = running.entry(queue.to_string()).or_insert(0);
-            *slot = slot.saturating_add(1);
+            // Probe by borrow: the queue is tracked after its first job.
+            #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+            if let Some(slot) = running.get_mut(queue) {
+                *slot = slot.saturating_add(1);
+            } else {
+                running.insert(queue.to_owned(), 1);
+            }
             *total = total.saturating_add(1);
         }
         QueueSlotGuard {
             slots: Arc::clone(self),
-            queue: queue.to_string(),
+            queue: Some(queue.to_owned()),
         }
     }
 
@@ -582,7 +649,8 @@ impl QueueSlots {
     ///
     /// When no limits are configured this is a passthrough that always succeeds
     /// (the active-path callers never take this branch — they use the fast path
-    /// — but keeping it balanced makes the guard safe to hold either way).
+    /// — and the passthrough guard counts nothing, so it is safe to hold either
+    /// way).
     #[allow(clippy::significant_drop_tightening)]
     pub(crate) fn try_reserve(self: &Arc<Self>, queue: &str) -> Option<QueueSlotGuard> {
         if self.limits.is_empty() {
@@ -601,12 +669,17 @@ impl QueueSlots {
         if !queue_may_claim(queue, running, *total, &self.limits, self.total_slots) {
             return None;
         }
-        let slot = running.entry(queue.to_string()).or_insert(0);
-        *slot = slot.saturating_add(1);
+        // Probe by borrow: the queue is tracked after its first job.
+        #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+        if let Some(slot) = running.get_mut(queue) {
+            *slot = slot.saturating_add(1);
+        } else {
+            running.insert(queue.to_owned(), 1);
+        }
         *total = total.saturating_add(1);
         Some(QueueSlotGuard {
             slots: Arc::clone(self),
-            queue: queue.to_string(),
+            queue: Some(queue.to_owned()),
         })
     }
 }
@@ -614,19 +687,24 @@ impl QueueSlots {
 /// RAII release for a slot acquired via [`QueueSlots::acquire`].
 pub(crate) struct QueueSlotGuard {
     slots: Arc<QueueSlots>,
-    queue: String,
+    /// `None` for a slot taken with no limits configured: nothing was
+    /// counted, so nothing is given back.
+    queue: Option<String>,
 }
 
 impl Drop for QueueSlotGuard {
     #[allow(clippy::significant_drop_tightening)]
     fn drop(&mut self) {
+        let Some(queue) = self.queue.as_deref() else {
+            return;
+        };
         let mut guard = self
             .slots
             .running
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (running, total) = &mut *guard;
-        if let Some(count) = running.get_mut(&self.queue) {
+        if let Some(count) = running.get_mut(queue) {
             *count = count.saturating_sub(1);
         }
         *total = total.saturating_sub(1);
@@ -642,7 +720,7 @@ pub struct JobClient {
     local_coordination: Option<Arc<LocalJobCoordination>>,
     #[cfg(feature = "redis")]
     redis: Option<RedisClient>,
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     pg_pool: Option<PgPool>,
     /// The durable `SQLite` queue's pool, when `jobs.backend = "sqlite"` is the
     /// running backend (issue #1907).
@@ -655,6 +733,11 @@ pub struct JobClient {
     per_job_settings: HashMap<String, JobRuntimeSettings>,
     pub interceptor: Option<Arc<dyn crate::interceptor::JobInterceptor>>,
     resilience_config: Option<Arc<crate::config::ResilienceConfig>>,
+    /// `jobs.postgres.shard_local` (#3072). When `true`, an in-transaction
+    /// enqueue does not use the fleet-wide `job_queue` breaker. A
+    /// control-database outage must not stop shard enqueues.
+    #[cfg(feature = "postgres")]
+    shard_local: bool,
     /// Injected entropy source for minting job ids. Defaults to
     /// [`crate::entropy::OsEntropy`]; a simulation seeds it via the app's
     /// [`crate::state::AppState::with_entropy`] so job ids replay deterministically.
@@ -740,7 +823,7 @@ pub(crate) enum EnqueueOutcome {
 /// One item on its way into [`JobClient::enqueue_many_pg`]'s batched
 /// `INSERT`. Every in-memory step already ran for it: capsule replay, id,
 /// constraints, registry and admin bookkeeping.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 struct BatchEnqueueRow {
     /// Index into the caller's `items`. Used to send the batch's outcome
     /// back to the right slot, no matter what order rows insert in.
@@ -780,6 +863,11 @@ struct QueuedJob {
     attempt: u32,
     max_attempts: u32,
     initial_backoff_ms: u64,
+    /// The tenant of the request that enqueued the job. Used only to
+    /// attribute cost: the handler does not run in this tenant's scope.
+    tenant: Option<String>,
+    /// `true` after the job waited for the cost signal (issue #1720).
+    cost_waited: bool,
     /// W3C `traceparent` serialized at enqueue time.  `None` when the
     /// `telemetry-otlp` feature is disabled or no active span was present.
     #[cfg(feature = "telemetry-otlp")]
@@ -794,11 +882,516 @@ enum JobExecutionOutcome {
     Succeeded,
     Failed(String),
     Panicked(String),
+    /// The worker lost its claim and stopped the handler (issue #3051).
+    /// Another worker owns the job now, so this worker must not settle it.
+    LeaseLost,
+}
+
+/// Limits on one job run (issue #3051).
+#[derive(Clone, Default)]
+pub(crate) struct ExecutionBounds {
+    /// Fail the run when it takes longer than this.
+    pub(crate) timeout: Option<std::time::Duration>,
+    /// Cancelled when the worker loses its claim on the job.
+    pub(crate) lease_lost: Option<tokio_util::sync::CancellationToken>,
+}
+
+/// How a bounded run ended.
+enum BoundedRun<T> {
+    Finished(T),
+    TimedOut(std::time::Duration),
+    LeaseLost,
+}
+
+/// Poll `run` until it finishes, its timeout expires, or the lease is lost.
+///
+/// On a timeout or a lost lease, the run future is dropped and `signals` is
+/// cancelled, so work the handler spawned can stop too.
+async fn bound_run<F: Future>(
+    run: F,
+    bounds: &ExecutionBounds,
+    signals: &crate::job_tracking::RunSignals,
+) -> BoundedRun<F::Output> {
+    let lease_lost = async {
+        match &bounds.lease_lost {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    let timeout = async {
+        match bounds.timeout {
+            Some(limit) => {
+                tokio::time::sleep(limit).await;
+                limit
+            }
+            None => std::future::pending().await,
+        }
+    };
+    // Lease loss first: when the claim is gone, stop at once.
+    let ended = tokio::select! {
+        biased;
+        () = lease_lost => BoundedRun::LeaseLost,
+        output = run => BoundedRun::Finished(output),
+        limit = timeout => BoundedRun::TimedOut(limit),
+    };
+    match &ended {
+        BoundedRun::Finished(_) => {}
+        BoundedRun::TimedOut(_) => signals.cancel(),
+        BoundedRun::LeaseLost => signals.mark_lease_lost(),
+    }
+    ended
+}
+
+/// Failure message for a run that exceeded its timeout.
+fn job_timeout_message(limit: std::time::Duration) -> String {
+    format!("job timed out after {}ms", limit.as_millis())
+}
+
+/// Shortest visibility timeout a durable backend uses. The heartbeat renews
+/// every third of it, so this keeps renewals at least 10ms apart. A shorter
+/// configured value is raised to this one.
+#[cfg(any(feature = "db", feature = "redis"))]
+const MIN_VISIBILITY_TIMEOUT_MS: u64 = 30;
+
+/// The visibility timeout a durable backend uses for both stale recovery and
+/// the heartbeat: the configured value, but not less than
+/// [`MIN_VISIBILITY_TIMEOUT_MS`]. Both use the same value, so the first renewal
+/// always comes inside the lease.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn effective_visibility_timeout_ms(configured: u64) -> u64 {
+    configured.max(MIN_VISIBILITY_TIMEOUT_MS)
+}
+
+/// [`effective_visibility_timeout_ms`] for a runtime start, with a warning
+/// when the configured value was too short.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn runtime_visibility_timeout_ms(backend: &str, configured: u64) -> u64 {
+    let effective = effective_visibility_timeout_ms(configured);
+    if effective != configured {
+        tracing::warn!(
+            backend,
+            configured_ms = configured,
+            effective_ms = effective,
+            "job visibility timeout is too short; using the minimum"
+        );
+    }
+    effective
+}
+
+/// Error recorded when a worker loses its claim on a running job.
+#[cfg(any(feature = "db", feature = "redis"))]
+const LEASE_LOST_ERROR: &str = "job lease lost; another worker owns the job";
+
+/// How often a worker renews its claim: a third of the visibility timeout.
+/// Runtimes pass [`effective_visibility_timeout_ms`], so this is at least 10ms.
+/// The 1ms floor only keeps `tokio::time::interval` from panicking on zero.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn lease_heartbeat_interval(visibility_timeout_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(visibility_timeout_ms / 3)
+        .max(std::time::Duration::from_millis(1))
+}
+
+/// How long a worker keeps running without a successful renewal: two thirds
+/// of the visibility timeout, so it stops before another worker can recover
+/// the claim.
+#[cfg(any(feature = "db", feature = "redis"))]
+const fn lease_give_up_after(visibility_timeout_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(visibility_timeout_ms.saturating_mul(2) / 3)
+}
+
+/// Result of one claim renewal.
+#[cfg(any(feature = "db", feature = "redis"))]
+#[derive(Debug)]
+enum LeaseRenewal {
+    /// The worker still holds the claim, and its expiry moved forward.
+    Renewed,
+    /// The worker no longer holds the claim.
+    Lost,
+    /// The renewal did not complete. The heartbeat tries again.
+    Failed(String),
+}
+
+/// Renews a durable job's claim while the job runs (issue #3051).
+///
+/// The heartbeat is its own task. On a multi-thread runtime, a handler that
+/// blocks its thread does not stop the heartbeat. The heartbeat stops when
+/// [`Self::stop`] runs, when the value is dropped, or when the process stops.
+/// Thus crash recovery continues to work.
+#[cfg(any(feature = "db", feature = "redis"))]
+struct LeaseHeartbeat {
+    lost: tokio_util::sync::CancellationToken,
+    stop: tokio_util::sync::CancellationToken,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(any(feature = "db", feature = "redis"))]
+impl LeaseHeartbeat {
+    /// Start the heartbeat for a claim sent at `claimed_at`, before the
+    /// handler runs.
+    ///
+    /// When the claim and the run setup took a third of the lease or more,
+    /// the first renewal is already due. It runs here, before the handler is
+    /// first polled: if the claim is gone, the lost token is cancelled on
+    /// return, so `bound_run` never starts the handler while another worker
+    /// may run the job.
+    async fn start<R, F>(
+        claimed_at: tokio::time::Instant,
+        visibility_timeout_ms: u64,
+        mut renew: R,
+    ) -> Self
+    where
+        R: FnMut() -> F + Send + 'static,
+        F: Future<Output = LeaseRenewal> + Send + 'static,
+    {
+        let interval = lease_heartbeat_interval(visibility_timeout_ms);
+        let started = tokio::time::Instant::now();
+        if started < crate::time_math::saturating_tokio_deadline(claimed_at, interval) {
+            return Self::spawn(claimed_at, visibility_timeout_ms, renew);
+        }
+        let give_up_at = crate::time_math::saturating_tokio_deadline(
+            claimed_at,
+            lease_give_up_after(visibility_timeout_ms),
+        );
+        // Keep the renewal outside the select, as `spawn` does.
+        let mut renewing = Box::pin(renew());
+        let renewal = tokio::select! {
+            biased;
+            renewal = &mut renewing => Some(renewal),
+            () = tokio::time::sleep_until(give_up_at) => {
+                tokio::spawn(renewing);
+                None
+            }
+        };
+        match renewal {
+            Some(LeaseRenewal::Renewed) => Self::spawn(started, visibility_timeout_ms, renew),
+            Some(LeaseRenewal::Failed(error)) if tokio::time::Instant::now() < give_up_at => {
+                tracing::warn!(error = %error, "job lease renewal failed; retrying");
+                Self::spawn(claimed_at, visibility_timeout_ms, renew)
+            }
+            _ => {
+                tracing::warn!("job lease lost before the handler started; not running it");
+                let lost = tokio_util::sync::CancellationToken::new();
+                lost.cancel();
+                Self {
+                    lost,
+                    stop: tokio_util::sync::CancellationToken::new(),
+                    task: None,
+                }
+            }
+        }
+    }
+
+    /// Call `renew` every third of `visibility_timeout_ms`, counting from
+    /// `claimed_at`: an instant taken just before the claim was sent.
+    ///
+    /// A `Lost` result cancels the lost token and ends the heartbeat. A
+    /// `Failed` result is logged and tried again. When no renewal succeeds
+    /// for two thirds of the visibility timeout, the heartbeat also cancels
+    /// the lost token: another worker can recover the claim soon, so this
+    /// worker must stop first.
+    fn spawn<R, F>(
+        claimed_at: tokio::time::Instant,
+        visibility_timeout_ms: u64,
+        mut renew: R,
+    ) -> Self
+    where
+        R: FnMut() -> F + Send + 'static,
+        F: Future<Output = LeaseRenewal> + Send + 'static,
+    {
+        let interval = lease_heartbeat_interval(visibility_timeout_ms);
+        let give_up_after = lease_give_up_after(visibility_timeout_ms);
+        let lost = tokio_util::sync::CancellationToken::new();
+        let stop = tokio_util::sync::CancellationToken::new();
+        let task = tokio::spawn({
+            let lost = lost.clone();
+            let stop = stop.clone();
+            async move {
+                // The claim's deadline counts from when the worker sent the
+                // claim, which can be well before this task starts.
+                let mut last_renewed = claimed_at;
+                let mut next_attempt =
+                    crate::time_math::saturating_tokio_deadline(last_renewed, interval);
+                loop {
+                    // Biased: stop goes first, so a sim gets the same order each run.
+                    tokio::select! {
+                        biased;
+                        () = stop.cancelled() => return,
+                        () = tokio::time::sleep_until(next_attempt) => {}
+                    }
+                    let started = tokio::time::Instant::now();
+                    // Attempts start one interval apart. A slow renewal does
+                    // not push the next one toward the give-up time.
+                    next_attempt = crate::time_math::saturating_tokio_deadline(started, interval);
+                    // The give-up time also bounds a renewal that stalls.
+                    let give_up_at =
+                        crate::time_math::saturating_tokio_deadline(last_renewed, give_up_after);
+                    // Keep the renewal outside the select. `select!` drops the
+                    // losing futures before it runs a branch. diesel-async
+                    // panics when it drops a `SQLite` query in flight on a
+                    // current-thread runtime.
+                    let mut renewing = Box::pin(renew());
+                    // Biased: a renewal that completes at the give-up time counts.
+                    let renewal = tokio::select! {
+                        biased;
+                        () = stop.cancelled() => None,
+                        renewal = &mut renewing => Some(renewal),
+                        () = tokio::time::sleep_until(give_up_at) => {
+                            tracing::warn!("job lease renewal stalled too long; stopping the job");
+                            lost.cancel();
+                            None
+                        }
+                    };
+                    let Some(renewal) = renewal else {
+                        // Let the renewal in flight finish on its own task.
+                        // Do not drop it. A late renewal never moves a claim
+                        // time back.
+                        tokio::spawn(renewing);
+                        return;
+                    };
+                    match renewal {
+                        LeaseRenewal::Renewed => last_renewed = started,
+                        LeaseRenewal::Lost => {
+                            lost.cancel();
+                            return;
+                        }
+                        LeaseRenewal::Failed(error) => {
+                            if last_renewed.elapsed() >= give_up_after {
+                                tracing::warn!(
+                                    error = %error,
+                                    "job lease renewal failed too long; stopping the job"
+                                );
+                                lost.cancel();
+                                return;
+                            }
+                            tracing::warn!(error = %error, "job lease renewal failed; retrying");
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            lost,
+            stop,
+            task: Some(task),
+        }
+    }
+
+    /// Token that is cancelled when the claim is lost.
+    fn lost_token(&self) -> tokio_util::sync::CancellationToken {
+        self.lost.clone()
+    }
+
+    /// Run `settle` (the ack or nack) while the heartbeat still renews the
+    /// claim, then stop it. A settle that stalls past the lease must not let
+    /// stale recovery requeue a job whose handler already finished. A renewal
+    /// that lands after the settle matches no claim, or only moves a new
+    /// claim's time forward.
+    async fn stop_after<F: Future>(self, settle: F) -> F::Output {
+        let settled = settle.await;
+        self.stop().await;
+        settled
+    }
+
+    /// Stop renewing and wait for the heartbeat task to end.
+    async fn stop(mut self) {
+        self.stop.cancel();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+#[cfg(any(feature = "db", feature = "redis"))]
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+/// Record that a durable worker starts `attempt`. When it replaces an earlier
+/// attempt this process started, balance that attempt's start here: recovery
+/// and the old worker's lease loss then find no note and count nothing (see
+/// `record_lease_lost`).
+///
+/// The caller notes the claim (`note_local_claim`) after its registry
+/// `record_start`. Recovery must not take a note before the gauge counts the
+/// start.
+///
+/// Use the note, not the admin record, to find the starts of this process. A
+/// job that another replica enqueued has no admin record here.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn record_attempt_start(
+    name: &str,
+    id: &str,
+    attempt: u32,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) -> JobAdminStartDecision {
+    let decision = job_admin.try_record_start(id, attempt);
+    if decision != JobAdminStartDecision::Canceled {
+        for _ in 0..job_admin.take_older_local_claims(id, attempt) {
+            state.job_registry.record_retry(
+                name,
+                "visibility timeout expired",
+                attempt.saturating_sub(1),
+            );
+        }
+    }
+    decision
+}
+
+/// Record a row that Postgres or `SQLite` stale recovery requeued at
+/// `new_attempt`. When this process started the previous attempt, this
+/// balances its start, so a later lease loss of either attempt is counted
+/// once (see `record_lease_lost`).
+#[cfg(feature = "db")]
+fn record_recovered_requeue(
+    name: &str,
+    id: &str,
+    new_attempt: u32,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
+    const ERROR: &str = "visibility timeout expired";
+    let previous = new_attempt.saturating_sub(1);
+    let started_here = job_admin.take_local_claim(id, previous);
+    job_admin.settle_recovered_requeue(id, new_attempt, ERROR);
+    if started_here {
+        state.job_registry.record_retry(name, ERROR, previous);
+    }
+}
+
+/// Record a claim that stale recovery dead-lettered at `attempt`. Count the
+/// failure. Balance `in_flight` only if this process started that attempt.
+/// Another replica's worker can own the claim.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn record_recovered_failure(
+    name: &str,
+    id: &str,
+    attempt: u32,
+    error: &str,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
+    if job_admin.take_local_claim(id, attempt) {
+        state
+            .job_registry
+            .record_failure(name, error.to_owned(), true);
+    } else {
+        state
+            .job_registry
+            .record_failure_not_started(name, error.to_owned(), true);
+    }
+}
+
+/// [`settle_redis_claim`] for the claim `record` holds.
+#[cfg(feature = "redis")]
+fn settle_redis_record(
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+    record: &RedisJobRecord,
+    applied: bool,
+) {
+    settle_redis_claim(
+        state,
+        job_admin,
+        &record.name,
+        &record.id,
+        record.attempt,
+        applied,
+    );
+}
+
+/// A Redis ack for attempt `attempt` of job `id` returned. Drop the note of
+/// the claim. If the ack applied to nothing, another worker or recovery took
+/// the claim. Then balance the start, unless recovery in this process already
+/// did. If the ack applied but a newer attempt balanced the start, undo the
+/// decrement that the caller makes next.
+#[cfg(feature = "redis")]
+fn settle_redis_claim(
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+    name: &str,
+    id: &str,
+    attempt: u32,
+    applied: bool,
+) {
+    let started_here = job_admin.take_local_claim(id, attempt);
+    if applied && !started_here {
+        // A newer attempt balanced this start. The caller's `record_*` call
+        // decrements again.
+        state.job_registry.restore_in_flight(name);
+    } else if started_here && !applied {
+        state.job_registry.record_retry(name, LEASE_LOST_ERROR, 0);
+    }
+}
+
+/// Record a claim that Redis stale recovery requeued at `new_attempt`.
+/// `immediate` is true when the job is due at once. A delayed requeue is
+/// recorded as enqueued when the `delayed` set promotes it.
+#[cfg(feature = "redis")]
+fn record_redis_recovered_requeue(
+    name: &str,
+    id: &str,
+    new_attempt: u32,
+    error: &str,
+    immediate: bool,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
+    let previous = new_attempt.saturating_sub(1);
+    let started_here = job_admin.take_local_claim(id, previous);
+    let settled = job_admin.settle_redis_recovered_requeue(id, new_attempt, error, immediate);
+    if started_here {
+        state.job_registry.record_retry(name, error, previous);
+    }
+    // A replacement that started here already took the job off the queue.
+    if immediate && settled != RedisRecoveredRequeue::ReplacementStarted {
+        state.job_registry.record_enqueue(name);
+    }
+}
+
+/// What Redis stale recovery's requeue changed in this process's admin
+/// record.
+#[cfg(feature = "redis")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedisRecoveredRequeue {
+    /// The record was moved to the new attempt, or this process has none.
+    Requeued,
+    /// The record already shows the new attempt or a later one: the
+    /// replacement started here and was left alone.
+    ReplacementStarted,
+}
+
+/// Record a run that stopped because its worker lost the claim. The job is
+/// not settled: the worker that holds the claim now owns that.
+///
+/// Stale recovery in this process can have recorded the job already, and a
+/// replacement attempt can be running. So this balances the start only while
+/// this process still holds the note of `attempt`.
+#[cfg(any(feature = "db", feature = "redis"))]
+fn record_lease_lost(
+    name: &str,
+    id: &str,
+    attempt: u32,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
+    tracing::warn!(job = %name, job_id = %id, "{LEASE_LOST_ERROR}; handler stopped");
+    let started_here = job_admin.take_local_claim(id, attempt);
+    job_admin.settle_lease_lost(id, attempt, LEASE_LOST_ERROR);
+    if started_here {
+        // Balances this worker's `record_start`.
+        state.job_registry.record_retry(name, LEASE_LOST_ERROR, 0);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobAdminStartDecision {
     Started,
+    /// Started, and replaced an earlier attempt this process still showed as
+    /// running. The caller balances that attempt's start.
+    Superseded,
     Canceled,
     Missing,
     AlreadyTransitioned,
@@ -1103,6 +1696,12 @@ struct JobAdminMemoryInner {
     /// fired so the spawned timer task exits immediately and releases the unique
     /// lock rather than holding it until the original due time fires.
     delay_cancelers: HashMap<String, tokio_util::sync::CancellationToken>,
+    /// Attempts of each job this process started and has not yet balanced in
+    /// the `in_flight` gauge. Unlike `records`, it covers jobs another
+    /// replica enqueued. Each attempt is balanced once: by the worker's
+    /// settle, by recovery, or by a newer attempt.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    local_claims: HashMap<String, Vec<u32>>,
 }
 
 /// Bounded process-local job dashboard backend used by the built-in runtime.
@@ -1131,6 +1730,8 @@ impl JobAdminMemoryBackend {
                 order: VecDeque::new(),
                 history_limit: history_limit.max(1),
                 delay_cancelers: HashMap::new(),
+                #[cfg(any(feature = "db", feature = "redis"))]
+                local_claims: HashMap::new(),
             })),
             clock: Arc::new(crate::time::SystemClock),
         }
@@ -1235,9 +1836,86 @@ impl JobAdminMemoryBackend {
                 record.attempt = attempt;
                 JobAdminStartDecision::Started
             }
+            // A newer attempt starts while this process still shows an older
+            // one as running (stale recovery requeued it here or elsewhere)
+            // or as retrying (its lease was lost). Durable backends only.
+            JobAdminStatus::Running | JobAdminStatus::Retrying if record.attempt < attempt => {
+                let superseded = record.status == JobAdminStatus::Running;
+                record.status = JobAdminStatus::Running;
+                record.started_at = Some(self.clock.now());
+                record.finished_at = None;
+                record.attempt = attempt;
+                if superseded {
+                    JobAdminStartDecision::Superseded
+                } else {
+                    JobAdminStartDecision::Started
+                }
+            }
             JobAdminStatus::Canceled => JobAdminStartDecision::Canceled,
             _ => JobAdminStartDecision::AlreadyTransitioned,
         }
+    }
+
+    /// Note that this process started `attempt` of job `id`.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn note_local_claim(&self, id: &str, attempt: u32) {
+        if let Ok(mut inner) = self.inner.write() {
+            inner
+                .local_claims
+                .entry(id.to_owned())
+                .or_default()
+                .push(attempt);
+        }
+    }
+
+    /// Drop the note for `attempt` of job `id`. Returns `true` when this
+    /// process started it and had not balanced it yet: the caller must balance
+    /// `in_flight`.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn take_local_claim(&self, id: &str, attempt: u32) -> bool {
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        let Some(attempts) = inner.local_claims.get_mut(id) else {
+            return false;
+        };
+        let Some(index) = attempts.iter().position(|noted| *noted == attempt) else {
+            return false;
+        };
+        attempts.swap_remove(index);
+        if attempts.is_empty() {
+            inner.local_claims.remove(id);
+        }
+        true
+    }
+
+    /// Drop the notes for attempts of job `id` older than `attempt`. Returns
+    /// how many there were.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn take_older_local_claims(&self, id: &str, attempt: u32) -> usize {
+        let Ok(mut inner) = self.inner.write() else {
+            return 0;
+        };
+        let Some(attempts) = inner.local_claims.get_mut(id) else {
+            return 0;
+        };
+        let before = attempts.len();
+        attempts.retain(|noted| *noted >= attempt);
+        let taken = before.saturating_sub(attempts.len());
+        if attempts.is_empty() {
+            inner.local_claims.remove(id);
+        }
+        taken
+    }
+
+    /// `true` when an operator canceled the job `id`.
+    fn is_canceled(&self, id: &str) -> bool {
+        self.inner.read().is_ok_and(|inner| {
+            inner
+                .records
+                .get(id)
+                .is_some_and(|record| record.status == JobAdminStatus::Canceled)
+        })
     }
 
     fn record_success(&self, id: &str) {
@@ -1265,6 +1943,93 @@ impl JobAdminMemoryBackend {
         record.status = JobAdminStatus::Retrying;
         record.finished_at = Some(self.clock.now());
         record.last_error = Some(error.to_owned());
+    }
+
+    /// Move a running record to `Retrying` after its worker lost the claim.
+    ///
+    /// Returns `true` when the record showed `attempt` as running and moved.
+    /// Returns `false` when this process has no record, or stale recovery or
+    /// a later attempt already moved it on. The `in_flight` balance does not
+    /// depend on this: see `take_local_claim`.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn settle_lease_lost(&self, id: &str, attempt: u32, error: &str) -> bool {
+        let Ok(mut inner) = self.inner.write() else {
+            return false;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return false;
+        };
+        if record.status != JobAdminStatus::Running || record.attempt != attempt {
+            return false;
+        }
+        record.status = JobAdminStatus::Retrying;
+        record.finished_at = Some(self.clock.now());
+        record.last_error = Some(error.to_owned());
+        true
+    }
+
+    /// Move a record that stale recovery requeued to `Enqueued` at
+    /// `new_attempt`, so the replacement attempt can start.
+    ///
+    /// A missing record, or one already moved on, stays as it is.
+    #[cfg(feature = "db")]
+    fn settle_recovered_requeue(&self, id: &str, new_attempt: u32, error: &str) {
+        let Ok(mut inner) = self.inner.write() else {
+            return;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return;
+        };
+        if record.status != JobAdminStatus::Running
+            || record.attempt.saturating_add(1) != new_attempt
+        {
+            return;
+        }
+        record.status = JobAdminStatus::Enqueued;
+        record.enqueued_at = Some(self.clock.now());
+        record.started_at = None;
+        record.finished_at = None;
+        record.attempt = new_attempt;
+        record.last_error = Some(error.to_owned());
+    }
+
+    /// Move a record that Redis stale recovery requeued at `new_attempt` to
+    /// `Enqueued` (`immediate`) or `Retrying` (due later, through the
+    /// `delayed` set).
+    ///
+    /// A record that already shows `new_attempt` or a later one (the
+    /// replacement started here) is left alone.
+    #[cfg(feature = "redis")]
+    fn settle_redis_recovered_requeue(
+        &self,
+        id: &str,
+        new_attempt: u32,
+        error: &str,
+        immediate: bool,
+    ) -> RedisRecoveredRequeue {
+        let Ok(mut inner) = self.inner.write() else {
+            return RedisRecoveredRequeue::Requeued;
+        };
+        let Some(record) = inner.records.get_mut(id) else {
+            return RedisRecoveredRequeue::Requeued;
+        };
+        if record.attempt >= new_attempt {
+            return RedisRecoveredRequeue::ReplacementStarted;
+        }
+        let now = self.clock.now();
+        record.last_error = Some(error.to_owned());
+        if immediate {
+            record.status = JobAdminStatus::Enqueued;
+            record.enqueued_at = Some(now);
+            record.scheduled_for = None;
+            record.started_at = None;
+            record.finished_at = None;
+            record.attempt = new_attempt;
+        } else {
+            record.status = JobAdminStatus::Retrying;
+            record.finished_at = Some(now);
+        }
+        RedisRecoveredRequeue::Requeued
     }
 
     fn record_failure(&self, id: &str, error: String) {
@@ -1521,6 +2286,8 @@ impl JobAdminMemoryBackend {
     #[cfg(test)]
     fn record_start_for_test(&self, id: &str, attempt: u32) {
         let _ = self.try_record_start(id, attempt);
+        #[cfg(any(feature = "db", feature = "redis"))]
+        self.note_local_claim(id, attempt);
     }
 
     #[cfg(test)]
@@ -1531,6 +2298,11 @@ impl JobAdminMemoryBackend {
     #[cfg(test)]
     fn record_failure_for_test(&self, id: &str, error: &str) {
         self.record_failure(id, error.to_owned());
+    }
+
+    #[cfg(test)]
+    fn snapshot_record_for_test(&self, id: &str) -> Option<JobAdminStoredRecord> {
+        self.inner.read().ok()?.records.get(id).cloned()
     }
 }
 
@@ -1944,6 +2716,17 @@ const REDIS_BLOCKED_PROMOTION_INTERVAL: std::time::Duration =
 #[cfg(feature = "redis")]
 const REDIS_CLAIM_SCAN_LIMIT: usize = 8;
 
+/// Score base of a job parked in the blocked zset for the cost signal (issue
+/// #1720). It is above any unix ms, so the timed promotion never moves these
+/// jobs. They go back to their queue when the signal is low.
+#[cfg(feature = "redis")]
+const REDIS_DEFERRED_SCORE_BASE: u64 = 1_000_000_000_000_000;
+
+/// Most deferred jobs that one claim call parks. They do not count toward
+/// `REDIS_CLAIM_SCAN_LIMIT`, so a deferred backlog leaves the queue fast.
+#[cfg(feature = "redis")]
+const REDIS_DEFER_SCAN_LIMIT: usize = 256;
+
 /// Safety TTL on unique locks for the pending/running windows.
 ///
 /// Those locks are normally released by the claim/transition scripts; the TTL
@@ -1951,6 +2734,25 @@ const REDIS_CLAIM_SCAN_LIMIT: usize = 8;
 /// keyspace), so a dead key can never deadlock uniqueness forever.
 #[cfg(feature = "redis")]
 const REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS: u64 = 86_400_000;
+
+/// TTL for a `running`-window unique lock while its job holds a claim: the
+/// crash backstop, or twice the visibility timeout when that is longer. The
+/// claim and each renewal set it, so the lock outlives the claim it guards
+/// even when the first renewal comes after the backstop (issue #3051).
+///
+/// Capped at ten years, so the Lua number stays an integer `PEXPIRE` accepts.
+#[cfg(feature = "redis")]
+const fn redis_running_lock_ttl_ms(visibility_timeout_ms: u64) -> u64 {
+    const MAX_TTL_MS: u64 = 10 * 365 * 86_400_000;
+    let claim_ttl = visibility_timeout_ms.saturating_mul(2);
+    if claim_ttl > MAX_TTL_MS {
+        MAX_TTL_MS
+    } else if claim_ttl > REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS {
+        claim_ttl
+    } else {
+        REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS
+    }
+}
 
 #[cfg(feature = "redis")]
 fn redis_unique_lock_key(unique_prefix: &str, name: &str, unique_key: &str) -> String {
@@ -2063,6 +2865,9 @@ struct RedisWorkerConfig {
     default_attempts: u32,
     default_backoff: u64,
     retry_promotion_interval: std::time::Duration,
+    /// `jobs.redis.dead_letter_limit`: maximum dead-letter list length.
+    /// `0` is unbounded.
+    dead_letter_limit: usize,
     /// The app's injected clock. Redis job records carry absolute
     /// millisecond timestamps (`enqueued_at_ms`, due-at scores, visibility
     /// deadlines), so they must be minted from the same clock the rest of the
@@ -2232,13 +3037,105 @@ fn build_job_consumer_span(name: &str, attempt: u32) -> tracing::Span {
     tracing::info_span!("job.execute", "otel.kind" = "consumer", job.name = %name, job.attempt = attempt)
 }
 
+/// Run one job attempt. Settle its tracked record at once.
+///
+/// Use this for a queue with no claim, such as the in-process queue.
+/// A claimed queue uses [`run_claimed_job_handler`] and settles after its ack.
 async fn run_job_handler(
     name: &str,
     handler: JobHandler,
     state: AppState,
     payload: Value,
     final_attempt: bool,
+    bounds: ExecutionBounds,
+    run: crate::cost::WorkRun,
 ) -> JobExecutionOutcome {
+    let (outcome, pending) =
+        run_claimed_job_handler(name, handler, state, payload, final_attempt, bounds, run).await;
+    pending.apply(name).await;
+    outcome
+}
+
+/// Run one job attempt, metered as one job run (issue #1720). All job
+/// backends run their handlers through here.
+///
+/// This function does not settle the tracked record. The caller applies the
+/// returned [`PendingSettle`] after the queue ack succeeds (issue #2583).
+/// A rejected ack means another attempt owns the job.
+async fn run_claimed_job_handler(
+    name: &str,
+    handler: JobHandler,
+    state: AppState,
+    payload: Value,
+    final_attempt: bool,
+    bounds: ExecutionBounds,
+    run: crate::cost::WorkRun,
+) -> (JobExecutionOutcome, PendingSettle) {
+    use crate::cost::WrapMetered as _;
+    crate::cost::WorkMeter::start(&state, crate::cost::WorkKind::Job, name, run)
+        .wrap(run_job_handler_unmetered(
+            name,
+            handler,
+            state,
+            payload,
+            final_attempt,
+            bounds,
+        ))
+        .await
+}
+
+/// Why a tracked job's capsule is not replayable.
+#[cfg(feature = "reporting")]
+const TRACKED_JOB_CAPSULE_NOTE: &str = "the job was tracked; replay runs a job untracked, so a \
+     handler that reads its job context would take a path production did not take";
+
+/// The capture settings and filter a job capsule uses, built once per app
+/// (#2351 item 6).
+#[cfg(feature = "reporting")]
+struct JobCaptureContext {
+    /// The configuration these were built from. A different one rebuilds them.
+    config: Arc<crate::config::AutumnConfig>,
+    settings: Arc<crate::capsule::CaptureSettings>,
+    filter: Arc<crate::log::filter::ParameterFilter>,
+}
+
+/// The app's [`JobCaptureContext`], when failure capture is on.
+#[cfg(feature = "reporting")]
+fn job_capture_context(state: &AppState) -> Option<Arc<JobCaptureContext>> {
+    let config = state.extension::<crate::config::AutumnConfig>()?;
+    if !config.failure_capture.enabled {
+        return None;
+    }
+    if let Some(context) = state.extension::<JobCaptureContext>()
+        && Arc::ptr_eq(&context.config, &config)
+    {
+        return Some(context);
+    }
+    // The same filter composition the capture layer uses, so one
+    // `[log] filter_parameters` list governs a job capsule and a request
+    // capsule identically.
+    let mut filter_parameters = config.log.filter_parameters.clone();
+    filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
+    filter_parameters.extend(crate::confidential::registered_confidential_column_names());
+    state.insert_extension(JobCaptureContext {
+        settings: Arc::new(crate::capsule::settings_from_config(&config)),
+        filter: Arc::new(crate::log::filter::ParameterFilter::new(
+            &filter_parameters,
+            &config.log.unfilter_parameters,
+        )),
+        config,
+    });
+    state.extension::<JobCaptureContext>()
+}
+
+async fn run_job_handler_unmetered(
+    name: &str,
+    handler: JobHandler,
+    state: AppState,
+    payload: Value,
+    final_attempt: bool,
+    bounds: ExecutionBounds,
+) -> (JobExecutionOutcome, PendingSettle) {
     // A job is a second entry point into the application, so a failure in one
     // gets the same capsule a failing request does (#1634). The scope wraps
     // the *whole* execution, so the clock, entropy, database and effect seams
@@ -2250,32 +3147,54 @@ async fn run_job_handler(
     let (tracked_key, payload) = crate::job_tracking::take_tracked_payload(payload);
 
     #[cfg(feature = "reporting")]
-    if let Some(config) = state.extension::<crate::config::AutumnConfig>()
-        && config.failure_capture.enabled
-    {
-        let settings = std::sync::Arc::new(crate::capsule::settings_from_config(&config));
-        // The same filter composition the capture layer uses, so one
-        // `[log] filter_parameters` list governs a job capsule and a request
-        // capsule identically.
-        let mut filter_parameters = config.log.filter_parameters.clone();
-        filter_parameters.extend(crate::encryption::registered_encrypted_column_names());
-        filter_parameters.extend(crate::confidential::registered_confidential_column_names());
-        let filter = std::sync::Arc::new(crate::log::filter::ParameterFilter::new(
-            &filter_parameters,
-            &config.log.unfilter_parameters,
-        ));
+    if let Some(context) = job_capture_context(&state) {
         let payload_for_capsule = payload.clone();
+        let tracked = tracked_key.is_some();
+        let state_cache = state.has_cache();
+        // Boxed, so the capture branch does not add a second copy of the run
+        // to this future.
+        let run = Box::pin(run_job_handler_inner(
+            name,
+            handler,
+            state,
+            tracked_key,
+            payload,
+            final_attempt,
+            bounds,
+        ));
         return crate::capsule::capture::capture_job(
             name,
             &payload_for_capsule,
-            settings,
-            filter,
-            run_job_handler_inner(name, handler, state, tracked_key, payload, final_attempt),
-            |outcome| job_capsule_outcome(outcome, final_attempt),
+            Arc::clone(&context.settings),
+            Arc::clone(&context.filter),
+            async move {
+                // Capture strips the tracking envelope, and replay runs the
+                // handler untracked. A tracked handler can branch on
+                // `is_tracked()` or report progress, so its capsule says it
+                // cannot replay (#2351 item 14).
+                if let Some(scope) = crate::capsule::current_scope() {
+                    scope.note_state_cache(state_cache);
+                    if tracked {
+                        scope.note(TRACKED_JOB_CAPSULE_NOTE);
+                        scope.mark_truncated();
+                    }
+                }
+                run.await
+            },
+            |(outcome, _)| job_capsule_outcome(outcome, final_attempt),
         )
         .await;
     }
-    run_job_handler_inner(name, handler, state, tracked_key, payload, final_attempt).await
+    run_job_handler_inner(
+        name,
+        handler,
+        state,
+        tracked_key,
+        payload,
+        final_attempt,
+        bounds,
+    )
+    .await
 }
 
 /// The capsule outcome a finished job execution records, or `None` when there
@@ -2299,7 +3218,7 @@ fn job_capsule_outcome(
     final_attempt: bool,
 ) -> Option<crate::capsule::CapsuleOutcome> {
     match outcome {
-        JobExecutionOutcome::Succeeded => None,
+        JobExecutionOutcome::Succeeded | JobExecutionOutcome::LeaseLost => None,
         JobExecutionOutcome::Failed(_) if !final_attempt => None,
         JobExecutionOutcome::Failed(message) => Some(crate::capsule::CapsuleOutcome::Status {
             // A job has no HTTP status; 500 is the outcome shape a capsule
@@ -2324,7 +3243,8 @@ async fn run_job_handler_inner(
     tracked_key: Option<String>,
     payload: Value,
     final_attempt: bool,
-) -> JobExecutionOutcome {
+    bounds: ExecutionBounds,
+) -> (JobExecutionOutcome, PendingSettle) {
     // A job run is work a sim drain must see (issue #2967).
     crate::sim::note_drain_progress();
     // Tracked jobs carry their args wrapped in an envelope keyed by a hash of
@@ -2333,21 +3253,23 @@ async fn run_job_handler_inner(
     // itself only ever sees the caller's original args, and make a
     // `JobContext` ambient for the duration of execution so `ctx.set_progress`
     // works from anywhere inside the handler.
-    let ctx = match &tracked_key {
-        Some(key) => match crate::job_tracking::tracking_store_from_state(&state) {
-            Some(store) => {
-                let _ = store.mark_running(key).await;
-                crate::job_tracking::JobContext::tracked(key.clone(), store)
-            }
-            None => crate::job_tracking::JobContext::none(),
-        },
-        None => crate::job_tracking::JobContext::none(),
-    };
+    let tracked = tracked_key.as_ref().and_then(|key| {
+        crate::job_tracking::tracking_store_from_state(&state).map(|store| (store, key.clone()))
+    });
+    let ctx = tracked
+        .as_ref()
+        .map_or_else(crate::job_tracking::JobContext::none, |(store, key)| {
+            crate::job_tracking::JobContext::tracked(key.clone(), store.clone())
+        });
+    let signals = crate::job_tracking::RunSignals::default();
+    let ctx = ctx.with_run(signals.clone());
 
     // Make this job's app the ambient event context so a job (or durable event
     // listener) that calls the free `events::publish` dispatches against its own
     // app rather than the process-global bus.
     let event_app = state.clone();
+    #[cfg(feature = "db")]
+    let tx_timeout_state = state.clone();
     let interceptor = state
         .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
         .map(|arc| (*arc).clone());
@@ -2380,45 +3302,58 @@ async fn run_job_handler_inner(
     let outcome = match interceptor_res {
         Ok(future) => {
             let execution = std::panic::AssertUnwindSafe(future).catch_unwind();
-            match crate::job_tracking::scope(
+            // A job runs outside any request, so its framework transactions
+            // get the configured timeouts from here (#3057).
+            #[cfg(feature = "db")]
+            let execution = crate::db::scope_background_tx_timeouts(&tx_timeout_state, execution);
+            let scoped = crate::job_tracking::scope(
                 ctx.clone(),
                 crate::events::scope_event_app(event_app, execution),
-            )
-            .await
-            {
-                Ok(Ok(())) => JobExecutionOutcome::Succeeded,
+            );
+            // Inside the bound, so a stalled store counts toward the job timeout.
+            let scoped = async move {
+                if let Some((store, key)) = tracked {
+                    let _ = store.mark_running(&key).await;
+                }
+                scoped.await
+            };
+            match bound_run(scoped, &bounds, &signals).await {
+                BoundedRun::Finished(Ok(Ok(()))) => JobExecutionOutcome::Succeeded,
                 // `message`, not `Display`: this string is persisted in a
                 // failure capsule and compared byte for byte on replay, so
                 // it must not move when `Display` gains the field list.
-                Ok(Err(error)) => JobExecutionOutcome::Failed(error.message()),
-                Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
+                BoundedRun::Finished(Ok(Err(error))) => {
+                    JobExecutionOutcome::Failed(error.message())
+                }
+                BoundedRun::Finished(Err(panic)) => {
+                    JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref()))
+                }
+                BoundedRun::TimedOut(limit) => {
+                    JobExecutionOutcome::Failed(job_timeout_message(limit))
+                }
+                BoundedRun::LeaseLost => JobExecutionOutcome::LeaseLost,
             }
         }
         Err(panic) => JobExecutionOutcome::Panicked(format_job_panic(panic.as_ref())),
     };
 
-    if tracked_key.is_some() {
+    let pending = if tracked_key.is_none() {
+        PendingSettle::None
+    } else {
         match &outcome {
-            JobExecutionOutcome::Succeeded => ctx.settle_success().await,
+            JobExecutionOutcome::Succeeded => PendingSettle::Success(ctx),
             // Panics always dead-letter regardless of remaining attempts
             // (matching every backend's worker loop), so they are always
             // terminal for tracking purposes too.
-            JobExecutionOutcome::Panicked(_) => {
-                ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
-                    .await;
-            }
-            JobExecutionOutcome::Failed(_) if final_attempt => {
-                ctx.settle_failure(crate::job_tracking::GENERIC_FAILURE_MESSAGE)
-                    .await;
-            }
-            JobExecutionOutcome::Failed(_) => {
-                // A retry is pending; leave the record running so progress
-                // persists across attempts.
-            }
+            JobExecutionOutcome::Panicked(_) => PendingSettle::Failure(ctx),
+            JobExecutionOutcome::Failed(_) if final_attempt => PendingSettle::Failure(ctx),
+            // A retry is pending, or another worker owns the job now. Leave
+            // the record running so progress persists across attempts.
+            JobExecutionOutcome::Failed(_) | JobExecutionOutcome::LeaseLost => PendingSettle::None,
         }
-    }
+    };
 
-    outcome
+    (outcome, pending)
 }
 
 fn format_job_panic(panic: &(dyn std::any::Any + Send)) -> String {
@@ -2500,9 +3435,9 @@ fn replayed_enqueue(
             // puts this text into the capsule's outcome, and the replay verdict
             // compares outcome text exactly, so a prefix here would report an
             // unchanged queue-failure capsule as a mismatch.
-            EnqueueVerdict::Failed(error) => Err(AutumnError::internal_server_error(
-                std::io::Error::other(error),
-            )),
+            // The recorded status goes back too, so a handler that branches on
+            // it takes the same path. An older capsule has none: a 500.
+            EnqueueVerdict::Failed(error, status) => Err(rebuilt_enqueue_error(error, status)),
             // `next_job` already logged the divergence; the enqueue fails
             // closed so the handler sees an error rather than a silent success
             // against a queue that was never touched.
@@ -2570,55 +3505,143 @@ pub(crate) async fn run_handler_with_interceptor(
         .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
         .map(|arc| (*arc).clone());
     let payload_for_handler = payload.clone();
+    // The contexts of a production run (#2351 item 14): the replayed app for
+    // events, the background transaction timeouts, and an untracked job
+    // context whose run is never cancelled. Replay refuses a tracked job's
+    // capsule, so untracked is what production saw.
+    let event_app = state.clone();
+    #[cfg(feature = "db")]
+    let tx_timeout_state = state.clone();
     let next = Box::pin(async move { (handler)(state, payload_for_handler).await });
-    match interceptor {
-        Some(interceptor) => interceptor.intercept_execute(name, &payload, next).await,
-        None => next.await,
-    }
+    let execution = async move {
+        match interceptor {
+            Some(interceptor) => interceptor.intercept_execute(name, &payload, next).await,
+            None => next.await,
+        }
+    };
+    #[cfg(feature = "db")]
+    let execution = crate::db::scope_background_tx_timeouts(&tx_timeout_state, execution);
+    let ctx = crate::job_tracking::JobContext::none()
+        .with_run(crate::job_tracking::RunSignals::default());
+    crate::job_tracking::scope(ctx, crate::events::scope_event_app(event_app, execution)).await
 }
 
-/// Record an after-commit enqueue at the moment the handler *registers* it.
+/// Run an after-commit registration on the enqueue seam.
 ///
 /// The deferred callback runs from `tokio::task::spawn`, which does not inherit
 /// task-locals, so the capture scope is gone by the time the enqueue actually
-/// reaches a backend and nothing would be recorded at all. Replay, meanwhile,
-/// answers from the tape here at the registration point — so without this every
-/// faithful `enqueue_after_commit` would find an empty tape and diverge.
+/// reaches a backend. So the seam is the registration: replay answers here,
+/// and capture records here.
 ///
-/// Recording at registration is also the more honest of the two: what the
-/// capsule is describing is the handler's behaviour, and "this handler asks for
-/// a job once its transaction commits" is exactly that. The backend outcome is
-/// not knowable here (it happens after the response), so the entry carries no
-/// error, and a transaction that rolls back leaves a recorded enqueue that
-/// never reached a queue — the same thing the handler asked for either way.
+/// The tape position is taken before the registration runs. It is filled with
+/// the result after, error included (#2351 item 9). A registration can fail,
+/// for example with no job runtime. If capture recorded a success, replay
+/// would return `Ok(())` to a handler that got an error. With no open
+/// transaction, the registration enqueues at once on this task. Capture does
+/// not record that inner enqueue a second time.
+async fn after_commit_seam(
+    name: &str,
+    payload: &Value,
+    schedule: EnqueueSchedule,
+    // Boxed: the registration holds a whole enqueue, and the seam must not
+    // copy it into each caller's future.
+    register: Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + '_>>,
+) -> AutumnResult<()> {
+    if let Some(answer) = replayed_enqueue(name, payload, schedule) {
+        return answer;
+    }
+    let slot = reserve_enqueue(payload);
+    let result = without_enqueue_tee(register).await;
+    fill_after_commit_enqueue(slot, name, schedule, result.as_ref().err());
+    result
+}
+
+/// The error a replay gives for a recorded enqueue failure: its message,
+/// with its status when the capsule has one.
 #[cfg(feature = "reporting")]
-fn record_after_commit_enqueue(name: &str, payload: &Value, schedule: EnqueueSchedule) {
-    let Some(scope) = crate::capsule::current_scope() else {
+fn rebuilt_enqueue_error(message: String, status: Option<u16>) -> AutumnError {
+    let error = AutumnError::internal_server_error(std::io::Error::other(message));
+    match status.and_then(|status| http::StatusCode::from_u16(status).ok()) {
+        Some(status) => error.with_status(status),
+        None => error,
+    }
+}
+
+/// Mark the capsule incomplete when replay cannot rebuild a failed
+/// enqueue's error: field details or a problem type the tape does not keep
+/// change its public `code()`.
+#[cfg(feature = "reporting")]
+fn note_unrebuildable_enqueue_error(scope: &crate::capsule::CaptureScope, error: &AutumnError) {
+    let rebuilt = rebuilt_enqueue_error(error.message(), Some(error.status().as_u16()));
+    // `details()` too: an empty field map has the plain error's code, but
+    // the rebuilt error has no details at all.
+    if rebuilt.code() != error.code() || error.details().is_some() {
+        scope.note(
+            "an enqueue failed with an error that replay cannot rebuild (field details or a \
+             problem type); the capsule is not replayable",
+        );
+        scope.mark_truncated();
+    }
+}
+
+/// Complete an after-commit slot with the registration's result.
+#[cfg(feature = "reporting")]
+fn fill_after_commit_enqueue(
+    slot: Option<EnqueueSlot>,
+    name: &str,
+    schedule: EnqueueSchedule,
+    error: Option<&AutumnError>,
+) {
+    let Some(slot) = slot else {
         return;
     };
-    let Some(index) = scope.reserve_job_enqueue() else {
-        return;
-    };
+    if let Some(error) = error {
+        note_unrebuildable_enqueue_error(&slot.scope, error);
+    }
     let (delay_secs, due_at) = match schedule {
         EnqueueSchedule::Immediate => (None, None),
-        EnqueueSchedule::After(delay) => (Some(delay), None),
+        EnqueueSchedule::After(delay) => (Some(delay_seconds(delay)), None),
         EnqueueSchedule::At(deadline) => (None, Some(deadline)),
     };
-    scope.fill_job_enqueue(
-        index,
+    slot.scope.fill_job_enqueue(
+        slot.index,
         crate::capsule::JobEffect {
             name: name.to_owned(),
-            payload: capsule_job_payload(payload),
+            payload: capsule_job_payload(&slot.payload),
             delay_secs,
             due_at,
-            error: None,
+            requested_due_at: None,
+            // `message`, not `Display`: recorded on the capsule tape.
+            error: error.map(AutumnError::message),
+            error_status: error.map(|error| error.status().as_u16()),
         },
     );
 }
 
 /// No capsule support compiled in: nothing to record.
 #[cfg(not(feature = "reporting"))]
-const fn record_after_commit_enqueue(_name: &str, _payload: &Value, _schedule: EnqueueSchedule) {}
+const fn fill_after_commit_enqueue(
+    _slot: Option<EnqueueSlot>,
+    _name: &str,
+    _schedule: EnqueueSchedule,
+    _error: Option<&AutumnError>,
+) {
+}
+
+tokio::task_local! {
+    /// Set while an outer seam owns this enqueue's tape slot.
+    static ENQUEUE_TEE_SUPPRESSED: ();
+}
+
+/// Run `future` with the inner enqueue seam silent: the caller records it.
+async fn without_enqueue_tee<F: Future>(future: F) -> F::Output {
+    ENQUEUE_TEE_SUPPRESSED.scope((), future).await
+}
+
+/// Whether an outer seam owns the current enqueue's tape slot.
+fn enqueue_tee_suppressed() -> bool {
+    ENQUEUE_TEE_SUPPRESSED.try_with(|()| ()).is_ok()
+}
 
 /// A relative delay in whole seconds, for the capsule's enqueue comparison.
 ///
@@ -2637,14 +3660,32 @@ const fn record_after_commit_enqueue(_name: &str, _payload: &Value, _schedule: E
 pub(crate) enum EnqueueSchedule {
     /// Run as soon as a worker takes it.
     Immediate,
-    /// Run after a relative delay, in whole seconds.
-    After(i64),
+    /// Run after a relative delay. Kept exact: capture records whole seconds
+    /// rounded up, and a v3 capsule recorded them cut off.
+    After(std::time::Duration),
     /// Run at an absolute instant.
     At(chrono::DateTime<chrono::Utc>),
 }
 
-fn delay_seconds(delay: std::time::Duration) -> i64 {
-    i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)
+pub(crate) fn delay_seconds(delay: std::time::Duration) -> i64 {
+    // Rounded up, as capture records it: a positive sub-second delay is not
+    // immediate.
+    let secs = delay
+        .as_secs()
+        .saturating_add(u64::from(delay.subsec_nanos() > 0));
+    i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
+/// The delay capture records for `due_at - now`: whole seconds, rounded up,
+/// as replay computes it in `delay_seconds`.
+#[cfg(any(test, feature = "reporting"))]
+const fn recorded_delay(delay: chrono::TimeDelta) -> i64 {
+    let secs = delay.num_seconds();
+    if delay.subsec_nanos() > 0 {
+        secs.saturating_add(1)
+    } else {
+        secs
+    }
 }
 
 /// No capsule support compiled in: never a replay.
@@ -2718,11 +3759,37 @@ struct EnqueueSlot {
     scope: Arc<crate::capsule::CaptureScope>,
     index: usize,
     payload: Value,
+    /// The absolute deadline the caller gave, before a past one was run at
+    /// once (#2351 item 18).
+    requested_due_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Reserve an enqueue slot that keeps the deadline the caller gave.
+#[cfg(feature = "reporting")]
+fn reserve_enqueue_due(
+    payload: &Value,
+    requested: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<EnqueueSlot> {
+    let mut slot = reserve_enqueue(payload)?;
+    slot.requested_due_at = requested;
+    Some(slot)
+}
+
+/// No capsule support compiled in: there is no slot.
+#[cfg(not(feature = "reporting"))]
+const fn reserve_enqueue_due(
+    _payload: &Value,
+    _requested: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<EnqueueSlot> {
+    None
 }
 
 /// Reserve an enqueue slot, when a capsule is being recorded.
 #[cfg(feature = "reporting")]
 fn reserve_enqueue(payload: &Value) -> Option<EnqueueSlot> {
+    if enqueue_tee_suppressed() {
+        return None;
+    }
     let scope = crate::capsule::current_scope()?;
     let index = scope.reserve_job_enqueue()?;
     Some(EnqueueSlot {
@@ -2731,6 +3798,7 @@ fn reserve_enqueue(payload: &Value) -> Option<EnqueueSlot> {
         // Cloned only once a slot exists, so an app with capture off never
         // pays for it.
         payload: payload.clone(),
+        requested_due_at: None,
     })
 }
 
@@ -2746,6 +3814,9 @@ fn fill_enqueue(
     let Some(slot) = slot else {
         return;
     };
+    if let Some(error) = error {
+        note_unrebuildable_enqueue_error(&slot.scope, error);
+    }
     slot.scope.fill_job_enqueue(
         slot.index,
         crate::capsule::JobEffect {
@@ -2754,12 +3825,25 @@ fn fill_enqueue(
             // `signed_duration_since` rather than `-`: this module's panic gate
             // denies `arithmetic_side_effects`, and the subtraction operator on
             // `DateTime` is not total.
-            delay_secs: due_at.map(|due| due.signed_duration_since(now).num_seconds()),
+            delay_secs: due_at.map(|due| recorded_delay(due.signed_duration_since(now))),
             due_at,
+            // Kept only when the deadline had passed and the job ran at once.
+            requested_due_at: due_at.map_or(slot.requested_due_at, |_| None),
             // `message`, not `Display`: recorded on the capsule tape.
             error: error.map(crate::AutumnError::message),
+            error_status: error.map(|error| error.status().as_u16()),
         },
     );
+}
+
+/// The entropy source a job client mints job ids from.
+///
+/// A replay answers an enqueue before a job id is drawn, so the draw must not
+/// go on the capsule's random tape: it would shift every later draw by one
+/// (#2351 item 11).
+fn job_client_entropy(state: &AppState) -> Arc<dyn crate::entropy::Entropy> {
+    let entropy = state.entropy_arc();
+    entropy.unrecorded().unwrap_or(entropy)
 }
 
 /// Retrieves the global initialized job client.
@@ -2949,9 +4033,7 @@ pub async fn enqueue_in(
     // app B, whose runtime filters due-at against its own clock, so the job would be
     // years off B's timeline and never become due. Same failure mode as the real-time
     // bug this migration fixed, reached from the other direction.
-    if let Some(answer) =
-        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
-    {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::After(delay)) {
         return answer;
     }
     let client = require_job_client()?;
@@ -3006,7 +4088,7 @@ pub async fn enqueue_at(
 ///     Ok(())
 /// }.scope_boxed()).await?;
 /// ```
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub async fn enqueue_on_conn<A: serde::Serialize>(
     name: &str,
     args: A,
@@ -3039,7 +4121,7 @@ pub async fn enqueue_on_conn<A: serde::Serialize>(
 ///
 /// Returns an error if the job runtime is not initialized, if `args` cannot be
 /// serialized to JSON, or if the database INSERT fails.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub async fn enqueue_in_on_conn<A: serde::Serialize>(
     name: &str,
     args: A,
@@ -3053,9 +4135,7 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) =
-        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
-    {
+    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::After(delay)) {
         return answer;
     }
     let client = require_job_client()?;
@@ -3071,7 +4151,7 @@ pub async fn enqueue_in_on_conn<A: serde::Serialize>(
 ///
 /// Returns an error if the job runtime is not initialized, if `args` cannot be
 /// serialized to JSON, or if the database INSERT fails.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub async fn enqueue_at_on_conn<A: serde::Serialize>(
     name: &str,
     args: A,
@@ -3119,18 +4199,27 @@ pub async fn enqueue_after_commit<A: serde::Serialize>(name: &str, args: A) -> A
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::Immediate) {
-        return answer;
-    }
-    // Recorded here, where replay also answers: the deferred callback
-    // runs without this task's capture scope, so nothing else would.
-    record_after_commit_enqueue(name, &payload, EnqueueSchedule::Immediate);
-    let Some(client) = global_job_client() else {
-        return Err(AutumnError::internal_server_error(std::io::Error::other(
+    let registration = payload.clone();
+    after_commit_seam(
+        name,
+        &payload,
+        EnqueueSchedule::Immediate,
+        Box::pin(async move {
+            after_commit_client()?
+                .enqueue_after_commit(name, registration)
+                .await
+        }),
+    )
+    .await
+}
+
+/// The job client an after-commit registration uses.
+fn after_commit_client() -> AutumnResult<Arc<JobClient>> {
+    global_job_client().ok_or_else(|| {
+        AutumnError::internal_server_error(std::io::Error::other(
             "job runtime is not initialized; register jobs with AppBuilder::jobs()",
-        )));
-    };
-    client.enqueue_after_commit(name, payload).await
+        ))
+    })
 }
 
 /// Delayed variant of [`enqueue_after_commit`]: after the surrounding
@@ -3154,24 +4243,21 @@ pub async fn enqueue_in_after_commit<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) =
-        replayed_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)))
-    {
-        return answer;
-    }
-    // Recorded here, where replay also answers: the deferred callback
-    // runs without this task's capture scope, so nothing else would.
-    record_after_commit_enqueue(name, &payload, EnqueueSchedule::After(delay_seconds(delay)));
-    let Some(client) = global_job_client() else {
-        return Err(AutumnError::internal_server_error(std::io::Error::other(
-            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
-        )));
-    };
-    // `enqueue_after_commit_delay` computes `when` inside the callback so
-    // the delay is measured from commit time, not from this call site.
-    client
-        .enqueue_after_commit_delay(name, payload, delay)
-        .await
+    let registration = payload.clone();
+    let schedule = EnqueueSchedule::After(delay);
+    after_commit_seam(
+        name,
+        &payload,
+        schedule,
+        Box::pin(async move {
+            // `enqueue_after_commit_delay` computes `when` inside the callback so
+            // the delay is measured from commit time, not from this call site.
+            after_commit_client()?
+                .enqueue_after_commit_delay(name, registration, delay)
+                .await
+        }),
+    )
+    .await
 }
 
 /// Absolute-instant variant of [`enqueue_in_after_commit`].
@@ -3190,20 +4276,18 @@ pub async fn enqueue_at_after_commit<A: serde::Serialize>(
             "job args serialization failed: {e}"
         )))
     })?;
-    if let Some(answer) = replayed_enqueue(name, &payload, EnqueueSchedule::At(when)) {
-        return answer;
-    }
-    // Recorded here, where replay also answers: the deferred callback
-    // runs without this task's capture scope, so nothing else would.
-    record_after_commit_enqueue(name, &payload, EnqueueSchedule::At(when));
-    let Some(client) = global_job_client() else {
-        return Err(AutumnError::internal_server_error(std::io::Error::other(
-            "job runtime is not initialized; register jobs with AppBuilder::jobs()",
-        )));
-    };
-    client
-        .enqueue_after_commit_due(name, payload, Some(when))
-        .await
+    let registration = payload.clone();
+    after_commit_seam(
+        name,
+        &payload,
+        EnqueueSchedule::At(when),
+        Box::pin(async move {
+            after_commit_client()?
+                .enqueue_after_commit_due(name, registration, Some(when))
+                .await
+        }),
+    )
+    .await
 }
 
 /// Enqueue a job inside an **already-open connection**, writing the job row
@@ -3233,7 +4317,7 @@ pub async fn enqueue_at_after_commit<A: serde::Serialize>(
 ///     })
 /// }).await?;
 /// ```
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub async fn enqueue_in_tx<A: serde::Serialize>(
     name: &str,
     args: A,
@@ -3253,7 +4337,7 @@ impl JobClient {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -3266,7 +4350,23 @@ impl JobClient {
             entropy: Arc::new(crate::entropy::OsEntropy),
             clock,
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         }
+    }
+
+    /// A client with no backend that knows job `name` at schema `version`.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn versioned_for_test(name: &str, version: u32) -> Self {
+        let mut client = Self::bare_for_test(Arc::new(crate::time::SystemClock));
+        client.per_job_settings.insert(
+            name.to_owned(),
+            JobRuntimeSettings {
+                version,
+                ..JobRuntimeSettings::default()
+            },
+        );
+        client
     }
 }
 
@@ -3377,11 +4477,11 @@ impl JobClient {
         if self.redis.is_some() {
             return false;
         }
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         {
             self.pg_pool.is_some()
         }
-        #[cfg(not(feature = "db"))]
+        #[cfg(not(feature = "postgres"))]
         {
             false
         }
@@ -3443,10 +4543,13 @@ impl JobClient {
         // rather than in the inner method so the capsule's clock tape gains
         // exactly one entry per enqueue, however the seam wraps it.
         let now = self.due_origin();
+        let requested = due_at;
         // Only treat a due time strictly in the future as "delayed"; a past or
         // absent due time enqueues for immediate execution exactly as before.
         let due_at = due_at.filter(|due| *due > now);
 
+        // A past deadline is still compared as the deadline the caller gave
+        // (`requested_due_at`), so a plain `enqueue` cannot consume it.
         // Failure-capsule seam (#1634). The free enqueue functions guard ahead
         // of the client lookup (a replay starts no job runtime), so by the time
         // control reaches here a replay can only have come through a *held*
@@ -3456,14 +4559,16 @@ impl JobClient {
         if let Some(answer) = replayed_enqueue(
             name,
             &payload,
-            due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
+            due_at
+                .or(requested)
+                .map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
         ) {
             return answer.map(|()| EnqueueOutcome::Queued);
         }
         // Reserve before the backend is asked and fill in after, so concurrent
         // enqueues keep initiation order and a backend *rejection* is recorded
         // as the failure the handler actually saw.
-        let slot = reserve_enqueue(&payload);
+        let slot = reserve_enqueue_due(&payload, requested);
         let result = self
             .enqueue_with_outcome_due_inner(name, payload, due_at, now, None)
             .await;
@@ -3631,6 +4736,8 @@ impl JobClient {
                     attempt: 1,
                     max_attempts: job_max_attempts,
                     initial_backoff_ms: job_backoff_ms,
+                    tenant: crate::cost::enqueuing_tenant(),
+                    cost_waited: false,
                     #[cfg(feature = "telemetry-otlp")]
                     traceparent,
                     #[cfg(feature = "telemetry-otlp")]
@@ -3865,7 +4972,7 @@ impl JobClient {
         name: &str,
         items: Vec<(Value, Option<chrono::DateTime<chrono::Utc>>)>,
     ) -> Vec<AutumnResult<EnqueueOutcome>> {
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         if self.can_batch_enqueue(name) {
             return self.enqueue_many_pg(name, items).await;
         }
@@ -3889,7 +4996,7 @@ impl JobClient {
     ///
     /// `false` means the sequential fallback runs instead. That path stays
     /// exactly as it works today; nothing changes for it.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     fn can_batch_enqueue(&self, name: &str) -> bool {
         if self.interceptor.is_some() || !self.durable_is_pg() {
             return false;
@@ -3915,7 +5022,7 @@ impl JobClient {
     /// sorted by that index before return. This avoids writing into a
     /// pre-sized slot by index, which this module's panic-free gate does
     /// not allow.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     #[allow(clippy::too_many_lines)]
     async fn enqueue_many_pg(
         &self,
@@ -3963,13 +5070,16 @@ impl JobClient {
                 continue;
             }
             let now = self.due_origin();
+            let requested = due_at;
             let due_at = due_at.filter(|due| *due > now);
-            let schedule = due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At);
+            let schedule = due_at
+                .or(requested)
+                .map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At);
             if let Some(answer) = replayed_enqueue(name, &payload, schedule) {
                 resolved.push((result_index, answer.map(|()| EnqueueOutcome::Queued)));
                 continue;
             }
-            let slot = reserve_enqueue(&payload);
+            let slot = reserve_enqueue_due(&payload, requested);
             let id = self.entropy.uuid_v4().to_string();
             let constraints = ResolvedJobConstraints::for_payload(settings, &payload);
 
@@ -4073,78 +5183,80 @@ impl JobClient {
                     // shared health signal, for every other enqueuer to
                     // read.
                     let breaker = self.job_queue_breaker();
-                    if breaker.before_call().is_err() {
-                        for row in batch {
-                            if row.due_at.is_some() {
-                                self.registry.record_cancel_scheduled(name);
-                            } else {
-                                self.registry.record_cancel(name);
-                            }
-                            self.registry.forget_pg_job_mark(&row.id);
-                            self.job_admin.record_cancelled(&row.id);
-                            let row_error = AutumnError::service_unavailable(
-                                std::io::Error::other("job queue circuit breaker is open"),
-                            );
-                            fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
-                            resolved.push((row.result_index, Err(row_error)));
-                        }
-                    } else {
-                        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker);
-                        let insert_result = pg_insert_jobs_many(
-                            pool,
-                            name,
-                            &job_queue,
-                            job_max_attempts,
-                            job_backoff_ms,
-                            unique_window_tag,
-                            concurrency_limit,
-                            &batch,
-                        )
-                        .await;
-                        if insert_result.is_ok() {
-                            guard.success();
-                        } else {
-                            guard.failure();
-                        }
-                        match insert_result {
-                            Ok(inserted_ids) => {
-                                let inserted: std::collections::HashSet<&str> =
-                                    inserted_ids.iter().map(String::as_str).collect();
-                                for row in batch {
-                                    let outcome = if inserted.contains(row.id.as_str()) {
-                                        EnqueueOutcome::Queued
-                                    } else {
-                                        self.record_deduplicated_enqueue(
-                                            name,
-                                            &row.id,
-                                            row.due_at.is_some(),
-                                        );
-                                        EnqueueOutcome::Deduplicated
-                                    };
-                                    fill_enqueue(row.slot, name, row.due_at, row.now, None);
-                                    resolved.push((row.result_index, Ok(outcome)));
+                    match breaker.admit() {
+                        Err(_) => {
+                            for row in batch {
+                                if row.due_at.is_some() {
+                                    self.registry.record_cancel_scheduled(name);
+                                } else {
+                                    self.registry.record_cancel(name);
                                 }
+                                self.registry.forget_pg_job_mark(&row.id);
+                                self.job_admin.record_cancelled(&row.id);
+                                let row_error = AutumnError::service_unavailable(
+                                    std::io::Error::other("job queue circuit breaker is open"),
+                                );
+                                fill_enqueue(row.slot, name, row.due_at, row.now, Some(&row_error));
+                                resolved.push((row.result_index, Err(row_error)));
                             }
-                            Err(error) => {
-                                let message = error.to_string();
-                                for row in batch {
-                                    if row.due_at.is_some() {
-                                        self.registry.record_cancel_scheduled(name);
-                                    } else {
-                                        self.registry.record_cancel(name);
+                        }
+                        Ok(guard) => {
+                            let insert_result = pg_insert_jobs_many(
+                                pool,
+                                name,
+                                &job_queue,
+                                job_max_attempts,
+                                job_backoff_ms,
+                                unique_window_tag,
+                                concurrency_limit,
+                                &batch,
+                            )
+                            .await;
+                            if insert_result.is_ok() {
+                                guard.success();
+                            } else {
+                                guard.failure();
+                            }
+                            match insert_result {
+                                Ok(inserted_ids) => {
+                                    let inserted: std::collections::HashSet<&str> =
+                                        inserted_ids.iter().map(String::as_str).collect();
+                                    for row in batch {
+                                        let outcome = if inserted.contains(row.id.as_str()) {
+                                            EnqueueOutcome::Queued
+                                        } else {
+                                            self.record_deduplicated_enqueue(
+                                                name,
+                                                &row.id,
+                                                row.due_at.is_some(),
+                                            );
+                                            EnqueueOutcome::Deduplicated
+                                        };
+                                        fill_enqueue(row.slot, name, row.due_at, row.now, None);
+                                        resolved.push((row.result_index, Ok(outcome)));
                                     }
-                                    self.registry.forget_pg_job_mark(&row.id);
-                                    self.job_admin.record_cancelled(&row.id);
-                                    let row_error =
-                                        AutumnError::internal_server_error_msg(message.clone());
-                                    fill_enqueue(
-                                        row.slot,
-                                        name,
-                                        row.due_at,
-                                        row.now,
-                                        Some(&row_error),
-                                    );
-                                    resolved.push((row.result_index, Err(row_error)));
+                                }
+                                Err(error) => {
+                                    let message = error.to_string();
+                                    for row in batch {
+                                        if row.due_at.is_some() {
+                                            self.registry.record_cancel_scheduled(name);
+                                        } else {
+                                            self.registry.record_cancel(name);
+                                        }
+                                        self.registry.forget_pg_job_mark(&row.id);
+                                        self.job_admin.record_cancelled(&row.id);
+                                        let row_error =
+                                            AutumnError::internal_server_error_msg(message.clone());
+                                        fill_enqueue(
+                                            row.slot,
+                                            name,
+                                            row.due_at,
+                                            row.now,
+                                            Some(&row_error),
+                                        );
+                                        resolved.push((row.result_index, Err(row_error)));
+                                    }
                                 }
                             }
                         }
@@ -4246,6 +5358,34 @@ impl JobClient {
         payload: impl serde::Serialize,
         due: AfterCommitDue,
     ) -> AutumnResult<()> {
+        let payload = serde_json::to_value(payload).map_err(|e| {
+            AutumnError::internal_server_error(std::io::Error::other(format!(
+                "enqueue_after_commit: failed to serialize payload for job '{name}': {e}"
+            )))
+        })?;
+        // A free `*_after_commit` function owns the seam already; a held
+        // client (the event bus's durable dispatch) is on the seam here.
+        let recorded = payload.clone();
+        let register = Box::pin(self.register_after_commit(name, payload, due));
+        if enqueue_tee_suppressed() {
+            return register.await;
+        }
+        let schedule = match due {
+            AfterCommitDue::At(None) => EnqueueSchedule::Immediate,
+            AfterCommitDue::At(Some(at)) => EnqueueSchedule::At(at),
+            AfterCommitDue::After(delay) => EnqueueSchedule::After(delay),
+        };
+        after_commit_seam(name, &recorded, schedule, register).await
+    }
+
+    /// Validate an after-commit enqueue and register it, or enqueue at once
+    /// with no open transaction.
+    async fn register_after_commit(
+        &self,
+        name: &str,
+        payload: Value,
+        due: AfterCommitDue,
+    ) -> AutumnResult<()> {
         // Validate name eagerly so a typo/unregistered job fails the
         // transaction (before any DB commit) rather than being silently
         // dropped later when the deferred callback runs.
@@ -4256,11 +5396,6 @@ impl JobClient {
         }
 
         let name = name.to_string();
-        let payload = serde_json::to_value(payload).map_err(|e| {
-            AutumnError::internal_server_error(std::io::Error::other(format!(
-                "enqueue_after_commit: failed to serialize payload for job '{name}': {e}"
-            )))
-        })?;
         // Also validate eagerly: the deferred callback below calls
         // enqueue_due (which re-checks this), but that runs after the
         // transaction has already committed — by then it's too late for the
@@ -4280,11 +5415,14 @@ impl JobClient {
         // client.enqueue() sees the originating request span even when the callback
         // runs in the after-commit task, which has no request span of its own.
         let enqueue_span = tracing::Span::current();
+        // The callback runs in a new task: carry the tenant for cost.
+        let tenant = crate::cost::enqueuing_tenant();
 
         let mut f_opt = Some(move || {
             let client = client.clone();
             let name = name.clone();
             let payload = payload.clone();
+            let tenant = tenant.clone();
             // Resolve the due instant here, inside the callback, so that an
             // AfterCommitDue::After delay is measured from commit time — using
             // this client's own clock, not the process-global one: an
@@ -4292,7 +5430,7 @@ impl JobClient {
             // committed, and resolving the global handle again here would both
             // take a second `RwLock` round-trip and read a different app's
             // clock in a multi-app test process.
-            async move {
+            crate::cost::with_enqueue_tenant(tenant, async move {
                 match due {
                     AfterCommitDue::At(at) => client.enqueue_due(&name, payload, at).await,
                     // Kept relative rather than resolved to an absolute instant
@@ -4302,7 +5440,7 @@ impl JobClient {
                         client.enqueue_relative(&name, payload, d).await.map(|_| ())
                     }
                 }
-            }
+            })
         });
 
         #[cfg(feature = "db")]
@@ -4340,7 +5478,7 @@ impl JobClient {
     /// unversioned jobs or an unregistered name — registration is validated
     /// separately by each caller. Used by the transactional after-commit
     /// chokepoint, whose typed-args entry points would otherwise store raw args.
-    fn wrap_payload_version(&self, name: &str, payload: Value) -> Value {
+    pub(crate) fn wrap_payload_version(&self, name: &str, payload: Value) -> Value {
         match self.per_job_settings.get(name) {
             Some(settings) if settings.version > 1 => {
                 crate::payload_version::wrap(settings.version, payload)
@@ -4407,12 +5545,11 @@ impl JobClient {
     ) -> AutumnResult<EnqueueOutcome> {
         let breaker = self.job_queue_breaker();
 
-        if breaker.before_call().is_err() {
+        let Ok(guard) = breaker.admit() else {
             return Err(AutumnError::service_unavailable(std::io::Error::other(
                 "job queue circuit breaker is open",
             )));
-        }
-        let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+        };
 
         let res = self
             .enqueue_durable_inner(
@@ -4450,7 +5587,7 @@ impl JobClient {
     ) -> AutumnResult<EnqueueOutcome> {
         // Only the Postgres arm below consumes this; keep the compiler quiet
         // on redis/sqlite-only builds where that arm does not compile in.
-        #[cfg(not(feature = "db"))]
+        #[cfg(not(feature = "postgres"))]
         let _ = &relative_delay;
         #[cfg(feature = "redis")]
         if let Some(redis) = &self.redis {
@@ -4484,7 +5621,7 @@ impl JobClient {
             )
             .await;
         }
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         if let Some(pool) = &self.pg_pool {
             // `due_at`/`relative_delay` are resolved inside `pg_insert_job`,
             // after this call's own pool checkout — see its comment.
@@ -4529,7 +5666,7 @@ impl JobClient {
     ///
     /// Returns an error if `name` is not a registered job, or if the
     /// database INSERT fails.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     pub async fn enqueue_on_conn(
         &self,
         name: &str,
@@ -4549,7 +5686,7 @@ impl JobClient {
     ///
     /// Returns an error if `name` is not a registered job, or if the database
     /// INSERT fails.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     pub async fn enqueue_on_conn_due(
         &self,
         name: &str,
@@ -4559,8 +5696,9 @@ impl JobClient {
     ) -> AutumnResult<()> {
         // Same origin that stamped the deadline — see `enqueue_with_outcome_due`.
         let now = self.due_origin();
+        let requested = due_at;
         let due_at = due_at.filter(|due| *due > now);
-        self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, None)
+        self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, None, requested)
             .await
     }
 
@@ -4568,7 +5706,7 @@ impl JobClient {
     /// transactional counterpart of [`Self::enqueue_relative`]. Keeps the
     /// delay distinct from an absolute instant so the Postgres arm can
     /// compute `run_at` on the database's own clock. Backs `enqueue_in_on_conn`.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     pub(crate) async fn enqueue_on_conn_relative_due(
         &self,
         name: &str,
@@ -4579,14 +5717,26 @@ impl JobClient {
         let (monotonic_origin, now) = self.relative_delay_origins();
         let due_at = Some(due_at_from(now, delay)).filter(|due| *due > now);
         let relative_delay = RelativeDelay::new(delay, monotonic_origin);
-        self.enqueue_on_conn_due_dispatch(name, payload, conn, due_at, now, Some(relative_delay))
-            .await
+        self.enqueue_on_conn_due_dispatch(
+            name,
+            payload,
+            conn,
+            due_at,
+            now,
+            Some(relative_delay),
+            None,
+        )
+        .await
     }
 
     /// Shared body of [`Self::enqueue_on_conn_due`] and
     /// [`Self::enqueue_on_conn_relative_due`] — only `due_at`/`relative_delay`
     /// resolution differs between the two.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the deadline the caller gave travels beside the resolved one"
+    )]
     async fn enqueue_on_conn_due_dispatch(
         &self,
         name: &str,
@@ -4595,6 +5745,7 @@ impl JobClient {
         due_at: Option<chrono::DateTime<chrono::Utc>>,
         now: chrono::DateTime<chrono::Utc>,
         relative_delay: Option<RelativeDelay>,
+        requested: Option<chrono::DateTime<chrono::Utc>>,
     ) -> AutumnResult<()> {
         // Failure-capsule seam (#1634). This is the transactional chokepoint —
         // it never funnels through `enqueue_with_outcome_due`, so without its
@@ -4603,7 +5754,9 @@ impl JobClient {
         if let Some(answer) = replayed_enqueue(
             name,
             &payload,
-            due_at.map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
+            due_at
+                .or(requested)
+                .map_or(EnqueueSchedule::Immediate, EnqueueSchedule::At),
         ) {
             return answer;
         }
@@ -4616,7 +5769,7 @@ impl JobClient {
         if self.pg_pool.is_some() {
             note_transactional_enqueue();
         }
-        let slot = reserve_enqueue(&payload);
+        let slot = reserve_enqueue_due(&payload, requested);
         let result = self
             .enqueue_on_conn_due_inner(name, payload, conn, due_at, relative_delay)
             .await;
@@ -4632,7 +5785,7 @@ impl JobClient {
     /// Carries its wrapper's `db` gate: the body names `AsyncPgConnection`,
     /// `pg_pool` and the postgres enqueue helpers, none of which exist without
     /// it.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     #[allow(clippy::too_many_lines)]
     async fn enqueue_on_conn_due_inner(
         &self,
@@ -4679,27 +5832,36 @@ impl JobClient {
         // transaction commits, so we cannot safely update process-local counters
         // here — the row may disappear on rollback while the counter persists.
         if self.pg_pool.is_some() {
-            let breaker = self.resilience_config.as_ref().map_or_else(
-                || {
-                    crate::circuit_breaker::global_registry().get_or_create(
-                        "job_queue",
-                        crate::circuit_breaker::CircuitBreakerPolicy::default(),
-                    )
-                },
-                |rc| {
-                    let policy =
-                        crate::circuit_breaker::CircuitBreakerPolicy::from_config(rc, "job_queue");
-                    crate::circuit_breaker::global_registry()
-                        .get_or_create_with_config("job_queue", policy)
-                },
-            );
-
-            if breaker.before_call().is_err() {
-                return Err(AutumnError::service_unavailable(std::io::Error::other(
-                    "job queue circuit breaker is open",
-                )));
-            }
-            let guard = crate::circuit_breaker::CircuitBreakerGuard::new(breaker.clone());
+            // Shard-local jobs (#3072): do not use the fleet-wide breaker. The
+            // row goes to the caller's database, and the caller's transaction
+            // fails when that database is down. A control-database outage
+            // must not stop shard enqueues.
+            let guard = if self.shard_local {
+                None
+            } else {
+                let breaker = self.resilience_config.as_ref().map_or_else(
+                    || {
+                        crate::circuit_breaker::global_registry().get_or_create(
+                            "job_queue",
+                            crate::circuit_breaker::CircuitBreakerPolicy::default(),
+                        )
+                    },
+                    |rc| {
+                        let policy = crate::circuit_breaker::CircuitBreakerPolicy::from_config(
+                            rc,
+                            "job_queue",
+                        );
+                        crate::circuit_breaker::global_registry()
+                            .get_or_create_with_config("job_queue", policy)
+                    },
+                );
+                let Ok(guard) = breaker.admit() else {
+                    return Err(AutumnError::service_unavailable(std::io::Error::other(
+                        "job queue circuit breaker is open",
+                    )));
+                };
+                Some(guard)
+            };
 
             let id_for_enqueue = id.clone();
             let payload_for_enqueue = payload.clone();
@@ -4724,7 +5886,9 @@ impl JobClient {
 
                 match &outcome {
                     Ok(EnqueueOutcome::Deduplicated) => {
-                        guard.success();
+                        if let Some(guard) = guard {
+                            guard.success();
+                        }
                         // A dedup decision is final even if the surrounding
                         // transaction rolls back, since no row was ever written, so
                         // the counter can be recorded immediately. This balances the
@@ -4737,10 +5901,14 @@ impl JobClient {
                         self.record_deduplicated_enqueue(name, &id_for_enqueue, false);
                     }
                     Ok(_) => {
-                        guard.success();
+                        if let Some(guard) = guard {
+                            guard.success();
+                        }
                     }
                     Err(_) => {
-                        guard.failure();
+                        if let Some(guard) = guard {
+                            guard.failure();
+                        }
                     }
                 }
 
@@ -4778,6 +5946,7 @@ pub fn start_runtime(
     config: &crate::config::JobConfig,
     run_workers: bool,
 ) -> AutumnResult<()> {
+    let jobs = apply_default_timeout(jobs, config.default_timeout_ms);
     validate_unique_job_names(&jobs).map_err(|error| {
         AutumnError::internal_server_error(std::io::Error::other(format!(
             "invalid jobs configuration: {error}"
@@ -4785,6 +5954,16 @@ pub fn start_runtime(
     })?;
 
     crate::job_tracking::ensure_tracking_store_installed_from_config(state, config);
+    if config.max_backoff_ms == 0 {
+        tracing::warn!("jobs.max_backoff_ms = 0: every job retry is due at once, with no backoff");
+    }
+    state.insert_extension(JobMaxBackoff(config.max_backoff_ms));
+    if config.tenants != crate::config::JobTenantsConfig::default() && config.backend != "local" {
+        tracing::warn!(
+            backend = %config.backend,
+            "[jobs.tenants] applies to the local backend only; it has no effect here"
+        );
+    }
 
     match config.backend.as_str() {
         "local" => {
@@ -4797,6 +5976,7 @@ pub fn start_runtime(
                 config.initial_backoff_ms,
                 &config.queues,
                 &config.pin,
+                &config.tenants,
                 run_workers,
             );
             Ok(())
@@ -4856,11 +6036,24 @@ pub fn start_runtime(
                 config.initial_backoff_ms,
                 &config.queues,
                 &config.pin,
+                &config.tenants,
                 run_workers,
             );
             Ok(())
         }
     }
+}
+
+/// Give each job with no `#[job(timeout)]` the `jobs.default_timeout_ms`
+/// limit. `0` means no limit.
+fn apply_default_timeout(mut jobs: Vec<JobInfo>, default_timeout_ms: u64) -> Vec<JobInfo> {
+    if default_timeout_ms > 0 {
+        for job in &mut jobs {
+            job.timeout
+                .get_or_insert_with(|| std::time::Duration::from_millis(default_timeout_ms));
+        }
+    }
+    jobs
 }
 
 /// Process-local uniqueness holds and concurrency slots for the local backend.
@@ -4897,6 +6090,10 @@ struct LocalJobCoordinationInner {
     unique_holds: HashMap<String, LocalUniqueHold>,
     running_slots: HashMap<String, u32>,
     waiting: HashMap<String, VecDeque<QueuedJob>>,
+    /// Deferrable jobs that wait for the cost signal to fall (issue #1720).
+    deferred: Vec<QueuedJob>,
+    /// `true` while one task checks `deferred`.
+    deferred_waiter: bool,
 }
 
 struct LocalUniqueHold {
@@ -4988,6 +6185,36 @@ enum LocalSlotDecision {
 }
 
 impl LocalJobCoordination {
+    /// Keep `job` until the cost signal falls. Return `true` when no task
+    /// checks the deferred jobs yet, so the caller must start one.
+    fn defer(&self, job: QueuedJob) -> bool {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.deferred.push(job);
+        let running = std::mem::replace(&mut inner.deferred_waiter, true);
+        drop(inner);
+        !running
+    }
+
+    /// Take the deferred jobs that may go back on the queue. Return `false` as
+    /// the second value when no job is left; the checking task then stops.
+    fn take_deferred(&self, ready: impl Fn(&QueuedJob) -> bool) -> (Vec<QueuedJob>, bool) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (go, stay): (Vec<_>, Vec<_>) = std::mem::take(&mut inner.deferred)
+            .into_iter()
+            .partition(|job| ready(job));
+        let more = !stay.is_empty();
+        inner.deferred = stay;
+        inner.deferred_waiter = more;
+        drop(inner);
+        (go, more)
+    }
+
     /// Coordination reading TTL expiry from `clock` (the app's injected clock).
     fn with_clock(clock: Arc<dyn crate::time::ClockSource>) -> Self {
         Self {
@@ -5117,6 +6344,7 @@ pub(crate) fn start_local_runtime(
         default_initial_backoff_ms,
         queues_config,
         &[],
+        &crate::config::JobTenantsConfig::default(),
         true,
     );
 }
@@ -5138,6 +6366,7 @@ pub(crate) fn start_local_runtime_inner(
     default_initial_backoff_ms: u64,
     queues_config: &crate::config::JobQueuesConfig,
     pin: &[String],
+    tenants: &crate::config::JobTenantsConfig,
     run_workers: bool,
 ) {
     let job_admin = default_job_admin_backend_for_state(state);
@@ -5192,14 +6421,20 @@ pub(crate) fn start_local_runtime_inner(
     let mut limits = QueueLimits::from_config(queues_config);
     limits.retain_queues(&schedule.names());
     let slots = QueueSlots::new(worker_count, limits);
-    let buffer = Arc::new(LocalQueueBuffer::new());
+    // Tenant isolation (#3072): fair order, per-tenant slots, lanes.
+    let isolation = tenant_lanes::TenantJobIsolation::from_config(tenants, worker_count);
+    let buffer = Arc::new(if isolation.is_some() {
+        LocalQueueBuffer::with_tenant_fairness()
+    } else {
+        LocalQueueBuffer::new()
+    });
 
     let client = JobClient {
         local_sender: Some(tx.clone()),
         local_coordination: Some(Arc::clone(&coordination)),
         #[cfg(feature = "redis")]
         redis: None,
-        #[cfg(feature = "db")]
+        #[cfg(feature = "postgres")]
         pg_pool: None,
         #[cfg(feature = "sqlite")]
         sqlite: None,
@@ -5211,11 +6446,13 @@ pub(crate) fn start_local_runtime_inner(
         interceptor: state
             .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
             .map(|arc| (*arc).clone()),
-        entropy: state.entropy_arc(),
+        entropy: job_client_entropy(state),
         clock: state.clock_arc(),
         resilience_config: state
             .extension::<crate::config::AutumnConfig>()
             .map(|c| Arc::new(c.resilience.clone())),
+        #[cfg(feature = "postgres")]
+        shard_local: false,
     };
     install_job_client(state, client);
 
@@ -5226,9 +6463,11 @@ pub(crate) fn start_local_runtime_inner(
     if run_workers {
         let buffer = Arc::clone(&buffer);
         let shutdown = shutdown.clone();
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(state, async move {
             loop {
                 tokio::select! {
+                    // Fixed branch order, so a sim replays it (#3067).
+                    biased;
                     () = shutdown.cancelled() => break,
                     maybe = rx.recv() => {
                         match maybe {
@@ -5241,7 +6480,7 @@ pub(crate) fn start_local_runtime_inner(
         });
     }
 
-    for _ in 0..worker_count {
+    for worker_index in 0..worker_count {
         let state = state.clone();
         let tx = tx.clone();
         let job_admin = job_admin.clone();
@@ -5251,13 +6490,65 @@ pub(crate) fn start_local_runtime_inner(
         let coordination = Arc::clone(&coordination);
         let slots = Arc::clone(&slots);
         let mut cursor = schedule.cursor();
+        let isolation = isolation.clone();
 
-        tokio::spawn(async move {
+        crate::sim::spawn_app_task(&state.clone(), async move {
+            let lane = isolation
+                .as_ref()
+                .and_then(|isolation| isolation.lane_of_worker(worker_index));
             loop {
                 // Register interest before checking so an enqueue that lands
                 // between the pop attempt and the await is never lost.
                 let notified = buffer.notify.notified();
-                if slots.is_active() {
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if let Some(isolation) = &isolation {
+                    // Tenant isolation (#3072): the same slot rules, plus a
+                    // tenant permit and a lane check on each pop.
+                    let mut candidates: Vec<String> = cursor.next_order().to_vec();
+                    if !pin_active {
+                        for queue in buffer.fair_queue_names() {
+                            if !candidates.contains(&queue) {
+                                candidates.push(queue);
+                            }
+                        }
+                    }
+                    let mut ran = false;
+                    for queue in &candidates {
+                        let reserved = if slots.is_active() {
+                            match slots.try_reserve(queue) {
+                                Some(guard) => Some(guard),
+                                None => continue,
+                            }
+                        } else {
+                            None
+                        };
+                        let Some((job, permit)) = buffer.try_pop_fair(queue, isolation, lane)
+                        else {
+                            continue;
+                        };
+                        let slot = reserved.unwrap_or_else(|| slots.acquire(queue));
+                        execute_local_job(
+                            job,
+                            &jobs_by_name,
+                            &tx,
+                            &state,
+                            &job_admin,
+                            &coordination,
+                        )
+                        .await;
+                        drop(slot);
+                        drop(permit);
+                        // A freed tenant slot can admit a job that another
+                        // worker skipped. That worker can be on any lane.
+                        buffer.notify.notify_waiters();
+                        ran = true;
+                        break;
+                    }
+                    if ran {
+                        continue;
+                    }
+                } else if slots.is_active() {
                     // Atomic reserve-then-claim (#1623): walk the priority order
                     // and reserve a slot under the running-count lock *before*
                     // popping, so two workers can never both pass the cap/reserved
@@ -5292,11 +6583,14 @@ pub(crate) fn start_local_runtime_inner(
                     // Fast path (no caps/reserved): single multi-queue pop across
                     // the (possibly pinned) order, bounding the never-strand
                     // fallback to the pinned set. Unchanged behavior (AC4).
-                    let order = slots.claimable(&cursor.next_order());
-                    let allowed: Option<std::collections::HashSet<String>> =
-                        pin_active.then(|| order.iter().cloned().collect());
-                    if let Some(job) = buffer.try_pop(&order, allowed.as_ref()) {
-                        let _slot = slots.acquire(&normalize_queue_name(&job.queue));
+                    // Borrow the cursor's order rather than copying it per
+                    // iteration (idle wakes included).
+                    let next = cursor.next_order();
+                    let order = slots.claimable_borrowed(&next);
+                    // With a pin, bound the never-strand sweep to this order.
+                    let allowed = pin_active.then_some(&*order);
+                    if let Some(job) = buffer.try_pop(&order, allowed) {
+                        let _slot = slots.acquire(normalized_queue_name(&job.queue));
                         execute_local_job(
                             job,
                             &jobs_by_name,
@@ -5310,6 +6604,8 @@ pub(crate) fn start_local_runtime_inner(
                     }
                 }
                 tokio::select! {
+                    // Fixed branch order, so a sim replays it (#3067).
+                    biased;
                     () = shutdown.cancelled() => break,
                     () = notified => {}
                 }
@@ -5441,6 +6737,9 @@ const LOCAL_QUEUE_WARN_THRESHOLD: usize = 10_000;
 /// a job whose queue is somehow outside the drain order is never stranded.
 struct LocalQueueBuffer {
     inner: std::sync::Mutex<HashMap<String, VecDeque<QueuedJob>>>,
+    /// With `[jobs.tenants]` (#3072): each queue served round-robin by
+    /// tenant, in place of `inner`.
+    fair: Option<std::sync::Mutex<HashMap<String, tenant_lanes::FairBucket<QueuedJob>>>>,
     notify: tokio::sync::Notify,
 }
 
@@ -5448,18 +6747,63 @@ impl LocalQueueBuffer {
     fn new() -> Self {
         Self {
             inner: std::sync::Mutex::new(HashMap::new()),
+            fair: None,
             notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// A buffer that serves each queue round-robin by tenant (#3072).
+    fn with_tenant_fairness() -> Self {
+        Self {
+            fair: Some(std::sync::Mutex::new(HashMap::new())),
+            ..Self::new()
         }
     }
 
     #[allow(clippy::significant_drop_tightening)]
     fn push(&self, job: QueuedJob) {
+        if let Some(fair) = &self.fair {
+            {
+                let mut map = fair
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Probe by borrow: an owned key is only built for a new bucket.
+                let queue = normalized_queue_name(&job.queue);
+                #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+                let bucket = match map.get_mut(queue) {
+                    Some(bucket) => bucket,
+                    None => map
+                        .entry(queue.to_owned())
+                        .or_insert_with(tenant_lanes::FairBucket::new),
+                };
+                if bucket.len() == LOCAL_QUEUE_WARN_THRESHOLD {
+                    tracing::warn!(
+                        queue = %job.queue,
+                        threshold = LOCAL_QUEUE_WARN_THRESHOLD,
+                        "local job queue has grown past the warning threshold; \
+                         memory use is unbounded — consider reducing enqueue rate or \
+                         switching to the Redis or Postgres backend"
+                    );
+                }
+                bucket.push(job.tenant.clone(), job);
+            }
+            // Wake every idle worker: a single woken worker can be on a lane
+            // that does not serve this tenant.
+            self.notify.notify_waiters();
+            return;
+        }
         {
             let mut map = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let bucket = map.entry(normalize_queue_name(&job.queue)).or_default();
+            // Probe by borrow: the queue's bucket exists after its first job.
+            let queue = normalized_queue_name(&job.queue);
+            #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+            let bucket = match map.get_mut(queue) {
+                Some(bucket) => bucket,
+                None => map.entry(queue.to_owned()).or_default(),
+            };
             if bucket.len() == LOCAL_QUEUE_WARN_THRESHOLD {
                 tracing::warn!(
                     queue = %job.queue,
@@ -5480,11 +6824,7 @@ impl LocalQueueBuffer {
     /// queue outside its allocation (issue #1623); `None` preserves the
     /// original "drain anything rather than strand work" behavior (AC4).
     #[allow(clippy::significant_drop_tightening)]
-    fn try_pop(
-        &self,
-        order: &[String],
-        allowed: Option<&std::collections::HashSet<String>>,
-    ) -> Option<QueuedJob> {
+    fn try_pop(&self, order: &[String], allowed: Option<&[String]>) -> Option<QueuedJob> {
         let mut map = self
             .inner
             .lock()
@@ -5497,6 +6837,8 @@ impl LocalQueueBuffer {
         // Never strand work: drain any queue outside the configured order,
         // subject to the pin/cap allow-set when one is in effect.
         for (name, queue) in map.iter_mut() {
+            // A linear scan of the borrowed order: a handful of queues, so it
+            // beats hashing, and nothing is copied into a set per iteration.
             if allowed.is_some_and(|set| !set.contains(name)) {
                 continue;
             }
@@ -5519,60 +6861,68 @@ impl LocalQueueBuffer {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get_mut(queue).and_then(VecDeque::pop_front)
     }
+
+    /// Pop the next job of `queue` that `isolation` admits on `lane`, with
+    /// the tenant permit that it holds while it runs (#3072).
+    #[allow(clippy::significant_drop_tightening)]
+    fn try_pop_fair(
+        &self,
+        queue: &str,
+        isolation: &tenant_lanes::TenantJobIsolation,
+        lane: Option<u16>,
+    ) -> Option<(QueuedJob, tenant_lanes::JobAdmit)> {
+        let mut map = self
+            .fair
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bucket = map.get_mut(queue)?;
+        let popped = bucket.pop_where(|tenant| isolation.try_admit(tenant, lane));
+        if bucket.len() == 0 {
+            map.remove(queue);
+        }
+        popped
+    }
+
+    /// The queues that hold fair-buffered jobs now.
+    fn fair_queue_names(&self) -> Vec<String> {
+        self.fair.as_ref().map_or_else(Vec::new, |fair| {
+            fair.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys()
+                .cloned()
+                .collect()
+        })
+    }
 }
 
-/// Equal-jitter backoff: spreads job retries across `[base/2, base]` instead of
-/// retrying every failed job at the *exact* same virtual instant.
-///
-/// The local job runtime's exponential backoff (`base_delay =
-/// initial_backoff_ms * 2^(attempt-1)`) is a pure function of
-/// `initial_backoff_ms` and `attempt` — nothing job-specific. When several jobs
-/// in the same queue fail at the same instant (a downstream dependency blips
-/// and takes every in-flight job down with it), every one of them computes the
-/// identical `base_delay` and therefore retries at the identical instant: a
-/// synchronized "thundering herd" that immediately re-floods the dependency it
-/// just backed off from instead of spreading the retry load. Drawing the
-/// spread from the framework's injected [`crate::entropy::Entropy`] seam
-/// breaks the synchronization — real OS entropy in production, seeded and
-/// bit-for-bit reproducible under a [`crate::sim::Sim`] run — while keeping the
-/// worst case no worse than the un-jittered delay (`delay <= base_delay_ms`),
-/// so this changes no existing retry-timeout budget.
-///
-/// "Equal jitter" (half the delay is guaranteed, the other half is random) is
-/// used over "full jitter" (`rand(0, base)`) so a retry can never fire
-/// near-instantly under heavy jitter — see
-/// <https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/>.
-///
-/// `half` rounds *up* (`div_ceil`, not plain integer division) so a small
-/// configured backoff is still honored: at `base_delay_ms = 1`, plain
-/// `1 / 2 == 0` would let the retry fire immediately (`0ms`) instead of
-/// preserving the configured 1ms floor, and would do so on *every* attempt of
-/// a job configured with a tiny backoff — silently turning it into a tight
-/// retry loop (Codex review). `spread` is sized so `half + (0..spread)` covers
-/// exactly `[half, base_delay_ms]` inclusive, so the delay is never less than
-/// half the base and never more than the base itself.
-fn jittered_retry_delay_ms(entropy: &dyn crate::entropy::Entropy, base_delay_ms: u64) -> u64 {
-    let half = base_delay_ms.div_ceil(2);
-    // `half <= base_delay_ms` (it is the ceiling half), so `spread >= 1` and
-    // the reduction below is always defined; the sum is capped at
-    // `base_delay_ms` by construction.
-    let spread = base_delay_ms.saturating_sub(half).saturating_add(1);
-    half.saturating_add(entropy.next_u64().checked_rem(spread).unwrap_or_default())
-}
+/// `AppState` extension: the `[jobs] max_backoff_ms` cap. `start_runtime`
+/// installs it. Without it, [`crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS`]
+/// applies.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JobMaxBackoff(pub(crate) u64);
 
-/// Exponential backoff delay in ms for `attempt` (1-indexed) on the local
-/// in-process backend — the counterpart of `redis_retry_delay_ms` /
-/// `pg_retry_delay_ms`.
-/// `attempt` is 1-indexed, so the exponent is `attempt - 1`; a `0` attempt
-/// saturates to the first-attempt delay rather than underflowing (matching
-/// the Redis and Postgres backends).
-const fn local_retry_delay_ms(initial_backoff_ms: u64, attempt: u32) -> u64 {
-    initial_backoff_ms.saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1)))
+/// The delay in ms before a job retry, for every backend (issue #3054).
+///
+/// `attempt` is the 1-indexed attempt that failed. The delay is full jitter
+/// in `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]`, drawn from
+/// `state.entropy()`. Jobs that fail together therefore do not retry
+/// together, and a [`crate::sim::Sim`] seed replays the same delays.
+pub(crate) fn job_retry_delay_ms(state: &AppState, initial_backoff_ms: u64, attempt: u32) -> u64 {
+    let cap = state
+        .extension::<JobMaxBackoff>()
+        .map_or(crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS, |cap| cap.0);
+    crate::backoff::full_jitter_ms(
+        state.entropy(),
+        initial_backoff_ms,
+        cap,
+        attempt.saturating_sub(1),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
 async fn execute_local_job(
-    job: QueuedJob,
+    mut job: QueuedJob,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     tx: &tokio::sync::mpsc::Sender<QueuedJob>,
     state: &AppState,
@@ -5590,9 +6940,11 @@ async fn execute_local_job(
                 info.initial_backoff_ms,
                 info.uniqueness.clone(),
                 info.concurrency.clone(),
+                info.timeout,
             )
         });
-    let Some((handler, info_max_attempts, info_backoff_ms, uniqueness, concurrency)) = maybe_info
+    let Some((handler, info_max_attempts, info_backoff_ms, uniqueness, concurrency, timeout)) =
+        maybe_info
     else {
         if job_admin.try_record_start(&job.id, job.attempt) == JobAdminStartDecision::Canceled {
             state.job_registry.record_cancel(&job.name);
@@ -5624,6 +6976,32 @@ async fn execute_local_job(
         .await;
         return;
     };
+
+    // Cost gate (issue #1720): a deferrable job waits while the cost signal is
+    // high. It has not started, so it holds no slot and uses no attempt, and
+    // its queued gauge does not change. The runtime keeps it in one deferred
+    // list, and one task checks that list every recheck interval: it puts a
+    // job back on the queue when the signal falls. A canceled job goes back at
+    // once, so the cancel branch below settles it. A canceled job does not
+    // wait. The task stops when the list is empty or the runtime shuts down.
+    if !job_admin.is_canceled(&job.id)
+        && let Some(signal) =
+            crate::cost::deferral_signal(state, crate::cost::WorkKind::Job, &job.name)
+    {
+        crate::cost::note_deferral(&signal);
+        tracing::info!(job = %job.name, value = signal.value(), "cost signal is high; job waits");
+        // The wait for the first signal value is not a window.
+        job.cost_waited = crate::cost::is_window(&signal);
+        if coordination.defer(job) {
+            tokio::spawn(run_deferred_job_waiter(
+                Arc::clone(coordination),
+                signal,
+                job_admin.clone(),
+                tx.clone(),
+            ));
+        }
+        return;
+    }
 
     // Concurrency gate: park the job when its group is saturated. Parked jobs
     // keep their enqueued status and resume when release_slot pops them.
@@ -5700,15 +7078,27 @@ async fn execute_local_job(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&job.attempt, &max_attempts);
+    // The local queue has no claim, so only the timeout bounds the run.
+    let bounds = ExecutionBounds {
+        timeout,
+        lease_lost: None,
+    };
     let f = run_job_handler(
         &job.name,
         handler,
         state.clone(),
         job.payload.clone(),
         final_attempt,
+        bounds,
+        crate::cost::WorkRun {
+            tenant: job.tenant.clone(),
+            waited: job.cost_waited,
+        },
     );
     let outcome = tracing::Instrument::instrument(f, job_span).await;
     match outcome {
+        // No claim on this queue, so no lost lease.
+        JobExecutionOutcome::LeaseLost => {}
         JobExecutionOutcome::Succeeded => {
             state.job_registry.record_success(&job.name);
             job_admin.record_success(&job.id);
@@ -5773,8 +7163,8 @@ async fn execute_local_job(
                 let traceparent = job.traceparent;
                 #[cfg(feature = "telemetry-otlp")]
                 let tracestate = job.tracestate;
-                let base_delay = local_retry_delay_ms(backoff_ms, job.attempt);
-                let delay = jittered_retry_delay_ms(state.entropy(), base_delay);
+                let tenant = job.tenant;
+                let delay = job_retry_delay_ms(state, backoff_ms, job.attempt);
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                     registry.record_enqueue(&name);
@@ -5788,6 +7178,8 @@ async fn execute_local_job(
                             attempt: job.attempt.saturating_add(1),
                             max_attempts,
                             initial_backoff_ms: backoff_ms,
+                            tenant,
+                            cost_waited: false,
                             #[cfg(feature = "telemetry-otlp")]
                             traceparent,
                             #[cfg(feature = "telemetry-otlp")]
@@ -5830,6 +7222,75 @@ async fn execute_local_job(
     // The concurrency slot frees as soon as the handler is no longer running,
     // including while a retry waits out its backoff.
     finish_local_slot(coordination, concurrency_group.as_ref(), tx, state);
+}
+
+/// The registered deferrable job names while the cost signal is high (issue
+/// #1720). The durable backends do not claim these jobs. Empty otherwise.
+#[cfg(any(feature = "db", feature = "redis"))]
+pub(crate) fn deferred_job_names(
+    state: &AppState,
+    jobs_by_name: &RwLock<HashMap<String, JobInfo>>,
+) -> Vec<String> {
+    if !crate::cost::deferring_jobs(state) {
+        return Vec::new();
+    }
+    jobs_by_name
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .keys()
+        .filter(|name| crate::cost::is_deferrable(crate::cost::WorkKind::Job, name))
+        .cloned()
+        .collect()
+}
+
+/// The deferred names as one JSON array, for the Redis and `SQLite` claims.
+#[cfg(any(feature = "sqlite", feature = "redis"))]
+pub(crate) fn deferred_names_json(deferred: &[String]) -> String {
+    if deferred.is_empty() {
+        return "[]".to_owned();
+    }
+    serde_json::to_string(deferred).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// The cost run of a durable job that was ready at `ready_ms` (unix ms). It
+/// counts as waited when a real window held it (issue #1720).
+#[cfg(any(feature = "db", feature = "redis"))]
+pub(crate) fn durable_work_run(state: &AppState, ready_ms: Option<i64>) -> crate::cost::WorkRun {
+    crate::cost::WorkRun {
+        tenant: None,
+        waited: ready_ms
+            .and_then(|ms| u64::try_from(ms).ok())
+            .is_some_and(|ms| crate::cost::held_in_window(state, ms)),
+    }
+}
+
+/// Check the deferred local jobs every recheck interval (issue #1720). Put a
+/// job back on the queue when the cost signal falls or an operator cancels it.
+async fn run_deferred_job_waiter(
+    coordination: Arc<LocalJobCoordination>,
+    signal: Arc<crate::cost::CostSignal>,
+    job_admin: JobAdminMemoryBackend,
+    sender: tokio::sync::mpsc::Sender<QueuedJob>,
+) {
+    loop {
+        tokio::select! {
+            // The runtime stopped: its queue is gone, as for any queued local
+            // job.
+            () = sender.closed() => return,
+            () = tokio::time::sleep(signal.recheck()) => {}
+        }
+        let low = !signal.is_high();
+        let (ready, more) = coordination.take_deferred(|job| low || job_admin.is_canceled(&job.id));
+        for job in ready {
+            tracing::info!(job = %job.name, "job goes back on the queue");
+            if sender.send(job).await.is_err() {
+                return;
+            }
+        }
+        if !more {
+            return;
+        }
+    }
 }
 
 /// Release a unique hold after a job settles. No-op for TTL-window holds
@@ -5905,7 +7366,8 @@ fn redis_record_key(record_prefix: &str, id: &str) -> String {
 /// keeps draining its existing backlog unchanged.
 #[cfg(feature = "redis")]
 fn redis_queue_key(key_prefix: &str, queue: &str) -> String {
-    let queue = normalize_queue_name(queue);
+    // Borrowed: the name is only compared and formatted into the key.
+    let queue = normalized_queue_name(queue);
     if queue == DEFAULT_QUEUE {
         format!("{key_prefix}:queue")
     } else {
@@ -5914,16 +7376,12 @@ fn redis_queue_key(key_prefix: &str, queue: &str) -> String {
 }
 
 #[cfg(feature = "redis")]
-const fn redis_retry_delay_ms(initial_backoff_ms: u64, attempt: u32) -> u64 {
-    initial_backoff_ms.saturating_mul(2_u64.saturating_pow(attempt.saturating_sub(1)))
-}
-
-#[cfg(feature = "redis")]
 fn clear_redis_claim(record: &mut RedisJobRecord) {
     record.claimed_by = None;
     record.claimed_at_ms = None;
 }
 
+/// Test model of a claim. Production sets the deadline from Redis `TIME`.
 #[cfg(all(feature = "redis", test))]
 fn claim_redis_record(
     mut record: RedisJobRecord,
@@ -5944,6 +7402,7 @@ fn prepare_redis_failure_action(
     mut record: RedisJobRecord,
     error: String,
     now_ms: u64,
+    retry_delay_ms: u64,
 ) -> RedisFailureAction {
     clear_redis_claim(&mut record);
     record.last_error = Some(error);
@@ -5952,10 +7411,7 @@ fn prepare_redis_failure_action(
     if is_final_attempt(&record.attempt, &record.max_attempts) {
         RedisFailureAction::DeadLetter(record)
     } else {
-        let due_at_ms = now_ms.saturating_add(redis_retry_delay_ms(
-            record.initial_backoff_ms,
-            record.attempt,
-        ));
+        let due_at_ms = now_ms.saturating_add(retry_delay_ms);
         record.attempt = record.attempt.saturating_add(1);
         RedisFailureAction::Retry(RedisRetrySchedule { record, due_at_ms })
     }
@@ -5973,16 +7429,15 @@ fn prepare_redis_panic_dead_letter(
     record
 }
 
+/// Build the recovery for a claimed record. The caller found the record past
+/// its deadline; the recovery script checks that again on the Redis server
+/// clock before it applies anything (issue #3051).
 #[cfg(feature = "redis")]
 fn recover_stale_redis_record(
     mut record: RedisJobRecord,
     now_ms: u64,
-    visibility_timeout_ms: u64,
 ) -> Option<RedisStaleRecovery> {
     let claimed_at_ms = record.claimed_at_ms?;
-    if claimed_at_ms.saturating_add(visibility_timeout_ms) > now_ms {
-        return None;
-    }
 
     let claimed_by = record
         .claimed_by
@@ -6712,6 +8167,16 @@ async fn redis_admin_active_list_page(
         total = total.saturating_add(len);
     }
 
+    // Jobs parked for the cost signal (issue #1720) sort after the
+    // concurrency-parked ones: a blocked rank below this count is a
+    // concurrency park.
+    let concurrency_parked: u64 = redis::cmd("ZCOUNT")
+        .arg(blocked_key)
+        .arg("-inf")
+        .arg(format!("({REDIS_DEFERRED_SCORE_BASE}"))
+        .query_async(connection)
+        .await
+        .map_err(|error| redis_admin_error("read blocked count", &error))?;
     let mut ids: Vec<String> = Vec::new();
     let mut blocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (index, local_start, count) in redis_page_spans(&lens, start, per_page) {
@@ -6728,7 +8193,7 @@ async fn redis_admin_active_list_page(
             .await
             .map_err(|error| redis_admin_error("read enqueued page", &error))?;
         let blocked = source.is_blocked();
-        for id in chunk {
+        for (rank, id) in (local_start..).zip(chunk) {
             // The queue and zset reads are not one atomic snapshot, and the
             // queues are read first: a job parked out of a queue in between
             // lands in both slices. (The reverse — promoted out of the zset —
@@ -6737,7 +8202,7 @@ async fn redis_admin_active_list_page(
             if ids.contains(&id) {
                 continue;
             }
-            if blocked {
+            if blocked && rank < concurrency_parked {
                 blocked_ids.insert(id.clone());
             }
             ids.push(id);
@@ -6904,12 +8369,25 @@ async fn push_json_list_item<T: ?Sized + Serialize + Sync>(
     }
 }
 
-#[cfg(feature = "redis")]
-#[allow(clippy::too_many_lines)]
+#[cfg(all(feature = "redis", test))]
 async fn claim_next_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
     queue_keys: &[String],
+) -> Result<Option<RedisJobRecord>, redis::RedisError> {
+    claim_next_redis_job_except(connection, worker_config, queue_keys, &[]).await
+}
+
+/// Claim the next job, but park a job named in `deferred` in the blocked zset
+/// (issue #1720). A parked job stays enqueued and keeps its attempt. It goes
+/// back to its queue when the signal is low.
+#[cfg(feature = "redis")]
+#[allow(clippy::too_many_lines)]
+async fn claim_next_redis_job_except(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    queue_keys: &[String],
+    deferred: &[String],
 ) -> Result<Option<RedisJobRecord>, redis::RedisError> {
     // Walks the priority-ordered queue list keys (ARGV[9..]) highest first,
     // popping entries until one is claimable. Jobs whose concurrency group is
@@ -6917,8 +8395,18 @@ async fn claim_next_redis_job(
     // and retried via promotion; the scan bound keeps one call from walking an
     // arbitrarily long queue. The concurrency counter INCR is atomic with the
     // claim itself, so two workers can never both observe a free slot for the
-    // last opening in a group.
+    // last opening in a group. A deferred job (the names in the JSON array
+    // after the queue keys) is parked the same way, until the next signal
+    // check.
+    // The claim deadline (the processing-set score) is Redis server time plus
+    // ARGV[3], the visibility timeout. Worker clocks never set or read it
+    // (issue #3051). `replicate_commands` lets the script write after `TIME`
+    // on Redis before 7; on Redis 7 it does nothing.
     const CLAIM_SCRIPT: &str = r"
+redis.replicate_commands()
+local server_time = redis.call('TIME')
+local deadline = tonumber(server_time[1]) * 1000
+  + math.floor(tonumber(server_time[2]) / 1000) + tonumber(ARGV[3])
 local function scope_string(value)
   if value == nil or value == cjson.null then
     return ''
@@ -6926,21 +8414,39 @@ local function scope_string(value)
   return tostring(value)
 end
 local queue_count = tonumber(ARGV[9])
+local deferred_score = ARGV[10 + queue_count]
+local deferred = {}
+for _, name in ipairs(cjson.decode(ARGV[11 + queue_count])) do
+  deferred[name] = true
+end
+local defer_limit = tonumber(ARGV[12 + queue_count])
 for qi = 1, queue_count do
   local queue_key = ARGV[9 + qi]
-  for attempt = 1, tonumber(ARGV[6]) do
+  local scanned = 0
+  local parked = 0
+  while scanned < tonumber(ARGV[6]) and parked < defer_limit do
     local id = redis.call('RPOP', queue_key)
     if not id then
       break
     end
     local key = KEYS[2] .. id
     local body = redis.call('GET', key)
+    local record = nil
     if body then
-      local ok, record = pcall(cjson.decode, body)
+      local ok, decoded = pcall(cjson.decode, body)
       if not ok then
-        redis.call('ZADD', KEYS[1], ARGV[3], id)
+        redis.call('ZADD', KEYS[1], deadline, id)
         return { id, body }
       end
+      record = decoded
+    end
+    if record and deferred[record['name']] then
+      redis.call('ZADD', KEYS[3], deferred_score, id)
+      parked = parked + 1
+    else
+      scanned = scanned + 1
+    end
+    if record and not deferred[record['name']] then
       local blocked = false
       if record['concurrency_limit'] and record['concurrency_limit'] ~= cjson.null then
         local counter = ARGV[4] .. record['name'] .. ':' .. scope_string(record['concurrency_key'])
@@ -6969,7 +8475,7 @@ for qi = 1, queue_count do
         record['finished_at_ms'] = nil
         local updated = cjson.encode(record)
         redis.call('SET', key, updated)
-        redis.call('ZADD', KEYS[1], ARGV[3], id)
+        redis.call('ZADD', KEYS[1], deadline, id)
         return { id, updated }
       end
     end
@@ -6979,7 +8485,6 @@ return nil
 ";
 
     let now_ms = now_unix_ms(worker_config.clock.as_ref());
-    let deadline_ms = now_ms.saturating_add(worker_config.visibility_timeout_ms);
     let blocked_due_ms = now_ms.saturating_add(REDIS_CONCURRENCY_REQUEUE_DELAY_MS);
     let mut cmd = redis::cmd("EVAL");
     cmd.arg(CLAIM_SCRIPT)
@@ -6989,16 +8494,21 @@ return nil
         .arg(&worker_config.blocked_key)
         .arg(&worker_config.worker_id)
         .arg(now_ms)
-        .arg(deadline_ms)
+        .arg(worker_config.visibility_timeout_ms)
         .arg(&worker_config.concurrency_prefix)
         .arg(blocked_due_ms)
         .arg(REDIS_CLAIM_SCAN_LIMIT)
         .arg(&worker_config.unique_prefix)
-        .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+        .arg(redis_running_lock_ttl_ms(
+            worker_config.visibility_timeout_ms,
+        ))
         .arg(queue_keys.len());
     for queue_key in queue_keys {
         cmd.arg(queue_key);
     }
+    cmd.arg(REDIS_DEFERRED_SCORE_BASE.saturating_add(now_ms))
+        .arg(deferred_names_json(deferred))
+        .arg(REDIS_DEFER_SCAN_LIMIT);
     let response: Option<(String, String)> = cmd.query_async(connection).await?;
 
     let Some((id, body)) = response else {
@@ -7197,8 +8707,32 @@ async fn promote_due_blocked_redis_jobs(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
 ) -> Result<(), redis::RedisError> {
+    let now = now_unix_ms(worker_config.clock.as_ref()).to_string();
+    promote_blocked_redis_range(connection, worker_config, "-inf", &now).await
+}
+
+/// Move the jobs that wait for the cost signal back into their queues (issue
+/// #1720). Call it while the signal is low.
+#[cfg(feature = "redis")]
+async fn promote_deferred_redis_jobs(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+) -> Result<(), redis::RedisError> {
+    let base = REDIS_DEFERRED_SCORE_BASE.to_string();
+    promote_blocked_redis_range(connection, worker_config, &base, "+inf").await
+}
+
+/// Move up to 64 blocked jobs with a score in `[min, max]` back into their
+/// queues.
+#[cfg(feature = "redis")]
+async fn promote_blocked_redis_range(
+    connection: &mut redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    min: &str,
+    max: &str,
+) -> Result<(), redis::RedisError> {
     const PROMOTE_BLOCKED_SCRIPT: &str = r"
-local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+local ids = redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[4], ARGV[1], 'LIMIT', 0, ARGV[2])
 local key_prefix = ARGV[3]
 for _, id in ipairs(ids) do
   if redis.call('ZREM', KEYS[1], id) == 1 then
@@ -7226,25 +8760,31 @@ return #ids
         .arg(2)
         .arg(&worker_config.blocked_key)
         .arg(&worker_config.record_prefix)
-        .arg(now_unix_ms(worker_config.clock.as_ref()))
+        .arg(max)
         .arg(64_usize)
         .arg(&worker_config.key_prefix)
+        .arg(min)
         .query_async(connection)
         .await?;
     Ok(())
 }
 
 /// Publish per-name blocked-on-concurrency gauges from the blocked zset.
+/// Jobs parked for the cost signal are not counted.
 #[cfg(feature = "redis")]
 async fn update_redis_blocked_gauges(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
     state: &AppState,
 ) -> Result<(), redis::RedisError> {
-    let ids: Vec<String> = redis::cmd("ZRANGE")
+    // Jobs parked for the cost signal sit above the concurrency band.
+    let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
         .arg(&worker_config.blocked_key)
+        .arg("-inf")
+        .arg(format!("({REDIS_DEFERRED_SCORE_BASE}"))
+        .arg("LIMIT")
         .arg(0)
-        .arg(1023)
+        .arg(1024)
         .query_async(connection)
         .await?;
     let mut counts: HashMap<String, u64> = HashMap::new();
@@ -7326,7 +8866,8 @@ fn fold_due_delayed_records(
 /// on every replica — including enqueue-only web replicas that never pop.
 ///
 /// Per-queue `depth` is the exact `LLEN` of each queue list plus any due
-/// (ready-at `<= now`) entries still parked in the delayed ZSET; oldest-waiting
+/// (ready-at `<= now`) entries still parked in the delayed ZSET, plus the jobs
+/// parked for the cost signal (issue #1720); oldest-waiting
 /// age comes from the tail record's enqueue time (enqueue `LPUSH`es to the head
 /// and claim `RPOP`s from the tail, so the tail is the next job to run) and/or
 /// the min due-delayed score. The per-name `queued` tally reads a bounded sample
@@ -7413,8 +8954,78 @@ async fn update_redis_queue_depth_gauges(
     )
     .await?;
 
+    // Jobs parked for the cost signal (issue #1720) are still enqueued.
+    let blocked_key = format!("{key_prefix}:blocked");
+    survey_cost_parked_gauges(
+        connection,
+        &blocked_key,
+        record_prefix,
+        &mut per_queue,
+        &mut per_name,
+    )
+    .await?;
+
     state.job_registry.set_queue_depth_gauges(&per_queue);
     state.job_registry.set_queued_counts(&per_name);
+    Ok(())
+}
+
+/// Fold the jobs parked for the cost signal (the blocked zset band above
+/// `REDIS_DEFERRED_SCORE_BASE`) into the per-queue and per-name tallies. Their
+/// oldest age is their enqueue time. The scan stops at
+/// `REDIS_QUEUE_DEPTH_DUE_SCAN_CAP` and logs a warning.
+#[cfg(feature = "redis")]
+async fn survey_cost_parked_gauges(
+    connection: &mut redis::aio::ConnectionManager,
+    blocked_key: &str,
+    record_prefix: &str,
+    per_queue: &mut HashMap<String, (u64, Option<u64>)>,
+    per_name: &mut HashMap<String, u64>,
+) -> Result<(), redis::RedisError> {
+    let page_size = REDIS_QUEUE_DEPTH_SAMPLE.max(1).cast_unsigned();
+    let mut offset: isize = 0;
+    let mut scanned: usize = 0;
+    loop {
+        let ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
+            .arg(blocked_key)
+            .arg(REDIS_DEFERRED_SCORE_BASE)
+            .arg("+inf")
+            .arg("LIMIT")
+            .arg(offset)
+            .arg(REDIS_QUEUE_DEPTH_SAMPLE)
+            .query_async(connection)
+            .await?;
+        let page_len = ids.len();
+        if !ids.is_empty() {
+            let keys: Vec<String> = ids
+                .iter()
+                .map(|id| redis_record_key(record_prefix, id))
+                .collect();
+            let bodies: Vec<Option<String>> =
+                redis::cmd("MGET").arg(keys).query_async(connection).await?;
+            let records = bodies.into_iter().flatten().filter_map(|body| {
+                serde_json::from_str::<RedisJobRecord>(&body)
+                    .ok()
+                    .map(|record| (record.queue, record.name, record.enqueued_at_ms))
+            });
+            fold_due_delayed_records(records, per_queue, per_name);
+        }
+        scanned = scanned.saturating_add(page_len);
+        if page_len < page_size {
+            break;
+        }
+        // Full final page at the safety bound: stop, and say the depth can be
+        // low, as the due-delayed scan does.
+        if scanned >= REDIS_QUEUE_DEPTH_DUE_SCAN_CAP {
+            tracing::warn!(
+                scanned,
+                cap = REDIS_QUEUE_DEPTH_DUE_SCAN_CAP,
+                "cost-parked queue-depth scan truncated at cap; reported depth may under-count"
+            );
+            break;
+        }
+        offset = offset.saturating_add(REDIS_QUEUE_DEPTH_SAMPLE);
+    }
     Ok(())
 }
 
@@ -7547,30 +9158,46 @@ fn expected_claim_args(record: &RedisJobRecord) -> Option<(&str, u64)> {
 
 #[cfg(feature = "redis")]
 const CLAIMED_REDIS_TRANSITION_SCRIPT: &str = r"
-local function trim_dead_history(dead_key, dead_record_prefix, limit)
-  local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
+-- Removes the oldest entries above `limit`, at most `batch` per call, so one
+-- call never blocks Redis for a long backlog. Returns the number removed.
+-- A limit of 0 keeps all entries.
+local function trim_dead_history(dead_key, dead_record_prefix, limit, batch)
+  if limit == nil or limit <= 0 then
+    return 0
+  end
+  local excess = redis.call('LLEN', dead_key) - limit
+  if excess <= 0 then
+    return 0
+  end
+  if batch ~= nil and batch > 0 and excess > batch then
+    excess = batch
+  end
+  local trimmed_records = redis.call('LRANGE', dead_key, -excess, -1)
   for _, encoded in ipairs(trimmed_records) do
     local trimmed_ok, trimmed = pcall(cjson.decode, encoded)
     if trimmed_ok and trimmed['id'] then
       redis.call('DEL', dead_record_prefix .. trimmed['id'])
     end
   end
-  redis.call('LTRIM', dead_key, 0, limit - 1)
+  redis.call('LTRIM', dead_key, 0, -excess - 1)
+  return #trimmed_records
 end
+-- Every return is {status, number of trimmed dead letters}.
+local trimmed = 0
 local key = KEYS[2] .. ARGV[1]
 local body = redis.call('GET', key)
 if not body then
-  return 0
+  return {0, 0}
 end
 local ok, record = pcall(cjson.decode, body)
 if not ok then
-  return 0
+  return {0, 0}
 end
 if record['claimed_by'] ~= ARGV[2] then
-  return 0
+  return {0, 0}
 end
 if record['claimed_at_ms'] ~= tonumber(ARGV[3]) then
-  return 0
+  return {0, 0}
 end
 redis.call('ZREM', KEYS[1], ARGV[1])
 if ARGV[9] == '1' then
@@ -7592,7 +9219,7 @@ elseif ARGV[4] == 'retry' then
   if ARGV[10] == 'pending' then
     if not redis.call('SET', KEYS[7], ARGV[1], 'NX', 'PX', tonumber(ARGV[11])) then
       redis.call('DEL', key)
-      return 2
+      return {2, 0}
     end
   end
   redis.call('SET', key, ARGV[5])
@@ -7603,13 +9230,23 @@ elseif ARGV[4] == 'retry' then
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[6] .. ARGV[1], ARGV[5])
-  trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[7]))
+  trimmed = trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[12]), tonumber(ARGV[13]))
   redis.call('DEL', key)
 else
-  return 0
+  return {0, 0}
 end
-return 1
+return {1, trimmed}
 ";
+
+/// Result of a claim-checked Redis transition script.
+#[cfg(feature = "redis")]
+#[derive(Debug, Clone, Copy, Default)]
+struct RedisTransitionOutcome {
+    /// Script status: `0` no-op, `1` applied, `2` retry dropped for a duplicate.
+    status: i64,
+    /// Dead letters the script removed to obey the dead-letter limit.
+    dead_letters_trimmed: u64,
+}
 
 #[cfg(feature = "redis")]
 async fn apply_claimed_redis_transition(
@@ -7619,9 +9256,9 @@ async fn apply_claimed_redis_transition(
     mode: &str,
     encoded_record: Option<String>,
     due_at_ms: Option<u64>,
-) -> Result<i64, redis::RedisError> {
+) -> Result<RedisTransitionOutcome, redis::RedisError> {
     let Some((claimed_by, claimed_at_ms)) = expected_claim_args(expected) else {
-        return Ok(0);
+        return Ok(RedisTransitionOutcome::default());
     };
 
     // The concurrency slot frees on every settle (success, retry backoff,
@@ -7637,7 +9274,7 @@ async fn apply_claimed_redis_transition(
     } else {
         "0"
     };
-    let applied: i64 = redis::cmd("EVAL")
+    let (status, dead_letters_trimmed): (i64, u64) = redis::cmd("EVAL")
         .arg(CLAIMED_REDIS_TRANSITION_SCRIPT)
         .arg(8)
         .arg(&worker_config.processing_key)
@@ -7663,10 +9300,15 @@ async fn apply_claimed_redis_transition(
             ""
         })
         .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+        .arg(worker_config.dead_letter_limit)
+        .arg(REDIS_DEAD_LETTER_TRIM_BATCH)
         .query_async(connection)
         .await?;
 
-    Ok(applied)
+    Ok(RedisTransitionOutcome {
+        status,
+        dead_letters_trimmed,
+    })
 }
 
 #[cfg(feature = "redis")]
@@ -7692,7 +9334,7 @@ async fn ack_redis_success(
         None,
     )
     .await?;
-    Ok(applied == 1)
+    Ok(applied.status == 1)
 }
 
 /// Outcome of [`schedule_redis_retry`], distinguishing an ordinary applied
@@ -7733,17 +9375,56 @@ async fn schedule_redis_retry(
         Some(schedule.due_at_ms),
     )
     .await?;
-    Ok(match applied {
+    Ok(match applied.status {
         1 => RedisRetryOutcome::Applied,
         2 => RedisRetryOutcome::DroppedByDuplicate,
         _ => RedisRetryOutcome::ClaimChanged,
     })
 }
 
+/// Maximum dead letters one script call removes. A longer backlog shrinks
+/// over the next dead letters, so one call never blocks Redis for long.
+#[cfg(feature = "redis")]
+const REDIS_DEAD_LETTER_TRIM_BATCH: usize = 1_000;
+
+/// The worker's dead-letter limit from `jobs.redis.dead_letter_limit`.
+///
+/// A Redis list holds at most `u32::MAX` entries, so a larger limit never
+/// trims. The clamp is necessary: Lua reads numbers as doubles, and `LRANGE`
+/// rejects a value above `i64::MAX` after the script has written.
+#[cfg(feature = "redis")]
+fn redis_dead_letter_limit(config: &crate::config::JobRedisConfig) -> usize {
+    config
+        .dead_letter_limit
+        .min(usize::try_from(u32::MAX).unwrap_or(usize::MAX))
+}
+
+/// Make a dead-letter trim visible: log at warn level and count it.
+#[cfg(feature = "redis")]
+fn report_redis_dead_letter_trim(
+    registry: &crate::actuator::JobRegistry,
+    dead_key: &str,
+    limit: usize,
+    trimmed: u64,
+) {
+    if trimmed == 0 {
+        return;
+    }
+    tracing::warn!(
+        trimmed,
+        dead_letter_limit = limit,
+        dead_key,
+        "redis dead-letter list is longer than jobs.redis.dead_letter_limit; \
+         deleted the oldest dead jobs and their metadata"
+    );
+    registry.record_dead_letter_trimmed(trimmed);
+}
+
 #[cfg(feature = "redis")]
 async fn dead_letter_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
+    registry: &crate::actuator::JobRegistry,
     expected: &RedisJobRecord,
     record: &RedisJobRecord,
 ) -> Result<bool, redis::RedisError> {
@@ -7760,37 +9441,71 @@ async fn dead_letter_redis_job(
         None,
     )
     .await?;
-    Ok(applied == 1)
+    report_redis_dead_letter_trim(
+        registry,
+        &worker_config.dead_key,
+        worker_config.dead_letter_limit,
+        applied.dead_letters_trimmed,
+    );
+    Ok(applied.status == 1)
 }
 
 #[cfg(feature = "redis")]
 const STALE_REDIS_RECOVERY_SCRIPT: &str = r"
-local function trim_dead_history(dead_key, dead_record_prefix, limit)
-  local trimmed_records = redis.call('LRANGE', dead_key, limit, -1)
+redis.replicate_commands()
+-- Removes the oldest entries above `limit`, at most `batch` per call, so one
+-- call never blocks Redis for a long backlog. Returns the number removed.
+-- A limit of 0 keeps all entries.
+local function trim_dead_history(dead_key, dead_record_prefix, limit, batch)
+  if limit == nil or limit <= 0 then
+    return 0
+  end
+  local excess = redis.call('LLEN', dead_key) - limit
+  if excess <= 0 then
+    return 0
+  end
+  if batch ~= nil and batch > 0 and excess > batch then
+    excess = batch
+  end
+  local trimmed_records = redis.call('LRANGE', dead_key, -excess, -1)
   for _, encoded in ipairs(trimmed_records) do
     local trimmed_ok, trimmed = pcall(cjson.decode, encoded)
     if trimmed_ok and trimmed['id'] then
       redis.call('DEL', dead_record_prefix .. trimmed['id'])
     end
   end
-  redis.call('LTRIM', dead_key, 0, limit - 1)
+  redis.call('LTRIM', dead_key, 0, -excess - 1)
+  return #trimmed_records
 end
+-- Every return is {status, number of trimmed dead letters}.
+local trimmed = 0
 local key = KEYS[2] .. ARGV[1]
 local body = redis.call('GET', key)
 if not body then
   redis.call('ZREM', KEYS[1], ARGV[1])
-  return 0
+  return {0, 0}
 end
 local ok, record = pcall(cjson.decode, body)
 if not ok then
   redis.call('ZREM', KEYS[1], ARGV[1])
-  return 0
+  return {0, 0}
 end
 if record['claimed_by'] ~= ARGV[2] then
-  return 0
+  return {0, 0}
 end
 if record['claimed_at_ms'] ~= tonumber(ARGV[3]) then
-  return 0
+  return {0, 0}
+end
+-- Stale only when the claim deadline is past on the Redis server clock. A
+-- heartbeat can move the deadline after the caller read the processing set.
+local deadline = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if not deadline then
+  return {0, 0}
+end
+local server_time = redis.call('TIME')
+local now = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+if tonumber(deadline) > now then
+  return {0, 0}
 end
 redis.call('ZREM', KEYS[1], ARGV[1])
 if ARGV[8] == '1' then
@@ -7808,31 +9523,37 @@ if ARGV[4] == 'requeue' then
   if ARGV[9] == 'pending' then
     if not redis.call('SET', KEYS[6], ARGV[1], 'NX', 'PX', tonumber(ARGV[10])) then
       redis.call('DEL', key)
-      return 1
+      return {1, 0}
     end
   end
   redis.call('SET', key, ARGV[5])
-  redis.call('LPUSH', KEYS[3], ARGV[1])
+  if ARGV[12] ~= '' then
+    redis.call('ZADD', KEYS[8], tonumber(ARGV[12]), ARGV[1])
+  else
+    redis.call('LPUSH', KEYS[3], ARGV[1])
+  end
   if ARGV[9] == 'running' then
     redis.call('PEXPIRE', KEYS[6], tonumber(ARGV[10]))
   end
 elseif ARGV[4] == 'dead' then
   redis.call('LPUSH', KEYS[4], ARGV[5])
   redis.call('SET', KEYS[5] .. ARGV[1], ARGV[5])
-  trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))
+  trimmed = trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]), tonumber(ARGV[11]))
   redis.call('DEL', key)
 else
-  return 0
+  return {0, 0}
 end
-return 1
+return {1, trimmed}
 ";
 
 #[cfg(feature = "redis")]
 async fn apply_stale_redis_recovery(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
+    registry: &crate::actuator::JobRegistry,
     expected: &RedisJobRecord,
     action: &RedisStaleRecovery,
+    requeue_due_at_ms: Option<u64>,
 ) -> Result<bool, redis::RedisError> {
     let Some((claimed_by, claimed_at_ms)) = expected_claim_args(expected) else {
         return Ok(false);
@@ -7861,9 +9582,9 @@ async fn apply_stale_redis_recovery(
     };
     // A requeued stale job returns to its own named queue, not the default one.
     let requeue_key = redis_queue_key(&worker_config.key_prefix, &record.queue);
-    let applied: usize = redis::cmd("EVAL")
+    let (status, trimmed): (i64, u64) = redis::cmd("EVAL")
         .arg(STALE_REDIS_RECOVERY_SCRIPT)
-        .arg(7)
+        .arg(8)
         .arg(&worker_config.processing_key)
         .arg(&worker_config.record_prefix)
         .arg(&requeue_key)
@@ -7871,12 +9592,13 @@ async fn apply_stale_redis_recovery(
         .arg(&worker_config.dead_record_prefix)
         .arg(worker_config.unique_lock_key_for(expected))
         .arg(worker_config.concurrency_counter_key_for(expected))
+        .arg(&worker_config.delayed_key)
         .arg(&expected.id)
         .arg(claimed_by)
         .arg(claimed_at_ms)
         .arg(mode)
         .arg(encoded)
-        .arg(DEFAULT_JOB_ADMIN_HISTORY_LIMIT)
+        .arg(worker_config.dead_letter_limit)
         .arg(release_unique)
         .arg(decrement_slot)
         .arg(if mode == "requeue" {
@@ -7885,23 +9607,143 @@ async fn apply_stale_redis_recovery(
             ""
         })
         .arg(REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS)
+        .arg(REDIS_DEAD_LETTER_TRIM_BATCH)
+        .arg(requeue_due_at_ms.map_or_else(String::new, |due| due.to_string()))
         .query_async(connection)
         .await?;
 
-    Ok(applied == 1)
+    report_redis_dead_letter_trim(
+        registry,
+        &worker_config.dead_key,
+        worker_config.dead_letter_limit,
+        trimmed,
+    );
+    Ok(status == 1)
+}
+
+/// Redis server time in Unix milliseconds.
+#[cfg(feature = "redis")]
+async fn redis_server_time_ms(
+    connection: &mut redis::aio::ConnectionManager,
+) -> Result<u64, redis::RedisError> {
+    let (secs, micros): (u64, u64) = redis::cmd("TIME").query_async(connection).await?;
+    Ok(secs.saturating_mul(1_000).saturating_add(micros / 1_000))
+}
+
+/// Move a claim deadline forward if `ARGV[2]`/`ARGV[3]` still hold the claim.
+/// The new deadline is Redis server time plus `ARGV[4]`. A `running`-window
+/// unique lock (`KEYS[3]`) that this job holds gets the `ARGV[5]` TTL again
+/// (`redis_running_lock_ttl_ms`), as at the claim, so it outlives a claim the
+/// heartbeat keeps.
+#[cfg(feature = "redis")]
+const RENEW_REDIS_CLAIM_SCRIPT: &str = r"
+redis.replicate_commands()
+local body = redis.call('GET', KEYS[2])
+if not body then
+  return 0
+end
+local ok, record = pcall(cjson.decode, body)
+if not ok then
+  return 0
+end
+if record['claimed_by'] ~= ARGV[2] or record['claimed_at_ms'] ~= tonumber(ARGV[3]) then
+  return 0
+end
+if not redis.call('ZSCORE', KEYS[1], ARGV[1]) then
+  return 0
+end
+local server_time = redis.call('TIME')
+local now = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+redis.call('ZADD', KEYS[1], 'XX', now + tonumber(ARGV[4]), ARGV[1])
+if record['unique_window'] == 'running' and redis.call('GET', KEYS[3]) == ARGV[1] then
+  redis.call('PEXPIRE', KEYS[3], tonumber(ARGV[5]))
+end
+return 1
+";
+
+/// Renew `record`'s claim: move its deadline in the processing set forward,
+/// and refresh the TTL of the `running`-window unique lock it holds.
+#[cfg(feature = "redis")]
+async fn renew_redis_claim(
+    connection: &mut redis::aio::ConnectionManager,
+    processing_key: &str,
+    record_key: &str,
+    unique_lock_key: &str,
+    record: &RedisJobRecord,
+    visibility_timeout_ms: u64,
+) -> LeaseRenewal {
+    let Some((claimed_by, claimed_at_ms)) = expected_claim_args(record) else {
+        return LeaseRenewal::Lost;
+    };
+    let renewed: Result<i64, redis::RedisError> = redis::cmd("EVAL")
+        .arg(RENEW_REDIS_CLAIM_SCRIPT)
+        .arg(3)
+        .arg(processing_key)
+        .arg(record_key)
+        .arg(unique_lock_key)
+        .arg(&record.id)
+        .arg(claimed_by)
+        .arg(claimed_at_ms)
+        .arg(visibility_timeout_ms)
+        .arg(redis_running_lock_ttl_ms(visibility_timeout_ms))
+        .query_async(connection)
+        .await;
+    match renewed {
+        Ok(1) => LeaseRenewal::Renewed,
+        Ok(_) => LeaseRenewal::Lost,
+        Err(error) => LeaseRenewal::Failed(format!("redis claim renewal failed: {error}")),
+    }
+}
+
+/// Start renewing `record`'s claim.
+#[cfg(feature = "redis")]
+async fn redis_lease_heartbeat(
+    connection: &redis::aio::ConnectionManager,
+    worker_config: &RedisWorkerConfig,
+    record: &RedisJobRecord,
+    claimed_at: tokio::time::Instant,
+) -> LeaseHeartbeat {
+    let connection = connection.clone();
+    let processing_key = worker_config.processing_key.clone();
+    let record_key = redis_record_key(&worker_config.record_prefix, &record.id);
+    let unique_lock_key = worker_config.unique_lock_key_for(record);
+    let record = record.clone();
+    let visibility_timeout_ms = worker_config.visibility_timeout_ms;
+    LeaseHeartbeat::start(claimed_at, visibility_timeout_ms, move || {
+        let mut connection = connection.clone();
+        let processing_key = processing_key.clone();
+        let record_key = record_key.clone();
+        let unique_lock_key = unique_lock_key.clone();
+        let record = record.clone();
+        async move {
+            renew_redis_claim(
+                &mut connection,
+                &processing_key,
+                &record_key,
+                &unique_lock_key,
+                &record,
+                visibility_timeout_ms,
+            )
+            .await
+        }
+    })
+    .await
 }
 
 #[cfg(feature = "redis")]
+#[allow(clippy::too_many_lines)]
 async fn recover_stale_redis_jobs(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) -> Result<(), redis::RedisError> {
+    // Compare claim deadlines to Redis server time, not the worker clock: a
+    // worker with a fast clock must not see live claims as expired.
     let stale_ids: Vec<String> = redis::cmd("ZRANGEBYSCORE")
         .arg(&worker_config.processing_key)
         .arg("-inf")
-        .arg(now_unix_ms(worker_config.clock.as_ref()))
+        .arg(redis_server_time_ms(connection).await?)
         .arg("LIMIT")
         .arg(0)
         .arg(64)
@@ -7938,34 +9780,59 @@ async fn recover_stale_redis_jobs(
                 .await?;
             continue;
         };
-        let Some(action) = recover_stale_redis_record(
-            record.clone(),
-            now_unix_ms(worker_config.clock.as_ref()),
-            worker_config.visibility_timeout_ms,
-        ) else {
+        let now_ms = now_unix_ms(worker_config.clock.as_ref());
+        let Some(action) = recover_stale_redis_record(record.clone(), now_ms) else {
             continue;
         };
+        // Claims that expire together (handlers that hung on one dependency)
+        // must not all run again at once (issue #3054). A delayed requeue goes
+        // through the `delayed` set; its promotion records the enqueue.
+        let due_at_ms = match &action {
+            RedisStaleRecovery::Requeue(_) => {
+                let delay = job_retry_delay_ms(state, record.initial_backoff_ms, record.attempt);
+                (delay > 0).then(|| now_ms.saturating_add(delay))
+            }
+            RedisStaleRecovery::DeadLetter(_) => None,
+        };
 
-        if apply_stale_redis_recovery(connection, worker_config, &record, &action).await? {
+        if apply_stale_redis_recovery(
+            connection,
+            worker_config,
+            &state.job_registry,
+            &record,
+            &action,
+            due_at_ms,
+        )
+        .await?
+        {
             match &action {
                 RedisStaleRecovery::Requeue(requeued) => {
-                    if let Some(error) = requeued.last_error.as_deref() {
-                        state
-                            .job_registry
-                            .record_retry(&requeued.name, error, record.attempt);
-                        job_admin.record_retrying(&requeued.id, error);
-                    }
-                    state.job_registry.record_enqueue(&requeued.name);
-                    job_admin.record_requeued(&requeued.id, requeued.attempt);
+                    record_redis_recovered_requeue(
+                        &requeued.name,
+                        &requeued.id,
+                        requeued.attempt,
+                        requeued
+                            .last_error
+                            .as_deref()
+                            .unwrap_or("visibility timeout expired"),
+                        due_at_ms.is_none(),
+                        state,
+                        job_admin,
+                    );
                 }
                 RedisStaleRecovery::DeadLetter(dead) => {
                     let error = dead
                         .last_error
                         .clone()
                         .unwrap_or_else(|| "visibility timeout expired".to_string());
-                    state
-                        .job_registry
-                        .record_failure(&dead.name, error.clone(), true);
+                    record_recovered_failure(
+                        &dead.name,
+                        &dead.id,
+                        dead.attempt,
+                        &error,
+                        state,
+                        job_admin,
+                    );
                     crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
                     // The worker that held this claim is gone and the job is
@@ -8047,11 +9914,20 @@ fn spawn_redis_worker(
                 }
             }
 
-            if blocked_promotion_throttle.take_due(tokio::time::Instant::now())
-                && let Err(error) =
+            if blocked_promotion_throttle.take_due(tokio::time::Instant::now()) {
+                if let Err(error) =
                     promote_due_blocked_redis_jobs(&mut connection, &worker_config).await
-            {
-                tracing::warn!(error = %error, "redis blocked job promotion failed");
+                {
+                    tracing::warn!(error = %error, "redis blocked job promotion failed");
+                }
+                // Jobs parked for the cost signal go back when it is low,
+                // even when this deploy no longer marks them deferrable.
+                if !crate::cost::deferring_jobs(&state)
+                    && let Err(error) =
+                        promote_deferred_redis_jobs(&mut connection, &worker_config).await
+                {
+                    tracing::warn!(error = %error, "redis deferred job promotion failed");
+                }
             }
 
             if worker_config.slots.is_active() {
@@ -8069,11 +9945,21 @@ fn spawn_redis_worker(
                         continue;
                     };
                     let queue_keys = worker_config.queue_keys_for(std::slice::from_ref(queue));
-                    match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
+                    // The claim deadline starts inside the claim script.
+                    let claimed_at = tokio::time::Instant::now();
+                    match claim_next_redis_job_except(
+                        &mut connection,
+                        &worker_config,
+                        &queue_keys,
+                        &deferred_job_names(&state, &jobs_by_name),
+                    )
+                    .await
+                    {
                         Ok(Some(record)) => {
                             process_redis_job_record(
                                 &mut connection,
                                 record,
+                                claimed_at,
                                 &jobs_by_name,
                                 &state,
                                 &job_admin,
@@ -8102,21 +9988,31 @@ fn spawn_redis_worker(
 
             // Fast path (no caps/reserved): a single multi-queue claim across the
             // full (possibly pinned) priority order. Unchanged behavior (AC4).
-            let order = worker_config.slots.claimable(&queue_cursor.next_order());
+            // Borrowed, not copied: this runs on every poll, idle ones included.
+            let next = queue_cursor.next_order();
+            let order = worker_config.slots.claimable_borrowed(&next);
             if order.is_empty() {
                 tokio::time::sleep(idle_sleep).await;
                 continue;
             }
             let queue_keys = worker_config.queue_keys_for(&order);
-            let claimed =
-                match claim_next_redis_job(&mut connection, &worker_config, &queue_keys).await {
-                    Ok(record) => record,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "redis job worker claim failed");
-                        tokio::time::sleep(idle_sleep).await;
-                        continue;
-                    }
-                };
+            // The claim deadline starts inside the claim script.
+            let claimed_at = tokio::time::Instant::now();
+            let claimed = match claim_next_redis_job_except(
+                &mut connection,
+                &worker_config,
+                &queue_keys,
+                &deferred_job_names(&state, &jobs_by_name),
+            )
+            .await
+            {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(error = %error, "redis job worker claim failed");
+                    tokio::time::sleep(idle_sleep).await;
+                    continue;
+                }
+            };
             let Some(record) = claimed else {
                 tokio::time::sleep(idle_sleep).await;
                 continue;
@@ -8126,10 +10022,11 @@ fn spawn_redis_worker(
             // caps/reserved accounting reflects the true in-flight count.
             let _slot = worker_config
                 .slots
-                .acquire(&normalize_queue_name(&record.queue));
+                .acquire(normalized_queue_name(&record.queue));
             process_redis_job_record(
                 &mut connection,
                 record,
+                claimed_at,
                 &jobs_by_name,
                 &state,
                 &job_admin,
@@ -8144,6 +10041,7 @@ fn spawn_redis_worker(
 
 #[cfg(feature = "redis")]
 #[allow(clippy::cognitive_complexity)]
+#[allow(clippy::too_many_arguments)]
 async fn settle_failed_redis_job(
     connection: &mut redis::aio::ConnectionManager,
     worker_config: &RedisWorkerConfig,
@@ -8152,22 +10050,26 @@ async fn settle_failed_redis_job(
     error: String,
     outcome: &str,
     job_admin: &JobAdminMemoryBackend,
+    pending: PendingSettle,
 ) {
     let action = prepare_redis_failure_action(
         record.clone(),
         error.clone(),
         now_unix_ms(worker_config.clock.as_ref()),
+        job_retry_delay_ms(state, record.initial_backoff_ms, record.attempt),
     );
     match action {
         RedisFailureAction::Retry(schedule) => {
             match schedule_redis_retry(connection, worker_config, record, &schedule).await {
                 Ok(RedisRetryOutcome::Applied) => {
+                    settle_redis_record(state, job_admin, record, true);
                     state
                         .job_registry
                         .record_retry(&schedule.record.name, &error, record.attempt);
                     job_admin.record_retrying(&schedule.record.id, &error);
                 }
                 Ok(RedisRetryOutcome::DroppedByDuplicate) => {
+                    settle_redis_record(state, job_admin, record, true);
                     // A duplicate already claimed the pending-window unique lock
                     // while this job ran, so the retry was coalesced into it —
                     // deleted, not requeued. This job will never run again, so its
@@ -8187,12 +10089,15 @@ async fn settle_failed_redis_job(
                     )
                     .await;
                 }
-                Ok(RedisRetryOutcome::ClaimChanged) => tracing::warn!(
-                    job = %record.name,
-                    job_id = %record.id,
-                    outcome = %outcome,
-                    "redis job retry skipped because claim changed"
-                ),
+                Ok(RedisRetryOutcome::ClaimChanged) => {
+                    settle_redis_record(state, job_admin, record, false);
+                    tracing::warn!(
+                        job = %record.name,
+                        job_id = %record.id,
+                        outcome = %outcome,
+                        "redis job retry skipped because claim changed"
+                    );
+                }
                 Err(error) => tracing::warn!(
                     job = %record.name,
                     job_id = %record.id,
@@ -8203,20 +10108,33 @@ async fn settle_failed_redis_job(
             }
         }
         RedisFailureAction::DeadLetter(dead) => {
-            match dead_letter_redis_job(connection, worker_config, record, &dead).await {
+            match dead_letter_redis_job(
+                connection,
+                worker_config,
+                &state.job_registry,
+                record,
+                &dead,
+            )
+            .await
+            {
                 Ok(true) => {
+                    settle_redis_record(state, job_admin, record, true);
                     state
                         .job_registry
                         .record_failure(&dead.name, error.clone(), true);
                     crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
                     job_admin.record_failure(&dead.id, error);
+                    pending.apply(&record.name).await;
                 }
-                Ok(false) => tracing::warn!(
-                    job = %record.name,
-                    job_id = %record.id,
-                    outcome = %outcome,
-                    "redis job dead-letter skipped because claim changed"
-                ),
+                Ok(false) => {
+                    settle_redis_record(state, job_admin, record, false);
+                    tracing::warn!(
+                        job = %record.name,
+                        job_id = %record.id,
+                        outcome = %outcome,
+                        "redis job dead-letter skipped because claim changed"
+                    );
+                }
                 Err(error) => tracing::warn!(
                     job = %record.name,
                     job_id = %record.id,
@@ -8237,25 +10155,39 @@ async fn dead_letter_panicked_redis_job(
     record: &RedisJobRecord,
     error: String,
     job_admin: &JobAdminMemoryBackend,
+    pending: PendingSettle,
 ) {
     let dead = prepare_redis_panic_dead_letter(
         record.clone(),
         error.clone(),
         now_unix_ms(worker_config.clock.as_ref()),
     );
-    match dead_letter_redis_job(connection, worker_config, record, &dead).await {
+    match dead_letter_redis_job(
+        connection,
+        worker_config,
+        &state.job_registry,
+        record,
+        &dead,
+    )
+    .await
+    {
         Ok(true) => {
+            settle_redis_record(state, job_admin, record, true);
             state
                 .job_registry
                 .record_failure(&dead.name, error.clone(), true);
             crate::alerts::notify_dead_lettered_job(state, &dead.name, &dead.id, &error);
             job_admin.record_failure(&dead.id, error);
+            pending.apply(&record.name).await;
         }
-        Ok(false) => tracing::warn!(
-            job = %record.name,
-            job_id = %record.id,
-            "redis job panic dead-letter skipped because claim changed"
-        ),
+        Ok(false) => {
+            settle_redis_record(state, job_admin, record, false);
+            tracing::warn!(
+                job = %record.name,
+                job_id = %record.id,
+                "redis job panic dead-letter skipped because claim changed"
+            );
+        }
         Err(error) => tracing::warn!(
             job = %record.name,
             job_id = %record.id,
@@ -8282,19 +10214,30 @@ async fn dead_letter_invalid_redis_job(
     // (`Ok(false)`), the job was NOT dead-lettered, so alerting here would be a
     // false page — mirror the sibling redis dead-letter paths that gate all of
     // this on the confirmed `Ok(true)` result.
-    if dead_letter_redis_job(connection, worker_config, record, &dead).await == Ok(true) {
+    let moved = dead_letter_redis_job(
+        connection,
+        worker_config,
+        &state.job_registry,
+        record,
+        &dead,
+    )
+    .await;
+    if moved == Ok(true) {
+        settle_redis_record(state, job_admin, record, true);
         state
             .job_registry
             .record_failure(&record.name, error.to_owned(), true);
         crate::alerts::notify_dead_lettered_job(state, &record.name, &record.id, error);
         job_admin.record_failure(&record.id, error.to_owned());
+        crate::job_tracking::settle_tracked_payload_as_failed(
+            state,
+            &record.payload,
+            crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+        )
+        .await;
+    } else if moved == Ok(false) {
+        settle_redis_record(state, job_admin, record, false);
     }
-    crate::job_tracking::settle_tracked_payload_as_failed(
-        state,
-        &record.payload,
-        crate::job_tracking::GENERIC_FAILURE_MESSAGE,
-    )
-    .await;
 }
 
 #[cfg(feature = "redis")]
@@ -8302,34 +10245,46 @@ async fn dead_letter_invalid_redis_job(
 async fn process_redis_job_record(
     connection: &mut redis::aio::ConnectionManager,
     mut record: RedisJobRecord,
+    claimed_at: tokio::time::Instant,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
     worker_config: &RedisWorkerConfig,
 ) {
-    if job_admin.try_record_start(&record.id, record.attempt) == JobAdminStartDecision::Canceled {
+    if record_attempt_start(&record.name, &record.id, record.attempt, state, job_admin)
+        == JobAdminStartDecision::Canceled
+    {
         state.job_registry.record_cancel(&record.name);
         job_admin.record_cancelled(&record.id);
-        let _ = ack_redis_success(connection, worker_config, &record).await;
-        crate::job_tracking::settle_tracked_payload_as_failed(
-            state,
-            &record.payload,
-            "This job was canceled.",
-        )
-        .await;
+        let acked = ack_redis_success(connection, worker_config, &record).await;
+        // A rejected ack means another attempt owns the job (issue #2583).
+        if matches!(acked, Ok(true)) {
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &record.payload,
+                "This job was canceled.",
+            )
+            .await;
+        }
         return;
     }
     state.job_registry.record_start(&record.name);
+    job_admin.note_local_claim(&record.id, record.attempt);
 
     let maybe_info = {
         let guard = jobs_by_name
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard
-            .get(&record.name)
-            .map(|info| (info.handler, info.max_attempts, info.initial_backoff_ms))
+        guard.get(&record.name).map(|info| {
+            (
+                info.handler,
+                info.max_attempts,
+                info.initial_backoff_ms,
+                info.timeout,
+            )
+        })
     };
-    let Some((handler, info_max_attempts, info_backoff_ms)) = maybe_info else {
+    let Some((handler, info_max_attempts, info_backoff_ms, timeout)) = maybe_info else {
         dead_letter_invalid_redis_job(
             connection,
             worker_config,
@@ -8381,58 +10336,83 @@ async fn process_redis_job_record(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&record.attempt, &record.max_attempts);
-    let f = run_job_handler(
+    let heartbeat = redis_lease_heartbeat(connection, worker_config, &record, claimed_at).await;
+    let bounds = ExecutionBounds {
+        timeout,
+        lease_lost: Some(heartbeat.lost_token()),
+    };
+    let f = run_claimed_job_handler(
         &record.name,
         handler,
         state.clone(),
         record.payload.clone(),
         final_attempt,
+        bounds,
+        durable_work_run(
+            state,
+            record.enqueued_at_ms.and_then(|ms| i64::try_from(ms).ok()),
+        ),
     );
-    match tracing::Instrument::instrument(f, job_span).await {
-        JobExecutionOutcome::Succeeded => {
-            match ack_redis_success(connection, worker_config, &record).await {
-                Ok(true) => {
-                    state.job_registry.record_success(&record.name);
-                    job_admin.record_success(&record.id);
+    let (outcome, pending) = tracing::Instrument::instrument(f, job_span).await;
+    heartbeat
+        .stop_after(async {
+        match outcome {
+            JobExecutionOutcome::LeaseLost => {
+                record_lease_lost(&record.name, &record.id, record.attempt, state, job_admin);
+            }
+            JobExecutionOutcome::Succeeded => {
+                match ack_redis_success(connection, worker_config, &record).await {
+                    Ok(true) => {
+                        settle_redis_record(state, job_admin, &record, true);
+                        state.job_registry.record_success(&record.name);
+                        job_admin.record_success(&record.id);
+                        pending.apply(&record.name).await;
+                    }
+                    Ok(false) => {
+                        settle_redis_record(state, job_admin, &record, false);
+                        tracing::warn!(
+                            job = %record.name,
+                            job_id = %record.id,
+                            "redis job success ack skipped because claim changed"
+                        );
+                    }
+                    Err(error) => tracing::warn!(
+                        job = %record.name,
+                        job_id = %record.id,
+                        error = %error,
+                        "redis job success ack failed"
+                    ),
                 }
-                Ok(false) => tracing::warn!(
-                    job = %record.name,
-                    job_id = %record.id,
-                    "redis job success ack skipped because claim changed"
-                ),
-                Err(error) => tracing::warn!(
-                    job = %record.name,
-                    job_id = %record.id,
-                    error = %error,
-                    "redis job success ack failed"
-                ),
+            }
+            JobExecutionOutcome::Failed(error) => {
+                settle_failed_redis_job(
+                    connection,
+                    worker_config,
+                    state,
+                    &record,
+                    error,
+                    "failed",
+                    job_admin,
+                    pending,
+                )
+                .await;
+            }
+            JobExecutionOutcome::Panicked(error) => {
+                tracing::error!(job = %record.name, error = %error, "redis job handler panicked");
+                dead_letter_panicked_redis_job(
+                    connection,
+                    worker_config,
+                    state,
+                    &record,
+                    error,
+                    job_admin,
+                    pending,
+                )
+                .await;
             }
         }
-        JobExecutionOutcome::Failed(error) => {
-            settle_failed_redis_job(
-                connection,
-                worker_config,
-                state,
-                &record,
-                error,
-                "failed",
-                job_admin,
-            )
-            .await;
-        }
-        JobExecutionOutcome::Panicked(error) => {
-            tracing::error!(job = %record.name, error = %error, "redis job handler panicked");
-            dead_letter_panicked_redis_job(
-                connection,
-                worker_config,
-                state,
-                &record,
-                error,
-                job_admin,
-            )
-            .await;
-        }
-    }
+        })
+        .await;
 }
 
 #[cfg(feature = "redis")]
@@ -8577,7 +10557,7 @@ fn start_redis_runtime(
                 unique_prefix: unique_prefix.clone(),
                 clock: state.clock_arc(),
             }),
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -8589,11 +10569,13 @@ fn start_redis_runtime(
             interceptor: state
                 .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
-            entropy: state.entropy_arc(),
+            entropy: job_client_entropy(state),
             clock: state.clock_arc(),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         },
     );
 
@@ -8642,10 +10624,14 @@ fn start_redis_runtime(
                 unique_prefix: unique_prefix.clone(),
                 concurrency_prefix: concurrency_prefix.clone(),
                 worker_id: format!("{}:{}", std::process::id(), state.entropy().uuid_v4()),
-                visibility_timeout_ms: config.redis.visibility_timeout_ms,
+                visibility_timeout_ms: runtime_visibility_timeout_ms(
+                    "redis",
+                    config.redis.visibility_timeout_ms,
+                ),
                 default_attempts: config.max_attempts,
                 default_backoff: config.initial_backoff_ms,
                 retry_promotion_interval,
+                dead_letter_limit: redis_dead_letter_limit(&config.redis),
                 clock: state.clock_arc(),
             },
         )?;
@@ -8655,19 +10641,19 @@ fn start_redis_runtime(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Postgres job backend (feature = "db")
+// Postgres job backend (feature = "postgres")
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 type PgPool = diesel_async::pooled_connection::deadpool::Pool<diesel_async::AsyncPgConnection>;
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_STATUS_ENQUEUED: &str = "enqueued";
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_STATUS_RUNNING: &str = "running";
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_STATUS_COMPLETED: &str = "completed";
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_STATUS_FAILED: &str = "failed";
 
 #[cfg(feature = "db")]
@@ -8689,7 +10675,7 @@ enum PgLifecycleRecord<'a> {
     },
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const fn pg_claim_transition_applied(rows_affected: usize) -> bool {
     rows_affected > 0
 }
@@ -8699,44 +10685,44 @@ fn record_pg_lifecycle_after_ack(
     ack_applied: bool,
     job_name: &str,
     job_id: &str,
+    attempt: u32,
     lifecycle: PgLifecycleRecord<'_>,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) -> bool {
+    // The worker is done with this claim. The note shows if something else
+    // already balanced its start.
+    let started_here = job_admin.take_local_claim(job_id, attempt);
+    if ack_applied && !started_here {
+        // A newer attempt balanced this start. The `record_*` call below
+        // decrements again.
+        state.job_registry.restore_in_flight(job_name);
+    }
     if !ack_applied {
         // The claim was evicted by stale-claim recovery before this ack ran.
         // The recovery task already transitioned the row in the database:
         // - non-terminal attempts are requeued (attempt < max_attempts)
         // - terminal attempts are dead-lettered (attempt >= max_attempts)
-        // Mirror whichever outcome the worker intended so /actuator metrics stay
-        // consistent with the database row.
-        if let PgLifecycleRecord::Failure { error } = lifecycle {
-            // Terminal failure whose ack no longer applies: stale-claim recovery already
-            // transitioned this row out from under the worker, and recovery — not this
-            // resuming worker — owns the dead-letter accounting for `!ack_applied` rows.
-            //   * Final attempt: `pg_recover_stale_claims` flipped the row to `failed`
-            //     and already called `record_failure(.., dead_letter=true)` plus
-            //     `notify_dead_lettered_job`. Recording again would double the
-            //     `/actuator/jobs` failure and dead-letter counters and fire a second,
-            //     dedup-suppressed alert for one DB row.
-            //   * Non-final panic or unknown-type dead-letter: recovery requeued the row
-            //     instead. It is still alive, so no dead-letter is owed yet; the real
-            //     terminal outcome is recorded when it next runs.
-            // Either way, record no failure, dead-letter, or alert here. Still balance
-            // this worker's own `record_start` so the process-local `in_flight` gauge does
-            // not leak — `record_retry` decrements `in_flight` without touching the
-            // failure counters — and settle this job_id's admin record to Failed. Admin
-            // state is keyed per job_id and untouched by the maintenance loop, so this is
-            // the single, non-duplicated update that moves it out of Running.
+        //
+        // Recovery owns the dead-letter accounting (failure counters, alert),
+        // so record none here. This worker's own `record_start` is balanced
+        // once: only while this process still holds the note of this attempt
+        // (issues #3051, #3166). Recovery in this process, or a replacement
+        // attempt that started here, already took the note and owns the count
+        // (see `record_lease_lost`). Recovery in another process leaves it, so
+        // it is balanced here: `record_retry` decrements `in_flight` without
+        // touching the failure counters.
+        let error = match lifecycle {
+            PgLifecycleRecord::Failure { error } => error,
+            _ => "visibility timeout expired",
+        };
+        if started_here {
             state.job_registry.record_retry(job_name, error, 0);
+        }
+        if job_admin.settle_lease_lost(job_id, attempt, error)
+            && matches!(lifecycle, PgLifecycleRecord::Failure { .. })
+        {
             job_admin.record_failure(job_id, error.to_owned());
-        } else {
-            // Non-terminal or successful outcome: decrement in_flight and
-            // mark as retrying; the row is already back in the queue.
-            state
-                .job_registry
-                .record_retry(job_name, "visibility timeout expired", 0);
-            job_admin.record_retrying(job_id, "visibility timeout expired");
         }
         return false;
     }
@@ -8797,10 +10783,12 @@ fn record_pg_lifecycle_after_ack(
 }
 
 #[cfg(feature = "db")]
+#[allow(clippy::too_many_arguments)]
 fn record_pg_lifecycle_ack_result(
     ack_result: AutumnResult<bool>,
     job_name: &str,
     job_id: &str,
+    attempt: u32,
     outcome: &str,
     lifecycle: PgLifecycleRecord<'_>,
     state: &AppState,
@@ -8809,7 +10797,7 @@ fn record_pg_lifecycle_ack_result(
     match ack_result {
         Ok(applied) => {
             let recorded = record_pg_lifecycle_after_ack(
-                applied, job_name, job_id, lifecycle, state, job_admin,
+                applied, job_name, job_id, attempt, lifecycle, state, job_admin,
             );
             if !recorded {
                 tracing::warn!(
@@ -8834,7 +10822,7 @@ fn record_pg_lifecycle_ack_result(
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn record_pg_row_lifecycle_ack_result(
     ack_result: AutumnResult<bool>,
     row: &PgJobRow,
@@ -8843,8 +10831,9 @@ fn record_pg_row_lifecycle_ack_result(
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
 ) -> bool {
+    let attempt = u32::try_from(row.attempt).unwrap_or(0);
     record_pg_lifecycle_ack_result(
-        ack_result, &row.name, &row.id, outcome, lifecycle, state, job_admin,
+        ack_result, &row.name, &row.id, attempt, outcome, lifecycle, state, job_admin,
     )
 }
 
@@ -8880,7 +10869,7 @@ fn record_pg_cancel_after_ack(
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn record_pg_row_cancel_after_ack(
     ack_result: AutumnResult<bool>,
     row: &PgJobRow,
@@ -8889,9 +10878,13 @@ fn record_pg_row_cancel_after_ack(
     record_pg_cancel_after_ack(ack_result, &row.name, &row.id, state)
 }
 
-#[cfg(feature = "db")]
+/// How long an idle Postgres worker waits before it polls for a job again.
+///
+/// The Postgres runtime has no `LISTEN`/`NOTIFY` wake-up. A new job waits
+/// for the next poll. `docs/guide/jobs.md` states this value.
+#[cfg(feature = "postgres")]
 const PG_WORKER_IDLE_SLEEP: std::time::Duration = std::time::Duration::from_millis(200);
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// How often to sweep expired rows out of `autumn_job_tracking`. Much
 /// slower than [`PG_MAINTENANCE_INTERVAL`] (which recovers stale claims —
@@ -8899,11 +10892,11 @@ const PG_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// urgency: the row is already invisible to reads/writes the moment it
 /// expires (`PgJobTrackingStore` filters on `expires_at` lazily), so this
 /// sweep exists only to bound table growth over time, not correctness.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_TRACKING_CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Columns returned by every SELECT from `autumn_jobs` when OTLP is disabled.
-#[cfg(all(feature = "db", not(feature = "telemetry-otlp")))]
+#[cfg(all(feature = "postgres", not(feature = "telemetry-otlp")))]
 const PG_JOB_SELECT_COLS: &str = "id, name, queue, payload::TEXT AS payload, status, attempt, \
     max_attempts, initial_backoff_ms, enqueued_at, run_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error";
@@ -8911,13 +10904,13 @@ const PG_JOB_SELECT_COLS: &str = "id, name, queue, payload::TEXT AS payload, sta
 /// Columns returned by every SELECT from `autumn_jobs` when OTLP is enabled.
 /// Includes the nullable `traceparent` and `tracestate` columns added by the
 /// `add_trace_context_to_jobs` migration.
-#[cfg(all(feature = "db", feature = "telemetry-otlp"))]
+#[cfg(all(feature = "postgres", feature = "telemetry-otlp"))]
 const PG_JOB_SELECT_COLS: &str = "id, name, queue, payload::TEXT AS payload, status, attempt, \
     max_attempts, initial_backoff_ms, enqueued_at, run_at, started_at, finished_at, \
     claimed_by, claimed_at, last_error, traceparent, tracestate";
 
 /// A job row read from the `autumn_jobs` Postgres table.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName, Debug, Clone)]
 #[allow(dead_code)]
 struct PgJobRow {
@@ -8961,7 +10954,7 @@ struct PgJobRow {
     tracestate: Option<String>,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl PgJobRow {
     fn to_admin_record(&self, status: JobAdminStatus) -> JobAdminRecord {
         let payload = serde_json::from_str::<Value>(&self.payload).unwrap_or(Value::Null);
@@ -8990,14 +10983,14 @@ impl PgJobRow {
 }
 
 /// A simple count row for admin queries.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgCount {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     count: i64,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgEnqueuedCounts {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -9006,14 +10999,40 @@ struct PgEnqueuedCounts {
     scheduled_count: i64,
 }
 
-/// Exponential backoff delay in ms for attempt `attempt` (1-indexed).
+/// The cap for a stale-claim requeue in SQL, in ms.
+///
+/// Claims that expire together (handlers that hung on one dependency) must
+/// not all run again at once (issue #3054). The SQL draws a per-row jitter in
+/// `[0, min(cap, initial_backoff_ms * 2^(attempt-1))]`, as the recovery
+/// updates many rows in one statement. Postgres uses its own `random()`.
+/// `SQLite` mixes the row id with one draw from the app's entropy, so a sim
+/// replays it (issue #3067). The cap is clamped like a relative enqueue, so
+/// the SQL cannot overflow.
 #[cfg(feature = "db")]
-fn pg_retry_delay_ms(initial_backoff_ms: i64, attempt: i32) -> i64 {
-    let exp = u32::try_from(attempt.saturating_sub(1)).unwrap_or(0);
-    initial_backoff_ms.saturating_mul(2_i64.saturating_pow(exp))
+pub(crate) fn stale_requeue_cap_ms(state: &AppState) -> i64 {
+    let cap = state
+        .extension::<JobMaxBackoff>()
+        .map_or(crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS, |cap| cap.0);
+    i64::try_from(cap)
+        .unwrap_or(i64::MAX)
+        .min(PG_MAX_RELATIVE_DELAY_MS)
 }
 
+/// [`job_retry_delay_ms`] for a durable SQL row, whose columns are signed.
 #[cfg(feature = "db")]
+pub(crate) fn sql_row_retry_delay_ms(
+    state: &AppState,
+    initial_backoff_ms: i64,
+    attempt: i32,
+) -> u64 {
+    job_retry_delay_ms(
+        state,
+        u64::try_from(initial_backoff_ms).unwrap_or(0),
+        u32::try_from(attempt).unwrap_or(0),
+    )
+}
+
+#[cfg(feature = "postgres")]
 async fn pg_evict_expired_unique_key(
     conn: &mut diesel_async::AsyncPgConnection,
     name: &str,
@@ -9044,7 +11063,7 @@ async fn pg_evict_expired_unique_key(
 /// app-vs-database clock skew that stamping from `chrono::Utc::now()` and
 /// binding the result would carry. `Absolute` is a real-world deadline the
 /// caller chose (`enqueue_at`); it is inserted unchanged, exactly as before.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PgDueAt {
     /// Run as soon as possible.
@@ -9074,7 +11093,7 @@ const PG_MAX_RELATIVE_DELAY_MS: i64 = i64::MAX / 1_000_000;
 /// (or a transactional/after-commit sibling) was called with, so it is
 /// measured from the database's clock. Otherwise `due_at` is either an
 /// explicit `enqueue_at` instant or `None` (immediate).
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn pg_due_from(
     relative_delay: Option<std::time::Duration>,
     due_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -9111,7 +11130,7 @@ fn pg_due_from(
 /// `idx_autumn_jobs_unique_inflight` closes the race where two app instances
 /// pass the guard simultaneously. Zero rows inserted for a unique job means
 /// the enqueue was coalesced.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn pg_insert_job(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -9284,7 +11303,7 @@ async fn pg_insert_job(
 /// (`pg_evict_expired_unique_key`) needs its own round trip per key, and
 /// this batch does not run it. [`JobClient::can_batch_enqueue`] checks
 /// this before any row reaches here.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn pg_insert_jobs_many(
     pool: &PgPool,
@@ -9426,7 +11445,7 @@ async fn pg_insert_jobs_many(
 ///
 /// Thin wrapper over [`pg_enqueue_job_at`] with no delay; retained for the
 /// Postgres backend's test suite, which exercises the immediate path directly.
-#[cfg(all(feature = "db", test))]
+#[cfg(all(feature = "postgres", test))]
 #[allow(clippy::too_many_arguments)]
 async fn pg_enqueue_job(
     pool: &PgPool,
@@ -9460,7 +11479,7 @@ async fn pg_enqueue_job(
 /// enqueue. `due_at`/`relative_delay` are resolved into a [`PgDueAt`] inside
 /// [`pg_insert_job`], after this function's own `pool.get()` wait — see that
 /// function's comment on why a relative delay must be resolved that late.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments)]
 async fn pg_enqueue_job_at(
     pool: &PgPool,
@@ -9501,7 +11520,7 @@ async fn pg_enqueue_job_at(
 /// When `run_at` is in the future the row is also a crash-safe delayed enqueue:
 /// invisible to workers until **both** the transaction commits **and** the due
 /// time passes.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments)]
 async fn pg_enqueue_on_conn_at(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -9541,35 +11560,55 @@ async fn pg_enqueue_on_conn_at(
 /// cap. The lock is transaction-scoped and only taken when at least one
 /// registered job declares a concurrency limit, so unconstrained deployments
 /// keep fully parallel claims.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 const PG_CLAIM_ADVISORY_LOCK_KEY: i64 = 0x6175_7475_6d6e_6a62; // "autumnjb"
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn pg_claim_sql() -> String {
+    // `$3` is the deferred job names (issue #1720): empty unless the cost
+    // signal is high. Those rows stay enqueued and keep their attempt.
     // `$2` is the worker's ordered queue list for this claim. Restricting to it
     // and ordering by `array_position` drains higher-priority queues first;
     // passing a per-iteration rotation of the list yields weighted draining.
     // Only reached when `queue_order` has 2+ entries — see
     // `pg_claim_sql_single_queue` for the single-queue fast path, which is the
     // common case (no `[jobs] queues` priority config).
+    //
+    // Each queue is probed in list order with its own `ORDER BY run_at LIMIT 1`
+    // so `idx_autumn_jobs_queue_ready (queue, run_at)` serves the head of each
+    // queue and the claim touches O(queues) rows instead of sorting the whole
+    // ready backlog of every polled queue (`ORDER BY array_position(..)` is
+    // opaque to the planner). The outer `ORDER BY q.ord, picked.run_at` keeps
+    // the original order: earliest-listed queue first, oldest `run_at` within it.
+    // Row locks are taken per probe, so a probe may briefly lock the head of a
+    // lower-priority queue that the outer `LIMIT 1` then discards; the locks
+    // drop when the statement ends and only make a concurrent claim skip that
+    // row for that instant.
     format!(
         "UPDATE autumn_jobs \
          SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
              pending_unique_key = CASE WHEN unique_window = 'pending' THEN unique_key ELSE NULL END, \
              unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
          WHERE id = ( \
-           SELECT candidate.id FROM autumn_jobs candidate \
-           WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
-             AND candidate.queue = ANY($2) \
-             AND (candidate.concurrency_limit IS NULL OR ( \
-               SELECT COUNT(*) FROM autumn_jobs running \
-               WHERE running.status = 'running' \
-                 AND running.name = candidate.name \
-                 AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
-             ) < candidate.concurrency_limit) \
-           ORDER BY array_position($2::text[], candidate.queue), candidate.run_at ASC \
+           SELECT picked.id \
+           FROM unnest($2::text[]) WITH ORDINALITY AS q(queue, ord) \
+           CROSS JOIN LATERAL ( \
+             SELECT candidate.id, candidate.run_at FROM autumn_jobs candidate \
+             WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
+               AND candidate.queue = q.queue \
+               AND (candidate.concurrency_limit IS NULL OR ( \
+                 SELECT COUNT(*) FROM autumn_jobs running \
+                 WHERE running.status = 'running' \
+                   AND running.name = candidate.name \
+                   AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
+               ) < candidate.concurrency_limit) \
+               AND NOT (candidate.name = ANY($3)) \
+             ORDER BY candidate.run_at ASC \
+             LIMIT 1 \
+             FOR UPDATE SKIP LOCKED \
+           ) picked \
+           ORDER BY q.ord, picked.run_at \
            LIMIT 1 \
-           FOR UPDATE SKIP LOCKED \
          ) \
          RETURNING {PG_JOB_SELECT_COLS}"
     )
@@ -9594,7 +11633,7 @@ fn pg_claim_sql() -> String {
 /// anyway — but lets the planner recognize `(queue, run_at)` index order and
 /// do an `Index Scan` + `Limit 1`, touching O(1) buffers regardless of
 /// backlog size.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn pg_claim_sql_single_queue() -> String {
     format!(
         "UPDATE autumn_jobs \
@@ -9611,6 +11650,7 @@ fn pg_claim_sql_single_queue() -> String {
                  AND running.name = candidate.name \
                  AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key \
              ) < candidate.concurrency_limit) \
+             AND NOT (candidate.name = ANY($3)) \
            ORDER BY candidate.run_at ASC \
            LIMIT 1 \
            FOR UPDATE SKIP LOCKED \
@@ -9619,14 +11659,104 @@ fn pg_claim_sql_single_queue() -> String {
     )
 }
 
-#[cfg(feature = "db")]
+/// Single-queue claim for the cost-deferral case (issue #1720): `deferred` is
+/// non-empty, so some job names are parked at the head of the queue.
+///
+/// `pg_claim_sql_single_queue` walks `idx_autumn_jobs_queue_ready` in `run_at`
+/// order and drops parked names with a heap-side filter, so a poll costs
+/// O(parked backlog) buffers, and the backlog grows because nothing claims the
+/// parked names. This variant instead skip-scans the distinct ready names on
+/// `idx_autumn_jobs_queue_name_ready (queue, name, run_at)` (one index-only
+/// probe per name), keeps the runnable ones with the `run_at` of their earliest
+/// due row (`heads`), and walks them in that order. Each probe returns the
+/// name's earliest concurrency-eligible row strictly earlier than the best found
+/// so far, and the walk stops at the first name whose head cannot beat the best,
+/// so a name with a large saturated backlog is never scanned past the point the
+/// plain claim would have stopped at. The claimed row is the one
+/// `pg_claim_sql_single_queue` would pick (ties on `run_at` stay unordered, as
+/// before). Row locks are taken per probe and drop with the statement, as in the
+/// multi-queue claim.
+///
+/// `heads` is referenced twice (the walk's base term tests it) so Postgres 12+
+/// materializes it instead of inlining it into every iteration; `AS MATERIALIZED`
+/// is not used because Postgres 11, the test-container default, rejects it.
+///
+/// Used only when `deferred` is non-empty, so the common path is untouched.
+#[cfg(feature = "postgres")]
+fn pg_claim_sql_single_queue_deferred() -> String {
+    format!(
+        "UPDATE autumn_jobs SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
+         pending_unique_key = CASE WHEN unique_window = 'pending' THEN unique_key ELSE NULL END, \
+         unique_key = CASE WHEN unique_window = 'pending' THEN NULL ELSE unique_key END \
+         WHERE id = ( \
+         WITH RECURSIVE names(n, skip) AS ( \
+         (SELECT name, name = ANY($3) FROM autumn_jobs \
+         WHERE status = 'enqueued' AND queue = $2 ORDER BY name LIMIT 1) \
+         UNION ALL \
+         SELECT nx.name, nx.name = ANY($3) FROM names \
+         CROSS JOIN LATERAL (SELECT name FROM autumn_jobs \
+         WHERE status = 'enqueued' AND queue = $2 AND name > names.n ORDER BY name LIMIT 1) nx \
+         ), \
+         heads AS ( \
+         SELECT names.n, h.head, row_number() OVER (ORDER BY h.head, names.n) AS i FROM names \
+         CROSS JOIN LATERAL (SELECT run_at AS head FROM autumn_jobs \
+         WHERE status = 'enqueued' AND queue = $2 AND name = names.n AND run_at <= NOW() \
+         ORDER BY run_at LIMIT 1) h \
+         WHERE NOT names.skip \
+         ), \
+         walk(i, best_at, best_id) AS ( \
+         SELECT 0::bigint, NULL::timestamptz, NULL::text WHERE EXISTS (SELECT 1 FROM heads) \
+         UNION ALL \
+         SELECT heads.i, COALESCE(p.run_at, walk.best_at), COALESCE(p.id, walk.best_id) \
+         FROM walk \
+         JOIN heads ON heads.i = walk.i + 1 AND (walk.best_at IS NULL OR heads.head < walk.best_at) \
+         LEFT JOIN LATERAL ( \
+         SELECT candidate.id, candidate.run_at FROM autumn_jobs candidate \
+         WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
+         AND (walk.best_at IS NULL OR candidate.run_at < walk.best_at) \
+         AND candidate.queue = $2 AND candidate.name = heads.n \
+         AND (candidate.concurrency_limit IS NULL OR (SELECT COUNT(*) FROM autumn_jobs running \
+         WHERE running.status = 'running' AND running.name = candidate.name \
+         AND running.concurrency_key IS NOT DISTINCT FROM candidate.concurrency_key) < candidate.concurrency_limit) \
+         ORDER BY candidate.run_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED) p ON true \
+         ) \
+         SELECT best_id FROM walk WHERE best_id IS NOT NULL ORDER BY i DESC LIMIT 1) \
+         RETURNING {PG_JOB_SELECT_COLS}"
+    )
+}
+
+/// The single-queue claim text for this poll: the plain claim, or the
+/// skip-scan variant while any job name is deferred.
+#[cfg(feature = "postgres")]
+fn pg_single_queue_claim_sql(deferred: &[String]) -> String {
+    if deferred.is_empty() {
+        pg_claim_sql_single_queue()
+    } else {
+        pg_claim_sql_single_queue_deferred()
+    }
+}
+
+#[cfg(all(feature = "postgres", test))]
 async fn pg_claim_next_job(
     pool: &PgPool,
     worker_id: &str,
     serialize_claims: bool,
     queue_order: &[String],
 ) -> Option<PgJobRow> {
+    pg_claim_next_job_except(pool, worker_id, serialize_claims, queue_order, &[]).await
+}
+
+/// Claim the next ready job, but not a job named in `deferred` (issue #1720).
+#[cfg(feature = "postgres")]
+async fn pg_claim_next_job_except(
+    pool: &PgPool,
+    worker_id: &str,
+    serialize_claims: bool,
+    queue_order: &[String],
+    deferred: &[String],
+) -> Option<PgJobRow> {
     use diesel::OptionalExtension as _;
+    type Names = diesel::sql_types::Array<diesel::sql_types::Text>;
     use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
 
     let mut conn = pool.get().await.ok()?;
@@ -9634,8 +11764,9 @@ async fn pg_claim_next_job(
     // `[jobs] queues` priority config — the common case) gets its own query
     // text rather than reusing `pg_claim_sql` with a one-element array.
     let claimed = if let [only_queue] = queue_order {
-        let sql = pg_claim_sql_single_queue();
+        let sql = pg_single_queue_claim_sql(deferred);
         let only_queue = only_queue.clone();
+        let deferred = deferred.to_vec();
         if serialize_claims {
             let worker_id = worker_id.to_owned();
             conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
@@ -9646,6 +11777,7 @@ async fn pg_claim_next_job(
                 diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Text, _>(worker_id)
                     .bind::<diesel::sql_types::Text, _>(only_queue)
+                    .bind::<Names, _>(deferred)
                     .get_result::<PgJobRow>(conn)
                     .await
                     .optional()
@@ -9655,6 +11787,7 @@ async fn pg_claim_next_job(
             diesel::sql_query(sql)
                 .bind::<diesel::sql_types::Text, _>(worker_id)
                 .bind::<diesel::sql_types::Text, _>(only_queue)
+                .bind::<Names, _>(deferred)
                 .get_result::<PgJobRow>(&mut *conn)
                 .await
                 .optional()
@@ -9662,6 +11795,7 @@ async fn pg_claim_next_job(
     } else {
         let sql = pg_claim_sql();
         let queue_order = queue_order.to_vec();
+        let deferred = deferred.to_vec();
         if serialize_claims {
             let worker_id = worker_id.to_owned();
             conn.transaction::<Option<PgJobRow>, diesel::result::Error, _>(async move |conn| {
@@ -9672,6 +11806,7 @@ async fn pg_claim_next_job(
                 diesel::sql_query(sql)
                     .bind::<diesel::sql_types::Text, _>(worker_id)
                     .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
+                    .bind::<Names, _>(deferred)
                     .get_result::<PgJobRow>(conn)
                     .await
                     .optional()
@@ -9681,6 +11816,7 @@ async fn pg_claim_next_job(
             diesel::sql_query(sql)
                 .bind::<diesel::sql_types::Text, _>(worker_id)
                 .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(queue_order)
+                .bind::<Names, _>(deferred)
                 .get_result::<PgJobRow>(&mut *conn)
                 .await
                 .optional()
@@ -9730,7 +11866,7 @@ where
 }
 
 /// Row shape for per-name aggregate count queries.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgNameCount {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -9741,7 +11877,7 @@ struct PgNameCount {
 
 /// Survey enqueued jobs whose concurrency group is saturated and publish the
 /// per-name counts as `blocked_on_concurrency` gauges.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_update_concurrency_blocked_gauges(pool: &PgPool, state: &AppState) {
     use diesel_async::RunQueryDsl as _;
 
@@ -9779,7 +11915,7 @@ async fn pg_update_concurrency_blocked_gauges(pool: &PgPool, state: &AppState) {
 }
 
 /// Row shape for the per-(queue, name) ready-depth survey.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgQueueDepthRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -9814,7 +11950,7 @@ struct PgQueueDepthRow {
 /// `/actuator/jobs` gauges backend-derived and authoritative on every replica —
 /// including enqueue-only web replicas, which previously reported ever-growing
 /// phantom depth from their local enqueue marks.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_update_queue_depth_gauges(pool: &PgPool, state: &AppState) {
     use diesel_async::RunQueryDsl as _;
 
@@ -9865,7 +12001,7 @@ async fn pg_update_queue_depth_gauges(pool: &PgPool, state: &AppState) {
 }
 
 /// Mark a running job as completed.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_ack_success(pool: &PgPool, job_id: &str, worker_id: &str) -> AutumnResult<bool> {
     use diesel_async::RunQueryDsl as _;
 
@@ -9887,8 +12023,9 @@ async fn pg_ack_success(pool: &PgPool, job_id: &str, worker_id: &str) -> AutumnR
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job ack failed: {e}")))
 }
 
-/// Handle a job failure: schedule a retry with exponential backoff or dead-letter.
-#[cfg(feature = "db")]
+/// Handle a job failure: schedule a retry after `retry_delay_ms`, or
+/// dead-letter.
+#[cfg(feature = "postgres")]
 #[allow(clippy::if_not_else)]
 async fn pg_nack_failure(
     pool: &PgPool,
@@ -9897,6 +12034,7 @@ async fn pg_nack_failure(
     error: &str,
     row: &PgJobRow,
     pending_unique_key: Option<&str>,
+    retry_delay_ms: u64,
 ) -> AutumnResult<bool> {
     use diesel_async::RunQueryDsl as _;
 
@@ -9906,7 +12044,11 @@ async fn pg_nack_failure(
         .map_err(|e| AutumnError::internal_server_error_msg(format!("pg pool error: {e}")))?;
 
     if !is_final_attempt(&row.attempt, &row.max_attempts) {
-        let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
+        // Clamped like a relative enqueue, so a huge `max_backoff_ms` cannot
+        // overflow the interval and fail the nack.
+        let delay_ms = i64::try_from(retry_delay_ms)
+            .unwrap_or(i64::MAX)
+            .min(PG_MAX_RELATIVE_DELAY_MS);
         // Re-enqueue and restore the pending-window unique key atomically in one
         // UPDATE to eliminate the window where status='enqueued' and
         // unique_key=NULL co-exist, which would let a concurrent enqueue bypass
@@ -9974,7 +12116,7 @@ async fn pg_nack_failure(
 /// Dead-letter a job unconditionally, regardless of remaining attempts.
 ///
 /// Used for panics, which are always terminal regardless of `max_attempts`.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_ack_dead_letter(
     pool: &PgPool,
     job_id: &str,
@@ -10005,7 +12147,7 @@ async fn pg_ack_dead_letter(
     .map_err(|e| AutumnError::internal_server_error_msg(format!("pg job dead-letter failed: {e}")))
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgStaleRecoveryRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -10016,6 +12158,8 @@ struct PgStaleRecoveryRow {
     payload: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     status: String,
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    attempt: i32,
 }
 
 /// Recover jobs whose visibility timeout has expired.
@@ -10023,8 +12167,13 @@ struct PgStaleRecoveryRow {
 /// Uses a single `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)` so
 /// concurrent maintenance tasks from multiple replicas each recover disjoint
 /// sets of stale jobs.
-#[cfg(feature = "db")]
-async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, state: &AppState) {
+#[cfg(feature = "postgres")]
+async fn pg_recover_stale_claims(
+    pool: &PgPool,
+    visibility_timeout_ms: u64,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+) {
     use diesel_async::RunQueryDsl as _;
 
     let Ok(mut conn) = pool.get().await else {
@@ -10047,7 +12196,10 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
              ELSE attempt \
            END, \
            run_at = CASE \
-             WHEN attempt < max_attempts THEN NOW() \
+             WHEN attempt < max_attempts THEN NOW() + \
+               floor(random() * (LEAST($2::BIGINT::FLOAT8, \
+                 initial_backoff_ms::FLOAT8 * power(2::FLOAT8, LEAST(GREATEST(attempt - 1, 0), 62))) \
+                 + 1)) * INTERVAL '1 millisecond' \
              ELSE run_at \
            END, \
            started_at = NULL, \
@@ -10083,9 +12235,10 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
            FOR UPDATE SKIP LOCKED \
            LIMIT 100 \
          ) \
-         RETURNING id, name, payload::TEXT AS payload, status",
+         RETURNING id, name, payload::TEXT AS payload, status, attempt",
     )
     .bind::<diesel::sql_types::BigInt, _>(i64::try_from(visibility_timeout_ms).unwrap_or(i64::MAX))
+    .bind::<diesel::sql_types::BigInt, _>(stale_requeue_cap_ms(state))
     .get_results::<PgStaleRecoveryRow>(&mut *conn)
     .await;
 
@@ -10096,6 +12249,12 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
     // expiry even though it will never run again.
     match rows {
         Ok(rows) => {
+            for row in &rows {
+                if row.status != "failed" {
+                    let attempt = u32::try_from(row.attempt).unwrap_or(0);
+                    record_recovered_requeue(&row.name, &row.id, attempt, state, job_admin);
+                }
+            }
             for row in rows.into_iter().filter(|row| row.status == "failed") {
                 // A crashed worker never resumes to observe its ack returning
                 // `Ok(false)`, so `record_pg_lifecycle_after_ack` never fires the
@@ -10107,11 +12266,17 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
                 // which is backed by `JobRegistry::snapshot()`, so without this a
                 // crashed-worker dead-letter would page but not appear where the alert
                 // says to look.
-                state.job_registry.record_failure(
+                record_recovered_failure(
                     &row.name,
-                    "visibility timeout expired".to_owned(),
-                    true,
+                    &row.id,
+                    u32::try_from(row.attempt).unwrap_or(0),
+                    "visibility timeout expired",
+                    state,
+                    job_admin,
                 );
+                // Also tells a lease-lost worker in this process that the job
+                // is already recorded (see `record_lease_lost`).
+                job_admin.record_failure(&row.id, "visibility timeout expired".to_owned());
                 crate::alerts::notify_dead_lettered_job(
                     state,
                     &row.name,
@@ -10131,28 +12296,88 @@ async fn pg_recover_stale_claims(pool: &PgPool, visibility_timeout_ms: u64, stat
     }
 }
 
+/// Move a running job's claim expiry forward, if this worker still holds it.
+#[cfg(feature = "postgres")]
+async fn pg_renew_claim(pool: &PgPool, job_id: &str, worker_id: &str) -> LeaseRenewal {
+    use diesel_async::RunQueryDsl as _;
+
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(error) => return LeaseRenewal::Failed(format!("pg pool error: {error}")),
+    };
+    match diesel::sql_query(
+        "UPDATE autumn_jobs SET claimed_at = NOW() \
+         WHERE id = $1 AND claimed_by = $2 AND status = 'running'",
+    )
+    .bind::<diesel::sql_types::Text, _>(job_id)
+    .bind::<diesel::sql_types::Text, _>(worker_id)
+    .execute(&mut *conn)
+    .await
+    {
+        Ok(0) => LeaseRenewal::Lost,
+        Ok(_) => LeaseRenewal::Renewed,
+        Err(error) => LeaseRenewal::Failed(format!("pg claim renewal failed: {error}")),
+    }
+}
+
+/// Start renewing `row`'s claim for `worker_id`.
+#[cfg(feature = "postgres")]
+async fn pg_lease_heartbeat(
+    pool: &PgPool,
+    row: &PgJobRow,
+    claimed_at: tokio::time::Instant,
+    worker_id: &str,
+    visibility_timeout_ms: u64,
+) -> LeaseHeartbeat {
+    let pool = pool.clone();
+    let job_id = row.id.clone();
+    let worker_id = worker_id.to_owned();
+    LeaseHeartbeat::start(claimed_at, visibility_timeout_ms, move || {
+        let pool = pool.clone();
+        let job_id = job_id.clone();
+        let worker_id = worker_id.clone();
+        async move { pg_renew_claim(&pool, &job_id, &worker_id).await }
+    })
+    .await
+}
+
 /// Execute one claimed job and ack/nack based on the outcome.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn pg_execute_job(
     row: PgJobRow,
+    claimed_at: tokio::time::Instant,
     jobs_by_name: &Arc<RwLock<HashMap<String, JobInfo>>>,
     pool: &PgPool,
     worker_id: &str,
     state: &AppState,
     job_admin: &JobAdminMemoryBackend,
+    visibility_timeout_ms: u64,
 ) {
     let attempt = u32::try_from(row.attempt).unwrap_or(0);
     let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
 
-    if job_admin.try_record_start(&row.id, attempt) == JobAdminStartDecision::Canceled {
-        let ack =
-            pg_nack_failure(pool, &row.id, worker_id, "canceled by operator", &row, None).await;
-        record_pg_row_cancel_after_ack(ack, &row, state);
+    if record_attempt_start(&row.name, &row.id, attempt, state, job_admin)
+        == JobAdminStartDecision::Canceled
+    {
+        let delay_ms = sql_row_retry_delay_ms(state, row.initial_backoff_ms, row.attempt);
+        let ack = pg_nack_failure(
+            pool,
+            &row.id,
+            worker_id,
+            "canceled by operator",
+            &row,
+            None,
+            delay_ms,
+        )
+        .await;
+        let applied = record_pg_row_cancel_after_ack(ack, &row, state);
         // `pg_nack_failure` reuses the ordinary retry-vs-dead-letter decision
         // even for a cancellation, so only settle the tracked record here
         // when this really was the terminal attempt; otherwise the job is
-        // about to be retried and `run_job_handler` will settle it later.
-        if is_final_attempt(&attempt, &max_attempts) {
+        // about to be retried and the retry will settle it later.
+        // A rejected ack means another attempt owns the job (issue #2583).
+        if applied && is_final_attempt(&attempt, &max_attempts) {
             let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
             crate::job_tracking::settle_tracked_payload_as_failed(
                 state,
@@ -10164,34 +12389,44 @@ async fn pg_execute_job(
         return;
     }
     state.job_registry.record_pg_start(&row.name, &row.id);
+    job_admin.note_local_claim(&row.id, attempt);
 
     let payload = serde_json::from_str::<Value>(&row.payload).unwrap_or(Value::Null);
     let job_info_snapshot = jobs_by_name
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&row.name)
-        .map(|info| (info.handler, info.uniqueness.clone()));
+        .map(|info| (info.handler, info.uniqueness.clone(), info.timeout));
     let pending_unique_key = job_info_snapshot
         .as_ref()
-        .and_then(|(_, uniqueness)| uniqueness.as_ref())
+        .and_then(|(_, uniqueness, _)| uniqueness.as_ref())
         .filter(|unique| unique.window == JobUniquenessWindow::Pending)
         .map(|unique| job_unique_key(unique, &payload));
-    let handler_opt = job_info_snapshot.map(|(handler, _)| handler);
+    let handler_opt = job_info_snapshot.map(|(handler, _, timeout)| (handler, timeout));
 
-    let Some(handler) = handler_opt else {
+    let Some((handler, timeout)) = handler_opt else {
         // Dead-letter immediately: no handler will ever exist on this process,
         // so requeueing (pg_nack_failure) would cause every worker to
         // repeatedly claim and discard the job until attempts are exhausted.
         let error = format!("unknown job '{}'", row.name);
         let ack = pg_ack_dead_letter(pool, &row.id, worker_id, &error).await;
         let lifecycle = PgLifecycleRecord::Failure { error: &error };
-        record_pg_row_lifecycle_ack_result(ack, &row, "unknown-type", lifecycle, state, job_admin);
-        crate::job_tracking::settle_tracked_payload_as_failed(
+        let applied = record_pg_row_lifecycle_ack_result(
+            ack,
+            &row,
+            "unknown-type",
+            lifecycle,
             state,
-            &payload,
-            crate::job_tracking::GENERIC_FAILURE_MESSAGE,
-        )
-        .await;
+            job_admin,
+        );
+        if applied {
+            crate::job_tracking::settle_tracked_payload_as_failed(
+                state,
+                &payload,
+                crate::job_tracking::GENERIC_FAILURE_MESSAGE,
+            )
+            .await;
+        }
         return;
     };
 
@@ -10204,31 +12439,83 @@ async fn pg_execute_job(
         let _ = job_span.set_parent(cx);
     }
     let final_attempt = is_final_attempt(&attempt, &max_attempts);
-    let f = run_job_handler(&row.name, handler, state.clone(), payload, final_attempt);
-    match tracing::Instrument::instrument(f, job_span).await {
+    let heartbeat =
+        pg_lease_heartbeat(pool, &row, claimed_at, worker_id, visibility_timeout_ms).await;
+    let bounds = ExecutionBounds {
+        timeout,
+        lease_lost: Some(heartbeat.lost_token()),
+    };
+    let f = run_claimed_job_handler(
+        &row.name,
+        handler,
+        state.clone(),
+        payload,
+        final_attempt,
+        bounds,
+        durable_work_run(state, row.run_at.map(|at| at.timestamp_millis())),
+    );
+    let (outcome, pending) = tracing::Instrument::instrument(f, job_span).await;
+    heartbeat
+        .stop_after(pg_settle_outcome(
+            outcome,
+            pending,
+            &row,
+            pool,
+            worker_id,
+            state,
+            job_admin,
+            pending_unique_key.as_deref(),
+        ))
+        .await;
+}
+
+/// Write a finished attempt back to `autumn_jobs` and record it.
+///
+/// The tracked record settles only when the ack applies (issue #2583).
+#[cfg(feature = "postgres")]
+#[allow(clippy::too_many_arguments)]
+async fn pg_settle_outcome(
+    outcome: JobExecutionOutcome,
+    pending: PendingSettle,
+    row: &PgJobRow,
+    pool: &PgPool,
+    worker_id: &str,
+    state: &AppState,
+    job_admin: &JobAdminMemoryBackend,
+    pending_unique_key: Option<&str>,
+) {
+    let attempt = u32::try_from(row.attempt).unwrap_or(0);
+    let max_attempts = u32::try_from(row.max_attempts).unwrap_or(1);
+    match outcome {
+        JobExecutionOutcome::LeaseLost => {
+            record_lease_lost(&row.name, &row.id, attempt, state, job_admin);
+        }
         JobExecutionOutcome::Succeeded => {
             let ack = pg_ack_success(pool, &row.id, worker_id).await;
-            record_pg_row_lifecycle_ack_result(
+            let applied = record_pg_row_lifecycle_ack_result(
                 ack,
-                &row,
+                row,
                 "success",
                 PgLifecycleRecord::Success,
                 state,
                 job_admin,
             );
+            if applied {
+                pending.apply(&row.name).await;
+            }
         }
         JobExecutionOutcome::Failed(error) => {
+            // One draw for the gauge and the nack UPDATE, so both agree.
+            let delay_ms = sql_row_retry_delay_ms(state, row.initial_backoff_ms, row.attempt);
             let lifecycle = if is_final_attempt(&attempt, &max_attempts) {
                 PgLifecycleRecord::Failure { error: &error }
             } else {
                 // Mirror the `run_at = NOW() + backoff` the nack UPDATE applies
-                // (same `pg_retry_delay_ms(row.initial_backoff_ms, row.attempt)`)
                 // so the local gauge tracks the retry as scheduled until it is
                 // actually claimable. A zero backoff is due-now (`None`).
-                let delay_ms = pg_retry_delay_ms(row.initial_backoff_ms, row.attempt);
                 let ready_at_ms = (delay_ms > 0).then(|| {
                     let now_ms = u64::try_from(state.clock().now().timestamp_millis()).unwrap_or(0);
-                    now_ms.saturating_add(u64::try_from(delay_ms).unwrap_or(0))
+                    now_ms.saturating_add(delay_ms)
                 });
                 PgLifecycleRecord::Retry {
                     error: &error,
@@ -10241,11 +12528,17 @@ async fn pg_execute_job(
                 &row.id,
                 worker_id,
                 &error,
-                &row,
-                pending_unique_key.as_deref(),
+                row,
+                pending_unique_key,
+                delay_ms,
             )
             .await;
-            record_pg_row_lifecycle_ack_result(ack, &row, "failure", lifecycle, state, job_admin);
+            let applied = record_pg_row_lifecycle_ack_result(
+                ack, row, "failure", lifecycle, state, job_admin,
+            );
+            if applied {
+                pending.apply(&row.name).await;
+            }
         }
         // Panics dead-letter immediately regardless of remaining attempts,
         // matching the local and redis backend behaviour.
@@ -10253,7 +12546,11 @@ async fn pg_execute_job(
             tracing::error!(job = %row.name, error = %error, "postgres job handler panicked");
             let ack = pg_ack_dead_letter(pool, &row.id, worker_id, &error).await;
             let lifecycle = PgLifecycleRecord::Failure { error: &error };
-            record_pg_row_lifecycle_ack_result(ack, &row, "panic", lifecycle, state, job_admin);
+            let applied =
+                record_pg_row_lifecycle_ack_result(ack, row, "panic", lifecycle, state, job_admin);
+            if applied {
+                pending.apply(&row.name).await;
+            }
         }
     }
 }
@@ -10262,12 +12559,14 @@ async fn pg_execute_job(
 ///
 /// Spawned once per runtime rather than per-worker so maintenance always runs
 /// even when all workers are occupied with long-running jobs.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_maintenance_loop(
     pool: PgPool,
     visibility_timeout_ms: u64,
     state: AppState,
+    job_admin: JobAdminMemoryBackend,
     survey_blocked: bool,
+    cleanup_tracking: bool,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut interval = tokio::time::interval(PG_MAINTENANCE_INTERVAL);
@@ -10277,12 +12576,12 @@ async fn pg_maintenance_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                pg_recover_stale_claims(&pool, visibility_timeout_ms, &state).await;
+                pg_recover_stale_claims(&pool, visibility_timeout_ms, &state, &job_admin).await;
                 if survey_blocked {
                     pg_update_concurrency_blocked_gauges(&pool, &state).await;
                 }
             }
-            _ = tracking_cleanup_interval.tick() => {
+            _ = tracking_cleanup_interval.tick(), if cleanup_tracking => {
                 pg_cleanup_expired_tracking_rows(&pool, &state).await;
             }
             () = shutdown.cancelled() => break,
@@ -10299,7 +12598,7 @@ async fn pg_maintenance_loop(
 /// local enqueue marks (which only grow, since it never pops). The survey
 /// interval doubles as the gauge cache TTL: the endpoint reads the last surveyed
 /// snapshot and never queries the backend per request.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_queue_depth_survey_loop(
     pool: PgPool,
     state: AppState,
@@ -10331,7 +12630,7 @@ async fn pg_queue_depth_survey_loop(
 /// check a `ModelRegistration::retain("autumn_job_tracking", ...)` would be
 /// honoured by `autumn db retention` and quietly violated here five minutes
 /// later, which is worse than having no hold at all.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_cleanup_expired_tracking_rows(pool: &PgPool, state: &AppState) {
     use diesel_async::RunQueryDsl as _;
 
@@ -10359,7 +12658,7 @@ async fn pg_cleanup_expired_tracking_rows(pool: &PgPool, state: &AppState) {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments)]
 async fn pg_worker_loop(
     pool: PgPool,
@@ -10370,6 +12669,7 @@ async fn pg_worker_loop(
     serialize_claims: bool,
     schedule: QueueSchedule,
     slots: Arc<QueueSlots>,
+    visibility_timeout_ms: u64,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut cursor = schedule.cursor();
@@ -10383,22 +12683,35 @@ async fn pg_worker_loop(
             // configured). The reserved guard is held for the whole job execution
             // and released on drop.
             let order = cursor.next_order();
+            let deferred = deferred_job_names(&state, &jobs_by_name);
             let mut handled = false;
             for queue in order.iter() {
                 let Some(guard) = slots.try_reserve(queue) else {
                     continue;
                 };
-                match pg_claim_next_job(
+                // The claim stamps `claimed_at` inside the claim query.
+                let claimed_at = tokio::time::Instant::now();
+                match pg_claim_next_job_except(
                     &pool,
                     &worker_id,
                     serialize_claims,
                     std::slice::from_ref(queue),
+                    &deferred,
                 )
                 .await
                 {
                     Some(row) => {
-                        pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin)
-                            .await;
+                        pg_execute_job(
+                            row,
+                            claimed_at,
+                            &jobs_by_name,
+                            &pool,
+                            &worker_id,
+                            &state,
+                            &job_admin,
+                            visibility_timeout_ms,
+                        )
+                        .await;
                         drop(guard);
                         handled = true;
                         break;
@@ -10420,7 +12733,9 @@ async fn pg_worker_loop(
 
         // Fast path (no caps/reserved): a single multi-queue claim across the
         // full (possibly pinned) priority order. Unchanged behavior (AC4).
-        let queue_order = slots.claimable(&cursor.next_order());
+        // Borrowed, not copied: this runs on every poll, idle ones included.
+        let next = cursor.next_order();
+        let queue_order = slots.claimable_borrowed(&next);
         if queue_order.is_empty() {
             tokio::select! {
                 () = shutdown.cancelled() => break,
@@ -10428,10 +12743,25 @@ async fn pg_worker_loop(
             }
             continue;
         }
-        match pg_claim_next_job(&pool, &worker_id, serialize_claims, &queue_order).await {
+        let deferred = deferred_job_names(&state, &jobs_by_name);
+        // The claim stamps `claimed_at` inside the claim query.
+        let claimed_at = tokio::time::Instant::now();
+        match pg_claim_next_job_except(&pool, &worker_id, serialize_claims, &queue_order, &deferred)
+            .await
+        {
             Some(row) => {
-                let _slot = slots.acquire(&normalize_queue_name(&row.queue));
-                pg_execute_job(row, &jobs_by_name, &pool, &worker_id, &state, &job_admin).await;
+                let _slot = slots.acquire(normalized_queue_name(&row.queue));
+                pg_execute_job(
+                    row,
+                    claimed_at,
+                    &jobs_by_name,
+                    &pool,
+                    &worker_id,
+                    &state,
+                    &job_admin,
+                    visibility_timeout_ms,
+                )
+                .await;
                 if shutdown.is_cancelled() {
                     break;
                 }
@@ -10447,7 +12777,7 @@ async fn pg_worker_loop(
 }
 
 /// Postgres-backed job admin dashboard.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(Clone)]
 struct PgJobAdminBackend {
     pool: PgPool,
@@ -10486,7 +12816,7 @@ struct PgJobAdminBackend {
 /// this whole change exists to remove. A NULL `run_at` (never happens in
 /// practice — it is stored as `COALESCE($run_at, NOW())`) coalesces
 /// `offset_ms` to a very negative value, treating it as ready for safety.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgCancelRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -10499,14 +12829,14 @@ struct PgCancelRow {
     offset_ms: i64,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 #[derive(diesel::QueryableByName)]
 struct PgPayloadRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     payload: String,
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl PgJobAdminBackend {
     async fn pg_snapshot(&self, query: &JobAdminQuery) -> AutumnResult<JobAdminSnapshot> {
         let mut conn = self.pool.get().await.map_err(|e| {
@@ -10595,11 +12925,27 @@ impl PgJobAdminBackend {
             }
             None => None,
         };
+        // The UPDATE also restores a `pending`-window dedup key: a claim moved
+        // it to `pending_unique_key`. The `NOT EXISTS` guard leaves it alone
+        // when a live twin holds the key. Same rule as `pg_nack_failure`.
         let updated = diesel::sql_query(
             "UPDATE autumn_jobs \
              SET status = 'enqueued', attempt = 1, run_at = NOW(), enqueued_at = NOW(), \
                  started_at = NULL, finished_at = NULL, \
-                 claimed_by = NULL, claimed_at = NULL, last_error = NULL \
+                 claimed_by = NULL, claimed_at = NULL, last_error = NULL, \
+                 unique_key = CASE \
+                   WHEN pending_unique_key IS NOT NULL \
+                        AND NOT EXISTS ( \
+                            SELECT 1 FROM autumn_jobs dup \
+                            WHERE dup.name = autumn_jobs.name \
+                              AND dup.unique_key = autumn_jobs.pending_unique_key \
+                              AND dup.id != autumn_jobs.id \
+                              AND dup.status IN ('enqueued', 'running') \
+                        ) \
+                   THEN pending_unique_key \
+                   ELSE unique_key \
+                   END, \
+                 pending_unique_key = NULL \
              WHERE id = $1 AND status = 'failed' \
              RETURNING payload::TEXT AS payload",
         )
@@ -10734,7 +13080,7 @@ impl PgJobAdminBackend {
     }
 }
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 impl JobAdminBackend for PgJobAdminBackend {
     fn snapshot(&self, query: JobAdminQuery) -> JobAdminFuture<'_, JobAdminSnapshot> {
         Box::pin(async move { self.pg_snapshot(&query).await })
@@ -10762,7 +13108,7 @@ impl JobAdminBackend for PgJobAdminBackend {
 /// (e.g. `"enqueued_at"`, `"started_at"`, `"finished_at"`). It is a `&'static
 /// str` from our own call sites — never user input — so embedding it via
 /// `format!` is safe.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_admin_page(
     conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
     status: &str,
@@ -10859,7 +13205,7 @@ async fn pg_admin_page(
 /// Ready rows surface as [`JobAdminStatus::Enqueued`] (newest-first); scheduled
 /// rows surface as [`JobAdminStatus::Scheduled`] with their `run_at` due time,
 /// soonest-due first.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 async fn pg_enqueued_and_scheduled_pages(
     conn: &mut diesel_async::pooled_connection::deadpool::Object<diesel_async::AsyncPgConnection>,
     enqueued_page: u64,
@@ -10940,8 +13286,8 @@ async fn pg_enqueued_and_scheduled_pages(
 
 /// `SQLite` stub for the Postgres job runtime.
 ///
-/// The durable Postgres job backend uses `LISTEN`/`NOTIFY`, `FOR UPDATE SKIP
-/// LOCKED` claiming, and advisory locks — none of which `SQLite` provides — so
+/// The durable Postgres job backend uses `FOR UPDATE SKIP LOCKED` claiming
+/// and advisory locks — `SQLite` provides neither — so
 /// under the `sqlite` feature the runtime pool (`RuntimeConnection`) is a
 /// `SQLite` pool that cannot drive the Postgres worker loops. Refuse a
 /// `jobs.backend = "postgres"` configuration with a clear message instead of
@@ -10959,10 +13305,187 @@ fn start_postgres_runtime(
     let _ = (jobs, state, shutdown, config, run_workers);
     Err(AutumnError::internal_server_error(std::io::Error::other(
         "jobs.backend=postgres is unsupported under the sqlite feature; SQLite has no \
-         LISTEN/NOTIFY or advisory-lock queue. Use jobs.backend=sqlite for a durable queue \
+         FOR UPDATE SKIP LOCKED or advisory locks. Use jobs.backend=sqlite for a durable queue \
          in your own SQLite file, or jobs.backend=local (the default) for the in-process \
          queue.",
     )))
+}
+
+/// The `autumn_jobs` migrations, in order (#3072, ADR 0018).
+///
+/// A shard-local job table is made from these same files, so it cannot drift
+/// from the control table. Each file is idempotent (`IF NOT EXISTS`).
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+const SHARD_JOB_SCHEMA: [(&str, &str); 6] = [
+    (
+        "20260513000000_create_job_queue",
+        include_str!("../migrations/20260513000000_create_job_queue/up.sql"),
+    ),
+    (
+        "20260519000000_add_trace_context_to_jobs",
+        include_str!("../migrations/20260519000000_add_trace_context_to_jobs/up.sql"),
+    ),
+    (
+        "20260610000000_add_job_uniqueness_concurrency",
+        include_str!("../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql"),
+    ),
+    (
+        "20260611000000_add_pending_unique_key_to_jobs",
+        include_str!("../migrations/20260611000000_add_pending_unique_key_to_jobs/up.sql"),
+    ),
+    (
+        "20260628000000_add_queue_to_jobs",
+        include_str!("../migrations/20260628000000_add_queue_to_jobs/up.sql"),
+    ),
+    (
+        "20261026170000_add_jobs_queue_name_ready_index",
+        include_str!("../migrations/20261026170000_add_jobs_queue_name_ready_index/up.sql"),
+    ),
+];
+
+/// Advisory-lock key that serializes the shard job DDL across replicas.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+const SHARD_JOB_SCHEMA_LOCK_KEY: i64 = 0x6175_746d_6a6f_6273; // "autmjobs"
+
+/// Make the job table on one shard. One transaction, under an advisory lock,
+/// so two replicas that boot together do not race on the DDL.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+async fn ensure_shard_job_schema(pool: &PgPool) -> Result<(), String> {
+    use diesel_async::SimpleAsyncConnection as _;
+    let mut conn = pool.get().await.map_err(|e| e.to_string())?;
+    // `ALTER TABLE` takes a strong lock even when the column exists. The
+    // lock timeout stops a long shard transaction from blocking boot; the
+    // caller tries again.
+    let mut sql = format!(
+        "BEGIN; SET LOCAL lock_timeout = '3s'; \
+         SELECT pg_advisory_xact_lock({SHARD_JOB_SCHEMA_LOCK_KEY});\n"
+    );
+    for (_, up) in SHARD_JOB_SCHEMA {
+        sql.push_str(up);
+        sql.push('\n');
+    }
+    sql.push_str("COMMIT;");
+    if let Err(error) = conn.batch_execute(&sql).await {
+        let _ = conn.batch_execute("ROLLBACK").await;
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
+/// The job workers of one shard (#3072).
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+struct ShardJobWorkers {
+    shard: String,
+    pool: PgPool,
+    jobs_by_name: Arc<RwLock<HashMap<String, JobInfo>>>,
+    state: AppState,
+    job_admin: JobAdminMemoryBackend,
+    serialize_claims: bool,
+    schedule: QueueSchedule,
+    slots: Arc<QueueSlots>,
+    visibility_timeout_ms: u64,
+    /// `0` on a web replica: make the table, run no loops.
+    worker_count: usize,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+impl ShardJobWorkers {
+    /// Make the shard's job table, then start its loops. A shard that is down
+    /// at boot is retried with backoff. It does not stop the other shards.
+    async fn run(self) {
+        let mut delay = std::time::Duration::from_secs(1);
+        loop {
+            match ensure_shard_job_schema(&self.pool).await {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        shard = %self.shard,
+                        error = %error,
+                        retry_in = ?delay,
+                        "cannot make the shard-local job table; retrying"
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        () = self.shutdown.cancelled() => return,
+                    }
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(30));
+                }
+            }
+        }
+        if self.worker_count == 0 {
+            return;
+        }
+        // The control registry backs the control queue gauges, which the
+        // control survey sets. Shard runs use a registry of their own, so
+        // they do not change those gauges.
+        let mut shard_state = self.state.clone();
+        shard_state.job_registry = crate::actuator::JobRegistry::new();
+        for job in self
+            .jobs_by_name
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+        {
+            shard_state
+                .job_registry
+                .register_on_queue(&job.name, &normalize_queue_name(&job.queue));
+        }
+        {
+            let pool = self.pool.clone();
+            let state = shard_state.clone();
+            let job_admin = self.job_admin.clone();
+            let shutdown = self.shutdown.clone();
+            let visibility_timeout_ms = self.visibility_timeout_ms;
+            // Gauges and tracking rows are on the control database only.
+            tokio::spawn(async move {
+                pg_maintenance_loop(
+                    pool,
+                    visibility_timeout_ms,
+                    state,
+                    job_admin,
+                    false,
+                    false,
+                    shutdown,
+                )
+                .await;
+            });
+        }
+        for _ in 0..self.worker_count {
+            let pool = self.pool.clone();
+            let jobs_by_name = Arc::clone(&self.jobs_by_name);
+            let state = shard_state.clone();
+            let job_admin = self.job_admin.clone();
+            let shutdown = self.shutdown.clone();
+            let schedule = self.schedule.clone();
+            let slots = Arc::clone(&self.slots);
+            let (visibility_timeout_ms, serialize_claims) =
+                (self.visibility_timeout_ms, self.serialize_claims);
+            let shard = self.shard.clone();
+            tokio::spawn(async move {
+                let worker_id = format!(
+                    "{}:{shard}:{}",
+                    std::process::id(),
+                    state.entropy().uuid_v4()
+                );
+                pg_worker_loop(
+                    pool,
+                    worker_id,
+                    jobs_by_name,
+                    state,
+                    job_admin,
+                    serialize_claims,
+                    schedule,
+                    slots,
+                    visibility_timeout_ms,
+                    shutdown,
+                )
+                .await;
+            });
+        }
+    }
 }
 
 /// Start the Postgres job runtime.
@@ -11031,7 +13554,7 @@ fn start_postgres_runtime(
     // by other replicas don't consume this process's shared slots (#1623).
     let mut limits = QueueLimits::from_config(&config.queues);
     limits.retain_queues(&schedule.names());
-    let slots = QueueSlots::new(config.workers.max(1), limits);
+    let slots = QueueSlots::new(config.workers.max(1), limits.clone());
 
     install_job_client(
         state,
@@ -11051,11 +13574,13 @@ fn start_postgres_runtime(
             interceptor: state
                 .extension::<Arc<dyn crate::interceptor::JobInterceptor>>()
                 .map(|arc| (*arc).clone()),
-            entropy: state.entropy_arc(),
+            entropy: job_client_entropy(state),
             clock: state.clock_arc(),
             resilience_config: state
                 .extension::<crate::config::AutumnConfig>()
                 .map(|c| Arc::new(c.resilience.clone())),
+            #[cfg(feature = "postgres")]
+            shard_local: config.postgres.shard_local,
         },
     );
 
@@ -11073,6 +13598,38 @@ fn start_postgres_runtime(
         });
     }
 
+    let visibility_timeout_ms =
+        runtime_visibility_timeout_ms("postgres", config.postgres.visibility_timeout_ms);
+    let worker_count = config.workers.max(1);
+
+    // Shard-local jobs (#3072, ADR 0018): a job table and workers on each
+    // shard. Every role makes the table, so `enqueue_in_tx` works on a web
+    // replica too. Only worker roles run loops.
+    if config.postgres.shard_local {
+        let shards = crate::db::DbState::shards(state).cloned().ok_or_else(|| {
+            AutumnError::internal_server_error(std::io::Error::other(
+                "jobs.postgres.shard_local = true needs [[database.shards]]",
+            ))
+        })?;
+        for shard in shards.iter() {
+            let shard_workers = ShardJobWorkers {
+                shard: shard.name().to_owned(),
+                pool: shard.primary_pool().clone(),
+                jobs_by_name: Arc::clone(&jobs_by_name),
+                state: state.clone(),
+                job_admin: job_admin.clone(),
+                serialize_claims,
+                schedule: schedule.clone(),
+                // Own slots: a control backlog must not hold a shard's workers.
+                slots: QueueSlots::new(worker_count, limits.clone()),
+                visibility_timeout_ms,
+                worker_count: if run_workers { worker_count } else { 0 },
+                shutdown: shutdown.clone(),
+            };
+            tokio::spawn(shard_workers.run());
+        }
+    }
+
     // Web role installs the enqueue client above but runs no worker loops and
     // no maintenance loop: another (worker/combined) replica drains the durable
     // Postgres queue. Bypass the `workers.max(1)` floor so zero loops run.
@@ -11080,20 +13637,20 @@ fn start_postgres_runtime(
         return Ok(());
     }
 
-    let visibility_timeout_ms = config.postgres.visibility_timeout_ms;
-    let worker_count = config.workers.max(1);
-
     // Single maintenance task shared across all workers.
     {
         let pool = pool.clone();
         let state = state.clone();
+        let job_admin = job_admin.clone();
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             pg_maintenance_loop(
                 pool,
                 visibility_timeout_ms,
                 state,
+                job_admin,
                 serialize_claims,
+                true,
                 shutdown,
             )
             .await;
@@ -11119,6 +13676,7 @@ fn start_postgres_runtime(
                 serialize_claims,
                 schedule,
                 slots,
+                visibility_timeout_ms,
                 shutdown,
             )
             .await;
@@ -11147,7 +13705,7 @@ fn build_per_job_settings(jobs: &[JobInfo]) -> HashMap<String, JobRuntimeSetting
 }
 
 /// Whether any registered job declares a concurrency limit.
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 fn any_job_has_concurrency(jobs: &[JobInfo]) -> bool {
     jobs.iter().any(|job| job.concurrency.is_some())
 }
@@ -11184,80 +13742,98 @@ mod tests {
         })
     }
 
-    #[test]
-    fn local_retry_delay_doubles_per_attempt_and_survives_a_zero_attempt() {
-        // The 1-indexed series must be preserved exactly.
-        assert_eq!(local_retry_delay_ms(100, 1), 100);
-        assert_eq!(local_retry_delay_ms(100, 2), 200);
-        assert_eq!(local_retry_delay_ms(100, 3), 400);
-        assert_eq!(local_retry_delay_ms(100, 4), 800);
-        assert_eq!(local_retry_delay_ms(100, 5), 1_600);
-
-        // Regression (issue #1611): `attempt - 1` underflows for `attempt ==
-        // 0` (a debug-build panic; a wildly wrong exponent in release). A
-        // zero attempt must degrade to the first-attempt delay, matching the
-        // Redis and Postgres backends' `saturating_sub(1)`.
-        assert_eq!(local_retry_delay_ms(100, 0), 100);
-
-        // A huge attempt must saturate, not overflow.
-        assert_eq!(local_retry_delay_ms(100, u32::MAX), u64::MAX);
+    fn seeded_state(seed: u64) -> AppState {
+        AppState::for_test().with_entropy(crate::entropy::SeededEntropy::shared(seed))
     }
 
     #[test]
-    fn jittered_retry_delay_stays_within_the_equal_jitter_bounds() {
-        let entropy = crate::entropy::SeededEntropy::new(0);
-        for _ in 0..1_000 {
-            let delay = jittered_retry_delay_ms(&entropy, 1_000);
+    fn job_retry_delay_stays_under_the_exponential_ceiling() {
+        let state = seeded_state(0);
+        for attempt in 1..=5_u32 {
+            let ceiling = 100 * (1_u64 << (attempt - 1));
+            for _ in 0..256 {
+                let delay = job_retry_delay_ms(&state, 100, attempt);
+                assert!(delay <= ceiling, "attempt {attempt}: {delay} > {ceiling}");
+            }
+        }
+    }
+
+    #[test]
+    fn job_retry_delay_survives_zero_and_huge_attempts() {
+        // Regression (issue #1611): attempt 0 is the first attempt, not an
+        // underflow. A huge attempt saturates at the cap.
+        let state = seeded_state(1);
+        for _ in 0..64 {
+            assert!(job_retry_delay_ms(&state, 100, 0) <= 100);
             assert!(
-                (500..=1_000).contains(&delay),
-                "equal jitter must land in [base/2, base], got {delay}"
+                job_retry_delay_ms(&state, 100, u32::MAX)
+                    <= crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS
             );
         }
     }
 
     #[test]
-    fn jittered_retry_delay_is_a_pure_function_of_the_entropy_stream() {
-        // Same seed, same number of prior draws ⇒ identical jittered delay —
-        // this is what makes a `#[sim_test]` retry-storm run bit-for-bit
-        // reproducible from its seed (W7, issue #1797).
-        let a = crate::entropy::SeededEntropy::new(42);
-        let b = crate::entropy::SeededEntropy::new(42);
-        let delays_a: Vec<u64> = (0..8).map(|_| jittered_retry_delay_ms(&a, 1_000)).collect();
-        let delays_b: Vec<u64> = (0..8).map(|_| jittered_retry_delay_ms(&b, 1_000)).collect();
-        assert_eq!(delays_a, delays_b);
-        assert!(
-            delays_a
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                > 1,
-            "a real spread of draws should not collapse to a single delay value: {delays_a:?}"
-        );
-    }
-
-    #[test]
-    fn jittered_retry_delay_preserves_a_one_millisecond_backoff() {
-        // A job configured with `backoff_ms = 1` must still wait ~1ms, not
-        // retry immediately: plain integer division (`1 / 2 == 0`) would let
-        // every attempt draw a 0ms delay, silently turning a tiny configured
-        // backoff into a tight retry loop (Codex review).
-        let entropy = crate::entropy::SeededEntropy::new(3);
+    fn job_retry_delay_obeys_the_configured_cap() {
+        let state = seeded_state(2);
+        state.insert_extension(JobMaxBackoff(1_000));
         for _ in 0..256 {
-            assert_eq!(jittered_retry_delay_ms(&entropy, 1), 1);
+            assert!(job_retry_delay_ms(&state, 250, 30) <= 1_000);
         }
     }
 
+    #[tokio::test]
+    async fn start_runtime_installs_the_configured_cap() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        let state = AppState::for_test();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let config = crate::config::JobConfig {
+            max_backoff_ms: 1_234,
+            ..Default::default()
+        };
+        start_runtime(Vec::new(), &state, &shutdown, &config, false).expect("local runtime");
+        assert_eq!(
+            state.extension::<JobMaxBackoff>().map(|cap| cap.0),
+            Some(1_234)
+        );
+        assert_eq!(
+            crate::config::JobConfig::default().max_backoff_ms,
+            3_600_000
+        );
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
     #[test]
-    fn jittered_retry_delay_never_exceeds_the_unjittered_delay() {
-        // The fix must never make a retry wait *longer* than the un-jittered
-        // exponential delay — only spread the herd within it — so it changes
-        // no existing retry-timeout budget.
-        let entropy = crate::entropy::SeededEntropy::new(7);
-        for base in [0, 1, 2, 3, 100, 250, 1_000, 60_000] {
-            for _ in 0..64 {
-                let delay = jittered_retry_delay_ms(&entropy, base);
-                assert!(delay <= base, "delay {delay} exceeded base {base}");
-            }
+    fn job_retry_delay_replays_from_the_seed() {
+        let a = seeded_state(42);
+        let b = seeded_state(42);
+        let delays_a: Vec<u64> = (0..8).map(|_| job_retry_delay_ms(&a, 1_000, 1)).collect();
+        let delays_b: Vec<u64> = (0..8).map(|_| job_retry_delay_ms(&b, 1_000, 1)).collect();
+        assert_eq!(delays_a, delays_b);
+    }
+
+    /// Issue #3054: N jobs that fail at the same attempt at the same instant
+    /// get different delays on every backend. Before the fix the durable
+    /// backends returned `initial_backoff_ms * 2^(attempt-1)` for all N.
+    #[test]
+    fn job_retry_delays_differ_for_jobs_that_fail_together() {
+        const JOBS: usize = 12;
+        let state = seeded_state(0x3054);
+        let delays: std::collections::BTreeSet<u64> = (0..JOBS)
+            .map(|_| job_retry_delay_ms(&state, 1_000, 1))
+            .collect();
+        assert!(
+            delays.len() > JOBS / 2,
+            "{JOBS} jobs got only {} distinct delays: {delays:?}",
+            delays.len()
+        );
+        #[cfg(feature = "postgres")]
+        {
+            let sql: std::collections::BTreeSet<u64> = (0..JOBS)
+                .map(|_| sql_row_retry_delay_ms(&state, 1_000, 1))
+                .collect();
+            assert!(sql.len() > JOBS / 2, "SQL rows: {sql:?}");
         }
     }
 
@@ -11406,7 +13982,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -11419,6 +13995,8 @@ mod tests {
                 entropy,
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
+                #[cfg(feature = "postgres")]
+                shard_local: false,
             }
         }
 
@@ -11520,7 +14098,7 @@ mod tests {
     /// needs its own round trip, which the batch does not run). Every
     /// other case must fall back to the sequential per-item path,
     /// unchanged. Regression test for the batching fix in issue #2748.
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     #[test]
     #[allow(clippy::too_many_lines)]
     fn can_batch_enqueue_only_when_postgres_uninterrupted_and_non_ttl() {
@@ -11738,7 +14316,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -11751,6 +14329,8 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::FixedClock::at(epoch)),
                 resilience_config: None,
+                #[cfg(feature = "postgres")]
+                shard_local: false,
             }
         }
 
@@ -11807,7 +14387,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -11820,6 +14400,8 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
+                #[cfg(feature = "postgres")]
+                shard_local: false,
             }
         }
 
@@ -11850,7 +14432,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -11863,6 +14445,8 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
+                #[cfg(feature = "postgres")]
+                shard_local: false,
             }
         }
 
@@ -11911,7 +14495,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -11927,6 +14511,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         });
 
         let failed_id = backend.record_enqueue_for_test(
@@ -11997,7 +14583,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -12013,6 +14599,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         });
 
         let failed_id = backend.record_enqueue_for_test("send_email", payload, 2, 5);
@@ -12055,7 +14643,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -12071,6 +14659,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         });
 
         let failed_id =
@@ -12116,7 +14706,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -12132,6 +14722,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         });
 
         let failed_id =
@@ -12177,6 +14769,181 @@ mod tests {
         );
     }
 
+    /// #2351 item 6: the capture settings and filter are built once per app,
+    /// not on every job execution.
+    #[cfg(feature = "reporting")]
+    #[test]
+    fn job_capture_context_is_built_once_per_app() {
+        let state = AppState::for_test();
+        let mut config = crate::config::AutumnConfig::default();
+        config.failure_capture.enabled = true;
+        state.insert_extension(config);
+        let first = job_capture_context(&state).expect("capture is on");
+        let second = job_capture_context(&state).expect("capture is on");
+        assert!(Arc::ptr_eq(&first, &second));
+        let off = AppState::for_test();
+        assert!(job_capture_context(&off).is_none());
+    }
+
+    /// #2351 item 14: a replayed job runs in the event app it ran in
+    /// during production, so a free `publish` reaches the same app.
+    #[tokio::test]
+    async fn replay_dispatch_publishes_against_the_replayed_app() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        struct ReplayProbe {
+            n: u8,
+        }
+        impl crate::events::Event for ReplayProbe {
+            const NAME: &'static str = "replay_probe";
+        }
+        fn publishing_handler(
+            _state: AppState,
+            _payload: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+            Box::pin(async move { crate::events::publish(ReplayProbe { n: 1 }).await })
+        }
+        let state = AppState::for_test();
+        state.insert_extension(crate::events::EventRecorder::default());
+        run_handler_with_interceptor(
+            "probe",
+            publishing_handler,
+            state.clone(),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("publish succeeds");
+        let recorder = state
+            .extension::<crate::events::EventRecorder>()
+            .expect("installed");
+        assert_eq!(recorder.count::<ReplayProbe>(), 1);
+    }
+
+    /// #2351 item 9: a registration that fails is recorded as the failure
+    /// it was, not as a queued job.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_failed_after_commit_registration_is_recorded_as_a_failure() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let result = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            enqueue_after_commit("never_registered", serde_json::json!({})),
+        )
+        .await;
+        let error = result.expect_err("no job runtime");
+        let jobs = scope.effects_snapshot().jobs;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0].error.as_deref(), Some(error.message().as_str()));
+    }
+
+    /// Codex review on #3222: a positive sub-second delay is not immediate.
+    /// Capture and replay both round it up to whole seconds.
+    #[test]
+    fn a_sub_second_delay_rounds_up_on_both_sides() {
+        assert_eq!(delay_seconds(Duration::from_millis(500)), 1);
+        assert_eq!(delay_seconds(Duration::from_secs(2)), 2);
+        assert_eq!(delay_seconds(Duration::ZERO), 0);
+        assert_eq!(recorded_delay(chrono::TimeDelta::milliseconds(500)), 1);
+        assert_eq!(recorded_delay(chrono::TimeDelta::seconds(2)), 2);
+        assert_eq!(recorded_delay(chrono::TimeDelta::zero()), 0);
+    }
+
+    /// Codex review on #3222: a rejected enqueue replays with the status it
+    /// had, not always as a 500. A reserved payload key is a 400.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_recorded_enqueue_error_replays_with_its_status() {
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let payload = serde_json::json!({"order": 7});
+        let recorded = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            after_commit_seam(
+                "send_receipt",
+                &payload,
+                EnqueueSchedule::Immediate,
+                Box::pin(async { Err(AutumnError::bad_request_msg("reserved key")) }),
+            ),
+        )
+        .await
+        .expect_err("the registration failed");
+        assert_eq!(recorded.status(), http::StatusCode::BAD_REQUEST);
+
+        let tape = Arc::new(crate::capsule::ReplayEffects::new(scope.effects_snapshot()));
+        let replayed = crate::capsule::with_effect_tape(Arc::clone(&tape), async {
+            after_commit_seam(
+                "send_receipt",
+                &payload,
+                EnqueueSchedule::Immediate,
+                Box::pin(async { Ok(()) }),
+            )
+            .await
+        })
+        .await
+        .expect_err("the replay reproduces the failure");
+        assert_eq!(replayed.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(replayed.message(), recorded.message());
+        assert_eq!(replayed.code(), recorded.code());
+        assert!(tape.divergences().is_empty(), "{:?}", tape.divergences());
+        assert!(!scope.is_truncated(), "a plain error replays as recorded");
+    }
+
+    /// Codex review on #3222: an enqueue error that carries field details
+    /// cannot be rebuilt on replay, so the capsule is marked incomplete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn an_enqueue_error_with_field_details_marks_the_capsule_incomplete() {
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let details =
+            std::collections::HashMap::from([("email".to_owned(), vec!["is taken".to_owned()])]);
+        let _ = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            after_commit_seam(
+                "send_receipt",
+                &serde_json::json!({}),
+                EnqueueSchedule::Immediate,
+                Box::pin(async move { Err(AutumnError::validation(details)) }),
+            ),
+        )
+        .await;
+        assert!(scope.is_truncated());
+    }
+
+    /// Codex review on #3222: an empty field map has the plain error's
+    /// `code()`, but replay would give it no `details()`. Refused too.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn an_enqueue_error_with_an_empty_details_map_marks_the_capsule_incomplete() {
+        let scope = Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            Arc::new(crate::capsule::CaptureSettings::default()),
+            Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let _ = crate::capsule::capture::with_capture_scope(
+            Arc::clone(&scope),
+            after_commit_seam(
+                "send_receipt",
+                &serde_json::json!({}),
+                EnqueueSchedule::Immediate,
+                Box::pin(async { Err(AutumnError::validation(std::collections::HashMap::new())) }),
+            ),
+        )
+        .await;
+        assert!(scope.is_truncated());
+    }
+
     #[tokio::test]
     async fn run_job_handler_reports_immediate_panics() {
         let state = AppState::for_test().with_profile("dev");
@@ -12186,6 +14953,8 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            ExecutionBounds::default(),
+            crate::cost::WorkRun::default(),
         )
         .await;
         assert_eq!(
@@ -12243,6 +15012,8 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            ExecutionBounds::default(),
+            crate::cost::WorkRun::default(),
         )
         .await;
 
@@ -12312,6 +15083,8 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            ExecutionBounds::default(),
+            crate::cost::WorkRun::default(),
         )
         .await;
 
@@ -12360,7 +15133,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -12376,6 +15149,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         };
 
         let res = client.enqueue("test_job", serde_json::json!({})).await;
@@ -12424,7 +15199,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -12440,6 +15215,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         };
 
         let res = client.enqueue("test_job", serde_json::json!({})).await;
@@ -12468,6 +15245,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -12511,6 +15289,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -12569,6 +15348,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -12613,6 +15393,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -12791,6 +15572,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -12834,6 +15616,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: panicking_handler,
+                timeout: None,
             },
         );
         let jobs_by_name = Arc::new(RwLock::new(jobs));
@@ -12850,6 +15633,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 3,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -12895,6 +15680,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: always_fail_handler,
+                timeout: None,
             },
         );
         let jobs_by_name = Arc::new(RwLock::new(jobs));
@@ -12911,6 +15697,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 2,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -12958,6 +15746,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: always_fail_handler,
+                timeout: None,
             },
         );
         let jobs_by_name = Arc::new(RwLock::new(jobs));
@@ -12974,6 +15763,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -13016,6 +15807,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: always_fail_handler,
+                timeout: None,
             },
         );
         let jobs_by_name = Arc::new(RwLock::new(jobs));
@@ -13032,6 +15824,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 2,
                 initial_backoff_ms: 60_000,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -13147,6 +15941,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: redis_counting_success_handler,
+                timeout: None,
             },
             JobInfo {
                 version: 1,
@@ -13157,6 +15952,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: redis_counting_success_handler,
+                timeout: None,
             },
         ];
 
@@ -13173,6 +15969,7 @@ mod tests {
             uniqueness: None,
             concurrency: None,
             handler: redis_counting_success_handler,
+            timeout: None,
         }];
         assert_eq!(
             redis_retry_promotion_interval_ms(60_000, &slow_jobs),
@@ -13196,12 +15993,13 @@ mod tests {
 
     #[cfg(feature = "redis")]
     #[test]
-    fn redis_failed_job_schedules_next_attempt_with_exponential_backoff() {
+    fn redis_failed_job_schedules_next_attempt_after_the_given_delay() {
         let mut record = redis_test_record(2, 4);
         record.claimed_by = Some("worker-a".to_string());
         record.claimed_at_ms = Some(20_000);
 
-        let action = prepare_redis_failure_action(record, "stripe timed out".to_string(), 50_000);
+        let action =
+            prepare_redis_failure_action(record, "stripe timed out".to_string(), 50_000, 500);
 
         let RedisFailureAction::Retry(schedule) = action else {
             panic!("second attempt below max should be scheduled for retry");
@@ -13223,7 +16021,8 @@ mod tests {
         record.claimed_by = Some("worker-a".to_string());
         record.claimed_at_ms = Some(20_000);
 
-        let action = prepare_redis_failure_action(record, "permanent failure".to_string(), 50_000);
+        let action =
+            prepare_redis_failure_action(record, "permanent failure".to_string(), 50_000, 500);
 
         let RedisFailureAction::DeadLetter(record) = action else {
             panic!("max attempt failure should dead-letter");
@@ -13259,8 +16058,8 @@ mod tests {
         record.claimed_by = Some("worker-a".to_string());
         record.claimed_at_ms = Some(10_000);
 
-        let action = recover_stale_redis_record(record, 45_000, 30_000)
-            .expect("expired claim should be recovered");
+        let action =
+            recover_stale_redis_record(record, 45_000).expect("expired claim should be recovered");
 
         let RedisStaleRecovery::Requeue(record) = action else {
             panic!("stale nonterminal claim should requeue");
@@ -13284,8 +16083,8 @@ mod tests {
         record.claimed_by = Some("worker-a".to_string());
         record.claimed_at_ms = Some(10_000);
 
-        let action = recover_stale_redis_record(record, 45_000, 30_000)
-            .expect("expired claim should be recovered");
+        let action =
+            recover_stale_redis_record(record, 45_000).expect("expired claim should be recovered");
 
         let RedisStaleRecovery::DeadLetter(record) = action else {
             panic!("stale terminal claim should dead-letter");
@@ -13306,13 +16105,15 @@ mod tests {
     #[test]
     fn redis_dead_letter_scripts_delete_trimmed_dead_record_metadata() {
         assert!(
-            CLAIMED_REDIS_TRANSITION_SCRIPT
-                .contains("trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[7]))"),
+            CLAIMED_REDIS_TRANSITION_SCRIPT.contains(
+                "trim_dead_history(KEYS[4], KEYS[6], tonumber(ARGV[12]), tonumber(ARGV[13]))"
+            ),
             "claimed-job dead-letter trim should delete metadata for records beyond the history limit"
         );
         assert!(
-            STALE_REDIS_RECOVERY_SCRIPT
-                .contains("trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]))"),
+            STALE_REDIS_RECOVERY_SCRIPT.contains(
+                "trim_dead_history(KEYS[4], KEYS[5], tonumber(ARGV[6]), tonumber(ARGV[11]))"
+            ),
             "stale-recovery dead-letter trim should delete metadata for records beyond the history limit"
         );
         assert!(
@@ -13328,6 +16129,89 @@ mod tests {
                 .count()
                 >= 1,
             "stale-recovery dead-letter script should remove trimmed per-id metadata"
+        );
+    }
+
+    /// Issues #3051 and #3055: the caller decodes `{status, trimmed}`, so a
+    /// bare `return 0` (as the server-time check once had) fails to decode and
+    /// turns "the claim is still live" into a Redis error.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_stale_recovery_script_returns_a_pair_on_every_path() {
+        let (_, body) = STALE_REDIS_RECOVERY_SCRIPT
+            .split_once("-- Every return is {status, number of trimmed dead letters}.")
+            .expect("the script marks where its own returns start");
+        for line in body
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.starts_with("return"))
+        {
+            assert!(
+                line.starts_with("return {"),
+                "stale-recovery returns must be a pair, found `{line}`"
+            );
+        }
+    }
+
+    /// Issue #3055: a limit of `0` (or less) must keep every dead record.
+    /// Without the guard, `LRANGE key 0 -1` selects the whole list and the
+    /// trim deletes the metadata of every dead job.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_dead_letter_scripts_treat_zero_limit_as_unbounded() {
+        for script in [CLAIMED_REDIS_TRANSITION_SCRIPT, STALE_REDIS_RECOVERY_SCRIPT] {
+            assert!(
+                script.contains("if limit == nil or limit <= 0 then\n    return 0\n  end"),
+                "the dead-letter trim must stop before LRANGE when the limit is 0"
+            );
+            assert!(
+                script.contains("return #trimmed_records"),
+                "the dead-letter trim must report how many entries it removed"
+            );
+        }
+    }
+
+    /// Issue #3055: the worker reads the limit from config. A Redis list holds
+    /// at most `u32::MAX` entries, so a larger limit is clamped. Without the
+    /// clamp, Lua sends a float to `LRANGE` and the script fails part way.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_dead_letter_limit_from_config_is_clamped_to_the_list_maximum() {
+        let mut config = crate::config::JobRedisConfig::default();
+        assert_eq!(redis_dead_letter_limit(&config), 10_000);
+        config.dead_letter_limit = 0;
+        assert_eq!(redis_dead_letter_limit(&config), 0);
+        config.dead_letter_limit = usize::MAX;
+        assert_eq!(redis_dead_letter_limit(&config) as u64, u64::from(u32::MAX));
+    }
+
+    /// Issue #3055: a trim logs at warn level and adds to the counter.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_dead_letter_trim_report_warns_and_counts() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let logs =
+            crate::log::capture::LogBuffer::new(16, crate::log::filter::ParameterFilter::default());
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::log::capture::LogCaptureLayer::new(logs.clone()));
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let registry = crate::actuator::JobRegistry::new();
+        report_redis_dead_letter_trim(&registry, "app:jobs:dead", 3, 0);
+        assert_eq!(registry.dead_letter_trimmed_total(), 0);
+        assert!(logs.snapshot(Some(tracing::Level::WARN), None).is_empty());
+
+        report_redis_dead_letter_trim(&registry, "app:jobs:dead", 3, 2);
+        assert_eq!(registry.dead_letter_trimmed_total(), 2);
+        let warns = logs.snapshot(Some(tracing::Level::WARN), None);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert_eq!(warns[0].level, "WARN");
+        assert_eq!(warns[0].fields["trimmed"], serde_json::json!(2));
+        assert_eq!(warns[0].fields["dead_letter_limit"], serde_json::json!(3));
+        assert_eq!(
+            warns[0].fields["dead_key"],
+            serde_json::json!("app:jobs:dead")
         );
     }
 
@@ -13356,6 +16240,7 @@ mod tests {
             default_attempts: 3,
             default_backoff: 1,
             retry_promotion_interval: Duration::from_millis(1),
+            dead_letter_limit: 10_000,
             clock: std::sync::Arc::new(crate::time::SystemClock),
         }
     }
@@ -13390,6 +16275,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler,
+                timeout: None,
             },
         )])))
     }
@@ -13834,6 +16720,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             record,
+            tokio::time::Instant::now(),
             &redis_jobs_by_name(redis_counting_success_handler, 2),
             &state,
             &job_admin,
@@ -13886,6 +16773,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             first,
+            tokio::time::Instant::now(),
             &jobs,
             &state,
             &job_admin,
@@ -13919,6 +16807,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             second,
+            tokio::time::Instant::now(),
             &jobs,
             &state,
             &job_admin,
@@ -13964,6 +16853,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             record,
+            tokio::time::Instant::now(),
             &redis_jobs_by_name(panicking_handler, 3),
             &state,
             &job_admin,
@@ -13989,6 +16879,22 @@ mod tests {
         assert_eq!(status.dead_letters, 1);
     }
 
+    /// Entropy whose draws are all 0, so every jittered retry delay is 0 ms.
+    /// IDs still come from the OS.
+    #[cfg(feature = "redis")]
+    #[derive(Debug)]
+    struct ZeroBackoffEntropy;
+
+    #[cfg(feature = "redis")]
+    impl crate::entropy::Entropy for ZeroBackoffEntropy {
+        fn next_u64(&self) -> u64 {
+            0
+        }
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            crate::entropy::OsEntropy.fill_bytes(dest);
+        }
+    }
+
     #[cfg(feature = "redis")]
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires Docker (testcontainers)"]
@@ -13997,7 +16903,7 @@ mod tests {
 
         let (_container, client) = redis_test_client().await;
         let worker_a = redis_test_worker_config("autumn:test:stale", "worker-a", 1);
-        let worker_b = redis_test_worker_config("autumn:test:stale", "worker-b", 30_000);
+        let worker_b = redis_test_worker_config("autumn:test:stale", "worker-b", 1);
         redis_enqueue_test_job(&client, &worker_a, 3).await;
 
         let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
@@ -14013,7 +16919,11 @@ mod tests {
         assert_eq!(claimed.attempt, 1);
 
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let state = AppState::for_test().with_profile("dev");
+        // A recovered claim waits a jittered delay (issue #3054). A draw of 0
+        // makes that delay 0 ms, so the job goes straight back to the queue.
+        let state = AppState::for_test()
+            .with_profile("dev")
+            .with_entropy(Arc::new(ZeroBackoffEntropy));
         let job_admin = JobAdminMemoryBackend::new_for_test(32);
         state.job_registry().register("send_email");
         recover_stale_redis_jobs(&mut connection, &worker_b, &state, &job_admin)
@@ -14048,7 +16958,7 @@ mod tests {
 
         let (_container, client) = redis_test_client().await;
         let worker_a = redis_test_worker_config("autumn:test:stale-dead", "worker-a", 1);
-        let worker_b = redis_test_worker_config("autumn:test:stale-dead", "worker-b", 30_000);
+        let worker_b = redis_test_worker_config("autumn:test:stale-dead", "worker-b", 1);
         redis_enqueue_test_job(&client, &worker_a, 1).await;
 
         let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
@@ -14095,6 +17005,271 @@ mod tests {
         assert!(!dead_record_exists);
     }
 
+    /// Enqueue, claim and fail `count` single-attempt jobs one at a time.
+    /// Returns the job ids, oldest dead letter first.
+    #[cfg(feature = "redis")]
+    async fn redis_dead_letter_test_jobs(
+        client: &redis::Client,
+        worker_config: &RedisWorkerConfig,
+        state: &AppState,
+        count: usize,
+    ) -> Vec<String> {
+        let mut connection = new_redis_connection_manager(client, "test redis worker").unwrap();
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        let jobs = redis_jobs_by_name(always_fail_handler, 1);
+        state.job_registry().register("send_email");
+        let mut ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            redis_enqueue_test_job(client, worker_config, 1).await;
+            let record = claim_next_redis_job(
+                &mut connection,
+                worker_config,
+                std::slice::from_ref(&worker_config.queue_key),
+            )
+            .await
+            .unwrap()
+            .expect("the single-attempt job should be claimed");
+            ids.push(record.id.clone());
+            process_redis_job_record(
+                &mut connection,
+                record,
+                tokio::time::Instant::now(),
+                &jobs,
+                state,
+                &job_admin,
+                worker_config,
+            )
+            .await;
+        }
+        ids
+    }
+
+    /// Ids held by the dead-letter list, newest first.
+    #[cfg(feature = "redis")]
+    async fn redis_dead_letter_ids(
+        connection: &mut redis::aio::ConnectionManager,
+        worker_config: &RedisWorkerConfig,
+    ) -> Vec<String> {
+        use redis::AsyncCommands as _;
+
+        let bodies: Vec<String> = connection
+            .lrange(&worker_config.dead_key, 0, -1)
+            .await
+            .unwrap();
+        bodies
+            .iter()
+            .map(|body| serde_json::from_str::<RedisJobRecord>(body).unwrap().id)
+            .collect()
+    }
+
+    /// Issue #3055 AC1: dead-lettering `limit + N` jobs keeps the newest
+    /// `limit`, deletes the metadata of the `N` oldest, warns, and counts.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_dead_letter_limit_trims_beyond_limit_with_warning_and_metric() {
+        use redis::AsyncCommands as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let logs =
+            crate::log::capture::LogBuffer::new(64, crate::log::filter::ParameterFilter::default());
+        let subscriber = tracing_subscriber::registry()
+            .with(crate::log::capture::LogCaptureLayer::new(logs.clone()));
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let (_container, client) = redis_test_client().await;
+        let mut worker_config =
+            redis_test_worker_config("autumn:test:dead-limit", "worker-a", 30_000);
+        worker_config.dead_letter_limit = 3;
+        let state = AppState::for_test().with_profile("dev");
+
+        let ids = redis_dead_letter_test_jobs(&client, &worker_config, &state, 5).await;
+
+        let mut connection = new_redis_connection_manager(&client, "test redis check").unwrap();
+        let kept = redis_dead_letter_ids(&mut connection, &worker_config).await;
+        let newest: Vec<String> = ids.iter().rev().take(3).cloned().collect();
+        assert_eq!(kept, newest, "the newest `limit` dead letters stay");
+        for (index, id) in ids.iter().enumerate() {
+            let key = format!("{}{id}", worker_config.dead_record_prefix);
+            let exists: bool = connection.exists(&key).await.unwrap();
+            assert_eq!(exists, index >= 2, "dead-record metadata for job {index}");
+        }
+
+        assert_eq!(state.job_registry().dead_letter_trimmed_total(), 2);
+        assert_eq!(
+            state.job_registry().snapshot()["send_email"].dead_letters,
+            5
+        );
+        let warns: Vec<_> = logs
+            .snapshot(Some(tracing::Level::WARN), None)
+            .into_iter()
+            .filter(|entry| entry.fields.get("dead_letter_limit").is_some())
+            .collect();
+        assert_eq!(warns.len(), 2, "one warning per trim: {warns:?}");
+        for warn in &warns {
+            assert_eq!(warn.fields["trimmed"], serde_json::json!(1));
+            assert_eq!(warn.fields["dead_letter_limit"], serde_json::json!(3));
+        }
+    }
+
+    /// Issue #3055 AC2: `dead_letter_limit = 0` never trims, even past the
+    /// old hard-coded cap of 1,000.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_dead_letter_limit_zero_never_trims() {
+        use redis::AsyncCommands as _;
+
+        let (_container, client) = redis_test_client().await;
+        // A short timeout lets the stale-recovery step below reclaim a claim.
+        let mut worker_config =
+            redis_test_worker_config("autumn:test:dead-unbounded", "worker-a", 1);
+        worker_config.dead_letter_limit = 0;
+        let state = AppState::for_test().with_profile("dev");
+        let mut connection = new_redis_connection_manager(&client, "test redis seed").unwrap();
+
+        // Seed exactly the old cap of dead letters, each with its metadata.
+        let seeded = DEFAULT_JOB_ADMIN_HISTORY_LIMIT;
+        let mut pipe = redis::pipe();
+        for index in 0..seeded {
+            let id = format!("seeded-{index}");
+            let body = serde_json::json!({ "id": id, "name": "send_email" }).to_string();
+            pipe.lpush(&worker_config.dead_key, &body).ignore();
+            pipe.set(format!("{}{id}", worker_config.dead_record_prefix), &body)
+                .ignore();
+        }
+        pipe.query_async::<()>(&mut connection).await.unwrap();
+
+        let ids = redis_dead_letter_test_jobs(&client, &worker_config, &state, 5).await;
+
+        // The stale-recovery script must not trim either.
+        redis_enqueue_test_job(&client, &worker_config, 1).await;
+        let reclaimed = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("the final attempt should be claimed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        recover_stale_redis_jobs(&mut connection, &worker_config, &state, &job_admin)
+            .await
+            .unwrap();
+
+        let dead_len: usize = connection.llen(&worker_config.dead_key).await.unwrap();
+        assert_eq!(dead_len, seeded + 6);
+        let stale_key = format!("{}{}", worker_config.dead_record_prefix, reclaimed.id);
+        let stale_kept: bool = connection.exists(&stale_key).await.unwrap();
+        assert!(stale_kept, "the stale dead letter keeps its metadata");
+        let oldest_key = format!("{}seeded-0", worker_config.dead_record_prefix);
+        let oldest_kept: bool = connection.exists(&oldest_key).await.unwrap();
+        assert!(oldest_kept, "the oldest dead record keeps its metadata");
+        for id in &ids {
+            let key = format!("{}{id}", worker_config.dead_record_prefix);
+            let exists: bool = connection.exists(&key).await.unwrap();
+            assert!(exists, "dead-record metadata for {id}");
+        }
+        assert_eq!(state.job_registry().dead_letter_trimmed_total(), 0);
+    }
+
+    /// Issue #3055: one dead letter trims at most one batch. A backlog (for
+    /// example after `0` changes to a finite limit) shrinks over several
+    /// dead letters, so one script call never blocks Redis for long.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_dead_letter_limit_trims_a_bounded_batch_per_dead_letter() {
+        use redis::AsyncCommands as _;
+
+        let (_container, client) = redis_test_client().await;
+        let mut worker_config =
+            redis_test_worker_config("autumn:test:dead-batch", "worker-a", 30_000);
+        worker_config.dead_letter_limit = 10;
+        let state = AppState::for_test().with_profile("dev");
+        let mut connection = new_redis_connection_manager(&client, "test redis seed").unwrap();
+
+        let batch = REDIS_DEAD_LETTER_TRIM_BATCH;
+        let seeded = batch + 500;
+        let mut pipe = redis::pipe();
+        for index in 0..seeded {
+            let id = format!("seeded-{index}");
+            let body = serde_json::json!({ "id": id, "name": "send_email" }).to_string();
+            pipe.lpush(&worker_config.dead_key, &body).ignore();
+            pipe.set(format!("{}{id}", worker_config.dead_record_prefix), &body)
+                .ignore();
+        }
+        pipe.query_async::<()>(&mut connection).await.unwrap();
+
+        redis_dead_letter_test_jobs(&client, &worker_config, &state, 1).await;
+        let dead_len: usize = connection.llen(&worker_config.dead_key).await.unwrap();
+        assert_eq!(
+            dead_len,
+            seeded + 1 - batch,
+            "the first trim removes one batch"
+        );
+        let trimmed = u64::try_from(batch).unwrap();
+        assert_eq!(state.job_registry().dead_letter_trimmed_total(), trimmed);
+        for (index, kept) in [(0, false), (batch - 1, false), (batch, true)] {
+            let key = format!("{}seeded-{index}", worker_config.dead_record_prefix);
+            let exists: bool = connection.exists(&key).await.unwrap();
+            assert_eq!(exists, kept, "metadata of seeded-{index}");
+        }
+
+        redis_dead_letter_test_jobs(&client, &worker_config, &state, 1).await;
+        let dead_len: usize = connection.llen(&worker_config.dead_key).await.unwrap();
+        assert_eq!(
+            dead_len, 10,
+            "the next trim removes the rest of the backlog"
+        );
+        assert_eq!(
+            state.job_registry().dead_letter_trimmed_total(),
+            u64::try_from(seeded + 2 - 10).unwrap()
+        );
+    }
+
+    /// Issue #3055: stale-claim recovery obeys the same limit and counter.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_dead_letter_limit_applies_to_stale_recovery() {
+        use redis::AsyncCommands as _;
+
+        let (_container, client) = redis_test_client().await;
+        let worker_a = redis_test_worker_config("autumn:test:dead-stale", "worker-a", 1);
+        // Recovery uses the timeout of the worker that recovers, so keep it short.
+        let mut worker_b = redis_test_worker_config("autumn:test:dead-stale", "worker-b", 1);
+        worker_b.dead_letter_limit = 1;
+        let state = AppState::for_test().with_profile("dev");
+
+        // One dead letter already fills the list.
+        let first = redis_dead_letter_test_jobs(&client, &worker_b, &state, 1).await;
+
+        redis_enqueue_test_job(&client, &worker_a, 1).await;
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let claimed = claim_next_redis_job(
+            &mut connection,
+            &worker_a,
+            std::slice::from_ref(&worker_a.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("the final attempt should be claimed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let job_admin = JobAdminMemoryBackend::new_for_test(32);
+        recover_stale_redis_jobs(&mut connection, &worker_b, &state, &job_admin)
+            .await
+            .unwrap();
+
+        let kept = redis_dead_letter_ids(&mut connection, &worker_b).await;
+        assert_eq!(kept, vec![claimed.id.clone()]);
+        let trimmed_key = format!("{}{}", worker_b.dead_record_prefix, first[0]);
+        let trimmed_exists: bool = connection.exists(&trimmed_key).await.unwrap();
+        assert!(!trimmed_exists, "the trimmed record loses its metadata");
+        assert_eq!(state.job_registry().dead_letter_trimmed_total(), 1);
+    }
+
     #[cfg(feature = "redis")]
     #[test]
     fn redis_release_unique_on_settle_applies_to_terminal_non_ttl_only() {
@@ -14130,6 +17305,22 @@ mod tests {
         assert_eq!(
             redis_unique_lock_ttl_ms(None),
             REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_running_lock_ttl_outlives_the_claim() {
+        assert_eq!(
+            redis_running_lock_ttl_ms(30_000),
+            REDIS_UNIQUE_LOCK_TTL_BACKSTOP_MS
+        );
+        let four_days = 4 * 86_400_000;
+        assert_eq!(redis_running_lock_ttl_ms(four_days), 2 * four_days);
+        assert_eq!(
+            redis_running_lock_ttl_ms(u64::MAX),
+            10 * 365 * 86_400_000,
+            "capped so PEXPIRE accepts it"
         );
     }
 
@@ -14270,6 +17461,122 @@ mod tests {
         assert_eq!(redis_requeue_unique_action(&record), "");
     }
 
+    /// The claim gives a `running`-window unique lock the 24 h backstop TTL.
+    /// The heartbeat keeps a claim alive past that, so each renewal must
+    /// refresh the lock too, or an equal job could start alongside it.
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_claim_renewal_refreshes_the_running_window_lock() {
+        let (_container, client) = redis_test_client().await;
+        let worker_config = redis_test_worker_config("renew-lock", "worker-1", 30_000);
+        let mut connection = new_redis_connection_manager(&client, "test redis worker").unwrap();
+        let constraints = ResolvedJobConstraints {
+            unique_key: Some("invoice-7".to_string()),
+            unique_window: Some(JobUniquenessWindow::Running),
+            concurrency_limit: None,
+            concurrency_scope: None,
+        };
+        assert_eq!(
+            redis_enqueue_with_constraints(
+                &client,
+                &worker_config,
+                "r1",
+                "send_invoice",
+                &constraints
+            )
+            .await,
+            EnqueueOutcome::Queued
+        );
+        let record = claim_next_redis_job(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+        )
+        .await
+        .unwrap()
+        .expect("claimed");
+        let lock_key = worker_config.unique_lock_key_for(&record);
+        let record_key = redis_record_key(&worker_config.record_prefix, &record.id);
+        let renew = |connection: &mut redis::aio::ConnectionManager, visibility_timeout_ms: u64| {
+            let mut connection = connection.clone();
+            let (processing_key, record_key, lock_key, record) = (
+                worker_config.processing_key.clone(),
+                record_key.clone(),
+                lock_key.clone(),
+                record.clone(),
+            );
+            async move {
+                renew_redis_claim(
+                    &mut connection,
+                    &processing_key,
+                    &record_key,
+                    &lock_key,
+                    &record,
+                    visibility_timeout_ms,
+                )
+                .await
+            }
+        };
+        let pttl = |connection: &mut redis::aio::ConnectionManager| {
+            let mut connection = connection.clone();
+            let lock_key = lock_key.clone();
+            async move {
+                redis::cmd("PTTL")
+                    .arg(&lock_key)
+                    .query_async::<i64>(&mut connection)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // The job has run almost 24 h: its lock is about to expire.
+        let _: () = redis::cmd("PEXPIRE")
+            .arg(&lock_key)
+            .arg(1_000)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(matches!(
+            renew(&mut connection, 30_000).await,
+            LeaseRenewal::Renewed
+        ));
+        let ttl = pttl(&mut connection).await;
+        assert!(
+            ttl > 1_000,
+            "the renewal must refresh the running-window lock; PTTL {ttl}"
+        );
+
+        // A visibility timeout past the 24 h backstop: the first renewal
+        // comes after a third of it, so the lock must outlive the claim.
+        let long_visibility_ms: u64 = 4 * 86_400_000;
+        assert!(matches!(
+            renew(&mut connection, long_visibility_ms).await,
+            LeaseRenewal::Renewed
+        ));
+        let ttl = pttl(&mut connection).await;
+        assert!(
+            u64::try_from(ttl).unwrap_or(0) > long_visibility_ms,
+            "the lock must outlive a long claim; PTTL {ttl}"
+        );
+
+        // A lock that another job holds now is not this claim's to extend.
+        let _: () = redis::cmd("SET")
+            .arg(&lock_key)
+            .arg("someone-else")
+            .arg("PX")
+            .arg(1_000)
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        assert!(matches!(
+            renew(&mut connection, 30_000).await,
+            LeaseRenewal::Renewed
+        ));
+        let ttl = pttl(&mut connection).await;
+        assert!(ttl <= 1_000, "another job's lock is left alone; PTTL {ttl}");
+    }
+
     #[cfg(feature = "redis")]
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
@@ -14370,6 +17677,111 @@ mod tests {
 
     /// #1186: a job parked in the blocked zset must stay listed on the
     /// enqueued tab instead of blinking out of it every promotion cycle.
+    /// Issue #1720: a deferred job is parked, not claimed. It keeps its
+    /// attempt, the next job on the queue runs, and the admin page lists it
+    /// as enqueued, not as blocked on concurrency. Only the low-signal
+    /// promotion puts it back.
+    #[cfg(feature = "redis")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn redis_admin_lists_a_cost_parked_job_as_enqueued() {
+        use redis::AsyncCommands as _;
+
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+
+        let (_container, client) = redis_test_client().await;
+        let prefix = "autumn:test:cost-parked";
+        let worker_config = redis_test_worker_config(prefix, "worker-c", 30_000);
+        let mut connection =
+            new_redis_connection_manager(&client, "test redis cost parked").unwrap();
+        let admin = redis_admin_test_backend_with_queues(
+            &client,
+            &worker_config,
+            vec![worker_config.queue_key.clone()],
+        );
+        let plain = ResolvedJobConstraints::default();
+        redis_enqueue_with_constraints(&client, &worker_config, "c1", "rebuild_index", &plain)
+            .await;
+        redis_enqueue_with_constraints(&client, &worker_config, "c2", "send_email", &plain).await;
+
+        let deferred = vec!["rebuild_index".to_owned()];
+        let claimed = claim_next_redis_job_except(
+            &mut connection,
+            &worker_config,
+            std::slice::from_ref(&worker_config.queue_key),
+            &deferred,
+        )
+        .await
+        .unwrap()
+        .expect("the job behind the deferred one is claimed");
+        assert_eq!(claimed.id, "c2");
+
+        let parked: Vec<(String, u64)> = connection
+            .zrange_withscores(&worker_config.blocked_key, 0, -1)
+            .await
+            .unwrap();
+        assert_eq!(parked.len(), 1, "{parked:?}");
+        assert_eq!(parked[0].0, "c1");
+        assert!(
+            parked[0].1 >= REDIS_DEFERRED_SCORE_BASE,
+            "parked above the timed band"
+        );
+        promote_due_blocked_redis_jobs(&mut connection, &worker_config)
+            .await
+            .unwrap();
+        let queued: u64 = connection.llen(&worker_config.queue_key).await.unwrap();
+        assert_eq!(queued, 0, "the timed promotion does not move it");
+        let body: String = connection
+            .get(redis_record_key(&worker_config.record_prefix, "c1"))
+            .await
+            .unwrap();
+        let record: RedisJobRecord = serde_json::from_str(&body).unwrap();
+        assert_eq!(record.attempt, 1, "a parked job keeps its attempt");
+        assert!(record.claimed_by.is_none(), "a parked job is not claimed");
+
+        let snapshot = admin
+            .snapshot(JobAdminQuery::default())
+            .await
+            .expect("snapshot");
+        let listed = snapshot
+            .enqueued
+            .records
+            .iter()
+            .find(|r| r.id == "c1")
+            .expect("the parked job is listed as enqueued");
+        assert!(!listed.blocked_on_concurrency);
+
+        // The backlog gauges still count it as queued.
+        let state = AppState::for_test().with_profile("dev");
+        state.job_registry().register("rebuild_index");
+        update_redis_queue_depth_gauges(
+            &mut connection,
+            prefix,
+            &["default".to_owned()],
+            &worker_config.delayed_key,
+            &worker_config.record_prefix,
+            &state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.job_registry().snapshot()["rebuild_index"].queued, 1);
+        assert_eq!(
+            state.job_registry().snapshot()["rebuild_index"].blocked_on_concurrency,
+            0
+        );
+
+        // The signal is low: the job goes back to its queue.
+        promote_deferred_redis_jobs(&mut connection, &worker_config)
+            .await
+            .unwrap();
+        let queued: Vec<String> = connection
+            .lrange(&worker_config.queue_key, 0, -1)
+            .await
+            .unwrap();
+        assert_eq!(queued, vec!["c1".to_owned()]);
+    }
+
     #[cfg(feature = "redis")]
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires Docker (testcontainers)"]
@@ -14767,6 +18179,7 @@ mod tests {
         process_redis_job_record(
             &mut connection,
             claimed,
+            tokio::time::Instant::now(),
             &jobs,
             &state,
             &job_admin,
@@ -15271,6 +18684,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -15323,6 +18737,7 @@ mod tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                    timeout: None,
                 },
                 JobInfo {
                     version: 1,
@@ -15333,6 +18748,7 @@ mod tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                    timeout: None,
                 },
             ],
             &state,
@@ -15497,6 +18913,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -15541,6 +18958,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -15569,7 +18987,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -15582,6 +19000,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         });
         assert!(global_job_client().is_some());
 
@@ -15895,6 +19315,8 @@ mod tests {
             state,
             serde_json::json!({}),
             true,
+            ExecutionBounds::default(),
+            crate::cost::WorkRun::default(),
         )
         .await;
         assert_eq!(
@@ -15905,8 +19327,9 @@ mod tests {
 
     // ── Tracked-job choke-point behavior (#1373) ──────────────────────────────
     //
-    // run_job_handler is the single point all three backends run handlers
-    // through; these tests drive it via the real local backend + the free
+    // run_job_handler (local) and run_claimed_job_handler (sqlite, postgres,
+    // redis) share one handler path; these tests drive the local path via
+    // the real local backend + the free
     // enqueue_tracked function rather than calling it directly, so they also
     // exercise enqueue_tracked's envelope-wrapping and the local backend's
     // retry/dead-letter decisions end to end.
@@ -16005,6 +19428,65 @@ mod tests {
         clear_global_job_client();
     }
 
+    /// Tenant lanes with per-queue slots on (#3072): every tenant's jobs run.
+    #[tokio::test]
+    async fn tenant_lanes_with_queue_slots_run_every_tenants_jobs() {
+        static RAN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        RAN.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut queues = crate::config::JobQueuesConfig::default();
+        queues.queues[0].concurrency = Some(2);
+        start_local_runtime_inner(
+            vec![JobInfo::new("lane_count", 1, 10, |_state, _payload| {
+                Box::pin(async move {
+                    RAN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+            })],
+            &state,
+            &shutdown,
+            2,
+            5,
+            250,
+            &queues,
+            &[],
+            &crate::config::JobTenantsConfig {
+                max_concurrent: 1,
+                lanes: 2,
+                lanes_per_tenant: 1,
+            },
+            true,
+        );
+
+        for tenant in ["a", "b", "c", "d"] {
+            for _ in 0..2 {
+                crate::tenancy::CURRENT_TENANT
+                    .scope(
+                        Some(tenant.to_owned()),
+                        enqueue("lane_count", serde_json::json!({})),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        enqueue("lane_count", serde_json::json!({})).await.unwrap();
+
+        timeout(Duration::from_secs(5), async {
+            while RAN.load(std::sync::atomic::Ordering::SeqCst) < 9 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("every tenant's jobs ran, and the job without a tenant");
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+
     #[tokio::test]
     async fn enqueue_rejects_a_payload_that_collides_with_the_tracked_envelope_shape() {
         let _guard = global_job_runtime_test_lock().lock().await;
@@ -16098,6 +19580,8 @@ mod tests {
             attempt: 1,
             max_attempts: 3,
             initial_backoff_ms: 10,
+            tenant: None,
+            cost_waited: false,
             #[cfg(feature = "telemetry-otlp")]
             traceparent: None,
             #[cfg(feature = "telemetry-otlp")]
@@ -16152,6 +19636,8 @@ mod tests {
             attempt: 1,
             max_attempts: 3,
             initial_backoff_ms: 10,
+            tenant: None,
+            cost_waited: false,
             #[cfg(feature = "telemetry-otlp")]
             traceparent: None,
             #[cfg(feature = "telemetry-otlp")]
@@ -16474,6 +19960,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 1,
+                tenant: None,
+                cost_waited: false,
                 #[cfg(feature = "telemetry-otlp")]
                 traceparent: None,
                 #[cfg(feature = "telemetry-otlp")]
@@ -16522,11 +20010,13 @@ mod tests {
         }
 
         #[test]
-        fn pg_retry_delay_grows_exponentially() {
-            assert_eq!(pg_retry_delay_ms(250, 1), 250);
-            assert_eq!(pg_retry_delay_ms(250, 2), 500);
-            assert_eq!(pg_retry_delay_ms(250, 3), 1_000);
-            assert_eq!(pg_retry_delay_ms(250, 4), 2_000);
+        fn sql_row_retry_delay_is_capped_and_safe_for_bad_columns() {
+            let state = AppState::for_test();
+            for attempt in [i32::MIN, -1, 0, 1, 4, i32::MAX] {
+                let delay = sql_row_retry_delay_ms(&state, 250, attempt);
+                assert!(delay <= crate::backoff::DEFAULT_JOB_MAX_BACKOFF_MS);
+            }
+            assert_eq!(sql_row_retry_delay_ms(&state, -5, 3), 0);
         }
 
         /// `enqueue_in` (a relative delay) must reach the INSERT as
@@ -16545,11 +20035,11 @@ mod tests {
             assert_eq!(pg_due_from(None, None), PgDueAt::Immediate);
             assert_eq!(pg_due_from(None, Some(at)), PgDueAt::Absolute(at));
             assert_eq!(
-                pg_due_from(Some(Duration::from_millis(2_000)), None),
+                pg_due_from(Some(Duration::from_secs(2)), None),
                 PgDueAt::RelativeMs(2_000)
             );
             assert_eq!(
-                pg_due_from(Some(Duration::from_millis(2_000)), Some(at)),
+                pg_due_from(Some(Duration::from_secs(2)), Some(at)),
                 PgDueAt::RelativeMs(2_000)
             );
         }
@@ -16582,7 +20072,7 @@ mod tests {
                 "any positive sub-millisecond delay must round up to 1ms, never down to 0"
             );
             assert_eq!(
-                pg_due_from(Some(Duration::from_millis(2_000)), None),
+                pg_due_from(Some(Duration::from_secs(2)), None),
                 PgDueAt::RelativeMs(2_000),
                 "an exact millisecond value must round-trip unchanged"
             );
@@ -16633,6 +20123,7 @@ mod tests {
                 Ok(false),
                 "slow_success",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -16662,6 +20153,7 @@ mod tests {
                 Ok(true),
                 "slow_success",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -16697,6 +20189,7 @@ mod tests {
                 Ok(false),
                 "slow_failure",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "visibility timeout expired"
@@ -16787,6 +20280,7 @@ mod tests {
                 Ok(true),
                 "slow_failure",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "worker failed"
@@ -16822,6 +20316,7 @@ mod tests {
                 Ok(true),
                 "slow_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -16871,6 +20366,7 @@ mod tests {
                 Ok(true),
                 "slow_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -16915,6 +20411,7 @@ mod tests {
                 Ok(true),
                 "fast_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -16975,6 +20472,7 @@ mod tests {
                 Ok(true),
                 "racer",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -17038,6 +20536,7 @@ mod tests {
                 Ok(true),
                 "slow_retry",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Retry {
                     error: "try again",
@@ -17083,6 +20582,7 @@ mod tests {
                 Err(AutumnError::internal_server_error_msg("ack failed")),
                 "slow_success",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -17111,6 +20611,7 @@ mod tests {
                 Ok(false),
                 "evicted_job",
                 &job_id,
+                1,
                 "success",
                 PgLifecycleRecord::Success,
                 &state,
@@ -17159,6 +20660,7 @@ mod tests {
                 Ok(false),
                 "terminal_job",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "handler timed out"
@@ -17215,10 +20717,13 @@ mod tests {
             // 1) Stale-claim recovery dead-letters the final-attempt row, mirroring
             //    the exact two-line sequence `pg_recover_stale_claims` runs per
             //    `failed` row it flips.
-            state.job_registry().record_failure(
+            record_recovered_failure(
                 "slow_resumer",
-                "visibility timeout expired".to_owned(),
-                true,
+                &job_id,
+                1,
+                "visibility timeout expired",
+                &state,
+                &job_admin,
             );
             crate::alerts::notify_dead_lettered_job(
                 &state,
@@ -17233,6 +20738,7 @@ mod tests {
                 Ok(false),
                 "slow_resumer",
                 &job_id,
+                1,
                 "failure",
                 PgLifecycleRecord::Failure {
                     error: "handler returned error"
@@ -17375,6 +20881,7 @@ mod tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                    timeout: None,
                 }],
                 &state,
                 &shutdown,
@@ -17394,8 +20901,8 @@ mod tests {
         }
 
         // The sqlite arm of the same call. `start_postgres_runtime` is a stub
-        // under the backend flip — SQLite has no LISTEN/NOTIFY and no
-        // advisory-lock queue — so it refuses regardless of what is configured,
+        // under the backend flip — SQLite has no `FOR UPDATE SKIP LOCKED` and
+        // no advisory locks — so it refuses regardless of what is configured,
         // and this is the only coverage of that refusal.
         #[cfg(feature = "sqlite")]
         #[tokio::test]
@@ -17446,9 +20953,17 @@ mod tests {
             let sql1 = include_str!("../migrations/20260513000000_create_job_queue/up.sql");
             conn.batch_execute(sql1).await.unwrap();
 
+            let sql_trace =
+                include_str!("../migrations/20260519000000_add_trace_context_to_jobs/up.sql");
+            conn.batch_execute(sql_trace).await.unwrap();
+
             let sql2 =
                 include_str!("../migrations/20260610000000_add_job_uniqueness_concurrency/up.sql");
             conn.batch_execute(sql2).await.unwrap();
+
+            let sql_pending =
+                include_str!("../migrations/20260611000000_add_pending_unique_key_to_jobs/up.sql");
+            conn.batch_execute(sql_pending).await.unwrap();
 
             let sql3 = include_str!("../migrations/20260628000000_add_queue_to_jobs/up.sql");
             conn.batch_execute(sql3).await.unwrap();
@@ -17473,6 +20988,96 @@ mod tests {
         async fn pg_exec(pool: &PgPool, sql: &str) {
             let mut conn = pool.get().await.unwrap();
             diesel::sql_query(sql).execute(&mut *conn).await.unwrap();
+        }
+
+        #[test]
+        fn pg_deferred_claim_sql_binds_the_same_three_parameters_as_the_plain_claim() {
+            let plain = pg_claim_sql_single_queue();
+            let deferred = pg_claim_sql_single_queue_deferred();
+            for param in ["$1", "$2", "$3"] {
+                assert!(plain.contains(param), "plain claim binds {param}");
+                assert!(deferred.contains(param), "deferred claim binds {param}");
+            }
+            assert!(
+                !deferred.contains("$4"),
+                "diesel binds exactly three values"
+            );
+            // The skip scan must not filter parked names out of the run_at scan.
+            assert!(deferred.contains("WITH RECURSIVE names"));
+            assert!(deferred.contains("FOR UPDATE SKIP LOCKED"));
+            assert!(deferred.contains("RETURNING id, name, queue"));
+            assert_eq!(pg_single_queue_claim_sql(&[]), plain);
+            assert_eq!(pg_single_queue_claim_sql(&["parked".to_owned()]), deferred);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_deferred_claim_skips_parked_names_and_keeps_run_at_order() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            {
+                use diesel_async::SimpleAsyncConnection as _;
+                let mut conn = pool.get().await.unwrap();
+                conn.batch_execute(include_str!(
+                    "../migrations/20261026170000_add_jobs_queue_name_ready_index/up.sql"
+                ))
+                .await
+                .unwrap();
+            }
+
+            // Parked backlog is the oldest work; `other` is later; `lim` is
+            // capped at one running job and one is already running.
+            pg_exec(
+                &pool,
+                "INSERT INTO autumn_jobs (id, name, status, run_at, queue, payload, \
+                 concurrency_limit) VALUES \
+                 ('p1', 'parked', 'enqueued', NOW() - interval '10 minutes', 'default', '{}', NULL), \
+                 ('p2', 'parked', 'enqueued', NOW() - interval '9 minutes', 'default', '{}', NULL), \
+                 ('l1', 'lim', 'enqueued', NOW() - interval '8 minutes', 'default', '{}', 1), \
+                 ('o2', 'other', 'enqueued', NOW() - interval '6 minutes', 'default', '{}', NULL), \
+                 ('o1', 'other', 'enqueued', NOW() - interval '7 minutes', 'default', '{}', NULL), \
+                 ('f1', 'other', 'enqueued', NOW() + interval '1 hour', 'default', '{}', NULL)",
+            )
+            .await;
+            pg_exec(
+                &pool,
+                "INSERT INTO autumn_jobs (id, name, status, run_at, queue, payload, claimed_at) \
+                 VALUES ('r1', 'lim', 'running', NOW(), 'default', '{}', NOW())",
+            )
+            .await;
+
+            let queues = ["default".to_string()];
+            let parked = vec!["parked".to_string()];
+            let first = pg_claim_next_job_except(&pool, "w", false, &queues, &parked)
+                .await
+                .expect("a runnable job exists behind the parked ones");
+            assert_eq!(
+                first.id, "o1",
+                "earliest runnable job; parked and capped skipped"
+            );
+            let second = pg_claim_next_job_except(&pool, "w", false, &queues, &parked)
+                .await
+                .expect("the next runnable job");
+            assert_eq!(second.id, "o2");
+            assert!(
+                pg_claim_next_job_except(&pool, "w", false, &queues, &parked)
+                    .await
+                    .is_none(),
+                "parked, concurrency-capped and future jobs are not claimable"
+            );
+
+            // With nothing deferred the plain claim still takes the oldest job.
+            let oldest = pg_claim_next_job(&pool, "w", false, &queues)
+                .await
+                .expect("parked job claimable once not deferred");
+            assert_eq!(oldest.id, "p1");
         }
 
         #[tokio::test]
@@ -17627,7 +21232,7 @@ mod tests {
 
             let job_id = uuid::Uuid::new_v4().to_string();
             let relative_delay =
-                RelativeDelay::new(Duration::from_millis(2_000), crate::time::monotonic_now());
+                RelativeDelay::new(Duration::from_secs(2), crate::time::monotonic_now());
             pg_enqueue_job_at(
                 &pool,
                 job_id.clone(),
@@ -17699,7 +21304,7 @@ mod tests {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                         let call_time = chrono::Utc::now();
                         let relative_delay = RelativeDelay::new(
-                            Duration::from_millis(2_000),
+                            Duration::from_secs(2),
                             crate::time::monotonic_now(),
                         );
                         pg_enqueue_on_conn_at(
@@ -17815,6 +21420,7 @@ mod tests {
                 minimum_sample_count: 3,
                 open_duration: Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             };
             let breaker =
                 crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
@@ -17828,7 +21434,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: Some(pool.clone()),
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -17841,6 +21447,8 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
+                #[cfg(feature = "postgres")]
+                shard_local: false,
             };
 
             let mut conn = pool.get().await.unwrap();
@@ -17963,9 +21571,17 @@ mod tests {
                 .await
                 .expect("first claim should succeed");
             assert_eq!(job.attempt, 1);
-            pg_nack_failure(&pool, &job_id, "worker-1", "first failure", &job, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &job_id,
+                "worker-1",
+                "first failure",
+                &job,
+                None,
+                u64::try_from(job.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             let after_first = pg_fetch_by_id(&pool, &job_id).await.unwrap();
             assert_eq!(after_first.status, PG_STATUS_ENQUEUED);
@@ -17983,9 +21599,17 @@ mod tests {
                 .await
                 .expect("second claim should succeed");
             assert_eq!(job2.attempt, 2);
-            pg_nack_failure(&pool, &job_id, "worker-1", "second failure", &job2, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &job_id,
+                "worker-1",
+                "second failure",
+                &job2,
+                None,
+                u64::try_from(job2.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             let final_row = pg_fetch_by_id(&pool, &job_id).await.unwrap();
             assert_eq!(final_row.status, PG_STATUS_FAILED);
@@ -18029,7 +21653,13 @@ mod tests {
             )).await;
 
             // Recover stale claims with a 1-second timeout
-            pg_recover_stale_claims(&pool, 1_000, &AppState::for_test()).await;
+            pg_recover_stale_claims(
+                &pool,
+                1_000,
+                &AppState::for_test(),
+                &JobAdminMemoryBackend::new(),
+            )
+            .await;
 
             let row = pg_fetch_by_id(&pool, &job_id).await.unwrap();
             assert_eq!(
@@ -18132,9 +21762,17 @@ mod tests {
             let job_f = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
                 .await
                 .expect("failed job to claim");
-            pg_nack_failure(&pool, &job_f.id, "w1", "server down", &job_f, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &job_f.id,
+                "w1",
+                "server down",
+                &job_f,
+                None,
+                u64::try_from(job_f.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             let backend = PgJobAdminBackend {
                 pool: pool.clone(),
@@ -18189,9 +21827,17 @@ mod tests {
             let jf = pg_claim_next_job(&pool, "w", false, &["default".to_string()])
                 .await
                 .unwrap();
-            pg_nack_failure(&pool, &jf.id, "w", "boom", &jf, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &jf.id,
+                "w",
+                "boom",
+                &jf,
+                None,
+                u64::try_from(jf.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             backend.retry("fail-r").await.expect("retry should succeed");
             let row = pg_fetch_by_id(&pool, "fail-r").await.unwrap();
@@ -18219,9 +21865,17 @@ mod tests {
             let jd = pg_claim_next_job(&pool, "w", false, &["default".to_string()])
                 .await
                 .unwrap();
-            pg_nack_failure(&pool, &jd.id, "w", "boom", &jd, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &jd.id,
+                "w",
+                "boom",
+                &jd,
+                None,
+                u64::try_from(jd.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             backend
                 .discard("fail-d")
@@ -18543,9 +22197,17 @@ mod tests {
             let claimed = pg_claim_next_job(&pool, "w", false, &["default".to_string()])
                 .await
                 .unwrap();
-            pg_nack_failure(&pool, &claimed.id, "w", "boom", &claimed, None)
-                .await
-                .unwrap();
+            pg_nack_failure(
+                &pool,
+                &claimed.id,
+                "w",
+                "boom",
+                &claimed,
+                None,
+                u64::try_from(claimed.initial_backoff_ms).unwrap_or(0),
+            )
+            .await
+            .unwrap();
 
             backend
                 .retry("pg-retry-tracked")
@@ -18586,7 +22248,9 @@ mod tests {
             let mut conn = pool.get().await.unwrap();
             let tracking_sql =
                 include_str!("../migrations/20260702000000_create_job_tracking/up.sql");
-            for stmt in tracking_sql.split(';') {
+            let version_sql =
+                include_str!("../migrations/20261022120000_add_version_to_job_tracking/up.sql");
+            for stmt in tracking_sql.split(';').chain(version_sql.split(';')) {
                 let stmt = stmt.trim();
                 if !stmt.is_empty() {
                     diesel::sql_query(stmt).execute(&mut *conn).await.unwrap();
@@ -18594,15 +22258,9 @@ mod tests {
             }
             drop(conn);
 
-            // A record whose TTL puts `expires_at` far in the past — the
-            // clock only controls what timestamp gets written, not any
-            // filtering here, since `pg_cleanup_expired_tracking_rows`
-            // compares against Postgres's real `NOW()`.
-            let long_ago = chrono::DateTime::parse_from_rfc3339("2000-01-01T00:00:00Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc);
-            let expired_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 60)
-                .with_clock(std::sync::Arc::new(crate::time::FixedClock::at(long_ago)));
+            // A zero TTL sets `expires_at` to the write's `NOW()`. The next
+            // read sees the row as expired.
+            let expired_store = crate::job_tracking::PgJobTrackingStore::new(pool.clone(), 0);
             expired_store
                 .create(
                     "expired-key",
@@ -18980,7 +22638,13 @@ mod tests {
 
             // Stale recovery dead-letters the final attempt, which must free
             // both the unique key and the concurrency slot.
-            pg_recover_stale_claims(&pool, 10, &AppState::for_test()).await;
+            pg_recover_stale_claims(
+                &pool,
+                10,
+                &AppState::for_test(),
+                &JobAdminMemoryBackend::new(),
+            )
+            .await;
             let recovered = pg_fetch_by_id(&pool, "crash-1").await.unwrap();
             assert_eq!(recovered.status, "failed");
 
@@ -19064,7 +22728,7 @@ mod tests {
             assert_eq!(row.id, "pg-crash-1");
             tokio::time::sleep(Duration::from_millis(50)).await;
 
-            pg_recover_stale_claims(&pool, 10, &state).await;
+            pg_recover_stale_claims(&pool, 10, &state, &JobAdminMemoryBackend::new()).await;
             let recovered = pg_fetch_by_id(&pool, "pg-crash-1").await.unwrap();
             assert_eq!(recovered.status, "failed");
 
@@ -19112,9 +22776,17 @@ mod tests {
                 .await
                 .expect("claim");
             assert!(
-                pg_nack_failure(&pool, &row.id, "w1", "boom", &row, None)
-                    .await
-                    .unwrap()
+                pg_nack_failure(
+                    &pool,
+                    &row.id,
+                    "w1",
+                    "boom",
+                    &row,
+                    None,
+                    u64::try_from(row.initial_backoff_ms).unwrap_or(0),
+                )
+                .await
+                .unwrap()
             );
 
             // The key is free after dead-letter, so a twin can be enqueued.
@@ -19171,6 +22843,142 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_retry_restores_pending_window_unique_key() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
+            };
+
+            let constraints = unique_constraints("acct-9", JobUniquenessWindow::Pending);
+            let enqueue = |id: &'static str| {
+                let pool = pool.clone();
+                let constraints = constraints.clone();
+                async move {
+                    pg_enqueue_job(
+                        &pool,
+                        id.to_string(),
+                        "sync_account",
+                        "default",
+                        serde_json::json!({}),
+                        1,
+                        10,
+                        &constraints,
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+            assert_eq!(enqueue("pend-fail").await, EnqueueOutcome::Queued);
+            // Claim moves the key to `pending_unique_key`; a final nack fails the row.
+            let row = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim");
+            assert!(
+                pg_nack_failure(&pool, &row.id, "w1", "boom", &row, Some("acct-9"), 0)
+                    .await
+                    .unwrap()
+            );
+
+            backend.pg_retry_failed("pend-fail").await.unwrap();
+
+            // The retried row holds its key again, so a twin is deduplicated.
+            assert_eq!(enqueue("pend-twin").await, EnqueueOutcome::Deduplicated);
+            // The claim moves the key back, so the key is not lost.
+            let claimed = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim retried");
+            assert_eq!(claimed.id, "pend-fail");
+            assert_eq!(enqueue("pend-after-claim").await, EnqueueOutcome::Queued);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it() {
+            use testcontainers::runners::AsyncRunner as _;
+            use testcontainers_modules::postgres::Postgres;
+
+            let container = Postgres::default().start().await.unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            let pool = pg_test_pool(&url);
+            pg_run_migration(&pool).await;
+            let backend = PgJobAdminBackend {
+                pool: pool.clone(),
+                registry: crate::actuator::JobRegistry::new(),
+                clock: std::sync::Arc::new(crate::time::SystemClock),
+            };
+
+            let constraints = unique_constraints("acct-10", JobUniquenessWindow::Pending);
+            let enqueue = |id: &'static str| {
+                let pool = pool.clone();
+                let constraints = constraints.clone();
+                async move {
+                    pg_enqueue_job(
+                        &pool,
+                        id.to_string(),
+                        "sync_account",
+                        "default",
+                        serde_json::json!({}),
+                        1,
+                        10,
+                        &constraints,
+                    )
+                    .await
+                    .unwrap()
+                }
+            };
+            assert_eq!(enqueue("held-fail").await, EnqueueOutcome::Queued);
+            let row = pg_claim_next_job(&pool, "w1", false, &["default".to_string()])
+                .await
+                .expect("claim");
+            assert!(
+                pg_nack_failure(&pool, &row.id, "w1", "boom", &row, Some("acct-10"), 0)
+                    .await
+                    .unwrap()
+            );
+            // The claim freed the key, so a twin takes it while the row is failed.
+            assert_eq!(enqueue("held-twin").await, EnqueueOutcome::Queued);
+
+            // The retry succeeds. The twin keeps the key; the retried row has none.
+            backend.pg_retry_failed("held-fail").await.unwrap();
+            let retried = pg_fetch_by_id(&pool, "held-fail").await.unwrap();
+            assert_eq!(retried.status, "enqueued");
+            assert!(pg_unique_keys(&pool, "held-fail").await.0.is_none());
+            assert!(pg_unique_keys(&pool, "held-fail").await.1.is_none());
+        }
+
+        async fn pg_unique_keys(pool: &PgPool, id: &str) -> (Option<String>, Option<String>) {
+            use diesel_async::RunQueryDsl as _;
+
+            #[derive(diesel::QueryableByName)]
+            struct Keys {
+                #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+                unique_key: Option<String>,
+                #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+                pending_unique_key: Option<String>,
+            }
+            let mut conn = pool.get().await.unwrap();
+            let keys = diesel::sql_query(
+                "SELECT unique_key, pending_unique_key FROM autumn_jobs WHERE id = $1",
+            )
+            .bind::<diesel::sql_types::Text, _>(id)
+            .get_result::<Keys>(&mut *conn)
+            .await
+            .unwrap();
+            (keys.unique_key, keys.pending_unique_key)
+        }
+
         async fn pg_fetch_by_id(pool: &PgPool, id: &str) -> Option<PgJobRow> {
             use diesel::OptionalExtension as _;
             let mut conn = pool.get().await.unwrap();
@@ -19194,7 +23002,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -19210,6 +23018,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         };
         (client, rx)
     }
@@ -19232,6 +23042,32 @@ mod tests {
         );
         let job = received.unwrap().expect("channel should not be closed");
         assert_eq!(job.name, "test_job");
+    }
+
+    /// Codex review on #3473: the outbox relay runs in its own task, so it
+    /// enqueues under the tenant the message stored, and a row from before
+    /// the tenant was stored enqueues with none.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn outbox_job_dispatch_restores_the_stored_tenant() {
+        let (client, mut rx) = make_test_client();
+        let state = AppState::for_test();
+        state.insert_extension(client);
+        for (body, tenant) in [
+            (
+                serde_json::json!({ "name": "test_job", "args": {}, "tenant": "acme" }),
+                Some("acme"),
+            ),
+            (serde_json::json!({ "name": "test_job", "args": {} }), None),
+        ] {
+            let message =
+                crate::outbox::OutboxMessage::new("m", "", "autumn.job", body, chrono::Utc::now());
+            crate::outbox::run_job_enqueue(state.clone(), message)
+                .await
+                .expect("relay enqueue");
+            let job = rx.recv().await.expect("queued job");
+            assert_eq!(job.tenant.as_deref(), tenant);
+        }
     }
 
     #[tokio::test]
@@ -19302,6 +23138,8 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
                 initial_backoff_ms: 0,
+                tenant: None,
+                cost_waited: false,
                 traceparent: Some(
                     "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
                 ),
@@ -19443,6 +23281,7 @@ mod tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: |_state, _payload| Box::pin(async { Ok(()) }),
+                    timeout: None,
                 },
             );
             let jobs_by_name = Arc::new(RwLock::new(jobs));
@@ -19459,6 +23298,8 @@ mod tests {
                     attempt: 1,
                     max_attempts: 1,
                     initial_backoff_ms: 0,
+                    tenant: None,
+                    cost_waited: false,
                     traceparent: Some(
                         "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".to_string(),
                     ),
@@ -19586,7 +23427,7 @@ mod tests {
                 local_coordination: None,
                 #[cfg(feature = "redis")]
                 redis: None,
-                #[cfg(feature = "db")]
+                #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "sqlite")]
                 sqlite: None,
@@ -19602,6 +23443,8 @@ mod tests {
                 entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
                 clock: std::sync::Arc::new(crate::time::SystemClock),
                 resilience_config: None,
+                #[cfg(feature = "postgres")]
+                shard_local: false,
             };
             rt.block_on(async {
                 client
@@ -19630,6 +23473,7 @@ mod tests {
             minimum_sample_count: 3,
             open_duration: Duration::from_secs(60),
             half_open_trial_count: 2,
+            ..crate::circuit_breaker::CircuitBreakerPolicy::default()
         };
         let breaker = crate::circuit_breaker::global_registry().get_or_create("job_queue", policy);
 
@@ -19644,7 +23488,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -19657,6 +23501,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         };
 
         for _ in 0..3 {
@@ -19795,7 +23641,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -19808,6 +23654,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: spy.clone(),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         };
 
         let _ = client.relative_delay_origins();
@@ -20003,6 +23851,54 @@ mod tests {
                 .delay_cancelers
                 .contains_key(&id),
             "cancel_enqueued must remove the delay canceler from the map"
+        );
+    }
+
+    fn deferred_test_job(id: &str) -> QueuedJob {
+        QueuedJob {
+            id: id.to_string(),
+            name: "deferred_test".to_string(),
+            queue: "default".to_string(),
+            payload: serde_json::json!({}),
+            attempt: 1,
+            max_attempts: 3,
+            initial_backoff_ms: 10,
+            tenant: None,
+            cost_waited: false,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
+        }
+    }
+
+    /// One task checks all deferred jobs, however many there are (#1720).
+    #[test]
+    fn deferred_jobs_share_one_waiter() {
+        let coordination = LocalJobCoordination::default();
+        assert!(
+            coordination.defer(deferred_test_job("a")),
+            "the first job starts the waiter"
+        );
+        assert!(
+            !coordination.defer(deferred_test_job("b")),
+            "later jobs use it"
+        );
+        assert!(!coordination.defer(deferred_test_job("c")));
+
+        let (ready, more) = coordination.take_deferred(|job| job.id == "b");
+        assert_eq!(
+            ready.iter().map(|j| j.id.as_str()).collect::<Vec<_>>(),
+            ["b"]
+        );
+        assert!(more, "two jobs still wait");
+
+        let (ready, more) = coordination.take_deferred(|_| true);
+        assert_eq!(ready.len(), 2);
+        assert!(!more, "the waiter stops when no job is left");
+        assert!(
+            coordination.defer(deferred_test_job("d")),
+            "a new job starts a new waiter"
         );
     }
 
@@ -20284,6 +24180,7 @@ mod tests {
                 }),
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -20527,7 +24424,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -20543,6 +24440,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         });
 
         enqueue_in_after_commit("test_job", serde_json::json!({"x": 1}), Duration::ZERO)
@@ -20571,7 +24470,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -20587,6 +24486,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         });
 
         let past = chrono::Utc::now() - chrono::TimeDelta::hours(1);
@@ -20725,7 +24626,7 @@ mod tests {
             local_coordination: None,
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "db")]
+            #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "sqlite")]
             sqlite: None,
@@ -20741,6 +24642,8 @@ mod tests {
             entropy: std::sync::Arc::new(crate::entropy::OsEntropy),
             clock: std::sync::Arc::new(crate::time::SystemClock),
             resilience_config: None,
+            #[cfg(feature = "postgres")]
+            shard_local: false,
         });
 
         // Called outside a db.tx, so without the eager check this would
@@ -20800,6 +24703,7 @@ mod uniqueness_concurrency_tests {
             }),
             concurrency: None,
             handler,
+            timeout: None,
         }
     }
 
@@ -20943,7 +24847,7 @@ mod uniqueness_concurrency_tests {
         assert_eq!(JobAdminStatus::Deduplicated.label(), "deduplicated");
     }
 
-    #[cfg(feature = "db")]
+    #[cfg(feature = "postgres")]
     #[test]
     fn aggregate_surveyed_job_gauges_maps_rows_to_both_families() {
         // Empty survey → empty gauges (a fully-drained backend reports nothing,
@@ -21365,6 +25269,7 @@ mod uniqueness_concurrency_tests {
                 }),
                 concurrency: None,
                 handler: unique_by_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -21446,6 +25351,7 @@ mod uniqueness_concurrency_tests {
                     key: None,
                 }),
                 handler: concurrency_probe_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -21531,6 +25437,7 @@ mod uniqueness_concurrency_tests {
                     key: Some("account_id".to_string()),
                 }),
                 handler: keyed_concurrency_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -21602,6 +25509,7 @@ mod uniqueness_concurrency_tests {
                 }),
                 concurrency: None,
                 handler: keyed_fail_or_slow_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -21679,13 +25587,31 @@ mod uniqueness_concurrency_tests {
         })
     }
 
+    /// Entropy that makes every retry wait its full 400 ms backoff (the
+    /// largest full-jitter draw), so the test can act during the wait. IDs
+    /// still come from the OS.
+    #[derive(Debug)]
+    struct FullBackoffEntropy;
+
+    impl crate::entropy::Entropy for FullBackoffEntropy {
+        fn next_u64(&self) -> u64 {
+            400
+        }
+        fn fill_bytes(&self, dest: &mut [u8]) {
+            crate::entropy::OsEntropy.fill_bytes(dest);
+        }
+    }
+
     #[tokio::test]
     async fn local_pending_window_key_is_reacquired_while_retry_waits_out_backoff() {
         let _guard = global_job_runtime_test_lock().lock().await;
         clear_global_job_client();
         PENDING_RETRY_CALLS.store(0, Ordering::SeqCst);
 
-        let state = AppState::for_test().with_profile("dev");
+        // Full jitter can draw a 0 ms wait (issue #3054). Pin the full wait.
+        let state = AppState::for_test()
+            .with_profile("dev")
+            .with_entropy(Arc::new(FullBackoffEntropy));
         let shutdown = tokio_util::sync::CancellationToken::new();
         start_local_runtime(
             vec![JobInfo {
@@ -21700,6 +25626,7 @@ mod uniqueness_concurrency_tests {
                 }),
                 concurrency: None,
                 handler: pending_retry_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -21797,6 +25724,7 @@ mod uniqueness_concurrency_tests {
                 }),
                 concurrency: None,
                 handler: dropped_pending_retry_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -21888,6 +25816,7 @@ mod uniqueness_concurrency_tests {
                     key: None,
                 }),
                 handler: slot_release_failing_handler,
+                timeout: None,
             }],
             &state,
             &shutdown,
@@ -21963,6 +25892,7 @@ mod uniqueness_concurrency_tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: priority_low_handler,
+                    timeout: None,
                 },
                 JobInfo {
                     version: 1,
@@ -21973,6 +25903,7 @@ mod uniqueness_concurrency_tests {
                     uniqueness: None,
                     concurrency: None,
                     handler: priority_urgent_handler,
+                    timeout: None,
                 },
             ],
             &state,
@@ -22099,6 +26030,110 @@ mod queue_schedule_tests {
         }
     }
 
+    /// The pre-reuse weighted `next_order`, copied with the cursor fields as
+    /// locals: a fresh `rest` and order `Vec` per call. The oracle for the
+    /// in-place refill.
+    fn reference_weighted_orders(weights: &[(&str, u32)], steps: usize) -> Vec<Vec<String>> {
+        let names: Vec<String> = weights.iter().map(|(n, _)| (*n).to_string()).collect();
+        let weights: Vec<u32> = weights.iter().map(|(_, w)| (*w).max(1)).collect();
+        let mut current = vec![0_i64; names.len()];
+        let total: i64 = weights.iter().map(|w| i64::from(*w)).sum();
+        let mut out = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let mut best = 0_usize;
+            for i in 0..names.len() {
+                current[i] = current[i].saturating_add(i64::from(weights[i]));
+                if current[i] > current[best] {
+                    best = i;
+                }
+            }
+            current[best] = current[best].saturating_sub(total);
+            let mut rest: Vec<usize> = (0..names.len()).filter(|&i| i != best).collect();
+            rest.sort_by(|&a, &b| current[b].cmp(&current[a]));
+            let mut order = Vec::with_capacity(names.len());
+            order.push(names[best].clone());
+            order.extend(rest.into_iter().map(|i| names[i].clone()));
+            out.push(order);
+        }
+        out
+    }
+
+    #[test]
+    fn weighted_cursor_keeps_its_sequence_and_reuses_its_buffer() {
+        // Hand-derived from the smooth weighted round-robin credits; one cycle
+        // is sum(weights) = 7 steps.
+        let expected: [[&str; 3]; 7] = [
+            ["critical", "default", "low"],
+            ["default", "low", "critical"],
+            ["critical", "low", "default"],
+            ["low", "critical", "default"],
+            ["critical", "default", "low"],
+            ["default", "critical", "low"],
+            ["critical", "default", "low"],
+        ];
+        let cfg = JobQueuesConfig::weighted([("critical", 4), ("default", 2), ("low", 1)]);
+        let schedule = QueueSchedule::from_config(&cfg);
+        // Dropped each step: the cursor keeps the only other handle.
+        let mut cursor = schedule.cursor();
+        for (step, want) in expected.iter().cycle().take(14).enumerate() {
+            let order = cursor.next_order();
+            assert_eq!(order.as_slice(), want.as_slice(), "step {step}");
+            assert_eq!(
+                Arc::strong_count(&order),
+                2,
+                "step {step}: cursor keeps a handle"
+            );
+        }
+        // Reused, not just kept: the first call copies off `names`, then every
+        // call after a dropped order refills that same allocation. A fresh
+        // `Vec` would get a new address, since the cursor still holds the old
+        // one while the new one is built.
+        let mut cursor = schedule.cursor();
+        drop(cursor.next_order());
+        let first = cursor.next_order();
+        let buffer = first.as_ptr();
+        drop(first);
+        for step in 0..12 {
+            let order = cursor.next_order();
+            assert_eq!(order.as_ptr(), buffer, "step {step}: buffer reused");
+        }
+        // Held: copy-on-write leaves every earlier order intact.
+        let mut cursor = schedule.cursor();
+        let held: Vec<_> = (0..7).map(|_| cursor.next_order()).collect();
+        for (step, (order, want)) in held.iter().zip(&expected).enumerate() {
+            assert_eq!(order.as_slice(), want.as_slice(), "held step {step}");
+        }
+    }
+
+    #[test]
+    fn weighted_cursor_matches_the_fresh_vec_reference() {
+        // Ties, unequal name lengths (so `clone_from` grows and shrinks a
+        // slot), a unicode name and weights that clamp to 1.
+        let tables: [&[(&str, u32)]; 4] = [
+            &[("critical", 4), ("default", 2), ("low", 1)],
+            &[
+                ("a", 1),
+                ("a-much-longer-queue-name", 1),
+                ("日本語", 3),
+                ("b", 0),
+            ],
+            &[("x", 5), ("y", 5)],
+            &[("q1", 7), ("q2", 3), ("q3", 3), ("q4", 1), ("q5", 2)],
+        ];
+        for weights in tables {
+            let cfg = JobQueuesConfig::weighted(weights.iter().copied());
+            let schedule = QueueSchedule::from_config(&cfg);
+            let reference = reference_weighted_orders(weights, 64);
+            let mut dropped = schedule.cursor();
+            let mut held_cursor = schedule.cursor();
+            let held: Vec<_> = (0..64).map(|_| held_cursor.next_order()).collect();
+            for (step, want) in reference.iter().enumerate() {
+                assert_eq!(*dropped.next_order(), *want, "{weights:?} step {step}");
+                assert_eq!(*held[step], *want, "{weights:?} held step {step}");
+            }
+        }
+    }
+
     #[test]
     fn effective_appends_unconfigured_declared_queue_at_lowest_priority() {
         let cfg = JobQueuesConfig::strict_list(["critical", "default"]);
@@ -22145,6 +26180,7 @@ mod queue_schedule_tests {
                 uniqueness: None,
                 concurrency: None,
                 handler,
+                timeout: None,
             },
         );
         let registry = Arc::new(RwLock::new(jobs));
@@ -22177,6 +26213,7 @@ mod queue_schedule_tests {
             uniqueness: None,
             concurrency: None,
             handler,
+            timeout: None,
         }];
         let cfg = JobQueuesConfig::strict_list(["critical"]);
 
@@ -22514,6 +26551,177 @@ mod queue_schedule_tests {
     }
 
     #[test]
+    fn queue_slots_passthrough_borrows_the_order() {
+        let slots = QueueSlots::new(4, QueueLimits::default());
+        let order = vec!["a".to_string(), "b".to_string()];
+        let passthrough = slots.claimable_borrowed(&order);
+        assert!(matches!(passthrough, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*passthrough, order.as_slice());
+        // With limits the filtered order is owned, and filtered as before.
+        let capped = QueueSlots::new(2, limits(&[("a", 1)], &[]));
+        let _a = capped.acquire("a");
+        let filtered = capped.claimable_borrowed(&order);
+        assert!(matches!(filtered, std::borrow::Cow::Owned(_)));
+        assert_eq!(&*filtered, ["b".to_string()].as_slice());
+        assert_eq!(capped.claimable(&order), vec!["b".to_string()]);
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions inspect the state under the one lock they read"
+    )]
+    fn queue_slots_passthrough_skips_bookkeeping() {
+        let slots = QueueSlots::new(4, QueueLimits::default());
+        let acquired = slots.acquire("a");
+        let reserved = slots.try_reserve("b").expect("no limits: always reserves");
+        {
+            let guard = slots.running.lock().unwrap();
+            assert!(guard.0.is_empty(), "no per-queue key without limits");
+            assert_eq!(guard.1, 0);
+        }
+        drop((acquired, reserved));
+        // Nothing was counted, so the drops give nothing back.
+        let guard = slots.running.lock().unwrap();
+        assert!(guard.0.is_empty());
+        assert_eq!(guard.1, 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions inspect the state under the one lock they read"
+    )]
+    fn queue_slots_reacquire_of_a_tracked_queue_counts_and_releases() {
+        let slots = QueueSlots::new(4, limits(&[("bulk", 3)], &[]));
+        let first = slots.acquire("bulk");
+        // The second take hits the already-tracked key (borrowed probe).
+        let second = slots.try_reserve("bulk").expect("under the cap");
+        {
+            let guard = slots.running.lock().unwrap();
+            assert_eq!(guard.0.get("bulk").copied(), Some(2));
+            assert_eq!(guard.1, 2);
+        }
+        drop(first);
+        assert_eq!(
+            slots.running.lock().unwrap().0.get("bulk").copied(),
+            Some(1)
+        );
+        // A guard dropped during a panic releases its slot too.
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = second;
+            panic!("job panicked while holding its slot");
+        }));
+        assert!(unwound.is_err());
+        let guard = slots.running.lock().unwrap();
+        assert_eq!(guard.0.get("bulk").copied(), Some(0));
+        assert_eq!(guard.1, 0);
+    }
+
+    #[test]
+    fn normalized_queue_name_matches_normalize_queue_name() {
+        // Expected values, not one function checked against the other:
+        // `normalize_queue_name` is `normalized_queue_name(..).to_owned()`.
+        for (raw, want) in [
+            ("", "default"),
+            (" ", "default"),
+            ("  \t\n", "default"),
+            ("mail", "mail"),
+            (" mail ", "mail"),
+            ("\tmail\n", "mail"),
+            ("default", "default"),
+            (" default ", "default"),
+            ("a b", "a b"),
+            ("日本語", "日本語"),
+            (" ünï ", "ünï"),
+        ] {
+            assert_eq!(normalized_queue_name(raw), want, "{raw:?}");
+            assert_eq!(normalize_queue_name(raw), want, "{raw:?}");
+        }
+        assert_eq!(normalized_queue_name("   "), DEFAULT_QUEUE);
+    }
+
+    fn buffered(id: &str, queue: &str) -> QueuedJob {
+        QueuedJob {
+            id: id.to_owned(),
+            name: "probe".to_owned(),
+            queue: queue.to_owned(),
+            payload: serde_json::Value::Null,
+            attempt: 1,
+            max_attempts: 1,
+            initial_backoff_ms: 0,
+            tenant: None,
+            cost_waited: false,
+            #[cfg(feature = "telemetry-otlp")]
+            traceparent: None,
+            #[cfg(feature = "telemetry-otlp")]
+            tracestate: None,
+        }
+    }
+
+    #[test]
+    fn local_buffer_push_normalizes_onto_one_bucket_per_queue() {
+        let buffer = LocalQueueBuffer::new();
+        buffer.push(buffered("1", "mail"));
+        // The bucket exists now: a borrowed probe hit, same bucket.
+        buffer.push(buffered("2", " mail "));
+        // Blank names land on the default queue.
+        buffer.push(buffered("3", "  "));
+        assert_eq!(buffer.inner.lock().unwrap().len(), 2);
+        assert_eq!(
+            buffer.try_pop_from("mail").map(|j| j.id),
+            Some("1".to_owned())
+        );
+        assert_eq!(
+            buffer.try_pop_from("mail").map(|j| j.id),
+            Some("2".to_owned())
+        );
+        assert!(buffer.try_pop_from("mail").is_none());
+        assert_eq!(
+            buffer.try_pop_from(DEFAULT_QUEUE).map(|j| j.id),
+            Some("3".to_owned())
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the assertions inspect the state under the one lock they read"
+    )]
+    fn local_fair_buffer_push_normalizes_onto_one_bucket_per_queue() {
+        let buffer = LocalQueueBuffer::with_tenant_fairness();
+        buffer.push(buffered("1", "mail"));
+        buffer.push(buffered("2", " mail "));
+        buffer.push(buffered("3", ""));
+        let mut names = buffer.fair_queue_names();
+        names.sort();
+        assert_eq!(names, vec![DEFAULT_QUEUE.to_string(), "mail".to_string()]);
+        let fair = buffer.fair.as_ref().expect("fair buffer").lock().unwrap();
+        assert_eq!(fair.get("mail").map(tenant_lanes::FairBucket::len), Some(2));
+    }
+
+    #[test]
+    fn local_buffer_fallback_sweep_respects_the_allowed_order() {
+        let buffer = LocalQueueBuffer::new();
+        buffer.push(buffered("1", "other"));
+        let order = vec!["mail".to_string()];
+        assert!(
+            buffer.try_pop(&order, Some(order.as_slice())).is_none(),
+            "pinned: no sweep outside the order"
+        );
+        let widened = vec!["mail".to_string(), "other".to_string()];
+        assert!(
+            buffer.try_pop(&order, Some(widened.as_slice())).is_some(),
+            "a queue in the allowed set is swept"
+        );
+        buffer.push(buffered("2", "other"));
+        assert!(
+            buffer.try_pop(&order, None).is_some(),
+            "unpinned: the sweep drains it"
+        );
+    }
+
+    #[test]
     fn queue_limits_from_config_reads_caps_and_reservations() {
         #[derive(serde::Deserialize)]
         struct Wrap {
@@ -22685,6 +26893,1677 @@ default = 1
             0,
             "critical's reserved slot was stolen by the flood {} time(s)",
             critical_failures.load(Ordering::SeqCst)
+        );
+    }
+}
+
+/// Claim lease and execution timeout (issue #3051).
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn heartbeat_interval_is_a_third_of_the_visibility_timeout() {
+        assert_eq!(lease_heartbeat_interval(30_000), Duration::from_secs(10));
+        assert_eq!(lease_heartbeat_interval(300), Duration::from_millis(100));
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn effective_visibility_timeout_keeps_three_renewals_inside_the_lease() {
+        assert_eq!(effective_visibility_timeout_ms(30_000), 30_000);
+        assert_eq!(
+            effective_visibility_timeout_ms(MIN_VISIBILITY_TIMEOUT_MS),
+            30
+        );
+        for configured in [0, 1, 5, 29] {
+            assert_eq!(
+                effective_visibility_timeout_ms(configured),
+                MIN_VISIBILITY_TIMEOUT_MS
+            );
+        }
+        for configured in [0, 1, 5, 29, 30, 31, 100, 30_000] {
+            let lease = effective_visibility_timeout_ms(configured);
+            let interval = lease_heartbeat_interval(lease);
+            assert!(
+                interval >= Duration::from_millis(10),
+                "no hot loop at {configured}"
+            );
+            assert!(
+                interval * 3 <= Duration::from_millis(lease),
+                "first renewal inside the lease at {configured}"
+            );
+        }
+    }
+
+    /// A heartbeat whose renewals return `results` in order, then `Renewed`.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn scripted_heartbeat(
+        results: Vec<fn() -> LeaseRenewal>,
+        calls: Arc<AtomicUsize>,
+    ) -> LeaseHeartbeat {
+        let results = Arc::new(results);
+        // 300ms visibility: renew every 100ms, give up after 200ms of failures.
+        LeaseHeartbeat::spawn(tokio::time::Instant::now(), 300, move || {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            let result = results.get(n).map_or(LeaseRenewal::Renewed, |f| f());
+            async move { result }
+        })
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_renews_on_its_interval_until_stopped() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(Vec::new(), Arc::clone(&calls));
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "one renewal per interval");
+        let lost = heartbeat.lost_token();
+        heartbeat.stop().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "no renewal after stop");
+        assert!(!lost.is_cancelled(), "a stop is not a lost lease");
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_cancels_the_lost_token_when_the_claim_is_gone() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(
+            vec![|| LeaseRenewal::Renewed, || LeaseRenewal::Lost],
+            Arc::clone(&calls),
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            lost.is_cancelled(),
+            "the second renewal found the claim gone"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the heartbeat ends on loss"
+        );
+        heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_retries_a_failed_renewal_without_losing_the_lease() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(
+            vec![|| LeaseRenewal::Failed("db down".to_owned())],
+            Arc::clone(&calls),
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            !lost.is_cancelled(),
+            "one failed renewal is not a lost lease"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the heartbeat keeps trying"
+        );
+        heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_gives_up_when_renewals_fail_for_two_thirds_of_the_timeout() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(
+            vec![|| LeaseRenewal::Failed("db down".to_owned()), || {
+                LeaseRenewal::Failed("db down".to_owned())
+            }],
+            Arc::clone(&calls),
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            lost.is_cancelled(),
+            "no renewal for 200ms of a 300ms timeout: another worker can take the job"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the heartbeat ends");
+        heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_keeps_renewing_until_the_settle_finishes() {
+        // A settle (ack/nack) that stalls past the lease, as on a reconnect
+        // or an exhausted pool. Stale recovery must not see the claim expire
+        // while the worker is still writing the result.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = scripted_heartbeat(Vec::new(), Arc::clone(&calls));
+        let lost = heartbeat.lost_token();
+        let settled = heartbeat
+            .stop_after(async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                "settled"
+            })
+            .await;
+        assert_eq!(settled, "settled");
+        assert!(
+            calls.load(Ordering::SeqCst) >= 9,
+            "renewals continue through a 1s settle on a 300ms lease, got {}",
+            calls.load(Ordering::SeqCst)
+        );
+        assert!(!lost.is_cancelled());
+        let after = calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after,
+            "no renewal after the settle"
+        );
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_keeps_a_lease_whose_renewals_are_slow_but_succeed() {
+        // Each renewal takes 90ms of the 100ms interval. Attempts must start
+        // one interval apart, not one interval after the last one finished,
+        // or the give-up time (two thirds of 300ms from the last renewal's
+        // start) passes while the next renewal is in flight.
+        let heartbeat = LeaseHeartbeat::spawn(tokio::time::Instant::now(), 300, || async {
+            tokio::time::sleep(Duration::from_millis(90)).await;
+            LeaseRenewal::Renewed
+        });
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !lost.is_cancelled(),
+            "slow renewals that all succeed must not stop the job"
+        );
+        heartbeat.stop().await;
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_gives_up_while_a_renewal_stalls() {
+        // A renewal that never returns, as on a pool wait or a reconnect.
+        let heartbeat = LeaseHeartbeat::spawn(
+            tokio::time::Instant::now(),
+            300,
+            std::future::pending::<LeaseRenewal>,
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(190)).await;
+        assert!(!lost.is_cancelled(), "inside two thirds of the timeout");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            lost.is_cancelled(),
+            "a stalled renewal must not keep the run alive past the give-up time"
+        );
+        heartbeat.stop().await;
+    }
+
+    /// A renewal that records a drop before it finishes. diesel-async panics
+    /// when it drops a `SQLite` query in flight on a current-thread runtime.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn renewal_that_records_a_drop(
+        dropped: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl FnMut() -> std::pin::Pin<Box<dyn Future<Output = LeaseRenewal> + Send>> + Send + 'static
+    {
+        struct InFlight(Arc<std::sync::atomic::AtomicBool>, bool);
+        impl Drop for InFlight {
+            fn drop(&mut self) {
+                if !self.1 {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        let dropped = Arc::clone(dropped);
+        move || {
+            let dropped = Arc::clone(&dropped);
+            Box::pin(async move {
+                let mut query = InFlight(dropped, false);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                query.1 = true;
+                LeaseRenewal::Failed("slow".to_owned())
+            })
+        }
+    }
+
+    /// The heartbeat must not drop a renewal in flight at the give-up time.
+    /// `select!` drops the losing futures before it runs a branch. On a
+    /// `SQLite` renewal, the drop panicked before `lost.cancel()`. The run
+    /// continued without a claim, and a peer ran the job again (#3067 sweep).
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_gives_up_without_dropping_a_renewal_in_flight() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat = LeaseHeartbeat::spawn(
+            tokio::time::Instant::now(),
+            300,
+            renewal_that_records_a_drop(&dropped),
+        );
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(210)).await;
+        assert!(
+            lost.is_cancelled(),
+            "the heartbeat stops the run at the give-up time"
+        );
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+        // Let the renewal finish on its own.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        heartbeat.stop().await;
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+    }
+
+    /// A stop must not drop a renewal in flight either.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_stops_without_dropping_a_renewal_in_flight() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat = LeaseHeartbeat::spawn(
+            tokio::time::Instant::now(),
+            300,
+            renewal_that_records_a_drop(&dropped),
+        );
+        // The first renewal starts at 100ms and runs for 1s.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        heartbeat.stop().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+    }
+
+    /// An overdue first renewal in `start` must not be dropped at the give-up
+    /// time.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_overdue_first_renewal_is_not_dropped_at_the_give_up_time() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let heartbeat =
+            LeaseHeartbeat::start(claimed_at, 300, renewal_that_records_a_drop(&dropped)).await;
+        assert!(
+            heartbeat.lost_token().is_cancelled(),
+            "no renewal before the give-up time: the handler must not run"
+        );
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!dropped.load(Ordering::SeqCst), "the renewal was dropped");
+    }
+
+    /// The claim's deadline starts when the backend writes the claim, before
+    /// the heartbeat starts. The renewals and the give-up time must count from
+    /// the claim, not from the spawn, or a slow claim round trip lets the
+    /// lease expire before the first renewal.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_counts_from_the_claim_not_from_its_start() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        // 300ms visibility: first renewal 100ms after the claim, give up
+        // 200ms after it.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::spawn(claimed_at, 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<LeaseRenewal>()
+            }
+        });
+        let lost = heartbeat.lost_token();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the first renewal comes one interval after the claim"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            lost.is_cancelled(),
+            "the give-up time counts from the claim"
+        );
+        heartbeat.stop().await;
+    }
+
+    /// The claim and the run setup took longer than a third of the lease, so
+    /// the first renewal is already due when the heartbeat starts. If the
+    /// claim is gone, the handler must not run at all: another worker may
+    /// already run the job.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_overdue_lost_claim_stops_the_handler_before_it_runs() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::start(claimed_at, 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { LeaseRenewal::Lost }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "renewed before returning");
+        assert!(heartbeat.lost_token().is_cancelled());
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let bounds = ExecutionBounds {
+            timeout: None,
+            lease_lost: Some(heartbeat.lost_token()),
+        };
+        let signals = crate::job_tracking::RunSignals::default();
+        let handler = {
+            let ran = Arc::clone(&ran);
+            async move {
+                ran.store(true, Ordering::SeqCst);
+            }
+        };
+        let ended = bound_run(handler, &bounds, &signals).await;
+        assert!(matches!(ended, BoundedRun::LeaseLost));
+        assert!(!ran.load(Ordering::SeqCst), "the handler never ran");
+        heartbeat.stop().await;
+    }
+
+    /// An overdue renewal that succeeds lets the run go ahead and anchors the
+    /// next renewal at its own start.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn an_overdue_claim_is_renewed_before_the_handler_runs() {
+        let claimed_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::start(claimed_at, 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { LeaseRenewal::Renewed }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "renewed before returning");
+        assert!(!heartbeat.lost_token().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "next one an interval later"
+        );
+        heartbeat.stop().await;
+    }
+
+    /// A claim that is not yet due for renewal costs no round trip at start.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn a_fresh_claim_starts_without_a_renewal() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let heartbeat = LeaseHeartbeat::start(tokio::time::Instant::now(), 300, {
+            let calls = Arc::clone(&calls);
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { LeaseRenewal::Renewed }
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        heartbeat.stop().await;
+    }
+
+    fn admin_with_running_job(attempt: u32) -> (JobAdminMemoryBackend, String) {
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        let id = admin.record_enqueue_for_test("leased", serde_json::json!({}), attempt, 3);
+        admin.record_start_for_test(&id, attempt);
+        (admin, id)
+    }
+
+    fn in_flight(state: &AppState) -> u64 {
+        state
+            .job_registry
+            .snapshot()
+            .get("leased")
+            .map_or(0, |status| status.in_flight)
+    }
+
+    #[cfg(feature = "redis")]
+    fn queued(state: &AppState) -> u64 {
+        state
+            .job_registry
+            .snapshot()
+            .get("leased")
+            .map_or(0, |status| status.queued)
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn lease_loss_settles_accounting_once_when_this_attempt_still_runs() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased");
+        let (admin, id) = admin_with_running_job(1);
+
+        record_lease_lost("leased", &id, 1, &state, &admin);
+
+        assert_eq!(in_flight(&state), 0, "balances this worker's start");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Retrying);
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn lease_loss_does_not_repeat_what_recovery_already_recorded() {
+        // Recovery in this process already moved the job on: a requeue to
+        // attempt 2 that a sibling worker then started.
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // the old attempt
+        let (admin, id) = admin_with_running_job(1);
+        state
+            .job_registry
+            .record_retry("leased", "visibility timeout expired", 1);
+        assert!(admin.take_local_claim(&id, 1), "recovery took the note");
+        admin.record_retrying(&id, "visibility timeout expired");
+        admin.record_requeued(&id, 2);
+        state.job_registry.record_start("leased"); // the replacement
+        admin.record_start_for_test(&id, 2);
+
+        record_lease_lost("leased", &id, 1, &state, &admin);
+
+        assert_eq!(in_flight(&state), 1, "the replacement is still in flight");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(
+            record.status,
+            JobAdminStatus::Running,
+            "replacement keeps its status"
+        );
+        assert_eq!(record.attempt, 2);
+
+        // A dead letter recorded by recovery is not overwritten either.
+        let (admin, id) = admin_with_running_job(1);
+        assert!(admin.take_local_claim(&id, 1), "recovery took the note");
+        admin.record_failure_for_test(&id, "visibility timeout expired");
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Failed);
+    }
+
+    /// Stale recovery requeues a job this process was running; the old
+    /// worker then loses its lease; the replacement starts here and also
+    /// loses its lease. Each start must be balanced exactly once.
+    #[cfg(feature = "db")]
+    #[test]
+    fn requeue_recovery_then_two_lease_losses_balance_in_flight() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Enqueued);
+        assert_eq!(record.attempt, 2);
+        assert_eq!(in_flight(&state), 0, "recovery balanced attempt 1");
+
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the old worker does not count again");
+
+        assert_eq!(
+            record_attempt_start("leased", &id, 2, &state, &admin),
+            JobAdminStartDecision::Started
+        );
+        state.job_registry.record_start("leased"); // attempt 2
+        admin.note_local_claim(&id, 2);
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    /// The replacement attempt starts after recovery's database requeue but
+    /// before its bookkeeping, or recovery ran in another process. Each start
+    /// must still be balanced exactly once.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn replacement_start_before_recovery_bookkeeping_balances_both_starts() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+
+        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
+        assert_eq!(decision, JobAdminStartDecision::Superseded);
+        state.job_registry.record_start("leased"); // attempt 2
+        admin.note_local_claim(&id, 2);
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Running);
+        assert_eq!(record.attempt, 2);
+        assert_eq!(
+            in_flight(&state),
+            1,
+            "attempt 1 is balanced, attempt 2 runs"
+        );
+
+        #[cfg(feature = "db")]
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        assert_eq!(
+            in_flight(&state),
+            1,
+            "late bookkeeping for attempt 1 counts nothing"
+        );
+
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn replacement_start_after_an_old_lease_loss_is_recorded() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+        record_lease_lost("leased", &id, 1, &state, &admin);
+        assert_eq!(in_flight(&state), 0);
+
+        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
+        assert_eq!(decision, JobAdminStartDecision::Started);
+        state.job_registry.record_start("leased"); // attempt 2
+        admin.note_local_claim(&id, 2);
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's start is balanced");
+    }
+
+    /// The handler finished, but stale recovery took the claim first, so the
+    /// ack or nack applies to nothing. Recovery in this process already moved
+    /// the record on; the old worker must not count its start again.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_lost_ack_after_recovery_counts_nothing_again() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0);
+
+        record_pg_lifecycle_ack_result(
+            Ok(false),
+            "leased",
+            &id,
+            1,
+            "success",
+            PgLifecycleRecord::Success,
+            &state,
+            &admin,
+        );
+        assert_eq!(in_flight(&state), 0, "attempt 1 is not balanced twice");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Enqueued);
+        assert_eq!(record.attempt, 2);
+
+        // The replacement started here: a late terminal nack for attempt 1
+        // leaves it alone.
+        state.job_registry.record_start("leased");
+        record_attempt_start("leased", &id, 2, &state, &admin);
+        admin.note_local_claim(&id, 2);
+        record_pg_lifecycle_ack_result(
+            Ok(false),
+            "leased",
+            &id,
+            1,
+            "failure",
+            PgLifecycleRecord::Failure { error: "boom" },
+            &state,
+            &admin,
+        );
+        assert_eq!(in_flight(&state), 1, "the replacement is still in flight");
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Running);
+        assert_eq!(record.attempt, 2);
+    }
+
+    /// `tokio::time::sleep` clamps a deadline past `Instant`'s range to its
+    /// far future, so an enormous timeout must not panic.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_timeout_acts_as_a_distant_deadline() {
+        let bounds = ExecutionBounds {
+            timeout: Some(Duration::from_millis(u64::MAX)),
+            lease_lost: None,
+        };
+        let signals = crate::job_tracking::RunSignals::default();
+        let ended = bound_run(async { 7 }, &bounds, &signals).await;
+        assert!(
+            matches!(ended, BoundedRun::Finished(7)),
+            "no overflow panic"
+        );
+    }
+
+    #[test]
+    fn a_start_for_the_same_or_an_older_attempt_changes_nothing() {
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        let id = admin.record_enqueue_for_test("leased", serde_json::json!({}), 2, 3);
+        admin.record_start_for_test(&id, 2);
+        assert_eq!(
+            admin.try_record_start(&id, 2),
+            JobAdminStartDecision::AlreadyTransitioned
+        );
+        assert_eq!(
+            admin.try_record_start(&id, 1),
+            JobAdminStartDecision::AlreadyTransitioned
+        );
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.attempt, 2);
+    }
+
+    /// Redis stale recovery requeued attempt 1 due at once, and a worker in
+    /// this process claimed attempt 2 before recovery's bookkeeping ran. The
+    /// bookkeeping must not balance attempt 1 again or touch attempt 2.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_recovery_bookkeeping_after_the_replacement_started_counts_nothing() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // attempt 1
+        let (admin, id) = admin_with_running_job(1);
+
+        let decision = record_attempt_start("leased", &id, 2, &state, &admin);
+        assert_eq!(decision, JobAdminStartDecision::Superseded);
+        state.job_registry.record_start("leased"); // attempt 2
+        admin.note_local_claim(&id, 2);
+        assert_eq!(in_flight(&state), 1);
+        let queued_before = queued(&state);
+
+        record_redis_recovered_requeue("leased", &id, 2, "expired", true, &state, &admin);
+        assert_eq!(in_flight(&state), 1, "attempt 1 is not balanced twice");
+        assert_eq!(
+            queued(&state),
+            queued_before,
+            "the replacement already left the queue: no enqueue is recorded"
+        );
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(
+            record.status,
+            JobAdminStatus::Running,
+            "attempt 2 still runs"
+        );
+        assert_eq!(record.attempt, 2);
+
+        record_lease_lost("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0, "the replacement's lease loss matches");
+    }
+
+    /// Redis stale recovery of an attempt this process was running balances
+    /// its start once, whether the retry is due at once or later.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_recovery_of_a_local_attempt_balances_it_once() {
+        for immediate in [true, false] {
+            let state = AppState::for_test();
+            state.job_registry.register("leased");
+            state.job_registry.record_start("leased"); // attempt 1
+            let (admin, id) = admin_with_running_job(1);
+
+            let queued_before = queued(&state);
+            record_redis_recovered_requeue("leased", &id, 2, "expired", immediate, &state, &admin);
+            assert_eq!(in_flight(&state), 0, "recovery balanced attempt 1");
+            assert_eq!(
+                queued(&state),
+                queued_before + u64::from(immediate),
+                "an immediate requeue is queued; a delayed one waits for promotion"
+            );
+            let record = admin.snapshot_record_for_test(&id).expect("record");
+            if immediate {
+                assert_eq!(record.status, JobAdminStatus::Enqueued);
+                assert_eq!(record.attempt, 2);
+            } else {
+                assert_eq!(record.status, JobAdminStatus::Retrying);
+            }
+
+            record_lease_lost("leased", &id, 1, &state, &admin);
+            assert_eq!(in_flight(&state), 0, "the old worker does not count again");
+        }
+    }
+
+    /// Redis stale recovery of a job this process did not start, or whose
+    /// lease loss it already recorded, leaves `in_flight` alone.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_recovery_leaves_counts_alone_for_a_job_not_running_here() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // some other job of this name
+        let (admin, id) = admin_with_running_job(1);
+        admin.record_retrying(&id, "lease lost"); // already balanced here
+        assert!(admin.take_local_claim(&id, 1));
+
+        record_redis_recovered_requeue("leased", &id, 2, "expired", true, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
+        let record = admin.snapshot_record_for_test(&id).expect("record");
+        assert_eq!(record.status, JobAdminStatus::Enqueued, "the requeue shows");
+        assert_eq!(record.attempt, 2);
+
+        record_redis_recovered_requeue("leased", "unknown-id", 2, "expired", true, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn requeue_recovery_leaves_counts_alone_for_a_job_started_elsewhere() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // some other job of this name
+        let (admin, id) = admin_with_running_job(1);
+        admin.record_retrying(&id, "earlier failure"); // not running here
+        assert!(admin.take_local_claim(&id, 1));
+
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
+        record_recovered_requeue("leased", "unknown-id", 2, &state, &admin);
+        assert_eq!(in_flight(&state), 1);
+    }
+
+    /// Start `attempt` of `id` here, as a durable worker does, for a job with
+    /// no admin record in this process.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    fn start_elsewhere_enqueued(
+        state: &AppState,
+        admin: &JobAdminMemoryBackend,
+        id: &str,
+        attempt: u32,
+    ) {
+        record_attempt_start("leased", id, attempt, state, admin);
+        state.job_registry.record_start("leased");
+        admin.note_local_claim(id, attempt);
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn lease_loss_balances_in_flight_when_this_process_has_no_admin_record() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+
+        record_lease_lost("leased", "enqueued-elsewhere", 1, &state, &admin);
+
+        assert_eq!(in_flight(&state), 0);
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn lease_loss_of_a_claim_started_elsewhere_leaves_in_flight_alone() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // a run of this type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+
+        record_lease_lost("leased", "never-started-here", 1, &state, &admin);
+
+        assert_eq!(in_flight(&state), 1);
+    }
+
+    /// Issue #3166: terminal recovery, then the old worker loses its lease.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn terminal_recovery_then_lease_loss_balances_once_without_a_record() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 3);
+        assert_eq!(in_flight(&state), 2);
+
+        record_recovered_failure("leased", "enqueued-elsewhere", 3, "expired", &state, &admin);
+        assert_eq!(in_flight(&state), 1, "recovery balanced attempt 3");
+
+        record_lease_lost("leased", "enqueued-elsewhere", 3, &state, &admin);
+        assert_eq!(in_flight(&state), 1, "the old worker does not count again");
+    }
+
+    /// Issue #3166: terminal recovery, then the old worker's ack applies to
+    /// nothing.
+    #[cfg(feature = "db")]
+    #[test]
+    fn terminal_recovery_then_lost_ack_balances_once_without_a_record() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 3);
+
+        record_recovered_failure("leased", "enqueued-elsewhere", 3, "expired", &state, &admin);
+        record_pg_lifecycle_ack_result(
+            Ok(false),
+            "leased",
+            "enqueued-elsewhere",
+            3,
+            "failure",
+            PgLifecycleRecord::Failure { error: "boom" },
+            &state,
+            &admin,
+        );
+
+        assert_eq!(in_flight(&state), 1, "attempt 3 is balanced once");
+    }
+
+    /// A lost ack for a claim that recovery in another process took still
+    /// balances this process's start.
+    #[cfg(feature = "db")]
+    #[test]
+    fn lost_ack_after_recovery_elsewhere_balances_the_start_once() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+
+        for _ in 0..2 {
+            record_pg_lifecycle_ack_result(
+                Ok(false),
+                "leased",
+                "enqueued-elsewhere",
+                1,
+                "success",
+                PgLifecycleRecord::Success,
+                &state,
+                &admin,
+            );
+        }
+
+        assert_eq!(in_flight(&state), 1, "only the other run remains");
+    }
+
+    /// Recovery of a claim another process started changes no gauge here
+    /// except the failure counters.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn terminal_recovery_of_a_claim_started_elsewhere_leaves_in_flight_alone() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // a run of this type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+
+        record_recovered_failure("leased", "started-elsewhere", 3, "expired", &state, &admin);
+
+        let status = state.job_registry.snapshot()["leased"].clone();
+        assert_eq!(status.in_flight, 1);
+        assert_eq!(status.total_failures, 1, "the dead letter still counts");
+        assert_eq!(status.dead_letters, 1);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn requeue_recovery_of_a_claim_started_here_balances_it_once_without_a_record() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+
+        record_recovered_requeue("leased", "enqueued-elsewhere", 2, &state, &admin);
+        assert_eq!(in_flight(&state), 1, "recovery balanced attempt 1");
+
+        record_lease_lost("leased", "enqueued-elsewhere", 1, &state, &admin);
+        assert_eq!(in_flight(&state), 1, "the old worker does not count again");
+    }
+
+    /// A newer attempt starts here while an older one still counts, and this
+    /// process has no admin record for the job.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[test]
+    fn a_superseded_start_is_balanced_without_an_admin_record() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 2);
+        assert_eq!(in_flight(&state), 1, "attempt 1 is balanced");
+
+        record_lease_lost("leased", "enqueued-elsewhere", 1, &state, &admin);
+        assert_eq!(in_flight(&state), 1, "late lease loss counts nothing");
+        record_lease_lost("leased", "enqueued-elsewhere", 2, &state, &admin);
+        assert_eq!(in_flight(&state), 0);
+    }
+
+    /// A settled claim leaves no note behind.
+    #[cfg(feature = "db")]
+    #[test]
+    fn an_applied_ack_drops_the_claim_note() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+
+        record_pg_lifecycle_ack_result(
+            Ok(true),
+            "leased",
+            "enqueued-elsewhere",
+            1,
+            "success",
+            PgLifecycleRecord::Success,
+            &state,
+            &admin,
+        );
+
+        assert_eq!(in_flight(&state), 0);
+        assert!(!admin.take_local_claim("enqueued-elsewhere", 1));
+    }
+
+    /// The note decides, not the record: a record that no longer shows the
+    /// attempt as running does not stop recovery from balancing a start this
+    /// process made.
+    #[cfg(feature = "db")]
+    #[test]
+    fn requeue_recovery_balances_a_noted_start_whatever_the_record_shows() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let (admin, id) = admin_with_running_job(1);
+        state.job_registry.record_start("leased"); // attempt 1
+        admin.record_retrying(&id, "earlier failure");
+
+        record_recovered_requeue("leased", &id, 2, &state, &admin);
+
+        assert_eq!(in_flight(&state), 1, "attempt 1 is balanced");
+    }
+
+    /// The worker settled first, so recovery finds no note.
+    #[cfg(feature = "db")]
+    #[test]
+    fn recovery_after_the_worker_settled_balances_nothing() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "elsewhere", 1);
+        record_pg_lifecycle_ack_result(
+            Ok(true),
+            "leased",
+            "elsewhere",
+            1,
+            "success",
+            PgLifecycleRecord::Success,
+            &state,
+            &admin,
+        );
+        assert_eq!(in_flight(&state), 1);
+
+        record_recovered_requeue("leased", "elsewhere", 2, &state, &admin);
+        record_recovered_failure("leased", "elsewhere", 1, "expired", &state, &admin);
+
+        assert_eq!(in_flight(&state), 1);
+    }
+
+    /// The retry of attempt 1 commits and a sibling worker here claims attempt
+    /// 2 before attempt 1 finishes its bookkeeping. The start of attempt 2
+    /// balanced attempt 1. The late applied ack must not balance it again.
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_late_applied_ack_does_not_balance_a_successor_attempt() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 1);
+        start_elsewhere_enqueued(&state, &admin, "enqueued-elsewhere", 2);
+        assert_eq!(in_flight(&state), 1, "attempt 2 runs");
+
+        record_pg_lifecycle_ack_result(
+            Ok(true),
+            "leased",
+            "enqueued-elsewhere",
+            1,
+            "failure",
+            PgLifecycleRecord::Retry {
+                error: "boom",
+                attempt: 1,
+                ready_at_ms: None,
+            },
+            &state,
+            &admin,
+        );
+
+        assert_eq!(in_flight(&state), 1, "attempt 2 still runs");
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_late_applied_redis_ack_does_not_balance_a_successor_attempt() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "elsewhere", 1);
+        start_elsewhere_enqueued(&state, &admin, "elsewhere", 2);
+
+        settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, true);
+        state.job_registry.record_success("leased");
+
+        assert_eq!(in_flight(&state), 1, "attempt 2 still runs");
+    }
+
+    /// A Redis ack that applied to nothing balances the start once, whether
+    /// recovery ran here or elsewhere.
+    #[cfg(feature = "redis")]
+    #[test]
+    fn a_lost_redis_ack_balances_the_start_once() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        state.job_registry.record_start("leased"); // another run, same type
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "elsewhere", 1);
+        // Recovery elsewhere: both acks apply to nothing.
+        settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, false);
+        settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, false);
+        assert_eq!(in_flight(&state), 1, "only the other run remains");
+
+        // Recovery here took the claim first.
+        start_elsewhere_enqueued(&state, &admin, "here", 3);
+        record_recovered_failure("leased", "here", 3, "expired", &state, &admin);
+        settle_redis_claim(&state, &admin, "leased", "here", 3, false);
+        assert_eq!(in_flight(&state), 1);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn an_applied_redis_ack_drops_the_claim_note() {
+        let state = AppState::for_test();
+        state.job_registry.register("leased");
+        let admin = JobAdminMemoryBackend::new_for_test(16);
+        start_elsewhere_enqueued(&state, &admin, "elsewhere", 1);
+        state.job_registry.record_success("leased");
+
+        settle_redis_claim(&state, &admin, "leased", "elsewhere", 1, true);
+
+        assert_eq!(in_flight(&state), 0, "an applied ack balances nothing");
+        assert!(!admin.take_local_claim("elsewhere", 1));
+    }
+
+    #[cfg(any(feature = "db", feature = "redis"))]
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_heartbeat_stops_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        drop(scripted_heartbeat(Vec::new(), Arc::clone(&calls)));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a dropped heartbeat never renews"
+        );
+    }
+
+    static TIMEOUT_SEEN: AtomicUsize = AtomicUsize::new(0);
+    static LEASE_SEEN: AtomicUsize = AtomicUsize::new(0);
+    /// Owned by `a_stalled_failure_settle_is_capped`: sharing `TIMEOUT_SEEN`
+    /// made the count read 2 when both timeout tests ran in parallel.
+    static STALLED_SETTLE_SEEN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Spawn work that records how the run was stopped in `seen`: 1 for a
+    /// timeout, 10 for a lost lease. Then hang.
+    async fn hang_and_watch(seen: &'static AtomicUsize) -> AutumnResult<()> {
+        let ctx = crate::job_tracking::JobContext::current();
+        assert!(!ctx.is_cancelled() && !ctx.lease_lost());
+        // Work the handler spawned outlives the handler future.
+        tokio::spawn(async move {
+            ctx.cancelled().await;
+            seen.fetch_add(if ctx.lease_lost() { 10 } else { 1 }, Ordering::SeqCst);
+        });
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+
+    fn timeout_watch_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(hang_and_watch(&TIMEOUT_SEEN))
+    }
+
+    fn stalled_settle_watch_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(hang_and_watch(&STALLED_SETTLE_SEEN))
+    }
+
+    fn lease_watch_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(hang_and_watch(&LEASE_SEEN))
+    }
+
+    fn boom_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move { panic!("boom") })
+    }
+
+    fn quick_handler(
+        _state: AppState,
+        _payload: Value,
+    ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'static>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_over_its_timeout_fails_and_cancels_spawned_work() {
+        let outcome = run_job_handler(
+            "hang",
+            timeout_watch_handler,
+            AppState::for_test().with_profile("dev"),
+            serde_json::json!({}),
+            false,
+            ExecutionBounds {
+                timeout: Some(Duration::from_millis(250)),
+                lease_lost: None,
+            },
+            crate::cost::WorkRun::default(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            JobExecutionOutcome::Failed("job timed out after 250ms".to_owned())
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            TIMEOUT_SEEN.load(Ordering::SeqCst),
+            1,
+            "timeout, not lease loss"
+        );
+    }
+
+    /// A tracking store whose chosen calls never return (issue #3151).
+    struct StalledTrackingStore {
+        stall_mark_running: bool,
+        stall_settle: bool,
+    }
+
+    impl crate::job_tracking::JobTrackingStore for StalledTrackingStore {
+        fn create<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: crate::job_tracking::TrackedJobOwner,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn mark_running<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            let stall = self.stall_mark_running;
+            Box::pin(async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn set_progress<'a>(
+            &'a self,
+            _key: &'a str,
+            _pct: u8,
+            _message: Option<String>,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn complete<'a>(
+            &'a self,
+            _key: &'a str,
+            _result: Value,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            let stall = self.stall_settle;
+            Box::pin(async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn fail<'a>(
+            &'a self,
+            _key: &'a str,
+            _error: String,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            let stall = self.stall_settle;
+            Box::pin(async move {
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = AutumnResult<Option<crate::job_tracking::TrackedJobRecord>>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn reset_for_retry<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: crate::job_tracking::TrackedJobOwner,
+            _expected: crate::job_tracking::RetryToken,
+        ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get_with_token<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> Pin<
+            Box<
+                dyn Future<
+                        Output = AutumnResult<
+                            Option<(
+                                crate::job_tracking::TrackedJobRecord,
+                                crate::job_tracking::RetryToken,
+                            )>,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unstalled_store_answers_every_call() {
+        use crate::job_tracking::{JobTrackingStore as _, TrackedJobOwner};
+        let store = StalledTrackingStore {
+            stall_mark_running: false,
+            stall_settle: false,
+        };
+        store.create("k", TrackedJobOwner::Anonymous).await.unwrap();
+        store.mark_running("k").await.unwrap();
+        store.set_progress("k", 5, None).await.unwrap();
+        store.complete("k", Value::Null).await.unwrap();
+        store.fail("k", "e".to_owned()).await.unwrap();
+        assert!(store.get("k").await.unwrap().is_none());
+        assert!(store.get_with_token("k").await.unwrap().is_none());
+        store
+            .reset_for_retry(
+                "k",
+                TrackedJobOwner::Anonymous,
+                crate::job_tracking::RetryToken::new(0),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Run a tracked job against `store`. The run must end within a long
+    /// virtual deadline, or the test fails.
+    async fn run_tracked(
+        store: StalledTrackingStore,
+        handler: JobHandler,
+        final_attempt: bool,
+        timeout: Option<Duration>,
+    ) -> JobExecutionOutcome {
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(crate::job_tracking::JobTrackingStoreEntry(Arc::new(store)));
+        let payload =
+            crate::job_tracking::wrap_tracked_payload("tracked-key", &serde_json::json!({}));
+        tokio::time::timeout(
+            Duration::from_secs(3600),
+            run_job_handler(
+                "tracked",
+                handler,
+                state,
+                payload,
+                final_attempt,
+                ExecutionBounds {
+                    timeout,
+                    lease_lost: None,
+                },
+                crate::cost::WorkRun::default(),
+            ),
+        )
+        .await
+        .expect("a stalled tracking store must not hold the worker")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_mark_running_counts_toward_the_timeout() {
+        let outcome = run_tracked(
+            StalledTrackingStore {
+                stall_mark_running: true,
+                stall_settle: false,
+            },
+            quick_handler,
+            false,
+            Some(Duration::from_millis(250)),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            JobExecutionOutcome::Failed("job timed out after 250ms".to_owned())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_success_settle_is_capped() {
+        let outcome = run_tracked(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+            quick_handler,
+            true,
+            Some(Duration::from_millis(250)),
+        )
+        .await;
+        assert_eq!(outcome, JobExecutionOutcome::Succeeded);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_failure_settle_is_capped() {
+        let outcome = run_tracked(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+            stalled_settle_watch_handler,
+            true,
+            Some(Duration::from_millis(250)),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            JobExecutionOutcome::Failed("job timed out after 250ms".to_owned())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_settle_ends_at_the_cap_even_with_a_longer_timeout() {
+        let start = tokio::time::Instant::now();
+        let outcome = run_tracked(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+            quick_handler,
+            true,
+            Some(Duration::from_secs(600)),
+        )
+        .await;
+        assert_eq!(outcome, JobExecutionOutcome::Succeeded);
+        assert_eq!(start.elapsed(), crate::job_tracking::TRACKING_SETTLE_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_settle_ends_at_the_cap_with_no_timeout() {
+        let start = tokio::time::Instant::now();
+        let outcome = run_tracked(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+            boom_handler,
+            false,
+            None,
+        )
+        .await;
+        assert!(matches!(outcome, JobExecutionOutcome::Panicked(_)));
+        assert_eq!(start.elapsed(), crate::job_tracking::TRACKING_SETTLE_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_terminal_write_outside_the_handler_is_capped() {
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(crate::job_tracking::JobTrackingStoreEntry(Arc::new(
+            StalledTrackingStore {
+                stall_mark_running: false,
+                stall_settle: true,
+            },
+        )));
+        let payload =
+            crate::job_tracking::wrap_tracked_payload("tracked-key", &serde_json::json!({}));
+        let start = tokio::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(3600),
+            crate::job_tracking::settle_tracked_payload_as_failed(&state, &payload, "cancelled"),
+        )
+        .await
+        .expect("a stalled tracking store must not hold the caller");
+        assert_eq!(start.elapsed(), crate::job_tracking::TRACKING_SETTLE_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_stops_a_stalled_mark_running() {
+        let lost = tokio_util::sync::CancellationToken::new();
+        let state = AppState::for_test().with_profile("dev");
+        state.insert_extension(crate::job_tracking::JobTrackingStoreEntry(Arc::new(
+            StalledTrackingStore {
+                stall_mark_running: true,
+                stall_settle: false,
+            },
+        )));
+        let payload =
+            crate::job_tracking::wrap_tracked_payload("tracked-key", &serde_json::json!({}));
+        let run = tokio::spawn(run_job_handler(
+            "tracked",
+            quick_handler,
+            state,
+            payload,
+            false,
+            ExecutionBounds {
+                timeout: None,
+                lease_lost: Some(lost.clone()),
+            },
+            crate::cost::WorkRun::default(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lost.cancel();
+        assert_eq!(run.await.expect("run task"), JobExecutionOutcome::LeaseLost);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lost_lease_stops_the_run_and_flags_the_context() {
+        let lost = tokio_util::sync::CancellationToken::new();
+        let run = tokio::spawn(run_job_handler(
+            "hang",
+            lease_watch_handler,
+            AppState::for_test().with_profile("dev"),
+            serde_json::json!({}),
+            false,
+            ExecutionBounds {
+                timeout: None,
+                lease_lost: Some(lost.clone()),
+            },
+            crate::cost::WorkRun::default(),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lost.cancel();
+        let outcome = run.await.expect("run task");
+        assert_eq!(outcome, JobExecutionOutcome::LeaseLost);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            LEASE_SEEN.load(Ordering::SeqCst),
+            10,
+            "lease loss is flagged"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_run_inside_its_bounds_succeeds() {
+        let outcome = run_job_handler(
+            "quick",
+            quick_handler,
+            AppState::for_test().with_profile("dev"),
+            serde_json::json!({}),
+            true,
+            ExecutionBounds {
+                timeout: Some(Duration::from_secs(1)),
+                lease_lost: Some(tokio_util::sync::CancellationToken::new()),
+            },
+            crate::cost::WorkRun::default(),
+        )
+        .await;
+        assert_eq!(outcome, JobExecutionOutcome::Succeeded);
+    }
+
+    #[test]
+    fn a_context_outside_a_run_is_never_cancelled() {
+        let ctx = crate::job_tracking::JobContext::current();
+        assert!(!ctx.lease_lost());
+        assert!(!ctx.is_cancelled());
+    }
+
+    #[test]
+    fn default_timeout_fills_only_jobs_with_no_timeout() {
+        let mut own = JobInfo::new("own", 1, 1, quick_handler);
+        own.timeout = Some(Duration::from_secs(5));
+        let jobs = vec![own, JobInfo::new("plain", 1, 1, quick_handler)];
+
+        let unchanged = apply_default_timeout(jobs.clone(), 0);
+        assert_eq!(unchanged[1].timeout, None, "0 means no limit");
+
+        let applied = apply_default_timeout(jobs, 2_000);
+        assert_eq!(
+            applied[0].timeout,
+            Some(Duration::from_secs(5)),
+            "own timeout wins"
+        );
+        assert_eq!(applied[1].timeout, Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn lease_lost_is_never_a_capsule_outcome() {
+        #[cfg(feature = "reporting")]
+        assert!(job_capsule_outcome(&JobExecutionOutcome::LeaseLost, true).is_none());
+    }
+
+    static LOCAL_HUNG_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static LOCAL_AFTER_RAN: AtomicUsize = AtomicUsize::new(0);
+
+    /// The timeout also bounds the local backend: a hung job fails, retries,
+    /// and frees the only worker for the next job.
+    #[tokio::test]
+    async fn local_backend_times_out_a_hung_job_and_frees_the_worker() {
+        let _guard = global_job_runtime_test_lock().lock().await;
+        clear_global_job_client();
+        LOCAL_HUNG_RUNS.store(0, Ordering::SeqCst);
+        LOCAL_AFTER_RAN.store(0, Ordering::SeqCst);
+
+        let mut hung = JobInfo::new("local_hung", 2, 1, |_state, _payload| {
+            Box::pin(async move {
+                LOCAL_HUNG_RUNS.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        });
+        hung.timeout = Some(Duration::from_millis(100));
+        let after = JobInfo::new("local_after", 1, 1, |_state, _payload| {
+            Box::pin(async move {
+                LOCAL_AFTER_RAN.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let state = AppState::for_test().with_profile("dev");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let config = crate::config::JobConfig {
+            workers: 1,
+            ..Default::default()
+        };
+        start_runtime(vec![hung, after], &state, &shutdown, &config, true)
+            .expect("local runtime starts");
+
+        enqueue("local_hung", serde_json::json!({}))
+            .await
+            .expect("enqueue");
+        enqueue("local_after", serde_json::json!({}))
+            .await
+            .expect("enqueue");
+
+        let dead_letters = || {
+            state
+                .job_registry
+                .snapshot()
+                .get("local_hung")
+                .map_or(0, |status| status.dead_letters)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while (LOCAL_AFTER_RAN.load(Ordering::SeqCst) < 1 || dead_letters() < 1)
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            LOCAL_AFTER_RAN.load(Ordering::SeqCst),
+            1,
+            "the worker was freed"
+        );
+        assert_eq!(
+            LOCAL_HUNG_RUNS.load(Ordering::SeqCst),
+            2,
+            "the timeout was retried"
+        );
+        let status = state
+            .job_registry
+            .snapshot()
+            .get("local_hung")
+            .cloned()
+            .expect("registered");
+        assert_eq!(status.dead_letters, 1, "the last attempt dead-letters");
+        assert!(
+            status
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out")),
+            "{status:?}"
+        );
+
+        shutdown.cancel();
+        clear_global_job_client();
+    }
+}
+
+#[cfg(all(test, feature = "db", not(feature = "sqlite")))]
+mod shard_job_schema_tests {
+    /// Every control migration that touches `autumn_jobs` must be in
+    /// `SHARD_JOB_SCHEMA`, or shard-local job tables drift (#3072).
+    #[test]
+    fn shard_job_schema_lists_every_autumn_jobs_migration() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut touching: Vec<String> = std::fs::read_dir(&dir)
+            .expect("migrations dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                // A statement (not a `--` comment) that names the table.
+                std::fs::read_to_string(entry.path().join("up.sql")).is_ok_and(|sql| {
+                    sql.lines()
+                        .filter(|line| !line.trim_start().starts_with("--"))
+                        .any(|line| {
+                            line.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                                .any(|word| word == "autumn_jobs")
+                        })
+                })
+            })
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        touching.sort();
+        let listed: Vec<String> = super::SHARD_JOB_SCHEMA
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        assert_eq!(
+            listed, touching,
+            "add the new autumn_jobs migration to SHARD_JOB_SCHEMA"
         );
     }
 }

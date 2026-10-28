@@ -266,7 +266,7 @@ pub fn check_dependencies_impl(eval: &crate::deps::Evaluation) -> CheckResult {
         Evaluation::AuditorMissing { checks } => (
             CheckStatus::Pass,
             format!(
-                "not evaluated — cargo-deny is not installed (`cargo install --locked cargo-deny`); {}",
+                "not evaluated. cargo-deny is not installed (`cargo install --locked cargo-deny`). Doctor cannot check that deny.toml is valid, so CI can still reject it; {}",
                 dependency_checks_phrase(checks)
             ),
             None,
@@ -1950,6 +1950,9 @@ pub fn check_custom_domains_config_impl(
             hint: Some("Raise [server.tls.acme.custom_domains] max_domains"),
         });
     }
+    if let Some(warn) = check_custom_domain_instructions(cd, registry) {
+        return Some(warn);
+    }
     Some(CheckResult {
         name: "custom_domains",
         status: CheckStatus::Pass,
@@ -1958,6 +1961,51 @@ pub fn check_custom_domains_config_impl(
             cd.max_domains
         )),
         hint: None,
+    })
+}
+
+/// Warn when a registered domain gets no DNS instructions (#2643).
+///
+/// Uses [`RoutingRecord::for_hostname`](autumn_web::custom_domain::RoutingRecord::for_hostname),
+/// as the tenant view does, so the two use one apex rule.
+fn check_custom_domain_instructions(
+    cd: &autumn_web::config::CustomDomainsConfig,
+    registry: &CustomDomainRegistryRead,
+) -> Option<CheckResult> {
+    use std::fmt::Write as _;
+    const SHOWN: usize = 5;
+    let ingress = cd.ingress();
+    let unusable: Vec<(&str, String)> = registry
+        .domains
+        .iter()
+        .filter_map(|(hostname, ..)| {
+            autumn_web::custom_domain::RoutingRecord::for_hostname(hostname, &ingress)
+                .err()
+                .map(|e| (hostname.as_str(), e))
+        })
+        .collect();
+    let (_, first) = unusable.first()?;
+    let mut names = unusable
+        .iter()
+        .take(SHOWN)
+        .map(|(hostname, _)| *hostname)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unusable.len() > SHOWN {
+        let _ = write!(names, " and {} more", unusable.len() - SHOWN);
+    }
+    let count = match unusable.len() {
+        1 => "1 registered domain gets".to_owned(),
+        n => format!("{n} registered domains get"),
+    };
+    Some(CheckResult {
+        name: "custom_domains",
+        status: CheckStatus::Warn,
+        detail: Some(format!("{count} no DNS instructions ({names}): {first}")),
+        hint: Some(
+            "Set [server.tls.acme.custom_domains] ingress_ipv4 / ingress_ipv6 for apex \
+             domains, and ingress_hostname for subdomains",
+        ),
     })
 }
 
@@ -3696,7 +3744,11 @@ fn resolve_daemon_service_report() -> DaemonServiceReport {
         DaemonServiceReport {
             service_capable: true,
             daemon,
-            service: crate::service::registered_service_state(&identity),
+            // A failed query shows as "no service" here. `doctor` only reports.
+            // `serve restart` treats the same failure as an error.
+            service: crate::service::registered_service_state(&identity)
+                .ok()
+                .flatten(),
             missing_prerequisites: crate::service::missing_prerequisites(),
         }
     }
@@ -7472,7 +7524,8 @@ pub struct AcmeDoctorConfig {
     /// the server won't boot, but doctor previously `filter_map`ped non-strings
     /// away — keeping the valid names and passing while the server rejects the
     /// config. Recorded here so the grader surfaces it as an `acme_config` FAIL.
-    /// `None` when every entry is a string (or `domains` is absent).
+    /// Also set when `domains` is not a list. `None` when every entry is a
+    /// string (or `domains` is absent).
     pub domains_error: Option<String>,
     /// The rendered invalid `acme.renew_before_days` value when the key is
     /// PRESENT but does not deserialize as a `u32` the way the runtime's typed
@@ -7487,6 +7540,17 @@ pub struct AcmeDoctorConfig {
     /// value is a valid `u32` or the key is absent (absent uses the runtime
     /// default, 30).
     pub renew_before_days_error: Option<String>,
+    /// The rendered `cache_dir` value when it is present but not a string. The
+    /// runtime's `PathBuf` field fails to deserialize and the server will not
+    /// boot (#2413). `None` when valid or absent.
+    pub cache_dir_error: Option<String>,
+    /// The rendered `contact_email` value when it is present but not a string
+    /// (#2413). `None` when valid or absent.
+    pub contact_email_error: Option<String>,
+    /// The rendered `acme` value when `[server.tls] acme` is not a table. The
+    /// runtime's `Option<AcmeConfig>` fails to deserialize; every other field
+    /// holds its default (#2413). `None` when `acme` is a table.
+    pub section_error: Option<String>,
     /// The `[server.tls.acme.dns]` section (issue #1620), when configured, as the
     /// runtime's typed `AcmeDnsConfig` sees it. `None` when the section is absent
     /// (HTTP-01 issuance) or when it does not deserialize — see
@@ -7619,14 +7683,24 @@ fn acme_short_hash(input: &str) -> String {
 
 /// Resolve `[server.tls.acme]` from the parsed `autumn.toml`, if configured.
 fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDoctorConfig> {
-    let acme = toml_table?
+    let acme_value = toml_table?
         .get("server")
         .and_then(toml::Value::as_table)?
         .get("tls")
         .and_then(toml::Value::as_table)?
-        .get("acme")
-        .and_then(toml::Value::as_table)?;
+        .get("acme")?;
+    let Some(acme) = acme_value.as_table() else {
+        // The runtime cannot deserialize a non-table `acme`; do not skip the checks.
+        let empty = toml::Table::new();
+        let mut config = resolve_acme_fields(&empty);
+        config.section_error = Some(acme_value.to_string().trim().to_owned());
+        return Some(config);
+    };
+    Some(resolve_acme_fields(acme))
+}
 
+/// Resolve the keys of a `[server.tls.acme]` table.
+fn resolve_acme_fields(acme: &toml::Table) -> AcmeDoctorConfig {
     // Collect the domains as the runtime's typed `Vec<String>` deserialization
     // does — and, unlike a lenient `filter_map`, RECORD any non-string entry
     // (e.g. `domains = ["app.example.com", 123]`) instead of silently dropping it.
@@ -7634,24 +7708,30 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
     // must FAIL rather than pass on the surviving string names.
     let mut domains = Vec::new();
     let mut domains_error = None;
-    if let Some(array) = acme.get("domains").and_then(toml::Value::as_array) {
-        for (index, entry) in array.iter().enumerate() {
-            let Some(domain) = entry.as_str() else {
-                domains_error = Some(format!(
-                    "entry at index {index} ({}) is not a string",
-                    entry.to_string().trim()
-                ));
-                break;
-            };
-            domains.push(domain.to_owned());
+    match acme.get("domains") {
+        None => {}
+        Some(toml::Value::Array(array)) => {
+            for (index, entry) in array.iter().enumerate() {
+                let Some(domain) = entry.as_str() else {
+                    domains_error = Some(format!(
+                        "entry at index {index} ({}) is not a string",
+                        entry.to_string().trim()
+                    ));
+                    break;
+                };
+                domains.push(domain.to_owned());
+            }
+        }
+        Some(other) => {
+            domains_error = Some(format!("value {} is not a list", other.to_string().trim()));
         }
     }
 
-    let contact_email = acme
-        .get("contact_email")
-        .and_then(toml::Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+    let (contact_email, contact_email_error) =
+        match parse_acme_scalar(acme, "contact_email", String::new()) {
+            Ok(email) => (email, None),
+            Err(bad_value) => (String::new(), Some(bad_value)),
+        };
 
     // Deserialize `http_challenge_port` the way the runtime's typed `AcmeConfig`
     // does: an absent key defaults to 80, an explicit valid `u16` is preserved
@@ -7676,10 +7756,11 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         Err(bad_value) => (30, Some(bad_value)),
     };
 
-    let cache_dir = acme
-        .get("cache_dir")
-        .and_then(toml::Value::as_str)
-        .map_or_else(|| std::path::PathBuf::from("config/acme"), Into::into);
+    let (cache_dir, cache_dir_error) =
+        match parse_acme_scalar(acme, "cache_dir", std::path::PathBuf::from("config/acme")) {
+            Ok(dir) => (dir, None),
+            Err(bad_value) => (std::path::PathBuf::from("config/acme"), Some(bad_value)),
+        };
 
     // Deserialize `directory` the way the runtime does; on error, record the bad
     // value so the acme-config grader FAILs (the runtime won't boot on it) rather
@@ -7726,7 +7807,7 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
             }
         });
 
-    Some(AcmeDoctorConfig {
+    AcmeDoctorConfig {
         domains,
         contact_email,
         http_challenge_port,
@@ -7739,11 +7820,14 @@ fn resolve_acme_doctor_config(toml_table: Option<&toml::Table>) -> Option<AcmeDo
         ca_root_error,
         domains_error,
         renew_before_days_error,
+        cache_dir_error,
+        contact_email_error,
+        section_error: None,
         dns,
         dns_error,
         custom_domains,
         custom_domains_error,
-    })
+    }
 }
 
 /// The shared `acme_config` Fail shape: every ACME-config violation reports the
@@ -7777,15 +7861,26 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
         port_error,
         domains_error,
         renew_before_days_error,
+        cache_dir_error,
+        contact_email_error,
+        section_error,
         ..
     } = config;
 
+    if let Some(bad_value) = section_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls] acme value {bad_value} is not valid: [server.tls.acme] must be a \
+                 table. The runtime fails to boot on any other type"
+            ),
+            "Write [server.tls.acme] as a table with its own keys",
+        ));
+    }
     if let Some(bad_value) = domains_error {
         return Some(acme_config_fail(
             format!(
-                "[server.tls.acme] domains {bad_value}: every entry must be a string hostname. \
-                 The runtime deserializes domains as a list of strings and fails to boot on a \
-                 non-string entry"
+                "[server.tls.acme] domains {bad_value}: it must be a list of string hostnames. \
+                 The runtime fails to boot on any other type"
             ),
             "List only string hostnames in [server.tls.acme] domains",
         ));
@@ -7824,6 +7919,24 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
              30), unquoted",
         ));
     }
+    if let Some(bad_value) = cache_dir_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls.acme] cache_dir value {bad_value} is not a valid path: it must be \
+                 a string. The runtime fails to boot on any other type"
+            ),
+            "Set [server.tls.acme] cache_dir to a quoted directory path",
+        ));
+    }
+    if let Some(bad_value) = contact_email_error {
+        return Some(acme_config_fail(
+            format!(
+                "[server.tls.acme] contact_email value {bad_value} is not valid: it must be a \
+                 string. The runtime fails to boot on any other type"
+            ),
+            "Set [server.tls.acme] contact_email to a quoted email address",
+        ));
+    }
     None
 }
 
@@ -7849,14 +7962,19 @@ fn check_acme_deserialize_errors(config: &AcmeDoctorConfig) -> Option<CheckResul
 /// This grader returns a `Fail` [`CheckResult`] for the first violated rule
 /// (messages mirror the runtime's), or `None` when the ACME config is valid.
 ///
-/// The recorded deserialize errors on `config` — [`domains_error`],
-/// [`directory_error`], [`port_error`] and [`renew_before_days_error`] — are
-/// checked FIRST, because the runtime DESERIALIZES `AcmeConfig` (failing on a
-/// non-string `domains` entry, a bad `directory`, or an out-of-range /
-/// non-integer `http_challenge_port` / `renew_before_days`) before it ever runs
+/// The recorded deserialize errors on `config` — [`section_error`],
+/// [`domains_error`], [`directory_error`], [`port_error`],
+/// [`renew_before_days_error`], [`cache_dir_error`] and [`contact_email_error`] —
+/// are checked FIRST, because the runtime DESERIALIZES `AcmeConfig` (failing on a
+/// non-table `acme`, a non-list or non-string `domains`, a bad `directory`, a
+/// non-string `cache_dir` / `contact_email`, or an out-of-range / non-integer
+/// `http_challenge_port` / `renew_before_days`) before it ever runs
 /// `validate()`. Each one is a rendered invalid value the operator wrote, so the
 /// FAIL can name it.
 ///
+/// [`section_error`]: AcmeDoctorConfig::section_error
+/// [`cache_dir_error`]: AcmeDoctorConfig::cache_dir_error
+/// [`contact_email_error`]: AcmeDoctorConfig::contact_email_error
 /// [`domains_error`]: AcmeDoctorConfig::domains_error
 /// [`directory_error`]: AcmeDoctorConfig::directory_error
 /// [`port_error`]: AcmeDoctorConfig::port_error
@@ -8003,20 +8121,13 @@ fn check_acme_domain_entries(domains: &[String], dns_configured: bool) -> Option
     None
 }
 
-/// The set of domains the `--online` doctor actively probes (port 80/443 + DNS).
+/// The base domains the `--online` doctor probes for `_acme-challenge` DNS.
 ///
-/// This is EVERY configured domain, not just the first: issuance orders an
-/// authorization for each name in `config.domains`, so probing only the first
-/// name can let doctor pass while issuance fails on an unprobed domain. Extracted
-/// as a pure helper so the "probe every configured domain" contract is
-/// unit-testable without real network I/O — `run()` enqueues one bounded port
-/// task and one DNS task for each domain returned here.
+/// Issuance orders an authorization for each name, so all configured domains
+/// are probed. A `*.` entry maps to its base domain, which holds the challenge
+/// record. A duplicate of an explicit apex is dropped (#1620). Port and address
+/// checks use [`acme_online_reachability_hosts`].
 fn acme_online_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
-    // A `*.myapp.com` entry has no address record of its own, so probing it
-    // literally would resolve to nothing and report a permanent, meaningless
-    // Warn on every wildcard deployment. Probe the base domain it covers
-    // instead — that IS the host tenants' subdomains point at — and drop the
-    // duplicate when the apex is also listed explicitly (#1620).
     let mut probed: Vec<String> = Vec::new();
     for domain in &config.domains {
         let target = domain.strip_prefix("*.").unwrap_or(domain).to_owned();
@@ -8025,6 +8136,30 @@ fn acme_online_probe_domains(config: &AcmeDoctorConfig) -> Vec<String> {
         }
     }
     probed
+}
+
+/// The label that stands in for a wildcard in reachability probes.
+const WILDCARD_PROBE_LABEL: &str = "doctor-check";
+
+/// The hosts the `--online` doctor probes for address and port reachability.
+///
+/// A wildcard often has no apex record. Probing the base domain would warn
+/// although the covered hosts resolve. So a `*.` entry is probed as a host it
+/// covers (#2478). The `_acme-challenge` check keeps the base name. See
+/// [`acme_online_probe_domains`].
+fn acme_online_reachability_hosts(config: &AcmeDoctorConfig) -> Vec<String> {
+    let mut hosts: Vec<String> = Vec::new();
+    for domain in &config.domains {
+        let host = match domain.strip_prefix("*.") {
+            Some("") => continue,
+            Some(base) => format!("{WILDCARD_PROBE_LABEL}.{base}"),
+            None => domain.clone(),
+        };
+        if !host.is_empty() && !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
 }
 
 /// Inspect the stored ACME certificate for the CONFIGURED domains under the
@@ -9134,6 +9269,129 @@ fn deploy_preflight_result(
     }
 }
 
+/// One `autumn doctor` check, run on its own thread.
+type DoctorTask = Box<dyn FnOnce() -> CheckResult + Send>;
+
+/// Map a media host check into a doctor result (#1974).
+///
+/// A deferred check (for example an env-indirected `[media.ffmpeg] bin`) is a
+/// warning, because `deploy up` does not stop on it either.
+fn media_check_result(check: crate::deploy::PreflightCheck) -> CheckResult {
+    CheckResult {
+        name: check.name,
+        status: if check.passed {
+            CheckStatus::Pass
+        } else if check.deferred {
+            CheckStatus::Warn
+        } else {
+            CheckStatus::Fail
+        },
+        detail: Some(check.detail),
+        hint: check.hint,
+    }
+}
+
+/// The SSH target for the media host checks: the one `[deploy]` host.
+///
+/// Media provisioning supports one host, so a fleet or an empty host list is
+/// an error. A user or host that starts with `-` is an error too.
+fn media_ssh_target(
+    hosts: &Result<Vec<String>, String>,
+    deploy_cfg: &DeployConfig,
+) -> Result<crate::deploy::exec::SshTarget, String> {
+    // `ssh` reads a leading `-` as an option, so refuse it.
+    if deploy_cfg.user.starts_with('-') {
+        return Err(format!(
+            "`[deploy] user` {:?} starts with `-`; ssh would read it as an option",
+            deploy_cfg.user
+        ));
+    }
+    match hosts.as_ref()?.as_slice() {
+        [host] if host.starts_with('-') => Err(format!(
+            "`[deploy]` host {host:?} starts with `-`; ssh would read it as an option"
+        )),
+        [host] => Ok(crate::deploy::exec::SshTarget {
+            host: host.clone(),
+            user: deploy_cfg.user.clone(),
+            port: deploy_cfg.ssh_port,
+        }),
+        others => Err(format!(
+            "MediaMTX provisioning needs exactly one `[deploy]` host; found {}",
+            others.len()
+        )),
+    }
+}
+
+/// Doctor tasks for an enabled `[media.mediamtx]` section (#1974).
+///
+/// The two config-only checks always run. Offline, `host` is `None`. With
+/// `--online`, `Some(Ok(factory))` runs the four host checks on executors from
+/// `factory`. `Some(Err(text))` fails each host check with `text`.
+fn media_doctor_tasks<E, F>(
+    cfg: &crate::deploy::media::MediaMtxHostConfig,
+    ffmpeg_bin: &str,
+    host: Option<Result<F, String>>,
+) -> Vec<DoctorTask>
+where
+    E: crate::deploy::exec::DeployExecutor + 'static,
+    F: Fn() -> E + Clone + Send + 'static,
+{
+    use crate::deploy::media;
+
+    let mut tasks: Vec<DoctorTask> = Vec::new();
+    for pure in [
+        media::mediamtx_ports_distinct,
+        media::mediamtx_ports_match_bases,
+    ] {
+        let cfg = cfg.clone();
+        tasks.push(Box::new(move || media_check_result(pure(&cfg))));
+    }
+    let Some(host) = host else {
+        return tasks;
+    };
+    let names = [
+        media::CHECK_FFMPEG_PREFLIGHT,
+        media::CHECK_MEDIAMTX_BINARY,
+        media::CHECK_RECORDINGS_DIR_WRITABLE,
+        media::CHECK_MEDIAMTX_PORTS_AVAILABLE,
+    ];
+    match host {
+        Ok(executor) => {
+            let ffmpeg_bin = ffmpeg_bin.to_owned();
+            let exec = executor.clone();
+            tasks.push(Box::new(move || {
+                media_check_result(media::ffmpeg_preflight(&exec(), &ffmpeg_bin))
+            }));
+            let host_checks: [fn(&E, &media::MediaMtxHostConfig) -> crate::deploy::PreflightCheck;
+                3] = [
+                media::mediamtx_binary_preflight,
+                media::recordings_dir_writable,
+                media::mediamtx_ports_available,
+            ];
+            for check in host_checks {
+                let (cfg, exec) = (cfg.clone(), executor.clone());
+                tasks.push(Box::new(move || media_check_result(check(&exec(), &cfg))));
+            }
+        }
+        Err(message) => {
+            for name in names {
+                let message = message.clone();
+                tasks.push(Box::new(move || CheckResult {
+                    name,
+                    status: CheckStatus::Fail,
+                    detail: Some(message),
+                    hint: Some(MEDIA_HOST_HINT),
+                }));
+            }
+        }
+    }
+    tasks
+}
+
+/// Hint for a media host check that has no single host to run on.
+const MEDIA_HOST_HINT: &str =
+    "Set one `[deploy] host` for MediaMTX provisioning (a media fleet is not supported)";
+
 /// Resolve the `[deploy]` doctor branch from the merged active-profile runtime
 /// table.
 ///
@@ -9270,6 +9528,13 @@ pub fn run(opts: DoctorOptions) {
     type Task = Box<dyn FnOnce() -> CheckResult + Send>;
 
     let cli_version = env!("CARGO_PKG_VERSION");
+
+    // The dependency audit runs in its own process group, so Ctrl+C does not
+    // reach it. Stop it here, or it keeps Cargo's package-cache lock.
+    let _ = ctrlc::set_handler(|| {
+        crate::deps::stop_all();
+        std::process::exit(130);
+    });
 
     if !opts.json {
         println!("\u{1F342} autumn doctor\n");
@@ -9783,6 +10048,7 @@ pub fn run(opts: DoctorOptions) {
         // detail rides in the detail text instead of multiplying names. See
         // `crate::deploy::DOCTOR_PREFLIGHT_GRADERS`.
         let deploy_hosts = crate::deploy::deploy_host_list(&deploy_cfg);
+        let media_hosts = deploy_hosts.clone();
         tasks.push(Box::new({
             let deploy_hosts = deploy_hosts.clone();
             move || match &deploy_hosts {
@@ -9891,6 +10157,27 @@ pub fn run(opts: DoctorOptions) {
                 crate::deploy::grade_migrate_check(std::path::Path::new("migrations")),
             )
         }));
+
+        // MediaMTX host checks (#1974), from the same `[media]` subtree `deploy
+        // up` reads. Offline: the config-only checks. `--online`: all six over SSH.
+        match crate::deploy::media::media_host_config_from_value(toml::Value::Table(
+            merged_deploy_toml,
+        )) {
+            Ok((media_cfg, ffmpeg_bin)) if media_cfg.enabled => {
+                let host = opts.online.then(|| {
+                    media_ssh_target(&media_hosts, &deploy_cfg)
+                        .map(|target| move || crate::deploy::exec::SshExecutor::new(target.clone()))
+                });
+                tasks.extend(media_doctor_tasks(&media_cfg, &ffmpeg_bin, host));
+            }
+            Ok(_) => {}
+            Err(err) => tasks.push(Box::new(move || CheckResult {
+                name: "media_config",
+                status: CheckStatus::Fail,
+                detail: Some(format!("[media] is present but invalid: {err}")),
+                hint: Some("Fix the `[media.mediamtx]` / `[media.ffmpeg]` keys in autumn.toml"),
+            })),
+        }
     }
 
     // 8a. Direct-HTTPS certificate readiness (#1603): validate `[server.tls]` cert and
@@ -10194,21 +10481,20 @@ pub fn run(opts: DoctorOptions) {
                 }
             }
 
-            // Probe EVERY configured domain: issuance orders authorizations for
-            // all `config.domains`, so a probe of only the first name can pass
-            // doctor while issuance fails on an unprobed domain. One port + DNS
-            // check per domain, each labeled with the domain in its detail; still
-            // bounded and gated behind --online.
+            // Probe EVERY configured domain. Issuance orders an authorization
+            // for each one, so a probe of the first name alone can pass while
+            // issuance fails. One port check and one DNS check per host. Each
+            // detail names its host. Bounded, and gated behind --online.
             if opts.online {
                 let dns01 = acme.dns.is_some();
-                for domain in acme_online_probe_domains(&acme) {
-                    let d80 = domain.clone();
+                for host in acme_online_reachability_hosts(&acme) {
+                    let d80 = host.clone();
                     tasks.push(Box::new(move || {
                         let p80 = probe_port(&d80, 80);
                         let p443 = probe_port(&d80, 443);
                         check_acme_ports_for_challenge(&d80, p80, p443, dns01)
                     }));
-                    let d_dns = domain;
+                    let d_dns = host;
                     tasks.push(Box::new(move || {
                         let outcome = resolve_dns_points_here(&d_dns);
                         check_acme_dns_for_challenge(&d_dns, &outcome, dns01)
@@ -10507,6 +10793,21 @@ pub fn run(opts: DoctorOptions) {
         );
         let capsule_bin_exists = capsule_bin.is_some_and(|p| p.exists());
         check_edge_routes_impl(&scan, capsule_bin_exists)
+    }));
+
+    // 17b. Edge capabilities (issue #1790 AC-5): name each `#[edge]` route
+    //      that needs something the edge cannot provide (a warning).
+    tasks.push(Box::new(move || {
+        if edge_virtual_workspace_root {
+            return edge_virtual_workspace_warn("edge_capabilities");
+        }
+        let capsule_bin = resolve_edge_capsule_bin(std::path::Path::new("."));
+        let scan = crate::edge_scan::resolve_edge_scan_with_extra_file(
+            std::path::Path::new("."),
+            &[],
+            capsule_bin.as_deref(),
+        );
+        check_edge_capabilities_impl(&scan)
     }));
 
     // 18. Orphaned plugin residue (issue #1631): a dependency with no mount, a
@@ -11757,7 +12058,263 @@ pub fn check_edge_routes_impl(
     }
 }
 
+/// Whether every `#[edge]` route uses only what the edge can provide.
+///
+/// Flags an unknown `needs(...)` capability, a write method, an origin-only
+/// extractor, or an undeclared `EdgeIdentity`. Each one also stops the build
+/// in rustc; doctor names it before the build starts.
+///
+/// Warns, never fails. The scan is a best guess: it reads every file under
+/// `src/` (also one no `mod` declares), cannot resolve target cfgs, and sees
+/// names, not types. rustc is the authority, and `autumn build` stops on a
+/// real case. `autumn doctor --strict` exits non-zero on the warning.
+pub fn check_edge_capabilities_impl(scan: &crate::edge_scan::EdgeScan) -> CheckResult {
+    const NAME: &str = "edge_capabilities";
+    if scan.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some("no #[edge] routes".into()),
+            hint: None,
+        };
+    }
+    let unsupported = scan.unsupported();
+    if unsupported.is_empty() {
+        return CheckResult {
+            name: NAME,
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "{} #[edge] route(s) use only edge capabilities",
+                scan.functions.len()
+            )),
+            hint: None,
+        };
+    }
+    CheckResult {
+        name: NAME,
+        status: CheckStatus::Warn,
+        detail: Some(crate::edge_scan::format_unsupported(&unsupported)),
+        hint: Some(crate::edge_scan::EDGE_UNSUPPORTED_HINT),
+    }
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod media_doctor_tests {
+    use super::{
+        CheckResult, CheckStatus, media_check_result, media_doctor_tasks, media_ssh_target,
+    };
+    use crate::deploy::exec::test_support::RecordingExecutor;
+    use crate::deploy::media::{
+        CHECK_FFMPEG_PREFLIGHT, CHECK_MEDIAMTX_BINARY, CHECK_MEDIAMTX_PORTS_AVAILABLE,
+        CHECK_MEDIAMTX_PORTS_DISTINCT, CHECK_MEDIAMTX_PORTS_MATCH_BASES,
+        CHECK_RECORDINGS_DIR_WRITABLE, MediaMtxHostConfig,
+    };
+    use autumn_web::config::DeployConfig;
+
+    fn enabled() -> MediaMtxHostConfig {
+        MediaMtxHostConfig {
+            enabled: true,
+            ..MediaMtxHostConfig::default()
+        }
+    }
+
+    fn run(tasks: Vec<super::DoctorTask>) -> Vec<CheckResult> {
+        tasks.into_iter().map(|task| task()).collect()
+    }
+
+    fn status_of(results: &[CheckResult], name: &str) -> CheckStatus {
+        results
+            .iter()
+            .find(|result| result.name == name)
+            .unwrap_or_else(|| panic!("no `{name}` result in {results:?}"))
+            .status
+            .clone()
+    }
+
+    /// A healthy host: every probe answers as a passing one would.
+    fn healthy_host() -> RecordingExecutor {
+        RecordingExecutor::new()
+            .with_stdout("media-ffmpeg-preflight", "ffmpeg version 6.1")
+            .with_stdout("media-mediamtx-binary", "absent")
+            .with_stdout("media-recordings-dir", "present")
+            .with_stdout(
+                "media-ports",
+                "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=5,fd=3))\n",
+            )
+    }
+
+    #[test]
+    fn media_check_result_maps_pass_deferred_and_fail() {
+        let check = |passed, deferred| crate::deploy::PreflightCheck {
+            name: CHECK_FFMPEG_PREFLIGHT,
+            scope: None,
+            passed,
+            deferred,
+            detail: "d".to_owned(),
+            hint: None,
+        };
+        assert_eq!(
+            media_check_result(check(true, false)).status,
+            CheckStatus::Pass
+        );
+        assert_eq!(
+            media_check_result(check(false, true)).status,
+            CheckStatus::Warn
+        );
+        assert_eq!(
+            media_check_result(check(false, false)).status,
+            CheckStatus::Fail
+        );
+        assert_eq!(
+            media_check_result(check(true, false)).name,
+            CHECK_FFMPEG_PREFLIGHT
+        );
+    }
+
+    #[test]
+    fn offline_runs_only_the_pure_checks() {
+        let results = run(media_doctor_tasks::<
+            RecordingExecutor,
+            fn() -> RecordingExecutor,
+        >(&enabled(), "/usr/bin/ffmpeg", None));
+        let names: Vec<_> = results.iter().map(|result| result.name).collect();
+        assert_eq!(
+            names,
+            [
+                CHECK_MEDIAMTX_PORTS_DISTINCT,
+                CHECK_MEDIAMTX_PORTS_MATCH_BASES
+            ]
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.status == CheckStatus::Pass)
+        );
+    }
+
+    #[test]
+    fn offline_catches_a_port_clash() {
+        let cfg = MediaMtxHostConfig {
+            hls_port: 1935,
+            ..enabled()
+        };
+        let results = run(media_doctor_tasks::<
+            RecordingExecutor,
+            fn() -> RecordingExecutor,
+        >(&cfg, "/usr/bin/ffmpeg", None));
+        assert_eq!(
+            status_of(&results, CHECK_MEDIAMTX_PORTS_DISTINCT),
+            CheckStatus::Fail
+        );
+    }
+
+    #[test]
+    fn online_runs_all_six_over_the_executor() {
+        let results = run(media_doctor_tasks(
+            &enabled(),
+            "/usr/bin/ffmpeg",
+            Some(Ok(healthy_host)),
+        ));
+        for name in [
+            CHECK_MEDIAMTX_PORTS_DISTINCT,
+            CHECK_MEDIAMTX_PORTS_MATCH_BASES,
+            CHECK_FFMPEG_PREFLIGHT,
+            CHECK_MEDIAMTX_BINARY,
+            CHECK_RECORDINGS_DIR_WRITABLE,
+            CHECK_MEDIAMTX_PORTS_AVAILABLE,
+        ] {
+            assert_eq!(
+                status_of(&results, name),
+                CheckStatus::Pass,
+                "{name}: {results:?}"
+            );
+        }
+        assert_eq!(results.len(), 6);
+    }
+
+    #[test]
+    fn online_shows_a_deferred_ffmpeg_path_as_a_warning() {
+        let results = run(media_doctor_tasks(
+            &enabled(),
+            "${AUTUMN_MEDIA__FFMPEG__BIN}",
+            Some(Ok(healthy_host)),
+        ));
+        assert_eq!(
+            status_of(&results, CHECK_FFMPEG_PREFLIGHT),
+            CheckStatus::Warn
+        );
+    }
+
+    #[test]
+    fn online_fails_each_host_check_when_there_is_no_single_host() {
+        let results = run(media_doctor_tasks::<
+            RecordingExecutor,
+            fn() -> RecordingExecutor,
+        >(
+            &enabled(),
+            "/usr/bin/ffmpeg",
+            Some(Err("needs one host".to_owned())),
+        ));
+        for name in [
+            CHECK_FFMPEG_PREFLIGHT,
+            CHECK_MEDIAMTX_BINARY,
+            CHECK_RECORDINGS_DIR_WRITABLE,
+            CHECK_MEDIAMTX_PORTS_AVAILABLE,
+        ] {
+            assert_eq!(status_of(&results, name), CheckStatus::Fail, "{name}");
+        }
+        assert_eq!(results.len(), 6, "the pure checks still run");
+    }
+
+    #[test]
+    fn media_ssh_target_needs_exactly_one_host() {
+        let deploy = DeployConfig {
+            user: "deployer".to_owned(),
+            ssh_port: 2222,
+            ..DeployConfig::default()
+        };
+        let one = media_ssh_target(&Ok(vec!["app.example.com".to_owned()]), &deploy)
+            .expect("one host is a target");
+        assert_eq!(one.host, "app.example.com");
+        assert_eq!(one.user, "deployer");
+        assert_eq!(one.port, 2222);
+
+        let two = vec!["a.example.com".to_owned(), "b.example.com".to_owned()];
+        assert!(media_ssh_target(&Ok(two), &deploy).is_err());
+        assert!(media_ssh_target(&Ok(Vec::new()), &deploy).is_err());
+        assert_eq!(
+            media_ssh_target(&Err("bad hosts".to_owned()), &deploy).unwrap_err(),
+            "bad hosts"
+        );
+    }
+
+    #[test]
+    fn media_ssh_target_refuses_an_option_shaped_user_or_host() {
+        // `ssh` would read these as options, not as a destination.
+        let bad_user = DeployConfig {
+            user: "-oProxyCommand=touch /tmp/x".to_owned(),
+            ..DeployConfig::default()
+        };
+        assert!(media_ssh_target(&Ok(vec!["app.example.com".to_owned()]), &bad_user).is_err());
+        let deploy = DeployConfig::default();
+        assert!(media_ssh_target(&Ok(vec!["-oProxyCommand=x".to_owned()]), &deploy).is_err());
+    }
+
+    #[test]
+    fn doctor_runs_the_media_tasks_in_the_deploy_branch() {
+        let src = include_str!("doctor.rs");
+        let run_body = src
+            .split("pub fn run(opts: DoctorOptions)")
+            .nth(1)
+            .expect("run present");
+        assert!(
+            run_body.contains("tasks.extend(media_doctor_tasks("),
+            "doctor must add the media tasks"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -11854,6 +12411,39 @@ mod tests {
             "the warning must name the handler and its location"
         );
         assert!(r.hint.unwrap().contains("edge_routes![]"));
+    }
+
+    #[test]
+    fn edge_capabilities_passes_without_edge_routes() {
+        let r = check_edge_capabilities_impl(&edge_scan_of("fn plain() {}"));
+        assert_eq!(r.status, CheckStatus::Pass);
+        assert_eq!(r.detail.as_deref(), Some("no #[edge] routes"));
+    }
+
+    #[test]
+    fn edge_capabilities_passes_for_supported_capabilities() {
+        let scan = edge_scan_of("#[edge(needs(kv))]\nfn note(cache: EdgeCache) {}");
+        let r = check_edge_capabilities_impl(&scan);
+        assert_eq!(r.status, CheckStatus::Pass, "{:?}", r.detail);
+    }
+
+    /// The scan is a best guess (it cannot see `mod` reachability, target
+    /// cfgs or every alias), so doctor warns. rustc is the authority, and
+    /// `autumn build` stops on a real case.
+    #[test]
+    fn edge_capabilities_warns_on_a_capability_the_edge_cannot_provide() {
+        let scan = edge_scan_of(
+            "#[get(\"/d\")]\n#[edge(needs(db))]\nfn dash(db: Db) {}\nfn wire() { edge_routes![dash]; }",
+        );
+        let r = check_edge_capabilities_impl(&scan);
+        assert_eq!(r.status, CheckStatus::Warn);
+        let detail = r.detail.unwrap();
+        assert!(detail.contains("dash @ src/routes.rs:3"), "{detail}");
+        assert!(detail.contains("needs(db)"), "{detail}");
+        assert!(detail.contains("`Db`"), "{detail}");
+        let hint = r.hint.unwrap();
+        assert!(hint.contains("needs(kv)"), "{hint}");
+        assert!(hint.contains("Remove #[edge]"), "{hint}");
     }
 
     #[test]
@@ -14204,6 +14794,9 @@ pub struct Vault {
             ca_root_error: None,
             domains_error: None,
             renew_before_days_error: None,
+            cache_dir_error: None,
+            contact_email_error: None,
+            section_error: None,
             dns: None,
             dns_error: None,
             custom_domains: None,
@@ -14299,6 +14892,85 @@ pub struct Vault {
                 .status,
             CheckStatus::Warn
         );
+    }
+
+    /// A read of one healthy record per hostname.
+    fn read_of_hosts(hosts: &[&str]) -> CustomDomainRegistryRead {
+        CustomDomainRegistryRead {
+            domains: hosts
+                .iter()
+                .map(|h| {
+                    (
+                        (*h).to_owned(),
+                        "tenant-a".to_owned(),
+                        "pending_dns".to_owned(),
+                        None,
+                    )
+                })
+                .collect(),
+            ..CustomDomainRegistryRead::default()
+        }
+    }
+
+    /// #2643: doctor warns when a registered domain gets no DNS instructions.
+    /// It uses the same builder as the tenant view.
+    #[test]
+    fn custom_domains_config_check_warns_when_a_domain_gets_no_dns_instructions() {
+        let hostname_only = custom_domains_config(true);
+        let warn = check_custom_domains_config_impl(
+            Some(&hostname_only),
+            None,
+            &read_of_hosts(&["app.clientco.com", "clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(warn.status, CheckStatus::Warn);
+        let detail = warn.detail.unwrap();
+        assert!(detail.starts_with("1 registered domain gets"), "{detail}");
+        assert!(detail.contains("clientco.co.uk"), "{detail}");
+        assert!(!detail.contains("app.clientco.com"), "{detail}");
+        assert!(warn.hint.unwrap().contains("ingress_ipv4"));
+
+        // Subdomains only: a CNAME serves them all.
+        let subs = check_custom_domains_config_impl(
+            Some(&hostname_only),
+            None,
+            &read_of_hosts(&["app.clientco.com", "app.clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(subs.status, CheckStatus::Pass);
+
+        // Addresses configured: the apex has its A records.
+        let mut with_addresses = custom_domains_config(true);
+        with_addresses.ingress_ipv4 = vec!["203.0.113.10".to_owned()];
+        let pass = check_custom_domains_config_impl(
+            Some(&with_addresses),
+            None,
+            &read_of_hosts(&["clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(pass.status, CheckStatus::Pass);
+
+        // Addresses only: a subdomain gets no CNAME target.
+        with_addresses.ingress_hostname = None;
+        let no_cname = check_custom_domains_config_impl(
+            Some(&with_addresses),
+            None,
+            &read_of_hosts(&["app.clientco.co.uk"]),
+        )
+        .unwrap();
+        assert_eq!(no_cname.status, CheckStatus::Warn);
+        assert!(no_cname.hint.unwrap().contains("ingress_hostname"));
+
+        // Many domains: the detail shows five names and a count.
+        let hosts: Vec<String> = (1..=7).map(|i| format!("c{i}.co.uk")).collect();
+        let hosts: Vec<&str> = hosts.iter().map(String::as_str).collect();
+        let many =
+            check_custom_domains_config_impl(Some(&hostname_only), None, &read_of_hosts(&hosts))
+                .unwrap();
+        let detail = many.detail.unwrap();
+        assert!(detail.starts_with("7 registered domains get"), "{detail}");
+        assert!(detail.contains("c5.co.uk and 2 more"), "{detail}");
+        assert!(!detail.contains("c6.co.uk"), "{detail}");
     }
 
     fn probe(status: &str, dns: CustomDomainDns) -> CustomDomainProbe {
@@ -14913,6 +15585,40 @@ pub struct Vault {
         );
     }
 
+    // #2478: a wildcard needs no apex record, so reachability checks use a
+    // host the wildcard covers. `_acme-challenge` still uses the base name.
+    #[test]
+    fn wildcard_reachability_probes_a_covered_host() {
+        let cfg = acme_doctor_cfg(&["*.myapp.com"], "ops@myapp.com");
+        assert_eq!(
+            acme_online_reachability_hosts(&cfg),
+            vec!["doctor-check.myapp.com".to_owned()]
+        );
+        assert_eq!(
+            acme_online_probe_domains(&cfg),
+            vec!["myapp.com".to_owned()],
+            "the challenge record stays at the base domain"
+        );
+
+        // Other bases and plain names stay separate; a bare `*.` is skipped.
+        let cfg = acme_doctor_cfg(&["*.a.com", "b.com", "*.", "*.sub.a.com"], "o@a.com");
+        assert_eq!(
+            acme_online_reachability_hosts(&cfg),
+            vec![
+                "doctor-check.a.com".to_owned(),
+                "b.com".to_owned(),
+                "doctor-check.sub.a.com".to_owned(),
+            ]
+        );
+
+        // An explicit apex is probed too; plain names are unchanged.
+        let cfg = acme_doctor_cfg(&["myapp.com", "*.myapp.com", "*.myapp.com"], "o@myapp.com");
+        assert_eq!(
+            acme_online_reachability_hosts(&cfg),
+            vec!["myapp.com".to_owned(), "doctor-check.myapp.com".to_owned()]
+        );
+    }
+
     // Regression (#1608, Codex): doctor must mirror AcmeConfig::validate(). An
     // ACME config with no/empty `domains` is REJECTED by the runtime at boot, so
     // doctor must FAIL it rather than silently pass acme_stored_cert.
@@ -15004,6 +15710,130 @@ pub struct Vault {
             "detail must mention http_challenge_port: {:?}",
             r.detail
         );
+    }
+
+    /// Grade a `[server.tls.acme]` body written as TOML text (#2413).
+    fn grade_acme_toml(toml_text: &str) -> CheckResult {
+        let raw: toml::Table = toml::from_str(toml_text).unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).expect("[server.tls.acme] present");
+        check_acme_config_impl(&acme).expect("config must FAIL")
+    }
+
+    // #2413 item 1: a non-string `cache_dir` must FAIL, not default.
+    #[test]
+    fn acme_config_fail_when_cache_dir_not_a_string() {
+        for bad in ["42", "true", "[\"config/acme\"]", "{ x = 1 }"] {
+            let r = grade_acme_toml(&format!(
+                "[server.tls.acme]\ndomains = [\"a.example.com\"]\n\
+                 contact_email = \"ops@example.com\"\ncache_dir = {bad}\n"
+            ));
+            assert!(matches!(r.status, CheckStatus::Fail), "{bad}");
+            let detail = r.detail.as_deref().unwrap_or_default();
+            assert!(
+                detail.contains("cache_dir") && detail.contains(bad),
+                "detail must name cache_dir and {bad}: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn acme_cache_dir_string_and_absent_still_resolve() {
+        let raw: toml::Table =
+            toml::from_str("[server.tls.acme]\ncache_dir = \"/var/acme\"\n").unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).unwrap();
+        assert!(acme.cache_dir_error.is_none());
+        assert_eq!(acme.cache_dir, std::path::PathBuf::from("/var/acme"));
+        let raw: toml::Table = toml::from_str("[server.tls.acme]\n").unwrap();
+        let acme = resolve_acme_doctor_config(Some(&raw)).unwrap();
+        assert!(acme.cache_dir_error.is_none());
+        assert_eq!(acme.cache_dir, std::path::PathBuf::from("config/acme"));
+    }
+
+    // #2413 item 2: a non-table `acme` key must not skip the ACME checks.
+    #[test]
+    fn acme_config_fail_when_acme_section_not_a_table() {
+        for bad in ["\"yes\"", "true", "7", "[1]"] {
+            let r = grade_acme_toml(&format!("[server.tls]\nacme = {bad}\n"));
+            assert!(matches!(r.status, CheckStatus::Fail), "{bad}");
+            let detail = r.detail.as_deref().unwrap_or_default();
+            assert!(
+                detail.contains("[server.tls.acme]")
+                    && detail.contains("table")
+                    && detail.contains(bad),
+                "detail must say acme must be a table and show {bad}: {detail}"
+            );
+        }
+    }
+
+    // #2413 item 3: name the type error, not a downstream symptom.
+    #[test]
+    fn acme_config_names_type_error_for_contact_email_and_domains() {
+        let r = grade_acme_toml(
+            "[server.tls.acme]\ndomains = [\"a.example.com\"]\ncontact_email = 42\n",
+        );
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("contact_email") && detail.contains("42") && detail.contains("string"),
+            "{detail}"
+        );
+        let r = grade_acme_toml(
+            "[server.tls.acme]\ndomains = \"a.example.com\"\ncontact_email = \"o@example.com\"\n",
+        );
+        let detail = r.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("a.example.com") && detail.contains("list"),
+            "{detail}"
+        );
+        assert!(!detail.contains("at least one domain"), "{detail}");
+    }
+
+    // #2413: doctor and the runtime must agree on every bad ACME value shape.
+    #[test]
+    fn acme_doctor_agrees_with_runtime_deserialize() {
+        let bad_values = ["42", "true", "[\"x\"]", "{ x = 1 }"];
+        let mut cases = vec![
+            "[server.tls]\nacme = \"yes\"".to_owned(),
+            "[server.tls]\nacme = 7".to_owned(),
+            "[server.tls.acme]\ndomains = [\"a.example.com\"]\ncontact_email = \"o@example.com\""
+                .to_owned(),
+        ];
+        for bad in bad_values {
+            for key in ["cache_dir", "contact_email", "domains"] {
+                let email = if key == "contact_email" {
+                    bad
+                } else {
+                    "\"o@example.com\""
+                };
+                let domains = if key == "domains" {
+                    bad
+                } else {
+                    "[\"a.example.com\"]"
+                };
+                let dir = if key == "cache_dir" {
+                    bad
+                } else {
+                    "\"/var/acme\""
+                };
+                cases.push(format!(
+                    "[server.tls.acme]\ndomains = {domains}\ncontact_email = {email}\ncache_dir = {dir}"
+                ));
+            }
+        }
+        for text in cases {
+            let raw: toml::Table = toml::from_str(&text).unwrap();
+            let doctor_fails = resolve_acme_doctor_config(Some(&raw))
+                .and_then(|acme| check_acme_config_impl(&acme))
+                .is_some();
+            let runtime_ok = raw
+                .get("server")
+                .and_then(|server| server.get("tls"))
+                .cloned()
+                .is_some_and(|tls| {
+                    tls.try_into::<autumn_web::config::TlsConfig>()
+                        .is_ok_and(|tls| tls.acme.as_ref().is_none_or(|a| a.validate().is_ok()))
+                });
+            assert_eq!(doctor_fails, !runtime_ok, "disagreement on:\n{text}");
+        }
     }
 
     // Regression (#1608, Codex P2): a malformed `http_challenge_port` must FAIL,
@@ -15871,7 +16701,7 @@ directory = \"production\"
         config.directory_label = "production".to_owned();
 
         // Every configured domain is scheduled for probing, not just the first.
-        let domains = acme_online_probe_domains(&config);
+        let domains = acme_online_reachability_hosts(&config);
         assert_eq!(
             domains,
             vec!["ok.example.com".to_owned(), "bad.example.com".to_owned()],
@@ -22143,6 +22973,20 @@ redirect_uri = "http://localhost/callback"
                 detail.contains("cargo install"),
                 "the detail must say how to enable it: {detail}"
             );
+        }
+
+        #[test]
+        fn a_missing_auditor_says_the_policy_is_not_validated_either() {
+            // Only cargo-deny knows its config schema. `yanked = "bogus"` is
+            // valid TOML, so doctor passes it, and CI rejects it (issue #2575).
+            let result = check_dependencies_impl(&Evaluation::AuditorMissing {
+                checks: vec!["advisories".to_owned()],
+            });
+            assert_eq!(result.status, CheckStatus::Pass);
+            let detail = result.detail.expect("detail");
+            assert!(detail.contains("not installed"), "{detail}");
+            assert!(detail.contains("valid"), "{detail}");
+            assert!(detail.contains("CI can still reject"), "{detail}");
         }
 
         #[test]

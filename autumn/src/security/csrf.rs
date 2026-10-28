@@ -111,6 +111,15 @@ pub struct CsrfFormField(pub String);
 #[derive(Clone, Debug)]
 pub struct CsrfTokenHeader(pub String);
 
+/// Set by a layer outside CSRF on a request a cross-site page cannot forge,
+/// to a route another layer gates itself: an x402-priced route that runs no
+/// handler without a `PAYMENT-SIGNATURE` header. The request carries no
+/// `Cookie` (no ambient credential to ride) or carries that header (which a
+/// cross-site page cannot send without passing CORS). CSRF validation does
+/// not apply to it. Crate-private, so only Autumn's own layers set it.
+#[derive(Debug, Clone, Copy)]
+pub struct CsrfNotApplicable;
+
 /// A CSRF token extracted from the request.
 ///
 /// Use this as a handler parameter to access the CSRF token for embedding
@@ -433,50 +442,59 @@ where
         // Match exemptions against the normalized path so dot-segment tricks
         // like `/api/../submit` (or percent-encoded `%2e%2e` variants) cannot
         // satisfy an `/api/` exemption prefix while targeting another route.
-        let clean = crate::security::path::clean_path(req.uri().path());
-        let path = clean.as_str();
-        let is_exempt = crate::security::path::is_exempt_path(path, &self.settings.exempt_paths);
-        let is_safe = is_exempt || self.settings.safe_methods.contains(req.method());
-        let raw_cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name);
+        // With no exemptions configured (the default) nothing can match, so the
+        // normalized copy of the path is not built.
+        let is_exempt = !self.settings.exempt_paths.is_empty() && {
+            let clean = crate::security::path::clean_path(req.uri().path());
+            crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths)
+        };
+        // The HTTP/2 `WebSocket` upgrade is safe, like the `GET` upgrade: a
+        // browser cannot add a CSRF header to it.
+        let is_safe = is_exempt
+            || self.settings.safe_methods.contains(req.method())
+            || crate::security::is_websocket_connect(&req)
+            || req.extensions().get::<CsrfNotApplicable>().is_some();
 
         // When signing is active, discard any cookie that fails HMAC verification
         // (unsigned pre-upgrade cookies, removed-key cookies, etc.) so a fresh signed
         // token is minted and the Set-Cookie header refreshes the browser value.
-        let cookie_token = match (&raw_cookie_token, &self.settings.signing_keys) {
-            (Some(tok), Some(_)) if !validate_cookie_token_hmac(tok, &self.settings) => None,
-            _ => raw_cookie_token.clone(),
-        };
+        // `validate_cookie_token_hmac` is `true` when signing is inactive.
+        let cookie_token = extract_cookie_token(req.headers(), &self.settings.cookie_name)
+            .filter(|tok| validate_cookie_token_hmac(tok, &self.settings));
 
-        // Generate a new token if none exists in the cookie.
+        // Only a mutating request reads the cookie token again (to compare the
+        // submitted token against it), so only it keeps a copy. Every other
+        // request moves the cookie value straight into `CsrfToken`.
+        let verify_against = if is_safe { None } else { cookie_token.clone() };
+
+        // Reuse the cookie's token, or mint one and the cookie that sets it.
         // When signing keys are active, the token is {uuid}.{hmac_hex}.
-        let token = cookie_token.clone().unwrap_or_else(|| {
-            let raw = Uuid::new_v4().to_string();
-            if let Some(keys) = &self.settings.signing_keys {
-                let sig = keys.sign(raw.as_bytes());
-                format!("{raw}.{sig}")
-            } else {
-                raw
-            }
-        });
+        let (token, set_cookie) = cookie_token.map_or_else(
+            || {
+                let raw = Uuid::new_v4().to_string();
+                let token = if let Some(keys) = &self.settings.signing_keys {
+                    let sig = keys.sign(raw.as_bytes());
+                    format!("{raw}.{sig}")
+                } else {
+                    raw
+                };
+                let set_cookie = format!(
+                    "{}={}; Path=/; SameSite=Lax; HttpOnly",
+                    self.settings.cookie_name, token
+                );
+                (token, Some(set_cookie))
+            },
+            |token| (token, None),
+        );
 
         // Insert CsrfToken, the configured form field name, and the configured
         // token header name into request extensions.
-        req.extensions_mut().insert(CsrfToken(token.clone()));
+        req.extensions_mut().insert(CsrfToken(token));
         req.extensions_mut()
             .insert(CsrfFormField(self.settings.form_field.clone()));
         req.extensions_mut().insert(CsrfTokenHeader(
             self.settings.token_header.as_str().to_owned(),
         ));
-
-        // Check if we need to set a cookie
-        let set_cookie = if cookie_token.is_none() {
-            Some(format!(
-                "{}={}; Path=/; SameSite=Lax; HttpOnly",
-                self.settings.cookie_name, token
-            ))
-        } else {
-            None
-        };
 
         let settings = Arc::clone(&self.settings);
         let mut inner = self.inner.clone();
@@ -486,7 +504,8 @@ where
 
         Box::pin(async move {
             if !is_safe {
-                let verdict = verify_csrf_token(&mut req, &settings, cookie_token.as_deref()).await;
+                let verdict =
+                    verify_csrf_token(&mut req, &settings, verify_against.as_deref()).await;
                 if !matches!(verdict, CsrfVerdict::Valid) {
                     let request_id = req
                         .extensions()
@@ -630,12 +649,8 @@ async fn verify_csrf_token(
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
 
-    // Media types are case-insensitive (RFC 9110 8.3.1) and the header may carry
-    // leading whitespace; normalize the type token for the urlencoded check.
-    let is_urlencoded = content_type
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("application/x-www-form-urlencoded");
+    let is_urlencoded =
+        crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded");
     // Parse the boundary with `multer::parse_boundary` — the exact parser
     // `axum::extract::Multipart` uses downstream (via `mime`) — so this CSRF
     // guard and the extractor can never disagree about the boundary, and it
@@ -1119,6 +1134,89 @@ mod tests {
             .unwrap();
         let token_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(Uuid::parse_str(&token_str).is_ok());
+    }
+
+    /// A safe request that already carries the CSRF cookie hands that exact
+    /// value to `CsrfToken` and sends no `Set-Cookie`: the cookie is reused, not
+    /// re-minted (pins the move of the cookie value into the extension).
+    #[tokio::test]
+    async fn safe_request_with_cookie_reuses_it_without_set_cookie() {
+        async fn handler(csrf: CsrfToken) -> String {
+            csrf.token().to_owned()
+        }
+
+        let cookie_token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/", get(handler))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("Cookie", format!("autumn-csrf={cookie_token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("set-cookie").is_none());
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], cookie_token.as_bytes());
+    }
+
+    /// A mutating request still verifies against the cookie's token (its copy
+    /// is kept only for that check) and, on success, sends no `Set-Cookie`.
+    #[tokio::test]
+    async fn mutating_request_with_cookie_verifies_and_reuses_it() {
+        async fn handler(csrf: CsrfToken) -> String {
+            csrf.token().to_owned()
+        }
+
+        let cookie_token = Uuid::new_v4().to_string();
+        let app = Router::new()
+            .route("/submit", post(handler))
+            .layer(CsrfLayer::from_config(&default_csrf_config()));
+
+        let ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={cookie_token}"))
+                    .header("X-CSRF-Token", cookie_token.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert!(ok.headers().get("set-cookie").is_none());
+        let body = axum::body::to_bytes(ok.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], cookie_token.as_bytes());
+
+        // A different submitted token is still rejected against the cookie.
+        let rejected = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/submit")
+                    .header("Cookie", format!("autumn-csrf={cookie_token}"))
+                    .header("X-CSRF-Token", Uuid::new_v4().to_string())
+                    .header(http::header::ACCEPT, "text/html")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

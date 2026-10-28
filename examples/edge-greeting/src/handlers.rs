@@ -15,7 +15,7 @@
 //!    extractor that is not there (`Db`, `Session`, `Clock`, `Rng`) does not
 //!    satisfy the `EdgeHandler` bound, and the diagnostic says so.
 //!
-//! # Why these six routes
+//! # Why these seven routes
 //!
 //! Each one is a class of thing that could plausibly differ between two
 //! compilations of "the same" code, which is what
@@ -28,13 +28,15 @@
 //! | `/stats` | repeated query keys and float formatting |
 //! | `/stats/count` | a primitive (`usize`) return value |
 //! | `/whoami` | credential invisibility: both lanes strip the same headers |
+//! | `/link/{name}` | a typed path helper and `with_query`, the same source on both lanes |
 //! | `/boom` | a panic: a trap at the edge, a 500 at the origin |
 
+use autumn_edge::paths::PathExt as _;
 use autumn_edge::prelude::*;
 
 /// How many routes the edge lane carries. Rendered by `/stats` and
 /// `/stats/count` so both lanes have a number to disagree about.
-pub const EDGE_ROUTE_COUNT: usize = 6;
+pub const EDGE_ROUTE_COUNT: usize = 7;
 
 /// `GET /greet/{name}` — the shape of an edge route in one screen.
 ///
@@ -127,6 +129,18 @@ pub async fn whoami(headers: HeaderMap) -> String {
     }
 }
 
+/// `GET /link/{name}` — a link built with a typed path helper.
+///
+/// The helper of an `#[edge]` route compiles for `wasm32-wasip1`, so this
+/// source does not change for the edge. Both lanes percent-encode the same
+/// way.
+#[get("/link/{name}")]
+#[edge]
+pub async fn link(Path(name): Path<String>) -> String {
+    let link = paths::greet(&name).with_query("from", "link");
+    format!("{link}\n")
+}
+
 /// `GET /boom` — a handler that panics, on purpose.
 ///
 /// At the edge a panic aborts, which traps the module; the host reports
@@ -147,5 +161,7 @@ pub async fn boom() -> String {
 /// hands the result to `autumn_edge::serve`.
 #[must_use]
 pub fn edge_routes() -> Vec<EdgeRoute> {
-    edge_routes![greet, note, stats, count, whoami, boom]
+    edge_routes![greet, note, stats, count, whoami, link, boom]
 }
+
+autumn_edge::paths![greet, link];

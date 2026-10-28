@@ -130,6 +130,18 @@ if let Some(broken) = &report.broken {
 // The raw chain, oldest first.
 let revisions = repo.ledger_revisions(id).await?;
 
+// The same chain, one keyset page at a time.
+use autumn_web::ledger::LedgerPageRequest;
+let mut request = LedgerPageRequest::first(100);
+loop {
+    let page = repo.ledger_revisions_page(id, request).await?;
+    // ... use page.revisions ...
+    match page.next {
+        Some(cursor) => request = LedgerPageRequest::after(cursor, 100),
+        None => break,
+    }
+}
+
 // The head hash, for pinning outside the database.
 let head = repo.ledger_head(id).await?;
 
@@ -159,7 +171,7 @@ model's public JSON. Encrypted columns are stored as recoverable ciphertext (the
 ledger table never holds plaintext the model chose to protect) and come back
 decrypted.
 
-Three consequences worth knowing:
+Some consequences worth knowing:
 
 - Declaring `#[version_history(sensitive = [...])]` columns on a ledgered
   repository is a **compile error** — see below.
@@ -176,6 +188,92 @@ Three consequences worth knowing:
   are covered there too. Key rotation is handled by the envelope's `key_id`, so a
   retired key still decrypts; only a column whose key is gone entirely drops out
   of the comparison, and the revision hash still covers it.
+- As-of reconstruction does not skip an encrypted column. If its key is gone,
+  `ledger_as_of` and `ledger_diff` return `LedgerError::ChainUnreadable`. The
+  error names the column and the revision. The model never holds ciphertext in a
+  plaintext field.
+- A delete revision snapshots the row as the database holds it after the
+  soft-delete `UPDATE`. The snapshot includes any column that a trigger changes.
+  `ledger_verify` reports no mismatch after a delete.
+- The ledger reads a snapshot only if its stored text is its canonical form.
+  Changed spacing, a different key order or a duplicate key return
+  `LedgerError::SnapshotNotCanonical`. `ledger_verify` reports it as
+  `LedgerBreak::SnapshotNotCanonical`. The ledger cannot read past such a
+  revision, so this break comes before any other break in the same chain.
+- If a snapshot does not decode into the current model, `ledger_as_of` and
+  `ledger_diff` return `LedgerError::SnapshotSchemaMismatch`. This is not tamper
+  evidence. To read old revisions after adding a required field, put
+  `#[serde(default)]` on it. For a renamed or retyped field, set a schema
+  version and an upcast function. See
+  [Changing a model's shape](#changing-a-models-shape). Run `ledger_verify` to
+  rule out an edit.
+- A field added as `Option<T>` needs no attribute. An old snapshot without it
+  reads as `None`. `ledger_diff` shows no change for that field until a
+  revision sets it. This does not hold with `skip_serializing_if`.
+
+## Changing a model's shape
+
+A revision keeps the columns the model had when the revision was written. After
+you change the model, `ledger_as_of` and `ledger_diff` must still read it.
+
+- **Add a field.** Use `Option<T>`, or add `#[serde(default)]`. An old revision
+  reads the default. Also raise the schema version. See the verify rule below.
+- **Rename or retype a field.** Raise the schema version. Write an upcast
+  function that converts an old snapshot:
+
+```rust
+#[repository(Invoice, soft_delete, ledgered(schema_version = 2, upcast = upcast_invoice))]
+pub trait InvoiceRepository {}
+
+// Version 1 called `title` `subject`.
+fn upcast_invoice(from_version: u32, snapshot: &mut serde_json::Value) -> Result<(), String> {
+    if from_version < 2 {
+        let object = snapshot.as_object_mut().ok_or("the snapshot is not an object")?;
+        if let Some(subject) = object.remove("subject") {
+            object.insert("title".to_string(), subject);
+        }
+    }
+    Ok(())
+}
+```
+
+How it works:
+
+- A model at schema version 2 or more writes `"$schema_version": N` into each new
+  snapshot. The revision hash covers it, so an edit to it breaks the chain. A
+  snapshot without the key is version 1. A model at version 1 writes no key, so
+  existing chains keep their hashes. `ledger_revisions` returns the snapshot
+  as stored, key included.
+- The ledger calls your function only for a snapshot older than the current
+  version. The function gets the version the revision was written at. It must
+  handle every version below `N`. The model then reads the converted snapshot
+  with its usual rules, so `#[serde(default)]` still fills a new field. A
+  function that panics gives the same error as one that returns an error.
+- `schema_version = 0`, and `upcast` without `schema_version = 2` or more, are
+  compile errors.
+- If the function returns an error, `ledger_as_of` and `ledger_diff` return
+  `LedgerError::SnapshotSchemaMismatch` with your message. This is not tamper
+  evidence.
+- A revision written by a newer model, for example after a rollback, is not
+  converted. If the model can still decode it, the ledger reads it. If not, the
+  error names both versions.
+- `ledger_diff` converts both revisions to the current shape before it compares
+  them. It shows only real changes. A renamed field is not a change.
+
+How `ledger_verify` treats a schema change:
+
+- It converts the head revision with your function. Then it compares the head
+  with the live row.
+- If the head is older than the model's schema version, it compares only the
+  columns that both have. A column that the head never recorded is not compared.
+  The next write records it. So a deploy does not cause a `LiveStateMismatch`
+  report. **Raise the schema version when you add a column.** Without this, a
+  record whose head predates the column reports `LiveStateMismatch`.
+- If the head is at the model's schema version, the comparison is strict. A
+  column that the head lacks is a difference. This keeps an out-of-band edit to
+  such a column visible.
+- If your function fails on the head, `ledger_verify` skips the live check and
+  writes a warning to the log. The hash chain is still checked.
 
 ## Bitemporality
 
@@ -206,6 +304,10 @@ pub trait InvoiceRepository {}
 ```
 
 The column may be `DateTime<Utc>`, `NaiveDateTime`, or an `Option` of either.
+
+A delete or restore is valid from the instant you make it. It does not read your
+column, which holds the row's old value. Otherwise a valid-time query about an
+earlier instant would return the deleted state.
 
 Both axes are queryable:
 
@@ -262,17 +364,40 @@ leaves something internally perfect. Nor can it see a write that reached the
 table without appending a revision at all.
 
 So `ledger_verify` also reads the live row and compares it against the head
-revision. That closes both gaps, and with them every remaining write path that
-can move a ledgered row without the repository's knowledge — a raw `UPDATE`, a
-[counter-cache](counter-cache.md) bump on a ledgered parent, a `dependent(...,
-on_delete = delete_all)` cascade declared on some *other* repository. None of
-those can be refused at compile time (they are declared elsewhere, or maintained
-by the framework), but none of them can hide either.
+revision. That closes both gaps, and it catches a raw `UPDATE` that reached the
+table without the repository.
 
 The reads are taken twice: a write landing between them would look exactly like a
 divergence, and this routine exists to produce trustworthy accusations. If the
 chain head moves under it, the live comparison is skipped rather than reported —
 a concurrent write is not tampering.
+
+### Writes from outside the repository
+
+Some framework paths write raw SQL to a table without the table's own
+repository. On a ledgered table, each one is **refused** with
+`LedgerError::OutOfBandWrite`. The write does not run, and the chain stays true.
+
+| Path | Result |
+|------|--------|
+| A [counter-cache](counter-cache.md) column on a ledgered parent | Refused on any child write or recompute. |
+| `dependent(..., on_delete = delete_all)` into a ledgered child | Refused. No row is erased. |
+| `dependent(..., on_delete = nullify)` into a ledgered child | Refused. No foreign key is cleared. |
+| `#[votable]` `react()` on a ledgered target or edge table | Refused. The aggregate does not change. |
+| `add_comment` / `delete_comment` into a ledgered comments table | Refused. |
+| `add_*` / `remove_*` / `set_*` into a ledgered `has_many(through)` join table | Refused. |
+| A [data capsule](data-capsules.md) import into a ledgered table | Refused with `DataCapsuleError::InvalidInput`. |
+| A write from an unledgered repository on the same table, or a `dependent(..., on_delete = destroy)` cascade through one | Refused. Its generated reads still work. `with_lock` and `find_or_create_by_*` use the write connection, so they are refused too. |
+| A model factory `create()` / `create_many()` | Panics with the same error. |
+
+The error names the table and the path. To fix it, remove the setting, write
+through the ledgered repository, or use `on_delete = destroy` (a ledgered child
+records a revision). The check runs even if the parent has no children.
+Autumn cannot refuse a hand-written `UPDATE`; the live-row cross-check catches it.
+The same is true for code that `autumn generate` writes into your crate, and for
+operator commands that copy rows (`autumn shard move-slot`, `autumn db scrub`).
+The check sees only repositories linked into the binary, and matches the bare
+table name.
 
 ### Threat model — read this
 
@@ -373,8 +498,11 @@ it is refused at the repository seam — at compile time, not at runtime:
 | `ledgered = true` without `soft_delete` | Rejected: a hard `DELETE` erases the row the ledger reconstructs, so an as-of query would return state whose record no longer exists and `verify` could not tell erasure from tampering. |
 | Calling `purge(id)` | Not generated. `purge` is soft-delete's hard-delete escape hatch — a raw `DELETE FROM` that writes no history at all. `delete_by_id` and `restore` — both of which record a revision — are the whole delete surface. |
 | A `dependent(..., on_delete = destroy)` cascade from a **soft**-deleting parent | The ledgered child is soft-deleted and records a revision, like any other delete. |
-| The same cascade from a **hard**-deleting parent | Refused at runtime with a typed `LedgerError::HardDeleteCascade`. Neither outcome is available: erasing the child destroys the record its ledger reconstructs, and soft-deleting it leaves a live foreign key pointing at a parent row about to disappear, which the database rejects. The parent's macro cannot see that the child is ledgered — they are separate `#[repository]` invocations — so this is the one guard the first slice cannot make a compile error. Make the parent `soft_delete`, or use `on_delete = nullify`. |
+| The same cascade from a **hard**-deleting parent | Refused at runtime with a typed `LedgerError::HardDeleteCascade`. Neither outcome is available: erasing the child destroys the record its ledger reconstructs, and soft-deleting it leaves a live foreign key pointing at a parent row about to disappear, which the database rejects. The parent's macro cannot see that the child is ledgered — they are separate `#[repository]` invocations — so this is a runtime guard, not a compile error. Make the parent `soft_delete`, or remove the `dependent(...)` clause. |
+| A `NaN` or infinite float in a ledgered write | Refused with `LedgerError::NonFiniteValue`. The error names the column. The write rolls back. A snapshot cannot store these values, because JSON cannot hold them. The check covers `f32`, `f64`, and `Option` or `Vec` of them. Floats inside other types, such as a JSON column, are not checked. |
 | `#[version_history(sensitive = [...])]` | Rejected: a redacted column cannot be reconstructed, so byte-for-byte as-of fidelity would be unprovable. |
+| A derived `delete_by_*` method | Rejected: it deletes in one bulk `UPDATE` and records no revision. Find the records, then call `delete_by_id` or `delete_many`. |
+| `tenant_scoped` with `tenant_id: Option<String>` | Rejected: see [Multi-tenancy and sharding](#multi-tenancy-and-sharding). |
 | `no_versioned_record_impl` | Rejected: the ledger snapshots through the generated `VersionedRecord` impl, and a hand-written one is not guaranteed to serialize every column. |
 | `retention(...)` / `position(...)` | Already rejected for `versioned = true`: both mutate rows outside the history-writing paths. |
 
@@ -389,6 +517,19 @@ tenant A's revisions, and `ledger_as_of` fails closed to `None`.
 read would interleave their chains into one sequence — 1, 1, 2, 2 — which
 `verify` would correctly call `DuplicateSeq` on history nobody touched. Read the
 ledger inside a tenant scope instead.
+
+The tenant column must be `String`, not `Option<String>`. A revision with a
+NULL tenant is not visible to a tenant-scoped read, and a cross-tenant read is
+refused, so no read could reach its chain. A nullable column is a compile error.
+
+The writer and the reader use the same source: the row's `tenant_id`. The
+writer writes it into each revision. The reader finds the chain and the live
+row by the active tenant, which is the same value. So each chain has exactly one
+read mode: the scope of the tenant that owns the row.
+
+A record cannot move to another tenant. An update that changes `tenant_id`
+fails with `LedgerError::TenantChange`. The move would leave the old chain with
+no live row, and start a new chain in the other tenant.
 
 Cross-shard ledger reads are rejected for the same class of reason: per-shard
 record ids are ambiguous, so a naive merge would be wrong. Query a specific shard
@@ -413,11 +554,15 @@ is cheap. The mark table takes an in-place
 `UPDATE` per ledgered write — the ledger's only non-append-only write — so it
 produces one dead tuple per revision in a table whose primary key is its only
 index; nothing unusual for autovacuum, but worth knowing at high write rates.
-`ledger_revisions`, `ledger_as_of`, `ledger_diff` and `ledger_verify` read a
-record's whole chain (there is no pagination in this slice), and `ledger_verify`
-additionally reads the live row, the high-water mark, and re-reads the head — the
-last of those is the stability gate that keeps a concurrent write from being
-mistaken for tampering.
+`ledger_as_of` and `ledger_diff` read one revision per instant.
+`ledger_revisions` reads a record's whole chain in one statement.
+`ledger_revisions_page` reads one keyset page on `(seq, id)`, so each page costs
+one indexed read. Pages are separate reads, not one snapshot. `ledger_verify`
+reads every revision, in pages of `LedgerPageRequest::VERIFY_LIMIT`, so its
+memory holds one page and the head. It
+also reads the live row, the high-water mark, and re-reads the head — the last
+of those is the stability gate that keeps a concurrent write from being mistaken
+for tampering.
 
 Snapshots store the full row, so a ledgered table's history grows with row width,
 not just with the size of each change — the price of O(1) as-of reconstruction
@@ -432,13 +577,10 @@ this slice.
 - No retention, compaction, or archival of old revisions.
 - No distributed or multi-node ledger consensus.
 - Postgres and SQLite only.
-- No pagination on `ledger_revisions` — a record's whole chain is read at once.
-- Writes that reach a ledgered table from outside its own repository — a
-  [counter-cache](counter-cache.md) column maintained on a ledgered parent, a
-  `dependent(..., on_delete = delete_all | nullify)` cascade declared on another
-  repository, a hand-written `UPDATE` — do not append a revision. They cannot be
-  refused at compile time (they are declared elsewhere), but `ledger_verify`
-  reports each as a `LiveStateMismatch`.
+- A hand-written `UPDATE` does not append a revision. Autumn cannot see it.
+  `ledger_verify` reports it as a `LiveStateMismatch`. Framework write paths
+  that bypass the repository are refused instead: see
+  [Writes from outside the repository](#writes-from-outside-the-repository).
 - Transaction time is read from the database *before* the write commits, so a
   revision can still become visible a commit's worth of time after the instant it
   carries. Closing that would need a commit timestamp, which cannot be read

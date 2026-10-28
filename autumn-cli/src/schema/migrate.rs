@@ -121,7 +121,9 @@ fn migrate_at(project_root: &Path, profile: Option<&str>) -> Result<(), String> 
     // files apply verbatim (`-- autumn-safety:` lines are inert SQL comments). The
     // snapshot baseline already advanced at `schema diff --write-migration` time,
     // so nothing is re-snapshotted here.
-    let result = apply_pending(backend, &url, &migrations_dir)?;
+    // The same table-lock policy as `autumn migrate` (#3057).
+    let lock_policy = crate::migrate::resolve_migration_lock_policy(profile);
+    let result = apply_pending(backend, &url, &migrations_dir, lock_policy)?;
     report_applied(&result);
 
     Ok(())
@@ -154,19 +156,30 @@ fn apply_pending(
     backend: Backend,
     url: &str,
     migrations_dir: &Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
 ) -> Result<MigrationResult, String> {
     match backend {
-        Backend::Postgres => apply_pending_pg(url, migrations_dir),
+        Backend::Postgres => apply_pending_pg(url, migrations_dir, lock_policy),
         Backend::Sqlite => apply_pending_sqlite(url, migrations_dir),
     }
 }
 
-/// Postgres apply path: advisory-locked (`run_pending_locked`) so concurrent
-/// migrators serialize cleanly.
-fn apply_pending_pg(url: &str, migrations_dir: &Path) -> Result<MigrationResult, String> {
+/// Postgres apply path: advisory-locked (`run_pending_locked_with_policy`) so
+/// concurrent migrators serialize cleanly, with the configured table-lock
+/// policy (#3057).
+fn apply_pending_pg(
+    url: &str,
+    migrations_dir: &Path,
+    lock_policy: autumn_web::migrate::MigrationLockPolicy,
+) -> Result<MigrationResult, String> {
     let migrations = file_based_migrations(migrations_dir)?;
-    autumn_web::migrate::run_pending_locked(url, migrations, Some(DEFAULT_LOCK_WAIT_TIMEOUT))
-        .map_err(|e| e.to_string())
+    autumn_web::migrate::run_pending_locked_with_policy(
+        url,
+        migrations,
+        Some(DEFAULT_LOCK_WAIT_TIMEOUT),
+        lock_policy,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// `SQLite` apply path (feature-gated). `SQLite` is a single-writer local database,

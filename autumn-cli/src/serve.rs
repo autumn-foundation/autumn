@@ -853,6 +853,9 @@ fn base_command(binary: &Path, paths: Option<&RuntimePaths>, opts: &ServeOptions
     // half-set internal protocol in a server's environment invites the next
     // mode check to trip over it.
     crate::db::retention::clear_inherited_one_shot_env(&mut cmd);
+    // Same for `autumn data capsule` (#1811): an inherited import mode would
+    // write records and exit instead of serving.
+    crate::data_capsule::clear_inherited_one_shot_env(&mut cmd);
     // For a workspace member selected with `-p`, run the child from the member's
     // manifest dir so its `autumn.toml`/profile and asset dirs resolve correctly
     // instead of the workspace-root CWD. Set both `current_dir` (covers CWD-
@@ -1219,6 +1222,21 @@ pub fn start_supervised(
     Ok(child)
 }
 
+/// Drain budget plus the stop grace, capped at the SCM ceiling.
+///
+/// The budget is user config, so the sum saturates. An overflow would panic
+/// the service host mid-stop. The SCM would then restart it.
+fn stop_deadline(budget_secs: u64) -> Duration {
+    Duration::from_secs(budget_secs)
+        .saturating_add(STOP_GRACE_BUFFER)
+        .min(crate::service::MAX_WAIT_HINT)
+}
+
+/// `prestop_grace_secs + shutdown_timeout_secs`, saturating.
+fn drain_budget_secs(prestop: u64, shutdown: u64) -> u64 {
+    prestop.saturating_add(shutdown)
+}
+
 /// Ask `child` to drain, wait out `budget_secs`, then force-kill its tree.
 /// Returns the child's exit code, or `None` when it could not be reaped.
 ///
@@ -1231,7 +1249,7 @@ pub fn stop_child(
     budget_secs: u64,
 ) -> Option<i32> {
     let _ = process::create_stop_request(&paths.stop_file());
-    let budget = Duration::from_secs(budget_secs) + STOP_GRACE_BUFFER;
+    let budget = stop_deadline(budget_secs);
     if process::wait_with_timeout(child, budget).is_err() {
         process::force_kill_group(child.id());
         let _ = child.kill();
@@ -1868,7 +1886,7 @@ fn stop_timeout(
     recorded_budget: Option<u64>,
 ) -> Duration {
     if let Some(secs) = recorded_budget {
-        return Duration::from_secs(secs) + STOP_GRACE_BUFFER;
+        return stop_deadline(secs);
     }
     let base_dir = opts
         .package
@@ -1877,7 +1895,7 @@ fn stop_timeout(
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let profile = effective_profile(None, recorded_release);
     let (prestop, shutdown) = resolve_shutdown_budget(&base_dir, Some(&profile));
-    Duration::from_secs(prestop + shutdown) + STOP_GRACE_BUFFER
+    stop_deadline(drain_budget_secs(prestop, shutdown))
 }
 
 /// The drain budget (`prestop_grace_secs + shutdown_timeout_secs`) resolved from
@@ -1891,7 +1909,7 @@ fn resolved_stop_budget_secs(opts: &ServeOptions) -> u64 {
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let profile = effective_profile(opts.profile.as_deref(), opts.release);
     let (prestop, shutdown) = resolve_shutdown_budget(&base_dir, Some(&profile));
-    prestop + shutdown
+    drain_budget_secs(prestop, shutdown)
 }
 
 /// The active profile: an explicit override (`profile_override`, e.g. a `restart`
@@ -2001,8 +2019,8 @@ fn effective_pin_from(
 }
 
 /// Resolve `(prestop_grace_secs, shutdown_timeout_secs)` with the app's layering
-/// for the given active `profile`. Defaults match the prod/dev profile
-/// smart-defaults for these keys.
+/// for the given active `profile`. Defaults come from the runtime's profile
+/// smart defaults.
 pub fn resolve_shutdown_budget(base_dir: &Path, profile: Option<&str>) -> (u64, u64) {
     resolve_shutdown_budget_from(base_dir, profile, &|key| std::env::var(key).ok())
 }
@@ -2023,8 +2041,8 @@ pub fn resolve_shutdown_budget_from(
     profile: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> (u64, u64) {
-    let mut prestop = 5u64;
-    let mut shutdown = 30u64;
+    let (mut prestop, mut shutdown) =
+        autumn_web::config::profile_shutdown_defaults(profile.unwrap_or_default());
 
     // Base autumn.toml [server], then inline [profile.<name>].server overrides.
     if let Ok(contents) = std::fs::read_to_string(base_dir.join("autumn.toml"))
@@ -2206,6 +2224,22 @@ fn remove_socket_if_not_live(_socket: &Path) {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stop_deadline_adds_the_grace_buffer() {
+        assert_eq!(stop_deadline(30), Duration::from_secs(35));
+    }
+
+    #[test]
+    fn stop_deadline_does_not_panic_on_a_huge_budget() {
+        assert_eq!(stop_deadline(u64::MAX), crate::service::MAX_WAIT_HINT);
+    }
+
+    #[test]
+    fn drain_budget_saturates_instead_of_overflowing() {
+        assert_eq!(drain_budget_secs(5, 30), 35);
+        assert_eq!(drain_budget_secs(u64::MAX, 1), u64::MAX);
+    }
+
     // ── Readiness protocol and the daemon endpoint (issue #1639) ───────────
     //
     // On Unix the CLI chooses the daemon's endpoint (the socket path it forces
@@ -2228,6 +2262,16 @@ mod tests {
                 address: "127.0.0.1:3000".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn ready_payload_with_no_endpoint_still_yields_the_budget_and_no_endpoint() {
+        // The capability line sits where the endpoint would. It must not parse
+        // as one.
+        let written = autumn_web::app::serve_ready_payload(35, "");
+        let (budget, endpoint) = parse_ready_payload(&written);
+        assert_eq!(budget, Some(35));
+        assert_eq!(endpoint, None);
     }
 
     #[test]
@@ -2732,6 +2776,51 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_budget_dev_profile_uses_dev_smart_defaults() {
+        // #2442: dev uses 0 s prestop and 1 s shutdown.
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(resolve_shutdown_budget(dir.path(), Some("dev")), (0, 1));
+            assert_eq!(
+                resolve_shutdown_budget(dir.path(), Some("development")),
+                (0, 1)
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_prod_profile_matches_runtime_smart_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(resolve_shutdown_budget(dir.path(), Some("prod")), (5, 35));
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_custom_profile_keeps_struct_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(
+                resolve_shutdown_budget(dir.path(), Some("staging")),
+                (5, 30)
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_budget_dev_toml_override_beats_smart_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("autumn.toml"),
+            "[server]\nshutdown_timeout_secs = 20\n",
+        )
+        .expect("write");
+        temp_env::with_vars(clear_shutdown_env(), || {
+            assert_eq!(resolve_shutdown_budget(dir.path(), Some("dev")), (0, 20));
+        });
+    }
+
+    #[test]
     fn shutdown_budget_reads_base_server_section() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -3029,6 +3118,24 @@ mod tests {
             "the flag must be explicitly removed (present with a None value), not \
              merely absent from the overrides -- absent means inherited: {entry:?}"
         );
+    }
+
+    #[test]
+    fn base_command_clears_an_inherited_data_capsule_mode() {
+        // #1811: `AUTUMN_DATA_CAPSULE=import` is read before the server binds.
+        // Inherited, it would import a capsule and exit instead of serving.
+        let opts = serve_opts_with_role(None);
+        let cmd = base_command(Path::new("/bin/true"), None, &opts);
+        for var in [
+            "AUTUMN_DATA_CAPSULE",
+            "AUTUMN_DATA_CAPSULE_SUBJECT",
+            "AUTUMN_DATA_CAPSULE_PATH",
+        ] {
+            let entry = cmd
+                .get_envs()
+                .find(|(k, _)| *k == std::ffi::OsStr::new(var));
+            assert_eq!(entry, Some((std::ffi::OsStr::new(var), None)), "{var}");
+        }
     }
 
     #[test]

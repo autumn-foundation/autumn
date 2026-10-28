@@ -37,10 +37,8 @@
 
 use axum::extract::FromRequestParts;
 use diesel;
-// Named by the default Postgres pool builder/TLS connector and by the
-// Postgres migration connection (`MigrationConnection`), which stays compiled
-// under the `sqlite` feature (diesel's `postgres` backend is still in the graph
-// via `db`), so this import is used on both builds.
+// Named by the Postgres pool builder, TLS connector and migration connection.
+#[cfg(feature = "postgres")]
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 #[cfg(not(feature = "sqlite"))]
@@ -106,6 +104,19 @@ pub type RuntimeBackend = diesel::pg::Pg;
 #[cfg(feature = "sqlite")]
 pub type RuntimeBackend = diesel::sqlite::Sqlite;
 
+/// One `SQLite` database per tenant or per routing slot (ADR 0019).
+#[cfg(feature = "sqlite")]
+pub mod fleet;
+/// Slot-ownership epochs and fencing for a fleet (issue #3233).
+#[cfg(feature = "sqlite")]
+pub mod fleet_ownership;
+/// Continuous replication of a fleet's databases (ADR 0019 §5).
+#[cfg(feature = "sqlite")]
+pub mod fleet_replication;
+/// Background work on fleet databases nobody asks for (issue 3234).
+#[cfg(feature = "sqlite")]
+pub mod fleet_sweeper;
+pub mod pooler;
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]
 pub mod sqlite_types;
@@ -128,7 +139,201 @@ tokio::task_local! {
     /// Task-local registry used by [`Db::tx`] to accumulate after-commit
     /// callbacks. Only set while the [`Db::tx`] future is being polled;
     /// absent outside a transaction block.
+    ///
+    /// Use [`register_after_commit`]: a callback pushed here directly does not
+    /// mark a failure capsule incomplete.
     pub static AFTER_COMMIT_REGISTRY: Arc<Mutex<Vec<CommitCallback>>>;
+}
+
+/// Timeouts that each framework transaction sets with `SET LOCAL` (#3057).
+///
+/// A transaction pooler (`PgBouncer` in transaction mode) drops a session
+/// `SET`, but keeps a `SET LOCAL` for the transaction that issued it. The
+/// values are milliseconds. `Some(0)` turns the limit off.
+///
+/// An unset statement timeout is sent as `0`. `Db::checkout` and generated
+/// repositories already `SET statement_timeout = 0` for the session when none
+/// is configured. `DEFAULT` would undo that and bring back a role or database
+/// default. An unset idle timeout is sent as `DEFAULT`; nothing sets it for
+/// the session, so that is the session value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TxTimeouts {
+    /// `statement_timeout`, in milliseconds.
+    pub(crate) statement_ms: Option<u64>,
+    /// `idle_in_transaction_session_timeout`, in milliseconds.
+    pub(crate) idle_in_transaction_ms: Option<u64>,
+}
+
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        dead_code,
+        reason = "`SET LOCAL` is Postgres-only; SQLite sends nothing"
+    )
+)]
+impl TxTimeouts {
+    /// Build from the configured durations. Each value is capped at
+    /// `i32::MAX` milliseconds, the Postgres maximum.
+    pub(crate) fn new(
+        statement: Option<std::time::Duration>,
+        idle_in_transaction: Option<std::time::Duration>,
+    ) -> Self {
+        Self {
+            statement_ms: statement.map(|d| pg_timeout_ms(Some(d))),
+            idle_in_transaction_ms: idle_in_transaction.map(|d| pg_timeout_ms(Some(d))),
+        }
+    }
+
+    /// The timeouts from an app's `[database]` config.
+    pub(crate) fn from_config(config: &crate::config::DatabaseConfig) -> Self {
+        Self::new(config.statement_timeout, config.idle_in_transaction_timeout)
+    }
+
+    /// The `SET LOCAL` batch, or `None` when neither value is set. Then
+    /// nothing is sent, and a transaction costs no extra round trip.
+    ///
+    /// The batch always has both statements, in this order. The capsule
+    /// recorder matches that exact form (`capsule::wire`).
+    pub(crate) fn set_local_sql(self) -> Option<String> {
+        (self.statement_ms.is_some() || self.idle_in_transaction_ms.is_some()).then(|| {
+            format!(
+                "SET LOCAL statement_timeout = {}; \
+                 SET LOCAL idle_in_transaction_session_timeout = {}",
+                self.statement_ms.unwrap_or(0),
+                self.idle_in_transaction_ms
+                    .map_or_else(|| "DEFAULT".to_owned(), |ms| ms.to_string())
+            )
+        })
+    }
+
+    /// Run `fut` with these timeouts in scope. Each outermost transaction
+    /// that [`scoped_transaction`] opens in `fut` sets them with `SET LOCAL`.
+    pub(crate) async fn scope<F: std::future::Future>(self, fut: F) -> F::Output {
+        TX_TIMEOUTS.scope(self, fut).await
+    }
+
+    /// Run a request `fut` with these timeouts as its defaults. A route's
+    /// [`StatementTimeout`] replaces the statement value when an extractor
+    /// sees it (see [`note_route_statement_timeout`]).
+    pub(crate) async fn scope_request<F: std::future::Future>(self, fut: F) -> F::Output {
+        REQUEST_TX_TIMEOUTS
+            .scope(Arc::new(Mutex::new(self)), fut)
+            .await
+    }
+
+    /// The timeouts in scope for this task: the innermost `Db` scope, else
+    /// the request defaults, else `None`.
+    pub(crate) fn current() -> Option<Self> {
+        TX_TIMEOUTS.try_with(|t| *t).ok().or_else(|| {
+            REQUEST_TX_TIMEOUTS
+                .try_with(|cell| {
+                    *cell
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                })
+                .ok()
+        })
+    }
+}
+
+/// Run background work (a scheduled task or a job) with the app's configured
+/// [`TxTimeouts`] in scope, so its framework transactions set them as a
+/// request's do (#3057). A `Db` method inside still scopes its own values.
+///
+/// The values are read here, so the returned future holds no borrow of
+/// `state`.
+pub(crate) fn scope_background_tx_timeouts<S: DbState, F: std::future::Future>(
+    state: &S,
+    fut: F,
+) -> impl std::future::Future<Output = F::Output> + use<S, F> {
+    let timeouts = TxTimeouts::new(
+        state.statement_timeout(),
+        state.idle_in_transaction_timeout(),
+    );
+    TX_TIMEOUTS.scope(timeouts, fut)
+}
+
+/// Record a route's [`StatementTimeout`] for the request's transactions.
+///
+/// The request layer sits outside the route layer that adds the extension,
+/// so an extractor that sees it reports it here. `Db` does this itself.
+/// Generated repositories call it through `__private`.
+#[doc(hidden)]
+pub fn note_route_statement_timeout(parts: &axum::http::request::Parts) {
+    if let Some(timeout) = parts.extensions.get::<StatementTimeout>() {
+        note_statement_timeout(*timeout);
+    }
+}
+
+/// Record a route's [`StatementTimeout`] for the request's transactions, for
+/// a handler that receives the extension itself (the offline-sync routes).
+pub(crate) fn note_statement_timeout(timeout: StatementTimeout) {
+    let ms = pg_timeout_ms(Some(timeout.0));
+    let _ = REQUEST_TX_TIMEOUTS.try_with(|cell| {
+        cell.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .statement_ms = Some(ms);
+    });
+}
+
+/// A Postgres timeout setting in milliseconds, capped at `i32::MAX`.
+fn pg_timeout_ms(timeout: Option<std::time::Duration>) -> u64 {
+    const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+    timeout.map_or(0, |d| {
+        u64::try_from(d.as_millis())
+            .unwrap_or(PG_TIMEOUT_MAX_MS)
+            .min(PG_TIMEOUT_MAX_MS)
+    })
+}
+
+tokio::task_local! {
+    /// The [`TxTimeouts`] of one `Db`: set by [`Db::tx`] and its siblings.
+    static TX_TIMEOUTS: TxTimeouts;
+}
+
+tokio::task_local! {
+    /// The request's [`TxTimeouts`], for code that opens a transaction on a
+    /// connection of its own (generated repositories). Set by the request
+    /// layer. Mutable so that a route override can replace the default.
+    static REQUEST_TX_TIMEOUTS: Arc<Mutex<TxTimeouts>>;
+}
+
+/// Issue the in-scope [`TxTimeouts`] as `SET LOCAL`, at transaction depth 1
+/// only. A savepoint keeps the outer transaction's values.
+///
+/// # Errors
+///
+/// Returns the database error from the `SET LOCAL` batch.
+#[cfg(not(feature = "sqlite"))]
+async fn apply_tx_timeouts<C>(conn: &mut C) -> Result<(), diesel::result::Error>
+where
+    C: diesel_async::AsyncConnection + Send,
+{
+    use diesel_async::TransactionManager as _;
+    let Some(sql) = TxTimeouts::current().and_then(TxTimeouts::set_local_sql) else {
+        return Ok(());
+    };
+    let depth = C::TransactionManager::transaction_manager_status_mut(conn)
+        .transaction_depth()?
+        .map(std::num::NonZeroU32::get);
+    if depth == Some(1) {
+        conn.batch_execute(&sql).await?;
+    }
+    Ok(())
+}
+
+/// `SET LOCAL` is Postgres syntax. `SQLite` has no such settings.
+#[cfg(feature = "sqlite")]
+#[allow(
+    clippy::unused_async,
+    clippy::needless_pass_by_ref_mut,
+    reason = "same signature as the Postgres version"
+)]
+async fn apply_tx_timeouts<C>(_conn: &mut C) -> Result<(), diesel::result::Error>
+where
+    C: diesel_async::AsyncConnection + Send,
+{
+    Ok(())
 }
 
 /// Per-request accumulator for database query timing, used by the
@@ -226,6 +431,11 @@ pub(crate) fn record_request_db_query(elapsed: Duration, sql: Option<&str>) {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     });
 
+    // Lane 3: per-request cost metering (issue #1720). No-op outside a
+    // metered request.
+    #[cfg(feature = "db")]
+    crate::cost::record_db_query();
+
     // Lane 2: request-wide SQL capture, independent of the timing lane. Only
     // active when a test scoped `REQUEST_QUERY_CAPTURE`; a no-op otherwise
     // (production, background jobs). The two `try_with` calls are independent —
@@ -278,6 +488,15 @@ pub(crate) fn request_db_timing_active() -> bool {
 #[cfg(feature = "db")]
 pub(crate) fn request_query_capture_active() -> bool {
     REQUEST_QUERY_CAPTURE.try_with(|_| ()).is_ok()
+}
+
+/// Whether any per-request DB lane is active: `Server-Timing` timing, test
+/// query capture, or cost metering (issue #1720).
+#[cfg(feature = "db")]
+fn request_db_lane_active() -> bool {
+    request_db_timing_active()
+        || request_query_capture_active()
+        || crate::cost::request_cost_active()
 }
 
 /// diesel-async [`Instrumentation`](diesel::connection::Instrumentation)
@@ -349,6 +568,10 @@ pub(crate) struct RequestQueryTimer {
     /// connections that actually carry a timer, which `Db::checkout` installs
     /// solely while a query observer is scoped.
     clock: std::sync::Arc<dyn crate::time::ClockSource>,
+    /// The sim gate's turn for the running statement. This timer replaces the
+    /// gate's own instrumentation on a connection, so it takes the turn too
+    /// (issue #3067). Off a sim runtime it does nothing.
+    turn: crate::sim::gate::QueryTurn,
 }
 
 #[cfg(feature = "db")]
@@ -371,6 +594,7 @@ impl Default for RequestQueryTimer {
         Self {
             pending: None,
             clock: std::sync::Arc::new(crate::time::SystemClock),
+            turn: crate::sim::gate::QueryTurn::default(),
         }
     }
 }
@@ -394,6 +618,7 @@ impl RequestQueryTimer {
         Self {
             pending: None,
             clock,
+            turn: crate::sim::gate::QueryTurn::default(),
         }
     }
 
@@ -456,7 +681,7 @@ impl RequestQueryTimer {
         // opted-out / off-request path) the timer does nothing and never
         // invokes `sql`, so the caller's `DebugQuery` `to_string()` allocation
         // is skipped — keeping a stale installed timer a cheap bool-probe no-op.
-        if !request_db_timing_active() && !request_query_capture_active() {
+        if !request_db_lane_active() {
             self.pending = None;
             return;
         }
@@ -497,8 +722,10 @@ impl diesel::connection::Instrumentation for RequestQueryTimer {
                 // opted-out timer never pays the allocation — see `on_start`.
                 let now = self.clock.monotonic();
                 self.on_start(now, || query.to_string());
+                self.turn.start();
             }
             InstrumentationEvent::FinishQuery { .. } => {
+                self.turn.finish();
                 let now = self.clock.monotonic();
                 self.on_finish(now);
             }
@@ -564,14 +791,28 @@ pub(crate) fn reject_ambient_after_commit_registry_for_tx() -> Result<(), Autumn
     Ok(())
 }
 
+/// Run the committed transaction's after-commit callbacks on a new task.
+///
+/// A spawned task does not inherit task-locals, so the [`TxTimeouts`] in
+/// scope here (the request's, or a scheduled task's or job's) are carried
+/// into it. A repository write in a callback then sets them as well (#3057).
 pub(crate) fn spawn_committed_after_commit_callbacks(
     callbacks: Vec<CommitCallback>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if callbacks.is_empty() {
         return None;
     }
+    // The callbacks run on a detached task, where capture cannot see their
+    // effects (#2351 item 3). A `register_after_commit` callback is counted
+    // from its registration, and marks the capsule incomplete here. A
+    // framework callback recorded its effect at registration and marks
+    // nothing. A rolled-back transaction drops its callbacks, so it marks
+    // nothing.
+    #[cfg(feature = "reporting")]
+    crate::capsule::boundary::note_committed_after_commit();
 
-    Some(tokio::task::spawn(async move {
+    let timeouts = TxTimeouts::current().unwrap_or_default();
+    let callbacks_run = async move {
         for cb in callbacks {
             let result = match std::panic::catch_unwind(AssertUnwindSafe(cb)) {
                 Ok(callback) => AssertUnwindSafe(callback).catch_unwind().await,
@@ -597,7 +838,15 @@ pub(crate) fn spawn_committed_after_commit_callbacks(
                 }
             }
         }
-    }))
+    };
+    // During a capsule replay the callbacks get the replay tape, so their
+    // effects are served or refused and never reach live services (#2351
+    // item 3).
+    #[cfg(feature = "reporting")]
+    let callbacks_run = crate::capsule::boundary::carry_detached(callbacks_run);
+    Some(tokio::task::spawn(
+        TX_TIMEOUTS.scope(timeouts, callbacks_run),
+    ))
 }
 
 fn after_commit_panic_message(payload: &(dyn Any + Send)) -> String {
@@ -655,11 +904,17 @@ where
     AFTER_COMMIT_REGISTRY
         .try_with(|registry| {
             let f = f_opt.take().expect("closure only entered once");
-            let boxed: CommitCallback = Box::new(move || Box::pin(f()));
+            // Counted until it runs, or until a rollback drops it.
+            #[cfg(feature = "reporting")]
+            let pending = crate::capsule::boundary::PendingAfterCommit::register();
+            let boxed: CommitCallback = Box::new(move || {
+                #[cfg(feature = "reporting")]
+                pending.started();
+                Box::pin(f())
+            });
             registry.lock().expect("registry lock").push(boxed);
         })
         .ok();
-
     // If still Some, the task-local wasn't set — we're outside a tx; run eagerly.
     if let Some(f) = f_opt {
         tracing::debug!("register_after_commit: no active transaction; running callback eagerly");
@@ -730,6 +985,12 @@ pub trait DbState {
     }
     /// Returns the global statement timeout, if configured.
     fn statement_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// Returns the global `idle_in_transaction_session_timeout`, if
+    /// configured (#3057).
+    fn idle_in_transaction_timeout(&self) -> Option<std::time::Duration> {
         None
     }
 
@@ -1069,8 +1330,10 @@ where
 
     // Record metrics regardless of success/failure
     let verb = sql.split_whitespace().next().unwrap_or("?");
-    let metric_key = format!("{route_key} {verb}");
-    metrics.record_db_query(&metric_key, elapsed_ms);
+    // Composed on the stack rather than into a `String` per query. Kept to
+    // this one statement: `fmt::Arguments` is `!Send` and must not live across
+    // an `.await` of this future.
+    metrics.record_db_query_fmt(format_args!("{route_key} {verb}"), elapsed_ms);
     // NOTE: deliberately *not* recorded into the per-request Server-Timing
     // accumulator. The connection-level `RequestQueryTimer` instrumentation
     // (installed at `Db::checkout`) already brackets every executed statement
@@ -1110,6 +1373,7 @@ where
 /// [`tokio_postgres::error::DbError`] in turn. Shared by [`is_query_canceled`]
 /// and [`is_retryable_txn_error`] — both need the same downcast-through-the-
 /// chain strategy, only with a different SQLSTATE to look for.
+#[cfg(feature = "postgres")]
 fn source_chain_has_sqlstate(
     err: &(dyn std::error::Error + 'static),
     predicate: impl Fn(&tokio_postgres::error::SqlState) -> bool,
@@ -1149,9 +1413,17 @@ fn is_query_canceled(err: &diesel::result::Error) -> bool {
         return true;
     }
 
-    source_chain_has_sqlstate(err, |state| {
-        *state == tokio_postgres::error::SqlState::QUERY_CANCELED
-    })
+    // Without the Postgres client there is no SQLSTATE to read.
+    #[cfg(feature = "postgres")]
+    {
+        source_chain_has_sqlstate(err, |state| {
+            *state == tokio_postgres::error::SqlState::QUERY_CANCELED
+        })
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        false
+    }
 }
 
 /// Error type for pool creation failures.
@@ -1315,7 +1587,7 @@ static SQLITE_REPLICATION_ACTIVE: std::sync::atomic::AtomicBool =
 ///   `sqlite3_unlock_notify`), so the pragma is inert for that one lock class —
 ///   harmless, not harmful (issue #2881).
 #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
-const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
+pub(crate) const fn sqlite_connection_pragmas(read_only: bool, replicating: bool) -> &'static str {
     if read_only {
         "PRAGMA busy_timeout = 5000; \
          PRAGMA foreign_keys = ON;"
@@ -1423,6 +1695,7 @@ fn build_pool(
 
     #[cfg(not(feature = "sqlite"))]
     {
+        let _ = crate::lock::pooler::warn_if_pooled(url);
         let timeout = Duration::from_secs(connect_timeout_secs);
         let config = pg_manager_config(url);
         let manager =
@@ -1600,8 +1873,9 @@ pub(crate) fn sqlite_target_is_shared_cache(target: &str) -> bool {
 /// parameter is exactly `value`, read the way `SQLite` reads it: only a `file:`
 /// URI has query parameters (a plain path containing `?` is just a filename),
 /// the `#fragment` is ignored, names and values are percent-decoded before the
-/// case-sensitive comparison, and a repeated parameter takes its last value. `target` may be a raw configured URL
-/// (`sqlite:file:...`) or an already-normalized one.
+/// case-sensitive comparison, and a repeated parameter takes its last value.
+/// A `%00` ends the name or value it is in. `target` may be a raw configured
+/// URL (`sqlite:file:...`) or an already normalized one.
 #[cfg(feature = "sqlite")]
 fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
     let target = normalize_sqlite_target(target);
@@ -1622,7 +1896,8 @@ fn sqlite_uri_has_query_pair(target: &str, key: &str, value: &str) -> bool {
 }
 
 /// Decode `%XX` escapes the way `SQLite`'s URI parser does; a `%` not followed
-/// by two hex digits is kept literally.
+/// by two hex digits is kept literally. A decoded NUL (`%00`) stops the
+/// decoding. `SQLite` drops the rest of that name or value (issue #3032).
 #[cfg(feature = "sqlite")]
 fn percent_decode(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
@@ -1635,6 +1910,9 @@ fn percent_decode(input: &str) -> Vec<u8> {
                 bytes.get(i + 2).and_then(|b| (*b as char).to_digit(16)),
             )
         {
+            if hi == 0 && lo == 0 {
+                break;
+            }
             // Two hex digits always fit in a byte.
             out.push(u8::try_from(hi * 16 + lo).unwrap_or(b'%'));
             i += 3;
@@ -1663,6 +1941,46 @@ fn build_sqlite_pool(
     url: &str,
     pool_size: usize,
     connect_timeout_secs: u64,
+) -> Result<Pool<RuntimeConnection>, PoolError> {
+    build_sqlite_pool_with(
+        url,
+        pool_size,
+        connect_timeout_secs,
+        SqliteCheckpointOwner::ProcessLatch,
+    )
+}
+
+/// Who checkpoints the WAL of a `SQLite` pool's database.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqliteCheckpointOwner {
+    /// Follow [`sqlite_replication_active`], read as each connection is
+    /// created: the control database, which the process replicator owns.
+    ProcessLatch,
+    /// A fleet database (ADR 0019): `true` when a fleet replicator owns its
+    /// checkpoints, `false` when `SQLite` auto-checkpoints. Never the process
+    /// latch — a fleet database the control replicator does not ship must
+    /// not lose auto-checkpointing, or its `-wal` grows without bound.
+    Fleet(bool),
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteCheckpointOwner {
+    fn replicating(self) -> bool {
+        match self {
+            Self::ProcessLatch => sqlite_replication_active(),
+            Self::Fleet(replicating) => replicating,
+        }
+    }
+}
+
+/// [`build_sqlite_pool`] with an explicit [`SqliteCheckpointOwner`].
+#[cfg(feature = "sqlite")]
+pub(crate) fn build_sqlite_pool_with(
+    url: &str,
+    pool_size: usize,
+    connect_timeout_secs: u64,
+    checkpoint_owner: SqliteCheckpointOwner,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
     // Under the `sqlite` feature the runtime targets SQLite, so the URL must
     // actually NAME a SQLite target. Everything past this point treats the
@@ -1778,14 +2096,14 @@ fn build_sqlite_pool(
     // per-connection pragmas (`busy_timeout`, `foreign_keys`), so a read-only pool builds
     // and serves reads. In-memory targets are not read-only and keep the full batch.
     let mut config = diesel_async::pooled_connection::ManagerConfig::<RuntimeConnection>::default();
-    config.custom_setup = Box::new(|url: &str| {
+    config.custom_setup = Box::new(move |url: &str| {
         use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
         let url = url.to_owned();
         async move {
             let mut conn = RuntimeConnection::establish(&url).await?;
             let pragmas = sqlite_connection_pragmas(
                 sqlite_target_is_read_only(&url),
-                sqlite_replication_active(),
+                checkpoint_owner.replicating(),
             );
             apply_sqlite_pragmas(&mut conn, pragmas)
                 .await
@@ -1895,7 +2213,7 @@ pub fn create_pool(config: &DatabaseConfig) -> Result<Option<Pool<RuntimeConnect
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout, url)?;
+    reject_sqlite_unsupported_timeouts(config, url)?;
 
     let pool = build_pool(
         url,
@@ -1971,6 +2289,43 @@ pub(crate) fn reject_sqlite_statement_timeout(
     )))
 }
 
+/// Reject every timeout `SQLite` cannot enforce: `database.statement_timeout`
+/// and `database.idle_in_transaction_timeout` (#3057). Each pool factory and
+/// provider path calls this one guard, so none can miss a setting.
+///
+/// # Errors
+///
+/// Returns [`PoolError::UnsupportedBackend`] for the first nonzero setting.
+#[cfg(feature = "sqlite")]
+pub(crate) fn reject_sqlite_unsupported_timeouts(
+    config: &DatabaseConfig,
+    target: &str,
+) -> Result<(), PoolError> {
+    reject_sqlite_statement_timeout(config.statement_timeout, target)?;
+    reject_sqlite_idle_in_transaction_timeout(config.idle_in_transaction_timeout)
+}
+
+/// Reject a configured `database.idle_in_transaction_timeout` under the
+/// `SQLite` backend (#3057). `SQLite` has no such setting, so a nonzero value
+/// would look enforced and not be. `None` and zero are allowed.
+///
+/// # Errors
+///
+/// Returns [`PoolError::UnsupportedBackend`] for a nonzero value.
+#[cfg(feature = "sqlite")]
+pub(crate) fn reject_sqlite_idle_in_transaction_timeout(
+    timeout: Option<Duration>,
+) -> Result<(), PoolError> {
+    let Some(timeout) = timeout.filter(|t| !t.is_zero()) else {
+        return Ok(());
+    };
+    Err(PoolError::UnsupportedBackend(format!(
+        "SQLite backend cannot enforce database.idle_in_transaction_timeout ({}ms). \
+         Unset it for the SQLite backend, or run on Postgres.",
+        timeout.as_millis()
+    )))
+}
+
 /// Reject a `SQLite` `replica_url` that cannot act as a real read replica for the
 /// given `primary_url`.
 ///
@@ -2016,7 +2371,7 @@ pub fn create_topology(config: &DatabaseConfig) -> Result<Option<DatabaseTopolog
     };
 
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(config.statement_timeout, primary_url)?;
+    reject_sqlite_unsupported_timeouts(config, primary_url)?;
 
     let primary = build_pool(
         primary_url,
@@ -2060,7 +2415,7 @@ pub fn create_shard_topology(
     // Postgres-only), so the same fail-closed guard applies per shard. The shard
     // inherits the `[database]` `statement_timeout`.
     #[cfg(feature = "sqlite")]
-    reject_sqlite_statement_timeout(defaults.statement_timeout, &shard.primary_url)?;
+    reject_sqlite_unsupported_timeouts(defaults, &shard.primary_url)?;
 
     let primary = build_pool(
         &shard.primary_url,
@@ -2299,8 +2654,8 @@ const fn retry_decision(attempt: u32, max_attempts: u32, retryable: bool) -> Ret
 /// Deterministic capped exponential backoff base: `initial * 2^(attempt-1)`,
 /// saturating on overflow and capped at `max`.
 ///
-/// Mirrors the jobs system's backoff shape (`pg_retry_delay_ms`) plus the cap
-/// idiom from the migrate startup loop. Kept jitter-free so it is unit-testable.
+/// Same exponential shape and cap as [`crate::backoff::ceiling_ms`]. Kept
+/// jitter-free so it is unit-testable. [`retry_backoff_delay`] adds the jitter.
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
 fn retry_backoff_base(initial: Duration, max: Duration, attempt: u32) -> Duration {
     // Cap the shift so `2^shift` never overflows and huge attempts saturate.
@@ -2361,13 +2716,8 @@ fn retry_backoff_delay(initial: Duration, max: Duration, attempt: u32) -> Durati
 /// domain/validation error as a transient conflict, silently re-running a
 /// non-idempotent closure and delaying the response.
 #[cfg_attr(feature = "sqlite", allow(dead_code))]
+#[must_use]
 pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
-    use tokio_postgres::error::SqlState;
-
-    fn is_retryable_sqlstate(state: &SqlState) -> bool {
-        *state == SqlState::T_R_SERIALIZATION_FAILURE || *state == SqlState::T_R_DEADLOCK_DETECTED
-    }
-
     if let Some(diesel_err) = err.downcast_chain_ref::<diesel::result::Error>() {
         return match diesel_err {
             // Fast path: diesel-async maps 40001 to SerializationFailure from
@@ -2388,7 +2738,7 @@ pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
                 diesel::result::DatabaseErrorKind::Unknown,
                 info,
             ) => {
-                source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate)
+                chain_has_retryable_sqlstate(diesel_err)
                     || info
                         .message()
                         .trim()
@@ -2397,19 +2747,47 @@ pub fn is_retryable_txn_error(err: &AutumnError) -> bool {
             // Any other kind (UniqueViolation, NotNullViolation, ...) is
             // authoritatively non-retryable — no string matching against its
             // message/constraint text.
-            _ => source_chain_has_sqlstate(diesel_err, is_retryable_sqlstate),
+            _ => chain_has_retryable_sqlstate(diesel_err),
         };
     }
 
-    // No `diesel::result::Error` anywhere in the chain — check for a raw
-    // `tokio_postgres` SQLSTATE directly. No text-based fallback beyond this;
-    // see the doc comment above for why.
+    raw_error_has_retryable_sqlstate(err)
+}
+
+/// Whether a Postgres `40001` or `40P01` SQLSTATE is in `err`'s source chain.
+#[cfg(feature = "postgres")]
+fn chain_has_retryable_sqlstate(err: &(dyn std::error::Error + 'static)) -> bool {
+    source_chain_has_sqlstate(err, is_retryable_sqlstate)
+}
+
+/// Without the Postgres client there is no SQLSTATE to read.
+#[cfg(not(feature = "postgres"))]
+fn chain_has_retryable_sqlstate(_err: &(dyn std::error::Error + 'static)) -> bool {
+    false
+}
+
+#[cfg(feature = "postgres")]
+fn is_retryable_sqlstate(state: &tokio_postgres::error::SqlState) -> bool {
+    use tokio_postgres::error::SqlState;
+    *state == SqlState::T_R_SERIALIZATION_FAILURE || *state == SqlState::T_R_DEADLOCK_DETECTED
+}
+
+/// A raw `tokio_postgres` error with a retryable SQLSTATE (no diesel error in
+/// the chain).
+#[cfg(feature = "postgres")]
+fn raw_error_has_retryable_sqlstate(err: &AutumnError) -> bool {
+    // No text-based fallback; see `is_retryable_txn_error` for why.
     err.downcast_chain_ref::<tokio_postgres::Error>()
         .and_then(tokio_postgres::Error::code)
         .is_some_and(is_retryable_sqlstate)
         || err
             .downcast_chain_ref::<tokio_postgres::error::DbError>()
             .is_some_and(|db| is_retryable_sqlstate(db.code()))
+}
+
+#[cfg(not(feature = "postgres"))]
+const fn raw_error_has_retryable_sqlstate(_err: &AutumnError) -> bool {
+    false
 }
 
 /// Run `f` inside a transaction on `conn`, adapting the `ScopedBoxFuture`
@@ -2441,6 +2819,12 @@ where
     use diesel_async::TransactionManager as _;
 
     C::TransactionManager::begin_transaction(conn).await?;
+    if let Err(set_error) = apply_tx_timeouts(conn).await {
+        return match C::TransactionManager::rollback_transaction(conn).await {
+            Ok(()) | Err(diesel::result::Error::BrokenTransactionManager) => Err(set_error.into()),
+            Err(rollback_error) => Err(rollback_error.into()),
+        };
+    }
     match f(&mut *conn).await {
         Ok(value) => {
             C::TransactionManager::commit_transaction(conn).await?;
@@ -2685,18 +3069,102 @@ where
 /// Connection type managed by the deadpool pool.
 pub type PooledConnection = diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>;
 
-/// Prove a pooled connection is actually alive, not merely checked out.
+/// Replica lag query (issue #3065).
 ///
-/// `pg_manager_config` sets `RecyclingMethod::Fast`, so `pool.get()` alone
-/// can return a stale connection without proving it is alive (issue #2485).
-/// A health/readiness probe that only checks out and drops a connection
-/// would then report a dead primary or replica as reachable. Run this on a
-/// fresh checkout so the probe itself proves liveness, not the pool.
-pub(crate) async fn probe_connection_alive(
+/// - Not in recovery (a primary, or a plain database): lag is `0`.
+/// - The WAL receiver runs, it got a message from the primary within the lag
+///   limit (`$1`, in ms), and all received WAL is replayed: lag is `0`. An
+///   idle primary writes no new transactions, so the replay timestamp alone
+///   would grow without limit. A disconnected or stalled receiver keeps its
+///   last receive LSN, so the LSN check alone would read as fresh. A message
+///   older than the limit proves nothing within the limit, so then the branch
+///   below applies. A role
+///   without `pg_read_all_stats` sees `last_msg_receipt_time` as `NULL`. That
+///   is not proof of freshness, so the branch below applies.
+/// - Else: time since the last replayed transaction. `NULL` when nothing has
+///   been replayed yet, which means "unknown". The `NULL` check comes before
+///   `GREATEST`, because `GREATEST(0, NULL)` is `0` in Postgres.
+#[cfg(not(feature = "sqlite"))]
+const REPLICA_LAG_SQL: &str = "SELECT CASE \
+     WHEN NOT pg_is_in_recovery() THEN 0::BIGINT \
+     WHEN EXISTS (SELECT 1 FROM pg_stat_wal_receiver \
+          WHERE last_msg_receipt_time > clock_timestamp() - make_interval(secs => $1::DOUBLE PRECISION / 1000)) \
+          AND pg_last_wal_receive_lsn() IS NOT NULL \
+          AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn() THEN 0::BIGINT \
+     WHEN pg_last_xact_replay_timestamp() IS NULL THEN NULL \
+     ELSE GREATEST(0, FLOOR(EXTRACT(EPOCH FROM \
+          (clock_timestamp() - pg_last_xact_replay_timestamp())) * 1000))::BIGINT \
+     END AS lag_ms";
+
+/// Measure the replica lag on `conn`, for the lag limit `max_lag`. See
+/// [`REPLICA_LAG_SQL`].
+#[cfg(not(feature = "sqlite"))]
+pub(crate) async fn measure_replica_lag(
     conn: &mut PooledConnection,
-) -> Result<(), diesel::result::Error> {
-    use diesel_async::SimpleAsyncConnection as _;
-    conn.batch_execute("SELECT 1").await
+    max_lag: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct LagRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+        lag_ms: Option<i64>,
+    }
+
+    let window_ms = i64::try_from(max_lag.as_millis()).unwrap_or(i64::MAX);
+    let row: LagRow = diesel::sql_query(REPLICA_LAG_SQL)
+        .bind::<diesel::sql_types::BigInt, _>(window_ms)
+        .get_result(&mut **conn)
+        .await
+        .map_err(|error| error.to_string())?;
+    let lag_ms = row
+        .lag_ms
+        .ok_or_else(|| "replica has not replayed a transaction yet".to_owned())?;
+    Ok(std::time::Duration::from_millis(
+        u64::try_from(lag_ms).unwrap_or(0),
+    ))
+}
+
+#[cfg(all(test, not(feature = "sqlite")))]
+mod replica_lag_sql_tests {
+    #[test]
+    fn the_receiver_window_is_the_lag_limit() {
+        let sql = super::REPLICA_LAG_SQL;
+        assert!(
+            !sql.contains("60 seconds"),
+            "a fixed window lets a stalled receiver read as fresh past the limit"
+        );
+        assert!(
+            sql.contains("last_msg_receipt_time > clock_timestamp() - make_interval(secs => $1"),
+            "the receiver must have heard from the primary within the lag limit: {sql}"
+        );
+    }
+
+    #[test]
+    fn unknown_replay_time_stays_null() {
+        let sql = super::REPLICA_LAG_SQL;
+        let null_check = sql
+            .find("pg_last_xact_replay_timestamp() IS NULL THEN NULL")
+            .expect("a replica with no replayed transaction must read as unknown");
+        let greatest = sql.find("GREATEST(").expect("negative lag is clamped");
+        assert!(
+            null_check < greatest,
+            "GREATEST(0, NULL) is 0, so the NULL check must come first"
+        );
+    }
+}
+
+/// `SQLite` has no replicas, so the lag is always `0`.
+#[cfg(feature = "sqlite")]
+#[allow(
+    clippy::unused_async,
+    reason = "same signature as the Postgres variant"
+)]
+pub(crate) async fn measure_replica_lag(
+    _conn: &mut PooledConnection,
+    _max_lag: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    Ok(std::time::Duration::ZERO)
 }
 
 struct TxDepthGuard<'a> {
@@ -2762,7 +3230,7 @@ pub struct Db {
     span: tracing::Span,
     tx_depth: usize,
     tx_poisoned: bool,
-    route_key: Option<String>,
+    route_key: Option<RouteKey>,
     metrics: Option<crate::middleware::MetricsCollector>,
     slow_query_threshold: std::time::Duration,
     /// Checkout instant on the injected clock's monotonic timeline; `Drop`
@@ -2772,6 +3240,11 @@ pub struct Db {
     /// from the same timeline `start_time` came from.
     clock: std::sync::Arc<dyn crate::time::ClockSource>,
     is_test_tx: bool,
+    /// Set with `SET LOCAL` at the start of each transaction (#3057).
+    tx_timeouts: TxTimeouts,
+    /// The tenant's `tenancy.max_db_connections` permit (#3072). Last, so it
+    /// drops after the connection.
+    _tenant_permit: Option<crate::bulkhead::TenantPermit>,
 }
 
 impl Db {
@@ -2869,7 +3342,8 @@ impl Db {
         let result = AFTER_COMMIT_REGISTRY
             .scope(
                 registry.clone(),
-                scoped_transaction::<T, E, _, _>(&mut self.conn, f),
+                self.tx_timeouts
+                    .scope(scoped_transaction::<T, E, _, _>(&mut self.conn, f)),
             )
             .await
             .map_err(Into::into);
@@ -3001,7 +3475,8 @@ impl Db {
         let result = AFTER_COMMIT_REGISTRY
             .scope(
                 registry.clone(),
-                scoped_immediate_transaction(&mut self.conn, f),
+                self.tx_timeouts
+                    .scope(scoped_immediate_transaction(&mut self.conn, f)),
             )
             .await
             .map_err(Into::into);
@@ -3158,9 +3633,13 @@ impl Db {
             // meaningless nested inside — the outer test transaction, so there is nothing
             // to retry against a single test-harness connection.
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+            let timeouts = self.tx_timeouts;
             let conn: &mut RuntimeConnection = &mut self.conn;
             let result = AFTER_COMMIT_REGISTRY
-                .scope(registry, scoped_transaction::<T, E, _, _>(conn, f))
+                .scope(
+                    registry,
+                    timeouts.scope(scoped_transaction::<T, E, _, _>(conn, f)),
+                )
                 .instrument(span.clone())
                 .await
                 .map_err(Into::into);
@@ -3182,9 +3661,13 @@ impl Db {
         #[cfg(feature = "sqlite")]
         {
             let registry: Arc<Mutex<Vec<CommitCallback>>> = Arc::new(Mutex::new(Vec::new()));
+            let timeouts = self.tx_timeouts;
             let conn: &mut RuntimeConnection = &mut self.conn;
             let result: Result<T, E> = AFTER_COMMIT_REGISTRY
-                .scope(registry.clone(), scoped_transaction::<T, E, _, _>(conn, f))
+                .scope(
+                    registry.clone(),
+                    timeouts.scope(scoped_transaction::<T, E, _, _>(conn, f)),
+                )
                 .instrument(span.clone())
                 .await;
             span.record("db.tx.attempts", 1u32);
@@ -3239,10 +3722,19 @@ impl Db {
                         builder = builder.deferrable();
                     }
 
+                    // The builder sends its own `BEGIN ...`, so the timeouts go
+                    // first inside the closure (#3057).
+                    let set_local = self.tx_timeouts.set_local_sql();
                     AFTER_COMMIT_REGISTRY
                         .scope(
                             registry.clone(),
-                            builder.run::<T, E, _>(async move |conn| f_ref(conn).await),
+                            builder.run::<T, E, _>(async move |conn| {
+                                if let Some(sql) = set_local {
+                                    use diesel_async::SimpleAsyncConnection as _;
+                                    conn.batch_execute(&sql).await?;
+                                }
+                                f_ref(conn).await
+                            }),
                         )
                         .instrument(span.clone())
                         .await
@@ -3333,6 +3825,33 @@ impl std::ops::DerefMut for Db {
     }
 }
 
+/// The per-route DB metrics key, `"METHOD /matched/path"`.
+///
+/// A matched route keeps the request's method and axum's shared
+/// [`MatchedPath`](axum::extract::MatchedPath) (an `Arc<str>`) and is composed
+/// only when written — at record time, into a stack buffer — instead of a fresh
+/// `String` per `Db` extraction. Anything already composed (an unmatched
+/// request's raw path, a shard-tagged label) is kept as-is.
+#[derive(Clone)]
+pub(crate) enum RouteKey {
+    /// A route axum matched: the method plus its shared matched-path template.
+    Matched {
+        method: axum::http::Method,
+        path: axum::extract::MatchedPath,
+    },
+    /// A key composed up front, written verbatim.
+    Composed(String),
+}
+
+impl std::fmt::Display for RouteKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Matched { method, path } => write!(f, "{method} {}", path.as_str()),
+            Self::Composed(key) => f.pad(key),
+        }
+    }
+}
+
 /// Everything required to check out and instrument a pooled connection.
 ///
 /// Shared by the plain [`Db`] extractor and shard-routed checkouts so that
@@ -3349,8 +3868,11 @@ pub(crate) struct DbCheckoutParams<'a> {
     /// Resolved statement timeout (route override already merged with the
     /// global config). `None` disables the timeout (`SET statement_timeout = 0`).
     pub statement_timeout: Option<std::time::Duration>,
+    /// `idle_in_transaction_session_timeout` for this connection's
+    /// transactions. `None` disables it.
+    pub idle_in_transaction_timeout: Option<std::time::Duration>,
     /// `"METHOD /matched/path"` key used for per-route DB metrics.
-    pub route_key: Option<String>,
+    pub route_key: Option<RouteKey>,
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
     pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
@@ -3403,6 +3925,22 @@ fn capsule_checkout_marker(capture_gap: Option<&str>) -> Option<String> {
     }
 }
 
+/// Await a pool checkout and record its wait time (issue #3064). The wait runs
+/// from the checkout request to a connection or an error. A checkout timeout
+/// is the most important signal, so the code records a failed checkout too.
+async fn timed_pool_wait<T>(
+    clock: &dyn crate::time::ClockSource,
+    metrics: Option<&crate::middleware::MetricsCollector>,
+    checkout: impl std::future::Future<Output = T>,
+) -> T {
+    let start = clock.monotonic();
+    let result = checkout.await;
+    if let Some(metrics) = metrics {
+        metrics.record_db_pool_wait(clock.monotonic().saturating_duration_since(start));
+    }
+    result
+}
+
 impl Db {
     /// Check a connection out of `params.pool` with full instrumentation.
     ///
@@ -3410,16 +3948,18 @@ impl Db {
     /// shard-routed checkouts: span creation, checkout interceptors,
     /// `SET statement_timeout`, and the metrics captured for the
     /// slow-query warning on `Drop`.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one checkout sequence; the deadline wait (#3058) is one more step"
+    )]
     pub(crate) async fn checkout(params: DbCheckoutParams<'_>) -> Result<Self, AutumnError> {
         // `SET statement_timeout` (and its i32-cap arithmetic below) is a
         // Postgres session GUC. Under the `sqlite` feature the runtime backend
         // is entirely SQLite (the `RuntimeConnection` alias flips wholesale —
         // see `build_sqlite_pool`), which rejects the statement and would turn
-        // every `Db`-using route into a 503. The const, the `RunQueryDsl`
-        // import, the timeout arithmetic, and the `SET` itself are therefore all
-        // gated off on the SQLite build; the Postgres path is byte-identical.
-        #[cfg(not(feature = "sqlite"))]
-        const PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
+        // every `Db`-using route into a 503. The `RunQueryDsl` import, the
+        // timeout arithmetic, and the `SET` itself are therefore all gated off
+        // on the SQLite build; the Postgres path is byte-identical.
         #[cfg(not(feature = "sqlite"))]
         use diesel_async::RunQueryDsl as _;
 
@@ -3459,12 +3999,24 @@ impl Db {
         #[cfg(all(feature = "reporting", feature = "sqlite"))]
         crate::capsule::note_backend_capture_gap();
 
+        // The tenant's share of the pool (#3072). Take it before the pool
+        // checkout, so a tenant at its cap does not hold a connection.
+        let tenant_permit = crate::bulkhead::acquire_db_permit().inspect_err(|_| {
+            if let Some(metrics) = &params.metrics {
+                metrics.record_tenant_db_rejection();
+            }
+        })?;
+
         let pool = params.pool;
         let mut checkout_future: std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<PooledConnection, AutumnError>> + Send + '_,
             >,
         > = Box::pin(async move {
+            // Staging fault injection (#3071). Inert outside a fault scope.
+            crate::fault_injection::inject(crate::fault_injection::FaultTarget::Database)
+                .await
+                .map_err(|fault| AutumnError::service_unavailable_msg(fault.to_string()))?;
             pool.get().await.map_err(|e| {
                 tracing::error!("Failed to acquire database connection: {e}");
                 AutumnError::service_unavailable_msg(e.to_string())
@@ -3477,23 +4029,28 @@ impl Db {
             checkout_future = interceptor.intercept_checkout(ctx, checkout_future);
         }
 
-        let mut conn = checkout_future.instrument(span.clone()).await?;
-
-        // `statement_timeout` is a Postgres session GUC; it is intentionally
-        // unused on the SQLite backend (see the gating note below), so consume
-        // it here to keep the shared `DbCheckoutParams` field from reading as
-        // dead code under `--features sqlite`.
-        #[cfg(feature = "sqlite")]
-        let _ = params.statement_timeout;
+        // The request deadline (issue #3058) limits the wait for a connection.
+        // It does not change `statement_timeout`: that is a session setting,
+        // so it would stay on the pooled connection for the next user.
+        // `bounded` checks the deadline before each poll, so an idle
+        // connection is not handed out once the deadline has passed.
+        // `timed_pool_wait` records the whole wait, a deadline stop included.
+        let mut conn = timed_pool_wait(
+            params.clock.as_ref(),
+            params.metrics.as_ref(),
+            crate::deadline::bounded(checkout_future.instrument(span.clone())),
+        )
+        .await
+        .map_err(|crate::deadline::DeadlineExceeded| {
+            AutumnError::service_unavailable(crate::deadline::DeadlineStopped(
+                "request deadline exceeded while waiting for a database connection",
+            ))
+        })??;
 
         // Postgres statement_timeout is a signed 32-bit integer (milliseconds).
         // Cap at i32::MAX to avoid a confusing 503 for very large configured values.
         #[cfg(not(feature = "sqlite"))]
-        let timeout_ms = params.statement_timeout.map_or(0u64, |d| {
-            u64::try_from(d.as_millis())
-                .unwrap_or(PG_TIMEOUT_MAX_MS)
-                .min(PG_TIMEOUT_MAX_MS)
-        });
+        let timeout_ms = pg_timeout_ms(params.statement_timeout);
 
         // Install a fresh per-request query timer, but only when a query observer is
         // active: either a `REQUEST_DB_TIMINGS` scope (the `ServerTimingLayer`, enabled
@@ -3507,9 +4064,9 @@ impl Db {
         // default via `diesel::connection::set_default_instrumentation` — query logging,
         // tracing, metrics — would have it silently clobbered on the first checkout and
         // never restored, even with `server_timing` disabled. Gating on
-        // `request_db_timing_active() || request_query_capture_active()` preserves the
-        // app's instrumentation whenever neither lane is scoped, the production default,
-        // and overwrites it only while a query observer is active.
+        // `request_db_lane_active()` preserves the app's instrumentation whenever no
+        // lane is scoped, the production default, and overwrites it only while a query
+        // observer is active. Cost metering (`[cost] enabled`) is the third lane.
         //
         // Installing a fresh timer on every observed checkout also clears any stale
         // `RequestQueryTimer` a pooled connection carried from a prior request —
@@ -3523,7 +4080,7 @@ impl Db {
         #[cfg(feature = "db")]
         {
             use diesel_async::AsyncConnection as _;
-            if request_db_timing_active() || request_query_capture_active() {
+            if request_db_lane_active() {
                 conn.set_instrumentation(RequestQueryTimer::with_clock(std::sync::Arc::clone(
                     &params.clock,
                 )));
@@ -3578,6 +4135,11 @@ impl Db {
             start_time,
             clock: params.clock,
             is_test_tx,
+            tx_timeouts: TxTimeouts::new(
+                params.statement_timeout,
+                params.idle_in_transaction_timeout,
+            ),
+            _tenant_permit: tenant_permit,
         })
     }
 
@@ -3598,6 +4160,7 @@ impl Db {
             pool_name: "test",
             shard: None,
             statement_timeout: None,
+            idle_in_transaction_timeout: None,
             route_key: None,
             metrics: None,
             slow_query_threshold: std::time::Duration::from_millis(500),
@@ -3621,7 +4184,8 @@ impl Db {
 #[derive(Clone)]
 pub(crate) struct RequestDbContext {
     pub statement_timeout: Option<std::time::Duration>,
-    pub route_key: Option<String>,
+    pub idle_in_transaction_timeout: Option<std::time::Duration>,
+    pub route_key: Option<RouteKey>,
     pub metrics: Option<crate::middleware::MetricsCollector>,
     pub slow_query_threshold: std::time::Duration,
     pub interceptors: Vec<std::sync::Arc<dyn crate::interceptor::DbConnectionInterceptor>>,
@@ -3632,16 +4196,27 @@ pub(crate) struct RequestDbContext {
 
 impl RequestDbContext {
     pub(crate) fn from_parts<S: DbState>(parts: &axum::http::request::Parts, state: &S) -> Self {
+        note_route_statement_timeout(parts);
         let timeout_override = parts.extensions.get::<StatementTimeout>().copied();
-        let matched_path = parts
+        // A matched route keeps the method and axum's shared `MatchedPath`: no
+        // `String` per extraction. Only a request no route matched (a fallback)
+        // composes its raw path, exactly as before.
+        let route_key = parts
             .extensions
             .get::<axum::extract::MatchedPath>()
-            .map_or_else(|| parts.uri.path(), axum::extract::MatchedPath::as_str);
+            .map_or_else(
+                || RouteKey::Composed(format!("{} {}", parts.method, parts.uri.path())),
+                |path| RouteKey::Matched {
+                    method: parts.method.clone(),
+                    path: path.clone(),
+                },
+            );
         Self {
             statement_timeout: timeout_override
                 .map(|t| t.0)
                 .or_else(|| state.statement_timeout()),
-            route_key: Some(format!("{} {}", parts.method, matched_path)),
+            idle_in_transaction_timeout: state.idle_in_transaction_timeout(),
+            route_key: Some(route_key),
             metrics: state.metrics().cloned(),
             slow_query_threshold: state.slow_query_threshold(),
             interceptors: state.db_interceptors(),
@@ -3721,6 +4296,7 @@ impl LazyDb {
             pool_name: "primary",
             shard: None,
             statement_timeout: self.ctx.statement_timeout,
+            idle_in_transaction_timeout: self.ctx.idle_in_transaction_timeout,
             route_key: self.ctx.route_key,
             metrics: self.ctx.metrics,
             slow_query_threshold: self.ctx.slow_query_threshold,
@@ -3784,6 +4360,7 @@ where
             pool_name: "primary",
             shard: None,
             statement_timeout: ctx.statement_timeout,
+            idle_in_transaction_timeout: ctx.idle_in_transaction_timeout,
             route_key: ctx.route_key,
             metrics: ctx.metrics,
             slow_query_threshold: ctx.slow_query_threshold,
@@ -3811,9 +4388,9 @@ impl Drop for Db {
                 .saturating_duration_since(self.start_time);
             let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
 
-            // Record DB query metric
-            let metric_key = format!("{route_key} SELECT");
-            metrics.record_db_query(&metric_key, elapsed_ms);
+            // Record DB query metric. Composed on the stack: this runs once
+            // per request that extracts `Db`.
+            metrics.record_db_query_fmt(format_args!("{route_key} SELECT"), elapsed_ms);
             // Deliberately not recorded into the Server-Timing per-request
             // accumulator. `elapsed` here is the whole connection
             // checkout-to-release window (see `start_time` and the `span` doc
@@ -3989,6 +4566,273 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 
 #[cfg(test)]
 mod tests {
+    /// An unset statement timeout keeps the session's `0` from checkout; an
+    /// unset idle timeout keeps the session value through `DEFAULT`.
+    #[test]
+    fn tx_timeouts_send_zero_for_an_unset_statement_timeout() {
+        use std::time::Duration;
+        let sql = |statement, idle| super::TxTimeouts::new(statement, idle).set_local_sql();
+        assert_eq!(sql(None, None), None);
+        assert_eq!(
+            sql(None, Some(Duration::from_secs(60))).as_deref(),
+            Some(
+                "SET LOCAL statement_timeout = 0; \
+                 SET LOCAL idle_in_transaction_session_timeout = 60000"
+            )
+        );
+        assert_eq!(
+            sql(Some(Duration::from_secs(30)), None).as_deref(),
+            Some(
+                "SET LOCAL statement_timeout = 30000; \
+                 SET LOCAL idle_in_transaction_session_timeout = DEFAULT"
+            )
+        );
+    }
+
+    /// A `database` fault fails the checkout before the pool dials.
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
+    async fn an_injected_database_fault_fails_the_checkout() {
+        use crate::fault_injection::{FaultKind, FaultRule, FaultTarget, with_faults};
+
+        let config = crate::config::DatabaseConfig {
+            primary_url: Some("postgres://127.0.0.1:1/faults".to_owned()),
+            connect_timeout_secs: 1,
+            ..Default::default()
+        };
+        let pool = super::create_pool(&config)
+            .expect("a lazy pool builds")
+            .expect("a URL is set");
+        let checkout = super::Db::checkout(super::DbCheckoutParams {
+            pool: &pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            route_key: None,
+            metrics: None,
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+            #[cfg(feature = "reporting")]
+            capture_gap: None,
+            clock: std::sync::Arc::clone(&super::DEFAULT_SYSTEM_CLOCK),
+        });
+        let rules = [FaultRule::new(FaultTarget::Database, FaultKind::Error, 1.0)];
+        let Err(error) = with_faults(&rules, checkout).await else {
+            panic!("the injected fault must fail the checkout");
+        };
+        assert!(error.to_string().contains("fault injection"), "{error}");
+    }
+
+    /// A scheduled task or a job has no request scope. The background scope
+    /// gives its framework transactions the app's configured timeouts.
+    #[tokio::test]
+    async fn background_work_gets_the_configured_tx_timeouts() {
+        use std::time::Duration;
+        struct Configured;
+        impl super::DbState for Configured {
+            fn pool(&self) -> Option<&super::Pool<super::RuntimeConnection>> {
+                None
+            }
+            fn statement_timeout(&self) -> Option<Duration> {
+                Some(Duration::from_secs(30))
+            }
+            fn idle_in_transaction_timeout(&self) -> Option<Duration> {
+                Some(Duration::from_secs(60))
+            }
+        }
+        assert_eq!(super::TxTimeouts::current(), None);
+        let inside = super::scope_background_tx_timeouts(&Configured, async {
+            super::TxTimeouts::current()
+        })
+        .await;
+        assert_eq!(
+            inside,
+            Some(super::TxTimeouts::new(
+                Some(Duration::from_secs(30)),
+                Some(Duration::from_secs(60))
+            ))
+        );
+    }
+
+    /// After-commit callbacks run on a spawned task, which inherits no
+    /// task-locals. The spawner carries the timeouts in scope into it.
+    #[tokio::test]
+    async fn after_commit_callbacks_keep_the_tx_timeouts() {
+        use std::time::Duration;
+        struct Configured;
+        impl super::DbState for Configured {
+            fn pool(&self) -> Option<&super::Pool<super::RuntimeConnection>> {
+                None
+            }
+            fn statement_timeout(&self) -> Option<Duration> {
+                Some(Duration::from_secs(30))
+            }
+        }
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let seen_in_callback = std::sync::Arc::clone(&seen);
+        let callback: super::CommitCallback = Box::new(move || {
+            Box::pin(async move {
+                *seen_in_callback.lock().expect("lock") = super::TxTimeouts::current();
+                Ok(())
+            })
+        });
+        let drain = super::scope_background_tx_timeouts(&Configured, async move {
+            super::spawn_committed_after_commit_callbacks(vec![callback])
+        })
+        .await
+        .expect("a callback was registered");
+        drain.await.expect("callback task");
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            Some(super::TxTimeouts::new(Some(Duration::from_secs(30)), None))
+        );
+    }
+
+    /// #2351 item 3: a callback the application registers runs on a detached
+    /// task. Capture cannot see its effects, so the capsule says so.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_registered_after_commit_callback_marks_the_capsule_incomplete() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let registry: std::sync::Arc<std::sync::Mutex<Vec<super::CommitCallback>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            super::AFTER_COMMIT_REGISTRY.scope(std::sync::Arc::clone(&registry), async {
+                super::register_after_commit(|| async { Ok(()) }).await;
+            }),
+        )
+        .await;
+        // Codex review on #3222: a registration alone is not detached work.
+        // A rolled-back transaction drops its callbacks.
+        assert!(!scope.is_truncated());
+        let callbacks = std::mem::take(&mut *registry.lock().expect("registry"));
+        let drain =
+            crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+                super::spawn_committed_after_commit_callbacks(callbacks)
+            })
+            .await;
+        drain.expect("a callback was spawned").await.expect("runs");
+        assert!(scope.is_truncated(), "the commit spawns detached work");
+    }
+
+    /// Codex review on #3222: a callback is built only after the one before
+    /// it completes, inside the drain task.
+    #[tokio::test]
+    async fn after_commit_callbacks_are_built_in_order_after_the_last_one_ran() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callback = |name: &'static str| -> super::CommitCallback {
+            let log = std::sync::Arc::clone(&log);
+            Box::new(move || {
+                log.lock().expect("log").push(format!("build {name}"));
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    log.lock().expect("log").push(format!("run {name}"));
+                    Ok(())
+                })
+            })
+        };
+        let drain =
+            super::spawn_committed_after_commit_callbacks(vec![callback("one"), callback("two")]);
+        drain.expect("a drain task").await.expect("runs");
+        assert_eq!(
+            *log.lock().expect("log"),
+            ["build one", "run one", "build two", "run two"]
+        );
+    }
+
+    /// Codex review on #3222: a rolled-back `register_after_commit` callback
+    /// does not mark a later commit's capsule incomplete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_rolled_back_registration_does_not_mark_a_later_commit() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let registry: std::sync::Arc<std::sync::Mutex<Vec<super::CommitCallback>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            super::AFTER_COMMIT_REGISTRY.scope(std::sync::Arc::clone(&registry), async {
+                super::register_after_commit(|| async { Ok(()) }).await;
+            }),
+        )
+        .await;
+        // The rollback drops the callback.
+        drop(std::mem::take(&mut *registry.lock().expect("registry")));
+        let framework: super::CommitCallback = Box::new(|| Box::pin(async { Ok(()) }));
+        let drain =
+            crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+                super::spawn_committed_after_commit_callbacks(vec![framework])
+            })
+            .await;
+        drain.expect("a drain task").await.expect("runs");
+        assert!(!scope.is_truncated());
+    }
+
+    /// Codex review on #3222: `Mailer::deliver_later` and the
+    /// `*_after_commit` job calls record their effect at registration and
+    /// push their callback directly. A commit with only such callbacks keeps
+    /// the capsule complete.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_recorded_framework_callback_keeps_the_capsule_complete() {
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "after-commit".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran_in_callback = std::sync::Arc::clone(&ran);
+        let callback: super::CommitCallback = Box::new(move || {
+            Box::pin(async move {
+                ran_in_callback.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        });
+        let drain =
+            crate::capsule::capture::with_capture_scope(std::sync::Arc::clone(&scope), async {
+                super::spawn_committed_after_commit_callbacks(vec![callback])
+            })
+            .await;
+        drain.expect("a callback was spawned").await.expect("runs");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!scope.is_truncated());
+    }
+
+    /// #2351 item 3: during a replay, the callbacks get the replay tape, so
+    /// their effects are served or refused and never reach live services.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn after_commit_callbacks_keep_the_replay_tape() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let seen_in_callback = std::sync::Arc::clone(&seen);
+        let callback: super::CommitCallback = Box::new(move || {
+            Box::pin(async move {
+                *seen_in_callback.lock().expect("lock") =
+                    crate::capsule::effects::current_tape().is_some();
+                Ok(())
+            })
+        });
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let drain = crate::capsule::with_effect_tape(tape, async move {
+            super::spawn_committed_after_commit_callbacks(vec![callback])
+        })
+        .await
+        .expect("a callback was registered");
+        drain.await.expect("callback task");
+        assert!(*seen.lock().expect("lock"));
+    }
+
     #[test]
     fn replication_adds_the_auto_checkpoint_lock_to_the_pooled_pragmas() {
         // Continuous replication (#1628) needs the replicator to be the only
@@ -4015,6 +4859,37 @@ mod tests {
 
     use super::*;
     use crate::config::DatabaseConfig;
+
+    /// A failed checkout still records its pool wait (issue #3064): a
+    /// checkout timeout is the overload signal operators need most.
+    #[cfg(not(feature = "sqlite"))]
+    #[tokio::test]
+    async fn checkout_records_pool_wait_even_on_failure() {
+        let manager = diesel_async::pooled_connection::AsyncDieselConnectionManager::<
+            RuntimeConnection,
+        >::new("postgres://autumn:autumn@127.0.0.1:1/nothing");
+        let pool = Pool::builder(manager).max_size(1).build().unwrap();
+        let metrics = crate::middleware::MetricsCollector::new();
+
+        let result = Db::checkout(DbCheckoutParams {
+            pool: &pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            route_key: None,
+            metrics: Some(metrics.clone()),
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+            #[cfg(feature = "reporting")]
+            capture_gap: None,
+            clock: std::sync::Arc::clone(&DEFAULT_SYSTEM_CLOCK),
+        })
+        .await;
+
+        assert!(result.is_err(), "nothing listens on port 1");
+        assert_eq!(metrics.db_pool_wait().count(), 1);
+    }
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::time::Duration;
@@ -5247,6 +6122,107 @@ mod tests {
         ));
     }
 
+    // Issue #3032. A decoded NUL (`%00`) ends only the name or value being
+    // read. SQLite keeps parsing the next pair. Checked with Python's
+    // `sqlite3` (SQLite 3.45).
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn percent_decode_stops_at_decoded_nul() {
+        assert_eq!(percent_decode("a%00b"), b"a");
+        assert_eq!(percent_decode("%00"), b"");
+        assert_eq!(percent_decode("a%0"), b"a%0");
+        assert_eq!(percent_decode("%53hared"), b"Shared");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_shared_cache_nul_ends_only_current_component() {
+        // NUL in a value: the text after it is dropped.
+        assert!(sqlite_target_is_shared_cache("file:a?cache=shared%00"));
+        assert!(sqlite_target_is_shared_cache("file:a?cache=shared%00x"));
+        assert!(!sqlite_target_is_shared_cache("file:a?cache=shar%00ed"));
+        // NUL in the last value: the last value still wins.
+        assert!(!sqlite_target_is_shared_cache(
+            "file::memory:?cache=shared&cache=private%00"
+        ));
+        assert!(sqlite_target_is_shared_cache(
+            "file:a?cache=private%00&cache=shared"
+        ));
+        assert!(!sqlite_target_is_shared_cache(
+            "file:a?cache=shared%00&cache=private"
+        ));
+        // NUL at the start of a name: the name is empty, so the pair is no
+        // `cache` pair.
+        assert!(sqlite_target_is_shared_cache(
+            "file:a?cache=shared&%00cache=private"
+        ));
+        // NUL inside a name: the name is cut there.
+        assert!(!sqlite_target_is_shared_cache("file:a?ca%00che=shared"));
+        assert!(sqlite_target_is_shared_cache("file:a?cache%00x=shared"));
+        assert!(!sqlite_target_is_shared_cache("file:a?cache=a%00b=shared"));
+        // Text after a NUL cannot start a new pair.
+        assert!(sqlite_target_is_shared_cache(
+            "file:a?cache=shared%00x=y&cache=shared"
+        ));
+        // NUL in the path does not stop the query.
+        assert!(sqlite_target_is_shared_cache("file:a%00?cache=shared"));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reject_sqlite_unsupported_timeouts_checks_both_settings() {
+        let idle_only = DatabaseConfig {
+            idle_in_transaction_timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        assert!(reject_sqlite_unsupported_timeouts(&idle_only, "file:/srv/app.db").is_err());
+        let statement_only = DatabaseConfig {
+            statement_timeout: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
+        assert!(reject_sqlite_unsupported_timeouts(&statement_only, "file:/srv/app.db").is_err());
+        assert!(
+            reject_sqlite_unsupported_timeouts(&DatabaseConfig::default(), "file:/srv/app.db")
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn create_shard_topology_refuses_sqlite_idle_timeout() {
+        let shard = crate::config::ShardConfig {
+            name: "s0".to_owned(),
+            primary_url: ":memory:".to_owned(),
+            ..Default::default()
+        };
+        let defaults = DatabaseConfig {
+            idle_in_transaction_timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        match create_shard_topology(&shard, &defaults) {
+            Err(PoolError::UnsupportedBackend(message)) => {
+                assert!(message.contains("idle_in_transaction_timeout"), "{message}");
+            }
+            Err(other) => panic!("expected UnsupportedBackend, got {other:?}"),
+            Ok(_) => panic!("expected UnsupportedBackend, got a topology"),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn reject_sqlite_idle_in_transaction_timeout_refuses_a_nonzero_value() {
+        let err = reject_sqlite_idle_in_transaction_timeout(Some(Duration::from_secs(60)))
+            .expect_err("SQLite cannot enforce it");
+        match err {
+            PoolError::UnsupportedBackend(message) => {
+                assert!(message.contains("idle_in_transaction_timeout"), "{message}");
+            }
+            other => panic!("expected UnsupportedBackend, got {other:?}"),
+        }
+        assert!(reject_sqlite_idle_in_transaction_timeout(None).is_ok());
+        assert!(reject_sqlite_idle_in_transaction_timeout(Some(Duration::ZERO)).is_ok());
+    }
+
     // The `statement_timeout` rejection must not claim `busy_timeout` bounds
     // lock waits for `cache=shared` targets (issue #2881): shared-cache
     // table-lock conflicts return `SQLITE_LOCKED` without invoking the busy
@@ -5640,6 +6616,102 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The per-route DB metrics key is `"METHOD /matched/path"` byte for byte,
+    /// and a matched route keeps axum's shared `MatchedPath` instead of a
+    /// `String` composed per extraction. An unmatched request keys by raw path.
+    #[tokio::test]
+    async fn request_db_context_keys_by_method_and_matched_path() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::{any, get};
+        use tower::ServiceExt;
+
+        /// Answers with the context's route key, then the metric key `Db`'s
+        /// drop records under it (composed on the stack, as `Drop` does).
+        async fn handler(parts: axum::http::request::Parts) -> String {
+            let ctx = RequestDbContext::from_parts(&parts, &TestDbState);
+            assert!(
+                matches!(ctx.route_key, Some(RouteKey::Matched { .. })),
+                "a matched route must not compose a String per extraction"
+            );
+            let route_key = ctx
+                .route_key
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let metrics = crate::middleware::MetricsCollector::new();
+            if let Some(key) = &ctx.route_key {
+                metrics.record_db_query_fmt(format_args!("{key} SELECT"), 1);
+            }
+            let metric_key = metrics
+                .snapshot()
+                .db_queries
+                .into_keys()
+                .next()
+                .unwrap_or_default();
+            format!("{route_key}\n{metric_key}")
+        }
+
+        async fn body_of(app: Router, request: Request<Body>) -> String {
+            let response = app.oneshot(request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+
+        let app = Router::new()
+            .route("/users/{id}", get(handler))
+            .route("/dav/{*rest}", any(handler));
+
+        let request = Request::builder()
+            .uri("/users/7")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            body_of(app.clone(), request).await,
+            "GET /users/{id}\nGET /users/{id} SELECT"
+        );
+
+        // An extension method too long for `Method`'s inline storage writes
+        // exactly as the old `format!("{} {}", method, path)` did.
+        let request = Request::builder()
+            .method("X-LONG-EXTENSION-VERB")
+            .uri("/dav/a/b")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            body_of(app, request).await,
+            "X-LONG-EXTENSION-VERB /dav/{*rest}\nX-LONG-EXTENSION-VERB /dav/{*rest} SELECT"
+        );
+
+        let (parts, ()) = Request::builder()
+            .method("POST")
+            .uri("/no/route?q=1")
+            .body(())
+            .unwrap()
+            .into_parts();
+        let ctx = RequestDbContext::from_parts(&parts, &TestDbState);
+        assert!(
+            matches!(ctx.route_key, Some(RouteKey::Composed(_))),
+            "a request no route matched composes its raw path"
+        );
+        assert_eq!(
+            ctx.route_key.as_ref().map(ToString::to_string).as_deref(),
+            Some("POST /no/route")
+        );
+    }
+
+    /// A composed key (a shard-tagged label, an unmatched path) is written
+    /// verbatim into both the metric key and the slow-query `route` field.
+    #[test]
+    fn route_key_composed_writes_verbatim() {
+        let key = RouteKey::Composed("GET /notes shard=shard0".to_owned());
+        assert_eq!(key.to_string(), "GET /notes shard=shard0");
+        assert_eq!(format!("{key} SELECT"), "GET /notes shard=shard0 SELECT");
     }
 
     /// #2264: `Db` is a `FromRequestParts` extractor. Axum runs it before a
@@ -6054,6 +7126,26 @@ mod tests {
 
     // ── Retryable-error classification ───────────────────────────
 
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn only_serialization_failure_and_deadlock_sqlstates_are_retryable() {
+        use tokio_postgres::error::SqlState;
+        assert!(is_retryable_sqlstate(&SqlState::T_R_SERIALIZATION_FAILURE));
+        assert!(is_retryable_sqlstate(&SqlState::T_R_DEADLOCK_DETECTED));
+        assert!(!is_retryable_sqlstate(&SqlState::UNIQUE_VIOLATION));
+        assert!(!is_retryable_sqlstate(&SqlState::QUERY_CANCELED));
+    }
+
+    #[test]
+    fn a_plain_diesel_error_is_not_a_cancelled_query() {
+        // No timeout text and no SQLSTATE in the chain.
+        assert!(!is_query_canceled(&diesel::result::Error::NotFound));
+        assert!(is_query_canceled(&diesel_db_error(
+            diesel::result::DatabaseErrorKind::Unknown,
+            "canceling statement due to statement timeout",
+        )));
+    }
+
     #[test]
     fn serialization_failure_is_retryable() {
         let err: AutumnError = AutumnError::internal_server_error(diesel_db_error(
@@ -6236,6 +7328,7 @@ mod tests {
 // `pub(crate)` so the failure-capsule recording pool can reuse the same
 // `sslmode` classification when deciding whether a database URL can be teed
 // (#1598) instead of re-implementing the parse.
+#[cfg(feature = "postgres")]
 pub(crate) mod tls {
     use std::sync::Arc;
 
@@ -6841,6 +7934,7 @@ pub(crate) mod tls {
 ///
 /// [`AsyncConnectionWrapper`]:
 ///     diesel_async::async_connection_wrapper::AsyncConnectionWrapper
+#[cfg(feature = "postgres")]
 #[allow(clippy::large_enum_variant)] // short-lived, one per migration target
 pub(crate) enum MigrationConnection {
     /// The historical libpq-backed connection (TLS posture `Off`).
@@ -6868,6 +7962,7 @@ pub(crate) enum MigrationConnection {
 /// rustls wrapper rather than the native libpq path. Split out of
 /// [`establish_migration_connection`] so the path selection is unit-testable
 /// without a server.
+#[cfg(feature = "postgres")]
 fn migration_connection_needs_rustls(database_url: &str) -> bool {
     !matches!(
         tls::TlsPosture::from_database_url(database_url),
@@ -6911,6 +8006,7 @@ fn migration_connection_needs_rustls(database_url: &str) -> bool {
 /// which fail with their documented guidance).
 ///
 /// [`TlsPosture::Unsupported`]: tls::TlsPosture::Unsupported
+#[cfg(feature = "postgres")]
 pub(crate) fn establish_migration_connection(
     database_url: &str,
 ) -> Result<MigrationConnection, diesel::ConnectionError> {
@@ -6982,7 +8078,7 @@ pub(crate) fn establish_sqlite_migration_connection(
     Ok(conn)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "postgres"))]
 mod migration_connection_tests {
     use super::migration_connection_needs_rustls;
 

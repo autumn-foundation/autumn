@@ -133,6 +133,11 @@ jobs:
         # Kept as its own lane rather than folded into the list above so a
         # `wasmi`-linking build is not forced on every gated-feature Clippy run.
         run: cargo clippy -p autumn-web --features "plugin-sandbox,test-support" --all-targets -- -D warnings
+      - name: Clippy (autumn-web, repl)
+        # `repl` (#2148) is off by default, so no run above compiles
+        # `repl.rs` or the REPL glue that `#[model]` and `#[repository]` emit.
+        # Its own lane, so the Rhai build stays out of the gated list.
+        run: cargo clippy -p autumn-web --features repl --all-targets -- -D warnings
       - name: Panic-free request-path gate
         run: ./scripts/check-panic-gate.sh
       - name: Determinism seam gate
@@ -151,7 +156,10 @@ jobs:
         # globally, so one such edge swaps `db::RuntimeConnection` for every
         # consumer in the graph. Until this gate, that invariant was prose plus
         # the `sqlite`-excluding feature lists below, and nothing read the
-        # manifests. No toolchain, ~1 second, self-testing.
+        # manifests. ~2 seconds, self-testing. The resolver layer asks
+        # `cargo metadata` what cargo resolves, so it is required here.
+        env:
+          SQLITE_GATE_REQUIRE_RESOLVE: "1"
         run: ./scripts/check-sqlite-unification.sh
       - name: Example binary-name collision gate
         # Two workspace members producing the same binary file name break the
@@ -795,6 +803,40 @@ jobs:
         # the admin plugin proves a real, non-trivial consumer of it.
         run: cargo check -p autumn-admin-plugin --all-targets
 
+  k8s-manifests:
+    name: Kubernetes manifests (helm lint, kubeconform)
+    runs-on: ubuntu-latest
+    # The job runs downloaded tools, so it gets a read-only token and keeps
+    # no credentials in the checkout.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Cache the pinned Kubernetes tools and schemas
+        uses: actions/cache@v6
+        with:
+          path: target/k8s-tools
+          key: k8s-tools-${{ hashFiles('scripts/check-k8s-manifests.sh') }}
+      - name: Lint the Helm chart, the Kustomize base and the SLO files
+        # Issue #3069. `autumn release init --target kubernetes` writes a Helm
+        # chart and a Kustomize base. `autumn slo generate` writes Prometheus
+        # rules and Argo Rollouts / Flagger templates. This job checks them
+        # with the real tools:
+        #
+        #   helm lint --strict, and helm template | kubeconform -strict, for
+        #   the default values and each opt-in mode (Argo Rollouts, Flagger,
+        #   PodMonitor); kustomize build | kubeconform -strict;
+        #   kubeconform on the golden CRD objects; and promtool check/test
+        #   rules on the golden rules, with an injected 5xx spike.
+        #
+        # No Rust toolchain: the script renders the templates itself. A Rust
+        # test keeps its placeholder list complete. The script pins the tool
+        # versions and the schema commits, and checks each tool tarball's
+        # SHA-256 on every run, also from the cache. Self-test first.
+        run: ./scripts/check-k8s-manifests.sh --self-test && ./scripts/check-k8s-manifests.sh
+
   migration-collisions:
     name: Diesel migration version collisions
     runs-on: ubuntu-latest
@@ -841,15 +883,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-      - uses: taiki-e/install-action@v2.87.20
+      - uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-deny@0.20.2
-      # Advisories go through the shared gate (issue #1600) so PR CI, the
-      # publish gate and a local run are literally the same check: the
-      # workspace graph, the SQLite backend graph, and the day-one graph of a
-      # freshly scaffolded app audited against the `deny.toml` that `autumn
-      # new` ships. It retries the advisory-database fetch and fails closed if
-      # the database stays unreachable.
+      # The shared gate (issue #1600) makes PR CI, the publish gate and a local
+      # run the same check. It audits the workspace graph, the SQLite graph and
+      # every `autumn new` flavor (#2466). It retries the advisory-database
+      # fetch. It fails closed if the database stays unreachable.
       - name: Dependency advisory gate
         run: ./scripts/check-advisories.sh
       # A gate nobody has watched fail is indistinguishable from one that no
@@ -930,6 +970,12 @@ jobs:
             /usr/share/swift
           sudo docker image prune --all --force || true
           df -h
+      - uses: actions/setup-node@v7
+        # `autumn-edge`'s JS host suite (`tests/js_host.rs`) runs the
+        # web-standard host under Node and fails under CI without one (ADR-0024).
+        # Installed after the cleanup above, which removes /opt/hostedtoolcache.
+        with:
+          node-version: 22
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
@@ -1133,6 +1179,8 @@ jobs:
             tls,
             acme,
             sla,
+            repl,
+            webmcp,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1189,11 +1237,15 @@ jobs:
         # `markdown` node kind reachable: without it that node fails validation
         # with `constela.feature_required` and the sanitizing render path is
         # never exercised.
+        #
+        # `constela_memory` is its own binary (a counting global allocator).
+        # It checks that a hostile document uses bounded peak memory (#2626).
         run: |
           cargo test -p autumn-web --features constela --lib constela::
           cargo test -p autumn-web --features constela --doc constela
           cargo test -p autumn-web --features constela --test integration_tests constela
           cargo test -p autumn-web --features "constela,markdown" --test integration_tests constela
+          cargo test -p autumn-web --features constela --test constela_memory
       - name: Run inbound-mail-gated tests (untrusted MIME parsing)
         if: matrix.lane == 'inbound-mail'
         # `inbound-mail` and its provider aliases are not default features, so
@@ -1219,6 +1271,7 @@ jobs:
         run: |
           cargo test -p autumn-web --features i18n --lib i18n::
           cargo test -p autumn-web --features "i18n,test-support" --test integration_tests translatable
+          cargo test -p autumn-web --features "i18n,test-support" --test integration_tests nul_message_i18n
       - name: Run plugin-sandbox tests (untrusted-plugin containment)
         if: matrix.lane == 'plugin-sandbox'
         # `plugin-sandbox` is not a default feature, so `cargo test --workspace`
@@ -1293,6 +1346,17 @@ jobs:
           cargo test -p autumn-web --features "redis,ws" --lib job::tests::redis_page_spans \
             | tee "${RUNNER_TEMP}/redis-page-spans.log"
           assert_ran "${RUNNER_TEMP}/redis-page-spans.log" "redis_page_spans unit tests"
+          # Issue #3061: the Redis idempotency store on a current-thread
+          # runtime. It used `block_in_place`, which panics there. No Docker:
+          # the store points at a closed port and must fail closed.
+          cargo test -p autumn-web --features "redis,ws" --lib idempotency::tests::redis_store_on_current_thread \
+            | tee "${RUNNER_TEMP}/redis-idempotency-current-thread.log"
+          assert_ran "${RUNNER_TEMP}/redis-idempotency-current-thread.log" "redis idempotency current-thread test"
+          # The Redis PING health indicator (#3059): fake RESP servers, no
+          # Docker. Named here so it does not run only by feature unification.
+          cargo test -p autumn-web --features "redis,ws" --lib redis_health:: \
+            | tee "${RUNNER_TEMP}/redis-health.log"
+          assert_ran "${RUNNER_TEMP}/redis-health.log" "redis_health unit tests"
       - name: Run direct-TLS (HTTPS) tests
         if: matrix.lane == 'tls'
         # `tls` is not a default feature, so the `test` job's workspace `cargo
@@ -1331,6 +1395,10 @@ jobs:
           cargo test -p autumn-web --features "tls,ws,test-support" \
             --test integration_tests tls_app_surface:: | tee "${RUNNER_TEMP}/tls-surface.log"
           assert_ran "${RUNNER_TEMP}/tls-surface.log" "tls_app_surface"
+          # ALPN `h2` negotiation and `wss://` over h2 extended CONNECT (#2321).
+          cargo test -p autumn-web --features "tls,ws,test-support" \
+            --test integration_tests tls_alpn:: | tee "${RUNNER_TEMP}/tls-alpn.log"
+          assert_ran "${RUNNER_TEMP}/tls-alpn.log" "tls_alpn"
           # The custom-domain SNI resolver + certificate cache (#1635) need
           # `tls` to compile at all, so the default `test` lane runs only the
           # feature-free half of `custom_domains`. Run the whole module here.
@@ -1440,6 +1508,61 @@ jobs:
           cargo test -p autumn-web --features sla --test integration_tests compile_fail::obligation \
             | tee "${RUNNER_TEMP}/sla-compile-fail.log"
           assert_ran "${RUNNER_TEMP}/sla-compile-fail.log" "obligation_compile_fail_tests"
+      - name: Set up Node for the WebMCP shim cases
+        if: matrix.lane == 'webmcp'
+        # The free-disk step removes /opt/hostedtoolcache. The shim cases
+        # run the served script under Node.
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run WebMCP-gated tests (in-page tool projection)
+        if: matrix.lane == 'webmcp'
+        # `webmcp` (#2619) is off by default. The todo-app example turns it on,
+        # so `cargo test --workspace` compiles it today by feature unification.
+        # That is accidental. Name it here so the suite stays covered on
+        # purpose. `assert_ran`: a filter that matches nothing exits 0. The
+        # browser cases need Chromium and run in publish-gate.yml.
+        env:
+          AUTUMN_REQUIRE_NODE: "1"
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features webmcp --lib -- webmcp agent_authority \
+            | tee "${RUNNER_TEMP}/webmcp-lib.log"
+          assert_ran "${RUNNER_TEMP}/webmcp-lib.log" "autumn-web webmcp unit tests"
+          cargo test -p autumn-web --features webmcp --test integration_tests webmcp \
+            | tee "${RUNNER_TEMP}/webmcp-integration.log"
+          assert_ran "${RUNNER_TEMP}/webmcp-integration.log" "webmcp integration tests"
+          grep -q 'shim_behaviour_cases_pass_under_node ... ok' "${RUNNER_TEMP}/webmcp-integration.log" \
+            || { echo "::error::the WebMCP shim cases did not run"; exit 1; }
+      - name: Run REPL-gated tests (console Rhai prompt)
+        if: matrix.lane == 'repl'
+        # `repl` (#2148) is off by default, so the `test` job compiles none of
+        # its suites. Building `integration_tests` with it also compiles the
+        # REPL registration of every `#[model]` and `#[repository]` in that
+        # binary. The Docker tests read a live Postgres table; the bare Docker
+        # sweep does not build `repl`, so they run here only.
+        run: |
+          set -euo pipefail
+          assert_ran() {
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
+              || { echo "::error::no tests ran for $2 — the suite is no longer compiled in"; exit 1; }
+          }
+          cargo test -p autumn-web --features repl --lib repl:: | tee "${RUNNER_TEMP}/repl-lib.log"
+          assert_ran "${RUNNER_TEMP}/repl-lib.log" "autumn-web repl unit tests"
+          # SQLite cannot stop a running statement, so the prompt sets no call
+          # limit there. Only this build compiles that branch.
+          cargo test -p autumn-web --features "repl,sqlite" --lib repl:: \
+            | tee "${RUNNER_TEMP}/repl-sqlite-lib.log"
+          assert_ran "${RUNNER_TEMP}/repl-sqlite-lib.log" "autumn-web repl unit tests on SQLite"
+          cargo test -p autumn-web --features "repl,test-support" --test integration_tests repl_ \
+            -- --include-ignored | tee "${RUNNER_TEMP}/repl-integration.log"
+          assert_ran "${RUNNER_TEMP}/repl-integration.log" "repl integration tests"
+          grep -q 'repl_reads_a_live_table ... ok' "${RUNNER_TEMP}/repl-integration.log" \
+            || { echo "::error::the REPL Docker test did not run"; exit 1; }
 
   # The Docker/testcontainer sweep runs as its own job rather than as the last
   # step of `test` (#1747). As step 16 of that job it inherited a disk already
@@ -1511,6 +1634,10 @@ jobs:
         # and exit non-zero without it on PATH. Same install command as
         # generator-conformance.yml's `scaffold-postgres` job.
         run: cargo install diesel_cli --version "=2.2.0" --no-default-features --features postgres --locked
+      - name: Pull Docker Hub images through a mirror
+        if: runner.os == 'Linux'
+        # The runner's unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
       - name: Pre-pull the testcontainer images
         if: runner.os == 'Linux'
         # The module default `postgres:11-alpine` is what 100+ tests start, all at
@@ -1526,7 +1653,9 @@ jobs:
         # PR #1985. The prior step ran in ~25 min against the old 45-minute
         # budget, and these are typical single-Postgres-container tests
         # (seconds to low minutes each), so +30 min is a conservative margin.
-        timeout-minutes: 75
+        # 75 -> 90 (#3347): on trunk-dev the step took 73m21s, and a PR run
+        # hit the 75-minute limit in the `examples/cms` tests with no failure.
+        timeout-minutes: 90
         env:
           # `feature_flags_pg_integration` below builds with `managed-pg-bundled`,
           # which compiles `postgresql_embedded`; its build script downloads
@@ -1557,7 +1686,6 @@ jobs:
           # the whole set on is its own change. #1186 added
           # `redis_admin_enqueued_page_merges_concurrency_parked_jobs` here,
           # which asserts the enqueued tab lists concurrency-parked jobs.
-          #
           # Same feature set as the `integration_tests` sweep below so both
           # share one autumn-web build. The pass-count check is there because
           # `cargo test` exits 0 when a filter matches nothing: without it a
@@ -1580,6 +1708,28 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-job-admin.log" \
             || { echo "::error::no redis job-admin dashboard tests ran — the ci.yml filters no longer match"; exit 1; }
+          # The Redis dead-letter limit suite (#3055) is `--lib` for the same
+          # reason. It has its own pass count, so an empty filter fails here.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::redis_dead_letter_limit_ \
+              | tee "${RUNNER_TEMP}/redis-dead-letter-limit.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-dead-letter-limit.log" \
+            || { echo "::error::no redis dead-letter limit tests ran — the ci.yml filter no longer matches"; exit 1; }
+          # The Redis claim-renewal test (#3051) is `--lib` for the same
+          # reason: it drives the crate-private renewal script directly.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::redis_claim_renewal_ \
+              | tee "${RUNNER_TEMP}/redis-claim-renewal.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/redis-claim-renewal.log" \
+            || { echo "::error::no redis claim-renewal tests ran — the ci.yml filter no longer matches"; exit 1; }
           # The Postgres relative-delay clock-skew regression (#2111 follow-up)
           # also lives in the `--lib` module (it drives crate-private types:
           # PgDueAt, pg_enqueue_job_at, pg_enqueue_on_conn_at), so it needs its
@@ -1602,6 +1752,63 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-relative-delay.log" \
             || { echo "::error::no pg relative-delay tests ran — the ci.yml filters no longer match"; exit 1; }
+          # The cost-deferral claim (#1720) is `--lib` too: it drives the
+          # crate-private `pg_claim_next_job_except`. Named by full path with a
+          # pass count, as above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::pg::pg_deferred_claim_skips_parked_names_and_keeps_run_at_order \
+              | tee "${RUNNER_TEMP}/pg-deferred-claim.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-deferred-claim.log" \
+            || { echo "::error::no pg deferred-claim test ran — the ci.yml filter no longer matches"; exit 1; }
+          # Issue #2576: the Postgres admin-retry unique-key tests are `--lib`
+          # (they drive the crate-private `PgJobAdminBackend`). Named by full
+          # path, with a pass count, as above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              job::tests::pg::pg_admin_retry_restores_pending_window_unique_key \
+              job::tests::pg::pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it \
+              | tee "${RUNNER_TEMP}/pg-admin-retry-key.log"
+          )
+          grep -qE 'test result: ok\. 2 passed' "${RUNNER_TEMP}/pg-admin-retry-key.log" \
+            || { echo "::error::the pg admin-retry key tests did not all run — the ci.yml filters no longer match"; exit 1; }
+          # The migration lock_timeout + retry suite (#3057) is `--lib`: it
+          # drives the migrator's private retry policy. Named by full path,
+          # with a pass count, for the same reason as the suites above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              migrate::tests::migration_blocked_by_a_held_lock_fails_fast_after_retries \
+              migrate::tests::migration_retry_applies_after_the_lock_is_released \
+              migrate::tests::non_transactional_migration_waits_without_lock_timeout \
+              migrate::tests::superuser_may_set_lc_messages \
+              migrate::tests::a_held_lock_on_the_migrations_table_fails_fast \
+              migrate::tests::server_lock_timeout_is_off_reads_the_database_default \
+              migrate::tests::the_pending_read_fails_fast_on_a_held_migrations_table_lock \
+              migrate::tests::a_held_lock_fails_the_checksum_check_fast \
+              migrate::tests::the_cli_checksum_check_fails_fast_on_a_held_lock \
+              | tee "${RUNNER_TEMP}/migration-lock-timeout.log"
+          )
+          grep -qE 'test result: ok\. 9 passed' "${RUNNER_TEMP}/migration-lock-timeout.log" \
+            || { echo "::error::the migration lock_timeout tests did not all run — the ci.yml filters no longer match"; exit 1; }
+          # Issue #3061: the database idempotency store's Postgres row-lock
+          # test is `--lib`: it drives the crate-private recovery-point copy.
+          # Named by full path, with a pass count, as above.
+          (
+            set -o pipefail
+            cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
+              --ignored --test-threads=1 \
+              idempotency::db_store::pg_tests:: \
+              | tee "${RUNNER_TEMP}/idempotency-db-store-pg.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/idempotency-db-store-pg.log" \
+            || { echo "::error::no idempotency db_store Postgres tests ran — the ci.yml filter no longer matches"; exit 1; }
           cargo test -p autumn-admin-plugin --test token_admin_db -- --ignored
           # Issue #2108: the same AdminModel cover as token_admin_db, for the
           # two models that read a `timestamptz` column. Both assert the audit
@@ -1621,7 +1828,8 @@ jobs:
           # block.
           cargo test -p autumn-media-plugin --test room_reaper_batch_profile -- --ignored
           # The DB-backed RoomStore lifecycle suite (create/join/roster/leave
-          # persistence, member-gating, heartbeat renewal, the reap sweep).
+          # persistence, member-gating, heartbeat renewal, the reap sweep,
+          # and the seat-cap and room-delete races, #2864 / #2407).
           # autumn-media-plugin has no crate-wide `--ignored` sweep, so each of
           # its Docker test targets is named here (#1974).
           cargo test -p autumn-media-plugin --test room_store_db -- --ignored
@@ -1634,6 +1842,20 @@ jobs:
           # not just the crate's own generic suite above. Testcontainer-
           # managed, so no `services:` block is needed.
           cargo test -p wiki --test search_plugin_integration -- --ignored
+          # reddit-clone (#2454): run all #[ignore]d tests (Postgres, MinIO, live event).
+          # The run is bare `--ignored`. A new test needs no workflow edit.
+          # `--lib --tests` excludes doc tests. Their `ignore` blocks are not Docker tests.
+          # Use one thread. The tests share one job runtime.
+          # Browser tests use the `system-tests` feature, so they do not compile here.
+          # Check the pass count. `cargo test` exits 0 when no test matches.
+          # This adds about 15 minutes to the 75-minute budget above.
+          (
+            set -o pipefail
+            cargo test -p reddit-clone --lib --tests -- --ignored --test-threads=1 \
+              | tee "${RUNNER_TEMP}/reddit-clone-docker-sweep.log"
+          )
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/reddit-clone-docker-sweep.log" \
+            || { echo "::error::no reddit-clone Docker test ran. Fix the filter in ci.yml."; exit 1; }
           # autumn-billing (#1190): the Postgres `DbBillingStore` contract suite
           # is testcontainer-managed, so no `services:` block is needed.
           cargo test -p autumn-billing --test mirror_db -- --ignored
@@ -1679,6 +1901,14 @@ jobs:
           # migrated table. Only its Chromium smoke runs elsewhere (the
           # publish-gate fleet e2e), so without this line the tier never runs.
           cargo test -p react-graphql --test graphql_api -- --ignored --test-threads=1
+          # examples/escape-hatches: the Docker tests in `hatches` (H1, H2, H3,
+          # H12, H13) and `boot`. `boot` starts the real binary to check the
+          # wiring that `TestApp` cannot reach (pool provider, error pages,
+          # exception filter, env-driven hatches). Testcontainer-managed. The
+          # `hatches` tests share tables; a lock in their `fresh_db` helper
+          # runs them one at a time.
+          cargo test -p escape-hatches --test hatches -- --ignored
+          cargo test -p escape-hatches --test boot -- --ignored
           cargo test -p autumn-cli --test flags -- --ignored
           cargo test -p autumn-cli --test config -- --ignored
           cargo test -p autumn-cli --test experiments -- --ignored
@@ -1727,6 +1957,7 @@ jobs:
             --skip console_playground_target_compiles_with_a_repository_round_trip \
             --skip console_run_exits_non_zero_when_the_database_is_unreachable \
             --skip console_run_surfaces_a_compile_error_in_the_playground \
+            --skip console_repl_runs_and_reports_errors_as_script_errors \
             --skip i18n_scaffold_cargo_checks \
             --skip i18n_scaffold_with_owner_scoped_search_cargo_checks \
             --skip i18n_scaffold_with_state_machine_and_attachment_cargo_checks \
@@ -1818,15 +2049,9 @@ jobs:
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
-            --skip capture_overhead_on_a_successful_query_request
-          # AC-7 deploy end-to-end (#1607, Slice 4): drives the real `autumn
-          # deploy up`/`rollback` over ssh/scp against a privileged systemd
-          # container (first deploy, zero-downtime redeploy, on-demand rollback,
-          # forced-failure auto-rollback). Isolated `--test deploy_e2e` binary; it
-          # builds its own fixture image (extracting kamal-proxy from the
-          # basecamp/kamal-proxy Docker Hub image) and needs the ssh client
-          # installed above.
-          cargo test -p autumn-cli --test deploy_e2e -- --ignored
+            --skip capture_overhead_on_a_successful_query_request \
+            --skip outbox_claim_profile
+          # `deploy_e2e` runs in `test-docker-deploy`, on a fresh disk (#2547).
           # Example apps are NOT auto-swept the way autumn-web's consolidated
           # `integration_tests` binary is (Codex review finding on #2530):
           # `saas` and `teams` each have their own Docker-gated
@@ -1894,6 +2119,47 @@ jobs:
           cargo test -p cms --test integration_test -- --ignored --test-threads=1
 
 
+  # AC-7 deploy end-to-end (#1607). It builds its own fixture image on top of
+  # the sweep's disk, which ran the runner out of space (#2547). It has its own
+  # job, so it starts on a clean disk. It runs `autumn deploy up`/`rollback`
+  # over ssh/scp against a privileged systemd container.
+  test-docker-deploy:
+    name: Test (Docker deploy)
+    needs: [lint, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+      - name: Install the ssh client
+        # The test drives the real `ssh`/`scp`. The runner may lack them.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-client
+          ssh -V
+      - name: Pull Docker Hub images through a mirror
+        # The unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
+      - name: Run deploy end-to-end test
+        timeout-minutes: 45
+        run: cargo test -p autumn-cli --test deploy_e2e -- --ignored
+      - name: Report disk
+        if: always()
+        run: df -h
+
   test-gate:
     name: Test suite
     # The stable, shard-count-independent name for BRANCH PROTECTION. It fails
@@ -1907,7 +2173,7 @@ jobs:
     # skipped required check can never be satisfied, so the PR stops being
     # mergeable even once the real failure is understood. `coverage` and `loom`
     # were briefly wired here and hit exactly that; they depend on `test`.
-    needs: [test, trybuild, test-features, test-docker]
+    needs: [test, trybuild, test-features, test-docker, test-docker-deploy]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -1956,7 +2222,7 @@ jobs:
       # Coverage is not bound by the crates.io baseline, so this list is a
       # deliberate superset (adds `offline-sync`, `embed-assets`, `tls`,
       # `acme`, `managed-pg*`, `system-tests`, `test-support`, ...).
-      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,markdown,constela,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
+      PG_FEATURES: "ws,presence,flash,cache-moka,maud,htmx,multipart,tailwind,http-client,oauth2,webauthn,openapi,mcp,webmcp,markdown,constela,db,offline-sync,test-support,telemetry-otlp,redis,i18n,embed-assets,storage,variants,reporting,mail,inbound-mail,inbound-mailgun,inbound-ses,seed,system-info,csv,pdf,system-tests,managed-pg,managed-pg-bundled,tls,acme,plugin-sandbox"
       # `postgresql_embedded`'s build script downloads Postgres binaries via
       # the GitHub API; unauthenticated it hits the 60 req/hr rate limit and
       # fails the build with a 403. Authenticate with the job's token to get
@@ -1989,7 +2255,7 @@ jobs:
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
         # resolve with an empty tool input and install nothing (broke the Fuzz
         # jobs with `error: no such command: fuzz`). Keep the explicit tool: input.
-        uses: taiki-e/install-action@v2.87.20
+        uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-llvm-cov
       - name: Generate coverage (workspace catch-all)
@@ -2091,17 +2357,97 @@ jobs:
           # tests are executed there, just not measured for coverage here.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
+          # The sqlite URI helpers in `db.rs` (#3032) are covered by lib unit
+          # tests only. Without this leg their lines are instrumented and
+          # never run, so Codecov reads them as uncovered. A name filter keeps
+          # the leg narrow.
+          # The SQLite database fleet (ADR 0019) is sqlite-only too: its runtime
+          # and per-database replication (`db::fleet`, `db::fleet_replication`)
+          # and the boot wiring are measured by the same leg, so no second
+          # lib-test build.
+          # `db::sqlite_types::` (#2582) measures the `SQLite` wrappers' schema
+          # impls and their unit tests.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
+            --lib -- db::tests::sqlite_ db::tests::percent_decode db::fleet \
+            fleet_layout:: app::fleet_boot_tests db::sqlite_types::
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_jobs_scheduler_e2e
+          # Issue #3061: the database idempotency store and `IdempotencyTx`.
+          # Outside this leg they run only in the `sqlite-runtime` job and the
+          # Docker-gated Postgres suite inside the consolidated binary, which
+          # no lane measures, so Codecov read `idempotency/db_store.rs` as
+          # wholly uncovered. Same feature set as the leg above, so the
+          # instrumented library build is shared.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sim_idempotency_db
+          # Its lib unit tests (the `SQLite` store, the copy and lock fencing,
+          # `IdempotencyTx`) are measured here too, or Codecov reads the store's
+          # in-file tests and the paths only they reach as uncovered. A filter
+          # that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --lib -- idempotency:: | tee "$RUNNER_TEMP/idempotency-sqlite-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-sqlite-cov.log"
+          # The fleet's HTTP suite: `ShardedDb`, sharded repositories and fan-out
+          # resolving to fleet databases (the fleet arms of `sharding.rs`).
+          # Shares the build above (same package and features).
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_fleet
+          # Issue #2555: the SQLite `TestDb` and the generated UUID key default.
+          # Both are sqlite-only code. Same features, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_test_db
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_uuid_primary_key
+          # Issue #3234: the fleet sweeper end to end. Same features, so no
+          # rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_fleet_sweeper
+          # Issue #2663: the SQLite split-sum aggregate and bulk decrement in
+          # `counter_cache.rs` are sqlite-only. Same features, so no rebuild.
+          # A filter that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --lib -- counter_cache::tests::sqlite_sum | tee "$RUNNER_TEMP/sqlite-sum-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/sqlite-sum-cov.log"
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_derivation_wide_sum
+          # Issue #3233: slot ownership driven by its renew loop in virtual
+          # time. Single-threaded, like its CI step. Same features, so no
+          # rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sim_fleet_ownership -- --test-threads=1
+          # Issue #3231: the SQLite commit-hook worker loop (stop token, claim
+          # heartbeat guard). No other lane measures it, so Codecov reads those
+          # lines as uncovered. Same features, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_commit_hook_worker
+          # Issue #2319: the ledger's chain reads, paged verify and out-of-band
+          # refusals run against a real database. These two targets are the
+          # Docker-free half; without them Codecov reads that code as uncovered.
+          # Same package and features as the legs above, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_ledger --test sqlite_ledger_out_of_band
+          # Issue #2553: the retention sweeps on SQLite. No other lane runs
+          # `sweep_sqlite`. Same package and features, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_framework_retention
+          # Issue #3267: the SQLite commit-hook worker's ack/nack retry runs
+          # only inside this suite. Without this leg Codecov reads it as
+          # uncovered. Same package and features as the legs above, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_commit_hook_worker
           # Issue #2108: the admin plugin's `backend_select!` sqlite arms and
           # the cross-backend model suite. Without this lane Codecov reads them
           # as a new uncovered surface. No Docker, ~0.01s of runtime.
           cargo llvm-cov --no-report -p autumn-admin-plugin --features autumn-web/sqlite \
             --test custom_admin_model -- --ignored
           cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Pull Docker Hub images through a mirror
+        if: matrix.lane == 'db-ignored'
+        # The runner's unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
       - name: Pre-pull the testcontainer images
         if: matrix.lane == 'db-ignored'
         # Same reason as the `test-docker` job: pull once, with retries, before
@@ -2120,6 +2466,92 @@ jobs:
             --test feature_flags_pg_integration -- --ignored
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --test scoped_tokens_db -- --ignored
+          # Issue #3072: the shard-local job runtime and the tenant DB
+          # bulkhead run only in these Docker tests of the consolidated
+          # binary; so does the ledger's Postgres fork (#2319). The Postgres
+          # data-capsule round trip (`data_capsule_pg`, the only test of
+          # `gdpr/portability/pg.rs` import) joins them: the `Test (Docker)`
+          # sweep runs it without coverage, so the patch gate saw none of that
+          # file. A filter that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored shard_local_jobs:: tenant_db_bulkhead:: ledger_postgres:: data_capsule_pg:: \
+            | tee "$RUNNER_TEMP/isolation-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/isolation-cov.log"
+          # Issue #2555: the Postgres `TestDb::reset_table` runs only in this
+          # Docker test of the consolidated binary. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored test_db_reset_table:: \
+            | tee "$RUNNER_TEMP/test-db-reset-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/test-db-reset-cov.log"
+          # Ledger (outbox claim index): the existing-tables branch of
+          # `outbox::ensure_schema` runs only in this Docker test, so the
+          # `Test (Docker)` sweep alone leaves it out of the patch gate. The
+          # filter stops at `docker::`: `docker_webhook_store` is a different
+          # suite that does not pass in this lane.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored --test-threads=1 outbox_pg::docker:: \
+            | tee "$RUNNER_TEMP/outbox-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/outbox-pg-cov.log"
+          # Issue #3061: the Postgres side of the database idempotency store
+          # runs only in these Docker tests, the `--lib` pg_tests and the
+          # consolidated binary's idempotency suites. Both filters are checked
+          # for a non-zero count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored idempotency::db_store::pg_tests:: \
+            | tee "$RUNNER_TEMP/idempotency-pg-lib-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-lib-cov.log"
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored idempotency_ \
+            | tee "$RUNNER_TEMP/idempotency-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-pg-cov.log"
+          # Issue #3262: the Postgres experiment store's snapshot, refresh and
+          # write paths run only in these Docker tests of the consolidated
+          # binary. A filter that matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored experiments_pg_integration:: \
+            | tee "$RUNNER_TEMP/experiments-pg-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/experiments-pg-cov.log"
+          # Issue #2583: the tracked-status settle after the queue ack on the
+          # Postgres and Redis backends runs only in these Docker tests. Check
+          # the count: a filter that matches nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored job_tracking_settle_ack:: \
+            | tee "$RUNNER_TEMP/settle-ack-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/settle-ack-cov.log"
+          # Issue #2875: the Postgres tracking store's database-clock expiry
+          # runs only in these Docker tests. Check the count: a filter that
+          # matches nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored pg_clock_skew:: \
+            | tee "$RUNNER_TEMP/tracking-clock-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-clock-cov.log"
+          # Issue #2581: the Redis tracking store's write counter and
+          # compare-and-swap run only in this Docker test. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --test integration_tests -- --ignored redis_retry_reset_ \
+            | tee "$RUNNER_TEMP/tracking-redis-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-redis-cov.log"
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored pg_tracking_cleanup_deletes_expired_rows \
+            | tee "$RUNNER_TEMP/tracking-cleanup-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/tracking-cleanup-cov.log"
+          # Issue #2576: the Postgres admin-retry key restore runs only in
+          # these `--lib` Docker tests. Check the count: a filter that matches
+          # nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored --test-threads=1 \
+            job::tests::pg::pg_admin_retry_restores_pending_window_unique_key \
+            job::tests::pg::pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it \
+            | tee "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
+          grep -Eq "test result: ok\. 2 passed" "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
+          # Ledger (deferred job claim, #1720): the skip-scan claim runs only
+          # in this `--lib` Docker test, so the `Test (Docker)` sweep alone
+          # leaves it out of the patch gate. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
+            --lib -- --ignored --test-threads=1 \
+            job::tests::pg::pg_deferred_claim_skips_parked_names_and_keeps_run_at_order \
+            | tee "$RUNNER_TEMP/pg-deferred-claim-cov.log"
+          grep -Eq "test result: ok\. 1 passed" "$RUNNER_TEMP/pg-deferred-claim-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \
@@ -2135,6 +2567,11 @@ jobs:
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test experiment_admin_bulk_delete_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-cache-redis -- --ignored
+          # The DB room store runs only in these Docker tests (#1974).
+          cargo llvm-cov --no-report -p autumn-media-plugin \
+            --test room_store_db -- --ignored
+          cargo llvm-cov --no-report -p autumn-media-plugin \
+            --test room_reaper_batch_profile -- --ignored
           cargo llvm-cov --no-report -p autumn-search -- --ignored
           cargo llvm-cov --no-report -p autumn-billing --test mirror_db -- --ignored
           cargo llvm-cov --no-report -p autumn-billing \
@@ -2144,6 +2581,136 @@ jobs:
           cargo llvm-cov --no-report -p autumn-cli --test flags -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test config -- --ignored
           cargo llvm-cov --no-report -p autumn-cli --test experiments -- --ignored
+          # The `autumn` bin target's unit tests are instrumented by no other
+          # lane, so without this line a change under autumn-cli/src reads as 0%
+          # patch coverage however well its unit tests cover it. Two modules so
+          # far: the declarative-schema engine (issue #1975) and `autumn upgrade`
+          # (issue #2342). Add a filter here for the next one. A filter that
+          # matches nothing exits 0, so check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- schema:: upgrade:: \
+            | tee "$RUNNER_TEMP/cli-schema-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-schema-cov.log"
+          # Issue #2344: same gap for `upgrade::` and `git_root::`. Issue #2386:
+          # same gap for `sbom::`. Issue #2442: same gap for the `serve::`
+          # shutdown-budget tests. No other lane instruments the `autumn` bin
+          # unit tests, so their patch coverage reads as 0%. Check the count: a
+          # filter that matches nothing exits 0.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- upgrade:: git_root:: sbom:: \
+            serve::tests::shutdown_budget \
+            | tee "$RUNNER_TEMP/cli-upgrade-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-upgrade-cov.log"
+          # Issue #2366: same gap for `db::scrub::`. Its classifier is unit
+          # tested, and no other lane instruments it. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::scrub:: \
+            | tee "$RUNNER_TEMP/cli-scrub-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scrub-cov.log"
+          # Issue #2418: same gap for `routes::`. Binary resolution is unit
+          # tested, and no other lane instruments it. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- routes::tests:: \
+            | tee "$RUNNER_TEMP/cli-routes-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-routes-cov.log"
+          # Issue #2572: same gap for `deps::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deps:: \
+            | tee "$RUNNER_TEMP/cli-deps-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deps-cov.log"
+          # Issue #2374: same gap for `built_artifact::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- built_artifact:: \
+            | tee "$RUNNER_TEMP/cli-built-artifact-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-built-artifact-cov.log"
+          # Issue #2448: same gap for `new::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- new:: \
+            | tee "$RUNNER_TEMP/cli-new-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-new-cov.log"
+          # Issue #2458: same gap for the `serve` ready-file parser tests. Check
+          # the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- serve::tests::ready_payload \
+            | tee "$RUNNER_TEMP/cli-ready-payload-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-ready-payload-cov.log"
+          # Issue #2476: same gap for `plugin::remove::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- plugin::remove:: \
+            | tee "$RUNNER_TEMP/cli-plugin-remove-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-plugin-remove-cov.log"
+          # Issues #2468 and #2497: same gap for `posture::` and
+          # `routes_audit::`. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- posture:: routes_audit:: \
+            | tee "$RUNNER_TEMP/cli-posture-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-posture-cov.log"
+          # Issue #2570: same gap for `deps::` (the policy search). Check the
+          # count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deps:: \
+            | tee "$RUNNER_TEMP/cli-deps-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deps-cov.log"
+          # Issue #3232: same gap for `autumn fleet` (its clap shape and the
+          # Postgres-build stub) and the `db::replica` config loader it shares.
+          # Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- fleet::imp::tests \
+            tests::fleet_subcommands db::replica:: \
+            | tee "$RUNNER_TEMP/cli-fleet-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-fleet-cov.log"
+          # Issue #2555: same gap for the generators. The SQLite uuid key and the
+          # SQLite scaffold smoke test change `generate::model`, `generate::dsl`,
+          # `generate::scaffold` and `generate::admin`, and their unit tests are
+          # instrumented by no other lane. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate:: \
+            | tee "$RUNNER_TEMP/cli-scaffold-sqlite-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scaffold-sqlite-cov.log"
+          # Issue #2396: same gap for `db::retention::` (the force env and the
+          # purge pre-flight). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- db::retention:: \
+            | tee "$RUNNER_TEMP/cli-retention-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-retention-cov.log"
+          # Issue #2531 (independently, also #2753/PR #3358: three
+          # near-identical Cargo-feature-injector functions were merged into
+          # one shared `ensure_autumn_web_feature` here): same gap for
+          # `generate::auth::` (the generated auth routes, and the
+          # Cargo-feature-injector unit tests, backed by unit tests on the
+          # `autumn` bin target that no other lane instruments). Check the
+          # count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::auth:: \
+            | tee "$RUNNER_TEMP/cli-generate-auth-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-auth-cov.log"
+          # Issue #2557: same gap for the `destroy` orphan sweep and the
+          # provenance manifest it reads and writes. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::sweep:: \
+            generate::provenance:: generate::emit:: \
+            | tee "$RUNNER_TEMP/cli-generate-sweep-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-sweep-cov.log"
+          # Issue #2580: same gap for the migration safety classifier
+          # (`migrate::safety::`). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- migrate::safety:: \
+            | tee "$RUNNER_TEMP/cli-migrate-safety-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-migrate-safety-cov.log"
+          # Issue #2553: the SQLite scrub runs through the `cli_tests` binary,
+          # which no other lane instruments. Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --test cli_tests -- db_scrub_sqlite:: \
+            | tee "$RUNNER_TEMP/cli-scrub-sqlite-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-scrub-sqlite-cov.log"
+          # PR #3407: same gap for `generate::tests::` (the Echo linked-copies
+          # drift guard comparing tauri's and tauri_mobile's placeholder icon
+          # assets, plus the module's other unit tests). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- generate::tests:: \
+            | tee "$RUNNER_TEMP/cli-generate-tests-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-generate-tests-cov.log"
+          # ADR-0024: same gap for `autumn edge bundle` (`edge_bundle::`), the
+          # header parser it shares with `edge serve` (`edge::tests`), and the
+          # `edge` subcommand shapes (`tests::parse_edge`). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- edge_bundle:: edge::tests \
+            tests::parse_edge \
+            | tee "$RUNNER_TEMP/cli-edge-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-edge-cov.log"
+          # Issue #2666: same gap for `autumn a11y verify` (`a11y::`), the cfg
+          # and feature reader it shares (`edge_scan::`), and its flags
+          # (`tests::parse_a11y`). Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- a11y:: edge_scan:: \
+            tests::parse_a11y \
+            | tee "$RUNNER_TEMP/cli-a11y-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-a11y-cov.log"
+          # Issue #2589: same gap for `deploy::` (the SQLite data-file ops and
+          # `deploy plan`) and `db::sqlite_snapshot::` (backup and restore).
+          # Check the count.
+          cargo llvm-cov --no-report -p autumn-cli --bin autumn -- deploy:: db::sqlite_snapshot:: \
+            | tee "$RUNNER_TEMP/cli-deploy-snapshot-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/cli-deploy-snapshot-cov.log"
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Upload to Codecov
         uses: codecov/codecov-action@v7
@@ -2221,6 +2788,27 @@ jobs:
         # does, but only at tag-push time. This is also the enforcing lane that
         # retires the panic-gate exemption for `middleware/trace_context.rs`.
         run: cargo clippy -p autumn-web --features "sqlite,telemetry-otlp" --lib -- -D warnings
+      - name: Clippy autumn-web as a SQLite-only app (no Postgres client)
+        # Issue #2605. Default features are off, so `postgres` is off. The list
+        # is the default set without `postgres`, plus each feature that does
+        # not need Postgres, except the test-only features.
+        # `autumn/tests/integration/sqlite_postgres_free.rs` keeps it complete.
+        # `cargo tree` then shows that no Postgres crate is in the graph. The
+        # step writes the tree to a file. Then a failed `cargo tree` fails the
+        # step.
+        env:
+          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile
+        run: |
+          cargo clippy -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" --lib -- -D warnings
+          tree="${RUNNER_TEMP}/sqlite-only-tree.txt"
+          cargo tree -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" \
+            -e normal,build --prefix none --format '{p}' > "$tree"
+          grep -q '^libsqlite3-sys ' "$tree" \
+            || { echo "::error::the SQLite-only tree has no libsqlite3-sys; the check is broken"; exit 1; }
+          if grep -E '^(pq-sys|pq-src|tokio-postgres|tokio-postgres-rustls|postgresql_embedded) ' "$tree"; then
+            echo "::error::a SQLite-only build links a Postgres crate (#2605)"
+            exit 1
+          fi
       - name: Clippy (autumn-web lib, sim-testing op-driver)
         # `sim-testing` (W6 PR2, issue #1797) promotes `proptest` to a library
         # dependency for `sim::op` — lint it here (alongside the sqlite lib
@@ -2285,6 +2873,48 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' \
             "${RUNNER_TEMP}/admin-plugin-sqlite.log" \
             || { echo "::error::no admin-plugin sqlite test ran — the #[ignore] or the target name changed"; exit 1; }
+      - name: Run the autumn-cli declarative-schema suite under sqlite
+        # Issue #1975. The SQLite arm of `autumn schema` (`schema pull`
+        # introspection, `schema migrate`, the recreate emitter) compiles only
+        # with `--no-default-features --features sqlite`. No other job builds
+        # it. No Docker: the tests use a temporary SQLite file. The pass count
+        # is checked, because a filter that matches nothing exits 0.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --bin autumn schema:: | tee "${RUNNER_TEMP}/cli-schema-sqlite-unit.log"
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --test cli_tests schema_ | tee "${RUNNER_TEMP}/cli-schema-sqlite-it.log"
+          for log in cli-schema-sqlite-unit cli-schema-sqlite-it; do
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/${log}.log" \
+              || { echo "::error::no autumn-cli sqlite schema test ran (${log})"; exit 1; }
+          done
+      - name: Run the autumn fleet CLI suite under sqlite
+        # Issue #3232. This job runs the SQLite tests of `autumn fleet`. Each
+        # test makes a fleet in a temporary directory, so no Docker. Linux
+        # only: `sqlite-fleet-windows` covers the Windows delete and restore
+        # paths in autumn-web. A filter that matches nothing exits 0, so the
+        # step checks the pass count.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --bin autumn fleet::imp::tests | tee "${RUNNER_TEMP}/cli-fleet-unit.log"
+          cargo test -p autumn-cli --no-default-features --features sqlite \
+            --test cli_tests fleet_cli | tee "${RUNNER_TEMP}/cli-fleet-it.log"
+          for log in cli-fleet-unit cli-fleet-it; do
+            grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/${log}.log" \
+              || { echo "::error::no autumn fleet test ran (${log})"; exit 1; }
+          done
+      - name: Clippy autumn-search under the sqlite backend
+        # Issue #2539 §5. The Postgres store binds a `BIGINT[]`, which SQLite
+        # does not have, so the crate did not compile under the flip. It now
+        # does, and the store refuses SQLite at boot and on every query. The
+        # flip is explicit here, as for the admin plugin above.
+        run: cargo clippy -p autumn-search --features autumn-web/sqlite --all-targets -- -D warnings
+      - name: Run the autumn-search lib tests under sqlite
+        # Runs the SQLite arm of the refusal tests. A bare `--lib` has no
+        # filter, so a pass-count check is not needed.
+        run: cargo test -p autumn-search --features autumn-web/sqlite --lib
       - name: Run the sqlite integration suite
         # Named sqlite `[[test]]` targets only. `test-support` is required by the
         # TestApp/Db-extractor-based tests (sqlite_db_extractor, sqlite_read_only_tx,
@@ -2300,10 +2930,15 @@ jobs:
             --test sqlite_scoped_repository \
             --test sqlite_read_only_tx \
             --test sqlite_transactional_url_pool \
+            --test sqlite_fleet \
+            --test sqlite_fleet_sweeper \
             --test sqlite_version_history \
             --test sqlite_ledger \
+            --test sqlite_ledger_out_of_band \
             --test sqlite_searchable_repository \
             --test sqlite_immediate_transaction \
+            --test sqlite_test_db \
+            --test sqlite_uuid_primary_key \
             --test sqlite_statement_timeout_fail_closed \
             --test sqlite_crud_basic \
             --test sqlite_unique_violation_field \
@@ -2313,26 +2948,45 @@ jobs:
             --test sqlite_upsert_isolation \
             --test sqlite_votable \
             --test sqlite_derivation \
+            --test sqlite_derivation_wide_sum \
             --test sqlite_money_ledger \
             --test sqlite_dependent_destroy \
             --test sqlite_commentable \
             --test sqlite_tracked_sessions \
             --test sqlite_commit_hook_worker \
             --test sqlite_framework_migrations \
+            --test sqlite_framework_retention \
             --test sim_chaos \
             --test sim_fault_plan_db \
+            --test sim_idempotency_db \
             --test sqlite_jobs_scheduler_e2e \
             --test confidential_repository_bidx \
             --test sim_sqlite_substrate \
             --test sim_sqlite_integration \
-            --test sim_chaos_crash
+            --test sim_chaos_crash \
+            --test sim_outbox_crash \
+            --test sqlite_outbox_writers
+      - name: Run the multi-replica sim suites (issue #3067)
+        # Several replicas on one sim clock and one SQLite database, and the
+        # partitioned fleet owner of issue #3233. Single
+        # threaded, like the `sim_` lane of the `test` job: `sim_fleet_trace`
+        # compares two traces byte for byte, and `tracing` caches callsite
+        # interest for the whole process.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support" \
+            --test sim_replicas \
+            --test sim_fleet_trace \
+            --test sim_fleet_ownership \
+            -- --test-threads=1
       - name: Run the sqlite mail-chaos suite (W5.a, issue #1797)
-        # `sim_chaos_mail` needs the `mail` feature for the mail
-        # interceptor/transport surface, so it runs as its own invocation to
-        # avoid widening the feature set of the other sqlite tests above.
+        # `sim_chaos_mail` and `sim_outbox_mail` (#3062) need the `mail`
+        # feature for the mail interceptor/transport surface, so they run as
+        # their own invocation to avoid widening the feature set of the other
+        # sqlite tests above.
         run: |
           cargo test -p autumn-web --features "sqlite,test-support,mail" \
-            --test sim_chaos_mail
+            --test sim_chaos_mail \
+            --test sim_outbox_mail
       - name: Run the sim op-driver DoD suite (W6 PR2, issue #1797)
         # `sim_op_driver` needs the `sim-testing` feature (`proptest` as a
         # library dependency) — runs as its own invocation to avoid widening
@@ -2362,17 +3016,24 @@ jobs:
   # break IS caught and shrunk: that's the `sim_sweep_driver` DoD suite in the
   # sqlite-runtime job above, not this job (which must always stay green).
   # Structured like the `loom` job below: its own bounded, standalone step.
+  #
+  # Issue #3067: built with `sqlite`, the sweep also runs the framework's own
+  # jobs, scheduler and lock scenarios across replicas under seeded faults,
+  # and runs the first `AUTUMN_SIM_TRACE_CHECKS` seeds twice to compare their
+  # traces. A failure prints a replay command for its seed and scenario.
   sim-sweep:
     name: Sim sweep (sim-testing)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Run the sim-sweep seed sweep
-        run: cargo run -p autumn-web --release --features sim-testing --bin sim-sweep
+        run: cargo run -p autumn-web --release --features "sim-testing,sqlite" --bin sim-sweep
         env:
           AUTUMN_SIM_SEEDS: "512"
+          AUTUMN_SIM_TRACE_CHECKS: "32"
 
   # Genuine loom model checks: the loom_models test binary uses loom::sync::*
   # unconditionally, so loom::model() exhaustively explores thread interleavings
@@ -2397,13 +3058,63 @@ jobs:
           RUSTFLAGS: "--cfg loom_models"
           LOOM_MAX_PREEMPTIONS: "3"
 
-  # Edge capsule conformance (issue #1790). The proof behind AC-2: the
+  # Shuttle checks of the real retry budget, tenant bulkhead and circuit
+  # breaker (`autumn/tests/shuttle_models.rs`). Like `loom`, the binary is
+  # empty unless its neutral cfg is set; under `--cfg shuttle_models`,
+  # `autumn/src/sync_shim.rs` gives those modules Shuttle's locks and atomics,
+  # so the shipped code runs under the scheduler. loom explores every
+  # interleaving of two or three threads; Shuttle samples random and PCT
+  # schedules of more threads and of async tasks. One test is a seeded lost
+  # update that Shuttle must find, so a scheduler that stopped interleaving
+  # would fail here rather than pass vacuously.
+  shuttle:
+    name: Shuttle
+    # `test`, NOT `test-gate` — same reasoning as `coverage` above.
+    needs: [test, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Run Shuttle checks
+        run: cargo test -p autumn-web --release --test shuttle_models
+        env:
+          RUSTFLAGS: "--cfg shuttle_models"
+          SHUTTLE_ITERATIONS: "2000"
+
+  # Stateright models of job claims, tick election and lease locks (#3071).
+  # Each model checks all reachable states within small bounds.
+  # Each seeded bug must give a counterexample.
+  # `cargo test --workspace` also runs the models.
+  # This job gives them their own check name.
+  # `verus.yml` runs the Verus proofs, and `kani.yml` the Kani proofs.
+  protocol-models:
+    name: Protocol models
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Check the protocol models
+        run: cargo test -p autumn-protocol-models
+
+  # Edge capsule conformance (issue #1790). The proof behind AC-1 to AC-3: the
   # `edge-greeting` fixture is compiled BOTH ways — natively and to a real
   # `wasm32-wasip1` artifact — and a shared request corpus is driven through
   # the native edge lane, the wasm capsule (via the pure-Rust `wasmi` host in
   # `autumn-edge`, so there is no runtime to install), and the full origin app.
   # Status, headers and body bytes are compared; every fallthrough is checked
-  # against the answer the origin actually gives.
+  # against the answer the origin actually gives. A gateway tier puts the
+  # capsule in front of the origin, and a generated tier sends 10,000
+  # requests through every lane. Tier E runs the edge node over real HTTP
+  # against an origin with a simulated distance, and needs a >= 50% lower
+  # median TTFB (the success metric). Tier J runs the web-standard JS host
+  # (ADR-0024) over the corpus and the generated requests and requires the
+  # reference host's outcome for each. The last steps run the real
+  # `autumn build`, then `autumn edge serve`, `autumn edge ttfb` and
+  # `autumn edge bundle`.
   #
   # Its own job because it is the only lane that installs a second target, and
   # NOT path-filtered on purpose: byte-identity between the origin and the edge
@@ -2421,6 +3132,11 @@ jobs:
         with:
           targets: wasm32-wasip1
       - uses: Swatinem/rust-cache@v2.7.8
+      - uses: actions/setup-node@v7
+        # Tier J runs the web-standard JS host (`autumn-edge/js`, ADR-0024)
+        # over the same corpus as the reference host.
+        with:
+          node-version: 22
       - name: Build the edge capsule
         # Ahead of the suite (which builds it too) so a wasm-only compile break
         # reports as a build failure rather than as a conformance failure.
@@ -2449,6 +3165,124 @@ jobs:
         # `--test-threads=1`: the suite installs a process-global panic hook
         # around the deliberately-panicking `/boom` handler.
         run: cargo test -p edge-greeting --test conformance -- --ignored --test-threads=1 --nocapture
+      - name: autumn build emits the capsule
+        # AC-1: one `autumn build` makes the capsule. `--debug` makes the
+        # native build fast. The capsule is always a release build. The app
+        # has no static routes. Thus this step also proves that an edge-only
+        # app builds without an error.
+        working-directory: examples/edge-greeting
+        run: |
+          cargo run -q -p autumn-cli --bin autumn -- build --debug --edge
+          test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm
+      - name: autumn build --embed emits the capsule
+        # AC-1 for an embed build. Remove the artifact first, so only this
+        # build can make it again.
+        working-directory: examples/edge-greeting
+        run: |
+          rm -f ../../target/wasm32-wasip1/release/edge-capsule.wasm
+          cargo run -q -p autumn-cli --bin autumn -- build --debug --embed --edge
+          test -s ../../target/wasm32-wasip1/release/edge-capsule.wasm
+      - name: autumn edge serve and autumn edge ttfb, end to end
+        # AC-3 with no glue: the real CLI puts the capsule in front of the
+        # real origin binary. One host has no distance, so the probe checks
+        # the bytes only (--divergence-only). Tier E checks the speed-up.
+        # The access log must show the edge lane for each probed path: a
+        # fallthrough also sends the origin's bytes.
+        working-directory: examples/edge-greeting
+        run: |
+          wait_for() {
+            for _ in $(seq 1 120); do curl -sf -o /dev/null "$1" && return 0; sleep 1; done
+            echo "::error::$1 did not answer"; return 1
+          }
+          cargo build -q -p edge-greeting --bin edge-greeting
+          ../../target/debug/edge-greeting &
+          wait_for http://127.0.0.1:3000/greet/ci
+          ../../target/debug/autumn edge serve \
+            --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
+            --origin http://127.0.0.1:3000 --listen 127.0.0.1:8787 \
+            --response-header 'access-control-allow-origin: *' > edge-node.log &
+          wait_for http://127.0.0.1:8787/greet/ci
+          ../../target/debug/autumn edge ttfb --divergence-only --rounds 20 \
+            --edge http://127.0.0.1:8787 --origin http://127.0.0.1:3000 \
+            --path /greet/ada --path '/stats?tag=one&tag=two' --path /stats/count
+          for path in /greet/ada /stats /stats/count; do
+            if [ "$(grep -c "^GET $path 200 edge " edge-node.log)" -lt 20 ]; then
+              cat edge-node.log
+              echo "::error::the capsule did not serve GET $path"
+              exit 1
+            fi
+          done
+      - name: autumn edge bundle runs in Cloudflare's runtime (workerd)
+        # ADR-0024: the bundle needs no vendor SDK and no glue. `wrangler dev`
+        # runs it in workerd, the open-source Workers runtime, against the
+        # real origin binary, with a seeded local KV namespace. An edge answer
+        # carries no `x-request-id` (only the origin's middleware mints one);
+        # a decline, a write and a trap reach the origin unchanged.
+        working-directory: examples/edge-greeting
+        run: |
+          wait_for() {
+            for _ in $(seq 1 120); do curl -sf -o /dev/null "$1" && return 0; sleep 1; done
+            echo "::error::$1 did not answer"; return 1
+          }
+          curl -sf -o /dev/null http://127.0.0.1:3000/greet/ci || {
+            ../../target/debug/edge-greeting &
+            wait_for http://127.0.0.1:3000/greet/ci
+          }
+          out="$RUNNER_TEMP/edge-bundle"
+          ../../target/debug/autumn edge bundle \
+            --capsule ../../target/wasm32-wasip1/release/edge-capsule.wasm \
+            --origin http://127.0.0.1:3000 --out "$out" \
+            --response-header 'access-control-allow-origin: *'
+          cd "$out"
+          printf '\n[[kv_namespaces]]\nbinding = "EDGE_KV"\nid = "ci"\n' >> wrangler.toml
+          npx --yes wrangler@4.152.0 kv key put --local --binding EDGE_KV greeting "from workers kv"
+          npx --yes wrangler@4.152.0 dev --port 8788 --ip 127.0.0.1 > wrangler.log 2>&1 &
+          wait_for http://127.0.0.1:8788/greet/ci
+          check() { # path, expected status, expected body substring, edge|origin
+            headers=$(curl -s -D - -o body.txt "${@:5}" "http://127.0.0.1:8788$1")
+            status=$(printf '%s' "$headers" | head -1 | cut -d' ' -f2)
+            lane=edge; printf '%s' "$headers" | grep -qi '^x-request-id:' && lane=origin
+            if [ "$status" != "$2" ] || ! grep -q "$3" body.txt || [ "$lane" != "$4" ]; then
+              cat wrangler.log; printf '%s\n' "$headers"; cat body.txt
+              echo "::error::$1: wanted $2 from the $4 lane containing '$3', got $status from $lane"
+              exit 1
+            fi
+          }
+          check /greet/ada 200 'Hello, ada!' edge
+          check '/stats?tag=one&tag=two' 200 'tags=\[tag=one tag=two\]' edge
+          check /note/greeting 200 'from workers kv' edge
+          check /nope 404 '' origin
+          check /boom 500 '' origin
+          check /feedback 200 '' origin -X POST -d msg=hi
+          curl -s -D - -o /dev/null http://127.0.0.1:8788/greet/ada | grep -qi '^x-frame-options: DENY' \
+            || { echo "::error::the probed security headers are missing at the edge"; exit 1; }
+
+  sqlite-fleet-windows:
+    name: SQLite fleet (windows-latest)
+    # Windows cannot delete a file that SQLite holds open (#3227). The fleet
+    # delete and restore paths differ there, and no other lane runs them.
+    runs-on: windows-latest
+    needs: [lint]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+      - name: Fleet unit tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p autumn-web --features "sqlite,test-support" --lib db::fleet \
+            | tee "${RUNNER_TEMP}/fleet-lib.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/fleet-lib.log" \
+            || { echo "::error::no fleet unit test ran"; exit 1; }
+      - name: Fleet integration tests
+        shell: bash
+        # `sqlite_fleet_sweeper` (#3234) finds a fleet by the file path SQLite
+        # reports, which Windows spells differently.
+        run: |
+          cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet
+          cargo test -p autumn-web --features "sqlite,test-support" --test sqlite_fleet_sweeper
 
   windows-tier1:
     name: Windows Tier 1 journey
@@ -2487,30 +3321,6 @@ jobs:
       # workflow file invalid, so every job in this file silently stops running.
       # They are exported from the first step instead.
       CARGO_TARGET_DIR: ${{ github.workspace }}\target
-      # The MSVC linker blows its PDB public-symbol limit linking the scaffolded
-      # `--bundled-pg` app with default debug info:
-      #
-      #   LNK4318: Very long symbol name encountered while producing debug information
-      #   LINK : fatal error LNK4319: A PDB limit was hit while adding public symbols
-      #
-      # autumn-web's full dependency graph plus `managed-pg-bundled` (which
-      # embeds the Postgres binaries) produces more public symbols in one debug
-      # binary than a PDB can hold. This is a real limit a Windows developer can
-      # hit too — it is documented as a Windows detail in
-      # docs/guide/platform-support.md and tracked for a product-level fix — so
-      # it is named here rather than silently configured around.
-      #
-      # Dropping debug info is a legitimate build configuration and does not
-      # weaken what this job gates: the journey still scaffolds, builds, boots a
-      # managed cluster, reloads, and shuts down. It only means a crash here
-      # yields a backtrace without line numbers.
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      # Second, independent mitigation for the same limit. `/DEBUG:LongSymbolTruncate`
-      # is what the linker itself recommends in the LNK4318 warning that precedes
-      # the fatal LNK4319, so this exact toolchain supports it. Belt and braces
-      # deliberately: a Windows CI cycle costs ~35 minutes, and the previous
-      # single-remedy attempt did not hold.
-      RUSTFLAGS: "-Clink-arg=/DEBUG:LongSymbolTruncate"
     steps:
       - uses: actions/checkout@v7
       # Pinned to the exact MSRV, not `@stable` (2026-09-28 finding, 🚦
@@ -2570,6 +3380,11 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "AUTUMN_MANAGED_PG_DATA_DIR=$env:RUNNER_TEMP\tier1-pg"
 
       - name: Build the CLI
+        # Env is set on this step only. A job-wide CARGO_PROFILE_DEV_DEBUG or
+        # RUSTFLAGS would override the scaffold's own dev profile (issue #2448)
+        # and hide a broken fix.
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
         run: cargo build -p autumn-cli --bin autumn
 
       - name: "Journey: autumn new (managed Postgres)"
@@ -2590,19 +3405,8 @@ jobs:
           $webPath = ("$env:GITHUB_WORKSPACE\autumn" -replace '\\', '/')
           Add-Content -Path "tier1_app\Cargo.toml" -Value "`n[patch.crates-io]`nautumn-web = { path = `"$webPath`" }`n"
 
-          # Drop debug info for this build. autumn-web's graph plus
-          # `managed-pg-bundled` overflows the MSVC PDB public-symbol limit
-          # (LNK4319) — see docs/guide/platform-support.md and issue #2448,
-          # which tracks scaffolding this so users never meet it.
-          #
-          # Written into the MANIFEST, not left to `CARGO_PROFILE_DEV_DEBUG`
-          # alone: that variable is set job-wide and verifiably works locally
-          # (it drops `-Cdebuginfo` for the package and its dependencies), yet
-          # the failing Windows link still carried `/DEBUG` and debug-bearing
-          # autumn_web objects. A manifest profile cannot be missed, and
-          # `package."*"` covers every dependency explicitly rather than by
-          # inheritance.
-          Add-Content -Path "tier1_app\Cargo.toml" -Value "`n[profile.dev]`ndebug = 0`n`n[profile.dev.package.`"*`"]`ndebug = 0`n"
+          # The scaffold sets [profile.dev] debug = "line-tables-only" (issue
+          # #2448). Do not override it here: this job must test the scaffold.
           Write-Host "--- generated Cargo.toml tail ---"
           Get-Content "tier1_app\Cargo.toml" -Tail 12 | Write-Host
 
@@ -2899,6 +3703,11 @@ jobs:
             Stop-Process -Id $dev.Id -Force -ErrorAction SilentlyContinue
             Get-Process -Name 'tier1_app' -ErrorAction SilentlyContinue | Stop-Process -Force
             Get-Process -Name 'postgres' -ErrorAction SilentlyContinue | Stop-Process -Force
+            # `Stop-Process` returns before the process has gone. The next step
+            # starts Postgres on this data directory again, and that start fails
+            # while the old postmaster still holds it. Wait for the exit.
+            Get-Process -Name 'postgres', 'tier1_app' -ErrorAction SilentlyContinue |
+              Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
           }
 
       - name: "Journey: the daemon starts, is discoverable, and serves"

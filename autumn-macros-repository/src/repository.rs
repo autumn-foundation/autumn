@@ -58,6 +58,9 @@ fn parse_version_history_sensitive(attrs: &[syn::Attribute]) -> syn::Result<Vec<
     Ok(cols)
 }
 
+use autumn_macros_support::cascade::{
+    CASCADE_LEVELS, CascadeLeg, any_const, cascade_level, level_name,
+};
 use autumn_macros_support::naming::infer_table_name;
 
 pub(crate) fn to_snake_case(name: &str) -> String {
@@ -123,6 +126,24 @@ fn generate_topic_format(topic: &str, record_ident: &TokenStream) -> syn::Result
     Ok(output)
 }
 
+/// [`generate_topic_format`] for a site that only *borrows* the topic.
+///
+/// A topic with no `{` is emitted as its own `&'static str` literal rather than
+/// `ToString::to_string(literal)`, so publishing on a static topic (the default:
+/// the table name) no longer allocates a fresh copy of it per broadcast; any
+/// other topic is `generate_topic_format`'s owned `String`. The two arms have
+/// different types, so splice this only where the topic is read by reference
+/// (`&__topic`, `__prev != __topic`, a `format!` argument) — never into a
+/// `String`-typed slot (`Option<String>` previous topics, the `(String, String)`
+/// delete tuples, a `Value::String` context entry).
+fn generate_topic_ref(topic: &str, record_ident: &TokenStream) -> syn::Result<TokenStream> {
+    if topic.contains('{') {
+        generate_topic_format(topic, record_ident)
+    } else {
+        Ok(quote! { #topic })
+    }
+}
+
 /// Which of the generated CRUD routes the `mcp` key opts in as MCP tools.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum McpExpose {
@@ -177,6 +198,9 @@ pub(crate) struct RepoConfig {
     /// Expose the generated CRUD routes as MCP tools (`mcp` / `mcp = "read"`).
     /// `None` = not opted in. Requires `api = "/path"`.
     pub(crate) mcp_expose: Option<McpExpose>,
+    /// The `authority_grant!` that governs the generated MCP tools
+    /// (`grant = Path`). Requires `mcp`.
+    pub(crate) grant: Option<syn::Path>,
     pub(crate) policy_type: Option<Ident>,
     pub(crate) scope_type: Option<Ident>,
     pub(crate) cursor_key: Option<String>,
@@ -211,6 +235,12 @@ pub(crate) struct RepoConfig {
     /// valid time equals transaction time: the fact became true when the
     /// database learned it.
     ledger_valid_time: Option<String>,
+    /// Snapshot schema version (`ledgered(schema_version = 2)`, #2326). Defaults
+    /// to 1. A version above 1 is written into each new snapshot.
+    ledger_schema_version: u32,
+    /// Function that converts an older snapshot
+    /// (`ledgered(schema_version = 2, upcast = path)`, #2326).
+    ledger_upcast: Option<syn::Path>,
     /// When `true`, suppress the auto-generated `impl VersionedRecord for Model`.
     /// Use this when the model already has a hand-written `VersionedRecord`
     /// implementation (custom serialization, non-`i64` primary key, etc.) to
@@ -277,6 +307,10 @@ pub(crate) struct RepoConfig {
     /// of the coherence gate (#1716). The reason is mandatory and non-blank so
     /// the escape hatch always carries its justification into the manifest.
     acknowledge_stale: Option<String>,
+    /// Set after the trait is parsed: the repository declares at least one
+    /// invalidation edge, at trait or method level (#3056). Each write then
+    /// invalidates after it commits.
+    declared_invalidation_edges: bool,
 }
 
 /// Per-method cache-coherence overrides read off the declared trait (#1716).
@@ -516,13 +550,13 @@ fn cached_read_companion_path(path: &syn::Path, prefix: &str) -> syn::Path {
 /// invalidation for a read that cannot go stale, and a gate that fails correct
 /// code is a gate that gets deleted.
 ///
-/// Returns the child repository paths, deduplicated by their rendered form. The
+/// Returns each child repository path and whether the cascade recurses into it,
+/// deduplicated by rendered form. The
 /// model is NOT inferred from the repository's type name — see
 /// `__AUTUMN_MODEL_NAME` in [`generate_coherence_items`] for why that guess is
 /// wrong exactly where it matters.
-fn dependent_child_repositories(config: &RepoConfig) -> Vec<syn::Path> {
-    let mut seen: Vec<String> = Vec::new();
-    let mut paths: Vec<syn::Path> = Vec::new();
+fn dependent_child_repositories(config: &RepoConfig) -> Vec<(syn::Path, bool)> {
+    let mut children: Vec<(String, syn::Path, bool)> = Vec::new();
     for dep in config
         .dependents
         .iter()
@@ -530,12 +564,85 @@ fn dependent_child_repositories(config: &RepoConfig) -> Vec<syn::Path> {
     {
         let child = &dep.child_repo;
         let rendered = quote!(#child).to_string();
-        if !seen.contains(&rendered) {
-            seen.push(rendered);
-            paths.push(dep.child_repo.clone());
+        // Only `destroy` runs the child's own cascade. `nullify` and
+        // `delete_all` are one statement on the child table.
+        let recurses = dep.action == DependentAction::Destroy;
+        if let Some(seen) = children.iter_mut().find(|(r, _, _)| *r == rendered) {
+            seen.2 |= recurses;
+        } else {
+            children.push((rendered, dep.child_repo.clone(), recurses));
         }
     }
-    paths
+    children.into_iter().map(|(_, p, r)| (p, r)).collect()
+}
+
+/// The `__AUTUMN_CASCADE_{k}` consts: the models a delete also writes, at each
+/// depth.
+///
+/// A `dependent(..)` clause is authoritative when present, as it is at run
+/// time. A `restrict` leg writes nothing. A `destroy` leg runs the child's own
+/// cascade. A repository that cascades into itself adds nothing. Each level
+/// reads only the level below it, so a cascade that loops is no const cycle.
+fn cascade_levels(config: &RepoConfig, pg_name: &Ident) -> TokenStream {
+    let level_consts = |any: TokenStream, expr_of: &dyn Fn(usize) -> TokenStream| {
+        let levels = (0..CASCADE_LEVELS).map(|k| {
+            let name = level_name(k);
+            let expr = expr_of(k);
+            quote! {
+                #[doc(hidden)]
+                pub const #name: ::autumn_web::agent_authority::CascadeLevel = #expr;
+            }
+        });
+        quote! {
+            #[doc(hidden)]
+            pub const __AUTUMN_CASCADE_ANY: bool = #any;
+            #(#levels)*
+        }
+    };
+    if config.dependents.is_empty() {
+        let model = &config.model_name;
+        // The inherent consts of `#[model]` win over the trait defaults.
+        let any = quote! {{
+            use ::autumn_web::repository::AutumnDependents as _;
+            #model::DEPENDENT_CASCADE_ANY
+        }};
+        return level_consts(any, &|k| {
+            let name = format_ident!("DEPENDENT_CASCADE_{}", k);
+            quote! {{
+                use ::autumn_web::repository::AutumnDependents as _;
+                #model::#name
+            }}
+        });
+    }
+    let mut legs: Vec<CascadeLeg> = Vec::new();
+    for dep in config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action != DependentAction::Restrict)
+    {
+        let child = &dep.child_repo;
+        // Only the bare name is proven to be this repository. A qualified path
+        // can name another repository with the same type name, and a macro
+        // cannot resolve paths. Keeping that leg can only refuse a governed
+        // delete. Skipping it could hide a model.
+        if child.is_ident(pg_name) {
+            continue;
+        }
+        let rendered = quote!(#child).to_string();
+        let destroy = dep.action == DependentAction::Destroy;
+        // One child can appear in several clauses. The runtime runs each, so
+        // the child's own cascade counts if any clause destroys.
+        if let Some(seen) = legs.iter_mut().find(|l| l.child.to_string() == rendered) {
+            seen.destroy |= destroy;
+            continue;
+        }
+        legs.push(CascadeLeg {
+            model: quote! { #child::__AUTUMN_MODEL_IDENT },
+            child: quote! { #child },
+            destroy,
+        });
+    }
+    level_consts(any_const(&legs), &|k| cascade_level(&legs, k))
 }
 
 /// Write methods that run the `dependent(...)` cascade.
@@ -580,8 +687,9 @@ fn cascade_mutation_registrations(
                 );
             child_repos
                 .iter()
-                .map(|child| {
+                .map(|(child, recurses)| {
                     let (edges, acknowledged) = (edges.clone(), acknowledged.clone());
+                    let recurses = *recurses;
                     quote! {
                     ::autumn_web::reexports::inventory::submit! {
                         ::autumn_web::cache::coherence::MutationDescriptor {
@@ -600,6 +708,9 @@ fn cascade_mutation_registrations(
                             invalidates: &[#(#edges),*],
                             acknowledged_stale: #acknowledged,
                             location: concat!(file!(), ":", line!()),
+                            cascades_into: ::core::option::Option::Some(
+                                (<#child>::__AUTUMN_REPOSITORY_NAME, #recurses)
+                            ),
                         }
                     }
                     }
@@ -641,6 +752,71 @@ fn reject_orphaned_coherence_attrs(
             writes.join(", ")
         ),
     ))
+}
+
+/// The generated invalidators for a repository with declared edges (#1716,
+/// #3056): sync, async, and the hidden hook each write runs when it ends.
+fn declared_invalidator(declared_edges: &[syn::Path], pg_name: &Ident) -> TokenStream {
+    // Reference the id CONSTANT, not the generated invalidator function:
+    // a mistyped edge then produces one "cannot find value" error naming
+    // the user's own path, rather than two errors that also leak the
+    // invalidator's mangled name.
+    let ids: Vec<syn::Path> = declared_edges
+        .iter()
+        .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
+        .collect();
+    quote! {
+        impl #pg_name {
+            /// Drop every cached read this repository declares it
+            /// invalidates.
+            ///
+            /// Returns whether every one of them was invalidated
+            /// **completely** — see
+            /// [`autumn_web::cache::coherence::invalidate_namespace`]. It is
+            /// `false` when a registered cache backend cannot drop a
+            /// namespace; the shipped `MokaCache` and `RedisCache` both can.
+            ///
+            /// Each generated write calls the async form when it ends
+            /// (#3056). Call this only for a write that does not use this
+            /// repository. Prefer `invalidate_declared_caches_async`: this
+            /// form blocks on a network backend.
+            #[must_use = "an ignored `false` means the cached value is still being served"]
+            pub fn invalidate_declared_caches() -> bool {
+                let mut __autumn_complete = true;
+                #(
+                    __autumn_complete &=
+                        ::autumn_web::cache::coherence::invalidate_namespace(#ids);
+                )*
+                __autumn_complete
+            }
+
+            /// Async form of `invalidate_declared_caches`, with the same
+            /// result. It does not block a runtime worker. A `false` is also
+            /// logged and counted in `autumn_cache_invalidation_failures_total`.
+            ///
+            /// Each write method of this repository calls it after it
+            /// commits (#3056), so an app does not have to.
+            #[must_use = "an ignored `false` means the cached value is still being served"]
+            pub async fn invalidate_declared_caches_async() -> bool {
+                let mut __autumn_complete = true;
+                #(
+                    __autumn_complete &=
+                        ::autumn_web::cache::coherence::invalidate_namespace_async(#ids).await;
+                )*
+                __autumn_complete
+            }
+
+            /// The invalidation each write runs when it ends (#3056).
+            /// A failure does not fail the write: it is logged and counted
+            /// where it happens.
+            #[doc(hidden)]
+            fn __autumn_invalidate_after_commit()
+                -> ::autumn_web::cache::CacheFuture<'static, bool>
+            {
+                ::std::boxed::Box::pin(Self::invalidate_declared_caches_async())
+            }
+        }
+    }
 }
 
 /// The `inventory` registrations and invalidator this repository publishes for
@@ -699,6 +875,7 @@ fn generate_coherence_items(
                         invalidates: &[#(#edges),*],
                         acknowledged_stale: #acknowledged,
                         location: concat!(file!(), ":", line!()),
+                        cascades_into: ::core::option::Option::None,
                     }
                 }
             }
@@ -723,6 +900,7 @@ fn generate_coherence_items(
     // type name. The guess is wrong for the supported escape hatch where they
     // differ — `#[repository(Comment)] trait ModerationRepository` — and a wrong
     // model means the cascade intersects nothing and the audit reports clean.
+    let cascade_consts = cascade_levels(config, pg_name);
     let published_model = quote! {
         impl #pg_name {
             /// The model this repository writes, for the cache-coherence
@@ -732,6 +910,10 @@ fn generate_coherence_items(
             pub const __AUTUMN_MODEL_NAME: fn() -> &'static ::core::primitive::str =
                 || ::core::any::type_name::<#model_name>();
 
+            #[doc(hidden)]
+            pub const __AUTUMN_REPOSITORY_NAME: &'static ::core::primitive::str =
+                #trait_name_str;
+
             /// The model this repository writes, unqualified — the subject an
             /// agent-authority grant names (#1691). `__AUTUMN_MODEL_NAME`
             /// carries the full `type_name` path, which no grant can be
@@ -739,46 +921,15 @@ fn generate_coherence_items(
             /// const context so the authority assertion works across crates.
             #[doc(hidden)]
             pub const __AUTUMN_MODEL_IDENT: &'static ::core::primitive::str = #model_ident;
+
+            #cascade_consts
         }
     };
 
     let invalidator = if declared_edges.is_empty() {
         quote! {}
     } else {
-        // Reference the id CONSTANT, not the generated invalidator function:
-        // a mistyped edge then produces one "cannot find value" error naming
-        // the user's own path, rather than two errors that also leak the
-        // invalidator's mangled name.
-        let ids: Vec<syn::Path> = declared_edges
-            .iter()
-            .map(|p| cached_read_companion_path(p, "__AUTUMN_CACHE_READ_ID__"))
-            .collect();
-        quote! {
-            impl #pg_name {
-                /// Drop every cached read this repository declares it
-                /// invalidates.
-                ///
-                /// Returns whether every one of them was invalidated
-                /// **completely** — see
-                /// [`autumn_web::cache::coherence::invalidate_namespace`]. It is
-                /// `false` when a registered cache backend cannot drop a
-                /// namespace; the shipped `MokaCache` and `RedisCache` both can.
-                ///
-                /// Call this after a write (or from a commit hook). The
-                /// build-time gate proves the *edge* is declared and that it
-                /// names a real cached read; it does not prove this function
-                /// runs.
-                #[must_use = "an ignored `false` means the cached value is still being served"]
-                pub fn invalidate_declared_caches() -> bool {
-                    let mut __autumn_complete = true;
-                    #(
-                        __autumn_complete &=
-                            ::autumn_web::cache::coherence::invalidate_namespace(#ids);
-                    )*
-                    __autumn_complete
-                }
-            }
-        }
+        declared_invalidator(&declared_edges, pg_name)
     };
 
     let cascade_submissions =
@@ -800,6 +951,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut commit_hooks = false;
     let mut api_path: Option<String> = None;
     let mut mcp_expose: Option<McpExpose> = None;
+    let mut grant: Option<syn::Path> = None;
     let mut mcp_span: Option<proc_macro2::Span> = None;
     let mut policy_type: Option<Ident> = None;
     let mut scope_type: Option<Ident> = None;
@@ -813,6 +965,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
     let mut no_versioned_record_impl = false;
     let mut ledgered = false;
     let mut ledger_valid_time: Option<String> = None;
+    let mut ledger_schema_version: Option<u32> = None;
+    let mut ledger_upcast: Option<syn::Path> = None;
     let mut primary_reads = false;
     let mut sharded = false;
     let mut broadcasts = false;
@@ -934,6 +1088,12 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                 mcp_expose = Some(McpExpose::All);
             }
             Ok(())
+        } else if meta.path.is_ident("grant") {
+            if grant.is_some() {
+                return Err(meta.error("duplicate `grant` key: a repository has one grant"));
+            }
+            grant = Some(meta.value()?.parse()?);
+            Ok(())
         } else if meta.path.is_ident("policy") {
             let value: Ident = meta.value()?.parse()?;
             policy_type = Some(value);
@@ -987,9 +1147,17 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                             let value: LitStr = nested.value()?.parse()?;
                             ledger_valid_time = Some(value.value());
                             Ok(())
+                        } else if nested.path.is_ident("schema_version") {
+                            let value: syn::LitInt = nested.value()?.parse()?;
+                            ledger_schema_version = Some(value.base10_parse::<u32>()?);
+                            Ok(())
+                        } else if nested.path.is_ident("upcast") {
+                            ledger_upcast = Some(nested.value()?.parse()?);
+                            Ok(())
                         } else {
                             Err(nested.error(
-                                "expected `valid_time = \"column\"` inside `ledgered(...)`",
+                                "expected `valid_time = \"column\"`, `schema_version = N` or \
+                                 `upcast = path` inside `ledgered(...)`",
                             ))
                         }
                     })?;
@@ -1236,6 +1404,15 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
             "commit_hooks = true requires hooks = Type",
         ));
     }
+    if let Some(path) = &grant
+        && mcp_expose.is_none()
+    {
+        return Err(syn::Error::new_spanned(
+            path,
+            "grant requires mcp: a grant governs the generated MCP tools, and no `mcp` key \
+             exposes any",
+        ));
+    }
     if mcp_expose.is_some() && api_path.is_none() {
         return Err(syn::Error::new(
             mcp_span.unwrap_or_else(proc_macro2::Span::call_site),
@@ -1307,11 +1484,29 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  `no_versioned_record_impl`, or drop `ledgered = true`",
             ));
         }
-    } else if ledger_valid_time.is_some() {
+    } else if ledger_valid_time.is_some()
+        || ledger_schema_version.is_some()
+        || ledger_upcast.is_some()
+    {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "ledgered(valid_time = \"...\") has no effect without the ledger; write \
-             `ledgered(valid_time = \"...\")` rather than disabling `ledgered`",
+            "ledgered(...) options have no effect without the ledger; write \
+             `ledgered(...)` rather than disabling `ledgered`",
+        ));
+    }
+    // #2326: a version below 1 names no shape, and a hook for version 1 never runs.
+    if ledger_schema_version == Some(0) {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "ledgered(schema_version = 0) is not a version: the first schema is version 1. \
+             Use 2 or more after you rename or retype a snapshot field",
+        ));
+    }
+    if ledger_upcast.is_some() && ledger_schema_version.unwrap_or(1) < 2 {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "ledgered(upcast = ...) needs `schema_version = 2` or more. The hook converts \
+             a snapshot older than the current version. Nothing is older than version 1",
         ));
     }
     if let Some(spec) = &retention {
@@ -1429,9 +1624,10 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         // Scoped down for this slice (issue #1358), mirroring retention(...)'s
         // own incompatibility list above: the generated `move_*` methods open
         // their own plain transaction and do not run the tenant/shard/version/
-        // hooks/cascade machinery those options add to the *generated CRUD*
-        // paths, so combining them would silently skip that machinery for a
-        // move rather than actually supporting it.
+        // hooks machinery those options add to the *generated CRUD* paths, so
+        // combining them would silently skip that machinery for a move rather
+        // than actually supporting it. `dependent(...)` is not on that list: a
+        // move never deletes a row, so there is no cascade to skip (#2427).
         if sharded {
             return Err(syn::Error::new(
                 proc_macro2::Span::call_site(),
@@ -1457,14 +1653,6 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
                  `versioned = true`, or treat position moves as unaudited for now",
             ));
         }
-        if !dependents.is_empty() {
-            return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "position(...) does not support dependent(...) yet: these are independent \
-                 concerns today (a move never deletes a row), but combining them is untested. \
-                 Remove `dependent(...)`, or file a follow-up if you need both",
-            ));
-        }
     }
     let table = table_name.unwrap_or_else(|| infer_table_name(&model));
     let generated_internal_hooks = false;
@@ -1476,6 +1664,7 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         commit_hooks,
         api_path,
         mcp_expose,
+        grant,
         policy_type,
         scope_type,
         cursor_key,
@@ -1488,6 +1677,8 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         no_versioned_record_impl,
         ledgered,
         ledger_valid_time,
+        ledger_schema_version: ledger_schema_version.unwrap_or(1),
+        ledger_upcast,
         primary_reads,
         sharded,
         broadcasts,
@@ -1502,6 +1693,28 @@ fn parse_repo_args(attr: TokenStream) -> syn::Result<RepoConfig> {
         position,
         invalidates,
         acknowledge_stale,
+        declared_invalidation_edges: false,
+    })
+}
+
+/// The error for a derived `delete_by_*` on a ledgered repository (#2319).
+///
+/// The derived delete is one bulk `UPDATE`. It records no revision, so the
+/// ledger would not match the table.
+fn ledgered_derived_delete_error(trait_def: &ItemTrait) -> Option<syn::Error> {
+    trait_def.items.iter().find_map(|item| {
+        let TraitItem::Fn(method) = item else {
+            return None;
+        };
+        let query = parse_query_name(&method.sig.ident.to_string())?;
+        (query.prefix == "delete").then(|| {
+            syn::Error::new_spanned(
+                &method.sig.ident,
+                "a ledgered repository cannot declare a derived `delete_by_*` method. It \
+                 deletes in one bulk write and records no revision. Find the records. \
+                 Then call `delete_by_id` or `delete_many`",
+            )
+        })
     })
 }
 
@@ -2090,16 +2303,28 @@ fn vh_insert_ts(
     // overridable by a `before_*` hook). Non-hooked repos have no `ctx`, so they
     // read the ambient current actor directly. Both fall back to the canonical
     // `SYSTEM_ACTOR` when no actor is in scope.
-    let actor_ts = if with_ctx {
+    //
+    // The resolved actor is only ever read as `&str` (`VersionHistoryWrite.actor`,
+    // `LedgerAppend.actor`), so it is borrowed rather than owned: straight out of
+    // `ctx` on the hooked path (the same borrow `__vh_request_id` already holds
+    // across the awaits below), out of a local holding the ambient actor on the
+    // non-hooked one, and the `&'static` `SYSTEM_ACTOR` otherwise. That saves a
+    // `String` per versioned write — the `ctx.actor` copy, or the
+    // `SYSTEM_ACTOR.to_string()` fallback.
+    let actor_bind_ts = if with_ctx {
         quote! {
-            ctx.actor
-                .clone()
-                .unwrap_or_else(|| ::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR.to_string())
+            let __vh_actor: &str = ctx
+                .actor
+                .as_deref()
+                .unwrap_or(::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR);
         }
     } else {
         quote! {
-            ::autumn_web::current::Current::actor()
-                .unwrap_or_else(|| ::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR.to_string())
+            let __vh_actor_scoped: ::core::option::Option<::std::string::String> =
+                ::autumn_web::current::Current::actor();
+            let __vh_actor: &str = __vh_actor_scoped
+                .as_deref()
+                .unwrap_or(::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR);
         }
     };
     let request_id_ts = if with_ctx {
@@ -2159,7 +2384,14 @@ fn vh_insert_ts(
     // Emitted here rather than at each call site so every write path version
     // history already covers is covered by the ledger too, by construction.
     let ledger_ts = if ledgered {
-        ledger_append_ts(&table_name_ts, op, record_expr, conn_ident, model_ident)
+        ledger_append_ts(
+            &table_name_ts,
+            op,
+            record_expr,
+            before_expr,
+            conn_ident,
+            model_ident,
+        )
     } else {
         quote! {}
     };
@@ -2175,7 +2407,7 @@ fn vh_insert_ts(
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_tenant_id()
             };
-            let __vh_actor: ::std::string::String = #actor_ts;
+            #actor_bind_ts
             let __vh_request_id: ::core::option::Option<&str> = #request_id_ts;
             // The statement itself — both backend arms, all seven binds — lives
             // in `autumn_web::version_history` rather than here. It is fully
@@ -2189,7 +2421,7 @@ fn vh_insert_ts(
                     tenant_id: __vh_tenant_id,
                     record_id: __vh_record_id,
                     op: #op_variant,
-                    actor: __vh_actor.as_str(),
+                    actor: __vh_actor,
                     request_id: __vh_request_id,
                     changes_json: __vh_changes_str.as_str(),
                 },
@@ -2209,6 +2441,56 @@ fn version_op_variant(op: &str) -> TokenStream {
         "insert" => quote! { ::autumn_web::version_history::VersionOp::Insert },
         "delete" => quote! { ::autumn_web::version_history::VersionOp::Delete },
         _ => quote! { ::autumn_web::version_history::VersionOp::Update },
+    }
+}
+
+/// Reload a ledgered row after its write and snapshot it (#2326, #2319).
+///
+/// A revision snapshots the state after its write, but no record a write path
+/// holds shows it reliably. A delete holds its pre-delete load; an insert,
+/// update or restore holds the statement's `RETURNING` row, which does not
+/// show what an AFTER trigger changed. A trigger or a default may change any
+/// column (#2326), `tenant_id` included, so reload the whole row. The bulk
+/// paths share this builder. The reload is one indexed lookup per ledgered
+/// write, in the transaction that already reads the chain head.
+///
+/// Everything the revision takes from the row is read from this reload: the
+/// snapshot, the tenant check, the non-finite check and the valid time.
+///
+/// Expands to an expression of the model's type.
+fn ledger_reload_after_write_ts(
+    table_name_ts: &str,
+    conn_ident: &TokenStream,
+    model_ident: &proc_macro2::Ident,
+) -> TokenStream {
+    let table_ident = format_ident!("{table_name_ts}");
+    quote! {
+        {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            // Named, not glob-aliased: the sync prelude also brings a
+            // `first`, and only an explicit import shadows it.
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            let __lg_after: ::core::option::Option<#model_ident> = #table_ident::table
+                .find(__lg_record_id)
+                .select(#model_ident::as_select())
+                .first::<#model_ident>(&mut *#conn_ident)
+                .await
+                .optional()
+                .map_err(::autumn_web::AutumnError::from)?;
+            // A missing row would leave a stale snapshot. Refuse.
+            let ::core::option::Option::Some(__lg_row) = __lg_after else {
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::internal_server_error(
+                        ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                            table: #table_name_ts.to_string(),
+                            record_id: __lg_record_id,
+                            detail: "the row cannot be read back after the write".to_string(),
+                        },
+                    ),
+                );
+            };
+            __lg_row
+        }
     }
 }
 
@@ -2245,54 +2527,75 @@ fn ledger_append_ts(
     table_name_ts: &str,
     op: &str,
     record_expr: &TokenStream,
+    before_expr: Option<&TokenStream>,
     conn_ident: &TokenStream,
     model_ident: &proc_macro2::Ident,
 ) -> TokenStream {
     let op_variant = version_op_variant(op);
 
-    // `ledgered` implies `soft_delete`, so a delete here is always soft: the row
-    // survives with `deleted_at` set. Version history's delete entry records the
-    // row's pre-delete values, and the record handed to this builder is that same
-    // pre-delete load — but every ledger revision snapshots the state after its
-    // write, or as-of reconstruction after a delete would return a row whose
-    // `deleted_at` is null while a live `with_deleted()` query shows it set.
-    //
-    // The `deleted_at` the UPDATE wrote is read back from the table rather than
-    // recomputed: the several soft-delete paths bind it from differently-scoped
-    // locals, and the bulk paths from a per-chunk one, so reading the stored value
-    // is the only spelling that compiles everywhere and the only one guaranteed
-    // byte-identical to the row. One extra indexed lookup, on ledgered deletes only.
-    let table_ident = format_ident!("{table_name_ts}");
-    let soft_delete_stamp = if op == "delete" {
+    let reload_after_write = ledger_reload_after_write_ts(table_name_ts, conn_ident, model_ident);
+
+    // #2326: a delete or restore is valid from the moment it is made. The record
+    // still holds the old valid time. Reading it would back-date the revision.
+    // `None` makes the append use the mutation instant.
+    let valid_from_stmt = if matches!(op, "delete" | "restore") {
         quote! {
-            {
-                use ::autumn_web::reexports::diesel::prelude::*;
-                // Named, not glob-aliased: the sync prelude also brings a
-                // `first`, and only an explicit import shadows it.
-                use ::autumn_web::reexports::diesel_async::RunQueryDsl;
-                let __lg_deleted_at: ::core::option::Option<
-                    ::autumn_web::reexports::chrono::NaiveDateTime,
-                > = #table_ident::table
-                    .find(__lg_record_id)
-                    .select(#table_ident::deleted_at)
-                    .first::<::core::option::Option<
-                        ::autumn_web::reexports::chrono::NaiveDateTime,
-                    >>(&mut *#conn_ident)
-                    .await
-                    .optional()
-                    .map_err(::autumn_web::AutumnError::from)?
-                    .flatten();
-                if let ::core::option::Option::Some(__lg_obj) = __lg_snapshot.as_object_mut() {
-                    __lg_obj.insert(
-                        "deleted_at".to_string(),
-                        ::autumn_web::reexports::serde_json::to_value(__lg_deleted_at)
-                            .unwrap_or(::autumn_web::reexports::serde_json::Value::Null),
-                    );
-                }
-            }
+            let __lg_valid_from: ::core::option::Option<
+                ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+            > = ::core::option::Option::None;
         }
     } else {
-        quote! {}
+        quote! {
+            let __lg_valid_from: ::core::option::Option<
+                ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
+            > = {
+                use ::autumn_web::ledger::LedgeredRecord as _;
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(&__lg_row)
+            };
+        }
+    };
+
+    // #2319: a chain belongs to one tenant. An update that moves the record
+    // would split it, so refuse it. A restore gets the same check: a BEFORE
+    // trigger can rewrite `tenant_id` into the `RETURNING` row itself, where
+    // the reload below cannot see a difference. An AFTER trigger can rewrite
+    // it on any write; the reload checks the row it left behind.
+    let tenant_change_check = match (op, before_expr) {
+        ("update" | "restore", Some(before)) => quote! {
+            ::autumn_web::ledger::refuse_tenant_change(
+                #table_name_ts,
+                __lg_record_id,
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#before)),
+                __lg_tenant_id,
+            )?;
+        },
+        _ => quote! {},
+    };
+
+    // #2326: refuse before the snapshot. The snapshot would turn NaN into `null`.
+    // A delete or restore writes no float, so a legacy row that holds one can
+    // still be deleted or restored. A trigger can still write one during them
+    // (#2319): refuse when the row was finite before the write and is not now.
+    let refuse = quote! {
+        ::autumn_web::ledger::refuse_non_finite(
+            #table_name_ts,
+            __lg_record_id,
+            __lg_row.__autumn_ledger_non_finite_column(),
+        )?;
+    };
+    let before_write = match (op, before_expr) {
+        // A delete's record is its pre-delete load.
+        ("delete", _) => Some(record_expr),
+        ("restore", Some(before)) => Some(before),
+        _ => None,
+    };
+    let non_finite_check = match before_write {
+        Some(before) => quote! {
+            if (#before).__autumn_ledger_non_finite_column().is_none() {
+                #refuse
+            }
+        },
+        None => refuse,
     };
 
     quote! {
@@ -2301,20 +2604,27 @@ fn ledger_append_ts(
                 use ::autumn_web::version_history::VersionedRecord as _;
                 (#record_expr).version_record_id()
             };
-            let __lg_tenant_id: ::core::option::Option<&str> = {
-                use ::autumn_web::version_history::VersionedRecord as _;
-                (#record_expr).version_tenant_id()
-            };
-            #[allow(unused_mut, reason = "only the delete arm rewrites the snapshot")]
+            // The row as the write left it, after any trigger ran.
+            let __lg_row: #model_ident = #reload_after_write;
+            #non_finite_check
+            let __lg_tenant_id: ::core::option::Option<&str> =
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#record_expr));
+            #tenant_change_check
+            // #2319: a trigger that rewrote `tenant_id` would split the chain.
+            ::autumn_web::ledger::refuse_tenant_change(
+                #table_name_ts,
+                __lg_record_id,
+                __lg_tenant_id,
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&__lg_row),
+            )?;
             let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
-                (#record_expr).__autumn_commit_hook_to_value()?;
-            #soft_delete_stamp
-            let __lg_valid_from: ::core::option::Option<
-                ::autumn_web::reexports::chrono::DateTime<::autumn_web::reexports::chrono::Utc>,
-            > = {
-                use ::autumn_web::ledger::LedgeredRecord as _;
-                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(&(#record_expr))
-            };
+                __lg_row.__autumn_commit_hook_to_value()?;
+            // #2326: a model past schema version 1 records the version it wrote.
+            ::autumn_web::ledger::stamp_schema_version(
+                &mut __lg_snapshot,
+                <#model_ident as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION,
+            );
+            #valid_from_stmt
             ::autumn_web::ledger::append_revision(
                 &mut *#conn_ident,
                 ::autumn_web::ledger::LedgerAppend {
@@ -2322,7 +2632,8 @@ fn ledger_append_ts(
                     tenant_id: __lg_tenant_id,
                     record_id: __lg_record_id,
                     op: #op_variant,
-                    actor: __vh_actor.as_str(),
+                    // `vh_insert_ts`'s borrowed `&str` actor binding.
+                    actor: __vh_actor,
                     request_id: __vh_request_id,
                     snapshot: __lg_snapshot,
                     valid_from: __lg_valid_from,
@@ -2720,10 +3031,23 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
+    // #2319: a derived `delete_by_*` is one bulk write with no revision.
+    if config.ledgered
+        && let Some(err) = ledgered_derived_delete_error(&trait_def)
+    {
+        return err.to_compile_error();
+    }
+
     if config.broadcasts && config.hooks_type.is_none() {
         config.hooks_type = Some(format_ident!("Pg{}InternalHooks", trait_def.ident));
         config.generated_internal_hooks = true;
     }
+
+    // #3056: a declared edge binds invalidation to the commit. An attribute
+    // that does not parse is reported by `generate_coherence_items`.
+    config.declared_invalidation_edges = !config.invalidates.is_empty()
+        || parse_method_coherence_attrs(&trait_def)
+            .is_ok_and(|overrides| overrides.values().any(|o| !o.invalidates.is_empty()));
 
     let model_name = &config.model_name;
     let table_name = &config.table_name;
@@ -3006,27 +3330,41 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             #[doc(hidden)]
             __autumn_shards: ::core::option::Option<::autumn_web::sharding::ShardSet>,
+            // Pins a fleet database open while this repository lives, so a
+            // lazily acquired connection never finds its pool closed
+            // (ADR 0019). `None` for configured shards.
+            #[doc(hidden)]
+            __autumn_shard_lease: ::core::option::Option<::autumn_web::sharding::ShardLease>,
         }
     } else {
         quote! {}
     };
 
     let shards_clone_field = if config.sharded {
-        quote! { __autumn_shards: self.__autumn_shards.clone(), }
+        quote! {
+            __autumn_shards: self.__autumn_shards.clone(),
+            __autumn_shard_lease: self.__autumn_shard_lease.clone(),
+        }
     } else {
         quote! {}
     };
 
     // The non-sharded extractor and shard-unaware constructors always use None.
     let shards_none_field = if config.sharded {
-        quote! { __autumn_shards: ::core::option::Option::None, }
+        quote! {
+            __autumn_shards: ::core::option::Option::None,
+            __autumn_shard_lease: ::core::option::Option::None,
+        }
     } else {
         quote! {}
     };
 
     // The self-routing sharded extractor populates this from the resolved ShardSet.
     let shards_some_field = if config.sharded {
-        quote! { __autumn_shards: ::core::option::Option::Some(__shard_set), }
+        quote! {
+            __autumn_shards: ::core::option::Option::Some(__shard_set),
+            __autumn_shard_lease: ::core::clone::Clone::clone(&__seed.lease),
+        }
     } else {
         quote! {}
     };
@@ -3038,6 +3376,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             __autumn_shards: ::core::option::Option::Some(
                 ::core::clone::Clone::clone(db.__autumn_shard_set()),
+            ),
+            __autumn_shard_lease: ::core::clone::Clone::clone(
+                &db.__autumn_repository_seed().lease,
             ),
         }
     } else {
@@ -3154,6 +3495,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     #idempotency_field
                     across_tenants: true,
                     __autumn_shards: ::core::option::Option::None,
+                    // The fan-out future acquires lazily after `__shard` is
+                    // gone: hold its lease so the fleet keeps it open.
+                    __autumn_shard_lease: __shard.lease(),
                     // Honor the shard's read routing (replica / fail-closed),
                     // but preserve an explicit parent primary-read override
                     // (`primary_reads` or `on_primary()`) so cross-shard
@@ -3167,10 +3511,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __autumn_slow_threshold: self.__autumn_slow_threshold,
                     // Re-tag the route label with this shard so per-shard DB
                     // metrics and slow-query logs attribute fan-out work to the
-                    // shard executing it, not the originally-routed shard.
+                    // shard executing it, not the originally-routed shard. A
+                    // fleet database tags `shard=fleet`, never its own name,
+                    // so a tenant fleet cannot explode metric cardinality.
                     __autumn_route: ::autumn_web::sharding::reshard_route_label(
                         self.__autumn_route.as_deref(),
-                        __shard.name(),
+                        __shard.metric_label(),
                     ),
                     // Shard sub-repos are used for read fan-out only; mutations
                     // broadcast from the parent, not the per-shard instance.
@@ -3278,6 +3624,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { ::core::result::Result::Ok(::core::option::Option::None) }
     };
 
+    let m2m_soft_delete = config.soft_delete;
     let m2m_conn_source_impl = quote! {
         impl ::autumn_web::repository::M2mConnSource for #pg_name {
             type Model = #model_name;
@@ -3313,6 +3660,11 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 &self,
             ) -> ::autumn_web::AutumnResult<::core::option::Option<::std::string::String>> {
                 #m2m_tenant_scope_body
+            }
+
+            // `#[commentable]` parent check: this repository's own rule (#2284).
+            fn __autumn_m2m_soft_delete(&self) -> ::core::option::Option<bool> {
+                ::core::option::Option::Some(#m2m_soft_delete)
             }
         }
     };
@@ -3734,6 +4086,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let trait_name_lit = trait_name.to_string();
         let pg_name_lit = pg_name.to_string();
         let model_name_lit = config.model_name.to_string();
+        let crate_version = autumn_macros_support::graph::crate_version();
         quote! {
             ::autumn_web::reexports::inventory::submit! {
                 ::autumn_web::graph::RepositoryGraphDescriptor {
@@ -3743,11 +4096,52 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     table: #table_name,
                     api: #graph_api_path,
                     module_path: ::core::module_path!(),
+                    crate_version: #crate_version,
                     file: ::core::file!(),
                     line: ::core::line!(),
                 }
             }
         }
+    };
+    // ── Console REPL registration (#2148) ───────────────────────────────
+    // Expands to nothing unless autumn-web has the `repl` feature.
+    let repl_registration = {
+        let trait_name_lit = trait_name.to_string();
+        let model_name_lit = config.model_name.to_string();
+        quote! {
+            ::autumn_web::__autumn_register_repl_repository!(
+                #trait_name,
+                #pg_name,
+                #model_name,
+                #trait_name_lit,
+                #model_name_lit
+            );
+        }
+    };
+    // #2319: this repository records no revision. If a ledgered repository
+    // owns the table, refuse the write connection. Generated reads use the read
+    // connection. `with_lock`, `find_or_create_by_*` and counter recomputes use
+    // the write connection, so they refuse too.
+    let unledgered_write_guard = if config.ledgered {
+        quote! {}
+    } else {
+        quote! {
+            ::autumn_web::ledger::refuse_out_of_band_write(
+                #table_name,
+                "a repository that is not ledgered",
+            )?;
+        }
+    };
+    // #2319: marks this table as ledgered. Raw-SQL framework paths read the
+    // mark and refuse to write to it.
+    let ledgered_table_registration = if config.ledgered {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::__private::LedgeredTableDescriptor { table: #table_name }
+            }
+        }
+    } else {
+        quote! {}
     };
     let versioned_inventory_registration = if config.versioned {
         quote! {
@@ -3966,9 +4360,38 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
         });
+        // #2319: one typed source for the chain's tenant. Only `String`
+        // implements `LedgerTenantColumn`, so a nullable column does not compile.
+        let tenant_method = config.tenant_scoped.then(|| {
+            quote! {
+                fn ledger_tenant_id(&self) -> ::core::option::Option<&str> {
+                    ::core::option::Option::Some(
+                        ::autumn_web::ledger::LedgerTenantColumn::ledger_tenant_id(&self.tenant_id),
+                    )
+                }
+            }
+        });
+        // #2326: the snapshot schema version, and the hook that converts an older one.
+        let schema_version = config.ledger_schema_version;
+        let schema_version_item = (schema_version > 1).then(|| {
+            quote! { const LEDGER_SCHEMA_VERSION: u32 = #schema_version; }
+        });
+        let upcast_method = config.ledger_upcast.as_ref().map(|path| {
+            quote! {
+                fn ledger_upcast(
+                    from_version: u32,
+                    snapshot: &mut ::autumn_web::reexports::serde_json::Value,
+                ) -> ::core::result::Result<(), ::std::string::String> {
+                    #path(from_version, snapshot)
+                }
+            }
+        });
         quote! {
             impl ::autumn_web::ledger::LedgeredRecord for #model_name {
                 #valid_from_method
+                #tenant_method
+                #schema_version_item
+                #upcast_method
             }
         }
     } else {
@@ -4128,14 +4551,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // returning `{}` here would let `ledger_as_of` reconstruct an
                 // empty record and call it history.
                 let snapshot: ::autumn_web::reexports::serde_json::Value =
-                    ::autumn_web::reexports::serde_json::from_str(&row.snapshot)
-                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                                table: #table_name.to_string(),
-                                record_id,
-                                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
-                            },
-                        ))?;
+                    ::autumn_web::ledger::parse_stored_snapshot(
+                        #table_name, record_id, row.seq, &row.snapshot,
+                    )?;
                 __out.push(::autumn_web::ledger::LedgerRevision {
                     id: row.id,
                     table_name: row.table_name,
@@ -4169,14 +4587,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => ::autumn_web::version_history::VersionOp::Update,
                 };
                 let snapshot: ::autumn_web::reexports::serde_json::Value =
-                    ::autumn_web::reexports::serde_json::from_str(&row.snapshot)
-                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                                table: #table_name.to_string(),
-                                record_id,
-                                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
-                            },
-                        ))?;
+                    ::autumn_web::ledger::parse_stored_snapshot(
+                        #table_name, record_id, row.seq, &row.snapshot,
+                    )?;
                 ::core::option::Option::Some(::autumn_web::ledger::LedgerRevision {
                     id: row.id,
                     table_name: row.table_name,
@@ -4213,14 +4626,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     _ => ::autumn_web::version_history::VersionOp::Update,
                 };
                 let snapshot: ::autumn_web::reexports::serde_json::Value =
-                    ::autumn_web::reexports::serde_json::from_str(&row.snapshot)
-                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                                table: #table_name.to_string(),
-                                record_id,
-                                detail: format!("revision {} has an unreadable snapshot: {err}", row.seq),
-                            },
-                        ))?;
+                    ::autumn_web::ledger::parse_stored_snapshot(
+                        #table_name, record_id, row.seq, &row.snapshot,
+                    )?;
                 let revision = ::autumn_web::ledger::LedgerRevision {
                     id: row.id,
                     table_name: row.table_name,
@@ -4348,7 +4756,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                          FROM _autumn_ledger_revisions \
                                          WHERE table_name = $1 AND record_id = $2 \
                                          AND ($3::text IS NULL OR tenant_id = $3) \
-                                         ORDER BY seq ASC"
+                                         ORDER BY seq ASC, id ASC"
                                     )
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
@@ -4398,7 +4806,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                          FROM _autumn_ledger_revisions \
                                          WHERE table_name = $1 AND record_id = $2 \
                                          AND ($3 IS NULL OR tenant_id = $3) \
-                                         ORDER BY seq ASC"
+                                         ORDER BY seq ASC, id ASC"
                                     )
                                     .bind::<::autumn_web::reexports::diesel::sql_types::Text, _>(#table_name)
                                     .bind::<::autumn_web::reexports::diesel::sql_types::BigInt, _>(record_id)
@@ -4412,6 +4820,37 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         };
 
                     ::core::result::Result::Ok(revisions)
+                }
+
+                /// One page of the record's revision chain, oldest first (#2319).
+                ///
+                /// A keyset page on `(seq, id)`. Each page is one indexed read,
+                /// so chain length does not change its cost. Pass the returned
+                /// `next` cursor to read the next page. Pages are separate
+                /// reads, not one snapshot: a write between two pages can add
+                /// revisions to a later page.
+                ///
+                /// # Errors
+                ///
+                /// The same as [`ledger_revisions`](Self::ledger_revisions).
+                pub async fn ledger_revisions_page(
+                    &self,
+                    record_id: i64,
+                    page: ::autumn_web::ledger::LedgerPageRequest,
+                ) -> ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerRevisionPage> {
+                    #ledger_cross_shard_guard
+                    #ledger_cross_tenant_guard
+                    #ledger_tenant_setup
+
+                    let mut conn = self.__autumn_acquire_read_conn().await?;
+                    ::autumn_web::ledger::read_revisions_page(
+                        &mut *conn,
+                        #table_name,
+                        __ledger_tenant_id,
+                        record_id,
+                        page,
+                    )
+                    .await
                 }
 
                 /// The single revision in force at a bitemporal instant,
@@ -4905,18 +5344,44 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     record_id: i64,
                     revision: &::autumn_web::ledger::LedgerRevision,
                 ) -> ::autumn_web::AutumnResult<#model_name> {
-                    #model_name::__autumn_commit_hook_from_value(revision.snapshot.clone())
-                        .map_err(|err| ::autumn_web::AutumnError::internal_server_error(
-                            ::autumn_web::ledger::LedgerError::ChainUnreadable {
-                                table: #table_name.to_string(),
-                                record_id,
-                                detail: format!(
-                                    "revision {} does not reconstruct into {}: {err}",
-                                    revision.seq,
-                                    stringify!(#model_name),
-                                ),
-                            },
+                    // #2326: bring an older snapshot to the current shape first.
+                    let (snapshot, stored) = Self::__autumn_ledger_upcast(record_id, revision)?;
+                    // #2326: the codec leaves an undecryptable envelope in place. Refuse it here.
+                    ::autumn_web::ledger::ensure_snapshot_recoverable(
+                        #table_name,
+                        record_id,
+                        revision.seq,
+                        &snapshot,
+                    )?;
+                    #model_name::__autumn_commit_hook_from_value(snapshot)
+                        .map_err(|err| ::autumn_web::ledger::schema_mismatch_at(
+                            #table_name,
+                            record_id,
+                            revision.seq,
+                            stored,
+                            <#model_name as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION,
+                            &format!("cannot decode into {}: {err}", stringify!(#model_name)),
                         ))
+                }
+
+                /// A revision's snapshot in the current model shape, with the
+                /// version it was written at (#2326).
+                #[doc(hidden)]
+                fn __autumn_ledger_upcast(
+                    record_id: i64,
+                    revision: &::autumn_web::ledger::LedgerRevision,
+                ) -> ::autumn_web::AutumnResult<(
+                    ::autumn_web::reexports::serde_json::Value,
+                    u32,
+                )> {
+                    ::autumn_web::ledger::upcast_snapshot(
+                        #table_name,
+                        record_id,
+                        revision.seq,
+                        &revision.snapshot,
+                        <#model_name as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION,
+                        <#model_name as ::autumn_web::ledger::LedgeredRecord>::ledger_upcast,
+                    )
                 }
 
                 /// A revision's model, in the same public projection
@@ -4947,7 +5412,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// # Errors
                 ///
                 /// Propagates read errors from
-                /// [`ledger_revisions`](Self::ledger_revisions).
+                /// [`ledger_revisions_page`](Self::ledger_revisions_page).
                 pub async fn ledger_verify(
                     &self,
                     record_id: i64,
@@ -4962,7 +5427,33 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     // exists to produce trustworthy accusations. If the chain head
                     // moved under us, the live comparison is skipped rather than
                     // reported — a concurrent write is not tampering.
-                    let revisions = self.ledger_revisions(record_id).await?;
+                    // #2319: read the chain in pages. Memory holds one page
+                    // and the head, however long the chain is.
+                    let mut verifier = ::autumn_web::ledger::LedgerChainVerifier::new(record_id);
+                    let mut last: ::core::option::Option<::autumn_web::ledger::LedgerRevision> =
+                        ::core::option::Option::None;
+                    let __verify_limit = ::autumn_web::ledger::LedgerPageRequest::VERIFY_LIMIT;
+                    let mut request = ::autumn_web::ledger::LedgerPageRequest::first(__verify_limit);
+                    loop {
+                        // #2326: a non-canonical snapshot is a break, not an error.
+                        let page = match self.ledger_revisions_page(record_id, request).await {
+                            ::core::result::Result::Ok(page) => page,
+                            ::core::result::Result::Err(err) =>
+                                return ::autumn_web::ledger::verification_from_read_error(record_id, err),
+                        };
+                        let next = page.next_request(__verify_limit);
+                        let mut revisions = page.revisions;
+                        for revision in &revisions {
+                            verifier.push(revision);
+                        }
+                        if let ::core::option::Option::Some(revision) = revisions.pop() {
+                            last = ::core::option::Option::Some(revision);
+                        }
+                        match next {
+                            ::core::option::Option::Some(next) => request = next,
+                            ::core::option::Option::None => break,
+                        }
+                    }
                     let live = self.__autumn_ledger_live_view(record_id).await?;
                     // Head and mark in ONE statement: read separately they could
                     // come from differently-lagged replicas, and a fresh mark
@@ -4974,10 +5465,10 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         high_water,
                     } = self.__autumn_ledger_settled_state(record_id).await?;
                     let stable = settled_head.as_ref().map(|h| h.seq)
-                        == revisions.last().map(|r| r.seq);
+                        == last.as_ref().map(|r| r.seq);
 
                     let live_state = if stable {
-                        match (revisions.last(), live.as_ref()) {
+                        match (last.as_ref(), live.as_ref()) {
                             (_, ::core::option::Option::None) =>
                                 ::autumn_web::ledger::LedgerLiveState::Absent,
                             (::core::option::Option::None, ::core::option::Option::Some(_)) =>
@@ -4990,10 +5481,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                                 // already is, and the live row was re-encoded
                                 // through the same codec. Decrypted before
                                 // comparison — see the helper.
-                                if Self::__autumn_ledger_live_matches(&head.snapshot, live_value) {
-                                    ::autumn_web::ledger::LedgerLiveState::Matches
-                                } else {
-                                    ::autumn_web::ledger::LedgerLiveState::Diverged
+                                // #2326: the head may predate a schema change. Bring it to
+                                // the current shape. When that fails, skip the live check.
+                                // A schema error is not tamper evidence.
+                                match Self::__autumn_ledger_upcast(record_id, head) {
+                                    ::core::result::Result::Ok((snapshot, stored)) => {
+                                        // Only a head from an older schema version may
+                                        // lack a column. A head at the current version
+                                        // is compared strictly.
+                                        let older = stored
+                                            < <#model_name as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION;
+                                        if Self::__autumn_ledger_live_matches(&snapshot, live_value, older) {
+                                            ::autumn_web::ledger::LedgerLiveState::Matches
+                                        } else {
+                                            ::autumn_web::ledger::LedgerLiveState::Diverged
+                                        }
+                                    }
+                                    ::core::result::Result::Err(err) => {
+                                        ::autumn_web::ledger::note_live_check_skipped(
+                                            #table_name,
+                                            record_id,
+                                            &err,
+                                        );
+                                        ::autumn_web::ledger::LedgerLiveState::NotChecked
+                                    }
                                 }
                             }
                         }
@@ -5018,14 +5529,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         ::autumn_web::ledger::LedgerHighWaterState::NotChecked
                     };
 
-                    ::core::result::Result::Ok(
-                        ::autumn_web::ledger::verify_chain_with_high_water(
-                            record_id,
-                            &revisions,
-                            live_state,
-                            high_water_state,
-                        ),
-                    )
+                    ::core::result::Result::Ok(verifier.finish(live_state, high_water_state))
                 }
 
                 /// Whether the head revision describes the row the table holds.
@@ -5044,6 +5548,9 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 /// carries the `key_id` that encrypted it, so a retired key still
                 /// decrypts.
                 ///
+                /// `tolerate_new_columns` is set only for a head written under an older
+                /// schema version. See `autumn_web::ledger::snapshots_agree`.
+                ///
                 /// A column whose key is gone entirely cannot be compared at all;
                 /// it is dropped from **both** sides rather than read as a
                 /// divergence. Only that residue is invisible to the cross-check,
@@ -5052,6 +5559,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 fn __autumn_ledger_live_matches(
                     head: &::autumn_web::reexports::serde_json::Value,
                     live: &::autumn_web::reexports::serde_json::Value,
+                    tolerate_new_columns: bool,
                 ) -> bool {
                     let mut head = head.clone();
                     let mut live = live.clone();
@@ -5068,8 +5576,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             object.remove(column);
                         }
                     }
-                    ::autumn_web::ledger::canonical_json(&head)
-                        == ::autumn_web::ledger::canonical_json(&live)
+                    // #2326: a head from an older schema may lack a new column.
+                    ::autumn_web::ledger::snapshots_agree(&head, &live, tolerate_new_columns)
                 }
 
                 /// The live row encoded through the model's durable codec, or
@@ -5732,6 +6240,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                         #idempotency_init
                         across_tenants: true,
                         __autumn_shards: ::core::option::Option::Some(__set),
+                        __autumn_shard_lease: ::core::option::Option::None,
                         __autumn_read_route: #cross_read_route,
                         __autumn_statement_timeout_ms: __seed.statement_timeout_ms,
                         __autumn_slow_threshold: __seed.slow_query_threshold,
@@ -5763,7 +6272,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
-    quote! {
+    let expanded = quote! {
         #coherence_items
 
         /// Generated repository trait with CRUD + derived queries.
@@ -5825,19 +6334,20 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             }
 
             async fn save(&self, new: &#new_name) -> ::autumn_web::AutumnResult<#model_name> {
-                // #1379: normalize `#[normalize]` columns on the insert path, before
-                // the `before_create` hook and the DB write, so validators and the
-                // database see the canonical value. Dispatches through the
-                // autoref-specialization probe: the `Yes` arm clones and canonicalizes
-                // only for models whose `New*` implements `Normalize`, and the `No`
-                // arm hands back the caller's borrow unchanged, so a model with no
-                // `#[normalize]` columns pays no clone. `Borrow` unifies the owned and
-                // borrowed arms to `&#new_name`.
+                // #1379: normalize `#[normalize]` columns before the
+                // `before_create` hook and the DB write. Validators and the
+                // database see the canonical value. The probe arms, in order:
+                // 1. `Noop`: returns the borrow. No clone (#2634).
+                // 2. `Yes`: clones and normalizes.
+                // 3. `No`: returns the borrow (a hand-written `New*`).
+                // `Borrow` unifies the arms to `&#new_name`.
                 #[allow(unused_imports)]
-                use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                use ::autumn_web::normalize::{
+                    SpezNormalizeNo as _, SpezNormalizeNoop as _, SpezNormalizeYes as _,
+                };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert();
                 let new: &#new_name = __autumn_normalized.borrow();
                 #save_body
             }
@@ -5872,35 +6382,30 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #soft_delete_impl_methods
 
             async fn save_many(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<Vec<#model_name>> {
-                // #1379: normalize each `#[normalize]` column before the bulk
-                // insert path (mirrors `save`). The `Yes` arm clones+canonicalizes
-                // only for `Normalize` `New*` types; the `No` arm hands back the
-                // caller's slice unchanged (no clone) for everything else.
-                // `Borrow` unifies the owned `Vec`/borrowed slice arms.
+                // #1379: normalize each row before the bulk insert. Same probe
+                // as `save`: only the `Yes` arm clones the batch.
                 #[allow(unused_imports)]
-                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                use ::autumn_web::normalize::{
+                    SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _, SpezNormalizeManyYes as _,
+                };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert_many();
                 let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_body
             }
 
             async fn save_many_skip_invalid(&self, new: &[#new_name]) -> ::autumn_web::AutumnResult<(Vec<#model_name>, Vec<(usize, ::autumn_web::AutumnError)>)> {
-                // #2586: normalize before the per-row `#[validate]` pass inside
-                // the body, so a skip-invalid import judges — and stores — the
-                // same canonical value `save_many` does.
-                //
-                // #2634: no clone when there is nothing to normalize. `#[model]`
-                // emits `impl Normalize` for the `New*` only when the model
-                // declares `#[normalize]` columns, so the probe's `Yes` arm wins
-                // exactly when normalization can change something; otherwise the
-                // borrowed `No` arm hands the caller's slice back untouched.
+                // #2586: normalize before the per-row `#[validate]` pass, so a
+                // skip-invalid import checks and stores the same canonical
+                // value as `save_many`. Same probe as `save_many`.
                 #[allow(unused_imports)]
-                use ::autumn_web::normalize::{SpezNormalizeManyNo as _, SpezNormalizeManyYes as _};
+                use ::autumn_web::normalize::{
+                    SpezNormalizeManyNo as _, SpezNormalizeManyNoop as _, SpezNormalizeManyYes as _,
+                };
                 #[allow(unused_imports)]
                 use ::std::borrow::Borrow as _;
-                let __autumn_normalized = ::autumn_web::normalize::SpezNormalize(new).spez_normalize_many();
+                let __autumn_normalized = (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert_many();
                 let new: &[#new_name] = __autumn_normalized.borrow();
                 #save_many_skip_invalid_body
             }
@@ -6104,6 +6609,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     ::autumn_web::RuntimeConnection,
                 >,
             > {
+                #unledgered_write_guard
                 let result = self.__autumn_acquire_from(&self.pool).await;
                 // Mark write only after a successful primary checkout, mirroring
                 // the guard in `Db::from_request_parts`. A failed acquire (pool
@@ -6168,6 +6674,8 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 >,
             > {
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
+                // Staging fault injection (#3071). Inert outside a fault scope.
+                ::autumn_web::fault_injection::__database_fault().await?;
                 let mut conn = pool.get().await.map_err(|e| {
                     ::autumn_web::reexports::tracing::error!(
                         "repository: failed to acquire database connection: {e}"
@@ -6276,10 +6784,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #hook_inventory_registration
         #versioned_inventory_registration
+        #ledgered_table_registration
         #sharded_inventory_registration
         #position_claim_registration
         #graph_inventory_registration
         #retention_inventory_registration
+        #repl_registration
 
         #api_handlers
 
@@ -6302,7 +6812,225 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         #search_compile_check
 
         #internal_hooks_defn
+    };
+
+    if config.declared_invalidation_edges {
+        let writes = write_method_names(&config, &trait_def);
+        // Also writes, but rolled up for the gate (see `write_method_names`):
+        // the closure of `with_lock`, the insert of `find_or_create_by_*`, and
+        // the scheduled retention sweep (not its dry run).
+        let mut also: Vec<String> = vec![
+            "with_lock".to_owned(),
+            "__autumn_retention_sweep".to_owned(),
+        ];
+        also.extend(trait_def.items.iter().filter_map(|item| match item {
+            TraitItem::Fn(f) if f.sig.ident.to_string().starts_with("find_or_create_by_") => {
+                Some(f.sig.ident.to_string())
+            }
+            _ => None,
+        }));
+        invalidate_after_each_write(expanded, &pg_name, &writes, &also)
+    } else {
+        expanded
     }
+}
+
+/// The transaction helpers a generated write commits through.
+const COMMIT_HELPERS: [&str; 3] = [
+    "scoped_transaction",
+    "scoped_immediate_transaction",
+    "maybe_immediate_transaction",
+];
+
+/// `helper(..).await` for one of [`COMMIT_HELPERS`].
+fn is_commit(expr: &syn::Expr) -> bool {
+    let syn::Expr::Await(awaited) = expr else {
+        return false;
+    };
+    let syn::Expr::Call(call) = &*awaited.base else {
+        return false;
+    };
+    matches!(&*call.func, syn::Expr::Path(func)
+        if func.path.segments.last().is_some_and(|seg| COMMIT_HELPERS.iter().any(|h| seg.ident == h)))
+}
+
+/// `self.hooks.after_create(..)` or `self.hooks.after_update(..)`.
+fn is_after_hook(expr: &syn::Expr) -> bool {
+    let syn::Expr::MethodCall(call) = expr else {
+        return false;
+    };
+    if call.method != "after_create" && call.method != "after_update" {
+        return false;
+    }
+    matches!(&*call.receiver, syn::Expr::Field(field)
+        if matches!(&field.member, syn::Member::Named(name) if name == "hooks")
+            && matches!(&*field.base, syn::Expr::Path(base) if base.path.is_ident("self")))
+}
+
+/// Ties the invalidation guard to the commits and hooks in one write body.
+///
+/// After each commit it calls `committed()`. Before each `after_*` hook it
+/// awaits `flush()`. Thus the hook, and every other reader, sees the committed
+/// row while the hook runs. A commit or hook inside a closure or an
+/// `async move` block cannot reach the guard. Then `unreachable` is set, and
+/// the write invalidates again at its end.
+#[derive(Default)]
+struct CommitPoints {
+    hooks: usize,
+    commits: usize,
+    unreachable: bool,
+}
+
+impl CommitPoints {
+    fn contains_site(expr: &syn::Expr) -> bool {
+        struct Find(bool);
+        impl<'ast> syn::visit::Visit<'ast> for Find {
+            fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+                if is_commit(expr) || is_after_hook(expr) {
+                    self.0 = true;
+                } else {
+                    syn::visit::visit_expr(self, expr);
+                }
+            }
+        }
+        let mut find = Find(false);
+        syn::visit::Visit::visit_expr(&mut find, expr);
+        find.0
+    }
+}
+
+impl syn::visit_mut::VisitMut for CommitPoints {
+    fn visit_expr_mut(&mut self, expr: &mut syn::Expr) {
+        let detached = matches!(expr, syn::Expr::Closure(_))
+            || matches!(expr, syn::Expr::Async(block) if block.capture.is_some());
+        if detached {
+            self.unreachable |= Self::contains_site(expr);
+        } else if is_commit(expr) {
+            let commit = expr.clone();
+            *expr = syn::parse_quote! {{
+                let __autumn_committed = #commit;
+                __autumn_invalidation.committed();
+                __autumn_committed
+            }};
+            self.commits += 1;
+        } else if is_after_hook(expr) {
+            let hook = expr.clone();
+            *expr = syn::parse_quote! {
+                async {
+                    let _ = __autumn_invalidation.flush().await;
+                    #hook.await
+                }
+            };
+            self.hooks += 1;
+        } else {
+            syn::visit_mut::visit_expr_mut(self, expr);
+        }
+    }
+}
+
+/// Make each write method of `pg_name` invalidate the declared cached reads
+/// after it commits (#3056).
+///
+/// A generated write runs and commits its own transactions inside the method
+/// body. [`CommitPoints`] marks each commit and invalidates before each
+/// `after_*` hook. The end of the body invalidates a commit that no hook
+/// followed. The end runs on `Ok` and on `Err`: a write can commit and then
+/// fail in an `after_*` hook.
+/// A guard also runs it on a panic or a cancelled request. A reader that read
+/// the old row before the commit cannot put it back: the invalidation bumps
+/// the namespace epoch, and the reader's fenced insert then skips.
+///
+/// This function wraps the parsed output, not each body generator. Thus a new
+/// write path cannot skip the wrap. Each name in `writes` must be found, or
+/// this is a compile error. Names in `also` are wrapped when they exist.
+fn invalidate_after_each_write(
+    expanded: TokenStream,
+    pg_name: &Ident,
+    writes: &[String],
+    also: &[String],
+) -> TokenStream {
+    let mut file: syn::File = match syn::parse2(expanded) {
+        Ok(file) => file,
+        Err(err) => return err.to_compile_error(),
+    };
+    let mut wrapped: Vec<String> = Vec::new();
+    for item in &mut file.items {
+        let syn::Item::Impl(item_impl) = item else {
+            continue;
+        };
+        let is_pg = matches!(&*item_impl.self_ty, syn::Type::Path(ty) if ty.path.is_ident(pg_name));
+        if !is_pg {
+            continue;
+        }
+        for impl_item in &mut item_impl.items {
+            let syn::ImplItem::Fn(method) = impl_item else {
+                continue;
+            };
+            let name = method.sig.ident.to_string();
+            let is_write = writes.contains(&name) || also.contains(&name);
+            if !is_write || method.sig.asyncness.is_none() {
+                continue;
+            }
+            let output = match &method.sig.output {
+                syn::ReturnType::Type(_, ty) => quote! { #ty },
+                syn::ReturnType::Default => quote! { () },
+            };
+            let mut points = CommitPoints::default();
+            syn::visit_mut::VisitMut::visit_block_mut(&mut points, &mut method.block);
+            // With hooks but no tracked commit, a commit after a flush is not
+            // seen. Then invalidate again at the end.
+            let unsure = points.unreachable || (points.hooks > 0 && points.commits == 0);
+            let end_unsure = if unsure {
+                quote! { __autumn_invalidation.committed(); }
+            } else {
+                quote! {}
+            };
+            let body = &method.block;
+            // A `find_or_create_by_*` that found the row, or a retention sweep
+            // that deleted nothing, wrote nothing. A failed sweep can still
+            // have committed earlier batches, so it invalidates.
+            let finish = if name == "__autumn_retention_sweep" {
+                quote! {
+                    if ::core::matches!(&__autumn_write_result, ::core::result::Result::Ok(report) if report.rows_swept == 0) {
+                        __autumn_invalidation.disarm();
+                    } else {
+                        let _ = __autumn_invalidation.run().await;
+                    }
+                }
+            } else if name.starts_with("find_or_create_by_") {
+                quote! {
+                    if ::core::matches!(&__autumn_write_result, ::core::result::Result::Ok((_, false))) {
+                        __autumn_invalidation.disarm();
+                    } else {
+                        let _ = __autumn_invalidation.run().await;
+                    }
+                }
+            } else {
+                quote! { let _ = __autumn_invalidation.run().await; }
+            };
+            method.block = syn::parse_quote! {{
+                #[allow(unused_mut)]
+                let mut __autumn_invalidation = ::autumn_web::cache::coherence::InvalidateAfterWrite::new(
+                    #pg_name::__autumn_invalidate_after_commit,
+                );
+                let __autumn_write_result: #output = async #body.await;
+                #end_unsure
+                #finish
+                __autumn_write_result
+            }};
+            wrapped.push(name);
+        }
+    }
+    let missed: Vec<&String> = writes.iter().filter(|w| !wrapped.contains(w)).collect();
+    let mut out = file.into_token_stream();
+    if !missed.is_empty() {
+        let message = format!(
+            "autumn internal error: write method(s) {missed:?} were not found as async methods \
+             of `{pg_name}`, so they would not invalidate the declared cached reads after commit"
+        );
+        out.extend(quote! { ::core::compile_error!(#message); });
+    }
+    out
 }
 
 struct CrudBodies {
@@ -9081,8 +9809,10 @@ fn emit_hooked_mutate_many(
         cc_before_delete_chunk,
     } = *inputs;
     let DependentCascade {
-        delete_many_compiletime_cascade,
-        delete_many_runtime_cascade,
+        delete_many_compiletime_probe,
+        delete_many_runtime_probe,
+        delete_many_compiletime_mutating,
+        delete_many_runtime_mutating,
         delete_many_cascade_tx_bind,
         delete_many_cascade_tx_ok,
         delete_many_cascade_post_publish,
@@ -9831,11 +10561,12 @@ fn emit_hooked_mutate_many(
         // returns the deferred broadcasts). A repository-attribute
         // `dependent(...)` instead emits it once with the compile-time cascade.
         let build_delete_many_body =
-            |delete_many_cascade: &proc_macro2::TokenStream,
+            |delete_many_probe: &proc_macro2::TokenStream,
+             delete_many_mutating: &proc_macro2::TokenStream,
              delete_many_tx_bind: &proc_macro2::TokenStream,
              delete_many_tx_ok: &proc_macro2::TokenStream,
              delete_many_post_publish: &proc_macro2::TokenStream,
-             delete_many_root_skip: &proc_macro2::TokenStream| {
+             delete_many_root_mark: &proc_macro2::TokenStream| {
                 quote! {
                     use ::autumn_web::reexports::diesel::prelude::*;
                     use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -9863,25 +10594,30 @@ fn emit_hooked_mutate_many(
                                 current_rows.extend(chunk_rows);
                             }
 
-                            // #1740: cascade dependent actions for every parent
-                            // before the bulk parent delete, so no child is
-                            // orphaned and the parent delete never trips a
-                            // foreign-key constraint. The cascade runs first, so
-                            // a batch root that is also another root's descendant
-                            // is deleted here and recorded in `__autumn_deleted`,
-                            // firing `before_delete` exactly once. The root hook
-                            // loop below then skips it (`#delete_many_root_skip`)
-                            // and the tolerant bulk `id = ANY` delete no longer
-                            // touches it.
-                            #delete_many_cascade
+                            // #1740 + #2427: the bulk order matches `delete_by_id`.
+                            //
+                            // 1. Probe every `restrict` in the tree. A 409 here
+                            //    fires no hook.
+                            // 2. Fire each root's `before_delete`. A veto here
+                            //    fires no child hook.
+                            // 3. Cascade the mutating dependents, then delete the
+                            //    roots.
+                            //
+                            // A batch root that is also another root's descendant
+                            // is marked in `__autumn_deleted` after its hook runs.
+                            // The cascade then skips that hook and its commit-hook
+                            // enqueue, so both fire exactly once.
+                            #delete_many_probe
 
                             for record in &current_rows {
-                                #delete_many_root_skip
                                 let mut ctx = MutationContext::new(MutationOp::Delete);
                                 #idempotency_setup
                                 self.hooks.before_delete(&mut ctx, record).await?;
                                 #delete_commit_hook_setup
+                                #delete_many_root_mark
                             }
+
+                            #delete_many_mutating
 
                             #delete_execution
 
@@ -9898,13 +10634,14 @@ fn emit_hooked_mutate_many(
                     Ok(())
                 }
             };
-        // Codex round-5-B: in the cascade forms, a batch root already deleted as
-        // another root's cascaded descendant must be skipped by the root hook
-        // loop (its `before_delete`/commit-hook already fired during the cascade).
-        // The plain (no-cascade) form has no `__autumn_deleted` set, so its skip
-        // token is empty and the loop is byte-identical to the prior codegen.
-        let delete_many_cascade_root_skip = quote! {
-            if __autumn_deleted.contains(&(#table_name, record.id)) { continue; }
+        // #2427: in the cascade forms, the root hook loop runs before the cascade.
+        // Mark each root it hooks, under a key the leaf executor reads, so a root
+        // that is also another root's descendant is not hooked a second time.
+        // The mark's table name differs from the plain one, so the root dedup
+        // check (`__autumn_deleted.contains((table, id))`) is unaffected. The
+        // plain (no-cascade) form has no such set, so its token is empty.
+        let delete_many_cascade_root_mark = quote! {
+            __autumn_deleted.insert((::core::concat!(#table_name, "#hooked"), record.id));
         };
         // Codex P1: with no repository-attribute `dependent(...)`, dispatch the
         // bulk cascade at run time via the model's `Model::dependents()` — empty
@@ -9917,16 +10654,18 @@ fn emit_hooked_mutate_many(
             let __plain = build_delete_many_body(
                 &quote! {},
                 &quote! {},
+                &quote! {},
                 &quote! { Ok(()) },
                 &quote! {},
                 &quote! {},
             );
             let __runtime = build_delete_many_body(
-                delete_many_runtime_cascade,
+                delete_many_runtime_probe,
+                delete_many_runtime_mutating,
                 delete_many_cascade_tx_bind,
                 delete_many_cascade_tx_ok,
                 delete_many_cascade_post_publish,
-                &delete_many_cascade_root_skip,
+                &delete_many_cascade_root_mark,
             );
             quote! {
                 use ::autumn_web::repository::AutumnDependents as _;
@@ -9939,11 +10678,12 @@ fn emit_hooked_mutate_many(
             }
         } else {
             build_delete_many_body(
-                delete_many_compiletime_cascade,
+                delete_many_compiletime_probe,
+                delete_many_compiletime_mutating,
                 delete_many_cascade_tx_bind,
                 delete_many_cascade_tx_ok,
                 delete_many_cascade_post_publish,
-                &delete_many_cascade_root_skip,
+                &delete_many_cascade_root_mark,
             )
         }
     };
@@ -10061,6 +10801,9 @@ fn emit_crud_bodies_hooked(
 
     let timeout_route_init = quote! {
         use ::autumn_web::db::DbState as _;
+        // A route's `StatementTimeout` also bounds this request's `SET LOCAL`
+        // (#3057).
+        ::autumn_web::__private::note_route_statement_timeout(&_parts);
         // Postgres statement_timeout is a signed 32-bit integer (ms).
         const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
         let __autumn_timeout_ms: u64 = _parts
@@ -10116,7 +10859,9 @@ fn emit_crud_bodies_hooked(
     };
 
     let (broadcast_create, broadcast_update, broadcast_delete) = if config.broadcasts {
-        let base_topic_expr = match generate_topic_format(
+        // Every use of this topic below is a `let __topic = ...;` read only by
+        // reference, so a static topic stays its `&'static str` literal.
+        let base_topic_expr = match generate_topic_ref(
             config
                 .broadcast_topic
                 .as_deref()
@@ -10143,6 +10888,9 @@ fn emit_crud_bodies_hooked(
             .unwrap_or(&default_container);
         let model_prefix = to_snake_case(&config.model_name.to_string());
 
+        // `container_expr` is a macro-time string, so the create swap id is
+        // spliced as its `&'static str` literal: `publish_oob` only borrows it,
+        // and a `.to_string()` here was one more allocation per broadcast create.
         let (render_expr, create_swap_id, create_swap_strategy, update_id_expr, delete_id_expr) =
             if let Some(ref render_path) = config.broadcast_render {
                 let extract_id = quote! {
@@ -10151,7 +10899,7 @@ fn emit_crud_bodies_hooked(
                 };
                 (
                     quote! { #render_path(__record_ref) },
-                    quote! { #container_expr.to_string() },
+                    quote! { #container_expr },
                     quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
                     extract_id.clone(),
                     extract_id,
@@ -10160,7 +10908,7 @@ fn emit_crud_bodies_hooked(
                 let dom_id = quote! { <#model_name as ::autumn_web::live::LiveFragment>::dom_id(__record_ref) };
                 (
                     quote! { <#model_name as ::autumn_web::live::LiveFragment>::render_fragment(__record_ref) },
-                    quote! { #container_expr.to_string() },
+                    quote! { #container_expr },
                     quote! { <#model_name as ::autumn_web::live::LiveFragment>::insert_swap() },
                     dom_id.clone(),
                     dom_id,
@@ -10173,11 +10921,11 @@ fn emit_crud_bodies_hooked(
                 if let ::core::option::Option::Some(__channels) = ::autumn_web::__private::get_global_channels() {
                     let __topic = #topic_expr;
                     let __fragment = #render_expr;
-                    let __create_id = #create_swap_id;
+                    let __create_id: &str = #create_swap_id;
                     let __create_swap = #create_swap_strategy;
                     if let ::core::result::Result::Err(__err) = __channels
                         .broadcast()
-                        .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                        .publish_oob(&__topic, __create_id, &__create_swap, &__fragment)
                     {
                         ::autumn_web::reexports::tracing::warn!(error = %__err, "auto-broadcast failed");
                     }
@@ -10366,6 +11114,18 @@ fn emit_crud_bodies_hooked(
             )
         };
 
+    // #3056: the durable runner also invalidates, before the user's
+    // `after_*_commit` hook. This covers a crash between the commit and the
+    // inline invalidation. A failure is logged and counted, but it does not
+    // fail the row: a cache outage must not delay or dead-letter user hooks.
+    let durable_invalidation = if config.declared_invalidation_edges {
+        quote! {
+            let _ = Self::invalidate_declared_caches_async().await;
+        }
+    } else {
+        quote! {}
+    };
+
     let hook_support_methods = if commit_hooks_enabled {
         quote! {
         #[doc(hidden)]
@@ -10399,6 +11159,7 @@ fn emit_crud_bodies_hooked(
                                 })?;
                         let __record: #model_name =
                             #model_name::__autumn_commit_hook_from_value(__record)?;
+                        #durable_invalidation
                         let __hooks =
                             <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
                         <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_create_commit(
@@ -10420,6 +11181,7 @@ fn emit_crud_bodies_hooked(
                                 })?;
                         let __record: #model_name =
                             #model_name::__autumn_commit_hook_from_value(__record)?;
+                        #durable_invalidation
                         let __hooks =
                             <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
                         <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_update_commit(
@@ -10441,6 +11203,7 @@ fn emit_crud_bodies_hooked(
                                 })?;
                         let __record: #model_name =
                             #model_name::__autumn_commit_hook_from_value(__record)?;
+                        #durable_invalidation
                         let __hooks =
                             <#hooks_ident as ::autumn_web::hooks::RepositoryHooksDefault>::autumn_default();
                         <#hooks_ident as ::autumn_web::hooks::MutationHooks>::after_delete_commit(
@@ -13186,6 +13949,9 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
 
     let timeout_route_init = quote! {
         use ::autumn_web::db::DbState as _;
+        // A route's `StatementTimeout` also bounds this request's `SET LOCAL`
+        // (#3057).
+        ::autumn_web::__private::note_route_statement_timeout(&_parts);
         // Postgres statement_timeout is a signed 32-bit integer (ms).
         const __AUTUMN_PG_TIMEOUT_MAX_MS: u64 = i32::MAX as u64;
         let __autumn_timeout_ms: u64 = _parts
@@ -13287,8 +14053,15 @@ fn emit_crud_bodies_plain(config: &RepoConfig, inputs: &CrudBodiesInputs<'_>) ->
 
 struct DependentCascade {
     dependent_child_helper: TokenStream,
+    /// Probe then mutate, for the hook-free body.
     delete_many_compiletime_cascade: TokenStream,
     delete_many_runtime_cascade: TokenStream,
+    /// The read-only probe pass alone, for the hooked body. Runs before the root hooks.
+    delete_many_compiletime_probe: TokenStream,
+    delete_many_runtime_probe: TokenStream,
+    /// The mutating pass alone, for the hooked body. Runs after the root hooks.
+    delete_many_compiletime_mutating: TokenStream,
+    delete_many_runtime_mutating: TokenStream,
     delete_many_cascade_tx_bind: TokenStream,
     delete_many_cascade_tx_ok: TokenStream,
     delete_many_cascade_post_publish: TokenStream,
@@ -13336,6 +14109,18 @@ fn emit_dependent_cascade(
 
     let model_name = &config.model_name;
     let table_name = &config.table_name;
+    // #2319: a destroy cascade runs on the parent's connection, not through
+    // `__autumn_acquire_conn`. Check the guard here too.
+    let dependent_unledgered_guard = if config.ledgered {
+        quote! {}
+    } else {
+        quote! {
+            ::autumn_web::ledger::refuse_out_of_band_write(
+                __table,
+                "a repository that is not ledgered",
+            )?;
+        }
+    };
     let table_ident = format_ident!("{table_name}");
     let commit_hooks_enabled = config.hooks_type.is_some() && config.commit_hooks;
 
@@ -13354,8 +14139,19 @@ fn emit_dependent_cascade(
         // aware), fire `before_delete`, apply the soft/hard delete mutation,
         // record version history, and enqueue the durable commit hook. This is
         // what makes `dependent = destroy` soft-delete-aware and hook-firing.
+        // #2427: a bulk `delete_many` hooks every batch root before it cascades.
+        // It then marks the root in `__deleted` under this key. When the cascade
+        // reaches that root as another root's descendant, the hook and the
+        // commit-hook enqueue already ran, so the leaf must not repeat them.
+        let destroy_already_hooked = quote! {
+            __deleted.contains(&(::core::concat!(#table_name, "#hooked"), __cid))
+        };
         let destroy_before_delete = if config.hooks_type.is_some() {
-            quote! { self.hooks.before_delete(&mut ctx, &__record).await?; }
+            quote! {
+                if !#destroy_already_hooked {
+                    self.hooks.before_delete(&mut ctx, &__record).await?;
+                }
+            }
         } else {
             quote! {}
         };
@@ -13461,17 +14257,19 @@ fn emit_dependent_cascade(
         };
         let destroy_commit_enqueue = if commit_hooks_enabled {
             quote! {
-                let __autumn_commit_hook_record = __record.__autumn_commit_hook_to_value()?;
-                ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
-                    conn,
-                    Self::__autumn_repository_commit_hook_key(),
-                    "delete",
-                    ctx.idempotency_key.as_deref(),
-                    ::core::option::Option::None,
-                    &ctx,
-                    &__autumn_commit_hook_record,
-                )
-                .await?;
+                if !#destroy_already_hooked {
+                    let __autumn_commit_hook_record = __record.__autumn_commit_hook_to_value()?;
+                    ::autumn_web::__private::enqueue_repository_commit_hook_on_conn(
+                        conn,
+                        Self::__autumn_repository_commit_hook_key(),
+                        "delete",
+                        ctx.idempotency_key.as_deref(),
+                        ::core::option::Option::None,
+                        &ctx,
+                        &__autumn_commit_hook_record,
+                    )
+                    .await?;
+                }
             }
         } else {
             quote! {}
@@ -13576,10 +14374,11 @@ fn emit_dependent_cascade(
             quote! {
                 {
                     let __broadcast_rec: &#model_name = &__record;
-                    let __del_topic: ::std::string::String =
-                        ::std::string::ToString::to_string(&#topic_expr);
-                    let __del_id: ::std::string::String =
-                        ::std::string::ToString::to_string(&#dom_id_expr);
+                    // Both expressions already yield an owned `String`;
+                    // `ToString::to_string(&..)` around them only copied it
+                    // again, per destroyed child row.
+                    let __del_topic: ::std::string::String = #topic_expr;
+                    let __del_id: ::std::string::String = #dom_id_expr;
                     __ret_broadcasts.push((__del_topic, __del_id));
                 }
             }
@@ -13665,6 +14464,35 @@ fn emit_dependent_cascade(
                 }
             }
         };
+        // #2427: the read-only twin of `emit_grandchild_call`, for `destroy`
+        // legs. It walks the leg with `Probe`, so a `restrict` at any depth is
+        // found before the first hook fires.
+        let grandchild_probe_calls: ::std::vec::Vec<_> = config
+            .dependents
+            .iter()
+            .filter(|dep| dep.action == DependentAction::Destroy)
+            .map(|dep| {
+                let child_repo = &dep.child_repo;
+                let fk = &dep.fk;
+                quote! {
+                    {
+                        let __autumn_gc_repo = #child_repo::with_pool_untracked(
+                            ::core::clone::Clone::clone(&self.pool)
+                        );
+                        __autumn_gc_repo.__autumn_apply_dependent_on_conn(
+                            conn,
+                            #fk,
+                            __cid,
+                            ::autumn_web::repository::DependentAction::Probe,
+                            #child_soft_for_grandchildren,
+                            __path,
+                            __deleted,
+                            __physical,
+                        ).await?;
+                    }
+                }
+            })
+            .collect();
         let grandchild_restrict_calls: ::std::vec::Vec<_> = config
             .dependents
             .iter()
@@ -13728,6 +14556,23 @@ fn emit_dependent_cascade(
                 );
             }
         };
+        let compiletime_grandchild_probe = quote! {
+            #(#grandchild_probe_calls)*
+        };
+        let runtime_grandchild_probe = quote! {
+            let __autumn_gc_rt_deps = #model_name::dependents();
+            for __autumn_gc_probe in __autumn_gc_rt_deps.iter().filter_map(|__s| __s.probe) {
+                __autumn_gc_probe(
+                    &self.pool,
+                    conn,
+                    __cid,
+                    #child_soft_for_grandchildren,
+                    __path,
+                    __deleted,
+                    __physical,
+                ).await?;
+            }
+        };
         let runtime_grandchild_mutating = quote! {
             let __autumn_gc_rt_deps = #model_name::dependents();
             for __autumn_gc_spec in __autumn_gc_rt_deps.iter().filter(|__s|
@@ -13757,6 +14602,11 @@ fn emit_dependent_cascade(
             compiletime_grandchild_restrict
         } else {
             runtime_grandchild_restrict
+        };
+        let grandchild_probe_cascade = if has_dependents {
+            compiletime_grandchild_probe
+        } else {
+            runtime_grandchild_probe
         };
         let grandchild_mutating_cascade = if has_dependents {
             compiletime_grandchild_mutating
@@ -13859,7 +14709,10 @@ fn emit_dependent_cascade(
         // invisible to `has_dependents`, which only sees the repository-attribute
         // route — still gets the recursive cascade it needs; see
         // `destroy_fast_path` below.
-        let destroy_per_row_loop = quote! {
+        // The locked child-id selection, shared by the Probe arm and the Destroy
+        // loop. Both must take the same `FOR UPDATE` lock before any restrict
+        // probe, so no FK insert slips in between probe and delete.
+        let destroy_select_ids = quote! {
             #[derive(::autumn_web::reexports::diesel::QueryableByName)]
             struct __AutumnDepId {
                 #[diesel(sql_type = ::autumn_web::reexports::diesel::sql_types::BigInt)]
@@ -13889,7 +14742,6 @@ fn emit_dependent_cascade(
             // plain read. `backend_select!` picks the suffix in autumn-web's own
             // compilation, so the Postgres SQL is byte-identical to before and the
             // SQLite form drops the clause.
-            #cc_serialize
             let __for_update: &str = ::autumn_web::backend_select! {
                 pg => { " FOR UPDATE" },
                 sqlite => { "" },
@@ -13904,6 +14756,11 @@ fn emit_dependent_cascade(
                     .load::<__AutumnDepId>(conn)
                     .await
                     .map_err(::autumn_web::AutumnError::from)?;
+        };
+
+        let destroy_per_row_loop = quote! {
+            #cc_serialize
+            #destroy_select_ids
             // #1800 case 2, pre-scan pass: probe the `restrict` grandchildren of
             // every selected child id before any child `before_delete` hook fires.
             // Codex round-5-A already ordered a child's own grandchild restrict
@@ -14011,6 +14868,67 @@ fn emit_dependent_cascade(
                 __path.remove(&(#table_name, __cid));
             }
             ::core::result::Result::Ok(#destroy_ret_value)
+        };
+
+        // The probe walk proper: lock the child ids, then probe each child's
+        // `restrict` legs and recurse into its `destroy` legs.
+        //
+        // The counter-cache advisory lock comes first, as in the Destroy loop, so
+        // both passes lock in the same order. A row reached by two paths is probed
+        // once: the walk records it in `__deleted` under a `#probed` key (one per
+        // parent delete kind), or a layered diamond would cost 2^depth reads.
+        let probe_walk = quote! {
+            #destroy_ret_decl
+            #cc_serialize
+            #destroy_select_ids
+            let __probed_table: &'static str = if __parent_soft {
+                ::core::concat!(#table_name, "#probed-soft")
+            } else {
+                ::core::concat!(#table_name, "#probed")
+            };
+            for __row in &__ids {
+                let __cid = __row.id;
+                if __physical.contains(&(#table_name, __cid))
+                    || __deleted.contains(&(__probed_table, __cid))
+                {
+                    continue;
+                }
+                if !__path.insert((#table_name, __cid)) {
+                    continue;
+                }
+                #grandchild_restrict_cascade
+                #grandchild_probe_cascade
+                __path.remove(&(#table_name, __cid));
+                __deleted.insert((__probed_table, __cid));
+            }
+            ::core::result::Result::Ok(#destroy_ret_value)
+        };
+        // A leg with no `restrict` and no `destroy` below it has nothing to probe.
+        // Skip the child-id select (and its row locks) for it: the walk would read
+        // every child row just to run an empty loop.
+        let probe_arm = if has_dependents {
+            let has_probeable_leg = config.dependents.iter().any(|dep| {
+                matches!(
+                    dep.action,
+                    DependentAction::Restrict | DependentAction::Destroy
+                )
+            });
+            if has_probeable_leg {
+                probe_walk
+            } else {
+                quote! { ::core::result::Result::Ok(::std::vec::Vec::new()) }
+            }
+        } else {
+            quote! {
+                if #model_name::dependents().iter().any(|__s| {
+                    __s.action == ::autumn_web::repository::DependentAction::Restrict
+                        || __s.probe.is_some()
+                }) {
+                    #probe_walk
+                } else {
+                    ::core::result::Result::Ok(::std::vec::Vec::new())
+                }
+            }
         };
 
         // Ledger: when `destroy_fast_path_eligible` (no repository-attribute
@@ -14176,7 +15094,15 @@ fn emit_dependent_cascade(
                         .await?;
                         ::core::result::Result::Ok(::std::vec::Vec::new())
                     }
+                    // #2427: read-only walk of a `destroy` leg. The parent runs it
+                    // before any hook, so a `restrict` at any depth returns the 409
+                    // before the first hook fires. It writes nothing; it only
+                    // pushes and pops `__path` to stop cycles.
+                    ::autumn_web::repository::DependentAction::Probe => {
+                        #probe_arm
+                    }
                     ::autumn_web::repository::DependentAction::Destroy => {
+                        #dependent_unledgered_guard
                         // Recursive cascade (#1739): each child row's mutation is
                         // applied inline, and BEFORE that mutation this repo's own
                         // `dependent(...)` cascade is invoked against the child id,
@@ -14211,30 +15137,38 @@ fn emit_dependent_cascade(
     } else {
         quote! { false }
     };
-    let emit_delete_many_cascade_call = |dep: &DependentSpec| {
-        let child_repo = &dep.child_repo;
-        let fk = &dep.fk;
-        let action_variant = dep.action.variant_ident();
-        quote! {
-            let __autumn_dep_repo = #child_repo::with_pool_untracked(
-                ::core::clone::Clone::clone(&self.pool)
-            );
-            __autumn_dep_broadcasts.extend(
-                __autumn_dep_repo
-                    .__autumn_apply_dependent_on_conn(
-                        conn,
-                        #fk,
-                        __autumn_pid,
-                        ::autumn_web::repository::DependentAction::#action_variant,
-                        #delete_many_parent_soft_lit,
-                        &mut __autumn_path,
-                        &mut __autumn_deleted,
-                        &mut __autumn_physically_deleted,
-                    )
-                    .await?
-            );
-        }
-    };
+    let emit_delete_many_cascade_call_as =
+        |dep: &DependentSpec, action_variant: proc_macro2::Ident| {
+            let child_repo = &dep.child_repo;
+            let fk = &dep.fk;
+            quote! {
+                let __autumn_dep_repo = #child_repo::with_pool_untracked(
+                    ::core::clone::Clone::clone(&self.pool)
+                );
+                __autumn_dep_broadcasts.extend(
+                    __autumn_dep_repo
+                        .__autumn_apply_dependent_on_conn(
+                            conn,
+                            #fk,
+                            __autumn_pid,
+                            ::autumn_web::repository::DependentAction::#action_variant,
+                            #delete_many_parent_soft_lit,
+                            &mut __autumn_path,
+                            &mut __autumn_deleted,
+                            &mut __autumn_physically_deleted,
+                        )
+                        .await?
+                );
+            }
+        };
+    let emit_delete_many_cascade_call =
+        |dep: &DependentSpec| emit_delete_many_cascade_call_as(dep, dep.action.variant_ident());
+    let delete_many_probe_calls: ::std::vec::Vec<_> = config
+        .dependents
+        .iter()
+        .filter(|dep| dep.action == DependentAction::Destroy)
+        .map(|dep| emit_delete_many_cascade_call_as(dep, format_ident!("Probe")))
+        .collect();
     let delete_many_restrict_calls: ::std::vec::Vec<_> = config
         .dependents
         .iter()
@@ -14322,12 +15256,18 @@ fn emit_dependent_cascade(
     // inside the transaction BEFORE the bulk parent delete. Restrict probes for
     // every parent run first (a 409 rolls the whole transaction back before any
     // mutating action), then the mutating dependents.
-    let delete_many_compiletime_cascade = quote! {
+    let delete_many_compiletime_probe = quote! {
         #delete_many_collect_parents
-        // Phase 1: probe all `restrict` dependents for every parent first.
+        // Phase 1: probe all `restrict` dependents for every parent first, then
+        // walk every `destroy` leg read-only (#2427). A 409 here fires no hook.
         for &__autumn_pid in &__autumn_dep_parent_ids {
             #(#delete_many_restrict_calls)*
+            __autumn_path.insert((#table_name, __autumn_pid));
+            #(#delete_many_probe_calls)*
+            __autumn_path.remove(&(#table_name, __autumn_pid));
         }
+    };
+    let delete_many_compiletime_mutating = quote! {
         // Phase 2: mutating dependents per parent, in declaration order.
         for &__autumn_pid in &__autumn_dep_parent_ids {
             // Codex round-5-B: a root already cascade-deleted as ANOTHER root's
@@ -14345,6 +15285,10 @@ fn emit_dependent_cascade(
             __autumn_path.remove(&(#table_name, __autumn_pid));
         }
     };
+    let delete_many_compiletime_cascade = quote! {
+        #delete_many_compiletime_probe
+        #delete_many_compiletime_mutating
+    };
     // Runtime (model-declared `#[has_many(dependent = ...)]`) bulk cascade
     // (Codex P1). When the repository declares NO `dependent(...)`, `delete_many`
     // must mirror the single-record `delete_by_id` runtime dispatch: walk the
@@ -14352,9 +15296,10 @@ fn emit_dependent_cascade(
     // mutating — reusing the SAME leaf executor / boxed-future recursion /
     // deferred-broadcast buffer as the compile-time path. Requires `__autumn_rt_deps`
     // (the `Model::dependents()` slice) to be bound in the enclosing scope.
-    let delete_many_runtime_cascade = quote! {
+    let delete_many_runtime_probe = quote! {
         #delete_many_collect_parents
-        // Phase 1: probe every parent's `restrict` dependents first.
+        // Phase 1: probe every parent's `restrict` dependents first, then walk
+        // every `destroy` leg read-only (#2427). A 409 here fires no hook.
         for &__autumn_pid in &__autumn_dep_parent_ids {
             for __autumn_spec in __autumn_rt_deps.iter().filter(|__s|
                 __s.action == ::autumn_web::repository::DependentAction::Restrict
@@ -14372,7 +15317,23 @@ fn emit_dependent_cascade(
                     .await?
                 );
             }
+            __autumn_path.insert((#table_name, __autumn_pid));
+            for __autumn_probe in __autumn_rt_deps.iter().filter_map(|__s| __s.probe) {
+                __autumn_probe(
+                    &self.pool,
+                    conn,
+                    __autumn_pid,
+                    #delete_many_parent_soft_lit,
+                    &mut __autumn_path,
+                    &mut __autumn_deleted,
+                    &mut __autumn_physically_deleted,
+                )
+                .await?;
+            }
+            __autumn_path.remove(&(#table_name, __autumn_pid));
         }
+    };
+    let delete_many_runtime_mutating = quote! {
         // Phase 2: mutating dependents per parent, in declaration order.
         for &__autumn_pid in &__autumn_dep_parent_ids {
             // Codex round-5-B (mirrors the compile-time block): skip a root already
@@ -14403,6 +15364,10 @@ fn emit_dependent_cascade(
             __autumn_path.remove(&(#table_name, __autumn_pid));
         }
     };
+    let delete_many_runtime_cascade = quote! {
+        #delete_many_runtime_probe
+        #delete_many_runtime_mutating
+    };
     // When a cascade runs, the transaction returns the deferred child broadcasts
     // so they can be published post-commit (a rolled-back cascade publishes
     // nothing). These "cascade" variants of the tx bind / return / publish / tail
@@ -14431,6 +15396,10 @@ fn emit_dependent_cascade(
         dependent_child_helper,
         delete_many_compiletime_cascade,
         delete_many_runtime_cascade,
+        delete_many_compiletime_probe,
+        delete_many_runtime_probe,
+        delete_many_compiletime_mutating,
+        delete_many_runtime_mutating,
         delete_many_cascade_tx_bind,
         delete_many_cascade_tx_ok,
         delete_many_cascade_post_publish,
@@ -15326,7 +16295,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
             let restore_impl_method = if config.ledgered {
                 let vh_restore = vh_insert_ts(
                     table_name,
-                    "update",
+                    "restore",
                     false,
                     &quote! { __restored },
                     Some(&quote! { record }),
@@ -15513,7 +16482,7 @@ fn emit_read_surface(config: &RepoConfig, inputs: &ReadSurfaceInputs<'_>) -> Rea
             let restore_impl_method = if config.ledgered {
                 let vh_restore = vh_insert_ts(
                     table_name,
-                    "update",
+                    "restore",
                     false,
                     &quote! { __restored },
                     Some(&quote! { record }),
@@ -17248,6 +18217,21 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
         ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
     };
 
+    // The current tenant, or `None` under `across_tenants()`. Shared by every list
+    // read, so all of them scope the same way.
+    let list_tenant_setup = if config.tenant_scoped {
+        quote! {
+            let __tenant = if self.across_tenants {
+                ::core::option::Option::None
+            } else {
+                let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
+                    .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
+                ::core::option::Option::Some(t)
+            };
+        }
+    } else {
+        quote! {}
+    };
     let list_impl_method = if config.tenant_scoped {
         quote! {
             async fn list(
@@ -17262,13 +18246,7 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                 // inherent methods take precedence when present.
                 #[allow(unused_imports)]
                 use ::autumn_web::pagination::AutumnListable as _;
-                let __tenant = if self.across_tenants {
-                    ::core::option::Option::None
-                } else {
-                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
-                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
-                    ::core::option::Option::Some(t)
-                };
+                #list_tenant_setup
                 let mut conn = self.__autumn_acquire_read_conn().await?;
 
                 let mut __count_q = #table_ident::table.into_boxed() #sd_filter;
@@ -17364,20 +18342,7 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                 req: &::autumn_web::pagination::PageRequest,
             ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::autumn_web::pagination::Page<#model_name>>> + Send;
         };
-        // Optional tenant setup + per-query tenant filters, mirroring `list`.
-        let scoped_tenant_setup = if config.tenant_scoped {
-            quote! {
-                let __tenant = if self.across_tenants {
-                    ::core::option::Option::None
-                } else {
-                    let t = ::autumn_web::tenancy::CURRENT_TENANT.try_with(|t| t.clone()).ok().flatten()
-                        .ok_or_else(|| ::autumn_web::AutumnError::internal_server_error_msg("Query scoped to tenant, but no tenant context was established"))?;
-                    ::core::option::Option::Some(t)
-                };
-            }
-        } else {
-            quote! {}
-        };
+        // Per-query tenant filters, mirroring `list`.
         let scoped_tenant_count_filter = if config.tenant_scoped {
             quote! {
                 if let ::core::option::Option::Some(ref t) = __tenant {
@@ -17408,7 +18373,7 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl;
                 #[allow(unused_imports)]
                 use ::autumn_web::pagination::AutumnListable as _;
-                #scoped_tenant_setup
+                #list_tenant_setup
                 let mut conn = self.__autumn_acquire_read_conn().await?;
 
                 let mut __count_q = #table_ident::table.into_boxed() #sd_filter;
@@ -17441,6 +18406,152 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
         (trait_method, impl_method)
     } else {
         (quote! {}, quote! {})
+    };
+
+    // ── #2185: count-free list reads ────────────────────────────────────
+    //
+    // `list_rows`/`list_scoped_rows` are `list`/`list_scoped` without the COUNT and
+    // the offset: one LIMIT statement, so all rows come from one snapshot. They use
+    // the same tenant fragment and allowlist helpers as `list`/`list_scoped`.
+    let list_rows_tenant_filter = if config.tenant_scoped {
+        quote! {
+            let __q = if let ::core::option::Option::Some(ref t) = __tenant {
+                __q.filter(#table_ident::tenant_id.eq(t.clone()))
+            } else {
+                __q
+            };
+        }
+    } else {
+        quote! {}
+    };
+    // Unlike `list`'s guard, this one also rejects when no shard set is
+    // configured: the read would drop the tenant filter and return one pool's
+    // rows as if they were all of them (#1741).
+    let rows_cross_shard_guard = |method: &str| {
+        if !(config.sharded && config.tenant_scoped) {
+            return quote! {};
+        }
+        let no_shard_set_msg = format!(
+            "cross-shard {method} requires a configured shard set: across_tenants() \
+             cannot read across shards without a shard set (the repository was built \
+             without shard context, e.g. via with_pool_untracked); build it with shard \
+             context instead"
+        );
+        let unsupported_msg = format!(
+            "cross-shard {method} is not supported: use find_all() with \
+             across_tenants() on a sharded repository instead"
+        );
+        quote! {
+            if self.across_tenants {
+                if self.__autumn_shards.is_none() {
+                    return ::core::result::Result::Err(
+                        ::autumn_web::AutumnError::bad_request_msg(#no_shard_set_msg)
+                    );
+                }
+                return ::core::result::Result::Err(
+                    ::autumn_web::AutumnError::bad_request_msg(#unsupported_msg)
+                );
+            }
+        }
+    };
+    let rows_read = |method: &str, owner_filter: TokenStream| {
+        let cross_shard_guard = rows_cross_shard_guard(method);
+        quote! {
+            #cross_shard_guard
+            use ::autumn_web::reexports::diesel::prelude::*;
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            #[allow(unused_imports)]
+            use ::autumn_web::pagination::AutumnListable as _;
+            #list_tenant_setup
+            let __limit = <i64 as ::core::convert::TryFrom<usize>>::try_from(limit).unwrap_or(i64::MAX);
+            let mut conn = self.__autumn_acquire_read_conn().await?;
+            let __q = #table_ident::table.into_boxed() #sd_filter;
+            #list_rows_tenant_filter
+            #owner_filter
+            let __q = #model_name::__autumn_list_apply_filters(__q, query);
+            let __q = #model_name::__autumn_list_apply_order(__q, query);
+            __q.limit(__limit)
+                .select(#model_name::as_select())
+                .load::<#model_name>(&mut conn)
+                .await
+                .map_err(::autumn_web::AutumnError::from)
+        }
+    };
+    let list_rows_doc = quote! {
+        /// One statement reads all rows, so they come from one snapshot: a
+        /// concurrent insert or delete cannot duplicate or skip a row. There
+        /// is no `COUNT(*)` and no offset.
+        ///
+        /// Use it for a bulk read, such as an export. To detect more than
+        /// `limit` rows, ask for one more row than you keep.
+    };
+    let unscoped_rows_read = rows_read("list_rows", quote! {});
+    let list_trait_method = quote! {
+        #list_trait_method
+
+        /// Load up to `limit` records in [`list`](Self::list) order, with the
+        /// same allowlisted sort, filters and scope.
+        ///
+        #list_rows_doc
+        fn list_rows(
+            &self,
+            query: &::autumn_web::pagination::ListQuery,
+            limit: usize,
+        ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>>> + Send;
+    };
+    let list_impl_method = quote! {
+        #list_impl_method
+
+        async fn list_rows(
+            &self,
+            query: &::autumn_web::pagination::ListQuery,
+            limit: usize,
+        ) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+            #unscoped_rows_read
+        }
+    };
+    let (list_scoped_trait_method, list_scoped_impl_method) = if let Some(ref owner_col) =
+        owner_col_ident
+    {
+        // The owner filter comes before the allowlist, so a request
+        // `filter[..]` can only narrow the owner's rows.
+        let scoped_rows_read = rows_read(
+            "list_scoped_rows",
+            quote! {
+                let __q = __q.filter(#table_ident::#owner_col.eq(owner_id));
+            },
+        );
+        (
+            quote! {
+                #list_scoped_trait_method
+
+                /// Load up to `limit` records **owned by `owner_id`** in
+                /// [`list_scoped`](Self::list_scoped) order, with the same
+                /// allowlisted sort and filters.
+                ///
+                #list_rows_doc
+                fn list_scoped_rows(
+                    &self,
+                    owner_id: i64,
+                    query: &::autumn_web::pagination::ListQuery,
+                    limit: usize,
+                ) -> impl ::std::future::Future<Output = ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>>> + Send;
+            },
+            quote! {
+                #list_scoped_impl_method
+
+                async fn list_scoped_rows(
+                    &self,
+                    owner_id: i64,
+                    query: &::autumn_web::pagination::ListQuery,
+                    limit: usize,
+                ) -> ::autumn_web::AutumnResult<::std::vec::Vec<#model_name>> {
+                    #scoped_rows_read
+                }
+            },
+        )
+    } else {
+        (list_scoped_trait_method, list_scoped_impl_method)
     };
 
     // `cursor_page` is generated only when the user declares `cursor_key = field`.
@@ -18538,11 +19649,13 @@ fn emit_query_surface(config: &RepoConfig, inputs: &QuerySurfaceInputs<'_>) -> Q
                     // lookup: a found row is returned unchanged, because this
                     // call inserts nothing.
                     #[allow(unused_imports)]
-                    use ::autumn_web::normalize::{SpezNormalizeNo as _, SpezNormalizeYes as _};
+                    use ::autumn_web::normalize::{
+                        SpezNormalizeNo as _, SpezNormalizeNoop as _, SpezNormalizeYes as _,
+                    };
                     #[allow(unused_imports)]
                     use ::std::borrow::Borrow as _;
                     let __autumn_normalized =
-                        ::autumn_web::normalize::SpezNormalize(new).spez_normalize();
+                        (&&::autumn_web::normalize::SpezNormalize(new)).spez_normalize_insert();
                     let new: &#new_name = __autumn_normalized.borrow();
                     #validate_or_found
                     // Step 2: create on the primary with ON CONFLICT DO NOTHING.
@@ -19053,6 +20166,20 @@ fn emit_write_bodies(
                         .await?
                     );
                 }
+                // #2427: walk every `destroy` leg read-only, so a deeper
+                // `restrict` blocks here too, before any hook fires.
+                for __autumn_probe in __autumn_rt_deps.iter().filter_map(|__s| __s.probe) {
+                    __autumn_probe(
+                        &self.pool,
+                        conn,
+                        id,
+                        #parent_soft_lit,
+                        &mut __autumn_path,
+                        &mut __autumn_deleted,
+                        &mut __autumn_physically_deleted,
+                    )
+                    .await?;
+                }
             };
             let runtime_cascade_mutating = quote! {
                 // Phase 2: mutating dependents in declaration order. Reuses the
@@ -19104,10 +20231,9 @@ fn emit_write_bodies(
             // hooks, so a later `restrict` 409 rolls back the DB but cannot retract
             // them. Hoisting the probes ahead of the mutating pass means a blocked
             // delete never touches a child hook.
-            let emit_cascade_call = |dep: &DependentSpec| {
+            let emit_cascade_call_as = |dep: &DependentSpec, action_variant: proc_macro2::Ident| {
                 let child_repo = &dep.child_repo;
                 let fk = &dep.fk;
-                let action_variant = dep.action.variant_ident();
                 quote! {
                     let __autumn_dep_repo = #child_repo::with_pool_untracked(
                         ::core::clone::Clone::clone(&self.pool)
@@ -19130,11 +20256,21 @@ fn emit_write_bodies(
                     );
                 }
             };
+            let emit_cascade_call =
+                |dep: &DependentSpec| emit_cascade_call_as(dep, dep.action.variant_ident());
             let restrict_calls: ::std::vec::Vec<_> = config
                 .dependents
                 .iter()
                 .filter(|dep| dep.action == DependentAction::Restrict)
                 .map(&emit_cascade_call)
+                .collect();
+            // #2427: walk every `destroy` leg read-only too, so a `restrict`
+            // below it blocks the delete before any hook fires.
+            let probe_calls: ::std::vec::Vec<_> = config
+                .dependents
+                .iter()
+                .filter(|dep| dep.action == DependentAction::Destroy)
+                .map(|dep| emit_cascade_call_as(dep, format_ident!("Probe")))
                 .collect();
             let mutating_calls: ::std::vec::Vec<_> = config
                 .dependents
@@ -19186,8 +20322,10 @@ fn emit_write_bodies(
                 __autumn_path.insert((#table_name, id));
                 // #1800 case 3 / Phase 1: probe all `restrict` dependents first —
                 // a 409 here rolls back before the parent `before_delete` hook (and
-                // any mutating action's child hook) fires.
+                // any mutating action's child hook) fires. #2427: then walk every
+                // `destroy` leg read-only, so a deeper `restrict` blocks here too.
                 #(#restrict_calls)*
+                #(#probe_calls)*
             };
             let cascade_mutating_calls = quote! {
                 // Phase 2: mutating dependents in declaration order. Reuses the
@@ -19257,19 +20395,42 @@ fn emit_write_bodies(
             }
         };
 
-        let topic_expr_outer = if config.tenant_scoped {
-            quote! {
-                ::std::format!(
-                    "tenant:{}:{}",
-                    ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
-                        &__record_ref.tenant_id
-                    ),
-                    #base_topic_expr_outer
-                )
+        // Borrow-only twin of `base_topic_expr_outer` for the `let __topic = ...;`
+        // publish sites, where a static topic stays a `&'static str` rather than
+        // being re-owned per broadcast. The `String`-typed slots
+        // (`__autumn_prev_topic`, the delete tuples, the delete_many pre-fetch
+        // vec) keep the owned `topic_expr_outer`.
+        let base_topic_ref_outer = match generate_topic_ref(
+            config
+                .broadcast_topic
+                .as_deref()
+                .unwrap_or(&config.table_name),
+            &quote! { __record_ref },
+        ) {
+            Ok(expr) => expr,
+            Err(err) => {
+                let compile_err = err.to_compile_error();
+                return Err(quote! { #compile_err });
             }
-        } else {
-            base_topic_expr_outer
         };
+
+        let scope_topic_to_tenant = |base_topic: TokenStream| {
+            if config.tenant_scoped {
+                quote! {
+                    ::std::format!(
+                        "tenant:{}:{}",
+                        ::autumn_web::tenancy::DisplayTenantId::tenant_id_str(
+                            &__record_ref.tenant_id
+                        ),
+                        #base_topic
+                    )
+                }
+            } else {
+                base_topic
+            }
+        };
+        let topic_expr_outer = scope_topic_to_tenant(base_topic_expr_outer);
+        let topic_ref_outer = scope_topic_to_tenant(base_topic_ref_outer);
 
         let model_prefix_outer = to_snake_case(&config.model_name.to_string());
         let default_container_outer = format!("{}-list", config.table_name);
@@ -19278,6 +20439,9 @@ fn emit_write_bodies(
             .as_deref()
             .unwrap_or(&default_container_outer);
 
+        // As in the commit-hook runner, the create swap id is the container's
+        // `&'static str` literal: `publish_oob` only borrows it. (The update
+        // path's `(String, OobSwap)` target tuple still owns its copy.)
         let (render_expr_outer, create_swap_id_outer, create_swap_outer, update_id_outer) =
             if let Some(ref render_path) = config.broadcast_render {
                 let extract_id = quote! {
@@ -19294,7 +20458,7 @@ fn emit_write_bodies(
                 };
                 (
                     quote! { #render_path(__record_ref) },
-                    quote! { #container_expr_outer.to_string() },
+                    quote! { #container_expr_outer },
                     quote! { ::autumn_web::htmx::OobSwap::BeforeEnd },
                     extract_id,
                 )
@@ -19305,7 +20469,7 @@ fn emit_write_bodies(
                             __record_ref
                         )
                     },
-                    quote! { #container_expr_outer.to_string() },
+                    quote! { #container_expr_outer },
                     quote! {
                         <#model_name as ::autumn_web::live::LiveFragment>::insert_swap()
                     },
@@ -19363,13 +20527,13 @@ fn emit_write_bodies(
                 if let ::core::option::Option::Some(__channels) =
                     ::autumn_web::__private::get_global_channels()
                 {
-                    let __topic = #topic_expr_outer;
+                    let __topic = #topic_ref_outer;
                     let __fragment = #render_expr_outer;
-                    let __create_id = #create_swap_id_outer;
+                    let __create_id: &str = #create_swap_id_outer;
                     let __create_swap = #create_swap_outer;
                     if let ::core::result::Result::Err(__err) = __channels
                         .broadcast()
-                        .publish_oob(&__topic, &__create_id, &__create_swap, &__fragment)
+                        .publish_oob(&__topic, __create_id, &__create_swap, &__fragment)
                     {
                         ::autumn_web::reexports::tracing::warn!(
                             error = %__err,
@@ -19421,7 +20585,7 @@ fn emit_write_bodies(
                     if let ::core::option::Option::Some(__channels) =
                         ::autumn_web::__private::get_global_channels()
                     {
-                        let __topic = #topic_expr_outer;
+                        let __topic = #topic_ref_outer;
                         let __fragment = #render_expr_outer;
                         let __id = #update_id_outer;
 
@@ -19504,7 +20668,7 @@ fn emit_write_bodies(
                     if let ::core::option::Option::Some(__channels) =
                         ::autumn_web::__private::get_global_channels()
                     {
-                        let __topic = #topic_expr_outer;
+                        let __topic = #topic_ref_outer;
                         let __fragment = #render_expr_outer;
                         let __id = #update_id_outer;
                         if let ::core::result::Result::Err(__err) = __channels
@@ -19632,7 +20796,7 @@ fn emit_write_bodies(
                     {
                         for __autumn_record in __autumn_result_vec {
                             let __record_ref = __autumn_record;
-                            let __topic = #topic_expr_outer;
+                            let __topic = #topic_ref_outer;
                             let __fragment = #render_expr_outer;
                             let __id = #update_id_outer;
                             if let ::core::result::Result::Err(__err) = __channels
@@ -20152,6 +21316,286 @@ mod tests {
         );
     }
 
+    // ── #3056: commit-bound invalidation ─────────────────────────────
+
+    /// The body tokens of each method in `impl {trait} for Pg{trait}`.
+    fn trait_impl_method_bodies(
+        generated: &TokenStream,
+        trait_name: &str,
+    ) -> std::collections::HashMap<String, String> {
+        let file: syn::File = syn::parse2(generated.clone()).expect("generated code parses");
+        let mut bodies = std::collections::HashMap::new();
+        for item in file.items {
+            let syn::Item::Impl(item_impl) = item else {
+                continue;
+            };
+            let is_trait_impl = item_impl
+                .trait_
+                .as_ref()
+                .and_then(|(path, _)| path.segments.last())
+                .is_some_and(|seg| seg.ident == trait_name);
+            if !is_trait_impl {
+                continue;
+            }
+            for impl_item in item_impl.items {
+                if let syn::ImplItem::Fn(method) = impl_item {
+                    bodies.insert(
+                        method.sig.ident.to_string(),
+                        method.block.to_token_stream().to_string(),
+                    );
+                }
+            }
+        }
+        bodies
+    }
+
+    #[test]
+    fn every_write_invalidates_declared_reads_after_commit() {
+        let attr = quote! { Post, invalidates(crate::views::recent_posts) };
+        let item = quote! {
+            pub trait PostRepository {
+                fn delete_by_author_id(author_id: i64) -> ();
+            }
+        };
+        let config = parse_repo_args(attr.clone()).expect("args");
+        let trait_def: ItemTrait = syn::parse2(item.clone()).expect("trait");
+        let writes = write_method_names(&config, &trait_def);
+        assert!(writes.contains(&"delete_by_author_id".to_owned()));
+
+        let bodies = trait_impl_method_bodies(&repository_macro(attr, item), "PostRepository");
+        for write in &writes {
+            let body = bodies
+                .get(write)
+                .unwrap_or_else(|| panic!("`{write}` must be in the trait impl"));
+            assert!(
+                body.contains("__autumn_invalidate_after_commit"),
+                "`{write}` must invalidate after it commits: {body}"
+            );
+        }
+        for read in ["find_by_id", "find_all", "count", "exists_by_id"] {
+            let body = bodies.get(read).expect("read method");
+            assert!(
+                !body.contains("__autumn_invalidate_after_commit"),
+                "a read (`{read}`) must not invalidate: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_invalidation_runs_after_the_body_on_ok_and_err() {
+        // A write can commit and then fail in an `after_*` hook, so the
+        // invalidation must not depend on `Ok`.
+        let bodies = trait_impl_method_bodies(
+            &repository_macro(
+                quote! { Post, invalidates(crate::views::recent_posts) },
+                quote! { pub trait PostRepository {} },
+            ),
+            "PostRepository",
+        );
+        let save = bodies.get("save").expect("save");
+        let guard = save
+            .find("InvalidateAfterWrite :: new")
+            .expect("a guard is armed before the body");
+        let body = save
+            .find("let __autumn_write_result")
+            .expect("the body runs");
+        let run = save
+            .find("__autumn_invalidation . run () . await")
+            .expect("the invalidation runs after the body");
+        assert!(guard < body && body < run, "{save}");
+        assert!(
+            !save.contains("is_ok ()"),
+            "it must not depend on Ok: {save}"
+        );
+    }
+
+    #[test]
+    fn each_after_hook_runs_after_a_flush_of_its_commit() {
+        // Codex review on #3137: an `after_*` hook runs after the commit, so it
+        // must not see, or let other readers see, the cached pre-commit value.
+        for (attr, has_hooks) in [
+            (
+                quote! { Post, invalidates(crate::views::recent_posts) },
+                false,
+            ),
+            (
+                quote! { Post, hooks = PostHooks, invalidates(crate::views::recent_posts) },
+                true,
+            ),
+            (
+                quote! {
+                    Post,
+                    hooks = PostHooks,
+                    commit_hooks = true,
+                    invalidates(crate::views::recent_posts)
+                },
+                true,
+            ),
+        ] {
+            let item = quote! { pub trait PostRepository {} };
+            let config = parse_repo_args(attr.clone()).expect("args");
+            let trait_def: ItemTrait = syn::parse2(item.clone()).expect("trait");
+            let writes = write_method_names(&config, &trait_def);
+            let bodies = trait_impl_method_bodies(&repository_macro(attr, item), "PostRepository");
+            let mut hooked = 0;
+            for write in &writes {
+                let body = &bodies[write];
+                let hooks = body.matches("self . hooks . after_create (").count()
+                    + body.matches("self . hooks . after_update (").count();
+                let flushed = body
+                    .matches("__autumn_invalidation . flush () . await ; self . hooks . after_")
+                    .count();
+                assert_eq!(
+                    hooks, flushed,
+                    "`{write}`: flush before each after hook: {body}"
+                );
+                assert!(
+                    !body.contains(
+                        "__autumn_invalidation . committed () ; let _ = __autumn_invalidation . run"
+                    ) && !body.contains("__autumn_invalidation . committed () ; if"),
+                    "`{write}`: every commit and hook must reach the guard: {body}"
+                );
+                if hooks > 0 {
+                    hooked += 1;
+                    assert!(
+                        body.contains("__autumn_invalidation . committed ()"),
+                        "`{write}`: each commit must mark the guard: {body}"
+                    );
+                }
+            }
+            if !has_hooks {
+                assert_eq!(hooked, 0, "no hooks, no hook calls");
+                continue;
+            }
+            for write in ["save", "update", "save_many", "update_many"] {
+                assert!(
+                    bodies[write].contains("flush () . await ; self . hooks . after_"),
+                    "`{write}` must flush before its after hook: {}",
+                    bodies[write]
+                );
+            }
+            assert!(hooked >= 4);
+        }
+    }
+
+    #[test]
+    fn the_retention_sweep_invalidates_when_it_deletes_rows() {
+        let out = repository_macro(
+            quote! {
+                Post,
+                soft_delete,
+                invalidates(crate::views::recent_posts),
+                retention(after = "30d", basis = created_at, purge_deleted_after = "90d")
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let sweep = generated_fn(&out, "pub async fn __autumn_retention_sweep");
+        assert!(
+            sweep.contains("__autumn_invalidate_after_commit"),
+            "a sweep commits deletes, so it must invalidate: {sweep}"
+        );
+        assert!(
+            sweep.contains("report . rows_swept == 0") && sweep.contains("disarm ()"),
+            "a sweep that deleted nothing must not invalidate: {sweep}"
+        );
+        let dry_run = generated_fn(&out, "pub fn __autumn_retention_dry_run");
+        assert!(
+            !dry_run.contains("__autumn_invalidate_after_commit"),
+            "a dry run writes nothing: {dry_run}"
+        );
+    }
+
+    #[test]
+    fn with_lock_and_find_or_create_also_invalidate() {
+        let out = repository_macro(
+            quote! { Post, invalidates(crate::views::recent_posts) },
+            quote! {
+                pub trait PostRepository {
+                    fn find_or_create_by_title(&self, title: String, new: &NewPost);
+                }
+            },
+        )
+        .to_string();
+        let find_or_create = generated_fn(&out, "pub async fn find_or_create_by_title");
+        assert!(
+            find_or_create.contains("__autumn_invalidate_after_commit"),
+            "{find_or_create}"
+        );
+        assert!(
+            find_or_create.contains("Ok ((_ , false))") && find_or_create.contains("disarm ()"),
+            "a find that wrote nothing must not invalidate: {find_or_create}"
+        );
+        let with_lock = generated_fn(&out, "pub async fn with_lock");
+        assert!(
+            with_lock.contains("__autumn_invalidate_after_commit"),
+            "{with_lock}"
+        );
+    }
+
+    #[test]
+    fn a_repository_with_no_edges_adds_no_after_commit_invalidation() {
+        let out =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(!out.contains("__autumn_invalidate_after_commit"), "{out}");
+        assert!(!out.contains("invalidate_declared_caches_async"), "{out}");
+    }
+
+    #[test]
+    fn a_declared_edge_also_gets_an_async_invalidator() {
+        let out = repository_macro(
+            quote! { Post, invalidates(crate::views::recent_posts) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains("pub async fn invalidate_declared_caches_async"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "invalidate_namespace_async (crate :: views :: __AUTUMN_CACHE_READ_ID__recent_posts)"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn durable_commit_hook_runners_invalidate_without_failing_the_row() {
+        let out = repository_macro(
+            quote! {
+                Post,
+                hooks = PostHooks,
+                commit_hooks = true,
+                invalidates(crate::views::recent_posts)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let runners = section_between(
+            &out,
+            "fn __autumn_register_repository_commit_hooks",
+            "inventory :: submit",
+        );
+        assert_eq!(
+            runners.matches("invalidate_declared_caches_async").count(),
+            3,
+            "the create, update and delete runners must each invalidate: {runners}"
+        );
+        assert!(
+            runners.contains("let _ = Self :: invalidate_declared_caches_async () . await"),
+            "a cache outage must not fail the row and dead-letter user hooks: {runners}"
+        );
+        let first_invalidation = runners
+            .find("invalidate_declared_caches_async")
+            .expect("invalidation");
+        let first_hook = runners.find("after_create_commit").expect("hook");
+        assert!(
+            first_invalidation < first_hook,
+            "the cache is fresh before the user's hook runs: {runners}"
+        );
+    }
+
     #[test]
     fn a_method_level_edge_also_reaches_the_invalidator() {
         // An edge that discharges the gate but has no callable counterpart is
@@ -20336,6 +21780,55 @@ mod tests {
         )
         .to_string();
         assert!(out.contains("import path only"), "{out}");
+    }
+
+    #[test]
+    fn a_cascade_names_its_child_repository_for_the_closure() {
+        // The parent cannot see the grandchild. It names the child so the
+        // audit can follow the chain (#2364).
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgTagRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            out.contains("cascades_into : :: core :: option :: Option :: Some (")
+                && out.contains("< PgCommentRepository > :: __AUTUMN_REPOSITORY_NAME"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("< PgTagRepository > :: __AUTUMN_REPOSITORY_NAME"),
+            "{out}"
+        );
+        assert!(out.contains("pub const __AUTUMN_REPOSITORY_NAME"), "{out}");
+    }
+
+    #[test]
+    fn only_a_destroy_cascade_is_followed_down() {
+        // `nullify` and `delete_all` are one SQL statement on the child
+        // table. They never reach the child's own cascade.
+        let out = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgTagRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgVoteRepository, fk = "post_id", on_delete = delete_all)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let link = |child: &str, recurses: &str| {
+            out.contains(&format!(
+                "< {child} > :: __AUTUMN_REPOSITORY_NAME , {recurses})"
+            ))
+        };
+        assert!(link("PgCommentRepository", "true"), "{out}");
+        assert!(link("PgTagRepository", "false"), "{out}");
+        assert!(link("PgVoteRepository", "false"), "{out}");
     }
 
     #[test]
@@ -21082,6 +22575,28 @@ mod tests {
         );
     }
 
+    /// #2284: each repository tells the `#[commentable]` helpers its own
+    /// soft-delete fact.
+    #[test]
+    fn repository_macro_reports_its_own_soft_delete_fact() {
+        let fact = |args| {
+            let generated =
+                repository_macro(args, quote! { pub trait PostRepository {} }).to_string();
+            let start = generated
+                .find("fn __autumn_m2m_soft_delete")
+                .unwrap_or_else(|| panic!("expected the soft-delete fact: {generated}"));
+            let body = &generated[start..];
+            let end = body.find('}').expect("method body");
+            body[..end].to_owned()
+        };
+
+        let soft = fact(quote! { Post, table = "posts", soft_delete });
+        assert!(soft.contains("Some (true)"), "{soft}");
+
+        let plain = fact(quote! { Post, table = "posts" });
+        assert!(plain.contains("Some (false)"), "{plain}");
+    }
+
     #[test]
     fn repository_macro_api_mutation_prechecks_pin_reads_to_primary() {
         let generated = repository_macro(
@@ -21238,7 +22753,7 @@ mod tests {
         let section = section_between(&generated, "async fn save (", "async fn update (");
 
         let normalize_at = section
-            .find("spez_normalize ()")
+            .find("spez_normalize_insert ()")
             .expect("save must normalize the payload");
         // Pinned to the exact emitted form: `new` is already a `&New*`, so an
         // extra borrow would validate only via `validator`'s blanket
@@ -21334,7 +22849,7 @@ mod tests {
         );
 
         let normalize_at = section
-            .find("spez_normalize_many ()")
+            .find("spez_normalize_insert_many ()")
             .expect("skip-invalid must normalize rows");
         let validate_at = section
             .find("MaybeValidate (__autumn_row)")
@@ -21890,6 +23405,211 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_publishes_the_models_its_delete_writes() {
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        for level in 0..4 {
+            assert!(
+                generated.contains(&format!("const __AUTUMN_CASCADE_{level}")),
+                "{generated}"
+            );
+            assert!(
+                generated.contains(&format!("Post :: DEPENDENT_CASCADE_{level}")),
+                "with no `dependent(..)` clause the model's own levels are used: {generated}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dependent_clause_names_its_child_models() {
+        let generated = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = destroy),
+                dependent(PgLikeRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgAuditRepository, fk = "post_id", on_delete = restrict)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_MODEL_IDENT"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "destroy runs the child's own cascade: {generated}"
+        );
+        assert!(
+            generated.contains("PgLikeRepository :: __AUTUMN_MODEL_IDENT"),
+            "nullify writes the child: {generated}"
+        );
+        assert!(
+            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE"),
+            "{generated}"
+        );
+        assert!(
+            !generated.contains("PgAuditRepository :: __AUTUMN_MODEL_IDENT"),
+            "restrict writes nothing: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_later_destroy_clause_keeps_the_childs_own_cascade() {
+        // `nullify` first, `destroy` second, one child. The runtime runs both,
+        // so the child's own cascade must be listed.
+        let generated = repository_macro(
+            quote! {
+                Post,
+                dependent(PgCommentRepository, fk = "post_id", on_delete = nullify),
+                dependent(PgCommentRepository, fk = "editor_id", on_delete = destroy)
+            },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn a_qualified_path_is_never_taken_for_the_repository_itself() {
+        // `plugin::PgCommentRepository` can be another repository with the same
+        // name. A macro cannot resolve paths, so it keeps the leg: a missed
+        // model would be a hole, a kept leg only refuses a governed delete.
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                dependent(plugin::PgCommentRepository, fk = "parent_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("plugin :: PgCommentRepository :: __AUTUMN_MODEL_IDENT"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("plugin :: PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn a_repository_that_cascades_into_itself_does_not_name_itself() {
+        let generated = repository_macro(
+            quote! {
+                Comment,
+                dependent(PgCommentRepository, fk = "parent_id", on_delete = destroy)
+            },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("PgCommentRepository :: __AUTUMN_CASCADE"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_with_grant() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp, grant = crate::grants::PostEditor"#
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        let grant = config.grant.expect("grant is parsed");
+        assert_eq!(
+            quote! { #grant }.to_string(),
+            "crate :: grants :: PostEditor"
+        );
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_grant_without_mcp() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", grant = PostEditor"#.parse().unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("a grant with no MCP tools governs nothing and must be rejected");
+        };
+        assert!(err.to_string().contains("mcp"), "{err}");
+    }
+
+    #[test]
+    fn parse_repo_args_rejects_a_duplicate_grant() {
+        let tokens: proc_macro2::TokenStream =
+            r#"Post, api = "/api/posts", mcp, grant = A, grant = B"#
+                .parse()
+                .unwrap();
+        let Err(err) = parse_repo_args(tokens) else {
+            panic!("two grants must be rejected");
+        };
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn a_granted_repository_governs_every_mcp_tool_it_generates() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp, grant = PostEditor },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(
+            generated
+                .matches("agent_authority : :: core :: option :: Option :: Some (&")
+                .count(),
+            5,
+            "list/get/create/update/delete each carry the authority"
+        );
+        assert_eq!(
+            generated.matches("AgentAuthorityDescriptor").count(),
+            5,
+            "each authority is registered for the manifest"
+        );
+        assert_eq!(
+            generated.matches("PostEditor . allows_write (").count(),
+            1,
+            "the writes are const-checked against the grant, once"
+        );
+        assert!(
+            generated
+                .contains("PostEditor . allows_write (PgPostRepository :: __AUTUMN_MODEL_IDENT)"),
+            "the write subject is the model ident: {generated}"
+        );
+        assert_eq!(
+            generated
+                .matches(
+                    "PostEditor . allows_writes_all (PgPostRepository :: __AUTUMN_CASCADE_3 . models)"
+                )
+                .count(),
+            1,
+            "the delete tool is checked against its cascade"
+        );
+    }
+
+    #[test]
+    fn a_granted_read_only_repository_has_no_write_assertion() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp = "read", grant = PostEditor },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(generated.matches("AgentAuthorityDescriptor").count(), 2);
+        assert_eq!(generated.matches("allows_write").count(), 0);
+    }
+
+    #[test]
+    fn an_ungranted_repository_emits_no_authority() {
+        let generated = repository_macro(
+            quote! { Post, api = "/api/posts", mcp },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert_eq!(generated.matches("AgentAuthority").count(), 0);
+    }
+
+    #[test]
     fn repository_macro_mcp_flags_all_five_crud_api_docs() {
         let generated = repository_macro(
             quote! { Post, api = "/api/posts", mcp },
@@ -22251,9 +23971,56 @@ mod tests {
             "hooked versioned save_many must record history for each inserted record before moving chunk results: {section}"
         );
         assert!(
-            section.contains("ctx . actor . clone"),
+            section.contains("ctx . actor . as_deref ()"),
             "hooked versioned save_many history should use the per-record MutationContext: {section}"
         );
+    }
+
+    /// The version-history actor is only read as `&str`, so both the hooked
+    /// (`ctx.actor`) and non-hooked (`Current::actor()`) paths borrow it and
+    /// fall back to the `&'static` `SYSTEM_ACTOR` — no per-write `String`.
+    #[test]
+    fn versioned_history_actor_is_borrowed_not_reallocated() {
+        for (args, actor_source) in [
+            (
+                quote! { Post, versioned = true },
+                "let __vh_actor_scoped : :: core :: option :: Option < :: std :: string :: String > = :: autumn_web :: current :: Current :: actor () ;",
+            ),
+            (
+                quote! { Post, hooks = PostHooks, versioned = true },
+                "let __vh_actor : & str = ctx . actor . as_deref ()",
+            ),
+        ] {
+            let generated =
+                repository_macro(args, quote! { pub trait PostRepository {} }).to_string();
+            assert!(generated.contains("append_version_history"), "{generated}");
+            assert!(
+                !generated.contains("SYSTEM_ACTOR . to_string ()"),
+                "the SYSTEM_ACTOR fallback must stay a &'static str: {generated}"
+            );
+            assert!(
+                !generated.contains("ctx . actor . clone ()"),
+                "the hooked actor must be borrowed from ctx: {generated}"
+            );
+            assert!(
+                !generated.contains("__vh_actor . as_str ()"),
+                "the actor binding is already a &str: {generated}"
+            );
+            assert!(
+                generated.contains(
+                    ". unwrap_or (:: autumn_web :: version_history :: VersionEntry :: SYSTEM_ACTOR) ;"
+                ),
+                "the actor must still fall back to SYSTEM_ACTOR: {generated}"
+            );
+            assert!(
+                generated.contains("actor : __vh_actor ,"),
+                "the version-history write must take the borrowed actor: {generated}"
+            );
+            assert!(
+                generated.contains(actor_source),
+                "the actor must be read from `{actor_source}`: {generated}"
+            );
+        }
     }
 
     #[test]
@@ -22712,44 +24479,41 @@ mod tests {
     }
 
     #[test]
-    fn repository_macro_delete_many_hooked_root_loop_skips_already_deleted_roots() {
-        // Codex round-5-B: for a HOOKED bulk parent, the root `before_delete` loop
-        // must run AFTER the cascade and skip any root already cascade-deleted as
-        // another root's descendant (present in `__autumn_deleted`) — otherwise that
-        // root's `before_delete` would fire twice (once as the cascaded descendant,
-        // once as the batch root). A `destroy` self-reference exercises the case.
+    fn repository_macro_delete_many_hooks_roots_between_probe_and_cascade() {
+        // #2427: a HOOKED bulk parent runs, in order: the read-only probe pass,
+        // each root's `before_delete` (marking the root as hooked), then the
+        // mutating cascade. So a `restrict` 409 fires no hook, a parent veto
+        // fires no child hook, and a root that is also another root's
+        // descendant is hooked once (the leaf skips the marked root's hook).
         let generated = repository_macro(
             quote! { Node, hooks = NodeHooks, dependent(PgNodeRepository, fk = "parent_id", on_delete = destroy) },
             quote! { pub trait NodeRepository {} },
         )
         .to_string();
         let section = delete_many_section(&generated);
-        assert!(
-            section.contains(
-                "if __autumn_deleted . contains (& (\"nodes\" , record . id)) { continue ; }"
-            ),
-            "round-5-B: the hooked bulk-root loop must skip a root already \
-             cascade-deleted before firing its before_delete: {section}"
-        );
-        // The skip guard must sit at the TOP of the root loop, before before_delete.
-        let skip_pos = section
-            .find("if __autumn_deleted . contains (& (\"nodes\" , record . id))")
-            .expect("root skip guard present");
+        let probe_pos = section
+            .find("DependentAction :: Probe")
+            .expect("bulk probe pass present");
         let before_delete_pos = section
             .find("before_delete")
             .expect("root loop fires before_delete");
+        let mark_pos = section
+            .find("concat ! (\"nodes\" , \"#hooked\")")
+            .expect("root loop marks each hooked root");
+        let mutating_pos = section
+            .find("DependentAction :: Destroy")
+            .expect("bulk mutating cascade present");
         assert!(
-            skip_pos < before_delete_pos,
-            "round-5-B: the __autumn_deleted skip must precede the root before_delete: {section}"
+            probe_pos < before_delete_pos
+                && before_delete_pos < mark_pos
+                && mark_pos < mutating_pos,
+            "#2427: order must be probe, root hook, root mark, mutating cascade: {section}"
         );
-        // And the cascade must precede that loop so `__autumn_deleted` is populated.
-        let cascade_pos = section
-            .find("__autumn_apply_dependent_on_conn")
-            .expect("cascade present");
+        // The leaf skips the hook and the commit enqueue for a marked root.
+        let destroy_arm = dependent_destroy_arm(&generated);
         assert!(
-            cascade_pos < before_delete_pos,
-            "round-5-B: the cascade must run before the root before_delete loop so a \
-             cascade-deleted root is already recorded: {section}"
+            destroy_arm.contains("concat ! (\"nodes\" , \"#hooked\")"),
+            "#2427: the leaf must skip the hook of a root the bulk loop hooked: {destroy_arm}"
         );
     }
 
@@ -22977,6 +24741,22 @@ mod tests {
     }
 
     #[test]
+    fn repository_macro_position_accepts_a_repository_attribute_dependent() {
+        // #2427: `position(...)` once rejected `dependent(...)` as "untested".
+        // A move never deletes a row, so the two do not interact.
+        let generated = repository_macro(
+            quote! { Card, position, dependent(PgNoteRepository, fk = "card_id", on_delete = destroy) },
+            quote! { pub trait CardRepository {} },
+        )
+        .to_string();
+        assert!(
+            !generated.contains("compile_error"),
+            "position(...) plus dependent(...) must expand: {generated}"
+        );
+        assert!(generated.contains("PgNoteRepository"));
+    }
+
+    #[test]
     fn repository_macro_dependent_destroy_positioned_skips_fast_path() {
         // Codex review, PR #2647: a `position(...)` child must keep the
         // per-row loop even though it has none of the other disqualifiers --
@@ -22986,11 +24766,8 @@ mod tests {
         // a time (see this file's `delete_chunk_size` guard, which forces
         // single-row chunks for the identical reason), so a batched delete
         // here would leave the survivors' ranks gapped or duplicated.
-        // `position(...)` does not yet support a repo's OWN `dependent(...)`
-        // (an unrelated, pre-existing restriction), so this checks the
-        // unconditionally-generated Destroy arm on a bare `position` leaf
-        // instead of pairing it with grandchildren like the sibling tests
-        // above do.
+        // This checks the unconditionally-generated Destroy arm on a bare
+        // `position` leaf, with no grandchildren.
         let generated = repository_macro(
             quote! { Comment, position },
             quote! { pub trait CommentRepository {} },
@@ -23425,8 +25202,8 @@ mod tests {
 
     #[test]
     fn repository_macro_bulk_root_skip_uses_all_handled_not_physical_set() {
-        // #1800 case 1: the bulk `delete_many` root dedup guards — the Phase-2 root
-        // skip and the HOOKED root loop skip — must consult the "all handled"
+        // #1800 case 1: the bulk `delete_many` root dedup guard — the Phase-2 root
+        // skip — must consult the "all handled"
         // `__autumn_deleted` set (which records soft AND physical deletes), NOT the
         // physical-only set. Otherwise a soft-deleted descendant that is also a batch
         // root would not be skipped and its `before_delete` would fire twice. The
@@ -23445,10 +25222,11 @@ mod tests {
             "#1800: the bulk Phase-2 root skip must consult the all-handled \
              __autumn_deleted set: {section}"
         );
+        // The hooked root loop no longer needs a skip: it runs before the cascade,
+        // so no root is deleted yet. It marks each root in `__autumn_deleted`.
         assert!(
-            section.contains("__autumn_deleted . contains (& (\"nodes\" , record . id))"),
-            "#1800: the hooked bulk-root hook loop skip must consult the all-handled \
-             __autumn_deleted set: {section}"
+            section.contains("__autumn_deleted . insert"),
+            "#2427: the hooked bulk-root loop must mark each root it hooks: {section}"
         );
         // The physical-only set is threaded into the bulk cascade calls (so the leaf
         // executor's diamond revisit-skip has it) but is NOT what the bulk-root dedup
@@ -23516,6 +25294,122 @@ mod tests {
         assert!(
             destroy_arm.contains("if __physical . contains"),
             "#1800: the Phase-2 diamond revisit-skip must consult __physical: {destroy_arm}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_destroy_legs_are_probed_before_the_parent_hook() {
+        // #2427: every `destroy` leg is walked read-only (`Probe`) in the up-front
+        // pass, before the parent `before_delete` hook and before any mutating leg.
+        // Covers the repository-attribute and the model-declared branch.
+        let repo_attr = repository_macro(
+            quote! { Post, hooks = PostHooks, dependent(PgCommentRepository, fk = "post_id", on_delete = destroy) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&repo_attr);
+        let probe_pos = section
+            .find("DependentAction :: Probe")
+            .expect("the destroy leg must be probed");
+        let hook_pos = section
+            .find("self . hooks . before_delete")
+            .expect("the parent hook must be emitted");
+        let destroy_pos = section
+            .find("DependentAction :: Destroy")
+            .expect("the destroy leg must cascade");
+        assert!(
+            probe_pos < hook_pos && hook_pos < destroy_pos,
+            "#2427 (repo-attribute): probe, then parent hook, then cascade: {section}"
+        );
+
+        let model_side = repository_macro(
+            quote! { Post, hooks = PostHooks },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let section = delete_by_id_section(&model_side);
+        let runtime = &section[section
+            .find("__autumn_path . insert")
+            .expect("runtime cascade arm present")..];
+        let probe_pos = runtime
+            .find("filter_map (| __s | __s . probe)")
+            .expect("the runtime cascade must probe each leg");
+        let hook_pos = runtime
+            .find("self . hooks . before_delete")
+            .expect("the parent hook must be emitted");
+        assert!(
+            probe_pos < hook_pos,
+            "#2427 (model-declared): probe must precede the parent hook: {runtime}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_probe_arm_is_read_only_and_cycle_safe() {
+        // #2427: the `Probe` arm locks the child ids like the Destroy arm, probes
+        // restricts, recurses into destroy legs, and writes nothing. It guards
+        // cycles with a push/pop on `__path`.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy), dependent(PgGuardRepository, fk = "comment_id", on_delete = restrict) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let helper = dependent_helper_body(&generated);
+        let start = helper
+            .find("DependentAction :: Probe =>")
+            .expect("probe arm present");
+        let arm = &helper[start..];
+        let arm = &arm[..arm
+            .find("DependentAction :: Destroy =>")
+            .unwrap_or(arm.len())];
+        assert!(
+            arm.contains("FOR UPDATE"),
+            "probe must lock child ids: {arm}"
+        );
+        assert!(
+            arm.contains("DependentAction :: Probe") && arm.contains("DependentAction :: Restrict"),
+            "probe must recurse into destroy legs and probe restrict legs: {arm}"
+        );
+        assert!(
+            arm.contains("__path . insert") && arm.contains("__path . remove"),
+            "probe must push and pop the active path: {arm}"
+        );
+        assert!(
+            arm.contains("#probed"),
+            "probe must record probed rows, or a diamond costs 2^depth reads: {arm}"
+        );
+        for write in [
+            "diesel :: delete",
+            "diesel :: update",
+            "before_delete",
+            "__physical . insert",
+        ] {
+            assert!(
+                !arm.contains(write),
+                "probe must not write ({write}): {arm}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_macro_probe_skips_a_leg_with_nothing_below_it() {
+        // #2427: a leaf with no restrict or destroy leg has nothing to probe, so
+        // its probe arm must not read or lock the child rows.
+        let generated = repository_macro(
+            quote! { Comment, dependent(PgReplyRepository, fk = "comment_id", on_delete = delete_all) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let helper = dependent_helper_body(&generated);
+        let start = helper
+            .find("DependentAction :: Probe =>")
+            .expect("probe arm present");
+        let arm = &helper[start..];
+        let arm = &arm[..arm
+            .find("DependentAction :: Destroy =>")
+            .unwrap_or(arm.len())];
+        assert!(
+            !arm.contains("FOR UPDATE"),
+            "no select for an empty probe: {arm}"
         );
     }
 
@@ -23683,6 +25577,138 @@ mod tests {
         );
     }
 
+    /// The cascade's topic and dom id expressions already yield owned
+    /// `String`s, so the accumulated `(topic, dom_id)` pair takes them as-is
+    /// instead of copying each through `ToString::to_string(&..)` per row.
+    #[test]
+    fn repository_macro_dependent_destroy_broadcast_does_not_recopy_topic_or_dom_id() {
+        let generated = repository_macro(
+            quote! { Comment, broadcasts = true, dependent(PgReplyRepository, fk = "comment_id", on_delete = destroy) },
+            quote! { pub trait CommentRepository {} },
+        )
+        .to_string();
+        let destroy_arm = dependent_destroy_arm(&generated);
+        assert!(
+            destroy_arm.contains("__ret_broadcasts . push"),
+            "{destroy_arm}"
+        );
+        assert!(
+            !destroy_arm.contains("ToString :: to_string (&"),
+            "the cascade must not copy an already-owned topic / dom id: {destroy_arm}"
+        );
+        // The pushed values themselves are unchanged: the static topic and the
+        // model's own `LiveFragment::dom_id`.
+        assert!(
+            destroy_arm.contains(
+                "let __del_topic : :: std :: string :: String = :: std :: string :: ToString :: to_string (\"comments\") ;"
+            ),
+            "{destroy_arm}"
+        );
+        assert!(
+            destroy_arm.contains(
+                "let __del_id : :: std :: string :: String = < Comment as :: autumn_web :: live :: LiveFragment > :: dom_id (__broadcast_rec) ;"
+            ),
+            "{destroy_arm}"
+        );
+    }
+
+    /// A static broadcast topic and the create container are spliced as
+    /// `&'static str` literals at the publish sites that only borrow them,
+    /// rather than re-owned per publish — on both the inline (`--live`) path
+    /// and the commit-hook runner.
+    #[test]
+    fn repository_macro_broadcast_static_topic_and_container_are_borrowed() {
+        for args in [
+            quote! { Post, broadcasts = true },
+            quote! { Post, hooks = PostHooks, commit_hooks = true, broadcasts = true },
+        ] {
+            let generated =
+                repository_macro(args, quote! { pub trait PostRepository {} }).to_string();
+            assert!(
+                generated.contains("let __topic = \"posts\" ;"),
+                "a static topic must be borrowed at the publish site: {generated}"
+            );
+            assert!(
+                !generated.contains(
+                    "let __topic = :: std :: string :: ToString :: to_string (\"posts\")"
+                ),
+                "a static topic must not be re-owned per publish: {generated}"
+            );
+            assert!(
+                generated.contains("let __create_id : & str = \"posts-list\" ;")
+                    && !generated.contains("\"posts-list\" . to_string ()"),
+                "the create container must be a borrowed literal: {generated}"
+            );
+            assert!(
+                generated.contains("publish_oob (& __topic , __create_id ,"),
+                "the create publish must pass the borrowed container id: {generated}"
+            );
+        }
+    }
+
+    /// A tenant-scoped static topic still formats as `tenant:{id}:{topic}`; only
+    /// the inner topic argument is now the literal rather than a fresh `String`.
+    #[test]
+    fn repository_macro_broadcast_tenant_scoped_static_topic_formats_the_literal() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, broadcasts = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("\"tenant:{}:{}\""),
+            "a tenant-scoped topic keeps its tenant prefix: {generated}"
+        );
+        assert!(
+            generated.contains("__record_ref . tenant_id) , \"posts\")"),
+            "the static base topic is a format! argument literal: {generated}"
+        );
+    }
+
+    /// `generate_topic_ref` only diverges from `generate_topic_format` for a
+    /// topic without `{`: that one becomes its own literal. Placeholder topics
+    /// and an unclosed `{` keep the owned expression, byte-for-byte.
+    #[test]
+    fn generate_topic_ref_borrows_only_static_topics() {
+        let record = quote! { __record_ref };
+        assert_eq!(
+            generate_topic_ref("posts", &record)
+                .expect("static topic")
+                .to_string(),
+            "\"posts\""
+        );
+        assert_eq!(
+            generate_topic_format("posts", &record)
+                .expect("static topic")
+                .to_string(),
+            ":: std :: string :: ToString :: to_string (\"posts\")",
+            "the owned form, still used by String-typed slots, is unchanged"
+        );
+        // A `}` alone is not a placeholder: the literal is the same bytes the
+        // owned form copies.
+        assert_eq!(
+            generate_topic_ref("a}b", &record)
+                .expect("static topic")
+                .to_string(),
+            "\"a}b\""
+        );
+        for topic in ["feed:{category}", "a{b", "{tenant}:{category}"] {
+            assert_eq!(
+                generate_topic_ref(topic, &record)
+                    .expect("valid topic")
+                    .to_string(),
+                generate_topic_format(topic, &record)
+                    .expect("valid topic")
+                    .to_string(),
+                "`{topic}` must keep the owned expression"
+            );
+        }
+        assert!(
+            generate_topic_ref("{}", &record).is_err(),
+            "an empty placeholder is still rejected"
+        );
+    }
+
     #[test]
     fn repository_generates_typed_list_method() {
         // #1126: `list()` is generated alongside `page()` and delegates
@@ -23774,6 +25800,182 @@ mod tests {
                 && body
                     .contains("__page_q = __page_q . filter (posts :: author_id . eq (owner_id))"),
             "list_scoped must filter both __count_q and __page_q by owner: {body}"
+        );
+    }
+
+    /// Returns the body of the generated `async fn <name>` up to the next
+    /// `async fn`, so a check cannot read into the next method.
+    fn generated_method_body<'a>(generated: &'a str, name: &str) -> &'a str {
+        let needle = format!("async fn {name} (");
+        let start = generated
+            .find(&needle)
+            .unwrap_or_else(|| panic!("`{name}` impl not found: {generated}"));
+        let rest = &generated[start + needle.len()..];
+        let end = rest.find("async fn ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn repository_list_rows_is_one_count_free_statement() {
+        // #2185: `list_rows` is `list` without the `COUNT(*)` and without the
+        // offset. It loads up to `limit` rows in one statement.
+        let generated =
+            repository_macro(quote! { Post }, quote! { pub trait PostRepository {} }).to_string();
+        assert!(
+            generated.contains("fn list_rows (& self , query : & :: autumn_web :: pagination :: ListQuery , limit : usize"),
+            "repository must declare `list_rows(query, limit)`: {generated}"
+        );
+        let body = generated_method_body(&generated, "list_rows");
+        assert!(
+            body.contains("Post :: __autumn_list_apply_filters")
+                && body.contains("Post :: __autumn_list_apply_order"),
+            "list_rows must use the same allowlist helpers as list: {body}"
+        );
+        assert!(
+            !body.contains(". count ()"),
+            "list_rows must not run a COUNT(*): {body}"
+        );
+        assert!(
+            !body.contains(". offset ("),
+            "list_rows must read from the first row, with no offset: {body}"
+        );
+        assert!(
+            body.contains(". limit (__limit)"),
+            "list_rows must bound the read with the caller's limit: {body}"
+        );
+        assert!(
+            body.contains("< i64 as :: core :: convert :: TryFrom < usize >> :: try_from (limit)"),
+            "list_rows must convert the limit without a wrapping cast: {body}"
+        );
+        assert!(
+            body.contains("__autumn_acquire_read_conn"),
+            "list_rows must keep the read routing of list: {body}"
+        );
+        assert_eq!(
+            body.matches(". load :: <").count(),
+            1,
+            "list_rows must issue exactly one statement: {body}"
+        );
+        assert!(
+            !generated.contains("list_scoped_rows"),
+            "no `owner =` attr must emit no owner-scoped methods: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_list_rows_keeps_the_soft_delete_filter_of_list() {
+        // #2185: the export must not show rows the index hides.
+        let generated = repository_macro(
+            quote! { Post, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let list = generated_method_body(&generated, "list");
+        let rows = generated_method_body(&generated, "list_rows");
+        let filter = "posts :: deleted_at . is_null ()";
+        assert!(list.contains(filter), "list premise changed: {list}");
+        assert!(
+            rows.contains(filter),
+            "list_rows must exclude soft-deleted rows like list: {rows}"
+        );
+    }
+
+    #[test]
+    fn repository_list_rows_keeps_the_tenant_filter_of_list() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let rows = generated_method_body(&generated, "list_rows");
+        assert!(
+            rows.contains("CURRENT_TENANT")
+                && rows.contains("posts :: tenant_id . eq (t . clone ())"),
+            "list_rows must scope to the current tenant like list: {rows}"
+        );
+    }
+
+    #[test]
+    fn repository_list_rows_keeps_the_cross_shard_guard_of_list() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let rows = generated_method_body(&generated, "list_rows");
+        assert!(
+            rows.contains("cross-shard list_rows is not supported"),
+            "list_rows must reject a cross-shard read like list: {rows}"
+        );
+    }
+
+    #[test]
+    fn repository_list_rows_rejects_across_tenants_without_a_shard_set() {
+        // A sharded repository built without shard context (e.g.
+        // `with_pool_untracked`) has one pool. An across-tenant read there drops
+        // the tenant filter and reads that one shard: a partial result with no
+        // error. Reject it, as the derived reads do (#1741).
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, sharded, owner = author_id },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        for method in ["list_rows", "list_scoped_rows"] {
+            let body = generated_method_body(&generated, method);
+            let guard = body
+                .find("if self . across_tenants")
+                .unwrap_or_else(|| panic!("{method} must check across_tenants: {body}"));
+            let no_shards = body
+                .find("if self . __autumn_shards . is_none ()")
+                .unwrap_or_else(|| panic!("{method} must check for a missing shard set: {body}"));
+            let read = body
+                .find("__autumn_acquire_read_conn")
+                .unwrap_or_else(|| panic!("{method} must read through the routed pool: {body}"));
+            assert!(
+                guard < no_shards && no_shards < read,
+                "{method} must reject a shardless across-tenant read before it reads: {body}"
+            );
+            assert!(
+                body.contains(&format!(
+                    "cross-shard {method} requires a configured shard set"
+                )),
+                "{method} must name the missing shard set: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn repository_owner_scoped_list_rows_filters_owner_before_the_allowlist() {
+        // #2185: the owner-scoped export reads through `list_scoped_rows`. The
+        // owner filter comes before the request filters, so `filter[..]` can
+        // only narrow the owner's rows.
+        let generated = repository_macro(
+            quote! { Post, owner = author_id, soft_delete },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("fn list_scoped_rows (& self , owner_id : i64 , query : & :: autumn_web :: pagination :: ListQuery , limit : usize"),
+            "owner-scoped repository must declare `list_scoped_rows`: {generated}"
+        );
+        let body = generated_method_body(&generated, "list_scoped_rows");
+        let owner = body
+            .find("posts :: author_id . eq (owner_id)")
+            .unwrap_or_else(|| panic!("list_scoped_rows must filter by owner: {body}"));
+        let allowlist = body
+            .find("Post :: __autumn_list_apply_filters")
+            .unwrap_or_else(|| panic!("list_scoped_rows must apply the allowlist: {body}"));
+        assert!(
+            owner < allowlist,
+            "the owner filter must come before the request filters: {body}"
+        );
+        assert!(
+            body.contains("posts :: deleted_at . is_null ()"),
+            "list_scoped_rows must exclude soft-deleted rows: {body}"
+        );
+        assert!(
+            !body.contains(". count ()") && !body.contains(". offset ("),
+            "list_scoped_rows must be one count-free read: {body}"
         );
     }
 
@@ -24588,12 +26790,75 @@ mod tests {
         let generated =
             repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
         assert!(
-            generated.contains("SpezNormalize (new) . spez_normalize ()"),
+            generated.contains("SpezNormalize (new)) . spez_normalize_insert ()"),
             "save must normalize the New input before persisting: {generated}"
         );
+        assert_eq!(
+            generated
+                .matches("SpezNormalize (new)) . spez_normalize_insert_many ()")
+                .count(),
+            2,
+            "save_many and save_many_skip_invalid must normalize each New input: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_insert_probe_checks_noop_marker_first() {
+        // #2692: every `New*` implements `Normalize`, so the clone arm alone
+        // would always win. The probe starts at `&&SpezNormalize` so the
+        // `NormalizeNoop` arm wins first and returns the borrow (#2634).
+        let generated =
+            repository_macro(quote! { User }, quote! { pub trait UserRepository {} }).to_string();
+        // One `&` lets the clone arm win for every generated `New*`.
+        assert_eq!(
+            generated.matches("SpezNormalize (new)").count(),
+            generated
+                .matches("(&& :: autumn_web :: normalize :: SpezNormalize (new))")
+                .count(),
+            "every insert probe must start at `&&SpezNormalize`: {generated}"
+        );
+        assert_eq!(
+            generated
+                .matches("(&& :: autumn_web :: normalize :: SpezNormalize (new))")
+                .count(),
+            3,
+            "save, save_many and save_many_skip_invalid must each probe once: {generated}"
+        );
         assert!(
-            generated.contains("SpezNormalize (new) . spez_normalize_many ()"),
-            "save_many must normalize each New input before persisting: {generated}"
+            generated.contains("SpezNormalizeNoop as _"),
+            "save must import the no-op arm: {generated}"
+        );
+        assert!(
+            generated.contains("SpezNormalizeManyNoop as _"),
+            "save_many must import the no-op arm: {generated}"
+        );
+
+        let generated = repository_macro(
+            quote! { Post },
+            quote! {
+                pub trait PostRepository {
+                    fn find_or_create_by_slug(&self, slug: String, new: &NewPost);
+                }
+            },
+        )
+        .to_string();
+        let start = generated
+            .find("pub async fn find_or_create_by_slug")
+            .expect("must generate find_or_create_by_slug");
+        assert!(
+            generated[start..].contains("pub async fn preload"),
+            "`preload` must follow, or the section runs to the end: {generated}"
+        );
+        let section = section_between(
+            &generated,
+            "pub async fn find_or_create_by_slug",
+            "pub async fn preload",
+        );
+        assert!(
+            section.contains(
+                "(&& :: autumn_web :: normalize :: SpezNormalize (new)) . spez_normalize_insert ()"
+            ) && section.contains("SpezNormalizeNoop as _"),
+            "find_or_create_by_* must use the three-arm probe: {section}"
         );
     }
 
@@ -24854,7 +27119,7 @@ mod tests {
             "tenant_id : __vh_tenant_id",
             "record_id : __vh_record_id",
             "op : :: autumn_web :: version_history :: VersionOp :: Insert",
-            "actor : __vh_actor . as_str ()",
+            "actor : __vh_actor ,",
             "request_id : __vh_request_id",
             "changes_json : __vh_changes_str . as_str ()",
         ] {
@@ -27062,6 +29327,146 @@ mod tests {
     }
 
     #[test]
+    fn ledgered_parses_a_schema_version_and_an_upcast_hook() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered(schema_version = 3, upcast = legacy::upcast_post)"
+                .parse()
+                .unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.ledger_schema_version, 3);
+        let path = config.ledger_upcast.expect("the hook path");
+        assert_eq!(quote! { #path }.to_string(), "legacy :: upcast_post");
+    }
+
+    #[test]
+    fn ledgered_defaults_to_schema_version_one_with_no_hook() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered = true".parse().unwrap();
+        let config = parse_repo_args(tokens).unwrap();
+        assert_eq!(config.ledger_schema_version, 1);
+        assert!(config.ledger_upcast.is_none());
+    }
+
+    #[test]
+    fn ledgered_rejects_schema_version_zero() {
+        let tokens: proc_macro2::TokenStream = "Post, soft_delete, ledgered(schema_version = 0)"
+            .parse()
+            .unwrap();
+        let msg = parse_repo_args(tokens)
+            .err()
+            .expect("version 0 names no shape")
+            .to_string();
+        assert!(msg.contains("schema_version = 0"), "{msg}");
+    }
+
+    #[test]
+    fn ledgered_rejects_an_upcast_hook_that_could_never_run() {
+        for args in [
+            "Post, soft_delete, ledgered(upcast = f)",
+            "Post, soft_delete, ledgered(schema_version = 1, upcast = f)",
+        ] {
+            let tokens: proc_macro2::TokenStream = args.parse().unwrap();
+            let msg = parse_repo_args(tokens)
+                .err()
+                .expect("a hook needs an older version to convert")
+                .to_string();
+            assert!(msg.contains("schema_version = 2"), "{args}: {msg}");
+        }
+    }
+
+    #[test]
+    fn ledgered_rejects_a_non_numeric_schema_version() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered(schema_version = \"2\")"
+                .parse()
+                .unwrap();
+        assert!(parse_repo_args(tokens).is_err());
+    }
+
+    #[test]
+    fn ledgered_rejects_a_schema_version_that_overflows() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered(schema_version = 99999999999)"
+                .parse()
+                .unwrap();
+        assert!(parse_repo_args(tokens).is_err());
+    }
+
+    #[test]
+    fn schema_options_need_the_ledger() {
+        let tokens: proc_macro2::TokenStream =
+            "Post, soft_delete, ledgered(schema_version = 2), ledgered = false"
+                .parse()
+                .unwrap();
+        let msg = parse_repo_args(tokens)
+            .err()
+            .expect("options without the ledger do nothing")
+            .to_string();
+        assert!(msg.contains("no effect without the ledger"), "{msg}");
+    }
+
+    #[test]
+    fn repository_macro_stamps_the_schema_version_before_the_append() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered(schema_version = 3, upcast = upcast_post) },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        // Each append site stamps first. So the first stamp comes before the
+        // first append, and the counts match.
+        let stamp = generated
+            .find("stamp_schema_version")
+            .expect("each snapshot is stamped");
+        let append = generated
+            .find("ledger :: append_revision (")
+            .expect("the revision is appended");
+        assert!(stamp < append, "the stamp must come before the append");
+        assert_eq!(
+            generated
+                .matches("ledger :: stamp_schema_version (")
+                .count(),
+            generated.matches("ledger :: append_revision (").count(),
+            "every append site stamps its snapshot"
+        );
+        assert!(
+            generated.contains("const LEDGER_SCHEMA_VERSION : u32 = 3"),
+            "the record impl declares the version: {generated}"
+        );
+        assert!(
+            generated.contains("upcast_post (from_version , snapshot)"),
+            "the record impl calls the hook: {generated}"
+        );
+    }
+
+    #[test]
+    fn repository_macro_upcasts_before_it_decodes_and_before_the_live_check() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let upcast = generated
+            .find("Self :: __autumn_ledger_upcast (")
+            .expect("the read path upcasts");
+        let decode = generated[upcast..]
+            .find("__autumn_commit_hook_from_value")
+            .expect("the model is decoded after the upcast");
+        assert!(decode > 0);
+        assert!(
+            generated.contains("ledger :: upcast_snapshot"),
+            "the helper runs the shared upcast: {generated}"
+        );
+        assert!(
+            generated.contains("snapshots_agree"),
+            "the live check compares the columns both shapes have: {generated}"
+        );
+        assert!(
+            !generated.contains("const LEDGER_SCHEMA_VERSION"),
+            "a version 1 model keeps the trait default: {generated}"
+        );
+    }
+
+    #[test]
     fn repository_macro_ledgered_omits_purge() {
         let generated = repository_macro(
             quote! { Post, soft_delete, ledgered = true },
@@ -27170,6 +29575,7 @@ mod tests {
 
         for method in [
             "ledger_revisions",
+            "ledger_revisions_page",
             "ledger_as_of",
             "ledger_as_of_at",
             "ledger_diff",
@@ -27202,6 +29608,203 @@ mod tests {
             "without valid_time = \"...\" the model takes the default \
              (valid time == transaction time): {generated}"
         );
+    }
+
+    fn ledger_append_for(op: &str) -> String {
+        ledger_append_ts(
+            "posts",
+            op,
+            &quote! { record },
+            Some(&quote! { before }),
+            &quote! { conn },
+            &format_ident!("Post"),
+        )
+        .to_string()
+    }
+
+    #[test]
+    fn ledger_append_stamps_delete_and_restore_with_the_mutation_instant() {
+        // #2326: a delete or restore must not inherit the row's old valid time.
+        for op in ["delete", "restore"] {
+            let generated = ledger_append_for(op);
+            assert!(
+                !generated.contains("ledger_valid_from"),
+                "`{op}` must take the mutation instant, not the record's valid time: {generated}"
+            );
+        }
+        for op in ["insert", "update"] {
+            assert!(
+                ledger_append_for(op).contains("ledger_valid_from (& __lg_row)"),
+                "`{op}` must read the valid time of the reloaded row"
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_append_refuses_a_non_finite_float_before_hashing() {
+        // #2326: the check must run before the snapshot is taken.
+        for op in ["insert", "update", "delete", "restore"] {
+            // A trigger may write the float, so check the reloaded row.
+            assert!(
+                ledger_append_for(op).contains("__lg_row . __autumn_ledger_non_finite_column"),
+                "`{op}` must check the reloaded row"
+            );
+        }
+        // A delete or restore writes no float, so a legacy value that was there
+        // before the write is not refused: the check is gated on the pre-write
+        // row. A delete's record is its pre-delete load; a restore has `before`.
+        assert!(
+            ledger_append_for("delete")
+                .contains("if (record) . __autumn_ledger_non_finite_column () . is_none ()"),
+            "{}",
+            ledger_append_for("delete")
+        );
+        assert!(
+            ledger_append_for("restore")
+                .contains("if (before) . __autumn_ledger_non_finite_column () . is_none ()"),
+            "{}",
+            ledger_append_for("restore")
+        );
+        for op in ["insert", "update"] {
+            assert!(
+                !ledger_append_for(op).contains(". is_none ()"),
+                "`{op}` refuses any non-finite value"
+            );
+        }
+        let generated = ledger_append_for("update");
+        let check = generated
+            .find("__autumn_ledger_non_finite_column")
+            .expect("every ledger append must check for non-finite floats");
+        let snapshot = generated
+            .find("__autumn_commit_hook_to_value")
+            .expect("snapshot is taken");
+        assert!(
+            check < snapshot,
+            "check must precede the snapshot: {generated}"
+        );
+    }
+
+    #[test]
+    fn ledger_append_refuses_a_tenant_change_on_every_mutation() {
+        // #2319: a chain belongs to one tenant. An AFTER trigger can rewrite
+        // `tenant_id` on any write, and no `RETURNING` row shows it, so every
+        // write reloads the row, checks its tenant, and snapshots that row.
+        for op in ["insert", "update", "delete", "restore"] {
+            let generated = ledger_append_for(op);
+            let reload = generated.find("__lg_after").expect("reloads the row");
+            let check = generated[reload..]
+                .find("refuse_tenant_change")
+                .map(|at| reload + at)
+                .expect("checks the reloaded row");
+            let snapshot = generated
+                .find("__lg_row . __autumn_commit_hook_to_value")
+                .expect("snapshots the reloaded row");
+            assert!(reload < check && check < snapshot, "{op}: {generated}");
+            assert_eq!(
+                generated.matches("__autumn_commit_hook_to_value").count(),
+                1,
+                "{op}: one snapshot, of the reloaded row"
+            );
+        }
+        // An update or restore also compares the written row with the one
+        // before, which catches a BEFORE trigger the reload cannot.
+        for op in ["update", "restore"] {
+            assert_eq!(
+                ledger_append_for(op)
+                    .matches("refuse_tenant_change")
+                    .count(),
+                2,
+                "{op}"
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_append_reads_the_tenant_from_the_ledgered_record() {
+        // #2319: the writer and the type assertion share one source.
+        let generated = ledger_append_for("insert");
+        assert!(
+            generated.contains("LedgeredRecord > :: ledger_tenant_id"),
+            "{generated}"
+        );
+        assert!(!generated.contains("version_tenant_id"), "{generated}");
+    }
+
+    #[test]
+    fn a_tenant_scoped_ledgered_record_reads_a_non_null_tenant() {
+        let generated = repository_macro(
+            quote! { Post, tenant_scoped, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("LedgerTenantColumn :: ledger_tenant_id (& self . tenant_id)"),
+            "{generated}"
+        );
+
+        let untenanted = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(!untenanted.contains("LedgerTenantColumn"), "{untenanted}");
+    }
+
+    #[test]
+    fn a_ledgered_repository_rejects_a_derived_delete() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! {
+                pub trait PostRepository {
+                    fn delete_by_title(title: String) -> ();
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("cannot declare a derived `delete_by_*` method"),
+            "{generated}"
+        );
+
+        // Derived reads stay allowed, and an unledgered derived delete too.
+        let reads = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! {
+                pub trait PostRepository {
+                    fn find_by_title(title: String) -> Vec<Post>;
+                }
+            },
+        )
+        .to_string();
+        assert!(!reads.contains("compile_error"), "{reads}");
+        let plain = repository_macro(
+            quote! { Post, soft_delete },
+            quote! {
+                pub trait PostRepository {
+                    fn delete_by_title(title: String) -> ();
+                }
+            },
+        )
+        .to_string();
+        assert!(!plain.contains("compile_error"), "{plain}");
+    }
+
+    #[test]
+    fn ledger_reconstruction_refuses_an_unrecovered_envelope() {
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        assert!(
+            generated.contains("ensure_snapshot_recoverable"),
+            "as-of reconstruction must reject an unrecovered envelope: {generated}"
+        );
+        let guard = generated.find("ensure_snapshot_recoverable").unwrap();
+        let decode = generated[guard..]
+            .find("__autumn_commit_hook_from_value")
+            .expect("the model is decoded after the guard");
+        assert!(decode > 0);
     }
 
     #[test]
@@ -27244,8 +29847,8 @@ mod tests {
         // history's delete entry records the pre-delete load, which would make
         // as-of after a delete report `deleted_at: null`.
         assert!(
-            generated.contains("\"deleted_at\" . to_string ()"),
-            "a ledgered delete revision must snapshot the stored deleted_at: {generated}"
+            generated.contains("__lg_row . __autumn_commit_hook_to_value"),
+            "a ledgered delete revision must snapshot the reloaded row: {generated}"
         );
     }
 
@@ -27321,10 +29924,18 @@ mod tests {
     fn repository_expansion_stays_within_budget() {
         // (label, attribute args, ceiling in bytes of `TokenStream::to_string`)
         let budgets: Vec<(&str, proc_macro2::TokenStream, usize)> = vec![
-            ("plain", quote! { Post }, 80_000),
+            // Raised from 80_000 (#2364): each write descriptor gained a
+            // `cascades_into` field, and each repository one name const.
+            // Understood and intended: about 400 bytes.
+            // Raised from 81_000 (#2520): the graph descriptor gained a
+            // `crate_version` field, an `option_env!` match of about 170
+            // bytes. Understood and intended.
+            ("plain", quote! { Post }, 82_000),
             ("soft_delete", quote! { Post, soft_delete }, 89_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
-            ("api", quote! { Post, api = "/posts" }, 95_000),
+            // Raised from 95_000 (#2451): each repository publishes its
+            // cascade consts. Understood and intended.
+            ("api", quote! { Post, api = "/posts" }, 96_000),
             ("searchable", quote! { Post, searchable }, 98_000),
             ("versioned", quote! { Post, versioned = true }, 128_000),
             // Raised from 201_000 (#2490): `ledger_as_of_at`/`ledger_diff_at`

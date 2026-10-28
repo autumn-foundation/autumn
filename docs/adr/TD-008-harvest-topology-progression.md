@@ -1,7 +1,17 @@
 # TD-008: Harvest Topology Progression From Embedded To External
 
-- Status: Proposed
+- Status: Superseded by ADR-0016 (ownership moved to Autumn Harvest)
+- Date superseded: 2026-10-07
 - Date: 2026-04-09
+
+> **Superseded.** The embedded / split / external topology described here
+> shipped in `autumn-harvest-plugin` (`HarvestMode`, `worker_enabled`,
+> `scheduler_enabled`). Harvest topology is now a Harvest decision, recorded in
+> the [Autumn Harvest repository](https://github.com/autumn-foundation/autumn-harvest).
+> See [ADR-0016](0016-durable-workflows-live-in-harvest.md) for the boundary
+> between Autumn jobs and Harvest. Crate names below (`autumn-web-harvest`,
+> `autumn_web_harvest`) are historical. The shipped crate is
+> `autumn-harvest-plugin`. This record is kept unchanged below for history.
 
 ## Context
 

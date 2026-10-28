@@ -53,7 +53,7 @@ pub use crate::derivation::{DerivationDef, DerivationDescriptor};
 // ── Dependent-cascade primitives (issue #2309 follow-up) ─────────────
 //
 // `dependent(...)` (#1369) generates an `__autumn_apply_dependent_on_conn`
-// method on every repository. Three of its four `DependentAction` arms —
+// method on every repository. Three of its five `DependentAction` arms —
 // restrict, nullify and delete_all — are pure dynamic SQL over a table name and
 // a foreign-key column, both of which are already runtime `&str` values in the
 // generated code. Emitting them per repository (254 lines, four
@@ -181,6 +181,7 @@ pub async fn dependent_nullify<M: 'static>(
 ) -> crate::AutumnResult<()> {
     use diesel_async::RunQueryDsl;
 
+    crate::ledger::refuse_out_of_band_write(table, "dependent nullify")?;
     if has_counter_caches {
         let ids = dependent_child_ids(conn, table, fk_column, parent_id).await?;
         counter_cache_before_detach_many(conn, specs, fk_column, &ids).await?;
@@ -330,6 +331,7 @@ pub async fn dependent_delete_all<M: 'static>(
 ) -> crate::AutumnResult<()> {
     use diesel_async::RunQueryDsl;
 
+    crate::ledger::refuse_out_of_band_write(table, "dependent delete_all")?;
     if has_counter_caches {
         // The id selection below row-locks the children before the
         // counter-cache hook can take the lock that serializes mutations on
@@ -626,6 +628,9 @@ pub enum RepositoryError {
 /// The cascade runs app-side (not via a DB `ON DELETE` constraint) so that
 /// soft-delete, lifecycle/commit hooks, and counter caches stay correct — a
 /// guarantee raw `ON DELETE CASCADE` cannot provide.
+// The hidden `Probe` variant is framework plumbing. The generated cascade matches
+// every variant in the user's crate, so the enum cannot be `#[non_exhaustive]`.
+#[allow(clippy::manual_non_exhaustive)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependentAction {
     /// Delete each child through the child repository's delete path, honoring
@@ -639,6 +644,10 @@ pub enum DependentAction {
     /// Refuse to delete the parent while any child exists, surfacing a typed
     /// `409 Conflict` error instead of orphaning or cascading.
     Restrict,
+    /// Read-only walk of a `destroy` leg. Probes every `restrict` below it,
+    /// and mutates nothing. Framework plumbing, not a user-facing action.
+    #[doc(hidden)]
+    Probe,
 }
 
 /// The boxed, `Send` future a [`RuntimeDependentCascadeFn`] returns.
@@ -716,6 +725,11 @@ pub struct RuntimeDependentSpec {
     pub action: DependentAction,
     /// Type-erased entry into the child repository's cascade leaf executor.
     pub cascade: RuntimeDependentCascadeFn,
+    /// Read-only twin of [`cascade`](RuntimeDependentSpec::cascade).
+    ///
+    /// Set for `destroy` only. It probes every `restrict` below the leg, so the
+    /// parent can reject a blocked delete before any hook fires.
+    pub probe: Option<RuntimeDependentCascadeFn>,
 }
 
 /// Exposes a model's runtime dependent-cascade specs to the parent
@@ -743,6 +757,25 @@ pub trait AutumnDependents {
     fn dependents() -> &'static [RuntimeDependentSpec] {
         &[]
     }
+
+    /// The models a delete of this model also writes, through `dependent`
+    /// associations that are not `restrict`, at depth 0 to 3. Each defaults to
+    /// none; `#[model]` shadows them with inherent consts. Read by the
+    /// agent-authority grant check.
+    #[doc(hidden)]
+    const DEPENDENT_CASCADE_ANY: bool = false;
+    #[doc(hidden)]
+    const DEPENDENT_CASCADE_0: crate::agent_authority::CascadeLevel =
+        crate::agent_authority::CascadeLevel::NONE;
+    #[doc(hidden)]
+    const DEPENDENT_CASCADE_1: crate::agent_authority::CascadeLevel =
+        crate::agent_authority::CascadeLevel::NONE;
+    #[doc(hidden)]
+    const DEPENDENT_CASCADE_2: crate::agent_authority::CascadeLevel =
+        crate::agent_authority::CascadeLevel::NONE;
+    #[doc(hidden)]
+    const DEPENDENT_CASCADE_3: crate::agent_authority::CascadeLevel =
+        crate::agent_authority::CascadeLevel::NONE;
 }
 
 // Blanket fallback — any type without an inherent `dependents()` (i.e. a model
@@ -920,6 +953,9 @@ pub trait ModelPrimaryKey {
 /// lookups with [`M2mConnSource::__autumn_m2m_tenant_scope`] when the target
 /// model carries a `tenant_id` column.
 ///
+/// It also backs the `#[commentable]` helpers. They use
+/// [`M2mConnSource::__autumn_m2m_soft_delete`] for the parent check (#2284).
+///
 /// Not part of the public API; not implemented by hand.
 #[cfg(feature = "db")]
 #[doc(hidden)]
@@ -989,6 +1025,17 @@ pub trait M2mConnSource: Send + Sync {
     /// Returns an error when the repository is `tenant_scoped`, is not in
     /// `across_tenants()` mode, and no tenant context was established.
     fn __autumn_m2m_tenant_scope(&self) -> crate::AutumnResult<::core::option::Option<String>>;
+
+    /// Whether this repository is `#[repository(..., soft_delete)]`, for the
+    /// `#[commentable]` helpers' parent check (#2284).
+    ///
+    /// - `Some(true)` — the helpers ignore a parent with `deleted_at` set.
+    /// - `Some(false)` — the helpers see every parent row, as the finders do.
+    /// - `None` (the default) — unknown. The helpers use the registry rule:
+    ///   filter if any repository of the model soft-deletes.
+    fn __autumn_m2m_soft_delete(&self) -> ::core::option::Option<bool> {
+        ::core::option::Option::None
+    }
 }
 
 /// Which of the three edge mutations a `#[votable]` `react()` call performed

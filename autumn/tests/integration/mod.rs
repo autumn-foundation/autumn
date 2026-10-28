@@ -10,6 +10,8 @@ mod acme_fake_ca;
 #[cfg(feature = "acme-pebble")]
 mod acme_pebble;
 mod acting_as_integration;
+#[cfg(feature = "maud")]
+mod aeo;
 mod after_commit_integration;
 #[cfg(feature = "mcp")]
 mod agent_authority;
@@ -30,8 +32,12 @@ mod boundary_hooks_integration;
 mod broadcast_recorder;
 #[cfg(all(feature = "db", feature = "cache-moka"))]
 mod cache_coherence;
+#[cfg(all(feature = "db", feature = "cache-moka", feature = "test-support"))]
+mod cache_invalidation_after_commit;
 #[cfg(feature = "cache-moka")]
 mod cache_stampede;
+#[cfg(feature = "cache-moka")]
+mod cached_impl_scope;
 #[cfg(all(feature = "db", feature = "cache-moka"))]
 mod cached_tenant_scope;
 mod chaos_cache_jitter_proptest;
@@ -81,10 +87,15 @@ mod config_deprecation;
 mod config_runtime_drift;
 #[cfg(feature = "constela")]
 mod constela;
+mod cost_deferral_durable;
+mod cost_metering;
 #[cfg(feature = "acme")]
 mod custom_domain_issuance;
 mod custom_domains;
 mod custom_layer;
+mod data_capsule;
+#[cfg(feature = "db")]
+mod data_capsule_pg;
 #[cfg(feature = "db")]
 mod data_classification;
 mod db_telemetry_tests;
@@ -95,6 +106,8 @@ mod distributed_lock;
 mod download;
 mod duplicate_route_detection;
 mod edge_conformance_ci_coverage;
+#[cfg(all(feature = "ledger-profile", not(feature = "sqlite")))]
+mod ledger_capsule_profile;
 // The origin-side half of the edge capsule (#1790). `cache-moka` supplies the
 // concrete `Cache` the `CacheEdgeKv` adapter is proven against; the wasm half
 // of the parity claim lives in the example crate's conformance suite, which
@@ -144,9 +157,14 @@ mod failure_capsule_end_to_end;
 mod failure_capsule_overhead;
 #[cfg(all(feature = "reporting", feature = "db", not(feature = "sqlite")))]
 mod failure_capsule_replay;
+#[cfg(all(feature = "reporting", feature = "http-client", feature = "cache-moka"))]
+mod failure_capsule_url_userinfo;
 mod fake_generators;
+mod fault_injection;
 mod feature_flags_integration;
 mod feed;
+#[cfg(feature = "maud")]
+mod form_field_options;
 mod form_for_derive;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
@@ -155,13 +173,19 @@ mod framework_retention;
 #[cfg(feature = "db")]
 mod framework_retention_pg;
 mod graceful_shutdown_contract;
+mod graph_crate_version;
 mod health_indicator_integration;
 mod hooks_lifecycle;
 #[cfg(feature = "htmx")]
 mod htmx_serving;
+mod http_latency_histogram;
 #[cfg(feature = "i18n")]
 mod i18n_integration;
+#[cfg(feature = "db")]
+mod idempotency_db_store;
 mod idempotency_middleware;
+#[cfg(feature = "redis")]
+mod idempotency_redis_current_thread;
 mod idempotency_tenant_scope;
 mod idempotency_token_principal;
 mod impersonation;
@@ -173,10 +197,20 @@ mod ingress_named_futures;
 mod inline_broadcast_prefetch;
 mod inspector_integration;
 mod isr_coordination;
+mod job_lease_heartbeat;
 mod job_recorder_integration;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod job_retry_jitter_pg;
+#[cfg(feature = "redis")]
+mod job_retry_jitter_redis;
 mod job_tenant_scope;
 mod job_tracking_route;
+mod job_tracking_settle_ack;
 mod job_tracking_stores_integration;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod lease_lock;
+#[cfg(feature = "db")]
+mod list_rows_snapshot;
 #[cfg(all(feature = "ws", feature = "maud", feature = "htmx", feature = "db"))]
 mod live_broadcast;
 mod live_state;
@@ -200,7 +234,11 @@ mod maud_render;
 #[cfg(feature = "mcp")]
 mod mcp_endpoint;
 #[cfg(feature = "mcp")]
+mod mcp_modern;
+#[cfg(feature = "mcp")]
 mod mcp_plugin;
+#[cfg(feature = "mcp")]
+mod mcp_progressive;
 #[cfg(all(feature = "db", feature = "mcp"))]
 mod mcp_repository;
 #[cfg(feature = "mcp")]
@@ -214,6 +252,8 @@ mod mcp_streaming;
 #[cfg(feature = "mcp")]
 mod mcp_structured_query;
 #[cfg(feature = "mcp")]
+mod mcp_tasks;
+#[cfg(feature = "mcp")]
 mod mcp_throttle_guard;
 mod middleware_introspection;
 mod middleware_pipeline;
@@ -221,6 +261,8 @@ mod middleware_stack_depth;
 mod middleware_stack_order;
 #[cfg(feature = "db")]
 mod migrate_checksum_proptest;
+// Reads migrate.rs and ci.yml as text; needs no feature.
+mod migration_lock_timeout_ci_coverage;
 #[cfg(feature = "db")]
 mod model_counter_cache;
 #[cfg(feature = "db")]
@@ -239,6 +281,8 @@ mod nested_form_atomic_save;
 mod nested_form_order_example;
 mod notifications;
 mod nul_byte_input;
+#[cfg(feature = "i18n")]
+mod nul_message_i18n;
 #[cfg(feature = "offline-sync")]
 mod offline_sync_conformance;
 #[cfg(feature = "offline-sync")]
@@ -253,8 +297,14 @@ mod offline_sync_push_batching_perf;
 mod offline_sync_store;
 #[cfg(feature = "openapi")]
 mod openapi;
+#[cfg(all(feature = "db", feature = "openapi"))]
+mod openapi_direction;
 #[cfg(feature = "openapi")]
 mod openapi_export;
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
+mod outbox_claim_profile;
+#[cfg(feature = "db")]
+mod outbox_pg;
 mod pagination;
 mod pagination_cursor_proptest;
 mod path_helpers;
@@ -274,6 +324,9 @@ mod problem_details;
 mod process_role_worker_gating;
 #[cfg(feature = "maud")]
 mod profile_conditional_surfaces;
+mod repl_off_by_default;
+#[cfg(feature = "repl")]
+mod repl_registration;
 #[cfg(feature = "db")]
 mod repository_column_order;
 // The capability-sandboxed plugin lane (#1609). Gated on `plugin-sandbox` (the
@@ -304,6 +357,15 @@ mod rate_limit_tenant_scope;
 mod raw_router_escape_hatch;
 #[cfg(feature = "db")]
 mod read_your_writes_routing;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod ready_db_ping;
+// `test-support` exposes the monitor-step hook the test drives; the Docker
+// sweep enables it, so the test still runs there.
+#[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
+mod replica_lag_pg;
+// Redis `PING` health indicator (#3059).
+#[cfg(feature = "redis")]
+mod redis_health_indicator;
 // ci.yml names the `--lib` Redis job-admin Docker tests by prefix filter; this
 // fails when one of them stops matching (#1186). No feature gate: it only reads
 // job.rs and ci.yml as text.
@@ -332,6 +394,10 @@ mod repository_bulk_operations;
 mod repository_commit_hooks_claim_ack_profile;
 #[cfg(feature = "db")]
 mod repository_dependent_destroy;
+#[cfg(feature = "db")]
+mod repository_dependent_ordering;
+#[cfg(feature = "db")]
+mod repository_nul_field;
 // Ledger findings/fix harness for the `dependent(..., on_delete = destroy)`
 // cascade's per-row loop: profiles a leaf child's reload-then-delete N+1 and
 // (after the fix) the batched `dependent_delete_all` replacement.
@@ -357,6 +423,8 @@ mod repository_scope_meta;
 mod repository_search;
 #[cfg(feature = "db")]
 mod repository_upsert_many_advisory_lock_batching_profile;
+#[cfg(feature = "http-client")]
+mod request_id_propagation;
 mod request_timeout;
 #[cfg(feature = "db")]
 mod retention;
@@ -365,6 +433,8 @@ mod rich_text;
 mod route_macro;
 mod routes_macro;
 mod scheduled_coordination;
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+mod scheduled_coordination_pg;
 mod schema_drift_guard;
 mod scoped_tokens;
 #[cfg(feature = "db")]
@@ -372,11 +442,14 @@ mod search_index_definition;
 mod secured_route;
 mod security;
 mod seo;
+mod server_http_limits;
 mod server_timing;
 #[cfg(feature = "http-client")]
 mod shadow_mirror;
 #[cfg(feature = "db")]
 mod shard_across_tenants_no_shard_set;
+#[cfg(feature = "db")]
+mod shard_local_jobs;
 #[cfg(feature = "db")]
 mod shard_map_guard;
 #[cfg(feature = "db")]
@@ -385,20 +458,29 @@ mod sharding_commit_hooks;
 #[cfg(feature = "db")]
 mod sharding_integration;
 mod signed_webhooks;
+mod sim_adaptive_admission;
+mod sim_admission_criticality;
 mod sim_advance_to;
 mod sim_ambient_clock;
 mod sim_ambient_modules;
 mod sim_chaos_clock_skew_monotonic;
+mod sim_circuit_breaker_slow_calls;
+#[cfg(feature = "http-client")]
+mod sim_client_throttle;
 mod sim_clock_drain;
 #[cfg(feature = "collab")]
 mod sim_collab_convergence;
+mod sim_cost_deferral;
 mod sim_crash_at;
+#[cfg(feature = "http-client")]
+mod sim_deadline;
 mod sim_default_entropy;
 mod sim_delayed_enqueue;
 mod sim_deterministic_ids;
 mod sim_drain_stall;
 mod sim_fault_plan;
 mod sim_fault_plan_pg;
+mod sim_idempotency_in_flight_ttl;
 mod sim_interleave;
 mod sim_job_clock;
 mod sim_liveness_watchdog;
@@ -407,18 +489,24 @@ mod sim_monotonic_clock;
 #[cfg(feature = "http-client")]
 mod sim_net;
 mod sim_rate_limit_clock;
+#[cfg(feature = "http-client")]
+mod sim_retry_budget;
 mod sim_retry_storm;
+#[cfg(feature = "http-client")]
+mod sim_retry_storm_http;
 mod sim_scheduled_ticks;
 #[cfg(feature = "sla")]
 mod sim_sla;
 #[cfg(feature = "sla")]
 mod sim_sla_replicas;
 mod sim_strict_wall_clock;
+mod sim_tenant_isolation;
 mod sim_test_smoke;
 mod sim_testapp_jobs;
 #[cfg(feature = "sla")]
 mod sla_obligation_macro;
 mod sqlite_ci_coverage;
+mod sqlite_postgres_free;
 #[cfg(feature = "db")]
 mod sqlite_replication;
 #[cfg(all(feature = "db", feature = "http-client"))]
@@ -438,12 +526,18 @@ mod system_test_api;
 #[cfg(feature = "db")]
 mod tenancy;
 mod tenancy_unit;
+mod tenant_bulkhead;
 mod tenant_cell_quota;
 mod tenant_cell_unit;
+#[cfg(feature = "db")]
+mod tenant_db_bulkhead;
 mod test_app_integration;
 mod test_db_integration;
+mod test_db_reset_table;
 mod throttle_route;
 mod time_zone_integration;
+#[cfg(feature = "tls")]
+mod tls_alpn;
 #[cfg(feature = "tls")]
 mod tls_app_surface;
 #[cfg(feature = "tls")]
@@ -458,6 +552,7 @@ mod translatable_model;
 #[cfg(feature = "i18n")]
 mod translatable_request;
 mod tx_isolation_retry_integration;
+mod tx_local_timeouts;
 #[cfg(feature = "db")]
 mod validate_merged_model;
 #[cfg(feature = "db")]
@@ -468,6 +563,12 @@ mod validate_patch_option_ip;
 mod webhook_outbound;
 #[cfg(feature = "db")]
 mod webhook_outbound_dispatch_fanout_profile;
+#[cfg(feature = "webmcp")]
+mod webmcp;
+#[cfg(all(feature = "system-tests", feature = "webmcp"))]
+mod webmcp_browser;
+#[cfg(feature = "webmcp")]
+mod webmcp_shim;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
 #[cfg(feature = "maud")]
@@ -488,3 +589,5 @@ mod widgets_tabs;
 mod widgets_toast;
 #[cfg(feature = "ws")]
 mod ws_integration;
+#[cfg(feature = "ws")]
+mod ws_realtime_limits;

@@ -92,7 +92,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        # Docker Hub's official image, through Google's mirror: a shared
+        # runner's unauthenticated Docker Hub pull limit is often spent.
+        image: mirror.gcr.io/library/postgres:16-alpine
         env:
           POSTGRES_USER: autumn
           POSTGRES_PASSWORD: autumn
@@ -106,6 +108,10 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v7
+
+      - name: Pull Docker Hub images through a mirror
+        # The runner's unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
 
       - name: Free disk space
         run: |
@@ -142,7 +148,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16-alpine
+        # Docker Hub's official image, through Google's mirror: a shared
+        # runner's unauthenticated Docker Hub pull limit is often spent.
+        image: mirror.gcr.io/library/postgres:16-alpine
         env:
           POSTGRES_USER: autumn
           POSTGRES_PASSWORD: autumn
@@ -156,6 +164,10 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@v7
+
+      - name: Pull Docker Hub images through a mirror
+        # The runner's unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
 
       - name: Free disk space
         run: |
@@ -188,6 +200,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+
+      - name: Pull Docker Hub images through a mirror
+        # The runner's unauthenticated Docker Hub pull limit is often spent.
+        run: ./scripts/ci-docker-hub-mirror.sh
 
       - name: Free disk space
         run: |

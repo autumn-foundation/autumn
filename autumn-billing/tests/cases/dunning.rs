@@ -299,6 +299,170 @@ async fn exhaustion_marks_unpaid_and_cancels_once() {
     );
 }
 
+/// `payment_failed` lands before the subscription event, every retry is
+/// declined and no second failure webhook arrives (#3081).
+async fn failure_before_subscription_exhausts(billing: BillingConfig, action_cancels: bool) {
+    let h = harness_with_hooks(
+        billing,
+        Arc::new(NoHooks),
+        MemoryBillingStore::shared(),
+        FakeProvider::with_parser(FakeParser::BillingEventJson),
+        clocked,
+    );
+    seed_orphan_failure(&h).await;
+    assert_eq!(row(&h).await.subscription_id, None);
+    let sub = BillingEventKind::SubscriptionChanged(
+        SubscriptionSnapshot::new("sub_1", "cus_1", SubscriptionStatus::PastDue)
+            .with_price(PRO_PRICE),
+    );
+    apply_event(&h.client, event("evt_sub", at(-100), sub))
+        .await
+        .unwrap();
+    let local = subscription(&h).await;
+    assert_eq!(
+        row(&h).await.subscription_id.as_deref(),
+        Some(local.id.as_str()),
+        "the subscription event links the open dunning row"
+    );
+    assert_eq!(
+        invoice(&h).await.subscription_id.as_deref(),
+        Some(local.id.as_str())
+    );
+    for delay in [3601, 7200, 10_800] {
+        h.client.advance_clock(Duration::from_secs(delay));
+        perform_ok(&h).await;
+    }
+    assert_eq!(row(&h).await.state, DunningState::Exhausted);
+    assert_eq!(subscription(&h).await.status, SubscriptionStatus::Unpaid);
+    assert_eq!(h.provider.cancel_calls(), usize::from(action_cancels));
+}
+
+/// A canceled subscription closes the rows it adopts, so no retry runs.
+#[tokio::test]
+async fn failure_before_canceled_subscription_closes_the_adopted_row() {
+    let h = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        MemoryBillingStore::shared(),
+        FakeProvider::with_parser(FakeParser::BillingEventJson),
+        clocked,
+    );
+    seed_orphan_failure(&h).await;
+    let gone = BillingEventKind::SubscriptionDeleted(SubscriptionSnapshot::new(
+        "sub_1",
+        "cus_1",
+        SubscriptionStatus::Canceled,
+    ));
+    apply_event(&h.client, event("evt_gone", at(-100), gone))
+        .await
+        .unwrap();
+    assert_eq!(row(&h).await.state, DunningState::Canceled);
+    assert_eq!(h.provider.retry_calls(), 0);
+}
+
+/// An `Unpaid` or expired subscription closes the rows it adopts too.
+#[tokio::test]
+async fn failure_before_unpaid_subscription_closes_the_adopted_row() {
+    for (key, status) in [
+        ("evt_unpaid", SubscriptionStatus::Unpaid),
+        ("evt_expired", SubscriptionStatus::IncompleteExpired),
+    ] {
+        let h = harness_with_hooks(
+            support::config(),
+            Arc::new(NoHooks),
+            MemoryBillingStore::shared(),
+            FakeProvider::with_parser(FakeParser::BillingEventJson),
+            clocked,
+        );
+        seed_orphan_failure(&h).await;
+        let ended = BillingEventKind::SubscriptionChanged(SubscriptionSnapshot::new(
+            "sub_1", "cus_1", status,
+        ));
+        apply_event(&h.client, event(key, at(-100), ended))
+            .await
+            .unwrap();
+        assert_eq!(row(&h).await.state, DunningState::Canceled, "{status:?}");
+        assert_eq!(h.provider.retry_calls(), 0);
+    }
+}
+
+/// Fallback: with no link on the row or the invoice, exhaustion finds the
+/// subscription by the provider id on the invoice.
+#[tokio::test]
+async fn exhaustion_resolves_the_subscription_by_provider_id() {
+    let h = harness_with_hooks(
+        support::config(),
+        Arc::new(NoHooks),
+        MemoryBillingStore::shared(),
+        FakeProvider::with_parser(FakeParser::BillingEventJson),
+        clocked,
+    );
+    seed_orphan_failure(&h).await;
+    // Write the subscription straight to the store: no link is made.
+    h.store
+        .upsert_subscription(autumn_billing::store::SubscriptionUpsert::new(
+            "local-sub",
+            "local-1",
+            "sub_1",
+            SubscriptionStatus::PastDue,
+            at(-100),
+            at(-100),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(row(&h).await.subscription_id, None);
+    for delay in [3601, 7200, 10_800] {
+        h.client.advance_clock(Duration::from_secs(delay));
+        perform_ok(&h).await;
+    }
+    assert_eq!(subscription(&h).await.status, SubscriptionStatus::Unpaid);
+    assert_eq!(h.provider.cancel_calls(), 1);
+}
+
+/// Mirror a customer and a failed invoice whose subscription is not mirrored.
+async fn seed_orphan_failure(h: &Harness) {
+    h.store
+        .upsert_customer(
+            CustomerUpsert::new("local-1", "fake", "cus_1", at(-300))
+                .with_user("42")
+                .with_email("a@example.test"),
+        )
+        .await
+        .unwrap();
+    let failed = BillingEventKind::InvoicePaymentFailed(
+        InvoiceSnapshot::new(
+            "in_1",
+            "cus_1",
+            InvoiceStatus::Open,
+            Money::from_minor(1999, Currency::USD),
+        )
+        .with_subscription("sub_1")
+        .with_attempt_count(1),
+    );
+    apply_event(&h.client, event("evt_fail", at(-200), failed))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn failure_before_subscription_still_cancels_on_exhaustion() {
+    failure_before_subscription_exhausts(support::config(), true).await;
+}
+
+#[tokio::test]
+async fn failure_before_subscription_still_marks_unpaid_on_exhaustion() {
+    let billing = support::config().dunning(
+        DunningPolicy::standard()
+            .with_retry_delays(vec![
+                Duration::from_secs(3600),
+                Duration::from_secs(7200),
+                Duration::from_secs(10_800),
+            ])
+            .with_on_exhausted(ExhaustionAction::MarkUnpaid),
+    );
+    failure_before_subscription_exhausts(billing, false).await;
+}
+
 #[tokio::test]
 async fn exhaustion_with_mark_unpaid_keeps_the_provider_subscription() {
     let billing = support::config().dunning(

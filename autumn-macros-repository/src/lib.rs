@@ -62,16 +62,13 @@ use proc_macro::TokenStream;
 /// Discharge the obligation with `invalidates(...)` — on the attribute for
 /// every write, or as `#[invalidates(...)]` on one trait method — or opt out
 /// with `acknowledge_stale = "reason"`. A repository that declares any edge
-/// also gets a generated `invalidate_declared_caches()` for its write paths to
-/// call. See `docs/guide/cache-coherence.md`.
+/// drops those cached reads after each generated write commits. It also gets
+/// `invalidate_declared_caches()` and `invalidate_declared_caches_async()` for
+/// writes that do not use the repository. See `docs/guide/cache-coherence.md`.
 #[proc_macro_attribute]
 pub fn repository(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let (crate_override, attr) =
-        match autumn_macros_support::crate_path::extract_crate_override(attr.into()) {
-            Ok(pair) => pair,
-            Err(err) => return err.into(),
-        };
-    let _guard = autumn_macros_support::crate_path::set_target(crate_override.as_deref());
-    autumn_macros_support::crate_path::finalize(repository::repository_macro(attr, item.into()))
-        .into()
+    autumn_macros_support::crate_path::with_override(attr.into(), item.into(), |attr, item| {
+        repository::repository_macro(attr, item)
+    })
+    .into()
 }

@@ -26,6 +26,9 @@ use crate::time::{ClockSource, MonotonicInstant, SystemClock};
 
 /// Newtype wrapper used to store the global cache in the extension map so that
 /// `set_cache` (called from startup hooks) is visible to all `AppState` clones.
+///
+/// Use [`AppState::set_cache`]: a backend inserted here directly is not on the
+/// failure-capsule seam.
 pub struct GlobalCacheEntry(pub Arc<dyn Cache>);
 
 use crate::actuator;
@@ -40,7 +43,6 @@ use crate::middleware;
 #[cfg(feature = "presence")]
 use crate::presence::Presence;
 use crate::probe;
-#[cfg(feature = "ws")]
 use tokio_util::sync::CancellationToken;
 
 /// A read-only view of one [`AppState`]'s extension map, for a caller that
@@ -213,13 +215,6 @@ pub struct AppState {
     #[cfg(all(feature = "collab", feature = "presence"))]
     pub(crate) collab: CollabHub,
 
-    /// Cancellation token signalled during graceful shutdown.
-    ///
-    /// WebSocket handlers receive a child token so they can clean up
-    /// when the server is stopping.
-    #[cfg(feature = "ws")]
-    pub(crate) shutdown: CancellationToken,
-
     /// Per-resource policy + scope registry used by `#[authorize]`
     /// and `#[repository(policy = ...)]`-generated handlers.
     pub(crate) policy_registry: PolicyRegistry,
@@ -326,6 +321,33 @@ impl AppState {
             .write()
             .expect("app state extension lock poisoned")
             .insert(TypeId::of::<T>(), Arc::new(value));
+    }
+
+    /// The shared [`SessionRotationHooks`](crate::session::SessionRotationHooks)
+    /// registry, created on first use.
+    ///
+    /// Hooks registered here run after each stored session-id rotation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal extension map mutex is poisoned.
+    #[must_use]
+    pub fn session_rotation_hooks(&self) -> crate::session::SessionRotationHooks {
+        let entry = {
+            let mut extensions = self
+                .extensions
+                .write()
+                .expect("app state extension lock poisoned");
+            Arc::clone(
+                extensions
+                    .entry(TypeId::of::<crate::session::SessionRotationHooks>())
+                    .or_insert_with(|| Arc::new(crate::session::SessionRotationHooks::default())),
+            )
+        };
+        entry
+            .downcast::<crate::session::SessionRotationHooks>()
+            .map(|hooks| (*hooks).clone())
+            .expect("rotation hooks extension has the wrong type")
     }
 
     /// Borrow a typed runtime extension if it has been installed.
@@ -602,6 +624,20 @@ impl AppState {
         &self.probes
     }
 
+    /// Apply `[health]` dependency-check settings: the cache TTL of the
+    /// indicator registry and of the database pings, the ping time limit, and
+    /// whether the primary ping gates `/ready`.
+    pub(crate) fn apply_health_config(&self, health: &crate::config::HealthConfig) {
+        self.health_indicator_registry
+            .set_cache_ttl(health.cache_ttl());
+        #[cfg(feature = "db")]
+        {
+            self.probes
+                .configure_db_check(health.cache_ttl(), health.ping_timeout());
+            self.probes.set_db_readiness(health.db_readiness);
+        }
+    }
+
     /// Mark startup as complete so readiness can become healthy.
     pub fn mark_startup_complete(&self) {
         self.probes.mark_startup_complete();
@@ -665,10 +701,19 @@ impl AppState {
             .or_else(|| self.shared_cache.clone())
     }
 
+    /// Whether the app state has a cache, from the builder, a state
+    /// initializer or a startup hook. A failure capsule records it, and a
+    /// replay installs a cache in its place before the initializers run
+    /// again (#2351). Replay runs no startup hook.
+    #[cfg(feature = "reporting")]
+    pub(crate) fn has_cache(&self) -> bool {
+        self.cache().is_some()
+    }
+
     /// Register a global cache backend (builder / test helper, build-time).
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<dyn Cache>) -> Self {
-        self.shared_cache = Some(cache);
+        self.shared_cache = Some(crate::cache::with_capsule_seam(cache));
         self
     }
 
@@ -805,6 +850,8 @@ impl AppState {
     /// Updates both the process-level global (used by `#[cached]` functions) and
     /// the extension map (used by `CacheResponseLayer::from_app` and `state.cache()`).
     pub fn set_cache(&self, cache: Arc<dyn Cache>) {
+        // Wrapped once, so the global and the extension are the same `Arc`.
+        let cache = crate::cache::with_capsule_seam(cache);
         crate::cache::set_global_cache(cache.clone());
         self.insert_extension(GlobalCacheEntry(cache));
     }
@@ -973,20 +1020,18 @@ impl AppState {
 
     /// Returns a child cancellation token for the server shutdown signal.
     ///
-    /// WebSocket handlers should select on this to clean up when the
-    /// server is shutting down.
-    #[cfg(feature = "ws")]
+    /// WebSocket handlers and the [`crate::extract::ShutdownToken`] extractor
+    /// use it. Select on it to clean up when the server stops.
     #[must_use]
     pub fn shutdown_token(&self) -> CancellationToken {
-        self.shutdown.child_token()
+        self.probes.shutdown_signal().child_token()
     }
 
     /// Helper for integration tests to simulate a server shutdown.
-    #[cfg(feature = "ws")]
     #[doc(hidden)]
     pub fn trigger_shutdown_for_test(&self) {
         self.begin_shutdown();
-        self.shutdown.cancel();
+        self.probes.shutdown_signal().cancel();
     }
 
     /// Update startup completion in tests after the router is already built.
@@ -1049,8 +1094,6 @@ impl AppState {
             presence,
             #[cfg(feature = "ws")]
             channels,
-            #[cfg(feature = "ws")]
-            shutdown: CancellationToken::new(),
             policy_registry: PolicyRegistry::default(),
             forbidden_response: ForbiddenResponse::default(),
             auth_session_key: "user_id".into(),
@@ -1120,6 +1163,10 @@ impl DbState for AppState {
     fn statement_timeout(&self) -> Option<std::time::Duration> {
         self.extension::<crate::config::AutumnConfig>()
             .and_then(|cfg| cfg.database.statement_timeout)
+    }
+    fn idle_in_transaction_timeout(&self) -> Option<std::time::Duration> {
+        self.extension::<crate::config::AutumnConfig>()
+            .and_then(|cfg| cfg.database.idle_in_transaction_timeout)
     }
 
     fn slow_query_threshold(&self) -> std::time::Duration {
@@ -1221,6 +1268,32 @@ impl crate::actuator::ProvideActuatorState for AppState {
             .map(|handle| (*handle).clone())
     }
 
+    fn architecture_graph_json(&self) -> Option<bytes::Bytes> {
+        crate::graph::served_json(self)
+    }
+
+    fn data_capsules(
+        &self,
+    ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::DataCapsuleError>
+    {
+        crate::gdpr::portability::CapsuleService::from_state(self)
+    }
+
+    fn cost_signal(&self) -> Option<crate::cost::CostSignal> {
+        self.extension::<crate::cost::CostSignal>()
+            .map(|signal| (*signal).clone())
+    }
+
+    fn cost_accountant(&self) -> Option<crate::cost::CostAccountant> {
+        // An accountant that the app inserted meters nothing while `[cost]
+        // enabled` is off, so the endpoint reports metering as off.
+        if !self.config_arc().cost.enabled {
+            return None;
+        }
+        self.extension::<crate::cost::CostAccountant>()
+            .map(|accountant| (*accountant).clone())
+    }
+
     fn deploy_version(&self) -> String {
         self.extension::<crate::canary::CanaryState>().map_or_else(
             || crate::canary::STABLE.to_owned(),
@@ -1247,8 +1320,21 @@ impl crate::actuator::ProvideActuatorState for AppState {
     }
 
     #[cfg(feature = "db")]
+    fn probe_state(&self) -> Option<&crate::probe::ProbeState> {
+        Some(&self.probes)
+    }
+
+    #[cfg(feature = "db")]
     fn shards(&self) -> Option<&crate::sharding::ShardSet> {
         self.shards.as_ref()
+    }
+
+    #[cfg(feature = "db")]
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    {
+        self.replica_pool.as_ref()
     }
     // a11y_posture() uses the trait default (all-false) intentionally: AppState
     // cannot know whether the application's layout is accessible.  Override this
@@ -1347,8 +1433,6 @@ impl AppState {
             presence,
             #[cfg(feature = "ws")]
             channels,
-            #[cfg(feature = "ws")]
-            shutdown: tokio_util::sync::CancellationToken::new(),
             policy_registry: crate::authorization::PolicyRegistry::default(),
             forbidden_response: crate::authorization::ForbiddenResponse::default(),
             auth_session_key: "user_id".into(),
@@ -1362,6 +1446,45 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    /// Counts checks of a health indicator.
+    struct Counted(std::sync::atomic::AtomicUsize);
+
+    impl crate::actuator::HealthIndicator for Counted {
+        fn check(&self) -> futures::future::BoxFuture<'_, crate::actuator::HealthCheckOutput> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { crate::actuator::HealthCheckOutput::up() })
+        }
+    }
+
+    async fn checks_after_two_runs(health: &crate::config::HealthConfig) -> usize {
+        let state = AppState::for_test();
+        state.apply_health_config(health);
+        let counted = Arc::new(Counted(std::sync::atomic::AtomicUsize::new(0)));
+        state
+            .health_indicator_registry
+            .register(
+                "counted",
+                crate::actuator::IndicatorGroup::Readiness,
+                counted.clone(),
+            )
+            .expect("register");
+        state.health_indicator_registry.run_readiness().await;
+        state.health_indicator_registry.run_readiness().await;
+        counted.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn apply_health_config_sets_the_indicator_cache_ttl() {
+        let cached = crate::config::HealthConfig::default();
+        assert_eq!(checks_after_two_runs(&cached).await, 1);
+
+        let uncached = crate::config::HealthConfig {
+            cache_ttl_ms: 0,
+            ..crate::config::HealthConfig::default()
+        };
+        assert_eq!(checks_after_two_runs(&uncached).await, 2);
+    }
+
     /// Re-clocking a state that a runtime has already touched is refused loudly.
     ///
     /// By the time job names are registered, the runtime holds its own clone of

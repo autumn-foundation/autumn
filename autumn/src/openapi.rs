@@ -111,10 +111,10 @@ pub const OPENAPI_UNAVAILABLE_UNCONFIGURED: &str =
 /// [`post`](crate::post), etc.) from the handler's path, signature, and
 /// any [`#[api_doc(...)]`](crate::api_doc) overrides.
 #[derive(Clone, Debug, Default)]
-// A flat, generated metadata descriptor; the independent boolean flags
-// (hidden, secured, sunset_opt_out, has_policy, public, mcp_tool, mcp_exclude)
-// each model a distinct, orthogonal route property, so grouping them into a
-// sub-struct would obscure rather than clarify.
+// A flat, generated metadata descriptor. Each boolean flag (hidden, secured,
+// sunset_opt_out, has_policy, public, mcp_tool, mcp_exclude, mcp_stream,
+// mcp_task, mcp_core, webmcp_tool, webmcp_exclude) models a distinct route property. A sub-struct would
+// obscure them.
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApiDoc {
     /// HTTP method as an uppercase string (e.g. `"GET"`).
@@ -215,6 +215,22 @@ pub struct ApiDoc {
     /// schema, this flag also exempts the tool from the JSON-out eligibility
     /// gate that otherwise excludes schema-less routes.
     pub mcp_stream: bool,
+    /// True when the endpoint opts in to the MCP Tasks extension via
+    /// `#[api_doc(mcp, task)]`. A client that declares the extension gets a
+    /// task handle and polls `tasks/get` for the result.
+    pub mcp_task: bool,
+    /// True for a core MCP tool, set by `#[api_doc(mcp, core)]`. The tool
+    /// carries `_meta["anthropic/alwaysLoad"]`, so a client that defers tools
+    /// loads it first. In the progressive catalog, `tools/list` holds the core
+    /// tools and the two meta-tools. The flag does not opt the endpoint in.
+    pub mcp_core: bool,
+    /// True when the endpoint opts in to `WebMCP` exposure via
+    /// `#[api_doc(webmcp)]`. `mcp` does not imply it: a page agent runs with
+    /// the session of the user.
+    pub webmcp_tool: bool,
+    /// True for `#[api_doc(webmcp = false)]`. It wins over the
+    /// `expose_all_as_webmcp` hatch.
+    pub webmcp_exclude: bool,
     /// Build-time authority envelope proved for this handler by
     /// `#[agent_operable(grant = ...)]` (issue #1691), or `None` for a handler
     /// that declares none.
@@ -519,6 +535,61 @@ impl_primitive_schema!(f32, "number", "number");
 impl_primitive_schema!(f64, "number", "number");
 impl_primitive_schema!(serde_json::Value, "object", "object");
 
+macro_rules! impl_scalar_schema {
+    ($ty:ty, $name:literal, $schema:expr) => {
+        impl OpenApiSchema for $ty {
+            fn schema_name() -> &'static str {
+                $name
+            }
+            fn schema() -> serde_json::Value {
+                $schema
+            }
+        }
+    };
+}
+
+impl_scalar_schema!(
+    uuid::Uuid,
+    "uuid",
+    serde_json::json!({ "type": "string", "format": "uuid" })
+);
+impl_scalar_schema!(
+    chrono::DateTime<chrono::Utc>,
+    "date-time",
+    serde_json::json!({ "type": "string", "format": "date-time" })
+);
+impl_scalar_schema!(
+    chrono::NaiveDate,
+    "date",
+    serde_json::json!({ "type": "string", "format": "date" })
+);
+// No `format`. A naive value has no UTC offset, so `date-time` is wrong.
+impl_scalar_schema!(
+    chrono::NaiveDateTime,
+    "naive-date-time",
+    serde_json::json!({
+        "type": "string",
+        "description": "ISO 8601 date-time with no UTC offset, e.g. 2026-09-06T18:00:00",
+    })
+);
+impl_scalar_schema!(rust_decimal::Decimal, "decimal", decimal_scalar_schema());
+
+/// The schema of a [`rust_decimal::Decimal`], as serde writes it.
+///
+/// By default, `rust_decimal` writes a JSON string. With the `serde-float` or
+/// `serde-arbitrary-precision` feature, it writes a number. Cargo merges the
+/// features of all crates in a build, so this function reads the type from
+/// serde at run time. The schema always matches the wire.
+#[must_use]
+pub fn decimal_scalar_schema() -> serde_json::Value {
+    match serde_json::to_value(rust_decimal::Decimal::new(12345, 2)) {
+        Ok(serde_json::Value::String(_)) => {
+            serde_json::json!({ "type": "string", "format": "decimal" })
+        }
+        _ => serde_json::json!({ "type": "number" }),
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────
 // Compile-time inventory of `#[derive(OpenApiSchema)]` component schemas.
 // ──────────────────────────────────────────────────────────────────
@@ -567,6 +638,86 @@ pub fn registered_derived_schema(identity: &str) -> Option<serde_json::Value> {
         .into_iter()
         .find(|descriptor| (descriptor.identity)() == identity)
         .map(|descriptor| (descriptor.schema)())
+}
+
+/// The position of a schema reference in an operation (issue #2607).
+///
+/// The server reads a request body and query parameters, so they use the shape
+/// a type deserializes from. The server writes a response body, so it uses the
+/// shape the type serializes to. `#[private]` is one cause of a difference: it
+/// skips a field on serialize only.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SchemaDirection {
+    /// The server reads the value: a request body or query parameters.
+    Request,
+    /// The server writes the value: a response body.
+    Response,
+}
+
+/// A schema for one [`SchemaDirection`] that replaces the derived schema
+/// (issue #2607).
+///
+/// `#[model]` submits one when the request and response shapes of a type can
+/// differ. A reference in [`Self::direction`] uses it. All other references
+/// use the [`DerivedSchemaDescriptor`].
+#[doc(hidden)]
+pub struct DirectionalSchemaDescriptor {
+    /// The type identity (`type_name`), as in [`DerivedSchemaDescriptor::identity`].
+    pub identity: fn() -> &'static str,
+    /// The direction this schema applies to.
+    pub direction: SchemaDirection,
+    /// The schema for that direction. `None` means that no accurate schema is
+    /// known. The spec then uses the opaque placeholder.
+    pub schema: Option<fn() -> serde_json::Value>,
+}
+
+inventory::collect!(DirectionalSchemaDescriptor);
+
+/// Look up the derived schema of `identity` for one direction (issue #2607).
+///
+/// A [`DirectionalSchemaDescriptor`] for that direction wins. Otherwise this
+/// is [`registered_derived_schema`]. `None` means that the spec uses the
+/// opaque placeholder.
+#[must_use]
+pub fn registered_derived_schema_for(
+    identity: &str,
+    direction: SchemaDirection,
+) -> Option<serde_json::Value> {
+    inventory::iter::<DirectionalSchemaDescriptor>
+        .into_iter()
+        .find(|descriptor| descriptor.direction == direction && (descriptor.identity)() == identity)
+        .map_or_else(
+            || registered_derived_schema(identity),
+            |descriptor| descriptor.schema.map(|schema| schema()),
+        )
+}
+
+/// Remove properties from an object schema, and from its `required` list.
+///
+/// `#[model]` calls this to make the response schema of `New*` (issue #2607).
+/// A `required` list that becomes empty is removed.
+#[doc(hidden)]
+pub fn remove_schema_properties(schema: &mut serde_json::Value, names: &[&str]) {
+    let Some(object) = schema.as_object_mut() else {
+        return;
+    };
+    if let Some(properties) = object
+        .get_mut("properties")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for name in names {
+            properties.remove(*name);
+        }
+    }
+    if let Some(required) = object
+        .get_mut("required")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        required.retain(|entry| entry.as_str().is_none_or(|name| !names.contains(&name)));
+        if required.is_empty() {
+            object.remove("required");
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -804,7 +955,7 @@ pub fn write_openapi_spec_to_dist(
     let json = serde_json::to_string_pretty(spec).map_err(std::io::Error::other)?;
     std::fs::write(dist_dir.join("openapi.json"), &json)?;
 
-    let yaml = serde_yaml::to_string(spec).map_err(std::io::Error::other)?;
+    let yaml = serde_saphyr::to_string(spec).map_err(std::io::Error::other)?;
     std::fs::write(dist_dir.join("openapi.yaml"), yaml)?;
 
     Ok(())
@@ -825,6 +976,12 @@ pub fn write_openapi_spec_to_dist(
 pub struct SchemaComponentIndex {
     /// identity key (`type_name` or legacy short name) → display component key.
     by_identity: BTreeMap<String, String>,
+    /// identity → key of its request component, for an identity whose request
+    /// and response shapes differ (issue #2607). The response keeps `by_identity`.
+    request_by_identity: BTreeMap<String, String>,
+    /// Identities referenced only in the request direction. Their one component
+    /// holds the request schema.
+    request_only: std::collections::BTreeSet<String>,
 }
 
 #[cfg(feature = "openapi")]
@@ -842,19 +999,57 @@ impl SchemaComponentIndex {
             .unwrap_or_else(|| component_key(entry.name))
     }
 
+    /// As [`Self::display_key`], for a reference in `direction` (issue #2607).
+    ///
+    /// The key is different only for a request reference to a type whose two
+    /// shapes differ.
+    #[must_use]
+    pub fn display_key_in(&self, entry: &SchemaEntry, direction: SchemaDirection) -> String {
+        match direction {
+            SchemaDirection::Request => self
+                .request_by_identity
+                .get(entry.identity_key())
+                .cloned()
+                .unwrap_or_else(|| self.display_key(entry)),
+            SchemaDirection::Response => self.display_key(entry),
+        }
+    }
+
     /// Resolve a raw schema *identity* string (`type_name`) to its display key,
     /// or `None` when the identity is not part of this index. Used by the
     /// finalize body-ref rewrite to map a nested derived-schema `$ref` (emitted
     /// as the field type's full `type_name`) to its collision-resolved component
     /// key (issue #1972).
-    fn display_key_for_identity(&self, identity: &str) -> Option<&str> {
+    fn display_key_for_identity(&self, identity: &str, direction: SchemaDirection) -> Option<&str> {
+        if direction == SchemaDirection::Request
+            && let Some(key) = self.request_by_identity.get(identity)
+        {
+            return Some(key);
+        }
         self.by_identity.get(identity).map(String::as_str)
     }
 
-    /// Iterate `(identity, display_key)` pairs — used by the back-fill to
-    /// register a component under its display key keyed by identity.
-    fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
-        self.by_identity.iter()
+    /// Iterate `(identity, display_key, direction)` for every component the
+    /// back-fill registers. `direction` selects the schema it holds.
+    fn components(&self) -> impl Iterator<Item = (&String, &String, SchemaDirection)> {
+        let main = self
+            .by_identity
+            .iter()
+            .map(|(identity, key)| (identity, key, self.main_direction(identity)));
+        let request = self
+            .request_by_identity
+            .iter()
+            .map(|(identity, key)| (identity, key, SchemaDirection::Request));
+        main.chain(request)
+    }
+
+    /// The schema direction of the main component of `identity`.
+    fn main_direction(&self, identity: &str) -> SchemaDirection {
+        if self.request_only.contains(identity) {
+            SchemaDirection::Request
+        } else {
+            SchemaDirection::Response
+        }
     }
 }
 
@@ -869,61 +1064,273 @@ fn qualified_suffix_key(identity: &str, depth: usize) -> String {
 
 /// Build the identity→display-key map for every schema referenced by `routes`.
 ///
-/// Pure over the route set, so [`generate_spec_at`] and the MCP tool builder
-/// derive the exact same keys.
+/// Pure over the route set. This index does not see user or route
+/// registrations, so a request key can be equal to one of their keys. Use
+/// [`schema_component_index_for`] to get the index that [`generate_spec`]
+/// uses.
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn build_schema_component_index(routes: &[&ApiDoc]) -> SchemaComponentIndex {
+    build_schema_component_index_reserving(routes, &BTreeMap::new())
+}
+
+/// The component index [`generate_spec`] uses for `config` and `routes`.
+///
+/// The MCP tool builder uses it too, so its `$ref`s match the served spec.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn schema_component_index_for(
+    config: &OpenApiConfig,
+    routes: &[&ApiDoc],
+) -> SchemaComponentIndex {
+    seeded_registry_and_index(config, routes).1
+}
+
+/// The registry before the back-fill (user and route registrations), and the
+/// index built so that no request key takes one of those keys.
+#[cfg(feature = "openapi")]
+fn seeded_registry_and_index(
+    config: &OpenApiConfig,
+    routes: &[&ApiDoc],
+) -> (SchemaRegistry, SchemaComponentIndex) {
+    let mut registry = SchemaRegistry::default();
+    for (name, schema) in &config.additional_schemas {
+        registry.insert(name.clone(), schema.clone());
+    }
+    registry.insert("ProblemDetails", problem_details_schema());
+    for api_doc in routes {
+        if !api_doc.hidden
+            && let Some(register) = api_doc.register_schemas
+        {
+            (register)(&mut registry);
+        }
+    }
+    let index = build_schema_component_index_reserving(routes, registry.schemas());
+    (registry, index)
+}
+
+/// Build the index. `registered` holds the user and route registrations. Their
+/// keys are reserved, and their refs are response uses.
+#[cfg(feature = "openapi")]
+fn build_schema_component_index_reserving(
+    routes: &[&ApiDoc],
+    registered: &BTreeMap<String, serde_json::Value>,
+) -> SchemaComponentIndex {
     // Collect (identity, base-display) for every referenced Ref entry, deduped
-    // by identity. `seen` gives the identity-graph closure below an O(1) "already
-    // queued?" check.
-    let mut refs: Vec<(String, String)> = Vec::new();
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // by identity, and each direction it is referenced in (issue #2607).
+    let mut graph = IdentityGraph::default();
     for api_doc in routes {
         if api_doc.hidden {
             continue;
         }
-        for entry in [
-            api_doc.request_body.as_ref(),
-            api_doc.response.as_ref(),
-            api_doc.query_schema.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        for (entry, direction) in [
+            (api_doc.request_body.as_ref(), SchemaDirection::Request),
+            (api_doc.response.as_ref(), SchemaDirection::Response),
+            (api_doc.query_schema.as_ref(), SchemaDirection::Request),
+        ] {
+            let Some(entry) = entry else { continue };
             for e in flatten_ref_entries(entry) {
-                let identity = e.identity_key().to_owned();
-                if seen.insert(identity.clone()) {
-                    refs.push((identity, component_key(e.name)));
-                }
+                graph.add(e.identity_key(), component_key(e.name), direction);
             }
         }
     }
 
-    // Close the identity graph: a `$ref` emitted *inside* a derived schema body
-    // (a nested named-struct field) can reference an identity that no route
-    // mentions directly. Fetch each derived body and recursively collect the
-    // identities it refers to, to a fixpoint, so nested-only types participate
-    // in collision detection and each earns its own component (issue #1972).
-    let mut queue: Vec<String> = refs.iter().map(|(id, _)| id.clone()).collect();
-    while let Some(identity) = queue.pop() {
-        let Some(body) = registered_derived_schema(&identity) else {
-            continue;
-        };
-        let mut nested: Vec<String> = Vec::new();
-        collect_body_ref_identities(&body, &mut nested);
-        for n in nested {
-            if seen.insert(n.clone()) {
-                let base = base_display_for_identity(&n);
-                refs.push((n.clone(), base));
-                queue.push(n);
+    // A registered component is a response component: the rewrite treats it
+    // as one. Thus a ref in it is a response use. An example is the short
+    // `<Model>` ref of the `<Model>Page` envelope. Without this rule, a type
+    // that only a list route returns is request-only, and its one component
+    // gets the request shape.
+    let mut registered_refs: Vec<String> = Vec::new();
+    for body in registered.values() {
+        collect_body_ref_identities(body, &mut registered_refs);
+    }
+    let by_identity = loop {
+        graph.close();
+        let by_identity = assign_display_keys(&graph.refs);
+        let mut grew = false;
+        for target in &registered_refs {
+            let identity = if graph.seen.contains(target) {
+                Some(target.clone())
+            } else {
+                by_identity
+                    .iter()
+                    .find(|(_, key)| *key == target)
+                    .map(|(identity, _)| identity.clone())
+            };
+            if let Some(identity) = identity {
+                grew |= graph.add_use(identity, SchemaDirection::Response);
             }
         }
-    }
+        if !grew {
+            break by_identity;
+        }
+    };
+
+    let request_only = graph
+        .seen
+        .iter()
+        .filter(|identity| {
+            !graph
+                .uses
+                .contains(&((*identity).clone(), SchemaDirection::Response))
+        })
+        .cloned()
+        .collect();
+    // A registration on the main key replaces the schema in both directions.
+    // Such a type does not split, so its request refs use that registration.
+    let fixed: std::collections::BTreeSet<String> = by_identity
+        .iter()
+        .filter(|(_, key)| registered.contains_key(*key))
+        .map(|(identity, _)| identity.clone())
+        .collect();
+    let split = split_identities(&graph.uses, &graph.bodies, &fixed);
+    let reserved: std::collections::BTreeSet<String> = registered.keys().cloned().collect();
+    let request_by_identity = assign_request_keys(&split, &by_identity, &reserved);
 
     SchemaComponentIndex {
-        by_identity: assign_display_keys(&refs),
+        by_identity,
+        request_by_identity,
+        request_only,
     }
+}
+
+/// The referenced identities, their directions, and their derived bodies.
+#[cfg(feature = "openapi")]
+#[derive(Default)]
+struct IdentityGraph {
+    /// `(identity, base display key)`, one entry for each identity.
+    refs: Vec<(String, String)>,
+    seen: std::collections::BTreeSet<String>,
+    uses: std::collections::BTreeSet<(String, SchemaDirection)>,
+    queue: Vec<(String, SchemaDirection)>,
+    bodies: BTreeMap<(String, SchemaDirection), Option<serde_json::Value>>,
+}
+
+#[cfg(feature = "openapi")]
+impl IdentityGraph {
+    /// Record a reference to `identity` in `direction`.
+    fn add(&mut self, identity: &str, base: String, direction: SchemaDirection) {
+        if self.seen.insert(identity.to_owned()) {
+            self.refs.push((identity.to_owned(), base));
+        }
+        self.add_use(identity.to_owned(), direction);
+    }
+
+    /// Record a use of a known identity. Returns `true` for a new use.
+    fn add_use(&mut self, identity: String, direction: SchemaDirection) -> bool {
+        let new = self.uses.insert((identity.clone(), direction));
+        if new {
+            self.queue.push((identity, direction));
+        }
+        new
+    }
+
+    /// Close the identity graph: a `$ref` emitted *inside* a derived schema
+    /// body (a nested named-struct field) can reference an identity that no
+    /// route mentions directly. Fetch each derived body and recursively collect
+    /// the identities it refers to, to a fixpoint, so nested-only types
+    /// participate in collision detection and each earns its own component
+    /// (issue #1972). A nested reference has the direction of the body it is
+    /// in (issue #2607).
+    fn close(&mut self) {
+        while let Some((identity, direction)) = self.queue.pop() {
+            let body = registered_derived_schema_for(&identity, direction);
+            if let Some(body) = &body {
+                let mut nested: Vec<String> = Vec::new();
+                collect_body_ref_identities(body, &mut nested);
+                for n in nested {
+                    let base = base_display_for_identity(&n);
+                    self.add(&n, base, direction);
+                }
+            }
+            self.bodies.insert((identity, direction), body);
+        }
+    }
+}
+
+/// The identities that need a separate request component (issue #2607).
+///
+/// An identity splits when both directions reference it and either its two
+/// schemas differ, or a type it references splits. The second rule finds an
+/// asymmetric type inside a symmetric wrapper. An identity in `fixed` never
+/// splits.
+#[cfg(feature = "openapi")]
+fn split_identities(
+    uses: &std::collections::BTreeSet<(String, SchemaDirection)>,
+    bodies: &BTreeMap<(String, SchemaDirection), Option<serde_json::Value>>,
+    fixed: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let body = |identity: &str, direction| {
+        bodies
+            .get(&(identity.to_owned(), direction))
+            .and_then(Option::as_ref)
+    };
+    let both: Vec<&str> = uses
+        .iter()
+        .filter(|(identity, direction)| {
+            *direction == SchemaDirection::Request
+                && uses.contains(&(identity.clone(), SchemaDirection::Response))
+                && !fixed.contains(identity)
+        })
+        .map(|(identity, _)| identity.as_str())
+        .collect();
+    let mut split: std::collections::BTreeSet<String> = both
+        .iter()
+        .filter(|identity| {
+            body(identity, SchemaDirection::Request) != body(identity, SchemaDirection::Response)
+        })
+        .map(|identity| (*identity).to_owned())
+        .collect();
+    loop {
+        let before = split.len();
+        for identity in &both {
+            if split.contains(*identity) {
+                continue;
+            }
+            let mut nested: Vec<String> = Vec::new();
+            if let Some(b) = body(identity, SchemaDirection::Request) {
+                collect_body_ref_identities(b, &mut nested);
+            }
+            if nested.iter().any(|n| split.contains(n)) {
+                split.insert((*identity).to_owned());
+            }
+        }
+        if split.len() == before {
+            return split;
+        }
+    }
+}
+
+/// Give each split identity a request key: `<Key>Request`, or `<Key>Request-N`
+/// when a component or `reserved` already has that key. Deterministic: the
+/// identities are visited in sorted order.
+#[cfg(feature = "openapi")]
+fn assign_request_keys(
+    split: &std::collections::BTreeSet<String>,
+    by_identity: &BTreeMap<String, String>,
+    reserved: &std::collections::BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut used: std::collections::BTreeSet<String> = by_identity
+        .values()
+        .cloned()
+        .chain(reserved.iter().cloned())
+        .collect();
+    let mut out = BTreeMap::new();
+    for identity in split {
+        let Some(main) = by_identity.get(identity) else {
+            continue;
+        };
+        let base = format!("{main}Request");
+        let mut key = base.clone();
+        let mut n = 2u32;
+        while used.contains(&key) {
+            key = format!("{base}-{n}");
+            n += 1;
+        }
+        used.insert(key.clone());
+        out.insert(identity.clone(), key);
+    }
+    out
 }
 
 /// Assign a **unique, deterministic** display component key to every referenced
@@ -1060,31 +1467,45 @@ fn rewrite_component_body_refs(
     components: &mut BTreeMap<String, serde_json::Value>,
     index: &SchemaComponentIndex,
 ) {
-    for schema in components.values_mut() {
-        rewrite_identity_refs(schema, index);
+    // A ref inside a request component is a request ref (issue #2607). A
+    // component the index does not own is a response component.
+    let directions: BTreeMap<String, SchemaDirection> = index
+        .components()
+        .map(|(_, key, direction)| (key.clone(), direction))
+        .collect();
+    for (key, schema) in components.iter_mut() {
+        let direction = directions
+            .get(key)
+            .copied()
+            .unwrap_or(SchemaDirection::Response);
+        rewrite_identity_refs(schema, index, direction);
     }
 }
 
 #[cfg(feature = "openapi")]
-fn rewrite_identity_refs(value: &mut serde_json::Value, index: &SchemaComponentIndex) {
+fn rewrite_identity_refs(
+    value: &mut serde_json::Value,
+    index: &SchemaComponentIndex,
+    direction: SchemaDirection,
+) {
     match value {
         serde_json::Value::Object(map) => {
             if let Some(serde_json::Value::String(reference)) = map.get_mut("$ref") {
                 let replacement = reference
                     .strip_prefix("#/components/schemas/")
-                    .and_then(|identity| index.display_key_for_identity(identity))
+                    .and_then(|identity| index.display_key_for_identity(identity, direction))
                     .map(|display| format!("#/components/schemas/{display}"));
                 if let Some(new_ref) = replacement {
                     *reference = new_ref;
                 }
             }
             for v in map.values_mut() {
-                rewrite_identity_refs(v, index);
+                rewrite_identity_refs(v, index, direction);
             }
         }
         serde_json::Value::Array(items) => {
             for v in items {
-                rewrite_identity_refs(v, index);
+                rewrite_identity_refs(v, index, direction);
             }
         }
         _ => {}
@@ -1200,17 +1621,12 @@ pub fn generate_spec_at(
     now: chrono::DateTime<chrono::Utc>,
 ) -> OpenApiSpec {
     let mut paths: BTreeMap<String, PathItem> = BTreeMap::new();
-    let mut registry = SchemaRegistry::default();
 
-    for (name, schema) in &config.additional_schemas {
-        registry.insert(name.clone(), schema.clone());
-    }
-    registry.insert("ProblemDetails", problem_details_schema());
-
-    // Resolve every referenced schema identity to a collision-free component
-    // display key up front, so both the `$ref` sites (via `operation_for`) and
-    // the back-fill below register/reference the exact same key (issue #1972).
-    let index = build_schema_component_index(routes);
+    // Seed the user and route registrations, then resolve every referenced
+    // schema identity to a collision-free component display key up front, so
+    // both the `$ref` sites (via `operation_for`) and the back-fill below
+    // register/reference the exact same key (issue #1972).
+    let (mut registry, index) = seeded_registry_and_index(config, routes);
 
     let mut any_secured = false;
     let mut any_scoped = false;
@@ -1224,9 +1640,6 @@ pub fn generate_spec_at(
         }
         if !api_doc.required_scopes.is_empty() {
             any_scoped = true;
-        }
-        if let Some(register) = api_doc.register_schemas {
-            (register)(&mut registry);
         }
 
         let operation = operation_for(api_doc, &config.api_versions, now, &index);
@@ -1249,10 +1662,11 @@ pub fn generate_spec_at(
     // inventory (matched by identity, so two same-named types never shadow each
     // other — issue #1972); only an identity with no derived schema (and no
     // explicit `OpenApiConfig::register_schema`) falls back to the minimal
-    // `{"type": "object", "title": "X"}` placeholder.
-    for (identity, display_key) in index.iter() {
+    // `{"type": "object", "title": "X"}` placeholder. Each component holds the
+    // schema of its direction (issue #2607).
+    for (identity, display_key, direction) in index.components() {
         if !registry.schemas().contains_key(display_key) {
-            let schema = registered_derived_schema(identity).unwrap_or_else(|| {
+            let schema = registered_derived_schema_for(identity, direction).unwrap_or_else(|| {
                 serde_json::json!({
                     "type": "object",
                     "title": display_key,
@@ -1374,7 +1788,7 @@ fn operation_for(
         content: std::iter::once((
             "application/json".to_owned(),
             MediaType {
-                schema: schema_value_for(entry, index),
+                schema: schema_value_for(entry, index, SchemaDirection::Request),
             },
         ))
         .collect(),
@@ -1394,7 +1808,7 @@ fn operation_for(
             content.insert(
                 "application/json".to_owned(),
                 MediaType {
-                    schema: schema_value_for(entry, index),
+                    schema: schema_value_for(entry, index, SchemaDirection::Response),
                 },
             );
             content
@@ -1483,7 +1897,8 @@ fn operation_for(
 #[cfg(feature = "openapi")]
 fn query_parameters_for(query_entry: &SchemaEntry, index: &SchemaComponentIndex) -> Vec<Parameter> {
     if matches!(query_entry.kind, SchemaKind::Ref)
-        && let Some(body) = registered_derived_schema(query_entry.identity_key())
+        && let Some(body) =
+            registered_derived_schema_for(query_entry.identity_key(), SchemaDirection::Request)
         && let Some(fields) = query_parameters_from_body(&body, index)
     {
         return fields;
@@ -1492,7 +1907,7 @@ fn query_parameters_for(query_entry: &SchemaEntry, index: &SchemaComponentIndex)
         name: query_entry.name.to_owned(),
         location: "query".to_owned(),
         required: false,
-        schema: schema_value_for(query_entry, index),
+        schema: schema_value_for(query_entry, index, SchemaDirection::Request),
         style: Some("form".to_owned()),
         explode: Some(true),
         description: None,
@@ -1526,7 +1941,7 @@ fn query_parameters_from_body(
                 // tracks — but not in this parameter's schema, since it lives
                 // outside components_map. Rewrite it here instead.
                 let mut schema = field_schema.clone();
-                rewrite_identity_refs(&mut schema, index);
+                rewrite_identity_refs(&mut schema, index, SchemaDirection::Request);
                 Parameter {
                     name: name.clone(),
                     location: "query".to_owned(),
@@ -1656,24 +2071,42 @@ fn ref_is_object(identity: &str) -> bool {
 /// contract — guaranteeing the tool schema cannot drift from the handler.
 ///
 /// `index` resolves each `Ref` to its collision-free component display key
-/// (issue #1972); build it once with [`build_schema_component_index`] over the
+/// (issue #1972); build it once with [`schema_component_index_for`] over the
 /// same route set so tool `$ref`s match the served OpenAPI components exactly.
+///
+/// This renders a response reference. For a request body or query, use
+/// [`schema_entry_to_value_in`] with [`SchemaDirection::Request`].
 #[cfg(feature = "openapi")]
 #[must_use]
 pub fn schema_entry_to_value(
     entry: &SchemaEntry,
     index: &SchemaComponentIndex,
 ) -> serde_json::Value {
-    schema_value_for(entry, index)
+    schema_value_for(entry, index, SchemaDirection::Response)
+}
+
+/// As [`schema_entry_to_value`], for a reference in `direction` (issue #2607).
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn schema_entry_to_value_in(
+    entry: &SchemaEntry,
+    index: &SchemaComponentIndex,
+    direction: SchemaDirection,
+) -> serde_json::Value {
+    schema_value_for(entry, index, direction)
 }
 
 #[cfg(feature = "openapi")]
-fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_json::Value {
+fn schema_value_for(
+    entry: &SchemaEntry,
+    index: &SchemaComponentIndex,
+    direction: SchemaDirection,
+) -> serde_json::Value {
     // `domain::Option<T>` / `domain::Vec<T>` reach the wrapper arms by last-path
     // -segment match but are ordinary named types: describe them as such.
     if wrapper_is_impostor(entry) {
         return serde_json::json!({
-            "$ref": format!("#/components/schemas/{}", index.display_key(entry))
+            "$ref": format!("#/components/schemas/{}", index.display_key_in(entry, direction))
         });
     }
     if entry_is_arbitrary_json(entry) {
@@ -1682,11 +2115,13 @@ fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_
     match entry.kind {
         SchemaKind::Primitive(json_type) => serde_json::json!({ "type": json_type }),
         SchemaKind::Ref => {
-            serde_json::json!({ "$ref": format!("#/components/schemas/{}", index.display_key(entry)) })
+            serde_json::json!({
+                "$ref": format!("#/components/schemas/{}", index.display_key_in(entry, direction))
+            })
         }
         SchemaKind::Array(items) => serde_json::json!({
             "type": "array",
-            "items": schema_value_for(items, index),
+            "items": schema_value_for(items, index, direction),
         }),
         SchemaKind::Nullable(inner) => {
             // OpenAPI 3.1 aligns with JSON Schema 2020-12, which supports
@@ -1707,7 +2142,7 @@ fn schema_value_for(entry: &SchemaEntry, index: &SchemaComponentIndex) -> serde_
                 SchemaKind::Ref | SchemaKind::Array(_) | SchemaKind::Nullable(_) => {
                     serde_json::json!({
                         "oneOf": [
-                            schema_value_for(inner, index),
+                            schema_value_for(inner, index, direction),
                             { "type": "null" },
                         ],
                     })
@@ -2105,6 +2540,92 @@ fn path_item_operations(item: &PathItem) -> Vec<(&'static str, &Operation)> {
 mod tests {
     use super::*;
 
+    // ── issue #2607: direction helpers ─────────────────────────────────
+
+    #[test]
+    fn remove_schema_properties_drops_the_property_and_its_required_entry() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": { "a": {}, "b": {} },
+            "required": ["a", "b"],
+        });
+        remove_schema_properties(&mut schema, &["b"]);
+        assert_eq!(
+            schema,
+            serde_json::json!({
+                "type": "object",
+                "properties": { "a": {} },
+                "required": ["a"],
+            })
+        );
+        remove_schema_properties(&mut schema, &["a"]);
+        assert!(schema.get("required").is_none(), "{schema}");
+    }
+
+    #[test]
+    fn request_key_skips_taken_and_reserved_keys() {
+        let by_identity: BTreeMap<String, String> = [
+            ("app::Widget".to_owned(), "Widget".to_owned()),
+            ("app::WidgetRequest".to_owned(), "WidgetRequest".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let split = std::iter::once("app::Widget".to_owned()).collect();
+        let reserved = std::iter::once("WidgetRequest-2".to_owned()).collect();
+        let keys = assign_request_keys(&split, &by_identity, &reserved);
+        assert_eq!(keys["app::Widget"], "WidgetRequest-3");
+    }
+
+    #[test]
+    fn split_follows_a_nested_split() {
+        let both = |id: &str| {
+            [
+                (id.to_owned(), SchemaDirection::Request),
+                (id.to_owned(), SchemaDirection::Response),
+            ]
+        };
+        let uses: std::collections::BTreeSet<(String, SchemaDirection)> = both("app::Outer")
+            .into_iter()
+            .chain(both("app::Inner"))
+            .chain(both("app::Plain"))
+            .collect();
+        let outer = serde_json::json!({
+            "properties": { "inner": { "$ref": "#/components/schemas/app::Inner" } }
+        });
+        let plain = serde_json::json!({ "type": "object" });
+        let bodies: BTreeMap<(String, SchemaDirection), Option<serde_json::Value>> = [
+            (
+                ("app::Outer".to_owned(), SchemaDirection::Request),
+                Some(outer.clone()),
+            ),
+            (
+                ("app::Outer".to_owned(), SchemaDirection::Response),
+                Some(outer),
+            ),
+            (
+                ("app::Inner".to_owned(), SchemaDirection::Request),
+                Some(serde_json::json!({ "required": ["secret"] })),
+            ),
+            (
+                ("app::Inner".to_owned(), SchemaDirection::Response),
+                Some(serde_json::json!({})),
+            ),
+            (
+                ("app::Plain".to_owned(), SchemaDirection::Request),
+                Some(plain.clone()),
+            ),
+            (
+                ("app::Plain".to_owned(), SchemaDirection::Response),
+                Some(plain),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let split = split_identities(&uses, &bodies, &std::collections::BTreeSet::new());
+        let split: Vec<&str> = split.iter().map(String::as_str).collect();
+        assert_eq!(split, vec!["app::Inner", "app::Outer"]);
+    }
+
     fn make_doc() -> ApiDoc {
         ApiDoc {
             method: "GET",
@@ -2380,7 +2901,11 @@ mod tests {
             kind: SchemaKind::Nullable(&INNER),
             identity: None,
         };
-        let value = schema_value_for(&entry, &SchemaComponentIndex::default());
+        let value = schema_value_for(
+            &entry,
+            &SchemaComponentIndex::default(),
+            SchemaDirection::Response,
+        );
         assert!(
             value.get("nullable").is_none(),
             "3.1 must not emit `nullable: true` (that is 3.0 only)"
@@ -2417,7 +2942,11 @@ mod tests {
             kind: SchemaKind::Nullable(&INNER),
             identity: None,
         };
-        let value = schema_value_for(&entry, &SchemaComponentIndex::default());
+        let value = schema_value_for(
+            &entry,
+            &SchemaComponentIndex::default(),
+            SchemaDirection::Response,
+        );
         assert!(
             value.get("nullable").is_none(),
             "3.1 must not emit `nullable: true`"
@@ -2686,5 +3215,53 @@ mod tests {
             assign_display_keys(&reversed),
             "display-key assignment must not depend on input order"
         );
+    }
+}
+
+/// The scalar impls compile without the `openapi` feature, so their tests do too.
+#[cfg(test)]
+mod scalar_schema_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_impls_document_strings_with_a_format() {
+        use serde_json::json;
+        let cases = [
+            (
+                <uuid::Uuid as OpenApiSchema>::schema(),
+                json!({"type": "string", "format": "uuid"}),
+            ),
+            (
+                <chrono::DateTime<chrono::Utc> as OpenApiSchema>::schema(),
+                json!({"type": "string", "format": "date-time"}),
+            ),
+            (
+                <chrono::NaiveDate as OpenApiSchema>::schema(),
+                json!({"type": "string", "format": "date"}),
+            ),
+        ];
+        for (got, want) in cases {
+            assert_eq!(got, want);
+        }
+        let naive = <chrono::NaiveDateTime as OpenApiSchema>::schema();
+        assert_eq!(naive["type"], "string");
+        assert!(
+            naive.get("format").is_none(),
+            "naive has no offset: {naive}"
+        );
+    }
+
+    #[test]
+    fn decimal_schema_matches_its_serde_output() {
+        let wire = serde_json::to_value(rust_decimal::Decimal::new(12345, 2)).unwrap();
+        let schema = <rust_decimal::Decimal as OpenApiSchema>::schema();
+        if wire.is_string() {
+            assert_eq!(
+                schema,
+                serde_json::json!({"type": "string", "format": "decimal"})
+            );
+        } else {
+            assert_eq!(schema, serde_json::json!({"type": "number"}));
+        }
     }
 }

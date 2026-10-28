@@ -41,6 +41,20 @@
 //! result — see `serve_tools_call` / `stream_tool_result`. Streaming is
 //! strictly opt-in per tool; the buffered path is unchanged.
 //!
+//! A tool tagged `#[api_doc(mcp, task)]` supports the MCP Tasks extension
+//! (`io.modelcontextprotocol/tasks`). When the client declares the extension,
+//! `tools/call` returns a task handle and the tool runs in the background.
+//! The client polls `tasks/get`. See the `tasks` submodule.
+//!
+//! A large app can send a short catalog. `#[api_doc(mcp, core)]` marks a core
+//! tool, and [`McpCatalog::Progressive`](crate::mcp::McpCatalog::Progressive)
+//! lists only the core tools plus
+//! `search_tools` and `call_tool`. See the `catalog` submodule.
+//!
+//! The endpoint is dual-era. A request with the protocol version in
+//! `params._meta` uses revision `2026-07-28`. Other requests use the legacy
+//! `initialize` flow. See the `modern` submodule.
+//!
 //! [`AppBuilder::expose_all_as_mcp`]: crate::app::AppBuilder::expose_all_as_mcp
 //!
 //! [mcp]: https://modelcontextprotocol.io
@@ -56,13 +70,20 @@ use std::sync::Arc;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use futures::{Stream, StreamExt as _};
+use futures::{FutureExt as _, Stream, StreamExt as _};
 use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
 use crate::sse::{Event, Sse};
 
-use crate::openapi::{ApiDoc, schema_entry_to_value};
+use crate::openapi::{ApiDoc, SchemaDirection, schema_entry_to_value_in};
+
+mod catalog;
+mod modern;
+mod tasks;
+
+pub use catalog::McpCatalog;
+pub use tasks::McpTaskConfig;
 
 /// Protocol version advertised when a client requests an unsupported one (or
 /// none). Also the newest version this server implements.
@@ -77,11 +98,20 @@ const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// MCP Streamable-HTTP transport headers a browser client attaches to its
-/// JSON-RPC requests. They are always added to the `OPTIONS` preflight's
-/// `Access-Control-Allow-Headers` (on top of the app's configured list) so a
-/// default CORS config doesn't block the follow-up `POST`. See
+/// JSON-RPC requests, and the x402 `payment-signature` of a paid tool call
+/// (forwarded to the priced route). They are always added to the `OPTIONS`
+/// preflight's `Access-Control-Allow-Headers` (on top of the app's configured
+/// list) so a default CORS config doesn't block the follow-up `POST`. See
 /// <https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#protocol-version-header>.
-const MCP_REQUEST_HEADERS: &[&str] = &["mcp-protocol-version", "mcp-session-id"];
+/// `Mcp-Name` and `Mcp-Method` are the routing headers a client sets on
+/// `tasks/*` requests (MCP Tasks extension).
+const MCP_REQUEST_HEADERS: &[&str] = &[
+    "mcp-protocol-version",
+    "mcp-session-id",
+    "mcp-name",
+    "mcp-method",
+    "payment-signature",
+];
 
 /// Upper bound on a tool's buffered response body (10 MiB). MCP tool results
 /// are structured JSON; this guards the in-process dispatch path against a
@@ -107,7 +137,15 @@ const FORWARDED_HEADERS: &[&str] = &[
     // when no locale query/cookie is present, so forward it for the tool result
     // to match the localized data a direct HTTP call would return.
     "accept-language",
+    // x402: the payment for a priced route (`[[aeo.paid_routes]]`). Without it
+    // a priced tool could only ever answer `402`.
+    "payment-signature",
 ];
+
+/// Response headers copied from the replayed handler response onto the
+/// rebuilt `/mcp` response: session and CSRF cookies, and the x402 challenge
+/// and settlement receipt of a priced route.
+const REPLAYED_RESPONSE_HEADERS: &[&str] = &["set-cookie", "payment-required", "payment-response"];
 
 /// Layer applier for the optional whole-endpoint auth gate (e.g.
 /// `RequireApiToken`). Boxed so any `tower::Layer` can be erased; applied to
@@ -130,6 +168,15 @@ pub struct McpRuntime {
     /// catalog (`initialize`/`tools/list`) as well as tool dispatch. Set via
     /// [`AppBuilder::secure_mcp`](crate::app::AppBuilder::secure_mcp).
     pub(crate) endpoint_layer: Option<McpEndpointLayer>,
+    /// Settings for task tools (MCP Tasks extension). Set via
+    /// [`AppBuilder::mcp_tasks`](crate::app::AppBuilder::mcp_tasks).
+    pub(crate) tasks: McpTaskConfig,
+    /// The server instructions. Set via
+    /// [`AppBuilder::mcp_instructions`](crate::app::AppBuilder::mcp_instructions).
+    pub(crate) instructions: Option<String>,
+    /// How `tools/list` presents the catalog. Set via
+    /// [`AppBuilder::mcp_catalog`](crate::app::AppBuilder::mcp_catalog).
+    pub(crate) catalog: McpCatalog,
 }
 
 impl McpRuntime {
@@ -140,6 +187,9 @@ impl McpRuntime {
             mount_path: mount_path.into(),
             expose_all: false,
             endpoint_layer: None,
+            tasks: McpTaskConfig::default(),
+            instructions: None,
+            catalog: McpCatalog::Full,
         }
     }
 }
@@ -169,10 +219,17 @@ struct McpTool {
     /// (e.g. an HTML handler tagged `status = 204`) can't leak its body into
     /// the tool result.
     empty_body: bool,
+    /// True for a `#[api_doc(mcp, task)]` tool. A client that declares the
+    /// MCP Tasks extension gets a task handle.
+    task: bool,
     /// The handler's build-time authority envelope (#1691), or `None` for an
     /// ungoverned tool. Drives the invocation's audit record and the
     /// reversibility-derived `destructiveHint`.
     agent_authority: Option<&'static crate::agent_authority::AgentAuthority>,
+    /// True for a core tool (`#[api_doc(mcp, core)]`).
+    core: bool,
+    /// The route's `OpenAPI` tags. `search_tools` matches them.
+    tags: Vec<String>,
 }
 
 impl McpTool {
@@ -185,6 +242,9 @@ impl McpTool {
         }
         obj.insert("inputSchema".into(), self.input_schema.clone());
         obj.insert("annotations".into(), self.annotations.clone());
+        if self.core {
+            obj.insert("_meta".into(), json!({ catalog::ALWAYS_LOAD: true }));
+        }
         Value::Object(obj)
     }
 }
@@ -222,6 +282,14 @@ pub(crate) struct McpWiring {
     /// [`AuditLogger`](crate::audit::AuditLogger) and the injected entropy seam
     /// without any per-handler wiring (#1691).
     pub state: crate::state::AppState,
+    /// The session cookie name. Its value is part of a task's owner digest.
+    pub session_cookie: String,
+    /// Settings for task tools.
+    pub tasks: McpTaskConfig,
+    /// The author's server instructions, if any.
+    pub instructions: Option<String>,
+    /// How `tools/list` presents the catalog.
+    pub catalog: McpCatalog,
 }
 
 /// The shared MCP server state attached to the endpoint handler. Holds the
@@ -265,8 +333,26 @@ pub struct McpServer {
     /// records through this (#1691); an app with no `AuditLogger` installed
     /// makes those writes a no-op, so nothing here is conditional on one.
     state: crate::state::AppState,
+    /// The session cookie name. Its value is part of a task's owner digest.
+    session_cookie: String,
+    /// Tasks created by task tools (MCP Tasks extension).
+    tasks: tasks::TaskStore,
+    /// True when one or more tools are task tools. Only then does the server
+    /// advertise the extension and serve `tasks/*`.
+    has_task_tools: bool,
     server_name: String,
     server_version: String,
+    /// The server instructions: the author's text and the catalog guidance.
+    instructions: Option<String>,
+    /// How `tools/list` presents the catalog.
+    catalog: McpCatalog,
+    /// The `search_tools` and `call_tool` entries. Empty in the full catalog.
+    meta_tools: Vec<Value>,
+    /// The searchable words of each tool, in catalog order. Empty in the
+    /// full catalog.
+    search_index: Vec<catalog::ToolWords>,
+    /// Enforces each grant's `rate` cap. Per process.
+    rate_limiter: crate::agent_authority::rate::RateLimiter,
 }
 
 impl McpServer {
@@ -507,12 +593,20 @@ fn build_input_schema(
     }
 
     if let Some(query) = &doc.query_schema {
-        let schema = rewrite_refs(schema_entry_to_value(query, index), components, &mut defs);
+        let schema = rewrite_refs(
+            schema_entry_to_value_in(query, index, SchemaDirection::Request),
+            components,
+            &mut defs,
+        );
         properties.insert("query".to_owned(), schema);
     }
 
     if let Some(body) = &doc.request_body {
-        let schema = rewrite_refs(schema_entry_to_value(body, index), components, &mut defs);
+        let schema = rewrite_refs(
+            schema_entry_to_value_in(body, index, SchemaDirection::Request),
+            components,
+            &mut defs,
+        );
         properties.insert("body".to_owned(), schema);
         required.push(json!("body"));
     }
@@ -695,7 +789,7 @@ pub fn derive_tools(
     // mapping the OpenAPI generator used, so a tool's inlined `$defs` refs match
     // the served component names even when two types share a last segment
     // (issue #1972).
-    let index = crate::openapi::build_schema_component_index(&refs);
+    let index = crate::openapi::schema_component_index_for(&config, &refs);
 
     let mut tools = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -756,10 +850,20 @@ pub fn derive_tools(
             empty_body: doc.response.is_none()
                 && has_empty_body_contract(doc.success_status)
                 && !doc.mcp_stream,
+            task: doc.mcp_task,
             agent_authority: doc.agent_authority,
+            core: doc.mcp_core,
+            tags: doc.tags.iter().map(|tag| (*tag).to_owned()).collect(),
         });
     }
     tools
+}
+
+/// Remove each tool that has a meta-tool name, in progressive mode only.
+/// The router calls it before the server and the AEO documents read the
+/// tools.
+pub(crate) fn drop_reserved_tools(tools: Vec<McpToolInfo>, mode: McpCatalog) -> Vec<McpToolInfo> {
+    catalog::drop_reserved(tools, mode)
 }
 
 /// Public, transport-agnostic description of a derived tool. Returned by
@@ -779,7 +883,10 @@ pub struct McpToolInfo {
     has_query: bool,
     streams: bool,
     empty_body: bool,
+    task: bool,
     agent_authority: Option<&'static crate::agent_authority::AgentAuthority>,
+    core: bool,
+    tags: Vec<String>,
 }
 
 impl McpToolInfo {
@@ -822,10 +929,40 @@ impl McpToolInfo {
         &self.path_template
     }
 
+    /// Path parameter names, in template order. A catch-all keeps its `*`.
+    #[must_use]
+    pub fn path_params(&self) -> &[String] {
+        &self.path_params
+    }
+
+    /// Whether the tool sends a JSON body (the `body` argument).
+    #[must_use]
+    pub const fn has_body(&self) -> bool {
+        self.has_body
+    }
+
+    /// Whether the tool sends a query string (the `query` argument).
+    #[must_use]
+    pub const fn has_query(&self) -> bool {
+        self.has_query
+    }
+
     /// Whether this is a streaming (`Sse`) tool.
     #[must_use]
     pub const fn streams(&self) -> bool {
         self.streams
+    }
+
+    /// Whether this is a task tool (`#[api_doc(mcp, task)]`).
+    #[must_use]
+    pub const fn supports_tasks(&self) -> bool {
+        self.task
+    }
+
+    /// Whether this is a core tool (`#[api_doc(mcp, core)]`).
+    #[must_use]
+    pub const fn is_core(&self) -> bool {
+        self.core
     }
 
     /// The build-time authority envelope proved for the handler behind this
@@ -847,7 +984,10 @@ impl McpServer {
     /// router-supplied [`McpWiring`] (CORS, trusted hosts, tenant/CSRF headers).
     #[must_use]
     pub(crate) fn new(tools: Vec<McpToolInfo>, dispatch: axum::Router, wiring: McpWiring) -> Self {
-        let tools: Vec<McpTool> = tools
+        let progressive = wiring.catalog == McpCatalog::Progressive;
+        // The router already removed a tool with a meta-tool name. A direct
+        // caller of this function gets the same filter.
+        let tools: Vec<McpTool> = catalog::drop_reserved(tools, wiring.catalog)
             .into_iter()
             .map(|t| McpTool {
                 name: t.name,
@@ -861,9 +1001,18 @@ impl McpServer {
                 has_query: t.has_query,
                 streams: t.streams,
                 empty_body: t.empty_body,
+                task: t.task,
                 agent_authority: t.agent_authority,
+                core: t.core,
+                tags: t.tags,
             })
             .collect();
+        let (meta_tools, search_index) = if progressive {
+            (catalog::meta_descriptors(&tools), catalog::index(&tools))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let has_task_tools = tools.iter().any(|t| t.task);
         let by_name = tools
             .iter()
             .enumerate()
@@ -880,8 +1029,16 @@ impl McpServer {
             envelope_rate_limited: wiring.envelope_rate_limited,
             envelope_load_shed: wiring.envelope_load_shed,
             state: wiring.state,
+            session_cookie: wiring.session_cookie,
+            tasks: tasks::TaskStore::new(wiring.tasks),
+            has_task_tools,
             server_name: "autumn-mcp".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            instructions: catalog::instructions(wiring.instructions.as_deref(), wiring.catalog),
+            catalog: wiring.catalog,
+            meta_tools,
+            search_index,
+            rate_limiter: crate::agent_authority::rate::RateLimiter::default(),
         }
     }
 }
@@ -1097,10 +1254,16 @@ struct ReplayContext<'a> {
     headers: &'a HeaderMap,
     identity: Option<&'a crate::security::ResolvedClientIdentity>,
     peer: Option<std::net::SocketAddr>,
+    /// The envelope's load-shed admission. A shed replay marks it, so the
+    /// envelope gives no limiter sample.
+    envelope_admission: Option<crate::middleware::EnvelopeAdmission>,
     /// The verified mTLS client identity of the connection the `/mcp` envelope
     /// arrived on (#1640), when there is one.
     #[cfg(feature = "tls")]
     client_cert: Option<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
+    /// True for a request in the modern era (protocol `2026-07-28`). Its
+    /// results get `resultType` and `_meta.serverInfo`.
+    modern: bool,
 }
 
 /// Reject an untrusted `Host`/`:authority` or a disallowed browser `Origin`
@@ -1185,6 +1348,7 @@ async fn serve_mcp(
     #[cfg(feature = "tls")] client_cert: Option<
         axum::extract::Extension<std::sync::Arc<crate::tls::client_auth::ClientIdentity>>,
     >,
+    envelope_admission: Option<axum::extract::Extension<crate::middleware::EnvelopeAdmission>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -1208,11 +1372,20 @@ async fn serve_mcp(
     let parsed: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
+            if modern::header_is_modern(&headers) {
+                let rejection = modern::parse_error(&e.to_string());
+                let mut response = json_response(&rejection.body);
+                *response.status_mut() = rejection.status;
+                return response;
+            }
             return json_response(&parse_error(&e.to_string()));
         }
     };
 
-    if let Some(rejection) = reject_unsupported_protocol_version(&headers, &parsed) {
+    // A request with the modern `_meta` fields uses protocol `2026-07-28`.
+    // Other requests use the legacy flow and its version header check.
+    let modern = modern::wants_modern(&headers, &parsed);
+    if !modern && let Some(rejection) = reject_unsupported_protocol_version(&headers, &parsed) {
         return rejection;
     }
 
@@ -1220,11 +1393,28 @@ async fn serve_mcp(
         headers: &headers,
         identity,
         peer: connect_info.map(|ext| (ext.0).0),
+        envelope_admission: envelope_admission.map(|ext| ext.0),
         #[cfg(feature = "tls")]
         client_cert,
+        modern,
     };
 
-    let mut response = match parsed {
+    let mut response = if modern {
+        serve_modern(&server, &ctx, parsed).await
+    } else {
+        serve_legacy(&server, &ctx, parsed).await
+    };
+
+    // The endpoint sits outside the global CORS layer, so an allowlisted
+    // browser client needs the grant on the actual response to read the body.
+    apply_cors_headers(&server.cors, origin.as_deref(), &mut response);
+    response
+}
+
+/// Serve a legacy request: one JSON-RPC message or a batch, after an
+/// `initialize` handshake (protocol `2025-06-18` and earlier).
+async fn serve_legacy(server: &Arc<McpServer>, ctx: &ReplayContext<'_>, parsed: Value) -> Response {
+    match parsed {
         // JSON-RPC 2.0: an empty batch is itself an Invalid Request.
         Value::Array(batch) if batch.is_empty() => {
             json_response(&error(Value::Null, -32600, "Invalid Request: empty batch"))
@@ -1240,17 +1430,20 @@ async fn serve_mcp(
         // batches calls; rejecting here keeps `tools/call` a single-message
         // request — where the per-call limiter and the 10 MiB cap both still
         // apply. Harmless metadata methods (initialize/tools/list/ping) may
-        // still be batched.
+        // still be batched. The server also refuses `tasks/*` in a batch. The
+        // owner check reads the request context. Only a single request has it.
         Value::Array(batch)
-            if batch
-                .iter()
-                .any(|msg| msg.get("method").and_then(Value::as_str) == Some("tools/call")) =>
+            if batch.iter().any(|msg| {
+                msg.get("method")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m == "tools/call" || is_task_method(m))
+            }) =>
         {
             json_response(&error(
                 Value::Null,
                 -32600,
-                "Invalid Request: batched tools/call is not supported; \
-                 send each tools/call as a single JSON-RPC request",
+                "Invalid Request: batched tools/call or tasks/* is not supported; \
+                 send each one as a single JSON-RPC request",
             ))
         }
         Value::Array(batch) => {
@@ -1258,7 +1451,7 @@ async fn serve_mcp(
             for msg in batch {
                 // Only metadata methods reach here (a batched `tools/call` is
                 // rejected above), so none set a `Set-Cookie`.
-                if let Some(resp) = handle_message(&server, &msg) {
+                if let Some(resp) = handle_message(server, &msg) {
                     out.push(resp);
                 }
             }
@@ -1274,10 +1467,12 @@ async fn serve_mcp(
         // tool) or buffered JSON; everything else (initialize/tools/list/ping)
         // is buffered. A notification (no `id`) yields `None` → 202.
         msg @ Value::Object(_) => {
-            if let Some((id, params)) = single_tools_call(&msg) {
-                serve_tools_call(&server, &ctx, id, params).await
+            if let Some((id, params)) = single_request(&msg, "tools/call") {
+                serve_tools_call(server, ctx, id, params).await
+            } else if let Some((method, id, params)) = single_task_request(&msg) {
+                json_response(&serve_task_method(server, ctx, &method, id, &params))
             } else {
-                handle_message(&server, &msg).map_or_else(
+                handle_message(server, &msg).map_or_else(
                     || StatusCode::ACCEPTED.into_response(),
                     |v| json_response(&v),
                 )
@@ -1289,12 +1484,48 @@ async fn serve_mcp(
             -32600,
             "Invalid Request: expected a JSON object or array",
         )),
-    };
+    }
+}
 
-    // The endpoint sits outside the global CORS layer, so an allowlisted
-    // browser client needs the grant on the actual response to read the body.
-    apply_cors_headers(&server.cors, origin.as_deref(), &mut response);
-    response
+/// Serve a modern request (protocol `2026-07-28`). Each POST carries one
+/// message, with its version and client capabilities in `_meta`.
+async fn serve_modern(server: &Arc<McpServer>, ctx: &ReplayContext<'_>, parsed: Value) -> Response {
+    let reply = |status: StatusCode, mut message: Value| {
+        modern::stamp(&mut message, &server.server_info());
+        let mut response = json_response(&message);
+        *response.status_mut() = status;
+        response
+    };
+    let rejected = |rejection: modern::Rejection| reply(rejection.status, rejection.body);
+
+    if parsed.is_array() {
+        return rejected(modern::batch_rejection());
+    }
+    // This revision defines no client notifications over HTTP. Accept one
+    // and send no body, as the transport requires.
+    if modern::is_notification(&parsed) {
+        return StatusCode::ACCEPTED.into_response();
+    }
+    if let Err(rejection) = modern::validate(ctx.headers, &parsed, |m| server.serves(m)) {
+        return rejected(rejection);
+    }
+    let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+    let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = parsed.get("params").cloned().unwrap_or(Value::Null);
+    match method {
+        "server/discover" => reply(StatusCode::OK, success(id, discover_result(server))),
+        "tools/list" => {
+            let mut result = tools_list_result(server);
+            modern::add_cache_hints(&mut result);
+            reply(StatusCode::OK, success(id, result))
+        }
+        "tools/call" => serve_tools_call(server, ctx, id, params).await,
+        m if is_task_method(m) => {
+            let message = serve_task_method(server, ctx, m, id, &params);
+            reply(modern::status_for(&message), message)
+        }
+        other => rejected(modern::method_not_found(id, other)),
+    }
 }
 
 /// Enforce the Streamable-HTTP `MCP-Protocol-Version` header. Returns a 400
@@ -1381,6 +1612,42 @@ fn handle_message(server: &McpServer, msg: &Value) -> Option<Value> {
     })
 }
 
+impl McpServer {
+    /// The server capabilities. The tasks extension is listed only when a
+    /// task tool exists.
+    fn capabilities(&self) -> Value {
+        let mut capabilities = json!({ "tools": { "listChanged": false } });
+        if self.has_task_tools {
+            capabilities["extensions"] = json!({ tasks::EXTENSION_ID: {} });
+        }
+        capabilities
+    }
+
+    /// Whether a modern request for `method` is served. Others get `-32601`.
+    fn serves(&self, method: &str) -> bool {
+        matches!(method, "server/discover" | "tools/list" | "tools/call")
+            || (is_task_method(method) && self.has_task_tools)
+    }
+
+    /// The server name and version (an MCP `Implementation`).
+    fn server_info(&self) -> Value {
+        json!({ "name": self.server_name, "version": self.server_version })
+    }
+}
+
+/// The `server/discover` result (protocol `2026-07-28`).
+fn discover_result(server: &McpServer) -> Value {
+    let mut result = json!({
+        "supportedVersions": modern::VERSIONS,
+        "capabilities": server.capabilities(),
+    });
+    if let Some(text) = &server.instructions {
+        result["instructions"] = json!(text);
+    }
+    modern::add_cache_hints(&mut result);
+    result
+}
+
 fn initialize_result(server: &McpServer, params: &Value) -> Value {
     // Echo the client's requested version only if we actually implement it;
     // otherwise advertise our newest supported version (MCP negotiation).
@@ -1388,23 +1655,43 @@ fn initialize_result(server: &McpServer, params: &Value) -> Value {
         Some(requested) if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) => requested,
         _ => DEFAULT_PROTOCOL_VERSION,
     };
-    json!({
+    let mut result = json!({
         "protocolVersion": protocol,
-        "capabilities": { "tools": { "listChanged": false } },
+        "capabilities": server.capabilities(),
         "serverInfo": {
             "name": server.server_name,
             "version": server.server_version,
         },
-    })
+    });
+    if let Some(text) = &server.instructions {
+        result["instructions"] = json!(text);
+    }
+    result
 }
 
+/// The `tools/list` result. The full catalog lists every tool. The
+/// progressive catalog lists the meta-tools, then the core tools.
 fn tools_list_result(server: &McpServer) -> Value {
-    let tools: Vec<Value> = server.tools.iter().map(McpTool::descriptor).collect();
+    let tools: Vec<Value> = match server.catalog {
+        McpCatalog::Progressive => server
+            .meta_tools
+            .iter()
+            .cloned()
+            .chain(
+                server
+                    .tools
+                    .iter()
+                    .filter(|t| t.core)
+                    .map(McpTool::descriptor),
+            )
+            .collect(),
+        McpCatalog::Full => server.tools.iter().map(McpTool::descriptor).collect(),
+    };
     json!({ "tools": tools })
 }
 
-/// Whether `msg` is a well-formed single `tools/call` request (JSON-RPC 2.0
-/// object, `method == "tools/call"`, with a usable `id`). Returns the cloned
+/// Whether `msg` is a well-formed single request for `method` (JSON-RPC 2.0
+/// object, with a usable `id`). Returns the cloned
 /// `id` and `params`. A `tools/call` is handled apart from [`handle_message`]
 /// so its (possibly streaming) result can ride the Streamable-HTTP SSE channel.
 ///
@@ -1412,12 +1699,12 @@ fn tools_list_result(server: &McpServer) -> Value {
 /// [`handle_message`], which produces the standard `-32600` error; a
 /// `tools/call` *notification* (no `id`) likewise falls through and is treated
 /// as a no-op notification (`202`), matching the pre-streaming behavior.
-fn single_tools_call(msg: &Value) -> Option<(Value, Value)> {
+fn single_request(msg: &Value, method: &str) -> Option<(Value, Value)> {
     let obj = msg.as_object()?;
     if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return None;
     }
-    if obj.get("method").and_then(Value::as_str) != Some("tools/call") {
+    if obj.get("method").and_then(Value::as_str) != Some(method) {
         return None;
     }
     let id = obj.get("id")?;
@@ -1426,6 +1713,114 @@ fn single_tools_call(msg: &Value) -> Option<(Value, Value)> {
     }
     let params = obj.get("params").cloned().unwrap_or(Value::Null);
     Some((id.clone(), params))
+}
+
+/// Methods of the MCP Tasks extension.
+const TASK_METHODS: &[&str] = &["tasks/get", "tasks/update", "tasks/cancel"];
+
+fn is_task_method(method: &str) -> bool {
+    TASK_METHODS.contains(&method)
+}
+
+/// A well-formed single `tasks/*` request: the method, `id` and `params`.
+fn single_task_request(msg: &Value) -> Option<(String, Value, Value)> {
+    let method = msg.get("method").and_then(Value::as_str)?;
+    if !is_task_method(method) {
+        return None;
+    }
+    let (id, params) = single_request(msg, method)?;
+    Some((method.to_owned(), id, params))
+}
+
+impl McpServer {
+    /// The digest of the credentials on this request. A task is visible only
+    /// to a request with the same digest.
+    ///
+    /// Parts: `Authorization`, the session cookie, the tenant header and the
+    /// mTLS certificate fingerprint. The envelope does not resolve a
+    /// principal, so the raw credentials are the parts. A caller with none of
+    /// them is anonymous. Only the 256-bit task ID protects such a task.
+    fn task_owner(&self, ctx: &ReplayContext<'_>) -> tasks::Owner {
+        let headers = ctx.headers;
+        let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        let session = headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(';'))
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find(|(name, _)| *name == self.session_cookie)
+            .map(|(_, value)| value);
+        #[cfg(feature = "tls")]
+        let certificate = ctx.client_cert.as_deref().map(|c| c.fingerprint.as_str());
+        #[cfg(not(feature = "tls"))]
+        let certificate = None;
+        tasks::Owner::new(&[
+            header("authorization"),
+            session,
+            self.tenant_header.as_deref().and_then(header),
+            certificate,
+        ])
+    }
+
+    /// A new task ID: 32 bytes from the injected entropy source, as hex.
+    fn new_task_id(&self) -> String {
+        let mut bytes = [0u8; 32];
+        self.state.entropy().fill_bytes(&mut bytes);
+        bytes.iter().fold(String::with_capacity(64), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+    }
+}
+
+/// Serve `tasks/get`, `tasks/update` or `tasks/cancel`.
+fn serve_task_method(
+    server: &McpServer,
+    ctx: &ReplayContext<'_>,
+    method: &str,
+    id: Value,
+    params: &Value,
+) -> Value {
+    if !server.has_task_tools {
+        return error(id, -32601, &format!("method not found: {method}"));
+    }
+    if !tasks::client_declares_tasks(params) {
+        return error_with_data(
+            id,
+            tasks::MISSING_CAPABILITY,
+            "Missing required client capability",
+            tasks::missing_capability_data(),
+        );
+    }
+    let Some(task_id) = params.get("taskId").and_then(Value::as_str) else {
+        return error(id, -32602, "`taskId` must be a string");
+    };
+    let owner = server.task_owner(ctx);
+    let now = server.state.clock().now();
+    let ack = || json!({ "resultType": "complete" });
+    // A task of another caller gives the same error as an unknown task, so a
+    // caller cannot find out that the ID exists.
+    let found = match method {
+        "tasks/get" => server.tasks.get(task_id, &owner, now),
+        "tasks/cancel" => server.tasks.cancel(task_id, &owner, now).then(ack),
+        // `inputResponses` is required. Autumn never asks for input, so no
+        // key is outstanding. The spec says to ignore such keys.
+        _ if !params.get("inputResponses").is_some_and(Value::is_object) => {
+            return error(id, -32602, "`inputResponses` must be a JSON object");
+        }
+        _ => server.tasks.contains(task_id, &owner, now).then(ack),
+    };
+    found.map_or_else(
+        || {
+            error(
+                id.clone(),
+                -32602,
+                "Failed to retrieve task: Task not found",
+            )
+        },
+        |result| success(id.clone(), result),
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -1444,6 +1839,71 @@ const MAX_ARGUMENT_NAMES_BYTES: usize = 512;
 /// Actor recorded when no principal was resolved for the call. Never empty: an
 /// audit row that cannot name who acted is still a row that must be greppable.
 const ANONYMOUS_AGENT: &str = "agent:anonymous";
+
+/// Admit a call. It must be inside the `rate` cap. Its attempt record must be
+/// writable, unless the action is provably reversible. A refusal becomes the
+/// tool error text.
+async fn admit_call(server: &McpServer, tool: &McpTool, audit: &AgentAudit) -> Result<(), String> {
+    if let Err(refusal) = check_rate_cap(server, tool) {
+        audit.record_refusal(&server.state, &refusal).await;
+        return Err(refusal);
+    }
+    // The last thing before the action runs: if this record cannot be written
+    // and the action is not provably reversible, it does not run.
+    audit
+        .record_attempt(&server.state)
+        .await
+        .map_err(str::to_owned)
+}
+
+/// Refuse a call that is over its grant's declared `rate` cap. A cap that
+/// cannot be read refuses every call: it must never mean "no cap".
+fn check_rate_cap(server: &McpServer, tool: &McpTool) -> Result<(), String> {
+    let Some(grant) = tool.agent_authority.map(|a| a.grant) else {
+        return Ok(());
+    };
+    let Some(rate) = grant.rate else {
+        return Ok(());
+    };
+    let Some(cap) = crate::agent_authority::rate::parse_rate(rate) else {
+        return Err(format!(
+            "rate cap `{rate}` for grant {} cannot be read; the call is refused",
+            grant.name
+        ));
+    };
+    server
+        .rate_limiter
+        .check(grant.name, grant.location, cap, server.state.clock().now())
+        .map_err(|wait| {
+            format!(
+                "rate cap {rate} for grant {} exceeded; retry in {wait}s",
+                grant.name
+            )
+        })
+}
+
+/// Longest actor id an audit row keeps.
+const MAX_ACTOR_LEN: usize = 128;
+
+/// An actor id fit for an audit row: letters, digits and plain id punctuation
+/// only, capped in length.
+///
+/// An allowlist, because line separators, zero-width marks and bidirectional
+/// marks are not control characters, and a list of them is never complete.
+fn clean_actor(actor: &str) -> Option<String> {
+    let clean: String = actor
+        .chars()
+        .filter(|c| {
+            c.is_alphanumeric()
+                || matches!(
+                    c,
+                    '-' | '_' | '.' | ':' | '@' | '+' | '/' | '=' | '#' | '~' | ' '
+                )
+        })
+        .take(MAX_ACTOR_LEN)
+        .collect();
+    (!clean.trim().is_empty()).then_some(clean)
+}
 
 /// The tool error returned when a non-reversible action cannot be recorded.
 const UNAUDITABLE_REFUSAL: &str =
@@ -1488,7 +1948,16 @@ struct AgentAudit {
 impl AgentAudit {
     /// Resolve the invocation's audit context from the tool's compile-time
     /// authority and the call's *shape*.
-    fn new(server: &McpServer, tool: &McpTool, arguments: &Value, ctx: &ReplayContext<'_>) -> Self {
+    ///
+    /// `via_call_tool` is true for a call that `call_tool` wrapped. The
+    /// record names the inner tool and adds `via = "call_tool"`.
+    fn new(
+        server: &McpServer,
+        tool: &McpTool,
+        arguments: &Value,
+        ctx: &ReplayContext<'_>,
+        via_call_tool: bool,
+    ) -> Self {
         let authority = tool.agent_authority;
         let grant = authority.map(|a| a.grant.name);
         let reversibility = authority.map(|a| a.grant.reversibility);
@@ -1512,6 +1981,9 @@ impl AgentAudit {
             shared.insert("effects".to_owned(), render_effects(authority.effects));
         }
         shared.insert("argument_names".to_owned(), argument_names(tool, arguments));
+        if via_call_tool {
+            shared.insert("via".to_owned(), catalog::CALL_TOOL.to_owned());
+        }
 
         Self {
             tool: tool.name.clone(),
@@ -1523,6 +1995,7 @@ impl AgentAudit {
             // the auth layer on the request scope, so a `secure_mcp` app names
             // its caller and an open one falls back rather than recording "".
             actor: crate::current::Current::scoped_actor()
+                .and_then(|actor| clean_actor(&actor))
                 .unwrap_or_else(|| ANONYMOUS_AGENT.to_owned()),
             ip: ctx.peer.map(|peer| peer.ip()),
             shared,
@@ -1546,6 +2019,18 @@ impl AgentAudit {
     /// unknown marker is that we do not get to assume.
     fn refuse_when_unauditable(&self) -> bool {
         self.reversibility != Some(crate::agent_authority::Reversibility::Reversible)
+    }
+
+    /// Name the principal the route's own auth layer resolved. Only the rows
+    /// written after dispatch carry it. The envelope's own actor, when it
+    /// resolved one, wins.
+    fn adopt_actor(&mut self, actor: Option<&str>) {
+        if self.actor != ANONYMOUS_AGENT {
+            return;
+        }
+        if let Some(clean) = actor.and_then(clean_actor) {
+            self.actor = clean;
+        }
     }
 
     /// Build one of this invocation's events.
@@ -1699,7 +2184,7 @@ impl AgentAudit {
     async fn record_outcome(
         &self,
         state: &crate::state::AppState,
-        status: StatusCode,
+        status: Option<StatusCode>,
         request_id: Option<&str>,
         disposition: Disposition,
     ) {
@@ -1707,16 +2192,19 @@ impl AgentAudit {
         // `200` before it has done anything, and a buffered tool can answer
         // `200` and then fail to hand its body over. `disposition` carries what
         // actually became of the action.
-        let succeeded = status.is_success() && disposition.is_success();
+        // `None`: the work stopped before the handler gave a status.
+        let succeeded = status.is_some_and(|s| s.is_success()) && disposition.is_success();
         let audit_status = if succeeded {
             crate::audit::AuditStatus::Success
         } else {
             crate::audit::AuditStatus::Failure
         };
         let mut event = self.event(format!("agent.tool.{}", self.tool), audit_status, "outcome");
-        event
-            .metadata
-            .insert("http_status".to_owned(), status.as_u16().to_string());
+        if let Some(status) = status {
+            event
+                .metadata
+                .insert("http_status".to_owned(), status.as_u16().to_string());
+        }
         if let Some(stream) = disposition.stream_state() {
             event
                 .metadata
@@ -1748,7 +2236,7 @@ impl AgentAudit {
             argument_names = self.shared.get("argument_names").map(String::as_str),
             actor = %self.actor,
             target = %self.path_template,
-            http_status = status.as_u16(),
+            http_status = status.map(|s| s.as_u16()),
             stream_state = disposition.stream_state(),
             result = disposition.result(),
             request_id = request_id,
@@ -1822,6 +2310,8 @@ enum Disposition {
     Stream(StreamState),
     /// The buffered path could not deliver the handler's body.
     Buffered(BufferedFailure),
+    /// A task stopped before its handler gave a result.
+    Task(TaskEnd),
 }
 
 impl Disposition {
@@ -1831,7 +2321,7 @@ impl Disposition {
         match self {
             Self::Settled => true,
             Self::Stream(state) => state.is_success(),
-            Self::Buffered(_) => false,
+            Self::Buffered(_) | Self::Task(_) => false,
         }
     }
 
@@ -1845,7 +2335,26 @@ impl Disposition {
     const fn result(self) -> Option<&'static str> {
         match self {
             Self::Buffered(failure) => Some(failure.as_str()),
+            Self::Task(end) => Some(end.as_str()),
             _ => None,
+        }
+    }
+}
+
+/// Why a task stopped before its handler gave a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskEnd {
+    /// `tasks/cancel` or the TTL stopped the work.
+    Aborted,
+    /// The handler panicked.
+    Panicked,
+}
+
+impl TaskEnd {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Aborted => "task_aborted",
+            Self::Panicked => "task_panicked",
         }
     }
 }
@@ -1884,23 +2393,37 @@ impl StreamState {
     }
 }
 
-/// Owns the one outcome record a streaming `tools/call` still owes.
+/// Owns the one outcome record a streaming or task `tools/call` still owes.
 ///
-/// The record is written when the projection reaches a terminal state — which
-/// may be "never", if the client hangs up. `Drop` is therefore the backstop:
-/// it cannot await, so it spawns the write instead. `recorded` makes the two
-/// paths mutually exclusive, so exactly one outcome reaches the sink per call.
-struct StreamAudit {
+/// The work writes the record when it reaches a terminal state. If that does
+/// not occur (the client hangs up, or cancels the task), `Drop` writes
+/// `abandoned`. `Drop` cannot await, so it spawns the write. `recorded` makes
+/// the two paths mutually exclusive: one outcome reaches the sink per call.
+struct OutcomeGuard {
     audit: AgentAudit,
     state: crate::state::AppState,
-    status: StatusCode,
+    /// The handler's status. `None` until a task's dispatch returns.
+    status: Option<StatusCode>,
     request_id: Option<String>,
+    /// What `Drop` records: the work stopped before it ended.
+    abandoned: Disposition,
     recorded: bool,
 }
 
-impl StreamAudit {
-    /// Record the outcome inline, from the projection's own async context.
-    async fn record(&mut self, stream: StreamState) {
+impl OutcomeGuard {
+    const fn new(audit: AgentAudit, state: crate::state::AppState, abandoned: Disposition) -> Self {
+        Self {
+            audit,
+            state,
+            status: None,
+            request_id: None,
+            abandoned,
+            recorded: false,
+        }
+    }
+
+    /// Record the outcome inline, from the work's own async context.
+    async fn record(&mut self, disposition: Disposition) {
         if self.recorded {
             return;
         }
@@ -1910,21 +2433,28 @@ impl StreamAudit {
                 &self.state,
                 self.status,
                 self.request_id.as_deref(),
-                Disposition::Stream(stream),
+                disposition,
             )
             .await;
     }
 }
 
-impl Drop for StreamAudit {
+impl Drop for OutcomeGuard {
     fn drop(&mut self) {
         if self.recorded {
             return;
         }
         self.recorded = true;
-        // The projection never reached an end: the response body was dropped
-        // while the handler still had output to give. That is an aborted
-        // action, and the trail has to say so rather than stay silent.
+        // The work never reached an end: a stream's response body was dropped
+        // while the handler still had output to give, or a task was cancelled,
+        // expired or panicked. The trail has to say so rather than stay silent.
+        let disposition = match self.abandoned {
+            // A drop during unwinding is a panic, not an abort.
+            Disposition::Task(_) if std::thread::panicking() => {
+                Disposition::Task(TaskEnd::Panicked)
+            }
+            other => other,
+        };
         let audit = self.audit.clone();
         let state = self.state.clone();
         let status = self.status;
@@ -1935,12 +2465,7 @@ impl Drop for StreamAudit {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 audit
-                    .record_outcome(
-                        &state,
-                        status,
-                        request_id.as_deref(),
-                        Disposition::Stream(StreamState::Aborted),
-                    )
+                    .record_outcome(&state, status, request_id.as_deref(), disposition)
                     .await;
             });
         }
@@ -2045,6 +2570,7 @@ fn apply_replay_extensions(
     server: &McpServer,
     ctx: &ReplayContext<'_>,
     audit: &AgentAudit,
+    detached: bool,
 ) {
     let extensions = request.extensions_mut();
 
@@ -2083,8 +2609,14 @@ fn apply_replay_extensions(
     // without this a `tools/call` would acquire one slot at the envelope and a
     // second at this replay for the same logical request — silently halving the
     // effective ceiling for MCP traffic.
-    if server.envelope_load_shed {
+    //
+    // A task (`detached`) outlives the envelope and its slot, so it takes
+    // its own slot instead.
+    if server.envelope_load_shed && !detached {
         extensions.insert(crate::middleware::LoadShedExempt);
+        if let Some(admission) = &ctx.envelope_admission {
+            extensions.insert(admission.clone());
+        }
     }
 }
 
@@ -2100,16 +2632,23 @@ struct Dispatched {
     request_id: Option<String>,
     /// Whether the handler answered with `text/event-stream`.
     is_event_stream: bool,
-    /// Any `Set-Cookie` the inner handler or middleware set (session renewal,
-    /// CSRF-cookie refresh, login), replayed onto the outer HTTP response so a
-    /// tool call sends what the equivalent direct call would have.
-    cookies: Vec<HeaderValue>,
+    /// The [`REPLAYED_RESPONSE_HEADERS`] the inner handler or middleware set
+    /// (session renewal, CSRF-cookie refresh, login, an x402 receipt),
+    /// replayed onto the outer HTTP response so a tool call sends what the
+    /// equivalent direct call would have.
+    replayed: Vec<(HeaderName, HeaderValue)>,
+    /// The principal the route's own auth layer resolved, if any.
+    actor: Option<String>,
 }
 
 impl Dispatched {
     fn inspect(response: &Response) -> Self {
         let headers = response.headers();
         Self {
+            actor: response
+                .extensions()
+                .get::<crate::agent_authority::AgentActor>()
+                .map(|actor| actor.0.clone()),
             status: response.status(),
             request_id: headers
                 .get("x-request-id")
@@ -2123,12 +2662,34 @@ impl Dispatched {
                         .to_ascii_lowercase()
                         .starts_with("text/event-stream")
                 }),
-            cookies: headers
-                .get_all(header::SET_COOKIE)
+            replayed: REPLAYED_RESPONSE_HEADERS
                 .iter()
-                .cloned()
+                .flat_map(|&name| {
+                    headers
+                        .get_all(name)
+                        .iter()
+                        .map(move |value| (HeaderName::from_static(name), value.clone()))
+                })
                 .collect(),
         }
+    }
+}
+
+/// Write the [`Dispatched::replayed`] headers onto the rebuilt `/mcp`
+/// response. A paid call's challenge or receipt also carries x402's
+/// `private, no-store`, so the paid result is not cached.
+fn apply_replayed(headers: &mut HeaderMap, replayed: Vec<(HeaderName, HeaderValue)>) {
+    let mut paid = false;
+    for (name, value) in replayed {
+        paid |= name.as_str().starts_with("payment-");
+        headers.append(name, value);
+    }
+    if paid {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-store"),
+        );
+        crate::aeo::commerce::expose_payment_headers(headers);
     }
 }
 
@@ -2136,19 +2697,24 @@ impl Dispatched {
 /// MCP tool result — buffered JSON for an ordinary tool, or a progressive SSE
 /// stream for a `#[api_doc(mcp, stream)]` tool whose handler returns `Sse`.
 async fn serve_tools_call(
-    server: &McpServer,
+    server: &Arc<McpServer>,
     ctx: &ReplayContext<'_>,
     id: Value,
     params: Value,
 ) -> Response {
-    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    // `inputSchema` is always an object; reject a non-object `arguments`
-    // (null/string/array) rather than coercing it to `{}` and dispatching.
-    let arguments = match params.get("arguments") {
-        None => json!({}),
-        Some(value) if value.is_object() => value.clone(),
-        Some(_) => return json_response(&error(id, -32602, "`arguments` must be a JSON object")),
+    // A modern request's result gets `resultType` and `_meta.serverInfo`.
+    let server_info = ctx.modern.then(|| server.server_info());
+    let reply = |mut message: Value| {
+        if let Some(info) = &server_info {
+            modern::stamp(&mut message, info);
+        }
+        json_response(&message)
     };
+    let (params, arguments, via_call_tool) = match prepare_call(server, &id, params, reply) {
+        PreparedCall::Run(params, arguments, via_call_tool) => (params, arguments, via_call_tool),
+        PreparedCall::Done(response) => return response,
+    };
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
 
     let Some(&idx) = server.by_name.get(name) else {
         return json_response(&error(id, -32602, &format!("unknown tool: {name}")));
@@ -2168,14 +2734,26 @@ async fn serve_tools_call(
 
     // Agent-authority envelope (#1691). Resolved before dispatch so the
     // correlation id exists ahead of anything that can go wrong.
-    let audit = AgentAudit::new(server, tool, &arguments, ctx);
-    apply_replay_extensions(&mut request, server, ctx, &audit);
+    let mut audit = AgentAudit::new(server, tool, &arguments, ctx, via_call_tool);
 
-    // The last thing before the action runs: if this record cannot be written
-    // and the action is not provably reversible, it does not run.
-    if let Err(refusal) = audit.record_attempt(&server.state).await {
-        return json_response(&success(id, tool_error(refusal)));
+    if let Err(refusal) = admit_call(server, tool, &audit).await {
+        return reply(success(id, tool_error(&refusal)));
     }
+
+    // MCP Tasks extension: give a task handle to a client that declared the
+    // extension. If the store is full, the tool runs as a blocking call.
+    // An x402-priced tool always answers on `/mcp`: a task has no response
+    // to carry the payment challenge or the receipt.
+    if tool.task
+        && tasks::client_declares_tasks(&params)
+        && !crate::aeo::commerce::prices_route(&server.state, &tool.method, &tool.path_template)
+        && let Some((task_id, created)) = reserve_task(server, ctx, &tool.name)
+    {
+        apply_replay_extensions(&mut request, server, ctx, &audit, true);
+        spawn_task(server, idx, &task_id, request, audit);
+        return reply(success(id, created));
+    }
+    apply_replay_extensions(&mut request, server, ctx, &audit, false);
 
     let response = match server.dispatch.clone().oneshot(request).await {
         Ok(resp) => resp,
@@ -2183,12 +2761,12 @@ async fn serve_tools_call(
             audit
                 .record_outcome(
                     &server.state,
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(StatusCode::INTERNAL_SERVER_ERROR),
                     None,
                     Disposition::Settled,
                 )
                 .await;
-            return json_response(&success(id, tool_error(&format!("dispatch failed: {e}"))));
+            return reply(success(id, tool_error(&format!("dispatch failed: {e}"))));
         }
     };
 
@@ -2196,8 +2774,10 @@ async fn serve_tools_call(
         status,
         request_id,
         is_event_stream,
-        cookies,
+        replayed,
+        actor,
     } = Dispatched::inspect(&response);
+    audit.adopt_actor(actor.as_deref());
     let client_accepts_sse = ctx
         .headers
         .get(header::ACCEPT)
@@ -2217,14 +2797,14 @@ async fn serve_tools_call(
         // disconnect — with no later event to correct it. The guard travels
         // with the projection and writes exactly one outcome when it reaches a
         // terminal state, or from its `Drop` if the client hangs up first.
-        let stream_audit = StreamAudit {
+        let mut stream_audit = OutcomeGuard::new(
             audit,
-            state: server.state.clone(),
-            status,
-            request_id,
-            recorded: false,
-        };
-        return stream_tool_result(id, &params, response, cookies, stream_audit);
+            server.state.clone(),
+            Disposition::Stream(StreamState::Aborted),
+        );
+        stream_audit.status = Some(status);
+        stream_audit.request_id = request_id;
+        return stream_tool_result(id, &params, response, replayed, stream_audit, server_info);
     }
 
     // Buffered path: the outcome is recorded only once the body has actually
@@ -2232,13 +2812,226 @@ async fn serve_tools_call(
     // anything — the body can still overflow the tool-result cap or error
     // mid-read, and the agent would then see a tool error while the audit row
     // claimed success (issue #1691 review round 2).
-    let (resp, failure) =
-        buffered_tool_response(tool, id, status, is_event_stream, cookies, response).await;
+    let (resp, failure) = buffered_tool_response(
+        tool,
+        id,
+        status,
+        is_event_stream,
+        replayed,
+        response,
+        server_info.as_ref(),
+    )
+    .await;
     let disposition = failure.map_or(Disposition::Settled, Disposition::Buffered);
     audit
-        .record_outcome(&server.state, status, request_id.as_deref(), disposition)
+        .record_outcome(
+            &server.state,
+            Some(status),
+            request_id.as_deref(),
+            disposition,
+        )
         .await;
     resp
+}
+
+/// A `tools/call` after the meta-tool step and the argument check.
+enum PreparedCall {
+    /// Run the call: its parameters, its `arguments` object, and whether
+    /// `call_tool` wrapped it.
+    Run(Value, Value, bool),
+    /// End the call with this response.
+    Done(Response),
+}
+
+/// Serve the meta-tools of the progressive catalog, then check the
+/// `arguments` of the call to run.
+///
+/// `search_tools` gets its answer here. `call_tool` gives the parameters of
+/// the inner call, which then takes the same path as a direct call.
+fn prepare_call(
+    server: &McpServer,
+    id: &Value,
+    params: Value,
+    reply: impl Fn(Value) -> Response,
+) -> PreparedCall {
+    let invalid =
+        |message: &str| PreparedCall::Done(json_response(&error(id.clone(), -32602, message)));
+    let (params, via_call_tool) = match params.get("name").and_then(Value::as_str) {
+        Some(catalog::SEARCH_TOOL) if server.catalog == McpCatalog::Progressive => {
+            return match search_tools(server, &params) {
+                Ok(result) => PreparedCall::Done(reply(success(id.clone(), result))),
+                Err(message) => invalid(&message),
+            };
+        }
+        Some(catalog::CALL_TOOL) if server.catalog == McpCatalog::Progressive => {
+            match catalog::unwrap_call(&params) {
+                Ok(inner) => (inner, true),
+                Err(message) => return invalid(&message),
+            }
+        }
+        _ => (params, false),
+    };
+    match call_arguments(&params) {
+        Ok(arguments) => PreparedCall::Run(params, arguments, via_call_tool),
+        Err(message) => invalid(message),
+    }
+}
+
+/// The `arguments` object of a `tools/call`. Absent arguments are `{}`.
+///
+/// `inputSchema` is always an object. A non-object `arguments` (null,
+/// string, array) is an error, not a value to coerce to `{}`.
+fn call_arguments(params: &Value) -> Result<Value, &'static str> {
+    match params.get("arguments") {
+        None => Ok(json!({})),
+        Some(value) if value.is_object() => Ok(value.clone()),
+        Some(_) => Err("`arguments` must be a JSON object"),
+    }
+}
+
+/// Serve a `search_tools` call. Returns the tool result, or the reason that
+/// the arguments are not valid.
+fn search_tools(server: &McpServer, params: &Value) -> Result<Value, String> {
+    let arguments = call_arguments(params)?;
+    let args = catalog::parse_search(&arguments)?;
+    let found = catalog::search(&server.tools, &server.search_index, &args);
+    let mut result = tool_ok(&found.to_string());
+    result["structuredContent"] = found;
+    Ok(result)
+}
+
+/// Add a `working` task to the store. Returns its ID and `CreateTaskResult`,
+/// or `None` (with a warning) when the store or the client's quota is full.
+fn reserve_task(
+    server: &McpServer,
+    ctx: &ReplayContext<'_>,
+    tool: &str,
+) -> Option<(String, Value)> {
+    let task_id = server.new_task_id();
+    let owner = server.task_owner(ctx);
+    // The quota key is the client IP. The caller cannot change it, so a new
+    // credential does not give a new quota.
+    let quota = ctx
+        .identity
+        .and_then(|id| id.addr)
+        .or_else(|| ctx.peer.map(|peer| peer.ip()))
+        .map_or_else(|| "unknown".to_owned(), |ip| ip.to_string());
+    let now = server.state.clock().now();
+    let Some(created) = server.tasks.create(&task_id, owner, &quota, now) else {
+        tracing::warn!(
+            tool = %tool,
+            "MCP task store is full; the tool call runs as a blocking call"
+        );
+        return None;
+    };
+    Some((task_id, created))
+}
+
+/// Run a task tool call in the background. The task is already in the store.
+fn spawn_task(
+    server: &Arc<McpServer>,
+    idx: usize,
+    task_id: &str,
+    request: axum::extract::Request,
+    audit: AgentAudit,
+) {
+    // Make the guard before the spawn. If tokio aborts the job before its
+    // first poll, the guard writes the outcome.
+    let outcome = OutcomeGuard::new(
+        audit,
+        server.state.clone(),
+        Disposition::Task(TaskEnd::Aborted),
+    );
+    let ttl = server.tasks.ttl();
+    let job_server = Arc::clone(server);
+    let job_id = task_id.to_owned();
+    let job = tokio::spawn(async move {
+        let server = job_server;
+        let run = std::panic::AssertUnwindSafe(run_task(&server, idx, request, outcome));
+        // The TTL bounds the job, also when no request comes to purge it.
+        // A timeout drops the guard, which writes `task_aborted`.
+        let Ok(ran) = tokio::time::timeout(ttl, run.catch_unwind()).await else {
+            let error = json!({ "code": -32603, "message": "Internal error" });
+            let state = tasks::TaskState::Failed(error, "The task TTL ended.".to_owned());
+            server
+                .tasks
+                .finish(&job_id, state, server.state.clock().now());
+            return;
+        };
+        let Ok((mut result, mut outcome, disposition, permit)) = ran else {
+            // A tool error is a result (`isError`). A panic outside the
+            // pipeline's own panic catch is a JSON-RPC internal error.
+            let error = json!({ "code": -32603, "message": "Internal error" });
+            let state = tasks::TaskState::Failed(error, "The tool handler panicked.".to_owned());
+            server
+                .tasks
+                .finish(&job_id, state, server.state.clock().now());
+            return;
+        };
+        // The reference client reads `resultType` on the result.
+        if let Some(object) = result.as_object_mut() {
+            object.insert("resultType".to_owned(), json!("complete"));
+        }
+        // Finish before the audit write. After `finish`, a cancel or the TTL
+        // cannot abort the job, so the result and the outcome record stay.
+        let state = tasks::TaskState::Completed(Arc::new(result));
+        server
+            .tasks
+            .finish(&job_id, state, server.state.clock().now());
+        drop(permit);
+        outcome.record(disposition).await;
+    });
+    server.tasks.set_abort(task_id, &job.abort_handle());
+    // Delete the task when its TTL ends, also when no request comes. The job
+    // can end early, so this timer is a separate task.
+    let sweep_server = Arc::clone(server);
+    tokio::spawn(async move {
+        tokio::time::sleep(ttl).await;
+        sweep_server.tasks.sweep(sweep_server.state.clock().now());
+    });
+}
+
+/// Dispatch a task's request. Returns its `CallToolResult`, the guard and
+/// disposition for the outcome record, and the buffer permit. The caller
+/// writes the record after it stores the result.
+async fn run_task(
+    server: &McpServer,
+    idx: usize,
+    request: axum::extract::Request,
+    mut outcome: OutcomeGuard,
+) -> (
+    Value,
+    OutcomeGuard,
+    Disposition,
+    Option<tokio::sync::SemaphorePermit<'_>>,
+) {
+    let tool = &server.tools[idx];
+    let response = match server.dispatch.clone().oneshot(request).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            outcome.status = Some(StatusCode::INTERNAL_SERVER_ERROR);
+            let result = tool_error(&format!("dispatch failed: {e}"));
+            return (result, outcome, Disposition::Settled, None);
+        }
+    };
+    let Dispatched {
+        status,
+        request_id,
+        is_event_stream,
+        actor,
+        ..
+    } = Dispatched::inspect(&response);
+    outcome.audit.adopt_actor(actor.as_deref());
+    // A task has no HTTP response to carry `Set-Cookie` or `Server-Timing`.
+    outcome.status = Some(status);
+    outcome.request_id = request_id;
+    // Limit how many task results buffer at once. The caller keeps the
+    // permit until the result is stored.
+    let permit = server.tasks.buffer_permit().await;
+    let (result, failure) =
+        read_tool_result(tool, status, is_event_stream, response.into_body()).await;
+    let disposition = failure.map_or(Disposition::Settled, Disposition::Buffered);
+    (result, outcome, disposition, permit)
 }
 
 /// Repackage a fully-buffered handler response as the JSON-RPC tool result.
@@ -2255,8 +3048,9 @@ async fn buffered_tool_response(
     id: Value,
     status: StatusCode,
     is_event_stream: bool,
-    cookies: Vec<HeaderValue>,
+    replayed: Vec<(HeaderName, HeaderValue)>,
     response: Response,
+    server_info: Option<&Value>,
 ) -> (Response, Option<BufferedFailure>) {
     // Capture the dispatch clone's `Server-Timing` header (#1348) so its
     // non-`total` metrics can be forwarded onto the rebuilt response. The clone
@@ -2273,43 +3067,18 @@ async fn buffered_tool_response(
         server_timings.push(value.clone());
     }
 
-    // Unlike a normal HTTP response (streamed straight to the socket), the MCP
-    // path buffers the whole body to repackage it as a tool result. Cap that
-    // buffer so a runaway handler can't OOM the process; report an overflow as
-    // an explicit tool error rather than silently truncating to an empty body.
-    let bytes = match axum::body::to_bytes(response.into_body(), MAX_TOOL_RESPONSE_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            // The agent gets a tool error, so the audit row must record one
-            // too: the call did not deliver what the handler produced.
-            let failure = BufferedFailure::classify(&error);
-            let message = match failure {
-                BufferedFailure::Overflow => format!(
-                    "handler response exceeded the {MAX_TOOL_RESPONSE_BYTES}-byte MCP tool-result limit"
-                ),
-                BufferedFailure::BodyError => {
-                    format!("handler response body failed mid-read: {error}")
-                }
-            };
-            return (
-                json_response(&success(id, tool_error(&message))),
-                Some(failure),
-            );
-        }
-    };
-    // A streaming handler buffered for a non-SSE client: collapse the SSE wire
-    // frames into their concatenated data payload so the client still receives a
-    // usable single result instead of raw `data:`-framed text.
-    let text = if is_event_stream {
-        collapse_sse_body(&bytes)
-    } else {
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
-
-    let value = buffered_tool_result(tool, id, status, &text);
-    let mut resp = json_response(&value);
-    for cookie in cookies {
-        resp.headers_mut().append(header::SET_COOKIE, cookie);
+    let (value, failure) =
+        read_tool_result(tool, status, is_event_stream, response.into_body()).await;
+    let mut message = success(id, value);
+    if let Some(info) = server_info {
+        modern::stamp(&mut message, info);
+    }
+    let mut resp = json_response(&message);
+    // The handler already ran: its cookies, and an x402 receipt for a payment
+    // already settled, reach the client even when its body failed to read.
+    apply_replayed(resp.headers_mut(), replayed);
+    if failure.is_some() {
+        return (resp, failure);
     }
     // Forward only the inner dispatch's non-`total` `Server-Timing` metrics
     // (e.g. `db;dur=…;desc="N queries"`) onto the rebuilt response, dropping the
@@ -2331,6 +3100,48 @@ async fn buffered_tool_response(
         }
     }
     (resp, None)
+}
+
+/// Read a handler body and package it as a `CallToolResult`.
+///
+/// Returns the result plus, when the body could not be delivered, why.
+async fn read_tool_result(
+    tool: &McpTool,
+    status: StatusCode,
+    is_event_stream: bool,
+    body: Body,
+) -> (Value, Option<BufferedFailure>) {
+    // Unlike a normal HTTP response (streamed straight to the socket), the MCP
+    // path buffers the whole body to repackage it as a tool result. Cap that
+    // buffer so a runaway handler can't OOM the process; report an overflow as
+    // an explicit tool error rather than silently truncating to an empty body.
+    let bytes = match axum::body::to_bytes(body, MAX_TOOL_RESPONSE_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            // The agent gets a tool error, so the audit row must record one
+            // too: the call did not deliver what the handler produced.
+            let failure = BufferedFailure::classify(&error);
+            let message = match failure {
+                BufferedFailure::Overflow => format!(
+                    "handler response exceeded the {MAX_TOOL_RESPONSE_BYTES}-byte MCP tool-result limit"
+                ),
+                BufferedFailure::BodyError => {
+                    format!("handler response body failed mid-read: {error}")
+                }
+            };
+            return (tool_error(&message), Some(failure));
+        }
+    };
+    // A streaming handler buffered for a non-SSE client: collapse the SSE wire
+    // frames into their concatenated data payload so the client still receives a
+    // usable single result instead of raw `data:`-framed text.
+    let text = if is_event_stream {
+        collapse_sse_body(&bytes)
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+
+    (buffered_tool_result(tool, status, &text), None)
 }
 
 /// Strip the `total` metric from a `Server-Timing` header value, returning the
@@ -2359,22 +3170,19 @@ fn strip_total_metric(value: &str) -> Option<String> {
     }
 }
 
-/// Package a buffered handler response as the JSON-RPC tool result.
+/// Package a buffered handler response as a `CallToolResult`.
 ///
 /// An empty-body-contract tool (declared 204/205, no response schema)
 /// advertises "empty text on success". Enforce that here rather than
 /// trusting the declaration: a handler whose real response carries a body
 /// (e.g. an HTML route mislabeled `status = 204`) must not leak it into the
 /// tool result. Discarding silently would hide the mislabel, so surface it.
-fn buffered_tool_result(tool: &McpTool, id: Value, status: StatusCode, text: &str) -> Value {
+fn buffered_tool_result(tool: &McpTool, status: StatusCode, text: &str) -> Value {
     if !status.is_success() {
-        return success(
-            id,
-            tool_error(&format!(
-                "handler returned HTTP {}: {text}",
-                status.as_u16()
-            )),
-        );
+        return tool_error(&format!(
+            "handler returned HTTP {}: {text}",
+            status.as_u16()
+        ));
     }
     if tool.empty_body {
         if !text.is_empty() {
@@ -2386,9 +3194,9 @@ fn buffered_tool_result(tool: &McpTool, id: Value, status: StatusCode, text: &st
                  not match what its handler actually returns)"
             );
         }
-        return success(id, tool_ok(""));
+        return tool_ok("");
     }
-    success(id, tool_ok(text))
+    tool_ok(text)
 }
 
 // ── Progressive (SSE) tool-result projection ──────────────────────
@@ -2484,7 +3292,10 @@ struct StreamProjection {
     /// The invocation's outstanding outcome record. Dropped with the rest of
     /// the projection when the client hangs up, which is how an aborted stream
     /// still gets a row (#1691).
-    audit: StreamAudit,
+    audit: OutcomeGuard,
+    /// The server info for a modern request. The final result gets
+    /// `resultType` and `_meta.serverInfo`.
+    stamp: Option<Value>,
 }
 
 /// Project a streaming handler's `Sse` response onto the MCP SSE channel.
@@ -2498,8 +3309,9 @@ fn stream_tool_result(
     id: Value,
     params: &Value,
     response: Response,
-    cookies: Vec<HeaderValue>,
-    audit: StreamAudit,
+    replayed: Vec<(HeaderName, HeaderValue)>,
+    audit: OutcomeGuard,
+    stamp: Option<Value>,
 ) -> Response {
     let progress_token = params
         .get("_meta")
@@ -2517,15 +3329,17 @@ fn stream_tool_result(
         result_parts: Vec::new(),
         phase: ProjectionPhase::Streaming,
         audit,
+        stamp,
     };
 
     let stream = futures::stream::unfold(state, project_next);
     let mut resp = Sse::new(stream)
         .keep_alive(crate::sse::keep_alive())
         .into_response();
-    for cookie in cookies {
-        resp.headers_mut().append(header::SET_COOKIE, cookie);
-    }
+    // Ask reverse proxies (nginx) not to buffer the stream.
+    resp.headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    apply_replayed(resp.headers_mut(), replayed);
     resp
 }
 
@@ -2547,7 +3361,10 @@ async fn project_next(
                 } else {
                     st.result_parts.concat()
                 };
-                let value = success(st.id.clone(), tool_ok(&content));
+                let mut value = success(st.id.clone(), tool_ok(&content));
+                if let Some(server_info) = &st.stamp {
+                    modern::stamp(&mut value, server_info);
+                }
                 st.phase = ProjectionPhase::Done;
                 return Some((Ok(Event::default().data(value.to_string())), st));
             }
@@ -2571,7 +3388,7 @@ async fn project_next(
                     let trailing = st.parser.finish();
                     enqueue_projected(&mut st, trailing);
                     st.phase = ProjectionPhase::Final;
-                    st.audit.record(outcome).await;
+                    st.audit.record(Disposition::Stream(outcome)).await;
                 }
             },
         }
@@ -3164,6 +3981,12 @@ fn error(id: Value, code: i64, message: &str) -> Value {
     obj.insert("id".into(), id);
     obj.insert("error".into(), json!({ "code": code, "message": message }));
     Value::Object(obj)
+}
+
+fn error_with_data(id: Value, code: i64, message: &str, data: Value) -> Value {
+    let mut out = error(id, code, message);
+    out["error"]["data"] = data;
+    out
 }
 
 fn parse_error(message: &str) -> Value {
@@ -3907,6 +4730,26 @@ mod tests {
     }
 
     #[test]
+    fn an_actor_id_keeps_only_id_characters_and_is_capped() {
+        assert_eq!(clean_actor("user-42").as_deref(), Some("user-42"));
+        assert_eq!(clean_actor("a\nb\r\u{0}c").as_deref(), Some("abc"));
+        assert_eq!(clean_actor("\n"), None);
+        assert_eq!(
+            clean_actor("ad\u{202E}min\u{200B}").as_deref(),
+            Some("admin")
+        );
+        // Line separators and soft or joining marks are not control characters.
+        assert_eq!(clean_actor("a\u{2028}b\u{2029}c").as_deref(), Some("abc"));
+        assert_eq!(clean_actor("a\u{2060}b\u{00AD}c").as_deref(), Some("abc"));
+        // Ordinary ids keep their punctuation.
+        assert_eq!(
+            clean_actor("agent:key_1.x@example.com").as_deref(),
+            Some("agent:key_1.x@example.com")
+        );
+        assert_eq!(clean_actor(&"x".repeat(500)).map(|a| a.len()), Some(128));
+    }
+
+    #[test]
     fn encode_query_arg_renders_the_extractor_dialect() {
         let mut pairs = QueryPairs::new();
         encode_query_arg("page", &json!(2), 1, &mut pairs).expect("scalar");
@@ -4171,7 +5014,10 @@ mod tests {
             has_query,
             streams: false,
             empty_body: false,
+            task: false,
             agent_authority: None,
+            core: false,
+            tags: Vec::new(),
         }
     }
 
@@ -4379,6 +5225,122 @@ mod tests {
         assert_eq!(cookies, ["session=abc", "csrf=dup1", "csrf=dup2"]);
     }
 
+    #[test]
+    fn x402_headers_cross_the_replay_both_ways() {
+        let t = tool("GET", "/api/report", false, false);
+        let mut headers = HeaderMap::new();
+        headers.insert("payment-signature", "eyJ4IjoxfQ==".parse().unwrap());
+        let req =
+            build_request(&t, &headers, &json!({}), "x-csrf-token", None).expect("request builds");
+        assert_eq!(req.headers()["payment-signature"], "eyJ4IjoxfQ==");
+
+        let response = Response::builder()
+            .header(header::SET_COOKIE, "session=abc")
+            .header("payment-response", "receipt")
+            .header("payment-required", "challenge")
+            .header("x-other", "kept inside")
+            .body(Body::empty())
+            .unwrap();
+        let replayed: Vec<_> = Dispatched::inspect(&response)
+            .replayed
+            .into_iter()
+            .map(|(name, value)| format!("{name}: {}", value.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            replayed,
+            [
+                "set-cookie: session=abc",
+                "payment-required: challenge",
+                "payment-response: receipt"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_still_returns_the_payment_receipt() {
+        let t = tool("GET", "/api/report", false, false);
+        let body = Body::from_stream(futures::stream::iter([Err::<Bytes, _>(
+            std::io::Error::other("boom"),
+        )]));
+        let response = Response::builder()
+            .header("payment-response", "receipt")
+            .body(body)
+            .unwrap();
+        let replayed = Dispatched::inspect(&response).replayed;
+        let (resp, failure) = buffered_tool_response(
+            &t,
+            json!(1),
+            StatusCode::OK,
+            false,
+            replayed,
+            response,
+            None,
+        )
+        .await;
+        assert!(failure.is_some());
+        assert_eq!(resp.headers()["payment-response"], "receipt");
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+        // A cross-origin browser client can read the receipt.
+        assert_eq!(
+            resp.headers()[header::ACCESS_CONTROL_EXPOSE_HEADERS],
+            "PAYMENT-REQUIRED, PAYMENT-RESPONSE"
+        );
+    }
+
+    /// Codex review (P2): a paid tool result keeps x402's `no-store`, on the
+    /// buffered and the streamed response alike; an unpaid one is untouched.
+    #[tokio::test]
+    async fn a_paid_tool_result_is_not_cached() {
+        let t = tool("GET", "/api/report", false, false);
+        let response = Response::builder()
+            .header("payment-response", "receipt")
+            .body(Body::from("{}"))
+            .unwrap();
+        let replayed = Dispatched::inspect(&response).replayed;
+        let (resp, _) = buffered_tool_response(
+            &t,
+            json!(1),
+            StatusCode::OK,
+            false,
+            replayed,
+            response,
+            None,
+        )
+        .await;
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "private, no-store");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        apply_replayed(
+            &mut headers,
+            vec![(
+                HeaderName::from_static("payment-required"),
+                HeaderValue::from_static("challenge"),
+            )],
+        );
+        assert_eq!(
+            headers
+                .get_all(header::CACHE_CONTROL)
+                .iter()
+                .collect::<Vec<_>>(),
+            ["private, no-store"]
+        );
+
+        let response = Response::builder().body(Body::from("{}")).unwrap();
+        let replayed = Dispatched::inspect(&response).replayed;
+        let (resp, _) = buffered_tool_response(
+            &t,
+            json!(1),
+            StatusCode::OK,
+            false,
+            replayed,
+            response,
+            None,
+        )
+        .await;
+        assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
+    }
+
     /// A trusted-Host policy that trusts the given hosts (plus dev loopback,
     /// which `from_config` adds for non-production profiles).
     fn trusted(hosts: &[&str]) -> crate::router::TrustedHostPolicy {
@@ -4407,6 +5369,10 @@ mod tests {
                 envelope_rate_limited: false,
                 envelope_load_shed: false,
                 state: crate::AppState::for_test(),
+                session_cookie: "autumn.sid".to_owned(),
+                tasks: McpTaskConfig::default(),
+                instructions: None,
+                catalog: McpCatalog::Full,
             },
         )
     }
@@ -4525,6 +5491,11 @@ mod tests {
         assert!(
             allow_headers.contains("mcp-protocol-version"),
             "allow-headers missing MCP-Protocol-Version: {allow_headers}"
+        );
+        // A paid tool call's retry carries the x402 payment.
+        assert!(
+            allow_headers.contains("payment-signature"),
+            "allow-headers missing Payment-Signature: {allow_headers}"
         );
 
         // Non-allowlisted origin → no CORS grant (browser will block the POST).

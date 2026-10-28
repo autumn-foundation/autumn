@@ -42,7 +42,7 @@
 //! In **multi-replica** deployments sharing a writable `dist/` volume or
 //! object-backed storage, each replica independently detects staleness and
 //! can race to regenerate the same page. Supply a
-//! [`crate::static_gen::isr_coordinator::PostgresIsrCoordinator`] (feature `db`) via
+//! [`crate::static_gen::isr_coordinator::PostgresIsrCoordinator`] (feature `postgres`) via
 //! [`crate::static_gen::StaticFileLayer::with_isr_coordinator`] so that only one replica wins
 //! the lock per revalidation window:
 //!
@@ -70,7 +70,9 @@ mod types;
 /// — there is no inbound client connection whose `request_timeout_ms` deadline
 /// should apply, and a legitimately slow prerender must not fail the build or
 /// skip an ISR refresh with a `503`. The request-timeout middleware skips its
-/// deadline whenever this marker is present on the request.
+/// deadline whenever this marker is present on the request. The trusted-host
+/// check lets a marked render with no `Host` through: a build has no client
+/// to send one, and the `prod` profile refuses an unmarked request without it.
 ///
 /// Live inbound requests to the same route (a manifest miss, no `dist`, or a
 /// cache read that falls through to the dynamic router) do NOT carry this
@@ -80,12 +82,14 @@ mod types;
 pub struct RenderDeadlineExempt;
 
 pub use build::{BuildError, render_static_routes};
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub use isr_coordinator::PostgresIsrCoordinator;
 pub use isr_coordinator::{
     IsrCoordinator, LocalIsrCoordinator, isr_advisory_lock_key, isr_window_key,
 };
-pub use middleware::{ResolvedStatic, StaticFileLayer, resolved_content_type};
+pub use middleware::{
+    ResolvedStatic, StaticFileLayer, resolved_content_type, resolved_entry_content_type,
+};
 pub use types::{
     ManifestEntry, ParamsFn, StaticManifest, StaticParams, StaticRouteMeta, url_to_file_path,
 };

@@ -4,6 +4,10 @@
 # Shell gates must stay LF-normalized on Windows; CRLF makes bash see
 # carriage returns in options and blank lines.
 *.sh text eol=lf
+# A scaffolded script template ends in `.sh.tmpl`, so `*.sh` misses it.
+# `autumn release init` embeds it with include_str! and writes it out as a
+# bash script; a CRLF checkout would ship a script bash cannot run.
+autumn-cli/src/templates/**/*.sh.tmpl text eol=lf
 
 # Force LF for embedded Markdown content used via include_str! so that
 # git autocrlf on Windows does not corrupt the frontmatter delimiters.

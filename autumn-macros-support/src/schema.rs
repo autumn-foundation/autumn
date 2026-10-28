@@ -38,6 +38,28 @@ pub fn field_is_collaborative(field: &syn::Field) -> bool {
     has_attr(field, "collaborative")
 }
 
+/// The serde direction a schema describes (issue #2607).
+///
+/// A response is what `Serialize` writes. A request is what `Deserialize`
+/// reads. The two can use different names for the same field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SerdeSide {
+    /// The shape `Serialize` writes (a response).
+    Serialize,
+    /// The shape `Deserialize` reads (a request).
+    Deserialize,
+}
+
+impl SerdeSide {
+    /// The key of this side in a split `rename(serialize = .., deserialize = ..)`.
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Serialize => "serialize",
+            Self::Deserialize => "deserialize",
+        }
+    }
+}
+
 /// The struct-level `#[serde(rename_all = "...")]` casing rule for serialization.
 ///
 /// Handles both the plain form and the split
@@ -49,34 +71,16 @@ pub fn field_is_collaborative(field: &syn::Field) -> bool {
 /// derive still validates the attribute itself).
 #[must_use]
 pub fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<String> {
-    let mut rule = None;
-    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
-        let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("rename_all") {
-                if let Ok(value) = meta.value() {
-                    // rename_all = "camelCase"
-                    if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
-                        rule = Some(s.value());
-                    }
-                } else {
-                    // rename_all(serialize = "...", deserialize = "...")
-                    let _ = meta.parse_nested_meta(|inner| {
-                        if let Ok(value) = inner.value()
-                            && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
-                            && inner.path.is_ident("serialize")
-                        {
-                            rule = Some(s.value());
-                        }
-                        Ok(())
-                    });
-                }
-            } else {
-                consume_unrecognized_meta(&meta)?;
-            }
-            Ok(())
-        });
-    }
-    rule
+    serde_rename_all_rule_for(attrs, SerdeSide::Serialize)
+}
+
+/// The struct-level `#[serde(rename_all = "...")]` casing rule for one side.
+///
+/// A plain `rename_all = ".."` applies to both sides. A split form applies only
+/// the value that names `side`.
+#[must_use]
+pub fn serde_rename_all_rule_for(attrs: &[syn::Attribute], side: SerdeSide) -> Option<String> {
+    serde_rename_value(attrs, "rename_all", side)
 }
 
 /// The field-level `#[serde(rename = "...")]` name for serialization.
@@ -87,23 +91,32 @@ pub fn serde_rename_all_serialize_rule(attrs: &[syn::Attribute]) -> Option<Strin
 /// `rename_all`, mirroring serde's own precedence.
 #[must_use]
 pub fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
-    let mut renamed = None;
-    for attr in field.attrs.iter().filter(|a| a.path().is_ident("serde")) {
+    field_serde_rename_for(field, SerdeSide::Serialize)
+}
+
+/// The field-level `#[serde(rename = "...")]` name for one side.
+#[must_use]
+pub fn field_serde_rename_for(field: &syn::Field, side: SerdeSide) -> Option<String> {
+    serde_rename_value(&field.attrs, "rename", side)
+}
+
+/// Read `key = ".."` or the `side` half of `key(serialize = .., deserialize = ..)`.
+fn serde_rename_value(attrs: &[syn::Attribute], key: &str, side: SerdeSide) -> Option<String> {
+    let mut found = None;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("serde")) {
         let _ = attr.parse_nested_meta(|meta| {
-            if meta.path.is_ident("rename") {
+            if meta.path.is_ident(key) {
                 if let Ok(value) = meta.value() {
-                    // rename = "headline"
                     if let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>() {
-                        renamed = Some(s.value());
+                        found = Some(s.value());
                     }
                 } else {
-                    // rename(serialize = "...", deserialize = "...")
                     let _ = meta.parse_nested_meta(|inner| {
                         if let Ok(value) = inner.value()
                             && let Ok(syn::Lit::Str(s)) = value.parse::<syn::Lit>()
-                            && inner.path.is_ident("serialize")
+                            && inner.path.is_ident(side.key())
                         {
-                            renamed = Some(s.value());
+                            found = Some(s.value());
                         }
                         Ok(())
                     });
@@ -114,7 +127,7 @@ pub fn field_serde_serialize_rename(field: &syn::Field) -> Option<String> {
             Ok(())
         });
     }
-    renamed
+    found
 }
 
 /// Apply a struct-level `#[serde(rename_all = "...")]` casing rule.
@@ -541,22 +554,30 @@ pub fn variant_is_serde_skipped(variant: &syn::Variant) -> bool {
 /// `r#type` advertises the property name `"type"` (what the handler actually
 /// deserializes), never the literal `"r#type"`.
 ///
-/// KNOWN LIMITATION: this uses the *serialize* side of a split
+/// This uses the *serialize* side of a split
 /// `#[serde(rename(serialize = ..., deserialize = ...))]` /
-/// `#[serde(rename_all(serialize = ..., deserialize = ...))]`. For the common
-/// symmetric `rename` / `rename_all` (which apply to both sides) this is exact;
-/// only the rare split-form input struct could differ between the advertised
-/// schema and the deserialized wire name. This is deliberate: it keeps the
-/// `#[derive(OpenApiSchema)]`, `#[model]`, and `FormModel` code paths in
-/// lockstep on the same serde helpers rather than duplicating a
-/// deserialize-side variant.
+/// `#[serde(rename_all(serialize = ..., deserialize = ...))]`. For the
+/// deserialize side, use [`schema_property_name_for`].
 #[must_use]
 pub fn schema_property_name(field: &syn::Field, rename_all_rule: Option<&str>) -> Option<String> {
+    schema_property_name_for(field, rename_all_rule, SerdeSide::Serialize)
+}
+
+/// As [`schema_property_name`], for one serde side.
+///
+/// `rename_all_rule` must come from the same side, through
+/// [`serde_rename_all_rule_for`].
+#[must_use]
+pub fn schema_property_name_for(
+    field: &syn::Field,
+    rename_all_rule: Option<&str>,
+    side: SerdeSide,
+) -> Option<String> {
     let ident = field.ident.as_ref()?;
     let raw = ident.to_string();
     let raw = raw.strip_prefix("r#").unwrap_or(&raw).to_owned();
     Some(
-        field_serde_serialize_rename(field)
+        field_serde_rename_for(field, side)
             .or_else(|| rename_all_rule.and_then(|rule| apply_serde_rename_all_rule(rule, &raw)))
             .unwrap_or(raw),
     )
@@ -851,6 +872,16 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
         return unconstrained_json_tokens(ty);
     }
 
+    // The wire type of `Decimal` depends on the serde features of the build.
+    // Read it at run time.
+    if let Some(identity_predicate) = decimal_identity_predicate(&name) {
+        return emit_identity_guarded(
+            ty,
+            &identity_predicate,
+            &quote! { ::autumn_web::openapi::decimal_scalar_schema() },
+        );
+    }
+
     if let Some((json_type, format, description)) = scalar_json_schema(&name) {
         let format_insert = format.map(|f| {
             quote! { __scalar.insert("format".to_owned(), #f.into()); }
@@ -944,10 +975,10 @@ pub fn emit_json_schema_tokens(ty: &syn::Type) -> TokenStream {
 /// non-primitive type that nevertheless serializes as a single scalar.
 ///
 /// Deliberately narrow: only types whose serde output is unambiguous.
-/// Numeric-adjacent wrappers (`Decimal`, `BigDecimal`) are left out on purpose —
-/// whether they serialize as a JSON number or a string depends on which serde
-/// feature the app enabled, and an opaque placeholder beats a confidently wrong
-/// scalar.
+/// `Decimal` is not in this table: its wire type depends on the serde features
+/// in the build, so [`decimal_identity_predicate`] reads it at run time.
+/// `BigDecimal` is not in this table. Its wire type is not certain, and a wrong
+/// scalar is worse than an opaque placeholder.
 ///
 /// The **naive** chrono types deliberately carry NO `format`. `OpenAPI`'s
 /// `date-time` and `time` are RFC 3339 productions that *require* a UTC offset,
@@ -1075,6 +1106,24 @@ fn unconstrained_json_tokens(ty: &syn::Type) -> TokenStream {
     )
 }
 
+/// Runtime predicate for `Decimal` and its `SQLite` wrapper, or `None` for any
+/// other name.
+///
+/// The wrapper path is matched as text. The type exists only with the `sqlite`
+/// feature, so this crate cannot name it. A unit test in `autumn` checks that
+/// the text equals the real `type_name`.
+fn decimal_identity_predicate(name: &str) -> Option<TokenStream> {
+    match name {
+        "Decimal" => Some(quote! {
+            __identity == ::core::any::type_name::<::autumn_web::reexports::rust_decimal::Decimal>()
+        }),
+        "SqliteDecimal" => Some(quote! {
+            __identity == "autumn_web::db::sqlite_types::SqliteDecimal"
+        }),
+        _ => None,
+    }
+}
+
 fn scalar_json_schema(
     name: &str,
 ) -> Option<(&'static str, Option<&'static str>, Option<&'static str>)> {
@@ -1092,7 +1141,7 @@ fn scalar_json_schema(
             None,
             Some("ISO 8601 time with no UTC offset, e.g. 18:00:00"),
         ),
-        "Uuid" => ("string", Some("uuid"), None),
+        "Uuid" | "SqliteUuid" => ("string", Some("uuid"), None),
         // #1771: both confidential wrappers serialize as a string — `Sealed` as
         // the base64 envelope, `BlindIndex` as its hex token. Without an entry
         // here the emitter publishes an unresolved `$ref` backfilled as an
@@ -1144,6 +1193,10 @@ fn scalar_identity_predicate(name: &str) -> Option<TokenStream> {
         "NaiveDateTime" => quote! { #chrono::NaiveDateTime },
         "NaiveTime" => quote! { #chrono::NaiveTime },
         "Uuid" => quote! { ::autumn_web::reexports::uuid::Uuid },
+        // Match as text. The type exists only with the `sqlite` feature.
+        "SqliteUuid" => {
+            return Some(quote! { __identity == "autumn_web::db::sqlite_types::SqliteUuid" });
+        }
         "Sealed" => quote! { ::autumn_web::confidential::Sealed },
         "BlindIndex" => quote! { ::autumn_web::confidential::BlindIndex },
         _ => return None,
@@ -1213,6 +1266,55 @@ pub fn emit_schema_fn_body_named(
             schema_property_name(f, rename_all_rule)
         }
     };
+    // With raw names, the struct does not copy the serde attributes of the
+    // field. Thus `skip_serializing_if` does not make the field optional.
+    emit_schema_body(
+        fields,
+        all_optional,
+        extra_required,
+        treat_as_optional,
+        patch_nullable,
+        &resolve_name,
+        !raw_field_names,
+    )
+}
+
+/// Emit the body of a request schema: the shape `Deserialize` reads (issue #2607).
+///
+/// `rename_all_rule` must be the deserialize-side rule. A field is required
+/// unless it is `Option<T>` or `treat_as_optional` returns `true`.
+/// `skip_serializing_if` has no effect here: `Deserialize` ignores it.
+pub fn emit_request_schema_fn_body(
+    fields: &[&&Field],
+    rename_all_rule: Option<&str>,
+    treat_as_optional: &dyn Fn(&Field) -> bool,
+) -> TokenStream {
+    let resolve_name =
+        |f: &Field| schema_property_name_for(f, rename_all_rule, SerdeSide::Deserialize);
+    emit_schema_body(
+        fields,
+        false,
+        &[],
+        treat_as_optional,
+        false,
+        &resolve_name,
+        false,
+    )
+}
+
+/// The shared emitter behind the public schema-body functions.
+///
+/// Set `skip_if_is_optional` to `true` for a response schema of a struct that
+/// keeps the `skip_serializing_if` of the field.
+fn emit_schema_body(
+    fields: &[&&Field],
+    all_optional: bool,
+    extra_required: &[&&Field],
+    treat_as_optional: &dyn Fn(&Field) -> bool,
+    patch_nullable: bool,
+    resolve_name: &dyn Fn(&Field) -> Option<String>,
+    skip_if_is_optional: bool,
+) -> TokenStream {
     // Resolve each field's advertised property name once — through the shared
     // serde helpers so the schema honors `#[serde(rename)]` /
     // `#[serde(rename_all)]` and strips raw-ident `r#` prefixes — and reuse the
@@ -1298,7 +1400,7 @@ pub fn emit_schema_fn_body_named(
             // Deciding it here, on the attribute rather than on the type, makes
             // the audit's stated premise actually true and needs no runtime
             // identity: the attribute is exactly what a proc macro can see.
-            if treat_as_optional(f) || field_has_skip_serializing_if(f) {
+            if treat_as_optional(f) || (skip_if_is_optional && field_has_skip_serializing_if(f)) {
                 continue;
             }
             let Some(name) = resolve_name(f) else {
@@ -1410,6 +1512,69 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_side_reads_the_deserialize_half_of_a_split_rename() {
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! {
+                #[serde(rename(serialize = "out", deserialize = "in"))]
+                pub title: String
+            })
+            .unwrap();
+        assert_eq!(
+            field_serde_rename_for(&field, SerdeSide::Deserialize).as_deref(),
+            Some("in")
+        );
+        assert_eq!(
+            schema_property_name_for(&field, None, SerdeSide::Deserialize).as_deref(),
+            Some("in")
+        );
+
+        // A plain rename applies to both sides.
+        let field: syn::Field = syn::Field::parse_named
+            .parse2(quote! { #[serde(rename = "headline")] pub title: String })
+            .unwrap();
+        assert_eq!(
+            field_serde_rename_for(&field, SerdeSide::Deserialize).as_deref(),
+            Some("headline")
+        );
+
+        let item: syn::DeriveInput = syn::parse2(quote! {
+            #[serde(rename_all(serialize = "camelCase", deserialize = "kebab-case"))]
+            struct S { a_b: String }
+        })
+        .unwrap();
+        assert_eq!(
+            serde_rename_all_rule_for(&item.attrs, SerdeSide::Deserialize).as_deref(),
+            Some("kebab-case")
+        );
+        assert_eq!(
+            serde_rename_all_serialize_rule(&item.attrs).as_deref(),
+            Some("camelCase")
+        );
+    }
+
+    #[test]
+    fn request_schema_requires_a_skip_serializing_if_field() {
+        let item: syn::DeriveInput = syn::parse2(quote! {
+            struct S {
+                #[serde(skip_serializing_if = "String::is_empty")]
+                tags: String,
+            }
+        })
+        .unwrap();
+        let syn::Data::Struct(data) = &item.data else {
+            unreachable!()
+        };
+        let fields: Vec<&Field> = data.fields.iter().collect();
+        let refs: Vec<&&Field> = fields.iter().collect();
+
+        let request = emit_request_schema_fn_body(&refs, None, &|_| false).to_string();
+        assert!(request.contains("__required . push"), "{request}");
+
+        let response = emit_schema_fn_body_full(&refs, false, &[], None, &|_| false).to_string();
+        assert!(!response.contains("__required . push"), "{response}");
+    }
+
+    #[test]
     fn schema_property_name_resolves_renames_and_strips_raw_idents() {
         // field rename wins over rename_all.
         let field: syn::Field = syn::Field::parse_named
@@ -1486,6 +1651,27 @@ mod tests {
         // A rule serde itself rejects resolves to no rename here.
         assert_eq!(apply_serde_rename_all_rule("bogusCase", "word_count"), None);
     }
+}
+
+#[test]
+fn decimal_family_predicates_cover_only_their_names() {
+    assert!(decimal_identity_predicate("Decimal").is_some());
+    assert!(decimal_identity_predicate("SqliteDecimal").is_some());
+    assert!(decimal_identity_predicate("Uuid").is_none());
+    assert!(decimal_identity_predicate("String").is_none());
+}
+
+#[test]
+fn sqlite_uuid_is_a_uuid_string_matched_by_text() {
+    assert_eq!(
+        scalar_json_schema("SqliteUuid"),
+        Some(("string", Some("uuid"), None))
+    );
+    let predicate = scalar_identity_predicate("SqliteUuid")
+        .expect("SqliteUuid has an identity predicate")
+        .to_string();
+    assert!(predicate.contains("autumn_web::db::sqlite_types::SqliteUuid"));
+    assert_eq!(scalar_json_schema("Decimal"), None);
 }
 
 #[test]

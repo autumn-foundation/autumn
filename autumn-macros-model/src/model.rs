@@ -18,11 +18,13 @@ use syn::parse::Parser as _;
 use syn::{DeriveInput, Field, LitStr};
 
 use crate::commentable::{emit_commentable_items, is_commentable_attr, resolve_commentable};
+use autumn_macros_support::cascade::{CASCADE_LEVELS, CascadeLeg, any_const, cascade_level};
 use autumn_macros_support::naming::{infer_table_name, pascal_to_snake, pluralize_word};
 use autumn_macros_support::schema::{
-    apply_serde_rename_all_rule, emit_schema_fn_body_full, emit_schema_fn_body_named,
-    field_has_skip_serializing_if, field_is_collaborative, field_is_translatable,
-    field_serde_serialize_rename, has_attr, is_option_type, serde_bare_word,
+    SerdeSide, apply_serde_rename_all_rule, emit_request_schema_fn_body, emit_schema_fn_body_full,
+    emit_schema_fn_body_named, field_has_skip_serializing_if, field_is_collaborative,
+    field_is_translatable, field_serde_serialize_rename, has_attr, has_serde_default,
+    is_option_type, schema_property_name, serde_bare_word, serde_rename_all_rule_for,
     serde_rename_all_serialize_rule, serde_valued_key, type_name_str,
 };
 
@@ -91,7 +93,12 @@ fn parse_attr_args(attr: TokenStream) -> syn::Result<ModelArgs> {
 ///   ...]`) is an error.
 /// - `#[references]` — bare; the target table is inferred from the field name.
 /// - `#[references(table = "other_table")]` — an explicit target table.
+/// - `#[references(on_delete = "...", on_update = "...")]` — a referential
+///   action, one of [`REFERENCES_ACTION_VALUES`]. `set_null` and
+///   `set_default` need an `Option<_>` field.
+/// - `#[renamed_from("old_name")]` — one `snake_case` old column name.
 fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
+    validate_model_renamed_from(&field.attrs)?;
     for attr in &field.attrs {
         if attr.path().is_ident("unique") {
             if !matches!(attr.meta, syn::Meta::Path(_)) {
@@ -131,15 +138,98 @@ fn validate_field_schema_markers(field: &Field) -> syn::Result<()> {
                 if meta.path.is_ident("table") {
                     let _value: LitStr = meta.value()?.parse()?;
                     Ok(())
+                } else if meta.path.is_ident("on_delete") || meta.path.is_ident("on_update") {
+                    let value: LitStr = meta.value()?.parse()?;
+                    validate_references_action(&value, &field.ty)
                 } else {
                     Err(meta.error(
-                        "unsupported `#[references(...)]` argument; expected `table = \"...\"`",
+                        "unsupported `#[references(...)]` argument; expected `table`, \
+                         `on_delete` or `on_update`",
                     ))
                 }
             })?;
         }
     }
     Ok(())
+}
+
+/// The `on_delete` / `on_update` values of `#[references(...)]`. Keep this list
+/// equal to `autumn_schema_core::FOREIGN_KEY_ACTION_ATTR_VALUES`. A unit test
+/// checks this.
+const REFERENCES_ACTION_VALUES: [&str; 5] = [
+    "cascade",
+    "restrict",
+    "set_null",
+    "set_default",
+    "no_action",
+];
+
+/// Validate one `#[references]` action value on a field of type `ty`.
+fn validate_references_action(value: &LitStr, ty: &syn::Type) -> syn::Result<()> {
+    let action = value.value();
+    if !REFERENCES_ACTION_VALUES.contains(&action.as_str()) {
+        let expected = REFERENCES_ACTION_VALUES
+            .map(|v| format!("`{v}`"))
+            .join(", ");
+        return Err(syn::Error::new_spanned(
+            value,
+            format!("unknown foreign-key action `{action}`; expected one of {expected}"),
+        ));
+    }
+    // A reference column has no default, so `set_default` also writes NULL.
+    if matches!(action.as_str(), "set_null" | "set_default") && option_inner(ty).is_none() {
+        return Err(syn::Error::new_spanned(
+            value,
+            format!("foreign-key action `{action}` needs an `Option<_>` field"),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a struct-level `#[renamed_from("old_table")]` hint (#1975).
+///
+/// The hint is for the `autumn schema` toolchain only. The macro accepts it,
+/// rejects a bad shape, and strips it. Codegen does not change.
+fn validate_model_renamed_from(attrs: &[syn::Attribute]) -> syn::Result<()> {
+    let mut seen = false;
+    for attr in attrs.iter().filter(|a| a.path().is_ident("renamed_from")) {
+        if seen {
+            return Err(syn::Error::new_spanned(
+                attr,
+                "use only one `#[renamed_from(\"old_name\")]` on an item",
+            ));
+        }
+        seen = true;
+        validate_renamed_from_shape(attr)?;
+    }
+    Ok(())
+}
+
+/// Validate one `#[renamed_from("old_name")]`: one string literal that is a
+/// plain identifier (`[a-z_][a-z0-9_]*`, at most 63 bytes). Keep in sync with
+/// `autumn-cli/src/schema/rename.rs::is_plain_identifier`.
+fn validate_renamed_from_shape(attr: &syn::Attribute) -> syn::Result<()> {
+    let error = || {
+        syn::Error::new_spanned(
+            attr,
+            "write `#[renamed_from(\"old_name\")]` with one snake_case name: \
+             start with a lowercase letter or `_`, then use lowercase letters, \
+             digits and `_`, at most 63 bytes",
+        )
+    };
+    let syn::Meta::List(list) = &attr.meta else {
+        return Err(error());
+    };
+    let name = syn::parse2::<LitStr>(list.tokens.clone())
+        .map_err(|_| error())?
+        .value();
+    let mut chars = name.chars();
+    let plain = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && name.len() <= 63;
+    if plain { Ok(()) } else { Err(error()) }
 }
 
 /// The three declarative association kinds supported on `#[model]`.
@@ -2097,53 +2187,67 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
         // `dependent(...)` escape hatch instead.
         let child_repo = format_ident!("Pg{}Repository", assoc.target);
         let thunk_ident = format_ident!("__autumn_dependent_cascade_{}", i);
-        thunk_fns.push(quote! {
-            fn #thunk_ident<'__a>(
-                __pool: &'__a ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
-                    ::autumn_web::RuntimeConnection,
-                >,
-                __conn: &'__a mut ::autumn_web::RuntimeConnection,
-                __parent_id: i64,
-                __parent_soft: bool,
-                // Codex round-5-B: the active recursion path (cycle-break) and the
-                // monotonic HANDLED set (soft OR physical), threaded through
-                // separately. #1800 case 1: `__physical` additionally tracks only
-                // physically-removed rows for the diamond revisit-skip.
-                __path: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
-                __deleted: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
-                __physical: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
-            ) -> ::autumn_web::repository::RuntimeDependentCascadeFuture<'__a> {
-                ::std::boxed::Box::pin(async move {
-                    // Own the child repository inside the async block so the
-                    // borrow `__autumn_apply_dependent_on_conn` takes of it stays
-                    // valid for the whole (immediately awaited) cascade.
-                    let __autumn_child_repo = #child_repo::with_pool_untracked(
-                        ::core::clone::Clone::clone(__pool),
-                    );
-                    __autumn_child_repo
-                        .__autumn_apply_dependent_on_conn(
-                            __conn,
-                            #fk,
-                            __parent_id,
-                            ::autumn_web::repository::DependentAction::#action_variant,
-                            __parent_soft,
-                            __path,
-                            __deleted,
-                            __physical,
-                        )
-                        .await
-                })
-            }
-        });
+        let mut emit_thunk = |ident: &proc_macro2::Ident, variant: &proc_macro2::Ident| {
+            thunk_fns.push(quote! {
+                fn #ident<'__a>(
+                    __pool: &'__a ::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
+                        ::autumn_web::RuntimeConnection,
+                    >,
+                    __conn: &'__a mut ::autumn_web::RuntimeConnection,
+                    __parent_id: i64,
+                    __parent_soft: bool,
+                    // Codex round-5-B: the active recursion path (cycle-break) and the
+                    // monotonic HANDLED set (soft OR physical), threaded through
+                    // separately. #1800 case 1: `__physical` additionally tracks only
+                    // physically-removed rows for the diamond revisit-skip.
+                    __path: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+                    __deleted: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+                    __physical: &'__a mut ::std::collections::HashSet<(&'static str, i64)>,
+                ) -> ::autumn_web::repository::RuntimeDependentCascadeFuture<'__a> {
+                    ::std::boxed::Box::pin(async move {
+                        // Own the child repository inside the async block so the
+                        // borrow `__autumn_apply_dependent_on_conn` takes of it stays
+                        // valid for the whole (immediately awaited) cascade.
+                        let __autumn_child_repo = #child_repo::with_pool_untracked(
+                            ::core::clone::Clone::clone(__pool),
+                        );
+                        __autumn_child_repo
+                            .__autumn_apply_dependent_on_conn(
+                                __conn,
+                                #fk,
+                                __parent_id,
+                                ::autumn_web::repository::DependentAction::#variant,
+                                __parent_soft,
+                                __path,
+                                __deleted,
+                                __physical,
+                            )
+                            .await
+                    })
+                }
+            });
+        };
+        emit_thunk(&thunk_ident, &action_variant);
+        // #2427: a `destroy` leg also gets a read-only twin, so the parent can
+        // probe every `restrict` below it before any hook fires.
+        let probe_expr = if action == DependentAction::Destroy {
+            let probe_ident = format_ident!("__autumn_dependent_probe_{}", i);
+            emit_thunk(&probe_ident, &format_ident!("Probe"));
+            quote! { ::core::option::Option::Some(#probe_ident) }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
         spec_entries.push(quote! {
             ::autumn_web::repository::RuntimeDependentSpec {
                 fk: #fk,
                 action: ::autumn_web::repository::DependentAction::#action_variant,
                 cascade: #thunk_ident,
+                probe: #probe_expr,
             }
         });
     }
 
+    let dependent_models = emit_dependent_models(model_ident, &deps);
     quote! {
         impl #model_ident {
             /// Runtime dependent-cascade specs consulted by the parent
@@ -2159,7 +2263,49 @@ fn emit_dependents_impl(model_ident: &syn::Ident, assocs: &[Association]) -> Tok
                 ];
                 __AUTUMN_DEPENDENTS
             }
+            #dependent_models
         }
+    }
+}
+
+/// The inherent `DEPENDENT_CASCADE_{k}` consts: the models a delete of
+/// `model_ident` also writes, at each depth. A `restrict` leg writes nothing. A
+/// `destroy` leg also runs the child's own cascade. A model that cascades into
+/// itself adds nothing new. Each level reads only the level below it, so a
+/// cascade that loops cannot make the consts depend on each other.
+fn emit_dependent_models(model_ident: &syn::Ident, deps: &[&Association]) -> TokenStream {
+    let legs: Vec<CascadeLeg> = deps
+        .iter()
+        .filter_map(|assoc| {
+            let action = assoc.dependent.expect("filtered to Some by the caller");
+            if action == DependentAction::Restrict || assoc.target == *model_ident {
+                return None;
+            }
+            let target = assoc.target.to_string();
+            let child_repo = format_ident!("Pg{}Repository", assoc.target);
+            Some(CascadeLeg {
+                model: quote! { #target },
+                child: quote! { #child_repo },
+                destroy: action == DependentAction::Destroy,
+            })
+        })
+        .collect();
+    if legs.is_empty() {
+        return quote! {};
+    }
+    let levels = (0..CASCADE_LEVELS).map(|k| {
+        let name = format_ident!("DEPENDENT_CASCADE_{}", k);
+        let level = cascade_level(&legs, k);
+        quote! {
+            #[doc(hidden)]
+            pub const #name: ::autumn_web::agent_authority::CascadeLevel = #level;
+        }
+    });
+    let any = any_const(&legs);
+    quote! {
+        #[doc(hidden)]
+        pub const DEPENDENT_CASCADE_ANY: bool = #any;
+        #(#levels)*
     }
 }
 
@@ -3322,6 +3468,7 @@ fn emit_association_items(
                         assoc.name
                     );
                     let join_table_ident = format_ident!("{}", through.table);
+                    let join_table_name = through.table.as_str();
                     let target_fk_ident = format_ident!("{}", through.target_fk);
 
                     m2m_items.push(quote! {
@@ -3504,6 +3651,8 @@ fn emit_association_items(
                                 parent_id: i64,
                                 child_id: i64,
                             ) -> ::autumn_web::AutumnResult<()> {
+                                // #2319: the link write records no ledger revision.
+                                ::autumn_web::ledger::refuse_out_of_band_write(#join_table_name, "has_many through")?;
                                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
                                 let mut conn = self.__autumn_m2m_write_conn().await?;
@@ -3530,6 +3679,8 @@ fn emit_association_items(
                                 parent_id: i64,
                                 child_id: i64,
                             ) -> ::autumn_web::AutumnResult<()> {
+                                // #2319: the link write records no ledger revision.
+                                ::autumn_web::ledger::refuse_out_of_band_write(#join_table_name, "has_many through")?;
                                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
                                 let mut conn = self.__autumn_m2m_write_conn().await?;
@@ -3553,6 +3704,8 @@ fn emit_association_items(
                                 parent_id: i64,
                                 child_ids: &[i64],
                             ) -> ::autumn_web::AutumnResult<()> {
+                                // #2319: the link write records no ledger revision.
+                                ::autumn_web::ledger::refuse_out_of_band_write(#join_table_name, "has_many through")?;
                                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
                                 use ::autumn_web::reexports::diesel_async::AsyncConnection as _;
@@ -4352,6 +4505,10 @@ fn emit_votable_items(
                 use ::autumn_web::reexports::diesel::{ExpressionMethods as _, QueryDsl as _};
                 use ::autumn_web::reexports::diesel_async::RunQueryDsl as _;
                 use ::autumn_web::reexports::scoped_futures::ScopedFutureExt as _;
+                // #2319: the aggregate UPDATE and the edge writes record no
+                // ledger revision, so a ledgered target or edge table refuses.
+                ::autumn_web::ledger::refuse_out_of_band_write(#table_name_str, "votable aggregate")?;
+                ::autumn_web::ledger::refuse_out_of_band_write(#edge_table_name, "votable edge")?;
                 // Resolved before the connection is taken, so a tenant_scoped
                 // repository with no tenant context fails closed without
                 // occupying a pooled connection.
@@ -4655,6 +4812,7 @@ fn user_attrs(field: &Field) -> Vec<&syn::Attribute> {
                 // they never leak onto the Diesel derives; codegen is unchanged.
                 && !a.path().is_ident("unique")
                 && !a.path().is_ident("references")
+                && !a.path().is_ident("renamed_from")
                 && !a.path().is_ident("position")
                 // #1384: `#[translatable]` is a marker the model macro reads;
                 // the behaviour lives in the field's `Translated` type, so the
@@ -5825,6 +5983,32 @@ fn emit_collaborative_items(model: &syn::Ident, fields: &[&syn::Ident]) -> Token
             }
         }
     }
+}
+
+/// The part of a crate version that must match for two versions to be
+/// compatible. It is the major version. Before 1.0 it is `0.minor`. Before 0.1
+/// it is `0.0.patch`. A prerelease matches only the same exact version, so it
+/// is the full version.
+fn compat_version(major: &str, minor: &str, patch: &str, pre: &str) -> String {
+    match (major, minor) {
+        _ if !pre.is_empty() => format!("{major}.{minor}.{patch}-{pre}"),
+        ("0", "0") => format!("0.0.{patch}"),
+        ("0", _) => format!("0.{minor}"),
+        _ => major.to_string(),
+    }
+}
+
+/// [`compat_version`] of the crate in compilation. Cargo sets these variables
+/// for the defining crate. The macro runs in that compilation.
+fn classified_compat_version() -> String {
+    let var = |name| std::env::var(name).unwrap_or_default();
+    let number = |name| std::env::var(name).unwrap_or_else(|_| "0".to_string());
+    compat_version(
+        &number("CARGO_PKG_VERSION_MAJOR"),
+        &number("CARGO_PKG_VERSION_MINOR"),
+        &number("CARGO_PKG_VERSION_PATCH"),
+        &var("CARGO_PKG_VERSION_PRE"),
+    )
 }
 
 /// An identifier's name with any raw-identifier prefix removed (`r#type` ->
@@ -7555,13 +7739,19 @@ fn emit_state_machine_on_conn(
                         "{}:{}:{}:{}:{}",
                         #model_str, #field_str, __record_id, #from, #to,
                     );
-                    let __effect = ::autumn_web::TransitionEffect {
-                        model: ::std::string::String::from(#model_str),
-                        field: ::std::string::String::from(#field_str),
-                        record_id: __record_id,
-                        from_state: ::std::string::String::from(#from),
-                        to_state: ::std::string::String::from(#to),
-                        idempotency_key: __idempotency_key,
+                    // The borrowed twin of `TransitionEffect`: `enqueue_on_conn`
+                    // only serializes its args, and the twin serializes to the
+                    // identical JSON, so the job still receives a
+                    // `TransitionEffect` — without first copying the literal
+                    // model/field/state names into owned `String`s for
+                    // `serde_json::to_value` to copy again.
+                    let __effect = ::autumn_web::__private::TransitionEffectRef {
+                        model: #model_str,
+                        field: #field_str,
+                        record_id: &__record_id,
+                        from_state: #from,
+                        to_state: #to,
+                        idempotency_key: &__idempotency_key,
                     };
                     ::autumn_web::job::enqueue_on_conn(
                         <#job>::NAME,
@@ -7579,7 +7769,9 @@ fn emit_state_machine_on_conn(
         })
         .collect();
 
+    // The method takes `AsyncPgConnection`, so it needs `postgres` (#2605).
     quote! {
+        ::autumn_web::__if_postgres! {
         impl #model_name {
             /// Validates a `{field}` transition and, for the fired edge, runs
             /// its declared effects on `conn` (issue #1973): first a sync
@@ -7600,6 +7792,7 @@ fn emit_state_machine_on_conn(
                 }
                 ::core::result::Result::Ok(__new_state)
             }
+        }
         }
     }
 }
@@ -7857,6 +8050,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let tables = graph_relation_tables.iter().map(String::as_str);
         quote! { &[#(#tables),*] }
     };
+    let graph_crate_version = autumn_macros_support::graph::crate_version();
 
     let filtered_outer_attrs: Vec<&syn::Attribute> = outer_attrs
         .iter()
@@ -7867,6 +8061,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 && !is_commentable_attr(a)
                 && !is_derivation_attr(a)
                 && !a.path().is_ident("shard_key")
+                // #1975: a declarative-schema hint, not a Diesel attribute.
+                && !a.path().is_ident("renamed_from")
         })
         .collect();
 
@@ -7884,6 +8080,9 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if let Err(err) = validate_field_schema_markers(field) {
             return err.to_compile_error();
         }
+    }
+    if let Err(err) = validate_model_renamed_from(outer_attrs) {
+        return err.to_compile_error();
     }
 
     // Validate that the declared shard_key names an existing field (or "id").
@@ -8949,6 +9148,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     // One zero-sized marker per classified column. It names the field inside the
     // compiler diagnostic when a leak is attempted, keys a `declassify!` boundary
     // to exactly one column, and publishes the manifest row.
+    let compat_suffix = format!("@{}", classified_compat_version());
     let classified_items: Vec<TokenStream> = classified_columns
         .iter()
         .map(|(ident, col, marker)| {
@@ -8966,12 +9166,13 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
                 impl ::autumn_web::classify::ClassifiedField for #marker {
                     const MODEL: &'static str = stringify!(#name);
-                    // Module-qualified, because the manifest keys on this: two
-                    // linked crates can each define a `Customer` with a
-                    // classified `email`, and the bare name would merge them
-                    // into one row.
+                    // The path has module and crate version. The manifest
+                    // keys on it. Two linked crates, or two incompatible
+                    // versions of one crate, can each define a `Customer`
+                    // with a classified `email`. A bare name or module path
+                    // would merge them into one row.
                     const MODEL_PATH: &'static str =
-                        concat!(module_path!(), "::", stringify!(#name));
+                        concat!(module_path!(), #compat_suffix, "::", stringify!(#name));
                     const FIELD: &'static str = #col;
                     const CLASSIFICATION: ::autumn_web::classify::Classification =
                         ::autumn_web::classify::Classification::PersonalData;
@@ -8980,7 +9181,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 ::autumn_web::reexports::inventory::submit! {
                     ::autumn_web::classify::manifest::ClassifiedFieldDescriptor {
                         model: stringify!(#name),
-                        model_path: concat!(module_path!(), "::", stringify!(#name)),
+                        model_path: concat!(module_path!(), #compat_suffix, "::", stringify!(#name)),
                         field: #col,
                         classification: ::autumn_web::classify::Classification::PersonalData,
                     }
@@ -9557,7 +9758,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if upsert_columns.is_empty() {
         upsert_columns.push(quote! {
-            #table_ident::id.eq(::autumn_web::reexports::diesel::pg::upsert::excluded(#table_ident::id))
+            #table_ident::id.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::id))
         });
     }
 
@@ -10067,10 +10268,19 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .collect();
 
+    let table_name_lit = table_ident.to_string();
     // create() inner body — shared by both the assoc and non-assoc paths.
     let create_inner_body = quote! {
         use ::autumn_web::reexports::diesel::prelude::*;
         use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+
+        // #2319: the factory insert records no ledger revision. Refuse before
+        // any association row is created, so a refusal writes nothing.
+        if let ::core::result::Result::Err(err) =
+            ::autumn_web::ledger::refuse_out_of_band_write(#table_name_lit, "factory")
+        {
+            panic!("factory: {err}");
+        }
 
         #(#factory_value_bindings)*
         #(#create_assoc_bindings)*
@@ -10109,7 +10319,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Supply a pre-built instance with the `.{type_snake}(instance)` setter
             /// to skip the extra insert.
             ///
-            /// Panics if the insert fails or if a cyclic association chain is detected
+            /// Panics if the insert fails, if the table is ledgered (#2319), or if a cyclic association chain is detected
             /// (depth > 32).
             pub async fn create(
                 self,
@@ -10136,7 +10346,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             /// Insert a record built from this factory into the database and return
             /// the fully-populated model (with server-assigned primary key).
             ///
-            /// Panics if the insert fails.
+            /// Panics if the insert fails, or if the table is ledgered (#2319).
             pub async fn create(
                 self,
                 pool: &::autumn_web::reexports::diesel_async::pooled_connection::deadpool::Pool<
@@ -10256,18 +10466,47 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         })
         .copied()
         .collect();
+    // #2148: the console REPL shows the same fields a JSON response carries.
+    // A model with classified columns has no `Serialize` impl, so it projects
+    // its visible fields through a view struct that keeps their serde
+    // attributes (`rename`, `serialize_with`, ...).
+    let repl_registration = {
+        let names: Vec<String> = serializable_field_refs
+            .iter()
+            .filter_map(|f| schema_property_name(f, schema_rename_all_rule))
+            .collect();
+        let projection = if has_classified {
+            let view_fields = serializable_field_refs.iter().filter_map(|f| {
+                let ident = f.ident.as_ref()?;
+                let ty = &f.ty;
+                let serde_attrs = f.attrs.iter().filter(|a| a.path().is_ident("serde"));
+                Some(quote! { #(#serde_attrs)* #ident: #ty })
+            });
+            quote! { fields [#(#view_fields),*] }
+        } else {
+            quote! { serde }
+        };
+        quote! {
+            ::autumn_web::__autumn_register_repl_model!(
+                #name,
+                ::core::stringify!(#name),
+                #table_name,
+                [#(#names),*],
+                #projection
+            );
+        }
+    };
     // `skip_serializing_if` is the third member of the omission family, after
     // the unconditional `skip` / `skip_serializing` filtered above. It differs
     // in kind: the field DOES appear in some responses, so the property stays —
     // it just cannot be `required`, because a response that trips the predicate
     // omits it and a strict client would reject that response.
     //
-    // Sound HERE and only here, because this schema describes a RESPONSE: the
-    // generated repository API takes `New*` / `Update*` as its request bodies,
-    // never the query struct. `#[derive(OpenApiSchema)]` has no such guarantee
-    // — the same type may be a `Json<T>` request — so it refuses the shape
-    // instead, since `skip_serializing_if` governs serialization alone and
-    // serde still rejects a request that omits the field.
+    // Sound because this schema describes a RESPONSE only. A request body of
+    // the model type uses the request schema below (#2607).
+    // `#[derive(OpenApiSchema)]` has one schema for both directions, so it
+    // refuses the shape instead: serde still rejects a request that omits the
+    // field.
     let query_struct_schema_body = emit_schema_fn_body_full(
         &serializable_field_refs,
         false,
@@ -10331,6 +10570,123 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     name: stringify!(#name),
                     identity: ::autumn_web::openapi::type_name_of::<#name>,
                     schema: <#name as ::autumn_web::openapi::OpenApiSchema>::schema,
+                }
+            }
+        }
+    };
+
+    // #2607: a custom route can take `Json<Model>`. That request includes the
+    // fields the read schema skips (`#[private]`, hidden `#[encrypted]`,
+    // `#[classified]`), and `skip_serializing_if` does not make a field
+    // optional in it. Submit the request schema as an override. The spec
+    // builder makes one component when the two schemas are equal.
+    //
+    // A deserialize-side adapter makes the field types wrong for a request.
+    // An `alias` adds a second accepted name. Then the override has no schema,
+    // and the request is the placeholder. `#[derive(OpenApiSchema)]` refuses
+    // the same attributes.
+    let request_field_refs: Vec<&&Field> = all_field_refs
+        .iter()
+        .filter(|f| serde_bare_word(&f.attrs, &["skip", "skip_deserializing"]).is_none())
+        .copied()
+        .collect();
+    let request_reshaped = serde_bare_word(outer_attrs, &["transparent"]).is_some()
+        || serde_valued_key(outer_attrs, &["from", "try_from", "tag"]).is_some()
+        || request_field_refs.iter().any(|f| {
+            serde_bare_word(&f.attrs, &["flatten"]).is_some()
+                || serde_valued_key(&f.attrs, &["with", "deserialize_with", "alias"]).is_some()
+        });
+    let request_schema_descriptor = if request_reshaped {
+        quote! {
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Request,
+                    schema: ::core::option::Option::None,
+                }
+            }
+        }
+    } else {
+        let request_rename_all_rule =
+            serde_rename_all_rule_for(outer_attrs, SerdeSide::Deserialize);
+        let container_default = has_serde_default(outer_attrs);
+        let request_schema_body = emit_request_schema_fn_body(
+            &request_field_refs,
+            request_rename_all_rule.as_deref(),
+            &|f: &Field| container_default || has_serde_default(&f.attrs),
+        );
+        // `deny_unknown_fields` rejects every key not in the schema.
+        let request_schema_body =
+            if serde_bare_word(outer_attrs, &["deny_unknown_fields"]).is_some() {
+                quote! {{
+                    let mut __autumn_request = { #request_schema_body };
+                    if let ::core::option::Option::Some(__autumn_object) =
+                        __autumn_request.as_object_mut()
+                    {
+                        __autumn_object.insert(
+                            "additionalProperties".to_owned(),
+                            ::autumn_web::reexports::serde_json::json!(false),
+                        );
+                    }
+                    __autumn_request
+                }}
+            } else {
+                request_schema_body
+            };
+        quote! {
+            impl #name {
+                #[doc(hidden)]
+                pub fn __autumn_openapi_request_schema()
+                    -> ::autumn_web::reexports::serde_json::Value
+                {
+                    #request_schema_body
+                }
+            }
+
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Request,
+                    schema: ::core::option::Option::Some(#name::__autumn_openapi_request_schema),
+                }
+            }
+        }
+    };
+
+    // #2607: `NewModel` skips a classified field on serialize. Thus a response
+    // does not have it, but its one schema requires it. Submit a response
+    // schema without those fields. With no classified field, submit nothing.
+    let new_response_hidden: Vec<String> = fields_for_new
+        .iter()
+        .filter(|f| field_is_classified(f))
+        .filter_map(|f| f.ident.as_ref().map(unraw_ident))
+        .collect();
+    let new_response_schema_descriptor = if new_response_hidden.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            impl #new_name {
+                #[doc(hidden)]
+                pub fn __autumn_openapi_response_schema()
+                    -> ::autumn_web::reexports::serde_json::Value
+                {
+                    let mut __schema =
+                        <#new_name as ::autumn_web::openapi::OpenApiSchema>::schema();
+                    ::autumn_web::openapi::remove_schema_properties(
+                        &mut __schema,
+                        &[#(#new_response_hidden),*],
+                    );
+                    __schema
+                }
+            }
+
+            ::autumn_web::reexports::inventory::submit! {
+                ::autumn_web::openapi::DirectionalSchemaDescriptor {
+                    identity: ::autumn_web::openapi::type_name_of::<#new_name>,
+                    direction: ::autumn_web::openapi::SchemaDirection::Response,
+                    schema: ::core::option::Option::Some(
+                        #new_name::__autumn_openapi_response_schema
+                    ),
                 }
             }
         }
@@ -10611,6 +10967,18 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             )
         })
         .collect();
+    let ledger_non_finite_checks: Vec<TokenStream> = all_fields
+        .iter()
+        .map(|f| {
+            let ident = f.ident.as_ref().expect("named field");
+            let field_name = LitStr::new(&ident.to_string(), ident.span());
+            quote! {
+                if (&::autumn_web::ledger::NonFiniteProbe(&self.#ident)).autumn_has_non_finite() {
+                    return ::core::option::Option::Some(#field_name);
+                }
+            }
+        })
+        .collect();
     let commit_hook_construct_fields: Vec<TokenStream> = all_fields
         .iter()
         .map(|f| {
@@ -10746,27 +11114,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #lookup_key => ::core::option::Option::Some(#expr), }
         })
         .collect();
-    // #2634: gate the `New*` `Normalize` impl on the insert struct actually
-    // having `#[normalize]` columns. With no columns the `Yes` arm of the
-    // repository autoref probe (`SpezNormalizeManyYes`) would win and clone
-    // the whole batch to run an empty `normalize()` — a guaranteed no-op.
-    // Omitting the impl lets the probe's `No` arm win, so `save` /
-    // `save_many` / `save_many_skip_invalid` / `find_or_create_by_*` pay no
-    // clone for unnormalized models. The read-model impl stays unconditional:
-    // it is `&mut self` in place (no clone involved) and user code may call
-    // `.normalize()` on it directly, so removing it would be a compile break.
-    // `NormalizedModel` stays unconditional too: derived finders call
-    // `normalize_lookup` for every model and rely on the `None` arm.
-    let normalize_new_impl = if normalize_new_stmts.is_empty() {
-        quote! {}
+    // #2692: emit `impl Normalize` for every `New*`, so a `T: Normalize`
+    // bound accepts it. If the `New*` has no `#[normalize]` columns, the impl
+    // does nothing. Then also emit `NormalizeNoop`, so the repository probe
+    // skips the clone (#2634). The read-model impl and `NormalizedModel` are
+    // unconditional.
+    let normalize_new_noop = if normalize_new_stmts.is_empty() {
+        quote! { impl ::autumn_web::normalize::NormalizeNoop for #new_name {} }
     } else {
-        quote! {
-            impl ::autumn_web::normalize::Normalize for #new_name {
-                fn normalize(&mut self) {
-                    #(#normalize_new_stmts)*
-                }
+        quote! {}
+    };
+    let normalize_new_impl = quote! {
+        impl ::autumn_web::normalize::Normalize for #new_name {
+            fn normalize(&mut self) {
+                #(#normalize_new_stmts)*
             }
         }
+        #normalize_new_noop
     };
     let normalize_impls = quote! {
         #normalize_new_impl
@@ -11412,6 +11776,10 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // expands to nothing, so models compile unchanged when seeding is off.
         ::autumn_web::__autumn_register_fake_seeder!(#name, stringify!(#name));
 
+        // ── #2148: console REPL registration ───────────────────────────
+        // Expands to nothing unless autumn-web has the `repl` feature.
+        #repl_registration
+
         // ── Architecture-graph node (#1747) ────────────────────────────
         // The model's own declaration of the table it maps to: the join key
         // every route, job and repository edge resolves against.
@@ -11426,6 +11794,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 table: #table_name,
                 relations: #graph_relations,
                 module_path: ::core::module_path!(),
+                crate_version: #graph_crate_version,
                 file: ::core::file!(),
                 line: ::core::line!(),
             }
@@ -11443,6 +11812,23 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             #commit_hook_serialize_where
             {
                 #commit_hook_serialize_body
+            }
+
+            /// First column holding a `NaN` or infinite float (#2326).
+            ///
+            /// A snapshot cannot store one: JSON would write `null`.
+            #[doc(hidden)]
+            #[allow(
+                clippy::needless_borrow,
+                reason = "the extra borrow selects the fallback impl"
+            )]
+            pub fn __autumn_ledger_non_finite_column(
+                &self,
+            ) -> ::core::option::Option<&'static str> {
+                #[allow(unused_imports)]
+                use ::autumn_web::ledger::{NonFiniteFallback as _, NonFiniteViaFloat as _};
+                #(#ledger_non_finite_checks)*
+                ::core::option::Option::None
             }
 
             #[doc(hidden)]
@@ -11537,6 +11923,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // in every generated client — even though the real schema was compiled
         // in all along.
         #query_schema_descriptor
+        #request_schema_descriptor
+        #new_response_schema_descriptor
 
         ::autumn_web::reexports::inventory::submit! {
             ::autumn_web::openapi::DerivedSchemaDescriptor {
@@ -13707,6 +14095,94 @@ mod tests {
     }
 
     #[test]
+    fn a_model_publishes_every_model_its_delete_writes() {
+        let item: TokenStream = quote! {
+            #[has_many(Comment, dependent = destroy)]
+            #[has_many(Like, dependent = nullify)]
+            #[has_many(Audit, dependent = restrict)]
+            struct Post {
+                #[id]
+                id: i64,
+                title: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        for level in 0..4 {
+            assert!(
+                generated.contains(&format!("const DEPENDENT_CASCADE_{level}")),
+                "expected level {level}: {generated}"
+            );
+        }
+        assert!(generated.contains("\"Comment\""), "{generated}");
+        assert!(
+            generated.contains("\"Like\""),
+            "nullify writes the child: {generated}"
+        );
+        assert!(
+            !generated.contains("\"Audit\""),
+            "restrict only probes and writes nothing: {generated}"
+        );
+        assert!(
+            generated.contains("PgCommentRepository :: __AUTUMN_CASCADE_0"),
+            "a destroy child cascades into its own dependents: {generated}"
+        );
+        assert!(
+            !generated.contains("PgLikeRepository :: __AUTUMN_CASCADE"),
+            "nullify runs no cascade of its own: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_self_referencing_dependent_adds_no_cycle() {
+        let item: TokenStream = quote! {
+            #[has_many(Comment, dependent = destroy)]
+            struct Comment {
+                #[id]
+                id: i64,
+                body: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        assert!(
+            !generated.contains("DEPENDENT_CASCADE"),
+            "a model that cascades only into itself publishes nothing: {generated}"
+        );
+    }
+
+    #[test]
+    fn a_level_never_reads_its_own_level_of_another_type() {
+        // Level k reads level k - 1 only, so a cascade that loops through two
+        // models is no const cycle.
+        let item: TokenStream = quote! {
+            #[has_many(Comment, dependent = destroy)]
+            struct Post {
+                #[id]
+                id: i64,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        let level_three = generated
+            .split("const DEPENDENT_CASCADE_3")
+            .nth(1)
+            .expect("level 3");
+        assert!(level_three.contains("__AUTUMN_CASCADE_2"), "{level_three}");
+        assert!(!level_three.contains("__AUTUMN_CASCADE_3"), "{level_three}");
+    }
+
+    #[test]
+    fn a_model_without_dependents_emits_no_cascade_levels() {
+        let item: TokenStream = quote! {
+            struct Post {
+                #[id]
+                id: i64,
+                title: String,
+            }
+        };
+        let generated = model_macro(quote! {}, item).to_string();
+        assert!(!generated.contains("DEPENDENT_CASCADE"), "{generated}");
+    }
+
+    #[test]
     fn model_emits_dependents_impl_for_declared_cascade() {
         // The `#[model]` expansion must generate the runtime `AutumnDependents`
         // dispatch (an inherent `dependents()` returning `RuntimeDependentSpec`s
@@ -14174,6 +14650,81 @@ mod tests {
         assert!(
             generated.contains("M2mConnSource"),
             "expected the mutation trait to be blanket-implemented over M2mConnSource"
+        );
+    }
+
+    #[test]
+    fn model_macro_m2m_mutations_refuse_a_ledgered_join_table() {
+        // #2319: the link writes record no ledger revision.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[has_many(Tag, through = post_tags)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        )
+        .to_string();
+        let guard = "refuse_out_of_band_write (\"post_tags\" , \"has_many through\")";
+        assert_eq!(
+            generated.matches(guard).count(),
+            3,
+            "add, remove and set must each refuse: {generated}"
+        );
+    }
+
+    #[test]
+    fn model_macro_factory_refuses_before_it_creates_associations() {
+        // #2319: a refused factory call must write nothing, so the guard runs
+        // before any `#[factory_assoc]` parent is created.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    #[factory_assoc(User)]
+                    pub user_id: i64,
+                }
+            },
+        )
+        .to_string();
+        let guard = generated
+            .find("refuse_out_of_band_write (\"posts\" , \"factory\")")
+            .expect("the factory refuses a ledgered table");
+        let assoc = generated
+            .find("User :: factory () . create (pool)")
+            .expect("the factory creates the association");
+        assert!(guard < assoc, "{generated}");
+    }
+
+    #[test]
+    fn model_macro_votable_refuses_a_ledgered_target_and_edge_table() {
+        // #2319: the aggregate UPDATE and the edge writes record no revision.
+        let generated = model_macro(
+            quote! {},
+            quote! {
+                #[votable(by = User, aggregate = sum)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                    pub score: i64,
+                }
+            },
+        )
+        .to_string();
+        assert!(
+            generated.contains("refuse_out_of_band_write (\"posts\" , \"votable aggregate\")"),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("refuse_out_of_band_write (\"votes\" , \"votable edge\")"),
+            "{generated}"
         );
     }
 
@@ -16548,13 +17099,42 @@ mod tests {
         );
         assert!(
             generated.contains("module_path !"),
-            "the manifest identity must be module-qualified so two `Customer`s \
-             in different crates cannot share a row: {generated}"
+            "the manifest identity must have module path and crate version so \
+             two `Customer`s cannot share a row: {generated}"
+        );
+        // This crate is the defining crate here, so its own version is the oracle.
+        let version = compat_version(
+            env!("CARGO_PKG_VERSION_MAJOR"),
+            env!("CARGO_PKG_VERSION_MINOR"),
+            env!("CARGO_PKG_VERSION_PATCH"),
+            env!("CARGO_PKG_VERSION_PRE"),
+        );
+        assert_eq!(
+            generated.matches(&format!("\"@{version}\"")).count(),
+            2,
+            "marker and descriptor must both carry the crate version: {generated}"
         );
         assert!(
             generated.contains("Classification :: PersonalData"),
             "{generated}"
         );
+    }
+
+    #[test]
+    fn compat_version_keeps_only_the_semver_incompatible_part() {
+        // A patch or compatible bump must not change the manifest key.
+        assert_eq!(compat_version("2", "7", "3", ""), "2");
+        assert_eq!(compat_version("1", "0", "9", ""), "1");
+        // Before 1.0 a minor bump is the breaking one.
+        assert_eq!(compat_version("0", "8", "4", ""), "0.8");
+        // Before 0.1 each patch release is incompatible.
+        assert_eq!(compat_version("0", "0", "1", ""), "0.0.1");
+        assert_eq!(compat_version("0", "0", "2", ""), "0.0.2");
+        // Cargo matches a prerelease only with the same exact version.
+        assert_eq!(compat_version("1", "0", "0", "alpha.1"), "1.0.0-alpha.1");
+        assert_eq!(compat_version("1", "0", "0", "beta.1"), "1.0.0-beta.1");
+        assert_eq!(compat_version("1", "1", "0", "alpha.1"), "1.1.0-alpha.1");
+        assert_eq!(compat_version("0", "8", "0", "rc.1"), "0.8.0-rc.1");
     }
 
     #[test]
@@ -17252,12 +17832,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_impl_for_new_is_gated_on_normalize_columns() {
-        // #2634: a model with no `#[normalize]` columns must not get
-        // `impl Normalize for New*` — otherwise the repository probe's `Yes`
-        // arm always wins and `save_many` clones a batch whose normalization
-        // is a guaranteed no-op. The read-model impl and `NormalizedModel`
-        // stay unconditional (public API surface and the finder `None` arm).
+    fn normalize_impl_for_new_is_unconditional_and_noop_is_marked() {
+        // #2692: every `New*` implements `Normalize`, so a `T: Normalize`
+        // bound accepts it. With no `#[normalize]` columns the impl is a
+        // no-op, and the `NormalizeNoop` marker tells the repository probe to
+        // skip the clone (#2634).
         let output = model_macro(
             TokenStream::new(),
             quote! {
@@ -17270,8 +17849,12 @@ mod tests {
         );
         let generated = output.to_string();
         assert!(
-            !generated.contains("normalize :: Normalize for NewUser"),
-            "must NOT generate `impl Normalize for NewUser` with no normalize columns: {generated}"
+            generated.contains("normalize :: Normalize for NewUser"),
+            "must generate `impl Normalize for NewUser`: {generated}"
+        );
+        assert!(
+            generated.contains("normalize :: NormalizeNoop for NewUser"),
+            "must mark the no-op `NewUser` impl with `NormalizeNoop`: {generated}"
         );
         assert!(
             generated.contains("normalize :: Normalize for User"),
@@ -17280,6 +17863,65 @@ mod tests {
         assert!(
             generated.contains("normalize :: NormalizedModel for User"),
             "must keep `impl NormalizedModel for User`: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_noop_marker_is_absent_when_new_has_normalize_columns() {
+        // #2692: the marker skips normalization on insert. A `New*` with a
+        // `#[normalize]` column must not get it.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[normalize(trim)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("normalize :: Normalize for NewUser"),
+            "must generate `impl Normalize for NewUser`: {generated}"
+        );
+        assert!(
+            !generated.contains("NormalizeNoop"),
+            "must not mark a normalizing `NewUser` as no-op: {generated}"
+        );
+    }
+
+    #[test]
+    fn normalize_noop_marker_when_normalize_column_is_not_in_new() {
+        // #2692: a `#[default]` column is not in `NewUser`. `NewUser` has
+        // nothing to normalize, so it gets the marker. `User` still
+        // normalizes the column.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct User {
+                    #[id]
+                    pub id: i64,
+                    #[default]
+                    #[normalize(trim)]
+                    pub email: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains("normalize :: NormalizeNoop for NewUser"),
+            "must mark `NewUser` as no-op: {generated}"
+        );
+        let user_impl = generated
+            .split("normalize :: Normalize for User")
+            .nth(1)
+            .expect("must generate `impl Normalize for User`");
+        let user_body = user_impl.split("impl").next().unwrap_or_default();
+        assert!(
+            user_body.contains("normalize :: trim"),
+            "`User` must still trim the column: {user_body}"
         );
     }
 
@@ -17942,6 +18584,61 @@ mod tests {
     }
 
     #[test]
+    fn references_actions_pass_validation() {
+        let field: syn::Field = syn::parse_quote! {
+            #[references(table = "accounts", on_delete = "cascade", on_update = "restrict")]
+            pub account_id: i64
+        };
+        validate_field_schema_markers(&field).expect("actions must validate");
+
+        let nullable: syn::Field = syn::parse_quote! {
+            #[references(on_delete = "set_null")]
+            pub account_id: Option<i64>
+        };
+        validate_field_schema_markers(&nullable).expect("`set_null` on `Option` must validate");
+    }
+
+    #[test]
+    fn references_unknown_action_rejected() {
+        let field: syn::Field = syn::parse_quote! {
+            #[references(on_delete = "casade")]
+            pub account_id: i64
+        };
+        let err = validate_field_schema_markers(&field).expect_err("a typo must be rejected");
+        assert!(
+            err.to_string()
+                .contains("unknown foreign-key action `casade`"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn references_set_null_or_set_default_on_required_field_rejected() {
+        // The column has no default, so `SET DEFAULT` also writes NULL.
+        for action in ["set_null", "set_default"] {
+            let field: syn::Field = syn::parse_quote! {
+                #[references(on_update = #action)]
+                pub account_id: i64
+            };
+            let err = validate_field_schema_markers(&field)
+                .expect_err("a NULL-writing action on a required field must be rejected");
+            assert!(
+                err.to_string()
+                    .contains(&format!("`{action}` needs an `Option<_>` field")),
+                "unexpected message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn references_action_values_match_schema_core() {
+        assert_eq!(
+            REFERENCES_ACTION_VALUES,
+            autumn_schema_core::FOREIGN_KEY_ACTION_ATTR_VALUES
+        );
+    }
+
+    #[test]
     fn model_managed_with_paren_args_rejected() {
         // `#[model(managed(foo))]` (parenthesized) must produce our clear
         // message, not a generic `syn` "expected identifier" parser error.
@@ -18020,6 +18717,101 @@ mod tests {
         assert_eq!(
             with_markers, without_markers,
             "schema markers must not alter generated code"
+        );
+    }
+
+    #[test]
+    fn renamed_from_with_one_snake_case_name_passes() {
+        let field: syn::Field = syn::parse_quote! {
+            #[renamed_from("title")]
+            pub headline: String
+        };
+        validate_field_schema_markers(&field).expect("a valid hint must pass");
+        let attrs: Vec<syn::Attribute> = vec![syn::parse_quote!(#[renamed_from("articles")])];
+        validate_model_renamed_from(&attrs).expect("a valid table hint must pass");
+    }
+
+    #[test]
+    fn malformed_renamed_from_is_rejected() {
+        let bad: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[renamed_from]),
+            syn::parse_quote!(#[renamed_from = "title"]),
+            syn::parse_quote!(#[renamed_from(title)]),
+            syn::parse_quote!(#[renamed_from("Title")]),
+            syn::parse_quote!(#[renamed_from("a b")]),
+            syn::parse_quote!(#[renamed_from("a", "b")]),
+            syn::parse_quote!(#[renamed_from("")]),
+            syn::parse_quote!(#[renamed_from("1a")]),
+        ];
+        let long = "a".repeat(64);
+        let bad: Vec<syn::Attribute> = bad
+            .into_iter()
+            .chain(std::iter::once(syn::parse_quote!(#[renamed_from(#long)])))
+            .collect();
+        for attr in bad {
+            let shown = quote!(#attr).to_string();
+            let field = syn::Field {
+                attrs: vec![attr.clone()],
+                ..syn::parse_quote! { pub headline: String }
+            };
+            let err = validate_field_schema_markers(&field)
+                .expect_err(&format!("`{shown}` must be rejected on a field"));
+            assert!(
+                err.to_string().contains("`#[renamed_from(\"old_name\")]`"),
+                "unexpected message for `{shown}`: {err}"
+            );
+            let err = validate_model_renamed_from(&[attr])
+                .expect_err(&format!("`{shown}` must be rejected on a model"));
+            assert!(
+                err.to_string().contains("`#[renamed_from(\"old_name\")]`"),
+                "unexpected message for `{shown}`: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_renamed_from_on_one_item_are_rejected() {
+        let attrs: Vec<syn::Attribute> = vec![
+            syn::parse_quote!(#[renamed_from("a")]),
+            syn::parse_quote!(#[renamed_from("b")]),
+        ];
+        assert!(validate_model_renamed_from(&attrs).is_err());
+        let field = syn::Field {
+            attrs,
+            ..syn::parse_quote! { pub headline: String }
+        };
+        assert!(validate_field_schema_markers(&field).is_err());
+    }
+
+    #[test]
+    fn renamed_from_does_not_change_codegen() {
+        let with_hints = model_macro(
+            quote! { managed },
+            quote! {
+                #[renamed_from("old_memberships")]
+                pub struct Membership {
+                    #[id]
+                    pub id: i64,
+                    #[renamed_from("account")]
+                    pub account_id: i64,
+                }
+            },
+        )
+        .to_string();
+        let without_hints = model_macro(
+            quote! { managed },
+            quote! {
+                pub struct Membership {
+                    #[id]
+                    pub id: i64,
+                    pub account_id: i64,
+                }
+            },
+        )
+        .to_string();
+        assert_eq!(
+            with_hints, without_hints,
+            "hints must not alter generated code"
         );
     }
 
@@ -18667,6 +19459,104 @@ mod tests {
             generated.contains("enqueue_on_conn")
                 && generated.contains("< SendShippedEmailJob > :: NAME"),
             "the effect must enqueue the named job on the connection: {generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_conn_method_needs_the_postgres_feature() {
+        // The method takes `AsyncPgConnection`. A SQLite-only app has no such
+        // type, so the method compiles only with `postgres` (#2605).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        let gate = generated
+            .find(":: autumn_web :: __if_postgres !")
+            .expect("the `_on_conn` impl must sit in `__if_postgres!`");
+        let method = generated
+            .find("transition_status_to_on_conn")
+            .expect("the `_on_conn` method must be emitted");
+        assert!(gate < method, "{generated}");
+    }
+
+    #[test]
+    fn id_only_model_upsert_uses_the_backend_neutral_excluded() {
+        // `diesel::pg` does not exist in a SQLite-only build (#2605).
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Tag {
+                    #[id]
+                    pub id: i64,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            !generated.contains("pg :: upsert :: excluded"),
+            "an id-only model must not name `diesel::pg`: {generated}"
+        );
+        assert!(
+            generated.contains("diesel :: upsert :: excluded"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn state_machine_on_commit_enqueues_the_borrowed_effect_payload() {
+        // The enqueued args are only serialized, so the effect is built as the
+        // borrowed `TransitionEffectRef` twin (same JSON as `TransitionEffect`):
+        // the macro-time names go in as literals and the per-call record id and
+        // idempotency key are borrowed, instead of four `String::from` copies.
+        let output = model_macro(
+            TokenStream::new(),
+            quote! {
+                pub struct Order {
+                    #[id]
+                    pub id: i64,
+                    #[state_machine(transitions(
+                        pending -> processing,
+                        processing -> shipped: on_commit = SendShippedEmailJob,
+                    ))]
+                    pub status: String,
+                }
+            },
+        );
+        let generated = output.to_string();
+        assert!(
+            generated.contains(":: autumn_web :: __private :: TransitionEffectRef {"),
+            "the effect payload must be the borrowed twin: {generated}"
+        );
+        for field in [
+            "model : \"Order\" ,",
+            "field : \"status\" ,",
+            "record_id : & __record_id ,",
+            "from_state : \"processing\" ,",
+            "to_state : \"shipped\" ,",
+            "idempotency_key : & __idempotency_key ,",
+        ] {
+            assert!(
+                generated.contains(field),
+                "the effect payload must carry `{field}`: {generated}"
+            );
+        }
+        assert!(
+            !generated.contains("from_state : :: std :: string :: String :: from"),
+            "the literal state names must not be copied into owned Strings: {generated}"
+        );
+        assert!(
+            !generated.contains(":: autumn_web :: TransitionEffect {"),
+            "the owned payload must no longer be built: {generated}"
         );
     }
 

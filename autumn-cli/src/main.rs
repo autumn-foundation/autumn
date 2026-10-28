@@ -3,10 +3,12 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod a11y;
+mod aeo;
 mod agents;
 mod alert;
 mod assets;
 mod build;
+mod built_artifact;
 mod cache_audit;
 mod canary;
 mod capacity;
@@ -18,6 +20,7 @@ mod config;
 mod console;
 mod credentials;
 mod data;
+mod data_capsule;
 mod data_flow;
 mod db;
 mod db_pull;
@@ -27,11 +30,15 @@ mod dev;
 mod dev_loop_bench;
 mod dev_loop_scaling;
 mod doctor;
+mod edge;
+mod edge_bundle;
 mod edge_scan;
 mod experiments;
 mod export;
 mod flags;
+mod fleet;
 mod generate;
+mod git_root;
 mod graph;
 mod http;
 mod i18n;
@@ -66,6 +73,7 @@ mod serve;
 mod service;
 mod setup;
 mod shard;
+mod slo;
 mod starters;
 mod task;
 mod test_cmd;
@@ -97,24 +105,7 @@ pub enum RoutesSubcommands {
     /// when any route is unclassified — i.e. neither framework-owned, guarded
     /// (`#[secured]` / `#[authorize]`), nor explicitly `#[public]` — naming each
     /// offending route so it can be closed. This is the CI gate.
-    Audit {
-        /// Package to inspect (for workspaces).
-        #[arg(short, long)]
-        package: Option<String>,
-        /// Binary target to inspect (for packages with multiple bin targets).
-        #[arg(long, value_name = "BIN")]
-        bin: Option<String>,
-        /// Write the JSON security manifest to this file path.
-        #[arg(long, value_name = "PATH")]
-        manifest: Option<String>,
-        /// Emit the JSON manifest to stdout instead of the human summary.
-        #[arg(long)]
-        json: bool,
-        /// Reserved for tightening the gate; fail-on-unclassified is already the
-        /// default behavior.
-        #[arg(long)]
-        strict: bool,
-    },
+    Audit(RoutesAuditArgs),
     /// Diff, acknowledge, and verify security posture across commits (#1624).
     ///
     /// `routes audit` proves what the security surface *is*; `routes posture`
@@ -161,13 +152,19 @@ pub enum PostureSubcommands {
         /// An acknowledgment digest, without the comment ceremony (repeatable).
         #[arg(long, value_name = "DIGEST")]
         ack: Vec<String>,
-        /// File of pull-request text to scan for `/ack-posture` markers.
+        /// File of pull-request comments, divided by
+        /// `<!-- autumn:ack-source -->` lines. Prefer `--ack-dir`.
         ///
-        /// The workflow harvests it from comments whose author is an OWNER,
-        /// MEMBER or COLLABORATOR: this command trusts what it is given and
-        /// enforces no authorization of its own.
+        /// This command does no authorization. The workflow must give it only
+        /// comments from people with write permission.
         #[arg(long, value_name = "PATH")]
         ack_file: Option<String>,
+        /// Directory of pull-request comments, one file per comment, to scan
+        /// for `/ack-posture` markers. Each file is parsed alone, so comment
+        /// text cannot fake a comment boundary. This command does no
+        /// authorization.
+        #[arg(long, value_name = "DIR")]
+        ack_dir: Option<String>,
         /// Treat a missing base manifest as "no baseline yet" (exit 0) instead
         /// of an error. What a repository enabling the gate wants on its first
         /// run.
@@ -260,6 +257,50 @@ pub struct CacheAuditArgs {
     /// Audit the binary built under this Cargo profile (a custom
     /// `[profile.<NAME>]` builds into `target/<NAME>`; `dev` into
     /// `target/debug`).
+    #[arg(long, value_name = "NAME")]
+    profile: Option<String>,
+}
+
+/// Arguments for `autumn routes audit`.
+///
+/// A separate `Args` struct for the same reason as [`CacheAuditArgs`]: it
+/// keeps clap's derive frame small.
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct RoutesAuditArgs {
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Write the JSON security manifest to this file path.
+    #[arg(long, value_name = "PATH")]
+    manifest: Option<String>,
+    /// Emit the JSON manifest to stdout instead of the human summary.
+    #[arg(long)]
+    json: bool,
+    /// Reserved for tightening the gate; fail-on-unclassified is already the
+    /// default behavior.
+    #[arg(long)]
+    strict: bool,
+    /// Cargo features to build the audited binary with. Repeat the flag or
+    /// give a comma-separated list. A route behind a feature that the build
+    /// does not enable is not in the manifest.
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the audited binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the audited binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Audit the release build. A route behind
+    /// `#[cfg(not(debug_assertions))]` is only in a release build.
+    #[arg(long, conflicts_with = "profile")]
+    release: bool,
+    /// Audit the binary built with this Cargo profile. You cannot use it
+    /// with `--release`.
     #[arg(long, value_name = "NAME")]
     profile: Option<String>,
 }
@@ -522,6 +563,30 @@ pub enum OpenApiSubcommands {
     Export(OpenApiExportArgs),
 }
 
+/// Subcommands for `autumn aeo`.
+#[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
+pub enum AeoSubcommands {
+    /// Print the DNS-AID records to publish for this site.
+    ///
+    /// Reads `[seo] base_url` from `autumn.toml` when `--base-url` is not
+    /// given. Sign the zone with DNSSEC.
+    Dns {
+        /// Site base URL, e.g. `https://example.com`.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// MCP mount path, when the app serves MCP (e.g. `/mcp`).
+        #[arg(long)]
+        mcp_path: Option<String>,
+        /// Record TTL in seconds.
+        #[arg(long, default_value_t = 3600)]
+        ttl: u32,
+        /// Profile whose `autumn.toml` overlay to read (default: the active
+        /// profile).
+        #[arg(long)]
+        profile: Option<String>,
+    },
+}
+
 /// Subcommands for `autumn agents`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum AgentsSubcommands {
@@ -577,6 +642,20 @@ pub enum A11ySubcommands {
         /// fails, consistent with `autumn i18n check --strict`.
         #[arg(long)]
         strict: bool,
+        /// Cargo features to turn on in every crate of the scan, in addition
+        /// to the default features. Repeat the flag or give a comma-separated
+        /// list. An item or a call under a `#[cfg(feature = "…")]` that is off
+        /// does not attribute a route. Features change only the route
+        /// attribution, not the findings or the exit code.
+        #[arg(long, value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Turn on every feature that the manifest declares, and the implicit
+        /// feature of each optional dependency that no `dep:` entry names.
+        #[arg(long)]
+        all_features: bool,
+        /// Do not turn on the `[features] default` set.
+        #[arg(long)]
+        no_default_features: bool,
     },
 }
 
@@ -989,6 +1068,156 @@ pub enum CapsuleCommands {
     },
 }
 
+/// `autumn edge` subcommands.
+#[derive(Subcommand)]
+pub enum EdgeCommands {
+    /// Run an edge node: the capsule in front of a remote origin.
+    ///
+    /// The node serves each request the capsule can serve. It sends every
+    /// other request (writes, declines, capsule errors) to the origin and
+    /// returns the origin's response. Run it near your users. Keep the
+    /// origin where it is. You write no glue code.
+    ///
+    /// At start, the node copies the origin's static security and CSP
+    /// headers from `GET <probe-path>`, so both lanes send the same headers.
+    /// Set a CORS policy that is the same for every route with
+    /// `--response-header`.
+    /// It stops on Ctrl-C or SIGTERM.
+    ///
+    /// # Examples
+    ///
+    ///   autumn edge serve --origin https://origin.example.com
+    ///   autumn edge serve --origin http://10.0.0.5:3000 --listen 0.0.0.0:8787 --kv kv.json
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Serve {
+        /// The capsule that `autumn build` wrote.
+        #[arg(
+            long,
+            value_name = "WASM",
+            default_value = "target/wasm32-wasip1/release/edge-capsule.wasm"
+        )]
+        capsule: String,
+        /// The origin base URL, for example `https://origin.example.com`.
+        #[arg(long, value_name = "URL")]
+        origin: String,
+        /// The address to listen on.
+        #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8787")]
+        listen: String,
+        /// A JSON file with one object of string values. It gives the `kv`
+        /// capability. Without it, a `needs(kv)` route goes to the origin.
+        #[arg(long, value_name = "FILE")]
+        kv: Option<String>,
+        /// The origin path for the header requests at start.
+        #[arg(long, value_name = "PATH", default_value = "/")]
+        probe_path: String,
+        /// Do not send the header requests at start.
+        #[arg(long)]
+        no_probe: bool,
+        /// Also set this header on each edge response. Repeat it.
+        #[arg(long = "response-header", value_name = "NAME: VALUE")]
+        response_headers: Vec<String>,
+        /// Keep the `x-forwarded-*` headers from this peer (an address or a
+        /// CIDR range), for example your TLS terminator. Repeat it.
+        #[arg(long = "trusted-proxy", value_name = "IP|CIDR")]
+        trusted_proxies: Vec<String>,
+        /// Do not write a line for each request.
+        #[arg(long)]
+        quiet: bool,
+    },
+    /// Write a deployable edge bundle for a web-standard runtime (ADR-0024).
+    ///
+    /// The bundle is the capsule, Autumn's JavaScript edge host and an entry
+    /// module for the platform. It needs no vendor SDK. The platform's own
+    /// CLI deploys it. The capsule serves each GET/HEAD it can; every other
+    /// request goes to the origin unchanged.
+    ///
+    /// Every bundle rewrites the capsule, the host and the entry. The
+    /// platform config (`wrangler.toml`) is written once and then kept, so
+    /// a KV namespace id or a route added to it survives.
+    ///
+    /// # Examples
+    ///
+    ///   autumn build
+    ///   autumn edge bundle --target cloudflare --origin https://origin.example.com
+    ///   cd edge/cloudflare && npx wrangler deploy
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Bundle {
+        /// The platform to bundle for.
+        #[arg(long, value_enum, default_value = "cloudflare")]
+        target: edge_bundle::BundleTarget,
+        /// The capsule that `autumn build` wrote.
+        #[arg(
+            long,
+            value_name = "WASM",
+            default_value = "target/wasm32-wasip1/release/edge-capsule.wasm"
+        )]
+        capsule: String,
+        /// The origin base URL. Required for a new bundle; it goes into the
+        /// platform config, which later bundles keep.
+        #[arg(long, value_name = "URL")]
+        origin: Option<String>,
+        /// The directory to write.
+        #[arg(long, value_name = "DIR", default_value = "edge/cloudflare")]
+        out: String,
+        /// The Worker name for a new config. Defaults to `<package>-edge`.
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// Also set this header on each edge response. Repeat it.
+        #[arg(long = "response-header", value_name = "NAME: VALUE")]
+        response_headers: Vec<String>,
+        /// The origin path the Worker reads the static security headers
+        /// from, once per isolate.
+        #[arg(long, value_name = "PATH", default_value = "/")]
+        probe_path: String,
+        /// Do not read the origin's static headers.
+        #[arg(long)]
+        no_probe: bool,
+    },
+    /// Measure time to first byte at the edge node and at the origin.
+    ///
+    /// Sends the same GETs to both, compares the bytes of each pair, and
+    /// reports the median and p90 TTFB of each side. Run it from a client
+    /// far from the origin.
+    ///
+    /// Exit codes: 0 pass, 1 a divergence or a reduction below
+    /// `--min-reduction`, 2 an error.
+    ///
+    /// # Examples
+    ///
+    ///   autumn edge ttfb --edge https://edge.example.com --origin https://origin.example.com --path /greet/ada
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Ttfb {
+        /// The edge node base URL.
+        #[arg(long, value_name = "URL")]
+        edge: String,
+        /// The origin base URL.
+        #[arg(long, value_name = "URL")]
+        origin: String,
+        /// A path to request, with a leading `/`. Repeat it.
+        #[arg(long = "path", value_name = "PATH", required = true)]
+        paths: Vec<String>,
+        /// How many times to request each path.
+        #[arg(long, value_name = "N", default_value_t = 100)]
+        rounds: usize,
+        /// The lowest median TTFB reduction, in percent, that passes.
+        #[arg(
+            long,
+            value_name = "PERCENT",
+            default_value_t = 50.0,
+            allow_negative_numbers = true,
+            value_parser = edge::parse_percent
+        )]
+        min_reduction: f64,
+        /// Check the bytes only. Do not fail on the TTFB reduction. Use it
+        /// when the client is near the origin, for example in CI.
+        #[arg(long)]
+        divergence_only: bool,
+    },
+}
+
 /// The Autumn web framework CLI.
 #[derive(Parser)]
 #[command(name = "autumn", version, about = "The Autumn web framework CLI")]
@@ -1397,6 +1626,21 @@ enum Commands {
     },
     /// Shard operations (e.g. moving a tenant's data between shards)
     Shard(ShardCommands),
+    /// Operate a `SQLite` database fleet: list, migrate, back up, delete, restore.
+    ///
+    /// Reads `[database.fleet]` from the app config. `restore` also reads
+    /// `[replication]`. Run it from the app directory: the fleet root must
+    /// exist. Works when the app is stopped and when it runs. Needs the
+    /// `sqlite` build of the CLI.
+    ///
+    /// # Examples
+    ///
+    ///   autumn fleet list --open
+    ///   autumn fleet migrate --concurrency 4
+    ///   autumn fleet backup tenant:acme /backups/acme.db
+    ///   autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
+    #[command(subcommand, verbatim_doc_comment)]
+    Fleet(FleetCommands),
     /// Live monitoring dashboard for a running Autumn application
     Monitor {
         /// URL of the running Autumn application
@@ -1447,9 +1691,13 @@ enum Commands {
     /// An existing playground is never overwritten; pass `--force` to
     /// regenerate it from the template.
     ///
+    /// `--repl` opens an interactive Rhai prompt on the same playground
+    /// instead: no compile per query, reads only.
+    ///
     /// # Examples
     ///
     ///   autumn console
+    ///   autumn console --repl
     ///   autumn console --profile demo
     ///   autumn console --force
     #[command(visible_alias = "c", verbatim_doc_comment)]
@@ -1468,6 +1716,12 @@ enum Commands {
         /// running it.
         #[arg(long)]
         scaffold_only: bool,
+        /// Open an interactive Rhai prompt instead of running the playground
+        /// code. Builds once with `autumn-web/repl`; `Cargo.toml` does not
+        /// change. Reads only: `<Repository>::find_all()`, `find_by_id(id)`,
+        /// `count()`.
+        #[arg(long)]
+        repl: bool,
     },
 
     /// Run the project's seed binary to populate the database with representative data.
@@ -1525,6 +1779,22 @@ enum Commands {
     Capsule {
         #[command(subcommand)]
         command: CapsuleCommands,
+    },
+    /// Run and measure the edge capsule.
+    ///
+    /// `serve` runs an edge node: the capsule from `autumn build` in front of
+    /// your origin. `ttfb` measures time to first byte at the node and at the
+    /// origin, and checks that both send the same bytes.
+    ///
+    /// # Examples
+    ///
+    ///   autumn edge serve --origin https://origin.example.com
+    ///   autumn edge ttfb --edge http://127.0.0.1:8787 --origin https://origin.example.com --path /
+    #[allow(clippy::doc_markdown)]
+    #[command(verbatim_doc_comment)]
+    Edge {
+        #[command(subcommand)]
+        command: EdgeCommands,
     },
     /// Replay a recorded failure capsule against the application.
     ///
@@ -1769,6 +2039,13 @@ enum Commands {
     /// Fire a synthetic operator alert through configured delivery channels.
     #[command(subcommand)]
     Alert(AlertCommands),
+
+    /// Turn the `[[slo]]` tables in autumn.toml into monitoring files.
+    ///
+    /// Writes Prometheus burn-rate rules, a Grafana dashboard, and Argo
+    /// Rollouts and Flagger analysis templates. See docs/guide/slo.md.
+    #[command(subcommand)]
+    Slo(SloCommands),
     /// Issue and revoke API bearer tokens backed by the `api_tokens` table.
     ///
     /// Requires the `api_tokens` table to exist. Run `autumn migrate` first;
@@ -1786,9 +2063,8 @@ enum Commands {
 
     /// Inspect and toggle feature flags at runtime without redeploying.
     ///
-    /// Feature flags control which actors see a feature. Mutations propagate
-    /// to all running replicas within seconds via Postgres LISTEN/NOTIFY cache
-    /// invalidation.
+    /// Feature flags control which actors see a feature. Running replicas
+    /// poll the database and see a change within one poll interval.
     ///
     /// The database URL is resolved from `autumn.toml`, profile overrides, or
     /// the `AUTUMN_DATABASE__PRIMARY_URL` / `AUTUMN_DATABASE__URL` /
@@ -2130,6 +2406,20 @@ enum Commands {
     ///   autumn agents manifest --check agent-authority.json --release
     #[command(subcommand, verbatim_doc_comment)]
     Agents(AgentsSubcommands),
+
+    /// Agent readiness (AEO) tooling.
+    ///
+    /// `autumn aeo dns` prints the DNS for AI Discovery (DNS-AID) records
+    /// for the site. An app cannot publish DNS itself. Add these lines to
+    /// your zone. Sign the zone with DNSSEC.
+    ///
+    /// # Examples
+    ///
+    ///   autumn aeo dns
+    ///   autumn aeo dns --base-url https://example.com --mcp-path /mcp
+    #[allow(clippy::doc_markdown)]
+    #[command(subcommand, verbatim_doc_comment)]
+    Aeo(AeoSubcommands),
 
     /// Cache-coherence tooling — prove no write can leave a cached read stale.
     ///
@@ -2667,6 +2957,8 @@ enum DbCommands {
     /// Refuses to run outside the `dev`/`test` profile without `--force`, the
     /// same guard as `autumn db drop`.
     ///
+    /// Works on Postgres and `SQLite` targets. `--sample` is Postgres-only.
+    ///
     /// # Examples
     ///
     ///   # Refresh staging from a production backup:
@@ -2733,7 +3025,7 @@ enum DbCommands {
     /// sticky experiment assignments, webhook replay markers, sessions, audit
     /// archives. This reports every one of them: the retention window in
     /// effect, which setting produced it, how it is enforced, and how many
-    /// rows are eligible for purge right now.
+    /// rows are eligible for purge right now. Sweeps run on Postgres and `SQLite`.
     ///
     /// Windows are declared in the `[retention]` section of `autumn.toml` and
     /// are enforced automatically on a recurring in-process sweep — this
@@ -3181,6 +3473,137 @@ impl MigrateCommands {
     }
 }
 
+/// Subcommands of `autumn fleet` (issue #3232).
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+enum FleetCommands {
+    /// Show every database on disk: name, size and path.
+    List {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// Also read each file: the identity row, the latest applied app
+        /// migration and the number of pending app migrations.
+        #[arg(long)]
+        open: bool,
+        /// Write JSON to stdout instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply pending migrations from `migrations/` to every database.
+    ///
+    /// Each database also gets the framework tables a fleet database gets at
+    /// boot. Plugin migrations are not applied: run the app once with
+    /// `AUTUMN_MIGRATE=1` for them. A failure on one database does not stop the
+    /// others. The command exits non-zero when one or more fail.
+    Migrate {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The number of databases to migrate at the same time.
+        #[arg(long, value_name = "N", default_value_t = 8,
+              value_parser = clap::value_parser!(u16).range(1..))]
+        concurrency: u16,
+        /// Migrate only this database (`tenant:<id>` or `slot:<nnnnn>`).
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
+    },
+    /// Copy one database to a new file (`VACUUM INTO`). Writes can continue
+    /// during the copy.
+    Backup {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The database: `tenant:<id>` or `slot:<nnnnn>`.
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// The path of the new file. It must not exist.
+        #[arg(value_name = "DEST")]
+        dest: std::path::PathBuf,
+    },
+    /// Remove one database file and its sidecars.
+    ///
+    /// Refused when another process has the file open.
+    Delete {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The database: `tenant:<id>` or `slot:<nnnnn>`.
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Confirm the deletion. Required on every profile.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Rebuild one database from its `[replication]` replica.
+    ///
+    /// Verifies the chain before it replaces the file, as
+    /// `autumn db replica restore` does. Refused when another process has the
+    /// file open.
+    Restore {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The database: `tenant:<id>` or `slot:<nnnnn>`.
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// Restore to this RFC 3339 instant instead of the latest state.
+        #[arg(long, value_name = "RFC3339")]
+        timestamp: Option<String>,
+        /// Confirm the replacement. Required on every profile.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+impl FleetCommands {
+    /// Translate the parsed CLI shape into the `fleet` command.
+    fn into_command(self) -> fleet::FleetCommand {
+        match self {
+            Self::List {
+                profile,
+                open,
+                json,
+            } => fleet::FleetCommand::List {
+                profile,
+                open,
+                json,
+            },
+            Self::Migrate {
+                profile,
+                concurrency,
+                key,
+            } => fleet::FleetCommand::Migrate {
+                profile,
+                concurrency: usize::from(concurrency),
+                key,
+            },
+            Self::Backup { profile, key, dest } => {
+                fleet::FleetCommand::Backup { profile, key, dest }
+            }
+            Self::Delete {
+                profile,
+                key,
+                force,
+            } => fleet::FleetCommand::Delete {
+                profile,
+                key,
+                force,
+            },
+            Self::Restore {
+                profile,
+                key,
+                timestamp,
+                force,
+            } => fleet::FleetCommand::Restore {
+                profile,
+                key,
+                timestamp,
+                force,
+            },
+        }
+    }
+}
+
 /// Subcommands for `autumn shard`.
 #[derive(clap::Args)]
 struct ShardCommands {
@@ -3303,6 +3726,96 @@ enum DataCommands {
         #[arg(long, value_name = "COOKIE")]
         cookie: Option<String>,
     },
+    /// Export, import, or verify a portable data capsule.
+    ///
+    /// A capsule holds all data of one subject: records, a manifest, blobs,
+    /// a signature, and an offline HTML viewer. The app runs the command with
+    /// its own models, database, and `[security.signing_secret]`.
+    ///
+    /// # Examples
+    ///
+    ///   autumn data capsule export --subject 42 --out ./capsule-42
+    ///   autumn data capsule verify ./capsule-42
+    ///   autumn data capsule import ./capsule-42
+    #[command(subcommand, verbatim_doc_comment)]
+    Capsule(DataCapsuleCommands),
+}
+
+/// Options shared by the `autumn data capsule` subcommands.
+#[derive(clap::Args)]
+struct CapsuleRunArgs {
+    /// Package to run (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to run (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Profile forwarded to the app binary via `AUTUMN_ENV`.
+    #[arg(long, default_value = "dev")]
+    profile: String,
+    /// Print the raw JSON report.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Subcommands for `autumn data capsule`.
+#[derive(Subcommand)]
+enum DataCapsuleCommands {
+    /// Write a signed capsule with all data of one subject.
+    Export {
+        /// The subject id (for example a user id).
+        #[arg(long)]
+        subject: String,
+        /// The output directory. It must not exist, or must be empty.
+        #[arg(long, value_name = "DIR")]
+        out: String,
+        #[command(flatten)]
+        run: CapsuleRunArgs,
+    },
+    /// Verify a capsule, then import its records and blobs.
+    Import {
+        /// The capsule directory.
+        path: String,
+        /// Allow import on a profile that is not `dev` or `test`.
+        #[arg(long)]
+        force: bool,
+        #[command(flatten)]
+        run: CapsuleRunArgs,
+    },
+    /// Check the signature and every file hash of a capsule.
+    Verify {
+        /// The capsule directory.
+        path: String,
+        #[command(flatten)]
+        run: CapsuleRunArgs,
+    },
+}
+
+/// Dispatch `autumn data capsule`.
+fn run_data_capsule(command: DataCapsuleCommands) {
+    let (action, path, force, run) = match command {
+        DataCapsuleCommands::Export { subject, out, run } => (
+            data_capsule::CapsuleAction::Export { subject },
+            out,
+            false,
+            run,
+        ),
+        DataCapsuleCommands::Import { path, force, run } => {
+            (data_capsule::CapsuleAction::Import, path, force, run)
+        }
+        DataCapsuleCommands::Verify { path, run } => {
+            (data_capsule::CapsuleAction::Verify, path, false, run)
+        }
+    };
+    data_capsule::run(&data_capsule::CapsuleOptions {
+        package: run.package.as_deref(),
+        bin: run.bin.as_deref(),
+        profile: &run.profile,
+        action,
+        path: &path,
+        force,
+        json: run.json,
+    });
 }
 
 /// Subcommands for `autumn maintenance`.
@@ -3388,6 +3901,40 @@ enum AlertCommands {
         #[arg(long)]
         channel: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum SloCommands {
+    /// Generate Prometheus rules, a Grafana dashboard and analysis templates.
+    ///
+    /// Reads the `[[slo]]` tables in autumn.toml (issue #3069). The output is
+    /// deterministic, so you can commit it and check it in CI with `--check`.
+    Generate(SloGenerateArgs),
+}
+
+#[derive(clap::Args)]
+struct SloGenerateArgs {
+    /// Directory for the generated files.
+    #[arg(long, value_name = "DIR", default_value = slo::DEFAULT_OUT_DIR)]
+    out_dir: PathBuf,
+    /// Application name for labels and object names. Default: `[deploy]
+    /// app_name`, then the package name.
+    #[arg(long, value_name = "NAME")]
+    app: Option<String>,
+    /// Extra label matchers for every query, for example 'job="shop"'.
+    #[arg(long, value_name = "MATCHERS")]
+    selector: Option<String>,
+    /// Prometheus address in the analysis templates.
+    #[arg(long, value_name = "URL", default_value = slo::DEFAULT_PROMETHEUS_URL)]
+    prometheus_url: String,
+    /// A label on the `PrometheusRule` object, for a Prometheus
+    /// `ruleSelector`, for example 'release=kube-prometheus-stack'. Repeat it
+    /// for more labels.
+    #[arg(long, value_name = "NAME=VALUE")]
+    rule_label: Vec<String>,
+    /// Compare with the files in --out-dir; write nothing. Exit 1 on drift.
+    #[arg(long)]
+    check: bool,
 }
 
 #[derive(Subcommand)]
@@ -3649,8 +4196,9 @@ enum ReleaseCommands {
     /// --target fly                    : also emits fly.toml.
     /// --target docker-compose         : also emits docker-compose.yml with app + Postgres.
     /// --target azure-container-apps   : also emits main.tf, variables.tf, outputs.tf,
-    ///                                   terraform.tfvars.example, and
-    ///                                   .github/workflows/azure-deploy.yml.
+    ///                                   terraform.tfvars.example,
+    ///                                   .github/workflows/azure-deploy.yml, and
+    ///                                   azure-cutover.sh.
     /// --target aws-app-runner         : also emits main.tf, variables.tf, outputs.tf, and
     ///                                   terraform.tfvars.example (ECR + App Runner + RDS,
     ///                                   no CI workflow — fast/minimal path).
@@ -3663,12 +4211,18 @@ enum ReleaseCommands {
     ///                                   .github/workflows/gcp-deploy.yml (Artifact
     ///                                   Registry + Cloud Run + Cloud SQL behind a VPC
     ///                                   connector, opt-in Memorystore Redis).
+    /// --target kubernetes             : also emits a Helm chart (deploy/helm/) and a
+    ///                                   Kustomize base (deploy/kustomize/base/) with
+    ///                                   /startup, /live and /ready probes, a `preStop`
+    ///                                   hook, a grace period longer than the drain
+    ///                                   window, a `PodDisruptionBudget`, and opt-in
+    ///                                   Argo Rollouts or Flagger canaries.
     Init {
         /// Overwrite existing files instead of erroring on collision.
         #[arg(long)]
         force: bool,
         /// Deployment target: fly | docker-compose | azure-container-apps | aws-app-runner |
-        /// aws-ecs | gcp-cloud-run (omit for bare Dockerfile).
+        /// aws-ecs | gcp-cloud-run | kubernetes (omit for bare Dockerfile).
         #[arg(long, value_name = "TARGET")]
         target: Option<String>,
         /// Scaffold a separate worker-role service in the generated
@@ -3743,6 +4297,13 @@ enum DeployCommands {
         /// inspected before anything else moves.
         #[arg(long)]
         no_rollback: bool,
+
+        /// Bake each host for this many seconds after its cutover, and roll it
+        /// back when the error rate or latency is too high (issue #3069).
+        ///
+        /// Overrides `[deploy.bake] duration_secs`. `0` turns the bake off.
+        #[arg(long, value_name = "SECS")]
+        bake_secs: Option<u64>,
     },
 
     /// Report every configured host's deploy state, read-only (issue #1621).
@@ -4896,6 +5457,7 @@ fn run_command(command: Commands) {
             }
         },
         Commands::Test { reset, cargo_args } => test_cmd::run(reset, &cargo_args),
+        Commands::Fleet(cmd) => fleet::run(&cmd.into_command()),
         Commands::Shard(cmd) => match cmd.command {
             ShardSubcommand::MoveSlot {
                 from,
@@ -4983,6 +5545,7 @@ fn run_command(command: Commands) {
             upsert_by.as_deref(),
             cookie.as_deref(),
         ),
+        Commands::Data(DataCommands::Capsule(command)) => run_data_capsule(command),
         Commands::New {
             name,
             starter,
@@ -5031,18 +5594,22 @@ fn run_command(command: Commands) {
                 );
                 wire_scaffold_plugins_into(&name, &plugins);
             } else {
+                let opts = new::GenerateOptions {
+                    with_i18n,
+                    with_seed,
+                    // --bundled-pg is a daemon flavor that keeps the database.
+                    with_daemon: daemon || bundled_pg,
+                    with_bundled_pg: bundled_pg,
+                    with_api: api,
+                };
+                // Before the preflight: it queries the network, and a
+                // contradictory request must fail first.
+                if let Err(err) = new::check_with_plugins(opts, with.len()) {
+                    eprintln!("Error: {err}");
+                    std::process::exit(1);
+                }
                 let plugins = resolve_scaffold_plugins(&with, Some(plugin::first_party_version()));
-                new::run(
-                    &name,
-                    new::GenerateOptions {
-                        with_i18n,
-                        with_seed,
-                        // --bundled-pg is a daemon flavor that keeps the database.
-                        with_daemon: daemon || bundled_pg,
-                        with_bundled_pg: bundled_pg,
-                        with_api: api,
-                    },
-                );
+                new::run(&name, opts);
                 wire_scaffold_plugins_into(&name, &plugins);
             }
         }
@@ -5055,12 +5622,21 @@ fn run_command(command: Commands) {
             event,
         }) => webhook::run_sim(&provider, &url, &secret, &payload, event.as_deref()),
         Commands::Alert(AlertCommands::Test { channel }) => alert::run_test(channel.as_deref()),
+        Commands::Slo(SloCommands::Generate(args)) => slo::run_generate(&slo::GenerateArgs {
+            out_dir: args.out_dir,
+            app: args.app,
+            selector: args.selector,
+            prometheus_url: args.prometheus_url,
+            rule_labels: args.rule_label,
+            check: args.check,
+        }),
         Commands::Console {
             profile,
             package,
             force,
             scaffold_only,
-        } => console::run(&profile, package.as_deref(), force, scaffold_only),
+            repl,
+        } => console::run(&profile, package.as_deref(), force, scaffold_only, repl),
         Commands::Seed {
             profile,
             package,
@@ -5074,6 +5650,63 @@ fn run_command(command: Commands) {
             model.as_deref(),
             yes_i_mean_prod,
         ),
+        Commands::Edge { command } => match command {
+            EdgeCommands::Serve {
+                capsule,
+                origin,
+                listen,
+                kv,
+                probe_path,
+                no_probe,
+                response_headers,
+                trusted_proxies,
+                quiet,
+            } => edge::serve(&edge::ServeOptions {
+                capsule: &capsule,
+                origin: &origin,
+                listen: &listen,
+                kv: kv.as_deref(),
+                probe_path: &probe_path,
+                no_probe,
+                response_headers: &response_headers,
+                trusted_proxies: &trusted_proxies,
+                quiet,
+            }),
+            EdgeCommands::Bundle {
+                target,
+                capsule,
+                origin,
+                out,
+                name,
+                response_headers,
+                probe_path,
+                no_probe,
+            } => edge_bundle::run(&edge_bundle::BundleOptions {
+                target,
+                capsule: &capsule,
+                origin: origin.as_deref(),
+                out: &out,
+                name: name.as_deref(),
+                response_headers: &response_headers,
+                probe_path: &probe_path,
+                no_probe,
+            }),
+            EdgeCommands::Ttfb {
+                edge: edge_url,
+                origin,
+                paths,
+                rounds,
+                min_reduction,
+                divergence_only,
+            } => edge::ttfb(&edge::TtfbOptions {
+                edge: &edge_url,
+                origin: &origin,
+                paths: &paths,
+                rounds,
+                min_reduction,
+                divergence_only,
+            }),
+        },
         Commands::Capsule { command } => match command {
             CapsuleCommands::Test {
                 capsule: path,
@@ -5177,6 +5810,12 @@ fn run_command(command: Commands) {
                 assets::run_verify(&manifest_path, &static_dir);
             }
         },
+        Commands::Aeo(AeoSubcommands::Dns {
+            base_url,
+            mcp_path,
+            ttl,
+            profile,
+        }) => aeo::dns(base_url, mcp_path.as_deref(), ttl, profile.as_deref()),
         Commands::Agents(AgentsSubcommands::Manifest(args)) => {
             let features = routes::CargoFeatures {
                 features: args.features,
@@ -5325,24 +5964,27 @@ fn run_command(command: Commands) {
             user_only,
             command,
         } => match command {
-            Some(RoutesSubcommands::Audit {
-                package: audit_package,
-                bin: audit_bin,
-                manifest,
-                json,
-                strict,
-            }) => {
+            Some(RoutesSubcommands::Audit(args)) => {
                 // Fall back to the parent `routes` target flags so both
                 // `autumn routes -p blog audit` and `autumn routes audit -p blog`
                 // select the same binary in multi-target workspaces.
-                let package = audit_package.or(package);
-                let bin = audit_bin.or(bin);
+                let package = args.package.or(package);
+                let bin = args.bin.or(bin);
                 routes_audit::run(&routes_audit::AuditOptions {
                     package: package.as_deref(),
                     bin: bin.as_deref(),
-                    manifest: manifest.as_deref(),
-                    json,
-                    strict,
+                    manifest: args.manifest.as_deref(),
+                    json: args.json,
+                    strict: args.strict,
+                    features: routes::CargoFeatures {
+                        features: args.features,
+                        all: args.all_features,
+                        no_default: args.no_default_features,
+                    },
+                    profile: routes::CargoProfile {
+                        release: args.release,
+                        profile: args.profile,
+                    },
                 });
             }
             Some(RoutesSubcommands::Posture(command)) => {
@@ -5354,6 +5996,7 @@ fn run_command(command: Commands) {
                         output,
                         ack,
                         ack_file,
+                        ack_dir,
                         allow_missing_base,
                     } => posture::run_diff(&posture::DiffOptions {
                         base,
@@ -5362,6 +6005,7 @@ fn run_command(command: Commands) {
                         output: output.as_deref(),
                         acks: ack,
                         ack_file: ack_file.as_deref(),
+                        ack_dir: ack_dir.as_deref(),
                         allow_missing_base: *allow_missing_base,
                     }),
                     PostureSubcommands::Digest { manifest, format } => {
@@ -5509,6 +6153,9 @@ fn run_command(command: Commands) {
                 path,
                 format,
                 strict,
+                features,
+                all_features,
+                no_default_features,
             } => {
                 let format = match format.as_str() {
                     "json" => a11y::OutputFormat::Json,
@@ -5520,9 +6167,14 @@ fn run_command(command: Commands) {
                         std::process::exit(2);
                     }
                 };
-                let code = a11y::run_in(
+                let code = a11y::run_in_with(
                     std::path::Path::new(&path),
                     a11y::A11yVerifyOptions { format, strict },
+                    &routes::CargoFeatures {
+                        features,
+                        all: all_features,
+                        no_default: no_default_features,
+                    },
                 );
                 std::process::exit(code);
             }
@@ -6022,8 +6674,10 @@ fn run_deprecations_check(package: Option<&str>, bin: Option<&str>) {
     routes::compile_binary(package, bin);
     let binary = routes::find_binary(package, bin);
 
-    let output = std::process::Command::new(&binary)
-        .env("AUTUMN_DUMP_ROUTES", "1")
+    let mut command = std::process::Command::new(&binary);
+    command.env(routes::DUMP_ENV, "1");
+    routes::clear_other_dump_modes(&mut command, routes::DUMP_ENV);
+    let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .output()
@@ -6166,11 +6820,16 @@ fn run_deploy_command(cmd: &DeployCommands) {
                 ..deploy::DeployOptions::default()
             },
         ),
-        DeployCommands::Up { only, no_rollback } => (
+        DeployCommands::Up {
+            only,
+            no_rollback,
+            bake_secs,
+        } => (
             deploy::DeployAction::Up,
             deploy::DeployOptions {
                 only: only.clone(),
                 no_rollback: *no_rollback,
+                bake_secs: *bake_secs,
                 ..deploy::DeployOptions::default()
             },
         ),
@@ -6254,13 +6913,27 @@ fn apply_plan(
     flags: generate::Flags,
     mode: ApplyMode,
 ) {
-    let result = plan.and_then(|p| match mode {
-        ApplyMode::Generate => p.execute(flags),
-        ApplyMode::Destroy => p.revert(flags),
-    });
+    let result = plan.and_then(|p| run_plan(p, flags, mode));
     if let Err(e) = result {
         eprintln!("Error: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Execute or revert `plan`, as the sole resource of this invocation.
+///
+/// Each `generate`/`destroy` process applies one plan, so the claim is true
+/// here. It lets `destroy` sweep files the templates no longer name (issue
+/// #2557).
+fn run_plan(
+    mut plan: generate::emit::Plan,
+    flags: generate::Flags,
+    mode: ApplyMode,
+) -> Result<(), generate::GenerateError> {
+    plan.claim_sole_resource();
+    match mode {
+        ApplyMode::Generate => plan.execute(flags),
+        ApplyMode::Destroy => plan.revert(flags),
     }
 }
 
@@ -6555,10 +7228,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                     |url| generate::tauri::plan_tauri_thin_client(&project_root, url),
                 )
             });
-            let result = plan.and_then(|p| match mode {
-                ApplyMode::Generate => p.execute(flags),
-                ApplyMode::Destroy => p.revert(flags),
-            });
+            let result = plan.and_then(|p| run_plan(p, flags, mode));
             match result {
                 Ok(()) => {
                     if mode == ApplyMode::Generate && !dry_run {
@@ -6599,10 +7269,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             };
             let plan =
                 guard.and_then(|()| generate::tauri_mobile::plan_tauri_mobile(&project_root, opts));
-            let result = plan.and_then(|p| match mode {
-                ApplyMode::Generate => p.execute(flags),
-                ApplyMode::Destroy => p.revert(flags),
-            });
+            let result = plan.and_then(|p| run_plan(p, flags, mode));
             match result {
                 Ok(()) => {
                     if mode == ApplyMode::Generate && !dry_run {
@@ -6868,10 +7535,7 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
                 plan_flags,
             ) {
                 Ok(plugin_plan) => {
-                    let result = match mode {
-                        ApplyMode::Generate => plugin_plan.plan.execute(flags),
-                        ApplyMode::Destroy => plugin_plan.plan.revert(flags),
-                    };
+                    let result = run_plan(plugin_plan.plan, flags, mode);
                     match result {
                         Ok(()) => {
                             if mode == ApplyMode::Generate && !dry_run {
@@ -6926,6 +7590,76 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    /// Parse `autumn fleet ...` into the `fleet` module's command.
+    fn fleet_command(args: &[&str]) -> fleet::FleetCommand {
+        let cli = Cli::try_parse_from(["autumn", "fleet"].iter().chain(args)).unwrap();
+        match cli.command {
+            Commands::Fleet(cmd) => cmd.into_command(),
+            _ => panic!("expected the fleet command"),
+        }
+    }
+
+    #[test]
+    fn fleet_subcommands_parse_into_fleet_commands() {
+        use fleet::FleetCommand;
+        assert_eq!(
+            fleet_command(&["list", "--open", "--json", "--profile", "prod"]),
+            FleetCommand::List {
+                profile: Some("prod".to_owned()),
+                open: true,
+                json: true
+            }
+        );
+        assert_eq!(
+            fleet_command(&["migrate"]),
+            FleetCommand::Migrate {
+                profile: None,
+                concurrency: 8,
+                key: None
+            }
+        );
+        assert_eq!(
+            fleet_command(&["migrate", "--concurrency", "2", "--key", "tenant:acme"]),
+            FleetCommand::Migrate {
+                profile: None,
+                concurrency: 2,
+                key: Some("tenant:acme".to_owned())
+            }
+        );
+        assert_eq!(
+            fleet_command(&["backup", "tenant:acme", "/backups/acme.db"]),
+            FleetCommand::Backup {
+                profile: None,
+                key: "tenant:acme".to_owned(),
+                dest: std::path::PathBuf::from("/backups/acme.db")
+            }
+        );
+        assert_eq!(
+            fleet_command(&["delete", "tenant:acme", "--force"]),
+            FleetCommand::Delete {
+                profile: None,
+                key: "tenant:acme".to_owned(),
+                force: true
+            }
+        );
+        assert_eq!(
+            fleet_command(&[
+                "restore",
+                "slot:00042",
+                "--timestamp",
+                "2026-10-01T12:00:00Z"
+            ]),
+            FleetCommand::Restore {
+                profile: None,
+                key: "slot:00042".to_owned(),
+                timestamp: Some("2026-10-01T12:00:00Z".to_owned()),
+                force: false
+            }
+        );
+        // Zero would migrate nothing at all.
+        assert!(Cli::try_parse_from(["autumn", "fleet", "migrate", "--concurrency", "0"]).is_err());
+    }
 
     #[test]
     fn parse_new_subcommand() {
@@ -7063,6 +7797,61 @@ mod tests {
     fn parse_setup_with_force() {
         let cli = Cli::try_parse_from(["autumn", "setup", "--force"]).unwrap();
         assert!(matches!(cli.command, Commands::Setup { force: true }));
+    }
+
+    #[test]
+    fn parse_deploy_up_bake_secs() {
+        let cli = Cli::try_parse_from(["autumn", "deploy", "up"]).unwrap();
+        let Commands::Deploy(DeployCommands::Up { bake_secs, .. }) = cli.command else {
+            panic!("expected deploy up");
+        };
+        assert_eq!(bake_secs, None);
+        let cli = Cli::try_parse_from(["autumn", "deploy", "up", "--bake-secs", "300"]).unwrap();
+        let Commands::Deploy(DeployCommands::Up { bake_secs, .. }) = cli.command else {
+            panic!("expected deploy up");
+        };
+        assert_eq!(bake_secs, Some(300));
+        assert!(Cli::try_parse_from(["autumn", "deploy", "up", "--bake-secs", "-1"]).is_err());
+    }
+
+    #[test]
+    fn parse_slo_generate_defaults_and_flags() {
+        let cli = Cli::try_parse_from(["autumn", "slo", "generate"]).unwrap();
+        let Commands::Slo(SloCommands::Generate(args)) = cli.command else {
+            panic!("expected slo generate");
+        };
+        assert_eq!(args.out_dir, PathBuf::from("deploy/slo"));
+        assert_eq!(args.prometheus_url, slo::DEFAULT_PROMETHEUS_URL);
+        assert!(args.app.is_none() && args.selector.is_none() && !args.check);
+
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "slo",
+            "generate",
+            "--out-dir",
+            "ops/slo",
+            "--app",
+            "shop",
+            "--selector",
+            "job=\"shop\"",
+            "--prometheus-url",
+            "http://prom:9090",
+            "--rule-label",
+            "release=kps",
+            "--rule-label",
+            "team=pay",
+            "--check",
+        ])
+        .unwrap();
+        let Commands::Slo(SloCommands::Generate(args)) = cli.command else {
+            panic!("expected slo generate");
+        };
+        assert_eq!(args.out_dir, PathBuf::from("ops/slo"));
+        assert_eq!(args.app.as_deref(), Some("shop"));
+        assert_eq!(args.rule_label, ["release=kps", "team=pay"]);
+        assert_eq!(args.selector.as_deref(), Some("job=\"shop\""));
+        assert_eq!(args.prometheus_url, "http://prom:9090");
+        assert!(args.check);
     }
 
     #[test]
@@ -7340,6 +8129,172 @@ mod tests {
                 features: None,
                 edge: false,
                 auditable: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_edge_serve() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "edge",
+            "serve",
+            "--origin",
+            "https://origin.example.com",
+            "--response-header",
+            "x-a: 1",
+            "--response-header",
+            "x-b: 2",
+            "--trusted-proxy",
+            "10.0.0.0/8",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Edge {
+                command:
+                    EdgeCommands::Serve {
+                        capsule,
+                        origin,
+                        listen,
+                        kv,
+                        probe_path,
+                        no_probe,
+                        response_headers,
+                        trusted_proxies,
+                        quiet,
+                    },
+            } => {
+                assert_eq!(trusted_proxies, ["10.0.0.0/8"]);
+                assert_eq!(capsule, "target/wasm32-wasip1/release/edge-capsule.wasm");
+                assert_eq!(origin, "https://origin.example.com");
+                assert_eq!(listen, "127.0.0.1:8787");
+                assert_eq!(kv, None);
+                assert_eq!(probe_path, "/");
+                assert!(!no_probe && !quiet);
+                assert_eq!(response_headers, ["x-a: 1", "x-b: 2"]);
+            }
+            _ => panic!("expected edge serve"),
+        }
+    }
+
+    #[test]
+    fn parse_edge_serve_needs_an_origin() {
+        assert!(Cli::try_parse_from(["autumn", "edge", "serve"]).is_err());
+    }
+
+    #[test]
+    fn parse_edge_bundle_defaults() {
+        let cli =
+            Cli::try_parse_from(["autumn", "edge", "bundle", "--origin", "https://o.example"])
+                .unwrap();
+        match cli.command {
+            Commands::Edge {
+                command:
+                    EdgeCommands::Bundle {
+                        target,
+                        capsule,
+                        origin,
+                        out,
+                        name,
+                        response_headers,
+                        probe_path,
+                        no_probe,
+                    },
+            } => {
+                assert_eq!(target, edge_bundle::BundleTarget::Cloudflare);
+                assert_eq!(capsule, "target/wasm32-wasip1/release/edge-capsule.wasm");
+                assert_eq!(origin.as_deref(), Some("https://o.example"));
+                assert_eq!(out, "edge/cloudflare");
+                assert_eq!(name, None);
+                assert!(response_headers.is_empty());
+                assert_eq!(probe_path, "/");
+                assert!(!no_probe);
+            }
+            _ => panic!("expected edge bundle"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "edge", "bundle", "--target", "lambda"]).is_err(),
+            "an unknown target is a usage error"
+        );
+    }
+
+    #[test]
+    fn parse_edge_ttfb() {
+        let cli = Cli::try_parse_from([
+            "autumn", "edge", "ttfb", "--edge", "http://e", "--origin", "http://o", "--path", "/a",
+            "--path", "/b", "--rounds", "7",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Edge {
+                command:
+                    EdgeCommands::Ttfb {
+                        edge,
+                        origin,
+                        paths,
+                        rounds,
+                        min_reduction,
+                        divergence_only,
+                    },
+            } => {
+                assert!(!divergence_only);
+                assert_eq!((edge.as_str(), origin.as_str()), ("http://e", "http://o"));
+                assert_eq!(paths, ["/a", "/b"]);
+                assert_eq!(rounds, 7);
+                assert!((min_reduction - 50.0).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected edge ttfb"),
+        }
+        assert!(
+            Cli::try_parse_from(["autumn", "edge", "ttfb", "--edge", "e", "--origin", "o"])
+                .is_err(),
+            "--path is required"
+        );
+    }
+
+    #[test]
+    fn parse_edge_ttfb_min_reduction_takes_a_finite_number() {
+        let base = [
+            "autumn", "edge", "ttfb", "--edge", "e", "--origin", "o", "--path", "/a",
+        ];
+        let parse = |value: &str| {
+            let mut args = base.to_vec();
+            args.extend(["--min-reduction", value]);
+            Cli::try_parse_from(args)
+        };
+        match parse("-10").unwrap().command {
+            Commands::Edge {
+                command: EdgeCommands::Ttfb { min_reduction, .. },
+            } => assert!((min_reduction + 10.0).abs() < f64::EPSILON),
+            _ => panic!("expected edge ttfb"),
+        }
+        for bad in ["NaN", "inf", "x"] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parse_edge_ttfb_divergence_only() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "edge",
+            "ttfb",
+            "--edge",
+            "http://e",
+            "--origin",
+            "http://o",
+            "--path",
+            "/a",
+            "--divergence-only",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Edge {
+                command: EdgeCommands::Ttfb {
+                    divergence_only: true,
+                    ..
+                }
             }
         ));
     }
@@ -8565,12 +9520,23 @@ mod tests {
                 package,
                 force,
                 scaffold_only,
+                repl,
             } => {
                 assert_eq!(profile, "dev");
                 assert!(package.is_none());
                 assert!(!force);
                 assert!(!scaffold_only);
+                assert!(!repl, "the REPL is opt-in");
             }
+            _ => panic!("expected Console command"),
+        }
+    }
+
+    #[test]
+    fn parse_console_with_repl() {
+        let cli = Cli::try_parse_from(["autumn", "console", "--repl"]).unwrap();
+        match cli.command {
+            Commands::Console { repl, .. } => assert!(repl),
             _ => panic!("expected Console command"),
         }
     }
@@ -9015,22 +9981,92 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Routes {
-                command:
-                    Some(RoutesSubcommands::Audit {
-                        package,
-                        manifest,
-                        json,
-                        strict,
-                        ..
-                    }),
+                command: Some(RoutesSubcommands::Audit(args)),
                 ..
             } => {
-                assert_eq!(package.as_deref(), Some("blog"));
-                assert_eq!(manifest.as_deref(), Some("target/security.json"));
-                assert!(json);
-                assert!(!strict);
+                assert_eq!(args.package.as_deref(), Some("blog"));
+                assert_eq!(args.manifest.as_deref(), Some("target/security.json"));
+                assert!(args.json);
+                assert!(!args.strict);
+                // No flag keeps the dev build and default features.
+                assert!(args.features.is_empty());
+                assert!(!args.all_features);
+                assert!(!args.no_default_features);
+                assert!(!args.release);
+                assert!(args.profile.is_none());
             }
             _ => panic!("expected Routes audit subcommand"),
+        }
+    }
+
+    /// The gate must audit the build that ships (#2472): a route behind
+    /// `#[cfg(not(debug_assertions))]` or a non-default feature is not in a
+    /// default dev build.
+    #[test]
+    fn parse_routes_audit_forwards_the_cargo_build_selection() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "routes",
+            "audit",
+            "--release",
+            "--features",
+            "embed-assets",
+            "--features",
+            "a,b",
+            "--no-default-features",
+            "--all-features",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Routes {
+                command: Some(RoutesSubcommands::Audit(args)),
+                ..
+            } => {
+                assert!(args.release);
+                assert_eq!(args.features, ["embed-assets", "a,b"]);
+                assert!(args.no_default_features);
+                assert!(args.all_features);
+            }
+            _ => panic!("expected Routes audit subcommand"),
+        }
+
+        let cli = Cli::try_parse_from(["autumn", "routes", "audit", "--profile", "dist"]).unwrap();
+        match cli.command {
+            Commands::Routes {
+                command: Some(RoutesSubcommands::Audit(args)),
+                ..
+            } => assert_eq!(args.profile.as_deref(), Some("dist")),
+            _ => panic!("expected Routes audit subcommand"),
+        }
+
+        // Cargo rejects `--release --profile`; refuse it before building.
+        assert!(
+            Cli::try_parse_from(["autumn", "routes", "audit", "--release", "--profile", "ci"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn parse_routes_posture_diff_accepts_ack_dir() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "routes",
+            "posture",
+            "diff",
+            "--base",
+            "b.json",
+            "--head",
+            "h.json",
+            "--ack-dir",
+            "acks",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Routes {
+                command: Some(RoutesSubcommands::Posture(PostureSubcommands::Diff { ack_dir, .. })),
+                ..
+            } => assert_eq!(ack_dir.as_deref(), Some("acks")),
+            _ => panic!("expected Routes posture diff subcommand"),
         }
     }
 
@@ -9046,19 +10082,14 @@ mod tests {
             Commands::Routes {
                 package: parent_package,
                 bin: parent_bin,
-                command:
-                    Some(RoutesSubcommands::Audit {
-                        package: audit_package,
-                        bin: audit_bin,
-                        ..
-                    }),
+                command: Some(RoutesSubcommands::Audit(args)),
                 ..
             } => {
                 assert_eq!(parent_package.as_deref(), Some("blog"));
-                assert_eq!(audit_package, None);
+                assert_eq!(args.package, None);
                 // The fallback the dispatch applies.
-                let resolved_package = audit_package.or(parent_package);
-                let resolved_bin = audit_bin.or(parent_bin);
+                let resolved_package = args.package.or(parent_package);
+                let resolved_bin = args.bin.or(parent_bin);
                 assert_eq!(resolved_package.as_deref(), Some("blog"));
                 assert_eq!(resolved_bin, None);
             }
@@ -9075,16 +10106,12 @@ mod tests {
         match cli.command {
             Commands::Routes {
                 package: parent_package,
-                command:
-                    Some(RoutesSubcommands::Audit {
-                        package: audit_package,
-                        ..
-                    }),
+                command: Some(RoutesSubcommands::Audit(args)),
                 ..
             } => {
                 assert_eq!(parent_package.as_deref(), Some("blog"));
-                assert_eq!(audit_package.as_deref(), Some("shop"));
-                let resolved = audit_package.or(parent_package);
+                assert_eq!(args.package.as_deref(), Some("shop"));
+                let resolved = args.package.or(parent_package);
                 assert_eq!(resolved.as_deref(), Some("shop"));
             }
             _ => panic!("expected Routes audit subcommand"),
@@ -9444,8 +10471,11 @@ mod tests {
                     ref path,
                     ref format,
                     strict: false,
+                    ref features,
+                    all_features: false,
+                    no_default_features: false,
                 }
-            } if path == "." && format == "text"
+            } if path == "." && format == "text" && features.is_empty()
         ));
     }
 
@@ -9468,8 +10498,48 @@ mod tests {
                     ref path,
                     ref format,
                     strict: true,
+                    ref features,
+                    all_features: false,
+                    no_default_features: false,
                 }
-            } if path == "./crates/web" && format == "json"
+            } if path == "./crates/web" && format == "json" && features.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parse_a11y_verify_features() {
+        let cli = Cli::try_parse_from([
+            "autumn",
+            "a11y",
+            "verify",
+            "--features",
+            "admin,db",
+            "--features",
+            "billing",
+            "--all-features",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::A11y {
+                action: A11ySubcommands::Verify {
+                    ref features,
+                    all_features: true,
+                    no_default_features: false,
+                    ..
+                }
+            } if features == &["admin,db".to_owned(), "billing".to_owned()]
+        ));
+        let cli =
+            Cli::try_parse_from(["autumn", "a11y", "verify", "--no-default-features"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::A11y {
+                action: A11ySubcommands::Verify {
+                    no_default_features: true,
+                    ..
+                }
+            }
         ));
     }
 

@@ -539,6 +539,31 @@ resource "google_cloud_run_v2_service" "this" {
         container_port = 3000
       }
 
+      # Cloud Run sends no traffic to an instance until its startup probe
+      # passes, so the startup probe is the traffic gate and uses /ready.
+      # /ready fails until startup is complete and while a readiness
+      # dependency is down. Cloud Run stops traffic to an instance by itself
+      # before SIGTERM. A slow first boot gets 2 minutes (24 x 5s). The
+      # bootstrap "hello" image answers 200 on every path, so it passes too.
+      startup_probe {
+        period_seconds    = 5
+        timeout_seconds   = 2
+        failure_threshold = 24
+        http_get {
+          path = "/ready"
+        }
+      }
+
+      # A failed liveness probe restarts the instance. /live does not fail
+      # when a dependency, such as the database, is down.
+      liveness_probe {
+        period_seconds  = 10
+        timeout_seconds = 3
+        http_get {
+          path = "/live"
+        }
+      }
+
       # CPU is only allocated while an instance is actively handling a
       # request by default (`cpu_idle = true`) — the cost-optimized setting,
       # and required for `min_instances = 0` scale-to-zero to actually save

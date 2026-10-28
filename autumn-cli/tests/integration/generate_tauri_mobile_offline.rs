@@ -292,7 +292,10 @@ fn offline_sync_shell_cargo_toml_preserves_no_default_features() {
     let shell_cargo = read(&project.join("src-tauri/Cargo.toml"));
     assert!(
         shell_cargo.contains(r#"autumn-web = { version = ""#)
-            && shell_cargo.contains(r#", default-features = false, features = ["offline-sync"] }"#),
+            // `offline-sync` needs a backend once defaults are off (#2605).
+            && shell_cargo.contains(
+                r#", default-features = false, features = ["offline-sync", "postgres"] }"#
+            ),
         "the shell's autumn-web edge must preserve default-features = false, got:\n{shell_cargo}"
     );
     toml::from_str::<toml::Value>(&shell_cargo).expect("generated Cargo.toml must parse");

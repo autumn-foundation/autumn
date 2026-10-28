@@ -168,7 +168,7 @@ The island crate that produces the wasm lives in `examples/island-flock`
 |-------|-------|
 | **Persona** | Developer building a production-shaped Autumn application and exploring the full feature set |
 | **Journey** | Full-stack Reddit clone: registration, sessions, posts, voting, live feeds, background jobs, transactional email, A/B experiments, signed webhook intake, outbound HTTP with SSRF protection, structured error reporting, cookie consent, and live-tunable runtime config |
-| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), route-level SEO (`seo(...)` + `SeoMeta`, a DB-backed `SitemapSource`, `/robots.txt` + `/sitemap.xml`), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService`, typed accessible form primitives (`a11y::TextField`/`TextArea`/`Select`/`Button` — an unlabeled field does not compile), the `ChangesetForm` validation round-trip with inline errors and a no-JavaScript form POST, sanitized user-submitted rich text (`markdown::render_user_content`), offset pagination (`PageRequest` + `pagination_nav`, plain `<a href>` page links), cookie consent (`inject_consent_banner`, the `Consent` gate, a withdraw flow), failure capsules (`[failure_capture]` behind the `capsules` profile + a committed capsule and an `autumn replay` walkthrough), and deterministic simulation testing (a seeded `#[sim_test]` over the hot-rank decay curve) |
+| **Key capabilities** | `#[secured]`, CSRF, sessions, `#[job]`, `#[ws]` channels, Redis fan-out, `#[scheduled]`, transactional email, htmx voting (`#[votable]`), threaded polymorphic comments on *two* models (`#[commentable]`, zero comment routes), route-level SEO (`seo(...)` + `SeoMeta`, a DB-backed `SitemapSource`, `/robots.txt` + `/sitemap.xml`), `ExperimentService`, `SignedWebhook`, `Client` extractor with SSRF guard, `ErrorReporter`, `RuntimeConfigService`, typed accessible form primitives (`a11y::TextField`/`TextArea`/`Select`/`Button` — an unlabeled field does not compile), the `ChangesetForm` validation round-trip with inline errors and a no-JavaScript form POST, sanitized user-submitted rich text (`markdown::render_user_content`), offset pagination (`PageRequest` + `pagination_nav`, plain `<a href>` page links), cookie consent (`inject_consent_banner`, the `Consent` gate, a withdraw flow), failure capsules (`[failure_capture]` behind the `capsules` profile + a committed capsule and an `autumn replay` walkthrough), and deterministic simulation testing (a seeded `#[sim_test]` over the hot-rank decay curve, and a nightly seed sweep of the whole app) |
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL, Redis (optional for local run; required for multi-replica fan-out) |
 | **Run command** | `cargo run -p reddit-clone` |
 | **Success proof** | `curl http://localhost:3000/` returns the front-page HTML *and* the cookie-consent banner; `curl http://localhost:3000/sitemap.xml` returns a `<urlset>` listing the site's communities and posts; `curl 'http://localhost:3000/r/rust?page=2'` returns page 2 with a `<nav aria-label="Pagination">` of plain links |
@@ -274,6 +274,21 @@ Boots with no database; the companion narrative is `docs/guide/pdf-downloads.md`
 | **Prerequisites** | Rust 1.88.0+, PostgreSQL (`docker compose up -d` in the example directory provides one); the React bundle is committed, so Node 20.19+/22.12+ is needed only to change the frontend |
 | **Run command** | `cargo run -p react-graphql` |
 | **Success proof** | `curl -s http://127.0.0.1:3000/graphql -H 'content-type: application/json' -d '{"query":"{ notes { title } }"}'` returns `{"data":{"notes":[{"title":"Welcome to Autumn Notes"},{"title":"Try the GraphQL endpoint"}]}}` (seeded on boot); `curl -s http://127.0.0.1:3000/api/notes` returns the same rows through the generated REST handler; the browser page lists them and adds a third from its form without a reload |
+
+---
+
+### `examples/escape-hatches` — Escape Hatches, Each With a Reason
+
+<!-- catalog:example name=escape-hatches tier=supported -->
+
+| Field | Value |
+|-------|-------|
+| **Persona** | Developer who knows the conventions and asks: "What do I do when `#[model]` + `#[repository]` is not enough?" |
+| **Journey** | Convention first, then the hatch: each hatch in a stockroom app starts from the convention, names the exact limit, and has a test that proves the limit and the fix (a lost-update hazard test comes first) |
+| **Key capabilities** | `with_lock` (baseline); `Db::tx` + guarded Diesel `UPDATE` for an all-or-nothing cart; a set-based Diesel `UPDATE`; `diesel::sql_query` + `QueryableByName` for a window function; `#[intercept]` with a custom tower layer; `.scoped(..)` with `RequireApiToken`; a CSRF `exempt_paths` for bearer clients; `.layer(..)` with `tower_http`; `.nest(..)` + `ServeDir` + `declare_plugin_routes`; a `Plugin` around a plain Axum router with its own state; `.merge(..)` (in a test); `.error_pages(..)`; `.exception_filter(..)`; `.with_pool_provider(..)` that reads a rotated password file; a `201 Created` + `Location` tuple response |
+| **Prerequisites** | Rust 1.88.0+, PostgreSQL (`docker compose up -d` in the example directory provides one) |
+| **Run command** | `STOCKROOM_SCANNER_TOKEN=dev-scanner-token cargo run -p escape-hatches` |
+| **Success proof** | After the README's seed `INSERT`, `curl -si http://127.0.0.1:3000/api/checkout -H 'authorization: Bearer dev-scanner-token' -H 'content-type: application/json' -d '{"order_ref":"o-100","lines":[{"sku":"HAM-1","quantity":2}]}'` returns `201 Created` with `location: /api/orders/o-100`; `curl -s http://127.0.0.1:3000/reports/stock-value` returns the top products per category |
 
 ---
 
@@ -410,6 +425,7 @@ can pick the closest starting point without overlap.
 | Collaborative editing | `collab-notes` | A `#[collaborative]` text field merged by an in-tree CRDT, streamed with live presence over `#[ws]` + channels, with no external real-time service |
 | PDF downloads | `invoice` | Renders one Maud view as both an on-screen page and a downloadable PDF via `autumn_web::pdf::Pdf`; also carries the worked `#[lifecycle]` invoice state machine |
 | SPA + GraphQL plugin | `react-graphql` | Autumn-rendered shell, committed Vite/React/TypeScript bundle, and a generic `GraphqlPlugin` whose resolvers go through a `#[model]`/`#[repository]` with hooks — the same rows also served by generated REST |
+| Escape hatches | `escape-hatches` | Each Autumn escape hatch in one stockroom app, each with a real reason and a test: raw Diesel and SQL below the repository, custom tower layers, raw Axum routers, a plugin, error pages, an exception filter, and a custom pool provider |
 
 ---
 

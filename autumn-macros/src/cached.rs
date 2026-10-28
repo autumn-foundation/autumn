@@ -40,7 +40,7 @@ use syn::punctuated::Punctuated;
 use syn::visit_mut::VisitMut;
 use syn::{Expr, Ident, ItemFn, LitInt, LitStr, Token};
 
-struct CachedAttrs {
+pub struct CachedAttrs {
     ttl: Option<String>,
     max: Option<usize>,
     result: bool,
@@ -60,6 +60,10 @@ struct CachedAttrs {
     /// gate. The reason is mandatory and must be non-blank so an escape hatch
     /// always carries its justification into the manifest.
     acknowledge_stale: Option<String>,
+    /// Enclosing type of an associated function. It joins the read identity,
+    /// so same-named functions in different impls do not share cache keys
+    /// (#2358).
+    pub scope: Option<String>,
 }
 
 /// Try to parse `max` as either a string literal or an integer literal.
@@ -81,7 +85,7 @@ fn parse_max_value(meta: &syn::meta::ParseNestedMeta<'_>) -> syn::Result<usize> 
     }
 }
 
-fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
+pub fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
     let mut result = CachedAttrs {
         ttl: None,
         max: None,
@@ -89,6 +93,7 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
         key: Vec::new(),
         reads: Vec::new(),
         acknowledge_stale: None,
+        scope: None,
     };
 
     if attr.is_empty() {
@@ -151,10 +156,24 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
             }
             result.acknowledge_stale = Some(reason);
             Ok(())
+        } else if meta.path.is_ident("scope") {
+            let value: LitStr = meta.value()?.parse()?;
+            if result.scope.is_some() {
+                return Err(meta.error("`scope` is set twice"));
+            }
+            let name = value.value();
+            if !is_type_path(name.trim()) {
+                return Err(syn::Error::new_spanned(
+                    &value,
+                    "`scope` must be a type name, such as \"Products\" or \"a::Store\"",
+                ));
+            }
+            result.scope = Some(name.trim().to_owned());
+            Ok(())
         } else {
             Err(meta.error(
-                "unsupported attribute: expected ttl, max, result, key, reads, or \
-                 acknowledge_stale",
+                "unsupported attribute: expected ttl, max, result, key, reads, \
+                 acknowledge_stale, or scope",
             ))
         }
     })
@@ -165,22 +184,11 @@ fn parse_cached_args(attr: TokenStream) -> syn::Result<CachedAttrs> {
 
 // ── #1716: dependency derivation ─────────────────────────────────────
 
-/// Associated functions on a model type that read persistent rows.
+/// Associated functions that name a model.
 ///
-/// Deliberately a closed list of *reading* verbs. A path call like
-/// `Post::find_all(db)` is evidence the cached value is derived from `Post`
-/// rows; `Post::new(..)` is not.
-const MODEL_READ_VERBS: &[&str] = &[
-    "find_all",
-    "find_by_id",
-    "count",
-    "exists_by_id",
-    "list",
-    "page",
-    "all",
-    "load",
-    "first",
-];
+/// `Post::find_all(db)` names `Post`; `Post::new(..)` does not. These verbs are
+/// rare on other types. The macro does not check the owner.
+const MODEL_READ_VERBS: &[&str] = &["find_all", "find_by_id", "exists_by_id"];
 
 /// Recover the model name from a repository type name.
 ///
@@ -283,23 +291,40 @@ impl VisitMut for DependencyVisitor {
         syn::visit_mut::visit_path_mut(self, path);
     }
 
-    fn visit_expr_call_mut(&mut self, call: &mut syn::ExprCall) {
-        // `Post::find_all(db)` — a reading associated function on a model type.
-        if let Expr::Path(p) = &*call.func {
-            let segments = &p.path.segments;
-            if segments.len() >= 2 {
-                let verb = segments[segments.len() - 1].ident.to_string();
-                let owner = segments[segments.len() - 2].ident.to_string();
-                if MODEL_READ_VERBS.contains(&verb.as_str())
-                    && is_model_ident(&owner)
-                    && model_from_repository_ident(&owner).is_none()
-                {
-                    self.found.models.insert(owner);
-                }
-            }
+    fn visit_expr_path_mut(&mut self, expr: &mut syn::ExprPath) {
+        // Covers `Post::find_all(db)`, a function reference such as
+        // `.map(Post::find_all)`, and `<Post>::find_all(db)`.
+        if let Some((owner, verb)) = owner_and_verb(expr)
+            && is_plain_model_owner(&owner)
+            && MODEL_READ_VERBS.contains(&verb.as_str())
+        {
+            self.found.models.insert(owner);
         }
-        syn::visit_mut::visit_expr_call_mut(self, call);
+        syn::visit_mut::visit_expr_path_mut(self, expr);
     }
+}
+
+/// The `(owner, verb)` of a path such as `Post::find_all` or `<Post>::find_all`.
+fn owner_and_verb(expr: &syn::ExprPath) -> Option<(String, String)> {
+    let verb = expr.path.segments.last()?.ident.to_string();
+    let owner = if let Some(qself) = &expr.qself {
+        let syn::Type::Path(ty) = &*qself.ty else {
+            return None;
+        };
+        ty.path.segments.last()?.ident.to_string()
+    } else {
+        let n = expr.path.segments.len();
+        if n < 2 {
+            return None;
+        }
+        expr.path.segments[n - 2].ident.to_string()
+    };
+    Some((owner, verb))
+}
+
+/// Whether an owner could be a model type: not `Self`, not a repository.
+fn is_plain_model_owner(owner: &str) -> bool {
+    owner != "Self" && is_model_ident(owner) && model_from_repository_ident(owner).is_none()
 }
 
 /// Recover the set of models a cached function reads, from its signature and
@@ -333,8 +358,15 @@ fn read_id_const_ident(fn_name: &syn::Ident) -> syn::Ident {
 /// the constant by path. In an `impl` block the constant is an ASSOCIATED
 /// const, which a bare path cannot reach; and `module_path!()` names the
 /// enclosing module either way, so every splice is the same string.
-fn read_id_expr(fn_name_str: &str) -> TokenStream {
-    quote! { concat!(module_path!(), "::", #fn_name_str) }
+///
+/// `scope` is the enclosing type of an associated function. The identity must
+/// stay a `const` string and `type_name` is not `const`, so the type comes from
+/// the macro, not from rustc.
+fn read_id_expr(fn_name_str: &str, scope: Option<&str>) -> TokenStream {
+    scope.map_or_else(
+        || quote! { concat!(module_path!(), "::", #fn_name_str) },
+        |scope| quote! { concat!(module_path!(), "::", #scope, "::", #fn_name_str) },
+    )
 }
 
 /// Name of the generated per-read invalidator.
@@ -369,7 +401,7 @@ fn generate_coherence_items(
 ) -> CoherenceItems {
     let vis = &input_fn.vis;
     let id_const = read_id_const_ident(fn_name);
-    let id_expr = read_id_expr(fn_name_str);
+    let id_expr = read_id_expr(fn_name_str, attrs.scope.as_deref());
     let invalidator = invalidator_ident(fn_name);
 
     // Declared beats derived: an explicit `reads(...)` is the strongest claim
@@ -396,9 +428,7 @@ fn generate_coherence_items(
         exprs.extend(derived.models.iter().map(|m| quote! { || #m }));
 
         // Honest over useful: a repository reached only through its trait has
-        // no constant to resolve, so the dependency set is *unknown*, not
-        // empty and not guessable. `Undetermined` is reported and never gates,
-        // which is the right answer for something this analysis cannot see.
+        // no constant to resolve, so the dependency set is *unknown*.
         let provenance = if derived.unresolved_repository || exprs.is_empty() {
             quote! { Undetermined }
         } else {
@@ -569,7 +599,7 @@ fn generate_cache_body(
         quote! { (|| #fn_block)() }
     };
 
-    let id_expr = read_id_expr(&fn_name.to_string());
+    let id_expr = read_id_expr(&fn_name.to_string(), attrs.scope.as_deref());
     let cache_init = quote! {
         // `Arc` rather than a bare `MokaCache` (#1716): the store stays a
         // per-function static, but a clone is handed to the coherence registry
@@ -622,6 +652,7 @@ fn generate_cache_body(
                 .try_with(::std::clone::Clone::clone)
                 .ok()
                 .flatten();
+        let __autumn_namespace: &::core::primitive::str = #id_expr;
         let __autumn_key = ::autumn_web::cache::make_cache_key(
             #id_expr,
             &(__autumn_tenant_key_component, #key_args),
@@ -634,6 +665,7 @@ fn generate_cache_body(
             if let Some(__autumn_cached) = ::autumn_web::cache::get_cached::<#value_type>(__autumn_cache, &__autumn_key) {
                 return <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_cached);
             }
+            let __autumn_shared_epoch = ::autumn_web::cache::sample_fill_epoch(__autumn_cache, __autumn_namespace);
             let __autumn_result = #compute;
             match <#ret_type as ::autumn_web::cache::CacheableResult>::into_result(__autumn_result) {
                 Ok(__autumn_val) => {
@@ -643,7 +675,7 @@ fn generate_cache_body(
                     // pre-invalidation value lands after the clear.
                     ::autumn_web::cache::coherence::with_fill_fence(
                         __autumn_epoch_cell, __autumn_epoch_at_entry,
-                        || ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone(), __autumn_ttl),
+                        || ::autumn_web::cache::insert_cached_fenced::<#value_type>(__autumn_cache, &__autumn_key, __autumn_val.clone(), __autumn_ttl, __autumn_namespace, __autumn_shared_epoch),
                     );
                     <#ret_type as ::autumn_web::cache::CacheableResult>::from_ok(__autumn_val)
                 }
@@ -656,6 +688,7 @@ fn generate_cache_body(
             if let Some(__autumn_cached) = ::autumn_web::cache::get_cached::<#value_type>(__autumn_cache, &__autumn_key) {
                 return __autumn_cached;
             }
+            let __autumn_shared_epoch = ::autumn_web::cache::sample_fill_epoch(__autumn_cache, __autumn_namespace);
             let __autumn_result = #compute;
             // The epoch check and the insert are one indivisible step: checking
             // first and inserting after leaves a window where an invalidation
@@ -663,7 +696,7 @@ fn generate_cache_body(
             // lands after the clear.
             ::autumn_web::cache::coherence::with_fill_fence(
                 __autumn_epoch_cell, __autumn_epoch_at_entry,
-                || ::autumn_web::cache::insert_cached::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone(), __autumn_ttl),
+                || ::autumn_web::cache::insert_cached_fenced::<#value_type>(__autumn_cache, &__autumn_key, __autumn_result.clone(), __autumn_ttl, __autumn_namespace, __autumn_shared_epoch),
             );
             __autumn_result
         }
@@ -748,6 +781,16 @@ pub fn cached_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #coherence_items
     }
+}
+
+/// Whether `text` is a plain type path: `Store` or `a::Store`.
+///
+/// No leading `::`, no generics, no spaces. `crate`, `self` and `super` count,
+/// because `impl crate::a::Store` is a legal self type.
+fn is_type_path(text: &str) -> bool {
+    text.split("::").all(|segment| {
+        matches!(segment, "crate" | "self" | "super") || syn::parse_str::<Ident>(segment).is_ok()
+    })
 }
 
 #[cfg(test)]
@@ -895,6 +938,85 @@ mod tests {
     }
 
     #[test]
+    fn scope_enters_the_read_identity() {
+        let out = cached_macro(
+            quote! { scope = "Products" },
+            quote! { async fn get(id: i64) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(
+            out.contains("concat ! (module_path ! () , \"::\" , \"Products\" , \"::\" , \"get\")"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("concat ! (module_path ! () , \"::\" , \"get\")"),
+            "the unscoped identity must not remain: {out}"
+        );
+    }
+
+    #[test]
+    fn without_scope_the_identity_is_unchanged() {
+        let out = cached_macro(
+            TokenStream::new(),
+            quote! { async fn get(id: i64) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(
+            out.contains("concat ! (module_path ! () , \"::\" , \"get\")"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_scope_that_is_not_a_type_name_is_a_compile_error() {
+        for bad in [" ", "x:", "::a", "Foo<T>", "a b", "1x", "a::"] {
+            let out = cached_macro(
+                quote! { scope = #bad },
+                quote! { async fn get(id: i64) -> String { String::new() } },
+            )
+            .to_string();
+            assert!(out.contains("compile_error"), "{bad}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_scope_is_a_compile_error() {
+        let out = cached_macro(
+            quote! { scope = "A", scope = "B" },
+            quote! { async fn get(id: i64) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(out.contains("compile_error"), "{out}");
+    }
+
+    #[test]
+    fn scope_combines_with_key_and_reads() {
+        let out = cached_macro(
+            quote! { scope = "Products", key(id), reads(Product) },
+            quote! { async fn get(id: i64, repo: &Repo) -> String { String::new() } },
+        )
+        .to_string();
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(out.contains("\"Products\""), "{out}");
+    }
+
+    #[test]
+    fn a_scope_may_use_path_keywords() {
+        for scope in ["crate::a::Store", "self::Store", "super::Store"] {
+            let out = cached_macro(quote! { scope = #scope }, quote! { fn get() {} }).to_string();
+            assert!(!out.contains("compile_error"), "{scope}: {out}");
+        }
+    }
+
+    #[test]
+    fn a_qualified_scope_enters_the_identity() {
+        let out = cached_macro(quote! { scope = "a::Store" }, quote! { fn get() {} }).to_string();
+        assert!(!out.contains("compile_error"), "{out}");
+        assert!(out.contains("\"a::Store\""), "{out}");
+    }
+
+    #[test]
     fn parse_key_selects_the_key_parameters() {
         let attrs = parse_cached_args(quote! { key(tenant_id, page) }).unwrap();
         let names: Vec<String> = attrs.key.iter().map(ToString::to_string).collect();
@@ -1036,6 +1158,29 @@ mod tests {
                 out.matches("with_fill_fence").count(),
                 "every insert must be fenced: {out}"
             );
+        }
+    }
+
+    /// The shared (cross-replica) epoch is read after the miss, before the
+    /// compute, and every insert goes through the epoch-checked form.
+    #[test]
+    fn the_insert_is_fenced_by_the_shared_epoch_too() {
+        for (attr, item) in [
+            (TokenStream::new(), quote! { async fn recent() -> u8 { 0 } }),
+            (
+                quote! { result },
+                quote! { async fn recent() -> Result<u8, Error> { Ok(0) } },
+            ),
+        ] {
+            let out = cached_macro(attr, item).to_string();
+            assert!(out.contains("insert_cached_fenced"), "{out}");
+            assert!(!out.contains("insert_cached ::"), "unfenced insert: {out}");
+            let miss = out.find("get_cached").expect("looks up");
+            let sample = out
+                .find("sample_fill_epoch")
+                .expect("samples the shared epoch");
+            let compute = out.find("__autumn_result =").expect("computes");
+            assert!(miss < sample && sample < compute, "wrong order: {out}");
         }
     }
 
@@ -1186,6 +1331,96 @@ mod tests {
     }
 
     #[test]
+    fn a_model_specific_verb_still_names_the_model() {
+        for verb in ["find_all", "find_by_id", "exists_by_id"] {
+            let verb = format_ident!("{verb}");
+            let f: ItemFn = syn::parse_quote! {
+                async fn recent(db: &mut Db) -> u8 {
+                    let _ = Post::#verb(db);
+                    0
+                }
+            };
+            assert_eq!(derived_models(&f), vec!["Post".to_string()], "{verb}");
+        }
+    }
+
+    #[test]
+    fn a_common_verb_names_no_model() {
+        for verb in ["load", "count", "all", "list", "page", "first"] {
+            let verb = format_ident!("{verb}");
+            let f: ItemFn = syn::parse_quote! {
+                async fn dashboard() -> Data { Config::#verb() }
+            };
+            assert!(derived_models(&f).is_empty(), "{verb}");
+        }
+    }
+
+    #[test]
+    fn a_model_read_is_found_in_every_call_shape() {
+        let shapes: [ItemFn; 3] = [
+            syn::parse_quote! { fn f() { let _ = Some(1).map(Post::find_all); } },
+            syn::parse_quote! { fn f(db: u8) { let _ = <Post>::find_all(db); } },
+            syn::parse_quote! { fn f(db: u8) { let _ = crate::Post::<T>::find_all(db); } },
+        ];
+        for f in &shapes {
+            assert_eq!(
+                derived_models(f),
+                vec!["Post".to_string()],
+                "{}",
+                quote!(#f)
+            );
+        }
+    }
+
+    /// A recovered model is still checked. An unrelated call must not hide it.
+    #[test]
+    fn a_model_read_beside_an_unrelated_call_stays_derived() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn dashboard(db: u8) -> Data {
+                let _ = Post::find_all(db);
+                helper(&Config::load()).await
+            }
+        };
+        let out = cached_macro(TokenStream::new(), quote! { #f }).to_string();
+        assert!(out.contains("DependencyProvenance :: Derived"), "{out}");
+        assert!(out.contains("\"Post\""), "{out}");
+        assert!(!out.contains("\"Config\""), "{out}");
+    }
+
+    #[test]
+    fn generated_output_marks_an_unrelated_call_undetermined() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn dashboard() -> Data {
+                let cfg = Config::load();
+                posts_via_helper(&cfg).await
+            }
+        };
+        let out = cached_macro(TokenStream::new(), quote! { #f }).to_string();
+        assert!(
+            out.contains("DependencyProvenance :: Undetermined"),
+            "{out}"
+        );
+        assert!(!out.contains("\"Config\""), "{out}");
+    }
+
+    #[test]
+    fn self_is_never_a_model() {
+        let f: ItemFn = syn::parse_quote! {
+            fn f(db: &mut Db) { let _ = Self::find_all(db); }
+        };
+        assert!(derived_models(&f).is_empty());
+    }
+
+    #[test]
+    fn a_declared_read_ignores_an_unrelated_call() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn f() -> u8 { let _ = Config::load(); 0 }
+        };
+        let out = cached_macro(quote! { reads(Post) }, quote! { #f }).to_string();
+        assert!(out.contains("Declared"), "{out}");
+    }
+
+    #[test]
     fn derivation_is_sorted_and_deduplicated() {
         let f: ItemFn = syn::parse_quote! {
             async fn feed(posts: &PgPostRepository, comments: &PgCommentRepository) -> u8 {
@@ -1316,8 +1551,8 @@ mod tests {
         let id = "concat ! (module_path ! () , \"::\" , \"recent\")";
         assert_eq!(
             out.matches(id).count(),
-            5,
-            "key, namespace registration, descriptor, id constant, invalidator: {out}"
+            6,
+            "key, namespace registration, fence namespace, descriptor, id constant, invalidator: {out}"
         );
         assert!(
             out.contains(&format!("make_cache_key ({id}")),

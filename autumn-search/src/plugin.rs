@@ -390,6 +390,29 @@ pub fn backfill_request_from_env(
     ))
 }
 
+/// Refuse [`SearchPlugin::postgres`] on a `SQLite` build of autumn-web.
+///
+/// The Postgres store runs `tsvector`, `pgvector` and advisory-lock SQL, and
+/// the runtime pool is `SQLite` under the flip. Boot stops here with a clear
+/// message, not at the first index write (#2539 §5).
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::missing_const_for_fn,
+    reason = "the SQLite arm of `backend_select!` returns an error"
+)]
+fn require_postgres_backend() -> Result<(), autumn_web::AutumnError> {
+    autumn_web::backend_select! {
+        pg => { Ok(()) },
+        sqlite => {
+            Err(autumn_web::AutumnError::internal_server_error_msg(
+                "SearchPlugin::postgres() needs the Postgres backend, but this build of \
+                 autumn-web uses SQLite (`--features sqlite`); install a different search \
+                 backend with `SearchPlugin::backend`",
+            ))
+        },
+    }
+}
+
 /// Parse [`BACKFILL_ENV`]. `None` means "no backfill requested".
 fn parse_backfill_target(raw: &str) -> Option<BackfillTarget> {
     let target = raw.trim();
@@ -468,6 +491,11 @@ impl Plugin for SearchPlugin {
                     return Err(autumn_web::AutumnError::internal_server_error_msg(format!(
                         "autumn-search: {message}"
                     )));
+                }
+                // A build mismatch, not a search outage: refuse it even when
+                // `enabled = false`.
+                if postgres.is_some() {
+                    require_postgres_backend()?;
                 }
                 // Install the client FIRST, and unconditionally. A handler
                 // that resolves the extension must find one whether or not
@@ -617,6 +645,22 @@ async fn run_backfill_and_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The Postgres store runs `tsvector`, `pgvector` and advisory-lock SQL. On
+    // a SQLite build, boot refuses it with a clear message (#2539 §5).
+    #[test]
+    fn the_postgres_store_needs_the_postgres_backend() {
+        let result = require_postgres_backend();
+        autumn_web::backend_select! {
+            pg => {
+                assert!(result.is_ok(), "{result:?}");
+            },
+            sqlite => {
+                let message = result.expect_err("refused on SQLite").to_string();
+                assert!(message.contains("SQLite"), "{message}");
+            },
+        }
+    }
 
     #[test]
     fn the_plugin_name_is_the_crate_name() {

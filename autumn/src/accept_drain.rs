@@ -23,15 +23,17 @@
 //! upgrade the successor shares the socket, so connections arriving in that
 //! window go to the successor; on a plain shutdown they wait in the kernel
 //! queue exactly as they would have once `accept()` stopped anyway.
+//!
+//! The settle window is a first guard. It can miss on a starved runtime. As a
+//! second guard, `http_server` defers the drain of a connection that has
+//! received no request, for up to `FRESH_CONN_GRACE` (2 s) or until its first request.
 
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-/// How long [`drain_signal`] waits, after shutdown begins, before starting the
-/// graceful drain. Long enough for an already-accepted connection's request to
-/// be read even on a starved runtime, short enough not to matter against a
-/// shutdown budget measured in seconds.
+/// Delay before the graceful drain starts. It lets most accepted connections
+/// read their request first.
 pub const ACCEPT_SETTLE: Duration = Duration::from_millis(100);
 
 /// A listener that hands out no further connections once `stop` is cancelled.
@@ -89,6 +91,21 @@ impl
 {
     fn connect_info(
         stream: axum::serve::IncomingStream<'_, StopAcceptingOnShutdown<tokio::net::TcpListener>>,
+    ) -> Self {
+        Self(*stream.remote_addr())
+    }
+}
+
+impl
+    axum::extract::connect_info::Connected<
+        crate::http_server::IncomingStream<'_, StopAcceptingOnShutdown<tokio::net::TcpListener>>,
+    > for TcpPeer
+{
+    fn connect_info(
+        stream: crate::http_server::IncomingStream<
+            '_,
+            StopAcceptingOnShutdown<tokio::net::TcpListener>,
+        >,
     ) -> Self {
         Self(*stream.remote_addr())
     }

@@ -271,17 +271,13 @@ pub async fn save(
         .with_conn(async |conn| crate::content::save_settings(conn, submitted.to_rows()).await)
         .await?;
 
-    // Discharge the invalidation `SiteOptionRepository` declares. *After* the
-    // commit, so a reader that repopulates the cache in between cannot cache
-    // the pre-commit values and then have the invalidation land before them. Without it the
-    // site would keep serving the old title, theme and permalink structure for
-    // up to the 60-second TTL — the settings form would look broken.
-    if !PgSiteOptionRepository::invalidate_declared_caches() {
-        autumn_web::reexports::tracing::warn!(
-            "cache backend cannot invalidate by namespace; settings may be stale until the TTL \
-             expires"
-        );
-    }
+    // Discharge the invalidation `SiteOptionRepository` declares. This write
+    // does not use a generated repository method, so it does not invalidate
+    // by itself. Invalidate *after* the commit, so a reader cannot cache the
+    // pre-commit values after the invalidation. Without it the site serves the
+    // old title, theme and permalink structure for up to the 60-second TTL. A
+    // failure is already logged and counted.
+    let _ = PgSiteOptionRepository::invalidate_declared_caches_async().await;
 
     Ok(Redirect::to("/admin/settings").into_response())
 }

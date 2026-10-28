@@ -1706,6 +1706,8 @@ pub const PRE_MIGRATE_LABELS: &[&str] = &[
     // The driver puts the live-slot marker repair ahead of every builder op, like
     // `install-proxy`.
     LIVE_SLOT_REPAIR_LABEL,
+    // The driver splices the MediaMTX binary install (#1974) ahead of the builder ops.
+    super::media::MEDIA_INSTALL_BINARY_LABEL,
 ];
 
 /// Whether a host that failed at `failed_step` had already run its migration.
@@ -1999,7 +2001,7 @@ fn adoption_recovery(service: &str, current: &str, shared: &str, source: MoveSou
 }
 
 /// Record that the shared `SQLite` database now exists (issue #1909, #2589 item
-/// 17), or `None` when the deploy manages no data file.
+/// 17), or `None` when the app has no `SQLite` data file.
 ///
 /// This runs AFTER the migrate one-shot, which is what creates the database on a
 /// first deploy. Without it the marker was only ever written by a LATER deploy
@@ -2012,17 +2014,76 @@ fn adoption_recovery(service: &str, current: &str, shared: &str, source: MoveSou
 /// Guarded on the file existing, so a run whose migration was skipped (or which
 /// legitimately has no database yet) records nothing rather than arming a
 /// refusal against a database that was never created.
+///
+/// A relative database is in `shared/data` by construction, so its path is
+/// checked as written, as `link-data` does. For an absolute one the HOST
+/// decides, with the resolver `check-data-dir` uses (#2589 item 19). A lexical
+/// check disagreed with the host under a symlinked `app_dir`, so no marker was
+/// recorded.
 #[must_use]
 pub fn sqlite_data_adopted_op(cfg: &ResolvedDeployConfig) -> Option<RemoteCommand> {
-    let shared = cfg.managed_sqlite_data_file()?;
+    let marker_q = shell_quote(&cfg.sqlite_data_marker_file());
+    if let Some(shared) = cfg.shared_sqlite_data_file() {
+        return Some(RemoteCommand::new(
+            "record-data-adopted",
+            format!(
+                "if [ -e {shared_q} ]; then : > {marker_q} || exit 1; fi",
+                shared_q = shell_quote(&shared),
+            ),
+        ));
+    }
+    let db = cfg.persistent_sqlite_data_file()?;
     Some(RemoteCommand::new(
         "record-data-adopted",
         format!(
-            "if [ -e {shared_q} ]; then : > {marker_q} || exit 1; fi",
-            shared_q = shell_quote(&shared),
-            marker_q = shell_quote(&cfg.sqlite_data_marker_file()),
+            "{resolve} \
+             if [ \"$place\" = managed ] && [ -e \"$db\" ]; then \
+             : > {marker_q} || exit 1; fi",
+            resolve = host_data_paths_shell(cfg, db),
         ),
     ))
+}
+
+/// Shell that resolves the app dir, `shared/data` and the database on the host,
+/// and sets `$place` for the database parent (#2589 item 19):
+///
+/// - `managed`: in `shared/data` under the resolved app dir, or in the
+///   resolved `shared/data` (a mounted volume can be a symlink).
+/// - `app`: anywhere else in the app dir. Pruning can delete it.
+/// - `other`: outside the app dir. The operator owns it.
+///
+/// `app` is tested BEFORE the resolved `shared/data`. So a `shared/data` link
+/// into `releases/`, or to an ancestor of the app dir, cannot admit a database
+/// that pruning deletes.
+///
+/// One resolver for every op that asks "is this in `shared/data`?", so the
+/// ops cannot disagree.
+///
+/// It resolves the longest prefix that exists, then adds the missing tail.
+/// `readlink -f` alone fails when more than the last component is missing,
+/// which is a fresh host with no `shared/data` yet. `readlink -m` does that, but
+/// it is not portable. Only a FINAL-component symlink stops the walk, so a
+/// dangling database link resolves to its target, and a dangling `shared/data`
+/// link (an absent mount) keeps its spelling. Without `readlink -f` the path
+/// stays as written.
+fn host_data_paths_shell(cfg: &ResolvedDeployConfig, db: &str) -> String {
+    format!(
+        "autumn_resolve() {{ p=$1; s=; \
+         while [ ! -e \"$p\" ] && {{ [ \"$p\" != \"$1\" ] || [ ! -L \"$p\" ]; }}; do \
+         case \"$p\" in /|.) break ;; esac; \
+         s=/$(basename \"$p\")$s; p=$(dirname \"$p\"); done; \
+         r=$(readlink -f \"$p\" 2>/dev/null) || r=$p; \
+         if [ -z \"$s\" ]; then printf '%s' \"$r\"; else printf '%s%s' \"${{r%/}}\" \"$s\"; fi; }}; \
+         app=$(autumn_resolve {app_dir_q}); pre=${{app%/}}; \
+         data=$(autumn_resolve {data_q}); db=$(autumn_resolve {db_q}); \
+         dir=$(dirname \"$db\"); \
+         case \"$dir\" in \"$pre/shared/data\"|\"$pre/shared/data/\"*) place=managed ;; \
+         \"$app\"|\"$pre/\"*) place=app ;; \
+         \"$data\"|\"$data/\"*) place=managed ;; *) place=other ;; esac;",
+        app_dir_q = shell_quote(&cfg.app_dir),
+        data_q = shell_quote(&cfg.shared_data_dir()),
+        db_q = shell_quote(db),
+    )
 }
 
 /// Verify on the HOST that an operator-managed absolute `SQLite` database is not
@@ -2041,9 +2102,8 @@ pub fn sqlite_data_adopted_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComman
 /// `readlink -f` both sides. It runs beside `link-data`, before anything is
 /// uploaded or pruned, so a refusal costs nothing.
 ///
-/// Directories are resolved, not the database file itself: the file may not
-/// exist yet, and `readlink -f` on a missing path still resolves its existing
-/// prefix, so an absent database grades the same as a present one.
+/// Both paths are resolved by [`host_data_paths_shell`]. A missing tail is kept
+/// as written, so an absent database grades the same as a present one.
 ///
 /// It also CREATES the parent when the database sits in `shared/data`. That is
 /// the placement the guide recommends (`sqlite:///srv/autumn/myapp/shared/data/app.db`),
@@ -2096,24 +2156,20 @@ pub fn sqlite_data_dir_guard_op(cfg: &ResolvedDeployConfig) -> Option<RemoteComm
         // path can itself be a symlink (`/var/lib/app.db -> …/releases/r1/app.db`),
         // and resolving only the parent leaves it outside the app dir and
         // approves it while the app opens the target inside `releases/`, where
-        // pruning deletes it. `readlink -f` resolves a path whose final component
-        // does not exist yet, so a not-yet-created database grades the same as a
-        // present one; the literal spelling is the fallback for a path it cannot
-        // resolve at all.
+        // pruning deletes it. A missing tail is kept as written, so a
+        // not-yet-created database grades the same as a present one. See
+        // `host_data_paths_shell`.
         format!(
-            "app=$(readlink -f {app_dir_q} 2>/dev/null || printf '%s' {app_dir_q}); \
-             db=$(readlink -f {db_q} 2>/dev/null || printf '%s' {db_q}); \
-             dir=$(dirname \"$db\"); \
-             case \"$dir\" in \
-             \"$app/shared/data\"|\"$app/shared/data/\"*) \
+            "{resolve} \
+             case \"$place\" in \
+             managed) \
              if [ -e \"$db\" ]; then : > {marker_q} || exit 1; \
              elif [ -e {marker_q} ]; then \
              echo {missing_refusal_q} >&2; echo {missing_recovery_q} >&2; exit 1; fi; \
              mkdir -p \"$dir\" || exit 1 ;; \
-             \"$app\"|\"$app/\"*) echo {refusal_q} >&2; exit 1 ;; \
+             app) echo {refusal_q} >&2; exit 1 ;; \
              esac",
-            app_dir_q = shell_quote(app_dir),
-            db_q = shell_quote(path),
+            resolve = host_data_paths_shell(cfg, path),
             marker_q = shell_quote(&marker),
             refusal_q = shell_quote(&refusal),
             missing_refusal_q = shell_quote(&missing_refusal),
@@ -3887,7 +3943,7 @@ pub(crate) mod test_support {
     /// [`super::DeployMode::First`] / `Absent`. A fleet test that forgets to script
     /// host N's probe would therefore exercise the first-deploy branch and still
     /// pass. [`RecordingExecutor::strict`] turns that into a loud panic.
-    pub(crate) const PROBE_LABELS: [&str; 8] = [
+    pub(crate) const PROBE_LABELS: [&str; 9] = [
         "proxy-compat-probe",
         "detect-current",
         "probe-release-dir",
@@ -3900,6 +3956,8 @@ pub(crate) mod test_support {
         "detect-maintenance-flag",
         // #2279: the fleet parses this one to decide if the old slot stopped.
         "drain-old-retry",
+        // #3069: the post-cutover bake parses each metrics sample.
+        "bake-sample",
     ];
 
     /// One recorded executor call. Uploads carry no local path: op building is
@@ -3955,6 +4013,9 @@ pub(crate) mod test_support {
         fail_on_occurrence: Vec<(&'static str, usize)>,
         /// Scripted stdout returned for a given command label.
         stdout_by_label: Vec<(&'static str, String)>,
+        /// #3069: scripted stdout for one 1-indexed occurrence of a label. It
+        /// wins over `stdout_by_label`, so a poll can see a changing value.
+        stdout_on_occurrence: Vec<(&'static str, usize, String)>,
         /// #1621: remote-path fragments whose `upload` should fail. Uploads carry
         /// no label, so failure is keyed on the destination path — the only
         /// identity an upload has. This is what lets a test fail a `WriteFile` op
@@ -4026,6 +4087,18 @@ pub(crate) mod test_support {
             stdout: impl Into<String>,
         ) -> Self {
             self.stdout_by_label.push((label, stdout.into()));
+            self
+        }
+
+        /// Script the stdout of one 1-indexed occurrence of `label` (#3069).
+        pub(crate) fn with_stdout_on_occurrence(
+            mut self,
+            label: &'static str,
+            occurrence: usize,
+            stdout: impl Into<String>,
+        ) -> Self {
+            self.stdout_on_occurrence
+                .push((label, occurrence, stdout.into()));
             self
         }
 
@@ -4116,10 +4189,16 @@ pub(crate) mod test_support {
                 });
             }
             let scripted = self
-                .stdout_by_label
+                .stdout_on_occurrence
                 .iter()
-                .find(|(l, _)| *l == cmd.label)
-                .map(|(_, out)| out.clone());
+                .find(|(l, n, _)| *l == cmd.label && *n == occurrence)
+                .map(|(_, _, out)| out.clone())
+                .or_else(|| {
+                    self.stdout_by_label
+                        .iter()
+                        .find(|(l, _)| *l == cmd.label)
+                        .map(|(_, out)| out.clone())
+                });
             assert!(
                 !(self.strict && scripted.is_none() && PROBE_LABELS.contains(&cmd.label)),
                 "unscripted probe `{}`{}: this fake would return EMPTY stdout, which every \
@@ -7725,6 +7804,10 @@ mod tests {
         // everything, so both are pre-migrate even though no builder emits them.
         assert!(failed_before_migrating("install-proxy"));
         assert!(failed_before_migrating(LIVE_SLOT_REPAIR_LABEL));
+        // The MediaMTX binary install (#1974) is spliced the same way.
+        assert!(failed_before_migrating(
+            super::super::media::MEDIA_INSTALL_BINARY_LABEL
+        ));
         // Anything unrecognised errs toward "the schema may have moved".
         assert!(!failed_before_migrating("readiness-gate"));
         assert!(!failed_before_migrating("some-future-op"));
@@ -8939,6 +9022,19 @@ mod tests {
             ),
         ] {
             let labels: Vec<&str> = ops.iter().map(DeployOp::label).collect();
+            // `deploy plan` shows the data steps in this order (#2589 item 5).
+            let data = ["link-data", "migrate", "record-data-adopted"];
+            let planned: Vec<&str> = super::super::build_deploy_plan(&cfg)
+                .iter()
+                .map(|step| step.label)
+                .filter(|label| data.contains(label))
+                .collect();
+            let executed: Vec<&str> = labels
+                .iter()
+                .copied()
+                .filter(|label| data.contains(label))
+                .collect();
+            assert_eq!(planned, executed, "{path}: the plan and the ops disagree");
             let migrate = labels
                 .iter()
                 .position(|l| *l == "migrate")
@@ -9060,31 +9156,272 @@ mod tests {
     }
 
     /// The adoption marker is recorded for BOTH placements, so the guard above
-    /// has something to key on. Keying it on the relative case alone is what left
-    /// the absolute one unguarded.
+    /// has something to key on. The HOST decides if the database is in
+    /// `shared/data` (#2589 item 19), so the op is emitted for every persistent
+    /// file and records nothing outside the namespace.
+    #[cfg(target_os = "linux")]
     #[test]
-    fn the_marker_covers_an_absolute_database_in_shared_data_too() {
+    fn the_marker_is_recorded_only_inside_shared_data_on_the_host() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let app = root.join("srv/myapp");
+        std::fs::create_dir_all(app.join("shared/data")).expect("shared dir");
+        std::fs::create_dir_all(root.join("var/lib")).expect("operator dir");
+        let marker = app.join("shared/sqlite-data-adopted");
+
+        for (db, recorded) in [
+            (app.join("shared/data/app.db"), true),
+            (root.join("var/lib/app.db"), false),
+        ] {
+            std::fs::write(&db, b"REAL").expect("db");
+            std::fs::remove_file(&marker).ok();
+            let mut cfg = resolved();
+            cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+            cfg.sqlite_data =
+                SqliteDataPlacement::Persistent(db.to_str().expect("utf-8").to_owned());
+            let op = sqlite_data_adopted_op(&cfg).expect("a persistent file is recorded");
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .output()
+                .expect("run record-data-adopted");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(marker.exists(), recorded, "{}", db.display());
+        }
+        // A Postgres app still gets nothing at all.
+        assert!(sqlite_data_adopted_op(&resolved()).is_none());
+    }
+
+    /// #2589 item 19, P1: a symlinked `app_dir` and a database spelled with the
+    /// RESOLVED path. The host calls it managed, so the marker must be recorded
+    /// on the deploy that creates the database, not one deploy later.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_marker_is_recorded_for_a_resolved_spelling_under_a_symlinked_app_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let real = root.join("mnt/myapp");
+        std::fs::create_dir_all(real.join("shared/data")).expect("shared dir");
+        let link = root.join("srv-myapp");
+        std::os::unix::fs::symlink(&real, &link).expect("symlinked app dir");
+        let db = real.join("shared/data/app.db");
+
         let mut cfg = resolved();
-        cfg.sqlite_data =
-            SqliteDataPlacement::Persistent("/srv/autumn/myapp/shared/data/app.db".to_owned());
-        let op = sqlite_data_adopted_op(&cfg).expect("an in-namespace database is recorded");
+        cfg.app_dir = link.to_str().expect("utf-8").to_owned();
+        cfg.sqlite_data = SqliteDataPlacement::Persistent(db.to_str().expect("utf-8").to_owned());
+        // The migration creates the database.
+        std::fs::write(&db, b"REAL").expect("db");
+        let op = sqlite_data_adopted_op(&cfg).expect("the host decides");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .output()
+            .expect("run record-data-adopted");
         assert!(
-            op.shell
-                .contains("if [ -e '/srv/autumn/myapp/shared/data/app.db' ]")
-                && op
-                    .shell
-                    .contains(": > '/srv/autumn/myapp/shared/sqlite-data-adopted'"),
+            out.status.success(),
             "{}",
-            op.shell
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            real.join("shared/sqlite-data-adopted").exists(),
+            "the first deploy must record the marker"
+        );
+    }
+
+    /// #2589 item 19, P2: a symlinked `app_dir`, the ALIAS spelling, and no
+    /// `shared/data` yet. The guard must still see the namespace and create the
+    /// directory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_data_dir_is_created_for_an_alias_spelling_on_a_fresh_host() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let real = root.join("mnt/myapp");
+        std::fs::create_dir_all(real.join("shared")).expect("shared dir");
+        let link = root.join("srv-myapp");
+        std::os::unix::fs::symlink(&real, &link).expect("symlinked app dir");
+        let db = link.join("shared/data/app.db");
+
+        let mut cfg = resolved();
+        cfg.app_dir = link.to_str().expect("utf-8").to_owned();
+        cfg.sqlite_data = SqliteDataPlacement::Persistent(db.to_str().expect("utf-8").to_owned());
+        let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .output()
+            .expect("run check-data-dir");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            real.join("shared/data").is_dir(),
+            "the parent must be created, or the migration cannot open the database"
+        );
+    }
+
+    /// `shared/data` can itself be a symlink to a mounted volume. The marker
+    /// must be recorded, and a lost volume must be refused (#2589 item 19).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_symlinked_shared_data_volume_is_guarded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = tmp.path().join("srv/myapp");
+        let volume = tmp.path().join("mnt/vol/data");
+        std::fs::create_dir_all(app.join("shared")).expect("shared dir");
+        std::fs::create_dir_all(&volume).expect("volume");
+        std::os::unix::fs::symlink(&volume, app.join("shared/data")).expect("mount link");
+        std::fs::write(volume.join("app.db"), b"REAL").expect("db");
+
+        let mut cfg = resolved();
+        cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+        cfg.sqlite_data = SqliteDataPlacement::Persistent(
+            app.join("shared/data/app.db")
+                .to_str()
+                .expect("utf-8")
+                .to_owned(),
+        );
+        let run = |op: RemoteCommand| {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&op.shell)
+                .output()
+                .expect("run op")
+        };
+        let out = run(sqlite_data_adopted_op(&cfg).expect("recorded"));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            app.join("shared/sqlite-data-adopted").exists(),
+            "no marker recorded"
         );
 
-        // A database OUTSIDE the deploy's namespace is the operator's: not
-        // recorded, and not guarded, because the deploy never creates its
-        // directory either.
-        cfg.sqlite_data = SqliteDataPlacement::Persistent("/var/lib/myapp/app.db".to_owned());
-        assert!(sqlite_data_adopted_op(&cfg).is_none());
-        // …and a Postgres app still gets nothing at all.
-        assert!(sqlite_data_adopted_op(&resolved()).is_none());
+        // The volume is lost: its mount point stays, empty.
+        std::fs::remove_file(volume.join("app.db")).expect("lose the volume");
+        let out = run(sqlite_data_dir_guard_op(&cfg).expect("verified"));
+        assert!(!out.status.success(), "a lost volume must stop the deploy");
+    }
+
+    /// `shared/data` linked into `releases/` is not a volume. Pruning deletes
+    /// it, so the guard must refuse it (#2589 item 19, Codex review on #3449).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shared_data_link_into_a_release_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = tmp.path().join("srv/myapp");
+        std::fs::create_dir_all(app.join("releases/r1")).expect("release dir");
+        std::fs::create_dir_all(app.join("shared")).expect("shared dir");
+        std::os::unix::fs::symlink(app.join("releases/r1"), app.join("shared/data"))
+            .expect("link into a release");
+        std::fs::write(app.join("releases/r1/app.db"), b"LIVE").expect("db");
+
+        let mut cfg = resolved();
+        cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+        cfg.sqlite_data = SqliteDataPlacement::Persistent(
+            app.join("shared/data/app.db")
+                .to_str()
+                .expect("utf-8")
+                .to_owned(),
+        );
+        let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .output()
+            .expect("run check-data-dir");
+        assert!(
+            !out.status.success(),
+            "a database in releases/ must be refused"
+        );
+        let op = sqlite_data_adopted_op(&cfg).expect("recorded");
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .status()
+            .expect("run record-data-adopted");
+        assert!(
+            !app.join("shared/sqlite-data-adopted").exists(),
+            "a database in releases/ is not adopted"
+        );
+    }
+
+    /// `shared/data` linked to an ANCESTOR of the app dir must not let a
+    /// database in `releases/` match the volume arm (Codex review on #3449).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shared_data_link_to_an_ancestor_does_not_admit_a_release() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = tmp.path().join("srv/myapp");
+        std::fs::create_dir_all(app.join("releases/r1")).expect("release dir");
+        std::fs::create_dir_all(app.join("shared")).expect("shared dir");
+        std::os::unix::fs::symlink(tmp.path().join("srv"), app.join("shared/data"))
+            .expect("link to an ancestor");
+        std::fs::write(app.join("releases/r1/app.db"), b"LIVE").expect("db");
+
+        let mut cfg = resolved();
+        cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+        cfg.sqlite_data = SqliteDataPlacement::Persistent(
+            app.join("shared/data/myapp/releases/r1/app.db")
+                .to_str()
+                .expect("utf-8")
+                .to_owned(),
+        );
+        let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .output()
+            .expect("run check-data-dir");
+        assert!(
+            !out.status.success(),
+            "a database in releases/ must be refused"
+        );
+    }
+
+    /// A dangling `shared/data` link is an absent mount. With the marker present
+    /// the guard must refuse, not resolve the link and match no arm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_dangling_shared_data_link_with_a_marker_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let app = tmp.path().join("srv/myapp");
+        std::fs::create_dir_all(app.join("shared")).expect("shared dir");
+        std::os::unix::fs::symlink(tmp.path().join("mnt/vol/data"), app.join("shared/data"))
+            .expect("dangling mount link");
+        std::fs::write(app.join("shared/sqlite-data-adopted"), b"").expect("marker");
+
+        let mut cfg = resolved();
+        cfg.app_dir = app.to_str().expect("utf-8").to_owned();
+        cfg.sqlite_data = SqliteDataPlacement::Persistent(
+            app.join("shared/data/app.db")
+                .to_str()
+                .expect("utf-8")
+                .to_owned(),
+        );
+        let op = sqlite_data_dir_guard_op(&cfg).expect("verified");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&op.shell)
+            .output()
+            .expect("run check-data-dir");
+        assert!(
+            !out.status.success(),
+            "an absent mount must stop the deploy"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("not mounted"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// A symlinked `app_dir` is invisible to the local lexical containment check,

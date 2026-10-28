@@ -110,6 +110,30 @@ pub fn namespaced_key(plugin: &str, tenant: Option<&str>, key: &str) -> String {
     )
 }
 
+/// Check a `kv-set` value against `kv_value_bytes`, without copying it.
+///
+/// Run before the per-capability quota is charged.
+///
+/// # Errors
+///
+/// The denial to answer with.
+pub(super) fn validate(
+    runtime: &CapabilityRuntime,
+    call: &CapabilityCall,
+) -> Result<(), CallResult> {
+    if let CapabilityCall::KvSet { id, value, .. } = call {
+        let ceiling = runtime.quotas().kv_value_bytes as usize;
+        if value.weight() > ceiling {
+            return Err(CallResult::denied(
+                *id,
+                DenialReason::QuotaExceeded,
+                format!("a kv value may hold at most {ceiling} bytes"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Answer one `kv-*` call. Capability, scope and quota are already checked.
 pub(super) fn perform(runtime: &CapabilityRuntime, call: &CapabilityCall, key: &str) -> CallResult {
     let id = call.id();
@@ -395,6 +419,8 @@ impl KvStore for MemoryKvStore {
 /// exists: a plugin's KV inherits whatever the operator already chose — Moka in
 /// process, Redis across replicas — and the eviction, TTL and metrics that come
 /// with it, rather than growing a second storage system nobody configured.
+///
+/// A backend failure reaches the guest as an error. It is not a miss.
 #[derive(Clone)]
 pub struct CacheKvStore(pub std::sync::Arc<dyn crate::cache::Cache>);
 
@@ -410,24 +436,13 @@ impl KvStore for CacheKvStore {
     // cross-replica backend it exists to reach. The erased pair is the
     // *in-process* half of the `Cache` trait: a serializing backend implements
     // `insert_value` as a no-op and answers `get_value` with `RawCacheBytes`,
-    // which no `downcast_ref::<PluginValue>` can see. Over Redis this stored
-    // nothing, reported success, and missed every read afterwards — a plugin
-    // told its write succeeded, on the one backend the module documents for
-    // more than one replica. The serde pair takes both paths: the downcast when
-    // the backend keeps values, JSON when it keeps bytes.
+    // which no `downcast_ref::<PluginValue>` can see. The serde pair takes both
+    // paths: the downcast when the backend keeps values, JSON when it keeps
+    // bytes. The `try_*` forms carry a backend failure to the guest, so an
+    // outage is not a miss and a lost write is not `Done` (#2523).
     fn get(&self, key: &str) -> Result<Option<PluginValue>, String> {
-        // Always `Ok`, and that is this adapter's limit rather than the
-        // trait's: `get_cached` answers `Option`, so a backend that is *down*
-        // and a key that is *absent* arrive here as the same `None` and no
-        // amount of care in this function can separate them. Distinguishing
-        // them needs an acknowledged read on the `Cache` trait itself, which is
-        // shared with every other cache user and not this module's to change.
-        // The trait above can carry the answer the day that lands; a custom
-        // store that talks to its backend directly can report it today.
-        Ok(crate::cache::get_cached::<PluginValue>(
-            self.0.as_ref(),
-            key,
-        ))
+        crate::cache::try_get_cached::<PluginValue>(self.0.as_ref(), key)
+            .map_err(|error| error.to_string())
     }
 
     fn set(&self, key: &str, value: PluginValue) -> Result<(), String> {
@@ -435,18 +450,14 @@ impl KvStore for CacheKvStore {
         // backend evicts it. A ceiling on *lifetime* is not one of the grants an
         // operator gave, and inventing one here would make a plugin's data
         // disappear on a schedule nothing in the manifest mentions.
-        crate::cache::insert_cached(self.0.as_ref(), key, value, None);
-        Ok(())
+        crate::cache::try_insert_cached(self.0.as_ref(), key, value, None)
+            .map_err(|error| error.to_string())
     }
 
     fn delete(&self, key: &str) -> Result<(), String> {
-        // `Ok` for the same reason `get` is: `Cache::invalidate` returns
-        // nothing, so a backend that refused the eviction and one that
-        // performed it are indistinguishable from here. Filed as finding 14 on
-        // #2523 along with the write and read halves — all three want the one
-        // acknowledged path on the shared `Cache` trait.
-        self.0.invalidate(key);
-        Ok(())
+        self.0
+            .try_invalidate(key)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -521,6 +532,102 @@ mod tests {
         );
         let _ = store.delete(&key);
         assert_eq!(store.get(&key), Ok(None), "and delete must remove it");
+    }
+
+    /// A backend whose every acknowledged operation fails.
+    ///
+    /// The plain `get_value` / `insert_raw_bytes` / `invalidate` cannot say so,
+    /// which is the gap the `try_*` methods close.
+    #[derive(Debug, Default)]
+    struct DownCache;
+
+    impl crate::cache::Cache for DownCache {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+            None
+        }
+
+        fn insert_value(&self, _key: &str, _value: Arc<dyn std::any::Any + Send + Sync>) {}
+
+        fn invalidate(&self, _key: &str) {}
+
+        fn clear(&self) {}
+
+        fn try_get_value(
+            &self,
+            _key: &str,
+        ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, crate::cache::CacheBackendError>
+        {
+            Err(crate::cache::CacheBackendError::new("backend down"))
+        }
+
+        fn try_insert_raw_bytes(
+            &self,
+            _key: &str,
+            _bytes: Vec<u8>,
+            _ttl: Option<Duration>,
+        ) -> Result<(), crate::cache::CacheBackendError> {
+            Err(crate::cache::CacheBackendError::new("backend down"))
+        }
+
+        fn try_invalidate(&self, _key: &str) -> Result<(), crate::cache::InvalidationError> {
+            Err(crate::cache::InvalidationError::new(3, "backend down"))
+        }
+    }
+
+    /// Answers every read with bytes that are not JSON.
+    #[derive(Debug, Default)]
+    struct CorruptCache;
+
+    impl crate::cache::Cache for CorruptCache {
+        fn get_value(&self, _key: &str) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+            None
+        }
+
+        fn insert_value(&self, _key: &str, _value: Arc<dyn std::any::Any + Send + Sync>) {}
+
+        fn invalidate(&self, _key: &str) {}
+
+        fn clear(&self) {}
+
+        fn try_get_value(
+            &self,
+            _key: &str,
+        ) -> Result<Option<Arc<dyn std::any::Any + Send + Sync>>, crate::cache::CacheBackendError>
+        {
+            Ok(Some(Arc::new(crate::cache::RawCacheBytes(b"{".to_vec()))))
+        }
+    }
+
+    #[test]
+    fn a_corrupt_stored_value_is_a_failure_not_an_absent_key() {
+        let store = CacheKvStore(Arc::new(CorruptCache) as Arc<dyn crate::cache::Cache>);
+        let get = store.get("k");
+        assert!(
+            get.as_ref().is_err_and(|e| e.contains("cannot be decoded")),
+            "{get:?}"
+        );
+    }
+
+    #[test]
+    fn a_cache_failure_reaches_the_guest_as_a_failure() {
+        let store = CacheKvStore(Arc::new(DownCache) as Arc<dyn crate::cache::Cache>);
+        let key = namespaced_key("shop", Some("alpha"), "cart");
+
+        let set = store.set(&key, PluginValue::Int(1));
+        assert!(
+            set.as_ref().is_err_and(|e| e.contains("backend down")),
+            "a write that did not land must not be `Ok`: {set:?}"
+        );
+        let get = store.get(&key);
+        assert!(
+            get.as_ref().is_err_and(|e| e.contains("backend down")),
+            "an outage must not read as an absent key: {get:?}"
+        );
+        let delete = store.delete(&key);
+        assert!(
+            delete.as_ref().is_err_and(|e| e.contains("backend down")),
+            "a delete that did not happen must not be `Ok`: {delete:?}"
+        );
     }
 
     /// A store that is *down* rather than empty.

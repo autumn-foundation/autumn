@@ -1679,16 +1679,27 @@ fn find_plan_content_for_path(plan: &Plan, path: &std::path::Path) -> Option<Str
         })
 }
 
-/// Ensure `autumn-web` in `[dependencies]` has `features = ["oauth2"]`.
+/// Ensure `autumn-web` in `[dependencies]` carries `features = ["<feature_name>"]`.
 ///
-/// The `[dependencies.autumn_web]` underscore spelling is only treated as this
-/// dependency when the table body renames the package back with
-/// `package = "autumn-web"` — without that rename Cargo resolves the table to a
-/// different package literally named `autumn_web`, which must be left untouched.
+/// Handles the three common forms a fresh Autumn project may use:
+/// - `autumn-web = "x.y"` (simple string)
+/// - `autumn-web = { version = "x.y", ... }` (inline table)
+/// - `[dependencies.autumn-web]` subtable (hyphenated spelling, or the
+///   underscore-normalized `[dependencies.autumn_web]` spelling — but only when
+///   its body renames the package back with `package = "autumn-web"`; without
+///   that rename Cargo resolves the table to a different package literally
+///   named `autumn_web`, which must be left untouched)
+///
+/// Shared by the `oauth2`/`mail`/`webauthn` feature injectors below. The only
+/// thing that ever varied between those three copies (once #2752/#2771 closed
+/// the underscore-subtable soundness gap and #2948/#3084 closed the multiline-
+/// array gaps in all three) was which feature string to require — see the
+/// clone-class history in issue #2753.
 #[allow(clippy::too_many_lines)]
-fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
+fn ensure_autumn_web_feature(toml: &str, feature_name: &str) -> String {
     const CRATE: &str = "autumn-web";
-    const FEATURE: &str = "\"oauth2\"";
+    let feature_lit = format!("\"{feature_name}\"");
+    let feature: &str = &feature_lit;
 
     let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
     let trailing_newline = toml.ends_with('\n');
@@ -1709,7 +1720,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
         if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
             let version = rest.trim_end_matches('"');
             lines[i] =
-                format!("{indent}{CRATE} = {{ version = \"{version}\", features = [{FEATURE}] }}");
+                format!("{indent}{CRATE} = {{ version = \"{version}\", features = [{feature}] }}");
             break;
         }
 
@@ -1717,7 +1728,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
             // A trailing `# comment` mentioning the feature is not TOML —
             // check only the code portion of the line, the same guard the
             // subtable branch below needs against a commented-out mention.
-            if strip_line_comment(&trimmed).contains(FEATURE) {
+            if strip_line_comment(&trimmed).contains(feature) {
                 break; // already present
             }
             if let Some(feat_bracket) =
@@ -1728,9 +1739,9 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                     let list_end = close_bracket + list_start;
                     let existing = trimmed[list_start..list_end].trim();
                     let new_list = if existing.is_empty() {
-                        FEATURE.to_owned()
+                        feature.to_owned()
                     } else {
-                        format!("{existing}, {FEATURE}")
+                        format!("{existing}, {feature}")
                     };
                     lines[i] = format!(
                         "{indent}{}{}{}",
@@ -1739,30 +1750,75 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                         &trimmed[list_end..]
                     );
                 } else {
-                    let mut j = i + 1;
-                    while j < lines.len() {
-                        let tj = lines[j].trim();
-                        if tj.starts_with('[') {
+                    // Multiline `features = [` … `]` array inside the
+                    // inline-table form (legal TOML since 1.0): mirror the
+                    // subtable branch's own multiline handling below rather
+                    // than a same-line-only scan. Codex review on #3084
+                    // found this thinner version could both lose the
+                    // separator before a feature appended after an entry
+                    // with no trailing comma, and miss an already-merged
+                    // feature sitting on a continuation line — the same two
+                    // defects #2948 already fixed once for the subtable
+                    // form.
+                    let mut k = i + 1;
+                    let mut already_present = false;
+                    let mut close_line = None;
+                    while k < lines.len() {
+                        let tk = lines[k].trim();
+                        if tk.starts_with('[') {
                             break;
                         }
-                        if let Some(close_idx) = find_unquoted(strip_line_comment(tj), ']') {
-                            let before_close = tj[..close_idx].trim();
-                            let sep = if before_close.is_empty() || before_close.ends_with(',') {
-                                ""
+                        let code = strip_line_comment(tk);
+                        if let Some(close_idx) = find_unquoted(code, ']') {
+                            // Unlike the subtable form, an inline table's `}`
+                            // can carry more comma-separated fields after the
+                            // array's `]` on this same line (`], path = "…" }`)
+                            // — Codex review on #3084 found a field whose own
+                            // string value happened to equal the feature name
+                            // (`path = "<feature>"`) made this look merged
+                            // already when the array itself was not. Only the
+                            // portion before `]` is the array.
+                            if code[..close_idx].contains(feature) {
+                                already_present = true;
+                            }
+                            close_line = Some(k);
+                            break;
+                        }
+                        if code.contains(feature) {
+                            already_present = true;
+                        }
+                        k += 1;
+                    }
+                    if !already_present && let Some(k) = close_line {
+                        let tk = lines[k].trim().to_owned();
+                        let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
+                        let before_close = tk[..close_idx].trim();
+                        // The closing bracket's own line may have no entry
+                        // before it, in which case the last real entry is on
+                        // an earlier line — including possibly the opener
+                        // line itself, past `features = [`.
+                        let last_entry = (i..=k).rev().find_map(|idx| {
+                            let raw: &str = if idx == k {
+                                before_close
+                            } else if idx == i {
+                                &trimmed[list_start..]
                             } else {
-                                ", "
+                                &lines[idx]
                             };
-                            let indent_j: String = lines[j]
-                                .chars()
-                                .take_while(char::is_ascii_whitespace)
-                                .collect();
-                            lines[j] = format!(
-                                "{indent_j}{before_close}{sep}{FEATURE}{}",
-                                &tj[close_idx..]
-                            );
-                            break;
-                        }
-                        j += 1;
+                            let raw = strip_line_comment(raw).trim();
+                            (!raw.is_empty()).then(|| raw.to_owned())
+                        });
+                        let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
+                            ", "
+                        } else {
+                            ""
+                        };
+                        let indent_k: String = lines[k]
+                            .chars()
+                            .take_while(char::is_ascii_whitespace)
+                            .collect();
+                        lines[k] =
+                            format!("{indent_k}{before_close}{sep}{feature}{}", &tk[close_idx..]);
                     }
                 }
             } else {
@@ -1774,7 +1830,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                     ", "
                 };
                 lines[i] = format!(
-                    "{indent}{}{sep}features = [{FEATURE}]{}",
+                    "{indent}{}{sep}features = [{feature}]{}",
                     &trimmed[..close],
                     &trimmed[close..]
                 );
@@ -1815,16 +1871,16 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                     // (a `]` inside the comment would misclassify a genuinely
                     // multiline array as single-line and merge into dead text
                     // past the `#`).
-                    if strip_line_comment(&t).contains(FEATURE) {
+                    if strip_line_comment(&t).contains(feature) {
                         break;
                     }
                     if let Some(open) = t.find('[') {
                         if let Some(close) = find_unquoted(strip_line_comment(&t), ']') {
                             let inner = t[open + 1..close].trim();
                             let new_inner = if inner.is_empty() {
-                                FEATURE.to_owned()
+                                feature.to_owned()
                             } else {
-                                format!("{inner}, {FEATURE}")
+                                format!("{inner}, {feature}")
                             };
                             let indent_j: String = lines[j]
                                 .chars()
@@ -1850,7 +1906,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                                 // a stray `]` inside a comment is not TOML —
                                 // check only the code portion of the line.
                                 let code = strip_line_comment(tk);
-                                if code.contains(FEATURE) {
+                                if code.contains(feature) {
                                     already_present = true;
                                 }
                                 if find_unquoted(code, ']').is_some() {
@@ -1894,7 +1950,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                                     .take_while(char::is_ascii_whitespace)
                                     .collect();
                                 lines[k] = format!(
-                                    "{indent_k}{before_close}{sep}{FEATURE}{}",
+                                    "{indent_k}{before_close}{sep}{feature}{}",
                                     &tk[close_idx..]
                                 );
                             }
@@ -1905,7 +1961,7 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
                 j += 1;
             }
             if !found_features {
-                lines.insert(i + 1, format!("features = [{FEATURE}]"));
+                lines.insert(i + 1, format!("features = [{feature}]"));
             }
             break;
         }
@@ -1918,6 +1974,11 @@ fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Ensure `autumn-web` in `[dependencies]` has `features = ["oauth2"]`.
+fn ensure_autumn_web_oauth2_feature(toml: &str) -> String {
+    ensure_autumn_web_feature(toml, "oauth2")
 }
 
 /// CLI entry point for `autumn generate auth <Name>` (no OAuth providers).
@@ -1953,224 +2014,8 @@ pub fn run_with_options(
 }
 
 /// Ensure `autumn-web` in `[dependencies]` has `features = ["mail"]`.
-///
-/// Handles the three common forms a fresh Autumn project may use:
-/// - `autumn-web = "x.y"` (simple string)
-/// - `autumn-web = { version = "x.y", ... }` (inline table)
-/// - `[dependencies.autumn-web]` subtable (hyphenated spelling, or the
-///   underscore-normalized `[dependencies.autumn_web]` spelling — but only when
-///   its body renames the package back with `package = "autumn-web"`; without
-///   that rename Cargo resolves the table to a different package literally
-///   called `autumn_web`, which must be left untouched)
-#[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_mail_feature(toml: &str) -> String {
-    const CRATE: &str = "autumn-web";
-    const FEATURE: &str = "\"mail\"";
-
-    let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
-    let trailing_newline = toml.ends_with('\n');
-
-    let simple_prefix = format!("{CRATE} = \"");
-    let table_prefix = format!("{CRATE} = {{");
-    let subtable_header = format!("[dependencies.{CRATE}]");
-    let subtable_header_underscore = format!("[dependencies.{}]", CRATE.replace('-', "_"));
-
-    let mut i = 0;
-    while i < lines.len() {
-        let trimmed = lines[i].trim().to_owned();
-        let indent: String = lines[i]
-            .chars()
-            .take_while(char::is_ascii_whitespace)
-            .collect();
-
-        if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
-            // autumn-web = "0.3"
-            let version = rest.trim_end_matches('"');
-            lines[i] =
-                format!("{indent}{CRATE} = {{ version = \"{version}\", features = [{FEATURE}] }}");
-            break;
-        }
-
-        if trimmed.starts_with(&table_prefix) {
-            // A trailing `# comment` mentioning the feature is not TOML —
-            // check only the code portion of the line, the same guard the
-            // subtable branch below needs against a commented-out mention.
-            if strip_line_comment(&trimmed).contains(FEATURE) {
-                break; // already present
-            }
-            if let Some(feat_bracket) =
-                find_unquoted_str(strip_line_comment(&trimmed), "features = [")
-            {
-                // Add to existing features list.
-                let list_start = feat_bracket + "features = [".len();
-                let list_end = find_unquoted(&trimmed[list_start..], ']').unwrap() + list_start;
-                let existing = trimmed[list_start..list_end].trim();
-                let new_list = if existing.is_empty() {
-                    FEATURE.to_owned()
-                } else {
-                    format!("{existing}, {FEATURE}")
-                };
-                lines[i] = format!(
-                    "{indent}{}{}{}",
-                    &trimmed[..list_start],
-                    new_list,
-                    &trimmed[list_end..]
-                );
-            } else {
-                // No features key — insert before closing `}`.
-                let close = trimmed.rfind('}').unwrap();
-                let before_close = trimmed[..close].trim_end();
-                let sep = if before_close.ends_with('{') {
-                    ""
-                } else {
-                    ", "
-                };
-                lines[i] = format!(
-                    "{indent}{}{sep}features = [{FEATURE}]{}",
-                    &trimmed[..close],
-                    &trimmed[close..]
-                );
-            }
-            break;
-        }
-
-        // Cargo does not normalize `-`/`_` in a dependency table key: unlike
-        // `[dependencies.autumn-web]`, `[dependencies.autumn_web]` names an
-        // unrelated package `autumn_web` unless its body renames it back with
-        // `package = "autumn-web"` (confirmed via `cargo metadata`). Require
-        // that declaration before treating the underscore form as a match, the
-        // same way `find_section_start_with_autumn_web_package` does.
-        let underscore_aliases_autumn_web = trimmed == subtable_header_underscore && {
-            let body_end = lines[i + 1..]
-                .iter()
-                .position(|l| l.trim_start().starts_with('['))
-                .map_or(lines.len(), |p| i + 1 + p);
-            lines[i + 1..body_end].iter().any(|l| {
-                let code = l.split_once('#').map_or(l.as_str(), |(before, _)| before);
-                declares_package(code, CRATE)
-            })
-        };
-
-        if trimmed == subtable_header || underscore_aliases_autumn_web {
-            // Scan ahead within the subtable.
-            let mut j = i + 1;
-            let mut found_features = false;
-            while j < lines.len() {
-                let t = lines[j].trim().to_owned();
-                if t.starts_with('[') {
-                    break;
-                }
-                if t.starts_with("features") {
-                    found_features = true;
-                    // A trailing `# comment` on the opener line is not TOML —
-                    // check only the code portion, both for "is the feature
-                    // already mentioned" and for locating a real closing `]`
-                    // (a `]` inside the comment would misclassify a genuinely
-                    // multiline array as single-line and merge into dead text
-                    // past the `#`).
-                    if strip_line_comment(&t).contains(FEATURE) {
-                        break;
-                    }
-                    if let Some(open) = t.find('[') {
-                        if let Some(close) = find_unquoted(strip_line_comment(&t), ']') {
-                            let inner = t[open + 1..close].trim();
-                            let new_inner = if inner.is_empty() {
-                                FEATURE.to_owned()
-                            } else {
-                                format!("{inner}, {FEATURE}")
-                            };
-                            let indent_j: String = lines[j]
-                                .chars()
-                                .take_while(char::is_ascii_whitespace)
-                                .collect();
-                            lines[j] = format!("{indent_j}features = [{new_inner}]");
-                        } else {
-                            // Multiline `features = [` … `]` array: scan every
-                            // line up to the closing bracket. The feature may
-                            // already be merged on a line other than the
-                            // opener, in which case nothing should be
-                            // appended (it would otherwise be duplicated on
-                            // every re-run of the generator).
-                            let mut k = j + 1;
-                            let mut already_present = false;
-                            let mut close_line = None;
-                            while k < lines.len() {
-                                let tk = lines[k].trim();
-                                if tk.starts_with('[') {
-                                    break;
-                                }
-                                // A `#`-commented-out mention of the feature or
-                                // a stray `]` inside a comment is not TOML —
-                                // check only the code portion of the line.
-                                let code = strip_line_comment(tk);
-                                if code.contains(FEATURE) {
-                                    already_present = true;
-                                }
-                                if find_unquoted(code, ']').is_some() {
-                                    close_line = Some(k);
-                                    break;
-                                }
-                                k += 1;
-                            }
-                            if !already_present && let Some(k) = close_line {
-                                let tk = lines[k].trim().to_owned();
-                                let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
-                                let before_close = tk[..close_idx].trim();
-                                // The closing bracket's own line may have no
-                                // entry before it (just `]`, or just a
-                                // comment), in which case the last real entry
-                                // — needed to know whether a comma must be
-                                // inserted — is on an earlier line. A trailing
-                                // `# comment` never counts as the entry: strip
-                                // it before checking, or a commented `"ws", #
-                                // note` line reads as not ending in ',' and
-                                // gets a second, invalid comma inserted ahead
-                                // of it.
-                                let last_entry = (j..=k).rev().find_map(|idx| {
-                                    let raw: &str = if idx == k {
-                                        before_close
-                                    } else if idx == j {
-                                        lines[idx].split_once('[').map_or("", |(_, rest)| rest)
-                                    } else {
-                                        &lines[idx]
-                                    };
-                                    let raw = strip_line_comment(raw).trim();
-                                    (!raw.is_empty()).then(|| raw.to_owned())
-                                });
-                                let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
-                                    ", "
-                                } else {
-                                    ""
-                                };
-                                let indent_k: String = lines[k]
-                                    .chars()
-                                    .take_while(char::is_ascii_whitespace)
-                                    .collect();
-                                lines[k] = format!(
-                                    "{indent_k}{before_close}{sep}{FEATURE}{}",
-                                    &tk[close_idx..]
-                                );
-                            }
-                        }
-                    }
-                    break;
-                }
-                j += 1;
-            }
-            if !found_features {
-                lines.insert(i + 1, format!("features = [{FEATURE}]"));
-            }
-            break;
-        }
-
-        i += 1;
-    }
-
-    let mut out = lines.join("\n");
-    if trailing_newline && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+    ensure_autumn_web_feature(toml, "mail")
 }
 
 fn append_oauth_stubs_to_toml(existing: &str, providers: &[String]) -> String {
@@ -3266,7 +3111,43 @@ pub async fn remember_me_startup(state: AppState) -> AutumnResult<()> {{
             state.config().auth.remember.clone(),
             state.auth_session_key().to_string(),
         );
+        // Re-point the tracked row after ANY session-id rotation (impersonation,
+        // idle rotation, app code), so the next request does not 401.
+        let pool = pool.clone();
+        state
+            .session_rotation_hooks()
+            .register(move |rotation| {{
+                let pool = pool.clone();
+                async move {{
+                    rebind_tracked_session_on_rotation(&pool, &rotation)
+                        .await
+                        .map_err(|e| e.to_string().into())
+                }}
+            }});
     }}
+    Ok(())
+}}
+
+/// Move the tracked row from the old session id's digest to the new one.
+///
+/// No row matches when the flow already rebound it, so a repeat is harmless.
+async fn rebind_tracked_session_on_rotation(
+    pool: &diesel_async::pooled_connection::deadpool::Pool<::autumn_web::RuntimeConnection>,
+    rotation: &::autumn_web::session::SessionRotation,
+) -> AutumnResult<()> {{
+    let mut db = pool.get().await.map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!("Failed to rebind tracked session: {{e}}"))
+    }})?;
+    // The row sits under any earlier id of this request: a flow may have moved
+    // it by hand after a first rotation.
+    let earlier: Vec<String> = rotation.earlier_ids.iter().map(|id| sha256_hex(id)).collect();
+    diesel::update({sess_table}::table.filter({sess_table}::token_digest.eq_any(earlier)))
+    .set({sess_table}::token_digest.eq(sha256_hex(&rotation.new_id)))
+    .execute(&mut *db)
+    .await
+    .map_err(|e| {{
+        AutumnError::internal_server_error_msg(format!("Failed to rebind tracked session: {{e}}"))
+    }})?;
     Ok(())
 }}
 
@@ -3729,10 +3610,20 @@ pub async fn require_tracked_session(
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| AutumnError::unauthorized_msg("Not authenticated."))?;
 
+    // While an operator impersonates, `{snake_name}_id` is the target but the row
+    // still belongs to the operator who signed in. Match the row by its owner.
+    let row_owner_id: i64 = ::autumn_web::auth::impersonation::audit_actor_id(
+        session,
+        &{snake_name}_id.to_string(),
+    )
+    .await
+    .parse()
+    .unwrap_or({snake_name}_id);
+
     let token_digest = session_token_digest(session).await;
     let tracked: Option<{pascal_name}Session> = {sess_table}::table
         .filter({sess_table}::token_digest.eq(&token_digest))
-        .filter({sess_table}::user_id.eq({snake_name}_id))
+        .filter({sess_table}::user_id.eq(row_owner_id))
         .select({pascal_name}Session::as_select())
         .first(&mut **db)
         .await
@@ -3822,7 +3713,7 @@ fn sessions_list_fragment(
                             @if let Some(csrf) = csrf {{
                                 input type="hidden" name=(csrf_name) value=(csrf.token());
                             }}
-                            input type="text" name="label" placeholder="Device label"
+                            input type="text" name="label" aria-label="Device label" placeholder="Device label"
                                 value=[s.label.as_deref()];
                             button type="submit" {{ "Save label" }}
                         }}
@@ -4058,12 +3949,12 @@ fn render_signup_form(
         form action="/signup" method="post" {{
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "Email" }}
-                input type="email" name="email" required autocomplete="email";
+                label for="email" {{ "Email" }}
+                input type="email" id="email" name="email" required autocomplete="email";
             }}
             div {{
-                label {{ "Password (" (min_len) "+ characters)" }}
-                input type="password" name="password" required
+                label for="password" {{ "Password (" (min_len) "+ characters)" }}
+                input type="password" id="password" name="password" required
                       autocomplete="new-password" minlength=(min_len);
             }}
             button type="submit" {{ "Sign Up" }}
@@ -4226,12 +4117,12 @@ pub async fn login_form(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Optio
         form action="/login" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "Email" }}
-                input type="email" name="email" required autocomplete="email";
+                label for="email" {{ "Email" }}
+                input type="email" id="email" name="email" required autocomplete="email";
             }}
             div {{
-                label {{ "Password" }}
-                input type="password" name="password" required
+                label for="password" {{ "Password" }}
+                input type="password" id="password" name="password" required
                       autocomplete="current-password";
             }}
             label {{
@@ -4276,6 +4167,28 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for MaybeClientIp {{
             .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         Ok(MaybeClientIp(ip))
     }}
+}}
+
+/// Stamp `locked_at` when the failure count reaches the threshold.
+///
+/// The UPDATE needs `failed_attempts >= threshold` and `locked_at IS NULL`.
+/// So only one concurrent caller changes the row, and a reset by a good login
+/// is never undone (#2500). The clock is read here, just before the write,
+/// so a slow caller cannot save an old time (#2531).
+///
+/// Returns `true` only when this call set the lock. Log only on `true`.
+async fn stamp_lockout(db: &mut Db, id: i64, threshold: i32) -> AutumnResult<bool> {{
+    let locked_rows = diesel::update(
+        {table}::table
+            .find(id)
+            .filter({table}::failed_attempts.ge(threshold))
+            .filter({table}::locked_at.is_null()),
+    )
+    .set({table}::locked_at.eq(Some(chrono::Utc::now().naive_utc())))
+    .execute(&mut **db)
+    .await
+    .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
+    Ok(locked_rows > 0)
 }}
 
 /// `POST /login` — verify credentials and start a session.
@@ -4381,35 +4294,15 @@ pub async fn login(
                 }};
 
                 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
-                    // Account transitions into the locked state — stamp locked_at,
-                    // but only if the row still shows an over-threshold, not-yet-locked
-                    // state at write time. `current_locked_at` above is a stale
-                    // in-memory read from before the password check; without a
-                    // fresh DB-level guard, a concurrent *successful* login could
-                    // reset failed_attempts/locked_at between our increment and this
-                    // write, and this UPDATE would silently re-lock an account that
-                    // just logged in successfully (#2500). Filtering on the row's
-                    // current failed_attempts and locked_at makes the write a no-op
-                    // in that case instead of clobbering the reset. Propagate errors:
-                    // if this write fails the account is not locked despite the
-                    // counter crossing the threshold, which would allow a successful
-                    // login to slip through.
-                    let locked_rows = diesel::update(
-                        {table}::table
-                            .find({snake_name}.id)
-                            .filter({table}::failed_attempts.ge(lockout_cfg.threshold))
-                            .filter({table}::locked_at.is_null()),
-                    )
-                        .set({table}::locked_at.eq(Some(now)))
-                        .execute(&mut *db)
-                        .await
-                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
+                    // The account reaches the threshold. `current_locked_at` is an
+                    // old read, so the helper checks the row again in the database.
+                    // Propagate errors: a failed write leaves the account unlocked.
+                    let newly_locked =
+                        stamp_lockout(&mut db, {snake_name}.id, lockout_cfg.threshold).await?;
 
-                    // Only emit lockout telemetry when this request's write actually
-                    // applied the lock — a concurrent successful login winning the
-                    // race above means the account never ends up locked, so it must
-                    // not be reported as such.
-                    if locked_rows > 0 {{
+                    // Log only when this call set the lock. A concurrent call or a
+                    // good login can win the race, and then nothing is logged.
+                    if newly_locked {{
                         // Truncate to a coarse IP prefix (IPv4 /24, IPv6 /64) so
                         // the telemetry event enables incident response without
                         // logging a precise user identifier.
@@ -4769,16 +4662,16 @@ fn render_change_password_form(
         form action="/account/password" method="post" {{
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "Current password" }}
-                input type="password" name="current_password" autocomplete="current-password" required;
+                label for="current-password" {{ "Current password" }}
+                input type="password" id="current-password" name="current_password" autocomplete="current-password" required;
             }}
             div {{
-                label {{ "New password" }}
-                input type="password" name="new_password" autocomplete="new-password" required;
+                label for="new-password" {{ "New password" }}
+                input type="password" id="new-password" name="new_password" autocomplete="new-password" required;
             }}
             div {{
-                label {{ "Confirm new password" }}
-                input type="password" name="new_password_confirmation" autocomplete="new-password" required;
+                label for="new-password-confirmation" {{ "Confirm new password" }}
+                input type="password" id="new-password-confirmation" name="new_password_confirmation" autocomplete="new-password" required;
             }}
             button type="submit" {{ "Change Password" }}
         }}
@@ -4976,12 +4869,12 @@ fn render_change_email_form(
         form action="/account/email" method="post" {{
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "New email address" }}
-                input type="email" name="new_email" autocomplete="email" required;
+                label for="new-email" {{ "New email address" }}
+                input type="email" id="new-email" name="new_email" autocomplete="email" required;
             }}
             div {{
-                label {{ "Current password" }}
-                input type="password" name="current_password" autocomplete="current-password" required;
+                label for="current-password" {{ "Current password" }}
+                input type="password" id="current-password" name="current_password" autocomplete="current-password" required;
             }}
             button type="submit" {{ "Send Confirmation Link" }}
         }}
@@ -5340,8 +5233,8 @@ pub async fn reauth_form(
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             input type="hidden" name="return_to" value=(return_to);
             div {{
-                label {{ "Password" }}
-                input type="password" name="password" autocomplete="current-password" required;
+                label for="password" {{ "Password" }}
+                input type="password" id="password" name="password" autocomplete="current-password" required;
             }}
             {totp_reauth_field}
             button type="submit" {{ "Confirm" }}
@@ -5403,8 +5296,8 @@ pub async fn reauth(
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(ret);
                     div {{
-                        label {{ "Password" }}
-                        input type="password" name="password" autocomplete="current-password" required;
+                        label for="password" {{ "Password" }}
+                        input type="password" id="password" name="password" autocomplete="current-password" required;
                     }}
                     {totp_reauth_field}
                     button type="submit" {{ "Confirm" }}
@@ -5463,20 +5356,8 @@ pub async fn reauth(
                     1i32
                 }};
                 if new_attempts >= lockout_cfg.threshold && current_locked_at.is_none() {{
-                    // See the login handler's matching guard (#2500): filter on the
-                    // row's current failed_attempts/locked_at rather than writing
-                    // unconditionally, so a concurrent successful reauth that already
-                    // reset the counter cannot be silently re-locked.
-                    diesel::update(
-                        {table}::table
-                            .find({snake_name}.id)
-                            .filter({table}::failed_attempts.ge(lockout_cfg.threshold))
-                            .filter({table}::locked_at.is_null()),
-                    )
-                        .set({table}::locked_at.eq(Some(now)))
-                        .execute(&mut *db)
-                        .await
-                        .map_err(|e| AutumnError::internal_server_error_msg(&format!("Failed to lock account: {{e}}")))?;
+                    // Same guarded stamp as `login` (#2500, #2531). This path does not log.
+                    stamp_lockout(&mut db, {snake_name}.id, lockout_cfg.threshold).await?;
                 }}
                 session.remove("reauth_pw_ok").await;
                 return Ok(reauth_form_err(&form.return_to));
@@ -5560,8 +5441,8 @@ pub async fn forgot_password_form(csrf: Option<CsrfToken>, csrf_field: Option<Cs
         form action="/forgot-password" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "Email" }}
-                input type="email" name="email" required autocomplete="email";
+                label for="email" {{ "Email" }}
+                input type="email" id="email" name="email" required autocomplete="email";
             }}
             button type="submit" {{ "Send Reset Link" }}
         }}
@@ -5672,8 +5553,8 @@ fn render_reset_password_form(
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             input type="hidden" name="token" value=(token);
             div {{
-                label {{ "New Password (" (min_len) "+ characters)" }}
-                input type="password" name="password" required
+                label for="password" {{ "New Password (" (min_len) "+ characters)" }}
+                input type="password" id="password" name="password" required
                       autocomplete="new-password" minlength=(min_len);
             }}
             button type="submit" {{ "Set New Password" }}
@@ -6012,8 +5893,8 @@ pub async fn resend_confirmation_form(
         form action="/auth/confirm/resend" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             div {{
-                label {{ "Email" }}
-                input type="email" name="email" required autocomplete="email";
+                label for="email" {{ "Email" }}
+                input type="email" id="email" name="email" required autocomplete="email";
             }}
             button type="submit" {{ "Resend Confirmation Email" }}
         }}
@@ -7825,7 +7706,8 @@ credential-stuffing attacks that rotate source IPs to bypass IP-rate limiting.
 
 1. Each failed login increments `failed_attempts` on the account row.
 2. When `failed_attempts` reaches `threshold`, `locked_at` is stamped with the
-   current time and a structured telemetry event fires (see below).
+   current time and a structured telemetry event fires (see below). Only the
+   request that sets `locked_at` logs, so each lock logs once.
 3. While the account is locked (`locked_at + cooloff_secs > now`), every login
    attempt — correct password or not — returns the same `422 Invalid email or
    password` response as a wrong-password attempt (non-enumerating).
@@ -8855,8 +8737,8 @@ fn totp_confirm_branch_src(snake_name: &str) -> String {
 /// `totp_enabled = true` and ignores it for accounts that don't.
 fn totp_reauth_field_src() -> String {
     "            div {{\n\
-     \x20               label {{ \"Authenticator code\" }}\n\
-     \x20               input type=\"text\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
+     \x20               label for=\"totp-code\" {{ \"Authenticator code\" }}\n\
+     \x20               input type=\"text\" id=\"totp-code\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
      \x20                   inputmode=\"text\" pattern=\"[0-9a-fA-F \\\\-]*\" placeholder=\"6-digit code or recovery code\";\n\
      \x20               small {{ \"Required if your account uses two-factor authentication.\" }}\n\
      \x20           }}\n"
@@ -8885,8 +8767,8 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(return_to);
                     div {{
-                        label {{ "Authenticator code" }}
-                        input type="text" name="totp_code" autocomplete="one-time-code"
+                        label for="totp-code" {{ "Authenticator code" }}
+                        input type="text" id="totp-code" name="totp_code" autocomplete="one-time-code"
                             inputmode="numeric" pattern="[0-9 ]*" required
                             placeholder="6-digit code or recovery code";
                         small {{ "Required if your account uses two-factor authentication." }}
@@ -8951,8 +8833,8 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(return_to);
                     div {{
-                        label {{ "Authenticator code" }}
-                        input type="text" name="totp_code" autocomplete="one-time-code"
+                        label for="totp-code" {{ "Authenticator code" }}
+                        input type="text" id="totp-code" name="totp_code" autocomplete="one-time-code"
                             inputmode="numeric" pattern="[0-9 ]*" required
                             placeholder="6-digit code or recovery code";
                         small {{ "Required if your account uses two-factor authentication." }}
@@ -9055,12 +8937,12 @@ fn totp_enc_key() -> AutumnResult<[u8; 32]> {
 fn encrypt_secret(plaintext: &[u8]) -> AutumnResult<String> {
     use rand::TryRngCore;
     let key = totp_enc_key()?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let cipher = Aes256Gcm::new(<&Key<Aes256Gcm>>::from(&key));
     let mut nonce_bytes = [0u8; 12];
     rand::rngs::OsRng
         .try_fill_bytes(&mut nonce_bytes)
         .map_err(|_| AutumnError::internal_server_error_msg("RNG failure generating nonce"))?;
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let nonce = <&Nonce<_>>::from(&nonce_bytes);
     let ct = cipher
         .encrypt(nonce, plaintext)
         .map_err(|_| AutumnError::internal_server_error_msg("failed to encrypt TOTP secret"))?;
@@ -9072,7 +8954,7 @@ fn encrypt_secret(plaintext: &[u8]) -> AutumnResult<String> {
 /// Decrypt a stored TOTP secret produced by [`encrypt_secret`].
 fn decrypt_secret(stored: &str) -> AutumnResult<Vec<u8>> {
     let key = totp_enc_key()?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let cipher = Aes256Gcm::new(<&Key<Aes256Gcm>>::from(&key));
     let raw = B64
         .decode(stored.trim())
         .map_err(|_| AutumnError::internal_server_error_msg("stored TOTP secret is not valid base64"))?;
@@ -9082,7 +8964,7 @@ fn decrypt_secret(stored: &str) -> AutumnResult<Vec<u8>> {
         ));
     }
     let (nonce_bytes, ct) = raw.split_at(12);
-    let nonce = Nonce::from_slice(nonce_bytes);
+    let nonce = <&Nonce<_>>::from(nonce_bytes);
     cipher
         .decrypt(nonce, ct)
         .map_err(|_| AutumnError::internal_server_error_msg("failed to decrypt TOTP secret"))
@@ -9183,9 +9065,10 @@ pub async fn two_factor_status(
             form action="/account/2fa/disable" method="post" {
                 @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
                 p {
-                    label { "Confirm with your password or a current 6-digit code:" }
-                    input type="password" name="password" autocomplete="current-password";
-                    input type="text" name="code" inputmode="numeric" autocomplete="one-time-code";
+                    label for="disable-password" { "Confirm with your password" }
+                    input type="password" id="disable-password" name="password" autocomplete="current-password";
+                    label for="disable-code" { "or a current 6-digit code" }
+                    input type="text" id="disable-code" name="code" inputmode="numeric" autocomplete="one-time-code";
                 }
                 button type="submit" { "Disable two-factor" }
             }
@@ -9194,8 +9077,8 @@ pub async fn two_factor_status(
             form action="/account/2fa/enable" method="post" {
                 @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
                 p {
-                    label { "Confirm your password to begin enrollment:" }
-                    input type="password" name="password" autocomplete="current-password" required;
+                    label for="enable-password" { "Confirm your password to begin enrollment:" }
+                    input type="password" id="enable-password" name="password" autocomplete="current-password" required;
                 }
                 button type="submit" { "Enable two-factor" }
             }
@@ -9283,7 +9166,8 @@ pub async fn two_factor_enable(
         p { "Enter the 6-digit code shown in your app to finish enabling 2FA." }
         form action="/account/2fa/confirm" method="post" {
             @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
-            input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required;
+            label for="confirm-code" { "6-digit code" }
+            input type="text" id="confirm-code" name="code" inputmode="numeric" autocomplete="one-time-code" required;
             button type="submit" { "Confirm and enable" }
         }
     }))
@@ -9536,8 +9420,8 @@ pub async fn login_verify_form(
         form action="/login/verify" method="post" {
             @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
             div {
-                label { "Authentication code or recovery code" }
-                input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" required;
+                label for="code" { "Authentication code or recovery code" }
+                input type="text" id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required;
             }
             button type="submit" { "Verify" }
         }
@@ -9880,8 +9764,8 @@ pub async fn magic_link_request_form(
         form action="/login/magic" method="post" {
             @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
             div {
-                label { "Email" }
-                input type="email" name="email" required autocomplete="email";
+                label for="email" { "Email" }
+                input type="email" id="email" name="email" required autocomplete="email";
             }
             button type="submit" { "Email me a link" }
         }
@@ -11269,246 +11153,8 @@ older browsers.
 }
 
 /// Ensure `autumn-web` in `[dependencies]` has `features = ["webauthn"]`.
-///
-/// The `[dependencies.autumn_web]` underscore spelling is only treated as this
-/// dependency when the table body renames the package back with
-/// `package = "autumn-web"` — without that rename Cargo resolves the table to a
-/// different package literally named `autumn_web`, which must be left untouched.
-#[allow(clippy::too_many_lines)]
 fn ensure_autumn_web_webauthn_feature(toml: &str) -> String {
-    const CRATE: &str = "autumn-web";
-    const FEATURE: &str = "\"webauthn\"";
-
-    let mut lines: Vec<String> = toml.lines().map(str::to_owned).collect();
-    let trailing_newline = toml.ends_with('\n');
-
-    let simple_prefix = format!("{CRATE} = \"");
-    let table_prefix = format!("{CRATE} = {{");
-    let subtable_header = format!("[dependencies.{CRATE}]");
-    let subtable_header_underscore = format!("[dependencies.{}]", CRATE.replace('-', "_"));
-
-    let mut i = 0;
-    while i < lines.len() {
-        let trimmed = lines[i].trim().to_owned();
-        let indent: String = lines[i]
-            .chars()
-            .take_while(char::is_ascii_whitespace)
-            .collect();
-
-        if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
-            let version = rest.trim_end_matches('"');
-            lines[i] =
-                format!("{indent}{CRATE} = {{ version = \"{version}\", features = [{FEATURE}] }}");
-            break;
-        }
-
-        if trimmed.starts_with(&table_prefix) {
-            // A trailing `# comment` mentioning the feature is not TOML —
-            // check only the code portion of the line, the same guard the
-            // subtable branch below needs against a commented-out mention.
-            if strip_line_comment(&trimmed).contains(FEATURE) {
-                break; // already present
-            }
-            if let Some(feat_bracket) =
-                find_unquoted_str(strip_line_comment(&trimmed), "features = [")
-            {
-                let list_start = feat_bracket + "features = [".len();
-                if let Some(close_bracket) = find_unquoted(&trimmed[list_start..], ']') {
-                    let list_end = close_bracket + list_start;
-                    let existing = trimmed[list_start..list_end].trim();
-                    let new_list = if existing.is_empty() {
-                        FEATURE.to_owned()
-                    } else {
-                        format!("{existing}, {FEATURE}")
-                    };
-                    lines[i] = format!(
-                        "{indent}{}{}{}",
-                        &trimmed[..list_start],
-                        new_list,
-                        &trimmed[list_end..]
-                    );
-                } else {
-                    let mut j = i + 1;
-                    while j < lines.len() {
-                        let tj = lines[j].trim();
-                        if tj.starts_with('[') {
-                            break;
-                        }
-                        if let Some(close_idx) = find_unquoted(strip_line_comment(tj), ']') {
-                            let before_close = tj[..close_idx].trim();
-                            let sep = if before_close.is_empty() || before_close.ends_with(',') {
-                                ""
-                            } else {
-                                ", "
-                            };
-                            let indent_j: String = lines[j]
-                                .chars()
-                                .take_while(char::is_ascii_whitespace)
-                                .collect();
-                            lines[j] = format!(
-                                "{indent_j}{before_close}{sep}{FEATURE}{}",
-                                &tj[close_idx..]
-                            );
-                            break;
-                        }
-                        j += 1;
-                    }
-                }
-            } else {
-                // No features key — insert before closing `}`.
-                let close = trimmed.rfind('}').unwrap();
-                let before_close = trimmed[..close].trim_end();
-                let sep = if before_close.ends_with('{') {
-                    ""
-                } else {
-                    ", "
-                };
-                lines[i] = format!(
-                    "{indent}{}{sep}features = [{FEATURE}]{}",
-                    &trimmed[..close],
-                    &trimmed[close..]
-                );
-            }
-            break;
-        }
-
-        // Cargo does not normalize `-`/`_` in a dependency table key: unlike
-        // `[dependencies.autumn-web]`, `[dependencies.autumn_web]` names an
-        // unrelated package `autumn_web` unless its body renames it back with
-        // `package = "autumn-web"` (confirmed via `cargo metadata`). Require
-        // that declaration before treating the underscore form as a match, the
-        // same way `find_section_start_with_autumn_web_package` does.
-        let underscore_aliases_autumn_web = trimmed == subtable_header_underscore && {
-            let body_end = lines[i + 1..]
-                .iter()
-                .position(|l| l.trim_start().starts_with('['))
-                .map_or(lines.len(), |p| i + 1 + p);
-            lines[i + 1..body_end].iter().any(|l| {
-                let code = l.split_once('#').map_or(l.as_str(), |(before, _)| before);
-                declares_package(code, CRATE)
-            })
-        };
-
-        if trimmed == subtable_header || underscore_aliases_autumn_web {
-            // Scan ahead within the subtable.
-            let mut j = i + 1;
-            let mut found_features = false;
-            while j < lines.len() {
-                let t = lines[j].trim().to_owned();
-                if t.starts_with('[') {
-                    break;
-                }
-                if t.starts_with("features") {
-                    found_features = true;
-                    // A trailing `# comment` on the opener line is not TOML —
-                    // check only the code portion, both for "is the feature
-                    // already mentioned" and for locating a real closing `]`
-                    // (a `]` inside the comment would misclassify a genuinely
-                    // multiline array as single-line and merge into dead text
-                    // past the `#`).
-                    if strip_line_comment(&t).contains(FEATURE) {
-                        break;
-                    }
-                    if let Some(open) = t.find('[') {
-                        if let Some(close) = find_unquoted(strip_line_comment(&t), ']') {
-                            let inner = t[open + 1..close].trim();
-                            let new_inner = if inner.is_empty() {
-                                FEATURE.to_owned()
-                            } else {
-                                format!("{inner}, {FEATURE}")
-                            };
-                            let indent_j: String = lines[j]
-                                .chars()
-                                .take_while(char::is_ascii_whitespace)
-                                .collect();
-                            lines[j] = format!("{indent_j}features = [{new_inner}]");
-                        } else {
-                            // Multiline `features = [` … `]` array: scan every
-                            // line up to the closing bracket. The feature may
-                            // already be merged on a line other than the
-                            // opener, in which case nothing should be
-                            // appended (it would otherwise be duplicated on
-                            // every re-run of the generator).
-                            let mut k = j + 1;
-                            let mut already_present = false;
-                            let mut close_line = None;
-                            while k < lines.len() {
-                                let tk = lines[k].trim();
-                                if tk.starts_with('[') {
-                                    break;
-                                }
-                                // A `#`-commented-out mention of the feature or
-                                // a stray `]` inside a comment is not TOML —
-                                // check only the code portion of the line.
-                                let code = strip_line_comment(tk);
-                                if code.contains(FEATURE) {
-                                    already_present = true;
-                                }
-                                if find_unquoted(code, ']').is_some() {
-                                    close_line = Some(k);
-                                    break;
-                                }
-                                k += 1;
-                            }
-                            if !already_present && let Some(k) = close_line {
-                                let tk = lines[k].trim().to_owned();
-                                let close_idx = find_unquoted(&tk, ']').unwrap_or(tk.len());
-                                let before_close = tk[..close_idx].trim();
-                                // The closing bracket's own line may have no
-                                // entry before it (just `]`, or just a
-                                // comment), in which case the last real entry
-                                // — needed to know whether a comma must be
-                                // inserted — is on an earlier line. A trailing
-                                // `# comment` never counts as the entry: strip
-                                // it before checking, or a commented `"ws", #
-                                // note` line reads as not ending in ',' and
-                                // gets a second, invalid comma inserted ahead
-                                // of it.
-                                let last_entry = (j..=k).rev().find_map(|idx| {
-                                    let raw: &str = if idx == k {
-                                        before_close
-                                    } else if idx == j {
-                                        lines[idx].split_once('[').map_or("", |(_, rest)| rest)
-                                    } else {
-                                        &lines[idx]
-                                    };
-                                    let raw = strip_line_comment(raw).trim();
-                                    (!raw.is_empty()).then(|| raw.to_owned())
-                                });
-                                let sep = if last_entry.is_some_and(|e| !e.ends_with(',')) {
-                                    ", "
-                                } else {
-                                    ""
-                                };
-                                let indent_k: String = lines[k]
-                                    .chars()
-                                    .take_while(char::is_ascii_whitespace)
-                                    .collect();
-                                lines[k] = format!(
-                                    "{indent_k}{before_close}{sep}{FEATURE}{}",
-                                    &tk[close_idx..]
-                                );
-                            }
-                        }
-                    }
-                    break;
-                }
-                j += 1;
-            }
-            if !found_features {
-                lines.insert(i + 1, format!("features = [{FEATURE}]"));
-            }
-            break;
-        }
-
-        i += 1;
-    }
-
-    let mut out = lines.join("\n");
-    if trailing_newline && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+    ensure_autumn_web_feature(toml, "webauthn")
 }
 
 fn append_webauthn_stub_to_toml(
@@ -11634,6 +11280,146 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Issue #3170: every `<label>` must name a control. A bare label gives a
+    /// screen reader no accessible name. A label is bound by `for` plus a
+    /// matching `id` in the same form, or by wrapping a checkbox. Every visible
+    /// input needs an `id` or an `aria-label`. Ids are unique in a form.
+    /// Wayfinder audit: every form control the auth scaffold emits has an
+    /// accessible name. A sibling `<label>` with no `for=` names nothing, so
+    /// the login/signup/reset/reauth inputs were unlabeled to assistive tech
+    /// and clicking the visible label did not focus its field.
+    #[test]
+    fn auth_scaffold_has_no_unlabeled_form_controls() {
+        let tmp = project_with_main();
+        plan_auth_full_ex2(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions {
+                providers: Vec::new(),
+            },
+            true, // totp
+            true, // passkeys
+            true, // magic_link
+        )
+        .expect("generate auth must scaffold")
+        .execute(Flags::default())
+        .unwrap();
+        let scan = crate::a11y::scan_project(&tmp.path().join("src")).unwrap();
+        let unlabeled: Vec<String> = scan
+            .findings
+            .iter()
+            .filter(|f| f.rule_id == "label")
+            .map(|f| format!("{}:{} <{}>", f.file, f.line, f.element))
+            .collect();
+        assert!(
+            unlabeled.is_empty(),
+            "auth scaffold has unlabeled controls: {unlabeled:#?}"
+        );
+    }
+
+    #[test]
+    fn generated_forms_bind_every_label_and_input() {
+        let variants = [
+            render_routes_file("User", "user", "users", &[], false, false),
+            render_routes_file("User", "user", "users", &[], true, false),
+            render_routes_file("User", "user", "users", &[], false, true),
+            render_routes_file("User", "user", "users", &["github".to_owned()], true, true),
+        ];
+        let mut bound = 0;
+        for routes in &variants {
+            for form in routes.split("form action=").skip(1) {
+                let mut ids = Vec::new();
+                for (at, _) in form.match_indices("id=\"") {
+                    let rest = &form[at + 4..];
+                    let id = &rest[..rest.find('"').expect("id value ends")];
+                    if form[..at].ends_with("for=\"") {
+                        continue;
+                    }
+                    assert!(!ids.contains(&id), "duplicate id \"{id}\" in one form");
+                    ids.push(id);
+                }
+                for (at, _) in form.match_indices("label ") {
+                    if form[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '"')
+                    {
+                        continue;
+                    }
+                    let rest = &form[at + "label ".len()..];
+                    if let Some(after_for) = rest.strip_prefix("for=\"") {
+                        let id = &after_for[..after_for.find('"').expect("for value ends")];
+                        assert!(ids.contains(&id), "label for=\"{id}\" has no input id");
+                        bound += 1;
+                    } else if rest.starts_with('{') {
+                        let window = &rest[..rest.find('}').expect("label ends")];
+                        assert!(
+                            window.contains("type=\"checkbox\""),
+                            "bare label names no control:\n{window}"
+                        );
+                    }
+                }
+                for (at, _) in form.match_indices("input type=\"") {
+                    let rest = &form[at..];
+                    let stmt = &rest[..rest.find(';').expect("input ends")];
+                    let kind = &stmt["input type=\"".len()..];
+                    if kind.starts_with("hidden") || kind.starts_with("checkbox") {
+                        continue;
+                    }
+                    assert!(
+                        stmt.contains("id=\"") || stmt.contains("aria-label="),
+                        "input has no id or aria-label:\n{stmt}"
+                    );
+                }
+            }
+        }
+        assert!(bound >= 40, "scan found too few labels: {bound}");
+    }
+
+    /// Issue #2347: while impersonating, `{snake}_id` is the target but the
+    /// tracked row belongs to the operator. The lookup must use the operator's
+    /// id, or the next request would miss the row and 401.
+    #[test]
+    fn require_tracked_session_matches_the_row_owner_while_impersonating() {
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        let start = routes
+            .find("pub async fn require_tracked_session")
+            .expect("require_tracked_session is generated");
+        let len = routes[start..].find("\n}\n").expect("fn body ends");
+        let body = &routes[start..start + len];
+        assert!(
+            body.contains("impersonation::audit_actor_id"),
+            "row owner must resolve through the impersonation record:\n{body}"
+        );
+    }
+
+    /// Issue #2347: any `rotate_id()` while logged in moves the digest the
+    /// tracked row is keyed by. The startup hook must register a rotation hook
+    /// that re-points the row, so flows without an explicit rebind (such as
+    /// impersonation) do not 401 on the next request.
+    #[test]
+    fn startup_hook_registers_a_tracked_session_rotation_hook() {
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        let hook_at = routes
+            .find("pub async fn remember_me_startup")
+            .expect("startup hook is generated");
+        let body_len = routes[hook_at..].find("\n}\n").expect("hook body ends");
+        let body = &routes[hook_at..hook_at + body_len];
+        assert!(
+            body.contains(".session_rotation_hooks()") && body.contains(".register("),
+            "startup hook must register a rotation hook:\n{body}"
+        );
+        assert!(
+            routes.contains("async fn rebind_tracked_session_on_rotation"),
+            "rotation hook body must be generated"
+        );
+        assert!(
+            routes.contains("rotation.earlier_ids"),
+            "the hook must find a row an earlier hop already moved"
+        );
+    }
 
     /// Generated request handlers must read config through `state.config_arc()`,
     /// never `state.config()`.
@@ -14915,6 +14701,54 @@ mod tests {
         );
     }
 
+    /// Characterization: `oauth2`/`webauthn` must behave exactly like `mail`
+    /// (above) for the plain `autumn-web = "x.y"` form — pinned ahead of the
+    /// #2753 `ensure_autumn_web_feature` extraction, which only `mail` had an
+    /// explicit test for.
+    #[test]
+    fn cargo_toml_gets_oauth2_feature_simple_string_form() {
+        let input = "[dependencies]\nautumn-web = \"0.3\"\n";
+        let out = ensure_autumn_web_oauth2_feature(input);
+        assert!(
+            out.contains("features = [\"oauth2\"]"),
+            "oauth2 feature missing: {out}"
+        );
+        assert_eq!(out.matches("autumn-web =").count(), 1, "must not duplicate");
+    }
+
+    #[test]
+    fn cargo_toml_gets_oauth2_feature_inline_table_with_existing_features() {
+        let input = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\"ws\"] }\n";
+        let out = ensure_autumn_web_oauth2_feature(input);
+        assert!(out.contains("\"oauth2\""), "oauth2 missing: {out}");
+        assert!(
+            out.contains("\"ws\""),
+            "existing feature must be kept: {out}"
+        );
+    }
+
+    #[test]
+    fn cargo_toml_gets_webauthn_feature_simple_string_form() {
+        let input = "[dependencies]\nautumn-web = \"0.3\"\n";
+        let out = ensure_autumn_web_webauthn_feature(input);
+        assert!(
+            out.contains("features = [\"webauthn\"]"),
+            "webauthn feature missing: {out}"
+        );
+        assert_eq!(out.matches("autumn-web =").count(), 1, "must not duplicate");
+    }
+
+    #[test]
+    fn cargo_toml_gets_webauthn_feature_inline_table_with_existing_features() {
+        let input = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\"ws\"] }\n";
+        let out = ensure_autumn_web_webauthn_feature(input);
+        assert!(out.contains("\"webauthn\""), "webauthn missing: {out}");
+        assert!(
+            out.contains("\"ws\""),
+            "existing feature must be kept: {out}"
+        );
+    }
+
     #[test]
     fn cargo_toml_mail_feature_idempotent() {
         let input = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\"mail\"] }\n";
@@ -16094,6 +15928,68 @@ mod tests {
         );
     }
 
+    /// Characterization: pins the same multiline-subtable-array behavior for
+    /// `oauth2` ahead of the #2753 extraction — the mail/webauthn copies above
+    /// already had this test, oauth2 did not.
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_merges_multiline_subtable_array() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\n    \"ws\",\n]\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"oauth2\""),
+            "multiline subtable features must be merged: {out}"
+        );
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            1,
+            "oauth2 duplicated: {out}"
+        );
+    }
+
+    /// Characterization: every existing subtable-form fixture for all three
+    /// `ensure_autumn_web_*_feature` copies used a multiline `features = [...]`
+    /// array, so the single-line subtable branch (`features = ["ws"]` on one
+    /// line, non-empty) had zero coverage before #3358's
+    /// `ensure_autumn_web_feature` extraction — codecov's patch-coverage check
+    /// on that PR only surfaced it once `generate::auth::` was actually
+    /// instrumented (ci.yml db-ignored lane).
+    #[test]
+    fn ensure_autumn_web_mail_feature_subtable_single_line_array_appends_feature() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = [\"ws\"]\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"mail\""),
+            "single-line subtable features must be merged: {out}"
+        );
+        assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
+    }
+
+    /// Same gap, the empty-array case: a single-line subtable `features = []`
+    /// has no existing entries, so the "insert the first feature" path
+    /// (rather than "append with a comma") must run instead.
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_subtable_single_line_empty_array_inserts_feature() {
+        let toml = "[dependencies.autumn-web]\nversion = \"0.3\"\nfeatures = []\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("features = [\"oauth2\"]"),
+            "oauth2 feature missing for single-line empty subtable array: {out}"
+        );
+    }
+
+    /// Same gap, the inline-table form: every existing inline-table fixture
+    /// either had no `features` key or a non-empty one, so the inline-table
+    /// "existing list is empty" path was never exercised either.
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_inline_table_empty_array_inserts_feature() {
+        let toml = "autumn-web = { version = \"0.3\", features = [] }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("features = [\"webauthn\"]"),
+            "webauthn feature missing for empty inline-table array: {out}"
+        );
+    }
+
     #[test]
     fn ensure_webauthn_rs_features_merges_multiline_subtable_array() {
         // #2753 missed-fix #2: same gap as the two autumn-web copies, in the
@@ -16266,6 +16162,182 @@ mod tests {
             out.matches("\"oauth2\"").count(),
             2,
             "oauth2 must be merged as a real feature (the comment's mention is the other match): {out}"
+        );
+    }
+
+    // #2753 missed-fix #3: a multiline `features = [` array inside the
+    // *inline-table* form (`autumn-web = { ..., features = [\n ... \n] }`,
+    // legal TOML since 1.0) was only handled by two of the three autumn-web
+    // copies. `oauth2`/`webauthn` already scanned forward for the real
+    // closing `]`; `mail` indexed the same-line search result with `.unwrap()`
+    // and panicked on this exact input instead of silently no-op'ing like
+    // missed-fix #1/#2 — a worse failure mode (CLI crash, not silent no-op).
+    #[test]
+    fn ensure_autumn_web_mail_feature_merges_multiline_inline_table_array() {
+        let toml =
+            "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"mail\""),
+            "multiline inline-table features must be merged: {out}"
+        );
+        assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_merges_multiline_inline_table_array() {
+        let toml =
+            "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"webauthn\""),
+            "multiline inline-table features must be merged: {out}"
+        );
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            1,
+            "webauthn duplicated: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_merges_multiline_inline_table_array() {
+        let toml =
+            "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n] }\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"oauth2\""),
+            "multiline inline-table features must be merged: {out}"
+        );
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            1,
+            "oauth2 duplicated: {out}"
+        );
+    }
+
+    // Codex review on #3084: a first version of the inline-table multiline
+    // fix (ported from oauth2/webauthn's own, then-unhardened branch) only
+    // looked at the closing line for the separator decision, so a last
+    // entry with no trailing comma on an earlier line produced invalid TOML
+    // — the same defect #2948 already fixed once for the subtable form.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_multiline_array_without_trailing_comma_stays_valid_toml()
+     {
+        let toml =
+            "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\"\n] }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"mail\""),
+            "both features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_inline_table_multiline_array_without_trailing_comma_stays_valid_toml()
+     {
+        let toml =
+            "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\"\n] }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"webauthn\""),
+            "both features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_inline_table_multiline_array_without_trailing_comma_stays_valid_toml()
+     {
+        let toml =
+            "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\"\n] }\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("\"ws\"") && out.contains("\"oauth2\""),
+            "both features must be present: {out}"
+        );
+        toml::from_str::<toml::Value>(&out)
+            .unwrap_or_else(|e| panic!("rewritten Cargo.toml must still parse: {e}\n{out}"));
+    }
+
+    // Codex review on #3084: the first version's "already present?" check
+    // only looked at the opener line, not the rest of a multiline
+    // inline-table array, so a feature already merged on a continuation
+    // line got a duplicate appended — the same defect #2948 already fixed
+    // once for the subtable form.
+    #[test]
+    fn ensure_autumn_web_mail_feature_does_not_duplicate_across_multiline_inline_table_array() {
+        let toml = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n    \"mail\",\n] }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert_eq!(out.matches("\"mail\"").count(), 1, "mail duplicated: {out}");
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_does_not_duplicate_across_multiline_inline_table_array() {
+        let toml = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n    \"webauthn\",\n] }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            1,
+            "webauthn duplicated: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_does_not_duplicate_across_multiline_inline_table_array() {
+        let toml = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n    \"oauth2\",\n] }\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            1,
+            "oauth2 duplicated: {out}"
+        );
+    }
+
+    // Codex review on #3084: an inline table's `}` can carry another
+    // comma-separated field after the array's `]` on the same line, unlike
+    // the subtable form. The "already present?" check read the whole
+    // closing line, so a field whose own string value happened to equal the
+    // feature name (`path = "mail"`) made the array look already merged
+    // when it was not, and the feature never got added.
+    #[test]
+    fn ensure_autumn_web_mail_feature_inline_table_field_value_matching_feature_name_is_not_mistaken_for_already_present()
+     {
+        let toml = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n], path = \"mail\" }\n";
+        let out = ensure_autumn_web_mail_feature(toml);
+        assert_eq!(
+            out.matches("\"mail\"").count(),
+            2,
+            "mail must be merged into the array, not mistaken for the trailing path field: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_inline_table_field_value_matching_feature_name_is_not_mistaken_for_already_present()
+     {
+        let toml = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n], path = \"webauthn\" }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert_eq!(
+            out.matches("\"webauthn\"").count(),
+            2,
+            "webauthn must be merged into the array, not mistaken for the trailing path field: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_inline_table_field_value_matching_feature_name_is_not_mistaken_for_already_present()
+     {
+        let toml = "[dependencies]\nautumn-web = { version = \"0.3\", features = [\n    \"ws\",\n], path = \"oauth2\" }\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert_eq!(
+            out.matches("\"oauth2\"").count(),
+            2,
+            "oauth2 must be merged into the array, not mistaken for the trailing path field: {out}"
         );
     }
 
@@ -16529,6 +16601,60 @@ mod tests {
         let code = out.split('#').next().unwrap();
         assert!(
             code.contains("features = [\"mail\"]"),
+            "a real, uncommented features key must be inserted: {out}"
+        );
+    }
+
+    /// Characterization: pins the same quote-aware key lookup for `oauth2`/
+    /// `webauthn` ahead of the #2753 extraction — only `mail` had this test,
+    /// though all three copies already shared the hardened `find_unquoted_str`
+    /// lookup this pins.
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_finds_key_past_quoted_lookalike_text_without_panicking() {
+        let toml = "autumn-web = { path = \"../features = [fork\", features = [\"oauth2\"] }\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        assert!(
+            out.contains("\"../features = [fork\""),
+            "the quoted path must survive untouched: {out}"
+        );
+        assert!(
+            out.contains("\"oauth2\""),
+            "oauth2 feature must be present: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_finds_key_past_quoted_lookalike_text_without_panicking() {
+        let toml = "autumn-web = { path = \"../features = [fork\", features = [\"webauthn\"] }\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        assert!(
+            out.contains("\"../features = [fork\""),
+            "the quoted path must survive untouched: {out}"
+        );
+        assert!(
+            out.contains("\"webauthn\""),
+            "webauthn feature must be present: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_oauth2_feature_ignores_commented_out_features_key() {
+        let toml = "autumn-web = { version = \"0.3\" } # features = [\"oauth2\"]\n";
+        let out = ensure_autumn_web_oauth2_feature(toml);
+        let code = out.split('#').next().unwrap();
+        assert!(
+            code.contains("features = [\"oauth2\"]"),
+            "a real, uncommented features key must be inserted: {out}"
+        );
+    }
+
+    #[test]
+    fn ensure_autumn_web_webauthn_feature_ignores_commented_out_features_key() {
+        let toml = "autumn-web = { version = \"0.3\" } # features = [\"webauthn\"]\n";
+        let out = ensure_autumn_web_webauthn_feature(toml);
+        let code = out.split('#').next().unwrap();
+        assert!(
+            code.contains("features = [\"webauthn\"]"),
             "a real, uncommented features key must be inserted: {out}"
         );
     }
@@ -17751,72 +17877,52 @@ mod tests {
         );
     }
 
-    /// #2500: the lock-stamping `UPDATE ... SET locked_at = now()` must never be
-    /// unconditional. A concurrent successful login can reset `failed_attempts`
-    /// to 0 and clear `locked_at` in the gap between the failed request's own
-    /// increment and its lock stamp; without a fresh DB-level guard the stamp
-    /// re-locks the account out from under the login that already succeeded.
-    /// Both the `login` and `reauth` handlers duplicate this block, so both
-    /// must carry the guard.
+    /// #2500, #2531: one helper stamps the lock. Login and reauth both call it.
+    /// The stamp is a guarded UPDATE: it needs `failed_attempts >= threshold`
+    /// and `locked_at IS NULL`. The clock is read inside the helper, just
+    /// before the write, never at the start of the request.
     #[test]
-    fn routes_file_guards_lock_stamp_against_concurrent_reset() {
+    fn routes_file_stamps_lock_once_through_one_guarded_helper() {
         let tmp = project_with_main();
         let plan = plan_auth(tmp.path(), "User", "20260508000000").unwrap();
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
 
-        let guarded_stamp_occurrences = routes
-            .matches("failed_attempts.ge(lockout_cfg.threshold)")
-            .count();
         assert_eq!(
-            guarded_stamp_occurrences, 2,
-            "both the login and reauth lock-stamp UPDATEs must filter on \
-             failed_attempts.ge(lockout_cfg.threshold) so a concurrent successful \
-             login's reset cannot be clobbered by a stale-threshold re-lock \
-             (found {guarded_stamp_occurrences}): {routes}"
+            routes.matches("async fn stamp_lockout(").count(),
+            1,
+            "expected one `stamp_lockout` helper: {routes}"
         );
-
-        // `locked_at.is_null()` also appears, unrelated, in the pre-existing
-        // success-path reset guard (`locked_at.is_null().or(locked_at.le(...)))`),
-        // so a bare substring count can't tell the lock-stamp guard apart from
-        // that unrelated clause and would stay green even if the lock-stamp
-        // UPDATE's own `.filter(locked_at.is_null())` were dropped. Anchor on
-        // `locked_at.eq(Some(now))` instead — the lock-stamp `.set(...)` call,
-        // which appears exactly once per handler (login, reauth) — and require
-        // both guard filters to appear immediately before each one.
-        let stamp_occurrences = routes.matches("locked_at.eq(Some(now))").count();
         assert_eq!(
-            stamp_occurrences, 2,
-            "expected exactly one lock-stamp UPDATE in each of login and reauth \
-             (found {stamp_occurrences}): {routes}"
+            routes.matches("stamp_lockout(&mut db").count(),
+            2,
+            "login and reauth must both call `stamp_lockout`: {routes}"
         );
-        let mut search_from = 0;
-        for i in 0..stamp_occurrences {
-            let stamp_at = routes[search_from..]
-                .find("locked_at.eq(Some(now))")
-                .map(|pos| search_from + pos)
-                .unwrap();
-            let window_start = stamp_at.saturating_sub(400);
-            let preceding = &routes[window_start..stamp_at];
-            assert!(
-                preceding.contains("failed_attempts.ge(lockout_cfg.threshold)")
-                    && preceding.contains("locked_at.is_null()"),
-                "lock-stamp UPDATE #{} must be guarded by both \
-                 failed_attempts.ge(lockout_cfg.threshold) and locked_at.is_null() \
-                 immediately before the `locked_at.eq(Some(now))` write, so it never \
-                 re-stamps (and extends the cool-off of) an account another request \
-                 already locked, nor clobbers a concurrent successful reset: {routes}",
-                i + 1
-            );
-            search_from = stamp_at + "locked_at.eq(Some(now))".len();
-        }
+        assert!(
+            !routes.contains("locked_at.eq(Some(now))"),
+            "no handler may stamp `locked_at` with its request-start `now`: {routes}"
+        );
+        let stamp_at = routes
+            .find("locked_at.eq(Some(")
+            .expect("helper must stamp locked_at");
+        assert_eq!(routes.matches("locked_at.eq(Some(").count(), 1, "{routes}");
+        let preceding = routes
+            .get(stamp_at.saturating_sub(500)..stamp_at)
+            .unwrap_or_default();
+        assert!(
+            preceding.contains("failed_attempts.ge(threshold)")
+                && preceding.contains("locked_at.is_null()"),
+            "stamp must be guarded by failed_attempts and locked_at IS NULL: {routes}"
+        );
+        let following = routes.get(stamp_at..stamp_at + 120).unwrap_or_default();
+        assert!(
+            following.contains("chrono::Utc::now().naive_utc()"),
+            "stamp must read the clock inside the helper, at write time: {routes}"
+        );
     }
 
-    /// #2500: the `account_locked` telemetry event must only fire when this
-    /// request's own write actually applied the lock. If a concurrent
-    /// successful login won the race (see the guard tested above), the
-    /// lock-stamp UPDATE affects zero rows and no lock ever took effect, so
-    /// logging `account_locked` would be a false positive.
+    /// #2500, #2531: `account_locked` logs once per lock. Only the call whose
+    /// UPDATE changed a row may log. Concurrent calls get `false`.
     #[test]
     fn routes_file_gates_lockout_telemetry_on_rows_actually_locked() {
         let tmp = project_with_main();
@@ -17824,18 +17930,27 @@ mod tests {
         plan.execute(Flags::default()).unwrap();
         let routes = fs::read_to_string(tmp.path().join("src/routes/auth.rs")).unwrap();
 
-        let login_block_start = routes
-            .find("Failed to lock account")
-            .expect("login handler must attempt to lock the account");
-        let telemetry_start = routes[login_block_start..]
-            .find("account_locked")
-            .expect("account_locked telemetry must follow the lock-stamp UPDATE");
-        let between = &routes[login_block_start..login_block_start + telemetry_start];
+        let helper = routes
+            .find("async fn stamp_lockout(")
+            .expect("helper must exist");
+        let body_end = routes[helper..]
+            .find("\n}\n")
+            .map_or(routes.len(), |e| helper + e);
+        let helper_body = &routes[helper..body_end];
         assert!(
-            between.contains("locked_rows") && between.contains("if locked_rows > 0"),
-            "telemetry must be gated behind a check that the lock-stamp UPDATE \
-             actually affected a row (`if locked_rows > 0`), not fired \
-             unconditionally after attempting the write: {routes}"
+            helper_body.contains("Ok(locked_rows > 0)") && !helper_body.contains("account_locked"),
+            "helper must return whether it changed a row and must not log: {helper_body}"
+        );
+        let call = routes
+            .find("stamp_lockout(&mut db")
+            .expect("login must call the helper");
+        let telemetry = routes[call..]
+            .find("account_locked")
+            .expect("telemetry must follow the helper call");
+        let between = &routes[call..call + telemetry];
+        assert!(
+            between.contains("if newly_locked"),
+            "telemetry must sit behind `if newly_locked`: {between}"
         );
     }
 

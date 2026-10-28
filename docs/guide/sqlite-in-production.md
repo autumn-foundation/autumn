@@ -43,6 +43,22 @@ guide is the published contract for exactly which is which.
 
 Enable the runtime by building the application with the `sqlite` cargo feature (it must be enabled only by the end application, never by a library). Autumn then boots and serves against a `sqlite://` URL:
 
+- **No Postgres client (#2605).** The `postgres` feature adds `pq-sys`,
+  `tokio-postgres` and diesel's Postgres backend. It is a default feature. To
+  compile none of them, turn default features off and do not enable
+  `postgres`:
+
+  ```toml
+  autumn-web = { version = "0.9", default-features = false, features = [
+      "sqlite", "maud", "htmx", "tailwind", "cache-moka", "http-client", "reporting", "flash",
+  ] }
+  ```
+
+  If you keep default features on, the runtime is still SQLite, but the build
+  also compiles the Postgres client. A build without `postgres` does not have
+  the Postgres-only items (for example `DbApiTokenStore`, the `pg` stores and
+  `PgSyncBackend`). CI checks a SQLite-only build with `cargo tree`.
+
 - **Connection type.** A `RuntimeConnection` alias abstracts the backend: `diesel_async::AsyncPgConnection` by default, and a `SyncConnectionWrapper<SqliteConnection>` under the `sqlite` feature. Generated repositories and hand-written queries take `&mut RuntimeConnection`, so they compile against either backend.
 - **Pool pragmas.** Each pooled connection is set up with `PRAGMA busy_timeout = 5000` (first, so later statements queue on it), `PRAGMA journal_mode = WAL`, `PRAGMA synchronous = NORMAL`, and `PRAGMA foreign_keys = ON`. A read-only SQLite target skips the two writing pragmas (WAL + `synchronous`). An in-memory database is pinned to a single pooled connection.
 - **Migrations.** Startup migrations run through diesel's `MigrationHarness` on a plain `SqliteConnection` with **no advisory lock** (SQLite is single-writer, so there is nothing to coordinate). Only `busy_timeout` is set on the migration connection — `foreign_keys = ON` is deliberately *omitted* there because it breaks table-recreating migrations. This applies to **file-backed** SQLite only: an **in-memory** target (`sqlite::memory:` / `:memory:` / `file::memory:`, including `cache=shared`) with registered startup migrations is **refused at boot** (`std::process::exit(1)`), because the schema is applied on a transient migration connection and is lost before the runtime pool anchors it. An in-memory target with *no* registered migrations is unaffected (it is the default test-harness configuration).
@@ -100,6 +116,7 @@ not a rewrite.
 | --- | --- |
 | One host, one process, zero-ops priority | **SQLite** |
 | One host, write volume comfortably below a single serialized writer | **SQLite** |
+| One host, many tenants, writes that queue behind each other | **SQLite [fleet](./sqlite-fleet.md)** (one writer per tenant) |
 | Multiple replicas / multiple hosts sharing data | **Postgres** |
 | Read replicas, sharding, or heavy write concurrency | **Postgres** |
 | You need Postgres-specific FTS features (language-stemming dictionaries), `LISTEN/NOTIFY`, or **cross-host** leader election | **Postgres** |
@@ -133,17 +150,18 @@ buckets on SQLite:
 | Migration serialization (concurrent boot) | ✅ `pg_advisory_lock` | ⚠️ | Startup migrations run **unlocked** — no advisory lock and no `BEGIN IMMEDIATE` reservation on the migration path. Concurrent same-host starts are not serialized by an explicit reservation; they rely on SQLite's single-writer semantics plus the pool `busy_timeout`. (Note: application **write-RMW** sites *do* issue `BEGIN IMMEDIATE` since #1996 — this row is only about the migration path.) | ⚠️ **Not serialized** — no advisory lock / no migration-path `BEGIN IMMEDIATE`; explicit reservation is a known gap (planned) |
 | Sessions + auth (DB-backed) | ✅ | ✅ | Session/auth tables live in SQLite; no external store. The `generate auth` tracked-sessions store binds `RuntimeBackend` rather than `diesel::pg::Pg`, so it compiles and runs on either backend, and its migration DDL and scaffolded guide are emitted in the app's own dialect (#1908 / #1927). Its `schema.rs` block is backend-independent (every column kind the table uses maps to the same diesel sql-type on both backends), not dialect-forked. The cookie-session backends (`[session] backend = "memory" | "redis"`) are backend-independent and unchanged. **Still Postgres-only, and out of this row's scope:** the framework `DbApiTokenStore` (`api_tokens` — machine tokens, not login sessions) is typed `Pool<AsyncPgConnection>` with Postgres-only DDL, and the `--starter saas` scaffold pins `AsyncPgConnection` throughout. | ✅ **Available now** (#1908, behind the `sqlite` feature) |
 | Durable `#[job]` background jobs | ✅ `FOR UPDATE SKIP LOCKED` | ✅ | `jobs.backend = "sqlite"`: a single-writer claim on the `autumn_jobs` table in the app's own file — durable and restart-safe, **no Redis required**. Retries, backoff, dead-lettering, uniqueness windows, concurrency limits, and the job dashboard match Postgres. | ✅ **Available now** (#1907) |
-| `#[scheduled]` tasks | ✅ advisory-lock leader election | ⚠️ | `scheduler.backend = "in_process"` (the default) fires every tick locally, because one process is always the leader. `scheduler.backend = "sqlite"` leases each tick in a table, so several processes on the host elect exactly one leader per tick. | ✅ **Available now** (#1907) |
+| `#[scheduled]` tasks | ✅ tick-table leader election | ⚠️ | `scheduler.backend = "in_process"` (the default) fires every tick locally, because one process is always the leader. `scheduler.backend = "sqlite"` leases each tick in a table, so several processes on the host elect exactly one leader per tick. | ✅ **Available now** (#1907) |
 | Distributed lock (`autumn_web::lock`) | ✅ `pg_advisory_lock` | ⚠️ | `autumn_web::lock::Lock` takes a lease row in `autumn_locks` instead of a session lock, so the processes on the host contend. A live holder renews; a dead one's lock frees at the lease expiry. | ⚠️ **Available now** (#1907) — single-host scope, lease not session, not re-entrant |
-| Feature-flag / experiment cache invalidation | ✅ `LISTEN/NOTIFY` | ⚠️ | In-process invalidation only (a single host has nothing to notify). `PgFlagStore` / `PgExperimentStore` are Postgres-only (they open a `PgConnection` and use `pg_notify`), so `from_database_config` returns `None` on a SQLite target rather than building a store that cannot connect. Autumn never picks a store for you — the app passes one to `with_flag_store`, so on SQLite pass `InMemoryFlagStore` (an `.expect()` on the `None` now fails at boot instead of at the first flag read). | ⚠️ **Available now — in-process only** |
-| Runtime config store (`runtime_config::pg`) | ✅ `pg_advisory_xact_lock` | ⚠️ | Same shape: `PgConfigStore::from_database_config` returns `None` on a SQLite target; pass `InMemoryConfigStore` or a custom `ConfigStore` instead. | ⚠️ **Available now — no DB-backed store** |
+| Feature-flag / experiment cache invalidation | ✅ polling | ⚠️ | In-process invalidation only (a single host has nothing to notify). `PgFlagStore` / `PgExperimentStore` are Postgres-only (they open a `PgConnection` and use `pg_notify`), so `from_database_config` returns `None` on a SQLite target rather than building a store that cannot connect. Autumn never picks a store for you — the app passes one to `with_flag_store`, so on SQLite pass `InMemoryFlagStore` (an `.expect()` on the `None` now fails at boot instead of at the first flag read). A store built with `new(url)` refuses a non-Postgres target at its first connect, with the target redacted. | ⚠️ **Available now — in-process only** |
+| Runtime config store (`runtime_config::pg`) | ✅ `pg_advisory_xact_lock` | ⚠️ | Same shape: `PgConfigStore::from_database_config` returns `None` on a SQLite target, and `new(url)` refuses one at its first connect; pass `InMemoryConfigStore` or a custom `ConfigStore` instead. | ⚠️ **Available now — no DB-backed store** |
 | ISR regeneration coordinator (`static_gen`) | ✅ `pg_try_advisory_lock` | ⚠️ | `PostgresIsrCoordinator` takes a `Pool<AsyncPgConnection>`, which a SQLite build's app state cannot produce — it is unreachable under the flip rather than refused. Single-host ISR uses the in-process coordinator, which is what one host needs. | ⚠️ **Available now — in-process coordinator** |
 | `autumn db backup` / `restore` | ✅ `pg_dump`/`pg_restore` | ✅ | Online-safe snapshot of the data file with SQLite's own `VACUUM INTO` — one transactional statement, safe against a live app, and **no external tools**. `restore` verifies the artifact with `PRAGMA integrity_check` before replacing the file, and clears the stale `-wal`/`-shm`. Retention (`--keep`) and offsite upload (`--upload`) work unchanged. | ✅ **Available now** (#1909) |
-| `autumn db scrub` | ✅ | ✅ | Will run against the SQLite file; today it connects with a Postgres driver and introspects Postgres catalogs, so a `sqlite://` target has no path through it. | ⛔ **Planned — #2553** |
-| Retention sweeps | ✅ | ✅ | Will run against the SQLite file. The `autumn db retention` verb is already backend-neutral (it runs your app binary); the runtime sweeps are not yet verified on SQLite. | ⛔ **Planned — #2553** |
+| `autumn db scrub` | ✅ | ✅ | Runs against the SQLite file, or a `.sqlite` backup artifact (`--artifact`), with the same fail-closed classification as Postgres. One transaction per file. `VACUUM` and a WAL truncate follow the commit, so free pages do not keep the old values. No external tools. `--sample` is Postgres-only and is refused. See [Data scrubbing](./data-scrubbing.md#sqlite). | ✅ **Available now** (#2553) |
+| Retention sweeps | ✅ | ✅ | `autumn db retention` sweeps `job_history`, `commit_hooks` and `experiment_assignments` in the SQLite file. The cutoff comes from the database clock. The report has the same shape as on Postgres. | ✅ **Available now** (#2553) |
 | `autumn deploy` data-file persistence | ✅ | ✅ | The data file is **persistent state**: it lives in `app_dir/shared/data` and each release is linked at it, so deploy, rollback and release retention never clobber or orphan it. See [where a SQLite data file lives](./deployment.md#where-a-sqlite-data-file-lives). | ✅ **Available now** (#1909) |
 | Read replicas (`replica_url`) | ✅ | ⛔ | **Boot-refuse.** No networked replicas on a single-file DB — out of scope. | ✅ **Available now — boot-refuse** |
 | Sharding / shard directory | ✅ | ⛔ | **Boot-refuse.** Native sharding is Postgres-only. | ✅ **Available now — boot-refuse** |
+| `autumn-search` Postgres store (`SearchPlugin::postgres()`) | ✅ `tsvector` + `pgvector` | ⛔ | **Boot-refuse.** The store runs `tsvector`, `pgvector` and advisory-lock SQL. On a SQLite build, boot stops with a message that names the cause, also when `[search] enabled = false`. A store an app builds without the plugin refuses every query. Install a different search backend with `SearchPlugin::backend`. | ✅ **Available now — boot-refuse** |
 | Full-text search (`--searchable` / `#[searchable]`) | ✅ `tsvector` + GIN | ✅ FTS5 | **Available now on both backends.** Postgres uses a `tsvector` generated column + GIN index; SQLite uses an external-content **FTS5** virtual table with `unicode61` tokenization and `bm25` ranking (weights from `#[searchable(weight=…)]`). The `--searchable` / `#[searchable]` scaffold generates on both (#1910 / #2047). | ✅ **Available now** |
 | Continuous replication + point-in-time restore | n/a | ✅ | Built into the running process (#1628): the write-ahead log is shipped to an S3-compatible or filesystem destination as it is written, and `autumn db replica restore` rebuilds the database on a fresh box, optionally at a chosen instant. See [durability](#durability-continuous-replication-and-point-in-time-restore). | ✅ **Available now** |
 | Streaming replication to a second live *node* | n/a | ⛔ | Out of scope; continuous replication targets storage, not a standby process. | Contract (out of scope) |
@@ -181,8 +199,9 @@ published support contract**. Available **today**:
 - **Backend-aware app dependencies (#1924)** — a SQLite app's `Cargo.toml` gets
   diesel on its `sqlite` feature with the bundled `libsqlite3-sys`, no `pq-sys`,
   and `autumn-web`'s `sqlite` feature, so the generated code actually compiles.
+- **UUID primary keys (#2555)** — `--id uuid` makes a `TEXT` key. The database
+  sets its value. See [UUID primary keys](#uuid-primary-keys-on-sqlite).
 - **Generate-time rejections**, each naming its tracking issue:
-  - `--id uuid` primary keys — #2555.
   - `ADD COLUMN NOT NULL` without a default (on both the add and rollback re-add
     paths).
   - `DROP INDEX` emitted before `DROP COLUMN` on the forward **and** rollback
@@ -218,16 +237,14 @@ published support contract**. Available **today**:
   [backup, restore, scrub, retention](#backup-restore-scrub-retention) and
   [deploy: the data file is persistent state](#deploy-the-data-file-is-persistent-state).
 
-**Not in this slice — scaffold smoke tests on SQLite.** A scaffolded app still
-carries the **Postgres-shaped** (`#[ignore]`d) smoke test: it uses the
-Postgres-only `TestDb` testcontainer and `TRUNCATE … RESTART IDENTITY`. The
-runtime landed without a SQLite-native scaffold smoke harness; that is tracked
-in #2555.
+**Scaffold smoke tests (#2555).** A scaffolded SQLite app has a SQLite-native
+smoke test. Under the `sqlite` feature, `autumn_web::test::TestDb` is a temp-file
+SQLite database, so the test needs no Docker and runs in a plain `cargo test`.
+See [Testing with `TestDb`](#testing-with-testdb-on-sqlite).
 
-The support-matrix rows still marked **Planned** name follow-on subsystem slices
-whose SQLite support has not landed yet (durable jobs and `#[scheduled]` tasks
-#1907, scrub and retention sweeps #2553). Backup/restore and `autumn deploy`
-data-file persistence landed in #1909. A **Planned** row does **not** mean the
+One support-matrix row is still **Planned**: durable jobs and `#[scheduled]`
+tasks (#1907). #1909 added backup/restore and `autumn deploy` data-file
+persistence. #2553 added scrub and retention sweeps. A **Planned** row does **not** mean the
 app refuses to boot — the runtime
 boots and serves; those subsystems are simply not wired for SQLite until their
 tracking issue lands.
@@ -310,9 +327,9 @@ reads-then-writes goes through `Db::tx_immediate`.
 
 ### `#[scheduled]` tasks
 
-The [multi-replica scheduler](./scheduled-multi-replica.md) uses advisory-lock
-leader election so that a fleet fires each tick exactly once. SQLite has no
-advisory locks, so it gets two single-host coordinators instead:
+The [multi-replica scheduler](./scheduled-multi-replica.md) uses a Postgres tick table
+so that a fleet fires each tick at most once. SQLite has no shared
+server, so it gets two single-host coordinators instead:
 
 - `scheduler.backend = "in_process"` (the **default**). The single process is
   always the leader, so every tick fires locally with no coordination
@@ -368,8 +385,8 @@ that would let two replicas both believe they hold it.
 
 ### Feature-flag / experiment cache invalidation
 
-On Postgres, a flag or experiment change fans out to every replica via
-`LISTEN/NOTIFY` so caches invalidate fleet-wide. On SQLite the invalidation is
+On Postgres, each replica polls the database, so a flag or experiment change
+reaches every replica within one poll interval. On SQLite the invalidation is
 **in-process only** — correct and immediate, because the single host is the only
 cache there is. See [Feature flags](./feature-flags.md) and
 [Experiments](./experiments.md).
@@ -402,8 +419,9 @@ across a web/worker split.
 
 Three differences from Postgres, all by design:
 
-- **Workers poll.** SQLite has no `LISTEN`/`NOTIFY`. An enqueue in the same
-  process wakes a worker directly; work another process enqueued is seen within
+- **Workers poll, with an in-process wake.** An enqueue in the same process
+  wakes a worker at once. The Postgres backend has no such wake. Work that
+  another process enqueued is seen within
   `jobs.sqlite.poll_interval_ms` (default 250ms). Lower it for latency, raise it
   to cut idle wakeups.
 - **The queue is host-local, and must be a file.** Two processes on one host
@@ -414,11 +432,11 @@ Three differences from Postgres, all by design:
   `scheduler.backend = "postgres"`) are each refused, but a second host pointed
   at the same file over a network filesystem is not detected. Do not do it; see
   [The single-host constraint](#the-single-host-constraint).
-- **History is pruned by the runtime, not by `autumn db retention`.** The sweep
-  behind `autumn db retention` is Postgres-only (#1909). Instead the SQLite job
-  runtime prunes its own tables: expired tracked-job records always, and
-  terminal `autumn_jobs` rows when `retention.job_history` is set. Leave that
-  window unset and job history is kept forever, exactly as on Postgres.
+- **History is pruned by the runtime and by `autumn db retention`.** The SQLite
+  job runtime prunes its own tables: expired tracked-job records always, and
+  terminal `autumn_jobs` rows when `retention.job_history` is set. The
+  `autumn db retention` sweep (#2553) applies the same rule on demand. Leave
+  the window unset and job history is kept forever, exactly as on Postgres.
 
 `jobs.backend = "local"` (the default) stays the right choice when the work does
 not need to survive a restart: it is in-process and needs no table.
@@ -437,6 +455,12 @@ no SQLite equivalent of installing `postgresql-client`.
 autumn db backup --keep 7 --dir /var/backups/myapp
 ```
 
+The backup opens the database with the same URI options the app uses (for
+example `vfs=unix-dotfile`), so its locks match the app's. It opens the file with
+`mode=rw`, so it never creates a database: a file that is removed before the
+backup opens it fails the run. The `--dir` path is used exactly, also when it is not UTF-8
+or starts with `file:`.
+
 The run directory is the same one Postgres backups write — `manifest.json` plus
 one artifact per target — except the artifact is `control.sqlite`, a real SQLite
 database you can open with any tool, and the manifest records
@@ -449,8 +473,11 @@ says `SQLite snapshot` so there is no ambiguity).
 touching the database, stages a copy beside the target, verifies that copy too,
 removes the target's `-wal`, `-shm` and `-journal` — a leftover journal describes
 pages of the file being replaced, and SQLite would replay it onto the restored one
-— and renames the copy into place, keeping the target's mode and owner. A restore
-refused at verification leaves the target byte-identical. The production guard is
+— and renames the copy into place, keeping the target's mode and owner. When the
+restore cannot give the copy to the old owner (only root can `chown`) and the mode
+does not let that owner read and write it, the restore stops before the rename and
+tells you which account to use. A restore refused at verification leaves the
+target byte-identical. The production guard is
 the same as Postgres: a non-dev/test profile needs `--force`.
 
 **Stop the app before restoring.** A running process keeps open handles to the
@@ -458,10 +485,15 @@ old file, so after the rename it serves the pre-restore database and loses every
 write it makes. This differs from Postgres, where `pg_restore` goes through the
 server.
 
-An **in-memory** database is refused by both: there is no file to snapshot.
+An **in-memory** database is refused by both: there is no file to snapshot. The
+check reads the URI as SQLite does: option names and values are percent-decoded,
+the last `mode` and the last `vfs` win, and `mode=memory` or `vfs=memdb` is in
+memory. On Windows, `file:///C:/data/app.db` names `C:\data\app.db`.
 
-[`db scrub`](./data-scrubbing.md) (#1602) and the runtime retention sweeps
-(#1605) are not yet wired for SQLite (#2553). Snapshots are the coarse-grained,
+[`db scrub`](./data-scrubbing.md#sqlite) (#1602) and the
+[retention sweeps](./data-retention.md) (#1605) run against the SQLite file
+(#2553). `autumn db scrub --artifact <run-dir>` restores a `.sqlite` backup and
+scrubs it in one command. Snapshots are the coarse-grained,
 cross-backend story; for second-granularity durability see
 [Durability: continuous replication](#durability-continuous-replication-and-point-in-time-restore)
 below, which composes with them rather than replacing them.
@@ -757,18 +789,33 @@ Rust equality. A row inserted by hand or migrated from elsewhere may not be:
 unhyphenated, uppercase), and such a row loads correctly but will not match a
 `find_by_…` for the same UUID. Write canonical text.
 
-**Smoke test.** A scaffolded SQLite app's `tests/<model>.rs` still uses
-`autumn_web::test::TestDb`, a Postgres-only testcontainer, so `cargo test` on a
-generated SQLite app does not compile yet — `autumn generate scaffold` warns
-about this on a SQLite app. The app itself is unaffected: `cargo run`, `cargo
-build` and `autumn migrate` all work. A SQLite `TestDb` lands with the runtime
-slice, #1905.
+**Smoke test.** A scaffolded SQLite app's `tests/<model>.rs` uses the SQLite
+`TestDb` (see [Testing with `TestDb`](#testing-with-testdb-on-sqlite)). It is not
+`#[ignore]`d, and each test gets its own database.
 
-Additional generator shapes are refused on SQLite:
+<a id="uuid-primary-keys-on-sqlite"></a>
 
-- **`--id uuid` primary keys** are rejected at generate time — the SQLite primary
-  key is `INTEGER PRIMARY KEY AUTOINCREMENT`, and a UUID primary key has no
-  working conversion yet. Tracked in #2555.
+#### UUID primary keys on SQLite
+
+`autumn generate model Post --id uuid` works on a SQLite app. SQLite has no
+`uuid` type and no `gen_random_uuid()`, so the generator writes:
+
+```sql
+id TEXT PRIMARY KEY NOT NULL DEFAULT (lower(hex(randomblob(4))) || '-' || ...)
+```
+
+The default makes a random version-4 UUID in lowercase text. The database makes
+the id, as on Postgres. `NOT NULL` is required: SQLite lets a
+`TEXT PRIMARY KEY` hold `NULL` unless the column forbids it. The model field is
+`pub id: SqliteUuid`, and the schema type is `Text`.
+
+A table that you wrote by hand as `TEXT PRIMARY KEY` has no such default. The
+schema tools expect the default for a `SqliteUuid` key, so `autumn schema diff`
+reports it as drift on that table. Add the default in a migration to clear it.
+
+On both backends, a UUID key cannot be used with `#[repository]`,
+`--searchable`, `generate scaffold` or `comments:commentable`. These need an
+`i64` key.
 > **`generate auth` / `generate mailer` now generate on SQLite (#1927 / #1908).**
 > Historically refused at generate time, both now scaffold SQLite-dialect
 > migrations on a SQLite app (`INTEGER PRIMARY KEY AUTOINCREMENT`, `DEFAULT
@@ -822,13 +869,29 @@ Additional generator shapes are refused on SQLite:
 > (`unicode61` tokenization, `bm25` ranking) on SQLite. See
 > [Full-text search](./full-text-search.md#6-sqlite-fts5).
 
-> **Scaffold smoke tests are still Postgres-shaped.** The generated-scaffold smoke
-> test (including the duplicate-`unique` rejection) uses
-> `autumn_web::test::TestDb`, a **Postgres-only** testcontainer, and
-> `TRUNCATE … RESTART IDENTITY`, and runs only under `cargo test -- --ignored`
-> (it is `#[ignore]`d). There is no SQLite `TestDb` yet, so a scaffolded SQLite
-> app still carries the Postgres-shaped smoke test rather than a SQLite-native
-> one. A backend-aware scaffold smoke harness is tracked in #2555.
+> **Scaffold smoke tests run on SQLite (#2555).** The generated-scaffold smoke
+> test (including the duplicate-`unique` rejection) uses the SQLite `TestDb`
+> and `db.reset_table(...)`. It is not `#[ignore]`d, and each test gets its own
+> database.
+
+<a id="testing-with-testdb-on-sqlite"></a>
+
+### Testing with `TestDb` on SQLite
+
+Under `--features sqlite`, `autumn_web::test::TestDb` is a temp-file SQLite
+database. Its API is the same as the Postgres `TestDb`:
+
+| Call | Effect |
+| --- | --- |
+| `TestDb::new().await` | A new database. Its file is removed on drop. |
+| `TestDb::shared().await` | One database for the test binary. Its file is not removed. |
+| `db.pool()` | The connection pool. Pass it to `TestApp::with_db`. |
+| `db.execute_sql(sql).await` | Run SQL. A statement list is allowed. |
+| `db.reset_table("t").await` | Delete all rows and restart the id counter. |
+
+Use `TestDb::new()` for parallel tests that use the same table names. Each call
+makes a new database. SQLite has no `TRUNCATE`. `reset_table` runs `DELETE`, then
+clears the row in `sqlite_sequence`.
 
 ### Migration mechanics on SQLite
 
@@ -841,22 +904,23 @@ A few SQLite-specific mechanics apply when the generator emits migrations:
 - **Rollback drops indexes before columns.** On the SQLite rollback path the
   generator emits `DROP INDEX` before `DROP COLUMN`, since SQLite will not drop a
   column that an index still references.
-- **Pre-existing indexes are dropped too (#1906).** A `Remove…From…` migration
-  reads the project's earlier `migrations/*/up.sql` and emits a `DROP INDEX IF
-  EXISTS` for every index still live on the table that names the removed column.
-  Composite, partial, expression and hand-named indexes are all covered, as are
-  indexes carried through an `ALTER TABLE … RENAME TO`. `down.sql` re-creates
-  them after re-adding the column.
+- **Pre-existing indexes are dropped too (#1906, #2579).** A `Remove…From…`
+  migration replays the project's earlier `migrations/*/up.sql` into an
+  in-memory SQLite database. It then tests which indexes block the
+  `DROP COLUMN`, and emits a `DROP INDEX IF EXISTS` for each one. It reads no
+  SQL text, so composite, partial, expression, quoted and renamed indexes
+  are all handled. `down.sql` re-creates them after it re-adds the column.
 
-  Three kinds stay invisible, and each still fails at apply time:
-  - an index created by hand against the database, outside `migrations/`;
-  - an index created in a migration's `down.sql` rather than its `up.sql`;
-  - the implicit index behind an inline `UNIQUE` or `PRIMARY KEY` column
-    constraint in a `CREATE TABLE`. SQLite refuses to drop such a column in any
-    case, and refuses to drop its `sqlite_autoindex_*` index too.
+  Two cases stay outside the replay:
+  - SQLite does not know an index made by hand outside `migrations/`.
+    The drop then fails when you apply the migration.
+  - A column behind an inline `UNIQUE` or `PRIMARY KEY`. SQLite cannot drop
+    it, and so cannot a column that a CHECK, view or trigger uses. `generate migration`
+    stops with an error. For a constraint, rebuild the table —
+    `autumn schema diff --write-migration` emits the rebuild.
 
-  For all three, rebuild the table — `autumn schema diff --write-migration`
-  emits the rebuild.
+  Each earlier migration must replay, for any table. If one does not,
+  `generate migration` stops and names the file.
 - **`autumn migrate check` applies SQLite rules (#1906).** The safety classifier
   reads the app's backend. It never recommends `CREATE INDEX CONCURRENTLY` (no
   such syntax), does not flag a plain `DROP INDEX` (a cheap catalog edit, and a
@@ -894,8 +958,10 @@ bugs; they are the scale-out tier's reason to exist, and every one of them
 
 - **Read replicas** (`replica_url` / replica routing) — a single file has no
   networked replica to route reads to.
-- **Native sharding** (the shard directory / multi-shard repositories) — see
-  [Sharding](./sharding.md).
+- **Configured shards** (`[[database.shards]]`, the shard directory) — see
+  [Sharding](./sharding.md). The SQLite tier shards differently: a
+  [database fleet](./sqlite-fleet.md) gives each tenant (or slot) its own file
+  behind the same `ShardedDb` / `#[repository(sharded)]` code.
 - **Replication to a second live node** (a standby process serving from the same
   data). Continuous replication to offsite *storage* is supported — see
   [durability](#durability-continuous-replication-and-point-in-time-restore) —
@@ -933,7 +999,7 @@ never as a runtime surprise on some unlucky code path days later.
   Postgres-only job/scheduler backend, a multi-replica lock) fails at boot with
   an actionable diagnostic.
 - A **generator** that would emit output which compiles on Postgres but breaks
-  on SQLite (for example an `--id uuid` primary key) is rejected at **generate
+  on SQLite (for example `--sharded`) is rejected at **generate
   time**, with the reason stated — never silent output that fails later.
 
 So the operational rule is simple: if a SQLite app boots, every feature it is

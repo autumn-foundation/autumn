@@ -15,6 +15,7 @@ pub mod routes;
 pub mod schema;
 pub mod seo;
 pub mod tasks;
+pub mod vote_core;
 
 use std::sync::{Arc, OnceLock};
 

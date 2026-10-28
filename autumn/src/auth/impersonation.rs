@@ -73,6 +73,14 @@
 //! target's account on the strength of the *operator's* re-authentication.
 //! [`end_impersonation`] restores the operator's own claim.
 //!
+//! # Extra identity keys
+//!
+//! Only the auth session key swaps by default. If the app stores other
+//! identity values in the session (for example `user_email`), return those
+//! keys from [`ImpersonationPolicy::target_session_values`].
+//! [`begin_impersonation`] swaps them. [`end_impersonation`] restores the
+//! operator's values. [`clear`] removes them and restores nothing.
+//!
 //! # Reserved session keys
 //!
 //! [`RESERVED_SESSION_KEYS`] belong to the framework; do not configure
@@ -139,6 +147,15 @@ pub const IMPERSONATION_SESSION_ID_KEY: &str = "impersonation_session_id";
 /// [`IMPERSONATOR_SESSION_KEY`].
 pub const IMPERSONATOR_STEP_UP_SESSION_KEY: &str = "impersonator_last_strong_auth_at";
 
+/// Session key stashing the operator's values for the extra identity keys.
+///
+/// The value is a JSON object. It maps each key to the operator's old value,
+/// or to `null` if the key was unset. [`begin_impersonation`] writes it for
+/// each key that [`ImpersonationPolicy::target_session_values`] returns.
+/// [`end_impersonation`] reads it. Reserved by the framework, like
+/// [`IMPERSONATOR_SESSION_KEY`].
+pub const IMPERSONATOR_IDENTITY_SESSION_KEY: &str = "impersonator_identity_keys";
+
 /// Session key holding the current role. Mirrors the key `#[secured("role")]`
 /// and the admin plugin's role middleware read.
 const ROLE_SESSION_KEY: &str = "role";
@@ -155,12 +172,13 @@ const ROLE_SESSION_KEY: &str = "role";
 /// this list: the swap would then clobber its own record.
 /// [`begin_impersonation`] refuses rather than corrupting the session, and
 /// `AppBuilder::impersonation_gate` logs the misconfiguration at startup.
-pub const RESERVED_SESSION_KEYS: [&str; 7] = [
+pub const RESERVED_SESSION_KEYS: [&str; 8] = [
     IMPERSONATOR_SESSION_KEY,
     IMPERSONATED_SESSION_KEY,
     IMPERSONATION_SESSION_ID_KEY,
     IMPERSONATOR_ROLE_SESSION_KEY,
     IMPERSONATOR_STEP_UP_SESSION_KEY,
+    IMPERSONATOR_IDENTITY_SESSION_KEY,
     ROLE_SESSION_KEY,
     crate::step_up::STEP_UP_SESSION_KEY,
 ];
@@ -304,6 +322,28 @@ pub trait ImpersonationPolicy: Send + Sync + 'static {
         _target: &'a ImpersonationTarget,
     ) -> BoxFuture<'a, Option<String>> {
         Box::pin(async { None })
+    }
+
+    /// Extra session keys to swap to the target, as `(key, value)` pairs.
+    /// A `None` value means the target has no value: the key is removed for the
+    /// impersonation, and the operator's value returns on the end.
+    ///
+    /// Use this when the app stores identity in keys other than the auth key,
+    /// for example `user_email`. [`begin_impersonation`] saves the operator's
+    /// value for each key and writes the target's value.
+    /// [`end_impersonation`] restores the operator's values. Resolve the values
+    /// server-side from the app's user store.
+    ///
+    /// Default: no keys. If the policy returns a reserved key (see
+    /// [`RESERVED_SESSION_KEYS`]) or the auth key, [`begin_impersonation`]
+    /// fails with `500`. The policy must not return other keys the framework
+    /// reads, such as the flash, locale or time-zone keys.
+    fn target_session_values<'a>(
+        &'a self,
+        _ctx: &'a PolicyContext,
+        _target: &'a ImpersonationTarget,
+    ) -> BoxFuture<'a, Vec<(String, Option<String>)>> {
+        Box::pin(async { Vec::new() })
     }
 }
 
@@ -459,7 +499,8 @@ pub async fn impersonation_state(
 
 /// Drop any impersonation record from the session.
 ///
-/// Audits nothing and restores nothing.
+/// Audits nothing and restores nothing. It removes the extra identity keys that
+/// the impersonation swapped in.
 ///
 /// This is **not** the revert — use [`end_impersonation`] for that. It exists
 /// for identity transitions that replace the session's user outright, where the
@@ -483,6 +524,49 @@ pub async fn clear(session: &Session) {
     session.remove(IMPERSONATION_SESSION_ID_KEY).await;
     session.remove(IMPERSONATOR_ROLE_SESSION_KEY).await;
     session.remove(IMPERSONATOR_STEP_UP_SESSION_KEY).await;
+    drop_identity_keys(session).await;
+}
+
+/// Keep a live impersonation across a rotation that did not change who is
+/// signed in.
+///
+/// The record is bound to the session id it was created under, so any later
+/// `rotate_id()` retires it. For a rotation you trust — an idle or periodic
+/// rotation policy, not a login — call this right after `rotate_id()` to move
+/// the binding to the new id. Returns `true` when the record was kept.
+///
+/// It refuses (returns `false`) unless the record was bound to the id just
+/// before the latest rotation and the session still resolves as the
+/// impersonated user. Call it right after each `rotate_id()`. A record already retired by an earlier rotation is never revived.
+///
+/// Do **not** call it from a login flow. A login by the impersonated user
+/// matches the same checks, and the rebind would hand them the record. Login
+/// flows call [`clear`] instead.
+///
+/// ```rust,no_run
+/// # use autumn_web::{session::Session, AppState};
+/// # use autumn_web::auth::impersonation;
+/// async fn rotate_on_idle(state: &AppState, session: &Session) {
+///     session.rotate_id().await;
+///     impersonation::rebind(state, session).await;
+/// }
+/// ```
+pub async fn rebind(state: &AppState, session: &Session) -> bool {
+    let previous_id = session.previous_id().await;
+    let bound = session.get(IMPERSONATION_SESSION_ID_KEY).await;
+    let impersonated = session.get(IMPERSONATED_SESSION_KEY).await;
+    let effective = session.get(state.auth_session_key()).await;
+    let still_live = bound.is_some()
+        && bound == previous_id
+        && session.contains_key(IMPERSONATOR_SESSION_KEY).await
+        && impersonated.is_some()
+        && impersonated == effective;
+    if still_live {
+        session
+            .insert(IMPERSONATION_SESSION_ID_KEY, session.id().await)
+            .await;
+    }
+    still_live
 }
 
 /// The id that audit and version writes made by this session should carry.
@@ -512,6 +596,16 @@ pub async fn audit_actor_id(session: &Session, effective_user_id: &str) -> Strin
         Some((impersonator, impersonated)) if impersonated == effective_user_id => impersonator,
         _ => effective_user_id.to_owned(),
     }
+}
+
+/// The id a per-user throttle should key on for `session`.
+///
+/// The real operator while impersonating, otherwise the effective user. An
+/// operator then spends their own budget and cannot throttle the customer out
+/// of their account. `None` when the session holds no user.
+pub(crate) async fn throttle_principal_id(session: &Session, auth_key: &str) -> Option<String> {
+    let effective = session.get(auth_key).await?;
+    Some(audit_actor_id(session, &effective).await)
 }
 
 // ── Extractor ────────────────────────────────────────────────────
@@ -587,8 +681,10 @@ async fn swap_identity(
     real_id: &str,
     target_id: &str,
     target_role: Option<&str>,
+    extra: &[(String, Option<String>)],
 ) {
     session.insert(IMPERSONATOR_SESSION_KEY, real_id).await;
+    stash_identity_keys(session, extra).await;
     session.insert(IMPERSONATED_SESSION_KEY, target_id).await;
     stash(session, ROLE_SESSION_KEY, IMPERSONATOR_ROLE_SESSION_KEY).await;
     // `last_strong_auth_at` is a bare timestamp with no identity bound to it,
@@ -614,6 +710,62 @@ async fn swap_identity(
     session
         .insert(IMPERSONATION_SESSION_ID_KEY, session.id().await)
         .await;
+}
+
+/// Save the operator's value for each extra key, then write the target's.
+async fn stash_identity_keys(session: &Session, extra: &[(String, Option<String>)]) {
+    // A stale stash names keys of an old target. Remove them and the stash, so
+    // nothing of the old record shows or returns. Restore nothing.
+    drop_identity_keys(session).await;
+    if extra.is_empty() {
+        return;
+    }
+    let mut saved = serde_json::Map::new();
+    for (key, value) in extra {
+        // Save the operator's value only once. A repeated key must not
+        // overwrite the saved value.
+        if !saved.contains_key(key) {
+            let old = session.get(key).await;
+            saved.insert(key.clone(), old.map_or(serde_json::Value::Null, Into::into));
+        }
+        set_or_remove(session, key, value.as_deref()).await;
+    }
+    session
+        .insert(
+            IMPERSONATOR_IDENTITY_SESSION_KEY,
+            serde_json::Value::Object(saved).to_string(),
+        )
+        .await;
+}
+
+/// Remove the extra keys named in the stash, and the stash. Restores nothing.
+async fn drop_identity_keys(session: &Session) {
+    let Some(raw) = session.remove(IMPERSONATOR_IDENTITY_SESSION_KEY).await else {
+        return;
+    };
+    let Ok(saved) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw) else {
+        return;
+    };
+    for key in saved.keys().filter(|key| !is_reserved_session_key(key)) {
+        session.remove(key).await;
+    }
+}
+
+/// Put back the operator's extra-key values saved by [`stash_identity_keys`].
+async fn restore_identity_keys(session: &Session) {
+    let Some(raw) = session.remove(IMPERSONATOR_IDENTITY_SESSION_KEY).await else {
+        return;
+    };
+    let Ok(saved) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw) else {
+        return;
+    };
+    for (key, value) in saved {
+        // Never write a reserved key from stored data.
+        if is_reserved_session_key(&key) {
+            continue;
+        }
+        set_or_remove(session, &key, value.as_str()).await;
+    }
 }
 
 /// Move `from` to `to`, leaving neither key set when `from` was absent.
@@ -767,6 +919,22 @@ pub async fn begin_impersonation(
         ));
     }
 
+    // Check the extra keys before any write. A bad key then fails the begin
+    // and leaves the session unchanged.
+    let extra = match gate.as_deref() {
+        Some(gate) => gate.policy().target_session_values(&ctx, &target).await,
+        None => Vec::new(),
+    };
+    if let Some((key, _)) = extra
+        .iter()
+        .find(|(key, _)| key == &auth_key || is_reserved_session_key(key))
+    {
+        return Err(crate::AutumnError::internal_server_error_msg(format!(
+            "impersonation refused: `target_session_values` returned the key \"{key}\", \
+             which is the auth key or a reserved key"
+        )));
+    }
+
     // Fail closed on a *missing* sink, not just a failing one.
     // `audit::write_from_state` deliberately returns `Ok(())` when no
     // `AuditLogger` is installed, so without this check an app that enabled
@@ -824,6 +992,7 @@ pub async fn begin_impersonation(
         &real_id,
         target_id,
         target_role.as_deref(),
+        &extra,
     )
     .await;
 
@@ -906,6 +1075,7 @@ pub async fn end_impersonation(
     session.remove(IMPERSONATOR_SESSION_KEY).await;
     session.remove(IMPERSONATED_SESSION_KEY).await;
     session.remove(IMPERSONATION_SESSION_ID_KEY).await;
+    restore_identity_keys(session).await;
     stash(session, IMPERSONATOR_ROLE_SESSION_KEY, ROLE_SESSION_KEY).await;
     // Put the operator's own step-up claim back exactly as it was, and discard
     // anything the impersonated session accrued — that freshness belonged to
@@ -1035,7 +1205,7 @@ mod tests {
         // the reserved-key check refuses the configuration instead.
         assert!(is_reserved_session_key(crate::step_up::STEP_UP_SESSION_KEY));
         assert_eq!(crate::step_up::STEP_UP_SESSION_KEY, "last_strong_auth_at");
-        assert_eq!(RESERVED_SESSION_KEYS.len(), 7);
+        assert_eq!(RESERVED_SESSION_KEYS.len(), 8);
     }
 
     #[test]

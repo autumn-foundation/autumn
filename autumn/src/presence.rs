@@ -79,16 +79,25 @@ impl PresenceInner {
     }
 
     fn add(&mut self, topic: &str, key: &str, connection_id: u64, meta: JsonValue) {
-        self.entries
-            .entry(topic.to_owned())
-            .or_default()
-            .entry(key.to_owned())
-            .or_default()
-            .push(ConnectionPresence {
-                connection_id,
-                meta,
-                last_heartbeat: crate::time::ambient_instant(),
-            });
+        let connection = ConnectionPresence {
+            connection_id,
+            meta,
+            last_heartbeat: crate::time::ambient_instant(),
+        };
+        // Probe with the borrowed names first. A join usually lands on a
+        // topic somebody is already on, and a second tab on a key already
+        // there; `entry` copied both names to probe a map that held them.
+        if let Some(by_key) = self.entries.get_mut(topic) {
+            if let Some(connections) = by_key.get_mut(key) {
+                connections.push(connection);
+                return;
+            }
+            by_key.insert(key.to_owned(), vec![connection]);
+            return;
+        }
+        let mut by_key = std::collections::BTreeMap::new();
+        by_key.insert(key.to_owned(), vec![connection]);
+        self.entries.insert(topic.to_owned(), by_key);
     }
 
     /// Remove the given connection.  Returns `true` if the key is now completely
@@ -188,6 +197,20 @@ pub enum PresenceEvent {
     },
 }
 
+/// [`PresenceEvent`]'s wire form, borrowed from the caller.
+///
+/// A join is encoded once and its key and metadata are then kept, and a
+/// leave's key stays with the handle, so an owned `PresenceEvent` copied the
+/// key, and deep-copied the metadata, only to serialize the copy. Same tag,
+/// casing and field order as [`PresenceEvent`], which every subscriber
+/// decodes it as; `presence_event_ref_encodes_like_presence_event` pins that.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum PresenceEventRef<'a> {
+    Join { key: &'a str, meta: &'a JsonValue },
+    Leave { key: &'a str },
+}
+
 /// Distributed presence tracker layered on top of [`Channels`].
 ///
 /// `Presence` is a request extractor — declare it as a handler argument and
@@ -263,12 +286,13 @@ impl Presence {
         let meta = meta.into();
         let connection_id = next_connection_id();
 
-        let event = PresenceEvent::Join {
-            key: key.clone(),
-            meta: meta.clone(),
-        };
-
-        let json = serde_json::to_string(&event).unwrap_or_default();
+        // Borrowed: the key and metadata move into the store and the handle
+        // below, so the event is encoded from them rather than from a copy.
+        let json = serde_json::to_string(&PresenceEventRef::Join {
+            key: &key,
+            meta: &meta,
+        })
+        .unwrap_or_default();
         let publish_channel = format!("presence:{topic}");
 
         {
@@ -283,6 +307,7 @@ impl Presence {
         PresenceHandle {
             topic,
             key,
+            channel: publish_channel,
             connection_id,
             inner: Arc::clone(&self.inner),
             channels: self.channels.clone(),
@@ -309,6 +334,23 @@ impl Presence {
             .lock()
             .expect("presence lock poisoned")
             .list(topic)
+    }
+
+    /// How many keys are on `topic`: `list(topic).len()` without building
+    /// the list.
+    ///
+    /// `presence_stream` recounts on every join and leave, for every open
+    /// stream, and `list` deep-copies every member to be counted. A key with
+    /// no connections left is removed from the store, so the per-key map's
+    /// length is exactly the number of entries `list` would return.
+    #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+    fn count(&self, topic: &str) -> usize {
+        self.inner
+            .lock()
+            .expect("presence lock poisoned")
+            .entries
+            .get(topic)
+            .map_or(0, std::collections::BTreeMap::len)
     }
 
     /// Evict presence entries whose heartbeat has not been refreshed within the
@@ -349,6 +391,8 @@ impl Presence {
 pub struct PresenceHandle {
     topic: String,
     key: String,
+    /// `presence:{topic}`, built once by `track` and reused by the leave.
+    channel: String,
     connection_id: u64,
     inner: Arc<Mutex<PresenceInner>>,
     channels: Channels,
@@ -394,13 +438,9 @@ impl Drop for PresenceHandle {
         // If the same user still has other tabs open their key remains present,
         // so emitting a Leave would incorrectly signal they have gone offline.
         if key_fully_removed {
-            let event = PresenceEvent::Leave {
-                key: self.key.clone(),
-            };
-            let json = serde_json::to_string(&event).unwrap_or_default();
-            let _ = self
-                .channels
-                .publish(&format!("presence:{}", self.topic), json);
+            let json = serde_json::to_string(&PresenceEventRef::Leave { key: &self.key })
+                .unwrap_or_default();
+            let _ = self.channels.publish(&self.channel, json);
         }
     }
 }
@@ -435,7 +475,7 @@ pub fn presence_stream(
     let subscriber = state.channels().subscribe(&format!("presence:{topic}"));
 
     let stream = subscriber.into_stream().map(move |_msg| {
-        let count = presence.list(&topic).len();
+        let count = presence.count(&topic);
         let badge_html = presence_badge(count).into_string();
         let data = crate::channels::inject_oob_attr(&badge_html, "outerHTML");
         Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(data))
@@ -533,6 +573,29 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].key, "alice");
         assert_eq!(entries[1].key, "bob");
+    }
+
+    /// `add` probes by borrow before inserting: a join on a known topic, and
+    /// a second tab on a known key, must land on the entries already there.
+    #[test]
+    fn add_reuses_existing_topic_and_key_entries() {
+        let presence = make_presence();
+        let _a1 = presence.track("room:1", "alice", serde_json::json!({"tab": 1}));
+        let _b = presence.track("room:1", "bob", serde_json::json!({}));
+        let _a2 = presence.track("room:1", "alice", serde_json::json!({"tab": 2}));
+        let _c = presence.track("room:2", "carol", serde_json::json!({}));
+
+        let entries = presence.list("room:1");
+        assert_eq!(
+            entries.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
+        assert_eq!(
+            entries[0].metas,
+            vec![serde_json::json!({"tab": 1}), serde_json::json!({"tab": 2})],
+            "a second tab appends to the key's connections, in join order"
+        );
+        assert_eq!(presence.list("room:2").len(), 1);
     }
 
     #[test]
@@ -691,6 +754,31 @@ mod tests {
         assert_eq!(parsed["key"], "alice");
     }
 
+    /// `track` and the handle's drop encode the borrowed mirror; every
+    /// subscriber decodes it as a `PresenceEvent`, so the bytes must match.
+    #[test]
+    fn presence_event_ref_encodes_like_presence_event() {
+        let meta = serde_json::json!({"label": "Ada", "tab": 2});
+        let borrowed = serde_json::to_string(&PresenceEventRef::Join {
+            key: "ada",
+            meta: &meta,
+        })
+        .unwrap();
+        let owned = serde_json::to_string(&PresenceEvent::Join {
+            key: "ada".to_owned(),
+            meta,
+        })
+        .unwrap();
+        assert_eq!(borrowed, owned);
+
+        let borrowed = serde_json::to_string(&PresenceEventRef::Leave { key: "ada" }).unwrap();
+        let owned = serde_json::to_string(&PresenceEvent::Leave {
+            key: "ada".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(borrowed, owned);
+    }
+
     // ── AC#4: TURNKEY PRESENCE HELPERS ──────────────────────────────────────
 
     #[cfg(feature = "maud")]
@@ -745,6 +833,31 @@ mod tests {
 
         // Verify the function itself builds (compilation check).
         let _sse = presence_stream(&state, "stream-test");
+    }
+
+    /// `presence_stream` counts with `count` instead of `list(..).len()`;
+    /// the two must agree, counting keys rather than connections.
+    #[cfg(all(feature = "ws", feature = "maud", feature = "htmx"))]
+    #[test]
+    fn count_matches_the_list_it_replaces() {
+        let presence = make_presence();
+        assert_eq!(presence.count("room:1"), 0);
+
+        let _a1 = presence.track("room:1", "alice", serde_json::json!({"tab": 1}));
+        let a2 = presence.track("room:1", "alice", serde_json::json!({"tab": 2}));
+        let b = presence.track("room:1", "bob", serde_json::json!({}));
+        let _c = presence.track("room:2", "carol", serde_json::json!({}));
+        assert_eq!(presence.count("room:1"), presence.list("room:1").len());
+        assert_eq!(presence.count("room:1"), 2, "two keys, three connections");
+
+        drop(a2);
+        drop(b);
+        assert_eq!(presence.count("room:1"), presence.list("room:1").len());
+        assert_eq!(
+            presence.count("room:1"),
+            1,
+            "a fully-left key is not counted"
+        );
     }
 
     /// Poll the `presence_stream` SSE body to exercise the closure that calls

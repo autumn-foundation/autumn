@@ -325,10 +325,31 @@ pub trait ProvideActuatorState {
         &self,
     ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>;
 
+    /// Returns the probe state that holds the cached primary database ping.
+    ///
+    /// `/actuator/health` uses this state to share one ping cache with
+    /// `/ready`. The default returns `None`. Then each request opens a new
+    /// connection and pings the primary with a 2 s limit. Override this
+    /// method to return the same state as `ProvideProbeState::probes`.
+    #[cfg(feature = "db")]
+    fn probe_state(&self) -> Option<&crate::probe::ProbeState> {
+        None
+    }
+
     /// Returns the configured shard set, used to expose per-shard pool
     /// metrics in the `/actuator/metrics` endpoint. Defaults to `None`.
     #[cfg(feature = "db")]
     fn shards(&self) -> Option<&crate::sharding::ShardSet> {
+        None
+    }
+
+    /// Returns the read-replica pool, used to export its gauges on
+    /// `/actuator/prometheus` with `pool="replica"`. Defaults to `None`.
+    #[cfg(feature = "db")]
+    fn replica_pool(
+        &self,
+    ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+    {
         None
     }
 
@@ -393,6 +414,15 @@ pub trait ProvideActuatorState {
         None
     }
 
+    /// Returns the serialized architecture graph served at `/actuator/graph`.
+    ///
+    /// The default returns `None`, and the endpoint answers `503`.
+    /// [`crate::AppState`] overrides this to return the graph that the
+    /// framework installed when it built this application's router.
+    fn architecture_graph_json(&self) -> Option<bytes::Bytes> {
+        None
+    }
+
     /// Returns the shadow-mirroring handle, when this replica assembled a
     /// mirror (`[shadow] enabled = true` with a reachable target configured).
     ///
@@ -401,6 +431,36 @@ pub trait ProvideActuatorState {
     /// an operator turning the feature on can tell "not enabled here" apart
     /// from "endpoint not mounted".
     fn shadow(&self) -> Option<crate::shadow::ShadowHandle> {
+        None
+    }
+
+    /// Returns the data-capsule service of `{prefix}/capsules/*` (issue #1811).
+    ///
+    /// The default gives an error, so the endpoints answer `501`.
+    /// [`crate::AppState`] uses
+    /// [`CapsuleService::from_state`](crate::gdpr::portability::CapsuleService::from_state).
+    ///
+    /// # Errors
+    ///
+    /// [`CapsuleError`](crate::gdpr::portability::DataCapsuleError) when the
+    /// service is not configured.
+    fn data_capsules(
+        &self,
+    ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::DataCapsuleError>
+    {
+        Err(crate::gdpr::portability::DataCapsuleError::NotConfigured(
+            "this state has no data-capsule service".to_owned(),
+        ))
+    }
+
+    /// Returns the cost signal (issue #1720). The default returns `None`.
+    fn cost_signal(&self) -> Option<crate::cost::CostSignal> {
+        None
+    }
+
+    /// Returns the cost accountant (issue #1720). The default returns `None`,
+    /// and `{prefix}/cost` then reports `"enabled": false`.
+    fn cost_accountant(&self) -> Option<crate::cost::CostAccountant> {
         None
     }
 }
@@ -859,6 +919,27 @@ struct QueueGaugeState {
     pg_marks_seq_order: std::collections::BTreeMap<u64, String>,
 }
 
+impl QueueGaugeState {
+    /// The queue `name` drains from (`default` when unregistered), borrowed
+    /// from the registration map rather than copied out per lookup.
+    fn queue_of(&self, name: &str) -> &str {
+        self.name_to_queue
+            .get(name)
+            .map_or("default", String::as_str)
+    }
+
+    /// The waiting marks of `name`'s queue, when that queue has an entry.
+    fn waiting_for_mut(&mut self, name: &str) -> Option<&mut std::collections::VecDeque<u64>> {
+        // Disjoint fields: `name_to_queue` is read while `waiting` is borrowed
+        // mutably, so the queue name is never copied out.
+        let queue = self
+            .name_to_queue
+            .get(name)
+            .map_or("default", String::as_str);
+        self.waiting.get_mut(queue)
+    }
+}
+
 /// Cap on [`QueueGaugeState::pg_marks_by_job_id`]. Comfortably above any
 /// realistic count of Postgres jobs sitting `enqueued` at once — enough that
 /// a job an operator wants to cancel is essentially always still tracked —
@@ -963,6 +1044,9 @@ pub struct JobRegistry {
     /// against `SystemClock`, and the two report different depths and ages for
     /// one set of marks. Installing a clock therefore travels to every clone.
     clock: Arc<RwLock<Arc<dyn crate::time::ClockSource>>>,
+    /// Redis dead letters this process removed to obey
+    /// `jobs.redis.dead_letter_limit` (issue #3055). Shared by all clones.
+    dead_letter_trimmed: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl JobRegistry {
@@ -977,6 +1061,7 @@ impl JobRegistry {
             clock: Arc::new(RwLock::new(
                 Arc::new(crate::time::SystemClock) as Arc<dyn crate::time::ClockSource>
             )),
+            dead_letter_trimmed: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1058,15 +1143,6 @@ impl JobRegistry {
                 .insert(name.to_string(), queue.to_string());
             guard.waiting.entry(queue.to_string()).or_default();
         }
-    }
-
-    /// The queue a job name drains from (defaults to `default`).
-    fn queue_for(&self, name: &str) -> String {
-        self.queues
-            .read()
-            .ok()
-            .and_then(|g| g.name_to_queue.get(name).cloned())
-            .unwrap_or_else(|| "default".to_string())
     }
 
     /// Snapshot per-queue depth and oldest-waiting-job age.
@@ -1190,17 +1266,34 @@ impl JobRegistry {
     /// Shared enqueue bookkeeping: bump the per-name `queued` counter and push a
     /// per-queue waiting mark stamped with the job's ready-at time.
     fn record_enqueue_at(&self, name: &str, ready_at_ms: u64) {
+        // Probe both maps by borrow: the name is registered at runtime start,
+        // so owned keys are only built for a never-seen name or queue.
         if let Ok(mut guard) = self.inner.write() {
-            let status = guard.entry(name.to_string()).or_insert(JobStatus::empty());
-            status.queued = status.queued.saturating_add(1);
+            #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+            if let Some(status) = guard.get_mut(name) {
+                status.queued = status.queued.saturating_add(1);
+            } else {
+                guard.insert(
+                    name.to_owned(),
+                    JobStatus {
+                        queued: 1,
+                        ..JobStatus::empty()
+                    },
+                );
+            }
         }
-        let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write() {
-            guard
-                .waiting
-                .entry(queue)
-                .or_default()
-                .push_back(ready_at_ms);
+            #[allow(clippy::option_if_let_else)] // the else branch re-borrows the map mutably
+            if let Some(waiting) = guard.waiting_for_mut(name) {
+                waiting.push_back(ready_at_ms);
+            } else {
+                let queue = guard.queue_of(name).to_owned();
+                guard
+                    .waiting
+                    .entry(queue)
+                    .or_default()
+                    .push_back(ready_at_ms);
+            }
         }
     }
 
@@ -1335,6 +1428,7 @@ impl JobRegistry {
     /// that in fact never left the queue. A non-terminal retry re-adds the
     /// entry with the retry's own mark via [`Self::record_pg_enqueue`]; a
     /// job that succeeds or terminally fails never needs it again.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     pub(crate) fn record_pg_start(&self, name: &str, id: &str) {
         if let Ok(mut guard) = self.inner.write()
             && let Some(status) = guard.get_mut(name)
@@ -1582,10 +1676,11 @@ impl JobRegistry {
     /// one. If no mark in the preferred category exists we fall back to the
     /// oldest mark so every enqueue still has a matching removal (no leak).
     fn pop_waiting(&self, name: &str, prefer_ready: bool) {
-        let queue = self.queue_for(name);
         let now = self.now_ms();
+        // The queue is looked up by borrow under the write lock taken here
+        // anyway, instead of copied out under a separate read lock first.
         if let Ok(mut guard) = self.queues.write()
-            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(waiting) = guard.waiting_for_mut(name)
         {
             let idx = waiting
                 .iter()
@@ -1601,9 +1696,8 @@ impl JobRegistry {
     /// on whatever timeline the caller resolved it against. A queue with no
     /// marks removes nothing — there is nothing to leak.
     fn pop_waiting_nearest(&self, name: &str, candidates: &[u64]) {
-        let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write()
-            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(waiting) = guard.waiting_for_mut(name)
         {
             let idx = waiting
                 .iter()
@@ -1627,9 +1721,8 @@ impl JobRegistry {
     /// removed — so the caller can fall back to a heuristic guess rather
     /// than silently leaving the job's real, current mark in place.
     fn pop_waiting_exact(&self, name: &str, exact_ms: u64) -> bool {
-        let queue = self.queue_for(name);
         if let Ok(mut guard) = self.queues.write()
-            && let Some(waiting) = guard.waiting.get_mut(&queue)
+            && let Some(waiting) = guard.waiting_for_mut(name)
             && let Some(idx) = waiting.iter().position(|mark| *mark == exact_ms)
         {
             waiting.remove(idx);
@@ -1646,11 +1739,14 @@ impl JobRegistry {
     /// timeline would otherwise contaminate.
     #[cfg(test)]
     pub(crate) fn waiting_marks_for_test(&self, name: &str) -> Vec<u64> {
-        let queue = self.queue_for(name);
         self.queues
             .read()
             .ok()
-            .and_then(|g| g.waiting.get(&queue).map(|w| w.iter().copied().collect()))
+            .and_then(|g| {
+                g.waiting
+                    .get(g.queue_of(name))
+                    .map(|w| w.iter().copied().collect())
+            })
             .unwrap_or_default()
     }
 
@@ -1688,6 +1784,7 @@ impl JobRegistry {
     /// `job.rs`) that needs to force capacity eviction without duplicating
     /// the constant. Test-only.
     #[cfg(test)]
+    #[allow(dead_code, reason = "used only by feature-gated job tests")]
     pub(crate) const fn pg_marks_cap_for_test() -> usize {
         PG_MARKS_BY_JOB_ID_CAP
     }
@@ -1715,10 +1812,39 @@ impl JobRegistry {
 
     /// Record a terminal failure.
     pub fn record_failure(&self, name: &str, error: String, dead_lettered: bool) {
+        self.record_failure_inner(name, error, dead_lettered, true);
+    }
+
+    /// Count a start again that a newer attempt already balanced. The caller
+    /// then makes the `record_*` call that ends the run, which decrements once.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    pub(crate) fn restore_in_flight(&self, name: &str) {
         if let Ok(mut guard) = self.inner.write()
             && let Some(status) = guard.get_mut(name)
         {
-            status.in_flight = status.in_flight.saturating_sub(1);
+            status.in_flight = status.in_flight.saturating_add(1);
+        }
+    }
+
+    /// Record a terminal failure of a run this process did not start.
+    /// Count the failure. Leave `in_flight` alone.
+    #[cfg(any(feature = "db", feature = "redis"))]
+    pub(crate) fn record_failure_not_started(
+        &self,
+        name: &str,
+        error: String,
+        dead_lettered: bool,
+    ) {
+        self.record_failure_inner(name, error, dead_lettered, false);
+    }
+
+    fn record_failure_inner(&self, name: &str, error: String, dead_lettered: bool, started: bool) {
+        if let Ok(mut guard) = self.inner.write()
+            && let Some(status) = guard.get_mut(name)
+        {
+            if started {
+                status.in_flight = status.in_flight.saturating_sub(1);
+            }
             status.total_failures = status.total_failures.saturating_add(1);
             status.last_error = Some(error);
             if dead_lettered {
@@ -1731,6 +1857,19 @@ impl JobRegistry {
     #[must_use]
     pub fn snapshot(&self) -> HashMap<String, JobStatus> {
         self.inner.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Add `count` dead letters that a trim removed.
+    pub fn record_dead_letter_trimmed(&self, count: u64) {
+        self.dead_letter_trimmed
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Total dead letters that trims removed in this process.
+    #[must_use]
+    pub fn dead_letter_trimmed_total(&self) -> u64 {
+        self.dead_letter_trimmed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -2009,6 +2148,13 @@ impl ConfigProperties {
             "database.replica_fallback",
             &format!("{:?}", config.database.replica_fallback),
             &format!("{:?}", defaults.database.replica_fallback),
+            profile_str,
+        );
+        Self::track_property(
+            props,
+            "database.replica_max_lag_ms",
+            &format!("{:?}", config.database.replica_max_lag_ms),
+            &format!("{:?}", defaults.database.replica_max_lag_ms),
             profile_str,
         );
     }
@@ -2519,13 +2665,50 @@ pub struct HealthRunResult {
     pub output: HealthCheckOutput,
 }
 
-type IndicatorList = Vec<(String, IndicatorGroup, Arc<dyn HealthIndicator>)>;
+/// One registered indicator and its result cache.
+#[derive(Clone)]
+struct IndicatorEntry {
+    name: String,
+    group: IndicatorGroup,
+    indicator: Arc<dyn HealthIndicator>,
+    cache: Arc<crate::health_cache::SingleFlightCache<HealthCheckOutput>>,
+}
+
+impl IndicatorEntry {
+    /// Run the check with its timeout, or return the cached result.
+    async fn run(self) -> HealthRunResult {
+        let indicator = Arc::clone(&self.indicator);
+        let output = self
+            .cache
+            .get_or_refresh(
+                move || async move { run_with_timeout(indicator.as_ref()).await },
+                || {
+                    let mut details = HashMap::new();
+                    details.insert("panicked".to_owned(), serde_json::Value::Bool(true));
+                    HealthCheckOutput::down().with_details(details)
+                },
+            )
+            .await;
+        HealthRunResult {
+            name: self.name,
+            group: self.group,
+            output,
+        }
+    }
+}
+
+#[derive(Default)]
+struct IndicatorList {
+    entries: Vec<IndicatorEntry>,
+    cache_ttl: std::time::Duration,
+}
 
 /// Registry of named [`HealthIndicator`] implementations.
 ///
 /// Populated by [`crate::app::AppBuilder::health_indicator`] and stored on
 /// [`crate::AppState`]. Provides duplicate-registration detection at startup
-/// and per-indicator timeout enforcement at request time.
+/// and per-indicator timeout enforcement at request time. Results can be
+/// cached for a short TTL (see [`Self::set_cache_ttl`]).
 #[derive(Clone, Default)]
 pub struct HealthIndicatorRegistry {
     inner: Arc<RwLock<IndicatorList>>,
@@ -2556,14 +2739,38 @@ impl HealthIndicatorRegistry {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if inner.iter().any(|(n, _, _)| n == &name) {
+        if inner.entries.iter().any(|entry| entry.name == name) {
             return Err(format!(
                 "HealthIndicator '{name}' is already registered; skipping duplicate"
             ));
         }
-        inner.push((name, group, indicator));
+        let cache = Arc::new(crate::health_cache::SingleFlightCache::new(inner.cache_ttl));
+        inner.entries.push(IndicatorEntry {
+            name,
+            group,
+            indicator,
+            cache,
+        });
         drop(inner);
         Ok(())
+    }
+
+    /// Set how long one indicator result stays valid. Zero (the default for
+    /// [`Self::new`]) turns the cache off. Applies to indicators registered
+    /// before and after this call.
+    ///
+    /// When a result is stale, one caller runs the check and the other
+    /// callers wait for its result (single-flight). A timed-out result is
+    /// cached too, so a hung dependency is not called again by each prober.
+    pub fn set_cache_ttl(&self, ttl: std::time::Duration) {
+        let mut inner = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.cache_ttl = ttl;
+        for entry in &inner.entries {
+            entry.cache.set_ttl(ttl);
+        }
     }
 
     /// Returns `true` when no indicators have been registered.
@@ -2572,6 +2779,7 @@ impl HealthIndicatorRegistry {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
             .is_empty()
     }
 
@@ -2587,8 +2795,18 @@ impl HealthIndicatorRegistry {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
             .iter()
-            .any(|(registered, _, _)| registered == name)
+            .any(|entry| entry.name == name)
+    }
+
+    /// Clone the entries so the read lock is released before async work.
+    fn entries(&self) -> Vec<IndicatorEntry> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .clone()
     }
 
     /// Run all registered indicators (both groups) with per-indicator timeouts.
@@ -2596,23 +2814,8 @@ impl HealthIndicatorRegistry {
     /// All indicators execute **concurrently**; total wall time is bounded by
     /// the slowest single indicator rather than N × timeout.
     pub async fn run_all(&self) -> Vec<HealthRunResult> {
-        let entries = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-
-        let mut results = futures::future::join_all(entries.into_iter().map(
-            |(name, group, indicator)| async move {
-                let output = run_with_timeout(indicator.as_ref()).await;
-                HealthRunResult {
-                    name,
-                    group,
-                    output,
-                }
-            },
-        ))
-        .await;
+        let mut results =
+            futures::future::join_all(self.entries().into_iter().map(IndicatorEntry::run)).await;
 
         for breaker in crate::circuit_breaker::global_registry().all_breakers() {
             let state = breaker.state();
@@ -2627,11 +2830,13 @@ impl HealthIndicatorRegistry {
                 "state".to_string(),
                 serde_json::Value::String(state.as_str().to_string()),
             );
-            if let Some(ratio_num) = serde_json::Number::from_f64(breaker.failure_ratio()) {
-                details.insert(
-                    "failure_ratio".to_string(),
-                    serde_json::Value::Number(ratio_num),
-                );
+            for (key, ratio) in [
+                ("failure_ratio", breaker.failure_ratio()),
+                ("slow_call_ratio", breaker.slow_call_ratio()),
+            ] {
+                if let Some(ratio_num) = serde_json::Number::from_f64(ratio) {
+                    details.insert(key.to_string(), serde_json::Value::Number(ratio_num));
+                }
             }
 
             results.push(HealthRunResult {
@@ -2649,25 +2854,11 @@ impl HealthIndicatorRegistry {
     /// All indicators execute **concurrently**; total wall time is bounded by
     /// the slowest single indicator rather than N × timeout.
     pub async fn run_readiness(&self) -> Vec<HealthRunResult> {
-        // Clone the full list to release the read lock before async work begins.
-        let entries = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-
         futures::future::join_all(
-            entries
+            self.entries()
                 .into_iter()
-                .filter(|(_, g, _)| *g == IndicatorGroup::Readiness)
-                .map(|(name, group, indicator)| async move {
-                    let output = run_with_timeout(indicator.as_ref()).await;
-                    HealthRunResult {
-                        name,
-                        group,
-                        output,
-                    }
-                }),
+                .filter(|entry| entry.group == IndicatorGroup::Readiness)
+                .map(IndicatorEntry::run),
         )
         .await
     }
@@ -2755,6 +2946,8 @@ struct DatabaseCheck {
     pool_size: u64,
     active_connections: u64,
     idle_connections: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 fn build_health_components(
@@ -2787,12 +2980,16 @@ fn build_health_components(
         let details = detailed
             .then(|| {
                 db_check.map(|d| {
-                    serde_json::json!({
+                    let mut details = serde_json::json!({
                         "status": d.status,
                         "pool_size": d.pool_size,
                         "active_connections": d.active_connections,
                         "idle_connections": d.idle_connections,
-                    })
+                    });
+                    if let Some(error) = &d.error {
+                        details["error"] = serde_json::json!(error);
+                    }
+                    details
                 })
             })
             .flatten();
@@ -2814,29 +3011,32 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     let detailed = state.health_detailed();
 
     // ── built-in db component ────────────────────────────────────
-    let (db_component_status, db_check) = {
+    let db_component = async {
         #[cfg(feature = "db")]
         {
-            #[allow(clippy::option_if_let_else)]
             if let Some(pool) = state.pool() {
+                // Readiness is a `SELECT 1` on the primary, not pool
+                // saturation (#3059). Pool numbers stay as details.
+                let primary = match state.probe_state() {
+                    Some(probes) => probes.check_primary_db(pool).await,
+                    None => crate::probe::ProbeState::check_primary_db_uncached(pool).await,
+                };
                 let status = pool.status();
-                let available = status.available as u64;
                 let size = status.max_size as u64;
-                let waiting = status.waiting as u64;
-                let idle = available;
-                let active = size.saturating_sub(available);
-
-                let healthy = available > 0 || waiting == 0;
-                let db_status = if healthy {
+                let idle = status.available as u64;
+                let db_status = if primary.up {
                     HealthStatus::Up
                 } else {
                     HealthStatus::Down
                 };
                 let db_check = Some(DatabaseCheck {
-                    status: if healthy { "ok" } else { "down" },
+                    status: if primary.up { "ok" } else { "down" },
                     pool_size: size,
-                    active_connections: active,
+                    active_connections: size.saturating_sub(idle),
                     idle_connections: idle,
+                    // The error can name the host or the user. `checks` is
+                    // always in the body, so show it only when detailed.
+                    error: primary.error.filter(|_| detailed),
                 });
                 (Some(db_status), db_check)
             } else {
@@ -2850,11 +3050,17 @@ pub async fn health<S: ProvideActuatorState + Send + Sync + 'static>(
     };
 
     // ── registered custom indicators ───────────────────────────
-    let indicator_results = if let Some(registry) = state.health_indicator_registry() {
-        registry.run_all().await
-    } else {
-        Vec::new()
+    let indicators = async {
+        if let Some(registry) = state.health_indicator_registry() {
+            registry.run_all().await
+        } else {
+            Vec::new()
+        }
     };
+
+    // Run both at the same time: the wall time is the slower one, not the sum.
+    let ((db_component_status, db_check), indicator_results) =
+        tokio::join!(db_component, indicators);
 
     // ── aggregate status ────────────────────────────────────────
     let mut all_statuses: Vec<HealthStatus> =
@@ -2997,6 +3203,26 @@ pub(crate) async fn env_endpoint<S: ProvideActuatorState + Send + Sync + 'static
 // ── Metrics ────────────────────────────────────────────────────
 
 /// `GET <actuator-prefix>/metrics` -- request metrics, latency, status codes, DB pool stats.
+/// The `cache` section of `/actuator/metrics`: the read-through snapshot, plus
+/// the stale-if-error and invalidation-failure counters (#3056).
+fn cache_metrics_json() -> serde_json::Value {
+    let mut cache =
+        serde_json::to_value(crate::cache::read_through_metrics().snapshot()).unwrap_or_default();
+    if let serde_json::Value::Object(ref mut map) = cache {
+        map.insert(
+            "stale_if_error_serves".to_string(),
+            crate::cache::read_through_metrics()
+                .stale_if_error_serves()
+                .into(),
+        );
+        map.insert(
+            "invalidation_failures".to_string(),
+            crate::cache::invalidation_failures_total().into(),
+        );
+    }
+    cache
+}
+
 pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> Json<serde_json::Value> {
@@ -3006,11 +3232,7 @@ pub(crate) async fn metrics_endpoint<S: ProvideActuatorState + Send + Sync + 'st
     // Include read-through cache stampede-protection counters (always
     // present; the read-through API works standalone without app state).
     if let serde_json::Value::Object(ref mut map) = result {
-        map.insert(
-            "cache".to_string(),
-            serde_json::to_value(crate::cache::read_through_metrics().snapshot())
-                .unwrap_or_default(),
-        );
+        map.insert("cache".to_string(), cache_metrics_json());
     }
 
     // Include DB pool stats if available
@@ -3106,6 +3328,7 @@ pub(crate) struct CircuitBreakerActuatorResponse {
     pub name: String,
     pub state: &'static str,
     pub failure_ratio: f64,
+    pub slow_call_ratio: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_ratio_threshold: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3116,6 +3339,13 @@ pub(crate) struct CircuitBreakerActuatorResponse {
     pub open_duration_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub half_open_trial_count: Option<u64>,
+    /// Absent when slow-call detection is off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slow_call_duration_threshold_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slow_call_rate_threshold: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cancelled_call_outcome: Option<&'static str>,
 }
 
 /// `GET <actuator-prefix>/circuitbreakers`
@@ -3131,11 +3361,18 @@ pub(crate) async fn circuitbreakers_endpoint<S: ProvideActuatorState + Send + Sy
             name: breaker.name().to_string(),
             state: breaker.state().as_str(),
             failure_ratio: breaker.failure_ratio(),
+            slow_call_ratio: breaker.slow_call_ratio(),
             failure_ratio_threshold: detailed.then_some(policy.failure_ratio_threshold),
             sample_window_secs: detailed.then_some(policy.sample_window.as_secs()),
             minimum_sample_count: detailed.then_some(policy.minimum_sample_count),
             open_duration_secs: detailed.then_some(policy.open_duration.as_secs()),
             half_open_trial_count: detailed.then_some(policy.half_open_trial_count),
+            slow_call_duration_threshold_ms: policy
+                .slow_call_duration_threshold
+                .filter(|_| detailed)
+                .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX)),
+            slow_call_rate_threshold: detailed.then_some(policy.slow_call_rate_threshold),
+            cancelled_call_outcome: detailed.then_some(policy.cancelled_call_outcome.as_str()),
         });
     }
 
@@ -3205,29 +3442,55 @@ fn render_labels(labels: &[(String, String)]) -> String {
 /// cardinality cap; emitted by `write_app_metrics` when any were dropped.
 pub(crate) const SERIES_DROPPED_FAMILY: &str = "autumn_metrics_series_dropped_total";
 
+/// Redis dead letters removed to obey `jobs.redis.dead_letter_limit`.
+pub(crate) const DEAD_LETTER_TRIMMED_FAMILY: &str = "autumn_jobs_dead_letter_trimmed_total";
+
+/// Time a `Db` checkout waits for a pool connection (issue #3064).
+pub(crate) const DB_POOL_WAIT_FAMILY: &str = "autumn_db_pool_wait_seconds";
+
+/// HTTP request latency histogram (issue #3064).
+pub(crate) const HTTP_DURATION_FAMILY: &str = "autumn_http_request_duration_seconds";
+
+/// Deprecated latency summary. It keeps the p50/p95/p99 quantile lines that
+/// `autumn_http_request_duration_seconds` carried before it became a histogram.
+pub(crate) const HTTP_DURATION_QUANTILES_FAMILY: &str =
+    "autumn_http_request_duration_quantiles_seconds";
+
+/// Slow calls per circuit breaker (issue #3060).
+pub(crate) const BREAKER_SLOW_CALLS_FAMILY: &str = "autumn_circuit_breaker_slow_calls_total";
+
+/// The slow-call ratio in each circuit breaker's window (issue #3060).
+pub(crate) const BREAKER_SLOW_CALL_RATIO_FAMILY: &str = "autumn_circuit_breaker_slow_call_ratio";
+
 /// Every metric family name the framework itself emits on `/actuator/prometheus`.
 ///
 /// Two callers share this list: `prometheus_endpoint` seeds its
 /// `emitted_families` set with it so a plugin [`MetricsSource`] cannot shadow a
 /// built-in family, and [`crate::metrics`] refuses to register an app metric
 /// under any of these names.
-pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 23] = [
+pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 46] = [
     "autumn_http_requests_total",
     "autumn_http_requests_active",
     "autumn_http_responses_total",
-    // `autumn_http_request_duration_seconds` is a **summary**, and a summary
-    // owns the derived `_sum`/`_count` family names the same way a histogram
-    // owns `_bucket`/`_sum`/`_count` — even though this exporter emits only
-    // quantile lines for it. A second family under either derived name gives
-    // the document two `# HELP` lines for one family, which makes Prometheus'
-    // own parser reject the *whole* scrape, not just that family.
-    "autumn_http_request_duration_seconds",
+    // A histogram owns its derived `_bucket`/`_sum`/`_count` names, and a
+    // summary owns `_sum`/`_count`, even when this exporter writes only
+    // quantile lines. A second family under a derived name gives the document
+    // two `# HELP` lines for one family. Prometheus then rejects the *whole*
+    // scrape, not just that family.
+    HTTP_DURATION_FAMILY,
+    "autumn_http_request_duration_seconds_bucket",
     "autumn_http_request_duration_seconds_sum",
     "autumn_http_request_duration_seconds_count",
+    HTTP_DURATION_QUANTILES_FAMILY,
+    "autumn_http_request_duration_quantiles_seconds_sum",
+    "autumn_http_request_duration_quantiles_seconds_count",
     "autumn_shutdown_aborted_requests_total",
     "autumn_request_timeouts_total",
     "autumn_read_your_writes_pins_total",
     "autumn_requests_shed_total",
+    "autumn_admission_limit",
+    "autumn_admission_shed_total",
+    "autumn_tenant_bulkhead_rejections_total",
     "autumn_http_route_requests_total",
     "autumn_metrics_source_errors_total",
     SERIES_DROPPED_FAMILY,
@@ -3239,6 +3502,22 @@ pub(crate) const BUILTIN_METRIC_FAMILY_NAMES: [&str; 23] = [
     "autumn_cache_read_through_stale_serves_total",
     "autumn_cache_fill_lock_acquires_total",
     "autumn_cache_fill_lock_contended_total",
+    "autumn_cache_read_through_stale_if_error_serves_total",
+    "autumn_cache_invalidation_failures_total",
+    DEAD_LETTER_TRIMMED_FAMILY,
+    "autumn_jobs_queue_depth",
+    "autumn_jobs_oldest_age_seconds",
+    "autumn_jobs_dead_letter_total",
+    "autumn_db_pool_max_size",
+    "autumn_db_pool_size",
+    "autumn_db_pool_available",
+    "autumn_db_pool_waiting",
+    DB_POOL_WAIT_FAMILY,
+    "autumn_db_pool_wait_seconds_bucket",
+    "autumn_db_pool_wait_seconds_sum",
+    "autumn_db_pool_wait_seconds_count",
+    BREAKER_SLOW_CALLS_FAMILY,
+    BREAKER_SLOW_CALL_RATIO_FAMILY,
     crate::shadow::COMPARISONS_METRIC,
     crate::shadow::DIVERGENCES_METRIC,
 ];
@@ -3395,6 +3674,67 @@ fn render_plugin_sources(
     }
 }
 
+/// Write `autumn_requests_shed_total`, `autumn_admission_limit` and
+/// `autumn_admission_shed_total` (#3068).
+fn write_admission_metrics(
+    out: &mut String,
+    version: &str,
+    http: &crate::middleware::metrics::HttpMetrics,
+) {
+    use std::fmt::Write as _;
+
+    // autumn_requests_shed_total
+    out.push_str(
+        "# HELP autumn_requests_shed_total \
+         HTTP requests rejected by admission control because the in-flight count was at its limit\n",
+    );
+    out.push_str("# TYPE autumn_requests_shed_total counter\n");
+    let _ = writeln!(
+        out,
+        "autumn_requests_shed_total{{version=\"{version}\"}} {}",
+        http.requests_shed_total
+    );
+
+    let admission = &http.admission;
+    out.push_str(
+        "# HELP autumn_admission_limit Current admission-control concurrency limit (0 = no limit)\n",
+    );
+    out.push_str("# TYPE autumn_admission_limit gauge\n");
+    let _ = writeln!(
+        out,
+        "autumn_admission_limit{{version=\"{version}\"}} {}",
+        admission.limit
+    );
+    out.push_str(
+        "# HELP autumn_admission_shed_total HTTP requests rejected by admission control, by criticality\n",
+    );
+    out.push_str("# TYPE autumn_admission_shed_total counter\n");
+    for (criticality, count) in [
+        ("critical", admission.shed_critical),
+        ("default", admission.shed_default),
+        ("sheddable", admission.shed_sheddable),
+    ] {
+        let _ = writeln!(
+            out,
+            "autumn_admission_shed_total{{version=\"{version}\",criticality=\"{criticality}\"}} {count}"
+        );
+    }
+    out.push_str(
+        "# HELP autumn_tenant_bulkhead_rejections_total \
+         Work rejected by a per-tenant bulkhead, by kind\n",
+    );
+    out.push_str("# TYPE autumn_tenant_bulkhead_rejections_total counter\n");
+    for (kind, count) in [
+        ("request", admission.tenant_request_rejections),
+        ("db", admission.tenant_db_rejections),
+    ] {
+        let _ = writeln!(
+            out,
+            "autumn_tenant_bulkhead_rejections_total{{version=\"{version}\",kind=\"{kind}\"}} {count}"
+        );
+    }
+}
+
 /// Render the built-in `autumn_http_*` metric families into `out`, tagged with
 /// the replica's deploy `version` label so canary and stable cohorts can be
 /// compared by a controller scraping both.
@@ -3402,6 +3742,7 @@ fn write_builtin_http_metrics(
     out: &mut String,
     version: &str,
     snapshot: &crate::middleware::metrics::MetricsSnapshot,
+    duration_series: &[crate::middleware::metrics::DurationSeries],
 ) {
     use std::fmt::Write;
 
@@ -3438,25 +3779,9 @@ fn write_builtin_http_metrics(
         );
     }
 
-    // request_duration_seconds — global latency percentiles exposed as Prometheus
-    // summary-style quantiles, labelled by deploy version so a canary controller
-    // can gate promotion on p99 latency per cohort.
-    out.push_str(
-        "# HELP autumn_http_request_duration_seconds HTTP request latency percentiles in seconds\n",
-    );
-    out.push_str("# TYPE autumn_http_request_duration_seconds summary\n");
-    for (quantile, millis) in [
-        ("0.5", snapshot.http.latency_ms.p50),
-        ("0.95", snapshot.http.latency_ms.p95),
-        ("0.99", snapshot.http.latency_ms.p99),
-    ] {
-        #[allow(clippy::cast_precision_loss)]
-        let seconds = millis as f64 / 1000.0;
-        let _ = writeln!(
-            out,
-            "autumn_http_request_duration_seconds{{version=\"{version}\",quantile=\"{quantile}\"}} {seconds}"
-        );
-    }
+    write_http_duration_histogram(out, version, duration_series);
+
+    write_http_duration_quantiles(out, version, snapshot);
 
     // autumn_shutdown_aborted_requests_total
     out.push_str(
@@ -3494,18 +3819,7 @@ fn write_builtin_http_metrics(
         snapshot.read_your_writes_pins_total
     );
 
-    // autumn_requests_shed_total
-    out.push_str(
-        "# HELP autumn_requests_shed_total \
-         HTTP requests rejected by admission control because server.max_concurrent_requests was at its ceiling\n",
-    );
-    out.push_str("# TYPE autumn_requests_shed_total counter\n");
-    let _ = writeln!(
-        out,
-        "autumn_requests_shed_total{{version=\"{version}\"}} {}",
-        snapshot.http.requests_shed_total
-    );
-
+    write_admission_metrics(out, version, &snapshot.http);
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
@@ -3524,6 +3838,90 @@ fn write_builtin_http_metrics(
             }
         }
     }
+}
+
+/// Render the deprecated global p50/p95/p99 summary (issue #3064). You cannot
+/// add summaries from different replicas. Use the histogram instead.
+fn write_http_duration_quantiles(
+    out: &mut String,
+    version: &str,
+    snapshot: &crate::middleware::metrics::MetricsSnapshot,
+) {
+    use std::fmt::Write;
+
+    let name = HTTP_DURATION_QUANTILES_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Deprecated: HTTP request latency quantiles in seconds. \
+         Use autumn_http_request_duration_seconds"
+    );
+    let _ = writeln!(out, "# TYPE {name} summary");
+    for (quantile, millis) in [
+        ("0.5", snapshot.http.latency_ms.p50),
+        ("0.95", snapshot.http.latency_ms.p95),
+        ("0.99", snapshot.http.latency_ms.p99),
+    ] {
+        #[allow(clippy::cast_precision_loss)]
+        let seconds = millis as f64 / 1000.0;
+        let _ = writeln!(
+            out,
+            "{name}{{version=\"{version}\",quantile=\"{quantile}\"}} {seconds}"
+        );
+    }
+}
+
+/// Render `autumn_http_request_duration_seconds` as a histogram (issue #3064).
+///
+/// Labels: `version`, `method`, `route`, `status_class`. Every label has a
+/// bounded value set. `route` is the matched route pattern, or `_unmatched`.
+/// `method` is a standard method, or `_other`.
+fn write_http_duration_histogram(
+    out: &mut String,
+    version: &str,
+    series: &[crate::middleware::metrics::DurationSeries],
+) {
+    use std::fmt::Write;
+
+    let name = HTTP_DURATION_FAMILY;
+    let _ = writeln!(out, "# HELP {name} HTTP request latency in seconds");
+    let _ = writeln!(out, "# TYPE {name} histogram");
+    for entry in series {
+        let labels = format!(
+            "version=\"{version}\",method=\"{}\",route=\"{}\",status_class=\"{}\"",
+            escape_prometheus_label_value(&entry.method),
+            escape_prometheus_label_value(&entry.route),
+            entry.status_class,
+        );
+        write_histogram_samples(out, name, &labels, &entry.histogram);
+    }
+}
+
+/// Write the `_bucket`, `_sum` and `_count` lines of one histogram series.
+/// `labels` is the rendered label list without braces.
+fn write_histogram_samples(
+    out: &mut String,
+    name: &str,
+    labels: &str,
+    histogram: &crate::middleware::metrics::HistogramSnapshot,
+) {
+    use std::fmt::Write;
+
+    let separator = if labels.is_empty() { "" } else { "," };
+    for (le, count) in crate::middleware::metrics::BUCKET_LABELS
+        .iter()
+        .zip(histogram.cumulative)
+    {
+        let _ = writeln!(
+            out,
+            "{name}_bucket{{{labels}{separator}le=\"{le}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "{name}_sum{{{labels}}} {}",
+        format_sample_value(histogram.sum_seconds)
+    );
+    let _ = writeln!(out, "{name}_count{{{labels}}} {}", histogram.count());
 }
 
 /// Render the built-in `autumn_cache_*` read-through stampede-protection
@@ -3580,10 +3978,223 @@ fn write_builtin_cache_metrics(
             "Distributed cache fill lock attempts that found the lock held by another replica",
             snapshot.fill_lock_contended,
         ),
+        (
+            "autumn_cache_read_through_stale_if_error_serves_total",
+            "Read-through fills that failed and served the last value instead (stale-if-error)",
+            crate::cache::read_through_metrics().stale_if_error_serves(),
+        ),
+        (
+            "autumn_cache_invalidation_failures_total",
+            "Cache invalidations that failed after all retries; stale data can be served",
+            crate::cache::invalidation_failures_total(),
+        ),
     ] {
         let _ = writeln!(out, "# HELP {name} {help}");
         let _ = writeln!(out, "# TYPE {name} counter");
         let _ = writeln!(out, "{name}{{version=\"{version}\"}} {value}");
+    }
+}
+
+/// Render the built-in job families into `out` (issues #3055, #3064).
+///
+/// Every family is always present, so an alert on `increase()` sees a `0`
+/// sample before the first event. The `queue` and `job` label values come from
+/// registered jobs and surveyed queues, so the label set is bounded.
+fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegistry) {
+    use std::fmt::Write;
+
+    let name = DEAD_LETTER_TRIMMED_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Redis dead letters removed to obey jobs.redis.dead_letter_limit"
+    );
+    let _ = writeln!(out, "# TYPE {name} counter");
+    let _ = writeln!(
+        out,
+        "{name}{{version=\"{version}\"}} {}",
+        registry.dead_letter_trimmed_total()
+    );
+
+    let mut queues: Vec<(String, QueueStatus)> = registry.queue_snapshot().into_iter().collect();
+    queues.sort_by(|a, b| a.0.cmp(&b.0));
+    let _ = writeln!(
+        out,
+        "# HELP autumn_jobs_queue_depth Jobs ready to run and waiting on each queue"
+    );
+    let _ = writeln!(out, "# TYPE autumn_jobs_queue_depth gauge");
+    for (queue, status) in &queues {
+        let queue = escape_prometheus_label_value(queue);
+        let _ = writeln!(
+            out,
+            "autumn_jobs_queue_depth{{version=\"{version}\",queue=\"{queue}\"}} {}",
+            status.depth
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP autumn_jobs_oldest_age_seconds Age of the oldest ready job on each queue"
+    );
+    let _ = writeln!(out, "# TYPE autumn_jobs_oldest_age_seconds gauge");
+    for (queue, status) in &queues {
+        let queue = escape_prometheus_label_value(queue);
+        #[allow(clippy::cast_precision_loss, reason = "Prometheus samples are f64")]
+        let seconds = status.oldest_waiting_age_ms as f64 / 1000.0;
+        let _ = writeln!(
+            out,
+            "autumn_jobs_oldest_age_seconds{{version=\"{version}\",queue=\"{queue}\"}} {}",
+            format_sample_value(seconds)
+        );
+    }
+
+    let mut jobs: Vec<(String, JobStatus)> = registry.snapshot().into_iter().collect();
+    jobs.sort_by(|a, b| a.0.cmp(&b.0));
+    let _ = writeln!(
+        out,
+        "# HELP autumn_jobs_dead_letter_total Job executions moved to the dead-letter queue"
+    );
+    let _ = writeln!(out, "# TYPE autumn_jobs_dead_letter_total counter");
+    for (job, status) in &jobs {
+        let job = escape_prometheus_label_value(job);
+        let _ = writeln!(
+            out,
+            "autumn_jobs_dead_letter_total{{version=\"{version}\",job=\"{job}\"}} {}",
+            status.dead_letters
+        );
+    }
+}
+
+/// A pool gauge: metric name, help text, and the `Status` field it reads.
+#[cfg(feature = "db")]
+type PoolGauge = (&'static str, &'static str, fn(&deadpool::Status) -> usize);
+
+/// Render the database pool families into `out` (issue #3064).
+///
+/// The wait histogram is always present. The gauges are present when the app
+/// has a pool. The `pool` label is `primary` or `replica`, or
+/// `shard:<name>:primary` and `shard:<name>:replica` for a sharded app.
+fn write_builtin_db_pool_metrics<S: ProvideActuatorState>(
+    out: &mut String,
+    version: &str,
+    state: &S,
+) {
+    use std::fmt::Write;
+
+    let name = DB_POOL_WAIT_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Time a Db checkout took to get a pool connection, connect time included"
+    );
+    let _ = writeln!(out, "# TYPE {name} histogram");
+    write_histogram_samples(
+        out,
+        name,
+        &format!("version=\"{version}\""),
+        &state.metrics().db_pool_wait(),
+    );
+
+    #[cfg(feature = "db")]
+    {
+        let mut pools: Vec<(String, deadpool::Status)> = Vec::new();
+        if let Some(pool) = state.pool() {
+            pools.push(("primary".to_owned(), pool.status()));
+        }
+        if let Some(pool) = state.replica_pool() {
+            pools.push(("replica".to_owned(), pool.status()));
+        }
+        if let Some(shards) = state.shards() {
+            for shard in shards.iter() {
+                pools.push((
+                    format!("shard:{}:primary", shard.name()),
+                    shard.primary_pool().status(),
+                ));
+                if let Some(replica) = shard.replica_pool() {
+                    pools.push((format!("shard:{}:replica", shard.name()), replica.status()));
+                }
+            }
+        }
+        if pools.is_empty() {
+            return;
+        }
+        let gauges: [PoolGauge; 4] = [
+            (
+                "autumn_db_pool_max_size",
+                "Maximum connections in the pool",
+                |s| s.max_size,
+            ),
+            ("autumn_db_pool_size", "Open connections in the pool", |s| {
+                s.size
+            }),
+            (
+                "autumn_db_pool_available",
+                "Idle connections in the pool",
+                |s| s.available,
+            ),
+            (
+                "autumn_db_pool_waiting",
+                "Tasks waiting for a pool connection",
+                |s| s.waiting,
+            ),
+        ];
+        for (gauge, help, read) in gauges {
+            let _ = writeln!(out, "# HELP {gauge} {help}");
+            let _ = writeln!(out, "# TYPE {gauge} gauge");
+            for (label, status) in &pools {
+                let label = escape_prometheus_label_value(label);
+                let _ = writeln!(
+                    out,
+                    "{gauge}{{version=\"{version}\",pool=\"{label}\"}} {}",
+                    read(status)
+                );
+            }
+        }
+    }
+}
+
+/// Render the per-breaker slow-call families (issue #3060) into `out`.
+///
+/// The families are absent while there is no breaker. One series for each
+/// breaker, sorted by name. Names are escaped: a host name is a breaker name.
+fn write_builtin_circuit_breaker_metrics(
+    out: &mut String,
+    version: &str,
+    breakers: &[crate::circuit_breaker::CircuitBreaker],
+) {
+    use std::fmt::Write;
+
+    if breakers.is_empty() {
+        return;
+    }
+    let mut breakers: Vec<_> = breakers.iter().collect();
+    breakers.sort_by(|a, b| a.name().cmp(b.name()));
+
+    let name = BREAKER_SLOW_CALLS_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Calls each circuit breaker counted as slow, cancelled slow calls included"
+    );
+    let _ = writeln!(out, "# TYPE {name} counter");
+    for breaker in &breakers {
+        let label = escape_prometheus_label_value(breaker.name());
+        let _ = writeln!(
+            out,
+            "{name}{{version=\"{version}\",name=\"{label}\"}} {}",
+            breaker.slow_calls_total()
+        );
+    }
+
+    let name = BREAKER_SLOW_CALL_RATIO_FAMILY;
+    let _ = writeln!(
+        out,
+        "# HELP {name} Share of slow calls in each circuit breaker sample window"
+    );
+    let _ = writeln!(out, "# TYPE {name} gauge");
+    for breaker in &breakers {
+        let label = escape_prometheus_label_value(breaker.name());
+        let _ = writeln!(
+            out,
+            "{name}{{version=\"{version}\",name=\"{label}\"}} {}",
+            breaker.slow_call_ratio()
+        );
     }
 }
 
@@ -3797,11 +4408,23 @@ pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 
     let version = escape_prometheus_label_value(&state.deploy_version());
     let mut out = String::with_capacity(2048);
 
-    write_builtin_http_metrics(&mut out, &version, &snapshot);
+    write_builtin_http_metrics(
+        &mut out,
+        &version,
+        &snapshot,
+        &state.metrics().duration_series(),
+    );
     write_builtin_cache_metrics(
         &mut out,
         &version,
         &crate::cache::read_through_metrics().snapshot(),
+    );
+    write_builtin_job_metrics(&mut out, &version, state.job_registry());
+    write_builtin_db_pool_metrics(&mut out, &version, &state);
+    write_builtin_circuit_breaker_metrics(
+        &mut out,
+        &version,
+        &crate::circuit_breaker::global_registry().all_breakers(),
     );
     if let Some(handle) = state.shadow() {
         write_builtin_shadow_metrics(&mut out, &version, &handle.snapshot());
@@ -4191,26 +4814,29 @@ fn derivation_report(
 /// route, its auth requirement, and which table each one touches -- a map of
 /// exactly where an attacker would look first, so it is not a public surface.
 ///
-/// A build that never installed a graph answers `503` with an explanation
-/// rather than `404`, so an operator can tell "this process has not published
-/// one" apart from "this build has no such endpoint".
-pub(crate) async fn graph_endpoint() -> axum::response::Response {
-    graph_response(crate::graph::served_json())
+/// The handler reads the graph from the state. Each application serves its
+/// own graph (#2520 item 17).
+///
+/// The endpoint answers `503`, not `404`, when the state has no graph. An
+/// operator can then tell "this app published no graph" from "this build has
+/// no such endpoint".
+pub(crate) async fn graph_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> axum::response::Response {
+    graph_response(state.architecture_graph_json())
 }
 
 /// Render the `/actuator/graph` response for a given installed graph.
 ///
-/// Split from the handler because the installed graph is a process-wide
-/// `OnceLock`: a test that installed one to exercise the "present" branch would
-/// decide the answer for every other test in the process. The branch is the
-/// behaviour worth testing, and it is testable here without that coupling.
-fn graph_response(graph: Option<&'static [u8]>) -> axum::response::Response {
+/// This function is separate from the handler. Tests use it to examine the
+/// two branches.
+fn graph_response(graph: Option<bytes::Bytes>) -> axum::response::Response {
     graph.map_or_else(
         || {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
-                    "error": "no architecture graph is installed in this process",
+                    "error": "no architecture graph is installed for this application",
                     "hint": "the graph is published when the application router is built; a \
                              process that serves requests without building one (a bare \
                              `axum::Router` in a test, say) has none to report",
@@ -4227,6 +4853,30 @@ fn graph_response(graph: Option<&'static [u8]>) -> axum::response::Response {
                 .into_response()
         },
     )
+}
+
+/// `GET <actuator-prefix>/cost` -- the cost signal, the request cost of
+/// each tenant, and the cost of job runs and task ticks (issue #1720).
+///
+/// Sensitive-gated: tenant ids and their costs are not public. With
+/// `[cost] enabled = false` the endpoint answers `{"enabled": false, ...}`.
+pub(crate) async fn cost_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+) -> Json<serde_json::Value> {
+    let signal = state.cost_signal();
+    let accountant = state.cost_accountant();
+    let snapshot = accountant
+        .as_ref()
+        .map(crate::cost::CostAccountant::snapshot)
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "enabled": accountant.is_some(),
+        "signal": signal.map(|signal| signal.snapshot()),
+        "total": snapshot.total,
+        "tenants": snapshot.tenants,
+        "jobs": snapshot.jobs,
+        "tasks": snapshot.tasks,
+    }))
 }
 
 /// `GET <actuator-prefix>/shadow` -- shadow-mirroring counters and the most
@@ -4247,6 +4897,127 @@ pub(crate) async fn shadow_endpoint<S: ProvideActuatorState + Send + Sync + 'sta
                 handle.snapshot()
             }),
     )
+}
+
+// ── Data capsules (issue #1811) ─────────────────────────────────────────────
+
+/// Request body for `POST <actuator-prefix>/capsules/export`.
+#[derive(Deserialize)]
+pub(crate) struct CapsuleExportRequest {
+    subject: String,
+}
+
+/// Request body for `POST <actuator-prefix>/capsules/{import,verify}`.
+#[derive(Deserialize)]
+pub(crate) struct CapsuleNameRequest {
+    capsule: String,
+}
+
+fn capsule_error(error: &crate::gdpr::portability::DataCapsuleError) -> axum::response::Response {
+    use crate::gdpr::portability::DataCapsuleError as E;
+    let status = match error {
+        E::NotConfigured(_) | E::MissingSigningSecret => StatusCode::NOT_IMPLEMENTED,
+        E::InvalidName(_) | E::InvalidInput(_) => StatusCode::BAD_REQUEST,
+        E::NotEmpty(_) | E::Conflict(_) => StatusCode::CONFLICT,
+        E::Integrity(_)
+        | E::UnsupportedFormat(_)
+        | E::UnknownTable(_)
+        | E::RelationshipCycle(_)
+        | E::Json { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(serde_json::json!({"status": "error", "message": error.to_string()})),
+    )
+        .into_response()
+}
+
+/// The service and the path of an existing capsule, or the error response.
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the response itself; it is made once per request"
+)]
+fn existing_capsule<S: ProvideActuatorState>(
+    state: &S,
+    name: &str,
+) -> Result<(crate::gdpr::portability::CapsuleService, std::path::PathBuf), axum::response::Response>
+{
+    let service = state.data_capsules().map_err(|e| capsule_error(&e))?;
+    let path = service.capsule_path(name).map_err(|e| capsule_error(&e))?;
+    // `symlink_metadata` does not follow a link, so a link to a capsule
+    // outside the directory is "not found".
+    let is_real_dir = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_dir());
+    if !is_real_dir {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"status": "error", "message": "capsule not found"})),
+        )
+            .into_response());
+    }
+    Ok((service, path))
+}
+
+/// `POST <actuator-prefix>/capsules/export` -- write a capsule for a subject.
+pub(crate) async fn capsules_export_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    Json(body): Json<CapsuleExportRequest>,
+) -> axum::response::Response {
+    let service = match state.data_capsules() {
+        Ok(service) => service,
+        Err(e) => return capsule_error(&e),
+    };
+    let name = crate::gdpr::portability::CapsuleService::capsule_name();
+    let path = match service.capsule_path(&name) {
+        Ok(path) => path,
+        Err(e) => return capsule_error(&e),
+    };
+    match service.export_to(&body.subject, &path).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "capsule": name, "report": report})),
+        )
+            .into_response(),
+        Err(e) => capsule_error(&e),
+    }
+}
+
+/// `POST <actuator-prefix>/capsules/verify` -- check a capsule signature and hashes.
+pub(crate) async fn capsules_verify_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    Json(body): Json<CapsuleNameRequest>,
+) -> axum::response::Response {
+    let (service, path) = match existing_capsule(&state, &body.capsule) {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    match service.verify(&path).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "report": report})),
+        )
+            .into_response(),
+        Err(e) => capsule_error(&e),
+    }
+}
+
+/// `POST <actuator-prefix>/capsules/import` -- verify, then import a capsule.
+pub(crate) async fn capsules_import_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
+    State(state): State<S>,
+    Json(body): Json<CapsuleNameRequest>,
+) -> axum::response::Response {
+    let (service, path) = match existing_capsule(&state, &body.capsule) {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    match service.import_from(&path).await {
+        Ok(summary) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "summary": summary})),
+        )
+            .into_response(),
+        Err(e) => capsule_error(&e),
+    }
 }
 
 #[cfg(feature = "http-client")]
@@ -4518,9 +5289,12 @@ pub(crate) async fn channels_endpoint<S: ProvideActuatorState + Send + Sync + 's
 #[cfg(feature = "ws")]
 pub(crate) async fn tasks_stream_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
+    tunnel: crate::http_server::KeepTunnel,
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |mut socket| async move {
+        // Over HTTP/2, the server keeps the connection while this is held.
+        let _tunnel = tunnel;
         let mut rx = state.channels().subscribe("sys:tasks");
         let shutdown = state.shutdown_token();
 
@@ -4582,6 +5356,9 @@ pub(crate) fn actuator_route_path(prefix: &str, suffix: &str) -> String {
     }
 }
 
+/// The data-capsule routes (issue #1811). All are `POST` and sensitive.
+const CAPSULE_ROUTES: [&str; 3] = ["/capsules/export", "/capsules/import", "/capsules/verify"];
+
 pub(crate) fn actuator_endpoint_paths(
     prefix: &str,
     sensitive: bool,
@@ -4610,7 +5387,13 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/jobs"));
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/shadow"));
+        paths.push(actuator_route_path(prefix, "/cost"));
         paths.push(actuator_route_path(prefix, "/graph"));
+        // POST-only, like `/webhooks/replay` below: listed so the startup
+        // barrier lets them through.
+        for suffix in CAPSULE_ROUTES {
+            paths.push(actuator_route_path(prefix, suffix));
+        }
         #[cfg(feature = "db")]
         {
             paths.push(actuator_route_path(prefix, "/derivations"));
@@ -4659,6 +5442,9 @@ pub(crate) fn actuator_mutating_routes(
 
     if sensitive {
         routes.push(("PUT", actuator_route_path(prefix, "/loggers/{name}")));
+        for suffix in CAPSULE_ROUTES {
+            routes.push(("POST", actuator_route_path(prefix, suffix)));
+        }
         #[cfg(feature = "http-client")]
         {
             routes.push(("POST", actuator_route_path(prefix, "/webhooks/replay")));
@@ -4765,8 +5551,24 @@ pub(crate) fn actuator_router_with_prefix<
                 axum::routing::get(shadow_endpoint::<S>),
             )
             .route(
+                &actuator_route_path(prefix, "/cost"),
+                axum::routing::get(cost_endpoint::<S>),
+            )
+            .route(
                 &actuator_route_path(prefix, "/graph"),
-                axum::routing::get(graph_endpoint),
+                axum::routing::get(graph_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/capsules/export"),
+                axum::routing::post(capsules_export_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/capsules/import"),
+                axum::routing::post(capsules_import_endpoint::<S>),
+            )
+            .route(
+                &actuator_route_path(prefix, "/capsules/verify"),
+                axum::routing::post(capsules_verify_endpoint::<S>),
             );
         #[cfg(feature = "db")]
         {
@@ -4805,7 +5607,8 @@ pub(crate) fn actuator_router_with_prefix<
                 )
                 .route(
                     &actuator_route_path(prefix, "/tasks/stream"),
-                    axum::routing::get(tasks_stream_endpoint::<S>),
+                    axum::routing::get(tasks_stream_endpoint::<S>)
+                        .connect(tasks_stream_endpoint::<S>),
                 );
         }
     }
@@ -4970,6 +5773,48 @@ mod tests {
         assert_eq!(drained.get("critical").unwrap().depth, 0);
         assert_eq!(drained.get("critical").unwrap().oldest_waiting_age_ms, 0);
         assert_eq!(drained.get("bulk").unwrap().depth, 0);
+    }
+
+    #[test]
+    fn job_registry_unregistered_name_counts_on_the_default_queue() {
+        // Never registered: the first enqueue inserts the name's status and
+        // the `default` queue's marks; later ones hit both by borrow.
+        let registry = JobRegistry::new();
+        registry.record_enqueue("ghost");
+        registry.record_enqueue("ghost");
+        assert_eq!(registry.snapshot().get("ghost").unwrap().queued, 2);
+        assert_eq!(registry.queue_snapshot().get("default").unwrap().depth, 2);
+        assert_eq!(registry.waiting_marks_for_test("ghost").len(), 2);
+        registry.record_start("ghost");
+        assert_eq!(registry.queue_snapshot().get("default").unwrap().depth, 1);
+        let status = registry.snapshot().get("ghost").cloned().unwrap();
+        assert_eq!((status.queued, status.in_flight), (1, 1));
+        // A first enqueue lands as exactly one queued job, all else empty.
+        registry.record_enqueue("fresh");
+        let fresh = registry.snapshot().get("fresh").cloned().unwrap();
+        assert_eq!(fresh.queued, 1);
+        assert_eq!(fresh.in_flight, 0);
+        assert_eq!(fresh.total_successes, 0);
+        assert!(fresh.last_error.is_none());
+    }
+
+    #[test]
+    fn job_registry_registered_queue_marks_stay_on_that_queue() {
+        let registry = JobRegistry::new();
+        registry.register_on_queue("send_email", "mail");
+        // The queue's mark list exists from registration, so every enqueue is
+        // a borrowed hit, and nothing leaks onto `default`.
+        for _ in 0..3 {
+            registry.record_enqueue("send_email");
+        }
+        let queues = registry.queue_snapshot();
+        assert_eq!(queues.get("mail").unwrap().depth, 3);
+        assert!(!queues.contains_key("default"));
+        assert_eq!(registry.waiting_marks_for_test("send_email").len(), 3);
+        registry.record_start("send_email");
+        registry.record_start("send_email");
+        assert_eq!(registry.queue_snapshot().get("mail").unwrap().depth, 1);
+        assert_eq!(registry.snapshot().get("send_email").unwrap().in_flight, 2);
     }
 
     /// Clones share marks, so they must share the clock that judges them.
@@ -5883,10 +6728,14 @@ mod tests {
         pool: Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
         #[cfg(feature = "db")]
         shards: Option<crate::sharding::ShardSet>,
+        #[cfg(feature = "db")]
+        replica_pool:
+            Option<diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>,
         #[cfg(feature = "ws")]
         channels: crate::channels::Channels,
         #[cfg(feature = "ws")]
         shutdown: tokio_util::sync::CancellationToken,
+        data_capsules: Option<crate::gdpr::portability::CapsuleService>,
     }
 
     impl ProvideActuatorState for TestActuatorState {
@@ -5932,6 +6781,13 @@ mod tests {
         fn shards(&self) -> Option<&crate::sharding::ShardSet> {
             self.shards.as_ref()
         }
+        #[cfg(feature = "db")]
+        fn replica_pool(
+            &self,
+        ) -> Option<&diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>>
+        {
+            self.replica_pool.as_ref()
+        }
         #[cfg(feature = "ws")]
         fn channels(&self) -> &crate::channels::Channels {
             &self.channels
@@ -5948,6 +6804,16 @@ mod tests {
         }
         fn log_buffer(&self) -> Option<crate::log::capture::LogBuffer> {
             self.log_buffer.clone()
+        }
+        fn data_capsules(
+            &self,
+        ) -> Result<
+            crate::gdpr::portability::CapsuleService,
+            crate::gdpr::portability::DataCapsuleError,
+        > {
+            self.data_capsules.clone().ok_or_else(|| {
+                crate::gdpr::portability::DataCapsuleError::NotConfigured("test".to_owned())
+            })
         }
     }
 
@@ -5974,10 +6840,13 @@ mod tests {
             pool: None,
             #[cfg(feature = "db")]
             shards: None,
+            #[cfg(feature = "db")]
+            replica_pool: None,
             #[cfg(feature = "ws")]
             channels: crate::channels::Channels::new(32),
             #[cfg(feature = "ws")]
             shutdown: tokio_util::sync::CancellationToken::new(),
+            data_capsules: None,
         }
     }
 
@@ -6175,6 +7044,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &runtime_state,
             &shutdown,
@@ -6252,6 +7122,7 @@ mod tests {
                 uniqueness: None,
                 concurrency: None,
                 handler: |_state, _payload| Box::pin(async move { Ok(()) }),
+                timeout: None,
             }],
             &runtime_state,
             &shutdown,
@@ -6296,6 +7167,86 @@ mod tests {
 
         shutdown.cancel();
         crate::job::clear_global_job_client();
+    }
+
+    /// A pool whose server accepts each connection and closes it at once.
+    ///
+    /// Not a closed port: on Windows a connect to a closed loopback port is
+    /// retried for about 2 s, so the ping times out instead of failing.
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    async fn refused_pool()
+    -> diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                drop(socket);
+            }
+        });
+        let config = crate::config::DatabaseConfig {
+            url: Some(format!("postgres://secret_user@{addr}/autumn")),
+            pool_size: 1,
+            connect_timeout_secs: 1,
+            ..Default::default()
+        };
+        crate::db::create_pool(&config)
+            .expect("valid pool config")
+            .expect("pool url is set")
+    }
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    async fn health_json(state: TestActuatorState) -> (StatusCode, serde_json::Value) {
+        let resp = actuator_router(true)
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[tokio::test]
+    async fn health_db_is_down_without_error_text_when_not_detailed() {
+        let mut state = test_state();
+        state.health_detailed = false;
+        state.pool = Some(refused_pool().await);
+
+        let (status, json) = health_json(state).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["components"]["db"]["status"], "DOWN");
+        assert_eq!(json["checks"]["database"]["status"], "down");
+        // The error text can name the host or the user: not for a public body.
+        assert!(json["checks"]["database"].get("error").is_none(), "{json}");
+        assert!(!json.to_string().contains("secret_user"), "{json}");
+    }
+
+    #[cfg(all(feature = "db", not(feature = "sqlite")))]
+    #[tokio::test]
+    async fn health_db_error_is_shown_when_detailed() {
+        let mut state = test_state();
+        state.health_detailed = true;
+        state.pool = Some(refused_pool().await);
+
+        let (status, json) = health_json(state).await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let error = json["checks"]["database"]["error"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(error.starts_with("primary connection failed"), "{json}");
+        assert_eq!(json["components"]["db"]["details"]["error"], error);
     }
 
     #[tokio::test]
@@ -6362,6 +7313,7 @@ mod tests {
                 minimum_sample_count: 2,
                 open_duration: std::time::Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             },
         );
         assert_eq!(
@@ -6397,6 +7349,10 @@ mod tests {
         assert_eq!(item["state"], "CLOSED");
         assert_eq!(item["failure_ratio_threshold"], 0.5);
         assert_eq!(item["minimum_sample_count"], 2);
+        assert_eq!(item["slow_call_ratio"], 0.0);
+        assert_eq!(item["slow_call_duration_threshold_ms"], 60_000);
+        assert_eq!(item["slow_call_rate_threshold"], 1.0);
+        assert_eq!(item["cancelled_call_outcome"], "slow");
 
         let mut undetailed_config = AutumnConfig::default();
         undetailed_config.health.detailed = false;
@@ -6425,6 +7381,83 @@ mod tests {
         assert_eq!(item_undetailed["state"], "CLOSED");
         assert!(item_undetailed.get("failure_ratio_threshold").is_none());
         assert!(item_undetailed.get("minimum_sample_count").is_none());
+        assert_eq!(item_undetailed["slow_call_ratio"], 0.0);
+        assert!(item_undetailed.get("slow_call_rate_threshold").is_none());
+        assert!(
+            item_undetailed
+                .get("slow_call_duration_threshold_ms")
+                .is_none()
+        );
+        assert!(item_undetailed.get("cancelled_call_outcome").is_none());
+        crate::circuit_breaker::global_registry().clear();
+    }
+
+    #[test]
+    fn prometheus_renders_breaker_slow_call_families() {
+        let mut out = String::new();
+        write_builtin_circuit_breaker_metrics(&mut out, "stable", &[]);
+        assert!(out.is_empty(), "no breaker: no family");
+
+        let policy = crate::circuit_breaker::CircuitBreakerPolicy {
+            slow_call_duration_threshold: Some(std::time::Duration::ZERO),
+            minimum_sample_count: 100,
+            ..crate::circuit_breaker::CircuitBreakerPolicy::default()
+        };
+        let slow = crate::circuit_breaker::CircuitBreaker::new("b\"slow", policy);
+        crate::circuit_breaker::CircuitBreakerGuard::new(slow.clone()).success();
+        crate::circuit_breaker::CircuitBreakerGuard::new(slow.clone()).success();
+        let idle = crate::circuit_breaker::CircuitBreaker::new(
+            "a.idle",
+            crate::circuit_breaker::CircuitBreakerPolicy::default(),
+        );
+
+        write_builtin_circuit_breaker_metrics(&mut out, "stable", &[slow, idle]);
+        let want = "\
+# HELP autumn_circuit_breaker_slow_calls_total Calls each circuit breaker counted as slow, cancelled slow calls included
+# TYPE autumn_circuit_breaker_slow_calls_total counter
+autumn_circuit_breaker_slow_calls_total{version=\"stable\",name=\"a.idle\"} 0
+autumn_circuit_breaker_slow_calls_total{version=\"stable\",name=\"b\\\"slow\"} 2
+# HELP autumn_circuit_breaker_slow_call_ratio Share of slow calls in each circuit breaker sample window
+# TYPE autumn_circuit_breaker_slow_call_ratio gauge
+autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"a.idle\"} 0
+autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
+";
+        assert_eq!(out, want);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn actuator_prometheus_shows_breaker_slow_call_families() {
+        let _lock = crate::circuit_breaker::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::circuit_breaker::global_registry().clear();
+        let _breaker = crate::circuit_breaker::global_registry().get_or_create(
+            "prometheus_slow_breaker",
+            crate::circuit_breaker::CircuitBreakerPolicy::default(),
+        );
+
+        let app = actuator_router(true).with_state(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains(
+            "autumn_circuit_breaker_slow_calls_total{version=\"stable\",name=\"prometheus_slow_breaker\"} 0"
+        ));
+        assert!(text.contains(
+            "autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"prometheus_slow_breaker\"} 0"
+        ));
         crate::circuit_breaker::global_registry().clear();
     }
 
@@ -6444,6 +7477,7 @@ mod tests {
                 minimum_sample_count: 2,
                 open_duration: std::time::Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             },
         );
 
@@ -6834,22 +7868,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[tokio::test]
-    async fn actuator_graph_serves_the_installed_graph_over_http() {
-        // The one test that proves the endpoint works end to end: install a
-        // graph, mount the real sensitive actuator router, and GET it. The
-        // `graph_response` unit tests below cannot catch a missing or misplaced
-        // `crate::graph::install` call — Codex round 1 found exactly that, with
-        // every unit test passing while a running app answered 503 forever.
-        //
-        // Sole installer in this test binary, on purpose: the installed graph
-        // is a process-wide `OnceLock`, so a second test installing its own
-        // would decide this one's answer. The install-site guard lives in
-        // `app::tests::graph_installed_before_every_router_build`.
-        crate::graph::install(crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]));
-
-        let app = actuator_router(true).with_state(test_state());
-        let resp = app
+    /// GET `/actuator/graph` on a real sensitive router over `state`.
+    async fn get_graph(state: crate::AppState) -> axum::response::Response {
+        actuator_router(true)
+            .with_state(state)
             .oneshot(
                 Request::builder()
                     .uri("/actuator/graph")
@@ -6857,7 +7879,21 @@ mod tests {
                     .unwrap(),
             )
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn actuator_graph_serves_the_installed_graph_over_http() {
+        // End to end: install a graph, mount the real sensitive router, GET it.
+        // The install-site guard is
+        // `app::tests::graph_installed_before_every_router_build`.
+        let state = crate::AppState::test_default();
+        crate::graph::install(
+            &state,
+            crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]),
+        );
+
+        let resp = get_graph(state).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -6876,11 +7912,57 @@ mod tests {
         );
     }
 
+    /// Item 17 of #2520: the second app in a process serves its own graph,
+    /// not the first app's.
+    #[tokio::test]
+    async fn two_apps_in_one_process_serve_their_own_graphs() {
+        let graph_with = |jobs: usize| {
+            let mut graph = crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]);
+            graph.completeness.jobs = jobs;
+            graph
+        };
+        let first = crate::AppState::test_default();
+        let second = crate::AppState::test_default();
+        crate::graph::install(&first, graph_with(1));
+        crate::graph::install(&second, graph_with(2));
+
+        for (state, jobs) in [(first, 1), (second, 2)] {
+            let resp = get_graph(state).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let decoded: crate::graph::manifest::ArchitectureGraph =
+                serde_json::from_slice(&body).expect("graph document");
+            assert_eq!(decoded.completeness.jobs, jobs);
+        }
+    }
+
+    /// A state with no installed graph answers 503. This includes a custom
+    /// `ProvideActuatorState` that keeps the default method.
+    #[tokio::test]
+    async fn actuator_graph_is_unavailable_for_a_state_with_no_graph() {
+        let resp = get_graph(crate::AppState::test_default()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let resp = actuator_router(true)
+            .with_state(test_state())
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/graph")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
     #[tokio::test]
     async fn actuator_graph_serves_the_installed_graph() {
         let graph = crate::graph::manifest::build(&[], 0, &[], &[], &[], &[]);
         let json = serde_json::to_vec(&graph).expect("serialize");
-        let resp = graph_response(Some(json.leak()));
+        let resp = graph_response(Some(bytes::Bytes::from(json)));
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -6896,7 +7978,7 @@ mod tests {
         assert_eq!(
             resp.status(),
             StatusCode::SERVICE_UNAVAILABLE,
-            "a process with no graph must say so rather than 404, which would read as \
+            "an app with no graph must say so rather than 404, which would read as \
              'this build has no such endpoint'"
         );
     }
@@ -7075,6 +8157,150 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
         assert!(json.get("database").is_some());
+    }
+
+    async fn scrape_prometheus(state: TestActuatorState) -> String {
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/prometheus")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    /// The value of the one sample line that starts with `prefix`.
+    fn sample_value(text: &str, prefix: &str) -> f64 {
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no sample `{prefix}` in:\n{text}"));
+        line.rsplit(' ').next().unwrap().parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn prometheus_exports_job_queue_gauges_and_dead_letters() {
+        let state = test_state();
+        let jobs = state.job_registry.clone();
+        jobs.register_on_queue("send_mail", "mail");
+        jobs.register_on_queue("resize", "media");
+        let now = jobs.now_ms();
+        jobs.record_enqueue_scheduled("send_mail", now - 5_000);
+        jobs.record_enqueue_scheduled("send_mail", now - 1_000);
+        jobs.record_enqueue("resize");
+        jobs.record_start("resize");
+        jobs.record_failure("resize", "boom".into(), true);
+
+        let text = scrape_prometheus(state).await;
+
+        assert!(
+            text.contains("# TYPE autumn_jobs_queue_depth gauge\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE autumn_jobs_oldest_age_seconds gauge\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("# TYPE autumn_jobs_dead_letter_total counter\n"),
+            "{text}"
+        );
+        let depth = "autumn_jobs_queue_depth{version=\"stable\",queue=\"mail\"} ";
+        assert!((sample_value(&text, depth) - 2.0).abs() < f64::EPSILON);
+        let empty = "autumn_jobs_queue_depth{version=\"stable\",queue=\"media\"} ";
+        assert!(sample_value(&text, empty).abs() < f64::EPSILON);
+        let age = "autumn_jobs_oldest_age_seconds{version=\"stable\",queue=\"mail\"} ";
+        assert!(sample_value(&text, age) >= 4.9, "oldest job waited 5s");
+        let dead = "autumn_jobs_dead_letter_total{version=\"stable\",job=\"resize\"} ";
+        assert!((sample_value(&text, dead) - 1.0).abs() < f64::EPSILON);
+        let none = "autumn_jobs_dead_letter_total{version=\"stable\",job=\"send_mail\"} ";
+        assert!(sample_value(&text, none).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn prometheus_exports_db_pool_wait_histogram() {
+        let state = test_state();
+        state
+            .metrics
+            .record_db_pool_wait(std::time::Duration::from_micros(300));
+        state
+            .metrics
+            .record_db_pool_wait(std::time::Duration::from_millis(120));
+
+        let text = scrape_prometheus(state).await;
+
+        assert!(
+            text.contains("# TYPE autumn_db_pool_wait_seconds histogram\n"),
+            "{text}"
+        );
+        let first = "autumn_db_pool_wait_seconds_bucket{version=\"stable\",le=\"0.001\"} ";
+        assert!((sample_value(&text, first) - 1.0).abs() < f64::EPSILON);
+        let inf = "autumn_db_pool_wait_seconds_bucket{version=\"stable\",le=\"+Inf\"} ";
+        assert!((sample_value(&text, inf) - 2.0).abs() < f64::EPSILON);
+        let count = "autumn_db_pool_wait_seconds_count{version=\"stable\"} ";
+        assert!((sample_value(&text, count) - 2.0).abs() < f64::EPSILON);
+        let sum = "autumn_db_pool_wait_seconds_sum{version=\"stable\"} ";
+        assert!((sample_value(&text, sum) - 0.1203).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "db")]
+    async fn prometheus_exports_db_pool_gauges() {
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::deadpool::Pool;
+
+        let mut state = test_state();
+        // deadpool is lazy, so no connection is opened.
+        let manager = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
+            crate::test_urls::primary("actuator_prometheus_pool"),
+        );
+        state.pool = Some(Pool::builder(manager).max_size(7).build().unwrap());
+        let replica = AsyncDieselConnectionManager::<crate::db::RuntimeConnection>::new(
+            crate::test_urls::primary("actuator_prometheus_replica"),
+        );
+        state.replica_pool = Some(Pool::builder(replica).max_size(3).build().unwrap());
+
+        let text = scrape_prometheus(state).await;
+        let replica_max = "autumn_db_pool_max_size{version=\"stable\",pool=\"replica\"} ";
+        assert!((sample_value(&text, replica_max) - 3.0).abs() < f64::EPSILON);
+
+        for (name, value) in [
+            ("autumn_db_pool_max_size", 7.0),
+            ("autumn_db_pool_size", 0.0),
+            ("autumn_db_pool_available", 0.0),
+            ("autumn_db_pool_waiting", 0.0),
+        ] {
+            assert!(text.contains(&format!("# TYPE {name} gauge\n")), "{text}");
+            let prefix = format!("{name}{{version=\"stable\",pool=\"primary\"}} ");
+            assert!((sample_value(&text, &prefix) - value).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
+    fn builtin_family_names_cover_queue_and_pool_metrics() {
+        for name in [
+            "autumn_jobs_queue_depth",
+            "autumn_jobs_oldest_age_seconds",
+            "autumn_jobs_dead_letter_total",
+            "autumn_db_pool_max_size",
+            "autumn_db_pool_size",
+            "autumn_db_pool_available",
+            "autumn_db_pool_waiting",
+            "autumn_db_pool_wait_seconds",
+            "autumn_db_pool_wait_seconds_bucket",
+            "autumn_db_pool_wait_seconds_sum",
+            "autumn_db_pool_wait_seconds_count",
+        ] {
+            assert!(BUILTIN_METRIC_FAMILY_NAMES.contains(&name), "{name}");
+        }
     }
 
     // ── Config properties endpoint tests ───────────────────────
@@ -7563,10 +8789,18 @@ mod tests {
         assert!(text.contains("autumn_http_responses_total{version=\"stable\",status=\"2xx\"} 1"));
         assert!(text.contains("autumn_http_responses_total{version=\"stable\",status=\"5xx\"} 1"));
 
-        // Latency percentiles are exposed in seconds, labelled by version.
-        assert!(text.contains("# TYPE autumn_http_request_duration_seconds summary"));
+        // Latency is a histogram in seconds, labelled by version, method,
+        // route and status class. The deprecated summary keeps the quantiles.
+        assert!(text.contains("# TYPE autumn_http_request_duration_seconds histogram"));
         assert!(text.contains(
-            "autumn_http_request_duration_seconds{version=\"stable\",quantile=\"0.99\"}"
+            "autumn_http_request_duration_seconds_count{version=\"stable\",method=\"GET\",route=\"/test\",status_class=\"2xx\"} 1"
+        ));
+        assert!(text.contains(
+            "autumn_http_request_duration_seconds_count{version=\"stable\",method=\"POST\",route=\"/test\",status_class=\"5xx\"} 1"
+        ));
+        assert!(text.contains("# TYPE autumn_http_request_duration_quantiles_seconds summary"));
+        assert!(text.contains(
+            "autumn_http_request_duration_quantiles_seconds{version=\"stable\",quantile=\"0.99\"}"
         ));
 
         assert!(text.contains(
@@ -7587,6 +8821,77 @@ mod tests {
         assert!(text.contains("# HELP autumn_requests_shed_total"));
         assert!(text.contains("# TYPE autumn_requests_shed_total counter"));
         assert!(text.contains("autumn_requests_shed_total{version=\"stable\"} 0"));
+
+        assert!(text.contains("# TYPE autumn_admission_limit gauge"));
+        assert!(text.contains("autumn_admission_limit{version=\"stable\"} 0"));
+        assert!(text.contains("# TYPE autumn_admission_shed_total counter"));
+        assert!(text.contains(
+            "autumn_admission_shed_total{version=\"stable\",criticality=\"sheddable\"} 0"
+        ));
+        assert!(text.contains("# TYPE autumn_tenant_bulkhead_rejections_total counter"));
+        assert!(text.contains(
+            "autumn_tenant_bulkhead_rejections_total{version=\"stable\",kind=\"request\"} 0"
+        ));
+        assert!(
+            text.contains(
+                "autumn_tenant_bulkhead_rejections_total{version=\"stable\",kind=\"db\"} 0"
+            )
+        );
+    }
+
+    /// Issue #3055: clones share one dead-letter trim counter.
+    #[test]
+    fn job_registry_dead_letter_trim_counter_is_shared() {
+        let registry = JobRegistry::new();
+        let clone = registry.clone();
+        assert_eq!(registry.dead_letter_trimmed_total(), 0);
+
+        clone.record_dead_letter_trimmed(3);
+        registry.record_dead_letter_trimmed(0);
+        registry.record_dead_letter_trimmed(2);
+        assert_eq!(registry.dead_letter_trimmed_total(), 5);
+        assert_eq!(clone.dead_letter_trimmed_total(), 5);
+    }
+
+    /// Issue #3055: the trim counter is a built-in Prometheus family.
+    #[tokio::test]
+    async fn prometheus_includes_dead_letter_trimmed_counter() {
+        const NAME: &str = "autumn_jobs_dead_letter_trimmed_total";
+        assert!(BUILTIN_METRIC_FAMILY_NAMES.contains(&NAME));
+
+        let state = test_state();
+        let scrape = |state: TestActuatorState| async move {
+            let resp = actuator_router(true)
+                .with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .uri("/actuator/prometheus")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(body.to_vec()).unwrap()
+        };
+
+        // A zero sample exists before the first trim, so an alert can use rate().
+        let text = scrape(state.clone()).await;
+        assert!(text.contains(&format!("# TYPE {NAME} counter")), "{text}");
+        assert!(
+            text.contains(&format!("{NAME}{{version=\"stable\"}} 0\n")),
+            "{text}"
+        );
+
+        state.job_registry.record_dead_letter_trimmed(7);
+        let text = scrape(state).await;
+        assert!(
+            text.contains(&format!("{NAME}{{version=\"stable\"}} 7\n")),
+            "{text}"
+        );
     }
 
     #[cfg(feature = "cache-moka")]
@@ -7638,6 +8943,8 @@ mod tests {
             "autumn_cache_read_through_stale_serves_total",
             "autumn_cache_fill_lock_acquires_total",
             "autumn_cache_fill_lock_contended_total",
+            "autumn_cache_read_through_stale_if_error_serves_total",
+            "autumn_cache_invalidation_failures_total",
         ] {
             assert!(
                 text.contains(&format!("# TYPE {name} counter")),
@@ -7686,6 +8993,8 @@ mod tests {
         assert!(json["cache"]["stale_serves"].is_u64());
         assert!(json["cache"]["fill_lock_acquires"].is_u64());
         assert!(json["cache"]["fill_lock_contended"].is_u64());
+        assert!(json["cache"]["stale_if_error_serves"].is_u64());
+        assert!(json["cache"]["invalidation_failures"].is_u64());
     }
 
     #[tokio::test]
@@ -7723,7 +9032,7 @@ mod tests {
         // and satisfy the quantile invariant p50 <= p95 <= p99.
         let quantile = |q: &str| -> f64 {
             let needle = format!(
-                "autumn_http_request_duration_seconds{{version=\"canary\",quantile=\"{q}\"}} "
+                "autumn_http_request_duration_quantiles_seconds{{version=\"canary\",quantile=\"{q}\"}} "
             );
             let line = text
                 .lines()
@@ -9452,9 +10761,9 @@ mod tests {
 
     #[tokio::test]
     async fn prometheus_endpoint_skips_plugin_family_colliding_with_builtin_summary_derived_name() {
-        // `autumn_http_request_duration_seconds` is a summary, so it owns
-        // `_sum` and `_count` too. A plugin family under either name would put
-        // a second `# HELP` line for that family into the document, and
+        // A histogram owns `_bucket`, `_sum` and `_count`. A summary owns
+        // `_sum` and `_count`. A plugin family under any of these names puts a
+        // second `# HELP` line for that family into the document, and
         // Prometheus' own parser rejects the whole scrape when that happens.
         struct DerivedSummarySource(&'static str);
         impl MetricsSource for DerivedSummarySource {
@@ -9472,8 +10781,11 @@ mod tests {
         }
 
         for derived in [
+            "autumn_http_request_duration_seconds_bucket",
             "autumn_http_request_duration_seconds_sum",
             "autumn_http_request_duration_seconds_count",
+            "autumn_http_request_duration_quantiles_seconds_sum",
+            "autumn_http_request_duration_quantiles_seconds_count",
         ] {
             let state = test_state();
             state
@@ -9591,6 +10903,269 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
+
+    // ── Data capsules (issue #1811) ─────────────────────────────────────────
+
+    fn capsule_state(dir: &std::path::Path) -> TestActuatorState {
+        use crate::gdpr::portability::{
+            CapsuleModel, CapsuleService, CapsuleSigner, FieldSpec, MemoryCapsuleStore,
+        };
+        let store = MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("email", "text"),
+            ],
+        );
+        store.insert(
+            "users",
+            serde_json::json!({"id": 7, "email": "ada@example.com"}),
+        );
+        let service = CapsuleService::new(
+            vec![CapsuleModel::new("users", "id")],
+            std::sync::Arc::new(store),
+            CapsuleSigner::new(b"actuator-capsule-secret-0123456789"),
+        )
+        .with_dir(dir);
+        let mut state = test_state();
+        state.data_capsules = Some(service);
+        state
+    }
+
+    async fn post_json(
+        state: TestActuatorState,
+        sensitive: bool,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = actuator_router(sensitive)
+            .with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn actuator_capsules_are_not_mounted_when_not_sensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (status, _) = post_json(
+            capsule_state(dir.path()),
+            false,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn actuator_capsules_answer_501_when_not_configured() {
+        let (status, json) = post_json(
+            test_state(),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{json}");
+        assert_eq!(json["status"], "error");
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_export_verify_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let (status, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["report"]["records"], 1);
+        let name = json["capsule"].as_str().expect("capsule name").to_owned();
+        assert!(dir.path().join(&name).join("viewer/index.html").is_file());
+
+        let (status, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/verify",
+            serde_json::json!({"capsule": name}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["report"]["subject"], "7");
+
+        // The row is already in the store, so import conflicts.
+        let (status, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/import",
+            serde_json::json!({"capsule": name}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_import_into_an_empty_store_succeeds() {
+        use crate::gdpr::portability::{
+            CapsuleModel, CapsuleService, CapsuleSigner, FieldSpec, MemoryCapsuleStore,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (_, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        let name = json["capsule"].as_str().unwrap().to_owned();
+
+        let empty = std::sync::Arc::new(MemoryCapsuleStore::new().table(
+            "users",
+            vec![
+                FieldSpec::new("id", "bigint"),
+                FieldSpec::new("email", "text"),
+            ],
+        ));
+        let mut state = test_state();
+        state.data_capsules = Some(
+            CapsuleService::new(
+                vec![CapsuleModel::new("users", "id")],
+                empty.clone(),
+                CapsuleSigner::new(b"actuator-capsule-secret-0123456789"),
+            )
+            .with_dir(dir.path()),
+        );
+        let (status, json) = post_json(
+            state,
+            true,
+            "/actuator/capsules/import",
+            serde_json::json!({"capsule": name}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["summary"]["records"], 1);
+        assert_eq!(json["summary"]["tables"][0]["table"], "users");
+        assert_eq!(empty.rows("users").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_export_rejects_an_empty_subject_with_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let (status, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": ""}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn actuator_capsule_verify_does_not_follow_a_symlinked_entry() {
+        // A signed capsule outside the directory, linked in by name.
+        let outside = tempfile::tempdir().unwrap();
+        let (_, json) = post_json(
+            capsule_state(outside.path()),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        let name = json["capsule"].as_str().unwrap().to_owned();
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path().join(&name), dir.path().join("linked")).unwrap();
+        for endpoint in ["verify", "import"] {
+            let (status, json) = post_json(
+                capsule_state(dir.path()),
+                true,
+                &format!("/actuator/capsules/{endpoint}"),
+                serde_json::json!({"capsule": "linked"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{endpoint}: {json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_import_accepts_only_a_plain_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["../etc", "/tmp/x", "a/b"] {
+            let (status, json) = post_json(
+                capsule_state(dir.path()),
+                true,
+                "/actuator/capsules/import",
+                serde_json::json!({"capsule": name}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_verify_answers_404_for_an_unknown_capsule() {
+        let dir = tempfile::tempdir().unwrap();
+        let (status, _) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/verify",
+            serde_json::json!({"capsule": "missing"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn actuator_capsule_verify_reports_tampering_as_422() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/export",
+            serde_json::json!({"subject": "7"}),
+        )
+        .await;
+        let name = json["capsule"].as_str().unwrap().to_owned();
+        std::fs::write(dir.path().join(&name).join("records/users.json"), "[]").unwrap();
+        let (status, json) = post_json(
+            capsule_state(dir.path()),
+            true,
+            "/actuator/capsules/verify",
+            serde_json::json!({"capsule": name}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{json}");
+    }
+
+    #[test]
+    fn actuator_capsule_routes_are_listed_only_in_sensitive_mode() {
+        for suffix in ["export", "import", "verify"] {
+            let path = format!("/actuator/capsules/{suffix}");
+            assert!(actuator_endpoint_paths("/actuator", true, false).contains(&path));
+            assert!(!actuator_endpoint_paths("/actuator", false, false).contains(&path));
+            assert!(actuator_mutating_routes("/actuator", true).contains(&("POST", path.clone())));
+            assert!(!actuator_mutating_routes("/actuator", false).contains(&("POST", path)));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -9699,6 +11274,99 @@ mod health_indicator_tests {
         assert_eq!(results[0].name, "probe_check");
     }
 
+    /// Counts checks. Each check waits `delay`.
+    struct CountingIndicator {
+        calls: std::sync::atomic::AtomicUsize,
+        delay: std::time::Duration,
+    }
+
+    impl CountingIndicator {
+        fn new(delay: std::time::Duration) -> Arc<Self> {
+            Arc::new(Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                delay,
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl HealthIndicator for CountingIndicator {
+        fn check(&self) -> futures::future::BoxFuture<'_, HealthCheckOutput> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(self.delay).await;
+                HealthCheckOutput::up()
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_runs_check_each_indicator_once_per_ttl() {
+        let registry = HealthIndicatorRegistry::new();
+        registry.set_cache_ttl(std::time::Duration::from_secs(1));
+        let indicator = CountingIndicator::new(std::time::Duration::from_millis(20));
+        registry
+            .register("svc", IndicatorGroup::Readiness, indicator.clone())
+            .unwrap();
+
+        let runs: Vec<_> = (0..32)
+            .map(|i| {
+                let registry = registry.clone();
+                tokio::spawn(async move {
+                    if i % 2 == 0 {
+                        registry.run_readiness().await
+                    } else {
+                        registry.run_all().await
+                    }
+                })
+            })
+            .collect();
+        for run in runs {
+            let results = run.await.unwrap();
+            let svc = results.iter().find(|r| r.name == "svc").unwrap();
+            assert_eq!(svc.output.status, HealthStatus::Up);
+        }
+        assert_eq!(indicator.calls(), 1);
+
+        tokio::time::advance(std::time::Duration::from_millis(1_001)).await;
+        registry.run_readiness().await;
+        assert_eq!(indicator.calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn new_registry_does_not_cache() {
+        let registry = HealthIndicatorRegistry::new();
+        let indicator = CountingIndicator::new(std::time::Duration::ZERO);
+        registry
+            .register("svc", IndicatorGroup::Readiness, indicator.clone())
+            .unwrap();
+
+        registry.run_readiness().await;
+        registry.run_readiness().await;
+
+        assert_eq!(indicator.calls(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_result_is_cached_too() {
+        let registry = HealthIndicatorRegistry::new();
+        registry.set_cache_ttl(std::time::Duration::from_secs(1));
+        let indicator = CountingIndicator::new(std::time::Duration::from_secs(3_600));
+        registry
+            .register("svc", IndicatorGroup::Readiness, indicator.clone())
+            .unwrap();
+
+        let first = registry.run_readiness().await;
+        let second = registry.run_readiness().await;
+
+        assert_eq!(first[0].output.status, HealthStatus::Unknown);
+        assert_eq!(second[0].output.status, HealthStatus::Unknown);
+        assert_eq!(indicator.calls(), 1);
+    }
+
     #[tokio::test]
     async fn timed_out_indicator_reports_unknown_with_flag() {
         struct SlowIndicator;
@@ -9745,6 +11413,7 @@ mod health_indicator_tests {
                 minimum_sample_count: 2,
                 open_duration: std::time::Duration::from_secs(60),
                 half_open_trial_count: 2,
+                ..crate::circuit_breaker::CircuitBreakerPolicy::default()
             },
         );
 
@@ -9757,6 +11426,10 @@ mod health_indicator_tests {
         assert_eq!(result.group, IndicatorGroup::HealthOnly);
         assert_eq!(result.output.status, HealthStatus::Up);
         assert_eq!(result.output.details.get("state").unwrap(), "CLOSED");
+        assert_eq!(
+            result.output.details.get("slow_call_ratio").unwrap(),
+            &serde_json::json!(0.0)
+        );
 
         breaker.after_call(false);
         breaker.after_call(false);

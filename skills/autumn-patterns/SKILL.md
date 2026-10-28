@@ -37,7 +37,7 @@ server is needed. Add the feature for tests only:
 
 ```toml
 [dev-dependencies]
-autumn-web = { version = "0.8", features = ["test-support"] }
+autumn-web = { version = "0.9", features = ["test-support"] }
 ```
 
 ```rust
@@ -152,7 +152,7 @@ checked against the grant exactly like proved ones.
 record and fails on drift or on an ungoverned mutating MCP tool. Every MCP
 `tools/call` writes attempt and outcome audit events carrying a correlation
 id, the grant, the compile-known reversibility and the proved effects, with no
-per-handler wiring. `rate`/`spend` are declared and published, not enforced.
+per-handler wiring. The MCP dispatcher enforces `rate` per process. `spend` is declared and published only.
 See `docs/guide/agent-authority.md`.
 
 ### Fake-data factories and bulk seeding (trunk-dev)
@@ -232,7 +232,7 @@ they may run more than once.
 
 The `#[job]` macro takes `AppState` and a typed args struct (serializable).
 The macro generates a `PascalCaseJob` struct with a static `enqueue` method.
-On trunk-dev (unreleased — not in published 0.5.0) a job may also accept an
+Since 0.6.0 a job may also accept an
 optional third `JobContext` argument for progress reporting on tracked jobs,
 and a `queue = "name"` attribute for named priority queues.
 
@@ -268,7 +268,9 @@ Use `#[scheduled]` for recurring work. Use `#[task]` for operator-invoked
 CLI work (`autumn task <name>`).
 
 For durable multi-step workflows or jobs that need activity retries, timers,
-or human approval steps, reach for Autumn Harvest.
+or human approval steps, reach for Autumn Harvest (`autumn-harvest-plugin`).
+Do not hand-roll step checkpoints or sagas on top of `#[job]`; see
+`docs/adr/0016-durable-workflows-live-in-harvest.md`.
 
 ## Security checklist
 

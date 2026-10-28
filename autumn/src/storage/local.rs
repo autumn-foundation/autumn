@@ -7,8 +7,9 @@
 //! Suitable for `dev`, single-replica deployments, and integration
 //! tests. Multi-replica production should use the `S3` backend.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 #[cfg(test)]
 use std::time::SystemTime;
 use std::time::{Duration, UNIX_EPOCH};
@@ -94,6 +95,17 @@ struct LocalInner {
     previous_signing_keys: Vec<SigningKey>,
 }
 
+/// One lock per blob path, for every `LocalBlobStore` in this process. A write
+/// holds it from the moment its bytes land at the path until its sidecar is in
+/// place, so two writers of one key cannot mix the bytes of one with the
+/// metadata of the other, even through two stores on one root. Writers in
+/// other processes do not take it: this store serves one process (use the S3
+/// backend for more), and the checks in `commit_meta` keep the bytes right
+/// for them, at worst without their MIME type.
+static COMMIT_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(std::sync::Mutex::default);
+
 impl LocalBlobStore {
     /// Create a new local store rooted at `root`.
     ///
@@ -141,6 +153,29 @@ impl LocalBlobStore {
                 previous_signing_keys,
             }),
         })
+    }
+
+    /// Take the commit lock of `path`. See `COMMIT_LOCKS`.
+    async fn lock_path(&self, path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+        // Two stores can name one root in two ways: key the lock on the
+        // canonical root.
+        let key = path.strip_prefix(&self.inner.root).map_or_else(
+            |_| path.to_path_buf(),
+            |rest| self.inner.canonical_root.join(rest),
+        );
+        let lock = {
+            let mut locks = COMMIT_LOCKS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let slot = locks.entry(key).or_default();
+            let lock = slot
+                .upgrade()
+                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+            *slot = Arc::downgrade(&lock);
+            lock
+        };
+        lock.lock_owned().await
     }
 
     /// Borrow the configured mount path.
@@ -261,6 +296,7 @@ impl BlobStore for LocalBlobStore {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(BlobStoreError::io(err));
             }
+            let _commit = self.lock_path(&path).await;
             if let Err(err) = atomic_replace(&tmp_path, &path).await {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(BlobStoreError::io(err));
@@ -293,6 +329,71 @@ impl BlobStore for LocalBlobStore {
                 byte_size: bytes.len() as u64,
                 etag: Some(etag),
             })
+        })
+    }
+
+    fn put_if_absent<'a>(
+        &'a self,
+        key: &'a str,
+        content_type: &'a str,
+        bytes: Bytes,
+    ) -> BlobFuture<'a, Option<Blob>> {
+        Box::pin(async move {
+            let path = self.safe_path_for_key(key).await?;
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(BlobStoreError::io)?;
+            }
+            let etag = sha256_hex(&bytes);
+            // Write a temp file, then hard-link it to `path`. A link fails
+            // when `path` exists, so this never replaces a blob that another
+            // writer made in the meantime.
+            let tmp_path = temp_sibling_path(&path);
+            if let Err(err) = tokio::fs::write(&tmp_path, &bytes).await {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(BlobStoreError::io(err));
+            }
+            let _commit = self.lock_path(&path).await;
+            let linked = tokio::fs::hard_link(&tmp_path, &path).await;
+            match linked {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    if err.kind() == std::io::ErrorKind::AlreadyExists {
+                        return Ok(None);
+                    }
+                    return Err(BlobStoreError::io(err));
+                }
+            }
+            let meta = StoredBlobMeta {
+                content_type: content_type.to_owned(),
+                etag: Some(etag.clone()),
+            };
+            match commit_meta(&path, &tmp_path, &meta).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    // Another writer replaced the blob: the key is taken.
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Ok(None);
+                }
+                Err(()) => {
+                    // A caller must not get a blob without its MIME type.
+                    remove_own_blob(&path, &tmp_path).await;
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(BlobStoreError::Io(format!(
+                        "could not store the metadata of {key}"
+                    )));
+                }
+            }
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            Ok(Some(Blob {
+                provider_id: self.inner.provider_id.clone(),
+                key: key.to_owned(),
+                content_type: content_type.to_owned(),
+                byte_size: bytes.len() as u64,
+                etag: Some(etag),
+            }))
         })
     }
 
@@ -337,6 +438,7 @@ impl BlobStore for LocalBlobStore {
 
             match result {
                 Ok((byte_size, etag)) => {
+                    let _commit = self.lock_path(&path).await;
                     if let Err(err) = atomic_replace(&tmp_path, &path).await {
                         let _ = tokio::fs::remove_file(&tmp_path).await;
                         return Err(BlobStoreError::io(err));
@@ -450,6 +552,7 @@ impl BlobStore for LocalBlobStore {
             // (now-missing) key returns `None` from the metadata-stat
             // call before the sidecar is even read, and a future `put`
             // overwrites the sidecar atomically.
+            let _commit = self.lock_path(&path).await;
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -896,6 +999,27 @@ fn backup_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
+/// `true` when `a` and `b` are the same file, not only the same bytes.
+async fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let (Ok(a), Ok(b)) = (
+        tokio::fs::symlink_metadata(a).await,
+        tokio::fs::symlink_metadata(b).await,
+    ) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        // No portable file id in std: a replacement of the same size and
+        // time is very unlikely, so treat that as the same file.
+        a.len() == b.len() && a.modified().ok() == b.modified().ok()
+    }
+}
+
 fn temp_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let mut name = path.file_name().map_or_else(
@@ -920,7 +1044,7 @@ fn temp_sibling_path(path: &std::path::Path) -> std::path::PathBuf {
 /// `attachments/{uuid}.pdf`) so the chance is vanishing. The S3
 /// backend has no equivalent issue because S3 stores `Content-Type` as
 /// part of the object's metadata.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StoredBlobMeta {
     pub content_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1011,6 +1135,71 @@ async fn write_meta_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) 
 /// fallback rather than stale `content_type` from the previous put.
 /// The bytes are already committed; we'd rather serve "I don't know"
 /// than misrepresent the MIME.
+/// Write the sidecar of a blob that `put_if_absent` linked from `tmp_path`.
+///
+/// The caller holds the commit lock of `path`, so no writer in this process
+/// runs between the checks and the write. The checks are for writers in
+/// other processes. `Ok(false)` when another writer replaced the blob first:
+/// its metadata stays. When the blob is replaced during the write, this call removes the
+/// sidecar while it is still its own. A reader then gets the default MIME
+/// type, never a wrong one.
+async fn commit_meta(
+    path: &std::path::Path,
+    tmp_path: &std::path::Path,
+    meta: &StoredBlobMeta,
+) -> Result<bool, ()> {
+    if !same_file(path, tmp_path).await {
+        return Ok(false);
+    }
+    write_meta_sidecar(path, meta).await?;
+    if same_file(path, tmp_path).await {
+        return Ok(true);
+    }
+    drop_own_sidecar(path, meta).await;
+    Ok(false)
+}
+
+/// Remove the blob at `path` only if it is the file that `tmp_path` linked.
+///
+/// A writer in another process (or another store on the same root) does not
+/// take the commit lock and can replace `path` at any time. So the rename takes
+/// the file that is in place at that moment, and the check and the removal act
+/// on that one file. A file of another writer goes back with a link, which
+/// never replaces a newer one. A sidecar stays: this call wrote none, and a
+/// sidecar without its blob is never read.
+async fn remove_own_blob(path: &std::path::Path, tmp_path: &std::path::Path) {
+    let taken = temp_sibling_path(path);
+    if tokio::fs::rename(path, &taken).await.is_err() {
+        return;
+    }
+    if !same_file(&taken, tmp_path).await {
+        let _ = tokio::fs::hard_link(&taken, path).await;
+    }
+    let _ = tokio::fs::remove_file(&taken).await;
+}
+
+/// Remove the sidecar of `blob_path` only if it still holds `meta`.
+///
+/// The rename takes the sidecar that is in place at that moment, so the check
+/// and the removal act on one file. A sidecar of another writer goes back
+/// with a link, which never replaces a newer sidecar.
+async fn drop_own_sidecar(blob_path: &std::path::Path, meta: &StoredBlobMeta) {
+    let path = meta_sidecar_path(blob_path);
+    let taken = temp_sibling_path(&path);
+    if tokio::fs::rename(&path, &taken).await.is_err() {
+        return;
+    }
+    let ours = tokio::fs::read(&taken)
+        .await
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<StoredBlobMeta>(&bytes).ok())
+        .is_some_and(|found| &found == meta);
+    if !ours {
+        let _ = tokio::fs::hard_link(&taken, &path).await;
+    }
+    let _ = tokio::fs::remove_file(&taken).await;
+}
+
 async fn drop_stale_sidecar(blob_path: &std::path::Path) {
     let path = meta_sidecar_path(blob_path);
     if let Err(err) = tokio::fs::remove_file(&path).await
@@ -1263,6 +1452,78 @@ mod tests {
         .unwrap()
     }
 
+    /// Two stores on one root in one process race like two writers of one
+    /// store: the commit lock must cover both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sidecar_describes_the_bytes_after_racing_writes_of_two_stores() {
+        let dir = temp_root();
+        let (first, second) = (store(dir.path()), store(dir.path()));
+        for round in 0..300 {
+            first.delete("k.bin").await.unwrap();
+            let (a, b) = (first.clone(), second.clone());
+            let ours = tokio::spawn(async move {
+                a.put_if_absent("k.bin", "image/png", Bytes::from(format!("ours {round}")))
+                    .await
+            });
+            let theirs = tokio::spawn(async move {
+                b.put(
+                    "k.bin",
+                    "text/plain",
+                    Bytes::from(format!("theirs {round}")),
+                )
+                .await
+            });
+            ours.await.unwrap().unwrap();
+            theirs.await.unwrap().unwrap();
+            let (bytes, meta) = first.get_with_meta("k.bin").await.unwrap();
+            let meta = meta.unwrap_or_else(|| panic!("round {round}: no sidecar"));
+            assert_eq!(
+                meta.etag.as_deref(),
+                Some(sha256_hex(&bytes).as_str()),
+                "round {round}"
+            );
+        }
+    }
+
+    /// A `put_if_absent` and a `put` race on one key. Whichever wins, the
+    /// sidecar must describe the bytes in place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sidecar_describes_the_bytes_after_racing_writes() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        for round in 0..300 {
+            s.delete("k.bin").await.unwrap();
+            let (a, b) = (s.clone(), s.clone());
+            let ours = tokio::spawn(async move {
+                a.put_if_absent("k.bin", "image/png", Bytes::from(format!("ours {round}")))
+                    .await
+            });
+            let theirs = tokio::spawn(async move {
+                b.put(
+                    "k.bin",
+                    "text/plain",
+                    Bytes::from(format!("theirs {round}")),
+                )
+                .await
+            });
+            ours.await.unwrap().unwrap();
+            theirs.await.unwrap().unwrap();
+            let (bytes, meta) = s.get_with_meta("k.bin").await.unwrap();
+            let meta = meta.unwrap_or_else(|| panic!("round {round}: no sidecar"));
+            assert_eq!(
+                meta.etag.as_deref(),
+                Some(sha256_hex(&bytes).as_str()),
+                "round {round}"
+            );
+            let want = if bytes.starts_with(b"ours") {
+                "image/png"
+            } else {
+                "text/plain"
+            };
+            assert_eq!(meta.content_type, want, "round {round}");
+        }
+    }
+
     #[tokio::test]
     async fn put_get_round_trip() {
         let dir = temp_root();
@@ -1275,6 +1536,127 @@ mod tests {
         assert!(blob.etag.is_some());
         let bytes = s.get("a/b.png").await.unwrap();
         assert_eq!(&bytes[..], b"abc");
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_writes_only_a_free_key() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        let blob = s
+            .put_if_absent("a/b.png", "image/png", Bytes::from_static(b"abc"))
+            .await
+            .unwrap()
+            .expect("the key is free");
+        assert_eq!(blob.byte_size, 3);
+        let head = s.head("a/b.png").await.unwrap().unwrap();
+        assert_eq!(head.content_type, "image/png");
+
+        let second = s
+            .put_if_absent("a/b.png", "text/plain", Bytes::from_static(b"xyz"))
+            .await
+            .unwrap();
+        assert!(second.is_none(), "the key is taken");
+        assert_eq!(&s.get("a/b.png").await.unwrap()[..], b"abc");
+        let head = s.head("a/b.png").await.unwrap().unwrap();
+        assert_eq!(head.content_type, "image/png");
+        // No temp file is left next to the blob.
+        let mut names: Vec<_> = std::fs::read_dir(dir.path().join("a"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["b.png", "b.png.meta"]);
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_meta_keeps_the_metadata_of_a_replacement() {
+        let dir = temp_root();
+        let path = dir.path().join("a.bin");
+        let tmp_path = dir.path().join("a.bin.tmp");
+        std::fs::write(&tmp_path, b"ours").unwrap();
+        // Another writer replaced the linked blob before the sidecar write.
+        std::fs::write(&path, b"theirs").unwrap();
+        let theirs = StoredBlobMeta {
+            content_type: "text/plain".to_owned(),
+            etag: Some(sha256_hex(b"theirs")),
+        };
+        write_meta_sidecar(&path, &theirs).await.unwrap();
+        let ours = StoredBlobMeta {
+            content_type: "image/png".to_owned(),
+            etag: Some(sha256_hex(b"ours")),
+        };
+
+        assert_eq!(commit_meta(&path, &tmp_path, &ours).await, Ok(false));
+        assert_eq!(read_meta_sidecar(&path).await, Some(theirs));
+    }
+
+    #[tokio::test]
+    async fn drop_own_sidecar_keeps_the_metadata_of_another_writer() {
+        let dir = temp_root();
+        let path = dir.path().join("a.bin");
+        let meta = |etag: &[u8]| StoredBlobMeta {
+            content_type: "text/plain".to_owned(),
+            etag: Some(sha256_hex(etag)),
+        };
+        write_meta_sidecar(&path, &meta(b"theirs")).await.unwrap();
+        drop_own_sidecar(&path, &meta(b"ours")).await;
+        assert_eq!(read_meta_sidecar(&path).await, Some(meta(b"theirs")));
+        // No temp file stays next to the blob.
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["a.bin.meta"]);
+
+        drop_own_sidecar(&path, &meta(b"theirs")).await;
+        assert_eq!(read_meta_sidecar(&path).await, None);
+    }
+
+    #[tokio::test]
+    async fn put_if_absent_fails_and_leaves_nothing_when_metadata_is_not_stored() {
+        let dir = temp_root();
+        let s = store(dir.path());
+        // A directory at the sidecar path makes the metadata write fail.
+        std::fs::create_dir_all(dir.path().join("a/b.png.meta")).unwrap();
+        let err = s
+            .put_if_absent("a/b.png", "image/png", Bytes::from_static(b"abc"))
+            .await
+            .expect_err("no metadata");
+        assert!(matches!(err, BlobStoreError::Io(_)), "{err:?}");
+        assert!(matches!(
+            s.get("a/b.png").await,
+            Err(BlobStoreError::NotFound(_))
+        ));
+        // No temp file stays next to the key.
+        let names: Vec<_> = std::fs::read_dir(dir.path().join("a"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["b.png.meta"]);
+    }
+
+    #[tokio::test]
+    async fn remove_own_blob_keeps_the_blob_of_another_writer() {
+        let dir = temp_root();
+        let path = dir.path().join("k.bin");
+        let ours = dir.path().join("ours.tmp");
+        std::fs::write(&ours, b"ours").unwrap();
+        // Another writer put its own file at the path.
+        std::fs::write(&path, b"theirs").unwrap();
+        remove_own_blob(&path, &ours).await;
+        assert_eq!(std::fs::read(&path).unwrap(), b"theirs");
+
+        // The file that `ours` linked goes.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&ours, &path).unwrap();
+        remove_own_blob(&path, &ours).await;
+        assert!(!path.exists());
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["ours.tmp"]);
     }
 
     #[tokio::test]

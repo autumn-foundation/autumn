@@ -342,6 +342,9 @@ pub struct SystemTest {
     /// App-wide Tower layers registered via [`SystemTest::layer`], applied in
     /// the same router position as [`crate::app::AppBuilder::layer`].
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    /// `WebMCP` settings from [`SystemTest::mount_webmcp`].
+    #[cfg(feature = "webmcp")]
+    webmcp: Option<crate::webmcp::WebMcpRuntime>,
 }
 
 impl Default for SystemTest {
@@ -369,7 +372,18 @@ impl SystemTest {
             hx_settle_timeout: DEFAULT_HX_SETTLE_TIMEOUT,
             state_override: None,
             custom_layers: Vec::new(),
+            #[cfg(feature = "webmcp")]
+            webmcp: None,
         }
+    }
+
+    /// Serve the `WebMCP` tool list, as
+    /// [`AppBuilder::mount_webmcp`](crate::app::AppBuilder::mount_webmcp)
+    /// does.
+    #[cfg(feature = "webmcp")]
+    pub fn mount_webmcp(mut self) -> Self {
+        self.webmcp.get_or_insert_with(Default::default);
+        self
     }
 
     /// Register routes to serve.  May be called multiple times; each call
@@ -554,6 +568,15 @@ impl SystemTest {
             (self.config, state)
         };
 
+        #[cfg(feature = "webmcp")]
+        if let Some(runtime) = self.webmcp {
+            let docs: Vec<crate::openapi::ApiDoc> = self
+                .routes
+                .iter()
+                .map(|route| route.api_doc.clone())
+                .collect();
+            crate::webmcp::install(&state, &docs, runtime, None, &config);
+        }
         crate::router::try_build_router_with_layers(self.routes, &config, state, self.custom_layers)
             .unwrap_or_else(|error| panic!("invalid router configuration: {error}"))
     }
@@ -1659,6 +1682,7 @@ mod tests {
             repository: None,
             idempotency: crate::route::RouteIdempotency::Direct,
             timeout: crate::route::RouteTimeout::Inherit,
+            criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,

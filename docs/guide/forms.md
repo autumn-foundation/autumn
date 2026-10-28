@@ -117,17 +117,71 @@ The free functions in `autumn_web::form` cover the rest of the control types:
 `password_input`, `textarea_input`, `checkbox_input`, `number_input`,
 `date_input`, `datetime_input`, and `select_input`.
 
-A `required_*` variant — one that adds the HTML5 constraint attributes for you —
-exists for **some but not all** of them:
+Each control has a `required_*` variant. It adds `required`,
+`aria-required="true"` and a visual `*` marker in the label. The marker has
+`aria-hidden="true"`, so a screen reader says "required" one time only. Tell
+sighted users what `*` means, for example with "* required" above the form.
+`required_*` writes only the client-side signal. The model rule
+`#[validate(presence)]` rejects a blank submission.
 
-| Has a `required_*` variant | Does not |
+### Hints, attributes and required state: `FieldOptions`
+
+Each helper also has a `*_with` variant that takes `&FieldOptions`. The label
+stays a positional argument, so a field with no label does not compile.
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, text_input_with};
+
+text_input_with(&changeset, "email", "Email", &FieldOptions::new()
+    .hint("We never share your address.")
+    .required()
+    .autocomplete("email")
+    .placeholder("you@example.com")
+    .data("test-id", "signup-email")
+    .hx("indicator", "#spinner"))
+```
+
+- `hint` renders `<p id="email-hint" class="autumn-field__hint">` between the
+  label and the control (after the label for a checkbox). `aria-describedby`
+  names the hint first, then the error.
+- The typed attributes (`placeholder`, `autocomplete`, `inputmode`, `pattern`,
+  `min`, `max`, `disabled`, `readonly`) render only on controls that use them.
+- `data` and `hx` add `data-*` and `hx-*` attributes. There is no setter for
+  `id`, `name`, `class` or `aria-*`: the helper owns them. The htmx helpers also
+  keep their own `hx-post`, `hx-params` and the other `hx-*` names they set.
+  If you set one name two times, the last value applies.
+- The browser does not submit the value of a `disabled` control.
+
+| Helper | With options |
 |---|---|
-| `text_input`, `number_input`, `date_input`, `datetime_input`, `select_input`, `rich_text_area` | `password_input`, `textarea_input`, `checkbox_input` |
+| `text_input` | `text_input_with` |
+| `text_input_htmx_with_token_field` | `text_input_htmx_with` |
+| `password_input` | `password_input_with` |
+| `textarea_input` | `textarea_input_with` |
+| `checkbox_input` | `checkbox_input_with` |
+| `number_input` | `number_input_with` |
+| `date_input` | `date_input_with` |
+| `datetime_input` | `datetime_input_with` |
+| `select_input` | `select_input_with` |
+| `rich_text_area_with_labels` | `rich_text_area_with` |
+| `rich_text_area_htmx_with_token_field_with_labels` | `rich_text_area_htmx_with` |
 
-For the three without one, set the attribute yourself in the markup. Server-side
-validation is unaffected either way: `required_*` only writes the client-side
-hint, and `#[validate(presence)]` on the model is what actually rejects a blank
-submission.
+The `*_with` htmx helpers take the submit-token field name. Pass
+`"_submit_token"` for the default. A nested-form `RowScope` has
+`text_input_with`, `number_input_with` and `textarea_input_with`.
+
+The Autumn stylesheet marks a field invalid with `:user-invalid`, so the
+browser's own check shows only after the user changes the field or submits.
+Server errors use the `autumn-field__input--invalid` class.
+
+### The error summary
+
+`autumn_web::widgets::error_summary(&changeset)` lists every error at the top of
+the form. Each entry links to `#field`, the `id` of the control. The summary has
+`tabindex="-1"` and `autofocus`, so focus moves to it when a submit fails, with
+no JavaScript. A form-level error (key `__all__`) has no link. Put one summary
+on a page, with no other `autofocus` element. Do not return it from an
+inline-validation response: it takes focus while the user types.
 
 ### Rendering a whole form in one call
 
@@ -135,14 +189,20 @@ A `#[model]` implements `FormModel`, so `form_for` can derive one control per
 editable column:
 
 ```rust,ignore
-use autumn_web::form::form_for;
+use autumn_web::form::{FieldOptions, form_for};
 
 form_for(&changeset, "/posts", "post")
     .csrf(csrf.token())
     .exclude("author_id")
     .override_label("body", "Post text")
+    .field_options("title", FieldOptions::new().hint("Keep it short."))
     .render()
 ```
+
+Use `.field_options(field, FieldOptions)` to give one field a hint, attributes
+or the required state. A checkbox and a password become required only from
+`FieldOptions`: a non-null `bool` column does not mean "must be checked", and
+the browser never fills a password field again on an edit form.
 
 This is what the scaffold generator emits. Reach for the individual helpers when
 the form's layout matters; reach for `form_for` when it does not.
@@ -162,9 +222,11 @@ validation error, the handler decides what to render, and the user gets their
 input back. This is the right choice for every server-rendered HTML form.
 
 **It can still reject a body it cannot decode.** `decode_form_body` returns 415
-for the wrong `Content-Type` and 400 when a field will not deserialize into its
-declared type — before the handler runs, so there is nothing to re-render with.
-The round-trip covers *invalid* values, not *unparseable* ones.
+for the wrong `Content-Type`, 400 when a field will not deserialize into its
+declared type, and 422 when a single-value field arrives more than once (see
+[multi-value fields](#multi-value-fields)) — before the handler runs, so there
+is nothing to re-render with. The round-trip covers *invalid* values, not
+*unparseable* ones.
 
 That distinction has a practical consequence: **type a form field as the string
 the browser actually submits, and convert after validation.** A field typed
@@ -591,13 +653,23 @@ if let Err(err) = repo.save(&new_post).await
 }
 ```
 
-This is a backstop, not the mechanism: rejecting at the form boundary is what
-gives the author something actionable. Two limits come with that. The 422 names
-no field — nothing at the database boundary knows which one the byte came from,
-so `errors` is empty unless you fold it in yourself as above. And classification
-is by server message, anchored on the `: 0x00` the encoding rejection ends with;
-a NUL smuggled into a `JSONB` column fails with a different message entirely
-(`unsupported Unicode escape sequence`, SQLSTATE `22P05`) and is not classified.
+This is a backstop. The form boundary is the main defense. It gives the author
+a message they can use.
+
+The generated `#[repository(api = ...)]` create and update handlers name the
+field. The `422` has an `errors[]` entry for each string that holds a NUL byte.
+Nested names use dots and brackets: `address.street`, `items[1].sku`. The
+Postgres does not say which column held the byte. The handler looks for it in
+the payload. A payload type without `Serialize` keeps an empty `errors[]`.
+In your own handler, call `autumn_web::error::nul_byte_json_fields` on the
+JSON body.
+
+Postgres rejects a NUL in a `JSONB` string with a different message
+(`unsupported Unicode escape sequence`, SQLSTATE `22P05`). The classifier
+matches that message and its detail exactly. It returns the same `422`.
+
+Classification uses the server message. If the server translates the message,
+the error stays a `500`. This is safe.
 
 ### When you would rather clean than reject
 
@@ -623,11 +695,24 @@ one using `validate_on_update = fetch`, persists the raw patch and throws the
 normalized draft away — so an `update` through either of those still sends the
 NUL to Postgres and still fails the write, now as a 422 rather than a 500.
 
-The message is a fixed English string. Unlike a scaffold's `common.error.taken`,
-it is recorded inside the extractor, before any handler holds a `Locale`, so
-there is nowhere to look up a translation. A localized app that needs a
-localized message can rewrite it from the handler by matching
-`NUL_CHARACTER_FIELD_ERROR` in `changeset.errors()`.
+### Localize the message
+
+With the `i18n` feature, the form extractors read the `Arc<Bundle>` from the
+request extensions. They resolve the request locale and look up
+`common.error.nul_character` (`autumn_web::form::NUL_CHARACTER_MESSAGE_KEY`).
+Add the key to each catalog:
+
+```text
+common.error.nul_character = No puede contener el carácter NUL (0x00)
+```
+
+If there is no bundle, or the key is missing, the message is
+`NUL_CHARACTER_FIELD_ERROR` in English. A missing key does not record a miss.
+
+`autumn generate scaffold --i18n` adds the English entry to `en.ftl`. `autumn i18n check`
+does not report the key as unused.
+
+The API `422` message stays in English. No locale is available there.
 
 ---
 
@@ -756,6 +841,69 @@ screen-reader user hears the error when focus lands on the field. The
 
 ---
 
+## Multi-value fields
+
+A checkbox group, a `<select multiple>` and a tag input send one key more than
+once: `tags=rust&tags=web`. Give the field a sequence type. Each value becomes
+one element:
+
+```rust,ignore
+#[derive(Deserialize, Serialize, Validate)]
+struct PostForm {
+    title: String,
+    #[serde(default)]          // no box checked → empty list
+    tags: Vec<String>,
+    #[serde(default)]
+    reviewer_ids: HashSet<i64>,
+    labels: Option<Vec<String>>, // absent → None
+}
+```
+
+`ChangesetForm<T>`, `NestedChangesetForm` and the multipart path all use these
+rules. So does `autumn_web::form::from_urlencoded`, for a handler that reads
+`Bytes`:
+
+| Body | Field | Result |
+|---|---|---|
+| `tags=a&tags=b` | `Vec<String>` | `["a", "b"]` |
+| `tags=a` | `Vec<String>` | `["a"]` |
+| (no `tags` key) | `#[serde(default)] Vec<String>` | `[]` |
+| (no `labels` key) | `Option<Vec<String>>` | `None` |
+| `q=a%20b&q=c+d` | `Vec<String>` | `["a b", "c d"]` |
+| `ids=1&ids=&ids=3` | `Vec<i64>` | `[1, 3]` — a blank element of a typed list is dropped |
+| `q=&q=x` | `Vec<String>` | `["", "x"]` — a blank string stays |
+| `ids=1&ids=x` | `Vec<i64>` | 400 |
+| `name=a&name=b` | `String` | **422** |
+
+**A repeated key on a single-value field is a 422.** The decoder does not
+select the first value or the last value. Two layers can select different
+values (a proxy log and the handler, for example). That causes
+parameter-pollution bugs. The message names the field, so a field that must be
+a `Vec` is easy to find. Single-value fields that arrive once decode as before.
+
+Notes:
+
+- Brackets are part of the key. `ids[]=1` does not fill `ids`. Use
+  `#[serde(alias = "ids[]")]` to accept both spellings. Do not send both in one
+  body.
+- `bool` also accepts `on`, the value a checkbox with no `value` attribute
+  sends.
+- A blank numeric or `bool` `Option` (`page=`) is `None`. A
+  `#[serde(default = "...")]` on that field does not apply to a blank value.
+- A fixed-size array (`[i64; 2]`) and a newtype around a `Vec` take one value.
+  Use a plain `Vec`.
+- `Changeset::field_values("tags")` returns every element as a string, to
+  re-render the checked boxes or the selected options. In a
+  [nested form](./nested-forms.md) row, `row.values("tags")` returns every
+  submitted value of that subfield. `row.value("tags")` returns only the last
+  one.
+- `field_from_urlencoded` reads one raw value for a preview. It is lenient and
+  returns the first value.
+- `Form<T>` still uses `serde_urlencoded`. It rejects a repeated key on a
+  struct field.
+
+---
+
 ## Multi-row and multi-step forms
 
 - **Repeated rows** — a `has_many` edited inline, with add/remove — are their own
@@ -773,23 +921,47 @@ screen-reader user hears the error when focus lands on the field. The
 per-file size caps — before your handler sees a byte. See
 [storage](./storage.md) for where the bytes then go.
 
-**`ChangesetForm` and file uploads do not compose.** It does decode
-`multipart/form-data` bodies when the `multipart` feature is on, but
-`decode_multipart` **skips file fields while consuming the stream** — so the
-upload is silently discarded, and a second `Multipart` extractor cannot recover
-it, because the body is already gone. A handler taking `ChangesetForm<T>` on a
-form that contains a file input validates the text fields correctly and loses
-the file with no error at all.
+**`ChangesetForm` keeps file parts**, so one form can take a file upload and
+its text fields together. On a `multipart/form-data` body (the
+`multipart` feature), the text fields decode into `T` as usual. Each file part
+goes to the form, not to `T`:
 
-So pick one per route:
+```rust,ignore
+#[post("/profile")]
+async fn update(mut form: ChangesetForm<ProfileForm>) -> impl IntoResponse {
+    if form.file("avatar").is_none() {
+        form.changeset.add_error("avatar", "Choose a picture");
+    }
+    let files = form.take_files(); // take them before `into_valid` consumes the form
+    match form.into_valid() {
+        Ok(profile) => { /* store `files`, save `profile` */ }
+        Err(form) => (StatusCode::UNPROCESSABLE_ENTITY, render(&form)).into_response(),
+    }
+}
+```
 
-| The route needs | Use |
+| Method | Returns |
 |---|---|
-| validated text fields, re-rendered on failure | `ChangesetForm<T>` — and no file inputs on that form |
-| a file upload | `Multipart`, validating the text fields yourself |
+| `form.file("avatar")` | the first file part named `avatar` |
+| `form.files("photos")` | every file part named `photos` (`<input type="file" multiple>`) |
+| `form.take_files()` | all file parts, moved out of the form |
 
-If you need both, split them: take the upload on its own route or its own
-request, and keep the changeset form for the fields that have to round-trip.
+Each `FormFile` has `field()`, `file_name()`, `content_type()` (from the
+client), `sniffed_content_type()` (from the bytes, when a MIME policy is set)
+and `bytes()`.
+
+Rules:
+
+- The `security.upload` policy applies: the MIME allowlist (400), the per-file
+  cap (413), and the request cap. The per-file cap also applies to each text
+  part. A route that sets a smaller `DefaultBodyLimit` keeps it.
+- The form holds each file in memory. The per-file cap and the request cap
+  limit that memory. For a file larger than you want in memory, use
+  `Multipart` and stream it to storage on its own route.
+- An empty optional file input (no file chosen) is not a file. `file(..)`
+  returns `None`.
+- A browser cannot fill a file input again. When you re-render after an error,
+  the user must choose the file again.
 
 ---
 

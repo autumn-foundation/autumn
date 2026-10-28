@@ -6,14 +6,18 @@
 # `.github/workflows/posture-gate.yml` executes, minus the GitHub-specific
 # halves (comment posting, acknowledgment harvesting):
 #
-#   1. Build each example's posture manifest with `autumn routes audit`. That
-#      is the head side, and it also enforces #1604's default-deny rule — an
+#   1. Build each example's posture manifest with `autumn routes audit`, under
+#      the build a deployment ships (`AUDIT_FLAGS`, issue #2472). That is the
+#      head side, and it also enforces #1604's default-deny rule — an
 #      unclassified route fails here before any diffing happens.
 #   2. Diff it against the baseline as of the BASE REVISION — not the working
 #      tree. A change that widens an example and refreshes its committed
 #      manifest in the same commit would otherwise compare identical sides and
 #      pass, which is precisely the change the gate exists to catch. Widening
 #      fails this script; narrowing and neutral changes are printed and pass.
+#
+# With --update, it also refreshes scripts/check-posture-demo.sh's goldens,
+# which are derived from reddit-clone's baseline.
 #
 # Drift between the committed manifest and the freshly built one is reported,
 # not failed: unlike an app repository, this one *is* the framework, so the
@@ -22,15 +26,29 @@
 # which is exactly what the diff — and not the byte comparison — measures.
 # Refresh the committed manifests with `--update` when they drift.
 #
-# Escape hatch, mirroring the product's: export AUTUMN_POSTURE_ACK with the
-# digest the diff prints to acknowledge a deliberate widening. It is recorded
-# in this script's output, and (in CI) in the job log.
+# Escape hatch: the same as in the product. Two variables acknowledge a
+# deliberate widening. The script prints each use. The CI job log keeps it.
+#
+#   AUTUMN_POSTURE_ACK      the marker the diff prints (digest and ceiling).
+#   AUTUMN_POSTURE_ACK_DIR  an absolute path to a directory with one file per
+#                           pull request comment. The diff scans each file
+#                           alone for `/ack-posture` markers. The scaffolded
+#                           gate does the same.
+#
+# In CI the `publish-gate` workflow sets them:
+#   - pull_request: the job reads the pull request comments. It keeps only
+#     comments from users with admin, write or maintain permission.
+#   - workflow_dispatch: the `posture_ack` input sets AUTUMN_POSTURE_ACK.
+#   - A comment does not re-run the workflow. Re-run the job after you comment.
+#   - tag push: no acknowledgment. A release tag has no pull request. Acknowledge
+#     and merge the widening first.
 #
 # Called from the `publish-gate` workflow. Run locally with:
 #
 #     ./scripts/check-posture-gate.sh
 #     ./scripts/check-posture-gate.sh --update      # refresh the baselines
 #     AUTUMN_POSTURE_ACK=<digest> ./scripts/check-posture-gate.sh
+#     AUTUMN_POSTURE_ACK_DIR=<dir> ./scripts/check-posture-gate.sh
 
 set -euo pipefail
 
@@ -39,7 +57,35 @@ cd "$root"
 
 # Examples carrying a committed posture baseline. Keep this list and the
 # `security-posture.json` files next to those examples in step.
-EXAMPLES=("hello")
+#
+# This is a representative subset, not the whole fleet (issue #2468). Each
+# example adds one build to `publish-gate`. The set shows each way a route gets
+# its classification:
+#   hello    - `#[public]` routes only
+#   flock    - a `#[public]` page for a WASM island
+#   invoice  - a `#[public]` page and a `#[public]` PDF
+#   todo-app - `#[public]` routes, and a bearer-token API that a layer guards
+#              (`AppBuilder::scoped_guarded`)
+#   reddit-clone - session-guarded `#[secured]` routes, the only example here
+#              with proven guards; a nested router declared with
+#              `declare_plugin_routes`; and generated repository routes
+#              marked public
+# The other examples stay out. Most mount admin or write routes with no guard.
+# `#[public]` on those routes would be false. Add an example only after you
+# classify each of its routes by hand.
+EXAMPLES=("hello" "flock" "invoice" "todo-app" "reddit-clone")
+
+# The binary to audit. Only an example with more than one binary needs this.
+example_bin() {
+  case "$1" in
+    todo-app) echo "--bin todo-app" ;;
+  esac
+}
+
+# The build to audit (issue #2472). A deployment ships a release build, and a
+# route behind `#[cfg(not(debug_assertions))]` is only in that build. The
+# examples have no non-default features to ship.
+AUDIT_FLAGS=(--release)
 
 UPDATE=0
 case "${1:-}" in
@@ -52,6 +98,7 @@ case "${1:-}" in
 esac
 
 ACK="${AUTUMN_POSTURE_ACK:-}"
+ACK_DIR="${AUTUMN_POSTURE_ACK_DIR:-}"
 
 # The revision whose committed manifests count as the accepted posture. In CI
 # this is the pull request's base branch; locally it defaults to the upstream
@@ -83,7 +130,13 @@ note() {
 command -v cargo >/dev/null || die "cargo is required"
 
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+cleanup() {
+  if [ -d "$work/base-tree" ]; then
+    git worktree remove --force "$work/base-tree" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$work"
+}
+trap cleanup EXIT
 
 echo "Building the autumn CLI…"
 # `--locked`: a Cargo.lock that does not match the manifests should fail the
@@ -93,6 +146,8 @@ cargo build -q --locked -p autumn-cli --bin autumn
 # locally commonly set (again mirroring check-sbom.sh).
 CLI="${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-$root/target}}/debug/autumn"
 [ -x "$CLI" ] || die "the autumn CLI did not build at $CLI"
+# Absolute, because the base rebuild below runs it from another directory.
+CLI="$(cd "$(dirname "$CLI")" && pwd)/$(basename "$CLI")"
 
 failed=0
 
@@ -104,9 +159,10 @@ for example in "${EXAMPLES[@]}"; do
   echo "── $example ────────────────────────────────────────────────"
 
   # Also the #1604 default-deny gate: an unclassified route fails right here.
-  "$CLI" routes audit -p "$example" --manifest "$fresh" >/dev/null \
+  # shellcheck disable=SC2046  # the flag is two words, or none
+  "$CLI" routes audit -p "$example" $(example_bin "$example") "${AUDIT_FLAGS[@]}" --manifest "$fresh" >/dev/null \
     || die "$example: \`autumn routes audit\` failed — see the output above"
-  ok "$example: every route carries a proven classification"
+  ok "$example: every route carries a classification"
 
   if [ "$UPDATE" = "1" ]; then
     cp "$fresh" "$baseline"
@@ -122,6 +178,7 @@ for example in "${EXAMPLES[@]}"; do
   # manifest in the same change cannot make both sides agree.
   accepted="$work/$example.base.json"
   bootstrap=0
+  from_ref=0
   if ! git rev-parse --verify --quiet "$POSTURE_BASE_REF^{commit}" >/dev/null; then
     # No base revision in this checkout (a shallow clone, or a local clone with
     # no remote). Comparing against the working tree still catches a widening
@@ -132,6 +189,7 @@ for example in "${EXAMPLES[@]}"; do
     note "$example: the working tree's $baseline (CI resolves the base ref)"
   elif git cat-file -e "$POSTURE_BASE_REF:$baseline" 2>/dev/null; then
     git show "$POSTURE_BASE_REF:$baseline" > "$accepted"
+    from_ref=1
     note "$example: comparing against $POSTURE_BASE_REF:$baseline"
   else
     # The baseline is new on this branch: there is no previously accepted
@@ -141,6 +199,28 @@ for example in "${EXAMPLES[@]}"; do
     note "$example: no baseline on $POSTURE_BASE_REF yet — bootstrapping"
   fi
 
+  # A base manifest from another build gives a false diff. This occurs once,
+  # when AUDIT_FLAGS changes. Then build the base revision with the same flags.
+  # A change to AUDIT_FLAGS is a change to this script, so code review covers
+  # it; no acknowledgment is asked. The diff exits 1 on a widening, so capture
+  # its output with `|| true`.
+  if [ "$from_ref" = "1" ]; then
+    probe="$("$CLI" routes posture diff --base "$accepted" --head "$fresh" --format json 2>/dev/null || true)"
+    if grep -q '"kind": "build_changed"' <<<"$probe"; then
+      note "$example: $POSTURE_BASE_REF:$baseline comes from another build."
+      note "$example: building $POSTURE_BASE_REF with ${AUDIT_FLAGS[*]} for the diff"
+      if [ ! -d "$work/base-tree" ]; then
+        git worktree add --detach --quiet "$work/base-tree" "$POSTURE_BASE_REF"
+      fi
+      # A separate target directory. In a shared one, base artifacts can look
+      # fresh to a later head build, which then uses base code.
+      (cd "$work/base-tree" \
+        && CARGO_TARGET_DIR="$work/base-target" \
+          "$CLI" routes audit -p "$example" $(example_bin "$example") "${AUDIT_FLAGS[@]}" --manifest "$accepted" >/dev/null) \
+        || die "$example: \`autumn routes audit\` failed on $POSTURE_BASE_REF"
+    fi
+  fi
+
   args=(routes posture diff --base "$accepted" --head "$fresh" --format text)
   if [ "$bootstrap" = "1" ]; then
     args+=(--allow-missing-base)
@@ -148,6 +228,10 @@ for example in "${EXAMPLES[@]}"; do
   if [ -n "$ACK" ]; then
     args+=(--ack "$ACK")
     note "$example: acknowledgment supplied via AUTUMN_POSTURE_ACK"
+  fi
+  if [ -n "$ACK_DIR" ]; then
+    args+=(--ack-dir "$ACK_DIR")
+    note "$example: reading acknowledgments from AUTUMN_POSTURE_ACK_DIR ($ACK_DIR)"
   fi
 
   set +e
@@ -159,8 +243,10 @@ for example in "${EXAMPLES[@]}"; do
     0) ok "$example: no unacknowledged widening" ;;
     1)
       echo "error: $example: this change widens the example's security surface." >&2
-      echo "       If that is intended, re-run with AUTUMN_POSTURE_ACK=<digest printed above>" >&2
-      echo "       and refresh the baseline with $0 --update in the same change." >&2
+      echo "       To accept it, comment the /ack-posture line printed above on the" >&2
+      echo "       pull request, then re-run the failed job (comments do not start a run). Locally, set" >&2
+      echo "       AUTUMN_POSTURE_ACK=<digest printed above>." >&2
+      echo "       Then refresh the baseline with $0 --update in the same change." >&2
       failed=1
       ;;
     *)
@@ -200,3 +286,12 @@ done
 echo
 [ "$failed" = "0" ] || die "the security posture gate failed for at least one example"
 ok "security posture gate passed for: ${EXAMPLES[*]}"
+
+# The reddit-clone golden diff is derived from the baseline above, so a
+# refreshed baseline refreshes it too. The check itself is its own step in the
+# `publish-gate` workflow.
+if [ "$UPDATE" = "1" ]; then
+  echo
+  echo "── reddit-clone posture demo ───────────────────────────────"
+  AUTUMN_CLI="$CLI" ./scripts/check-posture-demo.sh --update
+fi

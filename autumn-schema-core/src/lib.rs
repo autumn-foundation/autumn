@@ -28,6 +28,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 /// The SQL dialect a [`Schema`] / [`Table`] targets.
@@ -629,6 +631,39 @@ impl ColumnType {
     }
 }
 
+/// The `SQLite` expression that builds a random version-4 UUID (see
+/// [`SQLITE_UUID_V4_SQL`]). A macro, so `concat!` can embed it in a literal.
+macro_rules! sqlite_uuid_v4_sql {
+    () => {
+        "lower(hex(randomblob(4))) || '-' || lower(hex(randomblob(2))) || '-4' || \
+         substr(lower(hex(randomblob(2))), 2) || '-' || \
+         substr('89ab', 1 + (random() & 3), 1) || substr(lower(hex(randomblob(2))), 2) || \
+         '-' || lower(hex(randomblob(6)))"
+    };
+}
+
+macro_rules! sqlite_uuid_pk_sql {
+    () => {
+        concat!(
+            "TEXT PRIMARY KEY NOT NULL DEFAULT (",
+            sqlite_uuid_v4_sql!(),
+            ")"
+        )
+    };
+}
+
+/// A `SQLite` expression that yields a random version-4 UUID as canonical
+/// lowercase hyphenated text.
+///
+/// `SQLite` has no `gen_random_uuid()`. This builds the same value from
+/// `randomblob`. It sets the version nibble to `4` and the variant nibble to one
+/// of `8`, `9`, `a`, `b`. Put it in parentheses to use it as a column `DEFAULT`.
+/// It uses `random() & 3`. `abs(random())` can overflow for the smallest `i64`.
+pub const SQLITE_UUID_V4_SQL: &str = sqlite_uuid_v4_sql!();
+
+/// The Rust type of a `SQLite` UUID key: `autumn-web`'s `TEXT`-backed newtype.
+pub const SQLITE_UUID_RUST_TYPE: &str = "autumn_web::db::sqlite_types::SqliteUuid";
+
 /// The primary-key strategy for a generated table.
 ///
 /// Mirrors `dsl::IdType`. Defaults conceptually to [`BigSerial`](Self::BigSerial)
@@ -646,8 +681,9 @@ pub enum IdKind {
     /// by `schema pull` recreates as `SERIAL` (auto-increment) rather than a plain
     /// `INTEGER PRIMARY KEY` that silently loses the sequence.
     Serial,
-    /// `UUID PRIMARY KEY DEFAULT gen_random_uuid()` (PG) / `TEXT PRIMARY KEY`
-    /// (`SQLite`) — a non-enumerable UUID.
+    /// `UUID PRIMARY KEY DEFAULT gen_random_uuid()` (PG) / `TEXT PRIMARY KEY NOT
+    /// NULL DEFAULT (<v4 expression>)` (`SQLite`) — a non-enumerable UUID that
+    /// the database generates on both backends.
     Uuid,
 }
 
@@ -685,7 +721,19 @@ impl IdKind {
                 "INTEGER PRIMARY KEY AUTOINCREMENT"
             }
             (Self::Uuid, Backend::Postgres) => "UUID PRIMARY KEY DEFAULT gen_random_uuid()",
-            (Self::Uuid, Backend::Sqlite) => "TEXT PRIMARY KEY",
+            (Self::Uuid, Backend::Sqlite) => sqlite_uuid_pk_sql!(),
+        }
+    }
+
+    /// The Rust type for the `#[id]` struct field on `backend`.
+    ///
+    /// `SQLite` has no `uuid` column type. Its UUID key is the `TEXT`-backed
+    /// `SqliteUuid` newtype. Every other key has the same type on both backends.
+    #[must_use]
+    pub const fn rust_type_for(self, backend: Backend) -> &'static str {
+        match (self, backend) {
+            (Self::Uuid, Backend::Sqlite) => SQLITE_UUID_RUST_TYPE,
+            _ => self.rust_type(),
         }
     }
 }
@@ -727,6 +775,98 @@ pub enum SerialKind {
     Plain,
 }
 
+/// A referential action of a [`ForeignKey`] (`ON DELETE` / `ON UPDATE`).
+///
+/// `NO ACTION` is the database default. It has no variant: `None` is `NO ACTION`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ForeignKeyAction {
+    /// `RESTRICT`.
+    Restrict,
+    /// `CASCADE`.
+    Cascade,
+    /// `SET NULL`.
+    SetNull,
+    /// `SET DEFAULT`.
+    SetDefault,
+}
+
+/// The values that `on_delete` and `on_update` in `#[references(...)]` accept.
+pub const FOREIGN_KEY_ACTION_ATTR_VALUES: [&str; 5] = [
+    "cascade",
+    "restrict",
+    "set_null",
+    "set_default",
+    "no_action",
+];
+
+/// An unknown referential-action value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownForeignKeyAction(pub String);
+
+impl fmt::Display for UnknownForeignKeyAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown foreign-key action `{}`; expected one of {}",
+            self.0,
+            FOREIGN_KEY_ACTION_ATTR_VALUES
+                .map(|v| format!("`{v}`"))
+                .join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnknownForeignKeyAction {}
+
+impl ForeignKeyAction {
+    /// The SQL keywords, for example `SET NULL`.
+    #[must_use]
+    pub const fn sql(self) -> &'static str {
+        match self {
+            Self::Restrict => "RESTRICT",
+            Self::Cascade => "CASCADE",
+            Self::SetNull => "SET NULL",
+            Self::SetDefault => "SET DEFAULT",
+        }
+    }
+
+    /// Read a `#[references]` attribute value (see
+    /// [`FOREIGN_KEY_ACTION_ATTR_VALUES`]). `no_action` gives `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownForeignKeyAction`] for any other value.
+    pub fn from_attr(value: &str) -> Result<Option<Self>, UnknownForeignKeyAction> {
+        match value {
+            "cascade" => Ok(Some(Self::Cascade)),
+            "restrict" => Ok(Some(Self::Restrict)),
+            "set_null" => Ok(Some(Self::SetNull)),
+            "set_default" => Ok(Some(Self::SetDefault)),
+            "no_action" => Ok(None),
+            other => Err(UnknownForeignKeyAction(other.to_owned())),
+        }
+    }
+
+    /// Read catalog SQL (for example `SET NULL` from `pragma_foreign_key_list`).
+    /// The match ignores case and extra spaces. `NO ACTION` and an empty value
+    /// give `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownForeignKeyAction`] for any other value.
+    pub fn from_sql(value: &str) -> Result<Option<Self>, UnknownForeignKeyAction> {
+        let words = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        match words.to_ascii_uppercase().as_str() {
+            "CASCADE" => Ok(Some(Self::Cascade)),
+            "RESTRICT" => Ok(Some(Self::Restrict)),
+            "SET NULL" => Ok(Some(Self::SetNull)),
+            "SET DEFAULT" => Ok(Some(Self::SetDefault)),
+            "NO ACTION" | "" => Ok(None),
+            _ => Err(UnknownForeignKeyAction(value.to_owned())),
+        }
+    }
+}
+
 /// A foreign-key relationship carried by a [`Column`] (see [`Column::references`]).
 ///
 /// A `references` column stores an [`Int64`](ColumnType::Int64); its FK-ness is
@@ -737,15 +877,55 @@ pub struct ForeignKey {
     pub table: String,
     /// The referenced column name (e.g. `id`).
     pub column: String,
+    /// The `ON DELETE` action. `None` is `NO ACTION`. Serde skips the field
+    /// when it is `None`. Thus an old snapshot keeps the same bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_delete: Option<ForeignKeyAction>,
+    /// The `ON UPDATE` action. `None` is `NO ACTION`. Serde skips the field
+    /// when it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_update: Option<ForeignKeyAction>,
 }
 
 impl ForeignKey {
-    /// Construct a foreign key pointing at `table`.`column`.
+    /// Make a foreign key to `table`.`column` with no actions.
     pub fn new(table: impl Into<String>, column: impl Into<String>) -> Self {
         Self {
             table: table.into(),
             column: column.into(),
+            on_delete: None,
+            on_update: None,
         }
+    }
+
+    /// Set the `ON DELETE` action.
+    #[must_use]
+    pub const fn with_on_delete(mut self, action: Option<ForeignKeyAction>) -> Self {
+        self.on_delete = action;
+        self
+    }
+
+    /// Set the `ON UPDATE` action.
+    #[must_use]
+    pub const fn with_on_update(mut self, action: Option<ForeignKeyAction>) -> Self {
+        self.on_update = action;
+        self
+    }
+
+    /// The SQL that follows `REFERENCES t(c)`, for example
+    /// ` ON DELETE CASCADE`. The string is empty when there is no action.
+    #[must_use]
+    pub fn action_clauses(&self) -> String {
+        let mut out = String::new();
+        if let Some(action) = self.on_delete {
+            out.push_str(" ON DELETE ");
+            out.push_str(action.sql());
+        }
+        if let Some(action) = self.on_update {
+            out.push_str(" ON UPDATE ");
+            out.push_str(action.sql());
+        }
+        out
     }
 }
 
@@ -1563,7 +1743,30 @@ mod tests {
             IdKind::Uuid.pk_sql(Backend::Postgres),
             "UUID PRIMARY KEY DEFAULT gen_random_uuid()"
         );
-        assert_eq!(IdKind::Uuid.pk_sql(Backend::Sqlite), "TEXT PRIMARY KEY");
+        assert_eq!(
+            IdKind::Uuid.pk_sql(Backend::Sqlite),
+            format!("TEXT PRIMARY KEY NOT NULL DEFAULT ({SQLITE_UUID_V4_SQL})")
+        );
+    }
+
+    #[test]
+    fn id_kind_uuid_rust_type_follows_the_backend() {
+        assert_eq!(IdKind::Uuid.rust_type_for(Backend::Postgres), "uuid::Uuid");
+        assert_eq!(
+            IdKind::Uuid.rust_type_for(Backend::Sqlite),
+            "autumn_web::db::sqlite_types::SqliteUuid"
+        );
+        assert_eq!(IdKind::BigSerial.rust_type_for(Backend::Sqlite), "i64");
+    }
+
+    #[test]
+    fn sqlite_uuid_default_names_no_postgres_function() {
+        assert!(!SQLITE_UUID_V4_SQL.contains("gen_random_uuid"));
+        assert!(SQLITE_UUID_V4_SQL.contains("randomblob"));
+        assert!(
+            !SQLITE_UUID_V4_SQL.contains("abs("),
+            "abs(i64::MIN) overflows"
+        );
     }
 
     #[test]
@@ -1668,5 +1871,102 @@ mod tests {
                 .unwrap()
                 .contains("BigSerial")
         );
+    }
+
+    #[test]
+    fn foreign_key_action_renders_sql() {
+        assert_eq!(ForeignKeyAction::Restrict.sql(), "RESTRICT");
+        assert_eq!(ForeignKeyAction::Cascade.sql(), "CASCADE");
+        assert_eq!(ForeignKeyAction::SetNull.sql(), "SET NULL");
+        assert_eq!(ForeignKeyAction::SetDefault.sql(), "SET DEFAULT");
+    }
+
+    #[test]
+    fn foreign_key_action_reads_attribute_values() {
+        assert_eq!(
+            ForeignKeyAction::from_attr("cascade"),
+            Ok(Some(ForeignKeyAction::Cascade))
+        );
+        assert_eq!(
+            ForeignKeyAction::from_attr("restrict"),
+            Ok(Some(ForeignKeyAction::Restrict))
+        );
+        assert_eq!(
+            ForeignKeyAction::from_attr("set_null"),
+            Ok(Some(ForeignKeyAction::SetNull))
+        );
+        assert_eq!(
+            ForeignKeyAction::from_attr("set_default"),
+            Ok(Some(ForeignKeyAction::SetDefault))
+        );
+        // `no_action` is the database default. It is `None`, the same as no value.
+        assert_eq!(ForeignKeyAction::from_attr("no_action"), Ok(None));
+        // Each listed value reads. The macro accepts this same list.
+        for value in FOREIGN_KEY_ACTION_ATTR_VALUES {
+            assert!(ForeignKeyAction::from_attr(value).is_ok(), "{value}");
+        }
+        let err = ForeignKeyAction::from_attr("Cascade").unwrap_err();
+        assert!(err.to_string().contains("`Cascade`"), "{err}");
+        assert!(err.to_string().contains("set_null"), "{err}");
+    }
+
+    #[test]
+    fn foreign_key_action_reads_catalog_sql() {
+        assert_eq!(
+            ForeignKeyAction::from_sql("CASCADE"),
+            Ok(Some(ForeignKeyAction::Cascade))
+        );
+        assert_eq!(
+            ForeignKeyAction::from_sql("set null"),
+            Ok(Some(ForeignKeyAction::SetNull))
+        );
+        assert_eq!(
+            ForeignKeyAction::from_sql(" SET  DEFAULT "),
+            Ok(Some(ForeignKeyAction::SetDefault))
+        );
+        assert_eq!(
+            ForeignKeyAction::from_sql("RESTRICT"),
+            Ok(Some(ForeignKeyAction::Restrict))
+        );
+        assert_eq!(ForeignKeyAction::from_sql("NO ACTION"), Ok(None));
+        assert_eq!(ForeignKeyAction::from_sql(""), Ok(None));
+        assert!(ForeignKeyAction::from_sql("NONE").is_err());
+    }
+
+    #[test]
+    fn foreign_key_action_clauses_follow_the_references_clause() {
+        let plain = ForeignKey::new("users", "id");
+        assert_eq!(plain.action_clauses(), "");
+        let fk = ForeignKey::new("users", "id")
+            .with_on_delete(Some(ForeignKeyAction::Cascade))
+            .with_on_update(Some(ForeignKeyAction::Restrict));
+        assert_eq!(fk.action_clauses(), " ON DELETE CASCADE ON UPDATE RESTRICT");
+        let update_only =
+            ForeignKey::new("users", "id").with_on_update(Some(ForeignKeyAction::SetNull));
+        assert_eq!(update_only.action_clauses(), " ON UPDATE SET NULL");
+    }
+
+    #[test]
+    fn foreign_key_actions_are_serde_backward_compatible() {
+        // No action: the snapshot keeps its old bytes.
+        let plain = ForeignKey::new("users", "id");
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"table":"users","column":"id"}"#
+        );
+        // An old snapshot reads back with no action.
+        let legacy: ForeignKey =
+            serde_json::from_str(r#"{"table":"users","column":"id"}"#).unwrap();
+        assert_eq!(legacy, plain);
+        // An action round-trips.
+        let fk = ForeignKey::new("users", "id")
+            .with_on_delete(Some(ForeignKeyAction::SetNull))
+            .with_on_update(Some(ForeignKeyAction::Cascade));
+        let json = serde_json::to_string(&fk).unwrap();
+        assert_eq!(
+            json,
+            r#"{"table":"users","column":"id","on_delete":"SetNull","on_update":"Cascade"}"#
+        );
+        assert_eq!(serde_json::from_str::<ForeignKey>(&json).unwrap(), fk);
     }
 }

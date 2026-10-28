@@ -1162,7 +1162,13 @@ fn load_or_generate_signing_secret(
     )
 }
 
-fn render_placeholder_icon_svg() -> String {
+/// Duplicated byte-for-byte in `generate::tauri_mobile::render_placeholder_icon_svg`
+/// — the mobile generator's placeholder icon is the same SVG, hand-copied when
+/// `tauri_mobile.rs` was built. Two instances is below Echo's rule of three, so
+/// it stays linked rather than merged; see `tests::
+/// placeholder_icon_assets_match_between_desktop_and_mobile_tauri_generators`
+/// in `generate::mod` for the drift guard.
+pub fn render_placeholder_icon_svg() -> String {
     concat!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 512 512\">\n",
         "  <!-- Placeholder app icon. Replace with your own, then run:\n",
@@ -1923,9 +1929,16 @@ Next steps for the mobile thin client (webview → {remote_url}):\n\
 }
 
 // ── Placeholder icon bytes ────────────────────────────────────────────────────
+// Duplicated byte-for-byte in `generate::tauri_mobile` — the mobile generator's
+// PLACEHOLDER_PNG/_ICO/_ICNS are the same bytes, hand-copied when
+// `tauri_mobile.rs` was built. Two instances is below Echo's rule of three
+// (see issue #2509), so these stay linked rather than merged into a shared
+// `generate::icons` module. Change one, change the other: `tests::
+// placeholder_icon_assets_match_between_desktop_and_mobile_tauri_generators`
+// in `generate::mod` fails if they drift.
 // Minimal valid 1×1 RGBA PNG (autumn green #4F7942, opaque).
 // Replace with proper icons using: cargo tauri icon static/icons/icon.svg
-const PLACEHOLDER_PNG: &[u8] = &[
+pub const PLACEHOLDER_PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, // PNG signature
     0x00, 0x00, 0x00, 0x0d, // IHDR length = 13
     0x49, 0x48, 0x44, 0x52, // "IHDR"
@@ -1943,7 +1956,7 @@ const PLACEHOLDER_PNG: &[u8] = &[
 ];
 
 // Minimal ICO wrapping the placeholder PNG.
-const PLACEHOLDER_ICO: &[u8] = &[
+pub const PLACEHOLDER_ICO: &[u8] = &[
     0x00, 0x00, 0x01, 0x00, // ICO header: reserved=0, type=1(ICO)
     0x01, 0x00, // image count = 1
     0x00, 0x00, 0x00, 0x00, // width=0(→256), height=0(→256), palette=0, reserved=0
@@ -1959,7 +1972,7 @@ const PLACEHOLDER_ICO: &[u8] = &[
 ];
 
 // Minimal ICNS container wrapping the placeholder PNG as icp6 (PNG icon).
-const PLACEHOLDER_ICNS: &[u8] = &[
+pub const PLACEHOLDER_ICNS: &[u8] = &[
     0x69, 0x63, 0x6e, 0x73, // "icns" magic
     0x00, 0x00, 0x00, 0x56, // total file size = 86
     0x69, 0x63, 0x70, 0x36, // icon type "icp6" (PNG icon)

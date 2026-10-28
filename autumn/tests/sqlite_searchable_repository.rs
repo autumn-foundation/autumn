@@ -300,7 +300,7 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
     pool
 }
 
-/// Case-insensitive substring matching over SEARCH_FIELDS: matches are found
+/// Case-insensitive substring matching over `SEARCH_FIELDS`: matches are found
 /// (title OR body), case is ignored, and non-matching rows are excluded.
 #[tokio::test]
 async fn search_matches_substrings_case_insensitively_on_sqlite() {

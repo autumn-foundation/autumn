@@ -27,7 +27,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Digest as _;
 // `Notify` backs the Postgres kick-worker's coalesced pending flag, and (under
-// `sqlite`) the single-node poll-loop wake used in place of Postgres LISTEN/NOTIFY.
+// `sqlite`) the single-node poll-loop wake.
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -73,6 +73,12 @@ const HOOK_STALE_CLAIM_AFTER: Duration = Duration::from_secs(60);
 const HOOK_CLAIM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HOOK_PENDING_FINALIZER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const HOOK_AFTER_HOOK_FAILURE_MARK_RETRY_SLEEP: Duration = Duration::from_millis(100);
+// `SQLite` shared-cache table locks bypass `busy_timeout`, so a settle write can
+// fail once while a reader holds the table. Retry it briefly.
+#[cfg(feature = "sqlite")]
+const HOOK_SQLITE_SETTLE_MAX_ATTEMPTS: usize = 10;
+#[cfg(feature = "sqlite")]
+const HOOK_SQLITE_SETTLE_RETRY_SLEEP: Duration = Duration::from_millis(25);
 const HOOK_AFTER_HOOK_FAILURE_MARK_MAX_ATTEMPTS: usize = 3;
 
 // ── Backend-forked SQL (#1996 item 5) ────────────────────────────────────────
@@ -399,6 +405,20 @@ fn sqlite_repository_commit_hook_kick(pool: &RtPool) -> Arc<Notify> {
         .clone()
 }
 
+/// Drop a pool's kicker when the pool is closed for good: a fleet database
+/// closed by LRU or idle eviction (ADR 0019). Without this the registry keeps
+/// one entry per database ever opened.
+#[cfg(feature = "sqlite")]
+pub fn forget_sqlite_repository_commit_hook_kick(pool: &RtPool) {
+    let key = std::ptr::from_ref(pool.manager()).addr();
+    if let Some(registry) = SQLITE_HOOK_KICKERS.get() {
+        registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&key);
+    }
+}
+
 #[doc(hidden)]
 #[must_use]
 pub struct RepositoryCommitHookPendingHeartbeat {
@@ -560,14 +580,24 @@ where
         .bind::<diesel::sql_types::Text, _>(hook_name)
         .bind::<diesel::sql_types::Text, _>(context)
         .bind::<diesel::sql_types::Text, _>(record)
-        .execute(conn)
+        .execute(&mut *conn)
         .await
-        .map(|_| ())
         .map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "repository commit hook enqueue failed: {error}"
             ))
-        })
+        })?;
+    #[cfg(feature = "sqlite")]
+    mark_fleet_hooks(conn).await?;
+    Ok(())
+}
+
+/// Mark this connection's fleet database as holding commit hooks, in
+/// the caller's transaction (issue 3234). A no-op on any other database.
+#[cfg(feature = "sqlite")]
+async fn mark_fleet_hooks(conn: &mut crate::db::RuntimeConnection) -> AutumnResult<()> {
+    crate::db::fleet_sweeper::mark_connection(conn, crate::db::fleet_sweeper::PendingKind::Hooks)
+        .await
 }
 
 /// Insert a generated repository commit hook row in a staged state.
@@ -610,14 +640,16 @@ where
         .bind::<diesel::sql_types::Text, _>(context)
         .bind::<diesel::sql_types::Text, _>(record)
         .bind::<diesel::sql_types::Text, _>(owner.clone())
-        .execute(conn)
+        .execute(&mut *conn)
         .await
-        .map(|_| (id, owner))
         .map_err(|error| {
             AutumnError::internal_server_error_msg(format!(
                 "repository commit hook staging failed: {error}"
             ))
-        })
+        })?;
+    #[cfg(feature = "sqlite")]
+    mark_fleet_hooks(conn).await?;
+    Ok((id, owner))
 }
 
 /// Insert multiple generated repository commit hook rows in a staged state in a single query.
@@ -729,6 +761,8 @@ where
                         ))
                     })?;
             }
+            #[cfg(feature = "sqlite")]
+    mark_fleet_hooks(conn).await?;
             Ok(results)
         }},
     }
@@ -823,6 +857,8 @@ where
                         ))
                     })?;
             }
+            #[cfg(feature = "sqlite")]
+    mark_fleet_hooks(conn).await?;
             Ok(())
         }},
     }
@@ -1138,14 +1174,21 @@ fn sqlite_timestamp(instant: chrono::DateTime<chrono::Utc>) -> String {
 }
 
 #[cfg(all(feature = "ws", not(feature = "sqlite")))]
+/// Start the durable commit-hook worker. Returns its handle, or `None` when no
+/// handler is registered. Cancel `shutdown`, then await the handle: the
+/// iteration in flight settles (ack or nack) first.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "app-wide workers stop on shutdown; only the fleet awaits the handle"
+)]
 pub fn start_repository_commit_hook_worker(
     pool: PgPool,
     channels: Option<crate::channels::Channels>,
     shutdown: CancellationToken,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
-        return;
+        return None;
     }
 
     if let Some(ch) = channels.clone() {
@@ -1154,7 +1197,7 @@ pub fn start_repository_commit_hook_worker(
     }
 
     let worker_id = repository_commit_hook_worker_id();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         if let Some(ch) = channels {
             CURRENT_CHANNELS
                 .scope(ch, async move {
@@ -1180,18 +1223,28 @@ pub fn start_repository_commit_hook_worker(
                 }
             }
         }
-    });
+    }))
 }
 
 #[cfg(all(not(feature = "ws"), not(feature = "sqlite")))]
-pub fn start_repository_commit_hook_worker(pool: PgPool, shutdown: CancellationToken) {
+/// Start the durable commit-hook worker. Returns its handle, or `None` when no
+/// handler is registered. Cancel `shutdown`, then await the handle: the
+/// iteration in flight settles (ack or nack) first.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "app-wide workers stop on shutdown; only the fleet awaits the handle"
+)]
+pub fn start_repository_commit_hook_worker(
+    pool: PgPool,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
-        return;
+        return None;
     }
 
     let worker_id = repository_commit_hook_worker_id();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => break,
@@ -1201,7 +1254,7 @@ pub fn start_repository_commit_hook_worker(pool: PgPool, shutdown: CancellationT
                 }
             }
         }
-    });
+    }))
 }
 
 // ── `SQLite` durable worker (#1996 item 5) ─────────────────────────────────────
@@ -1215,19 +1268,26 @@ pub fn start_repository_commit_hook_worker(pool: PgPool, shutdown: CancellationT
 // ack/nack) it is on and settles it before observing `cancelled()` on the next
 // pass, so no leased row is abandoned mid-flight.
 #[cfg(all(feature = "ws", feature = "sqlite"))]
+/// Start the durable commit-hook worker. Returns its handle, or `None` when no
+/// handler is registered. Cancel `shutdown`, then await the handle: the
+/// iteration in flight settles (ack or nack) first.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "app-wide workers stop on shutdown; only the fleet awaits the handle"
+)]
 pub fn start_repository_commit_hook_worker(
     pool: RtPool,
     channels: Option<crate::channels::Channels>,
     shutdown: CancellationToken,
-) {
+) -> Option<tokio::task::JoinHandle<()>> {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
-        return;
+        return None;
     }
 
     let worker_id = repository_commit_hook_worker_id();
     let kick = sqlite_repository_commit_hook_kick(&pool);
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         if let Some(ch) = channels {
             CURRENT_CHANNELS
                 .scope(
@@ -1238,21 +1298,31 @@ pub fn start_repository_commit_hook_worker(
         } else {
             sqlite_repository_commit_hook_worker_loop(pool, worker_id, kick, shutdown).await;
         }
-    });
+    }))
 }
 
 #[cfg(all(not(feature = "ws"), feature = "sqlite"))]
-pub fn start_repository_commit_hook_worker(pool: RtPool, shutdown: CancellationToken) {
+/// Start the durable commit-hook worker. Returns its handle, or `None` when no
+/// handler is registered. Cancel `shutdown`, then await the handle: the
+/// iteration in flight settles (ack or nack) first.
+#[allow(
+    clippy::must_use_candidate,
+    reason = "app-wide workers stop on shutdown; only the fleet awaits the handle"
+)]
+pub fn start_repository_commit_hook_worker(
+    pool: RtPool,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     register_inventory_repository_commit_hook_runners();
     if !should_start_repository_commit_hook_worker(&registered_handler_keys()) {
-        return;
+        return None;
     }
 
     let worker_id = repository_commit_hook_worker_id();
     let kick = sqlite_repository_commit_hook_kick(&pool);
-    tokio::spawn(sqlite_repository_commit_hook_worker_loop(
+    Some(tokio::spawn(sqlite_repository_commit_hook_worker_loop(
         pool, worker_id, kick, shutdown,
-    ));
+    )))
 }
 
 #[cfg(feature = "sqlite")]
@@ -1268,11 +1338,11 @@ async fn sqlite_repository_commit_hook_worker_loop(
             () = shutdown.cancelled() => break,
             () = kick.notified() => {
                 recover_stale_repository_commit_hooks(&pool, &worker_id).await;
-                sqlite_drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
+                sqlite_drain_ready_repository_commit_hooks(&pool, &worker_id, 32, &shutdown).await;
             }
             () = tokio::time::sleep(HOOK_WORKER_IDLE_SLEEP) => {
                 recover_stale_repository_commit_hooks(&pool, &worker_id).await;
-                sqlite_drain_ready_repository_commit_hooks(&pool, &worker_id, 32).await;
+                sqlite_drain_ready_repository_commit_hooks(&pool, &worker_id, 32, &shutdown).await;
             }
         }
     }
@@ -1911,19 +1981,50 @@ async fn sqlite_claim_next_repository_commit_hook(
     }
 }
 
+/// Run an ack or nack write, retrying a transient failure a few times.
+///
+/// A settle write that fails once leaves the row `running` until stale-claim
+/// recovery, so the hook would sit idle for `HOOK_STALE_CLAIM_AFTER`.
+#[cfg(feature = "sqlite")]
+async fn sqlite_settle_with_retry<F, Fut>(mut settle: F) -> AutumnResult<bool>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = AutumnResult<bool>>,
+{
+    let mut attempt = 1;
+    loop {
+        match settle().await {
+            Err(_) if attempt < HOOK_SQLITE_SETTLE_MAX_ATTEMPTS => {
+                attempt += 1;
+                tokio::time::sleep(HOOK_SQLITE_SETTLE_RETRY_SLEEP).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// `SQLite` drain loop: claim → lease heartbeat → run (under the originating tenant
 /// scope) → ack/nack, one row at a time. Mirrors the Postgres
 /// `drain_ready_repository_commit_hooks` shape.
 #[cfg(feature = "sqlite")]
+///
+/// Returns how many hooks ran (succeeded or failed).
 pub async fn sqlite_drain_ready_repository_commit_hooks(
     pool: &RtPool,
     worker_id: &str,
     max_rows: usize,
-) {
+    stop: &CancellationToken,
+) -> usize {
+    let mut ran = 0;
     for _ in 0..max_rows {
+        // The row in flight settles; no new row starts once `stop` fires.
+        if stop.is_cancelled() {
+            break;
+        }
         let Some(row) = sqlite_claim_next_repository_commit_hook(pool, worker_id).await else {
             break;
         };
+        ran += 1;
 
         let heartbeat_shutdown = CancellationToken::new();
         let heartbeat_task = tokio::spawn(heartbeat_repository_commit_hook_claim(
@@ -1932,6 +2033,8 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
             worker_id.to_owned(),
             heartbeat_shutdown.child_token(),
         ));
+        // An aborted worker drops this future: the guard still stops the heartbeat.
+        let _heartbeat_guard = heartbeat_shutdown.clone().drop_guard();
 
         // Tenant isolation (INVIOLABLE): re-establish the SAME tenant the hook was
         // enqueued under before running it, so a `tenant_scoped` repository the
@@ -1953,8 +2056,10 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
 
         match result {
             Ok(()) => {
-                if let Err(error) =
-                    ack_repository_commit_hook_success(pool, &row.id, worker_id).await
+                if let Err(error) = sqlite_settle_with_retry(|| {
+                    ack_repository_commit_hook_success(pool, &row.id, worker_id)
+                })
+                .await
                 {
                     tracing::warn!(
                         hook_id = %row.id,
@@ -1972,9 +2077,11 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
                     autumn.after_commit.failures_total = failures_total,
                     "repository after_commit hook failed: {error}"
                 );
-                if let Err(nack_error) = sqlite_nack_repository_commit_hook_failure(
-                    pool, &row.id, worker_id, &error, &row,
-                )
+                if let Err(nack_error) = sqlite_settle_with_retry(|| {
+                    sqlite_nack_repository_commit_hook_failure(
+                        pool, &row.id, worker_id, &error, &row,
+                    )
+                })
                 .await
                 {
                     tracing::warn!(
@@ -1994,6 +2101,65 @@ pub async fn sqlite_drain_ready_repository_commit_hooks(
                 "repository commit hook heartbeat task failed"
             );
         }
+    }
+    ran
+}
+
+/// The channels a fleet sweep runs hooks with.
+#[cfg(all(feature = "sqlite", feature = "ws"))]
+pub type SweepChannels = crate::channels::Channels;
+/// The channels a fleet sweep runs hooks with.
+#[cfg(all(feature = "sqlite", not(feature = "ws")))]
+pub type SweepChannels = Channels;
+
+/// Drain the commit hooks of one fleet database for the fleet sweeper: recover
+/// stale claims, then run up to `max_rows` ready hooks. Returns how many ran.
+#[cfg(feature = "sqlite")]
+pub async fn sweep_fleet_database_hooks(
+    pool: &RtPool,
+    channels: Option<SweepChannels>,
+    max_rows: usize,
+    stop: &CancellationToken,
+) -> usize {
+    register_inventory_repository_commit_hook_runners();
+    let worker_id = repository_commit_hook_worker_id();
+    recover_stale_repository_commit_hooks(pool, &worker_id).await;
+    let drain = sqlite_drain_ready_repository_commit_hooks(pool, &worker_id, max_rows, stop);
+    #[cfg(feature = "ws")]
+    if let Some(channels) = channels {
+        return CURRENT_CHANNELS.scope(channels, drain).await;
+    }
+    #[cfg(not(feature = "ws"))]
+    let _ = channels;
+    drain.await
+}
+
+/// Whether a fleet database holds commit hooks that have not finished:
+/// queued, running, or staged. `false` when it has no hook table.
+///
+/// # Errors
+///
+/// Returns an error when the query fails.
+#[cfg(feature = "sqlite")]
+pub async fn has_pending_hooks(conn: &mut crate::db::RuntimeConnection) -> AutumnResult<bool> {
+    #[derive(diesel::QueryableByName)]
+    struct Pending {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let found = diesel::sql_query(
+        "SELECT COUNT(*) AS n FROM (SELECT 1 FROM autumn_repository_commit_hooks \
+         WHERE status IN ('enqueued', 'running', 'pending_after_hook', 'after_hook_succeeded') \
+         LIMIT 1)",
+    )
+    .get_result::<Pending>(conn)
+    .await;
+    match found {
+        Ok(pending) => Ok(pending.n > 0),
+        Err(error) if is_missing_hook_table_error(&error) => Ok(false),
+        Err(error) => Err(AutumnError::internal_server_error_msg(format!(
+            "repository commit hook probe failed: {error}"
+        ))),
     }
 }
 
@@ -2115,7 +2281,7 @@ fn repository_commit_hook_id(
     } else {
         push_hook_id_component(&mut hasher, "record", record.as_bytes());
     }
-    format!("idempotent:{}", hex_lower(hasher.finalize()))
+    format!("idempotent:{}", hex::encode(hasher.finalize()))
 }
 
 fn push_hook_id_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) {
@@ -2125,17 +2291,6 @@ fn push_hook_id_component(hasher: &mut sha2::Sha256, label: &str, value: &[u8]) 
     hasher.update(b":");
     hasher.update(value);
     hasher.update(b";");
-}
-
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
-        |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
 }
 
 pub fn repository_commit_hook_worker_id() -> String {
@@ -2787,5 +2942,17 @@ mod tests {
         );
 
         assert!(!is_missing_hook_table_error(&unrelated));
+    }
+
+    /// Characterization for the Echo clone class: `repository_commit_hook_id`
+    /// renders its digest through this file's own `hex_lower`, one of six
+    /// byte-identical copies across the crate. Pinned before `hex_lower` is
+    /// replaced by the `hex` crate (already a dependency) at its call site.
+    #[test]
+    fn repository_commit_hook_id_is_pinned_hex() {
+        assert_eq!(
+            repository_commit_hook_id(Some("order-42"), None, "handler", "hook", "record-1"),
+            "idempotent:b8fceec62ab6e24e8d96034789e38d8fe64c5e3f593675d5704ac980b6944ebf",
+        );
     }
 }

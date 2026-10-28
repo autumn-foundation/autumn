@@ -28,6 +28,25 @@ struct DerivedArgs {
     b: Option<i32>,
 }
 
+// Issue #2565: the `crate = "..."` helper attribute must compile through the
+// real macro. `autumn_web` is also the default, so this test proves only that
+// the helper attribute is registered and parsed. Unit tests in `autumn-macros`
+// prove that the name changes the generated paths.
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+#[openapi_schema(crate = "autumn_web")]
+struct OverriddenArgs {
+    a: String,
+}
+
+#[test]
+fn crate_override_helper_still_derives_the_schema() {
+    assert_eq!(OverriddenArgs::schema_name(), "OverriddenArgs");
+    assert_eq!(
+        autumn_web::openapi::registered_derived_schema(std::any::type_name::<OverriddenArgs>()),
+        Some(OverriddenArgs::schema())
+    );
+}
+
 // A plain struct WITHOUT the derive — the pre-#1972 behaviour (placeholder).
 #[derive(Serialize, Deserialize)]
 struct PlainArgs {
@@ -401,4 +420,47 @@ fn resolve_ref(root: &serde_json::Value, value: &serde_json::Value) -> serde_jso
         return root["$defs"][name].clone();
     }
     value.clone()
+}
+
+// ── Scalar fields that are not Rust primitives (issue #2582) ───────────
+
+#[derive(Serialize, Deserialize, OpenApiSchema)]
+struct ScalarArgs {
+    id: uuid::Uuid,
+    price: rust_decimal::Decimal,
+    placed_at: chrono::DateTime<chrono::Utc>,
+    due_on: chrono::NaiveDate,
+}
+
+#[post("/api/scalar-body")]
+#[api_doc(mcp, summary = "Body arg with non-primitive scalar fields")]
+async fn scalar_body(Json(body): Json<ScalarArgs>) -> AutumnResult<Json<ScalarArgs>> {
+    Ok(Json(body))
+}
+
+#[test]
+fn mcp_body_input_schema_documents_scalar_fields_inline() {
+    let docs = vec![__autumn_route_info_scalar_body().api_doc];
+    let tools = derive_tools(&docs, false, None);
+    let tool = tools.iter().find(|t| t.name() == "scalar_body").unwrap();
+    let body = resolve_ref(
+        tool.input_schema(),
+        &tool.input_schema()["properties"]["body"],
+    );
+    let props = &body["properties"];
+
+    assert_eq!(props["id"]["format"], "uuid", "{body}");
+    assert_eq!(props["placed_at"]["format"], "date-time", "{body}");
+    assert_eq!(props["due_on"]["format"], "date", "{body}");
+    assert_eq!(
+        props["price"],
+        autumn_web::openapi::decimal_scalar_schema(),
+        "{body}"
+    );
+    for field in ["id", "price", "placed_at", "due_on"] {
+        assert!(
+            props[field].get("$ref").is_none(),
+            "{field} is a ref: {body}"
+        );
+    }
 }

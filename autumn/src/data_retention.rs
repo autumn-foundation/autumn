@@ -41,6 +41,7 @@ use crate::config::{AutumnConfig, RetentionConfig};
 use crate::gdpr::{ErasureStrategy, GdprRegistry};
 use crate::state::AppState;
 use crate::task::{Schedule, TaskCoordination, TaskInfo};
+use std::fmt::Write as _;
 
 /// The scheduled-task name the framework sweep registers under.
 ///
@@ -59,13 +60,13 @@ pub const RETENTION_AUDIT_ACTOR: &str = "autumn:retention";
 /// How many rows one `DELETE` removes. A sweep never issues one unbounded
 /// delete: it walks the stale rows in batches so a single run cannot hold a
 /// long lock or spike replication lag on a hot table.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 const SWEEP_BATCH_ROWS: i64 = 500;
 
 /// Upper bound on batches per dataset per run. A run that hits this stops and
 /// resumes on the next tick, so a first sweep of a years-old table is spread
 /// over several ticks instead of one very long transaction storm.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 const SWEEP_MAX_BATCHES: usize = 1_000;
 
 // ── Dataset registry ─────────────────────────────────────────────────────
@@ -207,6 +208,23 @@ impl RetentionDataset {
             | Self::AuditArchives
             | Self::CustomDomains => None,
         }
+    }
+
+    /// The table that holds this dataset's records for `config`, or `None`
+    /// when they live elsewhere.
+    ///
+    /// `job_history` and `job_tracking` follow `jobs.backend`. Under Redis or
+    /// the in-memory queue, their records are not in the framework table. A
+    /// sweep or a table-keyed legal hold cannot reach them there.
+    #[must_use]
+    pub fn table_for(self, config: &AutumnConfig) -> Option<&'static str> {
+        // The `sqlite` runtime keeps both tables in the app's own file.
+        if matches!(self, Self::JobHistory | Self::JobTracking)
+            && !matches!(config.jobs.backend.as_str(), "postgres" | "sqlite")
+        {
+            return None;
+        }
+        self.table()
     }
 
     /// How this dataset's window is enforced *for a given configuration*.
@@ -411,13 +429,25 @@ pub fn effective_retention(config: &AutumnConfig, dataset: RetentionDataset) -> 
 ///
 /// Datasets with no backing table (`idempotency`, `webhook_replay`,
 /// `sessions`, `audit_archives`) can never be placed on hold this way, since
-/// a GDPR registration names a table.
+/// a GDPR registration names a table. The database idempotency store keeps
+/// its rows in `autumn_idempotency_keys` and expires them itself, outside
+/// this engine: it checks [`table_legal_hold`] for that table, as the
+/// job-tracking cleanup does for its own.
 #[must_use]
 pub fn legal_hold_for(
     dataset: RetentionDataset,
     registry: Option<&GdprRegistry>,
 ) -> Option<String> {
-    let table = dataset.table()?;
+    table_legal_hold(dataset.table()?, registry)
+}
+
+/// The legal-hold reason for `table`, if it is under a legal hold.
+///
+/// A table is held when the [`GdprRegistry`] registers it with
+/// [`ErasureStrategy::Retain`]. For code that deletes from a table outside
+/// the retention engine: it must not delete while this is `Some`.
+#[must_use]
+pub fn table_legal_hold(table: &str, registry: Option<&GdprRegistry>) -> Option<String> {
     let registration = registry?.get(table)?;
     if registration.erasure_strategy != ErasureStrategy::Retain {
         return None;
@@ -488,6 +518,32 @@ pub struct RetentionRunOptions<'a> {
     pub dataset: Option<&'a str>,
 }
 
+/// Which datasets one run covers.
+///
+/// The scheduler splits the work by where the data lives. Shared data must
+/// be swept once per tick. Per-process data must be swept on every replica.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RetentionScope {
+    /// Every dataset. The CLI uses this.
+    #[default]
+    All,
+    /// Datasets in shared stores (one run per fleet tick).
+    Shared,
+    /// Datasets in this process's local files (one run per replica).
+    PerReplica,
+}
+
+impl RetentionScope {
+    const fn covers(self, enforcement: RetentionEnforcement) -> bool {
+        let per_replica = matches!(enforcement, RetentionEnforcement::ArchiveRewrite);
+        match self {
+            Self::All => true,
+            Self::Shared => !per_replica,
+            Self::PerReplica => per_replica,
+        }
+    }
+}
+
 // ── Engine ───────────────────────────────────────────────────────────────
 
 /// Run the retention policy over every configured dataset (or the one named
@@ -514,12 +570,28 @@ pub async fn run_retention(
     state: &AppState,
     options: &RetentionRunOptions<'_>,
 ) -> AutumnResult<Vec<RetentionDatasetReport>> {
+    run_retention_for(state, options, RetentionScope::All).await
+}
+
+/// Like [`run_retention`], limited to the datasets in `scope`.
+///
+/// # Errors
+///
+/// Same as [`run_retention`].
+pub async fn run_retention_for(
+    state: &AppState,
+    options: &RetentionRunOptions<'_>,
+    scope: RetentionScope,
+) -> AutumnResult<Vec<RetentionDatasetReport>> {
     let datasets = resolve_datasets(options.dataset)?;
     let config = state.config_arc();
     let mut reports = Vec::with_capacity(datasets.len());
-    for dataset in datasets {
-        let report = run_one_dataset(state, &config, dataset, options.dry_run).await;
-        audit_sweep(state, &report).await;
+    for dataset in datasets
+        .into_iter()
+        .filter(|dataset| scope.covers(dataset.enforcement()))
+    {
+        let mut report = run_one_dataset(state, &config, dataset, options.dry_run).await;
+        audit_sweep(state, &mut report).await;
         reports.push(report);
     }
     Ok(reports)
@@ -587,11 +659,33 @@ async fn run_one_dataset(
         return report;
     };
 
+    // The sweep deletes from a table. Off Postgres, job history is not in it.
+    // Say so, so a zero is not read as "already clean".
+    if dataset == RetentionDataset::JobHistory && dataset.table_for(config).is_none() {
+        report.skipped = Some(format!(
+            "NOT enforced: jobs.backend = {:?} keeps finished jobs outside autumn_jobs, \
+             so this sweep cannot reach them",
+            config.jobs.backend
+        ));
+        report.duration_ms = elapsed_ms(started);
+        return report;
+    }
+
     // A legal hold outranks the window: check it before doing any counting,
     // so a held dataset never even reads the rows it must not delete.
     let registry = state.extension::<GdprRegistry>();
     if let Some(reason) = legal_hold_for(dataset, registry.as_deref()) {
-        report.skipped = Some(format!("legal hold: {reason}"));
+        report.skipped = Some(if dataset.table_for(config).is_some() {
+            format!("legal hold: {reason}")
+        } else {
+            // The hold names a table that does not hold these records. The
+            // record TTL still applies, so the hold does not protect them.
+            format!(
+                "legal hold: {reason}. NOT preserved: jobs.backend = {:?} stores these \
+                 records outside the held table, and the window shortens their TTL",
+                config.jobs.backend
+            )
+        });
         report.duration_ms = elapsed_ms(started);
         return report;
     }
@@ -616,6 +710,7 @@ async fn run_one_dataset(
                 dataset,
                 config,
                 effective.window.map_or(0, |window| window.as_secs()),
+                registry.as_deref(),
             ));
         }
         RetentionEnforcement::ArchiveRewrite => {
@@ -637,7 +732,12 @@ async fn run_one_dataset(
 /// in-memory session store records no expiry at all, so claiming plain
 /// "enforced by the backend" would present an unenforced policy as an
 /// enforced one. Each caveat is named rather than left to the guide.
-fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_secs: u64) -> String {
+fn backend_ttl_note(
+    dataset: RetentionDataset,
+    config: &AutumnConfig,
+    window_secs: u64,
+    registry: Option<&GdprRegistry>,
+) -> String {
     // `session.backend = "memory"` is the default, and `MemoryStore` is a
     // plain `HashMap` with no expiry: capping `session.max_age_secs` shortens
     // only the browser cookie while the server-side record lives as long as
@@ -659,6 +759,24 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
          the backend, not deleted by this sweep. Records written before this window was set \
          keep their original TTL until it elapses"
     );
+    // The database store skips its own cleanup while its table is held.
+    let held = (dataset == RetentionDataset::Idempotency
+        && config.idempotency.backend == crate::config::IdempotencyBackend::Database)
+        .then(|| table_legal_hold("autumn_idempotency_keys", registry))
+        .flatten();
+    if let Some(reason) = held {
+        let _ = write!(
+            note,
+            ". NOT removed: autumn_idempotency_keys is under legal hold: {reason}. The \
+             store keeps expired rows until the hold ends"
+        );
+    } else if evicts_lazily(dataset, config) {
+        note.push_str(
+            ". With the built-in store, expired records are not served. The store \
+             removes them only on later writes. A quiet process can keep them past the \
+             window. Use redis to remove them on time",
+        );
+    }
     if dataset == RetentionDataset::Sessions {
         note.push_str(
             ", and a custom SessionStore installed with AppBuilder::with_session_store must \
@@ -666,6 +784,27 @@ fn backend_ttl_note(dataset: RetentionDataset, config: &AutumnConfig, window_sec
         );
     }
     note
+}
+
+/// `true` when the dataset uses a built-in store that removes expired records
+/// only on later writes.
+fn evicts_lazily(dataset: RetentionDataset, config: &AutumnConfig) -> bool {
+    match dataset {
+        // The memory and database stores both sweep on every 128th write.
+        RetentionDataset::Idempotency => {
+            config.idempotency.backend != crate::config::IdempotencyBackend::Redis
+        }
+        RetentionDataset::WebhookReplay => {
+            config.security.webhooks.replay.backend == crate::webhook::WebhookReplayBackend::Memory
+        }
+        // An unknown backend falls back to the local runtime and its
+        // in-memory tracking store.
+        RetentionDataset::JobTracking => !matches!(
+            config.jobs.backend.as_str(),
+            "postgres" | "redis" | "sqlite"
+        ),
+        _ => false,
+    }
 }
 
 fn elapsed_ms(started: crate::time::MonotonicInstant) -> u64 {
@@ -815,7 +954,7 @@ const fn stale_row_predicate(dataset: RetentionDataset) -> Option<(&'static str,
 }
 
 /// The primary-key column each sweepable table batches by.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 const fn sweep_key_column(dataset: RetentionDataset) -> &'static str {
     match dataset {
         RetentionDataset::JobTracking => "key",
@@ -823,7 +962,7 @@ const fn sweep_key_column(dataset: RetentionDataset) -> &'static str {
     }
 }
 
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 async fn apply_sweep(
     state: &AppState,
     dataset: RetentionDataset,
@@ -836,7 +975,24 @@ async fn apply_sweep(
             Some("no database is configured, so this dataset has no rows here".to_owned());
         return;
     };
-    match sweep_postgres(&pool, dataset, window, dry_run).await {
+    #[cfg(not(feature = "sqlite"))]
+    let outcome = sweep_postgres(&pool, dataset, window, dry_run).await;
+    #[cfg(feature = "sqlite")]
+    let outcome = match sweep_sqlite(&pool, dataset, window, dry_run).await {
+        Ok(SqliteSweep::Swept(swept)) => Ok(swept),
+        Ok(SqliteSweep::MissingTable(table)) => {
+            report.skipped = Some(format!(
+                "{table} does not exist in this database, so this dataset has no rows here"
+            ));
+            return;
+        }
+        Ok(SqliteSweep::Skipped(reason)) => {
+            report.skipped = Some(reason);
+            return;
+        }
+        Err(failure) => Err(failure),
+    };
+    match outcome {
         Ok(swept) => {
             // Overwrite the provisional app-clock cutoff with the instant the
             // database actually applied, so the report and the audit record
@@ -859,6 +1015,7 @@ async fn apply_sweep(
             if let Some(cutoff) = failure.cutoff {
                 report.cutoff = Some(cutoff.to_rfc3339());
             }
+            report.eligible_rows = failure.eligible;
             report.rows_removed = failure.removed;
             report.truncated = true;
             report.error = Some(failure.error.to_string());
@@ -866,17 +1023,9 @@ async fn apply_sweep(
     }
 }
 
-/// The sweep itself is Postgres-only. Its predicates and batching are written
-/// against Postgres types and `NOW()`, and `autumn_experiment_assignments` is
-/// created by a Postgres-specific migration, so there is nothing here to run on
-/// `SQLite`. Report that rather than pretending a sweep ran.
-///
-/// The durable `SQLite` job backend (issue #1907) does create `autumn_jobs` and
-/// `autumn_job_tracking` in the app's own file, and prunes them itself from its
-/// maintenance loop — expired tracking records always, and terminal job rows
-/// when `retention.job_history` is set. A `SQLite` sweep driven from
-/// `autumn db retention` is tracked under #1909.
-#[cfg(any(not(feature = "db"), feature = "sqlite"))]
+/// A build without the `db` feature has no database to sweep. Report that
+/// rather than pretending a sweep ran.
+#[cfg(not(feature = "db"))]
 #[allow(clippy::unused_async)]
 async fn apply_sweep(
     _state: &AppState,
@@ -885,15 +1034,7 @@ async fn apply_sweep(
     _dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
-    report.skipped = Some(
-        if cfg!(feature = "sqlite") {
-            "the retention sweep is Postgres-only; on SQLite the durable job runtime prunes \
-             its own tables (see retention.job_history) and a sweep for the rest is planned"
-        } else {
-            "this build has no database support (`db` feature off)"
-        }
-        .to_owned(),
-    );
+    report.skipped = Some("this build has no database support (`db` feature off)".to_owned());
 }
 
 /// Resolve the sweep cutoff **on the database server** and count/delete
@@ -944,7 +1085,7 @@ async fn sweep_postgres(
     })?;
 
     let cutoff = resolve_cutoff(&mut conn, table, window).await?;
-    let eligible = count_stale(&mut conn, table, predicate, cutoff, 0).await?;
+    let eligible = count_stale(&mut conn, table, predicate, cutoff, 0, None).await?;
 
     if dry_run || eligible == 0 {
         return Ok(SweptDataset {
@@ -980,6 +1121,7 @@ async fn sweep_postgres(
             sweep_failed_at(
                 cutoff,
                 removed,
+                Some(eligible),
                 format!("retention sweep of {table} failed: {e}"),
             )
         })?;
@@ -1002,7 +1144,8 @@ async fn sweep_postgres(
     // is actually done. `truncated` ends up in the audit record, so a wrong
     // answer here is a compliance trail claiming enforcement that did not
     // happen.
-    let remaining = count_stale(&mut conn, table, predicate, cutoff, removed).await?;
+    let remaining =
+        count_stale(&mut conn, table, predicate, cutoff, removed, Some(eligible)).await?;
 
     Ok(SweptDataset {
         cutoff,
@@ -1014,11 +1157,12 @@ async fn sweep_postgres(
 
 /// Pair an error with the rows the pass had already deleted when it hit that
 /// error, so no failure path can silently drop the count.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 fn sweep_failed(removed: u64, message: String) -> SweepFailure {
     SweepFailure {
         cutoff: None,
         removed,
+        eligible: None,
         error: Box::new(crate::AutumnError::internal_server_error_msg(message)),
     }
 }
@@ -1030,11 +1174,17 @@ fn sweep_failed(removed: u64, message: String) -> SweepFailure {
 /// must state it — not the provisional app-clock value `run_one_dataset`
 /// seeded, which under clock skew names a different deletion boundary from
 /// the one actually applied.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
-fn sweep_failed_at(cutoff: DateTime<Utc>, removed: u64, message: String) -> SweepFailure {
+#[cfg(feature = "db")]
+fn sweep_failed_at(
+    cutoff: DateTime<Utc>,
+    removed: u64,
+    eligible: Option<u64>,
+    message: String,
+) -> SweepFailure {
     SweepFailure {
         cutoff: Some(cutoff),
         removed,
+        eligible,
         error: Box::new(crate::AutumnError::internal_server_error_msg(message)),
     }
 }
@@ -1042,10 +1192,12 @@ fn sweep_failed_at(cutoff: DateTime<Utc>, removed: u64, message: String) -> Swee
 /// A sweep pass that failed, carrying everything the pass still has to
 /// report: the cutoff the database applied (once known), the rows earlier
 /// autocommit batches already deleted, and the error itself.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[cfg(feature = "db")]
 struct SweepFailure {
     cutoff: Option<DateTime<Utc>>,
     removed: u64,
+    /// Rows counted before the batches ran. `None` when the failure came first.
+    eligible: Option<u64>,
     /// Boxed to keep the `Err` variant of this module's sweep `Result`s small:
     /// `AutumnError` is wide enough that carrying it inline trips
     /// `clippy::result_large_err` on every function that returns one.
@@ -1101,8 +1253,8 @@ async fn resolve_cutoff(
 
 /// Count the rows `predicate` currently matches.
 ///
-/// `removed_so_far` rides along so a failure here still reports the rows an
-/// earlier batch loop already deleted.
+/// A failure here still reports `removed_so_far` and the earlier `eligible`
+/// count, if any.
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 async fn count_stale(
     conn: &mut diesel_async::AsyncPgConnection,
@@ -1110,6 +1262,7 @@ async fn count_stale(
     predicate: &str,
     cutoff: DateTime<Utc>,
     removed_so_far: u64,
+    eligible: Option<u64>,
 ) -> Result<u64, SweepFailure> {
     use diesel_async::RunQueryDsl as _;
 
@@ -1130,13 +1283,14 @@ async fn count_stale(
         sweep_failed_at(
             cutoff,
             removed_so_far,
+            eligible,
             format!("retention count for {table} failed: {e}"),
         )
     })
 }
 
-/// What one Postgres sweep pass achieved.
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
+/// What one sweep pass achieved.
+#[cfg(feature = "db")]
 struct SweptDataset {
     /// The instant the database itself resolved for the window.
     cutoff: DateTime<Utc>,
@@ -1146,6 +1300,378 @@ struct SweptDataset {
     removed: u64,
     /// `true` when stale rows are still present after the pass.
     truncated: bool,
+}
+
+// ── SQLite sweep (issue #2553) ───────────────────────────────────────────
+
+/// The database clock in epoch milliseconds. Like the Postgres sweep, the
+/// cutoff is read on the database side. The job runtime's own prune uses the
+/// app clock, so the two differ only under a simulated clock.
+#[cfg(any(test, all(feature = "db", feature = "sqlite")))]
+const SQLITE_NOW_MS: &str = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)";
+
+/// How a `SQLite` dataset stores the time its predicate compares.
+#[cfg(any(test, all(feature = "db", feature = "sqlite")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SqliteClock {
+    /// `BIGINT` epoch milliseconds (`autumn_jobs`).
+    Millis,
+    /// `TEXT` as `YYYY-MM-DD HH:MM:SS`, UTC (`CURRENT_TIMESTAMP`).
+    Text,
+}
+
+/// The `SQLite` counterpart of [`stale_row_predicate`]: table, predicate and
+/// clock. `?1` is the cutoff. The rules match the Postgres predicates and the
+/// job runtime's own history prune.
+#[cfg(any(test, all(feature = "db", feature = "sqlite")))]
+#[must_use]
+fn stale_row_predicate_sqlite(
+    dataset: RetentionDataset,
+) -> Option<(&'static str, String, SqliteClock)> {
+    match dataset {
+        RetentionDataset::JobHistory => Some((
+            "autumn_jobs",
+            format!(
+                "status IN ('completed', 'failed', 'discarded') \
+                 AND finished_at IS NOT NULL AND finished_at < ?1 \
+                 AND NOT (unique_key IS NOT NULL AND unique_window = 'ttl' \
+                          AND enqueued_at > ({SQLITE_NOW_MS}) - COALESCE(unique_ttl_ms, 0))"
+            ),
+            SqliteClock::Millis,
+        )),
+        RetentionDataset::CommitHooks => Some((
+            "autumn_repository_commit_hooks",
+            "status IN ('completed', 'failed', 'after_hook_failed') \
+             AND finished_at IS NOT NULL AND finished_at < ?1"
+                .to_owned(),
+            SqliteClock::Text,
+        )),
+        RetentionDataset::ExperimentAssignments => Some((
+            "autumn_experiment_assignments",
+            "assigned_at < ?1 AND NOT EXISTS ( \
+                 SELECT 1 FROM autumn_experiments e \
+                 WHERE e.name = autumn_experiment_assignments.experiment \
+                   AND e.state IN ('draft', 'running', 'concluded'))"
+                .to_owned(),
+            SqliteClock::Text,
+        )),
+        // `job_tracking` is a backend-TTL dataset on `SQLite`: the job runtime
+        // deletes expired rows itself.
+        RetentionDataset::JobTracking
+        | RetentionDataset::Idempotency
+        | RetentionDataset::WebhookReplay
+        | RetentionDataset::Sessions
+        | RetentionDataset::AuditArchives
+        | RetentionDataset::CustomDomains => None,
+    }
+}
+
+/// The index that serves a dataset's cutoff scan, created if it is missing.
+/// `autumn_jobs` already has `idx_autumn_jobs_status_finished`.
+#[cfg(any(test, all(feature = "db", feature = "sqlite")))]
+const fn sqlite_sweep_index(dataset: RetentionDataset) -> Option<&'static str> {
+    match dataset {
+        RetentionDataset::CommitHooks => Some(
+            "CREATE INDEX IF NOT EXISTS idx_autumn_commit_hooks_finished \
+             ON autumn_repository_commit_hooks (finished_at) \
+             WHERE status IN ('completed', 'failed', 'after_hook_failed')",
+        ),
+        RetentionDataset::ExperimentAssignments => Some(
+            "CREATE INDEX IF NOT EXISTS idx_autumn_exp_assignments_assigned_at \
+             ON autumn_experiment_assignments (assigned_at)",
+        ),
+        _ => None,
+    }
+}
+
+/// The resolved cutoff, in the form the dataset's column stores.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+enum SqliteCutoff {
+    Millis(i64),
+    Text(String),
+}
+
+/// What a `SQLite` sweep did, or why it had nothing to do.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+enum SqliteSweep {
+    Swept(SweptDataset),
+    /// A dataset table this database does not have.
+    MissingTable(&'static str),
+    /// The table exists but its schema is too old to sweep safely.
+    Skipped(String),
+}
+
+#[cfg(all(feature = "db", feature = "sqlite"))]
+#[derive(diesel::QueryableByName)]
+struct SqliteCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+}
+
+/// Run (or dry-run) one dataset's sweep against the app's `SQLite` file.
+///
+/// Same contract as the Postgres sweep: the cutoff is resolved on the
+/// database, deletes run in bounded batches as separate statements, the outer
+/// `DELETE` repeats the predicate so a row revived mid-sweep survives, and a
+/// failure reports what earlier batches already removed.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+// One pass: look, resolve, count, index, delete in batches, recount.
+#[allow(clippy::too_many_lines)]
+async fn sweep_sqlite(
+    pool: &diesel_async::pooled_connection::deadpool::Pool<crate::db::RuntimeConnection>,
+    dataset: RetentionDataset,
+    window: Duration,
+    dry_run: bool,
+) -> Result<SqliteSweep, SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    let Some((table, predicate, clock)) = stale_row_predicate_sqlite(dataset) else {
+        return Err(sweep_failed(
+            0,
+            format!("{dataset} is not a sweep-enforced dataset"),
+        ));
+    };
+    let key = sweep_key_column(dataset);
+    let mut conn = pool.get().await.map_err(|e| {
+        sweep_failed(
+            0,
+            format!("retention sweep could not acquire a connection: {e}"),
+        )
+    })?;
+
+    for needed in std::iter::once(table)
+        .chain((dataset == RetentionDataset::ExperimentAssignments).then_some("autumn_experiments"))
+    {
+        if !sqlite_table_exists(&mut conn, needed).await? {
+            return Ok(SqliteSweep::MissingTable(needed));
+        }
+    }
+
+    // The job runtime adds `unique_ttl_ms` when it starts. A sweep that runs
+    // first on an older file must not guess: skip it and delete nothing.
+    if dataset == RetentionDataset::JobHistory
+        && !sqlite_column_exists(&mut conn, table, "unique_ttl_ms").await?
+    {
+        return Ok(SqliteSweep::Skipped(format!(
+            "{table} predates the unique_ttl_ms column, so the sweep cannot check TTL holds. \
+             Start the app once so the job runtime upgrades the table, then run this again"
+        )));
+    }
+
+    let (cutoff_at, cutoff) = resolve_sqlite_cutoff(&mut conn, table, window, clock).await?;
+    let eligible =
+        count_stale_sqlite(&mut conn, table, &predicate, &cutoff, 0, None, cutoff_at).await?;
+    if dry_run || eligible == 0 {
+        return Ok(SqliteSweep::Swept(SweptDataset {
+            cutoff: cutoff_at,
+            eligible,
+            removed: 0,
+            truncated: false,
+        }));
+    }
+
+    // The same indexes the Postgres migration adds. The SQLite migration for
+    // them is a no-op shim that existing files have already applied, so the
+    // sweep creates them. Without one, every batch rescans the table.
+    if let Some(index) = sqlite_sweep_index(dataset) {
+        diesel::sql_query(index)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                sweep_failed_at(
+                    cutoff_at,
+                    0,
+                    Some(eligible),
+                    format!("retention could not create the sweep index on {table}: {e}"),
+                )
+            })?;
+    }
+
+    let mut removed: u64 = 0;
+    for _ in 0..SWEEP_MAX_BATCHES {
+        let sql = format!(
+            "DELETE FROM {table} WHERE {predicate} AND {key} IN \
+             (SELECT {key} FROM {table} WHERE {predicate} LIMIT ?2)"
+        );
+        let query = diesel::sql_query(sql);
+        let affected = match &cutoff {
+            SqliteCutoff::Millis(ms) => {
+                query
+                    .bind::<diesel::sql_types::BigInt, _>(*ms)
+                    .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
+                    .execute(&mut *conn)
+                    .await
+            }
+            SqliteCutoff::Text(text) => {
+                query
+                    .bind::<diesel::sql_types::Text, _>(text.clone())
+                    .bind::<diesel::sql_types::BigInt, _>(SWEEP_BATCH_ROWS)
+                    .execute(&mut *conn)
+                    .await
+            }
+        }
+        .map_err(|e| {
+            sweep_failed_at(
+                cutoff_at,
+                removed,
+                Some(eligible),
+                format!("retention sweep of {table} failed: {e}"),
+            )
+        })?;
+        removed = removed.saturating_add(u64::try_from(affected).unwrap_or(u64::MAX));
+        // Stop on a batch that deleted nothing, not a short one: the outer
+        // predicate is re-checked at delete time, so a short batch does not
+        // mean the table is drained.
+        if affected == 0 {
+            break;
+        }
+    }
+
+    let remaining = count_stale_sqlite(
+        &mut conn,
+        table,
+        &predicate,
+        &cutoff,
+        removed,
+        Some(eligible),
+        cutoff_at,
+    )
+    .await?;
+    Ok(SqliteSweep::Swept(SweptDataset {
+        cutoff: cutoff_at,
+        eligible,
+        removed,
+        truncated: remaining > 0,
+    }))
+}
+
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn sqlite_table_exists(
+    conn: &mut crate::db::PooledConnection,
+    table: &str,
+) -> Result<bool, SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    diesel::sql_query(
+        "SELECT COUNT(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?1",
+    )
+    .bind::<diesel::sql_types::Text, _>(table)
+    .get_result::<SqliteCount>(&mut **conn)
+    .await
+    .map(|row| row.count > 0)
+    .map_err(|e| sweep_failed(0, format!("retention could not look for {table}: {e}")))
+}
+
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn sqlite_column_exists(
+    conn: &mut crate::db::PooledConnection,
+    table: &str,
+    column: &str,
+) -> Result<bool, SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    diesel::sql_query("SELECT COUNT(*) AS count FROM pragma_table_info(?1) WHERE name = ?2")
+        .bind::<diesel::sql_types::Text, _>(table)
+        .bind::<diesel::sql_types::Text, _>(column)
+        .get_result::<SqliteCount>(&mut **conn)
+        .await
+        .map(|row| row.count > 0)
+        .map_err(|e| sweep_failed(0, format!("retention could not inspect {table}: {e}")))
+}
+
+/// Resolve `now - window` **on the database**, as an instant and in the form
+/// the dataset's column stores.
+///
+/// An out-of-range window is an error, never a clamp: clamping would delete
+/// rows the report claims are inside the policy.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn resolve_sqlite_cutoff(
+    conn: &mut crate::db::PooledConnection,
+    table: &str,
+    window: Duration,
+    clock: SqliteClock,
+) -> Result<(DateTime<Utc>, SqliteCutoff), SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct CutoffRow {
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+        cutoff_ms: Option<i64>,
+    }
+
+    let too_wide = || {
+        sweep_failed(
+            0,
+            format!(
+                "retention window for {table} ({}s) exceeds the maximum the sweep can \
+                 apply; refusing rather than silently sweeping a shorter window",
+                window.as_secs()
+            ),
+        )
+    };
+    let window_ms = i64::try_from(window.as_millis()).map_err(|_| too_wide())?;
+    let row = diesel::sql_query(format!("SELECT {SQLITE_NOW_MS} - ?1 AS cutoff_ms"))
+        .bind::<diesel::sql_types::BigInt, _>(window_ms)
+        .get_result::<CutoffRow>(&mut **conn)
+        .await
+        .map_err(|e| {
+            sweep_failed(
+                0,
+                format!("retention could not resolve the cutoff for {table}: {e}"),
+            )
+        })?;
+    let ms = row.cutoff_ms.ok_or_else(too_wide)?;
+    // A text column holds whole seconds. Report the instant that is applied.
+    let at = match clock {
+        SqliteClock::Millis => DateTime::<Utc>::from_timestamp_millis(ms),
+        SqliteClock::Text => DateTime::<Utc>::from_timestamp(ms.div_euclid(1000), 0),
+    }
+    .ok_or_else(too_wide)?;
+    let cutoff = match clock {
+        SqliteClock::Millis => SqliteCutoff::Millis(ms),
+        SqliteClock::Text => SqliteCutoff::Text(at.format("%Y-%m-%d %H:%M:%S").to_string()),
+    };
+    Ok((at, cutoff))
+}
+
+#[cfg(all(feature = "db", feature = "sqlite"))]
+async fn count_stale_sqlite(
+    conn: &mut crate::db::PooledConnection,
+    table: &str,
+    predicate: &str,
+    cutoff: &SqliteCutoff,
+    removed_so_far: u64,
+    eligible: Option<u64>,
+    cutoff_at: DateTime<Utc>,
+) -> Result<u64, SweepFailure> {
+    use diesel_async::RunQueryDsl as _;
+
+    let query = diesel::sql_query(format!(
+        "SELECT COUNT(*) AS count FROM {table} WHERE {predicate}"
+    ));
+    match cutoff {
+        SqliteCutoff::Millis(ms) => {
+            query
+                .bind::<diesel::sql_types::BigInt, _>(*ms)
+                .get_result::<SqliteCount>(&mut **conn)
+                .await
+        }
+        SqliteCutoff::Text(text) => {
+            query
+                .bind::<diesel::sql_types::Text, _>(text.clone())
+                .get_result::<SqliteCount>(&mut **conn)
+                .await
+        }
+    }
+    .map(|row| u64::try_from(row.count).unwrap_or(0))
+    .map_err(|e| {
+        sweep_failed_at(
+            cutoff_at,
+            removed_so_far,
+            eligible,
+            format!("retention count for {table} failed: {e}"),
+        )
+    })
 }
 
 // ── Audit record (AC #6) ─────────────────────────────────────────────────
@@ -1168,7 +1694,12 @@ struct SweptDataset {
 /// but a dataset held back by a **legal hold** *is* recorded even though
 /// nothing was deleted: "the policy wanted to delete this and did not" is
 /// exactly what a reviewer needs to see.
-async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
+///
+/// If the write fails, the error text is added to
+/// [`RetentionDatasetReport::error`]. Rows can already be gone, so the CLI
+/// exits non-zero and the task fails. The text starts with "audit record" to
+/// separate it from a sweep error.
+async fn audit_sweep(state: &AppState, report: &mut RetentionDatasetReport) {
     let is_legal_hold = report
         .skipped
         .as_deref()
@@ -1177,18 +1708,6 @@ async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
     if report.dry_run || (!swept && !is_legal_hold) {
         return;
     }
-
-    tracing::info!(
-        target: "autumn.audit",
-        dataset = %report.dataset,
-        cutoff = report.cutoff.as_deref().unwrap_or("-"),
-        eligible_rows = report.eligible_rows.unwrap_or(0),
-        rows_removed = report.rows_removed,
-        truncated = report.truncated,
-        skipped = report.skipped.as_deref().unwrap_or(""),
-        error = report.error.as_deref().unwrap_or(""),
-        "retention_sweep"
-    );
 
     let status = if report.error.is_some() {
         crate::audit::AuditStatus::Failure
@@ -1217,18 +1736,101 @@ async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
     }
 
     if let Err(error) = crate::audit::write_from_state(state, event).await {
-        tracing::warn!(
+        tracing::error!(
             error = %error,
             dataset = %report.dataset,
+            rows_removed = report.rows_removed,
             "retention sweep audit record could not be written"
         );
+        let audit_failure = format!("audit record not written: {error}");
+        report.error = Some(match report.error.take() {
+            Some(sweep_failure) => format!("{sweep_failure}; {audit_failure}"),
+            None => audit_failure,
+        });
     }
+
+    // Emitted last, so the fallback trail carries an audit-write failure too.
+    tracing::info!(
+        target: "autumn.audit",
+        dataset = %report.dataset,
+        cutoff = report.cutoff.as_deref().unwrap_or("-"),
+        eligible_rows = report.eligible_rows.unwrap_or(0),
+        rows_removed = report.rows_removed,
+        truncated = report.truncated,
+        skipped = report.skipped.as_deref().unwrap_or(""),
+        error = report.error.as_deref().unwrap_or(""),
+        "retention_sweep"
+    );
+}
+
+// ── Purge guard ──────────────────────────────────────────────────────────
+
+/// Why an on-demand purge must stop, if it must.
+///
+/// The app checks this with the profile its own config loader resolved. The
+/// CLI also checks, as a fast pre-flight, but it only knows the profile name
+/// it passes in. A custom loader can pick another one. `profile` is that
+/// resolved name. `force` is the operator's `--force`.
+#[must_use]
+pub fn purge_refusal(profile: Option<&str>, force: bool) -> Option<String> {
+    if force {
+        return None;
+    }
+    let name = profile.map(str::trim);
+    if name.is_some_and(|name| {
+        ["dev", "development", "test"]
+            .iter()
+            .any(|safe| name.eq_ignore_ascii_case(safe))
+    }) {
+        return None;
+    }
+    Some(format!(
+        "refusing to purge framework data: the app resolved the {} profile. The configured \
+         [retention] policy already runs inside the app. Re-run with --force to purge now",
+        name.map_or_else(|| "an unknown".to_owned(), |name| format!("{name:?}"))
+    ))
 }
 
 // ── Scheduled task (AC #2) ───────────────────────────────────────────────
 
-/// The recurring in-process sweep, or `None` when no dataset declares a
-/// window.
+/// Turn dataset errors into one task error.
+///
+/// The caller runs this after all datasets finish, so one failure does not
+/// stop the others. The scheduler records the task as failed.
+fn fail_on_dataset_errors(reports: &[RetentionDatasetReport]) -> AutumnResult<()> {
+    let failures: Vec<String> = reports
+        .iter()
+        .filter_map(|report| {
+            report
+                .error
+                .as_deref()
+                .map(|error| format!("{}: {error}", report.dataset))
+        })
+        .collect();
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(crate::AutumnError::internal_server_error_msg(format!(
+        "retention sweep failed for {} dataset(s): {}",
+        failures.len(),
+        failures.join("; ")
+    )))
+}
+
+/// Name of the per-replica archive sweep task.
+pub const RETENTION_ARCHIVE_TASK_NAME: &str = "autumn-retention-archive-sweep";
+
+/// Whether any configured window needs the shared (fleet) sweep.
+fn shared_window_configured(config: &RetentionConfig) -> bool {
+    config.windows().iter().any(|(key, window)| {
+        window.is_some()
+            && RetentionDataset::from_key(key)
+                .is_none_or(|dataset| RetentionScope::Shared.covers(dataset.enforcement()))
+    })
+}
+
+/// The recurring in-process sweep of shared data, or `None` when no such
+/// dataset declares a window.
 ///
 /// Returning `None` is what makes AC #1's "leaving a dataset unset preserves
 /// today's behavior exactly" structural rather than a promise each sweeper
@@ -1236,10 +1838,11 @@ async fn audit_sweep(state: &AppState, report: &RetentionDatasetReport) {
 /// loop is spawned, and no query is ever issued.
 ///
 /// Registered as a [`TaskCoordination::Fleet`] task so a multi-replica
-/// deployment runs the sweep once per tick, not once per replica.
+/// deployment runs the sweep once per tick, not once per replica. The audit
+/// archive is not in it: see [`framework_archive_retention_task`].
 #[must_use]
 pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
-    if !config.any_window_configured() {
+    if !shared_window_configured(config) {
         return None;
     }
     Some(TaskInfo {
@@ -1248,17 +1851,50 @@ pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
         coordination: TaskCoordination::Fleet,
         handler: |state| {
             Box::pin(async move {
-                let reports = run_retention(&state, &RetentionRunOptions::default()).await?;
-                for report in &reports {
-                    if let Some(error) = report.error.as_deref() {
-                        tracing::warn!(
-                            dataset = %report.dataset,
-                            error,
-                            "framework retention sweep failed for one dataset"
-                        );
-                    }
-                }
-                Ok(())
+                let reports = run_retention_for(
+                    &state,
+                    &RetentionRunOptions::default(),
+                    RetentionScope::Shared,
+                )
+                .await?;
+                fail_on_dataset_errors(&reports)
+            })
+        },
+    })
+}
+
+/// Every scheduled retention task the config needs: the fleet sweep, the
+/// per-replica archive sweep, both, or none.
+#[must_use]
+pub fn framework_retention_tasks(config: &RetentionConfig) -> Vec<TaskInfo> {
+    framework_retention_task(config)
+        .into_iter()
+        .chain(framework_archive_retention_task(config))
+        .collect()
+}
+
+/// The recurring sweep of the local audit archive, or `None` when
+/// `retention.audit_archives` is unset.
+///
+/// The archive is a file on this replica's disk. A fleet-coordinated task
+/// would purge one replica's file and leave the others to grow. This task
+/// uses [`TaskCoordination::PerReplica`], so every replica purges its own.
+#[must_use]
+pub fn framework_archive_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
+    config.audit_archives.as_ref()?;
+    Some(TaskInfo {
+        name: RETENTION_ARCHIVE_TASK_NAME.to_owned(),
+        schedule: Schedule::FixedDelay(config.sweep_interval_duration()),
+        coordination: TaskCoordination::PerReplica,
+        handler: |state| {
+            Box::pin(async move {
+                let reports = run_retention_for(
+                    &state,
+                    &RetentionRunOptions::default(),
+                    RetentionScope::PerReplica,
+                )
+                .await?;
+                fail_on_dataset_errors(&reports)
             })
         },
     })
@@ -1267,6 +1903,436 @@ pub fn framework_retention_task(config: &RetentionConfig) -> Option<TaskInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::audit::{AuditError, AuditEvent, AuditLogger, AuditSink};
+    use std::sync::Arc;
+
+    struct FailingSink;
+
+    impl AuditSink for FailingSink {
+        fn write(
+            &self,
+            _event: AuditEvent,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AuditError>> + Send + '_>>
+        {
+            Box::pin(async { Err(AuditError::new("disk full")) })
+        }
+    }
+
+    fn held_report() -> RetentionDatasetReport {
+        RetentionDatasetReport {
+            dataset: "job_history".to_owned(),
+            description: String::new(),
+            enforcement: "sweep".to_owned(),
+            window_secs: Some(86_400),
+            source: "[retention]".to_owned(),
+            cutoff: Some("2026-01-01T00:00:00+00:00".to_owned()),
+            eligible_rows: Some(3),
+            rows_removed: 3,
+            truncated: false,
+            dry_run: false,
+            skipped: None,
+            duration_ms: 0,
+            error: None,
+        }
+    }
+
+    fn state_with_sink(sink: impl AuditSink) -> AppState {
+        let state = AppState::for_test();
+        state.insert_extension(AuditLogger::new().with_sink(Arc::new(sink)));
+        state
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_sets_the_report_error() {
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        audit_sweep(&state, &mut report).await;
+        let error = report.error.expect("audit failure must reach the report");
+        assert!(error.contains("audit record"), "{error}");
+        assert!(error.contains("disk full"), "{error}");
+        assert_eq!(report.rows_removed, 3, "removed rows stay reported");
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buf").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_trace_carries_the_audit_write_failure() {
+        let buf = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        audit_sweep(&state, &mut report).await;
+        let output = String::from_utf8(buf.0.lock().expect("buf").clone()).expect("utf8");
+        let line = output
+            .lines()
+            .find(|line| line.contains("retention_sweep"))
+            .expect("sweep trace line");
+        assert!(line.contains("audit record not written"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_legal_hold_audit_write_sets_the_report_error() {
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        report.eligible_rows = None;
+        report.rows_removed = 0;
+        report.skipped = Some("legal hold: tax records".to_owned());
+        audit_sweep(&state, &mut report).await;
+        assert!(report.error.is_some(), "{report:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_keeps_the_sweep_error() {
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        report.error = Some("statement timeout".to_owned());
+        audit_sweep(&state, &mut report).await;
+        let error = report.error.expect("error");
+        assert!(error.contains("statement timeout"), "{error}");
+        assert!(error.contains("disk full"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_written_audit_record_leaves_the_report_clean() {
+        let state = AppState::for_test();
+        let mut report = held_report();
+        audit_sweep(&state, &mut report).await;
+        assert_eq!(report.error, None);
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_never_fails_on_the_audit_sink() {
+        let state = state_with_sink(FailingSink);
+        let mut report = held_report();
+        report.dry_run = true;
+        audit_sweep(&state, &mut report).await;
+        assert_eq!(report.error, None);
+    }
+
+    fn config_with_backend(backend: &str) -> AutumnConfig {
+        let mut config = AutumnConfig::default();
+        config.jobs.backend = backend.to_owned();
+        config.retention.job_history = Some("90d".to_owned());
+        config.retention.job_tracking = Some("7d".to_owned());
+        config
+    }
+
+    #[tokio::test]
+    async fn job_history_is_not_enforced_on_a_redis_or_local_jobs_backend() {
+        for backend in ["redis", "local"] {
+            let config = config_with_backend(backend);
+            let report = run_one_dataset(
+                &AppState::for_test(),
+                &config,
+                RetentionDataset::JobHistory,
+                false,
+            )
+            .await;
+            let skipped = report.skipped.expect("the sweep cannot reach these jobs");
+            assert!(skipped.contains("NOT enforced"), "{backend}: {skipped}");
+            assert!(skipped.contains(backend), "{backend}: {skipped}");
+            assert_eq!(report.rows_removed, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn job_history_is_not_reported_unenforced_on_postgres_or_sqlite() {
+        for backend in ["postgres", "sqlite"] {
+            let config = config_with_backend(backend);
+            let report = run_one_dataset(
+                &AppState::for_test(),
+                &config,
+                RetentionDataset::JobHistory,
+                true,
+            )
+            .await;
+            let skipped = report.skipped.unwrap_or_default();
+            assert!(!skipped.contains("NOT enforced"), "{backend}: {skipped}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legal_hold_is_not_claimed_for_records_outside_the_held_table() {
+        let state = AppState::for_test();
+        let registry = GdprRegistry::new().register(crate::gdpr::ModelRegistration::retain(
+            "autumn_job_tracking",
+            "litigation",
+        ));
+        state.insert_extension(registry);
+
+        let redis = config_with_backend("redis");
+        let report = run_one_dataset(&state, &redis, RetentionDataset::JobTracking, true).await;
+        let skipped = report.skipped.expect("held");
+        assert!(skipped.starts_with("legal hold:"), "{skipped}");
+        assert!(skipped.contains("NOT preserved"), "{skipped}");
+
+        let postgres = config_with_backend("postgres");
+        let report = run_one_dataset(&state, &postgres, RetentionDataset::JobTracking, true).await;
+        let skipped = report.skipped.expect("held");
+        assert!(!skipped.contains("NOT preserved"), "{skipped}");
+    }
+
+    #[test]
+    fn only_jobs_datasets_depend_on_the_jobs_backend() {
+        let postgres = config_with_backend("postgres");
+        let redis = config_with_backend("redis");
+        let sensitive: Vec<&str> = RETENTION_DATASETS
+            .iter()
+            .filter(|dataset| dataset.table_for(&postgres) != dataset.table_for(&redis))
+            .map(|dataset| dataset.key())
+            .collect();
+        assert_eq!(sensitive, ["job_history", "job_tracking"]);
+    }
+
+    #[tokio::test]
+    async fn the_shared_scope_leaves_the_archive_to_each_replica() {
+        let state = AppState::for_test();
+        let options = RetentionRunOptions::default();
+        let shared = run_retention_for(&state, &options, RetentionScope::Shared)
+            .await
+            .expect("run");
+        let local = run_retention_for(&state, &options, RetentionScope::PerReplica)
+            .await
+            .expect("run");
+        assert!(shared.iter().all(|r| r.dataset != "audit_archives"));
+        assert_eq!(
+            local.iter().map(|r| r.dataset.as_str()).collect::<Vec<_>>(),
+            ["audit_archives"]
+        );
+        let all = run_retention(&state, &options).await.expect("run");
+        assert_eq!(all.len(), shared.len() + local.len());
+    }
+
+    #[test]
+    fn purge_is_refused_unless_the_app_resolved_a_dev_or_test_profile() {
+        for profile in [Some("dev"), Some("development"), Some("test"), Some("Dev")] {
+            assert_eq!(purge_refusal(profile, false), None, "{profile:?}");
+        }
+        for profile in [Some("prod"), Some("production"), Some("staging"), None] {
+            let refusal = purge_refusal(profile, false).expect("must refuse");
+            assert!(refusal.contains("--force"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn force_lifts_the_purge_refusal() {
+        assert_eq!(purge_refusal(Some("prod"), true), None);
+        assert_eq!(purge_refusal(None, true), None);
+    }
+
+    #[test]
+    fn the_task_list_follows_the_configured_windows() {
+        let names = |config: &RetentionConfig| {
+            framework_retention_tasks(config)
+                .into_iter()
+                .map(|task| task.name)
+                .collect::<Vec<_>>()
+        };
+        let mut config = RetentionConfig::default();
+        assert!(names(&config).is_empty());
+        config.audit_archives = Some("400d".to_owned());
+        assert_eq!(names(&config), [RETENTION_ARCHIVE_TASK_NAME]);
+        config.job_history = Some("90d".to_owned());
+        assert_eq!(
+            names(&config),
+            [RETENTION_SWEEP_TASK_NAME, RETENTION_ARCHIVE_TASK_NAME]
+        );
+    }
+
+    #[test]
+    fn fail_on_dataset_errors_passes_when_clean() {
+        assert!(fail_on_dataset_errors(&[held_report()]).is_ok());
+    }
+
+    #[test]
+    fn fail_on_dataset_errors_names_every_failed_dataset() {
+        let mut first = held_report();
+        first.error = Some("timeout".to_owned());
+        let mut second = held_report();
+        second.dataset = "commit_hooks".to_owned();
+        second.error = Some("denied".to_owned());
+        let ok = held_report();
+        let message = fail_on_dataset_errors(&[first, ok, second])
+            .expect_err("a failed dataset must fail the task")
+            .to_string();
+        assert!(message.contains("job_history"), "{message}");
+        assert!(message.contains("commit_hooks"), "{message}");
+        assert!(message.contains("timeout"), "{message}");
+    }
+
+    #[test]
+    fn in_memory_stores_warn_about_late_eviction() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Memory;
+        config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Memory;
+        config.jobs.backend = "local".to_owned();
+        for dataset in [
+            RetentionDataset::Idempotency,
+            RetentionDataset::WebhookReplay,
+            RetentionDataset::JobTracking,
+        ] {
+            let note = backend_ttl_note(dataset, &config, 60, None);
+            assert!(note.contains("built-in store"), "{dataset}: {note}");
+            assert!(note.contains("quiet process"), "{dataset}: {note}");
+        }
+    }
+
+    #[test]
+    fn shared_stores_do_not_warn_about_late_eviction() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Redis;
+        config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Redis;
+        config.jobs.backend = "redis".to_owned();
+        for dataset in [
+            RetentionDataset::Idempotency,
+            RetentionDataset::WebhookReplay,
+            RetentionDataset::JobTracking,
+        ] {
+            let note = backend_ttl_note(dataset, &config, 60, None);
+            assert!(!note.contains("quiet process"), "{dataset}: {note}");
+        }
+    }
+
+    #[test]
+    fn only_the_dataset_with_an_in_memory_store_warns() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Memory;
+        config.security.webhooks.replay.backend = crate::webhook::WebhookReplayBackend::Redis;
+        config.jobs.backend = "redis".to_owned();
+        let warns =
+            |dataset| backend_ttl_note(dataset, &config, 60, None).contains("quiet process");
+        assert!(warns(RetentionDataset::Idempotency));
+        assert!(!warns(RetentionDataset::WebhookReplay));
+        assert!(!warns(RetentionDataset::JobTracking));
+    }
+
+    #[test]
+    fn the_database_idempotency_store_warns_and_sqlite_jobs_do_not() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Database;
+        assert!(evicts_lazily(RetentionDataset::Idempotency, &config));
+        config.jobs.backend = "sqlite".to_owned();
+        assert!(!evicts_lazily(RetentionDataset::JobTracking, &config));
+    }
+
+    #[test]
+    fn an_unknown_jobs_backend_warns_because_it_falls_back_to_memory() {
+        let mut config = AutumnConfig::default();
+        config.jobs.backend = "postgresql".to_owned();
+        assert!(evicts_lazily(RetentionDataset::JobTracking, &config));
+        config.jobs.backend = "redis".to_owned();
+        assert!(!evicts_lazily(RetentionDataset::JobTracking, &config));
+    }
+
+    #[test]
+    fn a_held_database_idempotency_table_is_not_described_as_swept() {
+        let mut config = AutumnConfig::default();
+        config.idempotency.backend = crate::config::IdempotencyBackend::Database;
+        let registry = GdprRegistry::new().register(crate::gdpr::ModelRegistration::retain(
+            "autumn_idempotency_keys",
+            "litigation",
+        ));
+        let note = backend_ttl_note(RetentionDataset::Idempotency, &config, 60, Some(&registry));
+        assert!(note.contains("legal hold: litigation"), "{note}");
+        assert!(!note.contains("quiet process"), "{note}");
+    }
+
+    #[test]
+    fn the_memory_session_note_keeps_its_own_verdict() {
+        let mut config = AutumnConfig::default();
+        config.session.backend = crate::session::SessionBackend::Memory;
+        let note = backend_ttl_note(RetentionDataset::Sessions, &config, 60, None);
+        assert!(note.starts_with("NOT enforced"), "{note}");
+        assert!(!note.contains("quiet process"), "{note}");
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_failure_after_the_count_keeps_the_eligible_count() {
+        let failure = sweep_failed_at(Utc::now(), 500, Some(5_000_000), "timeout".to_owned());
+        assert_eq!(failure.eligible, Some(5_000_000));
+        assert_eq!(failure.removed, 500);
+        assert_eq!(sweep_failed(0, "no pool".to_owned()).eligible, None);
+    }
+
+    #[test]
+    fn sqlite_predicates_use_one_cutoff_and_the_same_statuses_as_postgres() {
+        for dataset in RETENTION_DATASETS {
+            let sqlite = stale_row_predicate_sqlite(dataset);
+            let pg = stale_row_predicate(dataset);
+            assert_eq!(
+                sqlite.as_ref().map(|(table, ..)| *table),
+                pg.map(|(table, _)| table)
+                    .filter(|_| dataset != RetentionDataset::JobTracking),
+                "{dataset}: same table set, job_tracking is TTL-only on SQLite"
+            );
+            if let Some((_, predicate, _)) = sqlite {
+                assert!(predicate.contains("?1"), "{dataset}: {predicate}");
+                assert!(
+                    !predicate.contains("$1") && !predicate.contains("?2"),
+                    "{predicate}"
+                );
+                if let Some((_, pg_predicate)) = pg {
+                    if pg_predicate.contains("status IN (") {
+                        assert_eq!(
+                            statuses_in(&predicate),
+                            statuses_in(pg_predicate),
+                            "{dataset}"
+                        );
+                    }
+                    if pg_predicate.contains("state IN (") {
+                        assert_eq!(states_in(&predicate), states_in(pg_predicate), "{dataset}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_sqlite_sweep_has_an_index_or_one_already_exists() {
+        for dataset in RETENTION_DATASETS {
+            let Some(index) = sqlite_sweep_index(dataset) else {
+                continue;
+            };
+            let (table, ..) = stale_row_predicate_sqlite(dataset).expect("a sweep");
+            assert!(index.contains(table), "{dataset}: {index}");
+            assert!(index.contains("IF NOT EXISTS"), "{index}");
+        }
+        assert!(sqlite_sweep_index(RetentionDataset::CommitHooks).is_some());
+        assert!(sqlite_sweep_index(RetentionDataset::ExperimentAssignments).is_some());
+    }
+
+    #[test]
+    fn sqlite_job_history_keeps_a_live_ttl_dedup_hold() {
+        let (_, predicate, clock) =
+            stale_row_predicate_sqlite(RetentionDataset::JobHistory).expect("sweepable");
+        assert_eq!(clock, SqliteClock::Millis);
+        assert!(predicate.contains("unique_ttl_ms"), "{predicate}");
+        assert!(predicate.contains("finished_at IS NOT NULL"), "{predicate}");
+    }
 
     #[test]
     fn resolve_datasets_defaults_to_every_dataset() {

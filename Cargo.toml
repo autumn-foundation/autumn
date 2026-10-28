@@ -1,5 +1,5 @@
 [workspace]
-members = ["autumn", "autumn-macros", "autumn-macros-model", "autumn-macros-repository", "autumn-macros-support", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "autumn-search", "autumn-edge", "autumn-plugin-reference", "autumn-billing", "examples/hello", "examples/edge-greeting", "examples/hot-upgrade", "examples/flock", "examples/todo-app", "examples/collab-notes", "examples/blog", "examples/cms", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/teams", "examples/media-room", "examples/invoice", "examples/react-graphql", "examples/mesh-catalog", "examples/mesh-storefront", "benchmarks/runtime/gate", "example-e2e"]
+members = ["autumn", "autumn-macros", "autumn-macros-model", "autumn-macros-repository", "autumn-macros-support", "autumn-cli", "autumn-schema-core", "autumn-admin-plugin", "autumn-media-plugin", "autumn-storage-s3", "autumn-cache-redis", "autumn-search", "autumn-edge", "autumn-plugin-reference", "autumn-billing", "examples/hello", "examples/edge-greeting", "examples/hot-upgrade", "examples/flock", "examples/todo-app", "examples/collab-notes", "examples/blog", "examples/cms", "examples/bookmarks", "examples/bookmarks-distributed", "examples/bookmarks-sharded", "examples/wiki", "examples/reddit-clone", "examples/saas", "examples/teams", "examples/media-room", "examples/invoice", "examples/react-graphql", "examples/escape-hatches", "examples/mesh-catalog", "examples/mesh-storefront", "benchmarks/runtime/gate", "example-e2e", "verification/models"]
 # The cargo-fuzz crate builds only under nightly with sanitizers and pulls
 # `autumn` in as a path dependency. Excluding it keeps `cargo build/test
 # --workspace` (and the publish gate) untouched; `fuzz/Cargo.toml` is also its
@@ -22,25 +22,38 @@ incremental = false
 [profile.test.build-override]
 debug = 0
 
+# The edge conformance suite runs about 20k capsule requests through the wasmi
+# interpreter. Unoptimized, that takes minutes. Optimize only the interpreter.
+# `[profile.test]` inherits these. They also apply to `plugin-sandbox`, which
+# uses wasmi too. The first build of wasmi takes longer.
+[profile.dev.package.wasmi]
+opt-level = 3
+
+[profile.dev.package.wasmi_core]
+opt-level = 3
+
+[profile.dev.package.wasmi_ir]
+opt-level = 3
+
+[profile.dev.package.wasmi_collections]
+opt-level = 3
+
 [patch.crates-io]
 autumn-web = { path = "autumn" }
 
 [workspace.package]
 edition = "2024"
 rust-version = "1.88.0"
-version = "0.8.0"
+version = "0.9.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/autumn-foundation/autumn"
 
 [workspace.dependencies]
 # Runtime
 # `http2` is load-bearing for issue #2321: `autumn/src/tls.rs` advertises
-# `h2` in the rustls ALPN list, and `axum::serve` runs every connection
-# through `hyper_util::server::conn::auto::Builder`, whose H2 arm is compiled
-# out unless hyper-util's `http2` feature is on (enabled here via
-# `axum/http2`). Without it, a client that negotiates `h2` gets
-# "HTTP/2 is not supported" and the connection dies instead of serving.
-# Pinned by `serve_stack_speaks_http2` in `autumn/src/tls.rs`.
+# `h2` in the rustls ALPN list. Autumn's serve loop needs hyper-util's `http2`
+# feature (see the `hyper-util` entry below). `axum/http2` gives the axum side
+# (HTTP/2 WebSockets, `axum::serve` in tests) the same HTTP/2 support.
 axum = { version = "0.8", features = ["macros", "ws", "http2"] }
 # Multipart boundary parsing for the submit-token replay guard. `multer` is the
 # exact parser axum's `Multipart` extractor uses downstream (via `mime`), so the
@@ -66,27 +79,28 @@ rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"]
 # to build a dual-stack IPv4+IPv6 `[::]` HTTP-01 challenge listener with
 # `IPV6_V6ONLY = false`, so Let's Encrypt can validate an AAAA-only deployment.
 socket2 = { version = "0.6", features = ["all"] }
-diesel = { version = "2", features = ["sqlite", "postgres"] }
+# Do not enable `postgres` here or on `diesel-async`. autumn-web's `postgres`
+# feature enables it, so a SQLite build compiles no Postgres backend (#2605).
+diesel = { version = "2", features = ["sqlite"] }
 pq-sys = { version = "0.7", features = ["bundled_without_openssl"] }
 # Keep the bundled libpq source at or above 0.3.13. `pq-src` 0.3.12 (libpq
 # 18.6) called `timingsafe_bcmp`, which glibc does not have, so every binary
 # that linked it failed with an undefined symbol; 0.3.13 compiles libpq's own
 # `src/port/timingsafe_bcmp.c`, so the floor excludes only the broken release.
-# `pq-sys` (below `autumn-web`'s `db` feature) accepts `>=0.2, <0.4`, so the
+# `pq-sys` (below `autumn-web`'s `postgres` feature) accepts `>=0.2, <0.4`, so the
 # pin changes no other crate.
 pq-src = { version = ">=0.3.13, <0.4", default-features = false }
 # `async-connection-wrapper` provides the sync diesel API (incl. running
 # diesel_migrations) over an async connection — used to run startup
 # migrations and wait checks through the rustls TLS connector, since the
 # bundled libpq (`pq-sys` below) has no SSL support.
-diesel-async = { version = "0.9", features = ["deadpool", "postgres", "async-connection-wrapper"] }
+diesel-async = { version = "0.9", features = ["deadpool", "async-connection-wrapper"] }
 diesel_migrations = "2"
 http = "1"
-# Direct edge for the `serve_stack_speaks_http2` regression test in
-# `autumn/src/tls.rs` (dev-dependency of the `autumn` crate only): it must NOT
-# enable `http2` itself, so that dropping `axum/http2` above breaks the test
-# compile. Pinned to the version already resolved in Cargo.lock.
-hyper-util = { version = "0.1.20", default-features = false, features = ["server", "tokio", "http1"] }
+# The `autumn` serve loop (`autumn/src/http_server.rs`, issue #3065) drives
+# `hyper_util::server::conn::auto::Builder` itself. `server-auto` turns on both
+# HTTP/1 and HTTP/2, which the ALPN `h2` advertisement in `tls.rs` needs.
+hyper-util = { version = "0.1.20", default-features = false, features = ["server-auto", "tokio", "service"] }
 libsqlite3-sys = { version = "0.38", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -100,10 +114,10 @@ tower = "0.5"
 tower-http = { version = "0.7", features = ["cors", "fs", "trace", "compression-gzip", "compression-br"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-tracing-opentelemetry = "0.33.0"
-opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "grpc-tonic", "tls-aws-lc", "tls-roots", "http-proto", "reqwest-client", "reqwest-rustls"] }
+tracing-opentelemetry = "0.34.0"
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "grpc-tonic", "tls-aws-lc", "tls-roots", "http-proto", "reqwest-client", "reqwest-rustls"] }
 # tokio-rustls-comp (not tokio-native-tls-comp): the workspace already
 # standardizes on rustls elsewhere (instant-acme, opentelemetry-otlp).
 # Required for `rediss://` URLs — e.g. the azure-container-apps release
@@ -131,7 +145,11 @@ rust_decimal = "1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 # HTML allowlist sanitizer for user-submitted rich text (issue #1255). Pulled in
 # by autumn-web's `markdown` feature; see `autumn/src/markdown/user_content.rs`.
-ammonia = "4.1"
+ammonia = "4.2.4"
+# Interactive console prompt (issue #2148). Pulled in only by autumn-web's
+# `repl` feature; see `autumn/src/repl.rs`.
+rhai = { version = "1", default-features = false, features = ["std", "serde"] }
+rustyline = { version = "17", default-features = false, features = ["with-file-history"] }
 chromiumoxide = { version = "0.9", default-features = false }
 # Pure-Rust PDF writer (issue #1317). `default-features = false` excludes the
 # `html` feature (azul CSS layout + rust-fontconfig system-font scanning) —
@@ -161,7 +179,7 @@ unsafe_code = "forbid"
 # neutral custom cfg is used instead of the usual `--cfg loom` so the flag does
 # not poison dependency crates (hyper-util/tokio) that carry their own
 # `#[cfg(loom)]` paths.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(loom_models)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(loom_models)', 'cfg(kani)', 'cfg(shuttle_models)'] }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }

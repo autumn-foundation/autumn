@@ -21,6 +21,7 @@ fn test_route_version_fields() {
         repository: None,
         idempotency: autumn_web::RouteIdempotency::default(),
         timeout: autumn_web::RouteTimeout::Inherit,
+        criticality: autumn_web::Criticality::Default,
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
     };
 
@@ -107,6 +108,7 @@ fn test_route_listing_with_version_and_status() {
             repository: None,
             idempotency: autumn_web::RouteIdempotency::default(),
             timeout: autumn_web::RouteTimeout::Inherit,
+            criticality: autumn_web::Criticality::Default,
             seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         },
         autumn_web::Route {
@@ -120,6 +122,7 @@ fn test_route_listing_with_version_and_status() {
             repository: None,
             idempotency: autumn_web::RouteIdempotency::default(),
             timeout: autumn_web::RouteTimeout::Inherit,
+            criticality: autumn_web::Criticality::Default,
             seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         },
         autumn_web::Route {
@@ -133,6 +136,7 @@ fn test_route_listing_with_version_and_status() {
             repository: None,
             idempotency: autumn_web::RouteIdempotency::default(),
             timeout: autumn_web::RouteTimeout::Inherit,
+            criticality: autumn_web::Criticality::Default,
             seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         },
         autumn_web::Route {
@@ -146,6 +150,7 @@ fn test_route_listing_with_version_and_status() {
             repository: None,
             idempotency: autumn_web::RouteIdempotency::default(),
             timeout: autumn_web::RouteTimeout::Inherit,
+            criticality: autumn_web::Criticality::Default,
             seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         },
     ];

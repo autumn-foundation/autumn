@@ -79,9 +79,9 @@ fn decrypt_as_the_browser_would(body: &[u8]) -> Vec<u8> {
     let cek = hkdf(salt, &ikm, b"Content-Encoding: aes128gcm\0", 16);
     let nonce = hkdf(salt, &ikm, b"Content-Encoding: nonce\0", 12);
 
-    let mut plaintext = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&cek))
+    let mut plaintext = Aes128Gcm::new(<&Key<Aes128Gcm>>::from(cek.as_slice()))
         .decrypt(
-            Nonce::from_slice(&nonce),
+            <&Nonce<_>>::from(nonce.as_slice()),
             Payload {
                 msg: ciphertext,
                 aad: b"",
@@ -350,6 +350,7 @@ mod pg {
     /// pins the other direction, so the two cannot drift apart silently.
     const CREATE_PUSH_SUBSCRIPTIONS_SQL: &str = "CREATE TABLE push_subscriptions (\
          id BIGSERIAL PRIMARY KEY, \
+         tenant_id TEXT NOT NULL DEFAULT '', \
          principal_id TEXT NOT NULL, \
          endpoint TEXT NOT NULL, \
          p256dh TEXT NOT NULL, \
@@ -422,6 +423,61 @@ mod pg {
             rows[0].auth(),
             URL_SAFE_NO_PAD.decode(UA_AUTH).expect("decode").as_slice()
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn db_store_isolates_the_same_principal_across_tenants() {
+        use autumn_web::tenancy::with_tenant;
+        let (store, _pool, _container) = setup().await;
+
+        with_tenant("a".to_owned(), store.save(stored(7, LIVE_ENDPOINT)))
+            .await
+            .expect("save");
+
+        let other = with_tenant("b".to_owned(), store.list_for("7"))
+            .await
+            .expect("list");
+        assert!(other.is_empty(), "tenant b must not see tenant a's devices");
+        let own = with_tenant("a".to_owned(), store.list_for("7"))
+            .await
+            .expect("list");
+        assert_eq!(own.len(), 1);
+        let removed = with_tenant("b".to_owned(), store.remove(LIVE_ENDPOINT, Some("7")))
+            .await
+            .expect("remove");
+        assert_eq!(removed, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn db_store_guards_a_cross_tenant_endpoint_move() {
+        use autumn_web::push::PushError;
+        use autumn_web::tenancy::with_tenant;
+        let (store, _pool, _container) = setup().await;
+        with_tenant("a".to_owned(), store.save(stored(7, LIVE_ENDPOINT)))
+            .await
+            .expect("save");
+
+        // Same principal id, other tenant, wrong auth key: refused.
+        let mut payload = subscription_json(LIVE_ENDPOINT);
+        payload["keys"]["auth"] = serde_json::json!(URL_SAFE_NO_PAD.encode([9_u8; 16]));
+        let hostile: autumn_web::push::BrowserSubscription =
+            serde_json::from_value(payload).expect("payload");
+        let hostile = hostile.decode(&7_i64.into()).expect("valid");
+        let err = with_tenant("b".to_owned(), store.save(hostile))
+            .await
+            .expect_err("a cross-tenant move needs both keys");
+        assert!(matches!(err, PushError::EndpointClaimed), "{err:?}");
+
+        // Same device, both keys: the row moves and changes tenant.
+        with_tenant("b".to_owned(), store.save(stored(7, LIVE_ENDPOINT)))
+            .await
+            .expect("move");
+        let a = with_tenant("a".to_owned(), store.list_for("7")).await;
+        assert!(a.expect("list").is_empty());
+        let b = with_tenant("b".to_owned(), store.list_for("7")).await;
+        assert_eq!(b.expect("list").len(), 1);
     }
 
     #[tokio::test]
@@ -549,6 +605,52 @@ mod pg {
             .await
             .expect("re-saving an existing endpoint is never capped");
         assert_eq!(store.list_for("7").await.expect("list").len(), max);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn db_store_pages_past_corrupt_rows_to_reach_healthy_ones() {
+        let (store, pool, _container) = setup().await;
+        let max = autumn_web::push::MAX_SUBSCRIPTIONS_PER_PRINCIPAL;
+
+        // A restore or a hand-written INSERT can leave more rows than the
+        // cap, with corrupt ones first. The SQL LIMIT alone would return only
+        // those corrupt rows and hide the healthy ones after them.
+        let mut conn = pool.get().await.expect("conn");
+        for i in 0..max {
+            diesel::sql_query(format!(
+                "INSERT INTO push_subscriptions (principal_id, endpoint, p256dh, auth) \
+                 VALUES ('7', 'https://push.example.com/corrupt-{i}', 'AAAA', 'AAAA')"
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("insert corrupt row");
+        }
+        for i in 0..3 {
+            diesel::sql_query(format!(
+                "INSERT INTO push_subscriptions (principal_id, endpoint, p256dh, auth) \
+                 VALUES ('7', 'https://push.example.com/healthy-{i}', '{UA_PUBLIC}', '{UA_AUTH}')"
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("insert healthy row");
+        }
+        drop(conn);
+
+        let rows = store.list_for("7").await.expect("list");
+        let endpoints: Vec<&str> = rows
+            .iter()
+            .map(autumn_web::push::StoredSubscription::endpoint)
+            .collect();
+        assert_eq!(
+            endpoints,
+            [
+                "https://push.example.com/healthy-0",
+                "https://push.example.com/healthy-1",
+                "https://push.example.com/healthy-2",
+            ],
+            "corrupt rows must neither be returned nor hide the healthy rows behind them"
+        );
     }
 
     #[tokio::test]

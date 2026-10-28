@@ -298,7 +298,9 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         &gate_ident,
         &quote! {
             #route_id_marker
-            let __autumn_throttle_headers = parts.headers.clone();
+            // Borrowed, not cloned: `__check_throttle` takes `&HeaderMap`,
+            // and this gate owns `parts` for the whole check.
+            let __autumn_throttle_headers = &parts.headers;
             // Optional because `MatchedPath` is absent for some routes
             // (fallbacks, unnested handlers). When present, the
             // runtime matched route pattern isolates an INLINE
@@ -342,7 +344,7 @@ pub fn throttle_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                     __AUTUMN_THROTTLE_ROUTE_ID,
                     __autumn_throttle_matched_path.as_ref().map(|__mp| __mp.as_str()),
                     #spec_tokens,
-                    &__autumn_throttle_headers,
+                    __autumn_throttle_headers,
                     __autumn_throttle_peer.map(|c| c.0),
                     __autumn_throttle_principal.as_ref(),
                     __autumn_throttle_session.as_ref(),
@@ -677,6 +679,14 @@ mod tests {
         assert!(
             generated.contains("__autumn_throttle_headers"),
             "should read headers from request parts:\n{generated}"
+        );
+        assert!(
+            generated.contains("__autumn_throttle_headers = & parts . headers"),
+            "the gate must borrow request headers:\n{generated}"
+        );
+        assert!(
+            !generated.contains("headers . clone ()"),
+            "the gate must borrow request headers, not clone them:\n{generated}"
         );
         assert!(
             generated.contains("ConnectInfo"),

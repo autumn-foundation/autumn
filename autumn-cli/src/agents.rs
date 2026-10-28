@@ -203,6 +203,24 @@ fn tool_changes(
             lines.push(format!("  - ungoverned MCP tool {}", describe_tool(tool)));
         }
     }
+    for tool in &current.ungoverned_webmcp_tools {
+        if !committed.ungoverned_webmcp_tools.contains(tool) {
+            lines.push(format!(
+                "  + ungoverned WebMCP tool {} [{}]{}",
+                describe_tool(tool),
+                tool.exposed_by,
+                if tool.mutating { " -- MUTATING" } else { "" }
+            ));
+        }
+    }
+    for tool in &committed.ungoverned_webmcp_tools {
+        if !current.ungoverned_webmcp_tools.contains(tool) {
+            lines.push(format!(
+                "  - ungoverned WebMCP tool {}",
+                describe_tool(tool)
+            ));
+        }
+    }
     lines
 }
 
@@ -276,23 +294,42 @@ pub fn format_ungoverned_failure(
     if allow_ungoverned {
         return None;
     }
-    let mutating = manifest.ungoverned_mutating_tools();
+    // A WebMCP tool runs in the user's own session, so it counts too (#2619).
+    // A route on both surfaces is one line.
+    let mcp = manifest.ungoverned_mutating_tools();
+    let webmcp = manifest.ungoverned_mutating_webmcp_tools();
+    let same = |a: &UngovernedTool, b: &UngovernedTool| {
+        (&a.method, &a.path, &a.tool) == (&b.method, &b.path, &b.tool)
+    };
+    let mutating: Vec<String> = mcp
+        .iter()
+        .map(|tool| {
+            let both = webmcp.iter().any(|w| same(tool, w));
+            format!(
+                "  {}{}",
+                describe_tool(tool),
+                if both { " [MCP+WebMCP]" } else { "" }
+            )
+        })
+        .chain(
+            webmcp
+                .iter()
+                .filter(|tool| !mcp.iter().any(|m| same(tool, m)))
+                .map(|tool| format!("  {} [WebMCP]", describe_tool(tool))),
+        )
+        .collect();
     if mutating.is_empty() {
         return None;
     }
-    let listed = mutating
-        .iter()
-        .map(|tool| format!("  {}", describe_tool(tool)))
-        .collect::<Vec<_>>()
-        .join("\n");
     Some(format!(
-        "\u{2717} {} MCP tool{} can change state with no authority envelope:\n{listed}\n\n\
+        "\u{2717} {} MCP or WebMCP tool{} can change state with no authority envelope:\n{}\n\n\
          An agent can call these, and nothing declares what they are allowed to do. Annotate each \
          handler with `#[agent_operable(grant = YourGrant)]` and declare the envelope with \
          `authority_grant!`, or re-run with `--allow-ungoverned` to record them as they are. \
          See docs/guide/agent-authority.md",
         mutating.len(),
         if mutating.len() == 1 { "" } else { "s" },
+        mutating.join("\n"),
     ))
 }
 
@@ -303,35 +340,37 @@ pub fn format_ungoverned_failure(
 /// failure and not the list.
 #[must_use]
 pub fn format_ungoverned_warning(manifest: &AgentAuthorityManifest) -> Option<String> {
-    if manifest.ungoverned_tools.is_empty() {
-        return None;
+    let mut blocks = Vec::new();
+    for (surface, tools) in [
+        ("MCP", &manifest.ungoverned_tools),
+        ("WebMCP", &manifest.ungoverned_webmcp_tools),
+    ] {
+        if tools.is_empty() {
+            continue;
+        }
+        let listed = tools
+            .iter()
+            .map(|tool| {
+                format!(
+                    "  {} [{}]{}",
+                    describe_tool(tool),
+                    tool.exposed_by,
+                    if tool.mutating {
+                        " -- mutating"
+                    } else {
+                        " -- read-only"
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        blocks.push(format!(
+            "! {} {surface} tool{} exposed with no authority envelope:\n{listed}",
+            tools.len(),
+            if tools.len() == 1 { "" } else { "s" },
+        ));
     }
-    let listed = manifest
-        .ungoverned_tools
-        .iter()
-        .map(|tool| {
-            format!(
-                "  {} [{}]{}",
-                describe_tool(tool),
-                tool.exposed_by,
-                if tool.mutating {
-                    " -- mutating"
-                } else {
-                    " -- read-only"
-                }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some(format!(
-        "! {} MCP tool{} exposed with no authority envelope:\n{listed}",
-        manifest.ungoverned_tools.len(),
-        if manifest.ungoverned_tools.len() == 1 {
-            ""
-        } else {
-            "s"
-        },
-    ))
+    (!blocks.is_empty()).then(|| blocks.join("\n"))
 }
 
 /// The `--check` gate on a binary that can act irreversibly with nothing
@@ -440,13 +479,18 @@ pub fn format_unregistered_failure(manifest: &AgentAuthorityManifest) -> Option<
 #[must_use]
 pub fn describe_unregistered(row: &UnregisteredAuthority) -> String {
     format!(
-        "{} {} ({}) -> {}::{}{}",
+        "{} {} ({}) -> {}::{}{}{}",
         row.method,
         row.path,
         row.handler,
         row.module_path,
         row.action,
-        if row.mcp_tool { " [mcp tool]" } else { "" }
+        if row.mcp_tool { " [mcp tool]" } else { "" },
+        if row.webmcp_tool {
+            " [webmcp tool]"
+        } else {
+            ""
+        }
     )
 }
 
@@ -529,6 +573,14 @@ fn action_changes(before: &ActionRow, after: &ActionRow) -> Vec<String> {
             before.exposure, after.exposure
         ));
     }
+    let webmcp = |row: &ActionRow| row.route.as_ref().is_some_and(|route| route.webmcp_tool);
+    if webmcp(before) != webmcp(after) {
+        lines.push(format!(
+            "      webmcp tool {} -> {}",
+            webmcp(before),
+            webmcp(after)
+        ));
+    }
     if before.provenance != after.provenance {
         // `provable` -> `declared` means someone wrote an effect down by hand.
         // That is legal, and it is exactly the change a reviewer must see.
@@ -604,16 +656,10 @@ pub fn run(opts: &AgentsManifestOptions<'_>) {
     routes::compile_binary_with(opts.package, opts.bin, &opts.features, &profile);
     let binary = routes::find_binary_in_profile(opts.package, opts.bin, &profile);
 
-    let output = Command::new(&binary)
-        .env(DUMP_ENV, "1")
-        // Every one of these is checked BEFORE the agent-authority dump in
-        // `AppBuilder::run`, so an exported one in the ambient environment
-        // would silently win and hand us a marker-less stdout.
-        .env_remove("AUTUMN_BUILD_STATIC")
-        .env_remove("AUTUMN_DUMP_ROUTES")
-        .env_remove("AUTUMN_DUMP_CACHE_COHERENCE")
-        .env_remove("AUTUMN_DUMP_DATA_FLOW")
-        .env_remove("AUTUMN_DUMP_JOBS")
+    let mut command = Command::new(&binary);
+    command.env(DUMP_ENV, "1");
+    routes::clear_other_dump_modes(&mut command, DUMP_ENV);
+    let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
@@ -816,8 +862,76 @@ mod tests {
             // The fixtures speak in terms of "is a tool"; how it got that way
             // is the hatch tests' business, and they set it explicitly.
             exposed_by: mcp_tool.then_some(McpExposedBy::Attribute),
+            duplicate_operation_id: false,
+            webmcp_tool: false,
+            webmcp_exposed_by: None,
             agent_authority: authority,
         }
+    }
+
+    /// A `WebMCP` tool (#2619) with no `/mcp` exposure.
+    fn webmcp_route(method: &str, path: &str, handler: &'static str) -> RouteSummary {
+        let mut r = route(method, path, handler, "shop::widgets", false, None);
+        r.webmcp_tool = true;
+        r.webmcp_exposed_by = Some(McpExposedBy::Attribute);
+        r
+    }
+
+    #[test]
+    fn a_mutating_webmcp_tool_with_no_envelope_fails_the_check() {
+        let manifest = manifest_of(
+            &[],
+            &[webmcp_route("DELETE", "/widgets/{id}", "destroy_widget")],
+        );
+        let failure = format_ungoverned_failure(&manifest, false)
+            .expect("an ungoverned WebMCP write must fail the gate");
+        assert!(failure.contains("WebMCP"), "{failure}");
+        assert!(failure.contains("destroy_widget"), "{failure}");
+        assert!(failure.contains("--allow-ungoverned"), "{failure}");
+        assert!(format_ungoverned_failure(&manifest, true).is_none());
+        let warning = format_ungoverned_warning(&manifest).expect("warning");
+        assert!(warning.contains("WebMCP"), "{warning}");
+        assert!(warning.contains("destroy_widget"), "{warning}");
+    }
+
+    #[test]
+    fn a_route_on_both_surfaces_fails_once() {
+        let mut both = webmcp_route("DELETE", "/widgets/{id}", "destroy_widget");
+        both.mcp_tool = true;
+        both.exposed_by = Some(McpExposedBy::Attribute);
+        let manifest = manifest_of(&[], &[both]);
+        let failure = format_ungoverned_failure(&manifest, false).expect("failure");
+        assert!(failure.contains("1 MCP or WebMCP tool can"), "{failure}");
+        assert!(failure.contains("[MCP+WebMCP]"), "{failure}");
+    }
+
+    #[test]
+    fn a_webmcp_flag_change_on_a_row_is_named_in_the_drift() {
+        let before = manifest_of(&[&DRAFT_REFUND], &[governed_route(&DRAFT_REFUND)]);
+        let mut route = governed_route(&DRAFT_REFUND);
+        route.webmcp_tool = true;
+        route.webmcp_exposed_by = Some(McpExposedBy::Attribute);
+        let after = manifest_of(&[&DRAFT_REFUND], &[route]);
+        let drift = format_drift(&before, &after).expect("drift");
+        assert!(drift.contains("webmcp tool false -> true"), "{drift}");
+    }
+
+    #[test]
+    fn a_read_only_webmcp_tool_warns_but_does_not_fail() {
+        let manifest = manifest_of(&[], &[webmcp_route("GET", "/widgets", "list_widgets")]);
+        assert!(format_ungoverned_failure(&manifest, false).is_none());
+        let warning = format_ungoverned_warning(&manifest).expect("warning");
+        assert!(warning.contains("list_widgets"), "{warning}");
+    }
+
+    #[test]
+    fn a_new_ungoverned_webmcp_tool_is_named_in_the_drift_report() {
+        let before = manifest_of(&[], &[]);
+        let after = manifest_of(&[], &[webmcp_route("POST", "/widgets", "make_widget")]);
+        let drift = format_drift(&before, &after).expect("drift");
+        assert!(drift.contains("+ ungoverned WebMCP tool"), "{drift}");
+        let back = format_drift(&after, &before).expect("drift");
+        assert!(back.contains("- ungoverned WebMCP tool"), "{back}");
     }
 
     fn governed_route(authority: &'static AgentAuthority) -> RouteSummary {

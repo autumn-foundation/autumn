@@ -8,8 +8,8 @@
 //! produced — reusing [`ColumnType::from_rust_type`] for the field-type mapping
 //! and the CLI's own [`naming::pluralize`] / [`naming::pascal_to_snake`] for
 //! table-name inference so the parser and the generator can never drift on those
-//! two axes. It emits **no** migration, `schema.rs`, or codegen output; those are
-//! later slices.
+//! two axes. It writes nothing; [`super::diff`] and [`super::schema_rs`] use
+//! its output.
 //!
 //! # Recognized `#[model]` vocabulary
 //!
@@ -17,19 +17,21 @@
 //! - `table = "..."` — explicit table-name override (mirrors the macro's one
 //!   real argument; see `autumn_macros`'s `parse_attr_args`).
 //! - `managed` (also accepted as `schema = "managed"`) — the Decision-4 adoption
-//!   marker recorded on [`Table::managed`]. NOTE: this is a **parser-recognized**
-//!   marker for the declarative-schema wave; the runtime `#[model]` macro does
-//!   not yet accept it as an argument. Any other nested argument is ignored
+//!   marker recorded on [`Table::managed`]. The `#[model]` macro accepts it
+//!   and ignores it for codegen (#2014). Any other nested argument is ignored
 //!   (forward-compatible).
 //!
 //! Field-level:
+//! - The column name is the `#[diesel(column_name = ...)]` value, else the field
+//!   name without a raw `r#` prefix (the `#[model]` macro rule).
 //! - `#[id]` — primary-key column (macro PK resolution is mirrored: explicit
 //!   `#[id]` fields win, else the first `i32`/`i64` field, else a reserved `id`).
 //! - `#[indexed]` — a non-unique secondary index on the column.
 //! - `#[default]` — a column default. Convention defaults the generator emits are
 //!   recovered by [`convention_default`]: the reserved `created_at` column *marked
 //!   `#[default]`* gets a `NOW()` default (→ [`ColumnDefault::Now`]) and a UUID
-//!   primary key on Postgres gets `gen_random_uuid()` (→ [`ColumnDefault::Sql`]).
+//!   primary key gets `gen_random_uuid()` on Postgres or the `randomblob` v4
+//!   expression on `SQLite` (→ [`ColumnDefault::Sql`]).
 //!   The `created_at` `NOW()` convention requires the generator's `#[default]`
 //!   marker — a hand-written `created_at` without `#[default]` gets no inferred
 //!   default. Every other `#[default]` field carries no inferred DB default (their
@@ -45,6 +47,10 @@
 //! - `#[unique]` — a `UNIQUE` column + unique index. Also **parser-recognized**:
 //!   generator output records uniqueness only in the migration (a `CREATE UNIQUE
 //!   INDEX`), not on the struct field (see the slice-3+ limitation below).
+//! - `#[renamed_from("old")]` — a rename hint, on a field (column) or on the
+//!   struct (table). It does not change the [`Table`]; it goes to
+//!   [`ParsedSchema::renames`] for the diff engine (see
+//!   [`crate::schema::rename`]). A malformed hint is ignored.
 //!
 //! Every other field attribute the `#[model]` macro accepts (`#[searchable]`,
 //! `#[validate]`, `#[encrypted]`, `#[private]`, `#[normalize]`, `#[lock_version]`,
@@ -89,7 +95,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use autumn_schema_core::{
-    Backend, Column, ColumnDefault, ColumnType, ForeignKey, Index, SerialKind, Table,
+    Backend, Column, ColumnDefault, ColumnType, ForeignKey, ForeignKeyAction, Index, SerialKind,
+    Table,
 };
 
 use crate::generate::naming;
@@ -110,6 +117,19 @@ pub enum SchemaParseError {
         line: usize,
         /// 1-based column of the error span.
         column: usize,
+    },
+    /// Two models map one column to different `#[encrypted]` modes. Taking
+    /// either would re-encrypt the column in a mode the application may not
+    /// read.
+    #[error(
+        "{table}.{column} is #[encrypted] in both modes by different models; \
+         remove the model that is not production code"
+    )]
+    ConflictingEncryptedMode {
+        /// The table both models map to.
+        table: String,
+        /// The column both models encrypt.
+        column: String,
     },
     /// A models file or directory could not be read.
     #[error("failed to read {path}: {source}")]
@@ -163,6 +183,24 @@ pub struct ParsedSchema {
     pub tables: Vec<Table>,
     /// Fields that could not be resolved (see [`SchemaDiagnostic`]).
     pub diagnostics: Vec<SchemaDiagnostic>,
+    /// `#[renamed_from("...")]` hints, in source order. Diff input only; a
+    /// snapshot never stores them.
+    pub renames: Vec<RenameHint>,
+    /// `(table, column)` for each column that the parser adds and the struct
+    /// does not declare (the convention `created_at`). The `#[model]` macro
+    /// does not read these columns.
+    pub implicit_columns: Vec<(String, String)>,
+}
+
+/// A `#[renamed_from("old")]` hint on a model or a field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameHint {
+    /// The new (desired) table name.
+    pub table: String,
+    /// The new (desired) column name. `None` for a table rename.
+    pub column: Option<String>,
+    /// The old name.
+    pub from: String,
 }
 
 impl ParsedSchema {
@@ -184,6 +222,8 @@ impl ParsedSchema {
         Self {
             tables,
             diagnostics: Vec::new(),
+            renames: Vec::new(),
+            implicit_columns: Vec::new(),
         }
     }
 }
@@ -196,15 +236,22 @@ impl ParsedSchema {
 /// Returns [`SchemaParseError::Syntax`] if `src` is not valid Rust.
 pub fn parse_model_source(src: &str, backend: Backend) -> Result<ParsedSchema, SchemaParseError> {
     let file = syn::parse_file(src).map_err(|e| SchemaParseError::from_syn(&e))?;
-    let mut out = ParsedSchema {
-        tables: Vec::new(),
-        diagnostics: Vec::new(),
-    };
+    let mut out = ParsedSchema::from_tables(Vec::new());
     for item in &file.items {
         if let syn::Item::Struct(item_struct) = item
             && let Some(model_attr) = find_model_attr(&item_struct.attrs)
         {
             let table = build_table(item_struct, model_attr, backend, &mut out.diagnostics);
+            out.renames.extend(rename_hints(item_struct, &table.name));
+            let declares_created_at = item_struct.fields.iter().any(|f| {
+                f.ident
+                    .as_ref()
+                    .is_some_and(|ident| field_column_name(f, ident) == "created_at")
+            });
+            if !declares_created_at && table.columns.iter().any(|c| c.name == "created_at") {
+                out.implicit_columns
+                    .push((table.name.clone(), "created_at".to_owned()));
+            }
             out.tables.push(table);
         }
     }
@@ -244,10 +291,7 @@ pub fn parse_models_dir(dir: &Path, backend: Backend) -> Result<ParsedSchema, Sc
     // Deterministic aggregation regardless of directory iteration order.
     paths.sort();
 
-    let mut out = ParsedSchema {
-        tables: Vec::new(),
-        diagnostics: Vec::new(),
-    };
+    let mut out = ParsedSchema::from_tables(Vec::new());
     for path in paths {
         let src = std::fs::read_to_string(&path).map_err(|source| SchemaParseError::Io {
             path: path.display().to_string(),
@@ -256,6 +300,8 @@ pub fn parse_models_dir(dir: &Path, backend: Backend) -> Result<ParsedSchema, Sc
         let mut parsed = parse_model_source(&src, backend)?;
         out.tables.append(&mut parsed.tables);
         out.diagnostics.append(&mut parsed.diagnostics);
+        out.renames.append(&mut parsed.renames);
+        out.implicit_columns.append(&mut parsed.implicit_columns);
     }
     Ok(out)
 }
@@ -315,33 +361,369 @@ pub fn parse_encrypted_columns(
     src: &str,
 ) -> Result<BTreeMap<String, BTreeMap<String, bool>>, SchemaParseError> {
     let file = syn::parse_file(src).map_err(|e| SchemaParseError::from_syn(&e))?;
-    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
-    for item in &file.items {
-        let syn::Item::Struct(item_struct) = item else {
-            continue;
-        };
-        let Some(model_attr) = find_model_attr(&item_struct.attrs) else {
-            continue;
-        };
-        let syn::Fields::Named(named) = &item_struct.fields else {
-            continue;
-        };
-        let model_name = item_struct.ident.to_string();
-        let table = parse_model_args(model_attr)
-            .table
-            .unwrap_or_else(|| naming::pluralize(&naming::pascal_to_snake(&model_name)));
-        for field in &named.named {
-            let Some(ident) = field.ident.as_ref() else {
-                continue;
+    let mut scan = EncryptedScan::default();
+    if production_enabled(&file.attrs) {
+        syn::visit::Visit::visit_file(&mut scan, &file);
+    }
+    if let Some((table, column)) = scan.conflict {
+        return Err(SchemaParseError::ConflictingEncryptedMode { table, column });
+    }
+    Ok(scan.found)
+}
+
+/// The attributes of a `syn::Item`, or none for a kind without any.
+pub fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Mod(i) => &i.attrs,
+        syn::Item::Fn(i) => &i.attrs,
+        syn::Item::Impl(i) => &i.attrs,
+        syn::Item::Const(i) => &i.attrs,
+        syn::Item::Static(i) => &i.attrs,
+        syn::Item::Trait(i) => &i.attrs,
+        syn::Item::Enum(i) => &i.attrs,
+        syn::Item::Type(i) => &i.attrs,
+        syn::Item::Union(i) => &i.attrs,
+        syn::Item::Struct(i) => &i.attrs,
+        syn::Item::ForeignMod(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::ForeignItem`, or none for a kind without any.
+pub fn foreign_item_attrs(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(i) => &i.attrs,
+        syn::ForeignItem::Static(i) => &i.attrs,
+        syn::ForeignItem::Type(i) => &i.attrs,
+        syn::ForeignItem::Macro(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::Pat`, or none for a kind without any.
+pub fn pat_attrs(pat: &syn::Pat) -> &[syn::Attribute] {
+    match pat {
+        syn::Pat::Const(p) => &p.attrs,
+        syn::Pat::Ident(p) => &p.attrs,
+        syn::Pat::Lit(p) => &p.attrs,
+        syn::Pat::Macro(p) => &p.attrs,
+        syn::Pat::Or(p) => &p.attrs,
+        syn::Pat::Paren(p) => &p.attrs,
+        syn::Pat::Path(p) => &p.attrs,
+        syn::Pat::Range(p) => &p.attrs,
+        syn::Pat::Reference(p) => &p.attrs,
+        syn::Pat::Rest(p) => &p.attrs,
+        syn::Pat::Slice(p) => &p.attrs,
+        syn::Pat::Struct(p) => &p.attrs,
+        syn::Pat::Tuple(p) => &p.attrs,
+        syn::Pat::TupleStruct(p) => &p.attrs,
+        syn::Pat::Type(p) => &p.attrs,
+        syn::Pat::Wild(p) => &p.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::GenericParam`.
+pub fn generic_param_attrs(param: &syn::GenericParam) -> &[syn::Attribute] {
+    match param {
+        syn::GenericParam::Lifetime(p) => &p.attrs,
+        syn::GenericParam::Type(p) => &p.attrs,
+        syn::GenericParam::Const(p) => &p.attrs,
+    }
+}
+
+/// The attributes of a `syn::FnArg`.
+pub fn fn_arg_attrs(arg: &syn::FnArg) -> &[syn::Attribute] {
+    match arg {
+        syn::FnArg::Receiver(r) => &r.attrs,
+        syn::FnArg::Typed(t) => &t.attrs,
+    }
+}
+
+/// The attributes of a `syn::TraitItem`, or none for a kind without any.
+pub fn trait_item_attrs(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Fn(i) => &i.attrs,
+        syn::TraitItem::Const(i) => &i.attrs,
+        syn::TraitItem::Type(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::ImplItem`, or none for a kind without any.
+pub fn impl_item_attrs(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Fn(i) => &i.attrs,
+        syn::ImplItem::Const(i) => &i.attrs,
+        syn::ImplItem::Type(i) => &i.attrs,
+        _ => &[],
+    }
+}
+
+/// The attributes of a `syn::Expr`, or none for a kind without any.
+pub fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    match expr {
+        syn::Expr::Array(e) => &e.attrs,
+        syn::Expr::Assign(e) => &e.attrs,
+        syn::Expr::Async(e) => &e.attrs,
+        syn::Expr::Await(e) => &e.attrs,
+        syn::Expr::Binary(e) => &e.attrs,
+        syn::Expr::Block(e) => &e.attrs,
+        syn::Expr::Break(e) => &e.attrs,
+        syn::Expr::Call(e) => &e.attrs,
+        syn::Expr::Cast(e) => &e.attrs,
+        syn::Expr::Closure(e) => &e.attrs,
+        syn::Expr::Const(e) => &e.attrs,
+        syn::Expr::Continue(e) => &e.attrs,
+        syn::Expr::Field(e) => &e.attrs,
+        syn::Expr::ForLoop(e) => &e.attrs,
+        syn::Expr::Group(e) => &e.attrs,
+        syn::Expr::If(e) => &e.attrs,
+        syn::Expr::Index(e) => &e.attrs,
+        syn::Expr::Infer(e) => &e.attrs,
+        syn::Expr::Let(e) => &e.attrs,
+        syn::Expr::Lit(e) => &e.attrs,
+        syn::Expr::Loop(e) => &e.attrs,
+        syn::Expr::Macro(e) => &e.attrs,
+        syn::Expr::Match(e) => &e.attrs,
+        syn::Expr::MethodCall(e) => &e.attrs,
+        syn::Expr::Paren(e) => &e.attrs,
+        syn::Expr::Path(e) => &e.attrs,
+        syn::Expr::Range(e) => &e.attrs,
+        syn::Expr::RawAddr(e) => &e.attrs,
+        syn::Expr::Reference(e) => &e.attrs,
+        syn::Expr::Repeat(e) => &e.attrs,
+        syn::Expr::Return(e) => &e.attrs,
+        syn::Expr::Struct(e) => &e.attrs,
+        syn::Expr::Try(e) => &e.attrs,
+        syn::Expr::TryBlock(e) => &e.attrs,
+        syn::Expr::Tuple(e) => &e.attrs,
+        syn::Expr::Unary(e) => &e.attrs,
+        syn::Expr::Unsafe(e) => &e.attrs,
+        syn::Expr::While(e) => &e.attrs,
+        syn::Expr::Yield(e) => &e.attrs,
+
+        _ => &[],
+    }
+}
+
+/// Whether the `#[cfg(...)]` attributes leave an item in a production build.
+///
+/// Only `test` is known to be off, and `not`, `all` and `any` combine it. Other
+/// predicates (a feature, a target) are unknown and count as on. This keeps a
+/// registration the app might have: scrubbing too much is the safe error.
+pub fn production_enabled(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().all(|a| {
+        if a.path().is_ident("cfg") {
+            a.parse_args::<syn::Meta>()
+                .map_or(true, |m| cfg_value(&m) != Some(false))
+        } else if a.path().is_ident("cfg_attr") {
+            cfg_attr_keeps_item(a)
+        } else {
+            true
+        }
+    })
+}
+
+/// `#[cfg_attr(pred, cfg(...))]` adds a `cfg` when `pred` holds. It disables the
+/// item only when `pred` is known true and an added `cfg` is known false.
+fn cfg_attr_keeps_item(attr: &syn::Attribute) -> bool {
+    use syn::punctuated::Punctuated;
+
+    let Ok(args) = attr.parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+    else {
+        return true;
+    };
+    let mut args = args.into_iter();
+    let Some(predicate) = args.next() else {
+        return true;
+    };
+    if cfg_value(&predicate) != Some(true) {
+        return true;
+    }
+    args.all(|meta| match &meta {
+        syn::Meta::List(list) if list.path.is_ident("cfg") => list
+            .parse_args::<syn::Meta>()
+            .map_or(true, |m| cfg_value(&m) != Some(false)),
+        // `cfg_attr` can add another `cfg_attr`.
+        syn::Meta::List(list) if list.path.is_ident("cfg_attr") => {
+            let inner = syn::Attribute {
+                pound_token: attr.pound_token,
+                style: attr.style,
+                bracket_token: attr.bracket_token,
+                meta: syn::Meta::List(list.clone()),
             };
-            if let Some(attr) = field.attrs.iter().find(|a| is_encrypted_attr(a)) {
-                out.entry(table.clone())
-                    .or_default()
-                    .insert(ident.to_string(), is_deterministic_encrypted(attr));
+            cfg_attr_keeps_item(&inner)
+        }
+        _ => true,
+    })
+}
+
+/// A `cfg` predicate's value when it is known without the build's settings.
+fn cfg_value(meta: &syn::Meta) -> Option<bool> {
+    use syn::punctuated::Punctuated;
+
+    match meta {
+        syn::Meta::Path(path) if path.is_ident("test") => Some(false),
+        syn::Meta::List(list) => {
+            let inner: Vec<Option<bool>> = list
+                .parse_args_with(Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated)
+                .ok()?
+                .iter()
+                .map(cfg_value)
+                .collect();
+            if list.path.is_ident("not") {
+                inner.first().copied().flatten().map(|v| !v)
+            } else if list.path.is_ident("all") {
+                if inner.contains(&Some(false)) {
+                    Some(false)
+                } else if inner.iter().all(|v| *v == Some(true)) {
+                    Some(true)
+                } else {
+                    None
+                }
+            } else if list.path.is_ident("any") {
+                if inner.contains(&Some(true)) {
+                    Some(true)
+                } else if inner.iter().all(|v| *v == Some(false)) {
+                    // Includes the empty `any()`, which Rust defines as false.
+                    Some(false)
+                } else {
+                    None
+                }
+            } else {
+                None
             }
         }
+        _ => None,
     }
-    Ok(out)
+}
+
+/// Collects `#[encrypted]` fields from every production `#[model]` struct, however deeply
+/// its module is nested.
+#[derive(Default)]
+struct EncryptedScan {
+    found: BTreeMap<String, BTreeMap<String, bool>>,
+    /// The first column two models encrypt in different modes.
+    conflict: Option<(String, String)>,
+}
+
+impl<'ast> syn::visit::Visit<'ast> for EncryptedScan {
+    fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        if production_enabled(&module.attrs) {
+            syn::visit::visit_item_mod(self, module);
+        }
+    }
+
+    // A test-only item or expression can hold a fixture model. Skip it whole.
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        if production_enabled(item_attrs(item)) {
+            syn::visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        if production_enabled(trait_item_attrs(item)) {
+            syn::visit::visit_trait_item(self, item);
+        }
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        if production_enabled(impl_item_attrs(item)) {
+            syn::visit::visit_impl_item(self, item);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if production_enabled(expr_attrs(expr)) {
+            syn::visit::visit_expr(self, expr);
+        }
+    }
+
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if production_enabled(&local.attrs) {
+            syn::visit::visit_local(self, local);
+        }
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if production_enabled(&arm.attrs) {
+            syn::visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        if production_enabled(foreign_item_attrs(item)) {
+            syn::visit::visit_foreign_item(self, item);
+        }
+    }
+
+    fn visit_pat(&mut self, pat: &'ast syn::Pat) {
+        if production_enabled(pat_attrs(pat)) {
+            syn::visit::visit_pat(self, pat);
+        }
+    }
+
+    fn visit_generic_param(&mut self, param: &'ast syn::GenericParam) {
+        if production_enabled(generic_param_attrs(param)) {
+            syn::visit::visit_generic_param(self, param);
+        }
+    }
+
+    fn visit_fn_arg(&mut self, arg: &'ast syn::FnArg) {
+        if production_enabled(fn_arg_attrs(arg)) {
+            syn::visit::visit_fn_arg(self, arg);
+        }
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if production_enabled(&field.attrs) {
+            syn::visit::visit_field(self, field);
+        }
+    }
+
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if production_enabled(&variant.attrs) {
+            syn::visit::visit_variant(self, variant);
+        }
+    }
+
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if production_enabled(&field.attrs) {
+            syn::visit::visit_field_value(self, field);
+        }
+    }
+
+    fn visit_item_struct(&mut self, item_struct: &'ast syn::ItemStruct) {
+        if !production_enabled(&item_struct.attrs) {
+            return;
+        }
+        if let Some(model_attr) = find_model_attr(&item_struct.attrs)
+            && let syn::Fields::Named(named) = &item_struct.fields
+        {
+            let model_name = item_struct.ident.to_string();
+            let table = parse_model_args(model_attr)
+                .table
+                .unwrap_or_else(|| naming::pluralize(&naming::pascal_to_snake(&model_name)));
+            for field in &named.named {
+                let Some(ident) = field.ident.as_ref() else {
+                    continue;
+                };
+                if !production_enabled(&field.attrs) {
+                    continue;
+                }
+                if let Some(attr) = field.attrs.iter().find(|a| is_encrypted_attr(a)) {
+                    let column = field_column_name(field, ident);
+                    let deterministic = is_deterministic_encrypted(attr);
+                    let known = self.found.entry(table.clone()).or_default();
+                    if known.insert(column.clone(), deterministic) == Some(!deterministic) {
+                        self.conflict.get_or_insert_with(|| (table.clone(), column));
+                    }
+                }
+            }
+        }
+        syn::visit::visit_item_struct(self, item_struct);
+    }
 }
 
 /// Read the `#[encrypted]` column set from a models file or directory, using the
@@ -354,17 +736,179 @@ pub fn parse_encrypted_columns(
 pub fn parse_encrypted_columns_path(
     path: &Path,
 ) -> Result<BTreeMap<String, BTreeMap<String, bool>>, SchemaParseError> {
-    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+    let mut sources = Vec::new();
     for file in model_source_files(path)? {
         let src = std::fs::read_to_string(&file).map_err(|source| SchemaParseError::Io {
             path: file.display().to_string(),
             source,
         })?;
-        for (table, columns) in parse_encrypted_columns(&src)? {
-            out.entry(table).or_default().extend(columns);
+        sources.push((file, src));
+    }
+    // A file reached only through `#[cfg(test)] mod x;` is test code.
+    let disabled = disabled_module_paths(&sources);
+    let mut out: BTreeMap<String, BTreeMap<String, bool>> = BTreeMap::new();
+    for (file, src) in &sources {
+        if disabled.excludes(file) {
+            continue;
+        }
+        for (table, columns) in parse_encrypted_columns(src)? {
+            let known = out.entry(table.clone()).or_default();
+            for (column, deterministic) in columns {
+                if known.insert(column.clone(), deterministic) == Some(!deterministic) {
+                    return Err(SchemaParseError::ConflictingEncryptedMode { table, column });
+                }
+            }
         }
     }
     Ok(out)
+}
+
+/// The paths that `cfg`-disabled modules would load, across a set of source
+/// files `(path, source)`.
+///
+/// A `lib`, `main` or `mod` file owns its own directory; any other file owns a
+/// directory named for its stem. A module inside a disabled inline module is
+/// disabled too, and an inline module adds its name to the path. A path that any
+/// enabled declaration also loads, in any file (`lib.rs` and `main.rs` are two
+/// crate roots), is production code and is left out. A source that does not
+/// parse adds nothing: the caller reports that.
+#[must_use]
+pub fn disabled_module_paths(sources: &[(std::path::PathBuf, String)]) -> DisabledModules {
+    let mut active: Vec<&(std::path::PathBuf, String)> = sources.iter().collect();
+    // A declaration inside a test-only file does not enable anything, so repeat
+    // without the files the last round excluded. The set only shrinks.
+    loop {
+        let mut found = ModulePaths::default();
+        for (file, src) in &active {
+            let Ok(parsed) = syn::parse_file(src) else {
+                continue;
+            };
+            let stem = file
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let parent = file.parent().unwrap_or_else(|| Path::new(""));
+            let module_dir = if matches!(stem, "lib" | "main" | "mod") {
+                parent.to_path_buf()
+            } else {
+                parent.join(stem)
+            };
+            collect_module_paths(
+                &parsed.items,
+                (&module_dir, parent),
+                !production_enabled(&parsed.attrs),
+                &mut found,
+            );
+        }
+        let modules = DisabledModules {
+            disabled: found.disabled,
+            enabled: found.enabled,
+        };
+        let before = active.len();
+        active.retain(|(file, _)| !modules.excludes(file));
+        if active.len() == before {
+            return modules;
+        }
+    }
+}
+
+/// The paths `cfg`-disabled and enabled modules load, from
+/// [`disabled_module_paths`].
+pub struct DisabledModules {
+    disabled: Vec<std::path::PathBuf>,
+    enabled: Vec<std::path::PathBuf>,
+}
+
+impl DisabledModules {
+    /// Whether `file` is test code: under a disabled path, and not under a more
+    /// specific path that an enabled declaration loads (`#[cfg(test)] mod
+    /// fixtures;` beside `#[path = "fixtures/models.rs"] mod models;`).
+    #[must_use]
+    pub fn excludes(&self, file: &Path) -> bool {
+        self.disabled.iter().any(|d| {
+            file.starts_with(d)
+                && !self
+                    .enabled
+                    .iter()
+                    .any(|e| file.starts_with(e) && e.starts_with(d))
+        })
+    }
+}
+
+/// `path` with `.` and `..` folded away, without touching the file system. A
+/// `#[path = "a/../b.rs"]` then compares equal to the walked file `b.rs`.
+fn normalize_lexically(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+#[derive(Default)]
+struct ModulePaths {
+    disabled: Vec<std::path::PathBuf>,
+    enabled: Vec<std::path::PathBuf>,
+}
+
+/// `dirs` is the directory that holds module files, and the base a `#[path]`
+/// attribute resolves against.
+fn collect_module_paths(
+    items: &[syn::Item],
+    dirs: (&Path, &Path),
+    parent_disabled: bool,
+    out: &mut ModulePaths,
+) {
+    let (dir, path_base) = dirs;
+    // The paths a module loads: its `#[path]`, else the conventional pair.
+    let paths_of = |module: &syn::ItemMod| -> Vec<std::path::PathBuf> {
+        let custom = module
+            .attrs
+            .iter()
+            .filter(|a| a.path().is_ident("path"))
+            .find_map(|a| match &a.meta {
+                syn::Meta::NameValue(nv) => match &nv.value {
+                    syn::Expr::Lit(syn::ExprLit {
+                        lit: syn::Lit::Str(path),
+                        ..
+                    }) => Some(path.value()),
+                    _ => None,
+                },
+                _ => None,
+            });
+        custom.map_or_else(
+            || {
+                vec![
+                    dir.join(format!("{}.rs", module.ident)),
+                    dir.join(module.ident.to_string()),
+                ]
+            },
+            |custom| vec![normalize_lexically(&path_base.join(custom))],
+        )
+    };
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        let disabled = parent_disabled || !production_enabled(&module.attrs);
+        match &module.content {
+            None if disabled => out.disabled.extend(paths_of(module)),
+            None => out.enabled.extend(paths_of(module)),
+            Some((_, nested)) => {
+                let nested_dir = dir.join(module.ident.to_string());
+                collect_module_paths(nested, (&nested_dir, &nested_dir), disabled, out);
+            }
+        }
+    }
 }
 
 /// The `.rs` sources a models path expands to: the file itself, or every `*.rs`
@@ -389,6 +933,7 @@ fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaPars
     }
     let mut paths = Vec::new();
     let mut stack = vec![path.to_path_buf()];
+    let root_depth = path.components().count();
     while let Some(dir) = stack.pop() {
         let read = std::fs::read_dir(&dir).map_err(|source| SchemaParseError::Io {
             path: dir.display().to_string(),
@@ -400,18 +945,29 @@ fn model_source_files(path: &Path) -> Result<Vec<std::path::PathBuf>, SchemaPars
                 source,
             })?;
             let candidate = entry.path();
-            let file_type = entry.file_type().map_err(|source| SchemaParseError::Io {
-                path: candidate.display().to_string(),
-                source,
-            })?;
-            if file_type.is_dir() {
-                stack.push(candidate);
-            } else if file_type.is_file() && candidate.extension().is_some_and(|ext| ext == "rs") {
+            // `metadata` follows a symlink, as `Path::is_dir` does for the
+            // models path itself. A dangling link has no metadata and is skipped.
+            let Ok(meta) = std::fs::metadata(&candidate) else {
+                continue;
+            };
+            if meta.is_dir() {
+                // A link to the directory being read, or to one above it, would
+                // loop the walk. Two links to one shared directory are distinct
+                // paths (`fixtures` and `models`), so each is walked.
+                let target =
+                    std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+                let here = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+                let too_deep = candidate.components().count() > root_depth + 64;
+                if !here.starts_with(&target) && !too_deep {
+                    stack.push(candidate);
+                }
+            } else if meta.is_file() && candidate.extension().is_some_and(|ext| ext == "rs") {
                 paths.push(candidate);
             }
         }
     }
     paths.sort();
+    paths.dedup();
     Ok(paths)
 }
 
@@ -445,6 +1001,90 @@ fn is_deterministic_encrypted(attr: &syn::Attribute) -> bool {
         Ok(())
     });
     deterministic
+}
+
+/// The `#[renamed_from("old")]` hints on one `#[model]` struct: the table hint
+/// first, then the field hints in field order.
+fn rename_hints(item: &syn::ItemStruct, table: &str) -> Vec<RenameHint> {
+    let mut out = Vec::new();
+    if let Some(from) = renamed_from(&item.attrs) {
+        out.push(RenameHint {
+            table: table.to_owned(),
+            column: None,
+            from,
+        });
+    }
+    if let syn::Fields::Named(named) = &item.fields {
+        for field in &named.named {
+            if let (Some(ident), Some(from)) = (&field.ident, renamed_from(&field.attrs)) {
+                out.push(RenameHint {
+                    table: table.to_owned(),
+                    column: Some(field_column_name(field, ident)),
+                    from,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The SQL column of a field: the `#[diesel(column_name = ...)]` value, else
+/// the field name without a raw `r#` prefix. This is the rule of the `#[model]`
+/// macro and of diesel.
+///
+/// The scan reads the tokens of the list, so another key with a type value
+/// (`deserialize_as = Vec<u8>`) does not stop it. (The macro's own detector
+/// stops at such a key; diesel does not.)
+fn field_column_name(field: &syn::Field, ident: &syn::Ident) -> String {
+    use proc_macro2::TokenTree;
+    for attr in field.attrs.iter().filter(|a| a.path().is_ident("diesel")) {
+        let syn::Meta::List(list) = &attr.meta else {
+            continue;
+        };
+        let tokens: Vec<TokenTree> = list.tokens.clone().into_iter().collect();
+        for window in tokens.windows(3) {
+            let [TokenTree::Ident(key), TokenTree::Punct(eq), value] = window else {
+                continue;
+            };
+            if key != "column_name" || eq.as_char() != '=' {
+                continue;
+            }
+            match value {
+                TokenTree::Ident(name) => return unraw(name),
+                TokenTree::Literal(literal) => {
+                    if let Ok(text) = syn::parse_str::<syn::LitStr>(&literal.to_string()) {
+                        return text.value();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    unraw(ident)
+}
+
+/// The identifier without a raw `r#` prefix.
+fn unraw(ident: &syn::Ident) -> String {
+    let raw = ident.to_string();
+    raw.strip_prefix("r#").unwrap_or(&raw).to_owned()
+}
+
+/// The old name in `#[renamed_from("old")]`. `None` unless `attrs` holds exactly
+/// one such attribute with one plain identifier. The macro rejects other shapes
+/// at compile time; the parser ignores them, so a bad name never reaches SQL.
+fn renamed_from(attrs: &[syn::Attribute]) -> Option<String> {
+    let mut found = attrs.iter().filter(|a| a.path().is_ident("renamed_from"));
+    let attr = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let syn::Meta::List(list) = &attr.meta else {
+        return None;
+    };
+    let name = syn::parse2::<syn::LitStr>(list.tokens.clone())
+        .ok()?
+        .value();
+    crate::schema::rename::is_plain_identifier(&name).then_some(name)
 }
 
 /// Find the `#[model]` / `#[autumn_web::model]` attribute on a struct, if any.
@@ -533,6 +1173,16 @@ struct FieldAttrs {
     /// empty-document default.
     is_collaborative: bool,
     reference: ReferenceSpec,
+    /// `#[references(on_delete = "...")]`. `None` is `NO ACTION`.
+    on_delete: Option<ForeignKeyAction>,
+    /// `#[references(on_update = "...")]`. `None` is `NO ACTION`.
+    on_update: Option<ForeignKeyAction>,
+    /// An unknown action value. The parser skips the column and records a
+    /// diagnostic.
+    reference_error: Option<String>,
+    /// `#[decimal_shape(precision = p, scale = s)]` (issue #2598): the declared
+    /// `decimal{p,s}`, or the problem with a bad attribute.
+    decimal_shape: Option<Result<(u8, u8), String>>,
 }
 
 /// The SQL default a `#[translatable]` column's storage requires — the empty
@@ -555,6 +1205,10 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
         is_translatable: false,
         is_collaborative: false,
         reference: ReferenceSpec::None,
+        on_delete: None,
+        on_update: None,
+        reference_error: None,
+        decimal_shape: None,
     };
     for attr in &field.attrs {
         let Some(ident) = attr.path().get_ident() else {
@@ -579,19 +1233,35 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
             // #1806: same storage contract as `#[translatable]` — `TEXT NOT
             // NULL` with an empty-container default the type cannot carry.
             "collaborative" => out.is_collaborative = true,
+            // #2598: the first good attribute wins, as in the `#[model]`
+            // macro. A bad attribute counts only when no good one follows.
+            "decimal_shape" if !matches!(out.decimal_shape, Some(Ok(_))) => {
+                out.decimal_shape = Some(parse_decimal_shape(attr));
+            }
             "references" => {
                 let mut target = None;
                 if !matches!(attr.meta, syn::Meta::Path(_)) {
-                    // Extract the known `table = "..."` override, but consume any
-                    // other nested list / `key = value` pair so a future arg
-                    // (e.g. `on_delete = "cascade"`) never aborts target
-                    // extraction.
+                    // Read `table`, `on_delete` and `on_update`. Consume each other
+                    // nested list or `key = value` pair. Then a new argument cannot
+                    // stop the read of the target.
                     let _ = attr.parse_nested_meta(|meta| {
+                        let action_key = ["on_delete", "on_update"]
+                            .into_iter()
+                            .find(|key| meta.path.is_ident(key));
                         if meta.path.is_ident("table")
                             && let Ok(value) = meta.value()
                             && let Ok(lit) = value.parse::<syn::LitStr>()
                         {
                             target = Some(lit.value());
+                        } else if let Some(key) = action_key
+                            && let Ok(value) = meta.value()
+                            && let Ok(lit) = value.parse::<syn::LitStr>()
+                        {
+                            match ForeignKeyAction::from_attr(&lit.value()) {
+                                Ok(action) if key == "on_delete" => out.on_delete = action,
+                                Ok(action) => out.on_update = action,
+                                Err(e) => out.reference_error = Some(e.to_string()),
+                            }
                         } else if meta.input.peek(syn::token::Paren) {
                             let _ = meta.parse_nested_meta(|_| Ok(()));
                         } else if let Ok(value) = meta.value() {
@@ -608,10 +1278,67 @@ fn parse_field_attrs(field: &syn::Field) -> FieldAttrs {
     out
 }
 
+/// Read `#[decimal_shape(precision = p, scale = s)]` (issue #2598).
+///
+/// `autumn generate` writes it on each `decimal{p,s}` field. The Rust type does
+/// not carry the shape. The bounds are the bounds of the generator DSL.
+fn parse_decimal_shape(attr: &syn::Attribute) -> Result<(u8, u8), String> {
+    let mut precision = None;
+    let mut scale = None;
+    attr.parse_nested_meta(|meta| {
+        let slot = if meta.path.is_ident("precision") {
+            &mut precision
+        } else if meta.path.is_ident("scale") {
+            &mut scale
+        } else {
+            return Err(meta.error("expected `precision` or `scale`"));
+        };
+        *slot = Some(meta.value()?.parse::<syn::LitInt>()?.base10_parse::<u8>()?);
+        Ok(())
+    })
+    .map_err(|e| format!("bad `#[decimal_shape]`: {e}"))?;
+    let (Some(precision), Some(scale)) = (precision, scale) else {
+        return Err("`#[decimal_shape]` needs `precision` and `scale`".to_owned());
+    };
+    let max = crate::generate::dsl::MAX_DECIMAL_PRECISION;
+    if precision == 0 || u32::from(precision) > max || scale > precision {
+        return Err(format!(
+            "`#[decimal_shape(precision = {precision}, scale = {scale})]` is out of range \
+             (precision 1 to {max}, scale 0 to precision)"
+        ));
+    }
+    Ok((precision, scale))
+}
+
+/// Return the problem with the `#[references]` actions of `raw`, or `None`. A
+/// problem is an unknown value, or `set_null` / `set_default` on a required
+/// column. A reference column has no default, so `SET DEFAULT` writes NULL.
+fn reference_action_problem(raw: &RawField) -> Option<String> {
+    if let Some(error) = &raw.attrs.reference_error {
+        return Some(error.clone());
+    }
+    if raw.nullable {
+        return None;
+    }
+    [raw.attrs.on_delete, raw.attrs.on_update]
+        .into_iter()
+        .flatten()
+        .find_map(|action| match action {
+            ForeignKeyAction::SetNull => Some("set_null"),
+            ForeignKeyAction::SetDefault => Some("set_default"),
+            _ => None,
+        })
+        .map(|value| format!("foreign-key action `{value}` needs an `Option<_>` field"))
+}
+
 /// A field lifted out of the struct with its name, parsed attributes, and Rust
 /// type (already split on `Option<…>`).
 struct RawField {
+    /// The SQL column name.
     name: String,
+    /// The Rust field name, without `r#`. A bare `#[references]` infers its
+    /// target table from it.
+    field: String,
     attrs: FieldAttrs,
     nullable: bool,
     rust_type: String,
@@ -639,7 +1366,8 @@ fn build_table(
             let Some(ident) = &field.ident else { continue };
             let (nullable, inner_ty) = strip_option(&field.ty);
             raw_fields.push(RawField {
-                name: ident.to_string(),
+                name: field_column_name(field, ident),
+                field: unraw(ident),
                 attrs: parse_field_attrs(field),
                 nullable,
                 rust_type: type_to_string(inner_ty),
@@ -680,6 +1408,18 @@ fn build_table(
         // Resolve the column type. A `#[references]` field is always an `Int64`
         // FK column regardless of the written Rust type (which is `i64` anyway).
         let is_reference = raw.attrs.reference != ReferenceSpec::None;
+        if is_reference && let Some(problem) = reference_action_problem(raw) {
+            // Fail closed: a bad action must never become `NO ACTION`. The diff
+            // keeps a skipped column as it is.
+            diagnostics.push(SchemaDiagnostic {
+                model: model_name.clone(),
+                table: table_name.clone(),
+                field: raw.name.clone(),
+                rust_type: raw.rust_type.clone(),
+                message: format!("{problem} on `{model_name}.{}`; column skipped", raw.name),
+            });
+            continue;
+        }
         let column_ty = if is_reference {
             Some(ColumnType::Int64)
         } else if raw.attrs.is_translatable
@@ -695,6 +1435,28 @@ fn build_table(
             Some(ColumnType::Text)
         } else {
             ColumnType::from_rust_type(&raw.rust_type)
+        };
+        // #2598: the declared shape replaces the `{12, 2}` default. A bad
+        // attribute skips the column: a guessed shape gives a wrong `SQLite`
+        // `CHECK`.
+        let column_ty = match (column_ty, &raw.attrs.decimal_shape) {
+            (Some(ColumnType::Decimal { .. }), Some(Ok((precision, scale)))) => {
+                Some(ColumnType::Decimal {
+                    precision: *precision,
+                    scale: *scale,
+                })
+            }
+            (Some(ColumnType::Decimal { .. }), Some(Err(problem))) => {
+                diagnostics.push(SchemaDiagnostic {
+                    model: model_name.clone(),
+                    table: table_name.clone(),
+                    field: raw.name.clone(),
+                    rust_type: raw.rust_type.clone(),
+                    message: format!("{problem} on `{model_name}.{}`; column skipped", raw.name),
+                });
+                continue;
+            }
+            (ty, _) => ty,
         };
         let Some(ty) = column_ty else {
             // Unknown/unsupported type (a generated enum, an association type):
@@ -745,17 +1507,21 @@ fn build_table(
             .or_else(|| convention_default(&raw.name, &ty, is_pk, raw.attrs.is_default, backend));
 
         // Foreign key: infer the target table from the generator's convention
-        // (`<name>` minus a trailing `_id`, pluralized) unless overridden.
+        // (the field name minus a trailing `_id`, pluralized) unless overridden.
         match &raw.attrs.reference {
             ReferenceSpec::None => {}
             ReferenceSpec::Inferred => {
-                let base = raw.name.strip_suffix("_id").unwrap_or(&raw.name);
+                let base = raw.field.strip_suffix("_id").unwrap_or(&raw.field);
                 column.references = Some(ForeignKey::new(naming::pluralize(base), "id"));
             }
             ReferenceSpec::Explicit(target) => {
                 column.references = Some(ForeignKey::new(target.clone(), "id"));
             }
         }
+        column.references = column.references.map(|fk| {
+            fk.with_on_delete(raw.attrs.on_delete)
+                .with_on_update(raw.attrs.on_update)
+        });
 
         // Index bookkeeping (deduped/retained below, mirroring the generator).
         if raw.attrs.is_unique {
@@ -845,8 +1611,8 @@ fn build_table(
 ///   soft-delete `deleted_at`.
 /// - a UUID `PRIMARY KEY` on Postgres -> `gen_random_uuid()` (the only primary
 ///   key that carries an explicit column `DEFAULT`; a `BIGSERIAL`/serial PK is
-///   type-encoded with no `DEFAULT` clause, and on sqlite a UUID PK is `TEXT
-///   PRIMARY KEY` with no default — indeed `uuid::Uuid` is a rejected type there).
+///   type-encoded with no `DEFAULT` clause) or, on sqlite, the `randomblob` v4
+///   expression `TEXT PRIMARY KEY NOT NULL DEFAULT (…)` carries (issue #2555).
 ///   A `#[id]` PK is not `#[default]`-marked, so this arm is NOT gated on
 ///   `is_default`.
 ///
@@ -866,8 +1632,11 @@ fn convention_default(
     {
         return Some(ColumnDefault::Now);
     }
-    if is_primary_key && *ty == ColumnType::Uuid && backend == Backend::Postgres {
-        return Some(ColumnDefault::Sql("gen_random_uuid()".to_owned()));
+    if is_primary_key && *ty == ColumnType::Uuid {
+        return Some(ColumnDefault::Sql(match backend {
+            Backend::Postgres => "gen_random_uuid()".to_owned(),
+            Backend::Sqlite => autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned(),
+        }));
     }
     None
 }
@@ -1460,6 +2229,32 @@ mod tests {
     }
 
     #[test]
+    fn uuid_primary_key_recovers_the_v4_expression_default_on_sqlite() {
+        // `generate model --id uuid` on `SQLite` emits `#[id] pub id: SqliteUuid`
+        // and `TEXT PRIMARY KEY NOT NULL DEFAULT (<v4 expression>)` (issue #2555).
+        // The parser must record that default, or a diff reads it as drift.
+        let src = r#"
+            #[autumn_web::model]
+            pub struct Session {
+                #[id]
+                pub id: autumn_web::db::sqlite_types::SqliteUuid,
+                pub token: String,
+            }
+        "#;
+        let parsed = parse_model_source(src, Backend::Sqlite).expect("parse");
+        let table = parsed.tables.into_iter().next().unwrap();
+        let id = col(&table, "id");
+        assert_eq!(id.ty, ColumnType::Uuid);
+        assert!(id.primary_key);
+        assert_eq!(
+            id.default,
+            Some(ColumnDefault::Sql(
+                autumn_schema_core::SQLITE_UUID_V4_SQL.to_owned()
+            ))
+        );
+    }
+
+    #[test]
     fn non_pk_uuid_field_has_no_inferred_default() {
         // The `gen_random_uuid()` convention is PRIMARY-KEY-only: a plain
         // `uuid::Uuid` column carries no DB default (its value, if any, lives in
@@ -1599,6 +2394,105 @@ mod tests {
                 scale: 2
             }
         );
+    }
+
+    /// #2598: `#[decimal_shape]` carries the declared `decimal{p,s}`. The Rust
+    /// type does not, so without it every decimal reads as `{12, 2}`.
+    #[test]
+    fn decimal_shape_attr_sets_precision_and_scale() {
+        let src = r#"
+            #[model]
+            pub struct Product {
+                #[id]
+                pub id: i64,
+                #[decimal_shape(precision = 10, scale = 2)]
+                pub price: rust_decimal::Decimal,
+                #[decimal_shape(precision = 5, scale = 0)]
+                pub qty: Option<autumn_web::db::sqlite_types::SqliteDecimal>,
+                pub plain: rust_decimal::Decimal,
+            }
+        "#;
+        let table = parse_one(src);
+        assert_eq!(
+            col(&table, "price").ty,
+            ColumnType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
+        let qty = col(&table, "qty");
+        assert_eq!(
+            qty.ty,
+            ColumnType::Decimal {
+                precision: 5,
+                scale: 0
+            }
+        );
+        assert!(qty.nullable);
+        // No attribute: the bare `decimal` default.
+        assert_eq!(
+            col(&table, "plain").ty,
+            ColumnType::Decimal {
+                precision: 12,
+                scale: 2
+            }
+        );
+    }
+
+    /// #2598: a bad `#[decimal_shape]` skips the column with a diagnostic. A
+    /// silent `{12, 2}` fallback gives a wrong `SQLite` `CHECK`.
+    #[test]
+    fn malformed_decimal_shape_attr_skips_the_column() {
+        for attr in [
+            "#[decimal_shape(precision = 10)]",
+            "#[decimal_shape(scale = 2)]",
+            "#[decimal_shape(precision = 10, scale = 2, extra = 1)]",
+            "#[decimal_shape(precision = \"ten\", scale = 2)]",
+            "#[decimal_shape(precision = 0, scale = 0)]",
+            "#[decimal_shape(precision = 29, scale = 2)]",
+            "#[decimal_shape(precision = 300, scale = 2)]",
+            "#[decimal_shape(precision = 4, scale = 5)]",
+            "#[decimal_shape]",
+        ] {
+            let src = format!(
+                "#[model]\npub struct Product {{\n    #[id]\n    pub id: i64,\n    \
+                 {attr}\n    pub price: rust_decimal::Decimal,\n}}\n"
+            );
+            let parsed = parse_model_source(&src, Backend::Sqlite).expect("parse");
+            assert!(
+                parsed.tables[0].columns.iter().all(|c| c.name != "price"),
+                "`{attr}` did not skip the column"
+            );
+            assert_eq!(
+                parsed.diagnostics.len(),
+                1,
+                "`{attr}` did not add one diagnostic"
+            );
+            assert_eq!(parsed.diagnostics[0].field, "price");
+            assert!(
+                parsed.diagnostics[0].message.contains("decimal_shape"),
+                "the diagnostic names the attribute: {}",
+                parsed.diagnostics[0].message
+            );
+        }
+    }
+
+    /// #2598: `#[decimal_shape]` on a field that is not a decimal changes
+    /// nothing. The `#[model]` macro ignores it there too.
+    #[test]
+    fn decimal_shape_attr_on_a_non_decimal_field_is_ignored() {
+        let src = r#"
+            #[model]
+            pub struct Product {
+                #[id]
+                pub id: i64,
+                #[decimal_shape(precision = 10, scale = 2)]
+                pub name: String,
+            }
+        "#;
+        let parsed = parse_model_source(src, Backend::Postgres).expect("parse");
+        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(col(&parsed.tables[0], "name").ty, ColumnType::Text);
     }
 
     #[test]
@@ -1799,14 +2693,14 @@ mod tests {
 
     #[test]
     fn references_unknown_kv_arg_is_ignored_and_target_survives() {
-        // A future `#[references(table = "...", on_delete = "...")]` arg must
-        // not abort extraction of the `table` target.
+        // An unknown `future_key = "..."` argument must not stop the read of
+        // `table`.
         let src = r#"
             #[model]
             pub struct Comment {
                 #[id]
                 pub id: i64,
-                #[references(table = "users", on_delete = "cascade")]
+                #[references(table = "users", future_key = "x")]
                 pub author_id: i64,
                 #[default]
                 pub created_at: chrono::NaiveDateTime,
@@ -1864,7 +2758,712 @@ mod tests {
             SchemaParseError::Io { path, .. } => {
                 assert!(path.contains("does_not_exist.rs"), "path names the input");
             }
-            other @ SchemaParseError::Syntax { .. } => panic!("expected Io error, got {other:?}"),
+            other => panic!("expected Io error, got {other:?}"),
+        }
+    }
+
+    // ---- #[renamed_from] hints (#1975, Decision 5) ----
+
+    #[test]
+    fn field_renamed_from_records_a_column_hint() {
+        let parsed = parse_model_source(
+            r#"
+            #[model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[renamed_from("title")]
+                pub headline: String,
+            }
+        "#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed.renames,
+            vec![RenameHint {
+                table: "posts".to_owned(),
+                column: Some("headline".to_owned()),
+                from: "title".to_owned(),
+            }]
+        );
+        // The hint does not change the column shape.
+        assert!(
+            parsed.tables[0]
+                .columns
+                .iter()
+                .any(|c| c.name == "headline")
+        );
+    }
+
+    #[test]
+    fn struct_renamed_from_records_a_table_hint() {
+        let parsed = parse_model_source(
+            r#"
+            #[model(managed)]
+            #[renamed_from("articles")]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+            }
+        "#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        assert_eq!(
+            parsed.renames,
+            vec![RenameHint {
+                table: "posts".to_owned(),
+                column: None,
+                from: "articles".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn malformed_renamed_from_is_ignored() {
+        // The macro rejects these at compile time; the parser never trusts them.
+        let parsed = parse_model_source(
+            r#"
+            #[model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[renamed_from("Bad Name")]
+                pub a: String,
+                #[renamed_from = "b_old"]
+                pub b: String,
+                #[renamed_from]
+                pub c: String,
+                #[renamed_from("x; DROP TABLE posts")]
+                pub d: String,
+                #[renamed_from("e_old", "e_other")]
+                pub e: String,
+            }
+        "#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        assert!(parsed.renames.is_empty(), "{:?}", parsed.renames);
+    }
+
+    #[test]
+    fn renamed_from_hints_aggregate_across_a_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "#[model(managed)] pub struct Post { #[id] pub id: i64, #[renamed_from(\"title\")] pub headline: String }",
+        )
+        .expect("write a");
+        std::fs::write(
+            dir.path().join("b.rs"),
+            "#[model(managed)] #[renamed_from(\"people\")] pub struct User { #[id] pub id: i64 }",
+        )
+        .expect("write b");
+        let parsed = parse_models_dir(dir.path(), Backend::Postgres).expect("parse dir");
+        assert_eq!(parsed.renames.len(), 2, "{:?}", parsed.renames);
+    }
+
+    /// A raw field ident names the SQL column without the `r#` prefix, as the
+    /// `#[model]` macro does.
+    #[test]
+    fn raw_ident_field_names_the_unrawed_column() {
+        let parsed = parse_model_source(
+            "#[model] pub struct Item { #[id] pub id: i64, pub r#type: String }",
+            Backend::Postgres,
+        )
+        .expect("parse");
+        let names: Vec<&str> = parsed.tables[0]
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(names.contains(&"type"), "{names:?}");
+        assert!(!names.iter().any(|n| n.starts_with("r#")), "{names:?}");
+    }
+
+    /// The encrypted-column map is keyed by the SQL column, so a raw identifier
+    /// and a `column_name` override both name the live column.
+    #[test]
+    fn encrypted_columns_use_the_sql_column_name() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct Item {
+                #[id] pub id: i64,
+                #[encrypted] pub r#type: String,
+                #[encrypted] #[diesel(column_name = "tok")] pub token: String,
+            }
+            "#,
+        )
+        .expect("parse");
+        let cols: Vec<&str> = found["items"].keys().map(String::as_str).collect();
+        assert_eq!(cols, vec!["tok", "type"]);
+    }
+
+    /// A test-only fixture model must not change a production column's mode.
+    #[test]
+    fn encrypted_columns_ignore_cfg_test_fixtures() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }
+            #[cfg(test)]
+            mod tests {
+                #[model]
+                pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }
+            }
+            "#,
+        )
+        .expect("parse");
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A test-only item of any kind can hold a fixture model.
+    #[test]
+    fn encrypted_columns_ignore_cfg_test_items_of_every_kind() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[cfg(test)] fn a() { #[model] struct U { #[id] id: i64, #[encrypted] email: String } }
+            #[cfg(test)] impl X { fn b() { #[model] struct V { #[id] id: i64, #[encrypted] e: String } } }
+            struct X;
+            impl X {
+                #[cfg(test)] fn c() { #[model] struct W { #[id] id: i64, #[encrypted] f: String } }
+            }
+            trait T {
+                #[cfg(test)] fn d() { #[model] struct Y { #[id] id: i64, #[encrypted] g: String } }
+            }
+            #[cfg(test)] const K: () = { #[model] struct Z { #[id] id: i64, #[encrypted] h: String } };
+            #[cfg(test)] static S: () = { #[model] struct Q { #[id] id: i64, #[encrypted] i: String } };
+            #[cfg(test)] trait TT { fn e() { #[model] struct R { #[id] id: i64, #[encrypted] j: String } } }
+            "#,
+        )
+        .expect("parse");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// Blocks, locals and associated consts can be test-only too.
+    #[test]
+    fn encrypted_columns_ignore_cfg_test_expressions_and_consts() {
+        let found = parse_encrypted_columns(
+            r#"
+            fn f() {
+                #[cfg(test)] { #[model] struct U { #[id] id: i64, #[encrypted] a: String } }
+                match 1 { #[cfg(test)] _ => { #[model] struct A { #[id] id: i64, #[encrypted] k: String } } }
+                let _r = R { #[cfg(test)] f: { #[model] struct B { #[id] id: i64, #[encrypted] l: String } } };
+                #[cfg(test)] let _x = { #[model] struct V { #[id] id: i64, #[encrypted] b: String } };
+            }
+            enum EV { #[cfg(test)] V = { #[model] struct H { #[id] id: i64, #[encrypted] n: String } 0 } }
+            fn param(#[cfg(test)] x: [(); { #[model] struct M { #[id] id: i64, #[encrypted] q: String } 0 }]) {}
+            struct GP<#[cfg(test)] T = [(); { #[model] struct N { #[id] id: i64, #[encrypted] r: String } 0 }]>(T);
+            fn clo() { let _ = |#[cfg(test)] x: [(); { #[model] struct CL { #[id] id: i64, #[encrypted] s: String } 0 }]| {}; }
+            #[cfg(test)] extern "C" { static FX: [u8; { #[model] struct FM { #[id] id: i64, #[encrypted] t: String } 0 }]; }
+            struct TY;
+            impl TY { #[cfg(test)] type A = [(); { #[model] struct J { #[id] id: i64, #[encrypted] o: String } 0 }]; }
+            trait TT2 { #[cfg(test)] type B = [(); { #[model] struct K { #[id] id: i64, #[encrypted] p: String } 0 }]; }
+            #[cfg(test)] enum E { V = { #[model] struct G { #[id] id: i64, #[encrypted] m: String } 0 } }
+            struct X;
+            impl X {
+                #[cfg(test)] const C: () = { #[model] struct W { #[id] id: i64, #[encrypted] c: String } };
+            }
+            trait T {
+                #[cfg(test)] const D: () = { #[model] struct Y { #[id] id: i64, #[encrypted] d: String } };
+            }
+            "#,
+        )
+        .expect("parse");
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A file reached only through `#[cfg(test)] mod x;` is test code.
+    #[test]
+    fn encrypted_columns_skip_out_of_line_cfg_test_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "#[cfg(test)] mod tests;\n").unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tests.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A `#[path]` with `..` still names the walked file.
+    #[test]
+    fn encrypted_columns_skip_a_test_file_named_by_a_dotdot_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"nested/../fixtures.rs\"] mod fixtures;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+        assert_eq!(
+            normalize_lexically(Path::new("/a/./b/../c")),
+            Path::new("/a/c")
+        );
+    }
+
+    /// A module nested in a disabled inline module is disabled too.
+    #[test]
+    fn encrypted_columns_skip_files_under_a_disabled_inline_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] mod tests { mod fixtures; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tests").join("fixtures.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A `#[cfg]` on a field turns that field off; the other alternative wins.
+    #[test]
+    fn encrypted_columns_ignore_cfg_disabled_fields() {
+        let found = parse_encrypted_columns(
+            r#"
+            #[model]
+            pub struct User {
+                #[id] pub id: i64,
+                #[cfg(not(test))] #[encrypted(deterministic)] pub email: String,
+                #[cfg(test)] #[encrypted] pub email: String,
+            }
+            "#,
+        )
+        .expect("parse");
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// `#[path]` moves a disabled module's file.
+    #[test]
+    fn encrypted_columns_skip_a_path_override_of_a_disabled_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"fixtures/special.rs\"] mod tests;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures").join("special.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Exclusive declarations: the `#[path]` one is test code, the plain one is not.
+    #[test]
+    fn a_path_override_does_not_disable_the_conventional_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"fixtures/test_models.rs\"] mod models;\n#[cfg(not(test))] mod models;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures").join("test_models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A name declared for test and for production still loads in production.
+    #[test]
+    fn an_enabled_twin_keeps_the_conventional_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] mod models;\n#[cfg(not(test))] mod models;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Two declarations of one custom path: the enabled one keeps it.
+    #[test]
+    fn an_enabled_twin_keeps_a_shared_custom_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] #[path = \"models.rs\"] mod a;\n#[cfg(not(test))] #[path = \"models.rs\"] mod b;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// A file no module reaches may still hold a stray model. Two modes for one
+    /// column is an error, not a last-wins merge.
+    #[test]
+    fn conflicting_encrypted_modes_are_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("z_fixture.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let err = parse_encrypted_columns_path(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, SchemaParseError::ConflictingEncryptedMode { ref column, .. } if column == "email"),
+            "{err:?}"
+        );
+    }
+
+    /// A symlinked model file or directory is followed, and a link back up the
+    /// tree does not loop.
+    #[cfg(unix)]
+    #[test]
+    fn encrypted_columns_follow_symlinked_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = tempfile::tempdir().unwrap();
+        std::fs::write(
+            real.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(real.path().join("models.rs"), dir.path().join("models.rs"))
+            .unwrap();
+        std::os::unix::fs::symlink(real.path(), dir.path().join("linked")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+        std::os::unix::fs::symlink(real.path(), dir.path().join("alias")).unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Two models in one file that encrypt a column differently conflict too.
+    #[test]
+    fn conflicting_modes_in_one_file_are_an_error() {
+        let err = parse_encrypted_columns(
+            r#"
+            #[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }
+            #[cfg(feature = "fixtures")]
+            mod fixtures {
+                #[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }
+            }
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SchemaParseError::ConflictingEncryptedMode { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// `lib.rs` disables a module that `main.rs` (another crate root) enables.
+    #[test]
+    fn another_crate_root_can_enable_a_disabled_module() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("lib.rs"), "#[cfg(test)] mod models;\n").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "mod models;\n").unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// An enabled file under a disabled module's directory stays production.
+    #[test]
+    fn an_enabled_path_under_a_disabled_directory_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "#[cfg(test)] mod fixtures;\n#[path = \"fixtures/models.rs\"] mod production_models;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("fixtures").join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted(deterministic)] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(found["users"]["email"], "{found:?}");
+    }
+
+    /// Disabled and odd spellings the module and `cfg` helpers must survive.
+    #[test]
+    fn module_and_cfg_helpers_survive_odd_input() {
+        let attrs = |src: &str| syn::parse_str::<syn::ItemFn>(src).unwrap().attrs;
+        // A malformed `cfg_attr` or `cfg` keeps the item.
+        assert!(production_enabled(&attrs("#[cfg_attr] fn f() {}")));
+        assert!(production_enabled(&attrs("#[cfg_attr(test)] fn f() {}")));
+        assert!(production_enabled(&attrs(
+            "#[cfg_attr(not(test), derive(Debug))] fn f() {}"
+        )));
+        assert!(production_enabled(&attrs(
+            "#[cfg_attr(not(test), cfg(feature = \"x\"))] fn f() {}"
+        )));
+        assert!(production_enabled(&attrs("#[cfg] fn f() {}")));
+        assert!(production_enabled(&attrs("#[cfg(\"literal\")] fn f() {}")));
+        assert!(!production_enabled(&attrs("#[cfg(any())] fn f() {}")));
+        assert!(production_enabled(&attrs("#[cfg(all())] fn f() {}")));
+        // A file-level `cfg(test)` empties the scan; an unparsable file adds nothing.
+        assert!(
+            parse_encrypted_columns(
+                "#![cfg(test)]\n#[model] pub struct U { #[encrypted] pub a: String }"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let dir = std::path::PathBuf::from("src");
+        let modules = disabled_module_paths(&[
+            (dir.join("bad.rs"), "fn {".to_owned()),
+            (
+                dir.join("lib.rs"),
+                "#![cfg(test)]\n#[path = 1] mod odd;\n#[cfg(test)] #[path] mod odd2;".to_owned(),
+            ),
+        ]);
+        assert!(modules.excludes(&dir.join("odd.rs")));
+        assert!(!modules.excludes(&dir.join("other.rs")));
+    }
+
+    /// A dangling symlink has no metadata and is skipped, not an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone.rs"), dir.path().join("dangling.rs"))
+            .unwrap();
+        std::fs::write(
+            dir.path().join("models.rs"),
+            "#[model] pub struct User { #[id] pub id: i64, #[encrypted] pub email: String }",
+        )
+        .unwrap();
+        let found = parse_encrypted_columns_path(dir.path()).unwrap();
+        assert!(!found["users"]["email"], "{found:?}");
+    }
+
+    /// A model in an inline module, at any depth, is still a model.
+    #[test]
+    fn encrypted_columns_are_found_in_inline_modules() {
+        let found = parse_encrypted_columns(
+            r#"
+            mod accounts {
+                pub mod inner {
+                    #[model]
+                    pub struct Account { #[id] pub id: i64, #[encrypted] pub token: String }
+                }
+            }
+            "#,
+        )
+        .expect("parse");
+        assert!(found["accounts"].contains_key("token"), "{found:?}");
+    }
+
+    /// `#[diesel(column_name = ...)]` names the SQL column. Both spellings.
+    #[test]
+    fn diesel_column_name_names_the_column() {
+        let parsed = parse_model_source(
+            r#"
+            #[model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                #[diesel(column_name = "headline")]
+                pub title: String,
+                #[diesel(column_name = body_text)]
+                #[renamed_from("body")]
+                pub body: String,
+            }
+        "#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        let table = &parsed.tables[0];
+        assert_eq!(col(table, "headline").ty, ColumnType::Text);
+        assert_eq!(col(table, "body_text").ty, ColumnType::Text);
+        assert!(!table.columns.iter().any(|c| c.name == "title"));
+        // The rename hint names the new column, not the field.
+        assert_eq!(parsed.renames[0].column.as_deref(), Some("body_text"));
+    }
+
+    /// Another `diesel(...)` key before `column_name` does not hide it.
+    #[test]
+    fn diesel_column_name_after_another_key_is_read() {
+        let parsed = parse_model_source(
+            r#"#[model] pub struct Doc {
+                #[id] pub id: i64,
+                #[diesel(deserialize_as = Vec<u8>, column_name = "blob_data")]
+                pub data: Vec<u8>,
+            }"#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        assert_eq!(col(&parsed.tables[0], "blob_data").ty, ColumnType::Bytes);
+    }
+
+    /// `#[references]` infers the target table from the field name, not from
+    /// the `column_name` value.
+    #[test]
+    fn references_target_comes_from_the_field_name() {
+        let parsed = parse_model_source(
+            r#"#[model(managed)] pub struct Post {
+                #[id] pub id: i64,
+                #[diesel(column_name = owner_id)]
+                #[references]
+                pub author_id: i64,
+            }"#,
+            Backend::Postgres,
+        )
+        .expect("parse");
+        let fk = col(&parsed.tables[0], "owner_id")
+            .references
+            .clone()
+            .unwrap();
+        assert_eq!(fk.table, "authors");
+    }
+    #[test]
+    fn references_actions_are_parsed() {
+        let src = r#"
+            #[model]
+            pub struct Comment {
+                #[id]
+                pub id: i64,
+                #[references(table = "users", on_delete = "cascade", on_update = "restrict")]
+                pub author_id: i64,
+                #[references(on_delete = "set_null")]
+                pub post_id: Option<i64>,
+                #[references(on_delete = "no_action")]
+                pub thread_id: i64,
+            }
+        "#;
+        let table = parse_one(src);
+        assert_eq!(
+            col(&table, "author_id").references,
+            Some(
+                ForeignKey::new("users", "id")
+                    .with_on_delete(Some(ForeignKeyAction::Cascade))
+                    .with_on_update(Some(ForeignKeyAction::Restrict))
+            )
+        );
+        assert_eq!(
+            col(&table, "post_id").references,
+            Some(ForeignKey::new("posts", "id").with_on_delete(Some(ForeignKeyAction::SetNull)))
+        );
+        // `no_action` is the default. The IR records no action for it.
+        assert_eq!(
+            col(&table, "thread_id").references,
+            Some(ForeignKey::new("threads", "id"))
+        );
+    }
+
+    #[test]
+    fn references_unknown_action_skips_the_column_with_a_diagnostic() {
+        // A typo must not become `NO ACTION`. The parser skips the column.
+        // Then the diff does not change the table.
+        let src = r#"
+            #[model]
+            pub struct Comment {
+                #[id]
+                pub id: i64,
+                #[references(on_delete = "casade")]
+                pub author_id: i64,
+            }
+        "#;
+        let parsed = parse_model_source(src, Backend::Postgres).expect("parse");
+        assert!(
+            parsed.tables[0]
+                .columns
+                .iter()
+                .all(|c| c.name != "author_id")
+        );
+        assert_eq!(parsed.diagnostics.len(), 1);
+        let diag = &parsed.diagnostics[0];
+        assert_eq!(diag.field, "author_id");
+        assert!(diag.message.contains("`casade`"), "{}", diag.message);
+    }
+
+    #[test]
+    fn references_null_writing_action_on_a_required_column_skips_it_with_a_diagnostic() {
+        // `SET NULL` on a `NOT NULL` column fails at delete time. The column has
+        // no default, so `SET DEFAULT` also writes NULL.
+        for action in ["set_null", "set_default"] {
+            let src = format!(
+                r#"
+                #[model]
+                pub struct Comment {{
+                    #[id]
+                    pub id: i64,
+                    #[references(on_update = "{action}")]
+                    pub author_id: i64,
+                }}
+            "#
+            );
+            let parsed = parse_model_source(&src, Backend::Postgres).expect("parse");
+            assert!(
+                parsed.tables[0]
+                    .columns
+                    .iter()
+                    .all(|c| c.name != "author_id")
+            );
+            assert_eq!(parsed.diagnostics.len(), 1);
+            assert!(
+                parsed.diagnostics[0].message.contains(action),
+                "{}",
+                parsed.diagnostics[0].message
+            );
         }
     }
 }

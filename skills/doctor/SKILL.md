@@ -75,9 +75,10 @@ These names match what `autumn doctor --json` actually emits in the `name` field
 | `plugin_residue` **(trunk-dev)** | Orphaned plugin wiring (issue #1631). Warns when a plugin is declared in `[dependencies]` but never mounted (`autumn plugin add <name>` finishes the install, `autumn plugin remove <name>` takes the dependency back — for a community `autumn-plugin-*` crate, add the `.plugin(...)` call from its README, since `add` never writes one). Fails when a plugin's fully-qualified type is mounted but the crate is not declared, which does not compile. Warns when migrations a plugin declares are still recorded as applied and the plugin is gone (`autumn plugin remove <name> --drop-data` reverts them); that last finding needs a configured database and the `diesel` CLI, and is skipped otherwise |
 | `platform_support` **(trunk-dev)** | Never fails — reports this platform's Windows support tier (issue #1616). On Windows its `detail` names the Tier 1 (native) and Tier 2 (WSL2) commands and the vcpkg/`VCPKG_ROOT` prerequisite for `generate auth --passkeys` |
 | `edge_routes` **(trunk-dev)** | Fails when an `#[edge]` handler also carries `#[secured]`/`#[authorize]`/`#[step_up]`/`#[throttle]`/`#[intercept]`: remove one of the two — edge routes are unauthenticated read-path routes served without origin middleware. Warns when a marked handler is missing from `edge_routes![]`, or when `src/bin/edge-capsule.rs` is absent |
+| `edge_capabilities` **(trunk-dev)** | Warns (a best-guess source scan; `--strict` exits non-zero) when an `#[edge]` route needs what the edge cannot provide: an unknown `needs(...)` (only `kv` and `identity` exist), a write method or `#[static_get]`/`#[ws]`/`#[oauth2_callback]`/`#[agent_operable]`, an extractor other than `Path`/`Query`/`HeaderMap`/`EdgeCache`/`EdgeIdentity` (e.g. `Db`, `Session`, `Method`, `Bytes`), or `EdgeIdentity` without `needs(identity)`. Remove `#[edge]` or the offending part. `autumn build` prints the same list before it compiles, and rustc stops on each one |
 | `dependencies` **(trunk-dev)** | Dependency policy findings (issue #1633). Fix or waive in `deny.toml` — a waiver is an `[advisories] ignore` entry, the same store the CI gate reads. Never fails for a missing cargo-deny or advisory database: those **pass** with a `not evaluated` detail, since warning would make `autumn doctor --strict` exit 1 on every machine without an optional tool. Warns with no verdict when `deny.toml` is not valid TOML, or declares a section in a spelling the generated CI workflow's grep cannot see |
 
-## Platform support check (unreleased — trunk-dev, issue #1616)
+## Platform support check (0.8.0, issue #1616)
 
 `autumn doctor` runs a `platform_support` check first, reporting the platform's
 Windows support tier. It **always passes** — the tier is information, not a
@@ -102,7 +103,7 @@ trunk-dev (issue #1639) and now run **natively** on Windows, `--bundled-pg`
 included — a refusal there is a bug, not the policy. See
 `docs/guide/platform-support.md`.
 
-## Daemon and service readiness (unreleased — trunk-dev)
+## Daemon and service readiness (0.8.0, issue #1639)
 
 `autumn doctor` runs a `daemon_service` check (issue #1639). Read its `detail`:
 it says whether a daemon is running for this project and on what endpoint,
@@ -114,9 +115,9 @@ not elevated enough to register or remove a service.
 A stopped daemon and an unregistered service are both normal: plenty of projects
 never want either. Do not read the check as a defect on that basis.
 
-## Operator alert checks (unreleased — trunk-dev)
+## Operator alert checks (0.6.0, issue #1610)
 
-On trunk-dev, `autumn doctor` adds production-only **operator-alert** warnings
+`autumn doctor` adds production-only **operator-alert** warnings
 (issue #1610). It warns when `[alerts]` configures no destination (no `email`
 and no `webhook_url`), when an `email` destination is paired with a disabled
 `[mail]` transport or an SMTP transport missing/invalid `[mail] from`, when
@@ -127,9 +128,9 @@ enabled = false` despite a configured destination. If you register an
 `[alerts] custom_channel = true` so `--strict` passes without a `[alerts]`
 destination. See `docs/guide/operator-alerts.md`.
 
-### Native alert transports (unreleased — trunk-dev, issue #1630)
+### Native alert transports (0.6.0, issue #1630)
 
-On trunk-dev, a configured native transport (a `[alerts] pagerduty_routing_key`,
+A configured native transport (a `[alerts] pagerduty_routing_key`,
 `slack_webhook_url`, or `discord_webhook_url`) now counts as an alert
 destination, so the production-only `alert_destination` no-destination warning
 no longer fires when only a native transport is set (no `email`/`webhook_url`
@@ -142,7 +143,7 @@ expose `https` webhook endpoints). Each `AUTUMN_ALERTS__*` env override is
 accepted in place of the TOML key (issue #1630). See
 `docs/guide/operator-alerts.md`.
 
-## Offsite-backup check (unreleased — trunk-dev, issue #1619)
+## Offsite-backup check (0.6.0, issue #1619)
 
 `autumn doctor` adds an `offsite_backup` check for the offsite S3 backup
 destination (`[backup.offsite]`). It never prints a credential value (only
@@ -161,9 +162,9 @@ destination:
 Remedy: add a `[backup.offsite]` section and run `autumn db backup --upload`, or
 set the specific key the check names. See `docs/guide/daemon.md`.
 
-## Topology-aware queue coverage (unreleased — trunk-dev, issue #1756)
+## Topology-aware queue coverage (0.6.0, issue #1756)
 
-On trunk-dev, `autumn doctor` hard-fails on a genuine job-queue coverage gap
+`autumn doctor` hard-fails on a genuine job-queue coverage gap
 once the operator declares the fleet topology. Declare every worker tier's pin
 under `[jobs.fleet]`:
 
@@ -187,9 +188,9 @@ comes from a `[jobs.fleet] manifest` emitted by `autumn jobs manifest` (a TOML
 Without `[jobs.fleet]` the check stays informational-only (Pass), exactly as
 before (issue #1756).
 
-## TLS certificate check (unreleased — trunk-dev, issue #1603)
+## TLS certificate check (0.6.0, issue #1603)
 
-On trunk-dev, `autumn doctor` adds a `tls` check that grades the `[server.tls]`
+`autumn doctor` adds a `tls` check that grades the `[server.tls]`
 configuration:
 
 - **Pass** — TLS is unconfigured (plain HTTP), or the configured leaf certificate
@@ -201,9 +202,9 @@ configuration:
 
 See issue #1852.
 
-## mTLS client-auth check (unreleased — trunk-dev, issue #1640)
+## mTLS client-auth check (0.8.0, issue #1640)
 
-On trunk-dev, `autumn doctor` adds a `tls_client_auth` check that grades the
+`autumn doctor` adds a `tls_client_auth` check that grades the
 `[server.tls.client_auth]` trust store offline — no server boot, no network:
 
 - **Pass** — the section is absent or `mode = "off"` (the listener requests no
@@ -217,9 +218,9 @@ On trunk-dev, `autumn doctor` adds a `tls_client_auth` check that grades the
   the bundle has expired, or `client_auth` is present but is not a table. These are the conditions the runtime refuses to boot
   on, so a Fail here means the app will not start.
 
-## ACME preflight checks (unreleased — trunk-dev, issue #1608)
+## ACME preflight checks (0.6.0, issue #1608)
 
-On trunk-dev, `autumn doctor --online` (alias `--preflight`) runs active network
+`autumn doctor --online` (alias `--preflight`) runs active network
 probes, gated behind the CLI `acme` feature:
 
 - `acme_ports` — grades reachability of `:80` (HTTP-01) and `:443`. Under
@@ -257,7 +258,7 @@ Two checks are graded **offline**, so they run without `--online`:
 
 See issues #1858 and #1620.
 
-## Deploy preflight checks (unreleased — trunk-dev, issues #1607/#1621)
+## Deploy preflight checks (0.6.0 and 0.7.0, issues #1607/#1621)
 
 When a `[deploy]` section is present in `autumn.toml`, `autumn doctor` runs the
 deploy preflight as a config-gated section, emitting deploy-namespaced checks:
@@ -300,7 +301,7 @@ proxy port, version/state drift) use `autumn deploy status [--json] [--strict]`
 rather than `doctor` — it probes the hosts read-only and `--strict` exits
 non-zero on drift. See `docs/guide/fleet-deploys.md`.
 
-## SQLite backend awareness (unreleased — trunk-dev, issue #1614)
+## SQLite backend awareness (0.6.0, issue #1614)
 
 For an app whose resolved primary database is `sqlite://…`, `autumn doctor`
 adapts Postgres-specific checks: the `pg_dump`/`pg_restore` client-tools check
@@ -309,7 +310,7 @@ reports informationally: those tools are not required for a SQLite app, whose
 `sqlite://` URL is only accepted as the lone primary in a single-role,
 single-host topology (SQLite is single-writer / no read-replica role).
 
-## Dependency policy check (unreleased — trunk-dev, issue #1633)
+## Dependency policy check (0.8.0, issue #1633)
 
 `autumn doctor` grades the app's lockfile against its own `deny.toml`, using the
 same auditor, policy file, waiver store and check list as the CI gate the

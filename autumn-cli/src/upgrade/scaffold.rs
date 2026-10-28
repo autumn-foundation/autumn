@@ -103,6 +103,12 @@ struct ManifestFile {
     files: BTreeMap<String, String>,
 }
 
+/// Most tries in [`Manifest::update`].
+const SWAP_ATTEMPTS: u32 = 8;
+
+/// A swap holds the old contents in `.autumn-upgrade-<file name>.<token>.old`.
+const CLAIM_SUFFIX: &str = ".old";
+
 const FLAVOR_API: &str = "api";
 const FLAVOR_FULLSTACK: &str = "fullstack";
 
@@ -140,10 +146,10 @@ pub struct Manifest {
 impl Manifest {
     /// The manifest describing `files` as just written.
     #[must_use]
-    pub fn for_files(
+    pub fn for_files<K: AsRef<str>>(
         version: &str,
         options: GenerateOptions,
-        files: &BTreeMap<&'static str, String>,
+        files: &BTreeMap<K, String>,
     ) -> Self {
         Self {
             version: Some(version.to_owned()),
@@ -151,7 +157,7 @@ impl Manifest {
             options,
             digests: files
                 .iter()
-                .map(|(path, contents)| ((*path).to_owned(), digest(contents)))
+                .map(|(path, contents)| (path.as_ref().to_owned(), digest(contents)))
                 .collect(),
             pinned: BTreeSet::new(),
         }
@@ -266,10 +272,11 @@ impl Manifest {
         // something nobody vouched for. A manifest reachable only through a
         // link is treated as absent, which is the same conservative answer a
         // project that never had one gets.
-        if matches!(read_current(root, MANIFEST_PATH), OnDisk::Linked(_)) {
-            return None;
+        // Parsed from the one snapshot: a second read could land in a swap.
+        match read_current(root, MANIFEST_PATH) {
+            OnDisk::Text(text) => Self::parse(&text),
+            _ => None,
         }
-        Self::parse(&std::fs::read_to_string(root.join(MANIFEST_PATH)).ok()?)
     }
 
     /// Write the manifest under `root`, creating `.autumn/` if needed.
@@ -282,18 +289,125 @@ impl Manifest {
     /// none of their protection: following the link would truncate a file
     /// outside the project, invisibly to that project's own `git diff`.
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
-        if matches!(read_current(root, MANIFEST_PATH), OnDisk::Linked(_)) {
-            return Err(std::io::Error::other(format!(
-                "{MANIFEST_PATH} (or a directory on the way to it) is a symlink; \
-                 writing through it could write outside the project"
-            )));
-        }
-        let path = root.join(MANIFEST_PATH);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        publish(&path, &self.render(), Publish::Replace).map_err(std::io::Error::other)
+        Self::update(root, |_| Ok(self.clone())).map(drop)
     }
+
+    /// Read, change and write the manifest as one compare-and-swap.
+    ///
+    /// `change` gets the current manifest (`None` if absent or unparsable) and
+    /// returns the new one, or an error to stop with nothing written. If another writer changes the file first, `change`
+    /// runs again on the new state, so that writer's pins are kept.
+    ///
+    /// # Errors
+    ///
+    /// Fails on a symlink, unreadable text, a write error, an interrupted
+    /// upgrade, or [`SWAP_ATTEMPTS`] lost swaps.
+    pub fn update(
+        root: &Path,
+        mut change: impl FnMut(Option<Self>) -> Result<Self, String>,
+    ) -> std::io::Result<Self> {
+        let path = root.join(MANIFEST_PATH);
+        for attempt in 1..=SWAP_ATTEMPTS {
+            let (current, mode) = match read_current(root, MANIFEST_PATH) {
+                OnDisk::Linked(_) => {
+                    return Err(std::io::Error::other(format!(
+                        "{MANIFEST_PATH} (or a directory on the way to it) is a symlink; \
+                         writing through it could write outside the project"
+                    )));
+                }
+                OnDisk::Opaque(_) => {
+                    return Err(std::io::Error::other(claim_in_flight(&path).map_or_else(
+                        || {
+                            format!(
+                                "{MANIFEST_PATH} cannot be read as text; delete it to start again"
+                            )
+                        },
+                        |held| interrupted(&held),
+                    )));
+                }
+                OnDisk::Absent => match claim_in_flight(&path) {
+                    Some(held) => return Err(std::io::Error::other(interrupted(&held))),
+                    None => (None, Publish::Create),
+                },
+                OnDisk::Text(text) => (Self::parse(&text), Publish::Swap(text)),
+            };
+            let next = change(current).map_err(std::io::Error::other)?;
+            let rendered = next.render();
+            // An identical rewrite would only touch the mtime.
+            let unchanged = match &mode {
+                Publish::Swap(text) if normalize(text) == normalize(&rendered) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            };
+            if let Some(text) = unchanged {
+                // Still current? A writer may have replaced it since the read.
+                if read_current(root, MANIFEST_PATH) == OnDisk::Text(text) {
+                    return Ok(next);
+                }
+                back_off(attempt);
+                continue;
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            match publish(&path, &rendered, mode) {
+                Ok(()) => return Ok(next),
+                Err(PublishError::Moved(_)) => back_off(attempt),
+                Err(
+                    PublishError::Late(error)
+                    | PublishError::Retained(error)
+                    | PublishError::Failed(error),
+                ) => {
+                    return Err(std::io::Error::other(error));
+                }
+            }
+        }
+        Err(std::io::Error::other(format!(
+            "{MANIFEST_PATH} kept changing; gave up after {SWAP_ATTEMPTS} tries"
+        )))
+    }
+}
+
+/// What to tell the user when a swap left its claim behind.
+fn interrupted(held: &Path) -> String {
+    format!(
+        "an interrupted upgrade left {} in place of {MANIFEST_PATH}; \
+         if {MANIFEST_PATH} is still missing, rename it back. Otherwise \
+         inspect it first: a newer manifest may have replaced it",
+        held.display()
+    )
+}
+
+/// Wait a little longer after each lost swap, so writers stop colliding.
+fn back_off(attempt: u32) {
+    std::thread::sleep(std::time::Duration::from_millis(5) * attempt);
+}
+
+/// A claim that a swap holds beside `path`, if one exists.
+fn claim_in_flight(path: &Path) -> Option<PathBuf> {
+    let prefix = claim_prefix(path)?;
+    std::fs::read_dir(path.parent()?)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|held| {
+            held.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                // The token has no dot, so `a.b` never claims for `a`.
+                name.strip_prefix(&prefix)
+                    .and_then(|rest| rest.strip_suffix(CLAIM_SUFFIX))
+                    .is_some_and(|token| !token.contains('.'))
+            })
+        })
+}
+
+/// The start of the claim names for `path`.
+fn claim_prefix(path: &Path) -> Option<String> {
+    Some(format!(
+        ".autumn-upgrade-{}.",
+        path.file_name()?.to_string_lossy()
+    ))
 }
 
 /// Why a file cannot be written without a human looking at it.
@@ -320,6 +434,9 @@ pub enum ConflictReason {
     /// Set from the codemods' *plan*, so a preview says the same thing the
     /// apply it is previewing will.
     MigratedThisRun,
+    /// A Cargo config file sits in the member while the workspace root owns
+    /// it. Cargo reads the nearest copy, so this one shadows the root copy.
+    Shadows,
 }
 
 impl ConflictReason {
@@ -334,6 +451,7 @@ impl ConflictReason {
             Self::MigratedThisRun => {
                 "this run's app-code migrations rewrote it; reconcile it by hand"
             }
+            Self::Shadows => "shadows the workspace root copy; delete it",
         }
     }
 }
@@ -500,22 +618,179 @@ pub fn resolve_options(root: &Path, manifest: Option<&Manifest>) -> GenerateOpti
     }
 }
 
-/// Files that a Cargo workspace owns at its root, not per crate.
-///
-/// `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` are all resolved
-/// from the *nearest ancestor* of the crate being built, so a crate-local copy
-/// does not add to the workspace's — it **shadows** it, silently dropping its
-/// lints and its MSRV pin with no diagnostic. GitHub only runs workflows from
-/// the repository root, so a member's `.github/workflows/ci.yml` never runs at
-/// all. Seeding any of them into a workspace member is not an upgrade; it is a
-/// regression that looks like one.
-const WORKSPACE_ROOT_OWNED: &[&str] = &[
-    "clippy.toml",
-    "rustfmt.toml",
-    "rust-toolchain.toml",
+/// Files that Cargo reads from the nearest ancestor. A member gets them at the
+/// workspace root. A copy in the member **shadows** the workspace's copy.
+const CARGO_ROOT_OWNED: &[&str] = &["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"];
+
+/// Files that GitHub reads from the **git root** only. A member gets them there.
+const GIT_ROOT_OWNED: &[&str] = &[
     ".github/workflows/ci.yml",
     ".github/workflows/posture-gate.yml",
 ];
+
+/// Who owns a group of root-level files for one project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Owner {
+    /// The project directory itself.
+    Here,
+    /// An ancestor directory. The files are planned there.
+    Above(PathBuf),
+    /// No safe place for them. They are not planned.
+    OutOfScope,
+}
+
+/// The owners of the root-level files of the project at `root`.
+struct RootOwners {
+    /// `clippy.toml`, `rustfmt.toml`, `rust-toolchain.toml`.
+    cargo: Owner,
+    /// The CI workflows.
+    workflows: Owner,
+}
+
+/// Find who owns the root files of `root`.
+///
+/// Rule: a file goes only where the member's own git repository reaches. With
+/// no git repository, nothing bounds a write, so nothing is planned. A nested
+/// repository or submodule never writes into the repository above it.
+///
+/// The posture gate runs from the git root with no working directory. It can
+/// only build the member when the git root is also the workspace root, so the
+/// workflows need that too.
+fn root_owners(root: &Path) -> RootOwners {
+    let Some(workspace) = workspace_root_above(root) else {
+        return RootOwners {
+            cargo: Owner::Here,
+            workflows: Owner::Here,
+        };
+    };
+    let out_of_scope = RootOwners {
+        cargo: Owner::OutOfScope,
+        workflows: Owner::OutOfScope,
+    };
+    let Ok(absolute) = root.canonicalize() else {
+        return out_of_scope;
+    };
+    let Some(git) = crate::git_root::find_git_root(&absolute) else {
+        return out_of_scope;
+    };
+    if git == absolute {
+        return RootOwners {
+            cargo: Owner::OutOfScope,
+            workflows: Owner::Here,
+        };
+    }
+    let cargo = if workspace.starts_with(&git) {
+        Owner::Above(workspace.clone())
+    } else {
+        Owner::OutOfScope
+    };
+    // The path from the git root is written into YAML. Refuse any character
+    // that YAML could read as syntax.
+    let workflows = if workspace == git
+        && relative_dir(&git, &absolute).is_some_and(|dir| safe_in_yaml(&dir))
+        && is_cargo_member(&workspace, &absolute)
+    {
+        Owner::Above(git)
+    } else {
+        Owner::OutOfScope
+    };
+    RootOwners { cargo, workflows }
+}
+
+/// Whether Cargo counts `member` as a member of the workspace at `workspace`.
+///
+/// Asked of Cargo, not read from `Cargo.toml`: `members` globs, `exclude` and
+/// path dependencies in the workspace directory all decide it. The posture
+/// gate selects the member with `-p`, and Cargo cannot select an excluded
+/// crate. `--no-deps` needs no network. If Cargo fails, the answer is no.
+fn is_cargo_member(workspace: &Path, member: &Path) -> bool {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let manifest = plain(member).join("Cargo.toml");
+    let Ok(output) = std::process::Command::new(cargo)
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(metadata) = serde_json::from_slice::<serde_json::Value>(&output.stdout) else {
+        return false;
+    };
+    let same = |value: Option<&str>, expected: &Path| {
+        value
+            .and_then(|path| Path::new(path).canonicalize().ok())
+            .is_some_and(|path| plain(&path) == plain(expected))
+    };
+    same(metadata["workspace_root"].as_str(), workspace)
+        && metadata["packages"].as_array().is_some_and(|packages| {
+            packages
+                .iter()
+                .any(|package| same(package["manifest_path"].as_str(), &manifest))
+        })
+}
+
+/// `path` without the `\\?\` prefix Windows adds to a canonical path.
+///
+/// Cargo can fail to match a member found through a path dependency when its
+/// manifest path has that prefix. On other systems this returns `path` as it is.
+fn plain(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// The `/`-separated path from `ancestor` down to `descendant`.
+fn relative_dir(ancestor: &Path, descendant: &Path) -> Option<String> {
+    let parts: Option<Vec<&str>> = descendant
+        .strip_prefix(ancestor)
+        .ok()?
+        .components()
+        .map(|part| part.as_os_str().to_str())
+        .collect();
+    Some(parts?.join("/"))
+}
+
+/// Whether `text` is safe to write into a YAML scalar as it is.
+fn safe_in_yaml(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+/// Cargo config files that sit in the member while the workspace root owns
+/// them. Each is a conflict: the member copy shadows the root copy, and the
+/// command never deletes a file.
+fn shadowing_copies(root: &Path) -> Vec<Entry> {
+    if !matches!(root_owners(root).cargo, Owner::Above(_)) {
+        return Vec::new();
+    }
+    CARGO_ROOT_OWNED
+        .iter()
+        .filter_map(|path| {
+            let current = read_current(root, path);
+            (current != OnDisk::Absent).then(|| Entry {
+                path: (*path).to_owned(),
+                status: Status::Conflict(ConflictReason::Shadows),
+                template: String::new(),
+                current,
+                diff: String::new(),
+                absolute: root.join(path),
+            })
+        })
+        .collect()
+}
 
 /// Whether `root` is a crate inside an enclosing Cargo workspace.
 ///
@@ -551,11 +826,11 @@ fn declares_workspace(directory: &Path) -> bool {
 
 /// The current release's framework-owned files, rendered for the project at
 /// `root`, or `None` when the project's name cannot be established.
+///
+/// A key is a path from `root`. A workspace member also gets the root-level
+/// files at their owner, as `../` paths (issue #2469).
 #[must_use]
-pub fn current_files(
-    root: &Path,
-    options: GenerateOptions,
-) -> Option<BTreeMap<&'static str, String>> {
+pub fn current_files(root: &Path, options: GenerateOptions) -> Option<BTreeMap<String, String>> {
     let name = project_name(root)?;
     let crate_name = name.replace('-', "_");
     let vars = TemplateVars {
@@ -564,10 +839,53 @@ pub fn current_files(
         autumn_version: env!("CARGO_PKG_VERSION"),
         rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
     };
-    let mut files = framework_owned_files(&vars, options);
-    if workspace_root_above(root).is_some() {
-        for path in WORKSPACE_ROOT_OWNED {
-            files.remove(path);
+    let mut files: BTreeMap<String, String> = framework_owned_files(&vars, options)
+        .into_iter()
+        .map(|(path, contents)| (path.to_owned(), contents))
+        .collect();
+    let owners = root_owners(root);
+    for (group, owner, is_workflow) in [
+        (CARGO_ROOT_OWNED, &owners.cargo, false),
+        (GIT_ROOT_OWNED, &owners.workflows, true),
+    ] {
+        match owner {
+            Owner::Here => {}
+            Owner::OutOfScope => {
+                for path in group {
+                    files.remove(*path);
+                }
+            }
+            Owner::Above(directory) => {
+                // `root_owners` proved both. If either fails now, plan nothing
+                // rather than a copy inside the member.
+                let placed = root.canonicalize().ok().and_then(|absolute| {
+                    let below = absolute.strip_prefix(directory).ok()?;
+                    let up = "../".repeat(below.components().count());
+                    Some((up, relative_dir(directory, &absolute)?))
+                });
+                let Some((up, member_dir)) = placed else {
+                    for path in group {
+                        files.remove(*path);
+                    }
+                    continue;
+                };
+                for path in group {
+                    let Some(contents) = files.remove(*path) else {
+                        continue;
+                    };
+                    let contents = if is_workflow {
+                        // A workflow that cannot be rewritten for the member
+                        // is not planned. It would name the wrong package.
+                        match crate::new::member_workflow(path, &contents, &name, &member_dir) {
+                            Some(rewritten) => rewritten,
+                            None => continue,
+                        }
+                    } else {
+                        contents
+                    };
+                    files.insert(format!("{up}{path}"), contents);
+                }
+            }
         }
     }
     Some(files)
@@ -586,10 +904,9 @@ enum OnDisk {
     Absent,
     /// Readable text, line endings normalised.
     Text(String),
-    /// Reached through a symbolic link. The contents are known — so a link
-    /// whose target already matches the scaffold is simply current — but the
-    /// path is never written, because the write would land wherever the link
-    /// points, which need not be inside the project.
+    /// Reached through a symbolic link. The contents may be known, but the
+    /// verdict never uses them: a link is always a conflict. The path is never
+    /// written, because the write would land outside the project.
     Linked(Option<String>),
     /// Present, and untouchable for this reason.
     Opaque(ConflictReason),
@@ -603,6 +920,30 @@ enum OnDisk {
 /// `--apply` would then create it outside the project, somewhere the project's
 /// own `git status` can never show.
 fn read_current(root: &Path, relative: &str) -> OnDisk {
+    // A swap in flight leaves its path absent for a moment. Wait it out, so a
+    // held file is not read as missing. A claim left by a crash costs only
+    // this bounded wait.
+    for attempt in 1..SWAP_ATTEMPTS {
+        let now = read_current_once(root, relative);
+        if now != OnDisk::Absent {
+            return now;
+        }
+        if claim_in_flight(&root.join(relative)).is_none() {
+            // The swap may have ended after the read above. Read again.
+            return read_current_once(root, relative);
+        }
+        back_off(attempt);
+    }
+    let now = read_current_once(root, relative);
+    // A claim that outlasts the wait is a swap that stalled or crashed. The
+    // file exists, held aside: unreadable, never absent.
+    if now == OnDisk::Absent && claim_in_flight(&root.join(relative)).is_some() {
+        return OnDisk::Opaque(ConflictReason::Unreadable);
+    }
+    now
+}
+
+fn read_current_once(root: &Path, relative: &str) -> OnDisk {
     let mut cursor = root.to_path_buf();
     let components: Vec<&str> = relative.split('/').collect();
     let (_leaf, parents) = components
@@ -645,13 +986,24 @@ fn read_text(absolute: &Path) -> Option<String> {
         .map(|text| normalize(&text))
 }
 
+/// What the app-code codemods plan for one file.
+#[derive(Debug, Clone)]
+pub struct Planned {
+    /// The text the codemods read.
+    pub original: String,
+    /// The text the codemods write.
+    pub updated: String,
+}
+
 /// Reconcile `files` against what is on disk under `root`.
+///
+/// `migrated` maps each path the codemods rewrite to its plan.
 #[must_use]
 pub fn classify(
     root: &Path,
-    files: &BTreeMap<&'static str, String>,
+    files: &BTreeMap<String, String>,
     manifest: Option<&Manifest>,
-    migrated: &BTreeSet<String>,
+    migrated: &BTreeMap<String, Planned>,
 ) -> Vec<Entry> {
     let recorded = |path: &str| manifest.and_then(|manifest| manifest.digests.get(path));
     let pinned = |path: &str| manifest.is_some_and(|manifest| manifest.pinned.contains(path));
@@ -661,18 +1013,28 @@ pub fn classify(
         .map(|(path, template)| {
             let absolute = root.join(path);
             let current = read_current(root, path);
+            // A migrated file is judged by its planned text. In a preview, the
+            // old file is still on disk. In `--apply`, the new file is already
+            // there. Any other text is a later edit, so the disk wins.
+            let planned = migrated.get(path);
+            let seen = match (&current, planned) {
+                (OnDisk::Text(text), Some(plan))
+                    if *text == normalize(&plan.original) || *text == normalize(&plan.updated) =>
+                {
+                    OnDisk::Text(normalize(&plan.updated))
+                }
+                _ => current.clone(),
+            };
             let normalized = normalize(template);
             let differs = |text: &str| {
                 let diff = super::diff::render(text, template);
                 (text != normalized, diff)
             };
-            let (status, diff) = match &current {
+            let (status, diff) = match &seen {
                 // Already what this release writes. Checked before anything
                 // else, including the pin: a pinned file that happens to match
-                // is current, not an exception.
-                OnDisk::Text(text) | OnDisk::Linked(Some(text)) if *text == normalized => {
-                    (Status::UpToDate, String::new())
-                }
+                // is current, not an exception. A link never counts.
+                OnDisk::Text(text) if *text == normalized => (Status::UpToDate, String::new()),
                 // The developer has said this one is theirs.
                 _ if pinned(path) => (Status::Pinned, String::new()),
                 // Not there at all. Autumn wrote it once and it is gone → a
@@ -692,20 +1054,17 @@ pub fn classify(
                         .unwrap_or_default(),
                 ),
                 OnDisk::Text(text) => {
-                    let status = if migrated.contains(*path) {
-                        Status::Conflict(ConflictReason::MigratedThisRun)
-                    } else {
-                        match recorded(path) {
-                            Some(baseline) if *baseline == digest(text) => Status::Update,
-                            Some(_) => Status::Conflict(ConflictReason::Edited),
-                            None => Status::Conflict(ConflictReason::NoBaseline),
-                        }
+                    let status = match recorded(path) {
+                        _ if planned.is_some() => Status::Conflict(ConflictReason::MigratedThisRun),
+                        Some(baseline) if *baseline == digest(text) => Status::Update,
+                        Some(_) => Status::Conflict(ConflictReason::Edited),
+                        None => Status::Conflict(ConflictReason::NoBaseline),
                     };
                     (status, differs(text).1)
                 }
             };
             Entry {
-                path: (*path).to_owned(),
+                path: path.clone(),
                 status,
                 template: normalize(template),
                 current,
@@ -728,7 +1087,9 @@ pub fn classify(
 /// whatever the developer happens to be standing in.
 #[must_use]
 pub fn is_project(root: &Path) -> bool {
-    root.join("autumn.toml").is_file() || root.join(MANIFEST_PATH).is_file()
+    let manifest = root.join(MANIFEST_PATH);
+    // A manifest held aside by a swap still marks the project.
+    root.join("autumn.toml").is_file() || manifest.is_file() || claim_in_flight(&manifest).is_some()
 }
 
 /// The upgrade guide for the release being upgraded to.
@@ -780,8 +1141,9 @@ pub struct ScaffoldReport {
     /// `Dockerfile`, the build script and the CI workflow. Downgrades are out
     /// of scope, so the run refuses instead and [`Self::entries`] is empty.
     pub scaffolded_by_newer: Option<String>,
-    /// Whether this project is a crate inside an enclosing Cargo workspace, in
-    /// which case the files that workspace owns at its root are out of scope.
+    /// Whether this project is a member of an enclosing Cargo workspace. The
+    /// report then plans the root files at the workspace root or the git root,
+    /// as `../` paths, where it can.
     pub workspace_member: bool,
     /// Every framework-owned file, up-to-date ones included.
     pub entries: Vec<Entry>,
@@ -912,6 +1274,16 @@ pub struct WriteFailure {
     pub written: usize,
 }
 
+/// The release a manifest names, when it is newer than this CLI.
+fn newer_release_recorded(manifest: Option<&Manifest>) -> Option<String> {
+    manifest
+        .and_then(|manifest| match (&manifest.written_by, &manifest.version) {
+            (Some(written_by), Some(version)) => Some(newest(Some(version), written_by)),
+            (recorded, None) | (None, recorded) => recorded.clone(),
+        })
+        .filter(|recorded| is_newer_than_this_cli(recorded))
+}
+
 /// Plan a reconciliation of the project at `root`.
 ///
 /// `_target` is accepted and ignored for the scaffold half, deliberately. This
@@ -922,18 +1294,24 @@ pub struct WriteFailure {
 /// 0.6.0 while rendering 0.7.0's files would simply be false.
 #[must_use]
 pub fn plan(root: &Path, target: &str) -> ScaffoldReport {
-    plan_after(root, target, &BTreeSet::new())
+    plan_after(root, target, &BTreeMap::new())
 }
 
 /// Plan a reconciliation, knowing which paths this run's app-code migrations
-/// have already rewritten.
+/// rewrite, and to what text.
 ///
 /// `build.rs` is both a framework-owned file and a `.rs` file the codemods
-/// scan, so one `--apply` can land on it twice. Told which files the first half
-/// touched, the second half reports them honestly instead of accusing the
-/// developer of an edit this command made moments earlier.
+/// scan, so one `--apply` can land on it twice. The map names the files the
+/// first half rewrites and gives their planned text. The second half reports
+/// those files honestly, and does not accuse the developer of an edit this
+/// command made moments earlier. The diff uses the planned text, so preview and
+/// apply show the same diff.
 #[must_use]
-pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> ScaffoldReport {
+pub fn plan_after(
+    root: &Path,
+    _target: &str,
+    migrated: &BTreeMap<String, Planned>,
+) -> ScaffoldReport {
     let target = env!("CARGO_PKG_VERSION").to_owned();
     let manifest = Manifest::load(root);
     let options = resolve_options(root, manifest.as_ref());
@@ -947,13 +1325,7 @@ pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> Sc
     // the newer of the two costs nothing, covers a manifest written before the
     // mark existed, and refuses an incoherent manifest whose `version` somehow
     // exceeds it rather than reasoning about which field to believe.
-    let scaffolded_by_newer = manifest
-        .as_ref()
-        .and_then(|manifest| match (&manifest.written_by, &manifest.version) {
-            (Some(written_by), Some(version)) => Some(newest(Some(version), written_by)),
-            (recorded, None) | (None, recorded) => recorded.clone(),
-        })
-        .filter(|recorded| is_newer_than_this_cli(recorded));
+    let scaffolded_by_newer = newer_release_recorded(manifest.as_ref());
     let files = scaffolded_by_newer
         .is_none()
         .then(|| current_files(root, options))
@@ -966,7 +1338,12 @@ pub fn plan_after(root: &Path, _target: &str, migrated: &BTreeSet<String>) -> Sc
         scaffolded_by_newer,
         workspace_member: workspace_root_above(root).is_some(),
         entries: files
-            .map(|files| classify(root, &files, manifest.as_ref(), migrated))
+            .map(|files| {
+                let mut entries = classify(root, &files, manifest.as_ref(), migrated);
+                entries.extend(shadowing_copies(root));
+                entries.sort_by(|a, b| a.path.cmp(&b.path));
+                entries
+            })
             .unwrap_or_default(),
         guide: release_guide(&target),
         target,
@@ -1077,43 +1454,67 @@ fn prerelease_precedence(left: &str, right: &str) -> std::cmp::Ordering {
 /// changes nothing. Accepting a path is a promise that reconciliation will skip
 /// it, and a promise about a file this command never touches is meaningless.
 pub fn accept(root: &Path, paths: &[String]) -> Result<Manifest, String> {
-    let manifest = Manifest::load(root);
-    let options = resolve_options(root, manifest.as_ref());
-    let owned = current_files(root, options).ok_or_else(|| {
-        "this project's `Cargo.toml` gives no usable `[package] name`, so the scaffold \
-         cannot be rendered and there is nothing to accept against"
-            .to_owned()
-    })?;
-    let unknown: Vec<&str> = paths
-        .iter()
-        .map(String::as_str)
-        .filter(|path| !owned.contains_key(path))
-        .collect();
-    if !unknown.is_empty() {
-        return Err(format!(
-            "not framework-owned in this project, so there is nothing to accept: {}",
-            unknown.join(", ")
-        ));
-    }
-
-    let mut manifest = manifest.unwrap_or_else(|| Manifest {
-        version: None,
-        written_by: None,
-        options,
-        digests: BTreeMap::new(),
-        pinned: BTreeSet::new(),
+    // Judged inside the update, on the manifest it actually read. A load made
+    // earlier can miss a manifest that a concurrent swap holds aside, and the
+    // options inferred without it can disown a file the project owns.
+    let mut refusal = None;
+    let updated = Manifest::update(root, |current| {
+        let options = resolve_options(root, current.as_ref());
+        let Some(owned) = current_files(root, options) else {
+            refusal = Some(
+                "this project's `Cargo.toml` gives no usable `[package] name`, so the \
+                 scaffold cannot be rendered and there is nothing to accept against"
+                    .to_owned(),
+            );
+            return Err(String::new());
+        };
+        let unknown: Vec<&str> = paths
+            .iter()
+            .map(String::as_str)
+            .filter(|path| !owned.contains_key(*path))
+            .collect();
+        if !unknown.is_empty() {
+            let hints: Vec<String> = unknown
+                .iter()
+                .filter_map(|path| {
+                    owned
+                        .keys()
+                        .find(|key| key.starts_with("../") && key.ends_with(&format!("/{path}")))
+                        .map(|key| format!("`{path}` is `{key}` here"))
+                })
+                .collect();
+            let hint = if hints.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", hints.join("; "))
+            };
+            refusal = Some(format!(
+                "not framework-owned in this project, so there is nothing to accept: {}{hint}",
+                unknown.join(", ")
+            ));
+            return Err(String::new());
+        }
+        let mut manifest = current.unwrap_or_else(|| Manifest {
+            version: None,
+            written_by: None,
+            options,
+            digests: BTreeMap::new(),
+            pinned: BTreeSet::new(),
+        });
+        manifest.options = options;
+        manifest.pinned.extend(paths.iter().cloned());
+        Ok(manifest)
     });
-    manifest.options = options;
-    manifest.pinned.extend(paths.iter().cloned());
-    manifest
-        .save(root)
-        .map_err(|error| format!("could not write {MANIFEST_PATH}: {error}"))?;
-    Ok(manifest)
+    match (refusal, updated) {
+        (Some(refusal), _) => Err(refusal),
+        (None, Ok(manifest)) => Ok(manifest),
+        (None, Err(error)) => Err(format!("could not write {MANIFEST_PATH}: {error}")),
+    }
 }
 
 /// Write the additions and updates in `report`, then refresh the manifest.
 ///
-/// Each file is re-read immediately before it is written and compared against
+/// Each file is re-read before it is written and compared against
 /// what the plan was computed from. A file something else changed in between —
 /// a formatter, a code generator, an editor saving — is refused rather than
 /// overwritten with a decision made about different bytes. `report.outcome` is
@@ -1131,10 +1532,12 @@ pub fn apply(report: &mut ScaffoldReport) -> Result<(), WriteFailure> {
         .enumerate()
     {
         if let Err(error) = write_one(entry) {
+            // A file that landed with a late write beside it still landed.
+            let written = written + usize::from(error.published);
             report.outcome = super::Outcome::Partial { written };
             return Err(WriteFailure {
                 path: entry.path.clone(),
-                error,
+                error: error.message,
                 written,
             });
         }
@@ -1175,16 +1578,16 @@ fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
     if report.entries.is_empty() {
         return Ok(());
     }
-    let previous = Manifest::load(&report.root);
-    let next = report.next_manifest(previous.as_ref());
-    // Rewriting an identical file would touch its mtime and show up in every
-    // `--apply` as a modified file with no diff.
-    let rendered = next.render();
-    let path = report.root.join(MANIFEST_PATH);
-    if std::fs::read_to_string(&path).is_ok_and(|current| current == rendered) {
-        return Ok(());
-    }
-    next.save(&report.root).map_err(|error| {
+    Manifest::update(&report.root, |previous| {
+        // The plan is older than this manifest. Recording from it would move
+        // a newer release's baseline backwards.
+        if let Some(newer) = newer_release_recorded(previous.as_ref()) {
+            return Err(format!("a newer release ({newer}) updated this project"));
+        }
+        Ok(report.next_manifest(previous.as_ref()))
+    })
+    .map(drop)
+    .map_err(|error| {
         format!(
             "the scaffold files were written, but the baseline could not be recorded: \
              {error}. Until it is, every file this run updated will be reported as a \
@@ -1195,26 +1598,24 @@ fn record_baseline(report: &ScaffoldReport) -> Result<(), String> {
 
 /// Write one entry, refusing to clobber anything that moved since the plan.
 ///
-/// The re-read is not belt-and-braces. The plan is a decision made about bytes
-/// read earlier, and between then and now a formatter, a code generator, an
-/// editor autosave, or a second `autumn upgrade` can have replaced them. Writing
-/// anyway would silently revert whatever landed in that window.
+/// The early re-read gives a clear error. [`Publish::Swap`] then checks the
+/// text again at the moment of the swap, so a later change is refused too.
 ///
 /// Written through a temporary file in the same directory and renamed into
 /// place, the way the app-code half of this command writes: a truncate-in-place
 /// interrupted by Ctrl-C or ENOSPC leaves a half-written `Dockerfile` and no
 /// copy of the original anywhere.
-fn write_one(entry: &Entry) -> Result<(), String> {
+fn write_one(entry: &Entry) -> Result<(), WriteError> {
     let on_disk = read_current_absolute(entry);
     if on_disk != entry.current {
-        return Err(match entry.current {
+        return Err(WriteError::from(match entry.current {
             OnDisk::Absent => "something appeared at this path after the preview was \
                                computed; it was left exactly as it is"
                 .to_owned(),
             _ => "this file changed after the preview was computed; \
                   it was left exactly as it is"
                 .to_owned(),
-        });
+        }));
     }
     // A plan is only ever built for `add` and `update`, and `read_current`
     // classifies a link or an unreadable file as a conflict, so reaching this
@@ -1222,9 +1623,9 @@ fn write_one(entry: &Entry) -> Result<(), String> {
     // the last line before a write, and the cost of being wrong is a file
     // outside the project.
     if matches!(on_disk, OnDisk::Opaque(_) | OnDisk::Linked(_)) {
-        return Err(
+        return Err(WriteError::from(
             "this path is a symlink or is unreadable; it was left exactly as it is".to_owned(),
-        );
+        ));
     }
 
     let directory = entry
@@ -1233,15 +1634,30 @@ fn write_one(entry: &Entry) -> Result<(), String> {
         .ok_or_else(|| "no parent directory".to_owned())?;
     std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
 
-    publish(
-        &entry.absolute,
-        &entry.template,
-        if entry.current == OnDisk::Absent {
-            Publish::Create
-        } else {
-            Publish::Replace
-        },
-    )
+    let mode = match &entry.current {
+        OnDisk::Text(text) => Publish::Swap(text.clone()),
+        _ => Publish::Create,
+    };
+    publish(&entry.absolute, &entry.template, mode).map_err(|error| WriteError {
+        published: error.published(),
+        message: error.to_string(),
+    })
+}
+
+/// Why one file was not written cleanly.
+struct WriteError {
+    message: String,
+    /// The new file is on disk, and something else needs a look.
+    published: bool,
+}
+
+impl From<String> for WriteError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            published: false,
+        }
+    }
 }
 
 /// Whether a publish may take a destination that already exists.
@@ -1249,12 +1665,50 @@ fn write_one(entry: &Entry) -> Result<(), String> {
 /// A statement about what the caller has *established*, not about what is on
 /// disk right now — the gap between those two is the race this exists to catch.
 /// Permissions are decided separately, from the destination itself.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Publish {
     /// The path was empty when the plan was made and must still be empty.
     Create,
-    /// The caller may take whatever is there.
-    Replace,
+    /// The path held this text (line endings ignored) at plan time. It must
+    /// hold it at swap time.
+    Swap(String),
+}
+
+/// Why a publish did not happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublishError {
+    /// Another writer changed the path first. Nothing of theirs was touched.
+    Moved(String),
+    /// The new file is in place, but a late write reached the old copy. The
+    /// copy was kept. Not retried: the write must be reported.
+    Late(String),
+    /// The new file was not installed, and a displaced copy was kept. Not
+    /// retried: the copy must be reported. Only the full swap builds it.
+    #[cfg_attr(windows, allow(dead_code))]
+    Retained(String),
+    /// The disk refused.
+    Failed(String),
+}
+
+impl PublishError {
+    /// Whether the new file is already in place despite the error.
+    const fn published(&self) -> bool {
+        matches!(self, Self::Late(_))
+    }
+}
+
+impl From<std::io::Error> for PublishError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Failed(error.to_string())
+    }
+}
+
+impl std::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Moved(text) | Self::Late(text) | Self::Retained(text) | Self::Failed(text)) =
+            self;
+        f.write_str(text)
+    }
 }
 
 /// Publish `contents` at `absolute`, atomically.
@@ -1272,23 +1726,21 @@ enum Publish {
 /// concurrent `autumn upgrade --apply` — defeating the very race protection
 /// staging exists for. The cost is that a hard crash can leave one
 /// `.autumn-upgrade-*.tmp` behind; it is inert, and never blocks a later run.
+/// A crash inside a swap can leave `.autumn-upgrade-*.old`: the old file. Rename
+/// it back.
 ///
-/// [`Publish::Create`] publishes without replacing, because `rename` *does*
-/// replace its destination on Unix. The plan's re-read happens before the bytes
-/// are written and synced, so a file another process creates inside that window
-/// would be silently clobbered by the very step that advertises it will not.
+/// [`Publish::Create`] never replaces. `rename` replaces on Unix, so a file
+/// created while staging would be lost.
 ///
-/// [`Publish::Replace`] does replace, since that is the point there. Its window
-/// is narrowed by the re-read, not closed: a writer that replaces the file
-/// between the re-read and the publish loses. Closing that needs an exchange
-/// primitive no portable API offers, and it is the same window every
-/// rename-based updater lives with.
-fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String> {
+/// [`Publish::Swap`] is a compare-and-swap: it replaces the destination only
+/// if it still holds the planned text, and refuses with [`PublishError::Moved`]
+/// otherwise. See [`swap`].
+fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), PublishError> {
     use std::io::Write as _;
 
     let directory = absolute
         .parent()
-        .ok_or_else(|| "no parent directory".to_owned())?;
+        .ok_or_else(|| PublishError::Failed("no parent directory".to_owned()))?;
     // Created through ordinary `0o666` open semantics so the process umask
     // applies, exactly as it does to the `fs::write` that `autumn new` uses.
     // `tempfile`'s own constructor deliberately creates `0600`, and deriving a
@@ -1305,44 +1757,199 @@ fn publish(absolute: &Path, contents: &str, mode: Publish) -> Result<(), String>
                 .write(true)
                 .create_new(true)
                 .open(path)
-        })
-        .map_err(|error| error.to_string())?;
+        })?;
 
-    // A file that is really there keeps the mode it already has; anything else
-    // is genuinely new and keeps the umask-derived mode it was just created
-    // with. Keyed on what is on disk rather than on `mode`, which says whether
-    // replacing is *allowed*, not whether there is anything to replace — a
-    // `Publish::Replace` of an absent path is the manifest on every
-    // `autumn new`.
+    // An existing file keeps its mode. A new file keeps the umask mode.
     if let Ok(metadata) = std::fs::metadata(absolute) {
         let _ = temp.as_file().set_permissions(metadata.permissions());
     }
 
-    temp.write_all(contents.as_bytes())
-        .map_err(|error| error.to_string())?;
-    temp.flush().map_err(|error| error.to_string())?;
+    temp.write_all(contents.as_bytes())?;
+    temp.flush()?;
     // The publish is atomic, but only against a crash if the bytes reached the
     // disk first: otherwise it can land before the data and publish an empty
     // file.
-    temp.as_file()
-        .sync_all()
-        .map_err(|error| error.to_string())?;
+    temp.as_file().sync_all()?;
 
     match mode {
-        Publish::Create => temp.persist_noclobber(absolute).map_err(|error| {
-            if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+        Publish::Create => temp
+            .persist_noclobber(absolute)
+            .map(drop)
+            .map_err(|error| {
+                if error.error.kind() == std::io::ErrorKind::AlreadyExists {
+                    PublishError::Moved(
+                        "something appeared at this path while it was being written; \
+                     it was left exactly as it is"
+                            .to_owned(),
+                    )
+                } else {
+                    error.error.into()
+                }
+            })?,
+        Publish::Swap(expected) => swap(temp, absolute, &expected)?,
+    }
+    Ok(())
+}
+
+/// Compare-and-swap: replace the destination only if it still holds `expected`.
+///
+/// First rename the destination aside. This is atomic and gives this process
+/// the exact file. Then compare it. On a mismatch, put it back, unless a newer
+/// file took its place. While the path is absent, a new writer is not
+/// overwritten, because the staged file is linked in without replacing.
+/// [`claim_in_flight`] lets readers see this window.
+#[cfg(not(windows))]
+fn swap(
+    temp: tempfile::NamedTempFile,
+    absolute: &Path,
+    expected: &str,
+) -> Result<(), PublishError> {
+    // Close the staged file first. Windows moves a file with a live handle
+    // badly, and the published file must not keep one open.
+    let staged = temp.into_temp_path();
+    let directory = absolute
+        .parent()
+        .ok_or_else(|| PublishError::Failed("no parent directory".to_owned()))?;
+    let claim = tempfile::Builder::new()
+        .prefix(
+            &claim_prefix(absolute)
+                .ok_or_else(|| PublishError::Failed("no file name".to_owned()))?,
+        )
+        .suffix(CLAIM_SUFFIX)
+        .tempfile_in(directory)?
+        .into_temp_path();
+    // The file only reserved a unique name. Remove it, so a crash before the
+    // rename leaves no empty claim, and a claim exists only once it holds the
+    // destination.
+    let _ = std::fs::remove_file(&claim);
+    match std::fs::rename(absolute, &claim) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PublishError::Moved(
+                "this file disappeared after the preview was computed".to_owned(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    // Only a plain file is read: a FIFO or device would block.
+    let held = std::fs::symlink_metadata(&claim).is_ok_and(|meta| meta.file_type().is_file())
+        && read_text(&claim).is_some_and(|text| text == normalize(expected));
+    if !held {
+        // Wrong file. Put it back. If a newer file is there, keep the old copy
+        // beside it and say where.
+        return Err(match claim.persist_noclobber(absolute) {
+            Ok(()) => PublishError::Moved(
+                "this file changed after the preview was computed; \
+                 it was left exactly as it is"
+                    .to_owned(),
+            ),
+            Err(error) => {
+                // The displaced copy is the only one. Report it, never retry it.
+                let restore = error.error.to_string();
+                let present = error.path.exists();
+                match error.path.keep() {
+                    Ok(path) => PublishError::Retained(format!(
+                        "this file changed twice after the preview was computed; \
+                         the earlier copy is at {}",
+                        path.display()
+                    )),
+                    Err(error) => PublishError::Failed(format!(
+                        "could not restore the displaced copy ({restore}) or keep it \
+                         (still there: {present}): {error}"
+                    )),
+                }
+            }
+        });
+    }
+
+    match staged.persist_noclobber(absolute) {
+        Ok(()) => finish_claim(claim, expected),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // The old copy may have had a late write too. Keep it if so. The
+            // staged file was not installed, so this is not a publish.
+            finish_claim(claim, expected).map_err(|error| match error {
+                PublishError::Late(message) => PublishError::Retained(message),
+                other => other,
+            })?;
+            Err(PublishError::Moved(
                 "something appeared at this path while it was being written; \
                  it was left exactly as it is"
-                    .to_owned()
-            } else {
-                error.error.to_string()
-            }
-        })?,
-        Publish::Replace => temp
-            .persist(absolute)
-            .map_err(|error| error.error.to_string())?,
-    };
-    Ok(())
+                    .to_owned(),
+            ))
+        }
+        Err(error) => {
+            // Restore the old file. If the path is taken, the new file stays
+            // and the old copy is kept beside it, and the error says where.
+            let staging = error.error.to_string();
+            Err(match claim.persist_noclobber(absolute) {
+                Ok(()) => PublishError::Failed(staging),
+                Err(restore) => match restore.path.keep() {
+                    Ok(path) => PublishError::Retained(format!(
+                        "{staging}; the earlier copy is at {}",
+                        path.display()
+                    )),
+                    Err(kept) => PublishError::Failed(format!(
+                        "{staging}; the earlier copy could not be kept: {kept}"
+                    )),
+                },
+            })
+        }
+    }
+}
+
+/// Windows: re-read, compare, then replace.
+///
+/// The rename-aside claim is not used here. On `windows-latest` a claim file
+/// went missing right after its rename, and the cause is not known. The old
+/// copy cannot be put back, so the claim could lose a write. This keeps the
+/// narrow window the code had before: a writer that changes the file between
+/// the compare and the replace loses. [`Manifest::update`] still re-reads and
+/// retries.
+#[cfg(windows)]
+fn swap(
+    temp: tempfile::NamedTempFile,
+    absolute: &Path,
+    expected: &str,
+) -> Result<(), PublishError> {
+    let unchanged = std::fs::symlink_metadata(absolute)
+        .is_ok_and(|meta| meta.file_type().is_file())
+        && read_text(absolute).is_some_and(|text| text == normalize(expected));
+    if !unchanged {
+        return Err(PublishError::Moved(
+            "this file changed after the preview was computed; \
+             it was left exactly as it is"
+                .to_owned(),
+        ));
+    }
+    temp.persist(absolute)
+        .map(drop)
+        .map_err(|error| PublishError::Failed(error.error.to_string()))
+}
+
+/// Drop the old copy, unless it changed since the compare.
+///
+/// A writer that opened the old file before the swap can still write into it.
+/// Keep such a copy and say where it is, so the write is not lost in silence.
+#[cfg_attr(windows, allow(dead_code))]
+fn finish_claim(claim: tempfile::TempPath, expected: &str) -> Result<(), PublishError> {
+    match read_text(&claim) {
+        Some(text) if text == normalize(expected) => return Ok(()),
+        // Nothing is there, so nothing can be kept.
+        None if !claim.exists() => return Ok(()),
+        _ => {}
+    }
+    match claim.keep() {
+        Ok(path) => Err(PublishError::Late(format!(
+            "this file was written during the swap; the earlier copy is at {}",
+            path.display()
+        ))),
+        // The new file is already in place, so this is still a publish.
+        Err(error) => Err(PublishError::Late(format!(
+            "this file was written during the swap, and the earlier copy could not \
+             be kept: {error}"
+        ))),
+    }
 }
 
 /// Re-read what an entry's path holds now, by the same rules the plan used —
@@ -1422,13 +2029,7 @@ fn render(report: &ScaffoldReport, diffs: bool) -> String {
         );
     }
     if report.workspace_member {
-        let _ = writeln!(
-            out,
-            "  This crate sits inside a Cargo workspace, so the files that workspace owns\n  \
-             at its root — clippy.toml, rustfmt.toml, rust-toolchain.toml and the CI\n  \
-             workflow — are out of scope here: a crate-local copy would shadow the\n  \
-             workspace's, not add to it. Reconcile those at the workspace root."
-        );
+        render_workspace_note(&mut out, &report.root);
     }
 
     let changed = report.changed();
@@ -1466,6 +2067,48 @@ fn render(report: &ScaffoldReport, diffs: bool) -> String {
     render_outcome(&mut out, report, diffs);
     let _ = writeln!(out, "Upgrade guide: {}", report.guide);
     out
+}
+
+/// Say where a workspace member's root-level files are planned.
+fn render_workspace_note(out: &mut String, root: &Path) {
+    use std::fmt::Write as _;
+
+    let owners = root_owners(root);
+    let _ = match owners.cargo {
+        Owner::Above(_) => writeln!(
+            out,
+            "  This crate is in a Cargo workspace. clippy.toml, rustfmt.toml and\n  \
+             rust-toolchain.toml are planned at the workspace root (the ../ paths):\n  \
+             a copy in the crate would shadow the workspace's. A root file that\n  \
+             another member wrote is a conflict. The command does not write it.\n  \
+             Use --accept to leave it to that member."
+        ),
+        _ => writeln!(
+            out,
+            "  This crate is in a Cargo workspace. clippy.toml, rustfmt.toml and\n  \
+             rust-toolchain.toml are out of scope: a crate-local copy would shadow\n  \
+             the workspace's copy. Reconcile them at the workspace root."
+        ),
+    };
+    match owners.workflows {
+        Owner::Above(_) => {
+            let _ = writeln!(
+                out,
+                "  The CI workflows are planned at the git root (the ../ paths): GitHub\n  \
+                 runs them only from there. They name this crate, so one workflow\n  \
+                 serves one member."
+            );
+        }
+        Owner::OutOfScope => {
+            let _ = writeln!(
+                out,
+                "  The CI workflows are out of scope too. They need a git repository\n  \
+                 whose root is the workspace root, and a plain directory path. Reconcile\n  \
+                 them by hand at the git root."
+            );
+        }
+        Owner::Here => {}
+    }
 }
 
 /// The closing paragraph: what happened, or what would, and how to undo it.
@@ -1582,6 +2225,8 @@ pub fn json(report: &ScaffoldReport) -> serde_json::Value {
             .iter()
             .map(|entry| serde_json::json!({
                 "path": entry.path,
+                // A root file sits outside the project directory.
+                "outside_project": entry.path.starts_with("../"),
                 "status": entry.status.label(),
                 "reason": entry.status.describe(),
                 "applied": entry.status.is_applied(),
@@ -2326,22 +2971,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_symlink_whose_content_is_already_current_is_not_drift() {
-        // Refusing to *write* through a link is right. Calling it drift when the
-        // bytes already match makes `--check` red forever with no remedy.
-        use std::os::unix::fs::PermissionsExt as _;
-
+    fn a_symlink_is_a_conflict_even_when_its_target_matches() {
+        // The verdict must not depend on a file outside the project (#2346).
         let tmp = scaffolded(GenerateOptions::default());
         let shared = tmp.path().join("shared-clippy.toml");
         let current = current_files(tmp.path(), GenerateOptions::default()).unwrap();
         fs::write(&shared, &current["clippy.toml"]).unwrap();
         fs::remove_file(tmp.path().join("clippy.toml")).unwrap();
         std::os::unix::fs::symlink(&shared, tmp.path().join("clippy.toml")).unwrap();
-        let _ = fs::metadata(&shared).map(|m| m.permissions().mode());
 
         let entries = plan_in(tmp.path()).entries;
-        assert_eq!(status_of(&entries, "clippy.toml"), &Status::UpToDate);
+        assert_eq!(
+            status_of(&entries, "clippy.toml"),
+            &Status::Conflict(ConflictReason::Symlink)
+        );
+        assert!(drifted(&entries));
+
+        // Editing the target elsewhere must not change the verdict.
+        fs::write(&shared, "# edited elsewhere\n").unwrap();
+        assert_eq!(
+            status_of(&plan_in(tmp.path()).entries, "clippy.toml"),
+            &Status::Conflict(ConflictReason::Symlink)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepting_a_matching_symlink_makes_it_pinned_not_drift() {
+        // `--accept` is the remedy: pinned is reported, never written.
+        let tmp = scaffolded(GenerateOptions::default());
+        let shared = tmp.path().join("shared-clippy.toml");
+        let current = current_files(tmp.path(), GenerateOptions::default()).unwrap();
+        fs::write(&shared, &current["clippy.toml"]).unwrap();
+        fs::remove_file(tmp.path().join("clippy.toml")).unwrap();
+        std::os::unix::fs::symlink(&shared, tmp.path().join("clippy.toml")).unwrap();
+
+        accept(tmp.path(), &["clippy.toml".to_owned()]).expect("accept");
+
+        let entries = plan_in(tmp.path()).entries;
+        assert_eq!(status_of(&entries, "clippy.toml"), &Status::Pinned);
         assert!(!drifted(&entries));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_non_matching_symlink_is_pinned_and_never_written() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let outside = tmp.path().join("outside.txt");
+        fs::write(&outside, "not mine to touch\n").unwrap();
+        let link = tmp.path().join("clippy.toml");
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        accept(tmp.path(), &["clippy.toml".to_owned()]).expect("accept");
+
+        let mut report = plan_in(tmp.path());
+        assert_eq!(status_of(&report.entries, "clippy.toml"), &Status::Pinned);
+        apply(&mut report).expect("apply");
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "not mine to touch\n");
     }
 
     #[cfg(unix)]
@@ -2395,12 +3081,9 @@ mod tests {
         assert!(Manifest::load(tmp.path()).unwrap().options.with_api);
     }
 
-    #[test]
-    fn a_workspace_member_is_not_given_the_files_a_workspace_root_owns() {
-        // `clippy.toml`, `rustfmt.toml` and `rust-toolchain.toml` resolve from
-        // the nearest ancestor, so a crate-local copy SHADOWS the workspace's —
-        // silently dropping its lints and MSRV pin. `.github/` only runs from
-        // the repository root. Seeding those into a member is not an upgrade.
+    /// A member crate `app/` under a Cargo workspace at the outer directory.
+    /// `git_marker` is written as `app/.git` when given.
+    fn member_with_git(git_marker: Option<&str>) -> (TempDir, PathBuf) {
         let outer = TempDir::new().unwrap();
         fs::write(
             outer.path().join("Cargo.toml"),
@@ -2415,27 +3098,353 @@ mod tests {
             "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
         );
         write(&root, "autumn.toml", "[server]\n");
-
-        let report = plan(&root, "0.7.0");
-        let offered: Vec<&str> = report.entries.iter().map(|e| e.path.as_str()).collect();
-        for root_owned in [
-            "clippy.toml",
-            "rustfmt.toml",
-            "rust-toolchain.toml",
-            ".github/workflows/ci.yml",
-        ] {
-            assert!(
-                !offered.contains(&root_owned),
-                "{root_owned} in {offered:?}"
-            );
+        write(&root, "src/lib.rs", "");
+        match git_marker {
+            Some("dir") => fs::create_dir(root.join(".git")).unwrap(),
+            Some(file) => write(&root, ".git", file),
+            None => {}
         }
-        // ...but the per-crate files are still reconciled.
+        (outer, root)
+    }
+
+    fn offered_paths(report: &ScaffoldReport) -> Vec<&str> {
+        report.entries.iter().map(|e| e.path.as_str()).collect()
+    }
+
+    const CARGO_FILES: [&str; 3] = ["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"];
+    const WORKFLOWS: [&str; 2] = [
+        ".github/workflows/ci.yml",
+        ".github/workflows/posture-gate.yml",
+    ];
+
+    /// Where each group is planned: `Some(prefix)` before the file name, or
+    /// `None` when the group is out of scope.
+    fn assert_scope(report: &ScaffoldReport, workflows: Option<&str>, cargo_files: Option<&str>) {
+        let offered = offered_paths(report);
+        for (group, prefix) in [
+            (WORKFLOWS.as_slice(), workflows),
+            (&CARGO_FILES, cargo_files),
+        ] {
+            for path in group {
+                let planned: Vec<&&str> = offered.iter().filter(|o| o.ends_with(path)).collect();
+                match prefix {
+                    Some(prefix) => {
+                        assert_eq!(
+                            planned,
+                            [&format!("{prefix}{path}").as_str()],
+                            "{offered:?}"
+                        );
+                    }
+                    None => assert!(planned.is_empty(), "{path} in {offered:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_member_with_no_git_repo_gets_no_root_files() {
+        // Nothing bounds a write without a git repository (issue #2469).
+        let (_outer, root) = member_with_git(None);
+        let report = plan(&root, "0.7.0");
+        assert_scope(&report, None, None);
+        let offered = offered_paths(&report);
         assert!(offered.contains(&"Dockerfile"), "{offered:?}");
         assert!(offered.contains(&"build.rs"), "{offered:?}");
+        assert!(render_text(&report).contains("CI workflows are out of scope"));
+    }
+
+    /// Layout `git_at` / `ws_at` / `member_at`, relative to one temp dir.
+    fn layout(git_at: &str, ws_at: &str, member_at: &str) -> (TempDir, PathBuf) {
+        let outer = TempDir::new().unwrap();
+        let dir = |rel: &str| outer.path().join(rel);
+        fs::create_dir_all(dir(git_at).join(".git")).unwrap();
+        fs::create_dir_all(dir(ws_at)).unwrap();
+        let listed = Path::new(member_at)
+            .strip_prefix(ws_at)
+            .unwrap_or_else(|_| Path::new(member_at))
+            .to_string_lossy()
+            .into_owned();
+        fs::write(
+            dir(ws_at).join("Cargo.toml"),
+            format!("[workspace]\nmembers = [\"{listed}\"]\n"),
+        )
+        .unwrap();
+        let root = dir(member_at);
+        fs::create_dir_all(&root).unwrap();
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        write(&root, "autumn.toml", "[server]\n");
+        write(&root, "src/lib.rs", "");
+        (outer, root)
+    }
+
+    #[test]
+    fn a_member_two_levels_down_uses_two_levels_of_dots() {
+        let (_outer, root) = layout(".", ".", "apps/demo");
+        let report = plan(&root, "0.7.0");
+        assert_scope(&report, Some("../../"), Some("../../"));
+        let gate = report
+            .entries
+            .iter()
+            .find(|e| e.path.ends_with("posture-gate.yml"))
+            .unwrap();
         assert!(
-            render_text(&report).contains("workspace"),
-            "{}",
-            render_text(&report)
+            gate.template
+                .contains("POSTURE_MANIFEST: apps/demo/security-posture.json")
+        );
+    }
+
+    #[test]
+    fn an_excluded_crate_gets_cargo_files_but_no_workflows() {
+        // `-p demo` cannot select a crate the workspace excludes.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = []\nexclude = [\"app\"]\n",
+        )
+        .unwrap();
+        assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
+    }
+
+    #[test]
+    fn a_path_dependency_in_the_workspace_is_a_member() {
+        // Cargo makes it an implicit member, so `-p demo` works.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[package]\nname = \"top\"\nversion = \"0.1.0\"\n\n\
+             [dependencies]\ndemo = { path = \"app\" }\n\n[workspace]\nmembers = []\n",
+        )
+        .unwrap();
+        write(outer.path(), "src/lib.rs", "");
+        assert_scope(&plan(&root, "0.7.0"), Some("../"), Some("../"));
+    }
+
+    #[test]
+    fn a_member_glob_does_not_override_exclude() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\nexclude = [\"app\"]\n",
+        )
+        .unwrap();
+        assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
+    }
+
+    #[test]
+    fn a_workspace_root_below_the_git_root_gets_cargo_files_only() {
+        // The posture gate runs from the git root. It cannot build there.
+        let (_outer, root) = layout(".", "ws", "ws/app");
+        assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
+    }
+
+    #[test]
+    fn a_workspace_root_above_the_git_repo_gets_nothing() {
+        // The Cargo files would land in another repository.
+        let (_outer, root) = layout("ws/repo", "ws", "ws/repo/app");
+        assert_scope(&plan(&root, "0.7.0"), None, None);
+    }
+
+    #[test]
+    fn a_deleted_root_file_is_removed_not_re_added() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        apply(&mut plan(&root, "0.7.0")).expect("apply");
+        fs::remove_file(outer.path().join("clippy.toml")).unwrap();
+        let report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "../clippy.toml"),
+            &Status::Removed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_github_directory_at_the_root_is_a_conflict() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        let elsewhere = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), outer.path().join(".github")).unwrap();
+        let mut report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "../.github/workflows/ci.yml"),
+            &Status::Conflict(ConflictReason::Symlink)
+        );
+        apply(&mut report).expect("apply");
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_member_copy_of_a_root_cargo_file_is_a_shadow_conflict() {
+        // `autumn new` writes these. Adopting the project into a workspace
+        // leaves them behind, and Cargo reads the nearest copy.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        write(&root, "clippy.toml", "# local\n");
+        let report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "clippy.toml"),
+            &Status::Conflict(ConflictReason::Shadows)
+        );
+        assert!(report.drifted());
+        let mut report = report;
+        apply(&mut report).expect("apply");
+        assert_eq!(
+            fs::read_to_string(root.join("clippy.toml")).unwrap(),
+            "# local\n"
+        );
+
+        fs::remove_file(root.join("clippy.toml")).unwrap();
+        let report = plan(&root, "0.7.0");
+        assert!(!offered_paths(&report).contains(&"clippy.toml"));
+    }
+
+    #[test]
+    fn accepting_a_bare_root_file_name_points_at_the_real_key() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        let error = accept(&root, &["clippy.toml".to_owned()]).unwrap_err();
+        assert!(error.contains("`../clippy.toml`"), "{error}");
+    }
+
+    #[test]
+    fn a_member_below_the_git_root_gets_its_workflows_at_the_git_root() {
+        // The common monorepo: `.git` at the workspace root, member below it.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        let report = plan(&root, "0.7.0");
+        assert_scope(&report, Some("../"), Some("../"));
+        assert!(!render_text(&report).contains("CI workflows are out of scope"));
+    }
+
+    #[test]
+    fn a_nested_git_repo_in_a_workspace_owns_its_workflows_but_not_its_lint_config() {
+        // Cargo resolves lint config by ancestry, but the workspace root is in
+        // another repository. GitHub runs this repo's own workflows.
+        let (_outer, root) = member_with_git(Some("dir"));
+        assert_scope(&plan(&root, "0.7.0"), Some(""), None);
+    }
+
+    #[test]
+    fn a_submodule_in_a_workspace_owns_its_workflows() {
+        // A submodule's `.git` is a file, not a directory.
+        let (_outer, root) = member_with_git(Some("gitdir: ../.git/modules/app\n"));
+        let report = plan(&root, "0.7.0");
+        assert_scope(&report, Some(""), None);
+        assert!(!render_text(&report).contains("CI workflows are out of scope"));
+    }
+
+    #[test]
+    fn a_stale_workflow_in_a_nested_git_repo_fails_the_gate() {
+        let (_outer, root) = member_with_git(Some("dir"));
+        write(&root, ".github/workflows/ci.yml", "name: stale\n");
+        assert!(plan(&root, "0.7.0").drifted());
+    }
+
+    #[test]
+    fn the_workspace_note_names_only_what_is_out_of_scope() {
+        let (_outer, root) = member_with_git(Some("dir"));
+        let text = render_text(&plan(&root, "0.7.0"));
+        assert!(text.contains("rustfmt.toml"), "{text}");
+        assert!(!text.contains("CI workflows are out of scope"), "{text}");
+    }
+
+    #[test]
+    fn apply_writes_a_members_root_files_at_the_root_and_none_in_the_member() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        let mut report = plan(&root, "0.7.0");
+        apply(&mut report).expect("apply");
+
+        for path in CARGO_FILES {
+            assert!(outer.path().join(path).is_file(), "{path} at the root");
+            assert!(!root.join(path).exists(), "{path} in the member");
+        }
+        let ci = fs::read_to_string(outer.path().join(".github/workflows/ci.yml")).unwrap();
+        assert!(ci.contains("working-directory: \"app\""), "{ci}");
+        let gate =
+            fs::read_to_string(outer.path().join(".github/workflows/posture-gate.yml")).unwrap();
+        assert!(
+            gate.contains("POSTURE_MANIFEST: app/security-posture.json"),
+            "{gate}"
+        );
+        assert!(!root.join(".github").exists());
+
+        // The next run finds nothing to do, and the digests live in the member.
+        let again = plan(&root, "0.7.0");
+        // (`autumn.toml` stays a conflict: the fixture wrote its own.)
+        for entry in again.entries.iter().filter(|e| e.path.starts_with("../")) {
+            assert_eq!(entry.status, Status::UpToDate, "{}", entry.path);
+        }
+        let manifest = Manifest::load(&root).expect("manifest");
+        assert!(
+            manifest.digests.contains_key("../clippy.toml"),
+            "{manifest:?}"
+        );
+    }
+
+    #[test]
+    fn a_root_file_another_member_wrote_is_a_conflict_not_an_overwrite() {
+        // Two members share one root workflow. The second sees the first's
+        // text (it names another package), so it is never written over.
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        write(
+            outer.path(),
+            ".github/workflows/ci.yml",
+            "name: other member\n",
+        );
+        let report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "../.github/workflows/ci.yml"),
+            &Status::Conflict(ConflictReason::NoBaseline)
+        );
+        let mut report = report;
+        apply(&mut report).expect("apply");
+        assert_eq!(
+            fs::read_to_string(outer.path().join(".github/workflows/ci.yml")).unwrap(),
+            "name: other member\n"
+        );
+    }
+
+    #[test]
+    fn a_member_in_a_directory_yaml_could_misread_gets_no_workflows() {
+        // The directory is written into the workflow. A space, `:` or `#` would
+        // change what the YAML means.
+        let outer = TempDir::new().unwrap();
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        fs::write(
+            outer.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"*\"]\n",
+        )
+        .unwrap();
+        let root = outer.path().join("my app");
+        fs::create_dir_all(&root).unwrap();
+        write(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        );
+        write(&root, "autumn.toml", "[server]\n");
+        assert_scope(&plan(&root, "0.7.0"), None, Some("../"));
+    }
+
+    #[test]
+    fn a_root_file_can_be_accepted_by_its_relative_path() {
+        let (outer, root) = member_with_git(None);
+        fs::create_dir(outer.path().join(".git")).unwrap();
+        write(outer.path(), "clippy.toml", "# ours\n");
+        accept(&root, &["../clippy.toml".to_owned()]).expect("accept");
+        let report = plan(&root, "0.7.0");
+        assert_eq!(
+            status_of(&report.entries, "../clippy.toml"),
+            &Status::Pinned
         );
     }
 
@@ -2617,7 +3626,9 @@ mod tests {
         let path = tmp.path().join("arrived.toml");
         fs::write(&path, "someone else got here first\n").unwrap();
 
-        let error = publish(&path, "ours\n", Publish::Create).expect_err("must refuse");
+        let error = publish(&path, "ours\n", Publish::Create)
+            .expect_err("must refuse")
+            .to_string();
         assert!(error.contains("appeared"), "{error}");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -2632,9 +3643,358 @@ mod tests {
         let path = tmp.path().join("existing.toml");
         fs::write(&path, "old\n").unwrap();
 
-        publish(&path, "new\n", Publish::Replace).expect("replace");
+        publish(&path, "new\n", Publish::Swap("old\n".to_owned())).expect("replace");
         assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
         assert!(no_scratch_beside(&path), "no scratch left behind");
+    }
+
+    #[test]
+    fn a_swap_refuses_a_destination_that_changed_after_the_plan() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("existing.toml");
+        fs::write(&path, "theirs, written after the plan\n").unwrap();
+
+        let error = publish(&path, "new\n", Publish::Swap("planned\n".to_owned()))
+            .expect_err("must refuse");
+        assert!(matches!(error, PublishError::Moved(_)), "{error}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "theirs, written after the plan\n"
+        );
+        assert!(no_scratch_beside(&path), "no scratch left behind");
+    }
+
+    #[test]
+    fn a_swap_refuses_a_destination_that_vanished() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("gone.toml");
+
+        let error = publish(&path, "new\n", Publish::Swap("planned\n".to_owned()))
+            .expect_err("must refuse");
+        assert!(matches!(error, PublishError::Moved(_)), "{error}");
+        assert!(!path.exists());
+        assert!(no_scratch_beside(&path), "no scratch left behind");
+    }
+
+    #[test]
+    fn a_swap_of_matching_text_ignores_line_endings() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("crlf.toml");
+        fs::write(&path, "a\r\nb\r\n").unwrap();
+
+        publish(&path, "new\n", Publish::Swap("a\nb\n".to_owned())).expect("swap");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+    }
+
+    #[test]
+    fn an_update_runs_again_when_a_writer_changed_the_manifest_first() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let mut runs = 0;
+        let root = tmp.path().to_path_buf();
+        let saved = Manifest::update(tmp.path(), |current| {
+            runs += 1;
+            let mut manifest = current.expect("manifest");
+            if runs == 1 {
+                // A second command pins its own file between our read and swap.
+                let mut theirs = manifest.clone();
+                theirs.pinned.insert("Dockerfile".to_owned());
+                fs::write(root.join(MANIFEST_PATH), theirs.render()).unwrap();
+            }
+            manifest.pinned.insert("build.rs".to_owned());
+            Ok(manifest)
+        })
+        .expect("update");
+        assert_eq!(runs, 2);
+        let pinned: Vec<&str> = saved.pinned.iter().map(String::as_str).collect();
+        assert_eq!(pinned, ["Dockerfile", "build.rs"]);
+        assert_eq!(Manifest::load(tmp.path()).unwrap(), saved);
+    }
+
+    #[test]
+    fn an_update_gives_up_when_the_manifest_never_settles() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let root = tmp.path().to_path_buf();
+        let mut runs = 0;
+        let error = Manifest::update(tmp.path(), |current| {
+            runs += 1;
+            let mut manifest = current.expect("manifest");
+            let mut theirs = manifest.clone();
+            theirs.pinned.insert(format!("racer-{runs}"));
+            fs::write(root.join(MANIFEST_PATH), theirs.render()).unwrap();
+            manifest.pinned.insert("mine".to_owned());
+            Ok(manifest)
+        })
+        .expect_err("must stop");
+        assert_eq!(runs, SWAP_ATTEMPTS);
+        assert!(error.to_string().contains("changing"), "{error}");
+        assert!(!Manifest::load(tmp.path()).unwrap().pinned.contains("mine"));
+    }
+
+    #[test]
+    fn an_update_never_builds_from_nothing_while_a_claim_is_in_flight() {
+        // A swap in progress leaves the manifest path absent. Reading that as
+        // "no manifest" would publish a blank one and erase the history.
+        let tmp = scaffolded(GenerateOptions::default());
+        let manifest_path = tmp.path().join(MANIFEST_PATH);
+        let held = manifest_path.with_file_name(".autumn-upgrade-scaffold.toml.claim.old");
+        fs::rename(&manifest_path, &held).unwrap();
+
+        let mut runs = 0;
+        let error = Manifest::update(tmp.path(), |current| {
+            runs += 1;
+            Ok(current.unwrap_or_else(|| panic!("built from nothing")))
+        })
+        .expect_err("must not build from nothing");
+        assert!(error.to_string().contains("interrupted"), "{error}");
+        assert_eq!(runs, 0);
+        assert!(held.exists(), "the held copy is never deleted");
+    }
+
+    #[test]
+    fn an_accept_judges_ownership_by_the_manifest_not_by_a_claim_gap() {
+        // While a swap holds the manifest, a plain load sees nothing and infers
+        // the API flavor, which does not own the Tailwind files.
+        let tmp = scaffolded(GenerateOptions::default());
+        for marker in [
+            "tailwind.config.js",
+            "static/css/input.css",
+            "static/js/htmx.min.js",
+        ] {
+            let _ = fs::remove_file(tmp.path().join(marker));
+        }
+        let manifest_path = tmp.path().join(MANIFEST_PATH);
+        let held = manifest_path.with_file_name(".autumn-upgrade-scaffold.toml.claim.old");
+        fs::rename(&manifest_path, &held).unwrap();
+        let restore = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            fs::rename(&held, &manifest_path).unwrap();
+        });
+
+        let accepted = accept(tmp.path(), &["tailwind.config.js".to_owned()]);
+        restore.join().unwrap();
+        let manifest = accepted.expect("owned by the recorded flavor");
+        assert!(manifest.pinned.contains("tailwind.config.js"));
+        assert!(!manifest.digests.is_empty(), "the history survives");
+    }
+
+    #[test]
+    fn a_load_waits_out_a_claim_instead_of_seeing_no_manifest() {
+        // `--check` and `--apply` plan from `load`. During a swap the path is
+        // absent, and "no manifest" would report spurious conflicts.
+        let tmp = scaffolded(GenerateOptions::default());
+        let manifest_path = tmp.path().join(MANIFEST_PATH);
+        let held = manifest_path.with_file_name(".autumn-upgrade-scaffold.toml.claim.old");
+        fs::rename(&manifest_path, &held).unwrap();
+        let restore = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            fs::rename(&held, &manifest_path).unwrap();
+        });
+
+        let loaded = Manifest::load(tmp.path());
+        restore.join().unwrap();
+        assert!(loaded.is_some(), "the manifest was only held aside");
+    }
+
+    #[test]
+    fn a_planning_read_waits_out_a_claim_on_a_scaffold_file() {
+        // The same gap hides any scaffold file a swap holds aside. Without the
+        // wait, its recorded digest and an absent file read as "removed".
+        let tmp = scaffolded(GenerateOptions::default());
+        let path = tmp.path().join("Dockerfile");
+        let held = path.with_file_name(".autumn-upgrade-Dockerfile.claim.old");
+        fs::rename(&path, &held).unwrap();
+        let restore = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            fs::rename(&held, &path).unwrap();
+        });
+
+        let report = plan_in(tmp.path());
+        restore.join().unwrap();
+        assert_eq!(*status_of(&report.entries, "Dockerfile"), Status::UpToDate);
+    }
+
+    #[test]
+    fn a_claim_written_through_an_open_handle_is_kept_not_deleted() {
+        // A writer that opened the old file before the swap keeps writing into
+        // it. Deleting that copy would lose the write without a trace.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("existing.toml");
+        let claim = tempfile::Builder::new()
+            .prefix(".autumn-upgrade-existing.toml.")
+            .suffix(CLAIM_SUFFIX)
+            .tempfile_in(tmp.path())
+            .unwrap()
+            .into_temp_path();
+        fs::write(&claim, "planned\nand a late write\n").unwrap();
+        let held = claim.to_path_buf();
+
+        let error = finish_claim(claim, "planned\n").expect_err("must keep the copy");
+        assert!(matches!(error, PublishError::Late(_)), "{error}");
+        assert!(error.to_string().contains(&*held.to_string_lossy()));
+        assert_eq!(
+            fs::read_to_string(&held).unwrap(),
+            "planned\nand a late write\n"
+        );
+
+        let clean = tempfile::Builder::new()
+            .prefix(".autumn-upgrade-existing.toml.")
+            .suffix(CLAIM_SUFFIX)
+            .tempfile_in(tmp.path())
+            .unwrap()
+            .into_temp_path();
+        fs::write(&clean, "planned\n").unwrap();
+        let gone = clean.to_path_buf();
+        finish_claim(clean, "planned\n").expect("unchanged copy is dropped");
+        assert!(!gone.exists());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_unchanged_update_still_checks_the_manifest_is_current() {
+        // `change` returns what it read, so the render matches. A writer that
+        // replaced the file after the read must still be seen.
+        let tmp = scaffolded(GenerateOptions::default());
+        let root = tmp.path().to_path_buf();
+        let mut runs = 0;
+        Manifest::update(tmp.path(), |current| {
+            runs += 1;
+            let manifest = current.expect("manifest");
+            if runs == 1 {
+                let mut theirs = manifest.clone();
+                theirs.pinned.insert("Dockerfile".to_owned());
+                fs::write(root.join(MANIFEST_PATH), theirs.render()).unwrap();
+            }
+            Ok(manifest)
+        })
+        .expect("update");
+        assert_eq!(runs, 2, "the stale snapshot must not be reported as done");
+    }
+
+    #[test]
+    fn a_project_known_only_by_a_held_manifest_is_still_a_project() {
+        let tmp = scaffolded(GenerateOptions::default());
+        fs::remove_file(tmp.path().join("autumn.toml")).unwrap();
+        let manifest_path = tmp.path().join(MANIFEST_PATH);
+        fs::rename(
+            &manifest_path,
+            manifest_path.with_file_name(".autumn-upgrade-scaffold.toml.claim.old"),
+        )
+        .unwrap();
+        assert!(is_project(tmp.path()));
+    }
+
+    #[test]
+    fn a_claim_that_never_ends_reads_as_unreadable_not_as_absent() {
+        // A crashed swap leaves the file held aside. Calling it removed would
+        // offer to restore it; unreadable is a conflict, which never writes.
+        let tmp = scaffolded(GenerateOptions::default());
+        let path = tmp.path().join("Dockerfile");
+        fs::rename(
+            &path,
+            path.with_file_name(".autumn-upgrade-Dockerfile.claim.old"),
+        )
+        .unwrap();
+
+        let report = plan_in(tmp.path());
+        assert_eq!(
+            *status_of(&report.entries, "Dockerfile"),
+            Status::Conflict(ConflictReason::Unreadable)
+        );
+    }
+
+    #[test]
+    fn a_claim_on_one_file_does_not_block_its_siblings() {
+        // A stale claim for `Dockerfile` says nothing about `rustfmt.toml`,
+        // which is simply missing and is offered as an addition.
+        let tmp = scaffolded(GenerateOptions::default());
+        fs::remove_file(tmp.path().join("rustfmt.toml")).unwrap();
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest.digests.remove("rustfmt.toml");
+        manifest.save(tmp.path()).unwrap();
+        fs::write(
+            tmp.path().join(".autumn-upgrade-Dockerfile.stale.old"),
+            "old\n",
+        )
+        .unwrap();
+
+        let report = plan_in(tmp.path());
+        assert_eq!(*status_of(&report.entries, "rustfmt.toml"), Status::Add);
+    }
+
+    #[test]
+    fn an_apply_planned_before_a_newer_release_wrote_refuses_to_record() {
+        // The plan was made against older digests. A newer release then
+        // rewrote the manifest. Recording now would move it backwards.
+        let tmp = scaffolded(GenerateOptions::default());
+        let stale = "# older\n";
+        write(tmp.path(), "clippy.toml", stale);
+        let mut manifest = Manifest::load(tmp.path()).unwrap();
+        manifest
+            .digests
+            .insert("clippy.toml".to_owned(), digest(stale));
+        manifest.save(tmp.path()).unwrap();
+        let mut report = plan_in(tmp.path());
+
+        let mut newer = Manifest::load(tmp.path()).unwrap();
+        newer.version = Some("99.0.0".to_owned());
+        newer.written_by = Some("99.0.0".to_owned());
+        newer.save(tmp.path()).unwrap();
+
+        let failure = apply(&mut report).expect_err("must not record over a newer manifest");
+        assert_eq!(failure.path, MANIFEST_PATH);
+        let kept = Manifest::load(tmp.path()).unwrap();
+        assert_eq!(kept.written_by.as_deref(), Some("99.0.0"));
+    }
+
+    #[test]
+    fn only_a_late_write_error_means_the_new_file_is_already_there() {
+        assert!(PublishError::Late("x".to_owned()).published());
+        assert!(!PublishError::Moved("x".to_owned()).published());
+        assert!(!PublishError::Retained("x".to_owned()).published());
+        assert!(!PublishError::Failed("x".to_owned()).published());
+    }
+
+    #[test]
+    fn a_stalled_claim_is_not_advised_to_be_renamed_over_a_manifest() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let manifest_path = tmp.path().join(MANIFEST_PATH);
+        fs::rename(
+            &manifest_path,
+            manifest_path.with_file_name(".autumn-upgrade-scaffold.toml.stalled.old"),
+        )
+        .unwrap();
+        let error =
+            Manifest::update(tmp.path(), |_| Err("unreachable".to_owned())).expect_err("must stop");
+        let text = error.to_string();
+        assert!(text.contains("still missing"), "{text}");
+    }
+
+    // Racy by design, and it needs the full swap, which Windows does not use.
+    #[cfg(not(windows))]
+    #[test]
+    fn two_accepts_at_once_keep_both_pins() {
+        for _ in 0..20 {
+            let tmp = scaffolded(GenerateOptions::default());
+            let root = tmp.path().to_path_buf();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let spawn = |path: &'static str| {
+                let (root, barrier) = (root.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    accept(&root, &[path.to_owned()])
+                })
+            };
+            let (left, right) = (spawn("Dockerfile"), spawn("build.rs"));
+            left.join().unwrap().expect("first accept");
+            right.join().unwrap().expect("second accept");
+            let pinned = Manifest::load(tmp.path()).unwrap().pinned;
+            assert!(pinned.contains("Dockerfile"), "{pinned:?}");
+            assert!(pinned.contains("build.rs"), "{pinned:?}");
+            let kept = Manifest::load(tmp.path()).unwrap();
+            assert!(kept.version.is_some(), "the baseline survives");
+            assert!(!kept.digests.is_empty(), "the digests survive");
+            assert!(no_scratch_beside(&root.join(MANIFEST_PATH)));
+        }
     }
 
     /// Whether the directory holding `path` is free of staging files.
@@ -2671,7 +4031,7 @@ mod tests {
             &Status::Update
         );
 
-        let migrated: BTreeSet<String> = std::iter::once("build.rs".to_owned()).collect();
+        let migrated = BTreeMap::from([("build.rs".to_owned(), plan_of(stale, stale))]);
         let previewed = plan_after(tmp.path(), "0.7.0", &migrated);
         assert_eq!(
             status_of(&previewed.entries, "build.rs"),
@@ -2683,6 +4043,143 @@ mod tests {
                 .iter()
                 .any(|entry| entry.path == "build.rs"),
             "a file the codemods rewrite is never a writable scaffold update"
+        );
+    }
+
+    #[test]
+    fn a_preview_and_an_apply_show_the_same_build_rs_diff() {
+        // The codemods change `build.rs`. Its template has also changed. A
+        // preview reads the old bytes from disk. `--apply` reads the new bytes.
+        // Both must diff the planned bytes.
+        let tmp = scaffolded(GenerateOptions::default());
+        let before = "fn main() { old_call(); }\n";
+        let after = "fn main() { new_call(); }\n";
+        write(tmp.path(), "build.rs", before);
+        let migrated = BTreeMap::from([("build.rs".to_owned(), plan_of(before, after))]);
+
+        let preview = plan_after(tmp.path(), "0.7.0", &migrated);
+        write(tmp.path(), "build.rs", after);
+        let apply = plan_after(tmp.path(), "0.7.0", &migrated);
+
+        let diff_of = |report: &ScaffoldReport| {
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.path == "build.rs")
+                .unwrap()
+                .diff
+                .clone()
+        };
+        assert_eq!(diff_of(&preview), diff_of(&apply));
+        assert!(diff_of(&preview).contains("new_call"));
+        assert!(!diff_of(&preview).contains("old_call"));
+    }
+
+    fn plan_of(original: &str, updated: &str) -> Planned {
+        Planned {
+            original: original.to_owned(),
+            updated: updated.to_owned(),
+        }
+    }
+
+    /// The verdict for `build.rs` before and after the codemods write it.
+    fn build_rs_verdicts(before: &str, planned: &str) -> (Status, Status) {
+        let tmp = scaffolded(GenerateOptions::default());
+        write(tmp.path(), "build.rs", before);
+        let migrated = BTreeMap::from([("build.rs".to_owned(), plan_of(before, planned))]);
+        let verdict = |tmp: &TempDir| {
+            let report = plan_after(tmp.path(), "0.7.0", &migrated);
+            *status_of(&report.entries, "build.rs")
+        };
+        let preview = verdict(&tmp);
+        write(tmp.path(), "build.rs", planned);
+        (preview, verdict(&tmp))
+    }
+
+    #[test]
+    fn a_codemod_that_reaches_the_template_is_up_to_date_in_both_modes() {
+        let template = current_files(
+            scaffolded(GenerateOptions::default()).path(),
+            GenerateOptions::default(),
+        )
+        .unwrap()["build.rs"]
+            .clone();
+        let (preview, apply) = build_rs_verdicts("fn main() { old_call(); }\n", &template);
+        assert_eq!(preview, Status::UpToDate);
+        assert_eq!(apply, Status::UpToDate);
+    }
+
+    #[test]
+    fn a_codemod_that_leaves_the_template_is_a_conflict_in_both_modes() {
+        let template = current_files(
+            scaffolded(GenerateOptions::default()).path(),
+            GenerateOptions::default(),
+        )
+        .unwrap()["build.rs"]
+            .clone();
+        let (preview, apply) = build_rs_verdicts(&template, "fn main() { new_call(); }\n");
+        let conflict = Status::Conflict(ConflictReason::MigratedThisRun);
+        assert_eq!(preview, conflict);
+        assert_eq!(apply, conflict);
+    }
+
+    #[test]
+    fn a_crlf_planned_text_diffs_like_its_lf_form() {
+        let tmp = scaffolded(GenerateOptions::default());
+        write(tmp.path(), "build.rs", "fn main() { old_call(); }\n");
+        let diff = |planned: &str| {
+            let migrated = BTreeMap::from([(
+                "build.rs".to_owned(),
+                plan_of("fn main() { old_call(); }\n", planned),
+            )]);
+            let report = plan_after(tmp.path(), "0.7.0", &migrated);
+            report
+                .entries
+                .into_iter()
+                .find(|entry| entry.path == "build.rs")
+                .unwrap()
+                .diff
+        };
+        let lf = diff("fn main() { new_call(); }\n");
+        assert_eq!(lf, diff("fn main() { new_call(); }\r\n"));
+        assert!(!lf.contains('\r'));
+    }
+
+    #[test]
+    fn a_file_changed_after_the_scan_keeps_its_real_diff() {
+        // The plan names neither the bytes on disk nor the bytes it writes. The
+        // report must not claim `up to date` for a file nobody wrote.
+        let tmp = scaffolded(GenerateOptions::default());
+        let template =
+            current_files(tmp.path(), GenerateOptions::default()).unwrap()["build.rs"].clone();
+        write(tmp.path(), "build.rs", "fn main() { edited_since(); }\n");
+        let migrated = BTreeMap::from([(
+            "build.rs".to_owned(),
+            plan_of("fn main() { old_call(); }\n", &template),
+        )]);
+        let report = plan_after(tmp.path(), "0.7.0", &migrated);
+        let entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.path == "build.rs")
+            .unwrap();
+        assert_eq!(
+            entry.status,
+            Status::Conflict(ConflictReason::MigratedThisRun)
+        );
+        assert!(entry.diff.contains("edited_since"));
+    }
+
+    #[test]
+    fn a_migrated_path_the_scaffold_does_not_own_is_ignored() {
+        let tmp = scaffolded(GenerateOptions::default());
+        let migrated = BTreeMap::from([("src/main.rs".to_owned(), plan_of("", "fn main() {}\n"))]);
+        let report = plan_after(tmp.path(), "0.7.0", &migrated);
+        assert!(
+            report
+                .entries
+                .iter()
+                .all(|entry| entry.path != "src/main.rs")
         );
     }
 
@@ -2713,7 +4210,13 @@ mod tests {
             "its own `[workspace]` makes it a root"
         );
         let offered: Vec<&str> = report.entries.iter().map(|e| e.path.as_str()).collect();
-        for owned in ["clippy.toml", "rustfmt.toml", "rust-toolchain.toml"] {
+        for owned in [
+            "clippy.toml",
+            "rustfmt.toml",
+            "rust-toolchain.toml",
+            ".github/workflows/ci.yml",
+            ".github/workflows/posture-gate.yml",
+        ] {
             assert!(offered.contains(&owned), "{owned} missing from {offered:?}");
         }
     }

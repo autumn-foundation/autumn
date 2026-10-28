@@ -532,6 +532,18 @@ pub trait ExperimentStore: Send + Sync + 'static {
         experiment: &str,
         limit: usize,
     ) -> Result<Vec<ChangeRecord>, ExperimentStoreError>;
+
+    /// Load the store before the first read. This can block.
+    ///
+    /// `AppBuilder::with_experiment_store` calls it once, on its own thread,
+    /// when the app installs the store. The default does nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExperimentStoreError`] on backend failure.
+    fn preload(&self) -> Result<(), ExperimentStoreError> {
+        Ok(())
+    }
 }
 
 impl<T: ExperimentStore> ExperimentStore for Arc<T> {
@@ -600,6 +612,9 @@ impl<T: ExperimentStore> ExperimentStore for Arc<T> {
     ) -> Result<Vec<ChangeRecord>, ExperimentStoreError> {
         (**self).history(experiment, limit)
     }
+    fn preload(&self) -> Result<(), ExperimentStoreError> {
+        (**self).preload()
+    }
 }
 
 // ── InMemoryExperimentStore ───────────────────────────────────────────────────
@@ -607,18 +622,78 @@ impl<T: ExperimentStore> ExperimentStore for Arc<T> {
 #[derive(Default)]
 struct StoreInner {
     experiments: HashMap<String, ExperimentConfig>,
-    assignments: HashMap<(String, String), Assignment>,
-    overrides: HashMap<(String, String), String>,
+    /// Keyed `(experiment, actor)`. Probed through `PairKey`, so a lookup
+    /// builds no owned key.
+    assignments: HashMap<PairKeyOwned, Assignment>,
+    /// Keyed `(experiment, actor)`, probed like `assignments`.
+    overrides: HashMap<PairKeyOwned, String>,
     changes: HashMap<String, Vec<ChangeRecord>>,
 }
+
+/// A borrowed view of an `(experiment, actor)` key, so the in-memory maps can
+/// be probed with two `&str`s instead of a fresh `PairKeyOwned`.
+trait PairKey {
+    fn pair(&self) -> (&str, &str);
+}
+
+/// The owned `(experiment, actor)` key of the in-memory maps.
+///
+/// A private newtype rather than a bare `(String, String)`, so the
+/// `Borrow<dyn PairKey>` impl below stays out of downstream crates: a second
+/// `Borrow` impl on `(String, String)` would break inference in their
+/// unannotated `map.get(k.borrow())` calls.
+#[derive(Debug, PartialEq, Eq)]
+struct PairKeyOwned(String, String);
+
+impl PairKey for PairKeyOwned {
+    fn pair(&self) -> (&str, &str) {
+        (self.0.as_str(), self.1.as_str())
+    }
+}
+
+// Hashes exactly what `dyn PairKey` hashes, so the owned key and its borrowed
+// form agree by construction (the `Borrow` contract).
+impl std::hash::Hash for PairKeyOwned {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.pair(), state);
+    }
+}
+
+impl PairKey for (&str, &str) {
+    fn pair(&self) -> (&str, &str) {
+        (self.0, self.1)
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn PairKey + 'a> for PairKeyOwned {
+    fn borrow(&self) -> &(dyn PairKey + 'a) {
+        self
+    }
+}
+
+// `Borrow` requires the borrowed form to hash and compare like the owned key:
+// a `PairKeyOwned` hashes as its two `str`s in order, and so does this.
+impl std::hash::Hash for dyn PairKey + '_ {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&self.pair(), state);
+    }
+}
+
+impl PartialEq for dyn PairKey + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.pair() == other.pair()
+    }
+}
+
+impl Eq for dyn PairKey + '_ {}
 
 /// In-memory [`ExperimentStore`] implementation.
 ///
 /// All data is lost when the process exits. Best suited for tests and single-
 /// replica development setups where cross-restart persistence is not required.
 ///
-/// For production, use the Postgres-backed store (coming soon) which persists
-/// assignments across restarts and propagates weight changes via LISTEN/NOTIFY.
+/// For production, use `pg::PgExperimentStore`. It persists assignments across
+/// restarts.
 #[derive(Default)]
 pub struct InMemoryExperimentStore {
     inner: RwLock<StoreInner>,
@@ -753,9 +828,10 @@ impl ExperimentStore for InMemoryExperimentStore {
         actor: &str,
     ) -> Result<Option<Assignment>, ExperimentStoreError> {
         let inner = self.inner.read().unwrap();
+        // Probe by borrow (see `PairKey`): a lookup copies neither string.
         Ok(inner
             .assignments
-            .get(&(experiment.to_owned(), actor.to_owned()))
+            .get(&(experiment, actor) as &dyn PairKey)
             .cloned())
     }
 
@@ -777,7 +853,9 @@ impl ExperimentStore for InMemoryExperimentStore {
                     if exp_config.exclusion_group.as_ref() == Some(group)
                         && inner
                             .assignments
-                            .contains_key(&(exp_name.clone(), assignment.actor.clone()))
+                            .contains_key(
+                                &(exp_name.as_str(), assignment.actor.as_str()) as &dyn PairKey
+                            )
                     {
                         return Err(ExperimentStoreError::Backend(format!(
                             "ExcludedByGroup:{group}"
@@ -788,7 +866,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         }
 
         let variant = assignment.variant.clone();
-        let key = (assignment.experiment.clone(), assignment.actor.clone());
+        let key = PairKeyOwned(assignment.experiment.clone(), assignment.actor.clone());
         inner.assignments.insert(key, assignment);
         drop(inner);
         Ok(variant)
@@ -802,7 +880,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         let inner = self.inner.read().unwrap();
         Ok(inner
             .overrides
-            .get(&(experiment.to_owned(), actor.to_owned()))
+            .get(&(experiment, actor) as &dyn PairKey)
             .cloned())
     }
 
@@ -812,7 +890,7 @@ impl ExperimentStore for InMemoryExperimentStore {
         actor: &str,
         variant: &str,
     ) -> Result<(), ExperimentStoreError> {
-        let key = (experiment.to_owned(), actor.to_owned());
+        let key = PairKeyOwned(experiment.to_owned(), actor.to_owned());
         self.inner
             .write()
             .unwrap()
@@ -837,7 +915,7 @@ impl ExperimentStore for InMemoryExperimentStore {
             }
             if inner
                 .assignments
-                .contains_key(&(exp_name.clone(), actor.to_owned()))
+                .contains_key(&(exp_name.as_str(), actor) as &dyn PairKey)
             {
                 return Ok(true);
             }
@@ -874,14 +952,15 @@ fn now_secs() -> u64 {
     crate::time::clock_unix_secs(&crate::time::AmbientClock)
 }
 
-/// FNV-1a 64-bit hash of a byte slice.
+/// FNV-1a 64-bit hash of `parts` laid end to end: exactly the hash of their
+/// concatenation, since FNV-1a folds one byte at a time.
 ///
 /// Stable, dependency-free, and specified by the FNV standard.
-fn fnv1a_64(data: &[u8]) -> u64 {
+fn fnv1a_64(parts: &[&[u8]]) -> u64 {
     const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;
     let mut hash = FNV_OFFSET;
-    for &byte in data {
+    for &byte in parts.iter().copied().flatten() {
         #[allow(clippy::cast_lossless)]
         {
             hash ^= byte as u64;
@@ -908,8 +987,9 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 /// the regression test below.
 #[must_use]
 pub fn experiment_bucket(experiment: &str, actor_id: &str) -> u64 {
-    let key = format!("{experiment}:{actor_id}");
-    fnv1a_64(key.as_bytes()) % 10_000
+    // `"<experiment>:<actor_id>"`, hashed part by part so no joined key is
+    // built. Pinned by `stable_hash_regression_known_fixtures`.
+    fnv1a_64(&[experiment.as_bytes(), b":".as_slice(), actor_id.as_bytes()]) % 10_000
 }
 
 /// Select a variant from `variants` given a `bucket` in `[0, 10 000)`.
@@ -1063,6 +1143,44 @@ impl ExperimentService {
     /// - [`ExperimentError::Store`] — backend failure.
     pub fn assign(&self, experiment: &str, actor: &str) -> Result<String, ExperimentError> {
         self.assign_with_request_id(experiment, actor, None)
+    }
+
+    /// Like [`assign`](Self::assign), but run on the blocking pool.
+    ///
+    /// Use it in async handlers. The store calls can connect to a database,
+    /// and `assign` would block the Tokio worker for that time.
+    ///
+    /// # Errors
+    ///
+    /// See [`assign`](Self::assign). A panic in the store call gives
+    /// [`ExperimentError::Store`].
+    pub async fn assign_async(
+        &self,
+        experiment: &str,
+        actor: &str,
+        request_id: Option<&str>,
+    ) -> Result<String, ExperimentError> {
+        let service = self.clone();
+        let (experiment, actor) = (experiment.to_owned(), actor.to_owned());
+        let request_id = request_id.map(str::to_owned);
+        crate::time::spawn_blocking(move || {
+            service.assign_with_request_id(&experiment, &actor, request_id.as_deref())
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(ExperimentError::Store(ExperimentStoreError::Backend(
+                format!("assignment task failed: {error}"),
+            )))
+        })
+    }
+
+    /// Load the store before the first read. See [`ExperimentStore::preload`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExperimentStoreError`] on backend failure.
+    pub fn preload(&self) -> Result<(), ExperimentStoreError> {
+        self.store.preload()
     }
 
     /// Like [`assign`](Self::assign) but propagates a `request_id` into the
@@ -1392,6 +1510,20 @@ impl ExperimentService {
     }
 }
 
+/// Preload the store of `service` on its own thread, and wait up to `wait`.
+///
+/// The app calls it when it installs the service. A failure logs a warning;
+/// it does not stop the app.
+pub(crate) fn preload_blocking(service: &ExperimentService, wait: std::time::Duration) {
+    let service = service.clone();
+    crate::feature_flags::preload_with(
+        "experiment",
+        "assignments fail until the first refresh",
+        wait,
+        move || service.preload(),
+    );
+}
+
 // ── Experiments extractor ─────────────────────────────────────────────────────
 
 /// Request extractor that resolves the current user's experiment service handle.
@@ -1411,7 +1543,7 @@ impl ExperimentService {
 ///
 /// #[get("/checkout")]
 /// async fn checkout(exps: Experiments) -> AutumnResult<Markup> {
-///     let variant = exps.assign("checkout_v2")?;
+///     let variant = exps.assign_async("checkout_v2").await?;
 ///     Ok(html! {
 ///         @match variant.as_str() {
 ///             "treatment" => (render_new_checkout()),
@@ -1437,10 +1569,28 @@ impl Experiments {
     /// # Errors
     ///
     /// See [`ExperimentService::assign_with_request_id`].
+    ///
+    /// With a Postgres store, this can block on a database connect. In an
+    /// async handler, use [`assign_async`](Self::assign_async).
     pub fn assign(&self, experiment: &str) -> Result<String, ExperimentError> {
         let actor = self.actor_id.as_deref().unwrap_or("anonymous");
         self.service
             .assign_with_request_id(experiment, actor, self.request_id.as_deref())
+    }
+
+    /// Like [`assign`](Self::assign), but run on the blocking pool.
+    ///
+    /// Use it in async handlers: `assign` can block the Tokio worker on a
+    /// database connect.
+    ///
+    /// # Errors
+    ///
+    /// See [`ExperimentService::assign_async`].
+    pub async fn assign_async(&self, experiment: &str) -> Result<String, ExperimentError> {
+        let actor = self.actor_id.as_deref().unwrap_or("anonymous");
+        self.service
+            .assign_async(experiment, actor, self.request_id.as_deref())
+            .await
     }
 
     /// Return the underlying service for direct access to admin operations.
@@ -1508,30 +1658,19 @@ impl axum::extract::FromRequestParts<crate::AppState> for Experiments {
 
 // ── pg module ─────────────────────────────────────────────────────────────────
 
-#[cfg(feature = "db")]
+#[cfg(feature = "postgres")]
 pub mod pg {
     use super::{
         Assignment, ChangeRecord, ExperimentConfig, ExperimentState, ExperimentStore,
         ExperimentStoreError, VariantConfig,
     };
+    use crate::feature_flags::pg::{STATEMENT_TIMEOUT_MS, retry_delay, with_connect_timeout};
+    use diesel::connection::SimpleConnection;
     use diesel::prelude::*;
     use std::collections::HashMap;
-    use std::sync::RwLock;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError, RwLock};
     use std::time::{Duration, Instant};
-
-    // ── Cache types ───────────────────────────────────────────────────────────
-
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum CacheLookup {
-        Hit(Option<ExperimentConfig>),
-        Miss,
-    }
-
-    #[derive(Debug, Clone)]
-    struct CachedEntry {
-        value: Option<ExperimentConfig>,
-        expires_at: Instant,
-    }
 
     // ── Row structs ───────────────────────────────────────────────────────────
 
@@ -1619,49 +1758,279 @@ pub mod pg {
         timestamp_secs: i64,
     }
 
-    #[derive(diesel::QueryableByName)]
-    struct ChangeExperimentRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        experiment: String,
+    // ── Snapshot ──────────────────────────────────────────────────────────────
+
+    /// All experiments, as the last refresh left them.
+    #[derive(Debug, Default)]
+    struct Snapshot {
+        experiments: HashMap<String, ExperimentConfig>,
+        /// `true` after the first full load.
+        loaded: bool,
+        /// Start of the last refresh attempt, good or bad.
+        checked_at: Option<Instant>,
+    }
+
+    /// State that a background refresh shares with the store.
+    struct Shared {
+        database_url: String,
+        /// `database_url` with a connect timeout.
+        connect_url: String,
+        cache_ttl: Duration,
+        snapshot: RwLock<Snapshot>,
+        /// `true` while a background refresh runs. Only one runs at a time.
+        refreshing: AtomicBool,
+        /// The refresh connection, kept between refreshes. Loads hold this
+        /// lock, so they run and install in order.
+        refresh_conn: Mutex<Option<diesel::PgConnection>>,
+        refresh_errors: AtomicU64,
+        /// Failed refreshes in a row. Zero after a good refresh.
+        failures: AtomicU32,
+        #[cfg(test)]
+        connect_threads: Mutex<Vec<std::thread::ThreadId>>,
+    }
+
+    impl std::fmt::Debug for Shared {
+        /// Leaves out the URL: it can hold a password.
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PgExperimentStore")
+                .field("cache_ttl", &self.cache_ttl)
+                .field("refresh_errors", &self.refresh_errors)
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// Holds the single refresh slot. Drop releases it, also when a spawned
+    /// refresh never runs.
+    struct RefreshSlot(Arc<Shared>);
+
+    impl Drop for RefreshSlot {
+        fn drop(&mut self) {
+            self.0.refreshing.store(false, Ordering::Release);
+        }
+    }
+
+    impl Shared {
+        fn connect(&self) -> Result<diesel::PgConnection, ExperimentStoreError> {
+            #[cfg(test)]
+            self.connect_threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(std::thread::current().id());
+            crate::db_url::require_postgres_target(&self.database_url, "PgExperimentStore")
+                .map_err(ExperimentStoreError::Backend)?;
+            // libpq quotes the target in its error, so redact it.
+            let mut conn = diesel::PgConnection::establish(&self.connect_url).map_err(|e| {
+                ExperimentStoreError::Backend(crate::db_url::redact_driver_error(
+                    &e.to_string(),
+                    &self.database_url,
+                ))
+            })?;
+            conn.batch_execute(&format!("SET statement_timeout = {STATEMENT_TIMEOUT_MS}"))
+                .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
+            Ok(conn)
+        }
+
+        /// `true` when the last refresh attempt is older than the TTL, or
+        /// older than the retry delay while refreshes fail.
+        fn is_stale(&self) -> bool {
+            let wait = retry_delay(self.cache_ttl, self.failures.load(Ordering::Relaxed));
+            let snapshot = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
+            snapshot.checked_at.is_none_or(|checked| {
+                checked
+                    .checked_add(wait)
+                    .is_some_and(|due| crate::time::system_instant() >= due)
+            })
+        }
+
+        fn is_loaded(&self) -> bool {
+            self.snapshot
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .loaded
+        }
+
+        fn mark_stale(&self) {
+            self.snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .checked_at = None;
+        }
+
+        fn read(&self, name: &str) -> Result<Option<ExperimentConfig>, ExperimentStoreError> {
+            let snapshot = self.snapshot.read().unwrap_or_else(PoisonError::into_inner);
+            match snapshot.experiments.get(name) {
+                Some(config) => Ok(Some(config.clone())),
+                None if snapshot.loaded => Ok(None),
+                None => Err(ExperimentStoreError::Backend(
+                    "experiment snapshot not loaded yet; call PgExperimentStore::refresh at startup"
+                        .to_owned(),
+                )),
+            }
+        }
+
+        /// Take the refresh slot, or `None` when a refresh already runs.
+        fn begin_refresh(self: &Arc<Self>) -> Option<RefreshSlot> {
+            self.refreshing
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .ok()
+                .map(|_| RefreshSlot(Arc::clone(self)))
+        }
+
+        /// Load all experiments on this thread and install them. This blocks.
+        fn reload(&self) -> Result<(), ExperimentStoreError> {
+            self.load().map(drop)
+        }
+
+        /// Load all experiments on this thread, install them, and return
+        /// them. This blocks.
+        fn load(&self) -> Result<Vec<ExperimentConfig>, ExperimentStoreError> {
+            let mut conn = self
+                .refresh_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            self.snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner)
+                .checked_at = Some(crate::time::system_instant());
+            let fresh = || {
+                let mut open = self.connect()?;
+                let all = load_all(&mut open)?;
+                Ok((open, all))
+            };
+            // A kept connection can be dead. Then retry once on a new one.
+            let loaded = conn
+                .take()
+                .map_or_else(fresh, |mut open| {
+                    load_all(&mut open)
+                        .map(|all| (open, all))
+                        .or_else(|_| fresh())
+                })
+                .map(|(open, all)| {
+                    // Keep the connection only after a good load.
+                    *conn = Some(open);
+                    all
+                });
+            if let Ok(all) = &loaded {
+                // Install before the lock drops, so loads install in order.
+                let mut snapshot = self
+                    .snapshot
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner);
+                snapshot.experiments = all.iter().map(|e| (e.name.clone(), e.clone())).collect();
+                snapshot.loaded = true;
+            }
+            drop(conn);
+            match loaded {
+                Ok(all) => {
+                    if self.failures.swap(0, Ordering::AcqRel) > 0 {
+                        tracing::info!("experiment refresh recovered");
+                    }
+                    Ok(all)
+                }
+                Err(error) => {
+                    self.refresh_errors.fetch_add(1, Ordering::Relaxed);
+                    if self.failures.fetch_add(1, Ordering::AcqRel) == 0 {
+                        tracing::warn!(
+                            %error,
+                            "experiment refresh failed; serving the last-known snapshot"
+                        );
+                    } else {
+                        tracing::debug!(%error, "experiment refresh failed again");
+                    }
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    fn load_all(
+        conn: &mut diesel::PgConnection,
+    ) -> Result<Vec<ExperimentConfig>, ExperimentStoreError> {
+        diesel::sql_query(
+            "SELECT name, description, state::text, variants::text, winner, \
+                    exclusion_group, \
+                    EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at_secs \
+             FROM autumn_experiments ORDER BY name",
+        )
+        .load::<ExperimentRow>(conn)
+        .map(|rows| rows.into_iter().map(ExperimentRow::into_config).collect())
+        .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
     }
 
     // ── PgExperimentStore ─────────────────────────────────────────────────────
 
-    /// Postgres-backed [`ExperimentStore`] with a short-lived read-through cache.
+    /// Postgres-backed [`ExperimentStore`] that serves config reads from memory.
     ///
-    /// Writes trigger `pg_notify('autumn_experiments', name)` so replicas can
-    /// invalidate their caches quickly via a background poll listener.
+    /// `get` reads an in-memory snapshot of all experiments. It does not
+    /// connect on the calling thread when a Tokio runtime is present. When the
+    /// snapshot is older than the cache TTL, `get` starts one refresh on the
+    /// blocking pool and returns the last-known value without waiting. With no runtime,
+    /// `get` refreshes on the calling thread.
+    ///
+    /// When a refresh fails, the store keeps the last-known snapshot, logs a
+    /// warning and counts the error ([`refresh_errors`](Self::refresh_errors)).
+    /// Before the first load, `get` returns an error.
+    ///
+    /// Per-actor calls (`get_assignment`, `record_assignment`, `get_override`,
+    /// `has_assignment_in_group`) still connect on the calling thread. In an
+    /// async handler, use
+    /// [`Experiments::assign_async`](super::Experiments::assign_async).
+    ///
+    /// Load the snapshot at startup: `AppBuilder::with_experiment_store` calls
+    /// [`ExperimentStore::preload`], and
+    /// [`spawn_poll_listener`](Self::spawn_poll_listener) refreshes on each
+    /// interval. Replicas see a remote write on their next refresh.
+    ///
+    /// Clone class: shares its snapshot-and-poll shape with `PgFlagStore`
+    /// (`autumn/src/feature_flags.rs` — see its doc for the full
+    /// cross-reference and the #3262/#3273 port history) and, less closely,
+    /// with `PgConfigStore` (`autumn/src/runtime_config.rs`). `retry_delay`,
+    /// `with_connect_timeout` and `STATEMENT_TIMEOUT_MS` are imported from
+    /// `feature_flags::pg` rather than redefined here. Unlike `PgFlagStore`,
+    /// this store has no local-write fast path: every write ends in
+    /// `refresh_after_write`, a full reload serialized through the same
+    /// `refresh_conn` lock the background poll uses, so it needs no
+    /// `generation`/`write_lock` pair to stay race-free.
     #[derive(Debug)]
     pub struct PgExperimentStore {
-        database_url: String,
-        cache_ttl: Duration,
-        cache: RwLock<HashMap<String, CachedEntry>>,
+        shared: Arc<Shared>,
     }
 
     impl Clone for PgExperimentStore {
+        /// Make a new store with the same URL and TTL and an empty snapshot.
         fn clone(&self) -> Self {
-            Self::with_cache_ttl(self.database_url.clone(), self.cache_ttl)
+            Self::with_cache_ttl(self.shared.database_url.clone(), self.shared.cache_ttl)
         }
     }
 
     impl PgExperimentStore {
-        /// Default read-through cache lifetime.
+        /// Default snapshot lifetime before `get` starts a refresh.
         pub const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(1);
 
-        /// Create a store using the default 1 s read-through cache.
+        /// Create a store with the default 1 s snapshot TTL.
         #[must_use]
         pub fn new(database_url: impl Into<String>) -> Self {
             Self::with_cache_ttl(database_url, Self::DEFAULT_CACHE_TTL)
         }
 
-        /// Create a store with an explicit cache TTL. Use `Duration::ZERO` to
-        /// disable caching.
+        /// Create a store with an explicit snapshot TTL. With `Duration::ZERO`,
+        /// each `get` starts a refresh.
         #[must_use]
         pub fn with_cache_ttl(database_url: impl Into<String>, cache_ttl: Duration) -> Self {
+            let database_url = database_url.into();
             Self {
-                database_url: database_url.into(),
-                cache_ttl,
-                cache: RwLock::new(HashMap::new()),
+                shared: Arc::new(Shared {
+                    connect_url: with_connect_timeout(&database_url),
+                    database_url,
+                    cache_ttl,
+                    snapshot: RwLock::new(Snapshot::default()),
+                    refreshing: AtomicBool::new(false),
+                    refresh_conn: Mutex::new(None),
+                    refresh_errors: AtomicU64::new(0),
+                    failures: AtomicU32::new(0),
+                    #[cfg(test)]
+                    connect_threads: Mutex::new(Vec::new()),
+                }),
             }
         }
 
@@ -1676,87 +2045,101 @@ pub mod pg {
             config.effective_primary_postgres_url().map(Self::new)
         }
 
-        fn connect(&self) -> Result<diesel::PgConnection, ExperimentStoreError> {
-            diesel::PgConnection::establish(&self.database_url)
-                .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
-        }
-
-        fn cached(&self, name: &str) -> CacheLookup {
-            let now = crate::time::ambient_instant();
-            let Ok(cache) = self.cache.read() else {
-                return CacheLookup::Miss;
-            };
-            match cache.get(name) {
-                Some(c) if c.expires_at > now => CacheLookup::Hit(c.value.clone()),
-                _ => CacheLookup::Miss,
-            }
-        }
-
-        fn store_cache(&self, name: &str, value: Option<ExperimentConfig>) {
-            if self.cache_ttl.is_zero() {
-                return;
-            }
-            let Some(expires_at) = crate::time::ambient_instant().checked_add(self.cache_ttl)
-            else {
-                return;
-            };
-            if let Ok(mut cache) = self.cache.write() {
-                cache.insert(name.to_owned(), CachedEntry { value, expires_at });
-            }
-        }
-
-        fn invalidate(&self, name: &str) {
-            if let Ok(mut cache) = self.cache.write() {
-                cache.remove(name);
-            }
-        }
-
-        /// Spawn a background thread that polls `autumn_experiment_changes` and
-        /// invalidates this store's cache for changed experiments.
+        /// Load all experiments into the snapshot now. This blocks: call it
+        /// at startup or from `spawn_blocking`.
         ///
-        /// The thread runs indefinitely; the returned handle can be detached.
+        /// # Errors
+        ///
+        /// Returns [`ExperimentStoreError::Backend`] when the load fails. The
+        /// last-known snapshot stays in use.
+        pub fn refresh(&self) -> Result<(), ExperimentStoreError> {
+            self.shared.reload()
+        }
+
+        /// Number of failed refreshes since the store was made.
+        #[must_use]
+        pub fn refresh_errors(&self) -> u64 {
+            self.shared.refresh_errors.load(Ordering::Relaxed)
+        }
+
+        fn connect(&self) -> Result<diesel::PgConnection, ExperimentStoreError> {
+            self.shared.connect()
+        }
+
+        /// Make a local write visible to the next `get`. The writer already
+        /// blocks on its own connect, so it can reload here. When the reload
+        /// fails, the next `get` starts a refresh.
+        fn refresh_after_write(&self) {
+            if self.shared.reload().is_err() {
+                self.shared.mark_stale();
+            }
+        }
+
+        /// Spawn a thread that refreshes the snapshot at once and then on each
+        /// `poll_interval`.
+        ///
+        /// Replicas see remote writes on the next refresh. Call this once at
+        /// startup and share the `Arc` with the app. The thread stops after
+        /// all clones of the `Arc` drop.
+        #[allow(
+            clippy::must_use_candidate,
+            reason = "the thread runs detached; callers drop the handle"
+        )]
         pub fn spawn_poll_listener(
-            store: std::sync::Arc<Self>,
+            store: Arc<Self>,
             poll_interval: Duration,
         ) -> std::thread::JoinHandle<()> {
+            let shared = Arc::downgrade(&store.shared);
+            drop(store);
             std::thread::spawn(move || {
-                const OVERLAP_SECS: i64 = 5;
-                // Postgres stamps `changed_at` with its own real clock, so the
-                // cursor reads the real clock too.
-                #[allow(
-                    clippy::disallowed_methods,
-                    reason = "cursor is compared with Postgres changed_at, a real clock"
-                )]
-                let now_secs = || {
-                    i64::try_from(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    )
-                    .unwrap_or(i64::MAX)
-                };
-                let mut last_polled_secs: i64 = now_secs() - OVERLAP_SECS;
-
-                loop {
-                    std::thread::sleep(poll_interval);
-                    let new_horizon = now_secs() - OVERLAP_SECS;
-                    if let Ok(mut conn) = store.connect() {
-                        let rows: Vec<ChangeExperimentRow> = diesel::sql_query(
-                            "SELECT DISTINCT experiment FROM autumn_experiment_changes \
-                             WHERE changed_at > to_timestamp($1)",
-                        )
-                        .bind::<diesel::sql_types::BigInt, _>(last_polled_secs)
-                        .load::<ChangeExperimentRow>(&mut conn)
-                        .unwrap_or_default();
-
-                        for row in rows {
-                            store.invalidate(&row.experiment);
+                while let Some(shared) = shared.upgrade() {
+                    if let Some(slot) = shared.begin_refresh() {
+                        // `reload` logs and counts its errors. A panic must
+                        // not stop the polls.
+                        let reload = std::panic::AssertUnwindSafe(|| slot.0.reload());
+                        if std::panic::catch_unwind(reload).is_err() {
+                            tracing::warn!("experiment refresh panicked");
                         }
                     }
-                    last_polled_secs = new_horizon;
+                    let wait = retry_delay(poll_interval, shared.failures.load(Ordering::Relaxed));
+                    drop(shared);
+                    std::thread::sleep(wait);
                 }
             })
+        }
+
+        #[cfg(test)]
+        fn install_for_test(&self, experiments: Vec<ExperimentConfig>) {
+            let mut snapshot = self
+                .shared
+                .snapshot
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            snapshot.experiments = experiments
+                .into_iter()
+                .map(|e| (e.name.clone(), e))
+                .collect();
+            snapshot.loaded = true;
+            snapshot.checked_at = Some(crate::time::system_instant());
+        }
+
+        #[cfg(test)]
+        fn connect_threads_for_test(&self) -> Vec<std::thread::ThreadId> {
+            self.shared
+                .connect_threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        #[cfg(test)]
+        fn refreshing_for_test(&self) -> bool {
+            self.shared.refreshing.load(Ordering::Acquire)
+        }
+
+        #[cfg(test)]
+        fn begin_refresh_for_test(&self) -> Option<RefreshSlot> {
+            self.shared.begin_refresh()
         }
     }
 
@@ -1764,37 +2147,37 @@ pub mod pg {
 
     impl ExperimentStore for PgExperimentStore {
         fn get(&self, name: &str) -> Result<Option<ExperimentConfig>, ExperimentStoreError> {
-            if let CacheLookup::Hit(v) = self.cached(name) {
-                return Ok(v);
+            if self.shared.is_stale()
+                && let Some(slot) = self.shared.begin_refresh()
+            {
+                match tokio::runtime::Handle::try_current() {
+                    // On a runtime: refresh on the blocking pool, never here.
+                    Ok(_) => {
+                        drop(crate::time::spawn_blocking(move || {
+                            // `reload` logs and counts its errors.
+                            let _ = slot.0.reload();
+                        }));
+                    }
+                    // No runtime: this thread can block. Before the first
+                    // load, report why it failed.
+                    Err(_) => {
+                        if let Err(error) = slot.0.reload()
+                            && !self.shared.is_loaded()
+                        {
+                            return Err(error);
+                        }
+                    }
+                }
             }
-            let mut conn = self.connect()?;
-            let result = diesel::sql_query(
-                "SELECT name, description, state::text, variants::text, winner, \
-                        exclusion_group, \
-                        EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at_secs \
-                 FROM autumn_experiments WHERE name = $1",
-            )
-            .bind::<diesel::sql_types::Text, _>(name)
-            .get_result::<ExperimentRow>(&mut conn)
-            .optional()
-            .map(|r| r.map(ExperimentRow::into_config))
-            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
-
-            self.store_cache(name, result.clone());
-            Ok(result)
+            self.shared.read(name)
         }
 
         fn list(&self) -> Result<Vec<ExperimentConfig>, ExperimentStoreError> {
-            let mut conn = self.connect()?;
-            diesel::sql_query(
-                "SELECT name, description, state::text, variants::text, winner, \
-                        exclusion_group, \
-                        EXTRACT(EPOCH FROM updated_at)::bigint AS updated_at_secs \
-                 FROM autumn_experiments ORDER BY name",
-            )
-            .load::<ExperimentRow>(&mut conn)
-            .map(|rows| rows.into_iter().map(ExperimentRow::into_config).collect())
-            .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
+            self.shared.load()
+        }
+
+        fn preload(&self) -> Result<(), ExperimentStoreError> {
+            self.refresh()
         }
 
         fn upsert(&self, config: ExperimentConfig) -> Result<(), ExperimentStoreError> {
@@ -1861,7 +2244,7 @@ pub mod pg {
                 ));
             }
 
-            self.invalidate(&config.name);
+            self.refresh_after_write();
             Ok(())
         }
 
@@ -1895,7 +2278,7 @@ pub mod pg {
             .bind::<diesel::sql_types::Text, _>(&mutation)
             .execute(&mut conn)
             .map_err(|e| ExperimentStoreError::Backend(e.to_string()))?;
-            self.invalidate(name);
+            self.refresh_after_write();
             Ok(())
         }
 
@@ -1968,7 +2351,7 @@ pub mod pg {
                 }
             }
 
-            self.invalidate(name);
+            self.refresh_after_write();
             Ok(())
         }
 
@@ -2186,6 +2569,315 @@ pub mod pg {
             .map_err(|e| ExperimentStoreError::Backend(e.to_string()))
         }
     }
+
+    #[cfg(test)]
+    mod pg_tests {
+        use super::*;
+
+        /// Nothing listens on port 1, so a connect fails at once.
+        const DEAD_URL: &str = "postgres://autumn@127.0.0.1:1/autumn?connect_timeout=2";
+
+        fn running(name: &str) -> ExperimentConfig {
+            let mut config = ExperimentConfig::new(name, vec![VariantConfig::new("control", 100)]);
+            config.state = ExperimentState::Running;
+            // `new` stamps the wall clock. Pin it so equal configs compare equal.
+            config.updated_at_secs = 0;
+            config
+        }
+
+        fn current_thread_runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        }
+
+        /// Wait (on the runtime) until no background refresh runs.
+        async fn settle(store: &PgExperimentStore) {
+            for _ in 0..1000 {
+                if !store.refreshing_for_test() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("background refresh did not finish");
+        }
+
+        #[test]
+        fn get_serves_last_known_value_when_refresh_fails() {
+            let store = PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::ZERO);
+            store.install_for_test(vec![running("exp")]);
+
+            // No runtime here, so `get` refreshes on this thread. It fails.
+            assert_eq!(store.get("exp").unwrap(), Some(running("exp")));
+            assert_eq!(store.get("absent").unwrap(), None);
+            assert_eq!(store.refresh_errors(), 2);
+        }
+
+        #[test]
+        fn get_within_ttl_does_not_connect() {
+            let store = PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![running("exp")]);
+            assert_eq!(store.get("exp").unwrap(), Some(running("exp")));
+            assert!(store.connect_threads_for_test().is_empty());
+        }
+
+        #[test]
+        fn get_on_runtime_never_connects_on_the_worker() {
+            let store =
+                std::sync::Arc::new(PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::ZERO));
+            store.install_for_test(vec![running("exp")]);
+
+            current_thread_runtime().block_on(async {
+                let worker = std::thread::current().id();
+                assert_eq!(store.get("exp").unwrap(), Some(running("exp")));
+                settle(&store).await;
+
+                let threads = store.connect_threads_for_test();
+                assert!(!threads.is_empty(), "the stale snapshot is refreshed");
+                assert!(!threads.contains(&worker), "no connect on the Tokio worker");
+            });
+            assert!(store.refresh_errors() >= 1);
+        }
+
+        #[test]
+        fn cold_get_on_runtime_errors_and_loads_in_background() {
+            let store = PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::ZERO);
+            current_thread_runtime().block_on(async {
+                let worker = std::thread::current().id();
+                assert!(store.get("exp").is_err(), "no snapshot yet");
+                settle(&store).await;
+                let threads = store.connect_threads_for_test();
+                assert!(!threads.is_empty());
+                assert!(!threads.contains(&worker));
+            });
+        }
+
+        #[test]
+        fn only_one_refresh_runs_at_a_time() {
+            let store = PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::ZERO);
+            let slot = store.begin_refresh_for_test();
+            assert!(slot.is_some());
+            assert!(store.begin_refresh_for_test().is_none());
+            drop(slot);
+            assert!(store.begin_refresh_for_test().is_some());
+        }
+
+        #[test]
+        fn failed_refresh_after_write_marks_the_snapshot_stale() {
+            let store = PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![running("exp")]);
+            assert!(!store.shared.is_stale());
+            store.refresh_after_write();
+            assert!(store.shared.is_stale());
+        }
+
+        #[test]
+        fn cold_get_without_runtime_reports_the_refresh_error() {
+            let store = PgExperimentStore::new(
+                "postgres://autumn:hunter2@127.0.0.1:1/autumn?connect_timeout=2",
+            );
+            let error = store.get("exp").unwrap_err().to_string();
+            assert!(!error.contains("not loaded"), "{error}");
+            assert!(!error.contains("hunter2"), "{error}");
+        }
+
+        #[test]
+        fn cold_get_while_a_refresh_runs_does_not_connect() {
+            let store = PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::ZERO);
+            let _slot = store.begin_refresh_for_test();
+            let error = store.get("exp").unwrap_err().to_string();
+            assert!(error.contains("not loaded"), "{error}");
+            assert!(store.connect_threads_for_test().is_empty());
+        }
+
+        #[test]
+        fn refresh_reports_backend_error() {
+            let store = PgExperimentStore::new(DEAD_URL);
+            assert!(store.refresh().is_err());
+            assert_eq!(store.refresh_errors(), 1);
+            assert!(store.preload().is_err());
+        }
+
+        #[test]
+        fn refresh_error_hides_the_password() {
+            let store = PgExperimentStore::new(
+                "postgres://autumn:hunter2@127.0.0.1:1/autumn?connect_timeout=2",
+            );
+            let error = store.refresh().unwrap_err().to_string();
+            assert!(!error.contains("hunter2"), "{error}");
+        }
+
+        #[test]
+        fn debug_output_hides_the_password() {
+            let store = PgExperimentStore::new(
+                "postgres://autumn:hunter2@127.0.0.1:1/autumn?connect_timeout=2",
+            );
+            let shown = format!("{store:?}");
+            assert!(shown.contains("PgExperimentStore"), "{shown}");
+            assert!(!shown.contains("hunter2"), "{shown}");
+        }
+
+        #[test]
+        fn clone_keeps_the_ttl_and_starts_with_an_empty_snapshot() {
+            let store = PgExperimentStore::with_cache_ttl(DEAD_URL, Duration::from_secs(60));
+            store.install_for_test(vec![running("exp")]);
+            let copy = store.clone();
+            assert_eq!(copy.shared.cache_ttl, Duration::from_secs(60));
+            assert!(!copy.shared.is_loaded());
+            assert!(store.shared.is_loaded(), "the original keeps its snapshot");
+        }
+
+        #[test]
+        fn poll_listener_refreshes_until_the_store_drops() {
+            let store = std::sync::Arc::new(PgExperimentStore::new(DEAD_URL));
+            let handle = PgExperimentStore::spawn_poll_listener(
+                std::sync::Arc::clone(&store),
+                Duration::from_millis(10),
+            );
+            for _ in 0..1000 {
+                if store.refresh_errors() >= 1 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(store.refresh_errors() >= 1, "the listener refreshed");
+            drop(store);
+            for _ in 0..3000 {
+                if handle.is_finished() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("poll listener outlived its store");
+        }
+
+        #[test]
+        fn poll_listener_stops_when_the_store_drops() {
+            let store = std::sync::Arc::new(PgExperimentStore::new(DEAD_URL));
+            let handle = PgExperimentStore::spawn_poll_listener(
+                std::sync::Arc::clone(&store),
+                Duration::from_millis(10),
+            );
+            drop(store);
+            for _ in 0..1000 {
+                if handle.is_finished() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("poll listener outlived its store");
+        }
+    }
+}
+
+// ── Test probe ────────────────────────────────────────────────────────────────
+
+/// In-memory store that counts `preload` calls and records the thread of each
+/// per-actor call.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct ProbeStore {
+    inner: InMemoryExperimentStore,
+    pub(crate) preloads: std::sync::atomic::AtomicUsize,
+    pub(crate) threads: Mutex<Vec<std::thread::ThreadId>>,
+    /// Make `get_assignment` panic.
+    panic_on_assignment: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+impl ProbeStore {
+    fn seen(&self) {
+        self.threads
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
+    }
+}
+
+#[cfg(test)]
+impl ExperimentStore for ProbeStore {
+    fn get(&self, name: &str) -> Result<Option<ExperimentConfig>, ExperimentStoreError> {
+        self.inner.get(name)
+    }
+    fn list(&self) -> Result<Vec<ExperimentConfig>, ExperimentStoreError> {
+        self.inner.list()
+    }
+    fn upsert(&self, config: ExperimentConfig) -> Result<(), ExperimentStoreError> {
+        self.inner.upsert(config)
+    }
+    fn set_state(
+        &self,
+        name: &str,
+        state: ExperimentState,
+        winner: Option<&str>,
+    ) -> Result<(), ExperimentStoreError> {
+        self.inner.set_state(name, state, winner)
+    }
+    fn set_variants(
+        &self,
+        name: &str,
+        variants: Vec<VariantConfig>,
+        actor: Option<&str>,
+    ) -> Result<(), ExperimentStoreError> {
+        self.inner.set_variants(name, variants, actor)
+    }
+    fn get_assignment(
+        &self,
+        experiment: &str,
+        actor: &str,
+    ) -> Result<Option<Assignment>, ExperimentStoreError> {
+        self.seen();
+        assert!(
+            !self
+                .panic_on_assignment
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "store call panicked"
+        );
+        self.inner.get_assignment(experiment, actor)
+    }
+    fn record_assignment(&self, assignment: Assignment) -> Result<String, ExperimentStoreError> {
+        self.seen();
+        self.inner.record_assignment(assignment)
+    }
+    fn get_override(
+        &self,
+        experiment: &str,
+        actor: &str,
+    ) -> Result<Option<String>, ExperimentStoreError> {
+        self.seen();
+        self.inner.get_override(experiment, actor)
+    }
+    fn set_override(
+        &self,
+        experiment: &str,
+        actor: &str,
+        variant: &str,
+    ) -> Result<(), ExperimentStoreError> {
+        self.inner.set_override(experiment, actor, variant)
+    }
+    fn has_assignment_in_group(
+        &self,
+        actor: &str,
+        group: &str,
+        exclude_experiment: &str,
+    ) -> Result<bool, ExperimentStoreError> {
+        self.seen();
+        self.inner
+            .has_assignment_in_group(actor, group, exclude_experiment)
+    }
+    fn history(
+        &self,
+        experiment: &str,
+        limit: usize,
+    ) -> Result<Vec<ChangeRecord>, ExperimentStoreError> {
+        self.inner.history(experiment, limit)
+    }
+    fn preload(&self) -> Result<(), ExperimentStoreError> {
+        self.preloads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -2198,6 +2890,123 @@ mod tests {
 
     fn make_svc() -> ExperimentService {
         ExperimentService::new(Arc::new(InMemoryExperimentStore::new()))
+    }
+
+    fn running_config(name: &str) -> ExperimentConfig {
+        let mut config = ExperimentConfig::new(
+            name,
+            vec![
+                VariantConfig::new("control", 50),
+                VariantConfig::new("b", 50),
+            ],
+        );
+        config.state = ExperimentState::Running;
+        config
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assign_async_runs_store_calls_off_the_worker() {
+        let store = Arc::new(ProbeStore::default());
+        store.upsert(running_config("exp")).unwrap();
+        let svc = ExperimentService::new(store.clone());
+        let worker = std::thread::current().id();
+
+        let first = svc.assign_async("exp", "user:1", None).await.unwrap();
+        let again = svc.assign_async("exp", "user:1", None).await.unwrap();
+
+        assert_eq!(first, again, "assignment stays sticky");
+        let threads = store.threads.lock().unwrap().clone();
+        assert!(!threads.is_empty(), "the store was called");
+        assert!(!threads.contains(&worker), "no store call on the worker");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn experiments_assign_async_uses_actor_and_runs_off_the_worker() {
+        let store = Arc::new(ProbeStore::default());
+        store.upsert(running_config("exp")).unwrap();
+        let exps = Experiments {
+            service: ExperimentService::new(store.clone()),
+            actor_id: Some("user:7".to_owned()),
+            request_id: None,
+        };
+        let worker = std::thread::current().id();
+
+        let variant = exps.assign_async("exp").await.unwrap();
+
+        let threads = store.threads.lock().unwrap().clone();
+        assert!(!threads.contains(&worker));
+        let sticky = store.get_assignment("exp", "user:7").unwrap().unwrap();
+        assert_eq!(sticky.variant, variant);
+    }
+
+    #[tokio::test]
+    async fn assign_async_maps_a_store_panic_to_a_store_error() {
+        let store = Arc::new(ProbeStore::default());
+        store.upsert(running_config("exp")).unwrap();
+        store
+            .panic_on_assignment
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let svc = ExperimentService::new(store);
+        let result = svc.assign_async("exp", "user:1", None).await;
+        assert!(
+            matches!(
+                &result,
+                Err(ExperimentError::Store(ExperimentStoreError::Backend(m)))
+                    if m.contains("assignment task failed")
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn preload_with_returns_after_the_wait_when_the_load_is_slow() {
+        let started = std::time::Instant::now();
+        crate::feature_flags::preload_with(
+            "test",
+            "none",
+            std::time::Duration::from_millis(10),
+            || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                Ok::<(), String>(())
+            },
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+    }
+
+    #[test]
+    fn preload_with_returns_when_the_load_panics_or_fails() {
+        let wait = std::time::Duration::from_secs(5);
+        crate::feature_flags::preload_with("test", "none", wait, || -> Result<(), String> {
+            panic!("load panicked")
+        });
+        crate::feature_flags::preload_with("test", "none", wait, || Err("failed".to_owned()));
+    }
+
+    #[test]
+    fn probe_store_delegates_to_the_in_memory_store() {
+        let store = ProbeStore::default();
+        store.upsert(running_config("exp")).unwrap();
+        store
+            .set_state("exp", ExperimentState::Concluded, Some("control"))
+            .unwrap();
+        store
+            .set_variants("exp", vec![VariantConfig::new("control", 100)], None)
+            .unwrap();
+        store.set_override("exp", "user:1", "control").unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(
+            store.get("exp").unwrap().unwrap().winner.as_deref(),
+            Some("control")
+        );
+        assert!(!store.history("exp", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn store_preload_defaults_to_ok() {
+        assert!(InMemoryExperimentStore::new().preload().is_ok());
+        let probe = Arc::new(ProbeStore::default());
+        probe.preload().unwrap();
+        assert_eq!(probe.preloads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn make_svc_with_sink() -> (ExperimentService, Arc<Mutex<Vec<ExposureRecord>>>) {
@@ -2380,6 +3189,182 @@ mod tests {
             6_602,
             "onboarding_v3:user:100 bucket changed — hash regression"
         );
+    }
+
+    /// `fnv1a_64` and `experiment_bucket` as they were before the hash took
+    /// parts, verbatim: `format!` joins the key, then one slice is hashed.
+    fn joined_fnv1a_64(data: &[u8]) -> u64 {
+        const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+        const FNV_PRIME: u64 = 1_099_511_628_211;
+        let mut hash = FNV_OFFSET;
+        for &byte in data {
+            #[allow(clippy::cast_lossless)]
+            {
+                hash ^= byte as u64;
+            }
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    fn joined_experiment_bucket(experiment: &str, actor_id: &str) -> u64 {
+        let key = format!("{experiment}:{actor_id}");
+        joined_fnv1a_64(key.as_bytes()) % 10_000
+    }
+
+    #[test]
+    fn experiment_bucket_is_fnv1a_of_the_joined_key() {
+        // Hashing the parts must give the joined key's bucket bit for bit,
+        // or every running experiment re-buckets its actors.
+        let edge_cases = [
+            ("checkout_v2", "user:1"),
+            ("", ""),
+            ("e", ""),
+            ("", "a"),
+            (":", ":"),
+            ("a:b", "c:d"),
+            ("ab", "c:d"),
+            ("a:b:", ":c"),
+            ("ünï", "çødé"),
+            ("exp🧪", "用户:42"),
+            ("tab\texp", "line\nactor"),
+        ];
+        for (experiment, actor) in edge_cases {
+            assert_eq!(
+                experiment_bucket(experiment, actor),
+                joined_experiment_bucket(experiment, actor),
+                "{experiment:?}/{actor:?}"
+            );
+        }
+        for experiment in ["checkout_v2", "onboarding_v3", "exp", "a:b"] {
+            for i in 0..1_000_u32 {
+                let actor = format!("user:{i}");
+                assert_eq!(
+                    experiment_bucket(experiment, &actor),
+                    joined_experiment_bucket(experiment, &actor),
+                    "{experiment:?}/{actor:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fnv1a_64_of_parts_equals_fnv1a_64_of_their_concatenation() {
+        // Every way of cutting a key into three (possibly empty) parts hashes
+        // like the uncut key.
+        for key in ["", ":", "checkout_v2:user:1", "ünï:çødé", "a::b"] {
+            let whole = joined_fnv1a_64(key.as_bytes());
+            let bytes = key.as_bytes();
+            for i in 0..=bytes.len() {
+                for j in i..=bytes.len() {
+                    let (head, rest) = bytes.split_at(i);
+                    let (middle, tail) = rest.split_at(j - i);
+                    assert_eq!(fnv1a_64(&[head, middle, tail]), whole, "{key:?} {i} {j}");
+                }
+            }
+            assert_eq!(fnv1a_64(&[bytes]), whole, "{key:?} in one part");
+        }
+        assert_eq!(fnv1a_64(&[]), joined_fnv1a_64(&[]), "no parts at all");
+    }
+
+    // ── In-memory store: `(experiment, actor)` keys probed by borrow ─────────
+
+    #[test]
+    fn pair_key_hashes_and_compares_like_the_owned_key() {
+        // The `Borrow<dyn PairKey>` contract: the borrowed form must hash and
+        // compare exactly like the `PairKeyOwned` key it stands for.
+        use std::hash::BuildHasher as _;
+        let state = std::collections::hash_map::RandomState::new();
+        for (experiment, actor) in [("exp", "user:1"), ("", ""), ("ex", "puser:1"), ("ünï", "ø")]
+        {
+            let owned = PairKeyOwned(experiment.to_owned(), actor.to_owned());
+            let owned_view: &dyn PairKey = &owned;
+            let borrowed: &dyn PairKey = &(experiment, actor);
+            assert_eq!(
+                state.hash_one(&owned),
+                state.hash_one(borrowed),
+                "{owned:?}"
+            );
+            assert_eq!(
+                state.hash_one(owned_view),
+                state.hash_one(borrowed),
+                "{owned:?}"
+            );
+            assert!(owned_view == borrowed, "{owned:?}");
+        }
+        // The same bytes, split elsewhere, are a different key.
+        let split_elsewhere: &dyn PairKey = &("ex", "puser:1");
+        let owned = PairKeyOwned("exp".to_owned(), "user:1".to_owned());
+        let owned_view: &dyn PairKey = &owned;
+        assert!(owned_view != split_elsewhere);
+    }
+
+    #[test]
+    fn in_memory_store_probes_pair_keys_by_borrow() {
+        let store = InMemoryExperimentStore::new();
+        store.set_override("exp", "qa:1", "treatment").unwrap();
+        store
+            .record_assignment(Assignment::new("exp", "user:1", "control", false))
+            .unwrap();
+        assert_eq!(
+            store.get_override("exp", "qa:1").unwrap().as_deref(),
+            Some("treatment")
+        );
+        assert_eq!(store.get_override("exp", "qa:2").unwrap(), None);
+        // Moving the split point must not collide.
+        assert_eq!(store.get_override("ex", "pqa:1").unwrap(), None);
+        assert_eq!(store.get_override("exp:", "qa:1").unwrap(), None);
+        assert_eq!(
+            store
+                .get_assignment("exp", "user:1")
+                .unwrap()
+                .unwrap()
+                .variant,
+            "control"
+        );
+        assert!(store.get_assignment("exp:user", "1").unwrap().is_none());
+        assert!(store.get_assignment("exp", "user:2").unwrap().is_none());
+    }
+
+    #[test]
+    fn exclusion_group_probe_finds_a_sibling_assignment_by_borrow() {
+        // `record_assignment` and `has_assignment_in_group` probe the sibling
+        // experiment's `(experiment, actor)` key without building it.
+        let store = InMemoryExperimentStore::new();
+        for name in ["exp_a", "exp_b"] {
+            store
+                .upsert(
+                    ExperimentConfig::new(name, vec![VariantConfig::new("v1", 1)])
+                        .exclusion_group("group"),
+                )
+                .unwrap();
+        }
+        store
+            .record_assignment(Assignment::new("exp_a", "user:1", "v1", false))
+            .unwrap();
+        assert!(
+            store
+                .has_assignment_in_group("user:1", "group", "exp_b")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_assignment_in_group("user:2", "group", "exp_b")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .has_assignment_in_group("user:1", "group", "exp_a")
+                .unwrap(),
+            "the excluded experiment itself does not count"
+        );
+        let err = store
+            .record_assignment(Assignment::new("exp_b", "user:1", "v1", false))
+            .unwrap_err();
+        assert!(err.to_string().contains("ExcludedByGroup:group"), "{err}");
+        store
+            .record_assignment(Assignment::new("exp_b", "user:2", "v1", false))
+            .unwrap();
     }
 
     // ── AC: weights — 0% weight variant is never assigned ────────────────────
@@ -3006,5 +3991,40 @@ mod tests {
                 "{url} is a Postgres target"
             );
         }
+    }
+
+    // `new(url)` does not screen the target. The first connect refuses it with
+    // a message that names the cause, and no credential goes out (#2539 §5).
+    #[cfg(feature = "db")]
+    #[test]
+    fn pg_experiment_store_new_refuses_a_non_postgres_target_at_first_use() {
+        use crate::experiments::ExperimentStore as _;
+
+        let store = pg::PgExperimentStore::new("sqlite://app:hunter2@host/app.db");
+        let err = store
+            .get("exp")
+            .expect_err("a SQLite target is refused")
+            .to_string();
+        assert!(
+            err.contains("Postgres"),
+            "the refusal names the cause: {err}"
+        );
+        assert!(!err.contains("hunter2"), "the refusal leaks: {err}");
+
+        // libpq quotes a malformed target in its error. That must not leak.
+        let store = pg::PgExperimentStore::new("postgres://app:hunter2@[::1/db");
+        let err = store
+            .get("exp")
+            .expect_err("a malformed target fails")
+            .to_string();
+        assert!(!err.contains("hunter2"), "the driver error leaks: {err}");
+
+        // libpq can quote only the decoded password.
+        let store = pg::PgExperimentStore::new("postgres://app:p%ss@localhost:1/db");
+        let err = store
+            .get("exp")
+            .expect_err("a bad escape fails")
+            .to_string();
+        assert!(!err.contains("p%ss"), "the driver error leaks: {err}");
     }
 }

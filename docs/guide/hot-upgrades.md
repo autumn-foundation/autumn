@@ -136,8 +136,15 @@ Same port, same socket, no restart — and `note=hello`, written to the old
 build's memory, is being read out of the new build's.
 
 `cargo test -p hot-upgrade --test live_upgrade` proves it under load: eight
-concurrent clients across the cutover, zero refused connections, zero failed
-reads, the pre-upgrade value intact, and the cutover latency spike measured.
+concurrent clients across the cutover, no lost request, zero failed reads, the
+pre-upgrade value intact, and the cutover latency spike measured.
+
+The test checks that no request is lost. It does not check that every answer
+is final. A client retries a reset connection once. The test allows at most
+five resets per run. A client also retries a `503` from the new build's startup
+barrier, for up to 30 seconds. A refused connection is retried for up to two
+seconds. The test allows at most sixteen refused requests per run. A connection that stays
+refused fails the test.
 
 ---
 
@@ -215,7 +222,17 @@ dropping state — reviewing what each field is mapped *to* is still yours.
    upgrade can still be abandoned (a failing startup hook), and a write the
    successor acknowledged would die with it while the predecessor resumed from
    the snapshot. Only one of the two processes is ever writable, so a retry
-   always lands somewhere that keeps it.
+   always lands somewhere that keeps it. A lock file in the handoff directory protects two steps: the
+   successor's publish-and-unfreeze, and the predecessor's decision to kill.
+   The predecessor cannot kill a successor that has become writable.
+   The successor also writes each change to a journal in the handoff directory.
+   It does this before it acknowledges the change. Suppose the successor dies
+   after it publishes, but before the predecessor settles (about one poll
+   interval). The predecessor then reads the journal and resumes from it. If the
+   new build changed the state version, the predecessor cannot read the journal.
+   It then resumes from its snapshot and logs an error. The journal also stops
+   if a disk write fails, and the successor logs a warning.
+   After the handoff settles, nothing watches the successor.
 4. **Drain.** The predecessor stops accepting, finishes its in-flight requests,
    runs its `on_shutdown` hooks, and exits. Connections queued on the shared
    socket are picked up by the successor — the socket is never closed, so

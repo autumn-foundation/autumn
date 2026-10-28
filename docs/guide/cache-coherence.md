@@ -101,9 +101,34 @@ A `(read, write)` pair fails the build when **all four** hold:
 
 ### Read identity is the cache-key namespace
 
-A cached read is identified by `module_path!() :: <fn name>` — the exact string
+A cached read is identified by `module_path!() :: <fn name>` (or `module_path!() :: <Type> :: <fn name>` with a `scope`) — the exact string
 `make_cache_key` already prefixes every one of its keys with. The manifest's
 identity and the runtime key space are the same string, by construction.
+
+Two impls in one module can hold a same-named `#[cached]` function. Put
+`#[cached_impl]` on each `impl` block. It adds the type to the identity:
+`module::Products::get`. You can also write `#[cached(scope = "Products")]`.
+Without a scope, both functions share one key space, and `autumn cache audit`
+reports the shared identity. The scope is opt-in.
+
+`#[cached_impl]` finds `#[cached]` by its path: `cached`, `autumn_web::cached`,
+`autumn_web::prelude::cached`, or the crate name Cargo resolves. It cannot see a
+`use` alias such as `use autumn_web as web;`. For those, write
+`#[cached(scope = "Products")]` by hand.
+
+The scope is the type path without generics: `a::Store`. Two impls can still
+share it: `impl Store<A>` and `impl Store<B>`, or two traits on one type with a
+same-named function. Give those a different `scope = "..."` by hand.
+
+```rust
+use autumn_web::prelude::*;
+
+#[cached_impl]
+impl Products {
+    #[cached]
+    async fn get(id: i64) -> String { /* .. */ }
+}
+```
 
 ### Invalidation edges are checked by the compiler
 
@@ -150,12 +175,17 @@ signature and body:
   and `#[repository(Comment)] trait ModerationRepository` correctly yields
   `Comment` rather than the `Moderation` its name suggests;
 * a reading associated call on a model type, from a **closed list** of verbs
-  (`find_all`, `find_by_id`, `count`, `exists_by_id`, `list`, `page`, `all`,
-  `load`, `first`) — `Post::find_all(db)` names `Post`, `Post::find_by_slug(…)`
-  does not.
+  (`find_all`, `find_by_id`, `exists_by_id`) — `Post::find_all(db)` names
+  `Post`, `Post::find_by_slug(…)` does not.
+
+Common verbs name nothing. `Config::load()`, `Metrics::count()` and
+`Post::all(db)` are not dependencies, because the macro cannot check that the
+owner is a model. If nothing else is recovered, the read is `undetermined`.
+If the macro recovers a model elsewhere, the read stays `derived` and checks
+that model only. Declare `reads(Post)` to name the model of `Post::all(db)`.
 
 A repository reached only through its **trait** — `repo: &impl PostRepository`
-— is the one case derivation cannot resolve: the constant lives on the concrete
+— cannot be resolved: the constant lives on the concrete
 struct, and the trait's name is not evidence of anything. Such a read is
 recorded `undetermined`, so it is reported and never gates. Take the concrete
 `Pg*` type, or declare `reads(...)`.
@@ -167,10 +197,13 @@ weaker claim than `declared`:
   cannot read is missed. That is why a read it recovers nothing from is recorded
   as `undetermined` rather than as having no dependencies.
 
-It is not, however, *wrong*: every model in a derived set comes either from a
-model type named outright or from a repository's own declaration, so a derived
-dependency naming a model that does not exist — which would make a real
-violation audit clean — cannot happen.
+Derivation can also be wrong. Every model in a derived set comes from a
+repository's own declaration, or from `find_all`, `find_by_id` or
+`exists_by_id` on a named type. The macro does not check that the type is a
+model. A non-model type with one of those methods is still named. An alias
+(`use Post as P`) is named as `P`. The macro cannot see a method call, a
+helper function, or a macro body.
+Declare `reads(...)` there.
 
 Declare `reads(...)` wherever the answer matters.
 
@@ -216,23 +249,82 @@ pub trait PostRepository {
 }
 ```
 
-A repository that declares any edge also gets a generated invalidator:
+A repository that declares any edge invalidates those reads **after each
+write commits**. You do not need to call anything:
 
 ```rust
-repo.save(&new).await?;
-if !PgPostRepository::invalidate_declared_caches() {
-    tracing::warn!("cache backend cannot drop a namespace; entries may still be served");
+repo.save(&new).await?; // committed, then the declared reads are dropped
+```
+
+Each generated write runs and commits its own transaction. When the write
+ends, it calls `invalidate_declared_caches_async()`. See
+[Commit-bound invalidation](#commit-bound-invalidation).
+
+The repository also gets the invalidator itself, for a write that does not go
+through the repository:
+
+```rust
+if !PgPostRepository::invalidate_declared_caches_async().await {
+    // Already logged and counted. Stale entries can be served until the TTL.
 }
 ```
 
-It is `#[must_use]`: it returns whether every declared read was invalidated
-**completely**, and an ignored `false` means the stale value is still being
-served. See [What this does not prove](#what-this-does-not-prove).
+`invalidate_declared_caches()` is the sync form. Both are `#[must_use]`: they
+return whether every declared read was invalidated **completely**. An ignored
+`false` means the stale value can still be served. See
+[What this does not prove](#what-this-does-not-prove).
 
 A method-level `#[invalidates(...)]` is folded into the same call. That
 over-invalidates on other write paths, which is safe; the alternative — an edge
 that discharges the gate with nothing callable behind it — is the paperwork this
 feature exists to prevent.
+
+### Commit-bound invalidation
+
+Issue [#3056](https://github.com/autumn-foundation/autumn/issues/3056).
+
+The order is: write, commit, then invalidate.
+
+1. The write method runs its transaction and commits.
+2. Before its `after_create` or `after_update` hook, or at its end if no hook
+   follows, it bumps the epoch of each declared namespace.
+3. It clears the local stores and asks the backend to drop the namespace.
+
+Thus an `after_*` hook that reads a declared cached read gets the committed
+row. Other readers also get it while the hook runs.
+
+If you invalidate before the commit, a reader can refill the old value between
+the `DEL` and the `COMMIT`. If you invalidate after the commit, step 2 stops the
+insert of a reader that read the old row before the commit.
+
+| Case | Result |
+| --- | --- |
+| The write returns `Err` | Invalidated too: a write can commit and then fail in an `after_*` hook. After a rollback, the cost is one cache miss. |
+| The request is cancelled, or the write panics | A guard spawns the invalidation, so it still runs. A cancel during the `COMMIT` round trip can invalidate before the server applies the commit; `commit_hooks` covers that case. |
+| `with_lock`, `find_or_create_by_*`, the retention sweep | Also invalidate. `find_or_create_by_*` skips it when it found the row, and the sweep skips it when it deleted nothing. |
+| The backend sweep fails | Retried (Redis: 3 attempts, jittered backoff). Then `warn!` and `autumn_cache_invalidation_failures_total`. The write stays `Ok`: it is committed. |
+| The repository has `commit_hooks` | The durable runner also invalidates, before `after_*_commit`. This covers a crash between the commit and the inline invalidation. A failure is logged and counted. It does not fail the row, so a cache outage does not delay or dead-letter your hooks. |
+| A write with several commits (`save_many` in chunks) | One sweep per commit that a hook or the end follows. |
+| Each write | One namespace sweep per declared read. On Redis this is a `SCAN MATCH` over the keyspace, so write latency grows with the keyspace. |
+| A write inside `Db::tx` | The repository write uses its own connection and commits on its own, so it invalidates at its own commit. |
+
+The local fence is per process. `RedisCache` also keeps a fill epoch in Redis.
+An invalidation raises it before the sweep. A fill reads it on a miss and
+stores its value only if it did not change. So a fill on **another replica**
+that read the old row before the commit cannot write it back. A backend with no
+shared epoch has only the per-process fence. On that backend, the stale
+write-back can still happen.
+
+A fill that starts after the invalidation but reads a **lagging read replica**
+can cache the old row. A TTL bounds this case.
+
+The shared epoch costs one `GET` on each miss. A hit costs nothing extra. The
+store is one Lua call, in place of the plain `SET`.
+
+The Lua call needs scripting. If you use a Redis ACL, the cache user needs
+`+eval`, `+evalsha` and `+script|load`, and the key pattern `~{prefix}:*`. With
+no scripting permission, no value is stored and every miss recomputes.
+`RedisCache` logs one `warn!` when this happens.
 
 ### 2. Or acknowledge the staleness
 
@@ -320,7 +412,9 @@ autumn_web::cache::coherence::register_namespace_store(
 It returns the namespace's fill epoch. Sample it before computing a value, then
 insert through `with_fill_fence` — `#[cached]` does this for you — or a fill
 already in flight when an invalidation lands will write its stale value back
-afterwards:
+afterwards. For a shared backend, also read `Cache::fill_epoch` and store with
+`insert_cached_fenced`. See "The fill fence" in the `invalidate_namespace`
+rustdoc.
 
 ```rust
 let sampled = epoch.load(std::sync::atomic::Ordering::Acquire);
@@ -433,7 +527,7 @@ $ autumn cache audit --manifest target/cache-coherence.json --json
     "invalidations": {
       "provenance": "provable",
       "source": "macro:#[repository(..., invalidates(...))]",
-      "runtime_caveat": "the edge's target is proven … That the invalidator is actually CALLED on the write path is not proven by this slice …",
+      "runtime_caveat": "the edge's target is proven … Each generated write method calls the invalidator after its own transaction commits … Not proven: that the backend sweep succeeds …",
       "entries": [
         {
           "mutation": "ProjectRepository::delete_by_id",
@@ -459,7 +553,7 @@ three dimensions here are `provable`: each is recovered from macro-expanded code
 with no config read and no process started. Where a dimension has an adjacent
 weak step it carries a `runtime_caveat` rather than being demoted, which is that
 rubric's stated tie-breaker — the invalidation edge is genuinely proven, and
-what is *not* proven is that the invalidator runs.
+what is *not* proven is that the backend sweep succeeds.
 
 The **entry** level of `cached_reads` uses a second, narrower vocabulary —
 `declared` / `derived` / `undetermined` — describing how one read's dependency
@@ -471,10 +565,11 @@ tell "we checked and it was fine" from "we never looked".
 
 ## What this does not prove
 
-* **That the invalidator runs.** The build proves the edge exists and that it
-  names a real cached read. Whether `invalidate_declared_caches()` is actually
-  called on the write path is the `invalidations` dimension's `runtime_caveat`;
-  wiring it automatically through repository commit hooks is the next slice.
+* **That the invalidation succeeds.** Each generated write calls the
+  invalidator after it commits, so the call is no longer up to you. The build
+  does not prove that the backend sweep succeeds. A failure is retried, then
+  logged and counted in `autumn_cache_invalidation_failures_total`. Alert on
+  that counter.
 * **Complete invalidation under an opaque backend.** Namespace invalidation
   clears every store registered for the read *and* asks the registered backend
   to drop the namespace — `MokaCache` by iteration, `RedisCache` by a `SCAN
@@ -483,10 +578,23 @@ tell "we checked and it was fine" from "we never looked".
   `Cache::invalidate_namespace`, and `invalidate_declared_caches()` reports that
   `false` verbatim rather than letting you believe the value is gone. It is
   `#[must_use]` for exactly that reason.
-* **A fill in flight on another replica.** The epoch fence stops a fill *this
-  process* started before an invalidation from writing its stale value back
-  after it. It cannot speak for another replica's in-flight fill into a shared
-  backend, so a `true` is a claim about this process, not the fleet.
+* **A fill that reads a lagging read replica.** A fill that starts after the
+  invalidation reads the database again. If that read goes to a replica that
+  has not applied the write, the old row is cached with a current epoch.
+* **A fill in flight on another replica.** With `RedisCache`, the shared epoch
+  fences it out, and a `true` is valid for all replicas. With a custom backend
+  that has no `fill_epoch`, the fence is per process. Another replica's fill
+  that started before the invalidation can then write a stale value back, and a
+  `true` is valid for this process only. The shared fence covers `#[cached]` and
+  `cache_fragment_in`. It does not cover `get_or_compute`, `Cache::clear`, or a
+  key-level `invalidate`.
+* **Loss of the epoch key.** Redis must keep the epoch keys
+  (`{prefix}:__autumn_epoch__:*`). Eviction, `FLUSHDB`, or a failover to a replica that
+  missed the bump can reset one to 0. A stale fill that sampled 0 can then
+  pass. Do not let an eviction policy remove these keys.
+* **A snapshot taken before the call.** The shared epoch is read after the
+  miss. If the caller read its data in an earlier transaction or snapshot, an
+  invalidation between that read and the miss is not fenced.
 * **Which writes exist.** Only `#[repository]` write methods are in the mutated
   set. A hand-rolled repository, a raw diesel `update`/`insert`/`delete`, a
   migration, or a job that writes directly is invisible to the gate — so a
@@ -497,7 +605,13 @@ tell "we checked and it was fine" from "we never looked".
   `#[repository(..., dependent(...))]` cascade **is** covered: it registers a
   write against the child model it deletes or nullifies, resolved from that
   child repository's own published model rather than guessed from its type name
-  (`on_delete = restrict` is excluded — it probes and never writes). But
+  (`on_delete = restrict` is excluded — it probes and never writes). A cascade
+  that reaches further `destroy` cascades is also covered. The audit follows
+  each child's own `dependent(...)` list at link time. A root delete registers
+  a write for every model below it. The root must declare an edge for each one.
+  The audit matches repositories by trait name. Two traits with the same name
+  count as one. `nullify` and `delete_all` write one table, so the audit does
+  not follow them further. But
   `#[has_many(Child, dependent = destroy)]` and
   `#[belongs_to(Parent, counter_cache)]` are declared on the model, which
   `#[repository]` cannot see, so the writes they cause carry no descriptor.

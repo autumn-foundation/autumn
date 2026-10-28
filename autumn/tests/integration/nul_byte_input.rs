@@ -196,4 +196,48 @@ mod docker {
             "the raw Postgres message must not become the client-facing one"
         );
     }
+
+    /// A NUL inside a JSON string bound to a `JSONB` column fails with
+    /// SQLSTATE `22P05`, not `22021`. It must also be a `422`.
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn real_pg_jsonb_nul_byte_insert_is_422_not_500() {
+        let (_container, pool) = start_postgres().await;
+        let mut conn = pool.get().await.expect("get connection");
+
+        diesel::sql_query(
+            "CREATE TABLE IF NOT EXISTS nul_json_test (id BIGSERIAL PRIMARY KEY, doc JSONB NOT NULL)",
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("create table");
+
+        let insert = |doc: serde_json::Value| {
+            diesel::sql_query("INSERT INTO nul_json_test (doc) VALUES ($1)")
+                .bind::<diesel::sql_types::Jsonb, _>(doc)
+        };
+
+        insert(serde_json::json!({"note": "beforeafter"}))
+            .execute(&mut *conn)
+            .await
+            .expect("clean insert should succeed");
+        // An escaped backslash is the text `\u0000`, which is storable.
+        insert(serde_json::json!({"note": "\\u0000"}))
+            .execute(&mut *conn)
+            .await
+            .expect("a literal backslash-u0000 is not a NUL");
+
+        let err: AutumnError = insert(serde_json::json!({"note": "before\u{0}after"}))
+            .execute(&mut *conn)
+            .await
+            .expect_err("Postgres must reject a NUL in a JSONB string")
+            .into();
+
+        assert!(is_nul_byte_violation(&err), "got: {err}");
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            err.to_string(),
+            autumn_web::error::NUL_BYTE_REJECTED_MESSAGE
+        );
+    }
 }

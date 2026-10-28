@@ -26,7 +26,7 @@
 //! [`AgentAuthorityManifest::unregistered_authorities`] catches the one
 //! remaining way a route could belong to neither list.
 //! [`AgentAuthorityManifest::excluded`] names each dimension that is declared
-//! but not enforced in this slice, with the caveat spelled out in the document
+//! but not proved at compile time, with the caveat spelled out in the document
 //! rather than left to the guide, and says whether the dimension could ever be
 //! proved at all. And [`ActionRow::asserted_effect_free`] carries every
 //! `#[agent_effect(none, …)]` hatch with its reason, so widening the blast
@@ -114,8 +114,60 @@ pub struct RouteSummary {
     /// agent-callable exactly like an annotated one and is the case a reviewer
     /// is least likely to know about (#1691 P2-6).
     pub exposed_by: Option<McpExposedBy>,
+    /// The route was eligible, but an earlier route took its `operation_id`.
+    ///
+    /// The MCP projector keeps the first route per tool name, so this route is
+    /// not a tool. [`dedupe_mcp_tool_names`] sets it.
+    pub duplicate_operation_id: bool,
+    /// Whether the route is a `WebMCP` tool: the [`webmcp_exposure`]
+    /// verdict. Such a tool runs in the user's own browser session.
+    pub webmcp_tool: bool,
+    /// Why it is a `WebMCP` tool, or `None` when it is not one.
+    pub webmcp_exposed_by: Option<McpExposedBy>,
     /// The handler's authority, when it carries `#[agent_operable]`.
     pub agent_authority: Option<&'static AgentAuthority>,
+}
+
+/// An MCP tool beats a `WebMCP` tool, a `WebMCP` tool beats a plain route, and
+/// a plain route beats one that lost its tool name to a duplicate.
+const fn route_rank(route: &RouteSummary) -> u8 {
+    match (
+        route.mcp_tool,
+        route.webmcp_tool,
+        route.duplicate_operation_id,
+    ) {
+        (true, _, _) => 3,
+        (false, true, _) => 2,
+        (false, false, false) => 1,
+        (false, false, true) => 0,
+    }
+}
+
+/// The caveat on a row whose route lost its tool name to an earlier route.
+pub const DUPLICATE_OPERATION_ID: &str = "duplicate-operation-id";
+
+/// Keep the first MCP tool per `operation_id`, as the projector does.
+///
+/// A later route with the same name is not a tool. It is marked
+/// [`RouteSummary::duplicate_operation_id`] so the collision stays visible.
+/// Call this on routes in the order the projector walks them.
+pub fn dedupe_mcp_tool_names(routes: &mut [RouteSummary]) {
+    let mut seen: BTreeSet<&'static str> = BTreeSet::new();
+    for route in routes.iter_mut().filter(|route| route.mcp_tool) {
+        if !seen.insert(route.operation_id) {
+            route.mcp_tool = false;
+            route.exposed_by = None;
+            route.duplicate_operation_id = true;
+        }
+    }
+    // The `WebMCP` projector also keeps the first tool per name.
+    let mut seen: BTreeSet<&'static str> = BTreeSet::new();
+    for route in routes.iter_mut().filter(|route| route.webmcp_tool) {
+        if !seen.insert(route.operation_id) {
+            route.webmcp_tool = false;
+            route.webmcp_exposed_by = None;
+        }
+    }
 }
 
 /// What made a route an MCP tool.
@@ -205,6 +257,30 @@ pub fn mcp_exposure(input: &McpExposureInput<'_>) -> Option<McpExposedBy> {
     hatch()
 }
 
+/// Whether a route is a `WebMCP` tool, and what made it one.
+///
+/// The [`mcp_exposure`] rule, with the `WebMCP` flags (`webmcp_tool`,
+/// `webmcp_exclude`, the `expose_all_as_webmcp` hatch) in the place of the
+/// `mcp` flags of `input`. A stream route is never a `WebMCP` tool. A test
+/// under the `webmcp` feature pins this equal to `webmcp::derive_tools`.
+#[must_use]
+pub fn webmcp_exposure(
+    input: &McpExposureInput<'_>,
+    webmcp_tool: bool,
+    webmcp_exclude: bool,
+    expose_all: bool,
+) -> Option<McpExposedBy> {
+    if input.mcp_stream {
+        return None;
+    }
+    mcp_exposure(&McpExposureInput {
+        mcp_tool: webmcp_tool,
+        mcp_exclude: webmcp_exclude,
+        expose_all,
+        ..*input
+    })
+}
+
 /// `GET` and `HEAD` are read-only; everything else mutates.
 ///
 /// The inverse of [`method_is_mutating`], named separately because the hatch
@@ -231,6 +307,15 @@ pub struct RouteRef {
     pub path: String,
     /// Whether the route is exposed as an MCP tool.
     pub mcp_tool: bool,
+    /// Whether the route is a `WebMCP` tool. The JSON omits it when `false`,
+    /// so a committed manifest does not drift.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub webmcp_tool: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The envelope an action was checked against, as it appears in a row.
@@ -242,7 +327,7 @@ pub struct GrantSummary {
     pub reversibility: Reversibility,
     /// Whether it may leave its tenant.
     pub tenant_scope: TenantScope,
-    /// Declared rate cap. Declared only — see
+    /// Rate cap. The MCP dispatcher enforces it — see
     /// [`AgentAuthorityManifest::excluded`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate: Option<String>,
@@ -289,9 +374,14 @@ pub struct ActionRow {
     pub module_path: String,
     /// `file:line` of the handler.
     pub location: String,
-    /// `"mcp-tool"`, `"http-route"`, or `"not-exposed"` when no route in this
-    /// binary reaches the handler.
+    /// `"mcp-tool"`, `"webmcp-tool"`, `"http-route"`, or `"not-exposed"` when
+    /// no route in this binary reaches the handler, or the only one lost its
+    /// tool name to a duplicate `operation_id`. A route on both surfaces is
+    /// `"mcp-tool"`; its [`RouteRef::webmcp_tool`] tells the rest.
     pub exposure: String,
+    /// Why the exposure is not what the route asked for, when it is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caveat: Option<String>,
     /// `"provable"` when every effect was derived by the analyser;
     /// `"declared"` when the author wrote any of them down by hand.
     pub provenance: String,
@@ -374,6 +464,26 @@ pub struct UngovernedTool {
     pub exposed_by: McpExposedBy,
 }
 
+/// A route that lost its MCP tool name to an earlier route.
+///
+/// The server does not expose it. The manifest still lists it, so the
+/// collision stays visible, with or without an envelope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedDuplicateTool {
+    /// The shared `operation_id`.
+    pub tool: String,
+    /// The handler function's name.
+    pub handler: String,
+    /// HTTP method.
+    pub method: String,
+    /// Route path template.
+    pub path: String,
+    /// Handler's module path.
+    pub module_path: String,
+    /// Always [`DUPLICATE_OPERATION_ID`].
+    pub caveat: String,
+}
+
 const fn default_exposed_by() -> McpExposedBy {
     McpExposedBy::Attribute
 }
@@ -400,6 +510,9 @@ pub struct UnregisteredAuthority {
     pub path: String,
     /// Whether the route is MCP-exposed, and so agent-callable.
     pub mcp_tool: bool,
+    /// Whether the route is a `WebMCP` tool.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub webmcp_tool: bool,
 }
 
 /// A dimension the manifest records but this slice does not enforce.
@@ -451,10 +564,18 @@ pub struct AgentAuthorityManifest {
     pub grants: Vec<GrantRow>,
     /// Every MCP-exposed route with no envelope, sorted by `(path, method)`.
     pub ungoverned_tools: Vec<UngovernedTool>,
+    /// Every `WebMCP` tool with no envelope, sorted by `(path, method)`. Such
+    /// a tool runs in the session of the user. The JSON omits it when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ungoverned_webmcp_tools: Vec<UngovernedTool>,
     /// Routes naming an authority nothing registered, sorted by
     /// `(module_path, action)`. Empty in any binary built by the macros.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unregistered_authorities: Vec<UnregisteredAuthority>,
+    /// Routes the MCP server skips because an earlier route has the same
+    /// `operation_id`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_duplicate_tools: Vec<SkippedDuplicateTool>,
     /// Dimensions recorded but not enforced.
     pub excluded: Vec<Excluded>,
 }
@@ -476,33 +597,7 @@ impl AgentAuthorityManifest {
         routes: &[RouteSummary],
         audit_sink_configured: bool,
     ) -> Self {
-        // Which route reaches which action, keyed on the authority's own
-        // identity rather than on pointer equality: a route carries the very
-        // `&'static AgentAuthority` the descriptor published, and naming the
-        // join in data keeps it checkable.
-        //
-        // MCP exposure wins over first-come. One handler can be mounted twice
-        // -- a plain HTTP route for people and an MCP route for agents -- and
-        // if the HTTP one merely registered first, taking it would label the
-        // action `http-route`, hide it from `non_reversible_actions()`, and
-        // let `--check` pass with no sink on an action an agent really can
-        // call. Among routes of equal exposure the first still wins, so the
-        // choice stays stable against link order.
-        let mut route_for: BTreeMap<(&str, &str), &RouteSummary> = BTreeMap::new();
-        for route in routes {
-            if let Some(authority) = route.agent_authority {
-                match route_for.entry((authority.module_path, authority.action)) {
-                    std::collections::btree_map::Entry::Vacant(slot) => {
-                        slot.insert(route);
-                    }
-                    std::collections::btree_map::Entry::Occupied(mut slot) => {
-                        if route.mcp_tool && !slot.get().mcp_tool {
-                            slot.insert(route);
-                        }
-                    }
-                }
-            }
-        }
+        let route_for = route_for_actions(routes);
 
         let mut actions: BTreeMap<(&str, &str), ActionRow> = BTreeMap::new();
         let mut used_grants: BTreeSet<(&str, &str)> = BTreeSet::new();
@@ -530,11 +625,15 @@ impl AgentAuthorityManifest {
                     module_path: authority.module_path.to_string(),
                     location: authority.location.to_string(),
                     exposure: exposure_of(route).to_string(),
+                    caveat: route
+                        .filter(|route| route.duplicate_operation_id)
+                        .map(|_| DUPLICATE_OPERATION_ID.to_string()),
                     provenance: row_provenance(authority).to_string(),
                     route: route.map(|route| RouteRef {
                         method: route.method.clone(),
                         path: route.path.clone(),
                         mcp_tool: route.mcp_tool,
+                        webmcp_tool: route.webmcp_tool,
                     }),
                     grant: GrantSummary {
                         name: authority.grant.name.to_string(),
@@ -578,7 +677,11 @@ impl AgentAuthorityManifest {
             })
             .collect();
 
-        let ungoverned_tools = ungoverned_tools_of(routes);
+        let ungoverned_tools =
+            ungoverned_tools_of(routes, |route| route.mcp_tool.then_some(route.exposed_by));
+        let ungoverned_webmcp_tools = ungoverned_tools_of(routes, |route| {
+            route.webmcp_tool.then_some(route.webmcp_exposed_by)
+        });
         let unregistered_authorities = unregistered_authorities_of(routes, &actions);
 
         Self {
@@ -592,7 +695,9 @@ impl AgentAuthorityManifest {
             actions: actions.into_values().collect(),
             grants,
             ungoverned_tools,
+            ungoverned_webmcp_tools,
             unregistered_authorities,
+            skipped_duplicate_tools: skipped_duplicate_tools_of(routes),
             excluded: excluded_dimensions(),
         }
     }
@@ -652,6 +757,40 @@ impl AgentAuthorityManifest {
                 );
             }
         }
+        if !self.ungoverned_webmcp_tools.is_empty() {
+            let _ = write!(
+                out,
+                "\n\nWebMCP tools with no envelope (ungoverned, in the user's session):"
+            );
+            for tool in &self.ungoverned_webmcp_tools {
+                let _ = write!(
+                    out,
+                    "\n  {} {} ({}) [{}]{}",
+                    tool.method,
+                    tool.path,
+                    tool.tool,
+                    tool.exposed_by,
+                    if tool.mutating {
+                        " -- MUTATING"
+                    } else {
+                        " -- read-only"
+                    }
+                );
+            }
+        }
+        if !self.skipped_duplicate_tools.is_empty() {
+            let _ = write!(
+                out,
+                "\n\nRoutes the MCP server skips ({DUPLICATE_OPERATION_ID}):"
+            );
+            for row in &self.skipped_duplicate_tools {
+                let _ = write!(
+                    out,
+                    "\n  {} {} ({}) shares the tool name `{}`",
+                    row.method, row.path, row.handler, row.tool
+                );
+            }
+        }
         if !self.unregistered_authorities.is_empty() {
             let _ = write!(
                 out,
@@ -668,9 +807,12 @@ impl AgentAuthorityManifest {
                     row.action,
                     if row.mcp_tool { " [mcp tool]" } else { "" }
                 );
+                if row.webmcp_tool {
+                    let _ = write!(out, " [webmcp tool]");
+                }
             }
         }
-        let _ = write!(out, "\n\nRecorded, not enforced by this slice:");
+        let _ = write!(out, "\n\nNot proved at compile time:");
         for entry in &self.excluded {
             let _ = write!(
                 out,
@@ -688,6 +830,16 @@ impl AgentAuthorityManifest {
     #[must_use]
     pub fn ungoverned_mutating_tools(&self) -> Vec<&UngovernedTool> {
         self.ungoverned_tools
+            .iter()
+            .filter(|tool| tool.mutating)
+            .collect()
+    }
+
+    /// Every `WebMCP` mutating tool with no envelope. `autumn agents manifest
+    /// --check` fails on these too, unless `--allow-ungoverned` is passed.
+    #[must_use]
+    pub fn ungoverned_mutating_webmcp_tools(&self) -> Vec<&UngovernedTool> {
+        self.ungoverned_webmcp_tools
             .iter()
             .filter(|tool| tool.mutating)
             .collect()
@@ -740,6 +892,40 @@ impl AgentAuthorityManifest {
     }
 }
 
+/// The route that reaches each action, keyed on `(module_path, action)`.
+fn route_for_actions(
+    routes: &[RouteSummary],
+) -> BTreeMap<(&'static str, &'static str), &RouteSummary> {
+    // Which route reaches which action, keyed on the authority's own
+    // identity rather than on pointer equality: a route carries the very
+    // `&'static AgentAuthority` the descriptor published, and naming the
+    // join in data keeps it checkable.
+    //
+    // Tool exposure (MCP, then WebMCP) wins over first-come. One handler can
+    // be mounted twice -- a plain HTTP route for people and an MCP route for
+    // agents -- and if the HTTP one merely registered first, taking it would
+    // label the action `http-route`, hide it from `non_reversible_actions()`,
+    // and let `--check` pass with no sink on an action an agent really can
+    // call. Among routes of equal exposure the first still wins, so the
+    // choice stays stable against link order.
+    let mut route_for: BTreeMap<(&str, &str), &RouteSummary> = BTreeMap::new();
+    for route in routes {
+        if let Some(authority) = route.agent_authority {
+            match route_for.entry((authority.module_path, authority.action)) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(route);
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    if route_rank(route) > route_rank(slot.get()) {
+                        slot.insert(route);
+                    }
+                }
+            }
+        }
+    }
+    route_for
+}
+
 /// One action's block of the human report: what it may do, on whose word, and
 /// what its grant allows that it never uses.
 fn write_action(out: &mut String, row: &ActionRow) {
@@ -758,6 +944,9 @@ fn write_action(out: &mut String, row: &ActionRow) {
             None => "-- not exposed by any route in this binary".to_string(),
         }
     );
+    if row.route.as_ref().is_some_and(|route| route.webmcp_tool) {
+        let _ = write!(out, " [webmcp tool]");
+    }
     if row.effects.is_empty() {
         let _ = write!(out, "\n      no proven effects");
     }
@@ -784,28 +973,55 @@ fn write_action(out: &mut String, row: &ActionRow) {
     }
 }
 
-/// Every MCP-exposed route with no authority envelope, sorted and deduplicated.
+/// Every route of one tool surface with no authority envelope, sorted and
+/// deduplicated. `exposure` gives `Some(exposed_by)` for a tool of the
+/// surface (`/mcp` or `WebMCP`), else `None`.
 ///
 /// Sorting matters as much as the contents: `inventory` and the route table
 /// hand rows back in link order, which is unspecified across builds, and
 /// `--check` would otherwise report that churn as drift.
-fn ungoverned_tools_of(routes: &[RouteSummary]) -> Vec<UngovernedTool> {
+fn ungoverned_tools_of(
+    routes: &[RouteSummary],
+    exposure: impl Fn(&RouteSummary) -> Option<Option<McpExposedBy>>,
+) -> Vec<UngovernedTool> {
     let mut tools: Vec<UngovernedTool> = routes
         .iter()
-        .filter(|route| route.mcp_tool && route.agent_authority.is_none())
-        .map(|route| UngovernedTool {
-            tool: route.operation_id.to_string(),
-            handler: route.handler.to_string(),
-            method: route.method.clone(),
-            path: route.path.clone(),
-            module_path: route.module_path.to_string(),
-            mutating: method_is_mutating(&route.method),
-            exposed_by: route.exposed_by.unwrap_or(McpExposedBy::Attribute),
+        .filter(|route| route.agent_authority.is_none())
+        .filter_map(|route| {
+            let exposed_by = exposure(route)?;
+            Some(UngovernedTool {
+                tool: route.operation_id.to_string(),
+                handler: route.handler.to_string(),
+                method: route.method.clone(),
+                path: route.path.clone(),
+                module_path: route.module_path.to_string(),
+                mutating: method_is_mutating(&route.method),
+                exposed_by: exposed_by.unwrap_or(McpExposedBy::Attribute),
+            })
         })
         .collect();
     tools.sort_by(|a, b| (&a.path, &a.method, &a.tool).cmp(&(&b.path, &b.method, &b.tool)));
     tools.dedup();
     tools
+}
+
+/// Routes the MCP server skips for a duplicate `operation_id`.
+fn skipped_duplicate_tools_of(routes: &[RouteSummary]) -> Vec<SkippedDuplicateTool> {
+    let mut rows: Vec<SkippedDuplicateTool> = routes
+        .iter()
+        .filter(|route| route.duplicate_operation_id)
+        .map(|route| SkippedDuplicateTool {
+            tool: route.operation_id.to_string(),
+            handler: route.handler.to_string(),
+            method: route.method.clone(),
+            path: route.path.clone(),
+            module_path: route.module_path.to_string(),
+            caveat: DUPLICATE_OPERATION_ID.to_string(),
+        })
+        .collect();
+    rows.sort_by(|a, b| (&a.path, &a.method, &a.tool).cmp(&(&b.path, &b.method, &b.tool)));
+    rows.dedup();
+    rows
 }
 
 /// Routes naming an authority no descriptor registered.
@@ -831,6 +1047,7 @@ fn unregistered_authorities_of(
                 method: route.method.clone(),
                 path: route.path.clone(),
                 mcp_tool: route.mcp_tool,
+                webmcp_tool: route.webmcp_tool,
             })
         })
         .collect();
@@ -858,10 +1075,10 @@ pub fn excluded_dimensions() -> Vec<Excluded> {
         Excluded {
             dimension: "rate".to_string(),
             eventual_provenance: "runtime-only".to_string(),
-            runtime_caveat: "declared, not enforced in this slice: the cap is checked for grammar \
-                             at compile time and recorded here, but nothing meters calls at \
-                             runtime. How often a running process is called is not a fact a \
-                             compiler can ever settle."
+            runtime_caveat: "enforced at runtime by the MCP dispatcher, per process: a call over \
+                             the cap is refused. N instances allow up to N times the declared \
+                             cap. A route called without MCP is not counted. A compiler cannot \
+                             know how often a process is called."
                 .to_string(),
         },
         Excluded {
@@ -891,18 +1108,20 @@ pub fn excluded_dimensions() -> Vec<Excluded> {
         Excluded {
             dimension: "cascading_deletes".to_string(),
             eventual_provenance: "provable".to_string(),
-            runtime_caveat: "a `dependent(...)` cascade is not folded into the write set in this \
-                             slice, so deleting a parent may write child models the grant does \
-                             not list."
+            runtime_caveat: "a delete through a generated repository is checked at compile time \
+                             against every model its `dependent(...)` cascade writes. A \
+                             hand-written repository, a database `ON DELETE CASCADE`, and the \
+                             manifest's own write set do not include them."
                 .to_string(),
         },
         Excluded {
             dimension: "generated_repository_tools".to_string(),
             eventual_provenance: "provable".to_string(),
-            runtime_caveat: "tools generated by `#[repository(api, mcp)]`, and read-only routes \
-                             swept in by `expose_all_as_mcp`, have no annotation site in this \
-                             slice. They are not gated -- they surface under `ungoverned_tools`, \
-                             each row naming whether an attribute or the hatch exposed it."
+            runtime_caveat: "tools generated by `#[repository(api, mcp)]` are governed only when \
+                             the repository names a grant (`grant = X`). Without one, and for \
+                             read-only routes swept in by `expose_all_as_mcp`, they are not \
+                             gated -- they surface under `ungoverned_tools`, each row naming \
+                             whether an attribute or the hatch exposed it."
                 .to_string(),
         },
     ]
@@ -966,10 +1185,17 @@ pub fn method_is_mutating(method: &str) -> bool {
 /// whole correctness rests on matching exactly what was written.
 pub const MCP_TOOL_EXPOSURE: &str = "mcp-tool";
 
+/// The [`ActionRow::exposure`] value for a route that is a `WebMCP` tool and
+/// not an MCP tool: an agent in the user's browser can call it.
+pub const WEBMCP_TOOL_EXPOSURE: &str = "webmcp-tool";
+
 /// How an action is reachable, as the row spells it.
 const fn exposure_of(route: Option<&RouteSummary>) -> &'static str {
     match route {
         Some(route) if route.mcp_tool => MCP_TOOL_EXPOSURE,
+        Some(route) if route.webmcp_tool => WEBMCP_TOOL_EXPOSURE,
+        // Eligible, but the projector keeps only the first route per name.
+        Some(route) if route.duplicate_operation_id => "not-exposed",
         Some(_) => "http-route",
         // Registered but unreachable: a plugin may register an action the host
         // does not mount. Reported, never a failure.
@@ -1203,6 +1429,9 @@ mod tests {
             // The fixtures speak in terms of "is a tool"; how it got that way
             // is the hatch tests' business, and they set it explicitly.
             exposed_by: mcp_tool.then_some(McpExposedBy::Attribute),
+            duplicate_operation_id: false,
+            webmcp_tool: false,
+            webmcp_exposed_by: None,
             agent_authority: authority,
         }
     }
@@ -1224,6 +1453,106 @@ mod tests {
             .iter()
             .find(|row| row.action == action)
             .unwrap_or_else(|| panic!("no `{action}` row in {:?}", manifest.actions))
+    }
+
+    // ── Duplicate operation ids (#2451) ──────────────────────────────
+
+    fn routes_sharing_one_operation_id() -> Vec<RouteSummary> {
+        let mut first = route(
+            "POST",
+            "/refunds",
+            "draft_refund",
+            "billing::refunds",
+            true,
+            Some(&DRAFT_REFUND),
+        );
+        first.operation_id = "shared_tool";
+        let mut second = route(
+            "POST",
+            "/notes",
+            "edit_note",
+            "notes",
+            true,
+            Some(&EDIT_NOTE),
+        );
+        second.operation_id = "shared_tool";
+        vec![first, second]
+    }
+
+    #[test]
+    fn a_duplicate_operation_id_keeps_the_first_tool_and_hides_the_rest() {
+        let mut routes = routes_sharing_one_operation_id();
+        dedupe_mcp_tool_names(&mut routes);
+        let manifest = AgentAuthorityManifest::from_parts(
+            &[&DRAFT_REFUND, &EDIT_NOTE],
+            &[&REFUND_GRANT, &REVERSIBLE_GRANT],
+            &routes,
+            true,
+        );
+        assert_eq!(find(&manifest, "draft_refund").exposure, "mcp-tool");
+        let skipped = find(&manifest, "edit_note");
+        assert_eq!(skipped.exposure, "not-exposed");
+        assert_eq!(skipped.caveat.as_deref(), Some(DUPLICATE_OPERATION_ID));
+    }
+
+    #[test]
+    fn a_skipped_ungoverned_duplicate_stays_visible() {
+        let mut routes = vec![
+            route("GET", "/a", "list_a", "m", true, None),
+            route("POST", "/b", "wipe_b", "m", true, None),
+        ];
+        routes[1].operation_id = "list_a";
+        dedupe_mcp_tool_names(&mut routes);
+        let manifest = AgentAuthorityManifest::from_parts(&[], &[], &routes, true);
+        assert_eq!(manifest.skipped_duplicate_tools.len(), 1);
+        let skipped = &manifest.skipped_duplicate_tools[0];
+        assert_eq!(skipped.tool, "list_a");
+        assert_eq!(skipped.handler, "wipe_b");
+        assert_eq!(skipped.path, "/b");
+        assert!(manifest.summary().contains(DUPLICATE_OPERATION_ID));
+    }
+
+    #[test]
+    fn a_skipped_duplicate_is_not_an_ungoverned_tool() {
+        let mut routes = vec![
+            route("GET", "/a", "list_a", "m", true, None),
+            route("POST", "/b", "wipe_b", "m", true, None),
+        ];
+        routes[1].operation_id = "list_a";
+        dedupe_mcp_tool_names(&mut routes);
+        let manifest = AgentAuthorityManifest::from_parts(&[], &[], &routes, true);
+        assert_eq!(manifest.ungoverned_tools.len(), 1);
+        assert!(manifest.ungoverned_mutating_tools().is_empty());
+    }
+
+    #[test]
+    fn one_handler_mounted_twice_stays_a_tool() {
+        let mut routes = routes_sharing_one_operation_id();
+        routes[1] = route(
+            "POST",
+            "/v2/refunds",
+            "draft_refund",
+            "billing::refunds",
+            true,
+            Some(&DRAFT_REFUND),
+        );
+        routes[1].operation_id = "shared_tool";
+        dedupe_mcp_tool_names(&mut routes);
+        let manifest =
+            AgentAuthorityManifest::from_parts(&[&DRAFT_REFUND], &[&REFUND_GRANT], &routes, true);
+        assert_eq!(find(&manifest, "draft_refund").exposure, "mcp-tool");
+    }
+
+    #[test]
+    fn distinct_operation_ids_are_untouched() {
+        let mut routes = routes_sharing_one_operation_id();
+        routes[1].operation_id = "other_tool";
+        dedupe_mcp_tool_names(&mut routes);
+        assert!(
+            routes
+                .iter()
+                .all(|r| r.mcp_tool && !r.duplicate_operation_id)
+        );
     }
 
     // ── Shape of the document ────────────────────────────────────────
@@ -2204,6 +2533,7 @@ mod tests {
                 method: "POST".to_string(),
                 path: "/refunds".to_string(),
                 mcp_tool: true,
+                webmcp_tool: false,
             }]
         );
         let summary = manifest.summary();
@@ -2369,5 +2699,247 @@ mod tests {
             1,
             "the caveat must be true"
         );
+    }
+
+    // ── WebMCP exposure (#2619) ──────────────────────────────────────
+
+    fn webmcp_route(
+        method: &str,
+        path: &str,
+        handler: &'static str,
+        authority: Option<&'static AgentAuthority>,
+    ) -> RouteSummary {
+        let mut r = route(method, path, handler, "billing::refunds", false, authority);
+        r.webmcp_tool = true;
+        r.webmcp_exposed_by = Some(McpExposedBy::Attribute);
+        r
+    }
+
+    #[test]
+    fn an_ungoverned_webmcp_tool_is_listed_apart_from_mcp_tools() {
+        let manifest = AgentAuthorityManifest::from_parts(
+            &[],
+            &[],
+            &[webmcp_route("POST", "/refunds", "draft_refund", None)],
+            true,
+        );
+        assert!(manifest.ungoverned_tools.is_empty());
+        assert_eq!(manifest.ungoverned_webmcp_tools.len(), 1);
+        assert_eq!(manifest.ungoverned_webmcp_tools[0].tool, "draft_refund");
+        assert_eq!(manifest.ungoverned_mutating_webmcp_tools().len(), 1);
+        assert!(manifest.ungoverned_mutating_tools().is_empty());
+        let summary = manifest.summary();
+        assert!(
+            summary.contains("WebMCP tools with no envelope"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn a_route_on_both_surfaces_is_in_both_lists() {
+        let mut both = webmcp_route("GET", "/refunds", "list_refunds", None);
+        both.mcp_tool = true;
+        both.exposed_by = Some(McpExposedBy::Attribute);
+        let manifest = AgentAuthorityManifest::from_parts(&[], &[], &[both], true);
+        assert_eq!(manifest.ungoverned_tools.len(), 1);
+        assert_eq!(manifest.ungoverned_webmcp_tools.len(), 1);
+        assert!(manifest.ungoverned_mutating_webmcp_tools().is_empty());
+    }
+
+    #[test]
+    fn a_governed_webmcp_action_reports_its_exposure() {
+        let manifest = AgentAuthorityManifest::from_parts(
+            &[&DRAFT_REFUND],
+            &[&REFUND_GRANT],
+            &[webmcp_route(
+                "POST",
+                "/refunds",
+                "draft_refund",
+                Some(&DRAFT_REFUND),
+            )],
+            true,
+        );
+        let row = find(&manifest, "draft_refund");
+        assert_eq!(row.exposure, WEBMCP_TOOL_EXPOSURE);
+        let route = row.route.as_ref().expect("route");
+        assert!(route.webmcp_tool && !route.mcp_tool);
+        assert!(manifest.ungoverned_webmcp_tools.is_empty());
+        assert!(
+            manifest.summary().contains("[webmcp tool]"),
+            "{}",
+            manifest.summary()
+        );
+    }
+
+    #[test]
+    fn mcp_exposure_wins_the_row_and_the_route_keeps_both_flags() {
+        let mut both = governed_route();
+        both.webmcp_tool = true;
+        both.webmcp_exposed_by = Some(McpExposedBy::Attribute);
+        let manifest =
+            AgentAuthorityManifest::from_parts(&[&DRAFT_REFUND], &[&REFUND_GRANT], &[both], true);
+        let row = find(&manifest, "draft_refund");
+        assert_eq!(row.exposure, MCP_TOOL_EXPOSURE);
+        let route = row.route.as_ref().unwrap();
+        assert!(route.mcp_tool && route.webmcp_tool);
+    }
+
+    #[test]
+    fn a_webmcp_route_outranks_a_plain_route_for_the_row() {
+        let plain = route(
+            "POST",
+            "/refunds",
+            "draft_refund",
+            "billing::refunds",
+            false,
+            Some(&DRAFT_REFUND),
+        );
+        let web = webmcp_route("POST", "/page/refunds", "draft_refund", Some(&DRAFT_REFUND));
+        let manifest = AgentAuthorityManifest::from_parts(
+            &[&DRAFT_REFUND],
+            &[&REFUND_GRANT],
+            &[plain, web],
+            true,
+        );
+        assert_eq!(
+            find(&manifest, "draft_refund").exposure,
+            WEBMCP_TOOL_EXPOSURE
+        );
+    }
+
+    #[test]
+    fn a_document_with_no_webmcp_keeps_its_old_json() {
+        // A committed manifest must not drift when nothing uses WebMCP.
+        let manifest = AgentAuthorityManifest::from_parts(
+            &[&DRAFT_REFUND],
+            &[&REFUND_GRANT],
+            &[governed_route()],
+            true,
+        );
+        let json = manifest.to_json();
+        assert!(!json.contains("webmcp"), "{json}");
+        let parsed: AgentAuthorityManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn webmcp_fields_round_trip() {
+        let manifest = AgentAuthorityManifest::from_parts(
+            &[&DRAFT_REFUND],
+            &[&REFUND_GRANT],
+            &[
+                webmcp_route("POST", "/refunds", "draft_refund", Some(&DRAFT_REFUND)),
+                webmcp_route("DELETE", "/refunds/{id}", "drop_refund", None),
+            ],
+            true,
+        );
+        let parsed: AgentAuthorityManifest = serde_json::from_str(&manifest.to_json()).unwrap();
+        assert_eq!(parsed, manifest);
+    }
+
+    #[test]
+    fn duplicate_webmcp_names_keep_the_first_tool() {
+        let mut routes = vec![
+            webmcp_route("GET", "/a", "list_a", None),
+            webmcp_route("GET", "/b", "list_b", None),
+        ];
+        routes[1].operation_id = "list_a";
+        dedupe_mcp_tool_names(&mut routes);
+        assert!(routes[0].webmcp_tool);
+        assert!(!routes[1].webmcp_tool && routes[1].webmcp_exposed_by.is_none());
+    }
+
+    #[test]
+    fn webmcp_exposure_is_the_mcp_rule_with_webmcp_flags_and_no_streams() {
+        let input = McpExposureInput {
+            method: "GET",
+            hidden: false,
+            mcp_tool: true,
+            mcp_exclude: false,
+            mcp_stream: false,
+            has_response_schema: true,
+            success_status: 200,
+            expose_all: true,
+        };
+        assert_eq!(
+            webmcp_exposure(&input, false, false, false),
+            None,
+            "mcp is not webmcp"
+        );
+        assert_eq!(
+            webmcp_exposure(&input, true, false, false),
+            Some(McpExposedBy::Attribute)
+        );
+        assert_eq!(
+            webmcp_exposure(&input, false, false, true),
+            Some(McpExposedBy::Hatch)
+        );
+        assert_eq!(webmcp_exposure(&input, true, true, true), None);
+        let post = McpExposureInput {
+            method: "POST",
+            ..input
+        };
+        assert_eq!(webmcp_exposure(&post, false, false, true), None);
+        let stream = McpExposureInput {
+            mcp_stream: true,
+            ..input
+        };
+        assert_eq!(webmcp_exposure(&stream, true, false, false), None);
+    }
+
+    #[cfg(feature = "webmcp")]
+    #[test]
+    fn webmcp_exposure_matches_the_webmcp_projector() {
+        use crate::openapi::{ApiDoc, SchemaEntry, SchemaKind};
+        const THING: SchemaEntry = SchemaEntry {
+            name: "Thing",
+            kind: SchemaKind::Ref,
+            identity: None,
+        };
+        for method in ["GET", "POST", "DELETE"] {
+            for webmcp_tool in [false, true] {
+                for webmcp_exclude in [false, true] {
+                    for mcp_stream in [false, true] {
+                        for has_response in [false, true] {
+                            for expose_all in [false, true] {
+                                let doc = ApiDoc {
+                                    method,
+                                    operation_id: "op",
+                                    webmcp_tool,
+                                    webmcp_exclude,
+                                    mcp_stream,
+                                    response: has_response.then_some(THING),
+                                    success_status: 200,
+                                    ..ApiDoc::default()
+                                };
+                                let input = McpExposureInput {
+                                    method,
+                                    hidden: false,
+                                    mcp_tool: false,
+                                    mcp_exclude: false,
+                                    mcp_stream,
+                                    has_response_schema: has_response,
+                                    success_status: 200,
+                                    expose_all: false,
+                                };
+                                assert_eq!(
+                                    webmcp_exposure(
+                                        &input,
+                                        webmcp_tool,
+                                        webmcp_exclude,
+                                        expose_all
+                                    )
+                                    .is_some(),
+                                    !crate::webmcp::derive_tools(&[doc], expose_all, None)
+                                        .is_empty(),
+                                    "{method} tool={webmcp_tool} exclude={webmcp_exclude} \
+                                     stream={mcp_stream} response={has_response} all={expose_all}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

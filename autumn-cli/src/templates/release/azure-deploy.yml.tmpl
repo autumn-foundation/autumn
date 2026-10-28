@@ -12,8 +12,10 @@
 #       registry and Contributor at the RESOURCE-GROUP scope — not just on
 #       the Container App: this workflow also starts the sibling migration
 #       Container Apps Job, and Azure RBAC granted on one resource does not
-#       inherit to another, even a sibling in the same environment. No
-#       client secret is needed: `permissions.id-token: write` below plus
+#       inherit to another, even a sibling in the same environment. The
+#       same scope lets azure-cutover.sh assign the app's user-assigned
+#       identity (#2314).
+#       No client secret is needed: `permissions.id-token: write` below plus
 #       azure/login's client-id/tenant-id/subscription-id inputs is enough
 #       for OIDC login.
 #
@@ -36,12 +38,18 @@ on:
       - "v*"
   workflow_dispatch:
 
+env:
+  # The posture manifest's path from the repository root. A workspace member
+  # sets `<member dir>/security-posture.json`: `hashFiles` and `subject-path`
+  # ignore `working-directory`.
+  POSTURE_MANIFEST: security-posture.json
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     # Two overlapping runs (e.g. two rapid tag pushes, or a tag push racing
     # a manual dispatch) must not interleave: the older run's later
-    # `az containerapp update` could execute after the newer one and roll
+    # cutover (azure-cutover.sh) could run after the newer one and roll
     # production back, or leave stale code serving against a schema the
     # newer run just migrated. One queue per repo, `cancel-in-progress:
     # false` so a run is never killed mid-migration/mid-cutover — it waits
@@ -235,35 +243,19 @@ jobs:
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
           AZURE_MIGRATE_JOB_NAME: ${{ vars.AZURE_MIGRATE_JOB_NAME }}
 
+      # Terraform creates the app with no identity, registry or secret refs
+      # (#2314). azure-cutover.sh copies them from the migration job and sets
+      # the real image in one write. Then it opens external ingress (#2312).
       - name: Deploy new image to Azure Container Apps
-        run: |
-          az containerapp update \
-            --name "$AZURE_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --image "$ACR_LOGIN_SERVER/$AZURE_APP_NAME:$IMAGE_TAG"
+        run: bash azure-cutover.sh
         env:
           ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
           AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
           IMAGE_TAG: ${{ steps.image_tag.outputs.value }}
           AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
-
-      - name: Enable external ingress
-        run: |
-          # Terraform boots the app with external ingress DISABLED so no
-          # inbound request can wake the bootstrap placeholder revision with
-          # production secret refs and the Key Vault-capable identity
-          # attached (#2312). Open it now that the real image is serving;
-          # the command is idempotent, so later deploys leave the setting
-          # untouched.
-          az containerapp ingress enable \
-            --name "$AZURE_APP_NAME" \
-            --resource-group "$AZURE_RESOURCE_GROUP" \
-            --type external \
-            --target-port 3000 \
-            --transport http
-        env:
-          AZURE_APP_NAME: ${{ vars.AZURE_APP_NAME }}
-          AZURE_RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP }}
+          AZURE_MIGRATE_JOB_NAME: ${{ vars.AZURE_MIGRATE_JOB_NAME }}
+          # Optional: set it only if you changed bootstrap_image in Terraform.
+          AZURE_BOOTSTRAP_IMAGE: ${{ vars.AZURE_BOOTSTRAP_IMAGE }}
 
       # ── Supply chain (issue #1615) ──────────────────────────────────────
       # Deliberately the LAST steps in the job. The image is already in the
@@ -350,8 +342,14 @@ jobs:
       # as the attestations above: a Sigstore hiccup is a visible warning, not a
       # blocked deploy of code that shipped fine.
       - name: Attest the security posture manifest
-        if: hashFiles('security-posture.json') != ''
+        if: hashFiles(env.POSTURE_MANIFEST) != ''
         continue-on-error: true
         uses: actions/attest-build-provenance@v3
         with:
-          subject-path: security-posture.json
+          subject-path: ${{ env.POSTURE_MANIFEST }}
+
+      # Not a failure: an app that never adopted the posture gate must deploy.
+      # An app that did adopt it, with the wrong path, needs this message.
+      - name: Warn when the security posture manifest is missing
+        if: hashFiles(env.POSTURE_MANIFEST) == ''
+        run: echo "::warning::${POSTURE_MANIFEST} not found, so this release has no posture attestation. Ignore this if the app has not adopted the posture gate. If it has, set POSTURE_MANIFEST to the manifest path from the repository root."

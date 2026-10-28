@@ -47,7 +47,9 @@ environment override: `AUTUMN_PUSH__PUBLIC_KEY`, `AUTUMN_PUSH__SUBJECT`,
 `subject` must be a `mailto:` or `https:` URI — RFC 8292 requires it, and it is
 how a push service operator reaches you about your traffic. A bare email
 address is the common mistake and is refused at boot, because otherwise the app
-starts fine and every delivery is rejected remotely.
+starts fine and every delivery is rejected remotely. A `mailto:` subject with
+a space or a second `@` is refused too. Autumn trims the value before it uses
+it.
 
 ### 3. Generate the PWA
 
@@ -119,7 +121,7 @@ is the framework's.
 | Method | Behavior |
 |---|---|
 | `send(principal, &message)` | Deliver to every device that principal has subscribed |
-| `send_many(principals, &message)` | Fan out across principals, aggregating one report |
+| `send_many(principals, &message)` | Fan out across principals (up to four at once), aggregating one report |
 | `subscribe(principal, &browser_subscription)` | Validate and record a browser subscription |
 | `unsubscribe(principal, endpoint)` | Remove one of that principal's subscriptions |
 | `vapid_public_key()` | The `applicationServerKey` the browser subscribes with |
@@ -267,6 +269,24 @@ what makes the upsert atomic. Two consequences worth knowing:
   `PushError::TooManySubscriptions` (`422`). Without a ceiling, one account
   could make every send unbounded work.
 
+## Multi-tenancy
+
+With `[tenancy] enabled = true`, all tenants share one `push_subscriptions`
+table. The owner of a subscription is the pair (tenant, principal). The store
+gets the tenant from the resolved tenant of the request, never from the body.
+
+- Two tenants can use the same principal id. A send in one tenant reaches only
+  that tenant's devices.
+- An endpoint is unique across tenants. To move an endpoint to another tenant
+  or principal, send both stored keys.
+- The cap of 20 subscriptions counts per (tenant, principal).
+- A send from a job has no request. Wrap it in
+  `autumn_web::tenancy::with_tenant(tenant_id, async { ... })`.
+- A custom `PushSubscriptionStore` must scope by tenant too.
+
+This matches the in-app feed. Use the same principal id for both and they
+refer to the same user in the same tenant.
+
 ## Fail fast, never silently
 
 The failure this subsystem is built to prevent is an app that starts cleanly,
@@ -297,6 +317,9 @@ happily records subscriptions, and silently never delivers anything.
 RFC 8030 gives push services `404 Not Found` and `410 Gone` to say a
 subscription no longer exists. Autumn removes those rows and reports them in
 `report.pruned`, so a dead endpoint is never re-sent to.
+
+A stored row with unreadable key data is skipped and logged. The other
+devices of that user still receive the push.
 
 Every *other* failure — a `5xx` outage, a `429` rate limit, a transport error —
 is counted in `report.failed` and the subscription is **left in place**.
@@ -397,7 +420,8 @@ shaped differently, mark it:
 <form action="/session/end" method="post" data-autumn-push-unsubscribe>
 ```
 
-A failed unsubscribe never blocks the sign-out itself.
+A failed unsubscribe never blocks the sign-out itself. The opt-out button
+revokes the browser subscription even when the server call fails.
 
 ## Payload limits
 

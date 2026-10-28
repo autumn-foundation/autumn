@@ -69,18 +69,18 @@ Loaded 1 attestation from GitHub API
 
 sha256:… was attested by:
 REPO                       PREDICATE_TYPE                  WORKFLOW
-autumn-foundation/autumn   https://slsa.dev/provenance/v1  .github/workflows/release.yml@refs/heads/trunk
+autumn-foundation/autumn   https://slsa.dev/provenance/v1  .github/workflows/cli-release.yml@refs/tags/vX.Y.Z
 ```
 
-> **What the source ref means.** The SBOM asset is attested by the Publish
-> Gate, which the tag push triggers directly, so its provenance records the tag
-> and the tagged commit. The CLI archives are attested by `cli-release.yml`,
-> which runs as a child of the `workflow_run`-triggered release workflow — and
-> GitHub always runs those in default-branch context, so their recorded ref and
-> commit name the default branch even though the build checked the tag out.
-> For those assets the subject digest, the repository and the CI run are exact;
-> the ref is not. Verify with `--repo`, and do not add `--source-ref
-> refs/tags/...` for an archive, which would fail against a genuine asset.
+Both assets are attested by workflows that the tag push triggers directly. The
+provenance records the tag and the tagged commit. To pin an archive to its
+release, add `--source-ref`:
+
+```bash
+gh attestation verify autumn-x86_64-unknown-linux-musl.tar.gz \
+  --repo autumn-foundation/autumn \
+  --source-ref refs/tags/vX.Y.Z
+```
 
 `--repo autumn-foundation/autumn` is **not optional**. Without it, an
 attestation from *any* repository would satisfy the check — including one an
@@ -194,6 +194,10 @@ autumn sbom --binary my-app.arm64
 (Slices that agree are not a disagreement — a universal binary whose slices
 carry identical lists is read normally.)
 
+A fat header is always big-endian on disk. A file that starts with the
+byte-swapped magic (`be ba fe ca`) is refused with a clear error. No Apple tool
+writes it.
+
 > **If the `autumn` inside the image is older than `sbom`.** The image installs
 > the CLI at the version its Dockerfile pins, so an image scaffolded before this
 > feature shipped carries a CLI without the subcommand. The binary is still
@@ -224,6 +228,11 @@ member, a `[patch]`ed git checkout — deliberately carry **no** `purl`, and a
 an unpublished crate points a scanner at somebody else's project. Git and
 alternate-registry dependencies get a `?vcs_url=` / `?repository_url=`
 qualifier naming where they actually came from.
+
+`cargo-auditable` records only a source category, not a URL. In `--binary`
+output, a git or alternate-registry package therefore has no `purl`. Its
+`bom-ref` starts with `git:` or `registry:`. The `cargo:source` property keeps
+the category.
 
 The sidecar SBOM is generated from `cargo metadata` and is therefore *broader*:
 it covers the whole resolved graph for the image's own target triple and
@@ -308,7 +317,7 @@ Run the same gate yourself against any checkout:
 
 ```bash
 ./scripts/check-sbom.sh                     # against the working tree
-RELEASE_TAG=v0.8.0 ./scripts/check-sbom.sh  # also enforce tag agreement
+RELEASE_TAG=v0.9.0 ./scripts/check-sbom.sh  # also enforce tag agreement
 ```
 
 **Downloads during an image build are checksum-verified.** Every artifact the
@@ -356,6 +365,11 @@ Run it locally. CI derives its check list from the sections `deny.toml`
 declares, so the exact command depends on your policy — `autumn doctor` does
 that derivation for you and reports the same verdict:
 
+In a workspace, `autumn doctor` and `autumn dev` read the outermost
+`deny.toml`, up to the `.git` folder. This is the file CI reads. A `deny.toml`
+in a member crate is ignored. A nested workspace (its own `[workspace]` table)
+keeps its own policy.
+
 ```bash
 cargo install --locked cargo-deny   # once
 autumn doctor                       # derives the checks, as CI does
@@ -386,7 +400,7 @@ error[vulnerability]: Marvin Attack: potential key recovery through timing sidec
     ├ Solution: No safe upgrade is available!
     ├ rsa v0.9.10
       └── jsonwebtoken v10.1.0
-          └── autumn-web v0.8.0
+          └── autumn-web v0.9.0
               └── my-app v0.1.0
 
 advisories FAILED
@@ -422,7 +436,7 @@ When there is no fix — or the vulnerable code path is unreachable from your ap
 [advisories]
 ignore = [
     # Why this is acceptable *here*, and when you will look again.
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; review-by 2026-10-01" },
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
 ]
 ```
 
@@ -436,14 +450,14 @@ Your generated `deny.toml` ships with a waiver already in it:
 which `autumn-web` depends on unconditionally, and no patched `rsa` release
 exists. An app generated with `--bundled-pg` gets a second one
 (`RUSTSEC-2024-0384`, `instant`, unmaintained, reachable only through the
-embedded-Postgres build stack) — and only that flavor gets it, so cargo-deny's
+embedded-Postgres build stack). Only that flavor gets it, so cargo-deny's
 "this waiver is unused" warning stays available to tell you when one of *your*
 waivers has gone stale.
 
 Those waivers are why a freshly scaffolded app's CI is green on day one instead
-of red on the first push. Autumn's own CI re-audits autumn-web's dependency tree
-against that exact policy on every run, so the shipped waiver set cannot quietly
-stop covering what the scaffold ships.
+of red on the first push. Autumn's CI generates each app flavor and audits it with
+that policy on every run. The shipped waiver set cannot stop covering the
+scaffold without a red build.
 
 Never disable the gate to get green. `continue-on-error: true`, `|| true`, and
 deleting the step all turn a security control into a decoration. Autumn's own
@@ -476,21 +490,18 @@ both PR CI and the **Publish Gate**, so a release cannot be tagged while an
 unwaived advisory sits in the tree being published:
 
 ```bash
-./scripts/check-advisories.sh              # workspace, sqlite, scaffold, fuzz, island-flock graphs
+./scripts/check-advisories.sh              # workspace, sqlite, generated apps, fuzz, island-flock graphs
 ./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
 ```
 
 Five graphs, because "the dependency tree" means five different things here.
-The scaffold graph is the interesting one of the first three: it audits
-`autumn-web`'s dependency tree against the `deny.toml` that `autumn new`
-writes, with every feature any scaffold flavor can enable turned on — so "your
-day-one CI is green" is a checked property of every release rather than a
-hope. Being precise about what that covers: it is the autumn-web half of your
-tree, audited generously (a superset of what your app compiles from
-autumn-web), resolved against Autumn's own lockfile. Your app's own direct
-dependencies, and the exact versions your lockfile resolves, are what *your*
-CI audits — which is why the gate ships with your app rather than only living
-here.
+The third pass generates every `autumn new` flavor with the CLI in this
+checkout. It then runs `cargo deny check advisories` inside each app, against
+the `deny.toml` that app ships. This is what your first CI run audits: the same
+root manifest, the same dev-dependencies and a fresh lockfile from crates.io.
+One difference: the gate patches `autumn-web` to this checkout. It therefore
+audits the release in flight. Cost: a CLI build, plus one `cargo fetch` and one
+audit per flavor.
 
 The other two are satellite graphs *inside this repo*, not your app's
 concern: `fuzz/` and `examples/island-flock/` are each their own excluded
@@ -528,8 +539,8 @@ job uses. Nothing here is a second implementation, and there is no second
 waiver format: a waiver is an `[advisories] ignore` entry, read by doctor, dev
 and CI alike.
 
-Two differences remain, and doctor reports both on its own line so you can
-judge them:
+Three differences remain. Doctor reports the first two on its own line so you
+can judge them:
 
 - **The auditor version.** The generated workflow pins `cargo-deny@0.20.2`; a
   local run uses whatever `cargo deny` is on your PATH. Doctor names the
@@ -540,6 +551,16 @@ judge them:
   (see *Offline and air-gapped* below) and names its data age. An advisory
   published since your last fetch is red in CI and silent locally — run
   `cargo deny fetch db` to close the gap.
+
+A third difference has no line, because doctor cannot see it. Only cargo-deny
+knows the `deny.toml` schema. Doctor checks that the file is valid TOML. If
+cargo-deny is not installed, doctor does not check the schema: `yanked =
+"bogus"` is valid TOML, so doctor passes and CI rejects it. Without cargo-deny,
+the doctor line says `not evaluated` and that doctor cannot check `deny.toml`. Install cargo-deny to close the gap.
+
+When a doctor or dev audit reaches its deadline (30 seconds), Autumn kills the
+`cargo-deny` process and the processes it started, so they cannot hold Cargo's
+package-cache lock. A finished audit is never killed.
 
 Uncommenting a section widens both sides at once. The generated workflow
 derives its check list from the file:
@@ -562,6 +583,12 @@ the same table. The two are held together by a test —
 `autumn doctor` over every one of those spellings and requires the same answer —
 so a rule that drifts fails the build rather than silently un-enforcing your
 policy.
+
+The two agree on every hand-written policy. They can split in two cases: an
+escaped key, which only doctor sees, and header-like text inside a string, which
+only the grep sees. Then doctor reports no verdict and names the sections. Write
+each section as a plain `[bans]` header, and keep header-like text out of
+strings.
 
 ### `autumn doctor` — the dependency check
 
@@ -689,7 +716,8 @@ On an air-gapped machine, set `[advisories] db-path` in `deny.toml` to a
 directory *holding* database checkouts — the same shape as
 `~/.cargo/advisory-dbs`, not a checkout itself — and mirror the RustSec
 repository into it. `~` and `$CARGO_HOME` are expanded, as cargo-deny expands
-them. Doctor reads that path and ages it the same way.
+them. A relative path is relative to the directory that holds `deny.toml`.
+Doctor reads that path and ages it the same way.
 
 ---
 
@@ -711,7 +739,7 @@ them. Doctor reads that path and ages it the same way.
 | `autumn doctor --json` | …as machine-readable output, ids and severities included. |
 | `cargo deny fetch db` | Refresh the RustSec advisory database doctor reads. |
 | `cargo deny check advisories` | Is anything in this tree known-vulnerable? (reads `deny.toml`) |
-| `./scripts/check-advisories.sh` | …for Autumn's own graphs, and for the app scaffold's. |
+| `./scripts/check-advisories.sh` | …for Autumn's own graphs, and for every generated app. |
 | `./scripts/check-advisories.sh --self-test` | Can that gate still reject a known CVE? |
 | `gh attestation verify F --repo O/R` | Did `O/R`'s CI build exactly these bytes? |
 

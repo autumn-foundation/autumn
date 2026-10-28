@@ -205,33 +205,7 @@ pub async fn serve_tls_router(
     fixture: &CertFixture,
     handshake_timeout: Duration,
 ) -> (TestServer, autumn_web::tls::CertReloader) {
-    let provider = autumn_web::tls::crypto_provider();
-    // The same one-call load `app.rs` uses, so the reload baseline is captured
-    // exactly as it is in production. The reloader is returned unspawned: only
-    // the renewal tests start it, at the test-friendly interval below.
-    let (resolver, reloader) = autumn_web::tls::CertReloader::load(
-        fixture.cert.clone(),
-        fixture.key.clone(),
-        Arc::clone(&provider),
-        now_unix(),
-        TEST_RELOAD_INTERVAL,
-    )
-    .expect("load cert/key");
-    let server_config =
-        autumn_web::tls::build_server_config(Arc::clone(&provider), Arc::clone(&resolver))
-            .expect("build server config");
-
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = tcp.local_addr().expect("local_addr");
-    let shutdown = CancellationToken::new();
-    let listener = autumn_web::tls::TlsListener::new(
-        tcp,
-        server_config,
-        handshake_timeout,
-        shutdown.child_token(),
-    );
+    let (addr, listener, shutdown, reloader) = bind_tls(fixture, handshake_timeout).await;
 
     // Mirror the app.rs HTTPS serve arm: no-op tap_io wrapper so axum supplies
     // ConnectInfo<SocketAddr>, plus into_make_service_with_connect_info.
@@ -258,6 +232,77 @@ pub async fn serve_tls_router(
         },
         reloader,
     )
+}
+
+/// Like [`serve_tls_router`], but served by `autumn_web::http_server::serve`,
+/// the serve loop the app runs in production. It owns the HTTP/2 builder, so
+/// the h2 suites use it. It gives no `ConnectInfo`.
+pub async fn serve_tls_router_production(
+    router: Router,
+    fixture: &CertFixture,
+    handshake_timeout: Duration,
+) -> (TestServer, autumn_web::tls::CertReloader) {
+    let (addr, listener, shutdown, reloader) = bind_tls(fixture, handshake_timeout).await;
+    let shutdown_wait = shutdown.clone();
+    let handle = tokio::spawn(autumn_web::http_server::serve(
+        listener,
+        router.into_make_service(),
+        autumn_web::http_server::HttpLimits::default(),
+        async move { shutdown_wait.cancelled().await },
+    ));
+    (
+        TestServer {
+            addr,
+            shutdown,
+            handle,
+        },
+        reloader,
+    )
+}
+
+/// Bind an ephemeral port and wrap it in the real
+/// [`TlsListener`](autumn_web::tls::TlsListener).
+///
+/// No settle delay is needed before connecting: the socket is listening from
+/// the moment it is bound, so a client that connects first simply waits in the
+/// kernel backlog. The reloader is returned unspawned: only the renewal tests
+/// start it, at the test-friendly interval.
+async fn bind_tls(
+    fixture: &CertFixture,
+    handshake_timeout: Duration,
+) -> (
+    SocketAddr,
+    autumn_web::tls::TlsListener,
+    CancellationToken,
+    autumn_web::tls::CertReloader,
+) {
+    let provider = autumn_web::tls::crypto_provider();
+    // The same one-call load `app.rs` uses, so the reload baseline is captured
+    // exactly as it is in production.
+    let (resolver, reloader) = autumn_web::tls::CertReloader::load(
+        fixture.cert.clone(),
+        fixture.key.clone(),
+        Arc::clone(&provider),
+        now_unix(),
+        TEST_RELOAD_INTERVAL,
+    )
+    .expect("load cert/key");
+    let server_config =
+        autumn_web::tls::build_server_config(Arc::clone(&provider), Arc::clone(&resolver))
+            .expect("build server config");
+
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = tcp.local_addr().expect("local_addr");
+    let shutdown = CancellationToken::new();
+    let listener = autumn_web::tls::TlsListener::new(
+        tcp,
+        server_config,
+        handshake_timeout,
+        shutdown.child_token(),
+    );
+    (addr, listener, shutdown, reloader)
 }
 
 /// Serve `router` over a plain TCP listener with the same connect-info and
@@ -296,13 +341,23 @@ pub async fn tls_connect(
     addr: SocketAddr,
     verifier: Arc<RecordingVerifier>,
 ) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    tls_connect_alpn(addr, verifier, &[]).await
+}
+
+/// Like [`tls_connect`], but offers exactly `alpn` as the ALPN list.
+pub async fn tls_connect_alpn(
+    addr: SocketAddr,
+    verifier: Arc<RecordingVerifier>,
+    alpn: &[&[u8]],
+) -> std::io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let config = rustls::ClientConfig::builder_with_provider(provider)
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     // SNI uses the certificate's `localhost` SAN even though we dial 127.0.0.1.
     let server_name = ServerName::try_from("localhost").unwrap();

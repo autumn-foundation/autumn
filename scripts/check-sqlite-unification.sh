@@ -38,8 +38,35 @@
 #      backend (`sqlite = ["autumn-web/sqlite", …]`), selected the same explicit
 #      way autumn-web's is; the same line in any other crate is an edge.
 #   3. No `default` feature list enables `sqlite`, bare or forwarded.
+#   4. Rules 2 and 3 follow chains of local features: `default = ["embedded"]`
+#      with `embedded = ["sqlite"]` is the same flip. The report shows the
+#      chain (issue #2571). They read all three spellings of the table:
+#      `[features]`, root `features.default = [...]` keys, and a root inline
+#      `features = { ... }` table.
+#   5. A dependency spelled as a dotted key at the root or under `[target]`
+#      (`dependencies.autumn-web = { … }`) is an edge too. There, an inline
+#      table is flattened into dotted keys at any depth, so
+#      `dependencies = { autumn-web = { … } }` and `target = { … }` read the
+#      same way.
+#   6. The lexer decodes ASCII unicode escapes, so `"\u0073qlite"` reads as
+#      "sqlite". A non-ASCII escape in a dependency or feature entry or
+#      header fails closed: the rules cannot read it.
 #
-# It is a manifest gate, not a build: no toolchain, ~1 second, self-testing.
+# The lexer folds TOML multi-line strings to one-line strings that keep their
+# text, so a bracket in one does not move the scan out of step, and
+# `features = ["""sqlite"""]` still reads as "sqlite" (issue #2571). It also
+# accepts the whitespace TOML allows in headers and dotted keys. A dot inside a
+# quoted key segment (`target."x.y"`) stays part of the name, and only the real
+# `features` field of an inline table counts.
+#
+# It is a manifest gate, not a build: ~2 seconds, self-testing. Two layers:
+#   - The SCAN reads every manifest with the awk lexer below. It needs no
+#     toolchain and also covers crates outside the workspace.
+#   - The RESOLVER reads `cargo metadata` for the workspace: the features
+#     cargo resolves today, and each member's declared edges and feature
+#     chains, optional or target-only ones too. Cargo parses the TOML, so no
+#     spelling can slip past it. It needs cargo and jq; without them it is
+#     skipped, unless SQLITE_GATE_REQUIRE_RESOLVE=1 (CI sets it).
 #
 # Deliberately scans EVERY `Cargo.toml` under the root, including crates the
 # root workspace excludes (fuzz targets, benchmark harnesses, `src-tauri`).
@@ -82,6 +109,15 @@ scan_manifest() {
     BEGIN {
       SQ = sprintf("%c", 39)   # a literal single quote, unwritable inline here
       pkg = ""
+      ml = ""
+      ESCAPED_HEADER = sprintf("%c", 1) "escaped-header"
+      # Stands in for a dot inside a quoted key segment, which is part of the
+      # name: target."x.y" is one segment.
+      DOTPH = sprintf("%c", 2)
+      # A dependency or feature name, as cargo accepts it once its quotes are
+      # gone: any run without a dot, blank, `=`, quote, slash, `?` or bracket.
+      NAME = "[^]. \t=\"/?[]+"
+      DEPS = "(dependencies|dev-dependencies|build-dependencies)"
       defines_flip_sqlite = 0
     }
 
@@ -92,7 +128,7 @@ scan_manifest() {
     # array. Getting either wrong desynchronizes the section tracker for the
     # rest of the file, which fails OPEN.
     # A backslash escapes the next character inside a BASIC string ("…") and
-    # is literal inside a literal string ('…'). Reading `\"` as the end of a
+    # is literal inside a literal string (SQ…SQ). Reading `\"` as the end of a
     # string desynchronizes everything after it: a `[` in ordinary package
     # metadata then reads as structural, the entry assembler swallows the
     # following dependency, and the scan fails OPEN.
@@ -124,6 +160,69 @@ scan_manifest() {
       }
       return depth <= 0
     }
+    # Decode each ASCII unicode escape (`\u0073`, `\U00000073`) in a basic
+    # string, so the rules read the name cargo reads. A non-ASCII escape, or
+    # one that decodes to a quote, a backslash or a control character, stays
+    # as written: `has_unicode_escape` still sees it.
+    function decode_escapes(s,   i, c, q, out, n, v) {
+      q = ""; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") {
+          n = (substr(s, i + 1, 1) == "u") ? 4 : (substr(s, i + 1, 1) == "U") ? 8 : 0
+          v = (n > 0) ? hex_value(substr(s, i + 2, n)) : -1
+          if (v >= 32 && v < 127 && v != 34 && v != 92) {
+            out = out sprintf("%c", v)
+            i += 1 + n
+          } else {
+            out = out c substr(s, i + 1, 1)
+            i++
+          }
+          continue
+        }
+        if (q != "") { if (c == q) q = "" }
+        else if (c == "\"" || c == SQ) q = c
+        out = out c
+      }
+      return out
+    }
+    # Whether a header names a table that can hold dependencies or features:
+    # `[features]`, `[target.…]`, or a path with a dependencies segment. Read
+    # by segment, so `[package.metadata.features-x]` is not one.
+    function is_dep_or_feature_header(h) {
+      gsub(SQ, "", h)
+      gsub(/"/, "", h)
+      gsub(/[ \t]*\.[ \t]*/, ".", h)
+      return h ~ /^\[[ \t]*(features[ \t]*\]|target\.)/ \
+          || h ~ /(^\[[ \t]*|\.)(dependencies|dev-dependencies|build-dependencies)[ \t]*(\.|\])/
+    }
+    # The value of a string of hex digits, or -1 if one is not a hex digit.
+    function hex_value(h,   i, d, v) {
+      if (h == "") return -1
+      v = 0
+      for (i = 1; i <= length(h); i++) {
+        d = index("0123456789abcdef", tolower(substr(h, i, 1))) - 1
+        if (d < 0) return -1
+        v = v * 16 + d
+      }
+      return v
+    }
+    # Whether `s` holds a unicode escape. Only a basic string has escapes:
+    # TOML reads a backslash in a literal string as a backslash.
+    function has_unicode_escape(s,   i, c, q) {
+      q = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") {
+          if (substr(s, i + 1, 1) ~ /[uU]/) return 1
+          i++
+          continue
+        }
+        if (q != "") { if (c == q) q = ""; continue }
+        if (c == "\"" || c == SQ) q = c
+      }
+      return 0
+    }
     # TOML literal strings are as valid as basic ones, so match against a copy
     # with the quotes normalized rather than writing every pattern twice.
     function normalize_quotes(s) { gsub(SQ, "\"", s); return s }
@@ -135,14 +234,115 @@ scan_manifest() {
     # the first `=`. Only the key is touched — quotes inside the value stay
     # significant to the value patterns (`"sqlite"`, `package = "autumn-web"`,
     # the `"dep/sqlite"` forwarding paths).
-    function unquote_key(entry,   i, key, tail) {
-      i = index(entry, "=")
+    function unquote_key(entry,   i) {
+      i = assign_index(entry)
       if (i == 0) return entry
-      key = substr(entry, 1, i - 1)
-      tail = substr(entry, i)
-      gsub(SQ, "", key)
-      gsub(/"/, "", key)
-      return key tail
+      return unquote_path(substr(entry, 1, i - 1)) substr(entry, i)
+    }
+    # A dotted key path with its quotes removed. Inside a quoted segment, a
+    # dot becomes DOTPH and an `=` or an escape goes, so the rules split the
+    # path and the entry only where TOML does. Blanks around a dot go too.
+    function unquote_path(s,   i, c, q, out) {
+      q = ""; out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") { i++; continue }
+        if (q != "") {
+          if (c == q) q = ""
+          else if (c == ".") out = out DOTPH
+          else if (c != "=") out = out c
+          continue
+        }
+        if (c == "\"" || c == SQ) { q = c; continue }
+        out = out c
+      }
+      gsub(/[ \t]*\.[ \t]*/, ".", out)
+      return out
+    }
+    # The index of the assignment `=`: the first one outside quotes.
+    function assign_index(s,   i, c, q) {
+      q = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") { i++; continue }
+        if (q != "") { if (c == q) q = ""; continue }
+        if (c == "\"" || c == SQ) { q = c; continue }
+        if (c == "=") return i
+      }
+      return 0
+    }
+
+    # TOML multi-line strings (three double or three single quotes) can span
+    # lines and hold any bracket or quote. Fold each one to a one-line basic
+    # string that keeps its text, so a value such as `"""sqlite"""` still
+    # reads as "sqlite". `ml` holds the open delimiter across lines, "" when
+    # none is open; `ml_buf` holds the text read so far.
+    function fold_multiline(s,   i, c, q, out, d, j) {
+      out = ""; q = ""; i = 1
+      if (ml != "") {
+        j = ml_close(s, 1)
+        if (j == 0) { ml_buf = ml_buf "\n" s; return "" }
+        ml_buf = ml_buf "\n" substr(s, 1, j - 4)
+        out = "\"" ml_text() "\""
+        ml = ""
+        i = j
+      }
+      for (; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") { out = out c substr(s, i + 1, 1); i++; continue }
+        if (q != "") { if (c == q) q = ""; out = out c; continue }
+        if (c == "#") { out = out substr(s, i); break }
+        d = substr(s, i, 3)
+        if (d == "\"\"\"" || d == SQ SQ SQ) {
+          ml = d
+          j = ml_close(s, i + 3)
+          if (j == 0) { ml_buf = substr(s, i + 3); return out }
+          ml_buf = substr(s, i + 3, j - 3 - (i + 3))
+          out = out "\"" ml_text() "\""
+          ml = ""
+          i = j - 1
+          continue
+        }
+        if (c == "\"" || c == SQ) q = c
+        out = out c
+      }
+      return out
+    }
+    # The text of the open multi-line string, made safe for a one-line basic
+    # string. TOML drops a newline right after the opening delimiter, and in
+    # a basic string a backslash at line end joins the next line. Quotes,
+    # backslashes, comment marks and brackets go, so the text cannot change
+    # the structure around it.
+    function ml_text(   t) {
+      t = ml_buf
+      sub(/^\n/, "", t)
+      if (ml == "\"\"\"") {
+        gsub(/\\\n[ \t\n]*/, "", t)
+        # Keep a real unicode escape, so the fail-closed rule still sees it:
+        # drop escaped backslashes, then park each remaining `\u` / `\U`.
+        gsub(/\\\\/, "", t)
+        gsub(/\\[uU]/, "\001u", t)
+      }
+      gsub(/["\\#{}\[\]]/, "", t)
+      gsub("\001", "\\", t)
+      gsub(SQ, "", t)
+      gsub(/\n/, " ", t)
+      return t
+    }
+    # Index just past the delimiter that closes `ml`, from `start`; 0 when
+    # this line does not close it. A run of up to five quotes closes with its
+    # last three: the first one or two are content.
+    function ml_close(s, start,   i, r, qc) {
+      qc = substr(ml, 1, 1)
+      for (i = start; i <= length(s); i++) {
+        if (qc == "\"" && substr(s, i, 1) == "\\") { i++; continue }
+        if (substr(s, i, 3) == ml) {
+          r = 3
+          while (r < 5 && substr(s, i + r, 1) == qc) r++
+          return i + r
+        }
+      }
+      return 0
     }
 
     # ── Entry assembly ───────────────────────────────────────────────────
@@ -152,7 +352,17 @@ scan_manifest() {
     # miss it entirely. Returns "" while an entry is still open.
     function feed(line,   entry) {
       sub(/\r$/, "", line)              # a CRLF checkout must not blind the gate
+      line = fold_multiline(line)
+      line = decode_escapes(line)
       line = strip_comment(line)
+      if (ml != "") {
+        # A multi-line string is still open: hold the entry until it closes.
+        if (pending == "") {
+          gsub(/^[ \t]+|[ \t]+$/, "", line)
+          pending = line; entry_line = FNR
+        } else pending = pending " " line
+        return ""
+      }
       if (pending != "") {
         pending = pending " " line
         if (!balanced(pending)) return ""
@@ -162,13 +372,19 @@ scan_manifest() {
       gsub(/^[ \t]+|[ \t]+$/, "", line)
       if (line == "") return ""
       if (line ~ /^\[/) {
+        # A unicode escape left in a dependency or feature header is a
+        # non-ASCII one, which the rules cannot read. Hand pass 2 a marker.
+        if (has_unicode_escape(line) && is_dep_or_feature_header(line)) {
+          entry_line = FNR; section = line; return ESCAPED_HEADER
+        }
         # A header ends any entry. It carries no string values, so every
         # quote in it is key-quoting (`[dependencies."autumn-web"]`,
         # `[target."cfg(unix)".dependencies]`); strip them so the section
         # matchers work off one spelling.
-        section = line
-        gsub(SQ, "", section)
-        gsub(/"/, "", section)
+        section = unquote_path(line)
+        # TOML allows whitespace inside the brackets too.
+        gsub(/^\[[ \t]+/, "[", section)
+        gsub(/[ \t]+\]$/, "]", section)
         return ""
       }
       if (!balanced(line)) { pending = line; entry_line = FNR; return "" }
@@ -176,12 +392,29 @@ scan_manifest() {
       return unquote_key(line)
     }
 
+    # The dependency name in a loose dotted key, or "". Only the paths cargo
+    # reads: `dependencies.X` and `target.T.dependencies.X` at the root,
+    # `T.dependencies.X` under `[target]`, `dependencies.X` under
+    # `[target.T]`. Not `package.metadata.dependencies.X`.
+    function loose_dep_name(key,   k) {
+      k = key
+      if (section == "") {
+        if (k ~ ("^target\\.[^.]+\\." DEPS "\\.")) sub(/^target\.[^.]+\./, "", k)
+      } else if (section == "[target]") {
+        if (k !~ ("^[^.]+\\." DEPS "\\.")) return ""
+        sub(/^[^.]+\./, "", k)
+      } else if (section !~ /^\[target\.[^]]+\]$/) return ""
+      if (k !~ ("^" DEPS "\\.")) return ""
+      sub(("^" DEPS "\\."), "", k)
+      sub(/\..*$/, "", k)
+      return k
+    }
     function is_dep_table() {
       return section ~ /(^\[|\.)(dependencies|dev-dependencies|build-dependencies)\]$/
     }
     # `[dependencies.autumn-web]` — the crate is in the header, not the key.
     function dep_section_crate(   name) {
-      if (!match(section, /(^\[|\.)(dependencies|dev-dependencies|build-dependencies)\.[A-Za-z0-9_-]+\]$/))
+      if (!match(section, "(^\\[|\\.)" DEPS "\\." NAME "\\]$"))
         return ""
       name = section
       sub(/\]$/, "", name)
@@ -199,13 +432,124 @@ scan_manifest() {
       # the feature only if something else enabled the dependency". A `default`
       # that pairs it with `dep:autumn-web` enables both, so the `?` spelling
       # flips the backend exactly like the plain one.
-      while (match(tail, /"[A-Za-z0-9_-]+\??\/sqlite"/)) {
+      while (match(tail, "\"" NAME "\\??/sqlite\"")) {
         name = substr(tail, RSTART + 1, RLENGTH - 2)
         sub(/\??\/sqlite$/, "", name)
         if (name ~ ("^(" flip ")$")) return 1
         if (name in alias_of && alias_of[name] ~ ("^(" flip ")$")) return 1
         tail = substr(tail, RSTART + RLENGTH)
       }
+      return 0
+    }
+    # Whether the `features` list of an entry names "sqlite". Only that list
+    # counts: `path = "sqlite"` is not a feature. In the dotted and section
+    # forms the key is `features` and the value is the list.
+    function features_name_sqlite(e,   i, key) {
+      i = assign_index(e)
+      if (i == 0) return 0
+      key = substr(e, 1, i - 1)
+      gsub(/[ \t]+$/, "", key)
+      if (key ~ /(^|\.)features$/) return list_has_sqlite(substr(e, i + 1))
+      return list_has_sqlite(inline_field(e, "features"))
+    }
+    # Whether a TOML list names "sqlite", in either quote style.
+    function list_has_sqlite(v) {
+      return (v ~ ("[\"" SQ "]sqlite[\"" SQ "]"))
+    }
+    # Split `s` at each `sep` outside quotes and brackets, into out[1..n].
+    function split_top(s, sep, out,   i, c, q, depth, n, start) {
+      n = 0; q = ""; depth = 0; start = 1
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (q == "\"" && c == "\\") { i++; continue }
+        if (q != "") { if (c == q) q = ""; continue }
+        if (c == "\"" || c == SQ) q = c
+        else if (c == "[" || c == "{") depth++
+        else if (c == "]" || c == "}") depth--
+        else if (c == sep && depth == 0) { out[++n] = substr(s, start, i - start); start = i + 1 }
+      }
+      out[++n] = substr(s, start)
+      return n
+    }
+    # The fields of the inline table that is the value of entry `e`, as
+    # `key = value` strings with unquoted keys, in out[1..n]; 0 if the value is
+    # not an inline table.
+    function inline_fields(e, out,   i, body, n, parts, p, m) {
+      i = assign_index(e)
+      if (i == 0) return 0
+      body = substr(e, i + 1)
+      sub(/^[ \t]+/, "", body)
+      sub(/[ \t]+$/, "", body)
+      if (substr(body, 1, 1) != "{" || substr(body, length(body), 1) != "}") return 0
+      n = split_top(substr(body, 2, length(body) - 2), ",", parts)
+      m = 0
+      for (p = 1; p <= n; p++) {
+        if (assign_index(parts[p]) == 0) continue
+        out[++m] = unquote_key(parts[p])
+        sub(/^[ \t]+/, "", out[m])
+      }
+      return m
+    }
+    # The value of field `name` in the inline table that is the value of `e`.
+    function inline_field(e, name,   n, f, k, i, fields) {
+      n = inline_fields(e, fields)
+      for (k = 1; k <= n; k++) {
+        i = assign_index(fields[k])
+        f = substr(fields[k], 1, i - 1)
+        gsub(/[ \t]+$/, "", f)
+        if (f == name) return substr(fields[k], i + 1)
+      }
+      return ""
+    }
+    # Whether the current section is the root or a [target] table, where an
+    # inline table is just another spelling of dotted keys.
+    function in_loose_section() {
+      return (section == "" || section ~ /^\[target(\.[^]]*)?\]$/)
+    }
+    # Entry `e` as a list of entries in q[1..n]. In a loose section, an
+    # inline-table value is flattened into dotted keys at any depth, so
+    # `dependencies = { autumn-web = { features = [...] } }` reads as
+    # `dependencies.autumn-web.features = [...]` and the dotted-key rules
+    # apply. Anything else is the one entry `e`.
+    function expand(e, q,   i, v) {
+      split("", q)
+      i = assign_index(e)
+      if (i == 0 || !in_loose_section()) { q[1] = e; return 1 }
+      v = substr(e, i + 1)
+      gsub(/^[ \t]+|[ \t]+$/, "", v)
+      if (v !~ /^\{.*\}$/) { q[1] = e; return 1 }
+      return flatten(e, q, 0)
+    }
+    # Append the dotted entries of inline-table entry `e` to q, after n.
+    function flatten(e, q, n,   i, prefix, m, k, fields, j, kk, v) {
+      i = assign_index(e)
+      prefix = substr(e, 1, i - 1)
+      gsub(/[ \t]+$/, "", prefix)
+      m = inline_fields(e, fields)
+      for (k = 1; k <= m; k++) {
+        j = assign_index(fields[k])
+        kk = substr(fields[k], 1, j - 1)
+        gsub(/[ \t]+$/, "", kk)
+        v = substr(fields[k], j + 1)
+        gsub(/^[ \t]+|[ \t]+$/, "", v)
+        if (v ~ /^\{.*\}$/) n = flatten(prefix "." kk " = " v, q, n)
+        else q[++n] = prefix "." kk " = " v
+      }
+      return n
+    }
+    # The feature entries (`name = [...]`) that entry `e` defines, in
+    # out[1..n]. The table has three spellings: a `[features]` table, root
+    # dotted keys (`features.default = [...]`), and a root inline table
+    # (`features = { default = [...] }`).
+    function feature_entries(e, out,   i, k) {
+      i = assign_index(e)
+      if (i == 0) return 0
+      if (section == "[features]") { out[1] = e; return 1 }
+      if (section != "") return 0
+      k = substr(e, 1, i - 1)
+      gsub(/[ \t]+$/, "", k)
+      if (k ~ /^features\.[^.]+$/) { out[1] = substr(e, 10); return 1 }
+      if (k == "features") return inline_fields(e, out)
       return 0
     }
     # The value of a `key = "value"` entry.
@@ -216,18 +560,60 @@ scan_manifest() {
       return value
     }
 
+    # Find each local feature that enables the flip, directly or through a
+    # chain of other local features (`default = ["embedded"]`,
+    # `embedded = ["sqlite"]`). `via[f]` is the next hop; "" for a direct one.
+    function resolve_reach(   k, n, p, parts, changed) {
+      for (k in feat_entry)
+        if (forwards_flip(feat_entry[k])) { reach[k] = 1; via[k] = "" }
+      if (defines_flip_sqlite && !("sqlite" in reach)) { reach["sqlite"] = 1; via["sqlite"] = "" }
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (k in feat_refs) {
+          if (k in reach) continue
+          n = split(feat_refs[k], parts, " ")
+          for (p = 1; p <= n; p++) {
+            if (parts[p] in reach) { reach[k] = 1; via[k] = parts[p]; changed = 1; break }
+          }
+        }
+      }
+    }
+    # The hops from feature `k` to the flip, for the report.
+    function chain(k,   s) {
+      s = k
+      while (via[k] != "") { k = via[k]; s = s " -> " k }
+      return s
+    }
+
     # ── Pass 1: whose manifest is this, and what does it define? ─────────
     NR == FNR {
       entry = feed($0)
       if (entry == "") next
+      nq = expand(entry, q)
+      for (qi = 1; qi <= nq; qi++) {
+      entry = q[qi]
       norm = normalize_quotes(entry)
-      if (section == "[package]" && norm ~ /^name[ \t]*=/) {
-        pkg = norm
-        sub(/^name[ \t]*=[ \t]*"/, "", pkg)
-        sub(/".*$/, "", pkg)
+      if ((section == "[package]" && norm ~ /^name[ \t]*=/) \
+          || (section == "" && norm ~ /^package\.name[ \t]*=/)) {
+        pkg = quoted_value(norm)
       }
-      if (section == "[features]" && norm ~ /^sqlite[ \t]*=/ && forwards_flip(norm))
-        defines_flip_sqlite = 1
+      # Record each feature, by any name cargo accepts, and the LOCAL features
+      # it enables. Pass 2 resolves the chains, after every alias is known.
+      nfe = feature_entries(norm, fe)
+      for (f = 1; f <= nfe; f++) {
+        fkey = fe[f]
+        sub(/[ \t]*=.*$/, "", fkey)
+        feat_entry[fkey] = fe[f]
+        refs = fe[f]
+        sub(/^[^=]*=/, "", refs)
+        feat_refs[fkey] = ""
+        while (match(refs, /"[^"]*"/)) {
+          ref = substr(refs, RSTART + 1, RLENGTH - 2)
+          refs = substr(refs, RSTART + RLENGTH)
+          if (ref !~ /[\/:]/) feat_refs[fkey] = feat_refs[fkey] " " ref
+        }
+      }
 
       # A RENAMED dependency names its real crate in a `package` key that can
       # sit anywhere in the entry, so the rules cannot see it one line at a
@@ -242,16 +628,22 @@ scan_manifest() {
         section_package[section] = quoted_value(norm)
         alias_of[dep_section_crate()] = section_package[section]
       }
-      if (is_dep_table() && norm ~ /^[A-Za-z0-9_-]+\.package[ \t]*=/) {
+      if (is_dep_table() && norm ~ ("^" NAME "\\.package[ \t]*=")) {
         name = norm
         sub(/\.package.*$/, "", name)
         dotted_package[name] = quoted_value(norm)
         alias_of[name] = dotted_package[name]
       }
+      # A rename spelled as loose dotted keys, at the root or under
+      # `[target]`: `dependencies.web.package = "autumn-web"`.
+      key = norm
+      sub(/[ \t]*=.*$/, "", key)
+      name = loose_dep_name(key)
+      if (name != "" && key ~ ("(^|\\.)" DEPS "\\." NAME "\\.package$")) alias_of[name] = quoted_value(norm)
       # The inline form, whose alias a FEATURE path then names:
       #   web = { package = "autumn-web", optional = true }
       #   embedded = ["dep:web", "web/sqlite"]
-      if (is_dep_table() && norm ~ /^[A-Za-z0-9_-]+[ \t]*=/ && norm ~ /package[ \t]*=[ \t]*"/) {
+      if (is_dep_table() && norm ~ ("^" NAME "[ \t]*=") && norm ~ /package[ \t]*=[ \t]*"/) {
         name = norm
         sub(/[ \t]*=.*$/, "", name)
         value = norm
@@ -259,64 +651,107 @@ scan_manifest() {
         sub(/".*$/, "", value)
         alias_of[name] = value
       }
+      }
       next
     }
 
     # ── Pass 2: the rules ────────────────────────────────────────────────
     FNR == 1 {
-      pending = ""; section = ""
+      pending = ""; section = ""; ml = ""
+      if ("sqlite" in feat_entry && forwards_flip(feat_entry["sqlite"]))
+        defines_flip_sqlite = 1
       # autumn-web owns the flip, so a bare "sqlite" in ITS default list is the
       # flip itself, with nothing to forward to.
       if (pkg ~ ("^(" flip ")$")) defines_flip_sqlite = 1
+      resolve_reach()
     }
     {
       entry = feed($0)
       if (entry == "") next
-      norm = normalize_quotes(entry)
-      mentions_sqlite = (norm ~ /"sqlite"/)
-      forwards = forwards_flip(norm)
-
-      # ── 1. A dependency edge that enables the flip ────────────────────
-      if (is_dep_table() && mentions_sqlite) {
-        # Inline: by key, or renamed with `package` in the same entry.
-        if (norm ~ ("^(" flip ")[ \t]*=") \
-            || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\"")) {
-          report("dependency edge enables the `sqlite` backend flip")
-          next
-        }
-        # Dotted: `autumn-web.features`, or an alias pass 1 resolved.
-        if (norm ~ /^[A-Za-z0-9_-]+\.features[ \t]*=/) {
-          alias = norm
-          sub(/\.features.*$/, "", alias)
-          if (alias ~ ("^(" flip ")$") \
-              || (alias in dotted_package && dotted_package[alias] ~ ("^(" flip ")$"))) {
-            report("dependency edge enables the `sqlite` backend flip")
-            next
-          }
-        }
-      }
-      # Section form: the crate is the last header segment, unless a
-      # `package` key inside the section renamed it.
-      crate = dep_section_crate()
-      if (crate != "" && (section in section_package)) crate = section_package[section]
-      if (crate ~ ("^(" flip ")$") && norm ~ /^features[ \t]*=/ && mentions_sqlite) {
-        report("dependency edge enables the `sqlite` backend flip")
+      if (entry == ESCAPED_HEADER) {
+        report("a unicode escape in a table header cannot be checked; write it plainly")
         next
       }
+      nq = expand(entry, q)
+      for (qi = 1; qi <= nq; qi++) {
+        entry = q[qi]
+        norm = normalize_quotes(entry)
+        mentions_sqlite = features_name_sqlite(entry)
+        forwards = forwards_flip(norm)
+        loose = (section == "" || section ~ /^\[target(\.[^]]*)?\]$/)
 
-      # ── 2 & 3. A feature that forwards or defaults into the flip ──────
-      if (section == "[features]") {
+        # ── 0. Spellings the rules below do not read: fail closed ─────────
+        # An ASCII escape was decoded above. A non-ASCII one left in a
+        # dependency or feature entry can spell a name the rules cannot read.
         key = norm
         sub(/[ \t]*=.*$/, "", key)
-        if (key == "default" && (forwards || (mentions_sqlite && defines_flip_sqlite))) {
-          report("`default` enables the `sqlite` backend flip")
-        } else if (forwards && key != "sqlite") {
-          report("feature `" key "` forwards the `sqlite` backend flip")
-        } else if (forwards && !(pkg ~ ("^(" flip ")$"))) {
-          # A same-named `sqlite` feature is the sanctioned opt-in ONLY in the
-          # two crates that own the flip. Anywhere else it is an edge wearing
-          # the exception as a name.
-          report("feature `sqlite` forwards the backend flip from a crate that does not own it")
+        if ((is_dep_table() || dep_section_crate() != "" || section == "[features]" \
+             || (loose && (loose_dep_name(key) != "" || (section == "" && key ~ /^features(\.|$)/)))) \
+            && has_unicode_escape(entry)) {
+          report("a unicode escape in a dependency or feature entry cannot be checked; write it plainly")
+          continue
+        }
+        # A dependency or feature table spelled as a dotted key, at the root or
+        # under `[target]`: `dependencies.autumn-web = { … }`.
+        if (loose) {
+          key = norm
+          sub(/[ \t]*=.*$/, "", key)
+          dep = loose_dep_name(key)
+          if (dep != "" && mentions_sqlite \
+              && (dep ~ ("^(" flip ")$") \
+                  || (dep in alias_of && alias_of[dep] ~ ("^(" flip ")$")) \
+                  || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\""))) {
+            report("dependency edge enables the `sqlite` backend flip")
+            continue
+          }
+        }
+
+        # ── 1. A dependency edge that enables the flip ────────────────────
+        if (is_dep_table() && mentions_sqlite) {
+          # Inline: by key, or renamed with `package` in the same entry.
+          if (norm ~ ("^(" flip ")[ \t]*=") \
+              || norm ~ ("package[ \t]*=[ \t]*\"(" flip ")\"")) {
+            report("dependency edge enables the `sqlite` backend flip")
+            continue
+          }
+          # Dotted: `autumn-web.features`, or an alias pass 1 resolved.
+          if (norm ~ ("^" NAME "\\.features[ \t]*=")) {
+            alias = norm
+            sub(/\.features.*$/, "", alias)
+            if (alias ~ ("^(" flip ")$") \
+                || (alias in dotted_package && dotted_package[alias] ~ ("^(" flip ")$"))) {
+              report("dependency edge enables the `sqlite` backend flip")
+              continue
+            }
+          }
+        }
+        # Section form: the crate is the last header segment, unless a
+        # `package` key inside the section renamed it.
+        crate = dep_section_crate()
+        if (crate != "" && (section in section_package)) crate = section_package[section]
+        if (crate ~ ("^(" flip ")$") && norm ~ /^features[ \t]*=/ && mentions_sqlite) {
+          report("dependency edge enables the `sqlite` backend flip")
+          continue
+        }
+
+        # ── 2 & 3. A feature that forwards or defaults into the flip ──────
+        nfe = feature_entries(norm, fe)
+        for (f = 1; f <= nfe; f++) {
+          key = fe[f]
+          sub(/[ \t]*=.*$/, "", key)
+          forwards = forwards_flip(fe[f])
+          if (key == "default" && (key in reach)) {
+            report("`default` enables the `sqlite` backend flip (" chain(key) ")")
+          } else if (forwards && key != "sqlite") {
+            report("feature `" key "` forwards the `sqlite` backend flip")
+          } else if ((key in reach) && key != "sqlite") {
+            report("feature `" key "` reaches the `sqlite` backend flip (" chain(key) ")")
+          } else if (forwards && !(pkg ~ ("^(" flip ")$"))) {
+            # A same-named `sqlite` feature is the sanctioned opt-in ONLY in the
+            # two crates that own the flip. Anywhere else it is an edge wearing
+            # the exception as a name.
+            report("feature `sqlite` forwards the backend flip from a crate that does not own it")
+          }
         }
       }
     }
@@ -353,6 +788,48 @@ gate_check() {
   return 0
 }
 
+# The authoritative check: ask cargo. Prints one line per violation in what
+# cargo resolves or in what a workspace member declares; returns 2 if cargo or
+# jq cannot run. The scan above reads TOML by hand and can miss a spelling that
+# cargo accepts. The resolver cannot. It covers workspace members only, so
+# the scan stays for the crates outside the workspace.
+resolve_check() {
+  local root="$1" meta
+  command -v cargo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 2
+  meta="$(cd "$root" && cargo metadata --format-version 1 2>/dev/null)" || return 2
+  jq -r --arg flip "$FLIP_CRATES" '
+    def flip: test("^(" + $flip + ")$");
+    # The local features that reach the seed set, the seed set included.
+    def closure($f):
+      def grow: . as $r
+        | ([$f | to_entries[] | select(any(.value[]; . as $v | any($r[]; . == $v))) | .key]
+           + $r | unique);
+      until(grow == .; grow);
+    (.packages | map({key: .id, value: .}) | from_entries) as $pkg
+    # 1. What cargo resolves today.
+    | ( .resolve.nodes[]
+        | select(($pkg[.id].name | flip) and (.features | index("sqlite")))
+        | "\($pkg[.id].name) resolves with the `sqlite` feature on" ),
+    # 2. What each workspace member declares, also on an optional or
+    #    target-only edge that is off today. Cargo has decoded every spelling.
+      ( .workspace_members[] | $pkg[.] as $p
+        | ( $p.dependencies[]
+            | select((.name | flip) and (.features | index("sqlite")))
+            | "\($p.name): its dependency on \(.name) enables `sqlite`" ),
+          ( [$p.dependencies[] | select(.name | flip) | (.rename // .name)] as $aliases
+            | ($p.features // {}) as $f
+            | [$f | to_entries[]
+                | select(any(.value[]; . as $v
+                    | any($aliases[]; $v == (. + "/sqlite") or $v == (. + "?/sqlite"))))
+                | .key] as $direct
+            | (if ($p.name | flip) then $direct + ["sqlite"] else $direct end | unique) as $seed
+            | ( $seed | closure($f) | .[] | select(. != "sqlite")
+                | "\($p.name): feature `\(.)` enables `sqlite`" ),
+              ( select(($direct | index("sqlite")) and (($p.name | flip) | not))
+                | "\($p.name): feature `sqlite` forwards the flip from a crate that does not own it" ) ) )
+  ' <<<"$meta" || return 2
+}
+
 run_real_check() {
   local root status=0
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -379,6 +856,21 @@ explicit invocation instead:
 
 See the \`sqlite = [...]\` comment in autumn/Cargo.toml." ;;
   esac
+
+  echo "==> asking cargo what the workspace resolves and declares"
+  local findings rstatus=0
+  findings="$(resolve_check "$root")" || rstatus=$?
+  if (( rstatus != 0 )); then
+    [[ "${SQLITE_GATE_REQUIRE_RESOLVE-}" == 1 ]] &&
+      die "the resolver check could not run (cargo metadata or jq failed)"
+    echo "note: cargo or jq not available; resolver check skipped"
+  elif [[ -n "$findings" ]]; then
+    printf '%s\n' "$findings"
+    die "cargo metadata shows an edge to the \`sqlite\` backend flip. Find it
+with: cargo tree -e features -i autumn-web"
+  else
+    echo "OK: cargo metadata shows no edge to the \`sqlite\` backend flip."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -588,6 +1080,367 @@ autumn-web = { version = "0.7", features = ["sqlite"] }
 EOF
   check_fail "an escaped quote does not desync the scan" escaped
 
+  # A TOML multi-line string can hold an unmatched bracket. The lexer must
+  # carry string state across lines, or the edge below is swallowed (#2571).
+  make_case multiline_basic <<'EOF'
+[package]
+name = "consumer"
+description = """
+an unmatched [ bracket
+"""
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a multi-line basic string does not desync the scan" multiline_basic
+
+  make_case multiline_literal <<'EOF'
+[package]
+name = "consumer"
+description = '''
+an unmatched { brace and a "quote
+'''
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a multi-line literal string does not desync the scan" multiline_literal
+
+  # A multi-line string that LOOKS like an edge is text, not an edge.
+  make_case multiline_text <<'EOF'
+[package]
+name = "consumer"
+description = """
+[dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+"""
+
+[dependencies]
+autumn-web = { version = "0.7", features = ["db"] }
+EOF
+  check_pass "an edge spelled inside a multi-line string is not an edge" multiline_text
+
+  # A multi-line string can BE the value. Folding must keep its text.
+  make_case multiline_value <<'EOF'
+[dependencies]
+autumn-web = { version = "0.7", features = ["""sqlite"""] }
+EOF
+  check_fail "a multi-line string value is read" multiline_value
+
+  make_case multiline_value_span <<'EOF'
+[dependencies]
+autumn-web = { version = "0.7", features = [
+"""
+sqlite""",
+] }
+EOF
+  check_fail "a multi-line string value that spans lines is read" multiline_value_span
+
+  make_case multiline_package <<'EOF'
+[dependencies.web]
+package = '''autumn-web'''
+features = ["sqlite"]
+EOF
+  check_fail "a multi-line literal package name is read" multiline_package
+
+  # Fail closed on spellings the rules do not decode or anchor on.
+  make_case unicode_escape <<'EOF'
+[dependencies]
+autumn-web = { version = "0.7", features = ["\u0073qlite"] }
+EOF
+  check_fail "a unicode escape in a dependency entry fails closed" unicode_escape
+
+  make_case multiline_unicode <<'EOF'
+[dependencies]
+autumn-web = { version = "0.7", features = ["""\u0073qlite"""] }
+EOF
+  check_fail "a unicode escape in a multi-line basic string fails closed" multiline_unicode
+
+  # TOML does not process escapes in a literal string, so this is a path.
+  make_case literal_backslash <<'EOF'
+[dependencies]
+autumn-web = { path = 'C:\users\foo\autumn', features = ["db"] }
+EOF
+  check_pass "a backslash-u in a literal string is not an escape" literal_backslash
+
+  make_case basic_escaped_backslash <<'EOF'
+[dependencies]
+autumn-web = { path = "C:\\users\\foo", features = ["db"] }
+EOF
+  check_pass "an escaped backslash before u is not an escape" basic_escaped_backslash
+
+  make_case header_unicode <<'EOF'
+[dependencies."autumn\u002dweb"]
+features = ["sqlite"]
+EOF
+  check_fail "a unicode escape in a table header fails closed" header_unicode
+
+  # An escape in unrelated metadata is not a dependency or a feature.
+  make_case header_metadata_escape <<'EOF'
+[package.metadata."\u006banner"]
+text = "\u00e9t\u00e9"
+EOF
+  check_pass "an escape in a metadata header is not an edge" header_metadata_escape
+
+  make_case header_metadata_word_escape <<'EOF'
+[package.metadata."features\u00e9"]
+text = "x"
+EOF
+  check_pass "a metadata header that holds a keyword and an escape is not an edge" header_metadata_word_escape
+
+  make_case header_dep_nonascii <<'EOF'
+[dependencies."w\u00e9bb"]
+package = "autumn-web"
+features = ["sqlite"]
+EOF
+  check_fail "a non-ASCII escape in a dependency header fails closed" header_dep_nonascii
+
+  make_case root_metadata_escape <<'EOF'
+package.metadata.banner = "\u0068ello"
+package.metadata.accent = "\u00e9"
+EOF
+  check_pass "an escape in a root metadata key is not an edge" root_metadata_escape
+
+  # A non-ASCII escape cannot be decoded here, so a feature key that holds
+  # one still fails closed.
+  make_case feature_key_escape <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+default = ["x"]
+"\u00e9" = ["sqlite"]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "a non-ASCII escape in a feature key fails closed" feature_key_escape
+
+  make_case spaced_header <<'EOF'
+[ dependencies ]
+autumn-web . features = ["sqlite"]
+EOF
+  check_fail "whitespace inside a header and a dotted key" spaced_header
+
+  make_case root_dotted <<'EOF'
+[package]
+name = "consumer"
+EOF
+  # A root-level dotted key must come before any header.
+  printf 'dependencies.autumn-web = { version = "0.7", features = ["sqlite"] }\n[package]\nname = "consumer"\n' \
+    >"$tmp/root_dotted/Cargo.toml"
+  check_fail "a dependency spelled as a root-level dotted key" root_dotted
+
+  make_case target_dotted <<'EOF'
+[target]
+"cfg(unix)".dependencies.autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a target dependency spelled as a dotted key" target_dotted
+
+  make_case root_dotted_renamed <<'EOF'
+dependencies.web.package = "autumn-web"
+dependencies.web.features = ["sqlite"]
+
+[package]
+name = "consumer"
+EOF
+  check_fail "a renamed dependency spelled as root-level dotted keys" root_dotted_renamed
+
+  make_case root_dotted_unrelated <<'EOF'
+dependencies.diesel = { version = "2", features = ["sqlite"] }
+dependencies.store.package = "some-store"
+dependencies.store.features = ["sqlite"]
+
+[package]
+name = "consumer"
+EOF
+  check_pass "an unrelated crate spelled as a dotted key is not an edge" root_dotted_unrelated
+
+  make_case loose_unicode_alias <<'EOF'
+dependencies."wébb".package = "autumn-web"
+dependencies."wébb".features = ["sqlite"]
+
+[package]
+name = "consumer"
+EOF
+  check_fail "a quoted non-ASCII alias in loose dotted keys" loose_unicode_alias
+
+  make_case section_unicode_alias <<'EOF'
+[dependencies."wébb"]
+package = "autumn-web"
+features = ["sqlite"]
+EOF
+  check_fail "a quoted non-ASCII alias in a section header" section_unicode_alias
+
+  # `sqlite` outside the `features` list is not a feature.
+  make_case sqlite_elsewhere <<'EOF'
+[dependencies]
+autumn-web = { path = "sqlite", branch = "sqlite" }
+EOF
+  check_pass "sqlite outside the features list is not an edge" sqlite_elsewhere
+
+  make_case quoted_inline_features <<'EOF'
+[dependencies]
+autumn-web = { version = "0.8", "features" = ["sqlite"] }
+EOF
+  check_fail "a quoted features key inside an inline table" quoted_inline_features
+
+  make_case root_metadata <<'EOF'
+package.metadata.dependencies.autumn-web = { features = ["sqlite"] }
+package.metadata.features = { default = ["autumn-web/sqlite"] }
+EOF
+  check_pass "dotted package metadata is not a dependency or a feature" root_metadata
+
+  make_case target_root_dotted <<'EOF'
+target."cfg(unix)".dependencies.autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a target dependency spelled as a root-level dotted key" target_root_dotted
+
+  make_case target_cfg_eq <<'EOF'
+target.'cfg(target_os = "linux")'.dependencies.autumn-web = { path = "../autumn", optional = true, features = ["sqlite"] }
+EOF
+  check_fail "a dotted target key whose cfg holds an equals sign" target_cfg_eq
+
+  # A dot inside a quoted key segment is part of the name, not a separator.
+  make_case target_quoted_dot <<'EOF'
+target."x.y".dependencies.autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a quoted target name that holds a dot" target_quoted_dot
+
+  make_case header_quoted_dot <<'EOF'
+[target."x.y".dependencies]
+autumn-web = { version = "0.7", features = ["sqlite"] }
+EOF
+  check_fail "a quoted target name with a dot in a header" header_quoted_dot
+
+  # The features table spelled as root dotted keys, or as an inline table,
+  # is the same table: chains and the default rule apply.
+  make_case root_features_default <<'EOF'
+package.name = "autumn-web"
+features.default = ["sqlite"]
+features.sqlite = []
+EOF
+  check_fail "a root dotted default that enables the flip" root_features_default
+
+  make_case root_features_chain <<'EOF'
+package.name = "autumn-cli"
+features.default = ["embedded"]
+features.embedded = ["sqlite"]
+features.sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "a root dotted feature chain to the flip" root_features_chain
+
+  make_case root_features_owner <<'EOF'
+package.name = "autumn-cli"
+features.default = ["postgres"]
+features.sqlite = ["autumn-web/sqlite"]
+EOF
+  check_pass "the owner opt-in spelled as root dotted keys" root_features_owner
+
+  make_case inline_features_default <<'EOF'
+package.name = "autumn-web"
+features = { default = ["tls", "sqlite"], sqlite = [], tls = [] }
+EOF
+  check_fail "an inline features table whose default enables the flip" inline_features_default
+
+  # Only the real `features` field of an inline table counts.
+  make_case path_holds_features <<'EOF'
+[dependencies]
+autumn-web = { path = 'features = ["sqlite"]' }
+EOF
+  check_pass "features text inside a path is not a feature" path_holds_features
+
+  make_case apostrophe_elsewhere <<'EOF'
+[dependencies]
+autumn-web = { path = "it's", features = ["sqlite"] }
+EOF
+  check_fail "an apostrophe in another value does not hide the features list" apostrophe_elsewhere
+
+  # An inline table at the root or under [target] is the same table as its
+  # dotted keys, at any depth.
+  make_case root_inline_deps <<'EOF'
+dependencies = { autumn-web = { path = "../autumn", features = ["sqlite"] } }
+EOF
+  check_fail "a root inline dependencies table" root_inline_deps
+
+  make_case root_inline_renamed <<'EOF'
+dependencies = { web = { package = "autumn-web", features = ["sqlite"] } }
+EOF
+  check_fail "a renamed dependency in a root inline table" root_inline_renamed
+
+  make_case root_inline_target <<'EOF'
+target = { "cfg(unix)" = { dependencies = { autumn-web = { version = "0.7", features = ["sqlite"] } } } }
+EOF
+  check_fail "a nested root inline target table" root_inline_target
+
+  make_case target_section_inline <<'EOF'
+[target."cfg(unix)"]
+dependencies = { autumn-web = { version = "0.7", features = ["sqlite"] } }
+EOF
+  check_fail "an inline dependencies table under a target section" target_section_inline
+
+  make_case root_inline_package <<'EOF'
+package = { name = "autumn-web" }
+features.default = ["sqlite"]
+EOF
+  check_fail "a root inline package table names the flip owner" root_inline_package
+
+  make_case root_inline_clean <<'EOF'
+dependencies = { autumn-web = { path = "../autumn", features = ["db"] }, diesel = { version = "2", features = ["sqlite"] } }
+EOF
+  check_pass "a clean root inline dependencies table" root_inline_clean
+
+  make_case root_features <<'EOF'
+features = { default = ["autumn-web/sqlite"] }
+
+[package]
+name = "consumer"
+EOF
+  check_fail "a features table spelled inline at the root" root_features
+
+  # A chain of local features reaches the flip in two hops (#2571).
+  make_case default_chain <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+default = ["embedded"]
+embedded = ["sqlite"]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "default reaching the flip through a local feature chain" default_chain
+
+  make_case feature_chain <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+everything = ["embedded", "tls"]
+embedded = ["sqlite"]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "a feature reaching the flip through a local feature chain" feature_chain
+
+  make_case chain_unicode <<'EOF'
+[package]
+name = "autumn-cli"
+
+[features]
+default = ["émbedded"]
+"émbedded" = ["sqlite"]
+sqlite = ["autumn-web/sqlite"]
+EOF
+  check_fail "a chain through a non-ASCII feature name" chain_unicode
+
+  make_case chain_unrelated <<'EOF'
+[package]
+name = "some-store"
+
+[features]
+default = ["embedded"]
+embedded = ["sqlite"]
+sqlite = ["rusqlite"]
+EOF
+  check_pass "a chain to an unrelated sqlite feature is not the flip" chain_unrelated
+
   make_case same_name_elsewhere <<'EOF'
 [package]
 name = "example-app"
@@ -693,6 +1546,64 @@ EOF
     pass+=1
   else
     echo "  FAIL: an empty tree must not report OK (status $status)"
+  fi
+
+  # The resolver layer, on a tiny path-only workspace. It needs cargo and jq;
+  # without them the cases are skipped, unless the caller requires them.
+  if command -v cargo >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+    make_resolve_case() {
+      local dir="$tmp/$1" edge="$2"
+      mkdir -p "$dir/web/src" "$dir/consumer/src"
+      : >"$dir/web/src/lib.rs"
+      : >"$dir/consumer/src/lib.rs"
+      printf '[workspace]\nmembers = ["web", "consumer"]\nresolver = "2"\n' >"$dir/Cargo.toml"
+      printf '[package]\nname = "autumn-web"\nversion = "0.0.0"\nedition = "2021"\n\n[features]\nsqlite = []\n' \
+        >"$dir/web/Cargo.toml"
+      printf '[package]\nname = "consumer"\nversion = "0.0.0"\nedition = "2021"\n\n[dependencies]\n%s\n' \
+        "$edge" >"$dir/consumer/Cargo.toml"
+    }
+    # A spelling the scan does not read; cargo does.
+    make_resolve_case resolve_fail '"autumn\u002dweb" = { path = "../web", features = ["sqlite"] }'
+    total+=1
+    if [[ -n "$(resolve_check "$tmp/resolve_fail" 2>/dev/null)" ]]; then
+      pass+=1
+    else
+      echo "  FAIL: resolver layer — a resolved \`sqlite\` feature not caught"
+    fi
+    # An optional edge that is off by default: nothing RESOLVES `sqlite`, but
+    # the declared edge enables it once the dependency is on.
+    make_resolve_case resolve_optional '[target."cfg(unix)".dependencies]
+autumn-web = { path = "../web", optional = true, features = ["sqlite"] }'
+    total+=1
+    if [[ -n "$(resolve_check "$tmp/resolve_optional" 2>/dev/null)" ]]; then
+      pass+=1
+    else
+      echo "  FAIL: resolver layer — an optional declared edge not caught"
+    fi
+    make_resolve_case resolve_chain 'web = { package = "autumn-web", path = "../web", optional = true }
+
+[features]
+extra = ["embedded"]
+embedded = ["web?/sqlite"]'
+    total+=1
+    if [[ -n "$(resolve_check "$tmp/resolve_chain" 2>/dev/null)" ]]; then
+      pass+=1
+    else
+      echo "  FAIL: resolver layer — a feature chain to the flip not caught"
+    fi
+    make_resolve_case resolve_pass 'autumn-web = { path = "../web" }'
+    total+=1
+    local out rstatus=0
+    out="$(resolve_check "$tmp/resolve_pass" 2>/dev/null)" || rstatus=$?
+    if [[ -z "$out" && "$rstatus" == 0 ]]; then
+      pass+=1
+    else
+      echo "  FAIL: resolver layer — a clean workspace rejected (status $rstatus)"
+    fi
+  elif [[ "${SQLITE_GATE_REQUIRE_RESOLVE-}" == 1 ]]; then
+    die "the resolver layer needs cargo and jq, and SQLITE_GATE_REQUIRE_RESOLVE=1"
+  else
+    echo "  note: cargo or jq not found; resolver self-test skipped"
   fi
 
   echo "self-test: $pass/$total passed"

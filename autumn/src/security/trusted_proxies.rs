@@ -54,6 +54,7 @@
     )
 )]
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -67,14 +68,17 @@ use tower::{Layer, Service};
 use crate::security::config::TrustedProxiesConfig;
 
 /// A parsed trusted-proxy CIDR range or exact IP.
+///
+/// The only CIDR matcher in the crate. The deprecated
+/// `security::proxy::TrustedProxy` delegates to it.
 #[derive(Debug, Clone, Copy)]
-struct TrustedProxy {
-    network: IpAddr,
-    prefix_len: u8,
+pub struct CidrRange {
+    pub network: IpAddr,
+    pub prefix_len: u8,
 }
 
-impl TrustedProxy {
-    fn parse(value: &str) -> Option<Self> {
+impl CidrRange {
+    pub fn parse(value: &str) -> Option<Self> {
         let trimmed = value.trim();
         if trimmed.is_empty() {
             return None;
@@ -104,7 +108,7 @@ impl TrustedProxy {
         })
     }
 
-    fn contains(&self, ip: IpAddr) -> bool {
+    pub fn contains(&self, ip: IpAddr) -> bool {
         if self.prefix_len == 0 {
             return matches!(
                 (self.network, ip),
@@ -140,7 +144,7 @@ impl TrustedProxy {
 /// [`ClientScheme`]: crate::extract::ClientScheme
 #[derive(Debug, Clone)]
 pub struct ProxyResolver {
-    ranges: Vec<TrustedProxy>,
+    ranges: Vec<CidrRange>,
     /// True when the original config had at least one range entry (even if all
     /// failed to parse).  When `true` and `ranges` is empty (all entries were
     /// invalid), we treat NO peer as trusted rather than all peers as trusted.
@@ -158,7 +162,7 @@ impl ProxyResolver {
             .ranges
             .iter()
             .filter_map(|proxy| {
-                TrustedProxy::parse(proxy).or_else(|| {
+                CidrRange::parse(proxy).or_else(|| {
                     tracing::warn!(
                         range = %proxy,
                         "ignoring invalid trusted_proxies range"
@@ -186,6 +190,34 @@ impl ProxyResolver {
             return true;
         }
         self.ranges.iter().any(|r| r.contains(ip))
+    }
+
+    /// Returns `true` when the immediate peer is a trusted proxy, so the app
+    /// can use a header that the proxy sets (such as `X-Request-Id`).
+    ///
+    /// - `trust_forwarded_headers = false`: never.
+    /// - `trusted_hops = N`: only when the `X-Forwarded-For` chain has more
+    ///   than `N` valid entries, as for the forwarded host. A direct client
+    ///   cannot satisfy the count.
+    /// - Ranges set: the peer IP must be in a range.
+    /// - Neither set: every peer.
+    pub(crate) fn is_trusted_peer<B>(&self, req: &Request<B>) -> bool {
+        if !self.trust_forwarded_headers {
+            return false;
+        }
+        if let Some(hops) = self.trusted_hops {
+            return Self::x_forwarded_for(req).is_some_and(|xff| {
+                xff.rsplit(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .filter_map(Self::parse_forwarded_ip)
+                    .count()
+                    > hops as usize
+            });
+        }
+        let peer_ip = Self::peer_ip(req);
+        peer_ip.is_some_and(|ip| self.is_trusted_ip(ip))
+            || (!self.ranges_configured && peer_ip.is_none())
     }
 
     /// Build a resolver that trusts loopback addresses only (dev-profile default).
@@ -423,25 +455,39 @@ impl ProxyResolver {
             .map(|ConnectInfo(addr)| addr.ip())
     }
 
-    fn x_forwarded_for<B>(req: &Request<B>) -> Option<String> {
-        let all: Vec<&str> = req
+    /// Every `X-Forwarded-For` line, joined with `", "` as if it were one
+    /// header. Lines that are not visible ASCII are skipped.
+    ///
+    /// Borrowed for the usual single line, so resolving a request behind a
+    /// proxy does not copy its chain (in hop-count mode the addr, host and
+    /// scheme resolvers each read it); only a request carrying several lines
+    /// pays for the joined string.
+    fn x_forwarded_for<B>(req: &Request<B>) -> Option<Cow<'_, str>> {
+        let mut lines = req
             .headers()
             .get_all("x-forwarded-for")
             .iter()
-            .filter_map(|v| v.to_str().ok())
-            .collect();
-
-        if all.is_empty() {
-            None
-        } else {
-            Some(all.join(", "))
+            .filter_map(|v| v.to_str().ok());
+        let first = lines.next()?;
+        let Some(second) = lines.next() else {
+            return Some(Cow::Borrowed(first));
+        };
+        let mut joined =
+            String::with_capacity(first.len().saturating_add(2).saturating_add(second.len()));
+        joined.push_str(first);
+        joined.push_str(", ");
+        joined.push_str(second);
+        for line in lines {
+            joined.push_str(", ");
+            joined.push_str(line);
         }
+        Some(Cow::Owned(joined))
     }
 }
 
 // ── Fuzzing seams ───────────────────────────────────────────────────────────
 // These `#[cfg(fuzzing)]` wrappers expose the private trusted-proxy parsing
-// surface (`TrustedProxy::parse`, `ProxyResolver::parse_forwarded_ip`, and the
+// surface (`CidrRange::parse`, `ProxyResolver::parse_forwarded_ip`, and the
 // full `X-Forwarded-*` resolver) to the `fuzz/` crate. They are compiled out of
 // every normal build (including `cargo package`), so the published crate is
 // byte-identical. See `fuzz/fuzz_targets/headers.rs`.
@@ -449,7 +495,7 @@ impl ProxyResolver {
 /// Fuzzing seam: parse a single `[security.trusted_proxies]` range/IP entry.
 #[cfg(fuzzing)]
 pub fn __fuzz_parse_trusted_proxy(value: &str) -> bool {
-    TrustedProxy::parse(value).is_some()
+    CidrRange::parse(value).is_some()
 }
 
 /// Fuzzing seam: parse a single `X-Forwarded-For` entry into an IP.
@@ -525,6 +571,12 @@ impl TrustedProxiesLayer {
         Self {
             resolver: Arc::new(ProxyResolver::from_config(config)),
         }
+    }
+
+    /// The resolver this layer uses. Other layers share it, so the trust
+    /// decision has one source.
+    pub(crate) fn resolver(&self) -> Arc<ProxyResolver> {
+        Arc::clone(&self.resolver)
     }
 }
 
@@ -641,14 +693,14 @@ mod tests {
 
     #[test]
     fn trusted_proxy_parse_exact_ipv4() {
-        let p = TrustedProxy::parse("10.0.0.1").unwrap();
+        let p = CidrRange::parse("10.0.0.1").unwrap();
         assert!(p.contains("10.0.0.1".parse().unwrap()));
         assert!(!p.contains("10.0.0.2".parse().unwrap()));
     }
 
     #[test]
     fn trusted_proxy_parse_cidr() {
-        let p = TrustedProxy::parse("10.0.0.0/24").unwrap();
+        let p = CidrRange::parse("10.0.0.0/24").unwrap();
         assert!(p.contains("10.0.0.1".parse().unwrap()));
         assert!(p.contains("10.0.0.254".parse().unwrap()));
         assert!(!p.contains("10.0.1.0".parse().unwrap()));
@@ -656,18 +708,18 @@ mod tests {
 
     #[test]
     fn trusted_proxy_parse_invalid_returns_none() {
-        assert!(TrustedProxy::parse("not-an-ip").is_none());
-        assert!(TrustedProxy::parse("").is_none());
-        assert!(TrustedProxy::parse("10.0.0.0/33").is_none());
+        assert!(CidrRange::parse("not-an-ip").is_none());
+        assert!(CidrRange::parse("").is_none());
+        assert!(CidrRange::parse("10.0.0.0/33").is_none());
     }
 
     #[test]
     fn trusted_proxy_contains_ipv6() {
-        let proxy = TrustedProxy::parse("2001:db8::/32").unwrap();
+        let proxy = CidrRange::parse("2001:db8::/32").unwrap();
         assert!(proxy.contains("2001:db8:1234::1".parse().unwrap()));
         assert!(!proxy.contains("2001:db9::1".parse().unwrap()));
 
-        let proxy_exact = TrustedProxy::parse("2001:db8::1").unwrap();
+        let proxy_exact = CidrRange::parse("2001:db8::1").unwrap();
         assert!(proxy_exact.contains("2001:db8::1".parse().unwrap()));
         assert!(!proxy_exact.contains("2001:db8::2".parse().unwrap()));
     }
@@ -1091,12 +1143,158 @@ mod tests {
         let host = resolver.resolve_client_host(&req).unwrap();
         assert_eq!(host, "real.example.com");
     }
+
+    // ── X-Forwarded-For line joining ───────────────────────────────────────
+
+    #[test]
+    fn x_forwarded_for_borrows_one_line_and_joins_several() {
+        let req = req_with_xff("192.0.2.1, 10.0.1.200");
+        assert!(matches!(
+            ProxyResolver::x_forwarded_for(&req),
+            Some(Cow::Borrowed("192.0.2.1, 10.0.1.200"))
+        ));
+
+        // A proxy that appends a header line instead of extending the
+        // existing one: the lines read as one comma-joined chain.
+        let req = Request::builder()
+            .header("x-forwarded-for", "192.0.2.1")
+            .header("x-forwarded-for", "203.0.113.10")
+            .header("x-forwarded-for", "10.0.1.200")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            ProxyResolver::x_forwarded_for(&req).as_deref(),
+            Some("192.0.2.1, 203.0.113.10, 10.0.1.200")
+        );
+
+        assert!(ProxyResolver::x_forwarded_for(&Request::builder().body(()).unwrap()).is_none());
+    }
+
+    #[test]
+    fn x_forwarded_for_skips_non_ascii_lines_before_joining() {
+        // A line that is not visible ASCII is dropped before the lines are
+        // counted, so the one valid line left is still borrowed as-is.
+        let req = Request::builder()
+            .header(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap(),
+            )
+            .header("x-forwarded-for", "192.0.2.1")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            ProxyResolver::x_forwarded_for(&req),
+            Some(Cow::Borrowed("192.0.2.1"))
+        ));
+
+        // Every line invalid reads as no header at all.
+        let req = Request::builder()
+            .header(
+                "x-forwarded-for",
+                axum::http::HeaderValue::from_bytes(b"caf\xc3\xa9").unwrap(),
+            )
+            .body(())
+            .unwrap();
+        assert!(ProxyResolver::x_forwarded_for(&req).is_none());
+    }
+
+    #[test]
+    fn trusted_hops_reads_multiple_xff_lines_as_one_chain() {
+        let resolver = ProxyResolver::from_config(&TrustedProxiesConfig {
+            ranges: Vec::new(),
+            trusted_hops: Some(1),
+            trust_forwarded_headers: true,
+        });
+        let req = Request::builder()
+            .header("x-forwarded-for", "192.0.2.1")
+            .header("x-forwarded-for", "10.0.1.200")
+            .body(())
+            .unwrap();
+        assert_eq!(
+            resolver.resolve_client_addr(&req),
+            Some("192.0.2.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn split_xff_lines_resolve_exactly_like_one_joined_line() {
+        // Regression guard for the borrowed single-line fast path: whatever
+        // the trust mode, a chain split over several lines must resolve the
+        // same addr, host and scheme as the same chain sent on one line.
+        let configs = [
+            TrustedProxiesConfig {
+                ranges: Vec::new(),
+                trusted_hops: Some(1),
+                trust_forwarded_headers: true,
+            },
+            TrustedProxiesConfig {
+                ranges: vec!["10.0.0.0/8".to_owned()],
+                trusted_hops: None,
+                trust_forwarded_headers: true,
+            },
+            TrustedProxiesConfig {
+                ranges: Vec::new(),
+                trusted_hops: None,
+                trust_forwarded_headers: true,
+            },
+        ];
+        let build = |lines: &[&str]| {
+            let mut builder = Request::builder()
+                .header("host", "internal.example")
+                .header("x-forwarded-host", "app.example")
+                .header("x-forwarded-proto", "HTTPS");
+            for line in lines {
+                builder = builder.header("x-forwarded-for", *line);
+            }
+            let mut req = builder.body(()).unwrap();
+            let peer: SocketAddr = "10.0.1.200:443".parse().unwrap();
+            req.extensions_mut().insert(ConnectInfo(peer));
+            req
+        };
+        let one_line = build(&["192.0.2.1, 10.0.0.7"]);
+        let split = build(&["192.0.2.1", "10.0.0.7"]);
+
+        for config in &configs {
+            let resolver = ProxyResolver::from_config(config);
+            assert_eq!(
+                resolver.resolve_client_addr(&one_line),
+                resolver.resolve_client_addr(&split),
+            );
+            assert_eq!(
+                resolver.resolve_client_host(&one_line),
+                resolver.resolve_client_host(&split),
+            );
+            assert_eq!(
+                resolver.resolve_client_scheme(&one_line),
+                resolver.resolve_client_scheme(&split),
+            );
+            assert_eq!(
+                resolver.is_trusted_peer(&one_line),
+                resolver.is_trusted_peer(&split),
+            );
+        }
+
+        // And the values themselves, pinned for the hop-count mode.
+        let resolver = ProxyResolver::from_config(&configs[0]);
+        assert_eq!(
+            resolver.resolve_client_addr(&split),
+            Some("192.0.2.1".parse().unwrap())
+        );
+        assert_eq!(
+            resolver.resolve_client_host(&split).as_deref(),
+            Some("app.example")
+        );
+        assert_eq!(
+            resolver.resolve_client_scheme(&split).as_deref(),
+            Some("https")
+        );
+    }
 }
 
 #[cfg(test)]
 mod proptests {
     //! Property-based invariants for the private trusted-proxy parsers.
-    //! `TrustedProxy::parse` and `ProxyResolver::parse_forwarded_ip` are
+    //! `CidrRange::parse` and `ProxyResolver::parse_forwarded_ip` are
     //! private, so they are fuzzed in-crate here rather than from an
     //! integration test.
     use super::*;
@@ -1105,10 +1303,10 @@ mod proptests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
-        /// `TrustedProxy::parse` never panics on arbitrary input.
+        /// `CidrRange::parse` never panics on arbitrary input.
         #[test]
         fn parse_range_never_panics(s in ".*") {
-            let _ = TrustedProxy::parse(&s);
+            let _ = CidrRange::parse(&s);
         }
 
         /// A bare valid IP parses, and (per the CIDR contract) `contains`
@@ -1116,7 +1314,7 @@ mod proptests {
         #[test]
         fn parse_bare_ipv4_round_trips(a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>()) {
             let ip = std::net::Ipv4Addr::new(a, b, c, d);
-            let parsed = TrustedProxy::parse(&ip.to_string());
+            let parsed = CidrRange::parse(&ip.to_string());
             prop_assert!(parsed.is_some());
             let range = parsed.unwrap();
             prop_assert!(range.contains(std::net::IpAddr::V4(ip)));
@@ -1132,8 +1330,8 @@ mod proptests {
         ) {
             let ip = std::net::Ipv4Addr::new(a, b, c, d).to_string();
             let padded = format!("{pad}{ip}{pad}");
-            let bare = TrustedProxy::parse(&ip);
-            let padded_parsed = TrustedProxy::parse(&padded);
+            let bare = CidrRange::parse(&ip);
+            let padded_parsed = CidrRange::parse(&padded);
             prop_assert_eq!(bare.is_some(), padded_parsed.is_some());
         }
 
@@ -1142,7 +1340,7 @@ mod proptests {
         #[test]
         fn parse_rejects_over_wide_prefix(a in any::<u8>(), b in any::<u8>(), c in any::<u8>(), d in any::<u8>(), prefix in 33u16..=255) {
             let s = format!("{a}.{b}.{c}.{d}/{prefix}");
-            prop_assert!(TrustedProxy::parse(&s).is_none());
+            prop_assert!(CidrRange::parse(&s).is_none());
         }
 
         /// `parse_forwarded_ip` never panics on arbitrary input.

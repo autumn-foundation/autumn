@@ -172,7 +172,8 @@ enum CommentsTable {
     /// (#2283). A `Comment` model scaffolded the ordinary way makes one.
     Conflicting {
         missing: Vec<&'static str>,
-        /// A rename from a table no migration creates: `missing` is a guess.
+        /// A rename or schema move from a table no migration creates, or a
+        /// `CREATE TABLE … AS`: `missing` is a guess.
         columns_unknown: bool,
     },
 }
@@ -254,9 +255,11 @@ fn conflicting_table_error(missing: &[&str], columns_unknown: bool) -> GenerateE
     );
     let message = if columns_unknown {
         format!(
-            "cannot add the shared `{COMMENTS_TABLE}` table: a migration renames another \
-             table to `{COMMENTS_TABLE}`, and no migration creates that table. The generator \
-             cannot read its columns. The generator wrote no files. Do one of these steps:\n\
+            "cannot add the shared `{COMMENTS_TABLE}` table: a migration makes a \
+             `{COMMENTS_TABLE}` table without a column list the generator can read (a \
+             rename or schema move of a table no migration creates, or a \
+             `CREATE TABLE … AS`). The generator cannot read its columns. The generator \
+             wrote no files. Do one of these steps:\n\
              {rename_or_drop} Then run the command again.\n\
              \x20 - If the table is already the shared one, add `#[commentable]` to the model \
              by hand. Do not use `comments:commentable`."
@@ -596,8 +599,9 @@ struct TableState {
     exists: bool,
     /// Which of [`REQUIRED_COLUMNS`] the table currently carries.
     columns: Vec<&'static str>,
-    /// The table came from a rename of a table that no migration creates, so
-    /// the replay cannot see its columns.
+    /// The table came from a rename or schema move of a table that no
+    /// migration creates, or from a `CREATE TABLE … AS`, so the replay cannot
+    /// see its columns.
     columns_unknown: bool,
 }
 
@@ -616,9 +620,11 @@ impl TableState {
 #[derive(Debug)]
 enum TableEvent {
     /// `CREATE TABLE name (…)`, and which of [`REQUIRED_COLUMNS`] its body
-    /// declares. A fresh table replaces whatever was known about the old one.
-    /// The flag is `IF NOT EXISTS`: then an existing table stays as it is.
-    Create(TableRef, Vec<&'static str>, bool),
+    /// declares — `None` when it has no column list (`CREATE TABLE x AS …`):
+    /// the name is taken, and the columns are unknown. A fresh table replaces
+    /// whatever was known about the old one. The flag is `IF NOT EXISTS`: then
+    /// an existing table stays as it is.
+    Create(TableRef, Option<Vec<&'static str>>, bool),
     /// `ALTER TABLE name … <column>`, adding it.
     Add(TableRef, &'static str),
     /// `ALTER TABLE name DROP COLUMN <column>` (or a rename away).
@@ -631,6 +637,9 @@ enum TableEvent {
     /// `ALTER TABLE old RENAME TO new`: the record moves with the table, so a
     /// rename INTO `comments` carries the source table's columns across.
     Rename { from: TableRef, to: TableRef },
+    /// `ALTER TABLE name SET SCHEMA other`: the same name in a new schema. The
+    /// record moves with the table, as for a rename.
+    Move { from: TableRef, to: TableRef },
 }
 
 impl TableEvent {
@@ -640,7 +649,8 @@ impl TableEvent {
             Self::Add(table, _)
             | Self::Remove(table, _)
             | Self::Touch(table)
-            | Self::Rename { from: table, .. } => Some(table),
+            | Self::Rename { from: table, .. }
+            | Self::Move { from: table, .. } => Some(table),
             Self::Create(..) | Self::Drop(..) => None,
         }
     }
@@ -680,11 +690,13 @@ struct Replay {
 fn file_events(sql: &str) -> Vec<(usize, TableEvent, bool)> {
     let mut events: Vec<(usize, TableEvent, bool)> = Vec::new();
     for (at, table, body, if_not_exists) in create_tables(sql) {
-        let columns = REQUIRED_COLUMNS
-            .iter()
-            .copied()
-            .filter(|column| declares_column(body, column))
-            .collect();
+        let columns = body.map(|body| {
+            REQUIRED_COLUMNS
+                .iter()
+                .copied()
+                .filter(|column| declares_column(body, column))
+                .collect()
+        });
         events.push((at, TableEvent::Create(table, columns, if_not_exists), false));
     }
     for (at, dropped, if_exists) in drop_tables(sql) {
@@ -696,6 +708,10 @@ fn file_events(sql: &str) -> Vec<(usize, TableEvent, bool)> {
         // A table rename moves the whole record; it mentions no column.
         if let Some(to) = table_rename_target(statement) {
             events.push((at, TableEvent::Rename { from: table, to }, if_exists));
+            continue;
+        }
+        if let Some(to) = table_set_schema_target(statement, &table) {
+            events.push((at, TableEvent::Move { from: table, to }, if_exists));
             continue;
         }
         // An ALTER naming the column may be adding it, dropping it, or
@@ -725,11 +741,18 @@ fn replay(files: &[String]) -> Replay {
         let mut events = file_events(sql);
         events.sort_by_key(|(at, _, _)| *at);
         for (_, event, if_exists) in events {
-            if if_exists
-                && !event
+            // A rename or schema move skips only a source the replay KNOWS is
+            // gone: one it never saw may exist (a `CREATE TABLE` this scan
+            // cannot read), and then the name it lands on is taken.
+            let skip = match &event {
+                TableEvent::Rename { from, .. } | TableEvent::Move { from, .. } => {
+                    tables.get(from).is_some_and(|state| !state.exists)
+                }
+                _ => !event
                     .altered_table()
-                    .is_some_and(|table| tables.get(table).is_some_and(|state| state.exists))
-            {
+                    .is_some_and(|table| tables.get(table).is_some_and(|state| state.exists)),
+            };
+            if if_exists && skip {
                 continue;
             }
             match event {
@@ -742,8 +765,8 @@ fn replay(files: &[String]) -> Replay {
                         table,
                         TableState {
                             exists: true,
-                            columns,
-                            columns_unknown: false,
+                            columns_unknown: columns.is_none(),
+                            columns: columns.unwrap_or_default(),
                         },
                     );
                 }
@@ -797,7 +820,20 @@ fn replay(files: &[String]) -> Replay {
                         name: to.name,
                     };
                     let source_known = tables.get(&from).is_some_and(|state| state.exists);
-                    if !source_known {
+                    // `IF EXISTS` does not stop `migrate` on a missing table.
+                    if !source_known && !if_exists {
+                        touched_while_absent.insert(from.clone());
+                    }
+                    let mut state = tables.remove(&from).unwrap_or_default();
+                    state.exists = true;
+                    state.columns_unknown |= !source_known;
+                    tables.insert(to, state);
+                }
+                TableEvent::Move { from, to } => {
+                    // As a rename, but `to` is already fully qualified.
+                    let source_known = tables.get(&from).is_some_and(|state| state.exists);
+                    // `IF EXISTS` does not stop `migrate` on a missing table.
+                    if !source_known && !if_exists {
                         touched_while_absent.insert(from.clone());
                     }
                     let mut state = tables.remove(&from).unwrap_or_default();
@@ -915,8 +951,8 @@ fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
 const CREATE_VERBS: &[&str] = &["table", "unlogged table"];
 
 /// Every persistent `CREATE TABLE` in `sql`: (offset, table, column-list body,
-/// `IF NOT EXISTS`).
-fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str, bool)> {
+/// `IF NOT EXISTS`). The body is `None` when the statement has no column list.
+fn create_tables(sql: &str) -> Vec<(usize, TableRef, Option<&str>, bool)> {
     let mut found = Vec::new();
     let mut base = 0usize;
     while let Some(at) = sql[base..].find("create ") {
@@ -943,9 +979,8 @@ fn create_tables(sql: &str) -> Vec<(usize, TableRef, &str, bool)> {
             continue;
         };
         let body_start = start + "create ".len() + verb.len() + used;
-        let Some(body) = create_table_body(sql, body_start) else {
-            continue;
-        };
+        // No column list (`CREATE TABLE x AS …`): the name is still taken.
+        let body = create_table_body(sql, body_start);
         found.push((start, table, body, if_not_exists));
     }
     found
@@ -1071,6 +1106,17 @@ fn table_rename_target(statement: &str) -> Option<TableRef> {
         return None;
     }
     parse_table_ref(&statement[at + " rename to ".len()..]).map(|(table, _)| table)
+}
+
+/// The new home of `table` after `ALTER TABLE … SET SCHEMA <schema>`, if
+/// `statement` (the text after the table name) is one.
+fn table_set_schema_target(statement: &str, table: &TableRef) -> Option<TableRef> {
+    let at = statement.find(" set schema ")?;
+    let (schema, _) = parse_ident_segment(&statement[at + " set schema ".len()..])?;
+    Some(TableRef {
+        schema: Some(schema).filter(|schema| schema != "public"),
+        name: table.name.clone(),
+    })
 }
 
 /// Whether `haystack` mentions `column` as a complete SQL identifier.
@@ -1357,6 +1403,13 @@ fn migration_up_sql_where(project_root: &Path, keep: impl Fn(&Path, &str) -> boo
         .collect()
 }
 
+/// Push one space, unless `out` already ends in one.
+fn push_space(out: &mut String) {
+    if !out.ends_with(' ') {
+        out.push(' ');
+    }
+}
+
 /// `sql` with `--` line comments and `/* … */` blocks removed.
 ///
 /// Matching runs over raw text, so a commented-out example — `-- CREATE TABLE
@@ -1534,22 +1587,24 @@ fn strip_sql_comments(sql: &str) -> String {
                     i += ch.len_utf8();
                 }
             }
+            // A comment, and any run of whitespace, becomes one space. Keyword
+            // phrases such as `drop table` or ` rename to ` then match however
+            // the author split them. Offsets index this output, not `sql`.
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
                 let end = sql[i..].find('\n').map_or(bytes.len(), |nl| i + nl);
-                // Blanked, not dropped, so offsets survive.
-                for _ in i..end {
-                    out.push(' ');
-                }
+                push_space(&mut out);
                 i = end;
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
                 let end = sql[i + 2..]
                     .find("*/")
                     .map_or(bytes.len(), |e| i + 2 + e + 2);
-                for _ in i..end {
-                    out.push(' ');
-                }
+                push_space(&mut out);
                 i = end;
+            }
+            _ if bytes[i].is_ascii_whitespace() => {
+                push_space(&mut out);
+                i += 1;
             }
             _ => {
                 let ch = sql[i..].chars().next().unwrap_or(' ');
@@ -2597,6 +2652,160 @@ mod tests {
             !already_migrated(tmp.path()),
             "the table only has `payload`, whatever its query mentions"
         );
+    }
+
+    /// `SET SCHEMA` moves the table out of the default schema, which frees the
+    /// name. Moving it back takes the name again.
+    #[test]
+    fn set_schema_moves_the_table_out_of_and_back_into_the_default_schema() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let migrations = tmp.path().join("migrations");
+        let first = migrations.join("0001_create");
+        std::fs::create_dir_all(&first).expect("mkdir");
+        std::fs::write(
+            first.join("up.sql"),
+            "CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n\
+             ALTER TABLE comments SET SCHEMA archive;\n",
+        )
+        .expect("write");
+        assert_eq!(
+            comments_table(tmp.path()),
+            CommentsTable::Absent,
+            "the table now lives in `archive`, so the default name is free"
+        );
+
+        let back = migrations.join("0002_back");
+        std::fs::create_dir_all(&back).expect("mkdir");
+        std::fs::write(
+            back.join("up.sql"),
+            "ALTER TABLE archive.comments SET SCHEMA public;\n",
+        )
+        .expect("write");
+        assert!(
+            conflicting_comments_table(tmp.path()),
+            "the plain table is back in the default schema"
+        );
+    }
+
+    /// Keywords may be split by any SQL whitespace, not one space.
+    #[test]
+    fn schema_moves_and_renames_accept_any_whitespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for undo in [
+            "ALTER TABLE comments\nSET\tSCHEMA   archive;\n",
+            "ALTER TABLE comments\nRENAME\tTO   legacy;\n",
+        ] {
+            std::fs::write(
+                dir.join("up.sql"),
+                format!("CREATE TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n{undo}"),
+            )
+            .expect("write");
+            assert_eq!(comments_table(tmp.path()), CommentsTable::Absent, "{undo}");
+        }
+    }
+
+    /// `IF EXISTS` makes a schema move of a dropped table a no-op.
+    #[test]
+    fn a_conditional_schema_move_of_a_dropped_table_changes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_move");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE archive.comments (id BIGINT);\n\
+             DROP TABLE archive.comments;\n\
+             ALTER TABLE IF EXISTS archive.comments SET SCHEMA public;\n",
+        )
+        .expect("write");
+        assert_eq!(
+            comments_table(tmp.path()),
+            CommentsTable::Absent,
+            "nothing moved, so `comments` is still free"
+        );
+    }
+
+    /// `IF EXISTS` makes a rename of a dropped table a no-op too. A source the
+    /// replay never saw may exist, so its rename counts.
+    #[test]
+    fn a_conditional_rename_only_skips_a_known_absent_table() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_rename");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE legacy_comments (id BIGINT);\n\
+             DROP TABLE legacy_comments;\n\
+             ALTER TABLE IF EXISTS legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert_eq!(
+            comments_table(tmp.path()),
+            CommentsTable::Absent,
+            "the source was dropped, so nothing was renamed"
+        );
+
+        std::fs::write(
+            dir.join("up.sql"),
+            "ALTER TABLE IF EXISTS legacy_comments RENAME TO comments;\n",
+        )
+        .expect("write");
+        assert_eq!(
+            comments_table(tmp.path()),
+            CommentsTable::Conflicting {
+                missing: REQUIRED_COLUMNS.to_vec(),
+                columns_unknown: true,
+            },
+            "an untracked source may exist, so `comments` may be taken"
+        );
+    }
+
+    /// A `CREATE TABLE … AS` has no column list, but it still takes the name.
+    #[test]
+    fn create_table_as_occupies_the_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_ctas");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("up.sql"),
+            "CREATE TABLE comments AS SELECT 1 AS id;\n",
+        )
+        .expect("write");
+        assert!(!already_migrated(tmp.path()), "its columns are unknown");
+        assert!(
+            matches!(
+                comments_table(tmp.path()),
+                CommentsTable::Conflicting {
+                    columns_unknown: true,
+                    ..
+                }
+            ),
+            "the name is taken, and its columns cannot be read"
+        );
+    }
+
+    /// DDL verbs may be split by any whitespace too, and by a comment.
+    #[test]
+    fn ddl_verbs_accept_any_whitespace() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_create");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let create = "CREATE\n  TABLE comments (id BIGSERIAL PRIMARY KEY, body TEXT);\n";
+        for undo in [
+            "DROP\nTABLE comments;\n",
+            "ALTER\nTABLE comments RENAME TO archived_comments;\n",
+            "DROP /* old */ TABLE\tcomments;\n",
+        ] {
+            std::fs::write(dir.join("up.sql"), format!("{create}{undo}")).expect("write");
+            assert_eq!(
+                comments_table(tmp.path()),
+                CommentsTable::Absent,
+                "the name is free after: {undo}"
+            );
+        }
+        std::fs::write(dir.join("up.sql"), create).expect("write");
+        assert!(conflicting_comments_table(tmp.path()));
     }
 
     /// A column the body only REFERENCES is not declared: `REFERENCES

@@ -1144,10 +1144,11 @@ Everything `model` produces, plus:
   `autumn_web::test::{TestApp, TestClient, TestDb}`: it boots a throwaway
   Postgres database, fires a request at a stand-in for the scaffolded index
   route, and asserts a real response — no running server, no env var, no
-  silent skip. `cargo test` reports it as `ignored` with an explicit reason
-  (Docker isn't assumed to be available); run `cargo test -- --ignored` to
-  execute it for real. `--api` scaffolds get the JSON equivalent, asserting
-  against `GET /api/<plural>`.
+  silent skip. On Postgres, `cargo test` reports it as `ignored` with an
+  explicit reason (Docker isn't assumed to be available); run
+  `cargo test -- --ignored` to execute it for real. On a SQLite app it uses a
+  temp-file database, so a plain `cargo test` runs it. `--api` scaffolds get the
+  JSON equivalent, asserting against `GET /api/<plural>`.
 - `src/main.rs` — the `mod` declarations plus `routes![…]` entries get
   added in place. Existing entries are preserved; rerunning the generator
   with the same arguments is a no-op. By default, the scaffold registers only
@@ -1219,10 +1220,11 @@ Contract of the generated handler:
 | Situation | Behaviour |
 | --------- | --------- |
 | Checked rows | Deleted through the repository's `delete_many`, then a `Deleted N <plural>` flash and a 303 back to the index. |
-| Field name | `name="ids"` (matching `autumn-admin-plugin`); the parser also accepts the `ids[]` spelling some clients send. |
+| Field name | `name="ids"` (matching `autumn-admin-plugin`). The ids decode into `BulkSelection { ids: Vec<i64> }` through `autumn_web::form::from_urlencoded`. The `ids[]` spelling also works. |
 | Empty selection | Info flash + 303 redirect. **Never** a 400 — a list-write endpoint doesn't fail on missing params. |
-| Malformed id (`ids=abc`) | Silently dropped, same as above. Duplicates are collapsed through a `HashSet`, so parsing a crafted body full of distinct ids stays linear rather than quadratic. |
-| Oversized selection | Capped at `MAX_BULK_IDS` (5000). A real selection is page-sized, so this only bites on a hand-crafted body — the default 32 MiB request limit otherwise leaves room for over a million ids. The parser stops one past the cap, and the handler refuses the batch with an error flash rather than truncating it: a silently partial destructive batch is worse than a refused one. |
+| Malformed body (`ids=abc`, or `ids` mixed with `ids[]`) | Error flash + 303 redirect. Never a 400. Nothing is deleted. |
+| Duplicate ids | Collapsed through a `HashSet`. A crafted body full of distinct ids stays linear, not quadratic. |
+| Oversized selection | Capped at `MAX_BULK_IDS` (5000). A real selection is page-sized, so this only bites on a hand-crafted body — the default 32 MiB request limit otherwise leaves room for over a million ids. The handler counts the submitted ids before it decodes them and stops one past the cap. It refuses the batch with an error flash rather than truncating it: a silently partial destructive batch is worse than a refused one. |
 | Large selection | The pre-flight `SELECT` is chunked at 1000 ids. `eq_any` binds one parameter per id, and `autumn_web::repository::MAX_BIND_PARAMS` is 32766 on SQLite, so one unbounded `eq_any` would fail with "too many SQL variables" before reaching the already-chunked `delete_many`. |
 | `--soft-delete` | The pre-flight `SELECT` filters `deleted_at IS NULL`, and `delete_many` applies the soft-delete update — no hand-rolled `deleted_at` write. |
 | Record policy wiring on (an owner column, the default) | Each selected row is authorized with the same `"delete"` action `destroy` uses. A row the actor may not delete is dropped from the batch rather than 403'ing the request, so the endpoint is not an existence oracle. |
@@ -1414,6 +1416,7 @@ autumn generate scaffold Post title:String comments:commentable
 
   ```rust
   .nest("/comments", autumn_web::commentable::router(Default::default()))
+  .declare_plugin_routes(autumn_web::commentable::route_infos("/comments"))
   ```
 
   and render a thread with `autumn_web::widgets::comment_thread`. Adding a
@@ -1545,21 +1548,20 @@ Contract of the generated handler:
 
 | Situation | Behaviour |
 | --------- | --------- |
-| `?sort=`/`?filter[col]=` | Honoured through the same `ListQuery` extractor and the same `repo.list` call the index uses, so the file reflects the filtered view rather than the whole table. Unknown or malicious keys are ignored against the model's column allowlist. |
+| `?sort=`/`?filter[col]=` | Honoured through the same `ListQuery` extractor the index uses. The export reads with `repo.list_rows`, which applies the same allowlist as the index's `repo.list`. The file therefore shows the filtered view, not the whole table. Unknown or malicious keys are ignored against the model's column allowlist. |
 | `?page=`/`?size=` | Ignored. An export spans every page of the current filter. |
 | `?q=` (`--searchable`) | **Not** honoured — `ListQuery` carries no full-text term, so the export cannot reproduce a `/<plural>/search` result set. Because of that the link is *placed* differently on a searchable scaffold: it renders **inside** the `#<plural>-search-results` container rather than beside "New …", so the htmx swap that shows search results also takes the link away. That matters because `active_search_input` pushes no URL — a link left outside the container would survive the swap still pointing at the unsearched set, and a user who narrowed the list would silently download the rows they just excluded. Searched results therefore offer no export; clear the search to get the link back. Filter with `?filter[col]=` instead, or add a `q` param to the handler and call the repository's `search_page` yourself. |
-| Row volume | Read in `MAX_PAGE_SIZE` (100) batches, so no single query loads the table, and capped at `MAX_EXPORT_ROWS` (10 000). That caps the **row count**, not bytes: the response is collected in memory, so a model with an unbounded `Text` column can still build a large body. Put a `{max}` length on such columns, lower the constant, or stream with `Download::from_stream` for a genuinely unbounded export. |
-| Hitting the cap | The file is truncated to `MAX_EXPORT_ROWS`, a `warn!` is logged, and the response carries `x-export-truncated: true`. To tell a complete export of exactly `MAX_EXPORT_ROWS` rows from a truncated one, the loop reads one batch **past** the cap and trims the surplus — so neither signal fires on an export that merely fills the cap exactly. There is no in-band marker in the CSV (it would parse as data), so narrow the filter (or raise the cap) rather than trusting a capped export for reconciliation. |
-| Concurrent writes | Consistency is **per batch, not per export**. Each batch is an independent `LIMIT`/`OFFSET` query on its own pooled connection, so a row inserted or deleted mid-export shifts the offsets under the batches still to come and can be written twice or skipped. The index has the same property; an export spans more pages and more wall-clock, so it is likelier to notice. A point-in-time exact download means reading the batches yourself inside `Db::tx_with(TxOptions::repeatable_read().read_only(), ..)` — repository reads cannot be routed through a caller's transaction today, so that path also means re-deriving the sort/filter allowlist and any owner scoping by hand. |
-| Request cost | The handler carries `#[throttle(limit = 6, per = "1m", key = "ip")]` that the index does not, and the cost is worse than the row count suggests: `list` runs a filtered `COUNT(*)` before each page, so a full export is ~100 page queries **and** ~100 whole-result-set counts — ~200 round trips where one index page costs two. The counts are waste (the export loop never reads `total_elements`; it stops on a short batch) but unavoidable, since `list` is also what applies the sort/filter allowlist and the repository exposes no count-free equivalent. On a large or poorly indexed table, lower `MAX_EXPORT_ROWS`, tighten the throttle, or put the route behind auth. Inline throttles apply regardless of `security.rate_limit.enabled` (that flag governs the *global* limiter); raise the limit freely for an internal back-office. |
+| Row volume | Read in **one** statement with no `COUNT(*)`, capped at `MAX_EXPORT_ROWS` (10 000). One statement reads one snapshot, so a row inserted or deleted during the export cannot appear twice or go missing (#2185). If you set `database.statement_timeout`, the whole read must finish in that time. That caps the **row count**, not bytes: the response is collected in memory, so a model with an unbounded `Text` column can still build a large body. Put a `{max}` length on such columns, lower the constant, or stream with `Download::from_stream` for a genuinely unbounded export. |
+| Hitting the cap | The file is truncated to `MAX_EXPORT_ROWS`, a `warn!` is logged, and the response carries `x-export-truncated: true`. To tell a complete export of exactly `MAX_EXPORT_ROWS` rows from a truncated one, the read asks for one row **past** the cap and drops it — so neither signal fires on an export that merely fills the cap exactly. There is no in-band marker in the CSV (it would parse as data), so narrow the filter (or raise the cap) rather than trusting a capped export for reconciliation. |
+| Throttle | `#[throttle(limit = 6, per = "1m", key = "ip")]`, which the index does not carry. An export is one query, but it loads up to `MAX_EXPORT_ROWS` rows and builds the whole file in memory. An index page loads up to 100 rows. The limit is per client address. It applies even when `security.rate_limit.enabled` is off, because that flag controls only the *global* limiter. Raise the limit for an internal back-office. On a large table, lower `MAX_EXPORT_ROWS` or put the route behind auth. |
 | `NULL` column | An **empty cell**, never the literal string `None`. |
 | Commas, quotes, newlines | Quoted and escaped per RFC 4180 by `export_csv`. Do not pre-quote values in `to_csv_record` — it would double-escape them. |
 | Values that look like formulas | Text-backed columns pass through an emitted `csv_text_cell` helper that prefixes an apostrophe to a value starting `=`, `+`, `-`, `@`, TAB or CR. Numeric, boolean, UUID, timestamp and enum columns are **not** guarded — they render from typed values and cannot carry a formula, and guarding them would corrupt a negative number. |
 | `Attachment` column | Exports the blob's storage **key**, not the signed, time-bounded URL the `show` view renders (a spreadsheet cell has no use for a URL that expires). Drop the column from `csv_columns` if those keys should not leave the app. |
-| `references` column | Exports the raw **foreign key**, not the parent label the index and `show` views resolve. An id round-trips back through `import_csv`; a label does not, and resolving one per row would be an N+1 inside the export loop. |
+| `references` column | Exports the raw **foreign key**, not the parent label the index and `show` views resolve. An id round-trips back through `import_csv`; a label does not, and resolving one per row would be an N+1 inside the export. |
 | `--default`ed column | **Included.** It is dropped from the form and the index table, but it is model data the `show` view already renders, and a spreadsheet wants it. |
-| `--soft-delete`'s `deleted_at` | Excluded. `list`/`list_scoped` filter `deleted_at IS NULL`, so the column is blank for every exportable row. |
-| Record policy wiring on (an owner column, the default) | The handler is `#[secured]` and reads through the repository's owner-scoped `list_scoped` — the same method the index uses. It never calls the unscoped `list`, so the download cannot contain another user's rows. |
+| `--soft-delete`'s `deleted_at` | Excluded. `list_rows`/`list_scoped_rows` filter `deleted_at IS NULL`, exactly as the index's `list`/`list_scoped` do, so the column is blank for every exportable row. |
+| Record policy wiring on (an owner column, the default) | The handler is `#[secured]` and reads through the repository's owner-scoped `list_scoped_rows`, which applies the same owner filter as the index's `list_scoped`. It never calls an unscoped read, so the download cannot contain another user's rows. |
 | No owner column | No `#[secured]`, exactly matching the generated index. The export opens no data path the list view did not already open. |
 | Route vs `/<plural>/{id}` | The static `export.csv` segment outranks the `{id}` parameter in the router, the same way `/<plural>/new` already does. With a `slug` route key that also means a record whose slug is literally `export.csv` is unreachable at its canonical URL — the same caveat `new` already carries. |
 
@@ -1618,7 +1620,7 @@ autumn generate scaffold Post title:String body:Text published:bool --import
   asserts exactly the valid row persists.
 
 **One column map, both directions** — for every column the form can set. A
-column the CSV cannot faithfully carry back (`Attachment`, `Bytea`) is named on
+column the CSV cannot faithfully carry back (`Attachment`) is named on
 the upload page as one the import cannot set, rather than round-tripped
 lossily. The import decodes each row against the
 *same* generated `CsvSchema` impl the export writes from — there is no second
@@ -1653,17 +1655,16 @@ Contract of the generated handler:
 | `bool` column | Normalized through an emitted `csv_bool_cell`: `TRUE`/`FALSE` (what Excel writes), `1`/`0`, `yes`/`no`, `on`/`off` all decode, and a **blank** cell means `false` for a non-nullable column — the same thing an unchecked checkbox means, which the form's `#[serde(default)]` already encodes. A nullable column keeps its blank as `NULL`. An unrecognised value is passed through untouched so it fails with the form's own message, naming the column. |
 | Duplicate header names | The last column wins, silently (`import_csv` builds a `column -> value` map). A shifted or duplicated column in a spreadsheet therefore imports the wrong data rather than being rejected — check the preview. |
 | No owner column | The POST is still `#[secured]` (unlike the export, which mirrors an unsecured index): an import writes. |
-| Owner-scoped scaffold | `authorize_create` runs once, exactly as for `create` — and, exactly as for `create`, an owner column is taken from the submitted data, so an authorized user can insert rows owned by anyone. That is not new (the create form has the same property), but note the asymmetry with the export directly above, which *is* owner-scoped through `list_scoped`. Move the owner column out of the file and set it from the session in the row closure if that matters. |
+| Owner-scoped scaffold | `authorize_create` runs once, exactly as for `create` — and, exactly as for `create`, an owner column is taken from the submitted data, so an authorized user can insert rows owned by anyone. That is not new (the create form has the same property), but note the asymmetry with the export directly above, which *is* owner-scoped through `list_scoped_rows`. Move the owner column out of the file and set it from the session in the row closure if that matters. |
 | `--belongs-to` child | The parent foreign key comes from the FILE, not from a URL — the nested create route's "the parent is the route" rule does not apply to a flat `POST /<children>/import`. |
 | A write that fails partway | `save_many_skip_invalid` writes in chunks, each in its own transaction. A failure a constraint cannot explain (a timeout, a dropped connection) aborts the call with earlier chunks already committed; the report says so in a `role="alert"` banner rather than 500ing, because the operator's natural next move — re-upload — would duplicate whatever landed. How many rows landed is unknowable there, so the count keeps the parse pass's total (rows that *reached* the write) and its label reverts to the dry run's wording rather than claiming an insert count it cannot have. |
 | A row reported as failed | May still be **in the database**. `after_create` hooks run once the insert has committed, and a hook that fails puts an already-persisted row among the failures with nothing to distinguish it from a row that never landed. (A row the model's own `#[validate]` rules rejected is the exception: that check runs before the insert, so nothing was written — but the report cannot tell you which kind you are looking at.) Whenever the database stage rejected any row, the report carries a `role="alert"` note saying so — check the list view before re-importing. |
 | A value for a column the import cannot set | Named in a `role="alert"` note on the report when the uploaded file actually carries one (`id` and `created_at` excluded — every exported file has those, so flagging them would fire on every round trip). Silently dropping an operator's spreadsheet edit is the one failure the counts could otherwise hide entirely. |
 | Row volume | Capped at `MAX_IMPORT_ROWS` (10 000), mirroring the export. A file over the cap is **refused whole** with a 422, never imported as a prefix — a partially imported spreadsheet is the trap this route exists to avoid. The count is taken by `autumn_web::data::csv::count_data_rows` *before* the import, because a malformed row never reaches the row handler (`import_csv` records it and moves on), so an in-handler counter would miss exactly the file that costs the most to accumulate. The rendered error list is separately capped at `MAX_REPORT_ERRORS` (200) with a "further errors not listed" line; the counts above the table are always the whole truth. |
 | An oversized upload | A **413** from the framework's size guard, not the friendly 422 the other refusals use — the status is the accurate one, but the page is the generic error page. |
-| A column the import cannot set | Filtered out of the row *before* `decode_form` sees it, not merely omitted from the column lists. For most such columns that is belt-and-braces (serde ignores a field the form does not have), but a `Bytea` column **does** have a form field, so the filter is what actually stops its exported mojibake being written back. |
-| A model with no settable column at all | Refused, with a warning. An empty form decodes *any* row, so such an importer could only ever commit rows of database defaults — and a file with any header would do it. Reached when every column is an `Attachment`, a `Bytea`, or `--default`ed. |
-| A **non-nullable** `Bytea` column | The import is **refused** for the whole model, with a warning naming the column. The import must filter the column out (see the row below), but the generated form declares a non-nullable `Bytea` as a bare `String` with no default — so a filtered row would fail "missing field" and the importer could never import anything. Make it `Option<Bytea>`, drop it, or import it by hand. This is the same shape as the `#[encrypted]` refusal: a column the import cannot set that the form nonetheless requires. |
-| `Bytea` column (nullable) | **Not importable.** The export renders it with `String::from_utf8_lossy`, so any non-UTF-8 byte is already a U+FFFD replacement character in the file — writing that back would silently replace a binary column with mojibake. It is listed among the columns the import cannot set, and supplying a value for it raises the report's discarded-column alert. A reversible encoding (base64/hex) would have to change the export too; that is out of this slice. |
+| A column the import cannot set | Filtered out of the row *before* `decode_form` sees it, not merely omitted from the column lists. Serde ignores a field the form does not have, so this is a second guard. |
+| A model with no settable column at all | Refused, with a warning. An empty form decodes *any* row, so such an importer could only ever commit rows of database defaults — and a file with any header would do it. Reached when every column is an `Attachment` or `--default`ed. |
+| `Bytea` column | Round-trips. The export writes `\x` + lowercase hex (the Postgres `bytea` text form), so no byte is lost. The import decodes it back byte-identically. Upper-case hex is also accepted. A cell without the `\x` prefix, with an odd number of digits, or with a non-hex character fails its row. The `\x` prefix stops a spreadsheet from reading the cell as a number, so leading zeros stay. A blank value is NULL in a nullable column and empty bytes in a required one; `\x` alone is empty bytes. A spreadsheet can cut a cell that is too long (about 32 000 characters in Excel), so edit large blobs with care. The edit form uses the same text. The index and show views stay lossy, because they only display. |
 | `Attachment` column | Not importable — a storage key in a cell is not a file. The column is left NULL; upload the file through the record's own edit form afterwards. |
 | `datetime` column | Round-trips, naive and tz-aware alike: the export writes chrono's `Display` form (a space between date and time, plus a zone name for a tz-aware column) and an `--import` scaffold's `parse_local_datetime` accepts both shapes alongside the browser's `datetime-local` `T` form. Without the flag the helper is unchanged. |
 | A value that looks like a formula | Round-trips too. The export prefixes an apostrophe to a text cell beginning `=`, `+`, `-`, `@`, TAB or CR; the import strips it back off — but only in exactly that shape, so `'tis` is left alone. A value someone really typed as `'=x` is indistinguishable from a guarded `=x` in the file and resolves to the latter; drop the `csv_unguard_cell` call if you would rather store the apostrophe. |
@@ -2211,6 +2212,19 @@ quietly do nothing. It also keeps one command from claiming another's files:
 `autumn new --starter` writes through the same machinery, and no generator
 owns what it wrote.
 
+`generate` records each edit it makes to a shared file (`Cargo.toml`,
+`src/main.rs`, `i18n/en.ftl`) under `[[runs.<id>]]`. `destroy` refuses when
+a recorded edit is in a file that still exists, and the new plan reverts that
+kind of edit at a different place. This happens when a project setting that
+the arguments do not show (for example `[i18n] dir`) changes after `generate`.
+Without the check, `destroy` deletes the owned files and leaves the edit in
+the shared file. The message names each edit. Undo the setting change and run
+`destroy` again. Or check the files by hand and pass `--force`. `--dry-run`
+lists the edits and changes nothing. A plan that reverts more than `generate`
+edited is fine. An edit in a file that no longer exists is also fine. A
+manifest from an older CLI has no record, so `destroy` keeps the old behaviour.
+`destroy` checks only edits that have a revert.
+
 Commit `.autumn/generated.toml`. It is the baseline a later checkout compares
 against. Without it, `destroy` can only compare against the current templates —
 so a CLI upgrade that changed a template makes every untouched file that
@@ -2233,6 +2247,26 @@ A file that several resources share (a mailer's `_layout.html`, say) is
 never a hard error and is never force-deleted. `destroy` removes it only
 when it is provably this generator's own output and no sibling resource is
 left in its directory; otherwise it warns and leaves it in place.
+
+A newer CLI can rename or drop a file that an older template made. The current
+plan does not name the old file, but the manifest does. `destroy` sweeps it:
+
+- It deletes the file when the digest still matches and the current templates
+  create a file in the same directory. It prints
+  `Removed <path> (no longer generated)`.
+- It keeps the file and names it in a warning when you edited the file, when
+  other resources can share it, when other Rust code still names it, when the
+  templates create nothing in its directory, or when the manifest entry is from
+  Autumn 0.8.0 (that entry does not say which resource owns the file).
+  `--force` does not change this.
+- It never sweeps a migration, a project file such as `Cargo.toml` or
+  `src/main.rs`, a path with a dot segment (`.env`, `.git/`), a file under
+  `target/`, or a path through a symlink.
+
+The manifest decides what the sweep can delete, so review changes to
+`.autumn/generated.toml` as you review code.
+
+`--dry-run` lists the files the sweep would delete.
 
 `destroy` also removes each entry it acted on from the manifest, and deletes
 the manifest once it holds nothing. Deleting or hand-editing the manifest

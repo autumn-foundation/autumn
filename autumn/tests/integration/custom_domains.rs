@@ -146,6 +146,55 @@ async fn dns_instructions_are_cname_for_subdomains_and_addresses_for_apex() {
     assert!(apex.render().contains('A'));
 }
 
+/// #2643: an apex under a multi-label public suffix gets A/AAAA records.
+#[tokio::test]
+async fn multi_label_suffix_apexes_get_address_records() {
+    let registry = registry();
+    for hostname in ["clientco.co.uk", "customer.com.au", "tenant.co.jp"] {
+        let domain = registry.register(hostname, "tenant-a", NOW).await.unwrap();
+        let instructions = DnsInstructions::for_domain(&domain, &ingress()).unwrap();
+        match &instructions.routing {
+            RoutingRecord::Address { name, ipv4, .. } => {
+                assert_eq!(name, hostname);
+                assert_eq!(ipv4, &["203.0.113.10".to_owned()]);
+            }
+            other @ RoutingRecord::Cname { .. } => {
+                panic!("{hostname}: expected address records, got {other:?}")
+            }
+        }
+    }
+
+    let sub = registry
+        .register("app.clientco.co.uk", "tenant-a", NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        DnsInstructions::for_domain(&sub, &ingress())
+            .unwrap()
+            .routing,
+        RoutingRecord::Cname { .. }
+    ));
+}
+
+/// #2643: with no ingress addresses, a multi-label apex gets the same error
+/// as a two-label apex, not a CNAME it cannot publish.
+#[tokio::test]
+async fn multi_label_suffix_apex_without_addresses_names_the_missing_keys() {
+    let hostname_only = ExpectedIngress {
+        hostname: Some("ingress.myapp.com".to_owned()),
+        ..ExpectedIngress::default()
+    };
+    let registry = registry();
+    for hostname in ["clientco.com", "clientco.co.uk"] {
+        let domain = registry.register(hostname, "tenant-a", NOW).await.unwrap();
+        let err = DnsInstructions::for_domain(&domain, &hostname_only).unwrap_err();
+        assert!(
+            err.contains("ingress_ipv4") && err.contains("ingress_ipv6"),
+            "{hostname}: {err}"
+        );
+    }
+}
+
 // ── #2642: ownership proof by TXT token ──────────────────────────────────
 
 /// Both shapes render the TXT record that carries the registration's token,
@@ -581,6 +630,46 @@ async fn a_stale_verification_result_is_discarded_for_a_re_registered_hostname()
 }
 
 // ── AC3: request routing for a registered domain ─────────────────────────
+
+/// #2351 (Codex review on #3222): a capsule that recorded a failed tenant
+/// lookup must not resolve through a custom domain on replay.
+#[cfg(feature = "reporting")]
+#[tokio::test]
+async fn a_recorded_tenant_failure_does_not_resolve_through_a_custom_domain_on_replay() {
+    let mut config = AutumnConfig::default();
+    config.tenancy.enabled = true;
+    config.tenancy.source = "subdomain".to_owned();
+    config.tenancy.base_domain = Some("myapp.com".to_owned());
+
+    let registry = registry();
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    registry
+        .record_active("app.clientco.com", NOW, NOW + 86_400)
+        .await
+        .unwrap();
+
+    let tape = Arc::new(autumn_web::capsule::ReplayEffects::new(
+        autumn_web::capsule::CapsuleEffects {
+            tenant: Some(autumn_web::capsule::TenantEffect { id: None }),
+            ..autumn_web::capsule::CapsuleEffects::default()
+        },
+    ));
+    let req = Request::builder()
+        .header("Host", "app.clientco.com")
+        .body(())
+        .unwrap();
+    let (mut parts, ()) = req.into_parts();
+    let result = autumn_web::capsule::with_effect_tape(
+        Arc::clone(&tape),
+        extract_tenant_from_parts_with_domains(&mut parts, &config, Some(&registry)),
+    )
+    .await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(tape.divergences().len(), 1);
+}
 
 #[tokio::test]
 async fn a_verified_custom_domain_resolves_to_its_tenant() {

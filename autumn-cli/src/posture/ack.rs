@@ -7,11 +7,14 @@
 //! /ack-posture 3f2a91c0d47b5e6a  widening /admin/users on purpose, launch week
 //! ```
 //!
-//! The digest binds the acknowledgment to **the exact set of widening
-//! findings** it was written for. That is what makes the marker survive
-//! unrelated pushes (the set is unchanged, so the digest is unchanged) while
-//! re-blocking the moment a later commit widens something new (a new set is a
-//! new digest, and no comment carries it yet).
+//! The digest binds the acknowledgment to **the set of widening findings** it
+//! was written for. An unrelated push keeps it valid. A new widening needs a
+//! new digest, and no comment carries it yet.
+//!
+//! A widened route also gets a `ceiling=` token. It holds the approved posture
+//! of the route (see [`super::ceiling`]). The marker means "no wider than
+//! this". Narrowing keeps it valid. A removed constraint blocks again. A bare
+//! digest means "exactly this".
 //!
 //! Everything parsed here came from a pull-request comment, which is to say
 //! from anyone who can type. Two lines of defense: this parser is strict about
@@ -21,18 +24,19 @@
 //! have been filtered already and says so out loud rather than pretending to an
 //! authorization model it has no identity to enforce.
 //!
-//! The same division applies to [`SOURCE_SEPARATOR`]: it is the one line this
-//! parser takes at face value, so the harvester neutralizes any occurrence
-//! inside a body before writing it. A caller feeding this function unfiltered
-//! text inherits that job.
+//! [`parse_acks`] trusts one line, [`SOURCE_SEPARATOR`], as a comment
+//! boundary. A comment that contains that line can fake a boundary. So the
+//! scaffolded workflow writes one file per comment and uses `--ack-dir`, which
+//! parses each file with [`parse_comment`]. That parser trusts no line.
 
+use super::ceiling::Cover;
 use super::diff::Finding;
 use super::model::hex_digest;
 
 /// The comment phrase that acknowledges a posture widening.
 pub const ACK_PHRASE: &str = "/ack-posture";
 
-/// Line the harvester writes between two comment bodies.
+/// Line that divides two comment bodies in an `--ack-file`.
 ///
 /// Fenced-code state must not leak from one comment into the next: a colleague
 /// who pastes a log and forgets the closing fence would otherwise silently
@@ -40,6 +44,9 @@ pub const ACK_PHRASE: &str = "/ack-posture";
 /// marker *inside* a fence (the gate's own posted report contains one) becomes
 /// live. Each body is parsed with its own fence state.
 pub const SOURCE_SEPARATOR: &str = "<!-- autumn:ack-source -->";
+
+/// The key of the optional token that carries a ceiling (see [`super::ceiling`]).
+pub const CEILING_KEY: &str = "ceiling=";
 
 /// How much of the digest the phrase carries. 64 bits is far more than enough
 /// to bind an acknowledgment to a finding set nobody is trying to collide, and
@@ -53,6 +60,8 @@ pub struct Acknowledgment {
     pub digest: String,
     /// Whatever the author wrote after the digest, when they wrote anything.
     pub reason: Option<String>,
+    /// The `ceiling=` payload, when the marker carries one.
+    pub ceiling: Option<String>,
 }
 
 /// The digest of a set of widening findings.
@@ -74,7 +83,32 @@ pub fn short(digest: &str) -> String {
     digest.chars().take(SHORT_DIGEST_LEN).collect()
 }
 
-/// Extract every acknowledgment marker from harvested pull-request text.
+/// Extract every acknowledgment marker from harvested pull-request text in
+/// which [`SOURCE_SEPARATOR`] lines divide the comment bodies (`--ack-file`).
+///
+/// Each body is parsed on its own by [`parse_comment`].
+#[must_use]
+pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
+    let mut acks = Vec::new();
+    let mut body = String::new();
+    for line in text.lines() {
+        if line.trim() == SOURCE_SEPARATOR {
+            acks.extend(parse_comment(&body));
+            body.clear();
+        } else {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    acks.extend(parse_comment(&body));
+    acks
+}
+
+/// Extract every acknowledgment marker from one comment body.
+///
+/// The body has no separator to trust: [`SOURCE_SEPARATOR`] in it is plain
+/// text. `--ack-dir` uses this for each file, so no text in a comment can
+/// fake a comment boundary (#2472).
 ///
 /// Strict on purpose:
 /// - the phrase must start the line (leading whitespace allowed), so it cannot
@@ -87,7 +121,7 @@ pub fn short(digest: &str) -> String {
 ///   does not acknowledge anything either;
 /// - the digest must be plain lower/upper-case hex, 8..=64 characters.
 #[must_use]
-pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
+pub fn parse_comment(text: &str) -> Vec<Acknowledgment> {
     let mut acks = Vec::new();
     // The character and length of the fence currently open, if any. Toggling a
     // bool instead would let the inner ``` of a report quoted inside a ````
@@ -115,17 +149,6 @@ pub fn parse_acks(text: &str) -> Vec<Acknowledgment> {
     // inline code — including across a newline.
     let mut code_span: Option<usize> = None;
     for line in text.lines() {
-        if line.trim() == SOURCE_SEPARATOR {
-            // A new comment body starts here, with a clean slate. Checked
-            // first, because the separator is itself an HTML comment.
-            fence = None;
-            html_comment = false;
-            quote_paragraph = false;
-            raw_html = None;
-            open_tag = TagState::default();
-            code_span = None;
-            continue;
-        }
         // A blank line ends the quoted paragraph, so the lazy continuation
         // stops here and the rest of the comment is live text again. Read from
         // the raw line: a line that renders empty because it is all HTML
@@ -450,17 +473,33 @@ fn parse_marker(line: &str) -> Option<Acknowledgment> {
         return None;
     }
     let rest = rest.trim_start();
-    let (token, reason) = rest
-        .find(char::is_whitespace)
-        .map_or((rest, ""), |i| (&rest[..i], rest[i..].trim()));
+    let (token, rest) = split_token(rest);
     let digest = token.to_ascii_lowercase();
     if !is_digest(&digest) {
         return None;
     }
+    // Optional `ceiling=` token. Reject the marker if the token is bad. A
+    // bare-digest reading would silently change "no wider than" to "exactly
+    // this".
+    let rest = rest.trim_start();
+    let (next, after) = split_token(rest);
+    let (ceiling, reason) = match next.strip_prefix(CEILING_KEY) {
+        Some(payload) if super::ceiling::is_payload(payload) => (Some(payload.to_owned()), after),
+        Some(_) => return None,
+        None => (None, rest),
+    };
+    let reason = reason.trim();
     Some(Acknowledgment {
         digest,
         reason: (!reason.is_empty()).then(|| reason.to_owned()),
+        ceiling,
     })
+}
+
+/// The first whitespace-delimited token and what follows it.
+fn split_token(text: &str) -> (&str, &str) {
+    text.find(char::is_whitespace)
+        .map_or((text, ""), |i| (&text[..i], &text[i..]))
 }
 
 /// Whether `candidate` is a plausible digest: hex, and long enough to be worth
@@ -470,20 +509,39 @@ fn is_digest(candidate: &str) -> bool {
     (8..=64).contains(&candidate.len()) && candidate.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// Whether any harvested acknowledgment matches `digest`.
+/// Whether any harvested acknowledgment approves the current widening.
 ///
-/// A marker may carry the short form or the full digest; both are compared
-/// case-insensitively against the expected digest's corresponding prefix.
+/// A bare marker must match the `exact` digest (short or full). A ceiling
+/// marker must match the same findings, and no route may be wider than the
+/// ceiling.
 #[must_use]
-pub fn matching<'a>(acks: &'a [Acknowledgment], digest: &str) -> Option<&'a Acknowledgment> {
-    acks.iter()
-        .find(|ack| super::verify::marker_matches(digest, &ack.digest))
+pub fn matching<'a>(
+    acks: &'a [Acknowledgment],
+    exact: &str,
+    cover: &Cover,
+) -> Option<&'a Acknowledgment> {
+    acks.iter().find(|ack| {
+        ack.ceiling.as_ref().map_or_else(
+            || super::verify::marker_matches(exact, &ack.digest),
+            |payload| cover.accepts(payload, &ack.digest),
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::posture::diff::Severity;
+
+    /// `matching` for bare markers: no widened route, so an empty cover.
+    fn matching<'a>(acks: &'a [Acknowledgment], digest: &str) -> Option<&'a Acknowledgment> {
+        let head = crate::posture::model::PostureManifest::parse(
+            r#"{"schema_version":3,"dimensions":{"routes":{"provenance":"provable","source":"m","entries":[]}},"excluded":[]}"#,
+            "t.json",
+        )
+        .expect("fixture parses");
+        super::matching(acks, digest, &crate::posture::ceiling::cover(&[], &head))
+    }
 
     fn finding(kind: &'static str, path: &str) -> Finding {
         Finding {
@@ -521,6 +579,34 @@ mod tests {
         assert_eq!(short(&d).len(), SHORT_DIGEST_LEN);
         assert!(d.starts_with(&short(&d)));
         assert!(short(&d).chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ── ceiling token ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parses_a_ceiling_token_and_keeps_the_reason() {
+        let acks = parse_acks("/ack-posture 0123456789abcdef ceiling=GET|%2Fa|x launch week");
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].digest, "0123456789abcdef");
+        assert_eq!(acks[0].ceiling.as_deref(), Some("GET|%2Fa|x"));
+        assert_eq!(acks[0].reason.as_deref(), Some("launch week"));
+    }
+
+    #[test]
+    fn a_bare_marker_has_no_ceiling() {
+        let acks = parse_acks("/ack-posture 0123456789abcdef ceiling-ish reason");
+        assert_eq!(acks[0].ceiling, None);
+        assert_eq!(acks[0].reason.as_deref(), Some("ceiling-ish reason"));
+    }
+
+    /// A marker that tried to carry a ceiling and failed is not a bare marker:
+    /// dropping the ceiling would turn "no wider than" into "exactly this".
+    #[test]
+    fn a_malformed_ceiling_token_voids_the_marker() {
+        for bad in ["ceiling=", "ceiling=a`b", "ceiling=<x>", "ceiling=a\u{e9}"] {
+            let line = format!("/ack-posture 0123456789abcdef {bad}");
+            assert!(parse_acks(&line).is_empty(), "{bad}");
+        }
     }
 
     // ── parsing ─────────────────────────────────────────────────────────────
@@ -799,6 +885,22 @@ Looks fine to me.
 -->
 ";
         assert!(parse_acks(body).is_empty());
+    }
+
+    /// One comment, parsed alone, has no separator to trust: the line is
+    /// plain text, so it cannot reset a fence and make a marker live.
+    #[test]
+    fn a_single_comment_does_not_honor_the_separator() {
+        let body = format!("```\n{SOURCE_SEPARATOR}\n/ack-posture 0123456789abcdef\n```\n");
+        assert!(
+            parse_comment(&body).is_empty(),
+            "{:?}",
+            parse_comment(&body)
+        );
+        assert_eq!(
+            parse_comment("/ack-posture 0123456789abcdef  ok\n").len(),
+            1
+        );
     }
 
     /// The harvester's own separator is an HTML comment, so comment tracking

@@ -1,22 +1,23 @@
-//! Declarative-schema tooling (wave-15, tracking issue #1975).
+//! Declarative-schema tooling (tracking issue #1975).
 //!
-//! Slice 2 lives here: [`parse`], a `syn`-backed reader that lifts an app's
-//! `#[model]` structs into the shared [`autumn_schema_core`] IR — the
-//! **desired state** later slices (a checked-in snapshot, then the diff engine
-//! and the full `autumn schema` command group) build on. It is read-only:
-//! nothing here writes a migration, `schema.rs`, or any other codegen output.
+//! [`parse`] reads the `#[model]` structs into the [`autumn_schema_core`] IR:
+//! the desired state. [`snapshot`] holds the checked-in baseline. [`diff`]
+//! compares the two and writes the migration. [`run`] backs the
+//! `autumn schema parse|snapshot|diff|pull|migrate|doctor` commands.
 //!
-//! The experimental [`run`] entrypoint backs `autumn schema parse <path>` (slice
-//! 2) and `autumn schema snapshot` (slice 3). `parse` prints the parsed IR as
-//! JSON; `snapshot` writes the canonical, checked-in [`snapshot`] baseline the
-//! later diff engine consumes. These are the first actions of the eventual full
-//! `autumn schema` group.
+//! [`rename`] applies `#[renamed_from]` hints in the diff. [`shadow`] replays
+//! the migrations on an empty dev database for `schema diff --dev-url`.
+//! [`schema_rs`] writes the `diesel::table!` blocks of the managed models to
+//! `src/schema.rs` on `schema diff --write-migration`.
 
 pub mod diff;
 pub mod doctor;
 pub mod introspect;
 pub mod migrate;
 pub mod parse;
+pub mod rename;
+pub mod schema_rs;
+pub mod shadow;
 pub mod snapshot;
 
 use std::collections::BTreeMap;
@@ -48,8 +49,10 @@ impl From<BackendArg> for Backend {
     }
 }
 
-/// The `autumn schema` subcommand actions (experimental). Slices 2–3 ship
-/// `parse` and `snapshot`; `diff`/… arrive in later slices.
+/// The environment variable that `schema diff --dev-url` also reads.
+const DEV_URL_ENV: &str = "AUTUMN_DEV_URL";
+
+/// The `autumn schema` subcommand actions (experimental).
 #[derive(clap::Subcommand, Debug)]
 pub enum SchemaAction {
     /// Parse `#[model]` structs at PATH (a `.rs` file or a directory of them)
@@ -83,7 +86,8 @@ pub enum SchemaAction {
     },
     /// Diff the declared `#[model]` structs against the checked-in snapshot and
     /// either print the pending migration (default) or write it as a diesel
-    /// `up.sql`/`down.sql` pair (`--write-migration`). Destructive drops are
+    /// `up.sql`/`down.sql` pair (`--write-migration`). `--write-migration` also
+    /// advances the snapshot and writes `src/schema.rs`. Destructive drops are
     /// refused unless `--allow-destructive` is passed.
     Diff {
         /// Models source (a `.rs` file or a directory). Defaults to `src/models`
@@ -96,7 +100,8 @@ pub enum SchemaAction {
         /// The dialect. Defaults to the project's configured backend.
         #[arg(long, value_enum)]
         backend: Option<BackendArg>,
-        /// Write `migrations/<timestamp>_<name>/{up,down}.sql` instead of printing.
+        /// Write `migrations/<timestamp>_<name>/{up,down}.sql` instead of
+        /// printing. Also advance the snapshot and update `src/schema.rs`.
         #[arg(long)]
         write_migration: bool,
         /// Migration directory suffix when writing. Defaults to `schema_update`.
@@ -105,6 +110,18 @@ pub enum SchemaAction {
         /// Permit destructive drops / an independent drop+add (tier-2 guard).
         #[arg(long)]
         allow_destructive: bool,
+        /// Use the migrations, replayed on a scratch database, as the baseline.
+        /// On Postgres the command creates the scratch database on the server
+        /// of URL (the role needs CREATEDB) and drops it after; the database in
+        /// URL does not change. The snapshot becomes optional. Also read from
+        /// `AUTUMN_DEV_URL`, which keeps the password out of the process list.
+        #[arg(
+            long,
+            value_name = "URL",
+            env = DEV_URL_ENV,
+            hide_env_values = true
+        )]
+        dev_url: Option<String>,
     },
     /// Introspect the configured Postgres database and write a canonical,
     /// dialect-tagged snapshot of its live shape — the DB-derived diff baseline.
@@ -112,8 +129,9 @@ pub enum SchemaAction {
     /// Read-only w.r.t. the database (only catalog reads). Unlike `snapshot`
     /// (which derives the baseline from the declared `#[model]` structs), `pull`
     /// derives it from the live database, so a brownfield schema — or a schema
-    /// that drifted from the models — is captured exactly as it exists. Postgres
-    /// only in this slice; a `SQLite` URL is refused with a clear message.
+    /// that drifted from the models — is captured exactly as it exists. A
+    /// `SQLite` URL needs a CLI built with `--features sqlite`; the default
+    /// build refuses it with a clear message.
     Pull {
         /// Config profile whose database URL to introspect (defaults to the
         /// ambient profile resolution the other CLI commands use).
@@ -176,14 +194,16 @@ pub fn run(action: SchemaAction) {
             write_migration,
             name,
             allow_destructive,
-        } => run_diff(
-            from.as_deref(),
-            snapshot.as_deref(),
+            dev_url,
+        } => run_diff(&DiffArgs {
+            from: from.as_deref(),
+            snapshot: snapshot.as_deref(),
             backend,
             write_migration,
-            name.as_deref(),
+            name: name.as_deref(),
             allow_destructive,
-        ),
+            dev_url: dev_url.as_deref(),
+        }),
         SchemaAction::Pull {
             profile,
             out,
@@ -654,45 +674,76 @@ fn reverse_only_removals(reverse: &MigrationPlan) -> Vec<String> {
 /// parsed or diffed, so a dialect-mismatched snapshot fails cleanly with
 /// [`snapshot::SnapshotError::BackendMismatch`] and no diff work runs. This is
 /// the first caller of [`SchemaSnapshot::ensure_backend_matches`].
-fn run_diff(
-    from: Option<&Path>,
-    snapshot_path: Option<&Path>,
+/// The inputs of `autumn schema diff`.
+#[derive(Debug, Default, Clone, Copy)]
+struct DiffArgs<'a> {
+    /// `--from`: the models source.
+    from: Option<&'a Path>,
+    /// `--snapshot`: the baseline snapshot path.
+    snapshot: Option<&'a Path>,
+    /// `--backend`: the dialect.
     backend: Option<BackendArg>,
+    /// `--write-migration`.
     write_migration: bool,
-    name: Option<&str>,
+    /// `--name`: the migration directory suffix.
+    name: Option<&'a str>,
+    /// `--allow-destructive`.
     allow_destructive: bool,
-) -> Result<(), String> {
+    /// `--dev-url`: replay the migrations on this database and use the result
+    /// as the baseline (see [`shadow`]).
+    dev_url: Option<&'a str>,
+}
+
+fn run_diff(args: &DiffArgs<'_>) -> Result<(), String> {
     let project_root = std::env::current_dir()
         .map_err(|e| format!("failed to resolve the current directory: {e}"))?;
-    diff_at(
-        &project_root,
-        from,
-        snapshot_path,
-        backend,
-        write_migration,
-        name,
-        allow_destructive,
-    )
+    diff_at(&project_root, args)
 }
 
 /// The body of [`run_diff`], taking an explicit `project_root` (rather than the
 /// process CWD) so the command wiring is testable without mutating the current
 /// directory.
-fn diff_at(
+fn diff_at(project_root: &Path, args: &DiffArgs<'_>) -> Result<(), String> {
+    diff_at_with(project_root, args, &write_file_atomic)
+}
+
+/// Write `text` to `path` through a temporary file and a rename, so a failed
+/// write never leaves a part of the file. Keeps the permissions of the old
+/// file. A symbolic link stays a link: the write goes to its target.
+fn write_file_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    std::io::Write::write_all(&mut tmp, text.as_bytes())?;
+    if let Ok(meta) = std::fs::metadata(&target) {
+        tmp.as_file().set_permissions(meta.permissions())?;
+    }
+    tmp.as_file().sync_all()?;
+    tmp.persist(&target).map(|_| ()).map_err(|e| e.error)
+}
+
+/// [`diff_at`] with the `src/schema.rs` writer as a parameter, so a test can
+/// make the write fail.
+fn diff_at_with(
     project_root: &Path,
-    from: Option<&Path>,
-    snapshot_path: Option<&Path>,
-    backend: Option<BackendArg>,
-    write_migration: bool,
-    name: Option<&str>,
-    allow_destructive: bool,
+    args: &DiffArgs<'_>,
+    write_schema_rs: &dyn Fn(&Path, &str) -> std::io::Result<()>,
 ) -> Result<(), String> {
+    let DiffArgs {
+        from,
+        snapshot: snapshot_path,
+        backend,
+        write_migration,
+        name,
+        allow_destructive,
+        dev_url,
+    } = *args;
     // When any input falls back to a project-relative default (the models
-    // source, the default snapshot path, or the auto-detected backend), the
-    // command needs the current directory to be the project root — mirroring
-    // `run_snapshot`.
+    // source, the default snapshot path, the auto-detected backend, or the
+    // `migrations/` directory a `--dev-url` replays), the command needs the
+    // current directory to be the project root — mirroring `run_snapshot`.
     let backend_given = backend.is_some();
-    if (from.is_none() || snapshot_path.is_none() || backend.is_none())
+    if (from.is_none() || snapshot_path.is_none() || backend.is_none() || dev_url.is_some())
         && crate::generate::ensure_project_root(project_root).is_err()
     {
         return Err(project_root_required_error(!backend_given));
@@ -705,28 +756,12 @@ fn diff_at(
         Backend::from,
     );
 
-    // (b) Load the baseline snapshot (default `SNAPSHOT_DEFAULT_PATH`). A missing
-    //     file is a friendly "run `autumn schema snapshot` first" error.
+    // (b) Load the snapshot. (c) PROVIDER-LOCK GUARD — before parsing/diffing.
     let snapshot_path = snapshot_path.map_or_else(
         || project_root.join(SNAPSHOT_DEFAULT_PATH),
         Path::to_path_buf,
     );
-    let baseline = snapshot::load_snapshot(&snapshot_path).map_err(|e| match e {
-        snapshot::SnapshotError::Io { source, .. }
-            if source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            format!(
-                "no schema snapshot at {} — run `autumn schema snapshot` first to create the diff baseline",
-                snapshot_path.display()
-            )
-        }
-        other => other.to_string(),
-    })?;
-
-    // (c) PROVIDER-LOCK GUARD — before parsing/diffing.
-    baseline
-        .ensure_backend_matches(backend)
-        .map_err(|e| e.to_string())?;
+    let snapshot = load_diff_snapshot(&snapshot_path, backend, dev_url.is_some())?;
 
     // (d) Parse the desired state with the SAME backend tag.
     let models_path = match from {
@@ -738,22 +773,52 @@ fn diff_at(
         eprintln!("warning: {}", d.message);
     }
 
+    // The baseline: the snapshot, or with `--dev-url` the replayed migrations.
+    let (baseline_tables, other_relations) = match dev_url {
+        Some(url) => {
+            let replay = replay_baseline(project_root, url, backend, snapshot.as_ref(), &desired)?;
+            (replay.tables, replay.other_relations)
+        }
+        None => (
+            snapshot
+                .as_ref()
+                .map(|s| s.tables.clone())
+                .unwrap_or_default(),
+            std::collections::BTreeSet::new(),
+        ),
+    };
+
     // (e) Diff (pure) then guard (policy).
     let opts = diff::DiffOptions {
         allow_destructive,
         ..Default::default()
     };
-    let plan = diff::diff_schema(&baseline.tables, &desired, opts);
+    let plan = diff::diff_schema(&baseline_tables, &desired, opts);
     if plan.is_empty() {
-        println!("No schema changes — models match the snapshot baseline.");
+        println!("No schema changes — models match the baseline.");
+        if write_migration {
+            let sync = plan_schema_rs(project_root, &desired, &plan)?;
+            let adopted = adopted_snapshot(snapshot.as_ref(), &baseline_tables, backend, &desired);
+            commit_empty_plan(
+                &snapshot_path,
+                adopted.as_ref(),
+                sync.as_ref(),
+                write_schema_rs,
+            )?;
+        }
         return Ok(());
     }
     diff::guard_plan(&plan, opts).map_err(|e| e.to_string())?;
+    if let Some(clash) = relation_clash(&plan, &baseline_tables, &other_relations) {
+        return Err(clash);
+    }
 
-    // The SQLite table-recreate path needs each affected table's full desired (up)
-    // / baseline (down) shape, which the per-change deltas don't carry; thread them
-    // in via the context. Postgres ignores it (identical output).
-    let ctx = diff::SchemaContext::from_tables(&desired.tables, &baseline.tables);
+    // A SQLite table-recreate needs the full desired and baseline tables, and the
+    // skipped decimal columns. Postgres ignores the context. The baseline is the
+    // renamed baseline: the plan's non-rename changes use the new names.
+    let renamed = rename::renamed_baseline(&baseline_tables, &plan.changes);
+    let ctx =
+        diff::SchemaContext::from_tables(&desired.tables, &renamed).with_skipped_decimals(&desired);
     let up = diff::emit_up_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
     let down = diff::emit_down_sql_with_context(&plan, &ctx).map_err(|e| e.to_string())?;
 
@@ -762,6 +827,9 @@ fn diff_at(
         println!("\n-- up.sql\n{up}\n-- down.sql\n{down}");
         return Ok(());
     }
+
+    // Read `src/schema.rs` before the first write, so a read error stops here.
+    let sync = plan_schema_rs(project_root, &desired, &plan)?;
 
     // (f) Write the migration dir, matching the generator's naming convention.
     let ts = crate::generate::timestamp_now();
@@ -783,13 +851,17 @@ fn diff_at(
     // regenerate the same SQL as a second migration (baseline never advanced)
     // and applying both would fail on duplicate DDL. Roll the migration dir back
     // on a snapshot-write failure so the pre-command state is left intact.
-    let target_tables = project_plan_target(&baseline.tables, &plan);
-    if let Err(e) =
-        snapshot::write_snapshot(&snapshot_path, &SchemaSnapshot::new(backend, target_tables))
-    {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(e.to_string());
-    }
+    let mut target_tables = project_plan_target(&baseline_tables, &plan);
+    mark_managed(&mut target_tables, &desired);
+
+    // (h) Then write `src/schema.rs` (see `commit_outputs`).
+    commit_outputs(
+        &snapshot_path,
+        Some(&SchemaSnapshot::new(backend, target_tables)),
+        Some(&dir),
+        sync.as_ref(),
+        write_schema_rs,
+    )?;
 
     println!(
         "wrote migration {} ({} change(s))",
@@ -797,7 +869,340 @@ fn diff_at(
         plan.changes.len()
     );
     println!("advanced schema snapshot at {}", snapshot_path.display());
+    report_schema_rs(sync.as_ref());
     Ok(())
+}
+
+/// `--write-migration` with no SQL change. A newly managed model needs no
+/// migration, but the snapshot records its `managed` flag (`adopted`, see
+/// [`adopted_snapshot`]) and `src/schema.rs` can need its block.
+fn commit_empty_plan(
+    snapshot_path: &Path,
+    adopted: Option<&SchemaSnapshot>,
+    sync: Option<&(PathBuf, schema_rs::SchemaRsSync)>,
+    write_schema_rs: &dyn Fn(&Path, &str) -> std::io::Result<()>,
+) -> Result<(), String> {
+    commit_outputs(snapshot_path, adopted, None, sync, write_schema_rs)?;
+    if adopted.is_some() {
+        println!("recorded the managed models in {}", snapshot_path.display());
+    }
+    report_schema_rs(sync);
+    Ok(())
+}
+
+/// The snapshot to write for an empty plan: the snapshot with the new
+/// `managed` flags, when a flag changed. With `--dev-url` and no snapshot,
+/// a new snapshot from the replayed `baseline`, as a non-empty plan makes.
+fn adopted_snapshot(
+    snapshot: Option<&SchemaSnapshot>,
+    baseline: &[Table],
+    backend: Backend,
+    desired: &parse::ParsedSchema,
+) -> Option<SchemaSnapshot> {
+    snapshot.map_or_else(
+        || {
+            let mut tables = baseline.to_vec();
+            mark_managed(&mut tables, desired);
+            Some(SchemaSnapshot::new(backend, tables))
+        },
+        |s| {
+            let mut tables = s.tables.clone();
+            mark_managed(&mut tables, desired);
+            (tables != s.tables).then(|| SchemaSnapshot::new(s.backend, tables))
+        },
+    )
+}
+
+/// Mark each table that a managed model declares as managed. A model that
+/// becomes managed is then recorded in the snapshot, and a later delete of
+/// the model drops its table. The flag never goes back to unmanaged.
+fn mark_managed(tables: &mut [Table], desired: &parse::ParsedSchema) {
+    for table in tables {
+        if desired
+            .tables
+            .iter()
+            .any(|t| t.managed && t.name == table.name)
+        {
+            table.managed = true;
+        }
+    }
+}
+
+/// Write the snapshot (when given), then `src/schema.rs` (when given). If a
+/// write fails, restore the old snapshot and remove `migration`. Then a new
+/// run starts from the same state.
+fn commit_outputs(
+    snapshot_path: &Path,
+    snapshot: Option<&SchemaSnapshot>,
+    migration: Option<&Path>,
+    sync: Option<&(PathBuf, schema_rs::SchemaRsSync)>,
+    write_schema_rs: &dyn Fn(&Path, &str) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let remove_migration = || {
+        if let Some(dir) = migration {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    };
+    let old_snapshot = std::fs::read(snapshot_path).ok();
+    if let Some(snapshot) = snapshot
+        && let Err(e) = snapshot::write_snapshot(snapshot_path, snapshot)
+    {
+        remove_migration();
+        return Err(e.to_string());
+    }
+    if let Err(e) = apply_schema_rs(sync, write_schema_rs) {
+        remove_migration();
+        if snapshot.is_some() && restore_file(snapshot_path, old_snapshot.as_deref()).is_err() {
+            return Err(format!(
+                "{e}; could not restore the snapshot at {} — check it",
+                snapshot_path.display()
+            ));
+        }
+        return Err(format!(
+            "{e}; the migration and the snapshot were not changed"
+        ));
+    }
+    Ok(())
+}
+
+/// The `src/schema.rs` sync for `plan`: the path and the result, when the
+/// file exists and the text changes. `None` when the project has no
+/// `src/schema.rs` or the text stays the same. Prints the skipped tables of
+/// an existing file.
+///
+/// # Errors
+///
+/// Returns an error when the file exists but cannot be read. The caller
+/// stops before it writes anything.
+fn plan_schema_rs(
+    project_root: &Path,
+    desired: &parse::ParsedSchema,
+    plan: &MigrationPlan,
+) -> Result<Option<(PathBuf, schema_rs::SchemaRsSync)>, String> {
+    let path = project_root.join(schema_rs::SCHEMA_RS_PATH);
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if desired.tables.iter().any(|t| t.managed) {
+                eprintln!(
+                    "note: no {} — the diesel schema was not written",
+                    schema_rs::SCHEMA_RS_PATH
+                );
+            }
+            return Ok(None);
+        }
+        Err(e) => return Err(format!("failed to read {}: {e}", path.display())),
+    };
+    let sync = schema_rs::sync_for_plan(&existing, desired, plan);
+    for (table, reason) in &sync.skipped {
+        eprintln!(
+            "warning: {} — did not write `{table}`: {reason}",
+            schema_rs::SCHEMA_RS_PATH
+        );
+    }
+    if sync.text == existing {
+        return Ok(None);
+    }
+    // The sync edits text. Never write a file that does not parse.
+    if let Err(reason) = schema_rs::validate(&sync.text) {
+        eprintln!(
+            "warning: did not update {}: {reason}; edit it by hand",
+            schema_rs::SCHEMA_RS_PATH
+        );
+        return Ok(None);
+    }
+    Ok(Some((path, sync)))
+}
+
+/// Write the `src/schema.rs` sync from [`plan_schema_rs`], if any.
+fn apply_schema_rs(
+    sync: Option<&(PathBuf, schema_rs::SchemaRsSync)>,
+    write: &dyn Fn(&Path, &str) -> std::io::Result<()>,
+) -> Result<(), String> {
+    let Some((path, sync)) = sync else {
+        return Ok(());
+    };
+    write(path, &sync.text).map_err(|e| format!("failed to write {}: {e}", path.display()))
+}
+
+/// Put `path` back to the bytes in `old`. Remove it when `old` is `None`.
+fn restore_file(path: &Path, old: Option<&[u8]>) -> std::io::Result<()> {
+    old.map_or_else(
+        || std::fs::remove_file(path),
+        |bytes| std::fs::write(path, bytes),
+    )
+}
+
+/// Print what the `src/schema.rs` sync changed.
+fn report_schema_rs(sync: Option<&(PathBuf, schema_rs::SchemaRsSync)>) {
+    let Some((path, sync)) = sync else { return };
+    let mut parts = Vec::new();
+    if !sync.written.is_empty() {
+        parts.push(format!("wrote {}", sync.written.join(", ")));
+    }
+    if !sync.removed.is_empty() {
+        parts.push(format!("removed {}", sync.removed.join(", ")));
+    }
+    for (old, new) in &sync.renamed {
+        parts.push(format!("renamed {old} to {new}"));
+    }
+    if parts.is_empty() {
+        parts.push("updated the table lists".to_owned());
+    }
+    println!("updated {} ({})", path.display(), parts.join("; "));
+}
+
+/// Load the diff snapshot, provider-locked to `backend`. A missing snapshot is
+/// a friendly "run `autumn schema snapshot` first" error, except with
+/// `--dev-url` (`optional`), where it is `None`.
+fn load_diff_snapshot(
+    snapshot_path: &Path,
+    backend: Backend,
+    optional: bool,
+) -> Result<Option<SchemaSnapshot>, String> {
+    match snapshot::load_snapshot(snapshot_path) {
+        Ok(snapshot) => {
+            snapshot
+                .ensure_backend_matches(backend)
+                .map_err(|e| e.to_string())?;
+            Ok(Some(snapshot))
+        }
+        Err(snapshot::SnapshotError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            if optional {
+                Ok(None)
+            } else {
+                Err(format!(
+                    "no schema snapshot at {} — run `autumn schema snapshot` first to create the diff baseline",
+                    snapshot_path.display()
+                ))
+            }
+        }
+        Err(other) => Err(other.to_string()),
+    }
+}
+
+/// The `--dev-url` baseline: the migrations replayed on the dev database, with
+/// a warning when they do not match the snapshot, and with managed flags from
+/// the snapshot and the models (see [`shadow::adopt_managed_flags`]).
+fn replay_baseline(
+    project_root: &Path,
+    url: &str,
+    backend: Backend,
+    snapshot: Option<&SchemaSnapshot>,
+    desired: &parse::ParsedSchema,
+) -> Result<shadow::Replay, String> {
+    let mut replayed = shadow::replay(backend, url, &project_root.join("migrations"))?;
+    shadow::adopt_model_spelling(&mut replayed.tables, desired);
+    if let Some(snapshot) = snapshot {
+        warn_snapshot_drift(&snapshot.tables, &replayed.tables);
+    }
+    shadow::adopt_managed_flags(
+        &mut replayed.tables,
+        snapshot.map(|s| &s.tables[..]),
+        desired,
+    );
+    Ok(replayed)
+}
+
+/// The refusal for a plan target (a new or renamed table or index) whose name
+/// is already taken. Tables, indexes, views, sequences and other relations
+/// share one namespace, so the migration would fail. Taken names are the
+/// baseline's tables and indexes plus `others` (the non-table relations of a
+/// `--dev-url` replay), less the names the plan frees first: the old name of a
+/// renamed table or index, and an index dropped just before its re-add. Two
+/// targets in the plan with one name collide as well.
+fn relation_clash(
+    plan: &MigrationPlan,
+    baseline: &[Table],
+    others: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    // Names compare case-insensitively: SQLite resolves them that way, and on
+    // Postgres a false match only refuses (the safe side).
+    let key = |name: &str| name.to_ascii_lowercase();
+    let added: std::collections::BTreeSet<String> = plan
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::AddIndex { index, .. } => Some(key(&index.name)),
+            _ => None,
+        })
+        .collect();
+    let freed: std::collections::BTreeSet<String> = plan
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            SchemaChange::RenameTable { from, .. } | SchemaChange::RenameIndex { from, .. } => {
+                Some(key(from))
+            }
+            SchemaChange::DropIndex { index, .. } if added.contains(&key(&index.name)) => {
+                Some(key(&index.name))
+            }
+            _ => None,
+        })
+        .collect();
+    let existing: std::collections::BTreeSet<String> = others
+        .iter()
+        .map(|n| key(n))
+        .chain(baseline.iter().flat_map(|t| {
+            std::iter::once(key(&t.name)).chain(t.indexes.iter().map(|i| key(&i.name)))
+        }))
+        .collect();
+    let taken = |name: &str| {
+        let k = key(name);
+        !freed.contains(&k) && existing.contains(&k)
+    };
+    // A name that two targets of this plan share collides too.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    plan.changes.iter().find_map(|c| {
+        let names: Vec<&String> = match c {
+            // A new table brings its own indexes.
+            SchemaChange::CreateTable(t) => std::iter::once(&t.name)
+                .chain(t.indexes.iter().map(|i| &i.name))
+                .collect(),
+            SchemaChange::RenameTable { to, .. } => vec![to],
+            SchemaChange::AddIndex { index, .. } | SchemaChange::RenameIndex { index, .. } => {
+                vec![&index.name]
+            }
+            _ => return None,
+        };
+        let name = names
+            .into_iter()
+            .find(|n| taken(n) || !seen.insert(key(n)))?;
+        Some(format!(
+            "`{name}` is already a table, index, view, sequence, type or other relation \
+             in the schema; choose another name"
+        ))
+    })
+}
+
+/// Warn on stderr when the snapshot does not match the schema the migrations
+/// make (the `--dev-url` replay). The diff still uses the replayed schema.
+fn warn_snapshot_drift(snapshot: &[Table], replayed: &[Table]) {
+    if let Some(text) = snapshot_drift(snapshot, replayed) {
+        eprintln!("warning: the snapshot does not match the migrations.\n{text}");
+    }
+}
+
+/// The differences between the snapshot and the replayed schema, in both
+/// directions, or `None` when they match. Same comparison as doctor's
+/// database-schema-drift check.
+fn snapshot_drift(snapshot: &[Table], replayed: &[Table]) -> Option<String> {
+    let drift = doctor::compute_db_schema_drift(snapshot, replayed);
+    if drift.is_clean() {
+        return None;
+    }
+    let mut text = String::new();
+    if !drift.forward.is_empty() {
+        text.push_str("Changes that turn the snapshot into the migrated schema:\n");
+        text.push_str(&diff::describe_plan(&drift.forward));
+    }
+    if !drift.reverse.is_empty() {
+        text.push_str("Changes that turn the migrated schema into the snapshot:\n");
+        text.push_str(&diff::describe_plan(&drift.reverse));
+    }
+    Some(text)
 }
 
 /// Project the guarded migration `plan` onto the `baseline` tables to compute the
@@ -812,6 +1217,9 @@ fn diff_at(
 /// the migration actually does. Table order is irrelevant here: `write_snapshot`
 /// re-sorts tables by name canonically.
 fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
+    // Renames come first in a plan and depend only on the baseline, so apply
+    // them before the name-keyed working set is built.
+    let baseline = rename::renamed_baseline(baseline, &plan.changes);
     // Name-keyed working set cloned from the baseline.
     let mut tables: BTreeMap<String, Table> = baseline
         .iter()
@@ -899,10 +1307,15 @@ fn project_plan_target(baseline: &[Table], plan: &MigrationPlan) -> Vec<Table> {
                     t.checks.push(check.clone());
                 }
             }
-            // The non-emittable marker variants: `guard_plan` refuses these before
+            // The renames were applied above by `renamed_baseline`, and
+            // the non-emittable marker variants: `guard_plan` refuses these before
             // we get here (a guarded plan never carries one), so projecting them is
             // a no-op — never a panic.
-            SchemaChange::PrimaryKeyChange { .. }
+            SchemaChange::RenameTable { .. }
+            | SchemaChange::RenameColumn { .. }
+            | SchemaChange::RenameIndex { .. }
+            | SchemaChange::RenameConflict { .. }
+            | SchemaChange::PrimaryKeyChange { .. }
             | SchemaChange::ForeignKeyChange { .. }
             | SchemaChange::IdentityChange { .. }
             | SchemaChange::DropTableBlockedByInboundFk { .. }
@@ -1095,12 +1508,10 @@ mod tests {
         let root = scaffold_project(POST_MODEL, &posts_snapshot("Sqlite"));
         let err = diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            false,
-            None,
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                ..DiffArgs::default()
+            },
         )
         .unwrap_err();
         assert!(
@@ -1120,12 +1531,10 @@ mod tests {
         // No snapshot file written.
         let err = diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            false,
-            None,
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                ..DiffArgs::default()
+            },
         )
         .unwrap_err();
         assert!(
@@ -1144,12 +1553,11 @@ mod tests {
         let before = std::fs::read_to_string(&snapshot_path).expect("snapshot before");
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            None,
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                ..DiffArgs::default()
+            },
         )
         .expect("no-op diff ok");
         assert!(
@@ -1161,6 +1569,238 @@ mod tests {
             before, after,
             "a no-op diff must leave the snapshot byte-for-byte unchanged"
         );
+    }
+
+    #[test]
+    fn write_migration_with_renamed_from_renames_and_advances_snapshot() {
+        let models = r#"
+            #[autumn_web::model(managed)]
+            #[renamed_from("posts")]
+            pub struct Article {
+                #[id]
+                pub id: i64,
+                #[renamed_from("title")]
+                pub headline: String,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        diff_at(
+            root.path(),
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("rename_posts"),
+                ..DiffArgs::default()
+            },
+        )
+        .expect("a rename needs no --allow-destructive");
+
+        let migrations = root.path().join("migrations");
+        let dirs: Vec<_> = std::fs::read_dir(&migrations)
+            .expect("read migrations dir")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(dirs.len(), 1, "{dirs:?}");
+        let up = std::fs::read_to_string(dirs[0].join("up.sql")).expect("up.sql");
+        assert_eq!(
+            up.trim(),
+            "ALTER TABLE posts RENAME TO articles;\n\n\
+             ALTER TABLE articles RENAME COLUMN title TO headline;"
+        );
+
+        let snapshot_path = root.path().join(".autumn/schema-snapshot.json");
+        let advanced = snapshot::load_snapshot(&snapshot_path).expect("load snapshot");
+        let names: Vec<&str> = advanced.tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["articles"]);
+        assert!(
+            advanced.tables[0]
+                .columns
+                .iter()
+                .any(|c| c.name == "headline")
+        );
+
+        // The hints stay in the source; the next diff is a no-op.
+        diff_at(
+            root.path(),
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("again"),
+                ..DiffArgs::default()
+            },
+        )
+        .expect("second diff");
+        assert_eq!(std::fs::read_dir(&migrations).expect("read").count(), 1);
+    }
+
+    #[test]
+    fn snapshot_drift_sees_replay_only_facets_both_ways() {
+        let mut posts = autumn_schema_core::Table::new("posts", Backend::Postgres);
+        posts
+            .columns
+            .push(Column::new("id", autumn_schema_core::ColumnType::Int64));
+        assert_eq!(snapshot_drift(&[posts.clone()], &[posts.clone()]), None);
+
+        // A hand-written CHECK in the migrations that the snapshot lacks.
+        let mut replayed = posts.clone();
+        replayed.checks.push(autumn_schema_core::CheckConstraint {
+            name: Some("id_positive".to_owned()),
+            expression: "id > 0".to_owned(),
+        });
+        let text = snapshot_drift(&[posts.clone()], &[replayed.clone()]).expect("drift");
+        assert!(text.contains("id_positive"), "{text}");
+        // And the other way: the snapshot has it, the migrations do not.
+        let text = snapshot_drift(&[replayed], &[posts]).expect("drift");
+        assert!(text.contains("id_positive"), "{text}");
+    }
+
+    #[test]
+    fn a_new_table_or_rename_on_a_replayed_view_name_is_refused() {
+        let others: std::collections::BTreeSet<String> =
+            ["report".to_owned(), "posts_id_seq".to_owned()].into();
+        let plan = |change| MigrationPlan {
+            backend: Backend::Postgres,
+            changes: vec![change],
+        };
+        let create = plan(SchemaChange::CreateTable(autumn_schema_core::Table::new(
+            "report",
+            Backend::Postgres,
+        )));
+        assert!(relation_clash(&create, &[], &others).is_some_and(|e| e.contains("report")));
+        let rename = plan(SchemaChange::RenameTable {
+            from: "old".to_owned(),
+            to: "posts_id_seq".to_owned(),
+        });
+        assert!(relation_clash(&rename, &[], &others).is_some());
+        let mut with_index = autumn_schema_core::Table::new("new_table", Backend::Postgres);
+        with_index.indexes.push(autumn_schema_core::Index::new(
+            "report",
+            vec!["id".to_owned()],
+            false,
+        ));
+        assert!(
+            relation_clash(&plan(SchemaChange::CreateTable(with_index)), &[], &others).is_some()
+        );
+        let fine = plan(SchemaChange::RenameTable {
+            from: "old".to_owned(),
+            to: "new".to_owned(),
+        });
+        assert_eq!(relation_clash(&fine, &[], &others), None);
+    }
+
+    #[test]
+    fn a_new_index_named_like_a_baseline_index_on_another_table_is_refused() {
+        use autumn_schema_core::{Index, Table};
+        let mut audit = Table::new("audit", Backend::Postgres);
+        audit
+            .indexes
+            .push(Index::new("idx_reports_slug", vec!["x".to_owned()], false));
+        let baseline = vec![audit, Table::new("reports", Backend::Postgres)];
+        let none = std::collections::BTreeSet::new();
+        let add = |name: &str| SchemaChange::AddIndex {
+            table: "reports".to_owned(),
+            index: Index::new(name, vec!["slug".to_owned()], false),
+        };
+        let plan = |changes| MigrationPlan {
+            backend: Backend::Postgres,
+            changes,
+        };
+        let err =
+            relation_clash(&plan(vec![add("idx_reports_slug")]), &baseline, &none).expect("clash");
+        assert!(
+            err.contains("idx_reports_slug") && err.contains("already"),
+            "{err}"
+        );
+        // A table name is taken too.
+        assert!(relation_clash(&plan(vec![add("audit")]), &baseline, &none).is_some());
+        // A replaced index (dropped before its re-add) frees its name.
+        let replaced = plan(vec![
+            SchemaChange::DropIndex {
+                table: "audit".to_owned(),
+                index: Index::new("idx_reports_slug", vec!["x".to_owned()], false),
+            },
+            add("idx_reports_slug"),
+        ]);
+        assert_eq!(relation_clash(&replaced, &baseline, &none), None);
+        assert_eq!(
+            relation_clash(&plan(vec![add("idx_new")]), &baseline, &none),
+            None
+        );
+        // Names match case-insensitively (SQLite resolves them that way).
+        let mixed: std::collections::BTreeSet<String> = ["Reports".to_owned()].into();
+        let create = plan(vec![SchemaChange::CreateTable(Table::new(
+            "reports",
+            Backend::Sqlite,
+        ))]);
+        assert!(relation_clash(&create, &[], &mixed).is_some());
+        assert!(relation_clash(&plan(vec![add("IDX_REPORTS_SLUG")]), &baseline, &none).is_some());
+        // Two targets in one plan cannot share a name either.
+        let twice = plan(vec![
+            SchemaChange::RenameIndex {
+                table: "reports".to_owned(),
+                from: "idx_old".to_owned(),
+                index: Index::new("idx_users_mails", vec!["x".to_owned()], false),
+            },
+            SchemaChange::CreateTable(Table::new("idx_users_mails", Backend::Postgres)),
+        ]);
+        assert!(
+            relation_clash(&twice, &baseline, &none).is_some_and(|e| e.contains("idx_users_mails"))
+        );
+    }
+
+    #[test]
+    fn dev_url_makes_the_snapshot_optional() {
+        let root = scaffold_project(POST_MODEL, "unused");
+        std::fs::remove_file(root.path().join(".autumn/schema-snapshot.json")).expect("rm");
+        let err = diff_at(
+            root.path(),
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                dev_url: Some("postgres://user:pw_do_not_leak@127.0.0.1:1/dev"),
+                ..DiffArgs::default()
+            },
+        )
+        .unwrap_err();
+        assert!(!err.contains("autumn schema snapshot"), "{err}");
+        assert!(
+            err.contains("127.0.0.1") && !err.contains("pw_do_not_leak"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_dev_url_reads_names_that_differ_only_in_case_as_the_model_names() {
+        let root = scaffold_project(POST_MODEL, "unused");
+        std::fs::remove_file(root.path().join(".autumn/schema-snapshot.json")).expect("rm");
+        let init = root.path().join("migrations/20000101000000_init");
+        std::fs::create_dir_all(&init).expect("mkdir");
+        std::fs::write(
+            init.join("up.sql"),
+            "CREATE TABLE \"Posts\" (id INTEGER PRIMARY KEY AUTOINCREMENT, \
+             \"Title\" TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+        )
+        .expect("up.sql");
+        std::fs::write(init.join("down.sql"), "DROP TABLE \"Posts\";").expect("down.sql");
+        diff_at(
+            root.path(),
+            &DiffArgs {
+                backend: Some(BackendArg::Sqlite),
+                dev_url: Some("sqlite::memory:"),
+                write_migration: true,
+                ..DiffArgs::default()
+            },
+        )
+        .expect("`Posts` and `Title` are the model's `posts` and `title`");
+        let written: Vec<String> = std::fs::read_dir(root.path().join("migrations"))
+            .expect("migrations")
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (!p.ends_with("20000101000000_init"))
+                    .then(|| std::fs::read_to_string(p.join("up.sql")).unwrap_or_default())
+            })
+            .collect();
+        assert!(written.is_empty(), "no new migration: {written:?}");
     }
 
     #[test]
@@ -1178,12 +1818,12 @@ mod tests {
         let root = scaffold_project(models, &posts_snapshot("Postgres"));
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("add_body"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("add_body"),
+                ..DiffArgs::default()
+            },
         )
         .expect("write migration ok");
 
@@ -1271,12 +1911,12 @@ mod tests {
 
         let result = diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("add_body"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("add_body"),
+                ..DiffArgs::default()
+            },
         );
 
         // Restore permissions so the tempdir can be cleaned up (and the migrations
@@ -1328,12 +1968,12 @@ mod tests {
         // Generate change A. The snapshot advances to include `body`.
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("add_body"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("add_body"),
+                ..DiffArgs::default()
+            },
         )
         .expect("write migration A ok");
 
@@ -1357,12 +1997,12 @@ mod tests {
         // migration directory is written (the snapshot already matches).
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("add_body_again"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("add_body_again"),
+                ..DiffArgs::default()
+            },
         )
         .expect("second (converged) diff ok");
         let dir_count = std::fs::read_dir(root.path().join("migrations"))
@@ -1394,12 +2034,12 @@ mod tests {
 
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            true,
-            Some("add_draft"),
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                write_migration: true,
+                name: Some("add_draft"),
+                ..DiffArgs::default()
+            },
         )
         .expect("write migration B (draft) ok");
 
@@ -1429,6 +2069,253 @@ mod tests {
             !up.contains("body"),
             "the second migration must NOT re-generate the already-added `body`: {up}"
         );
+    }
+
+    // -- `src/schema.rs` sync (Decision 1) -----------------------------------
+
+    /// The `posts` block that `POST_MODEL` renders.
+    const POSTS_BLOCK: &str = "diesel::table! {
+    posts (id) {
+        id -> Int8,
+        title -> Text,
+        created_at -> Timestamp,
+    }
+}
+";
+
+    fn write_schema_rs(root: &Path, text: &str) -> PathBuf {
+        let path = root.join(schema_rs::SCHEMA_RS_PATH);
+        std::fs::write(&path, text).expect("schema.rs");
+        path
+    }
+
+    fn write_args<'a>() -> DiffArgs<'a> {
+        DiffArgs {
+            backend: Some(BackendArg::Pg),
+            write_migration: true,
+            ..DiffArgs::default()
+        }
+    }
+
+    #[test]
+    fn write_migration_writes_the_new_column_to_schema_rs() {
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let path = write_schema_rs(root.path(), POSTS_BLOCK);
+        diff_at(root.path(), &write_args()).expect("write migration ok");
+        let schema = std::fs::read_to_string(path).expect("schema.rs");
+        assert!(
+            schema.contains("        body -> Nullable<Text>,\n"),
+            "{schema}"
+        );
+    }
+
+    #[test]
+    fn write_migration_removes_the_block_of_a_dropped_table() {
+        let root = scaffold_project("", &posts_snapshot("Postgres"));
+        let path = write_schema_rs(
+            root.path(),
+            &format!(
+                "{POSTS_BLOCK}\ndiesel::table! {{\n    users (id) {{\n        id -> Int8,\n    }}\n}}\n"
+            ),
+        );
+        diff_at(
+            root.path(),
+            &DiffArgs {
+                allow_destructive: true,
+                ..write_args()
+            },
+        )
+        .expect("drop ok");
+        let schema = std::fs::read_to_string(path).expect("schema.rs");
+        assert!(!schema.contains("posts"), "{schema}");
+        assert!(schema.contains("users (id)"), "{schema}");
+    }
+
+    #[test]
+    fn a_no_op_write_migration_still_syncs_a_stale_schema_rs() {
+        let root = scaffold_project(POST_MODEL, &posts_snapshot("Postgres"));
+        let snapshot_path = root.path().join(SNAPSHOT_DEFAULT_PATH);
+        let before = std::fs::read_to_string(&snapshot_path).expect("snapshot");
+        let path = write_schema_rs(
+            root.path(),
+            "diesel::table! {\n    posts (id) {\n        id -> Int8,\n    }\n}\n",
+        );
+        diff_at(root.path(), &write_args()).expect("no-op ok");
+        assert_eq!(
+            std::fs::read_to_string(path).expect("schema.rs"),
+            POSTS_BLOCK
+        );
+        assert!(!root.path().join("migrations").exists());
+        assert_eq!(std::fs::read_to_string(&snapshot_path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_preview_diff_and_a_missing_schema_rs_write_no_schema_rs() {
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let path = write_schema_rs(root.path(), POSTS_BLOCK);
+        diff_at(
+            root.path(),
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                ..DiffArgs::default()
+            },
+        )
+        .expect("preview ok");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), POSTS_BLOCK);
+
+        // No `src/schema.rs`: the command does not make one.
+        std::fs::remove_file(&path).unwrap();
+        diff_at(root.path(), &write_args()).expect("write ok");
+        assert!(!path.exists());
+    }
+
+    /// Adding `managed` to a model records it in the snapshot, so a later
+    /// delete of the model drops the table.
+    #[test]
+    fn adopting_a_model_records_it_as_managed_in_the_snapshot() {
+        let root = scaffold_project(
+            POST_MODEL,
+            &posts_snapshot("Postgres").replace("\"managed\": true", "\"managed\": false"),
+        );
+        diff_at(root.path(), &write_args()).expect("adopt ok");
+        let snapshot =
+            snapshot::load_snapshot(&root.path().join(SNAPSHOT_DEFAULT_PATH)).expect("load");
+        assert!(snapshot.tables[0].managed, "{:?}", snapshot.tables[0]);
+        assert!(!root.path().join("migrations").exists());
+    }
+
+    /// An edit to the macros alone (the dropped table has no block) is
+    /// written.
+    #[test]
+    fn a_macro_only_schema_rs_change_is_written() {
+        let root = scaffold_project("", &posts_snapshot("Postgres"));
+        let path = write_schema_rs(
+            root.path(),
+            "diesel::allow_tables_to_appear_in_same_query!(posts, users);\n",
+        );
+        diff_at(
+            root.path(),
+            &DiffArgs {
+                allow_destructive: true,
+                ..write_args()
+            },
+        )
+        .expect("drop ok");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "");
+    }
+
+    /// A `src/schema.rs` that exists but cannot be read stops the command
+    /// before it writes anything.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_schema_rs_stops_the_command_before_any_write() {
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let snapshot_path = root.path().join(SNAPSHOT_DEFAULT_PATH);
+        let before = std::fs::read_to_string(&snapshot_path).expect("snapshot");
+        // A directory at the path: reading it fails with an error that is
+        // not "not found", also as root.
+        std::fs::create_dir_all(root.path().join(schema_rs::SCHEMA_RS_PATH)).unwrap();
+        let err = diff_at(root.path(), &write_args()).unwrap_err();
+        assert!(err.contains("schema.rs"), "{err}");
+        assert!(!root.path().join("migrations").exists());
+        assert_eq!(std::fs::read_to_string(&snapshot_path).unwrap(), before);
+    }
+
+    /// A `src/schema.rs` the sync cannot edit into valid Rust is left as is;
+    /// the migration and the snapshot still advance.
+    #[test]
+    fn an_update_that_would_not_parse_is_not_written() {
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let broken = "diesel::table! {\n    posts (id) {\n        id -> Int8,\n";
+        let path = write_schema_rs(root.path(), broken);
+        diff_at(root.path(), &write_args()).expect("write ok");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), broken);
+        assert!(root.path().join("migrations").exists());
+    }
+
+    /// `--dev-url --write-migration` with no snapshot and no SQL change
+    /// still creates the snapshot from the replayed baseline, with the new
+    /// managed flags.
+    #[test]
+    fn an_empty_dev_url_write_creates_the_snapshot() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let snapshot_path = root.path().join(SNAPSHOT_DEFAULT_PATH);
+        let desired = parse::parse_model_source(POST_MODEL, Backend::Postgres).expect("parse");
+        let mut baseline = desired.tables.clone();
+        baseline[0].managed = false;
+        let adopted = adopted_snapshot(None, &baseline, Backend::Postgres, &desired);
+        commit_empty_plan(&snapshot_path, adopted.as_ref(), None, &|_, _| Ok(())).expect("commit");
+        let written = snapshot::load_snapshot(&snapshot_path).expect("snapshot");
+        assert!(written.tables[0].managed, "{:?}", written.tables);
+    }
+
+    /// A failed `schema.rs` write leaves the migration and the snapshot as
+    /// they were before the command.
+    #[test]
+    fn write_migration_rolls_back_on_schema_rs_write_failure() {
+        let models = r#"
+            #[autumn_web::model(managed)]
+            pub struct Post {
+                #[id]
+                pub id: i64,
+                pub title: String,
+                pub body: Option<String>,
+            }
+        "#;
+        let root = scaffold_project(models, &posts_snapshot("Postgres"));
+        let snapshot_path = root.path().join(SNAPSHOT_DEFAULT_PATH);
+        let before = std::fs::read_to_string(&snapshot_path).expect("snapshot");
+        let path = write_schema_rs(root.path(), POSTS_BLOCK);
+        let err = diff_at_with(root.path(), &write_args(), &|_, _| {
+            Err(std::io::Error::other("disk full"))
+        })
+        .unwrap_err();
+        assert!(
+            err.contains("schema.rs") && err.contains("disk full"),
+            "{err}"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(root.path().join("migrations"))
+            .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(leftover.is_empty(), "{leftover:?}");
+        assert_eq!(std::fs::read_to_string(&snapshot_path).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), POSTS_BLOCK);
     }
 
     /// Round 3 / Finding X: a second `--write-migration` resolving to an
@@ -1547,12 +2434,10 @@ mod tests {
         let root = scaffold_project(models, &posts_snapshot("Postgres"));
         let err = diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            false,
-            None,
-            false,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                ..DiffArgs::default()
+            },
         )
         .unwrap_err();
         assert!(
@@ -1563,12 +2448,11 @@ mod tests {
         // With the flag it succeeds (prints the plan).
         diff_at(
             root.path(),
-            None,
-            None,
-            Some(BackendArg::Pg),
-            false,
-            None,
-            true,
+            &DiffArgs {
+                backend: Some(BackendArg::Pg),
+                allow_destructive: true,
+                ..DiffArgs::default()
+            },
         )
         .expect("allowed with --allow-destructive");
     }

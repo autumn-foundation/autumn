@@ -39,6 +39,7 @@ showcasing the framework's major features in a single cohesive application.
 | **No-JavaScript fallbacks** (forms and pagination carry no `hx-*` attributes; vote and comment controls degrade to form POSTs) | `routes/posts.rs`, `routes/subreddits.rs`, `routes/layout.rs` |
 | **Failure capsules** (record a failing request, replay it offline with `autumn replay`) | `autumn-capsules.toml`, `capsules/`, `tests/failure_capsule.rs` |
 | **Deterministic simulation testing** (`#[sim_test]`, virtual clock, `always!` / `sometimes!`) | `tests/sim_hot_rank.rs` |
+| **DST nightly**: a seed sweep of the whole app, with a gate that it calls each public sim function | `tests/sim_nightly.rs`, `src/vote_core.rs` |
 
 ## Prerequisites
 
@@ -228,6 +229,29 @@ zero) and `sometimes!` for reachability, with an explicit
 `assert_all_sometimes_satisfied()` so a green run is provably non-vacuous. See
 [`docs/guide/simulation-testing.md`](../../docs/guide/simulation-testing.md).
 
+### The DST nightly
+
+`tests/sim_nightly.rs` runs one full scenario per seed:
+
+- votes that race, through the real vote rule in `src/vote_core.rs` (which
+  `routes/votes.rs` also uses),
+- posts that age in virtual time, jobs and the scheduled rank sweep,
+- replicas with skewed clocks, and a crash,
+- a webhook over `SimNet`, an LLM stub and SMTP faults.
+
+The `sim-nightly.yml` workflow sweeps 4,000,000 seeds each night.
+
+```bash
+cargo test -p reddit-clone --release --test sim_nightly                 # 8 seeds and the guard tests
+AUTUMN_SIM_SEEDS=10000 cargo test -p reddit-clone --release --test sim_nightly \
+    -- --nocapture sim_nightly_sweep                                     # about 45 seeds/s per core
+```
+
+The nightly found one bug on its first sweep. A replica clock that was more
+than 2 hours slow ranked a new post as NaN. Postgres raised an error on the
+same `POWER` in the scheduled rank `UPDATE`. `calculate_hot_rank` and its SQL
+now keep the age at 0 or more.
+
 ## Why This Example Uses Jobs Instead Of Harvest
 
 Autumn Harvest is still the companion workflow engine for durable, multi-step
@@ -329,7 +353,7 @@ curl -s http://localhost:3000/ | grep 'autumn-consent-banner'
 
 | Part | File | Guide |
 |------|------|-------|
-| `ChangesetForm` round-trip, re-rendering a 422 with the author's input | `src/routes/posts.rs` | [`forms.md`](../../docs/guide/forms.md) |
+| `ChangesetForm` round-trip, re-rendering a 422 with the author's input and a focused error summary (`error_summary` in `layout.rs`) | `src/routes/posts.rs` | [`forms.md`](../../docs/guide/forms.md) |
 | Typed accessible controls and their error wiring | `src/routes/posts.rs` | [`accessibility.md`](../../docs/guide/accessibility.md) |
 | Sanitized user-submitted Markdown post bodies | `src/routes/posts.rs` (`show`) | [`rich-text.md`](../../docs/guide/rich-text.md) |
 | Consent routes, the banner layer, the `analytics` gate | `src/routes/consent.rs`, `src/main.rs` | [`cookie-consent.md`](../../docs/guide/cookie-consent.md) |

@@ -146,6 +146,7 @@ fn page(title: &str, content: Markup) -> Markup {
 }
 
 #[get("/invoices/{id}")]
+#[public]
 pub async fn invoice_detail(id: Path<i64>, clock: Clock) -> Markup {
     let invoice = Invoice::demo(*id);
     let title = format!("Invoice #{}", invoice.id);
@@ -153,6 +154,7 @@ pub async fn invoice_detail(id: Path<i64>, clock: Clock) -> Markup {
 }
 
 #[get("/invoices/{id}/pdf")]
+#[public]
 pub async fn invoice_pdf(id: Path<i64>, clock: Clock) -> Pdf {
     let invoice = Invoice::demo(*id);
     let filename = format!("invoice-{}.pdf", invoice.id);

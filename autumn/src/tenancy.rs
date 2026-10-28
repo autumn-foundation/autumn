@@ -51,6 +51,19 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
     }
 }
 
+/// The tenant of the current task, or `""` when none is in scope.
+///
+/// Framework-owned per-principal tables (notifications, push) store this in a
+/// `tenant_id` column. `""` is the "no tenant" value, so an app without
+/// tenancy keeps a plain `NOT NULL DEFAULT ''` column.
+pub(crate) fn current_tenant_id() -> String {
+    CURRENT_TENANT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 // Helper to run in-test tenancy contexts
 pub async fn with_tenant<F, R>(tenant_id: String, future: F) -> R
 where
@@ -105,8 +118,20 @@ pub async fn extract_tenant_from_parts_with_domains(
     config: &crate::config::AutumnConfig,
     domains: Option<&crate::custom_domain::CustomDomainRegistry>,
 ) -> Result<String, crate::AutumnError> {
-    if let Some(tenant_id) = replayed_tenant() {
-        return Ok(tenant_id);
+    let replayed = replayed_tenant();
+    match &replayed {
+        ReplayedTenant::NoTape | ReplayedTenant::RecordedFailure | ReplayedTenant::Unchecked => {}
+        ReplayedTenant::Resolved(tenant_id) => return Ok(tenant_id.clone()),
+        // The capsule has no tenant lookup. Live resolution would succeed on
+        // input the recording never had, so fail closed (#2351 item 13).
+        ReplayedTenant::Unrecorded => {
+            return Err(crate::AutumnError::internal_server_error(
+                std::io::Error::other(
+                    "the replayed run resolved a tenant, which the capsule has no recording for; \
+                     live tenant resolution was not consulted",
+                ),
+            ));
+        }
     }
     // Only under `source = "subdomain"`, where the `Host` header is ALREADY the
     // tenant signal. Under `header`/`session`/`jwt` the tenant comes from a
@@ -119,49 +144,100 @@ pub async fn extract_tenant_from_parts_with_domains(
         && let Some(host) = request_host(parts)
         && let Some(tenant_id) = registry.tenant_for_host(&host)
     {
-        record_tenant(&tenant_id);
+        if matches!(replayed, ReplayedTenant::RecordedFailure) {
+            return Err(tenant_resolved_after_recorded_failure());
+        }
+        record_tenant(Some(&tenant_id));
         return Ok(tenant_id);
     }
-    // A capsule with no recorded tenant falls through to the real resolver.
-    // That is not a gap: the recorded request's headers are restored verbatim,
-    // so a run whose recorded failure *was* a tenant-resolution error
-    // reproduces that error instead of being handed a different 503 saying the
-    // capsule is too old.
+    // A recorded failed lookup runs the real resolver again. The recorded
+    // request's headers are restored verbatim, so a run whose recorded failure
+    // *was* a tenant-resolution error reproduces that error.
     let resolved = extract_tenant_from_parts_inner(parts, config).await;
-    if let Ok(tenant_id) = resolved.as_ref() {
-        record_tenant(tenant_id);
+    // The recording failed here. A lookup that now succeeds would run the
+    // request under a tenant production never had, so fail closed.
+    if matches!(replayed, ReplayedTenant::RecordedFailure) && resolved.is_ok() {
+        return Err(tenant_resolved_after_recorded_failure());
     }
+    // A failure is recorded too, so replay can tell it from a lookup the
+    // recording never made.
+    record_tenant(resolved.as_ref().ok().map(String::as_str));
     resolved
 }
 
 // The `capsule` module is behind the `reporting` feature, so both halves of the
 // seam have a no-op twin for builds without it.
 
+/// Log a lookup that resolved where the recording failed, and return the
+/// error that fails the run closed.
+fn tenant_resolved_after_recorded_failure() -> crate::AutumnError {
+    note_tenant_resolved_after_recorded_failure();
+    crate::AutumnError::internal_server_error(std::io::Error::other(
+        "the recorded tenant lookup failed, but the replayed run resolved a tenant",
+    ))
+}
+
+/// What a capsule replay says about the tenant lookup.
+enum ReplayedTenant {
+    /// No replay serves this task.
+    NoTape,
+    /// The recording resolved this tenant.
+    Resolved(String),
+    /// The recording tried and failed.
+    RecordedFailure,
+    /// The recording has no tenant lookup. The tape logged a divergence.
+    Unrecorded,
+    /// A v3 capsule with no tenant lookup. Resolve, and do not check.
+    Unchecked,
+}
+
 /// The tenant a capsule replay serves, when one is serving this task.
 #[cfg(feature = "reporting")]
-fn replayed_tenant() -> Option<String> {
-    crate::capsule::effects::current_tape().and_then(|tape| tape.tenant())
+fn replayed_tenant() -> ReplayedTenant {
+    use crate::capsule::effects::TenantVerdict;
+    let Some(tape) = crate::capsule::effects::current_tape() else {
+        return ReplayedTenant::NoTape;
+    };
+    match tape.tenant() {
+        TenantVerdict::Resolved(id) => ReplayedTenant::Resolved(id),
+        TenantVerdict::RecordedFailure => ReplayedTenant::RecordedFailure,
+        TenantVerdict::Unrecorded => ReplayedTenant::Unrecorded,
+        TenantVerdict::Unchecked => ReplayedTenant::Unchecked,
+    }
+}
+
+/// Log a tenant that resolved where the recording failed.
+#[cfg(feature = "reporting")]
+fn note_tenant_resolved_after_recorded_failure() {
+    if let Some(tape) = crate::capsule::effects::current_tape() {
+        tape.tenant_resolved_after_recorded_failure();
+    }
 }
 
 /// No capsule support compiled in: never a replay.
 #[cfg(not(feature = "reporting"))]
-const fn replayed_tenant() -> Option<String> {
-    None
+const fn note_tenant_resolved_after_recorded_failure() {}
+
+/// No capsule support compiled in: never a replay.
+#[cfg(not(feature = "reporting"))]
+const fn replayed_tenant() -> ReplayedTenant {
+    ReplayedTenant::NoTape
 }
 
-/// Tee the resolved tenant into the in-flight request's capsule.
+/// Tee the lookup's result into the in-flight request's capsule. `None` is a
+/// failed lookup.
 #[cfg(feature = "reporting")]
-fn record_tenant(tenant_id: &str) {
+fn record_tenant(tenant_id: Option<&str>) {
     if let Some(scope) = crate::capsule::current_scope() {
         scope.record_tenant(crate::capsule::TenantEffect {
-            id: Some(tenant_id.to_owned()),
+            id: tenant_id.map(ToOwned::to_owned),
         });
     }
 }
 
 /// No capsule support compiled in: nothing to record.
 #[cfg(not(feature = "reporting"))]
-const fn record_tenant(_tenant_id: &str) {}
+const fn record_tenant(_tenant_id: Option<&str>) {}
 
 /// The request's effective host, preferring the proxy-resolved one.
 ///
@@ -659,6 +735,21 @@ pub async fn tenancy_middleware(
     // automatically carries the resolved tenant id.
     crate::log::context::set_tenant_id(&tenant_id);
 
+    // Per-tenant bulkheads (#3072). The request permit lives until the
+    // response head is ready, as an admission permit does.
+    let bulkheads =
+        state.extension_or_insert_with(|| TenantBulkheads::from_config(&config.tenancy));
+    let acquired = bulkheads
+        .requests
+        .as_ref()
+        .map(|bulkhead| bulkhead.try_acquire(&tenant_id));
+    if matches!(acquired, Some(None)) {
+        state.metrics.record_tenant_request_rejection();
+        let origin = parts.headers.get(axum::http::header::ORIGIN);
+        return tenant_bulkhead_rejection(&tenant_id, &config.cors, origin);
+    }
+    let _request_permit = acquired.flatten();
+
     let request = Request::from_parts(parts, body);
     let tenant_id_clone = tenant_id.clone();
 
@@ -676,27 +767,78 @@ pub async fn tenancy_middleware(
                 .then(|| std::time::Duration::from_secs(config.tenancy.idle_ttl_secs)),
         )
     });
-    let handle = crate::tenant_cell::TenantCellHandle::new(
+    // The id goes in as an `Arc<str>`, so the clone for the body below, and
+    // the body's clone on every frame, copy no id.
+    let handle = crate::tenant_cell::TenantCellHandle::from_shared(
         (*registry).clone(),
-        tenant_id.clone(),
+        std::sync::Arc::from(tenant_id.as_str()),
         config.tenancy.quota_bytes,
     );
     let handle_for_body = Some(handle.clone());
 
-    let response = CURRENT_TENANT
-        .scope(
-            Some(tenant_id),
-            crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(handle), next.run(request)),
-        )
-        .await;
+    let run = crate::tenant_cell::CURRENT_TENANT_CELL.scope(Some(handle), next.run(request));
+    let response = match bulkheads.db.clone() {
+        Some(db) => {
+            CURRENT_TENANT
+                .scope(
+                    Some(tenant_id),
+                    crate::bulkhead::TENANT_DB_BULKHEAD.scope(db, run),
+                )
+                .await
+        }
+        None => CURRENT_TENANT.scope(Some(tenant_id), run).await,
+    };
 
     let (parts, body) = response.into_parts();
     let wrapped = TenantPropagatingBody {
         inner: body,
         tenant_id: tenant_id_clone,
         handle: handle_for_body,
+        db_bulkhead: bulkheads.db.clone(),
     };
     Response::from_parts(parts, axum::body::Body::new(wrapped))
+}
+
+/// The per-tenant bulkheads of an app (#3072), made once from
+/// `[tenancy]` and kept in the app state.
+struct TenantBulkheads {
+    /// `tenancy.max_concurrent_requests`.
+    requests: Option<std::sync::Arc<crate::bulkhead::TenantBulkhead>>,
+    /// `tenancy.max_db_connections`.
+    db: Option<std::sync::Arc<crate::bulkhead::TenantBulkhead>>,
+}
+
+impl TenantBulkheads {
+    fn from_config(config: &crate::config::TenancyConfig) -> Self {
+        let make = |max: usize| (max > 0).then(|| crate::bulkhead::TenantBulkhead::new(max));
+        Self {
+            requests: make(config.max_concurrent_requests),
+            db: make(config.max_db_connections),
+        }
+    }
+}
+
+/// The `503` for a request over its tenant's cap. Same shape as an
+/// admission shed: Problem Details, `Retry-After: 1` and the CORS headers.
+/// The tenancy layer runs outside `CorsLayer`, so it adds them itself.
+fn tenant_bulkhead_rejection(
+    tenant_id: &str,
+    cors: &crate::config::CorsConfig,
+    origin: Option<&axum::http::HeaderValue>,
+) -> Response {
+    tracing::debug!(tenant = %tenant_id, "tenant request cap reached");
+    let mut response = crate::AutumnError::service_unavailable_msg(
+        "Too many concurrent requests for this tenant; try again shortly.",
+    )
+    .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_static("1"),
+    );
+    if !cors.allowed_origins.is_empty() {
+        crate::router::mirror_cors_headers(cors, origin, &mut response);
+    }
+    response
 }
 
 pin_project! {
@@ -708,6 +850,9 @@ pin_project! {
         pub inner: B,
         pub tenant_id: String,
         pub handle: Option<crate::tenant_cell::TenantCellHandle>,
+        // The `tenancy.max_db_connections` bulkhead (#3072). A checkout
+        // while the body is polled counts against it.
+        pub db_bulkhead: Option<std::sync::Arc<crate::bulkhead::TenantBulkhead>>,
     }
 }
 
@@ -725,8 +870,13 @@ where
         let this = self.project();
         let tenant_id = this.tenant_id.clone();
         let handle = this.handle.clone();
+        let inner = this.inner;
         CURRENT_TENANT.sync_scope(Some(tenant_id), || {
-            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(handle, || this.inner.poll_frame(cx))
+            crate::tenant_cell::CURRENT_TENANT_CELL.sync_scope(handle, || match this.db_bulkhead {
+                Some(db) => crate::bulkhead::TENANT_DB_BULKHEAD
+                    .sync_scope(std::sync::Arc::clone(db), || inner.poll_frame(cx)),
+                None => inner.poll_frame(cx),
+            })
         })
     }
 
@@ -830,6 +980,122 @@ mod tests {
     use super::*;
     use crate::security::ResolvedClientIdentity;
 
+    /// A body that takes a database permit each time it is polled (#3072).
+    struct PermitProbeBody {
+        outcome: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    impl HttpBody for PermitProbeBody {
+        type Data = bytes::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            let rejected = crate::bulkhead::acquire_db_permit().is_err();
+            *self.outcome.lock().unwrap() = Some(rejected);
+            Poll::Ready(None)
+        }
+    }
+
+    /// A streaming body is in the database bulkhead too (#3072).
+    #[test]
+    fn a_streaming_body_poll_is_inside_the_db_bulkhead() {
+        let bulkhead = crate::bulkhead::TenantBulkhead::new(1);
+        let _held = bulkhead.try_acquire("acme").expect("the one permit");
+        let outcome = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut wrapped = TenantPropagatingBody {
+            inner: PermitProbeBody {
+                outcome: std::sync::Arc::clone(&outcome),
+            },
+            tenant_id: "acme".to_owned(),
+            handle: None,
+            db_bulkhead: Some(bulkhead),
+        };
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let _ = Pin::new(&mut wrapped).poll_frame(&mut cx);
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(true),
+            "the body's checkout counts against the tenant's cap"
+        );
+    }
+
+    /// The middleware clones the tenant-cell handle for the body, and the body
+    /// clones it on every frame: the clones share one tenant id.
+    #[test]
+    fn tenant_cell_handle_clones_share_one_tenant_id() {
+        let reg = crate::tenant_cell::TenantCellRegistry::new();
+        let handle =
+            crate::tenant_cell::TenantCellHandle::new(reg.clone(), "acme".to_owned(), 1_000);
+        let clone = handle.clone();
+        assert_eq!(clone.tenant_id(), "acme");
+        assert!(
+            std::ptr::eq(handle.tenant_id(), clone.tenant_id()),
+            "clones share the id"
+        );
+        let debug = format!("{clone:?}");
+        assert!(debug.contains("tenant_id: \"acme\""), "{debug}");
+
+        // The middleware's constructor keeps the caller's allocation.
+        let shared: std::sync::Arc<str> = std::sync::Arc::from("globex");
+        let from_shared = crate::tenant_cell::TenantCellHandle::from_shared(
+            reg,
+            std::sync::Arc::clone(&shared),
+            1_000,
+        );
+        assert!(std::ptr::eq(
+            from_shared.tenant_id().as_ptr(),
+            shared.as_ptr()
+        ));
+        assert_eq!(from_shared.cell().tenant_id(), "globex");
+    }
+
+    /// A handler runs inside the tenant's database bulkhead (#3072).
+    #[tokio::test]
+    async fn a_handler_is_inside_the_db_bulkhead() {
+        use tower::ServiceExt as _;
+        let state = crate::AppState::for_test();
+        let mut config = crate::config::AutumnConfig::default();
+        config.tenancy.enabled = true;
+        config.tenancy.source = "header".to_string();
+        config.tenancy.header_name = "x-tenant-id".to_string();
+        config.tenancy.max_db_connections = 1;
+        state.insert_extension(config);
+        let app = axum::Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async {
+                    let first = crate::bulkhead::acquire_db_permit();
+                    let second = crate::bulkhead::acquire_db_permit();
+                    let held = matches!(first, Ok(Some(_)));
+                    if held && second.is_err() {
+                        axum::http::StatusCode::OK
+                    } else {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                tenancy_middleware,
+            ))
+            .with_state(state);
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .header("x-tenant-id", "acme")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::OK,
+            "one permit, then a 503 for the same tenant"
+        );
+    }
+
     fn subdomain_config() -> crate::config::AutumnConfig {
         let mut c = crate::config::AutumnConfig::default();
         c.tenancy.enabled = true;
@@ -879,6 +1145,71 @@ mod tests {
         let mut parts = make_parts("tenant1.example.com");
         let result = extract_tenant_from_parts(&mut parts, &config).await;
         assert_eq!(result.unwrap(), "tenant1");
+    }
+
+    /// #2351 item 13: an active replay tape with no tenant entry fails closed.
+    /// Live resolution would succeed here, and the run would depend on input
+    /// the recording never had.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_replay_with_no_recorded_tenant_fails_closed() {
+        let config = subdomain_config();
+        let mut parts = make_parts("tenant1.example.com");
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects::default(),
+        ));
+        let result = crate::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            extract_tenant_from_parts(&mut parts, &config),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// Review fix: a lookup the recording saw fail must not succeed on replay.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_recorded_failure_that_now_resolves_fails_closed() {
+        let config = subdomain_config();
+        let mut parts = make_parts("tenant1.example.com");
+        let tape = std::sync::Arc::new(crate::capsule::ReplayEffects::new(
+            crate::capsule::CapsuleEffects {
+                tenant: Some(crate::capsule::TenantEffect { id: None }),
+                ..crate::capsule::CapsuleEffects::default()
+            },
+        ));
+        let result = crate::capsule::with_effect_tape(
+            std::sync::Arc::clone(&tape),
+            extract_tenant_from_parts(&mut parts, &config),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(tape.divergences().len(), 1);
+    }
+
+    /// #2351 item 13: capture records a failed lookup, so replay can tell it
+    /// from a lookup the recording never made.
+    #[cfg(feature = "reporting")]
+    #[tokio::test]
+    async fn a_failed_tenant_lookup_is_recorded() {
+        let config = subdomain_config();
+        let mut parts = make_parts("example.com");
+        let scope = std::sync::Arc::new(crate::capsule::CaptureScope::new(
+            "tenant-test".to_owned(),
+            std::sync::Arc::new(crate::capsule::CaptureSettings::default()),
+            std::sync::Arc::new(crate::log::filter::ParameterFilter::default()),
+        ));
+        let result = crate::capsule::capture::with_capture_scope(
+            std::sync::Arc::clone(&scope),
+            extract_tenant_from_parts(&mut parts, &config),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(
+            scope.effects_snapshot().tenant,
+            Some(crate::capsule::TenantEffect { id: None })
+        );
     }
 
     /// When `ResolvedClientIdentity.host` is present, subdomain mode uses it instead

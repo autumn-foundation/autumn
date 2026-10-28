@@ -100,7 +100,8 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 |------|------|----------------|
 | `generated_project_compiles_runs_and_serves` | `e2e.rs` | `autumn new` → `cargo build` + HTTP responses |
 | `generated_scaffold_cargo_checks` | `generate.rs` | `generate scaffold` → `cargo check --tests` |
-| `generated_sqlite_scaffold_cargo_checks` | `generate.rs` | SQLite-configured scaffold (`Uuid`/`decimal`/`enum`/`DateTime`/`Attachment`/`json`) → `cargo check`. Not `--all-targets`: the scaffold smoke test is Postgres-only until #1905 (#1924) |
+| `generated_sqlite_scaffold_cargo_checks` | `generate.rs` | SQLite-configured scaffold (`Uuid`/`decimal`/`enum`/`DateTime`/`Attachment`/`json`) plus an `--id uuid` model → `cargo check` (#1924, #2555) |
+| `generated_sqlite_scaffold_smoke_tests_pass` | `generate.rs` | SQLite-configured HTML and `--api` scaffolds → `cargo test --tests`. The generated smoke tests run on the SQLite `TestDb` (#2555) |
 | `generated_scaffold_config_cargo_checks` | `generate.rs` | config-driven scaffold → `cargo check --tests` |
 | `generated_scaffold_serves_posts_index_and_json_api` | `generate.rs` | scaffold + Postgres migrations + live HTTP |
 | `generated_constrained_scaffold_enforces_validation_end_to_end` | `generate.rs` | scaffold DSL `{…}` constraints + Postgres + live HTTP: rendered HTML5 attributes, 422 + inline errors, nothing stored (#1388) |
@@ -108,6 +109,7 @@ code that **compiles, boots, and serves**. The tests that prove this live in
 | `console_playground_target_compiles_with_a_repository_round_trip` | `integration/console.rs` | playground + `repo.find_all()` → `cargo check --bin playground` |
 | `console_run_exits_non_zero_when_the_database_is_unreachable` | `integration/console.rs` | `autumn console` propagates config/connection failures non-zero |
 | `console_run_surfaces_a_compile_error_in_the_playground` | `integration/console.rs` | a broken playground edit surfaces cargo diagnostics, non-zero |
+| `console_repl_runs_and_reports_errors_as_script_errors` | `integration/console.rs` | `autumn console --repl` builds with Rhai, answers piped lines, a failed read is a script error |
 | `encrypted_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` scaffold → `cargo check --tests` |
 | `encrypted_api_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--api` → `cargo check --tests` |
 | `encrypted_live_scaffold_cargo_checks` | `integration/scaffold_encrypted.rs` | `{encrypted}` + `--live` → `cargo check --tests` |
@@ -820,24 +822,24 @@ RustSec advisory sits in the tree being published. Run it locally exactly as CI
 does:
 
 ```bash
-./scripts/check-advisories.sh              # workspace, sqlite, scaffold, fuzz, island-flock graphs
+./scripts/check-advisories.sh              # workspace, sqlite, generated apps, fuzz, island-flock graphs
 ./scripts/check-advisories.sh --self-test  # prove the gate still rejects a CVE
 ```
 
-It audits a third graph beyond the two above: `autumn-web` under the `deny.toml`
-that `autumn new` writes into a generated app (`autumn-cli/src/templates/deny.toml.tmpl`),
-so an advisory the scaffold's shipped waiver set does not cover fails here
-rather than in a user's first CI run. Its advisory-database fetch retries and
-**fails closed**; the audits then run `--offline`, so a failure always names an
-advisory rather than a network blip. `--self-test` audits a throwaway crate with
+The third graph is every `autumn new` flavor. The gate generates each one and
+audits it with its own shipped `deny.toml`
+(`autumn-cli/src/templates/deny.toml.tmpl`). An advisory that the waivers do
+not cover fails here, not in a user's first CI run. The gate retries the
+advisory-database fetch and **fails closed**. The audits then run `--offline`,
+so a failure always names an advisory, not a network error. `--self-test` audits a throwaway crate with
 a deliberately injected known-vulnerable dependency and requires the gate to
 reject it, then to accept it once — and only once — that id is waived.
 
 **Scope.** The gate covers the shipped root workspace — the default plus
 additive Postgres feature graph (`deny.toml`) and the mutually-exclusive sqlite
 backend graph (`deny-sqlite.toml`), including dev- and build-dependency
-licenses — plus, for advisories only, autumn-web's tree under the policy
-`autumn new` ships (`autumn-cli/src/templates/deny.toml.tmpl`). It also covers
+licenses — plus, for advisories only, every `autumn new` flavor, generated
+and audited with its own shipped `deny.toml`. It also covers
 the repository's separate *excluded* sub-workspaces — `fuzz/` and
 `examples/island-flock`, which each declare their own `[workspace]` and are
 excluded from the root `Cargo.toml` for their own build reasons (a

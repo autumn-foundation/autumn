@@ -1,0 +1,12 @@
+# Baseline: `query_decode` bench @ 8ecc0ca (release, valgrind 3.22 callgrind / dhat)
+# marginal = run(2000 iterations) - run(0); one iteration = one RICH + one SIMPLE decode
+callgrind Ir  run(0)    = 2,032,199
+callgrind Ir  run(2000) = 67,104,005
+callgrind Ir  marginal  = 65,071,806   (32,536 Ir/iteration)
+dhat blocks   run(0)    = 3,313        (185,654 bytes)
+dhat blocks   run(500)  = 36,313       (2,014,656 bytes)
+dhat blocks   marginal  = 66.0/iteration, 3,657 bytes/iteration
+# Self-cost: malloc/free family ~25%; Cow<[u8]>::from(PercentDecode) 10.0%;
+# query_string::insert 7.0%; form_urlencoded Parse::next 6.8%.
+# Alloc sites/iteration: Vec<String> first-push in insert() = 11 (17%); form_urlencoded decode = 15;
+# base.to_owned() = 13; value.into_owned() = 9.

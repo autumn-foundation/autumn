@@ -374,10 +374,9 @@ pub struct ReshapedRow {
 /// author is told. Publishing the wrong shape would be worse than publishing
 /// none, since a generated client acts on it.
 ///
-/// Only the SERIALIZE side matters here: this schema describes a response, and
-/// the generated API takes `New*` / `Update*` as request bodies. `from` /
-/// `try_from` (deserialize-side) and a split `rename_all` (whose serialize side
-/// is the one a response uses) therefore still register normally.
+/// Only the SERIALIZE side matters here: this schema describes a response. A
+/// request uses a separate schema (#2607). `into` changes only the serialize
+/// side, so the request schema still registers.
 #[test]
 fn a_reshaped_model_does_not_register_its_field_schema() {
     let registered =
@@ -386,6 +385,15 @@ fn a_reshaped_model_does_not_register_its_field_schema() {
         registered.is_none(),
         "`#[serde(into = ...)]` makes the field-by-field schema wrong, so it must not be \
          advertised: {registered:?}"
+    );
+
+    assert!(
+        autumn_web::openapi::registered_derived_schema_for(
+            std::any::type_name::<ReshapedRow>(),
+            autumn_web::openapi::SchemaDirection::Request,
+        )
+        .is_some(),
+        "`into` is serialize-only, so the request schema is accurate"
     );
 
     // The write companions do not inherit container attributes, so their
@@ -530,6 +538,44 @@ mod collision {
         pub raw: i64,
     }
 
+    /// Last segment `Decimal`, serializes as an object, derives nothing.
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct Decimal {
+        pub raw: ::std::string::String,
+    }
+
+    /// Same, for the `SQLite` wrapper names.
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct SqliteUuid {
+        pub raw: ::std::string::String,
+    }
+
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct SqliteDecimal {
+        pub raw: ::std::string::String,
+    }
+
+    #[derive(autumn_web::openapi::OpenApiSchema)]
+    #[allow(
+        dead_code,
+        reason = "fields give the derive a shape; nothing reads them"
+    )]
+    pub struct HoldsNumericCollisions {
+        pub price: Decimal,
+        pub wrapped_id: SqliteUuid,
+        pub wrapped_price: SqliteDecimal,
+        pub real: ::rust_decimal::Decimal,
+    }
+
     // `uuid::Uuid` carries no serde impls in this crate's feature set, so the
     // fixture derives the schema alone — which is all these tests exercise.
     // Every field below is written as the BARE name, exactly as a colliding
@@ -552,6 +598,26 @@ mod collision {
         /// The genuine `String`, for contrast.
         pub real_label: ::std::string::String,
     }
+}
+
+/// Same guard for the `Decimal` family (issue #2582): an application type that
+/// shares the name stays a `$ref`; the genuine `Decimal` stays a scalar.
+#[test]
+fn colliding_decimal_family_names_are_not_inlined_as_scalars() {
+    let schema =
+        <collision::HoldsNumericCollisions as autumn_web::openapi::OpenApiSchema>::schema();
+    for field in ["price", "wrapped_id", "wrapped_price"] {
+        let prop = &schema["properties"][field];
+        assert!(
+            prop.get("type").is_none(),
+            "{field} is not a scalar: {prop}"
+        );
+        assert!(prop.get("$ref").is_some(), "{field} keeps its $ref: {prop}");
+    }
+    assert!(
+        schema["properties"]["real"].get("$ref").is_none(),
+        "the genuine Decimal stays a scalar: {schema}"
+    );
 }
 
 /// `Option` and `Vec` are matched on the LAST PATH SEGMENT too, so an
@@ -993,7 +1059,7 @@ pub struct DeserAdapterRow {
 /// rule the container attributes follow, asked of the fields.
 ///
 /// `deserialize_with` is the control: it changes only what a request is parsed
-/// from, and this schema describes a response, so it still registers.
+/// from, so the response schema still registers and the request has none.
 #[test]
 fn a_field_serialization_adapter_blocks_registration() {
     let registered =
@@ -1009,6 +1075,14 @@ fn a_field_serialization_adapter_blocks_registration() {
             .is_some(),
         "`#[serde(deserialize_with)]` leaves the response shape alone, so the read schema is \
          still accurate and must still register"
+    );
+    assert!(
+        autumn_web::openapi::registered_derived_schema_for(
+            std::any::type_name::<DeserAdapterRow>(),
+            autumn_web::openapi::SchemaDirection::Request,
+        )
+        .is_none(),
+        "`#[serde(deserialize_with)]` changes the request shape, so no request schema"
     );
 }
 
@@ -1038,10 +1112,10 @@ pub struct ConditionalRow {
 
 /// The read schema keeps the property but must NOT require it.
 ///
-/// Sound because this schema describes a RESPONSE only — the generated API
-/// takes `New*` / `Update*` as request bodies, never the query struct. A
-/// response tripping the predicate omits `tags`, and a strict generated client
-/// would reject that response if the schema demanded it.
+/// Sound because this schema describes a RESPONSE only. A request uses a
+/// separate schema that requires `tags` (#2607). A response tripping the
+/// predicate omits `tags`, and a strict generated client would reject that
+/// response if the schema demanded it.
 ///
 /// `#[derive(OpenApiSchema)]` deliberately refuses this shape instead, because
 /// the same type there may be a `Json<T>` request and `skip_serializing_if`
@@ -1066,6 +1140,18 @@ fn read_schema_keeps_conditionally_omitted_field_but_does_not_require_it() {
     assert!(
         !required.contains(&"tags"),
         "a response may omit it, so a client must not demand it: {required:?}"
+    );
+
+    let request = autumn_web::openapi::registered_derived_schema_for(
+        std::any::type_name::<ConditionalRow>(),
+        autumn_web::openapi::SchemaDirection::Request,
+    )
+    .expect("request schema");
+    assert!(
+        request["required"]
+            .as_array()
+            .is_some_and(|r| r.iter().any(|v| v == "tags")),
+        "serde requires `tags` in a request: {request}"
     );
 }
 
@@ -1244,7 +1330,7 @@ fn model_shared_by_repository_and_handwritten_route_is_one_short_component() {
         .schemas
         .keys()
         .filter(|k| {
-            k.ends_with("Gadget") && k.as_str() != "NewGadget" && k.as_str() != "UpdateGadget"
+            k.contains("Gadget") && k.as_str() != "NewGadget" && k.as_str() != "UpdateGadget"
         })
         .collect();
     assert_eq!(

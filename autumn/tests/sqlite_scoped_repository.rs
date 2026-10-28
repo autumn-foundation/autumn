@@ -89,5 +89,5 @@ fn scope_apis_thread_runtime_connection_under_sqlite() {
     // type-checks above — compiled under `--features sqlite`, i.e. the scope
     // APIs now carry `&mut RuntimeConnection` (the SQLite wrapper) rather than a
     // hard-coded `&mut AsyncPgConnection`.
-    assert!(std::mem::size_of::<WidgetScope>() == 0);
+    assert_eq!(std::mem::size_of::<WidgetScope>(), 0);
 }

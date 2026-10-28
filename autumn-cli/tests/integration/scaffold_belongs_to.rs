@@ -58,8 +58,27 @@ fn select_loader_uses_title_display_column_heuristic() {
         "the loader must select the id + the `title` display column:\n{routes}"
     );
     assert!(
-        routes.contains(".map(|(id, label)| (id.to_string(), label))"),
+        routes.contains(
+            ".map(|(id, label)| (id.to_string(), if autumn_web::a11y::is_blank(&label) { id.to_string() } else { label }))"
+        ),
         "options must be labeled by the display value, not the id:\n{routes}"
+    );
+}
+
+#[test]
+fn select_loader_labels_a_blank_nullable_display_value_by_id() {
+    // A blank label gives an option with no name, and trips the
+    // `SelectOption::new` debug assert (#2666).
+    let (_tmp, routes) = belongs_to_routes(
+        "bt-null-title-app",
+        &["title:Option<String>"],
+        "post:references",
+    );
+    assert!(
+        routes.contains(
+            ".map(|(id, label)| (id.to_string(), label.filter(|label| !autumn_web::a11y::is_blank(label)).unwrap_or_else(|| id.to_string())))"
+        ),
+        "a blank or missing display value must fall back to the id:\n{routes}"
     );
 }
 

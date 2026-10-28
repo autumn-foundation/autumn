@@ -51,6 +51,7 @@
 
 pub mod artifact;
 pub mod capability;
+pub mod dynamic;
 pub mod grants;
 pub mod host;
 pub mod manifest;
@@ -73,12 +74,15 @@ pub use artifact::{
 pub use capability::{
     ActivitySummary, CacheKvStore, CallResult, CallValue, CapabilityCall, CapabilityEvent,
     CapabilityOutcome, CapabilityRateLimiter, CapabilityRuntime, CapabilityServices, DenialReason,
-    FragmentNode, JobSink, KvStore, MAX_DETAIL_CHARS, MAX_EVENTS, MAX_KV_KEY_BYTES, MAX_LOG_EVENTS,
-    MAX_OUTBOUND_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_RESULT_BYTES, MAX_ROW_BYTES,
-    MAX_ROW_COLUMNS, MAX_ROW_ID_BYTES, MAX_TARGET_CHARS, MAX_VALUE_TEXT_BYTES, MemoryJobSink,
-    MemoryKvStore, MemoryPluginStore, NO_TENANT, OutboundHttp, OutboundRequest, OutboundResponse,
-    PluginActivityLog, PluginJob, PluginRow, PluginStore, PluginValue, QueryPage, RecordingHttp,
-    RenderError, Scope, StoreError, bounded_rows, row_weight, tenant_segment,
+    DroppedCalls, FragmentNode, JobSink, KvStore, MAX_DETAIL_CHARS, MAX_EVENTS, MAX_KV_KEY_BYTES,
+    MAX_LOG_EVENTS, MAX_OUTBOUND_HEADERS, MAX_RESPONSE_HEADER_BYTES, MAX_RESULT_BYTES,
+    MAX_ROW_BYTES, MAX_ROW_COLUMNS, MAX_ROW_ID_BYTES, MAX_TARGET_CHARS, MAX_VALUE_TEXT_BYTES,
+    MemoryJobSink, MemoryKvStore, MemoryPluginStore, NO_TENANT, OutboundHttp, OutboundRequest,
+    OutboundResponse, PluginActivityLog, PluginJob, PluginRow, PluginStore, PluginValue, QueryPage,
+    RecordingHttp, RenderError, Scope, StoreError, bounded_rows, row_weight, tenant_segment,
+};
+pub use dynamic::{
+    MountError, MountedPluginInfo, PluginMounts, framework_prefixes, mounts_fallback,
 };
 pub use grants::{
     CapabilityGrants, CapabilityQuotas, ConsentDelta, MAX_GRANT_ENTRIES, MAX_GRANT_IDENT_LEN,
@@ -95,7 +99,10 @@ pub use manifest::{
     MAX_REQUEST_BODY_BYTES, MAX_REQUEST_BODY_TIMEOUT_MS, MAX_RESPONSE_BYTES, ManifestError,
     ResourceLimits, SandboxCapability, SandboxManifest, WIRE_VERSION,
 };
-pub use plugin::{SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin};
+pub use plugin::{
+    DEFAULT_GUEST_SLOTS, SANDBOX_ATTRIBUTION_HEADER, SandboxPluginError, SandboxedPlugin,
+    set_guest_slots,
+};
 pub use slots::{RenderSlots, SlotError};
 pub use wire::{
     ALLOWED_REQUEST_HEADERS, ALLOWED_RESPONSE_CONTENT_TYPES, ALLOWED_RESPONSE_HEADERS, OwnedRoutes,
@@ -120,7 +127,7 @@ pub fn __fuzz_read_artifact(bytes: &[u8]) -> bool {
 #[doc(hidden)]
 #[must_use]
 pub fn __fuzz_parse_guest_frame(line: &str) -> bool {
-    wire::from_line::<wire::GuestFrame>(line).is_ok()
+    wire::from_guest_line(line).is_ok()
 }
 
 /// Parse a manifest. Fuzzing seam; not a public API.

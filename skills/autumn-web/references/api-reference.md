@@ -1,12 +1,13 @@
-# autumn-web API Reference (0.8.0)
+# autumn-web API Reference (0.9.0)
 
 Use this file as a quick map for public names, features, dependency versions,
 and config keys. Verify against current source when exact code matters.
 
-Version identity: this reference tracks **0.8.0**, the current release line,
+Version identity: this reference tracks **0.9.0**, the current release line,
 which is also the version `trunk-dev` carries. Entries carry the release they
 arrived in: **(0.6.0)** is absent from 0.5.x, **(0.7.0)** is absent from 0.6.x and
-earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries predate 0.6.0.
+earlier, **(0.8.0)** is absent from 0.7.x and earlier, and **(0.9.0)** is absent
+from 0.8.x and earlier. Unmarked entries predate 0.6.0.
 
 ## Published crates
 
@@ -28,7 +29,7 @@ earlier, and **(0.8.0)** is absent from 0.7.x and earlier. Unmarked entries pred
 | `autumn-billing` | `autumn-billing/` | Stripe subscription billing plugin |
 
 All publishable crates share the `[workspace.package]` version and release
-together at `0.8.0`. This table lists the same crates, in the same order, as
+together at `0.9.0`. This table lists the same crates, in the same order, as
 `CRATES` in `scripts/check-publish-dry-run.sh` — that script is the executable
 copy of the publish order.
 
@@ -118,7 +119,7 @@ copy of the publish order.
 
 | Macro | Purpose |
 |---|---|
-| `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, and `seo(...)` |
+| `#[get]`, `#[post]`, `#[put]`, `#[patch]`, `#[delete]` | HTTP route handlers; optional args `name`, `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout = "off"`, `criticality` (`"critical"`, `"default"` or `"sheddable"`; admission class, #3068), and `seo(...)` |
 | `routes![...]` | Collect route handlers |
 | `#[autumn_web::main]` | Tokio runtime + Autumn profile bootstrap; optional runtime args `flavor` (`"multi_thread"` default / `"current_thread"`), `worker_threads`, `max_blocking_threads`, `thread_name`, `thread_stack_size`, `thread_keep_alive = "30s"`, and `configure = path::to::fn` — a `fn(&mut tokio::runtime::Builder)` run last, the escape hatch for `Builder` methods the args don't name (0.8.0). Numeric args take expressions, not only literals. No args = tokio defaults; an unknown/duplicate/zero arg, or `worker_threads` under `current_thread`, is a compile error |
 | `#[static_get]`, `static_routes![...]` | Static pre-render routes for `autumn build`; also accepts `params`, `revalidate`, and `seo(...)`. The `Content-Type` the handler declares is recorded per route in `dist/manifest.json` and served verbatim (0.8.0, #1832) — set it explicitly for non-HTML routes (`application/xml`, `application/rss+xml`) since the serve path no longer infers it from the route slug |
@@ -126,13 +127,13 @@ copy of the publish order.
 | `static_gen::StaticFileLayer::resolve_entry` → `ResolvedStatic` | Manifest lookup returning the file path **and** the ready-to-serve `Content-Type`; `resolve` is the file-path-only shorthand. `static_gen::resolved_content_type` is the decision function: recorded type → recognized route extension → served file name → `application/octet-stream` (0.8.0, #1832) |
 | `#[ws]` | WebSocket route handler (`ws`) |
 | `#[model]` | Diesel model derives (`db`) |
-| `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (#1716) |
+| `#[repository]` | CRUD repository and generated API (`db`); `mcp` / `mcp = "read"` expose the generated routes as MCP tools; `invalidates(path::to::cached_fn)` declares a cache-coherence invalidation edge proven by `autumn cache audit` (#1716); each generated write then drops those reads after it commits, with no manual call (#3056) |
 | `#[service]` | Service implementation scaffolding (`db`) |
 | `#[secured]` | Session auth and role guard |
 | `#[public]` | Marks a route handler as deliberately unauthenticated for the `autumn routes audit` coverage manifest — mirrors `#[secured]`, classifying the route `public` vs `gated`/`framework`/`unclassified` (0.6.0, #1604) |
 | `#[authorize]` | Record-level policy guard |
 | `#[api_doc]` | Route OpenAPI metadata |
-| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802) |
+| `#[derive(OpenApiSchema)]` | Field-accurate component schema for a plain `Query<T>` / `Json<T>` type, registered in the back-fill inventory so no `register_schema` call is needed. Named-field structs, and enums whose variants are all unit variants (a JSON string enum honoring `rename` / `rename_all` / `skip`). Generic types, tuple structs, data-carrying variants and non-default enum representations (`#[serde(tag/content/untagged)]`) are compile errors — write the impl by hand for those. `#[model]` types register themselves and need no derive (#802). Scalar fields (`Uuid`, `DateTime`, `NaiveDate`, `NaiveDateTime`, `Decimal`, `SqliteUuid`, `SqliteDecimal`) document as inline scalars, never `$ref`. `Decimal` is `string`/`decimal`, or `number` if serde writes a number (#2582) |
 | `#[oauth2_callback]` | OAuth2/OIDC callback route |
 | `#[cached]` | Memoize function results; `key(a, b)` narrows the cache key, `reads(Model, …)` declares the cache-coherence dependency set, `acknowledge_stale = "…"` opts out of the gate (#1716) |
 | `#[scheduled]`, `tasks![...]` | Recurring scheduled tasks |
@@ -348,7 +349,7 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `versioned`/`ledgered` does not compile against a classified model, and durable
   commit hooks refuse the payload at runtime — both snapshot the whole record.
   Generated: the field marker + `classify::ClassifiedField` impl (with a
-  `module_path!()`-qualified `MODEL_PATH`), a
+  `MODEL_PATH` made from `module_path!()` and the crate version), a
   `classify::manifest::ClassifiedFieldDescriptor` inventory registration, and
   `Model::__AUTUMN_CLASSIFIED_COLUMNS`. `autumn data-flow` emits the manifest.
   See `docs/guide/data-classification.md`.
@@ -386,6 +387,15 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `Model::__AUTUMN_CONFIDENTIAL_COLUMNS`. See
   `docs/guide/confidential-fields.md` for the threat model, including what
   sealing does not hide.
+- NUL byte (`0x00`) in text (issues #2423, #2439) — Postgres cannot store it.
+  `ChangesetForm` and `NestedChangesetForm` add a field error. The message is
+  `form::NUL_CHARACTER_FIELD_ERROR`. With an `i18n` bundle, they look up
+  `form::NUL_CHARACTER_MESSAGE_KEY` (`common.error.nul_character`) in the
+  request locale. A NUL that reaches the database is a `422`, for `TEXT` and
+  for `JSONB`. `error::is_nul_byte_violation` detects it. The generated
+  `#[repository(api = ...)]` create and update handlers name the field in
+  `errors[]`. `error::nul_byte_json_fields` finds the field in a JSON body.
+  See `docs/guide/forms.md`.
 - `#[normalize(trim, downcase, upcase, squish, strip_nul, with = path::to::fn)]` (issue
   #1379) — canonicalizes a `String` column, composing normalizers
   left-to-right. Built-ins live in `autumn_web::normalize`
@@ -400,8 +410,9 @@ from -> to: "guard", ...))]` field attribute on `String` fields, generating
   `#[normalize(downcase)]` with a `unique` column yields case-insensitive
   uniqueness. Non-`String` fields are a compile error (mirrors `#[encrypted]`).
   Generated hooks: `impl autumn_web::normalize::Normalize` on the model and
-  `NewX`; `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on
-  every model.
+  on every `NewX` (a no-op when the model has no `#[normalize]` columns);
+  `impl autumn_web::normalize::NormalizedModel` (`normalize_lookup`) on every
+  model.
 
 ## Repository-generated methods (`#[repository]`)
 
@@ -510,7 +521,11 @@ extractor across one. `autumn_web::commentable::router(cfg)` serves
 single mount; it authorizes the **tenant**, never the record, so an app with
 private records must set `CommentsConfig::authorize(...)`. Build a host page's
 own thread with `commentable::thread_dom_id`/`thread_action` so the router's
-re-render lands on the same element. See `docs/guide/commentable.md`.
+re-render lands on the same element. Pair the `nest` with
+`.declare_plugin_routes(commentable::route_infos("/comments"))` (trunk-dev):
+the nested router is opaque to `autumn routes audit`, which fails without it.
+`GET` is `public`; `POST` is `gated` with `provenance: "declared"`. See
+`docs/guide/commentable.md`.
 
 **(0.7.0)** — `#[votable]` reaction helpers (#1362): declaring
 `#[votable(by = User, aggregate = sum|count)]` on a `#[model]` emits a
@@ -593,7 +608,10 @@ So prefer a real nested type over the comma-separated-string and
 JSON-in-a-string workarounds. This is the same bracket syntax `ListQuery`'s
 `?filter[<col>]=<val>` already used, generalized to arbitrary objects,
 sequences and depths — and it applies to the **query string only**: `Form<T>`
-still decodes bodies through `serde_urlencoded`.
+still decodes bodies through `serde_urlencoded`. `ChangesetForm` and
+`NestedChangesetForm` bodies decode through `form::from_urlencoded` (issue
+#3394): a repeated key fills a `Vec`/`HashSet`/`Option<Vec>`, a repeat on a
+single-value field is a 422, and brackets stay part of the key.
 
 Behaviour worth knowing when writing handlers:
 
@@ -755,6 +773,21 @@ Free functions rendering changeset-aware, accessible inputs:
   `form.text_input(...)`).
 - **(0.6.0)**: `checkbox_input`, `number_input`, `date_input`,
   `datetime_input`, `select_input`.
+- **(0.9.0, #3395)**: `FieldOptions` + a `*_with` variant of each helper
+  (`text_input_with`, `text_input_htmx_with(.., url, token_field, &opts)`,
+  `password_input_with`, `textarea_input_with`, `checkbox_input_with`,
+  `number_input_with`, `date_input_with`, `datetime_input_with`,
+  `select_input_with`, `rich_text_area_with`, `rich_text_area_htmx_with`,
+  `RowScope::{text,number,textarea}_input_with`). `FieldOptions::new()
+  .hint(..).required().placeholder(..).autocomplete(..).inputmode(..)
+  .pattern(..).min(..).max(..).disabled().readonly().data(name, v).hx(name, v)`.
+  The hint is `{field}-hint`, named in `aria-describedby` before the error.
+  No setter for `id`/`name`/`class`/`aria-*`; the label stays positional.
+  Every control has a `required_*` helper (`required_password_input`,
+  `required_textarea_input`, `required_checkbox_input` added); a required
+  label shows an `aria-hidden` `*` marker. `FormFor::field_options(field,
+  FieldOptions)` sets options per field (a checkbox and a password take
+  `required` only from options).
 - **(0.6.0)**: `form_for(&changeset,
   action, method) -> FormFor` whole-form builder. Renders the opening
   `<form>` (audited CSRF injection + hidden `_method` override, as
@@ -821,6 +854,11 @@ primitives (`TextArea`, `Select` + `SelectOption`, `Checkbox`, `FileField`,
 - `MenuItem::new(name)` (renders `role="menuitem"` on a `<button>`; `.href(..)`
   switches to `<a>`); `.icon(markup)` (name ⇒ `aria-label`) / `.class(..)`.
   WCAG 4.1.2.
+- The types prove that a name is present, not that it holds text. An empty or
+  blank name (`Img::new(src, "")`, `.aria_label("")`, a blank
+  `RadioOption`/`SelectOption` label) trips a `debug_assert!` at the call site
+  (#2666). Give a name from data a fallback (`a11y::is_blank(text)` uses the
+  same rule); use `Img::decorative(src)` for an image with no information.
 
 ### Labeled-typestate form primitives (`TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` / `RadioGroup`)
 
@@ -860,7 +898,10 @@ Per-primitive setters (in addition to the shared set):
 - **`RadioGroup::new(name, first)`** — the first `RadioOption` is a constructor
   argument, so a group always has a choice; `.option(RadioOption)` /
   `.options(iter)`, `.checked_value(s)`, `.id_prefix(s)` (for the same group
-  rendered repeatedly). `RadioOption::new(value, label)`
+  rendered repeatedly). `.option` takes a built `RadioOption`, as `new` does;
+  `Select::option` takes the `(value, label)` pair. Choice ids are valid CSS
+  selectors: a first part that does not start with a letter after any
+  leading `_` gets one more `_` (`1plan` → `_1plan-…`). `RadioOption::new(value, label)`
   requires the choice label; `.checked()` / `.disabled()`. The group renders
   `<fieldset><legend>` (visible name) or `<div>` (ARIA name), both with
   `role="radiogroup"`; `aria-invalid` and `hx-*` land on each `<input>`,
@@ -976,7 +1017,10 @@ Per-primitive setters (in addition to the shared set):
   &AvatarConfig)` with `AvatarSize::{Small,Medium,Large}` (image or
   colored-initials fallback); `alert(AlertVariant, body)` / `alert_with(...,
   &AlertConfig)` with `AlertVariant::{Info,Success,Warning,Error}` and
-  `error_summary(&Changeset) -> Option<Markup>`. All prelude re-exported.
+  `error_summary(&Changeset) -> Option<Markup>` (each entry links to
+  `#field`; the root has `id="error-summary" tabindex="-1" autofocus`, so
+  focus moves to it on a failed submit — one per page). All prelude
+  re-exported.
 - `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
   `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
   `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
@@ -1035,7 +1079,28 @@ in **Typed accessible primitives** above.)
 
 `autumn_web::cache::{get_or_compute, get_or_compute_with,
 GetOrComputeOptions, CacheFillError, jittered_ttl}` — single-flight fills,
-optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)`.
+optional `.distributed_fill_lock(true)` / `.stale_while_revalidate(grace)` /
+`.stale_if_error(window)`. With `stale_if_error`, a failed fill serves the last
+value for up to `window` after it went stale (RFC 5861, #3056). A `MokaCache`
+must have no TTL, or a TTL of at least `ttl + window`.
+
+## Cache invalidation errors (#3056)
+
+- `Cache::invalidate_async(key)` / `Cache::invalidate_namespace_async(ns)`
+  return `Result<(), InvalidationError>`. Prefer them in async code: the sync
+  `invalidate` cannot report a failure.
+- `coherence::invalidate_namespace_async(ns)` and the generated
+  `invalidate_declared_caches_async()` return `false` when a sweep failed.
+- A final failure is logged with `warn!` and counted in
+  `autumn_cache_invalidation_failures_total`. Alert on it.
+- `RedisCache` retries with `InvalidationRetry` (default 3 attempts);
+  change it with `.with_invalidation_retry(InvalidationRetry::new(..))`.
+- `RedisCache` keeps a shared fill epoch per namespace (#2356).
+  `invalidate_namespace` raises it before the sweep, so a `true` is valid for
+  all replicas. It needs a Redis write (`INCR`), and `false` if that fails.
+  Fills made by `#[cached]` and `cache_fragment_in` use it. A custom backend
+  opts in with `Cache::shares_fill_epoch`, `Cache::fill_epoch` and
+  `Cache::insert_raw_bytes_if_epoch`.
 
 ## Downloads (0.6.0)
 
@@ -1134,6 +1199,9 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   `[jobs.queues]` weight table; tracked jobs (`job::enqueue_tracked`,
   `enqueue_tracked_for`, `TrackedJobHandle`, optional third `JobContext`
   handler arg, `GET /_autumn/jobs/{token}`, `jobs.tracking.*` config).
+- 0.9.0 (#3051): `timeout = "30s"` key and `jobs.default_timeout_ms`;
+  durable claims renew on a heartbeat; `JobContext::lease_lost()`,
+  `is_cancelled()`, `cancelled()`.
 
 ## Distributed locks (0.6.0)
 
@@ -1206,12 +1274,54 @@ to a downloadable PDF `IntoResponse` built on `Download`.
   step-up claim is stashed for the duration; a record whose recorded target no
   longer matches the session's effective user is stale and is ignored; an
   `auth.session_key` colliding with `RESERVED_SESSION_KEYS` is refused
-  (`is_reserved_session_key`).
+  (`is_reserved_session_key`). Extra identity keys (for example `user_email`)
+  swap only when `ImpersonationPolicy::target_session_values` returns them;
+  `end_impersonation` restores the operator's values.
   Admin UI: `AdminPlugin::with_impersonation(gate)`,
   `autumn_admin_plugin::{impersonation_banner_for, impersonation_banner,
   ImpersonationBanner, AdminImpersonation, IMPERSONATION_BANNER_CSS}`, routes
   `POST {prefix}/impersonate` (gated) and `POST {prefix}/impersonate/stop`
   (ungated on purpose). Session-based auth only.
+- **(#2347)**: session-rotation hooks —
+  `AppBuilder::on_session_rotation(|rotation| async move { /* rotation.old_id,
+  rotation.new_id, rotation.earlier_ids */ Ok(()) })` and `AppState::session_rotation_hooks()` run after a rotated
+  session is stored (not for a destroyed one). Use them to move state keyed by
+  the session id. Generated auth registers one for the tracked-session row.
+  `impersonation::rebind(&state, &session)` keeps a record across a trusted
+  same-user `rotate_id()`; never call it from a login flow. The rate-limit
+  principal is the operator while impersonating.
+
+## Idempotency keys (#3061)
+
+`Idempotency-Key` replay for mutating requests. See `docs/guide/idempotency.md`.
+
+- Enable with `AppBuilder::idempotent()` / `TestApp::idempotent()`, or
+  `[idempotency] enabled = true`.
+- Config `[idempotency]`: `backend` (`memory` | `redis` | `database`),
+  `ttl_secs` (response retention, default `86400`), `in_flight_ttl_secs`
+  (lock expiry after a crash or failed save, default `60`).
+- `backend = "database"` → `DbIdempotencyStore` (table
+  `autumn_idempotency_keys`, from `FRAMEWORK_MIGRATIONS`). For exactly-once
+  payments, take the `IdempotencyTx` extractor and call
+  `idem.commit(conn, response).await?` inside `db.tx(...)`; return the
+  response it gives back. A crash after the commit replays it; it is never
+  re-run. Use a primary `Db` connection, not a shard.
+- Multi-step handlers: `idem.set_recovery_point(conn, "step")` in a tx;
+  `idem.recovery_point(&mut db)` on retry. Another body with the same key
+  gets `422`.
+- `IdempotencyTx` methods are no-ops without a key or with another backend.
+- Scope: session, resolved tenant, and for token clients the bearer
+  principal. Mount `RequireApiToken` with `AppBuilder::layer` so the key uses
+  the verified principal (a rotated token still replays, and retries replay
+  instead of `409`). Without it and without a session, the key uses a digest
+  of the raw `Authorization` header. Fine for agent / MCP token APIs.
+- `#[post("/x", idempotent = false)]` (`RouteIdempotency::Off`) keeps the
+  layer off a route that dedupes by its own key, e.g. a durable workflow
+  route.
+- Custom store: implement the async `IdempotencyStore` trait (`get`, `set`
+  returning whether it stored, `try_lock(key, owner, ttl)`,
+  `unlock(key, owner)`, and optionally `renew_lock(key, owner, ttl)`; each
+  returns an `IdempotencyFuture`). Do not block the runtime thread.
 
 ## Submit tokens (0.6.0, #1360)
 
@@ -1271,10 +1381,11 @@ double-submits and replays.
 | `jobs(Vec<JobInfo>)` | Background jobs |
 | `one_off_tasks(Vec<OneOffTaskInfo>)` | CLI tasks |
 | `migrations(EmbeddedMigrations)` | Diesel embedded migrations |
-| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived). Get the document out with `autumn openapi export` — no boot, no database (#802) |
-| `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()` toggle exposure per route (plugin fluent opt-in) |
+| `openapi(OpenApiConfig)` | OpenAPI generation; `register_schema(key, json)` seeds a hand-written component schema (seeded first, so it wins over anything derived, in both request and response positions). Get the document out with `autumn openapi export` — no boot, no database (#802). A type with different request and response shapes gets two components, `Widget` and `WidgetRequest` (#2607). To render a ref yourself, use `openapi::schema_entry_to_value_in(entry, &openapi::schema_component_index_for(&config, &routes), SchemaDirection::Request)` for a request; `schema_entry_to_value` renders a response |
+| `mount_mcp(path)`, `expose_all_as_mcp()`, `secure_mcp(layer)`, `mcp_tasks(config)`, `mcp_instructions(text)`, `mcp_catalog(catalog)` | MCP endpoint projection (`mcp`); `Route::mcp()/mcp_exclude()/mcp_stream()/mcp_task()/mcp_core()` toggle exposure per route (plugin fluent opt-in); `mcp_tasks` sets task-tool limits; `mcp_instructions` sets the server instructions; `mcp_catalog(McpCatalog::Progressive)` lists core tools plus `search_tools` and `call_tool` |
 | `exception_filter(...)`, `error_pages(...)` | Error rendering |
 | `scoped(prefix, layer, routes)` | Scoped route group |
+| `scoped_guarded(prefix, layer, routes)` | Scoped group whose `layer` is the auth guard, such as `RequireApiToken` (trunk-dev, #2468). `routes audit` lists its unclassified routes as `gated` with `provenance: "declared"`. The audit cannot check the claim. Do not use it with a layer that does not authenticate. A plugin cannot use it for its own routes |
 | `layer(...)`, `has_layer<T>()`, `get_layer_types()` | Tower middleware |
 | `merge(router)`, `nest(path, router)` | Raw Axum composition |
 | `declare_plugin_routes(...)` | Plugin route declarations |
@@ -1335,6 +1446,37 @@ even inside a `#[sim_test]`. For a deadline whose counterparty is
 | `sim::crash_at(index, op)` → `CrashOutcome` | Drop `op` at its `index`-th suspension. Pair with `CrashPoint::await_index` and `Sim::kill` / `Sim::restart` |
 | `Sim::try_run_to_idle()` → `Result<(), SimStall>` | `run_to_idle` panics with the seed when the drain never settles (a job that re-enqueues itself); this returns the `SimStall` instead |
 | `http_client::ClientError::SimNetwork` | A sim drop, partition, timeout or unknown host. `ClientError` is `#[non_exhaustive]` |
+
+## Deadlines and retry budgets (#3058)
+
+| API | Purpose |
+|---|---|
+| `deadline::Deadline::current()` | The request deadline of the current task, set by the request timeout. `remaining()`, `is_expired()`, `clamp(limit)` |
+| `Deadline::scope(fut)` / `Deadline::after(d)` | Run `fut` with a deadline (the earlier one wins). Use it to carry the deadline into `tokio::spawn` |
+| `deadline::bounded(fut)` | Stop `fut` at the current deadline; `Err(DeadlineExceeded)` maps to `504` |
+| `deadline::DEADLINE_HEADER` | `x-autumn-deadline-ms`: time left in ms, sent by the outbound `Client` |
+| `http_client::ClientError::DeadlineExceeded` | The deadline stopped an outbound call. `504`; not a circuit-breaker failure |
+| `extract::ShutdownToken` | Extractor; cancelled when the server stops accepting connections |
+
+## Multi-replica simulation (`autumn_web::sim`, #3067)
+
+Two or three apps on one sim clock and one `SQLite` database, for tests of
+jobs, the scheduler and locks across nodes.
+
+| API | Use |
+|---|---|
+| `Sim::mount_replica(name_or_Replica, app)` / `replica(name)` / `try_replica(name)` | Mount named apps next to each other. Each has its own state, job runtime and scheduled tasks |
+| `Sim::kill_replica(name)` / `restart_replica(name, app)` | Stop a replica's tasks as a crash does; mount it again |
+| `Replica::named("b").clock_ahead(d)` / `clock_behind(d)` / `clock_drift_ppm(p)` / `seeded_clock(max, ppm)` | A clock per replica. `Sim::step_replica_clock(name, TimeDelta)` is an NTP step. Keep the skew below `scheduler.lease_ttl_secs` |
+| `Sim::db_link(name)` + `SqliteSubstrate::replica_pool(&link)` | One replica's own pool on the shared database. `link.lose_session()` / `restore_session()`, `mid_query_errors(table, p)`, `commit_ambiguity(table, p)`, `clear_faults()`, `events()` |
+| `Sim::run_for(d)` | Move time one event at a time; time does not move while a query runs. Use it, not `advance`, with replicas |
+| `sim::runtime()` | The runtime `#[sim_test]` uses (one blocking thread, gated DB work), for a sim outside the macro |
+| `sim::trace::capture(fut)` → `(T, Trace)` / `Trace::diff` | Record framework `tracing` events with sim time; run one seed twice and diff. Run trace checks in their own test binary |
+
+Rules for code a sim drives: `biased;` in `tokio::select!`; no database
+`random()`; never drop a `SQLite` query in flight (pin it outside the
+`select!`, spawn it if another branch wins). See
+`docs/guide/simulation-testing.md` → "Multiple replicas".
 
 ## Authored fault scenarios (`autumn_web::sim::FaultPlan`, #1680)
 
@@ -1406,7 +1548,7 @@ multipart = ["axum/multipart"]
 tailwind = []
 oauth2 = ["http-client"]
 http-client = ["dep:reqwest"]
-openapi = ["dep:serde_yaml"]
+openapi = ["dep:serde-saphyr"]
 mcp = ["openapi"]
 markdown = ["dep:pulldown-cmark"]
 constela = ["maud"]
@@ -1441,7 +1583,7 @@ csv = ["dep:csv"]
 system-tests = ["dep:chromiumoxide"]
 ```
 
-`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.8"`.
+`storage-s3` is not an `autumn-web` feature. Use `autumn-storage-s3 = "0.9"`.
 
 ## Generated UI (`autumn_web::constela`, feature `constela`)
 
@@ -1622,6 +1764,35 @@ Endpoint builders:
   full `200` feed. See `docs/guide/conditional-get.md`. The `blog` example
   wires a `/feed.xml` route this way.
 
+## Edge capsules (`autumn_edge`, trunk-dev, #1790)
+
+An `#[edge]` GET route also compiles into a `wasm32-wasip1` capsule
+(`autumn build`). See `docs/guide/edge.md`.
+
+| Item | Purpose |
+| --- | --- |
+| `gateway::EdgeGateway::new(artifact, origin)` (feature `host`) | Reference host: runs the capsule in front of any origin `tower::Service`. A decline forwards the original request; the origin's response returns unchanged |
+| `.with_kv(kv)` / `.with_response_headers(headers)` | Provide the `kv` capability; set the origin's static security headers (and a static CSP) on edge responses |
+| `gateway::Lane` | In the response extensions: `Edge`, `Fallthrough(reason)`, `OriginOnly` |
+| `node::EdgeNode::new(gateway)` (feature `node`) | HTTP edge node; capsule on a blocking thread, at most one per CPU (`.with_max_capsules(n)`); 400 on a dot-segment path; `.with_access_log(f)` gets the lane of each request; `.with_host(v)` gives both lanes the origin's `host` (`HttpOrigin::host()`); `.with_trusted_proxies(vec)` keeps `x-forwarded-*` from those peers (`node::TrustedProxy::parse("10.0.0.0/8")`), else replaces them for both lanes |
+| `node::HttpOrigin::new(url)` | The origin over HTTP for the gateway; no redirects, no proxy, no credentials in the URL, hop-by-hop headers removed, `upgrade` (WebSocket) tunnelled; 502 when the origin does not connect in 10 s or stops for 60 s |
+| `node::origin_static_headers(url, path)` | Security and CSP headers with the same value in two origin responses (CORS is not copied: set it with `--response-header`) |
+| `node::serve(listener, service, shutdown)` | Serves `service` until `shutdown`; gives the peer address to `HttpOrigin` |
+| `node::ttfb::measure(&Probe)` | TTFB edge vs origin and a byte compare of each pair; `Report::passes(min_percent)` |
+| `autumn edge serve --origin URL` | CLI edge node; `--capsule`, `--listen`, `--kv FILE`, `--probe-path`, `--no-probe`, `--response-header`, `--trusted-proxy`, `--quiet`; stops on Ctrl-C or SIGTERM |
+| `autumn edge ttfb --edge URL --origin URL --path P` | CLI probe; exit 0 pass, 1 divergence or reduction < `--min-reduction` (50), 2 error; `--divergence-only` |
+| `autumn edge bundle --target cloudflare --origin URL` | Writes `edge/cloudflare/`: capsule, JS host, `worker.mjs` (rewritten each run) and `wrangler.toml` (written once); `--response-header`, `--probe-path`, `--no-probe`, `--name`, `--out`, `--capsule`. Deploy with `wrangler deploy` |
+| `js::HOST` / `js/autumn-edge-host.mjs` | Web-standard JS host: `Capsule` (same WASI surface as `host`), `createEdgeGateway({ capsule, origin, kv, identity, responseHeaders, probeOrigin, clientIp, onLane })`; async KV by replay-on-miss (ADR-0024) |
+| `paths![…]` / `paths::PathExt::with_query` | Typed path helpers of `#[edge]` routes; compile for wasm; same bytes as `autumn_web::paths` |
+| `autumn build --embed` | Embedded native binary, then the capsule (with `embed-assets`) |
+| `conformance::compare_capsule(origin, capsule)` | Raw capsule vs origin; excuses `VOLATILE_HEADERS`, `SECURITY_HEADERS` and `CORS_HEADERS` only |
+| `conformance::compare(origin, served)` | What the client gets vs origin; excuses `VOLATILE_HEADERS` only |
+
+The gateway refuses an edge response with `set-cookie`, a hop-by-hop header,
+a wrong `content-length`, a body on 204/205/304, or a status outside 200-599
+(`capsule_error` fallthrough). An app with only edge routes and no static routes builds
+without an error.
+
 ## Cache-Control freshness (`etag::cache_for` / `CacheControl`)
 
 Declarative per-handler `Cache-Control` header (0.6.0, issue #1344).
@@ -1695,15 +1866,28 @@ Frequently used env keys:
 | `AUTUMN_DATABASE__PRIMARY_URL` | `database.primary_url` |
 | `AUTUMN_DATABASE__REPLICA_URL` | `database.replica_url` |
 | `AUTUMN_DATABASE__REPLICA_FALLBACK` | `database.replica_fallback` |
+| `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS` | `database.replica_max_lag_ms` |
+| `AUTUMN_SERVER__HTTP__HEADER_READ_TIMEOUT_MS` | `server.http.header_read_timeout_ms` |
+| `AUTUMN_REALTIME__MAX_MESSAGE_BYTES` | `realtime.max_message_bytes` |
 | `AUTUMN_DATABASE__AUTO_MIGRATE_IN_PRODUCTION` | `database.auto_migrate_in_production` |
 | `AUTUMN_SESSION__BACKEND` | `session.backend` |
 | `AUTUMN_SESSION__REDIS__URL` | `session.redis.url` |
 | `AUTUMN_CHANNELS__BACKEND` | `channels.backend` |
 | `AUTUMN_CHANNELS__REPLAY_BUFFER` | `channels.replay_buffer` (0.6.0) |
 | `AUTUMN_JOBS__BACKEND` | `jobs.backend` (`local` / `postgres` / `redis` / `sqlite`) |
+| `AUTUMN_JOBS__DEFAULT_TIMEOUT_MS` | `jobs.default_timeout_ms` (`0` = no limit) |
 | `AUTUMN_JOBS__SQLITE__VISIBILITY_TIMEOUT_MS` | `jobs.sqlite.visibility_timeout_ms` |
 | `AUTUMN_JOBS__SQLITE__POLL_INTERVAL_MS` | `jobs.sqlite.poll_interval_ms` |
 | `AUTUMN_JOBS__REDIS__URL` | `jobs.redis.url` |
+| `AUTUMN_JOBS__REDIS__DEAD_LETTER_LIMIT` | `jobs.redis.dead_letter_limit` (default 10 000; `0` = unbounded) |
+| `AUTUMN_OUTBOX__ENABLED` | `outbox.enabled` (default `false`; transactional outbox relay) |
+| `AUTUMN_OUTBOX__POLL_INTERVAL_MS` | `outbox.poll_interval_ms` (default 500) |
+| `AUTUMN_OUTBOX__BATCH_SIZE` | `outbox.batch_size` (default 100) |
+| `AUTUMN_OUTBOX__MAX_ATTEMPTS` | `outbox.max_attempts` (default 10) |
+| `AUTUMN_OUTBOX__INITIAL_BACKOFF_MS` | `outbox.initial_backoff_ms` (default 1000) |
+| `AUTUMN_OUTBOX__MAX_BACKOFF_MS` | `outbox.max_backoff_ms` (default 300000) |
+| `AUTUMN_OUTBOX__LEASE_MS` | `outbox.lease_ms` (default 60000) |
+| `AUTUMN_OUTBOX__RETENTION_MS` | `outbox.retention_ms` (default 7 days) |
 | `AUTUMN_SCHEDULER__BACKEND` | `scheduler.backend` (`in_process` / `postgres` / `sqlite`) |
 | `AUTUMN_SECURITY__SIGNING_SECRET` | `security.signing_secret.secret` |
 | `AUTUMN_SECURITY__ALLOW_UNAUTHORIZED_REPOSITORY_API` | `security.allow_unauthorized_repository_api` |
@@ -1712,7 +1896,41 @@ Frequently used env keys:
 | `AUTUMN_MAIL__ALLOW_IN_PROCESS_DELIVER_LATER_IN_PRODUCTION` | `mail.allow_in_process_deliver_later_in_production` |
 | `AUTUMN_STORAGE__BACKEND` | `storage.backend` |
 | `AUTUMN_CACHE__BACKEND` | `cache.backend` |
+| `AUTUMN_HEALTH__CACHE_TTL_MS` | `health.cache_ttl_ms` (default `1000`; `0` = no cache) (#3059) |
+| `AUTUMN_HEALTH__PING_TIMEOUT_MS` | `health.ping_timeout_ms` (default `2000`; `0` refused) (#3059) |
+| `AUTUMN_HEALTH__DB_READINESS` | `health.db_readiness` (default `true`) (#3059) |
+| `AUTUMN_HEALTH__REDIS_READINESS` | `health.redis_readiness` (default `false`) (#3059) |
 | `AUTUMN_OBSERVABILITY__SERVER_TIMING` | `observability.server_timing` (0.6.0) — bool; `Server-Timing` response header opt-in. Defaults on in `dev`/`development`, off elsewhere. See `docs/guide/observability/server-timing.md`. |
+
+### `[health]` — readiness pings and result cache (#3059)
+
+`/ready`, `/health` and the `db` component of `/actuator/health` send
+`SELECT 1` to the primary on one dedicated connection outside the pool. Pool
+saturation is **not** a readiness signal: do not write a health indicator that
+reads `pool.status()`. To shed load, set `server.max_concurrent_requests`.
+
+```toml
+[health]
+cache_ttl_ms = 1000      # one refresh per window; probers share it; 0 = off
+ping_timeout_ms = 2000   # a late DB/Redis ping is DOWN; keep below the probe timeout
+db_readiness = true      # false: a failed primary ping does not gate /ready
+redis_readiness = false  # true: redis:<subsystem> indicators gate /ready
+```
+
+- The read replica and `db:shard:<name>` use the same ping.
+- Each subsystem that runs on Redis (channels, idempotency, jobs, rate_limit,
+  sessions, submit_token, webhook_replay) gets a `redis:<subsystem>` indicator
+  (feature `redis`); `RedisCachePlugin` adds `redis:cache`. It is health-only
+  by default, because all replicas share Redis. For another Redis, register
+  `autumn_web::redis_health::RedisHealthIndicator::new(url)?.configured(&config.health)`
+  with `.health_indicator(name, Arc::new(..))`. A plugin that has the
+  `AppState` uses `RedisHealthIndicator::shared(&state, url)` instead, so it
+  shares the app's one `PING` connection per URL.
+- Registered indicators are cached too
+  (`HealthIndicatorRegistry::set_cache_ttl`). In a `TestApp` test that flips an
+  indicator and reads it again at once, set `health.cache_ttl_ms = 0`.
+- The DB error text appears only when `health.detailed = true`.
+- See `docs/guide/health-indicators.md` ("Fail open on shared dependencies").
 
 ### `[cluster]` — embedded clustering (0.7.0, #1762)
 
@@ -1775,6 +1993,20 @@ max_capsules = 50         # oldest-first prune (capsule-named files only), befor
 - **A capsule is production data** — result rows, path segments, and SQL text
   are not maskable; treat the directory like a database dump and read
   `docs/guide/failure-capsules.md` (security section leads) before enabling.
+- Seam gaps closed (#2351): cache removals (`invalidate`, `invalidate_namespace`,
+  `clear`) and untyped `cache::get`/`insert` are recorded and replayed — a replay
+  never reaches the installed backend. `autumn replay` installs a tape-backed
+  `Mailer`. Capsule format is 4; v3 capsules still load and replay with v3 rules.
+- `autumn_web::capsule::guard_egress(subsystem, method, url)` — call it before a
+  request on your own HTTP/S3 client: replay refuses the call (an unrecorded
+  divergence), capture marks the capsule incomplete. CAPTCHA, OAuth2, SES,
+  `autumn-storage-s3` and the media plugin already call it.
+- `autumn_web::capsule::spawn(fut)` — use instead of `tokio::spawn` for work a
+  request does not await: capture marks the capsule incomplete; replay carries
+  the tape into the task. A raw `tokio::spawn` is invisible to both sides.
+- Replay refuses a capsule that started detached work (`db::register_after_commit`,
+  a stale-while-revalidate refresh), ran a tracked job, read/wrote an untyped
+  cache value, or whose compared data held the literal text `[FILTERED]`.
 
 ### `[server.tls]` (feature `tls`, 0.6.0, #1603)
 
@@ -1796,7 +2028,7 @@ In-process HTTPS termination on the same host:port (off by default).
 - **In a container:** the image builder runs a bare `cargo build --release`, so
   `tls` must be a *default* feature of the app; mount the PEMs and set
   `AUTUMN_SERVER__TLS__CERT_PATH` / `__KEY_PATH`; set
-  `AUTUMN_HEALTHCHECK_URL=https://localhost:3000/health` plus
+  `AUTUMN_HEALTHCHECK_URL=https://localhost:3000/startup` plus
   `AUTUMN_HEALTHCHECK_INSECURE=1` so the generated Dockerfile's HEALTHCHECK
   probes its own loopback listener over TLS instead of failing forever. See
   `docs/guide/tls.md`.

@@ -124,6 +124,31 @@ impl LocaleScope {
         }
     }
 
+    /// Build a scope from values the caller already holds — the per-request
+    /// constructor for [`AmbientLocaleLayer`](super::AmbientLocaleLayer) and
+    /// [`LocalePrefixScopeLayer`](super::LocalePrefixScopeLayer), which snapshot
+    /// the chain and default locale once at construction.
+    ///
+    /// Same result as [`with_default_locale`](Self::with_default_locale),
+    /// empty-chain fallback included, without copying the chain into a `Vec`
+    /// and back into a fresh `Arc`, re-allocating the default locale, or
+    /// reading the process-wide default only to discard it.
+    #[must_use]
+    pub(super) fn from_shared(tag: String, chain: Arc<[String]>, default_locale: Arc<str>) -> Self {
+        Self {
+            tag: Arc::new(RwLock::new(tag)),
+            // Checked per request, not at layer construction: an empty chain
+            // means "the process default", which `install_locale_defaults` can
+            // change after the layer was built.
+            chain: if chain.is_empty() {
+                effective_chain()
+            } else {
+                chain
+            },
+            default_locale,
+        }
+    }
+
     /// Build a scope for `tag` walking the process-wide installed chain.
     #[must_use]
     pub fn for_tag(tag: impl Into<String>) -> Self {
@@ -156,6 +181,17 @@ impl LocaleScope {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = tag.into();
+    }
+
+    /// [`set_tag`](Self::set_tag) for a tag the caller only borrows: copies it
+    /// into the scope's existing buffer, which a locale tag almost always fits,
+    /// instead of allocating a fresh `String` to replace it.
+    pub(super) fn refine_tag(&self, tag: &str) {
+        let mut guard = self
+            .tag
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tag.clone_into(&mut *guard);
     }
 
     /// The fallback chain walked when the active locale has no translation.
@@ -279,7 +315,9 @@ pub fn ambient_locale() -> Option<String> {
 /// [`Locale`](super::Locale) extractor to publish its own answer — see
 /// [`LocaleScope::tag`]'s note on why the layer's answer can be coarser.
 pub fn publish_ambient_locale(tag: &str) {
-    let _ = ACTIVE_LOCALE.try_with(|scope| scope.set_tag(tag));
+    // Runs on every in-scope `Locale` extraction: reuse the scope's buffer
+    // rather than allocating a replacement `String` for a borrowed tag.
+    let _ = ACTIVE_LOCALE.try_with(|scope| scope.refine_tag(tag));
 }
 
 /// The locale scope in effect, if any. Used by response-producing code that
@@ -352,9 +390,16 @@ pub fn write_locale() -> String {
 /// process booted last — the property [`install_locale_defaults`] documents.
 #[must_use]
 pub fn scoped_or_global_default_locale() -> String {
+    String::from(&*scoped_or_global_default_locale_shared())
+}
+
+/// [`scoped_or_global_default_locale`] as the `Arc` the scope (or the
+/// process-wide install) already holds: a refcount bump, not a copy. Column
+/// decoding asks once per decoded value — per translatable column per row.
+fn scoped_or_global_default_locale_shared() -> Arc<str> {
     ACTIVE_LOCALE
-        .try_with(|scope| scope.default_locale.to_string())
-        .unwrap_or_else(|_| default_locale_snapshot().to_string())
+        .try_with(|scope| Arc::clone(&scope.default_locale))
+        .unwrap_or_else(|_| default_locale_snapshot())
 }
 
 // ── The translatable value ───────────────────────────────────────────────────
@@ -475,7 +520,15 @@ impl Translated {
     #[must_use]
     pub fn resolve(&self) -> Option<&str> {
         ACTIVE_LOCALE
-            .try_with(|scope| self.lookup(Some(&scope.tag()), &scope.chain))
+            .try_with(|scope| {
+                // Compare against the tag in place rather than cloning it: this
+                // runs once per rendered field, and `lookup` only reads it.
+                let tag = scope
+                    .tag
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                self.lookup(Some(tag.as_str()), &scope.chain)
+            })
             .unwrap_or_else(|_| self.lookup(None, &effective_chain()))
     }
 
@@ -691,7 +744,7 @@ mod db {
     use diesel::serialize::{self, IsNull, Output, ToSql};
     use diesel::sql_types::Text;
 
-    use super::{Translated, scoped_or_global_default_locale};
+    use super::{Translated, scoped_or_global_default_locale_shared};
 
     impl ToSql<Text, diesel::sqlite::Sqlite> for Translated {
         fn to_sql<'b>(
@@ -703,6 +756,7 @@ mod db {
         }
     }
 
+    #[cfg(feature = "postgres")]
     impl ToSql<Text, diesel::pg::Pg> for Translated {
         fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, diesel::pg::Pg>) -> serialize::Result {
             use std::io::Write as _;
@@ -720,10 +774,11 @@ mod db {
             let raw = String::from_sql(bytes)?;
             // Request-scoped when a scope is in effect, so a row decoded during
             // a request never depends on which app in the process booted last;
-            // the process-wide install is the out-of-request fallback.
+            // the process-wide install is the out-of-request fallback. Borrowed
+            // from the shared `Arc` rather than copied: this runs per value.
             Ok(Self::decode_column(
                 &raw,
-                &scoped_or_global_default_locale(),
+                &scoped_or_global_default_locale_shared(),
             ))
         }
     }
@@ -768,6 +823,8 @@ pub fn translatable_columns_for_table(table: &str) -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::super::{
         Translated, fallback_chain_snapshot, install_locale_defaults, with_locale,
         with_locale_chain_sync,
@@ -1059,6 +1116,60 @@ mod tests {
         super::super::publish_ambient_locale("es");
     }
 
+    /// `refine_tag` copies into the scope's existing buffer, so the value must
+    /// still be replaced whole: a shorter tag leaves no trailing bytes, a longer
+    /// one grows the buffer, and every clone sharing the lock sees the change.
+    #[test]
+    fn refining_the_tag_replaces_it_whole() {
+        let scope = super::LocaleScope::with_default_locale("pt-BR", chain(&["en"]), "en");
+        let shared = scope.clone();
+        scope.refine_tag("es");
+        assert_eq!(scope.tag(), "es");
+        scope.refine_tag("zh-Hant-TW");
+        assert_eq!(scope.tag(), "zh-Hant-TW");
+        scope.refine_tag("zh-Hant-TW");
+        assert_eq!(scope.tag(), "zh-Hant-TW");
+        scope.refine_tag("en");
+        assert_eq!(scope.tag(), "en", "a shorter tag leaves no trailing bytes");
+        assert_eq!(shared.tag(), "en", "clones share the refined tag");
+    }
+
+    /// Every refinement is observed by the next `resolve`, which reads the tag
+    /// in place under the lock rather than from a copy taken earlier.
+    #[test]
+    fn resolve_follows_each_refinement_of_the_scope() {
+        let t = Translated::from_pairs([("en", "Hello"), ("es", "Hola")]);
+        let seen = with_locale_chain_sync("en", chain(&["en"]), || {
+            let first = t.to_string();
+            super::super::publish_ambient_locale("es");
+            let second = t.to_string();
+            super::super::publish_ambient_locale("en");
+            let third = t.resolve().map(str::to_owned);
+            (first, second, third)
+        });
+        assert_eq!(seen.0, "Hello");
+        assert_eq!(seen.1, "Hola");
+        assert_eq!(seen.2.as_deref(), Some("Hello"));
+    }
+
+    /// The borrowed read keeps the poison tolerance the cloning read had: a
+    /// panic while the tag was being refined must not turn every later render
+    /// into a panic too.
+    #[test]
+    fn resolve_tolerates_a_poisoned_tag_lock() {
+        let scope = super::LocaleScope::with_default_locale("es", chain(&["en"]), "en");
+        // Poison the tag lock by panicking while holding it.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = scope.tag.write().unwrap();
+            panic!("poison the scope's tag lock");
+        }));
+        assert!(result.is_err());
+        assert!(scope.tag.is_poisoned());
+        let t = Translated::from_pairs([("en", "Hello"), ("es", "Hola")]);
+        let got = super::with_locale_scope_sync(scope, || t.resolve().map(str::to_owned));
+        assert_eq!(got.as_deref(), Some("Hola"));
+    }
+
     /// A scope built with an explicitly empty chain still resolves through the
     /// process default rather than collapsing to the sentinel.
     #[test]
@@ -1133,6 +1244,79 @@ mod tests {
 
             install_locale_defaults("en", chain(&["en"]));
         });
+    }
+
+    /// The per-request constructor the layers use hands over their snapshotted
+    /// chain and default locale: the scope holds the very same allocations.
+    #[test]
+    fn a_shared_scope_reuses_the_layers_chain_and_default() {
+        let chain_arc: Arc<[String]> = chain(&["fr", "en"]).into();
+        let default: Arc<str> = Arc::from("fr");
+        let scope = super::LocaleScope::from_shared(
+            "es".to_owned(),
+            Arc::clone(&chain_arc),
+            Arc::clone(&default),
+        );
+        assert_eq!(scope.tag(), "es");
+        assert_eq!(scope.chain(), chain(&["fr", "en"]).as_slice());
+        assert_eq!(scope.default_locale(), "fr");
+        assert!(
+            Arc::ptr_eq(&scope.chain, &chain_arc),
+            "chain shared, not copied"
+        );
+        assert!(
+            Arc::ptr_eq(&scope.default_locale, &default),
+            "default shared, not copied"
+        );
+
+        // Indistinguishable from the public constructor's scope.
+        let public = super::LocaleScope::with_default_locale("es", chain(&["fr", "en"]), "fr");
+        assert_eq!(scope.tag(), public.tag());
+        assert_eq!(scope.chain(), public.chain());
+        assert_eq!(scope.default_locale(), public.default_locale());
+    }
+
+    /// A shared scope given an empty chain falls back to the process chain,
+    /// which is never empty; a non-empty chain is kept as the very `Arc` the
+    /// layer passed in. Read-only on the process defaults: other lib tests
+    /// (the `app` ones) install them without this module's guard.
+    #[test]
+    fn a_shared_scope_falls_back_on_an_empty_chain_and_keeps_a_given_one() {
+        let empty: Arc<[String]> = Arc::from(Vec::<String>::new());
+        let fallback = super::LocaleScope::from_shared("de".to_owned(), empty, "en".into());
+        assert!(
+            !fallback.chain().is_empty(),
+            "an empty chain must fall back to the process chain, never stay empty"
+        );
+        assert_eq!(fallback.tag(), "de");
+
+        let given: Arc<[String]> = Arc::from(chain(&["pt", "en"]));
+        let kept =
+            super::LocaleScope::from_shared("pt".to_owned(), Arc::clone(&given), "en".into());
+        assert!(
+            Arc::ptr_eq(&kept.chain, &given),
+            "a non-empty chain is shared, not copied"
+        );
+    }
+
+    /// The `Arc` column decoding borrows is the scope's own, and the public
+    /// `String` form returns the same text.
+    #[test]
+    fn the_shared_default_locale_matches_the_owned_one() {
+        let scope = super::LocaleScope::with_default_locale("es", chain(&["en"]), "fr");
+        let probe = scope.clone();
+        let (shared, owned) = super::with_locale_scope_sync(scope, || {
+            (
+                super::scoped_or_global_default_locale_shared(),
+                super::scoped_or_global_default_locale(),
+            )
+        });
+        assert_eq!(&*shared, "fr");
+        assert_eq!(owned, "fr");
+        assert!(
+            Arc::ptr_eq(&shared, &probe.default_locale),
+            "a refcount bump on the scope's default, not a copy"
+        );
     }
 
     /// The default locale is stored EXPLICITLY, not inferred from the chain's

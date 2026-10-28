@@ -32,6 +32,29 @@ mod schema {
 
 use schema::{coherence_posts, coherence_tags};
 
+use chain_schema::{coherence_blogs, coherence_entries, coherence_notes};
+
+mod chain_schema {
+    autumn_web::reexports::diesel::table! {
+        coherence_blogs (id) {
+            id -> Int8,
+            title -> Text,
+        }
+    }
+    autumn_web::reexports::diesel::table! {
+        coherence_entries (id) {
+            id -> Int8,
+            blog_id -> Int8,
+        }
+    }
+    autumn_web::reexports::diesel::table! {
+        coherence_notes (id) {
+            id -> Int8,
+            entry_id -> Int8,
+        }
+    }
+}
+
 #[autumn_web::model]
 pub struct CoherencePost {
     #[id]
@@ -81,6 +104,22 @@ pub async fn coherence_opaque(seed: i64) -> i64 {
     seed
 }
 
+/// An unrelated `Type::verb()` call is no dependency (#2362).
+pub struct CoherenceSettings;
+
+impl CoherenceSettings {
+    // Only the cached read below calls this; nothing runs that read.
+    #[allow(dead_code)]
+    pub const fn load() -> i64 {
+        1
+    }
+}
+
+#[autumn_web::cached]
+pub async fn coherence_unrelated_call(seed: i64) -> i64 {
+    seed + CoherenceSettings::load()
+}
+
 #[autumn_web::repository(CoherencePost, invalidates(coherence_recent_titles))]
 pub trait CoherencePostRepository {}
 
@@ -104,6 +143,84 @@ pub async fn coherence_moderated_labels(
 ) -> Vec<String> {
     let _ = (tenant, repo);
     Vec::new()
+}
+
+// ── A nested cascade (#2364) ─────────────────────────────────────────
+//
+// Blog -> Entry -> Note, `destroy` at each step. `CoherenceBlogRepository`
+// names `Entry`. Only `CoherenceEntryRepository` names `Note`.
+
+#[autumn_web::model(table = "coherence_blogs")]
+pub struct CoherenceBlog {
+    #[id]
+    pub id: i64,
+    pub title: String,
+}
+
+#[autumn_web::model(table = "coherence_entries")]
+pub struct CoherenceEntry {
+    #[id]
+    pub id: i64,
+    pub blog_id: i64,
+}
+
+#[autumn_web::model(table = "coherence_notes")]
+pub struct CoherenceNote {
+    #[id]
+    pub id: i64,
+    pub entry_id: i64,
+}
+
+#[autumn_web::repository(CoherenceNote, table = "coherence_notes")]
+pub trait CoherenceNoteRepository {}
+
+#[autumn_web::repository(
+    CoherenceEntry,
+    table = "coherence_entries",
+    dependent(PgCoherenceNoteRepository, fk = "entry_id", on_delete = destroy)
+)]
+pub trait CoherenceEntryRepository {}
+
+#[autumn_web::repository(
+    CoherenceBlog,
+    table = "coherence_blogs",
+    dependent(PgCoherenceEntryRepository, fk = "blog_id", on_delete = destroy)
+)]
+pub trait CoherenceBlogRepository {}
+
+#[autumn_web::cached(reads(CoherenceNote))]
+pub async fn coherence_note_count() -> i64 {
+    0
+}
+
+#[test]
+fn a_root_delete_mutates_the_grandchild_model() {
+    for method in ["delete_by_id", "delete_many"] {
+        let models: Vec<String> = coherence::registered_mutations()
+            .into_iter()
+            .filter(|m| m.repository == "CoherenceBlogRepository" && m.method == method)
+            .map(|m| model_key(&m.model).to_string())
+            .collect();
+        assert!(
+            models.contains(&"CoherenceNote".to_string()),
+            "{method}: {models:?}"
+        );
+    }
+}
+
+#[test]
+fn the_gate_flags_a_grandchild_read_the_root_does_not_invalidate() {
+    let read = read_named("coherence_note_count");
+    let findings = coherence::check(
+        std::slice::from_ref(&read),
+        &coherence::registered_mutations(),
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.mutation == "CoherenceBlogRepository::delete_by_id"),
+        "{findings:?}"
+    );
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -218,6 +335,13 @@ fn a_cached_read_id_is_its_cache_key_namespace() {
 #[test]
 fn an_underivable_read_is_undetermined_not_silently_coherent() {
     let read = read_named("coherence_opaque");
+    assert_eq!(read.provenance, DependencyProvenance::Undetermined);
+    assert!(read.reads.is_empty());
+}
+
+#[test]
+fn an_unrelated_call_does_not_make_a_read_derived() {
+    let read = read_named("coherence_unrelated_call");
     assert_eq!(read.provenance, DependencyProvenance::Undetermined);
     assert!(read.reads.is_empty());
 }
@@ -416,6 +540,8 @@ fn seeded_mutation(model: &str, method: &str) -> Mutation {
         invalidates: Vec::new(),
         acknowledged_stale: None,
         location: format!("src/{model}_repo.rs:1"),
+        cascades_into: None,
+        cascade_recurses: false,
     }
 }
 

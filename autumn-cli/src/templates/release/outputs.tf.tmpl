@@ -6,7 +6,7 @@
 # hostname. Visiting the revision-specific hostname sends a different Host
 # header than the one trusted_hosts allows and gets a 400; it would also go
 # stale as soon as CI creates a new revision outside Terraform (via
-# `az containerapp update`), since Terraform's own state isn't refreshed by
+# azure-cutover.sh), since Terraform's own state isn't refreshed by
 # that. local.app_fqdn is plan-time-derivable and never depends on which
 # revision currently happens to be active.
 output "app_fqdn" {

@@ -253,6 +253,10 @@ A timeout emits structured telemetry — a `request_timeouts_total` counter plus
 `tracing` warning (target `autumn::timeout`) carrying the `route` template and
 `elapsed_ms` — so you can alert on it.
 
+The timeout `503` has a `Retry-After` header of 1-3 s. The handler and its
+outbound calls can read the deadline. See
+[Timeouts, Deadlines and Retry Budgets](timeouts-and-budgets.md).
+
 ### What the deadline covers
 
 The deadline bounds the time to produce the **response head**, not the duration
@@ -402,7 +406,9 @@ without a request id, since `RequestIdLayer` never ran for them).
 
 The ordering guarantee that matters most: **in a fully dynamic build, user
 layers run inside `RequestIdLayer` on ingress**, so every `.layer()` you
-register can read the generated `RequestId` from the request extensions.
+register can read the `RequestId` from the request extensions. The ID is
+new, or an inbound one from a trusted proxy (see
+[Overload signals](observability/overload-signals.md#request-ids)).
 Exception filters, metrics, and error-page rendering all sit *outside* your
 layers, which means errors you produce (and errors you let bubble up from
 handlers) are still caught by Autumn's error pipeline.
@@ -616,8 +622,8 @@ autumn_web::app()
 Write a small `Layer`/`Service` pair (see the pattern in
 `autumn/tests/custom_layer.rs`) that rewrites or inserts request/response
 headers, then register it with `.layer(MyLayer)`. Because the layer sits
-inside `RequestIdLayer`, you can stamp the request ID onto any outgoing
-header for downstream services.
+inside `RequestIdLayer`, you can read the request ID. Note that `http_client`
+already sends it as `x-request-id` on outbound calls.
 
 ---
 

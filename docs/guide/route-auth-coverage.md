@@ -69,6 +69,22 @@ A `#[repository(api = ..., policy = ...)]` or `scope = ...` auto-API route is
 also `gated` — its guard lives on the generated CRUD handler, not on a
 `#[secured]` attribute, but the classifier knows to look there too.
 
+### Guarded by a layer
+
+A guard can be a tower layer instead of an attribute. `RequireApiToken` is a
+layer. Mount such a group with `scoped_guarded`, not `scoped`:
+
+```rust
+app.scoped_guarded("/api", RequireApiToken::new(store), routes![list_todos])
+```
+
+A route in the group with no `#[secured]` or `#[public]` is then `gated`, and
+its manifest entry has `"provenance": "declared"`. The audit cannot see inside
+the layer. It records your claim and does not check it. A handler's own `#[public]` or `#[secured]`
+wins over the group.
+
+Do not use `#[public]` on these routes. They are not public.
+
 ### `public` — deliberately open routes
 
 Use `#[public]` when a route has no guard *on purpose*. It injects no runtime
@@ -150,7 +166,17 @@ autumn routes audit --json
 
 # In a workspace, target a specific package/bin
 autumn routes audit -p blog --bin server
+
+# Audit the build you deploy (same flags as `cargo build`)
+autumn routes audit --release
 ```
+
+The manifest describes the binary that the audit builds. By default, that is
+the dev profile with default features. A route behind
+`#[cfg(not(debug_assertions))]` or a non-default feature is only in the
+manifest when you build it. Use `--release`, `--profile`, `--features`,
+`--all-features` and `--no-default-features` to audit the build you ship. The
+manifest records the build in its `build` object.
 
 Exit code is `0` when every route is classified, `1` otherwise — wire it into
 CI as a hard gate exactly like `cargo clippy -- -D warnings`. `autumn new`

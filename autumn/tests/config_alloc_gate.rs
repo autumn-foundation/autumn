@@ -318,9 +318,17 @@ fn per_request_allocations_stay_under_the_ceiling() {
 ///
 /// The same honesty rule as the block ceiling applies: a failure a hair over
 /// the line means re-measure under both feature sets and re-derive, not nudge.
+///
+/// Re-derived for #3071, which failed it at 30,574. Measured with the pinned
+/// 1.99 toolchain: **28,030** under the 8 default features and **30,574**
+/// under the full `cargo test --workspace` set, which is wider than the
+/// 13-feature build above. With the two fault-injection layers taken out of
+/// the stack, the workspace number is 30,430: the `Either` arms their
+/// `option_layer` adds cost 144 bytes when the section is off, with no new
+/// block. The ceiling is the workspace measurement plus about a tenth.
 #[test]
 fn per_request_allocated_bytes_stay_under_the_ceiling() {
-    const CEILING: u64 = 30_500;
+    const CEILING: u64 = 33_600;
 
     let measured = measure_per_request(|app| app);
     println!(

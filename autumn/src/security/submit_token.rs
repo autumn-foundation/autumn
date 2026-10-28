@@ -174,15 +174,14 @@ const fn is_mutating_method(method: &Method) -> bool {
     )
 }
 
-fn hex_lower(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().fold(
-        String::with_capacity(bytes.as_ref().len() * 2),
-        |mut out, byte| {
-            use std::fmt::Write as _;
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
+/// Release this attempt's in-flight lock for `key`. Each attempt has its own
+/// `owner`: an attempt that outlived its lock must not free the lock of a retry
+/// that took the token since. An error is logged; the lock then expires by its
+/// in-flight TTL.
+async fn release_lock(store: &Arc<dyn IdempotencyStore>, key: &str, owner: &str) {
+    if let Err(error) = store.unlock(key, owner).await {
+        tracing::warn!(error = %error, "Submit-token unlock failed; the lock expires by its TTL");
+    }
 }
 
 /// Derive the store key for a submitted token. The token is a per-render random
@@ -192,7 +191,7 @@ fn storage_key(token: &str) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(b"autumn.submit_token:v1:");
     hasher.update(token.as_bytes());
-    format!("submit:{}", hex_lower(hasher.finalize()))
+    format!("submit:{}", hex::encode(hasher.finalize()))
 }
 
 // ── Multipart / body scanning helpers ─────────────────────────────────────────
@@ -295,12 +294,8 @@ async fn extract_submitted_token(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    // Media types are case-insensitive (RFC 9110 8.3.1) and the header may carry
-    // leading whitespace; normalize the type token for the urlencoded check.
-    let is_urlencoded = content_type
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("application/x-www-form-urlencoded");
+    let is_urlencoded =
+        crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded");
     // Parse the boundary with `multer::parse_boundary` — the exact parser
     // `axum::extract::Multipart` uses downstream (via `mime`) — so the guard and
     // the extractor can never disagree about the boundary. A hand-rolled
@@ -531,10 +526,15 @@ where
         req.extensions_mut()
             .insert(SubmitFormField(self.settings.field_name.clone()));
 
-        let clean = crate::security::path::clean_path(req.uri().path());
-        let path = clean.as_str();
-        let is_exempt = crate::security::path::is_exempt_path(path, &self.settings.exempt_paths);
-        let is_guarded = !is_exempt && is_mutating_method(req.method());
+        // Only a mutating request is guarded, and only a configured exemption
+        // (matched on the normalized path, so dot-segments cannot reach one)
+        // lifts the guard. A GET, or any request when no exemptions are
+        // configured (the default), skips building the normalized copy.
+        let is_guarded = is_mutating_method(req.method())
+            && (self.settings.exempt_paths.is_empty() || {
+                let clean = crate::security::path::clean_path(req.uri().path());
+                !crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths)
+            });
 
         // Every GET (and every exempt/non-mutating request) takes this branch:
         // nothing below needs `self.inner` cloned into an owned value, so
@@ -583,7 +583,7 @@ where
             // collapsing to a cache miss: a swallowed error would fall through,
             // acquire a fresh lock, and re-run the mutation for an
             // already-consumed token. No lock is held yet, so surface `503`.
-            match settings.store.try_get(&key) {
+            match settings.store.get(&key).await {
                 Ok(Some(entry)) => return Ok(replay_response(&entry.record)),
                 Ok(None) => {}
                 Err(error) => {
@@ -597,8 +597,28 @@ where
 
             // Acquire the in-flight lock. A concurrent duplicate that loses the
             // race gets a 409 so it can never re-run the handler.
-            if !settings.store.try_lock(&key, settings.in_flight_ttl) {
-                return Ok(in_flight_conflict_response());
+            let owner = Uuid::new_v4().to_string();
+            let lock_taken_at = crate::time::ambient_instant();
+            let acquired = settings
+                .store
+                .try_lock(&key, &owner, settings.in_flight_ttl)
+                .await
+                .unwrap_or_else(|error| {
+                    // Fail closed: an outage must not let two submits run.
+                    tracing::warn!(
+                        error = %error,
+                        "Submit-token lock unavailable; failing closed"
+                    );
+                    false
+                });
+            if !acquired {
+                // A store may refuse the lock because a racing request stored
+                // its response and released the token after our lookup:
+                // replay it. Otherwise the token is in flight.
+                return Ok(match settings.store.get(&key).await {
+                    Ok(Some(entry)) => replay_response(&entry.record),
+                    Ok(None) | Err(_) => in_flight_conflict_response(),
+                });
             }
 
             // Double-check after locking: a racing request may have completed
@@ -608,9 +628,9 @@ where
             // `in_flight_ttl`) so a retry with the same token is rejected
             // in-flight rather than re-running the handler — exactly as
             // `IdempotencyService` does on a post-lock lookup error.
-            match settings.store.try_get(&key) {
+            match settings.store.get(&key).await {
                 Ok(Some(entry)) => {
-                    settings.store.unlock(&key);
+                    release_lock(&settings.store, &key, &owner).await;
                     return Ok(replay_response(&entry.record));
                 }
                 Ok(None) => {}
@@ -623,9 +643,47 @@ where
                 }
             }
 
+            if let Some(response) =
+                lapsed_lock_response(&settings, &key, &owner, lock_taken_at).await
+            {
+                return Ok(response);
+            }
+
             let response = inner.call(req).await?;
-            Ok(cache_consumed_token_response(response, &settings, &key).await)
+            Ok(cache_consumed_token_response(response, &settings, &key, &owner).await)
         })
+    }
+}
+
+/// The `409` for a submit whose lock lapsed before the handler ran, or `None`
+/// when the lock still covers the handler: renewed when the work since it was
+/// taken was slow (see `keep_lock_for_handler`). A renewal error fails closed.
+async fn lapsed_lock_response(
+    settings: &SubmitTokenSettings,
+    key: &str,
+    owner: &str,
+    taken_at: std::time::Instant,
+) -> Option<Response<Body>> {
+    use crate::idempotency::LockForHandler;
+    match crate::idempotency::keep_lock_for_handler(
+        settings.store.as_ref(),
+        key,
+        owner,
+        settings.in_flight_ttl,
+        taken_at,
+    )
+    .await
+    {
+        Ok(LockForHandler::Held | LockForHandler::Renewed) => None,
+        Ok(LockForHandler::Lost) => {
+            tracing::warn!("Submit-token lock lapsed before the handler ran; returning 409");
+            release_lock(&settings.store, key, owner).await;
+            Some(in_flight_conflict_response())
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "Submit-token lock renewal failed; failing closed");
+            Some(in_flight_conflict_response())
+        }
     }
 }
 
@@ -637,6 +695,7 @@ async fn cache_consumed_token_response(
     response: Response<Body>,
     settings: &SubmitTokenSettings,
     key: &str,
+    owner: &str,
 ) -> Response<Body> {
     let (parts, body) = response.into_parts();
     match collect_body(body, MAX_CACHEABLE_RESPONSE_BODY).await {
@@ -661,7 +720,9 @@ async fn cache_consumed_token_response(
                 // success.
                 if let Err(error) = settings
                     .store
-                    .try_set(key, record, Vec::new(), settings.ttl)
+                    .set(key, owner, record, Vec::new(), settings.ttl)
+                    .await
+                    .and_then(crate::idempotency::stored)
                 {
                     tracing::error!(
                         error = %error,
@@ -670,14 +731,14 @@ async fn cache_consumed_token_response(
                     return crate::idempotency::persistence_failed_response();
                 }
             }
-            settings.store.unlock(key);
+            release_lock(&settings.store, key, owner).await;
             Response::from_parts(parts, Body::from(bytes))
         }
         CollectedBody::Oversized { body, .. } => {
             // Too large to cache — stream through. The lock is released; a later
             // retry re-runs (acceptable: form responses are tiny redirects, so
             // this path is not hit in practice).
-            settings.store.unlock(key);
+            release_lock(&settings.store, key, owner).await;
             Response::from_parts(parts, body)
         }
         CollectedBody::Errored(error) => {
@@ -702,7 +763,7 @@ async fn cache_consumed_token_response(
                 "Submit-token response buffering failed on a read error; failing closed"
             );
             if !(200..400).contains(&status) {
-                settings.store.unlock(key);
+                release_lock(&settings.store, key, owner).await;
             }
             response_read_error_response()
         }
@@ -712,7 +773,9 @@ async fn cache_consumed_token_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::idempotency::{IdempotencyEntry, IdempotencyStoreError, MemoryIdempotencyStore};
+    use crate::idempotency::{
+        IdempotencyEntry, IdempotencyFuture, IdempotencyStoreError, MemoryIdempotencyStore,
+    };
     use axum::Router;
     use axum::routing::{get, post};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1189,27 +1252,80 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn expired_token_re_runs_after_ttl() {
+    /// The exemption check only runs when exemptions are configured, but when
+    /// it runs it still matches the normalized path: a percent-encoded
+    /// dot-segment cannot climb out of an exempt prefix to a guarded route.
+    #[tokio::test]
+    async fn dot_segments_cannot_reach_an_exempt_prefix() {
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let layer = SubmitTokenLayer::new(store, &default_config()).with_exempt_path("/api/");
+        let app = Router::new()
+            .fallback(move || {
+                let count = count_inner.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    "ok"
+                }
+            })
+            .layer(layer);
+
+        let submit = |uri: &'static str, token: &'static str| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .body(Body::from(format!("_submit_token={token}")))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Inside the exempt prefix: not guarded, so both submits run.
+        submit("/api/items", "tok-exempt").await;
+        submit("/api/items", "tok-exempt").await;
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+
+        // `/api/%2e%2e/submit` normalizes to `/submit`, which is not exempt, so
+        // the replayed token does not re-run the handler.
+        count.store(0, Ordering::SeqCst);
+        submit("/api/%2e%2e/submit", "tok-dot").await;
+        submit("/api/%2e%2e/submit", "tok-dot").await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_token_re_runs_after_ttl() {
         // A very short TTL means the stored record expires and a later submit
         // re-runs rather than replaying.
         let store = MemoryIdempotencyStore::new(Duration::from_millis(10));
         let key = storage_key("ttl-token");
-        store.set(
-            &key,
-            IdempotencyRecord {
-                status: 200,
-                headers: Vec::new(),
-                body: b"first".to_vec(),
-                metadata: Vec::new(),
-            },
-            Vec::new(),
-            Duration::from_millis(10),
-        );
-        assert!(store.get(&key).is_some());
+        store
+            .set(
+                &key,
+                "",
+                IdempotencyRecord {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"first".to_vec(),
+                    metadata: Vec::new(),
+                },
+                Vec::new(),
+                Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+        assert!(store.get(&key).await.unwrap().is_some());
         std::thread::sleep(Duration::from_millis(30));
         assert!(
-            store.get(&key).is_none(),
+            store.get(&key).await.unwrap().is_none(),
             "record must expire after its TTL"
         );
     }
@@ -1424,33 +1540,36 @@ mod tests {
     }
 
     impl IdempotencyStore for FailingSetStore {
-        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
             self.inner.get(key)
         }
 
-        fn set(&self, _key: &str, _record: IdempotencyRecord, _body_hash: Vec<u8>, _ttl: Duration) {
-            // No-op: the fallible `try_set` path is what the guard uses; this
-            // simulated backend never persists so retries cannot see a record.
-        }
-
-        fn try_set(
-            &self,
-            _key: &str,
+        fn set<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: &'a str,
             _record: IdempotencyRecord,
             _body_hash: Vec<u8>,
             _ttl: Duration,
-        ) -> Result<(), IdempotencyStoreError> {
-            Err(IdempotencyStoreError::backend(
-                "simulated consumed-token persistence failure",
-            ))
+        ) -> IdempotencyFuture<'a, bool> {
+            Box::pin(async {
+                Err(IdempotencyStoreError::backend(
+                    "simulated consumed-token persistence failure",
+                ))
+            })
         }
 
-        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
-            self.inner.try_lock(key, lock_ttl)
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.try_lock(key, owner, lock_ttl)
         }
 
-        fn unlock(&self, key: &str) {
-            self.inner.unlock(key);
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
         }
     }
 
@@ -1506,6 +1625,79 @@ mod tests {
         );
     }
 
+    /// A store whose writes are always fenced out: `set` stores nothing and
+    /// returns `false`, as when a newer request took the key.
+    struct FencedSetStore {
+        inner: MemoryIdempotencyStore,
+    }
+
+    impl IdempotencyStore for FencedSetStore {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+            self.inner.get(key)
+        }
+
+        fn set<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: &'a str,
+            _record: IdempotencyRecord,
+            _body_hash: Vec<u8>,
+            _ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            Box::pin(std::future::ready(Ok(false)))
+        }
+
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.try_lock(key, owner, lock_ttl)
+        }
+
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
+        }
+    }
+
+    /// A fenced-out token write after the handler succeeded fails closed like
+    /// a failed write: `503`, and the lock stays, so a retry gets `409`.
+    #[tokio::test]
+    async fn fenced_out_write_fails_closed_and_holds_lock() {
+        let store: Arc<dyn IdempotencyStore> = Arc::new(FencedSetStore {
+            inner: MemoryIdempotencyStore::new(Duration::from_secs(600)),
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store));
+
+        let first = app
+            .clone()
+            .oneshot(urlencoded_post("tok-fenced"))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let second = app
+            .clone()
+            .oneshot(urlencoded_post("tok-fenced"))
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
     /// Finding (fail closed on response-stream error): when the handler has
     /// already committed its mutation and returned a 2xx, but its response body
     /// stream then errors mid-buffer, the guard can neither record the token nor
@@ -1556,7 +1748,7 @@ mod tests {
         // No consumed-token record was persisted (the body never fully buffered).
         let key = storage_key(token);
         assert!(
-            store.get(&key).is_none(),
+            store.get(&key).await.unwrap().is_none(),
             "a response-stream error must not persist a consumed-token record"
         );
 
@@ -1631,7 +1823,7 @@ mod tests {
         // never fully buffered).
         let key = storage_key(token);
         assert!(
-            store.get(&key).is_none(),
+            store.get(&key).await.unwrap().is_none(),
             "a non-success response-stream error must not persist a consumed-token record"
         );
 
@@ -1670,37 +1862,40 @@ mod tests {
     }
 
     impl IdempotencyStore for FailingGetStore {
-        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
-            // The infallible path collapses a read failure to a cache miss —
-            // exactly the fail-open behaviour the guard must NOT rely on. It
-            // uses `try_get` instead, so this stays here only for the trait.
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
             if self.fail_reads.load(Ordering::SeqCst) {
-                None
+                Box::pin(async {
+                    Err(IdempotencyStoreError::backend(
+                        "simulated consumed-token lookup failure",
+                    ))
+                })
             } else {
                 self.inner.get(key)
             }
         }
 
-        fn try_get(&self, key: &str) -> Result<Option<IdempotencyEntry>, IdempotencyStoreError> {
-            if self.fail_reads.load(Ordering::SeqCst) {
-                Err(IdempotencyStoreError::backend(
-                    "simulated consumed-token lookup failure",
-                ))
-            } else {
-                self.inner.try_get(key)
-            }
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            record: IdempotencyRecord,
+            body_hash: Vec<u8>,
+            ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.set(key, owner, record, body_hash, ttl)
         }
 
-        fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
-            self.inner.set(key, record, body_hash, ttl);
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.try_lock(key, owner, lock_ttl)
         }
 
-        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
-            self.inner.try_lock(key, lock_ttl)
-        }
-
-        fn unlock(&self, key: &str) {
-            self.inner.unlock(key);
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
         }
     }
 
@@ -1749,6 +1944,82 @@ mod tests {
             1,
             "the handler must not re-run when the consumed-token lookup fails"
         );
+    }
+
+    /// A store whose lookup after the lock is slow, and which cannot renew a
+    /// lock (the trait's default `renew_lock`).
+    struct SlowLookupNoRenewStore {
+        inner: MemoryIdempotencyStore,
+        lookups: AtomicUsize,
+    }
+
+    impl IdempotencyStore for SlowLookupNoRenewStore {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+            let lookup = self.lookups.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if lookup == 1 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                self.inner.get(key).await
+            })
+        }
+
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            record: IdempotencyRecord,
+            body_hash: Vec<u8>,
+            ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.set(key, owner, record, body_hash, ttl)
+        }
+
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.try_lock(key, owner, lock_ttl)
+        }
+
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
+        }
+    }
+
+    /// A submit whose lookup after the lock used more than a tenth of the
+    /// in-flight TTL needs a renewed lock; a store that cannot renew answers
+    /// `409` instead of running the handler on a lock that may have lapsed.
+    #[tokio::test]
+    async fn slow_post_lock_lookup_without_renewal_does_not_run_the_handler() {
+        let store: Arc<dyn IdempotencyStore> = Arc::new(SlowLookupNoRenewStore {
+            inner: MemoryIdempotencyStore::new(Duration::from_secs(600)),
+            lookups: AtomicUsize::new(0),
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let config = SubmitTokenConfig {
+            in_flight_ttl_secs: 1,
+            ..default_config()
+        };
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(SubmitTokenLayer::new(store, &config));
+
+        let response = app.oneshot(urlencoded_post("tok-slow")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(count.load(Ordering::SeqCst), 0, "the handler must not run");
     }
 
     /// Finding J (preserve body read errors): when the request body stream
@@ -1823,22 +2094,34 @@ mod tests {
     }
 
     impl IdempotencyStore for TtlRecordingStore {
-        fn get(&self, key: &str) -> Option<IdempotencyEntry> {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
             self.inner.get(key)
         }
 
-        fn set(&self, key: &str, record: IdempotencyRecord, body_hash: Vec<u8>, ttl: Duration) {
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            record: IdempotencyRecord,
+            body_hash: Vec<u8>,
+            ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
             *self.set_ttl.lock().unwrap() = Some(ttl);
-            self.inner.set(key, record, body_hash, ttl);
+            self.inner.set(key, owner, record, body_hash, ttl)
         }
 
-        fn try_lock(&self, key: &str, lock_ttl: Duration) -> bool {
+        fn try_lock<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
             *self.lock_ttl.lock().unwrap() = Some(lock_ttl);
-            self.inner.try_lock(key, lock_ttl)
+            self.inner.try_lock(key, owner, lock_ttl)
         }
 
-        fn unlock(&self, key: &str) {
-            self.inner.unlock(key);
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
         }
     }
 
@@ -1925,7 +2208,12 @@ mod tests {
         // consumed response yet.
         let token = "tok-inflight";
         let key = storage_key(token);
-        assert!(store.try_lock(&key, Duration::from_secs(86_400)));
+        assert!(
+            store
+                .try_lock(&key, "first-attempt", Duration::from_secs(86_400))
+                .await
+                .unwrap()
+        );
 
         // A concurrent retry with the same token is rejected in-flight and never
         // reaches the handler.
@@ -1939,6 +2227,168 @@ mod tests {
             count.load(Ordering::SeqCst),
             0,
             "the handler must not run for a retry held out by the in-flight lock"
+        );
+    }
+
+    /// Attempt A outlives its 1 s lock and fails, so it is not cached and
+    /// releases its lock. Retry B took the key after A's lock expired and is
+    /// still running. A's release must not free B's lock: a third attempt gets
+    /// `409` and does not run the handler while B runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn late_release_keeps_a_newer_attempts_lock() {
+        let store: Arc<dyn IdempotencyStore> =
+            Arc::new(MemoryIdempotencyStore::new(Duration::from_secs(600)));
+        let config = SubmitTokenConfig {
+            enabled: true,
+            in_flight_ttl_secs: 1,
+            ..Default::default()
+        };
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        let run = count.fetch_add(1, Ordering::SeqCst);
+                        match run {
+                            // A: outlives its lock, then fails (not cached).
+                            0 => {
+                                tokio::time::sleep(Duration::from_millis(1_500)).await;
+                                (StatusCode::INTERNAL_SERVER_ERROR, "failed")
+                            }
+                            // B: still running when A releases.
+                            1 => {
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                (StatusCode::CREATED, "created")
+                            }
+                            _ => (StatusCode::CREATED, "created"),
+                        }
+                    }
+                }),
+            )
+            .layer(SubmitTokenLayer::new(store, &config));
+
+        let token = "tok-late-release";
+        let a = tokio::spawn(app.clone().oneshot(urlencoded_post(token)));
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let b = tokio::spawn(app.clone().oneshot(urlencoded_post(token)));
+        // A finishes at ~1.5 s and releases; B runs until ~3.2 s.
+        let a = a.await.unwrap().unwrap();
+        assert_eq!(a.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let c = app.clone().oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            c.status(),
+            StatusCode::CONFLICT,
+            "B still holds the token; A's release must not free B's lock"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2, "C did not run the handler");
+        let b = b.await.unwrap().unwrap();
+        assert_eq!(b.status(), StatusCode::CREATED);
+    }
+
+    /// A store that refuses the lock and hides the first lookup: as if a
+    /// racing request stored its response and released the token between
+    /// this request's lookup and its lock (the database store refuses a lock
+    /// while a response is stored).
+    struct LateRecordStore {
+        inner: MemoryIdempotencyStore,
+        gets: AtomicUsize,
+    }
+
+    impl IdempotencyStore for LateRecordStore {
+        fn get<'a>(&'a self, key: &'a str) -> IdempotencyFuture<'a, Option<IdempotencyEntry>> {
+            if self.gets.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Box::pin(async { Ok(None) });
+            }
+            self.inner.get(key)
+        }
+
+        fn set<'a>(
+            &'a self,
+            key: &'a str,
+            owner: &'a str,
+            record: IdempotencyRecord,
+            body_hash: Vec<u8>,
+            ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            self.inner.set(key, owner, record, body_hash, ttl)
+        }
+
+        fn try_lock<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: &'a str,
+            _lock_ttl: Duration,
+        ) -> IdempotencyFuture<'a, bool> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn unlock<'a>(&'a self, key: &'a str, owner: &'a str) -> IdempotencyFuture<'a, ()> {
+            self.inner.unlock(key, owner)
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_refused_by_a_late_record_replays_it() {
+        let token = "tok-late-record";
+        let inner = MemoryIdempotencyStore::new(Duration::from_secs(600));
+        let record = IdempotencyRecord {
+            status: 201,
+            headers: Vec::new(),
+            body: b"first".to_vec(),
+            metadata: Vec::new(),
+        };
+        inner
+            .set(
+                &storage_key(token),
+                "racer",
+                record,
+                Vec::new(),
+                Duration::from_secs(600),
+            )
+            .await
+            .unwrap();
+        let store: Arc<dyn IdempotencyStore> = Arc::new(LateRecordStore {
+            inner,
+            gets: AtomicUsize::new(0),
+        });
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_inner = count.clone();
+        let app = Router::new()
+            .route(
+                "/submit",
+                post(move || {
+                    let count = count_inner.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        "created"
+                    }
+                }),
+            )
+            .layer(layer_with_store(store));
+
+        let response = app.oneshot(urlencoded_post(token)).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "the racing request's response is replayed, not a 409"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 0, "the handler did not run");
+    }
+
+    /// Characterization for the Echo clone class: `storage_key` renders its
+    /// digest through this file's own `hex_lower`, one of six byte-identical
+    /// copies across the crate. Pinned when `hex_lower` was replaced by the
+    /// `hex` crate (already a dependency) at its call site.
+    #[test]
+    fn storage_key_is_pinned_hex() {
+        assert_eq!(
+            storage_key("token-abc"),
+            "submit:2a8a128a33f0f4cec8eb049c91fc3242d32de4ca2384fa3e7a3770b7ab952d1b"
         );
     }
 }

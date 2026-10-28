@@ -9,6 +9,9 @@ touches tenant memory. Allocations that flow through the cell are tracked
 against the tenant's quota; when the cell is evicted and dropped, Rust's
 ownership rules deterministically reclaim its tracked footprint.
 
+A cell counts memory. It does not cap requests, connections or jobs: for
+that, see [Cell and Shuffle-Shard Isolation](cell-isolation.md).
+
 This is orthogonal to sharding. Sharding decides *which database* a tenant's
 rows live on; cells decide how much memory allocated through the supported
 arena API a single tenant may retain before its own requests start failing.

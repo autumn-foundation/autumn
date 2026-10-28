@@ -28,8 +28,8 @@ builder chain and printed these lines for you):
 
 ```toml
 [dependencies]
-autumn-web = "0.8"
-autumn-media-plugin = "0.8"
+autumn-web = "0.9"
+autumn-media-plugin = "0.9"
 ```
 
 ## `[media]` configuration
@@ -90,6 +90,18 @@ autumn_web::app()
     .await;
 ```
 
+Both primitives are off by default. If you enable neither, the plugin installs
+no routes, extensions or jobs. It logs a warning.
+
+| Builder call | Installs |
+|---|---|
+| `with_broadcast()` | `MediaMtxClient` and `MediaUrls` extensions |
+| `with_rooms()` | Room routes, `RoomService` and the room reaper |
+| Either one | `MediaStorage`, `MediaWorkflows` and the encode jobs |
+
+The retention sweep also starts if you set `recordings_root`. If the storage
+config is not valid, the plugin installs no storage, workflows, jobs or sweep.
+
 ### Migrating from Arroyo
 
 `MediaConfig::from_arroyo_env()` maps an existing Arroyo deployment's `ARROYO_*`
@@ -104,21 +116,27 @@ installs a `RoomService` on `AppState`:
 | Method | Path | Purpose |
 |--------|------|---------|
 | `POST` | `/api/media/rooms` | Create a room. |
-| `POST` | `/api/media/rooms/{room_id}/join` | Join; returns a session token and mesh WHIP/WHEP targets. |
+| `POST` | `/api/media/rooms/{room_id}/join` | Join; returns a session token and mesh WHIP/WHEP targets. A `display_name` longer than 64 characters gets `400`. |
 | `POST` | `/api/media/rooms/{room_id}/leave` | Leave. |
 | `POST` | `/api/media/rooms/{room_id}/heartbeat` | Hold the seat: refresh liveness, renew the token expiry. |
 | `GET`  | `/api/media/rooms/{room_id}` | Member-gated roster (`Authorization: Bearer <token>`). |
 
 Create and join are `#[secured]`: they need an authenticated session and return
 `401` to an anonymous caller. Leave, heartbeat and the roster are authorized by
-the per-room session token `join` returns. The routes ship **no rate limiting**;
-mount them behind your application's own middleware.
+the per-room session token `join` returns. Set `room_rate_limit_per_minute` to
+limit each client IP per route (off by default). Behind a reverse proxy, also
+set `[security.trusted_proxies]`, or all clients share the proxy's IP.
+
+A heartbeat renews the token expiry, but never past `joined_at +
+room_session_max_seconds` (default 12 hours). After that, heartbeat and roster
+return `404`. The client leaves (leave accepts a token of any age), then joins
+again.
 
 A background reaper reclaims seats and rooms that go quiet. A client holds its
 seat by sending a heartbeat, or by polling the roster, on any interval under the
 idle TTL (default 15 minutes). Room state lives in process memory by default;
 set `room_store_backend = "db"` for a shared store that survives restarts and is
-safe across processes.
+safe across processes: joins from two processes never pass the seat cap.
 
 ## Status
 

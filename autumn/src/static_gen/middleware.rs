@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
-use super::StaticManifest;
 use super::isr_coordinator::{IsrCoordinator, LocalIsrCoordinator, isr_window_key};
+use super::{ManifestEntry, StaticManifest};
 
 /// Per-route ISR state, tracking whether a regeneration is in flight
 /// and when the last regeneration attempt occurred.
@@ -109,6 +109,31 @@ fn is_legal_content_type_byte(b: u8) -> bool {
     b == b'\t' || (0x20..0x7f).contains(&b)
 }
 
+/// The `Content-Type` values axum attaches only because of a handler's Rust
+/// return type: `String`/`&str` give the first, `Vec<u8>`/`Bytes` the second.
+/// They state no intent about the page.
+const GENERIC_RETURN_TYPE_DEFAULTS: [&str; 2] =
+    ["text/plain; charset=utf-8", "application/octet-stream"];
+
+/// Return the `Content-Type` to record or compare for `route_path` (#2409).
+///
+/// A generic return-type default becomes the route's asset-extension type.
+/// Any other value stays as it is. Build records the result. ISR applies it
+/// to the expected and the fresh type before comparing.
+///
+/// Axum's `String` header is the same as a hand-written
+/// `text/plain; charset=utf-8`. The two look equal, so the extension wins:
+/// `nosniff` blocks a stylesheet served as `text/plain`. To opt out, write
+/// bare `text/plain`, or `application/octet-stream` with a parameter.
+pub(super) fn effective_content_type<'a>(declared: &'a str, route_path: &str) -> &'a str {
+    if GENERIC_RETURN_TYPE_DEFAULTS.contains(&declared)
+        && let Some(from_extension) = crate::assets::content_type_for_opt(route_path)
+    {
+        return from_extension;
+    }
+    declared
+}
+
 /// The recorded `Content-Type` a manifest entry can actually be served with, or
 /// `None` when the stored value is unusable (#1832).
 ///
@@ -192,7 +217,7 @@ pub fn resolved_content_type(
     file_path: &Path,
 ) -> http::HeaderValue {
     if let Some(recorded) = usable_recorded_content_type(recorded)
-        && let Ok(value) = http::HeaderValue::from_str(recorded)
+        && let Ok(value) = http::HeaderValue::from_str(effective_content_type(recorded, route_path))
     {
         return value;
     }
@@ -206,6 +231,50 @@ pub fn resolved_content_type(
             })
     });
     http::HeaderValue::from_static(derived)
+}
+
+/// The `Content-Type` to serve for a manifest `entry` (#2403).
+///
+/// A declared type is served as is. An inferred one goes through
+/// [`resolved_content_type`]. An app that serves `dist/` itself must use this
+/// function to match Autumn.
+#[must_use]
+pub fn resolved_entry_content_type(
+    entry: &ManifestEntry,
+    route_path: &str,
+    file_path: &Path,
+) -> http::HeaderValue {
+    if entry.content_type_explicit
+        && let Some(declared) = usable_recorded_content_type(entry.content_type.as_deref())
+        && let Ok(value) = http::HeaderValue::from_str(declared)
+    {
+        return value;
+    }
+    resolved_content_type(entry.content_type.as_deref(), route_path, file_path)
+}
+
+/// The type ISR must see in a fresh response for `entry`, or `None` for no check.
+///
+/// A usable declared type is pinned by the route attribute, so the handler
+/// header cannot desync from it and needs no guard.
+fn isr_expected_content_type(
+    entry: &ManifestEntry,
+    route_path: &str,
+    file_path: &Path,
+) -> Option<String> {
+    let usable = usable_recorded_content_type(entry.content_type.as_deref());
+    if entry.content_type_explicit {
+        // An unusable declared value is ignored when serving, so guard the
+        // type that is served instead.
+        return match usable {
+            Some(_) => None,
+            None => resolved_content_type(None, route_path, file_path)
+                .to_str()
+                .ok()
+                .map(str::to_owned),
+        };
+    }
+    usable.map(|recorded| effective_content_type(recorded, route_path).to_owned())
 }
 
 impl StaticFileLayer {
@@ -266,7 +335,7 @@ impl StaticFileLayer {
     /// The default is [`LocalIsrCoordinator`], which is suitable for
     /// single-replica and development deployments. For multi-replica
     /// deployments sharing a writable `dist/` volume, supply a distributed
-    /// backend such as `PostgresIsrCoordinator` (feature `db`) to prevent
+    /// backend such as `PostgresIsrCoordinator` (feature `postgres`) to prevent
     /// stampede writes.
     ///
     /// # Example (production multi-replica)
@@ -347,12 +416,11 @@ impl StaticFileLayer {
                 // Only a value the serve path would actually honour: an
                 // unusable one is ignored there, so treating it as the ISR
                 // expectation would refuse every regeneration forever.
-                usable_recorded_content_type(entry.content_type.as_deref()),
+                isr_expected_content_type(entry, request_path, &file_path).as_deref(),
             );
         }
 
-        let content_type =
-            resolved_content_type(entry.content_type.as_deref(), request_path, &file_path);
+        let content_type = resolved_entry_content_type(entry, request_path, &file_path);
 
         Some(ResolvedStatic {
             file_path,
@@ -700,10 +768,13 @@ async fn regenerate_page(
     // caller's existing `warn!`, and the ISR cooldown throttles the retries; a
     // rebuild (`autumn build`) is what re-records the type.
     if let Some(expected) = expected_content_type {
+        // Same normalization as build, so a generic default compares equal to
+        // the extension type it was recorded as (#2409).
         let actual = response
             .headers()
             .get(axum::http::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok());
+            .and_then(|v| v.to_str().ok())
+            .map(|v| effective_content_type(v.trim(), url));
         if !actual.is_some_and(|actual| content_type_equivalent(actual, expected)) {
             // Logged here as well as by the caller: an ordinary regeneration
             // failure is transient, but this one repeats every cooldown until
@@ -1759,6 +1830,281 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "<h1>fresh</h1>");
     }
 
+    /// #2409: a `String` handler on `/theme.css` records `text/css`. Its fresh
+    /// `text/plain` default must normalize to the same type, not freeze the route.
+    #[tokio::test]
+    async fn regenerate_page_accepts_generic_default_normalized_to_extension_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("theme.css");
+        std::fs::write(&dest, "a{}").expect("write");
+
+        let router =
+            axum::Router::new().fallback(axum::routing::get(|| async { "b{}".to_owned() }));
+
+        regenerate_page(
+            &router,
+            "/theme.css",
+            &dest,
+            Some("text/css; charset=utf-8"),
+        )
+        .await
+        .expect("generic default normalizes to the recorded extension type");
+
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "b{}");
+    }
+
+    /// #2409: a JSON response must not overwrite a recorded `text/css` file.
+    #[tokio::test]
+    async fn regenerate_page_refuses_json_over_recorded_extension_type() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("theme.css");
+        std::fs::write(&dest, "a{}").expect("write");
+
+        let router = axum::Router::new().fallback(axum::routing::get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"x":1}"#,
+            )
+        }));
+
+        let err = regenerate_page(
+            &router,
+            "/theme.css",
+            &dest,
+            Some("text/css; charset=utf-8"),
+        )
+        .await
+        .expect_err("JSON must not replace a text/css file");
+        assert!(err.to_string().contains("Content-Type changed"), "{err}");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "a{}");
+    }
+
+    /// #2409: an old or edited manifest holding a generic default on an
+    /// extensioned route serves the extension type.
+    #[test]
+    fn resolved_content_type_normalizes_recorded_generic_default() {
+        let value = resolved_content_type(
+            Some("text/plain; charset=utf-8"),
+            "/theme.css",
+            Path::new("theme.css/index.html"),
+        );
+        assert_eq!(value, "text/css; charset=utf-8");
+    }
+
+    /// #2409: ISR must not freeze on a recorded generic default.
+    #[tokio::test]
+    async fn regenerate_page_accepts_trimmed_generic_default_header() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("theme.css");
+        std::fs::write(&dest, "a{}").expect("write");
+        let router = axum::Router::new().fallback(axum::routing::get(|| async {
+            (
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    " text/plain; charset=utf-8",
+                )],
+                "b{}",
+            )
+        }));
+        regenerate_page(
+            &router,
+            "/theme.css",
+            &dest,
+            Some("text/css; charset=utf-8"),
+        )
+        .await
+        .expect("padded generic default normalizes");
+    }
+
+    /// #2409 end to end: build a `String` route on `/theme.css`, then ISR it.
+    #[tokio::test]
+    async fn isr_guards_extensioned_string_route_built_by_render_static_routes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist_dir = dir.path().join("dist");
+        let string_router =
+            || axum::Router::new().fallback(axum::routing::get(|| async { "a{}".to_owned() }));
+        let meta = crate::static_gen::StaticRouteMeta {
+            path: "/theme.css",
+            name: "theme",
+            revalidate: Some(1),
+            params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
+        };
+        crate::static_gen::render_static_routes(string_router(), &[meta], &dist_dir)
+            .await
+            .expect("render");
+        let manifest = StaticManifest::load(&dist_dir.join("manifest.json")).expect("manifest");
+        let recorded = manifest.routes["/theme.css"].content_type.clone();
+        assert_eq!(recorded.as_deref(), Some("text/css; charset=utf-8"));
+
+        let dest = dist_dir.join(&manifest.routes["/theme.css"].file);
+        regenerate_page(&string_router(), "/theme.css", &dest, recorded.as_deref())
+            .await
+            .expect("String handler still regenerates");
+
+        let json_router = axum::Router::new().fallback(axum::routing::get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                "{}",
+            )
+        }));
+        regenerate_page(&json_router, "/theme.css", &dest, recorded.as_deref())
+            .await
+            .expect_err("JSON must not overwrite the stylesheet");
+    }
+
+    // ── #2403: an explicit entry is served and guarded as declared ───────────
+
+    fn explicit_entry(content_type: &str, revalidate: Option<u64>) -> ManifestEntry {
+        ManifestEntry::new("logo.png/index.html")
+            .with_revalidate(revalidate)
+            .with_content_type(Some(content_type.to_owned()))
+            .with_content_type_explicit(true)
+    }
+
+    #[test]
+    fn explicit_generic_type_is_served_as_declared() {
+        let entry = explicit_entry("application/octet-stream", None);
+        let value =
+            resolved_entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
+        assert_eq!(value, "application/octet-stream");
+    }
+
+    #[test]
+    fn explicit_entry_with_an_unusable_type_still_falls_back() {
+        let entry = explicit_entry("   ", None);
+        let value =
+            resolved_entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
+        assert_eq!(value, "image/png");
+    }
+
+    #[test]
+    fn explicit_entry_with_a_non_ascii_type_falls_back() {
+        let entry = explicit_entry("image/p\u{e9}ng", None);
+        let value =
+            resolved_entry_content_type(&entry, "/logo.png", Path::new("logo.png/index.html"));
+        assert_eq!(value, "image/png");
+    }
+
+    /// The runtime byte rule the macro copies: tab and `0x20..0x7f`.
+    #[test]
+    fn legal_content_type_bytes_match_the_macro_rule() {
+        for b in 0..=255u8 {
+            let expected = b == b'\t' || (0x20..0x7f).contains(&b);
+            assert_eq!(is_legal_content_type_byte(b), expected, "byte {b:#x}");
+        }
+    }
+
+    /// Whole path: build with a declared type, serve through the layer, then
+    /// ISR with a handler that sets another header.
+    #[tokio::test]
+    async fn declared_type_survives_serving_and_isr() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dist_dir = dir.path().join("dist");
+        let router = axum::Router::new().fallback(axum::routing::get(|| async {
+            ([(axum::http::header::CONTENT_TYPE, "text/plain")], "b")
+        }));
+        let meta = crate::static_gen::StaticRouteMeta {
+            path: "/logo.png",
+            name: "logo",
+            revalidate: Some(3600),
+            params_fn: None,
+            seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: Some("application/octet-stream"),
+        };
+        crate::static_gen::render_static_routes(router.clone(), &[meta], &dist_dir)
+            .await
+            .expect("render");
+
+        let layer = StaticFileLayer::new(&dist_dir).expect("layer");
+        let hit = layer.resolve_entry("/logo.png").expect("hit");
+        assert_eq!(hit.content_type, "application/octet-stream");
+
+        let manifest = StaticManifest::load(&dist_dir.join("manifest.json")).expect("manifest");
+        let entry = &manifest.routes["/logo.png"];
+        let expected = isr_expected_content_type(entry, "/logo.png", &hit.file_path);
+        regenerate_page(&router, "/logo.png", &hit.file_path, expected.as_deref())
+            .await
+            .expect("an explicit entry regenerates whatever the handler header says");
+    }
+
+    #[test]
+    fn inferred_generic_type_is_still_remapped() {
+        let value = resolved_content_type(
+            Some("application/octet-stream"),
+            "/logo.png",
+            Path::new("logo.png/index.html"),
+        );
+        assert_eq!(value, "image/png");
+    }
+
+    /// ISR skips the type guard for an explicit entry: the route attribute
+    /// pins the header, so the handler's own header is irrelevant.
+    #[test]
+    fn isr_does_not_guard_the_type_of_an_explicit_entry() {
+        let entry = explicit_entry("application/octet-stream", Some(1));
+        let file = Path::new("logo.png/index.html");
+        assert_eq!(isr_expected_content_type(&entry, "/logo.png", file), None);
+    }
+
+    /// An explicit flag with no usable type serves the derived type, so ISR
+    /// must guard that same type.
+    #[test]
+    fn isr_guards_the_fallback_type_of_an_unusable_explicit_entry() {
+        let file = Path::new("logo.png/index.html");
+        for bad in [None, Some(""), Some("   "), Some("image/p\u{e9}ng")] {
+            let entry = ManifestEntry::new("logo.png/index.html")
+                .with_content_type(bad.map(str::to_owned))
+                .with_content_type_explicit(true);
+            assert_eq!(
+                isr_expected_content_type(&entry, "/logo.png", file).as_deref(),
+                Some("image/png"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn isr_still_guards_the_type_of_an_inferred_entry() {
+        let entry = ManifestEntry::new("theme.css/index.html")
+            .with_content_type(Some("text/plain; charset=utf-8".to_owned()));
+        assert_eq!(
+            isr_expected_content_type(&entry, "/theme.css", Path::new("theme.css/index.html"))
+                .as_deref(),
+            Some("text/css; charset=utf-8")
+        );
+    }
+
+    #[test]
+    fn effective_content_type_maps_generic_default_to_extension_type() {
+        assert_eq!(
+            effective_content_type("text/plain; charset=utf-8", "/theme.css"),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(
+            effective_content_type("application/octet-stream", "/logo.png"),
+            "image/png"
+        );
+        // Explicit, agreeing, or unknown-extension types stay as declared.
+        assert_eq!(
+            effective_content_type("application/json", "/n.txt"),
+            "application/json"
+        );
+        assert_eq!(
+            effective_content_type("text/plain; charset=utf-8", "/n.txt"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            effective_content_type("application/octet-stream", "/r.pdf"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            effective_content_type("text/plain", "/theme.css"),
+            "text/plain"
+        );
+    }
+
     /// A route that records no type has nothing to desync, so regeneration is
     /// unconstrained — this is the pre-#1832 behaviour for legacy manifests.
     #[tokio::test]
@@ -1910,6 +2256,7 @@ mod tests {
                 revalidate: Some(1),
                 params_fn: None,
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
+                content_type: None,
             }],
             &dist,
         )
@@ -2007,6 +2354,7 @@ mod tests {
             revalidate: Some(1),
             params_fn: None,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            content_type: None,
         };
 
         // Old behavior: the build records the post-layer type ...

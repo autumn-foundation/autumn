@@ -117,6 +117,27 @@ pub fn saturating_time_delta_secs(secs: u64) -> TimeDelta {
         .unwrap_or(TimeDelta::MAX)
 }
 
+/// Kani proofs over the saturating time helpers. Run with
+/// `cargo kani -p autumn-web --lib`.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    /// Any second count gives a `TimeDelta`, never a panic. Counts that fit
+    /// are exact; the rest clamp to `TimeDelta::MAX`.
+    #[kani::proof]
+    fn time_delta_secs_never_panics() {
+        let secs: u64 = kani::any();
+        let delta = saturating_time_delta_secs(secs);
+        assert!(delta >= TimeDelta::zero());
+        if let Some(exact) = i64::try_from(secs).ok().and_then(TimeDelta::try_seconds) {
+            assert_eq!(delta, exact);
+        } else {
+            assert_eq!(delta, TimeDelta::MAX);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

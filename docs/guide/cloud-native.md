@@ -43,7 +43,7 @@ those paths itself.
 | Endpoint | Probe | What it reflects |
 | --- | --- | --- |
 | `/live` | liveness | Only that the process is up. Ignores startup and dependency state, so it answers `200` whenever the process is running. |
-| `/ready` | readiness | Startup completion, shutdown draining, connection-pool saturation, a configured read replica (unless `replica_fallback = "primary"`), and any readiness indicators you register. `503` when any is not ready. |
+| `/ready` | readiness | Startup completion, shutdown draining, a cached `SELECT 1` on the primary database, a configured read replica (unless `replica_fallback = "primary"`), and any readiness indicators you register. `503` when any is not ready. |
 | `/startup` | startup | Stays unavailable until startup hooks complete. |
 | `/health` | — | Compatibility alias for readiness: same checks and same status as `/ready`. |
 
@@ -55,19 +55,21 @@ Recommended use:
 
 Do not point all three at `/health` just because it was easy in older apps.
 `/health` is a readiness answer, so it returns `503` for conditions a restart
-does not fix: a saturated connection pool, a read replica that cannot safely
+does not fix: an unreachable primary database, a read replica that cannot safely
 serve reads, a readiness indicator of your own reporting down, or a drain
 already in progress. A *liveness* probe reading one of those has the
 orchestrator kill a process that was working — a busy minute becomes a restart
 loop, which is the failure mode separate probes exist to prevent. Point
 liveness at `/live`, which reports on the process and nothing else.
 
-Readiness does **not** ping the primary database. The built-in `db` indicator
-reports pool *availability* — whether a connection is free, or nobody is queued
-for one — so a primary that has become unreachable while the pool still holds
-idle connections can leave `/ready` at `200`. A configured read replica is
-different: it is probed with a real `SELECT 1`. If you need readiness to gate
-on primary connectivity, register an indicator that runs a query.
+Readiness pings the primary database with `SELECT 1` on one dedicated
+connection outside the pool. Autumn keeps the result for `health.cache_ttl_ms`
+(default 1 s). One probe refreshes it, and the other probes wait. A ping that
+fails or takes longer than `health.ping_timeout_ms` (default 2 s) gives `503`.
+Keep that limit below the probe `timeoutSeconds`. Pool saturation does **not**
+affect readiness. A busy app replica stays in rotation. To shed excess
+requests with `503` and `Retry-After`, set `server.max_concurrent_requests`
+(off by default). A configured read replica gets the same ping.
 
 For readiness that also reflects your own subsystems, see
 [Health Indicators](health-indicators.md).
@@ -87,6 +89,7 @@ service_namespace = "apps"
 environment = "production"
 otlp_endpoint = "http://otel-collector:4317"
 protocol = "Grpc"
+sample_ratio = 1.0   # parent-based ratio for new traces
 ```
 
 If you are not ready for OTLP yet, force `log.format = "Json"` so your logs are
@@ -107,6 +110,10 @@ With the `telemetry-otlp` cargo feature enabled and `telemetry.enabled = true`:
   span tagged with `db.system=postgresql` whose scope covers the lifetime
   of the pooled connection — Diesel activity performed through it appears
   as a child of the request span in Jaeger / Tempo / Datadog.
+- **Sampling.** `telemetry.sample_ratio` sets a parent-based ratio sampler.
+  See [Overload signals](observability/overload-signals.md#sampler).
+- **Trace IDs in logs.** Request log events carry `trace_id` and `span_id`.
+- **Outbound CLIENT spans.** `http_client` opens one span per attempt.
 - **Job and mailer trace propagation.** `#[job]` and `#[mailer]` boundaries
   now carry the W3C `traceparent` / `tracestate` into their durable payloads.
   See below.
@@ -624,6 +631,74 @@ target. A spike in this counter after a deployment indicates more reads than
 expected are being pinned — tune `pin_after_write_secs` or audit which handlers
 are injecting `Db` unnecessarily.
 
+### Lag-aware reads
+
+The read-your-own-writes pin lasts a fixed time. A replica that is further
+behind serves stale reads after the pin ends. Set a lag limit to stop this:
+
+```toml
+[database]
+replica_url = "postgres://user:pass@replica:5432/app"
+replica_max_lag_ms = 5_000
+```
+
+With a limit set:
+
+- The app measures the lag on the replica in the background. The interval
+  is half the limit, between 250 ms and 5 s. `/ready` reports the last
+  sample and does not run the lag query itself.
+- A sample older than twice the limit (at least 1 s) counts as unknown. When
+  the checks stop (a hung query, a full pool), reads go to the primary.
+- While the lag is over the limit, reads go to the primary. This is true for
+  both `replica_fallback` values: a lagging replica is stale, not down. With
+  `fail_readiness`, this puts the read load of every pod on the primary.
+- While the lag is not known (no sample yet, or the query failed), reads go
+  to the primary.
+- Lag alone does not fail readiness. A shared replica that falls behind must
+  not remove every pod from the load balancer.
+- With `[health] detailed = true`, `/ready` reports the replica:
+  `{"replica": {"ready": false, "lag_ms": 30000, "max_lag_ms": 5000, "detail": "..."}}`.
+
+The lag query returns `0` when the WAL receiver runs, it got a message from
+the primary within the lag limit, and all received WAL is replayed. If not,
+it returns the time since the last replayed transaction.
+This is a simplified form of the query:
+
+```sql
+SELECT CASE
+  WHEN NOT pg_is_in_recovery() THEN 0
+  WHEN EXISTS (SELECT 1 FROM pg_stat_wal_receiver
+               WHERE last_msg_receipt_time > clock_timestamp() - <replica_max_lag_ms>)
+       AND pg_last_wal_replay_lsn() >= pg_last_wal_receive_lsn() THEN 0
+  ELSE clock_timestamp() - pg_last_xact_replay_timestamp()  -- in ms
+END
+```
+
+Know these limits of the query:
+
+- After a long quiet period on the primary, the first new WAL can show a
+  large lag for one check. Reads then use the primary for one interval.
+- On a quiet link, the replica hears from the primary about every half
+  `wal_receiver_timeout` (a replica setting, 60 s by default). When
+  `replica_max_lag_ms` is shorter than that interval, a quiet replica reads as
+  stale between messages, and reads use the primary. To use a short limit on
+  a quiet database, set `wal_receiver_timeout` on the replica to at most
+  twice the limit.
+- A replica that restores WAL from an archive (no WAL receiver) shows the
+  time since its last replayed transaction.
+- Clock skew between the primary and the replica adds to the value.
+- The receiver check needs a role with `pg_read_all_stats` (for example
+  through `pg_monitor`). Without it, Postgres hides
+  `last_msg_receipt_time`, and the query always uses the time since the last
+  replayed transaction. On a quiet primary, reads then go to the primary.
+
+The limit applies only to `database.replica_url`. Shard replicas do not use
+it yet. Without `replica_url`, the app ignores the limit
+and logs a warning.
+
+The environment variable is `AUTUMN_DATABASE__REPLICA_MAX_LAG_MS`. Behind a
+connection pooler, see [Running behind PgBouncer / RDS Proxy](connection-poolers.md).
+
 ## Shared Cache
 
 In-process Moka caches are the zero-config default and are perfect for
@@ -661,7 +736,7 @@ autumn_web::app()
 ```toml
 # Cargo.toml
 [dependencies]
-autumn-cache-redis = "0.8"
+autumn-cache-redis = "0.9"
 ```
 
 `CacheResponseLayer::from_app(&state)` returns `Some(layer)` wired to the
@@ -834,19 +909,23 @@ transaction commits or rolls back.
 
 ### Cache invalidation after writes
 
-`after_update` hooks receive a `MutationContext` that accepts
-`ctx.invalidate("key")` calls to declare cache keys that should be evicted
-after the write commits. This is coordinated with the shared-cache integration
-(#535) so that the correct backend — Moka or Redis — is targeted regardless of
-which replica processed the write:
+Declare which cached reads a repository's writes make stale. Each generated
+write then drops them **after it commits**, on the configured backend
+(in-process Moka, or shared Redis). You do not need to call anything:
 
 ```rust
-async fn after_update(&self, ctx: &mut MutationContext, page: &Page) -> AutumnResult<()> {
-    ctx.invalidate(format!("pages:{}", page.id));
-    ctx.invalidate("pages:all");
-    Ok(())
-}
+#[repository(Page, invalidates(crate::views::page_list))]
+pub trait PageRepository {}
 ```
+
+A failed backend sweep is retried, then logged and counted in
+`autumn_cache_invalidation_failures_total`. See
+[Cache Coherence](cache-coherence.md#commit-bound-invalidation).
+
+`MutationContext::invalidate("key")` only records a key in
+`ctx.invalidate_keys`. The generated repository does not evict these keys.
+Use `invalidates(...)`, or call `Cache::invalidate_async` from an
+`after_*_commit` hook.
 
 ## Rolling Deploy Lifecycle
 
@@ -863,8 +942,8 @@ timeout.
 | 2 | **ready_draining** | `/ready` flips to `503 Service Unavailable` **strictly before** the TCP listener closes. Upstream load balancers can now deregister the replica. |
 | 3 | **prestop_grace** | Autumn sleeps `server.prestop_grace_secs` (default `5`). Set this to at least your LB's health-check interval plus deregistration propagation time. |
 | 4 | **ws_closing** | The WebSocket shutdown token fires. Handlers that opt into `WithShutdown` should send a `1001 Going Away` close frame so clients can reconnect to another replica. Handlers that do not use `WithShutdown` will have their connections closed without a close frame. |
-| 5 | **listener_stopping** | The TCP listener stops accepting new connections. `#[job]` workers and `#[scheduled]` tasks stop dequeuing/launching new work — they share the same cancellation token as the listener. The HTTP drain then starts after a 100 ms settle window, so a connection accepted just before the stop has its request read and served rather than being closed as idle. |
-| 6 | **in_flight_drain** | In-flight HTTP requests complete for up to `server.shutdown_timeout_secs` (default `30`). Requests still running at the deadline are aborted and counted in `autumn_shutdown_aborted_requests_total`. The process exits with code `1` and a structured log line naming the exceeded phase. |
+| 5 | **listener_stopping** | The TCP listener stops accepting new connections. `#[job]` workers and `#[scheduled]` tasks stop dequeuing/launching new work — they share the same cancellation token as the listener. The HTTP drain then starts after a 100 ms settle window. A connection that has sent no request at the drain signal gets up to 2 s more to send one. The server closes it if none comes. The server serves such a connection instead of closing it as idle. |
+| 6 | **in_flight_drain** | In-flight HTTP requests complete for up to `server.shutdown_timeout_secs` (default `30`, prod profile `35`). Requests still running at the deadline are aborted and counted in `autumn_shutdown_aborted_requests_total`. The process exits with code `1` and a structured log line naming the exceeded phase. |
 | 7 | **app_hooks** | `on_shutdown` hooks run in **LIFO registration order** with a per-hook and total budget equal to `shutdown_timeout_secs`. Plugin hooks registered during `build()` run after app hooks (LIFO means last-registered runs first). Overruns are logged at WARN but do not block the remaining budget. |
 | 8 | **telemetry_flush** | OpenTelemetry span exporter flushes buffered spans (handled by the `_telemetry_guard` drop). |
 | 9 | **db_pool_close** | The Diesel connection pool is dropped with the process. |
@@ -878,8 +957,10 @@ timeout.
 # Tune to: LB health-check interval + deregistration propagation time.
 prestop_grace_secs = 5
 
-# Maximum seconds for in-flight requests to drain (default: 30).
-shutdown_timeout_secs = 30
+# Maximum seconds for in-flight requests to drain (default: 30; prod
+# profile: 35, the 30 s request timeout + 5 s). Keep it above
+# server.timeouts.request_timeout_ms; see timeouts-and-budgets.md.
+shutdown_timeout_secs = 35
 ```
 
 Environment variable overrides:
@@ -890,6 +971,9 @@ AUTUMN_SERVER__SHUTDOWN_TIMEOUT_SECS=60
 ```
 
 ### Kubernetes / ECS configuration
+
+`autumn release init --target kubernetes` writes a Helm chart and a Kustomize
+base with these settings. See [Kubernetes](kubernetes.md).
 
 Wire `prestop_grace_secs` to your `preStop` hook and termination grace period:
 
@@ -902,8 +986,8 @@ spec:
       # shutdown_timeout_secs covers drain AND on_shutdown hooks combined
       # (they share one budget, not two separate windows).
       # If you use a Kubernetes preStop hook, include its duration in the total.
-      # Example: 5 (preStop sleep) + 5 (prestop_grace) + 30 (drain+hooks) + 10 (buffer) = 50 s.
-      terminationGracePeriodSeconds: 50
+      # Example: 5 (preStop sleep) + 5 (prestop_grace) + 35 (drain+hooks) + 10 (buffer) = 55 s.
+      terminationGracePeriodSeconds: 55
       containers:
         - name: app
           readinessProbe:
@@ -992,6 +1076,46 @@ autumn_web::app()
     .await;
 ```
 
+## Production Protections
+
+The `prod` profile turns on these protections (issue #3057). Each has a
+one-line opt-out.
+
+| Protection | `prod` default | Opt-out |
+| --- | --- | --- |
+| Load shedding | primary pool size × 32 in-flight requests (at least 256), then `503` | `server.max_concurrent_requests = 0` |
+| Statement timeout | `database.statement_timeout = "30s"` | `"0s"` |
+| Idle in transaction | `database.idle_in_transaction_timeout = "60s"` | `"0s"` |
+| Strict config | `server.strict_config = true` | `false` |
+| Migration lock wait | `database.migration_lock_timeout = "5s"`, `5` retries (all profiles) | `"0s"` |
+| Rate limiting | off | turn it on, see below |
+
+Notes:
+
+- **Load shedding.** An explicit `server.max_concurrent_requests` wins. A
+  [capacity contract](capacity-contracts.md) wins over the profile default.
+  When the contract cannot be used, the profile default applies. Probe and
+  actuator routes are never shed. Watch `autumn_requests_shed_total`.
+- **Timeouts.** Each framework transaction starts with `SET LOCAL
+  statement_timeout` and `SET LOCAL idle_in_transaction_session_timeout`. A
+  transaction pooler (`PgBouncer` in transaction mode) keeps these. It drops
+  the session `SET` that applies outside a transaction. To bound those
+  statements too, set the timeout on the app's database role:
+  `ALTER ROLE app SET statement_timeout = '30s'`. Run migrations with a
+  different role, because the migrator does not change `statement_timeout`.
+  A route's `StatementTimeout` applies to the transactions of that request.
+  SQLite builds do not get these defaults, and refuse a nonzero value.
+- **Migrations.** In each transactional migration, a DDL statement that waits
+  more than `5s` for a table lock fails. The migrator retries it after a
+  jittered delay. A `run_in_transaction = false` migration (for example
+  `CREATE INDEX CONCURRENTLY`) waits with no limit. Run migrations against
+  Postgres directly, not through `PgBouncer`.
+- **Rate limiting.** `prod` does not turn it on. A shared limit can block
+  clients behind one proxy address. Configure
+  [`security.rate_limit`](rate-limiting.md) and
+  [`security.trusted_proxies`](middleware.md#forwarded-header-client-identity-plugin-author-guidance)
+  for your traffic, then turn it on.
+
 ## Minimal Deployment Checklist
 
 Before calling an Autumn app "cloud ready", verify:
@@ -1013,3 +1137,7 @@ Before calling an Autumn app "cloud ready", verify:
 - `server.prestop_grace_secs` is tuned to match your load balancer's deregistration propagation time
 - `terminationGracePeriodSeconds` (Kubernetes) or equivalent is set to `preStop_hook_secs + prestop_grace_secs + shutdown_timeout_secs + buffer` (`shutdown_timeout_secs` covers drain **and** hooks combined)
 - `autumn_shutdown_aborted_requests_total` is monitored and alerts on any non-zero value after a rolling deploy
+- the [production protections](#production-protections) are on, or each opt-out is deliberate
+- `autumn_requests_shed_total` is monitored, and the shedding ceiling is tuned or comes from a capacity contract
+- `autumn.toml` boots under `strict_config` (the `prod` default)
+- rate limiting is configured for your traffic, or you have a documented reason to leave it off
