@@ -4,7 +4,7 @@
 //! reference the custom properties via `var(--bg)`, `var(--primary)`, etc.
 //!
 //! Each color token is `light-dark(<light>, <dark>)` (#3396). The OS
-//! selects the scheme; `data-theme="light|dark"` overrides it on any element.
+//! selects the scheme. `data-theme="light|dark"` overrides it on any element.
 //! `data-density="compact|comfortable|spacious"` scales the `--space-*`
 //! tokens. The set also has type, radius, z-index and breakpoint scales. See
 //! `docs/guide/widget-styling.md`.
@@ -43,9 +43,9 @@ pub const FLASH_CSS: &str = "\
     margin-bottom: 1rem;
     font-size: 0.875rem;
 }
-.flash-success { background: var(--success-light); color: var(--success); border: 1px solid var(--success); }
-.flash-error { background: var(--danger-light); color: var(--danger); border: 1px solid var(--danger); }
-.flash-warning { background: var(--warning-light); color: var(--warning); border: 1px solid var(--warning); }
+.flash-success { background: var(--success-light); color: var(--success-text); border: 1px solid var(--success); }
+.flash-error { background: var(--danger-light); color: var(--danger-hover); border: 1px solid var(--danger); }
+.flash-warning { background: var(--warning-light); color: var(--warning-text); border: 1px solid var(--warning); }
 .flash-info { background: var(--primary-light); color: var(--primary); border: 1px solid var(--primary); }
 ";
 
@@ -56,24 +56,24 @@ pub(crate) mod test_support {
 
     /// A color scheme. Selects one side of `light-dark()`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub(crate) enum Scheme {
+    pub enum Scheme {
         Light,
         Dark,
     }
 
     impl Scheme {
-        pub(crate) const BOTH: [Self; 2] = [Self::Light, Self::Dark];
+        pub const BOTH: [Self; 2] = [Self::Light, Self::Dark];
     }
 
     /// The main `:root` block: the text before the first nested rule.
-    pub(crate) fn main_block() -> &'static str {
+    pub fn main_block() -> &'static str {
         let start = TOKENS_CSS.find(":root {").expect(":root block");
         let body = &TOKENS_CSS[start..];
         &body[..body.find('}').expect("closed :root block")]
     }
 
     /// The body of the `@supports not (color: light-dark(...))` block.
-    pub(crate) fn fallback_block() -> &'static str {
+    pub fn fallback_block() -> &'static str {
         let start = TOKENS_CSS
             .find("@supports not (color: light-dark(")
             .expect("@supports fallback block");
@@ -83,7 +83,7 @@ pub(crate) mod test_support {
     }
 
     /// `(name, value)` for each custom property in `block`.
-    pub(crate) fn declarations(block: &str) -> Vec<(&str, &str)> {
+    pub fn declarations(block: &str) -> Vec<(&str, &str)> {
         block
             .split(';')
             .filter_map(|decl| {
@@ -97,14 +97,14 @@ pub(crate) mod test_support {
     }
 
     /// The `(light, dark)` pair of a `light-dark(a, b)` value.
-    pub(crate) fn light_dark(value: &str) -> Option<(&str, &str)> {
+    pub fn light_dark(value: &str) -> Option<(&str, &str)> {
         let args = value.strip_prefix("light-dark(")?.strip_suffix(')')?;
         let (light, dark) = args.split_once(',')?;
         Some((light.trim(), dark.trim()))
     }
 
     /// The `#rrggbb` value of color token `name` in `scheme`, or `None`.
-    pub(crate) fn color(name: &str, scheme: Scheme) -> Option<String> {
+    pub fn color(name: &str, scheme: Scheme) -> Option<String> {
         let value = declarations(main_block())
             .into_iter()
             .find(|(n, _)| *n == name)?
@@ -120,7 +120,7 @@ pub(crate) mod test_support {
     }
 
     /// `#rrggbb` -> WCAG relative luminance.
-    pub(crate) fn luminance(hex: &str) -> f64 {
+    pub fn luminance(hex: &str) -> f64 {
         let channel = |i: usize| {
             let c = f64::from(u8::from_str_radix(&hex[1 + i * 2..3 + i * 2], 16).unwrap()) / 255.0;
             if c <= 0.03928 {
@@ -136,13 +136,13 @@ pub(crate) mod test_support {
     }
 
     /// WCAG contrast ratio of two `#rrggbb` colors.
-    pub(crate) fn contrast(a: &str, b: &str) -> f64 {
+    pub fn contrast(a: &str, b: &str) -> f64 {
         let (a, b) = (luminance(a), luminance(b));
         (a.max(b) + 0.05) / (a.min(b) + 0.05)
     }
 
     /// True for `#rrggbb`.
-    pub(crate) fn is_hex6(value: &str) -> bool {
+    pub fn is_hex6(value: &str) -> bool {
         value.len() == 7
             && value.starts_with('#')
             && value[1..].chars().all(|c| c.is_ascii_hexdigit())
@@ -317,6 +317,7 @@ mod tests {
             "--space-2",
             "--space-3",
             "--space-4",
+            "--space-5",
             "--space-6",
             "--space-8",
             "--font-size-xs",
@@ -324,9 +325,11 @@ mod tests {
             "--font-size-md",
             "--font-size-lg",
             "--font-size-xl",
+            "--font-size-2xl",
             "--line-height-tight",
             "--line-height-normal",
             "--font-weight-normal",
+            "--font-weight-medium",
             "--font-weight-semibold",
             "--font-weight-bold",
             "--font-mono",
@@ -341,6 +344,7 @@ mod tests {
             "--breakpoint-sm",
             "--breakpoint-md",
             "--breakpoint-lg",
+            "--breakpoint-xl",
         ] {
             assert!(
                 TOKENS_CSS.contains(&format!("{token}:")),
@@ -369,6 +373,27 @@ mod tests {
         ] {
             let rule = format!("[data-density=\"{density}\"] {{ --density-scale: {scale}; }}");
             assert!(TOKENS_CSS.contains(&rule), "missing `{rule}`");
+        }
+    }
+
+    /// Flash text on its tint passes WCAG AA in both schemes (#3396).
+    #[test]
+    fn flash_text_meets_aa_in_both_schemes() {
+        for level in ["success", "error", "warning", "info"] {
+            let rule = FLASH_CSS
+                .lines()
+                .find(|l| l.starts_with(&format!(".flash-{level} ")))
+                .unwrap_or_else(|| panic!("no .flash-{level} rule"));
+            let token = |prop: &str| {
+                let at = rule.find(&format!("{prop}: var(")).unwrap() + prop.len() + 6;
+                rule[at..at + rule[at..].find(')').unwrap()].to_owned()
+            };
+            for scheme in Scheme::BOTH {
+                let fg = test_support::color(&token("color"), scheme).unwrap();
+                let bg = test_support::color(&token("background"), scheme).unwrap();
+                let ratio = contrast(&fg, &bg);
+                assert!(ratio >= 4.5, "{scheme:?} .flash-{level}: {ratio:.2}:1");
+            }
         }
     }
 

@@ -47,7 +47,7 @@ fn no_csrf_or_return_to_field_unless_set() {
 fn csrf_and_return_to_render_hidden_fields() {
     let out = theme_toggle(
         &ThemeToggleConfig::new(Theme::Light)
-            .csrf("tok\"en", "_csrf")
+            .csrf_token("tok\"en")
             .return_to("/posts?page=2"),
     )
     .into_string();
@@ -59,6 +59,13 @@ fn csrf_and_return_to_render_hidden_fields() {
         out.contains(r#"<input type="hidden" name="return_to" value="/posts?page=2">"#),
         "{out}"
     );
+    let renamed = theme_toggle(
+        &ThemeToggleConfig::new(Theme::Light)
+            .csrf_token("t")
+            .csrf_field("tok"),
+    )
+    .into_string();
+    assert!(renamed.contains(r#"name="tok" value="t""#), "{renamed}");
 }
 
 #[test]
@@ -98,7 +105,45 @@ fn widget_script_enhances_the_toggle() {
         "autumn.theme=",
         "document.documentElement",
         "aria-pressed",
+        // A custom `.action()` keeps its request; only the framework route
+        // is handled in place.
+        "'/_autumn/theme'",
+        // Back/forward cache: sync again when a stored page shows.
+        "pageshow",
     ] {
         assert!(js.contains(needle), "autumn-widgets.js lacks `{needle}`");
     }
+}
+
+/// Run the toggle cases in `tests/fixtures/theme/toggle_harness.js` under
+/// Node, against the served script. With no Node on `PATH` the test skips,
+/// unless `AUTUMN_REQUIRE_NODE` is set.
+#[cfg(feature = "htmx")]
+#[test]
+fn widget_script_cases_pass_under_node() {
+    use std::process::Command;
+
+    let node = std::env::var_os("NODE").unwrap_or_else(|| "node".into());
+    if Command::new(&node).arg("--version").output().is_err() {
+        assert!(
+            std::env::var_os("AUTUMN_REQUIRE_NODE").is_none(),
+            "AUTUMN_REQUIRE_NODE is set, but Node is not on PATH"
+        );
+        eprintln!("skipping the theme toggle cases: Node is not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("temp dir");
+    let script = dir.path().join("autumn-widgets.js");
+    std::fs::write(&script, autumn_web::htmx::AUTUMN_WIDGETS_JS).expect("write the script");
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/theme/toggle_harness.js");
+    let out = Command::new(&node)
+        .arg(&harness)
+        .arg(&script)
+        .output()
+        .expect("run node");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "theme toggle cases failed:\n{stdout}\n{stderr}");
+    assert!(stdout.contains("all passed"), "{stdout}\n{stderr}");
 }

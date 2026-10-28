@@ -35,7 +35,8 @@ did not have the `autumn-` prefix (issue #3396).
    `widgets::theme_toggle` is a form that posts to `ui::theme::THEME_PATH`.
    The app mounts `ui::theme::router()`. `autumn-widgets.js` applies the
    theme in place and writes the cookie, with no request.
-7. The cookie is not `HttpOnly`, because the JS writes it. It holds one of
+7. The cookie is not `HttpOnly`, because the JS writes it. It is not
+   `Secure`, so the no-JS path also works on plain http. It holds one of
    three fixed words and no personal data.
 8. The admin plugin embeds the core `TOKENS_CSS`.
 9. `alert`, `badge` and `wizard-*` classes get the `autumn-` prefix. Variant
@@ -43,8 +44,8 @@ did not have the `autumn-` prefix (issue #3396).
 
 ## Options not selected
 
-- Mount the theme route automatically. It adds a mutating route to every
-  app, which widens the security posture of each example.
+- Mount the theme route automatically. It adds a state-changing route to
+  each app, which the app did not ask for.
 - Split tokens into `--x-light` and `--x-dark`. `--primary-light` already
   names a tint, so the names would clash.
 - A `GET` form. A `GET` request must not change state.
@@ -57,3 +58,5 @@ did not have the `autumn-` prefix (issue #3396).
   that token. It can override with its own `light-dark()`.
 - A page cache shared between users must vary on `Cookie` when the layout
   reads the theme cookie.
+- Apps that link the widget stylesheet follow the OS dark mode. A page with
+  light-only colors pins `data-theme="light"`. The example apps do this.

@@ -2,9 +2,9 @@
 
 - **Breaking:** **widgets:** the alert, badge and wizard stepper classes have
   the `autumn-` prefix (issue #3396). `alert alert-error` is now
-  `autumn-alert autumn-alert--error`, `badge badge--success` is now
-  `autumn-badge autumn-badge--success`, and `wizard-*` is now
-  `autumn-wizard-*` ([migration guide](docs/migrations/next.md)).
+  `autumn-alert autumn-alert--error`. `badge badge--success` is now
+  `autumn-badge autumn-badge--success`. `wizard-*` is now `autumn-wizard-*`
+  ([migration guide](docs/migrations/next.md)).
 
 ### Added
 
@@ -19,14 +19,22 @@
 - **ui:** `data-density="compact|comfortable|spacious"` scales the space
   tokens on any element.
 - **widgets:** `theme_toggle` — a System / Light / Dark switch that works
-  without JS. `ui::theme::Theme` reads the `autumn.theme` cookie, so the
-  layout renders `data-theme` before the first paint. Merge
+  without JS. The `ui::theme::Theme` extractor reads the `autumn.theme`
+  cookie. Read it in your layout and render `data-theme` on `<html>`. Merge
   `ui::theme::router()` for the no-JS `POST /_autumn/theme` route.
-  `autumn-widgets.js` applies the theme in place.
+  `autumn-widgets.js` applies the theme in place. The admin plugin reads the
+  same cookie.
 - **stories:** the gallery has a theme switcher (System / Light / Dark) and a
   density switcher. They replace the four color presets.
 
 ### Changed
+
+- **ui:** the widgets follow the OS dark mode. A page with light-only colors
+  can pin the light scheme with `data-theme="light"` on `<html>`
+  ([migration guide](docs/migrations/next.md)). The example apps do this.
+- **ui:** the alert icon, the modal, the card and the stat card use the
+  token colors, so they are correct in both schemes. The flash text uses
+  the `-text` tokens and passes WCAG AA.
 
 - **ui:** the light `--text-muted` is `#666e7b` (was `#6b7280`), so muted text
   passes WCAG AA on `--surface-muted`.

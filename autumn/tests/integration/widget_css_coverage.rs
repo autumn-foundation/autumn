@@ -206,4 +206,10 @@ fn legacy_unprefixed_classes_are_gone() {
         alert.contains(r#"class="autumn-alert autumn-alert--error""#),
         "{alert}"
     );
+    let badge =
+        autumn_web::widgets::badge("x", autumn_web::widgets::BadgeVariant::Danger).into_string();
+    assert!(
+        badge.contains(r#"class="autumn-badge autumn-badge--danger""#),
+        "{badge}"
+    );
 }

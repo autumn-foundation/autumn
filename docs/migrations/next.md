@@ -153,7 +153,7 @@ A test that calls `.assert_selector(".wizard-progress")` must use
 `.autumn-wizard-progress`. `autumn generate wizard` writes the new name.
 
 **Automation:** `manual` — the selectors are in the app's own stylesheets,
-scripts and tests, which no codemod may change for the app.
+scripts and tests. A codemod cannot find them reliably.
 
 ## Plugin authors
 
@@ -210,6 +210,20 @@ Changes that still compile but behave differently at runtime. Examples:
 - A scheduled task now runs on a different worker.
 
 If nothing changed, delete this section.
+
+- **Widgets follow the OS dark mode (#3396).** The widget stylesheet sets
+  `color-scheme: light dark`, and each color token has a dark value. On a
+  dark OS, fields, cards, alerts, modals and toasts become dark. A page whose
+  own colors are light only (for example Tailwind `bg-gray-50` on `<body>`)
+  then shows dark widgets on a light page. To keep the light scheme, set it
+  on `<html>`:
+
+  ```rust
+  html lang="en" data-theme="light" { /* … */ }
+  ```
+
+  To support both schemes, use the tokens (`var(--bg)`, `var(--text)`) for
+  the page colors, and see `docs/guide/widget-styling.md#dark-mode`.
 
 ## Deprecations retained from `{X.Y}`
 

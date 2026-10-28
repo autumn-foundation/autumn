@@ -292,4 +292,71 @@ mod tests {
             );
         }
     }
+
+    /// The alert icon glyph sits on a `currentColor` circle. It must stand
+    /// out from the circle in both schemes (WCAG 1.4.11, 3:1).
+    #[test]
+    fn alert_icon_glyph_is_visible_in_both_schemes() {
+        let glyph = declared(".autumn-alert__icon-glyph", "fill", Scheme::Light);
+        assert!(glyph.starts_with('#'), "{glyph}");
+        for scheme in Scheme::BOTH {
+            for variant in ["info", "success", "warning", "error"] {
+                let circle = declared(&format!(".autumn-alert--{variant}"), "color", scheme);
+                let glyph = declared(".autumn-alert__icon-glyph", "fill", scheme);
+                let ratio = contrast(&glyph, &circle);
+                assert!(ratio >= 3.0, "{scheme:?} {variant}: {ratio:.2}:1");
+            }
+        }
+    }
+
+    /// A widget that paints a token surface also sets its text color.
+    /// Otherwise it inherits the page color, which can be the other scheme.
+    #[test]
+    fn a_token_surface_sets_its_own_text_color() {
+        let mut missing = Vec::new();
+        let mut rest = WIDGETS_COMPONENT_CSS;
+        while let Some(open) = rest.find('{') {
+            let selector = rest[..open].rsplit(['}', '/']).next().unwrap_or("").trim();
+            let close = open + rest[open..].find('}').unwrap();
+            let body = &rest[open..close];
+            let paints = body.lines().any(|l| {
+                let l = l.trim();
+                l.starts_with("background") && l.contains("var(--surface")
+            });
+            let colors = body.lines().any(|l| l.trim().starts_with("color:"));
+            if paints && !colors && !selector.contains(':') {
+                missing.push(selector.to_owned());
+            }
+            rest = &rest[close + 1..];
+        }
+        assert!(missing.is_empty(), "surface without color: {missing:?}");
+    }
+
+    /// The modal paints the token surface. The browser's dialog colors are
+    /// not the tokens, and in dark mode they hide the dialog edge.
+    #[test]
+    fn modal_uses_the_token_surface() {
+        let body = rule_body(".autumn-modal");
+        for declaration in [
+            "background: var(--surface);",
+            "color: var(--text);",
+            "border: 1px solid var(--border);",
+        ] {
+            assert!(body.contains(declaration), "missing `{declaration}`:{body}");
+        }
+    }
+
+    /// The exit animation cancels the region gap, which density scales.
+    #[test]
+    fn toast_exit_follows_the_density_gap() {
+        assert!(rule_body(".autumn-toast-region").contains("gap: var(--space-2);"));
+        let at = WIDGETS_COMPONENT_CSS
+            .find("@keyframes autumn-toast-out")
+            .unwrap();
+        let frames = &WIDGETS_COMPONENT_CSS[at..at + 400];
+        assert!(
+            frames.contains("margin-top: calc(-1 * var(--space-2));"),
+            "{frames}"
+        );
+    }
 }

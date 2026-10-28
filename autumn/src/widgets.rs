@@ -2781,7 +2781,8 @@ pub struct ThemeToggleConfig<'a> {
     current: crate::ui::theme::Theme,
     action: &'a str,
     return_to: Option<&'a str>,
-    csrf: Option<(&'a str, &'a str)>,
+    csrf_token: Option<&'a str>,
+    csrf_field: &'a str,
     label: &'a str,
     option_labels: [&'a str; 3],
     class: Option<&'a str>,
@@ -2797,14 +2798,17 @@ impl<'a> ThemeToggleConfig<'a> {
             current,
             action: crate::ui::theme::THEME_PATH,
             return_to: None,
-            csrf: None,
+            csrf_token: None,
+            csrf_field: "_csrf",
             label: "Theme",
             option_labels: ["System", "Light", "Dark"],
             class: None,
         }
     }
 
-    /// Post to a different path (an app's own theme route).
+    /// Post to a different path (an app's own theme route). With JS, the
+    /// form then still posts, so the app can store the choice. Only a form
+    /// that posts to [`crate::ui::theme::THEME_PATH`] changes in place.
     #[must_use]
     pub const fn action(mut self, action: &'a str) -> Self {
         self.action = action;
@@ -2819,11 +2823,35 @@ impl<'a> ThemeToggleConfig<'a> {
         self
     }
 
-    /// Add the CSRF hidden field: the token value and the form field name
-    /// (`"_csrf"` unless `security.csrf.form_field` changes it).
+    /// Set the CSRF token. Without a token no hidden field is rendered,
+    /// and the no-JS post gets `403` from the CSRF layer.
     #[must_use]
-    pub const fn csrf(mut self, token: &'a str, field: &'a str) -> Self {
-        self.csrf = Some((token, field));
+    pub const fn csrf_token(mut self, token: &'a str) -> Self {
+        self.csrf_token = Some(token);
+        self
+    }
+
+    /// Set the CSRF field name. Default: `"_csrf"`.
+    #[must_use]
+    pub const fn csrf_field(mut self, field: &'a str) -> Self {
+        self.csrf_field = field;
+        self
+    }
+
+    /// Set both from the handler's extractors. A `None` token renders no
+    /// field; a `None` field keeps `"_csrf"`. Same as `ReactionControls::csrf`.
+    #[must_use]
+    pub fn csrf(
+        mut self,
+        token: Option<&'a crate::security::CsrfToken>,
+        field: Option<&'a crate::security::CsrfFormField>,
+    ) -> Self {
+        if let Some(token) = token {
+            self.csrf_token = Some(token.token());
+        }
+        if let Some(field) = field {
+            self.csrf_field = field.0.as_str();
+        }
         self
     }
 
@@ -2853,13 +2881,13 @@ impl<'a> ThemeToggleConfig<'a> {
 ///
 /// Emits a `POST` form with one submit button per theme. The current theme
 /// has `aria-pressed="true"`. Without JS, the form posts to
-/// [`crate::ui::theme::THEME_PATH`] (mount [`crate::ui::theme::router`]),
-/// which stores the `autumn.theme` cookie and redirects back.
-/// `autumn-widgets.js` finds the `data-autumn-theme-toggle` hook, applies
-/// `data-theme` on `<html>` and writes the cookie, with no request.
+/// [`crate::ui::theme::THEME_PATH`] (mount [`crate::ui::theme::router`]).
+/// The route stores the `autumn.theme` cookie and redirects back.
+/// `autumn-widgets.js` finds the `data-autumn-theme-toggle` hook. It applies
+/// `data-theme` on `<html>` and writes the cookie. It sends no request.
 ///
-/// Read the cookie in the layout with [`crate::ui::theme::Theme`] and render
-/// `data-theme` on `<html>`, so the first paint has the correct theme.
+/// Read the cookie in the layout with [`crate::ui::theme::Theme`]. Render
+/// `data-theme` on `<html>`. Thus the first paint shows the correct theme.
 ///
 /// # Example
 ///
@@ -2867,7 +2895,7 @@ impl<'a> ThemeToggleConfig<'a> {
 /// use autumn_web::ui::theme::Theme;
 /// use autumn_web::widgets::{ThemeToggleConfig, theme_toggle};
 ///
-/// let html = theme_toggle(&ThemeToggleConfig::new(Theme::Dark).csrf("tok", "_csrf"))
+/// let html = theme_toggle(&ThemeToggleConfig::new(Theme::Dark).csrf_token("tok"))
 ///     .into_string();
 /// assert!(html.contains(r#"value="dark" class="autumn-theme-toggle__option" aria-pressed="true""#));
 /// assert!(html.contains(r#"name="_csrf" value="tok""#));
@@ -2880,8 +2908,8 @@ pub fn theme_toggle(config: &ThemeToggleConfig<'_>) -> maud::Markup {
     let root = merge_class("autumn-theme-toggle", config.class);
     maud::html! {
         form method="post" action=(config.action) class=(root) data-autumn-theme-toggle {
-            @if let Some((token, field)) = config.csrf {
-                input type="hidden" name=(field) value=(token);
+            @if let Some(token) = config.csrf_token {
+                input type="hidden" name=(config.csrf_field) value=(token);
             }
             @if let Some(path) = config.return_to {
                 input type="hidden" name="return_to" value=(path);
@@ -4669,7 +4697,7 @@ pub fn badge_with(label: &str, variant: BadgeVariant, config: &BadgeConfig<'_>) 
 /// the value, use `badge(label, BadgeVariant::for_label(label))`.
 ///
 /// The admin plugin's hand-rolled `badge badge-{op}` audit-log spans are the
-/// migration target for this helper; the `.badge` class contract here is a
+/// migration target for this helper; the `.autumn-badge` class contract here is a
 /// superset that can replace them.
 #[cfg(feature = "maud")]
 #[must_use]
@@ -4943,8 +4971,10 @@ impl AlertVariant {
             svg class="autumn-alert__icon-svg" viewBox="0 0 20 20" width="20" height="20"
                 aria-hidden="true" focusable="false" {
                 circle cx="10" cy="10" r="10" fill="currentColor" {}
-                text x="10" y="15" text-anchor="middle" font-size="13"
-                    font-family="sans-serif" fill="#fff" { (glyph) }
+                // `fill` is the no-CSS fallback. The stylesheet sets
+                // `--surface`, which stays visible on the dark-scheme circle.
+                text class="autumn-alert__icon-glyph" x="10" y="15" text-anchor="middle"
+                    font-size="13" font-family="sans-serif" fill="#fff" { (glyph) }
             }
         }
     }
@@ -8718,6 +8748,12 @@ mod tests {
         .into_string();
         assert!(html.contains(r#"class="autumn-alert__icon-svg""#), "{html}");
         assert!(!html.contains(r#"class="alert__icon-svg""#), "{html}");
+        // #3396: the glyph color comes from CSS (`--surface`), so it stays
+        // visible on the light dark-scheme circle.
+        assert!(
+            html.contains(r#"class="autumn-alert__icon-glyph""#),
+            "{html}"
+        );
     }
 
     // ── hero ─────────────────────────────────────────────────────────────

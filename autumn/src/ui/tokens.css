@@ -1,5 +1,5 @@
 /* Autumn design tokens v2 (#3396).
-   Colors: light-dark(<light>, <dark>). The OS selects the scheme;
+   Colors: light-dark(<light>, <dark>). The OS selects the scheme.
    data-theme="light|dark" overrides it on any element. */
 :root {
     color-scheme: light dark;
@@ -67,8 +67,8 @@
     --density-scale: 1;
 }
 
-/* Space scale. Declared on each [data-density] element too, so it
-   recalculates where a subtree sets its own density. */
+/* Space scale. The [data-density] rule declares it again. Thus a subtree
+   with its own density gets new values. */
 :root,
 [data-density] {
     --space-1: calc(0.25rem * var(--density-scale));
@@ -87,9 +87,10 @@
 [data-theme="light"] { color-scheme: light; }
 [data-theme="dark"] { color-scheme: dark; }
 
-/* Browsers without light-dark(): the light values. */
+/* Browsers without light-dark(): the light values, in the light scheme. */
 @supports not (color: light-dark(#000, #fff)) {
     :root {
+        color-scheme: light;
         --bg: #f9fafb;
         --surface: #ffffff;
         --surface-muted: #f1f5f9;
@@ -114,4 +115,5 @@
         --info-light: #eff6ff;
         --shadow: 0 1px 3px rgb(0 0 0 / 10%), 0 1px 2px rgb(0 0 0 / 6%);
     }
+    [data-theme] { color-scheme: light; }
 }

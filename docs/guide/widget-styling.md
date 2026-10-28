@@ -71,6 +71,14 @@ To set the scheme, put `data-theme` on `<html>`:
 
 A browser without `light-dark()` gets the light values.
 
+A page with light-only colors of its own (for example Tailwind `bg-gray-50`
+on `<body>`) must pin the light scheme. Otherwise a dark OS shows dark widgets
+on a light page:
+
+```html
+<html data-theme="light">
+```
+
 ### Let the user select the theme
 
 1. Merge the theme route into the app:
@@ -84,15 +92,20 @@ A browser without `light-dark()` gets the light values.
    paint has the correct theme:
 
    ```rust
-   use autumn_web::security::CsrfToken;
+   use autumn_web::security::{CsrfFormField, CsrfToken};
    use autumn_web::ui::theme::Theme;
    use autumn_web::widgets::{ThemeToggleConfig, theme_toggle};
 
-   fn layout(theme: Theme, csrf: &CsrfToken, body: maud::Markup) -> maud::Markup {
+   fn layout(
+       theme: Theme,
+       csrf: Option<&CsrfToken>,
+       field: Option<&CsrfFormField>,
+       body: maud::Markup,
+   ) -> maud::Markup {
        maud::html! {
            html lang="en" data-theme=[theme.data_theme()] {
                body {
-                   (theme_toggle(&ThemeToggleConfig::new(theme).csrf(csrf.token(), "_csrf")))
+                   (theme_toggle(&ThemeToggleConfig::new(theme).csrf(csrf, field)))
                    (body)
                }
            }
@@ -101,13 +114,25 @@ A browser without `light-dark()` gets the light values.
    ```
 
    `Theme` is an extractor. Add `theme: Theme` to the handler arguments.
+   Without the CSRF token, the no-JS post gets `403`.
 
-3. Load `autumn-widgets.js` (see the htmx guide). With the script, a click
-   applies the theme at once and sends no request. Without the script, the
-   form posts to `/_autumn/theme`, which stores the cookie and redirects back.
+3. Load the widget script once in the layout:
+
+   ```html
+   <script src="/static/js/autumn-widgets.js" defer></script>
+   ```
+
+   With the script, a click applies the theme at once and sends no request.
+   Without the script, the form posts to `/_autumn/theme`. The route stores
+   the cookie and redirects back.
 
 The cookie is `autumn.theme`. It holds `light` or `dark`. "System" deletes it.
-It is not `HttpOnly`, because the script writes it.
+It is not `HttpOnly`, because the script writes it. The admin plugin reads
+the same cookie.
+
+To store the choice in a user profile, post to your own route with
+`.action("/settings/theme")`. The script then applies the theme and lets the
+form post.
 
 If a shared cache stores pages that read the cookie, send `Vary: Cookie`.
 
@@ -171,10 +196,9 @@ See the [migration guide](../migrations/next.md) for the full map.
 ## Coverage
 
 A build-time test (`autumn/tests/integration/widget_css_coverage.rs`) scans
-every widget source file for emitted `autumn-*` classes and asserts each has a
-backing rule in the shipped stylesheet — so a new widget class can't ship
-unstyled without failing the build. A second test fails when a widget emits,
-or the stylesheet styles, an old unprefixed class.
+each widget source file for `autumn-*` classes. Each class must have a rule in
+the stylesheet. A new class without a rule fails the build. A second test
+fails when a widget emits, or the stylesheet styles, an old unprefixed class.
 
 Contrast tests check the token pairs and the widget text in the light and the
 dark scheme against WCAG AA.

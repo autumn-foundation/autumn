@@ -583,6 +583,8 @@ pub struct AdminChrome<'a> {
     pub show_config: bool,
     /// Impersonation banner, if the session is impersonating.
     pub impersonation: Option<&'a ImpersonationBanner>,
+    /// The user's theme from the `autumn.theme` cookie (#3396).
+    pub theme: autumn_web::ui::theme::Theme,
 }
 
 /// Model-list data that is specific to `model_list_page`.
@@ -652,6 +654,7 @@ pub fn admin_layout(
         messages,
         show_config,
         impersonation,
+        theme,
         ..
     } = *chrome;
     // Each nav item's href is computed once here and reused both to
@@ -693,7 +696,7 @@ pub fn admin_layout(
 
     html! {
         (DOCTYPE)
-        html lang="en" {
+        html lang="en" data-theme=[theme.data_theme()] {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
@@ -2565,6 +2568,7 @@ mod tests {
             messages: &[],
             show_config: false,
             impersonation: None,
+            theme: autumn_web::ui::theme::Theme::System,
         }
     }
 
@@ -2707,6 +2711,28 @@ mod tests {
             html.contains(autumn_web::ui::tokens::TOKENS_CSS),
             "the admin layout must embed the core tokens"
         );
+    }
+
+    /// Issue #3396: the admin reads the app's theme cookie, so a user who
+    /// picks Dark in the app also gets a dark admin.
+    #[test]
+    fn admin_layout_renders_the_stored_theme() {
+        use autumn_web::ui::theme::Theme;
+        let r = dummy_registry();
+        let dark = dashboard_page(
+            &AdminChrome {
+                theme: Theme::Dark,
+                ..test_chrome(&r)
+            },
+            &[],
+        )
+        .into_string();
+        assert!(
+            dark.contains(r#"<html lang="en" data-theme="dark">"#),
+            "{dark}"
+        );
+        let system = dashboard_page(&test_chrome(&r), &[]).into_string();
+        assert!(system.contains(r#"<html lang="en">"#), "{system}");
     }
 
     /// A dark scheme makes `--primary` and `--danger` light. White text on

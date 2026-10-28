@@ -84,7 +84,8 @@ pub struct TodoForm {
 fn layout(title: &str, content: Markup) -> Markup {
     html! {
         (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html lang="en" {
+        // Light-only page colors: pin the light scheme (#3396).
+        html lang="en" data-theme="light" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";

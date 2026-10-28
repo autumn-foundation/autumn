@@ -1351,7 +1351,7 @@ mod tests {
         for line in STORY_GALLERY_CSS.lines() {
             let line = line.trim_start();
             assert!(
-                !(line.starts_with("--") && !line.starts_with("--density-scale")),
+                !line.starts_with("--") || line.starts_with("--density-scale"),
                 "gallery redefines a token: {line}"
             );
         }
