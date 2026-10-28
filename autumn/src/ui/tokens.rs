@@ -164,6 +164,7 @@ mod tests {
         "--text",
         "--text-muted",
         "--border",
+        "--control-border",
         "--primary",
         "--primary-hover",
         "--primary-light",
@@ -281,6 +282,10 @@ mod tests {
             ("--info", "--surface", TEXT),
             ("--success", "--surface", UI),
             ("--warning", "--surface", UI),
+            // WCAG 1.4.11: a text input's border is its only boundary.
+            ("--control-border", "--surface", UI),
+            ("--control-border", "--bg", UI),
+            ("--control-border", "--surface-muted", UI),
         ];
         let mut failures = Vec::new();
         for scheme in Scheme::BOTH {

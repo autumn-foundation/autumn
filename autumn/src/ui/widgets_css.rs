@@ -359,4 +359,22 @@ mod tests {
             "{frames}"
         );
     }
+
+    /// WCAG 1.4.11: a text input's border is its only visible boundary, so
+    /// it uses `--control-border` (3:1), not the decorative `--border`.
+    #[test]
+    fn text_inputs_use_the_control_border() {
+        for selector in [
+            ".autumn-field__input",
+            ".autumn-search__input",
+            ".autumn-autocomplete__input",
+            ".autumn-comment-input",
+        ] {
+            let body = rule_body(selector);
+            assert!(
+                body.contains("border: 1px solid var(--control-border);"),
+                "{selector}:{body}"
+            );
+        }
+    }
 }

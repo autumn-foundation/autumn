@@ -564,7 +564,7 @@ body {
 .story-switch { display: flex; align-items: center; gap: 0.4rem; margin: 0; padding: 0; border: 0; }
 .story-switch legend { float: left; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-right: 0.25rem; padding: 0; }
 .story-switch input[type='radio'] { position: absolute; opacity: 0; width: 1px; height: 1px; }
-.story-switch label { padding: 0.3rem 0.75rem; border-radius: var(--radius-full); border: 1px solid var(--border); font-size: 0.8rem; line-height: 1; cursor: pointer; color: var(--text-muted); }
+.story-switch label { padding: 0.3rem 0.75rem; border-radius: var(--radius-full); border: 1px solid var(--control-border); font-size: 0.8rem; line-height: 1; cursor: pointer; color: var(--text-muted); }
 .story-switch input[type='radio']:checked + label { background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
 .story-switch input[type='radio']:focus-visible + label { outline: 2px solid var(--primary); outline-offset: 2px; }
 

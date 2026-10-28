@@ -224,7 +224,7 @@ const ADMIN_CSS: &str = "
     .form-input {
         width: 100%;
         padding: 0.5rem 0.75rem;
-        border: 1px solid var(--border);
+        border: 1px solid var(--control-border);
         border-radius: 0.375rem;
         font-size: 0.875rem;
         line-height: 1.5;
@@ -263,7 +263,7 @@ const ADMIN_CSS: &str = "
     .search-bar input {
         flex: 1;
         padding: 0.5rem 0.75rem;
-        border: 1px solid var(--border);
+        border: 1px solid var(--control-border);
         border-radius: 0.375rem;
         font-size: 0.875rem;
     }
@@ -2733,6 +2733,20 @@ mod tests {
         );
         let system = dashboard_page(&test_chrome(&r), &[]).into_string();
         assert!(system.contains(r#"<html lang="en">"#), "{system}");
+    }
+
+    /// WCAG 1.4.11: a text input's border is its only boundary, so the admin
+    /// inputs use the 3:1 `--control-border` token (#3396).
+    #[test]
+    fn admin_inputs_use_the_control_border() {
+        for selector in [".form-input {", ".search-bar input {"] {
+            let start = ADMIN_CSS.find(selector).unwrap();
+            let end = start + ADMIN_CSS[start..].find('}').unwrap();
+            assert!(
+                ADMIN_CSS[start..end].contains("border: 1px solid var(--control-border);"),
+                "{selector}"
+            );
+        }
     }
 
     /// A dark scheme makes `--primary` and `--danger` light. White text on

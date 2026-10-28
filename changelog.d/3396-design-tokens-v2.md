@@ -15,7 +15,8 @@
   `--space-*`, `--font-size-*`, `--font-weight-*`, `--line-height-*`,
   `--radius-*`, `--z-*` and `--breakpoint-*`. New role tokens:
   `--on-primary`, `--on-danger`, `--surface-muted`, `--info`, `--info-light`,
-  `--success-text` and `--warning-text`.
+  `--success-text`, `--warning-text` and `--control-border` (the 3:1 border
+  of a text input; the inputs use it).
 - **ui:** `data-density="compact|comfortable|spacious"` scales the space
   tokens on any element.
 - **widgets:** `theme_toggle` — a System / Light / Dark switch that works

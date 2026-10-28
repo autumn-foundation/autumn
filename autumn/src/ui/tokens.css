@@ -10,6 +10,8 @@
     --text: light-dark(#111827, #e6e8ef);
     --text-muted: light-dark(#666e7b, #a1a7b8);
     --border: light-dark(#e5e7eb, #363c50);
+    /* A text input's only boundary: 3:1 on every surface (WCAG 1.4.11). */
+    --control-border: light-dark(#848b98, #70778e);
     --primary: light-dark(#7c3aed, #a78bfa);
     --primary-hover: light-dark(#6d28d9, #c4b5fd);
     --primary-light: light-dark(#ede9fe, #2e1f5c);
@@ -97,6 +99,7 @@
         --text: #111827;
         --text-muted: #666e7b;
         --border: #e5e7eb;
+        --control-border: #848b98;
         --primary: #7c3aed;
         --primary-hover: #6d28d9;
         --primary-light: #ede9fe;

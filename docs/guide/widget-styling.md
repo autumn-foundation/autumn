@@ -32,7 +32,7 @@ same tokens.
 
 | Group | Tokens |
 | --- | --- |
-| Surface | `--bg`, `--surface`, `--surface-muted`, `--border` |
+| Surface | `--bg`, `--surface`, `--surface-muted`, `--border`, `--control-border` |
 | Text | `--text`, `--text-muted` |
 | Accent | `--primary`, `--primary-hover`, `--primary-light`, `--on-primary` |
 | Status | `--danger*`, `--on-danger`, `--success*`, `--warning*`, `--info*` |
@@ -45,6 +45,9 @@ same tokens.
 `--on-primary` and `--on-danger` are the text colors on a `--primary` or a
 `--danger` fill. Do not use white text on a fill: in the dark scheme the fill
 is light.
+
+`--control-border` is the border of a text input. It has 3:1 contrast on
+every surface in both schemes (WCAG 1.4.11). `--border` is for decoration.
 
 The breakpoint tokens are for reference only. `@media` cannot read `var()`.
 The stylesheet uses `768px` for its one breakpoint, the same as

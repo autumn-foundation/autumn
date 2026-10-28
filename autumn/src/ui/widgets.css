@@ -121,7 +121,7 @@
 .autumn-field__input {
     width: 100%;
     padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--border);
+    border: 1px solid var(--control-border);
     border-radius: var(--radius);
     font-size: var(--font-size-sm);
     line-height: var(--line-height-normal);
@@ -366,7 +366,7 @@
 .autumn-search__input {
     width: 100%;
     padding: var(--space-2) var(--space-3) var(--space-2) 2.25rem;
-    border: 1px solid var(--border);
+    border: 1px solid var(--control-border);
     border-radius: var(--radius);
     font-size: var(--font-size-sm);
     color: var(--text);
@@ -403,7 +403,7 @@
 .autumn-autocomplete__input {
     width: 100%;
     padding: var(--space-2) var(--space-3);
-    border: 1px solid var(--border);
+    border: 1px solid var(--control-border);
     border-radius: var(--radius);
     font-size: var(--font-size-sm);
     color: var(--text);
@@ -1817,7 +1817,7 @@
 .autumn-comment-input {
     width: 100%;
     padding: var(--space-2);
-    border: 1px solid var(--border);
+    border: 1px solid var(--control-border);
     border-radius: var(--radius);
     background-color: var(--surface);
     color: var(--text);
