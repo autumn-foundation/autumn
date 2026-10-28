@@ -904,6 +904,22 @@ pub static APP_MIGRATIONS: &[AppMigration] = &[
         guide: "docs/migrations/0.9.0.md#constela-tighter-bounds-on-what-a-document-keeps",
         rewrite: Rewrite::GuideOnly,
     },
+    AppMigration {
+        id: "0.9.0-api-doc-webmcp-fields",
+        version: "0.9.0",
+        title: "WebMCP: `ApiDoc` gains `webmcp_tool` and `webmcp_exclude` fields",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.9.0.md#webmcp-apidoc-gains-webmcp_tool-and-webmcp_exclude-fields",
+        rewrite: Rewrite::GuideOnly,
+    },
+    AppMigration {
+        id: "0.9.0-agent-authority-webmcp-fields",
+        version: "0.9.0",
+        title: "Agent authority: manifest rows gain WebMCP fields",
+        confidence: Confidence::Manual,
+        guide: "docs/migrations/0.9.0.md#agent-authority-manifest-rows-gain-webmcp-fields",
+        rewrite: Rewrite::GuideOnly,
+    },
 ];
 
 /// The full registry.
