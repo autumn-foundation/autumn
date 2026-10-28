@@ -544,6 +544,41 @@ mod sqlite {
         assert!(error.to_string().contains("outbox is off"), "{error}");
     }
 
+    /// Codex review on #3473: an outbox job keeps the schema version of its
+    /// job and the tenant that enqueued it, as an after-commit enqueue does.
+    #[tokio::test]
+    async fn enqueue_job_stores_the_version_envelope_and_the_tenant() {
+        #[derive(diesel::QueryableByName)]
+        struct Payload {
+            #[diesel(sql_type = Text)]
+            payload: String,
+        }
+        let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
+        fx.state
+            .insert_extension(crate::job::JobClient::versioned_for_test("welcome", 2));
+        let mut conn = fx.state.pool().unwrap().get().await.unwrap();
+        let outbox = Outbox::new(&fx.state);
+        crate::tenancy::CURRENT_TENANT
+            .scope(
+                Some("acme".to_owned()),
+                outbox.enqueue_job(&mut conn, "welcome", &serde_json::json!({ "user": 7 })),
+            )
+            .await
+            .unwrap();
+
+        let stored = diesel::sql_query("SELECT payload FROM autumn_outbox")
+            .get_result::<Payload>(&mut conn)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&stored.payload).unwrap();
+        assert_eq!(body["name"], "welcome");
+        assert_eq!(
+            body["args"],
+            crate::payload_version::wrap(2, serde_json::json!({ "user": 7 }))
+        );
+        assert_eq!(body["tenant"], "acme");
+    }
+
     #[tokio::test]
     async fn a_message_that_crashes_every_relay_goes_to_dead_letters() {
         let mut handlers = OutboxHandlers::default();
