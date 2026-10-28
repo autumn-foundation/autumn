@@ -140,7 +140,9 @@ Issue #2309 fixed two problems:
 
 Issue #2795 then gated 16 more modules of `autumn-web` behind default-on
 features (ADR 0027). The daemon starter turns them off, and `psl` leaves its
-build. A default build does not change.
+build. A default build does not change. On one 4 vCPU box a cold `hello`
+build fell from 118 s to 101 s. The CI gate budget is unchanged until the
+scheduled run confirms the gain.
 
 Both #2309 fixes are real and measured. Neither brings cold start under the
 original 60s/90s target. The reason: `autumn-web`'s own hand-written source

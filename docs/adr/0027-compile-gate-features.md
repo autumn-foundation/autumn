@@ -81,6 +81,10 @@ Rules:
   extractors still compile.
 - The feature-combination gate must build each feature alone.
 - The IR of `autumn-web` fell by 14%. Line count did not predict time.
+- Measured on one 4 vCPU box, no-DB feature set, dev profile: `autumn-web`
+  alone built in 64-65 s before and 55-57 s after. A cold build of a
+  `hello`-shaped app took 118 s before and 101 s after. These are single-box
+  numbers. The CI cold-start gate has the real figure.
 - Config sections `[alerts]` and `[[slo]]` still parse when their feature is
   off. They do nothing, and the app logs a warning.
 - A one-shot mode (`AUTUMN_DUMP_GRAPH`, `AUTUMN_DB_RETENTION`,
