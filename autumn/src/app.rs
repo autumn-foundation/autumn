@@ -11821,12 +11821,21 @@ fn spawn_custom_domain_task(
     } = bind_state;
 
     state.insert_extension(std::sync::Arc::clone(&registry));
+    let limiter = std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
+        config.issuance_per_domain_per_day,
+        config.issuance_global_per_hour,
+        config.failure_backoff_secs,
+        config.max_failure_backoff_secs,
+    ));
     if let Err(e) = state.health_indicator_registry.register(
         "custom_domains",
         crate::actuator::IndicatorGroup::HealthOnly,
-        std::sync::Arc::new(crate::custom_domain::CustomDomainHealthIndicator::new(
-            std::sync::Arc::clone(&registry),
-        )),
+        std::sync::Arc::new(
+            crate::custom_domain::CustomDomainHealthIndicator::new(std::sync::Arc::clone(
+                &registry,
+            ))
+            .with_limiter(std::sync::Arc::clone(&limiter)),
+        ),
     ) {
         tracing::warn!("{e}");
     }
@@ -11846,12 +11855,7 @@ fn spawn_custom_domain_task(
             config.resolver_addrs().unwrap_or_default(),
         )),
         issuer,
-        limiter: std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
-            config.issuance_per_domain_per_day,
-            config.issuance_global_per_hour,
-            config.failure_backoff_secs,
-            config.max_failure_backoff_secs,
-        )),
+        limiter,
         ingress: config.ingress(),
         renew_before_days: acme.renew_before_days,
         // A per-domain failure is a framework-scheduled operation failing, so

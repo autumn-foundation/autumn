@@ -1282,6 +1282,48 @@ async fn health_is_up_while_a_failing_domain_still_serves_and_down_once_it_expir
     assert_eq!(indicator.grade(NOW + 86_401).status, HealthStatus::Down);
 }
 
+#[tokio::test]
+async fn health_reports_the_spent_issuance_budget_without_going_down() {
+    use autumn_web::actuator::HealthStatus;
+    use autumn_web::custom_domain::{CustomDomainHealthIndicator, IssuanceLimiter};
+
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        TableVerifier::new(&[]),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    let limiter = Arc::new(IssuanceLimiter::new(1, 2, 300, 3600));
+    limiter.record_attempt("a.clientco.com", NOW);
+    limiter.record_attempt("b.clientco.com", NOW);
+
+    let indicator = CustomDomainHealthIndicator::new(Arc::clone(&h.registry)).with_limiter(limiter);
+    let graded = indicator.grade(NOW + 10);
+    assert_eq!(
+        graded.status,
+        HealthStatus::Up,
+        "a spent budget is throttling, not an outage"
+    );
+    let budget = &graded.details["issuance_budget"];
+    assert_eq!(budget["global_used"], 2);
+    assert_eq!(budget["global_limit"], 2);
+    assert_eq!(budget["per_domain_limit"], 1);
+    assert_eq!(budget["global_retry_after_secs"], 3590);
+    let at_limit = serde_json::to_string(&budget["domains_at_limit"]).unwrap();
+    assert!(at_limit.contains("a.clientco.com"), "{at_limit}");
+}
+
+#[tokio::test]
+async fn health_has_no_budget_detail_without_a_limiter() {
+    use autumn_web::custom_domain::CustomDomainHealthIndicator;
+
+    let h = harness(
+        TableVerifier::new(&[]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    let graded = CustomDomainHealthIndicator::new(Arc::clone(&h.registry)).grade(NOW);
+    assert!(!graded.details.contains_key("issuance_budget"));
+}
+
 // ── Regressions found by review ──────────────────────────────────────────
 
 #[tokio::test]

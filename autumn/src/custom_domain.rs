@@ -2191,6 +2191,23 @@ pub struct IssuanceLimiter {
     attempts: RwLock<Attempts>,
 }
 
+/// How much of each issuance budget is spent at one instant.
+///
+/// Lets an operator tell "throttled" from "broken".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetUsage {
+    /// Orders placed in the last hour, across all domains.
+    pub global_used: usize,
+    /// The hourly cap.
+    pub global_limit: u32,
+    /// Seconds until the global budget gains room. `None` while it has room.
+    pub global_retry_after_secs: Option<i64>,
+    /// The per-domain daily cap.
+    pub per_domain_limit: u32,
+    /// Domains that spent the daily cap, sorted.
+    pub domains_at_limit: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 struct Attempts {
     /// Attempt timestamps per domain, within the per-domain window.
@@ -2273,6 +2290,33 @@ impl IssuanceLimiter {
             };
         }
         IssuanceDecision::Allow
+    }
+
+    /// The spent share of each budget at `now_unix`.
+    #[must_use]
+    pub fn usage(&self, now_unix: i64) -> BudgetUsage {
+        let attempts = read_lock(&self.attempts);
+        let global = within(&attempts.global, now_unix, GLOBAL_WINDOW_SECS);
+        let mut domains_at_limit: Vec<String> = attempts
+            .per_domain
+            .iter()
+            .filter(|(_, hits)| {
+                within(hits, now_unix, PER_DOMAIN_WINDOW_SECS).len()
+                    >= self.per_domain_per_day as usize
+            })
+            .map(|(host, _)| host.clone())
+            .collect();
+        drop(attempts);
+        domains_at_limit.sort();
+        let full = global.len() >= self.global_per_hour as usize;
+        BudgetUsage {
+            global_used: global.len(),
+            global_limit: self.global_per_hour,
+            global_retry_after_secs: full
+                .then(|| retry_after(&global, now_unix, GLOBAL_WINDOW_SECS)),
+            per_domain_limit: self.per_domain_per_day,
+            domains_at_limit,
+        }
     }
 
     /// Record that an order was placed for `hostname`.
@@ -2491,6 +2535,7 @@ impl DomainVerifier for SystemDomainVerifier {
 #[derive(Debug)]
 pub struct CustomDomainHealthIndicator {
     registry: Arc<CustomDomainRegistry>,
+    limiter: Option<Arc<IssuanceLimiter>>,
     now_unix: fn() -> i64,
 }
 
@@ -2498,7 +2543,18 @@ impl CustomDomainHealthIndicator {
     /// An indicator over `registry`.
     #[must_use]
     pub fn new(registry: Arc<CustomDomainRegistry>) -> Self {
-        Self { registry, now_unix }
+        Self {
+            registry,
+            limiter: None,
+            now_unix,
+        }
+    }
+
+    /// Also report how much of the issuance budget is spent.
+    #[must_use]
+    pub fn with_limiter(mut self, limiter: Arc<IssuanceLimiter>) -> Self {
+        self.limiter = Some(limiter);
+        self
     }
 
     /// Grade the registry at `now_unix` (pure; used by `check` and tests).
@@ -2533,6 +2589,20 @@ impl CustomDomainHealthIndicator {
         }
         if !expired.is_empty() {
             details.insert("expired".to_owned(), serde_json::json!(expired));
+        }
+        // A spent budget is throttling, not an outage: it never changes status.
+        if let Some(limiter) = &self.limiter {
+            let u = limiter.usage(now_unix);
+            details.insert(
+                "issuance_budget".to_owned(),
+                serde_json::json!({
+                    "global_used": u.global_used,
+                    "global_limit": u.global_limit,
+                    "global_retry_after_secs": u.global_retry_after_secs,
+                    "per_domain_limit": u.per_domain_limit,
+                    "domains_at_limit": u.domains_at_limit,
+                }),
+            );
         }
 
         HealthCheckOutput {
@@ -3290,6 +3360,36 @@ mod tests {
         assert_eq!(record.next_attempt_unix, Some(400));
         assert!(!record.is_due(399));
         assert!(record.is_due(400));
+    }
+
+    #[test]
+    fn usage_counts_only_attempts_inside_each_window() {
+        let limiter = IssuanceLimiter::new(2, 3, 300, 3600);
+        limiter.record_attempt("a.test", 1000);
+        limiter.record_attempt("a.test", 1100);
+        limiter.record_attempt("b.test", 1200);
+        let usage = limiter.usage(1300);
+        assert_eq!(usage.global_used, 3);
+        assert_eq!(usage.global_limit, 3);
+        assert_eq!(
+            usage.global_retry_after_secs,
+            Some(1000 + GLOBAL_WINDOW_SECS - 1300)
+        );
+        assert_eq!(usage.per_domain_limit, 2);
+        assert_eq!(usage.domains_at_limit, vec!["a.test".to_owned()]);
+        // After the hour, the global window is empty. The day window is not.
+        let later = limiter.usage(1200 + GLOBAL_WINDOW_SECS);
+        assert_eq!(later.global_used, 0);
+        assert_eq!(later.global_retry_after_secs, None);
+        assert_eq!(later.domains_at_limit, vec!["a.test".to_owned()]);
+    }
+
+    #[test]
+    fn usage_of_an_unused_limiter_is_empty() {
+        let usage = IssuanceLimiter::new(2, 3, 300, 3600).usage(1000);
+        assert_eq!(usage.global_used, 0);
+        assert_eq!(usage.global_retry_after_secs, None);
+        assert!(usage.domains_at_limit.is_empty());
     }
 
     #[test]
