@@ -2345,16 +2345,13 @@ jobs:
             --lib -- plugin_sandbox
           cargo llvm-cov --no-report -p autumn-web --features "plugin-sandbox,test-support" \
             --test integration_tests -- plugin_sandbox
-          # Explicit sqlite+mail lane (#1614). Excluding autumn-cli from the
-          # catch-all removed the only place it compiled autumn-web under the
-          # `sqlite` + `mail` union — exactly the `DbSuppressionStore`
-          # backend-flip #1614 fixed, so coverage must keep compiling it.
-          # Isolated to `-p autumn-web` so the sqlite flip can never leak onto
-          # the Pg-assuming workspace crates. A named sqlite `[[test]]` target
-          # keeps THIS lane narrow; it is no longer "the same rule the
-          # `sqlite-runtime` job follows" — #1905 made the lib unit tests
-          # backend-parametric, so that job now runs a bare `--lib`. Those
-          # tests are executed there, just not measured for coverage here.
+          # Explicit sqlite+mail lane (#1614). It compiles autumn-web with the
+          # `sqlite` and `mail` features, so `DbSuppressionStore` keeps
+          # building on SQLite. The lane uses `-p autumn-web` only. This keeps
+          # the SQLite flip away from the Postgres-only workspace crates. It
+          # runs one named `[[test]]` target to stay narrow. The
+          # `sqlite-runtime` job runs the lib unit tests. They are not
+          # measured for coverage here.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
           # The sqlite URI helpers in `db.rs` (#3032) are covered by lib unit
@@ -2843,9 +2840,9 @@ jobs:
         # because nothing runs it.
         run: cargo test -p autumn-web --features sqlite --lib
       - name: Run the mail suppression store tests under sqlite
-        # Issue #2697. The tests need `mail`, which the bare `--lib` step
-        # above omits. The pass count is checked, because a filter that
-        # matches nothing exits 0.
+        # Issue #2697. These tests need the `mail` feature.
+        # The bare `--lib` step above does not enable it.
+        # A filter that matches nothing exits 0, so the step checks the pass count.
         run: |
           set -o pipefail
           cargo test -p autumn-web --features "sqlite,mail" --lib \

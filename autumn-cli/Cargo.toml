@@ -54,10 +54,9 @@ acme = ["tls", "autumn-web/acme"]
 # on top of autumn-web's #1614 sqlite runtime lane). Non-default and MUTUALLY
 # EXCLUSIVE with the default Postgres backend: it turns on `autumn-web/sqlite`,
 # which flips autumn-web's `RuntimeConnection` type alias from Postgres to SQLite
-# for the WHOLE build graph, and pulls diesel's sqlite migration backend. Because
-# cargo feature unification is global AND the `postgres` bundle (a default
-# feature) pulls the pg-only `mail` path that does not compile under the flip,
-# the sqlite CLI MUST be built with default features OFF:
+# for the WHOLE build graph, and pulls diesel's sqlite migration backend. Cargo
+# unifies features across the build graph, and the `postgres` bundle is a
+# default feature. So build the SQLite CLI with default features off:
 #   `cargo build -p autumn-cli --no-default-features --features sqlite`
 # NEVER `--all-features` (co-enables the Postgres path and fails to compile), and
 # never co-built with the `postgres` bundle. Default builds target Postgres and

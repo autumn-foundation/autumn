@@ -4733,9 +4733,10 @@ pub mod db_suppression {
 
     use super::{MailError, SuppressionStore};
 
-    // Column type follows the runtime backend, as in `notifications`. The
-    // DDL is TIMESTAMPTZ on Postgres and TEXT on SQLite. `Timestamptz` has
-    // no SQLite impl, and `postgres` can be on while SQLite runs.
+    // The column type follows the runtime backend.
+    // Postgres uses TIMESTAMPTZ. SQLite uses TEXT.
+    // `Timestamptz` has no SQLite impl.
+    // The `postgres` feature can be on when SQLite is the runtime.
     #[cfg(not(feature = "sqlite"))]
     type UnsubscribedAt = diesel::sql_types::Timestamptz;
     #[cfg(feature = "sqlite")]
@@ -4757,10 +4758,11 @@ pub mod db_suppression {
         list_id: &'a str,
     }
 
-    /// Postgres-backed suppression list keyed by `(subscriber, list_id)`.
+    /// Suppression list keyed by `(subscriber, list_id)`.
     ///
-    /// Backed by the `mail_unsubscribes` table provisioned by the migration that
-    /// `autumn generate mailer --list-unsubscribe` writes into the app.
+    /// It uses the runtime database backend (Postgres or `SQLite`). It stores
+    /// rows in the `mail_unsubscribes` table. `autumn generate mailer
+    /// --list-unsubscribe` writes the migration for that table.
     #[derive(Clone)]
     pub struct DbSuppressionStore {
         pool: Pool<crate::db::RuntimeConnection>,
@@ -4894,7 +4896,8 @@ pub mod db_suppression {
         }
     }
 
-    // Runs the DDL that `generate mailer --list-unsubscribe` emits on SQLite.
+    // These tests run the SQLite DDL from `generate mailer --list-unsubscribe`.
+    // Keep `DDL` the same as the generator output.
     #[cfg(all(test, feature = "sqlite"))]
     mod sqlite_tests {
         use super::*;
@@ -4952,6 +4955,8 @@ pub mod db_suppression {
                 .await
                 .expect("typed read of unsubscribed_at");
             assert_eq!(at.len(), 1);
+            let age = Utc::now() - at[0];
+            assert!(age.num_seconds().abs() < 60, "default is not recent: {age}");
         }
     }
 }
