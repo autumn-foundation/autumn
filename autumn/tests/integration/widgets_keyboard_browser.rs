@@ -79,6 +79,8 @@ fn page_body() -> Markup {
     let ac = AutocompleteConfig::new("/colors", "color_id")
         .debounce(0)
         .fallback_options(COLORS);
+    // A long debounce holds the old options while the user edits the query.
+    let slow = AutocompleteConfig::new("/colors", "slow_id").debounce(1500);
     html! {
         (nav_bar("/", &nav))
         h1 id="title" { "Keyboard" }
@@ -87,6 +89,7 @@ fn page_body() -> Markup {
             (autocomplete_input("ac", "Color", &ac))
             button type="submit" { "Save" }
         }
+        (autocomplete_input("slow", "Slow color", &slow))
         button id="swap" hx-get="/fragment" hx-target="#slot" { "Swap" }
         div id="slot" {}
         button id="swap-outer" hx-get="/fragment-outer" hx-target="#slot-outer" hx-swap="outerHTML" {
@@ -546,6 +549,35 @@ async fn combobox_aria_expanded_is_false_without_options() {
     assert_eq!(attr(&page, "ac-query", "aria-expanded").await, "false");
     press(&page, "ArrowDown").await;
     assert_eq!(attr(&page, "ac-query", "aria-activedescendant").await, "");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn editing_the_query_clears_the_active_option() {
+    // Enter during the debounce must not commit an option of the old query.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    page.fill("#slow-query", "g").await.expect("fill");
+    wait_for(
+        &page,
+        "document.querySelectorAll('#slow-options [role=option]').length > 0",
+    )
+    .await;
+    press(&page, "ArrowDown").await;
+    assert_ne!(attr(&page, "slow-query", "aria-activedescendant").await, "");
+
+    press(&page, "r").await;
+    assert_eq!(attr(&page, "slow-query", "aria-activedescendant").await, "");
+    press(&page, "Enter").await;
+    assert_eq!(
+        eval_string(&page, "document.getElementById('slow-value').value").await,
+        ""
+    );
+    assert_eq!(
+        eval_string(&page, "document.getElementById('slow-query').value").await,
+        "gr"
+    );
 }
 
 #[tokio::test]

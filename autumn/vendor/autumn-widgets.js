@@ -443,6 +443,8 @@
 
     queryInput.addEventListener('input', function () {
       var hidden = getHidden();
+      // The highlight belongs to the old query. Enter must not commit it.
+      setActive(queryInput, listbox, null);
       var minLen = parseInt(queryInput.dataset.acMinLength || '0', 10);
       if (freeText) {
         // Free-text mode: keep the hidden field in sync with the typed query.
