@@ -362,7 +362,9 @@ mod tests {
     /// `[data-density]` element too, so a subtree can set its own density.
     #[test]
     fn density_scales_the_space_tokens() {
-        assert!(TOKENS_CSS.contains(":root,\n[data-density] {"));
+        // Windows checks the CSS out with CRLF line ends.
+        let css = TOKENS_CSS.replace("\r\n", "\n");
+        assert!(css.contains(":root,\n[data-density] {"));
         let space = TOKENS_CSS
             .lines()
             .filter(|l| l.trim_start().starts_with("--space-"))
