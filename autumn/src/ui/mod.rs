@@ -8,7 +8,6 @@
 /// Reusable Maud pagination-nav renderers (offset and cursor).
 #[cfg(feature = "maud")]
 pub mod pagination;
-/// Theme preference cookie, density words and the theme route (#3396).
 pub mod theme;
 pub mod tokens;
 /// Framework-owned widget component CSS — see [`widgets_css`] for docs.
