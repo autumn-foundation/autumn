@@ -9,13 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Nothing yet.
 
-## [0.9.0] - 2026-10-26
+## [0.9.0] - 2026-10-28
 
 For a narrative tour of this release, see the
 [0.9.0 release walkthrough](docs/releases/0.9.0.md); for the upgrade path from
 0.8.x, see the [migration guide](docs/migrations/0.9.0.md).
 
 ### Breaking Changes
+
+- **Breaking:** `ApiDoc` gains public `webmcp_tool` and `webmcp_exclude`
+  fields. A struct literal needs `..ApiDoc::default()`
+  ([migration guide](docs/migrations/0.9.0.md)).
+
+- **Breaking:** `agent_authority::manifest::RouteSummary`, `RouteRef`,
+  `UnregisteredAuthority` and `AgentAuthorityManifest` gain WebMCP fields. A
+  hand-built literal must add them
+  ([migration guide](docs/migrations/0.9.0.md)).
 
 - **Breaking:** **media:** `MediaPlugin` now installs only the primitives you
   enable (issue #1974,
@@ -274,6 +283,32 @@ For a narrative tour of this release, see the
   ([migration guide](docs/migrations/0.9.0.md)).
 
 ### Added
+
+- **webmcp:** Autumn gives routes as tools to the agent in the browser of
+  the user (issue #2619).
+  Enable the `webmcp` feature, tag a route `#[api_doc(webmcp)]` (or
+  `Route::webmcp()`), and call `AppBuilder::mount_webmcp()`. Autumn serves
+  the tool list at `/_autumn/webmcp/tools.json` with the same derivation and
+  `inputSchema` as `/mcp`. The page script `js/autumn-webmcp.js` registers
+  each tool with `document.modelContext.registerTool()`. A call is a
+  same-origin `fetch` with the user's session cookie and CSRF token, so the
+  full route pipeline runs. `#[api_doc(mcp)]` does not imply it.
+  `expose_all_as_webmcp()` makes each eligible `GET` route a tool.
+
+- **webmcp:** form tools. `webmcp::form_tool(name, description)` makes a
+  `<form>` a tool. `webmcp::form_tool_confirm` makes a tool that asks the
+  user first. The script makes the schema from the fields, and submits
+  the form through htmx. An htmx swap unregisters the form tools of the
+  swapped content.
+
+- **webmcp:** a `DELETE` tool, or a tool behind a grant that is not
+  `reversible`, asks the user first (`requestUserInteraction()`, else
+  `confirm()`). When the user refuses, the script sends no request.
+
+- **agent-authority:** the manifest reports WebMCP exposure apart from `/mcp`
+  exposure: `"exposure": "webmcp-tool"`, `route.webmcp_tool`, and
+  `ungoverned_webmcp_tools`. `autumn agents manifest --check` fails on an
+  ungoverned WebMCP write.
 
 - **sharding / sqlite:** a SQLite database fleet: one database file per
   tenant or per routing slot, behind the existing sharding extractors
@@ -1061,6 +1096,24 @@ For a narrative tour of this release, see the
 - **cost:** `CostSignal::set_recheck` sets the time between two signal checks.
 
 ### Changed
+
+- **jobs:** [no-plugin] the durable Postgres job claim no longer scans the parked backlog while
+  deferrable job names are deferred by the cost signal (issue #1720). A new
+  `idx_autumn_jobs_queue_name_ready` index (migration
+  `20261026170000_add_jobs_queue_name_ready_index`; plain `CREATE INDEX`, a brief
+  `SHARE` lock while it builds) lets the claim cost O(distinct ready job names)
+  buffers per poll instead of O(parked backlog). The claim without deferral is unchanged.
+
+- **deps:** dependency refresh for 0.9.0. `opentelemetry`,
+  `opentelemetry_sdk` and `opentelemetry-otlp` 0.33, `tracing-opentelemetry`
+  0.34, `brotli` 9, `croner` 4, `css-inline` 0.23 and `getrandom` 0.4. Every
+  other dependency moved to its newest release that still builds on the 1.88
+  MSRV. `wasmi` stays on 0.40: 2.0.0 crashes on Windows when it and its caller
+  are built at different optimization levels.
+
+- **openapi:** `openapi.yaml` is now written with `serde-saphyr`, a safe-Rust
+  YAML serializer, in place of the deprecated `serde_yaml`. The document is
+  unchanged; the YAML layout of a few scalars (quoting) can differ.
 
 - **web:** `Query<T>` decoding stores a single-valued key's value inline instead of in a one-element `Vec`, cutting allocations per decode by ~14% (no behavior change). [no-plugin]
 
@@ -2460,6 +2513,10 @@ For a narrative tour of this release, see the
   and no static routes. The capsule is then the build's output.
 
 ### Security
+
+- `unsafe-libyaml` (RUSTSEC-2024-0449, unmaintained) is no longer in the
+  dependency graph, so its waiver is gone from the workspace `deny.toml` and
+  from the `deny.toml` that `autumn new` writes.
 
 - Bumped `tokio` to 1.54.1 (RUSTSEC-2026-0386, `AsyncFd` I/O-safety unsoundness) and recorded a dated, reasoned `cargo-deny` waiver for RUSTSEC-2026-0387 (`crypto-bigint` 0.4.9 via `aws-sigv4`'s unused SigV4a path; no 0.4.x fix exists).
 

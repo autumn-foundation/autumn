@@ -253,11 +253,11 @@ for crate in "${CRATES[@]}"; do
     #     intersection-eligible and have been ADDED. `acme-pebble`, also new in
     #     0.8.0, stays OUT: it implies `test-support` (excluded below) and only
     #     the dedicated Pebble CI step enables it.
-    #   - EXCLUDES the 0.9.0-only features `ledger-profile` and `repl`: both are
-    #     NEW in 0.9.0 and absent from the 0.8.0 baseline, so the symmetric
-    #     enable would fail the baseline build ("v0.8.0 does not have feature
-    #     ...") and re-break the gate. Add each once a future baseline carries
-    #     it — the same rule that gated `collab`/`sla`/`constela`/
+    #   - EXCLUDES the 0.9.0-only features `ledger-profile`, `repl` and `webmcp`:
+    #     all three are NEW in 0.9.0 and absent from the 0.8.0 baseline, so the
+    #     symmetric enable would fail the baseline build ("v0.8.0 does not have
+    #     feature ...") and re-break the gate. Add each once a future baseline
+    #     carries it — the same rule that gated `collab`/`sla`/`constela`/
     #     `plugin-sandbox` out of the previous revision. `postgres`, also new in
     #     0.9.0, is named for the current build only (see below).
     #   - EXCLUDES `sqlite`, which IS baseline-present in 0.6.0, because it
@@ -325,10 +325,10 @@ for crate in "${CRATES[@]}"; do
     [[ -n "$autumn_web_current_version" ]] || \
       die "could not determine autumn-web version for the SemVer allowlist guard"
     if [[ "$autumn_web_current_version" != "$SEMVER_ALLOWLIST_TARGET_VERSION" ]]; then
-      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.8.0-baseline ∩ 0.9.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently ledger-profile/repl) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
+      die "autumn-web is now v${autumn_web_current_version} but the SemVer feature allowlist is pinned to ${SEMVER_ALLOWLIST_TARGET_VERSION} (computed as the 0.8.0-baseline ∩ 0.9.0 feature set). cargo-semver-checks now compares against a newer baseline, which may already carry features this list still omits (currently ledger-profile/repl/webmcp) — recompute both allowlists as (new-baseline ∩ current) features before releasing. See the comment above this block."
     fi
 
-    # `ledger-profile` and `repl` are deliberately ABSENT: this list is the
+    # `ledger-profile`, `repl` and `webmcp` are deliberately ABSENT: this list is the
     # 0.8.0-baseline ∩ 0.9.0 intersection and is passed to BOTH builds, so
     # naming a feature the published baseline does not have fails that
     # invocation outright ("does not have feature") and turns the gate into a
