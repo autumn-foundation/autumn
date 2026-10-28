@@ -25,12 +25,12 @@ use crate::traits::{
     ListResult, SortDirection, record_id,
 };
 
-const TOKENS_CSS: &str = include_str!("tokens.css");
+use autumn_web::ui::tokens::TOKENS_CSS;
 
 // ── CSS ─────────────────────────────────────────────────────────────
 
-/// Admin-specific styles that build on the plugin's shared tokens
-/// ([`TOKENS_CSS`]) and the framework's shared flash styles
+/// Admin-specific styles that build on the core design tokens
+/// ([`TOKENS_CSS`], light and dark) and the framework's shared flash styles
 /// ([`autumn_web::flash::FLASH_CSS`]).
 const ADMIN_CSS: &str = "
     /* Skip-to-content link: visually hidden at rest, revealed on keyboard focus. */
@@ -41,7 +41,7 @@ const ADMIN_CSS: &str = "
         z-index: 9999;
         padding: 0.5rem 1rem;
         background: var(--primary);
-        color: #fff;
+        color: var(--on-primary);
         border-radius: 0 0 0.25rem 0.25rem;
         font-size: 0.875rem;
         text-decoration: none;
@@ -166,13 +166,13 @@ const ADMIN_CSS: &str = "
     .btn:hover { background: var(--bg); text-decoration: none; }
     .btn-primary {
         background: var(--primary);
-        color: white;
+        color: var(--on-primary);
         border-color: var(--primary);
     }
     .btn-primary:hover { background: var(--primary-hover); }
     .btn-danger {
         background: var(--danger);
-        color: white;
+        color: var(--on-danger);
         border-color: var(--danger);
     }
     .btn-danger:hover { background: var(--danger-hover); }
@@ -297,7 +297,7 @@ const ADMIN_CSS: &str = "
     .autumn-pager a:hover { background: var(--bg); text-decoration: none; }
     .autumn-pager .autumn-pager__current {
         background: var(--primary);
-        color: white;
+        color: var(--on-primary);
         border-color: var(--primary);
     }
     .autumn-pager .autumn-pager__ellipsis { border: none; color: var(--text-muted); }
@@ -2116,10 +2116,10 @@ fn render_readonly_display(field: &AdminField, record: Option<&Value>) -> Markup
     // than at the one call site keeps a future caller from reopening the hole.
     if ::autumn_web::confidential::is_confidential_column_name(field.name) {
         return html! {
-            p class="form-static-value" style="margin: 0; padding: 0.375rem 0; color: #555;" {
+            p class="form-static-value" style="margin: 0; padding: 0.375rem 0; color: var(--text-muted);" {
                 span title="sealed for its owner" { "••••••••" }
             }
-            small class="form-help" style="color: #888;" {
+            small class="form-help" style="color: var(--text-muted);" {
                 "This field cannot be changed after creation."
             }
         };
@@ -2132,10 +2132,10 @@ fn render_readonly_display(field: &AdminField, record: Option<&Value>) -> Markup
         })
         .unwrap_or_default();
     html! {
-        p class="form-static-value" style="margin: 0; padding: 0.375rem 0; color: #555;" {
+        p class="form-static-value" style="margin: 0; padding: 0.375rem 0; color: var(--text-muted);" {
             (value)
         }
-        small class="form-help" style="color: #888;" {
+        small class="form-help" style="color: var(--text-muted);" {
             "This field cannot be changed after creation."
         }
     }
@@ -2569,8 +2569,7 @@ mod tests {
     }
 
     // WCAG 1.4.3 (contrast minimum) relative-luminance / contrast-ratio
-    // formulas, applied to the admin plugin's own `tokens.css` color pairs.
-    // `#RRGGBB` only — every color literal in `tokens.css` is that shape.
+    // formulas, applied to the core token color pairs (`#RRGGBB` only).
     fn hex_channel(hex: &str, i: usize) -> f64 {
         f64::from(u8::from_str_radix(&hex[1 + i * 2..3 + i * 2], 16).unwrap()) / 255.0
     }
@@ -2647,46 +2646,85 @@ mod tests {
     // foreground text). `--warning-text`/`--success-text` are the same hue
     // darkened to the framework's existing flash-message foreground shade,
     // reused here rather than inventing a new color.
-    const SURFACE: &str = "#ffffff";
-    const WARNING: &str = "#d97706";
-    const WARNING_TEXT: &str = "#92400e";
-    const SUCCESS: &str = "#059669";
-    const SUCCESS_TEXT: &str = "#065f46";
+    //
+    // Issue #3396: the admin embeds the core tokens, which have a dark
+    // scheme. The same pairs must pass in both schemes.
+
+    /// One side of the `light-dark()` value of core color token `name`.
+    fn core_color(name: &str, dark: bool) -> String {
+        let css = autumn_web::ui::tokens::TOKENS_CSS;
+        let at = css
+            .find(&format!("{name}: light-dark("))
+            .unwrap_or_else(|| panic!("{name} is not a light-dark() core token"));
+        let args = &css[at + name.len() + ": light-dark(".len()..];
+        let args = &args[..args.find(')').unwrap()];
+        let (light, dark_value) = args.split_once(',').unwrap();
+        (if dark { dark_value } else { light }).trim().to_owned()
+    }
 
     #[test]
     fn raw_warning_and_success_tokens_fail_wcag_aa_text_contrast_on_surface() {
         // Documents why `--warning`/`--success` may not be used directly as
         // small/normal foreground text — the defect `-text` variants fix.
-        assert!(
-            contrast_ratio(WARNING, SURFACE) < 4.5,
-            "if this now passes, --warning's hex changed and the -text variant may be redundant"
-        );
-        assert!(
-            contrast_ratio(SUCCESS, SURFACE) < 4.5,
-            "if this now passes, --success's hex changed and the -text variant may be redundant"
-        );
+        let surface = core_color("--surface", false);
+        for token in ["--warning", "--success"] {
+            assert!(
+                contrast_ratio(&core_color(token, false), &surface) < 4.5,
+                "if this now passes, {token} changed and the -text variant may be redundant"
+            );
+        }
     }
 
     #[test]
     fn text_safe_warning_and_success_tokens_meet_wcag_aa_contrast_on_surface() {
+        for dark in [false, true] {
+            let surface = core_color("--surface", dark);
+            for token in ["--warning-text", "--success-text", "--text", "--text-muted"] {
+                let ratio = contrast_ratio(&core_color(token, dark), &surface);
+                assert!(
+                    ratio >= 4.5,
+                    "{token} on --surface (dark={dark}): {ratio:.2}"
+                );
+            }
+            for (fg, bg) in [("--on-primary", "--primary"), ("--on-danger", "--danger")] {
+                let ratio = contrast_ratio(&core_color(fg, dark), &core_color(bg, dark));
+                assert!(ratio >= 4.5, "{fg} on {bg} (dark={dark}): {ratio:.2}");
+            }
+        }
+    }
+
+    /// Issue #3396: no private token copy. The layout embeds the core set.
+    #[test]
+    fn admin_layout_embeds_the_core_tokens() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         assert!(
-            contrast_ratio(WARNING_TEXT, SURFACE) >= 4.5,
-            "--warning-text on --surface must clear WCAG AA 4.5:1"
+            !manifest_dir.join("src/tokens.css").exists(),
+            "delete the private copy; use autumn_web::ui::tokens::TOKENS_CSS"
         );
+        let r = dummy_registry();
+        let html = dashboard_page(&test_chrome(&r), &[]).into_string();
         assert!(
-            contrast_ratio(SUCCESS_TEXT, SURFACE) >= 4.5,
-            "--success-text on --surface must clear WCAG AA 4.5:1"
+            html.contains(autumn_web::ui::tokens::TOKENS_CSS),
+            "the admin layout must embed the core tokens"
         );
-        // tokens.css is the source of truth; keep these hex literals honest.
-        let css = include_str!("tokens.css");
-        assert!(
-            css.contains(&format!("--warning-text: {WARNING_TEXT}")),
-            "{css}"
-        );
-        assert!(
-            css.contains(&format!("--success-text: {SUCCESS_TEXT}")),
-            "{css}"
-        );
+    }
+
+    /// A dark scheme makes `--primary` and `--danger` light. White text on
+    /// them fails contrast, so a fill uses `--on-primary` / `--on-danger`.
+    #[test]
+    fn admin_css_has_no_white_text_on_a_token_fill() {
+        for rule in ADMIN_CSS.split('}') {
+            let white = ["color: #fff;", "color: white;"]
+                .iter()
+                .any(|w| rule.contains(w));
+            let token_fill = rule
+                .lines()
+                .any(|l| l.trim().starts_with("background") && l.contains("var(--"));
+            assert!(
+                !(white && token_fill),
+                "white text on a token fill:{rule}}}"
+            );
+        }
     }
 
     #[test]

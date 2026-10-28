@@ -244,6 +244,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "reaction-controls",
     "stat-card",
     "tabs",
+    "theme-toggle",
     "toast",
     "transition-controls",
     "translated-transition-controls",

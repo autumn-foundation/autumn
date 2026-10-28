@@ -407,10 +407,10 @@ pub async fn wizard_progress_steps(
 ///
 /// ```html
 /// <nav aria-label="Checkout progress">
-///   <ol role="list" class="wizard-progress">
-///     <li class="wizard-step wizard-step--completed">…Shipping…</li>
-///     <li class="wizard-step wizard-step--current" aria-current="step">…Payment…</li>
-///     <li class="wizard-step wizard-step--upcoming">…Review…</li>
+///   <ol role="list" class="autumn-wizard-progress">
+///     <li class="autumn-wizard-step autumn-wizard-step--completed">…Shipping…</li>
+///     <li class="autumn-wizard-step autumn-wizard-step--current" aria-current="step">…Payment…</li>
+///     <li class="autumn-wizard-step autumn-wizard-step--upcoming">…Review…</li>
 ///   </ol>
 /// </nav>
 /// ```
@@ -422,28 +422,28 @@ pub async fn wizard_progress(ctx: &WizardContext, current_step: &str) -> Markup 
 
     html! {
         nav aria-label="Progress" {
-            ol role="list" class="wizard-progress" {
+            ol role="list" class="autumn-wizard-progress" {
                 @for (i, step) in steps.iter().enumerate() {
                     @let step_num = i + 1;
                     @let class = match step.state {
-                        StepState::Completed => "wizard-step wizard-step--completed",
-                        StepState::Current   => "wizard-step wizard-step--current",
-                        StepState::Upcoming  => "wizard-step wizard-step--upcoming",
+                        StepState::Completed => "autumn-wizard-step autumn-wizard-step--completed",
+                        StepState::Current   => "autumn-wizard-step autumn-wizard-step--current",
+                        StepState::Upcoming  => "autumn-wizard-step autumn-wizard-step--upcoming",
                     };
                     @if step.state == StepState::Current {
                         li class=(class) aria-current="step" {
-                            span class="wizard-step__number" { (step_num) }
-                            span class="wizard-step__label" { (step.label) }
+                            span class="autumn-wizard-step__number" { (step_num) }
+                            span class="autumn-wizard-step__label" { (step.label) }
                         }
                     } @else {
                         li class=(class) {
-                            span class="wizard-step__number" { (step_num) }
-                            span class="wizard-step__label" { (step.label) }
+                            span class="autumn-wizard-step__number" { (step_num) }
+                            span class="autumn-wizard-step__label" { (step.label) }
                         }
                     }
                 }
             }
-            p class="wizard-progress__summary" aria-live="polite" {
+            p class="autumn-wizard-progress__summary" aria-live="polite" {
                 "Step " (current_number) " of " (total)
             }
         }
@@ -1077,8 +1077,14 @@ mod tests {
             .unwrap();
         let markup = wizard_progress(&wizard, "payment").await;
         let html = markup.into_string();
-        assert!(html.contains("wizard-step--completed"));
-        assert!(html.contains("wizard-step--current"));
-        assert!(html.contains("wizard-step--upcoming"));
+        assert!(html.contains(r#"class="autumn-wizard-progress""#), "{html}");
+        assert!(html.contains("autumn-wizard-step autumn-wizard-step--completed"));
+        assert!(html.contains("autumn-wizard-step autumn-wizard-step--current"));
+        assert!(html.contains("autumn-wizard-step autumn-wizard-step--upcoming"));
+        assert!(
+            html.contains(r#"class="autumn-wizard-step__number""#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"class="wizard-"#), "{html}");
     }
 }

@@ -1,12 +1,12 @@
 /*
  * Autumn — framework-owned widget component CSS (issue #1215)
  *
- * Backs every `autumn-*` (and `wizard-*`) class emitted by
+ * Backs every `autumn-*` class emitted by
  * `autumn_web::{form, widgets, wizard, ui::pagination, storage::form_helper,
  * job_tracking}`. Plain CSS — no `@import`/`@apply` — so it works standalone,
- * without a Tailwind build. Colors, borders, and radius reference the shared
- * design tokens (`ui/tokens.css`); re-theme by overriding the token
- * `:root` variables, not by forking these rules.
+ * without a Tailwind build. Colors, spacing, type, radius and z-index use the
+ * shared design tokens (`ui/tokens.css`). Re-theme by overriding the tokens,
+ * not by forking these rules. The tokens carry the dark scheme and density.
  *
  * Not included here: `autumn-dev-*` (dev-error badge ships its own inline
  * `<style>`) and `.flash`/`.flash-*` (served separately as `FLASH_CSS`).
@@ -14,93 +14,93 @@
 
 /* ── Wizard progress stepper ──────────────────────────────────────────────── */
 
-.wizard-progress {
+.autumn-wizard-progress {
     display: flex;
     align-items: flex-start;
     list-style: none;
     padding: 0;
-    margin: 0 0 1.5rem 0;
+    margin: 0 0 var(--space-6) 0;
 }
 
-.wizard-step {
+.autumn-wizard-step {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: var(--space-2);
     flex-shrink: 0;
 }
 
-.wizard-step + .wizard-step {
+.autumn-wizard-step + .autumn-wizard-step {
     flex: 1;
 }
 
-.wizard-step + .wizard-step::before {
+.autumn-wizard-step + .autumn-wizard-step::before {
     content: '';
     flex: 1;
     height: 2px;
     background-color: var(--border);
 }
 
-.wizard-step--completed + .wizard-step::before {
+.autumn-wizard-step--completed + .autumn-wizard-step::before {
     background-color: var(--primary);
 }
 
-.wizard-step__number {
+.autumn-wizard-step__number {
     display: flex;
     align-items: center;
     justify-content: center;
     width: 2rem;
     height: 2rem;
-    border-radius: 9999px;
+    border-radius: var(--radius-full);
     font-size: 0.8125rem;
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     flex-shrink: 0;
-    background-color: var(--border);
+    background-color: var(--surface-muted);
     color: var(--text-muted);
 }
 
-.wizard-step__label {
-    font-size: 0.875rem;
+.autumn-wizard-step__label {
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     text-transform: capitalize;
     white-space: nowrap;
 }
 
-.wizard-step--completed .wizard-step__number {
+.autumn-wizard-step--completed .autumn-wizard-step__number {
     background-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
 }
 
-.wizard-step--completed .wizard-step__label {
+.autumn-wizard-step--completed .autumn-wizard-step__label {
     color: var(--primary);
 }
 
-.wizard-step--current .wizard-step__number {
+.autumn-wizard-step--current .autumn-wizard-step__number {
     background-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
     box-shadow: 0 0 0 3px var(--primary-light);
 }
 
-.wizard-step--current .wizard-step__label {
+.autumn-wizard-step--current .autumn-wizard-step__label {
     color: var(--text);
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
 }
 
-/* Same as the unmodified .wizard-step__number/__label defaults — stated
+/* Same as the unmodified .autumn-wizard-step__number/__label defaults — stated
    explicitly so every state the widget emits has a rule, per the coverage
    test in tests/integration/widget_css_coverage.rs. */
-.wizard-step--upcoming .wizard-step__number {
-    background-color: var(--border);
+.autumn-wizard-step--upcoming .autumn-wizard-step__number {
+    background-color: var(--surface-muted);
     color: var(--text);
 }
 
-.wizard-step--upcoming .wizard-step__label {
+.autumn-wizard-step--upcoming .autumn-wizard-step__label {
     color: var(--text-muted);
 }
 
-.wizard-progress__summary {
-    font-size: 0.75rem;
+.autumn-wizard-progress__summary {
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
-    margin-top: 0.5rem;
+    margin-top: var(--space-2);
 }
 
 /* ── Form fields (autumn-field) ───────────────────────────────────────────── */
@@ -108,23 +108,23 @@
 .autumn-field {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 1rem;
+    gap: var(--space-1);
+    margin-bottom: var(--space-4);
 }
 
 .autumn-field__label {
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     color: var(--text);
 }
 
 .autumn-field__input {
     width: 100%;
-    padding: 0.5rem 0.75rem;
+    padding: var(--space-2) var(--space-3);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    font-size: 0.875rem;
-    line-height: 1.5;
+    font-size: var(--font-size-sm);
+    line-height: var(--line-height-normal);
     color: var(--text);
     background-color: var(--surface);
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
@@ -168,7 +168,7 @@
 
 .autumn-field__required {
     color: var(--danger);
-    margin-left: 0.25rem;
+    margin-left: var(--space-1);
 }
 
 /* A checkbox shows the box, then the label, on one line. */
@@ -176,7 +176,7 @@
     flex-direction: row;
     flex-wrap: wrap;
     align-items: center;
-    gap: 0.5rem;
+    gap: var(--space-2);
 }
 
 .autumn-field--checkbox .autumn-field__input {
@@ -210,8 +210,8 @@
    input can't be repopulated, so this line is the only signal that the record
    already holds a blob. */
 .autumn-field__current {
-    font-size: 0.875rem;
-    margin: 0 0 0.25rem;
+    font-size: var(--font-size-sm);
+    margin: 0 0 var(--space-1);
 }
 
 .autumn-attachment__meta {
@@ -228,8 +228,8 @@
 .autumn-rich-text__toolbar {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.5rem;
-    padding: 0.375rem 0.5rem;
+    gap: var(--space-2);
+    padding: 0.375rem var(--space-2);
     border: 1px solid var(--border);
     border-bottom: none;
     border-radius: var(--radius) var(--radius) 0 0;
@@ -239,8 +239,8 @@
 .autumn-rich-text__toolbar-item {
     display: inline-flex;
     align-items: baseline;
-    gap: 0.25rem;
-    font-size: 0.75rem;
+    gap: var(--space-1);
+    font-size: var(--font-size-xs);
 }
 
 .autumn-rich-text__toolbar-label {
@@ -273,23 +273,23 @@
 .autumn-rich-text__preview-wrapper {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    margin-top: 0.5rem;
+    gap: var(--space-1);
+    margin-top: var(--space-2);
 }
 
 .autumn-rich-text__preview-label {
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     color: var(--text);
 }
 
 .autumn-rich-text__preview {
-    padding: 0.75rem;
+    padding: var(--space-3);
     border: 1px dashed var(--border);
     border-radius: var(--radius);
     background-color: var(--surface);
     color: var(--text);
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
     line-height: 1.6;
     overflow-wrap: anywhere;
 }
@@ -313,7 +313,7 @@
 .autumn-rich-text__preview th,
 .autumn-rich-text__preview td {
     border: 1px solid var(--border);
-    padding: 0.25rem 0.5rem;
+    padding: var(--space-1) var(--space-2);
 }
 
 /* ── Submit button (autumn-submit) ────────────────────────────────────────── */
@@ -322,13 +322,13 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 0.5rem 1.25rem;
+    padding: var(--space-2) var(--space-5);
     background-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
     border: none;
     border-radius: var(--radius);
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     cursor: pointer;
     transition: background-color 0.15s ease;
 }
@@ -352,22 +352,22 @@
 .autumn-search {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 1rem;
+    gap: var(--space-1);
+    margin-bottom: var(--space-4);
 }
 
 .autumn-search__label {
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     color: var(--text);
 }
 
 .autumn-search__input {
     width: 100%;
-    padding: 0.5rem 0.75rem 0.5rem 2.25rem;
+    padding: var(--space-2) var(--space-3) var(--space-2) 2.25rem;
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
     color: var(--text);
     background-color: var(--surface);
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E");
@@ -389,22 +389,22 @@
     position: relative;
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 1rem;
+    gap: var(--space-1);
+    margin-bottom: var(--space-4);
 }
 
 .autumn-autocomplete__label {
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     color: var(--text);
 }
 
 .autumn-autocomplete__input {
     width: 100%;
-    padding: 0.5rem 0.75rem;
+    padding: var(--space-2) var(--space-3);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
     color: var(--text);
     background-color: var(--surface);
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
@@ -421,7 +421,7 @@
     top: 100%;
     left: 0;
     right: 0;
-    z-index: 50;
+    z-index: var(--z-dropdown);
     background-color: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -429,13 +429,13 @@
     max-height: 15rem;
     overflow-y: auto;
     list-style: none;
-    margin: 0.25rem 0 0 0;
-    padding: 0.25rem 0;
+    margin: var(--space-1) 0 0 0;
+    padding: var(--space-1) 0;
 }
 
 .autumn-autocomplete__option {
-    padding: 0.5rem 0.75rem;
-    font-size: 0.875rem;
+    padding: var(--space-2) var(--space-3);
+    font-size: var(--font-size-sm);
     color: var(--text);
     cursor: pointer;
 }
@@ -451,8 +451,8 @@
 .autumn-nav {
     display: flex;
     align-items: center;
-    gap: 1rem;
-    padding: 0.75rem 1rem;
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-4);
 }
 
 .autumn-nav--sidebar {
@@ -461,7 +461,7 @@
 }
 
 .autumn-nav__brand {
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     color: var(--text);
     text-decoration: none;
 }
@@ -478,14 +478,14 @@
 .autumn-nav__collapse {
     display: flex;
     align-items: center;
-    gap: 1rem;
+    gap: var(--space-4);
     flex: 1;
 }
 
 .autumn-nav__items {
     display: flex;
     align-items: center;
-    gap: 1rem;
+    gap: var(--space-4);
     list-style: none;
     margin: 0;
     padding: 0;
@@ -514,8 +514,8 @@
 }
 
 .autumn-nav__section {
-    font-size: 0.75rem;
-    font-weight: 600;
+    font-size: var(--font-size-xs);
+    font-weight: var(--font-weight-semibold);
     text-transform: uppercase;
     color: var(--text-muted);
 }
@@ -569,7 +569,7 @@
 .autumn-locale-switcher {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: var(--space-2);
 }
 
 .autumn-locale-switcher a {
@@ -582,15 +582,56 @@
 }
 
 .autumn-locale-switcher__current {
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     color: var(--text-muted);
+}
+
+/* ── Theme toggle (autumn-theme-toggle, issue #3396) ───────────────────────── */
+
+.autumn-theme-toggle {
+    display: inline-flex;
+    margin: 0;
+}
+
+.autumn-theme-toggle__group {
+    display: inline-flex;
+    gap: var(--space-1);
+    padding: var(--space-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    background: var(--surface);
+}
+
+.autumn-theme-toggle__option {
+    padding: var(--space-1) var(--space-3);
+    border: 0;
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+}
+
+.autumn-theme-toggle__option:hover {
+    color: var(--text);
+}
+
+.autumn-theme-toggle__option[aria-pressed="true"] {
+    background: var(--primary);
+    color: var(--on-primary);
+}
+
+.autumn-theme-toggle__option:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
 }
 
 /* ── Breadcrumb (autumn-breadcrumb) ───────────────────────────────────────── */
 
 .autumn-breadcrumb {
-    font-size: 0.875rem;
-    margin-bottom: 1rem;
+    font-size: var(--font-size-sm);
+    margin-bottom: var(--space-4);
 }
 
 .autumn-breadcrumb__list {
@@ -625,7 +666,7 @@
 
 .autumn-breadcrumb__current {
     color: var(--text);
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
 }
 
 .autumn-breadcrumb__text {
@@ -635,45 +676,45 @@
 /* ── Hero (autumn-hero) ────────────────────────────────────────────────────── */
 
 .autumn-hero {
-    padding: 3rem 1.5rem;
+    padding: 3rem var(--space-6);
     text-align: center;
 }
 
 .autumn-hero__title {
     margin: 0;
     font-size: 2rem;
-    font-weight: 700;
+    font-weight: var(--font-weight-bold);
     color: var(--text);
 }
 
 .autumn-hero__subtitle {
-    margin: 0.75rem 0 0 0;
-    font-size: 1.125rem;
+    margin: var(--space-3) 0 0 0;
+    font-size: var(--font-size-lg);
     color: var(--text-muted);
 }
 
 .autumn-hero__actions {
     display: flex;
     justify-content: center;
-    gap: 0.75rem;
-    margin-top: 1.5rem;
+    gap: var(--space-3);
+    margin-top: var(--space-6);
 }
 
 .autumn-hero__cta {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 0.625rem 1.5rem;
+    padding: 0.625rem var(--space-6);
     border-radius: var(--radius);
     font-size: 0.9375rem;
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
     text-decoration: none;
     transition: background-color 0.15s ease, border-color 0.15s ease;
 }
 
 .autumn-hero__cta--primary {
     background-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
     border: 1px solid var(--primary);
 }
 
@@ -697,12 +738,12 @@
 .autumn-property-list {
     display: grid;
     grid-template-columns: minmax(8rem, max-content) 1fr;
-    gap: 0.5rem 1rem;
+    gap: var(--space-2) var(--space-4);
     margin: 0;
 }
 
 .autumn-property-list dt {
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
     color: var(--text-muted);
 }
 
@@ -733,14 +774,14 @@
 .autumn-modal__content {
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
-    padding: 1.5rem;
+    gap: var(--space-3);
+    padding: var(--space-6);
 }
 
 .autumn-modal__title {
     margin: 0;
-    font-size: 1.125rem;
-    font-weight: 600;
+    font-size: var(--font-size-lg);
+    font-weight: var(--font-weight-semibold);
     color: var(--text);
 }
 
@@ -752,8 +793,8 @@
 .autumn-modal__footer {
     display: flex;
     justify-content: flex-end;
-    gap: 0.5rem;
-    margin-top: 0.25rem;
+    gap: var(--space-2);
+    margin-top: var(--space-1);
 }
 
 .autumn-modal__confirm-form {
@@ -761,13 +802,13 @@
 }
 
 .autumn-modal__cancel {
-    padding: 0.5rem 1.25rem;
+    padding: var(--space-2) var(--space-5);
     background-color: var(--surface);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     cursor: pointer;
 }
 
@@ -776,13 +817,13 @@
 }
 
 .autumn-modal__confirm {
-    padding: 0.5rem 1.25rem;
+    padding: var(--space-2) var(--space-5);
     background-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
     border: 1px solid var(--primary);
     border-radius: var(--radius);
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     cursor: pointer;
 }
 
@@ -793,7 +834,7 @@
 .autumn-modal__confirm--danger {
     background-color: var(--danger);
     border-color: var(--danger);
-    color: #fff;
+    color: var(--on-danger);
 }
 
 .autumn-modal__confirm--danger:hover {
@@ -805,16 +846,16 @@
 
 .autumn-tabs__list {
     display: flex;
-    gap: 0.25rem;
+    gap: var(--space-1);
     border-bottom: 1px solid var(--border);
-    margin-bottom: 1rem;
+    margin-bottom: var(--space-4);
 }
 
 .autumn-tabs__tab {
-    padding: 0.5rem 1rem;
+    padding: var(--space-2) var(--space-4);
     margin-bottom: -1px;
     color: var(--text-muted);
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
     font-size: 0.9375rem;
     text-decoration: none;
     border-bottom: 2px solid transparent;
@@ -922,7 +963,7 @@
 .autumn-pager--cursor {
     display: flex;
     align-items: center;
-    gap: 0.25rem;
+    gap: var(--space-1);
 }
 
 .autumn-pager__link,
@@ -932,10 +973,10 @@
     align-items: center;
     justify-content: center;
     min-width: 2rem;
-    padding: 0.375rem 0.75rem;
+    padding: 0.375rem var(--space-3);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
     color: var(--text);
     text-decoration: none;
 }
@@ -956,7 +997,7 @@
 .autumn-pager__current {
     background-color: var(--primary);
     border-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
 }
 
 .autumn-pager__ellipsis {
@@ -974,18 +1015,18 @@
 .autumn-direct-upload {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: var(--space-2);
 }
 
 .autumn-upload-progress {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: var(--space-1);
 }
 
 .autumn-upload-bar {
     height: 0.375rem;
-    border-radius: 9999px;
+    border-radius: var(--radius-full);
     background-color: var(--border);
     overflow: hidden;
 }
@@ -1009,75 +1050,72 @@
 .autumn-job-status {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: var(--space-2);
 }
 
 .autumn-job-status__bar {
     width: 100%;
     height: 0.5rem;
-    border-radius: 9999px;
+    border-radius: var(--radius-full);
     accent-color: var(--primary);
 }
 
 .autumn-job-status__message {
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
 }
 
 .autumn-job-status__success {
-    font-size: 0.875rem;
-    color: #065f46;
-    color: color-mix(in srgb, var(--success, #059669) 60%, var(--text, #111827));
+    font-size: var(--font-size-sm);
+    color: var(--success-text);
 }
 
 .autumn-job-status__error {
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
     color: var(--danger);
 }
 
 /* ── Badge / status pill (#1259) ──────────────────────────────────────────── */
 
-.badge {
+.autumn-badge {
     display: inline-flex;
     align-items: center;
-    gap: 0.25rem;
-    padding: 0.125rem 0.5rem;
-    font-size: 0.75rem;
-    font-weight: 600;
-    line-height: 1.25;
+    gap: var(--space-1);
+    padding: 0.125rem var(--space-2);
+    font-size: var(--font-size-xs);
+    font-weight: var(--font-weight-semibold);
+    line-height: var(--line-height-tight);
     border-radius: var(--radius);
     border: 1px solid transparent;
     white-space: nowrap;
 }
 
-.badge--neutral {
-    background: var(--surface-muted, #f1f5f9);
+.autumn-badge--neutral {
+    background: var(--surface-muted);
     color: var(--text-muted);
     border-color: var(--border);
 }
 
-.badge--info {
-    background: var(--info-light, #eff6ff);
-    color: var(--info, #1e3a8a);
-    border-color: var(--info, #93c5fd);
+.autumn-badge--info {
+    background: var(--info-light);
+    color: var(--info);
+    border-color: var(--info);
 }
 
-.badge--success {
-    background: var(--success-light, #ecfdf5);
-    color: #065f46;
-    color: var(--success-text, color-mix(in srgb, var(--success, #059669) 60%, #111827));
+.autumn-badge--success {
+    background: var(--success-light);
+    color: var(--success-text);
     border-color: var(--success);
 }
 
-.badge--warning {
-    background: var(--warning-light, #fffbeb);
-    color: #92400e;
-    color: var(--warning-text, color-mix(in srgb, var(--warning, #d97706) 60%, #111827));
-    border-color: var(--warning, #fcd34d);
+.autumn-badge--warning {
+    background: var(--warning-light);
+    color: var(--warning-text);
+    border-color: var(--warning);
 }
 
-.badge--danger {
-    background: var(--danger-light, #fef2f2);
+.autumn-badge--danger {
+    background: var(--danger-light);
     color: var(--danger-hover);
     border-color: var(--danger);
 }
@@ -1089,7 +1127,7 @@
     align-items: center;
     justify-content: center;
     flex: 0 0 auto;
-    border-radius: 9999px;
+    border-radius: var(--radius-full);
     overflow: hidden;
     vertical-align: middle;
     border: 1px solid var(--border);
@@ -1101,13 +1139,13 @@
 
 .autumn-avatar--initials {
     color: #fff;
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     text-transform: uppercase;
     /* Fallback; the deterministic per-name color is one of the
        .autumn-avatar--cN palette classes below (defined after this rule so it
        wins at equal specificity). Class-based — not an inline style — so it
        survives a nonce CSP that forbids inline `style` attributes. */
-    background: var(--primary);
+    background: hsl(262, 60%, 45%);
 }
 
 /* Deterministic per-name background palette (selected by avatar_palette_class).
@@ -1134,7 +1172,7 @@
 .autumn-avatar--md {
     width: 40px;
     height: 40px;
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
 }
 
 .autumn-avatar--lg {
@@ -1150,56 +1188,56 @@
 
 /* ── Alert / callout (#1314) ──────────────────────────────────────────────── */
 
-.alert {
+.autumn-alert {
     display: flex;
     align-items: flex-start;
     gap: 0.625rem;
-    padding: 0.75rem 1rem;
+    padding: var(--space-3) var(--space-4);
     border-radius: var(--radius);
     border: 1px solid var(--border);
-    margin-bottom: 1rem;
+    margin-bottom: var(--space-4);
 }
 
-.alert__icon {
+.autumn-alert__icon {
     flex: 0 0 auto;
     display: inline-flex;
     line-height: 1;
 }
 
-.alert__content {
+.autumn-alert__content {
     flex: 1 1 auto;
     min-width: 0;
 }
 
-.alert__title {
-    margin: 0 0 0.25rem;
+.autumn-alert__title {
+    margin: 0 0 var(--space-1);
     font-size: 0.9375rem;
-    font-weight: 700;
+    font-weight: var(--font-weight-bold);
 }
 
-.alert__body {
-    font-size: 0.875rem;
+.autumn-alert__body {
+    font-size: var(--font-size-sm);
 }
 
-.alert__errors {
+.autumn-alert__errors {
     margin: 0;
-    padding-left: 1.25rem;
+    padding-left: var(--space-5);
 }
 
-.alert__dismiss {
+.autumn-alert__dismiss {
     flex: 0 0 auto;
     cursor: pointer;
     line-height: 1;
-    font-size: 1.25rem;
+    font-size: var(--font-size-xl);
     color: inherit;
-    padding: 0 0.25rem;
+    padding: 0 var(--space-1);
     background: none;
     border: 0;
 }
 
 /* Visually hidden but kept in tab order / focusable (WCAG 2.1.1) — never
    `display:none`/`hidden`, which would remove it from the keyboard path. */
-.alert__dismiss-toggle {
+.autumn-alert__dismiss-toggle {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -1211,37 +1249,35 @@
     border: 0;
 }
 
-.alert__dismiss:has(.alert__dismiss-toggle:focus-visible) {
+.autumn-alert__dismiss:has(.autumn-alert__dismiss-toggle:focus-visible) {
     outline: 2px solid var(--primary);
     outline-offset: 2px;
 }
 
-.alert:has(.alert__dismiss-toggle:checked) {
+.autumn-alert:has(.autumn-alert__dismiss-toggle:checked) {
     display: none;
 }
 
-.alert-info {
-    background: var(--info-light, #eff6ff);
-    color: var(--info, #1e3a8a);
-    border-color: var(--info, #93c5fd);
+.autumn-alert--info {
+    background: var(--info-light);
+    color: var(--info);
+    border-color: var(--info);
 }
 
-.alert-success {
-    background: var(--success-light, #ecfdf5);
-    color: #065f46;
-    color: var(--success-text, color-mix(in srgb, var(--success, #059669) 60%, #111827));
+.autumn-alert--success {
+    background: var(--success-light);
+    color: var(--success-text);
     border-color: var(--success);
 }
 
-.alert-warning {
-    background: var(--warning-light, #fffbeb);
-    color: #92400e;
-    color: var(--warning-text, color-mix(in srgb, var(--warning, #d97706) 60%, #111827));
-    border-color: var(--warning, #fcd34d);
+.autumn-alert--warning {
+    background: var(--warning-light);
+    color: var(--warning-text);
+    border-color: var(--warning);
 }
 
-.alert-error {
-    background: var(--danger-light, #fef2f2);
+.autumn-alert--error {
+    background: var(--danger-light);
     color: var(--danger-hover);
     border-color: var(--danger);
 }
@@ -1254,10 +1290,10 @@
     position: fixed;
     bottom: 1rem;
     right: 1rem;
-    z-index: 1000;
+    z-index: var(--z-toast);
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: var(--space-2);
     max-width: min(24rem, calc(100vw - 2rem));
     pointer-events: none;
 }
@@ -1268,11 +1304,11 @@
    shows nor occupies space. */
 .autumn-toast {
     pointer-events: auto;
-    padding: 0.75rem 1rem;
+    padding: var(--space-3) var(--space-4);
     border: 1px solid var(--border);
     border-left-width: 4px;
     border-radius: var(--radius);
-    background: var(--surface, #fff);
+    background: var(--surface);
     color: var(--text);
     box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
     font-size: 0.9375rem;
@@ -1294,11 +1330,11 @@
 }
 
 .autumn-toast--info {
-    border-left-color: var(--info, #3b82f6);
+    border-left-color: var(--info);
 }
 
 .autumn-toast--warning {
-    border-left-color: var(--warning, #d97706);
+    border-left-color: var(--warning);
 }
 
 .autumn-toast--error {
@@ -1341,20 +1377,20 @@
 .autumn-feed {
     display: flex;
     flex-direction: column;
-    gap: 1rem;
+    gap: var(--space-4);
 }
 
 .autumn-feed__sentinel {
     display: flex;
     justify-content: center;
-    padding: 1rem 0;
+    padding: var(--space-4) 0;
 }
 
 .autumn-feed__more {
     display: inline-block;
-    padding: 0.5rem 1.25rem;
+    padding: var(--space-2) var(--space-5);
     color: var(--primary);
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
     font-size: 0.9375rem;
     text-decoration: none;
     border: 1px solid var(--border);
@@ -1432,7 +1468,7 @@
 .autumn-transition-controls {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.5rem;
+    gap: var(--space-2);
     align-items: center;
 }
 
@@ -1443,7 +1479,7 @@
 }
 
 .autumn-transition button {
-    padding: 0.5rem 1rem;
+    padding: var(--space-2) var(--space-4);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background-color: var(--surface);
@@ -1529,7 +1565,7 @@
 /* The aggregate, announced via `aria-live="polite"` after an htmx swap.
    `tabular-nums` stops the strip from reflowing as the score changes width. */
 .autumn-reaction-count {
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     font-variant-numeric: tabular-nums;
     color: var(--text);
 }
@@ -1554,13 +1590,13 @@
     left: 0;
     right: 0;
     bottom: 0;
-    z-index: 1000;
+    z-index: var(--z-banner);
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 1rem;
-    padding: 1rem 1.5rem;
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-6);
     background-color: var(--surface);
     border-top: 1px solid var(--text-muted);
     box-shadow: var(--shadow);
@@ -1576,7 +1612,7 @@
 .autumn-consent-banner__actions {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.5rem;
+    gap: var(--space-2);
     margin: 0;
 }
 
@@ -1587,7 +1623,7 @@
    dark-pattern "big Accept button, buried Reject link" this widget exists
    to avoid. */
 .autumn-consent-banner__button {
-    padding: 0.5rem 1rem;
+    padding: var(--space-2) var(--space-4);
     border: 1px solid var(--text-muted);
     border-radius: var(--radius);
     background-color: var(--surface);
@@ -1621,13 +1657,13 @@
 .autumn-bulk-actions {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.5rem;
+    gap: var(--space-2);
     align-items: center;
-    margin-top: 0.75rem;
+    margin-top: var(--space-3);
 }
 
 .autumn-bulk-actions button {
-    padding: 0.5rem 1rem;
+    padding: var(--space-2) var(--space-4);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background-color: var(--surface);
@@ -1681,7 +1717,7 @@
 .autumn-comments {
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
+    gap: var(--space-3);
 }
 
 /* Every nesting level is an `<ol>`: the order is meaningful (chronological),
@@ -1693,14 +1729,14 @@
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
+    gap: var(--space-3);
 }
 
 /* A nested level indents behind a rule, which is what makes depth legible
    without a per-level class (the widget renders arbitrarily deep). The
    `border-inline-start` is logical, so it flips for RTL locales. */
 .autumn-comment .autumn-comment-list {
-    margin-block-start: 0.75rem;
+    margin-block-start: var(--space-3);
     padding-inline-start: 0.875rem;
     border-inline-start: 2px solid var(--border);
 }
@@ -1717,7 +1753,7 @@
 }
 
 .autumn-comment-author {
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     color: var(--text);
 }
 
@@ -1734,7 +1770,7 @@
 }
 
 .autumn-comment-body p {
-    margin: 0 0 0.5rem;
+    margin: 0 0 var(--space-2);
 }
 
 .autumn-comment-body p:last-child {
@@ -1745,7 +1781,7 @@
    all -- the reply form is in the DOM and reachable by keyboard whether or not
    htmx (or any script) loaded. */
 .autumn-comment-reply {
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
 }
 
 .autumn-comment-reply-toggle {
@@ -1763,7 +1799,7 @@
     display: flex;
     flex-direction: column;
     gap: 0.375rem;
-    margin: 0.5rem 0 0;
+    margin: var(--space-2) 0 0;
 }
 
 /* The label doubles as the visible prompt, so it is not visually hidden -- a
@@ -1775,7 +1811,7 @@
 
 .autumn-comment-input {
     width: 100%;
-    padding: 0.5rem;
+    padding: var(--space-2);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background-color: var(--surface);
@@ -1791,7 +1827,7 @@
 
 .autumn-comment-submit {
     align-self: flex-start;
-    padding: 0.375rem 0.75rem;
+    padding: 0.375rem var(--space-3);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background-color: var(--surface);
@@ -1819,10 +1855,10 @@
    only -- the role is the machine-readable state. */
 .autumn-comments-error {
     margin: 0;
-    padding: 0.5rem 0.75rem;
-    border: 1px solid var(--danger, #b3261e);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--danger);
     border-radius: var(--radius);
-    color: var(--danger, #b3261e);
+    color: var(--danger);
 }
 
 /* ── Card (#2354) ──────────────────────────────────────────────────────────
@@ -1835,34 +1871,34 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: var(--shadow);
-    margin-bottom: 1.5rem;
+    margin-bottom: var(--space-6);
 }
 
 .autumn-card__header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    gap: 1rem;
-    padding: 1rem 1.5rem 0.75rem;
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-6) var(--space-3);
     border-bottom: 1px solid var(--border);
 }
 
 .autumn-card__title {
     margin: 0;
-    font-size: 1.125rem;
-    font-weight: 600;
+    font-size: var(--font-size-lg);
+    font-weight: var(--font-weight-semibold);
     color: var(--text);
 }
 
 .autumn-card__body {
-    padding: 1.5rem;
+    padding: var(--space-6);
 }
 
 .autumn-card__footer {
-    padding: 0.75rem 1.5rem;
+    padding: var(--space-3) var(--space-6);
     border-top: 1px solid var(--border);
     color: var(--text-muted);
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
 }
 
 /* ── Stat card (#2354) ───────────────────────────────────────────────────── */
@@ -1872,19 +1908,19 @@
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: var(--shadow);
-    padding: 1.25rem;
+    padding: var(--space-5);
 }
 
 .autumn-stat-card__label {
     font-size: 0.8125rem;
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
     color: var(--text-muted);
 }
 
 .autumn-stat-card__value {
-    margin-top: 0.25rem;
+    margin-top: var(--space-1);
     font-size: 1.75rem;
-    font-weight: 700;
+    font-weight: var(--font-weight-bold);
     color: var(--text);
 }
 
@@ -1898,7 +1934,7 @@
 .autumn-search-empty,
 .autumn-autocomplete-empty {
     margin: 0;
-    padding: 0.75rem 1rem;
+    padding: var(--space-3) var(--space-4);
     color: var(--text-muted);
 }
 
@@ -1911,6 +1947,6 @@
 /* ── Active nav link (#2354) ─────────────────────────────────────────────── */
 
 .autumn-active {
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     color: var(--primary);
 }

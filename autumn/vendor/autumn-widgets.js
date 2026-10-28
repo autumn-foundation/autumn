@@ -238,9 +238,60 @@
     if (t.matches && t.matches('dialog[closedby="any"][open]')) t.close();
   });
 
+  // ── theme_toggle (#3396) ──────────────────────────────────────────────────
+  // autumn_web::widgets::theme_toggle is a no-JS POST form. Here the choice
+  // is applied in place: data-theme on <html>, the autumn.theme cookie (the
+  // same cookie the server route writes), and aria-pressed on each toggle.
+  // No request is sent. Capture phase, so a boosted form sends nothing too.
+  var THEMES = ['system', 'light', 'dark'];
+
+  // The stored theme, or null. Two cookies with one name: trust neither,
+  // as the server does.
+  function readThemeCookie() {
+    var found = document.cookie.split(';').map(function (pair) {
+      return pair.trim();
+    }).filter(function (pair) {
+      return pair.indexOf('autumn.theme=') === 0;
+    });
+    if (found.length !== 1) return null;
+    var value = found[0].slice('autumn.theme='.length);
+    return THEMES.indexOf(value) >= 0 ? value : null;
+  }
+
+  function applyTheme(theme) {
+    var root = document.documentElement;
+    if (theme === 'system') root.removeAttribute('data-theme');
+    else root.setAttribute('data-theme', theme);
+    document.querySelectorAll('[data-autumn-theme-toggle] button[name="theme"]')
+      .forEach(function (button) {
+        button.setAttribute('aria-pressed', button.value === theme ? 'true' : 'false');
+      });
+  }
+
+  function storeTheme(theme) {
+    var tail = '; Path=/; SameSite=Lax' + (location.protocol === 'https:' ? '; Secure' : '');
+    document.cookie = theme === 'system'
+      ? 'autumn.theme=; Max-Age=0' + tail
+      : 'autumn.theme=' + theme + '; Max-Age=31536000' + tail;
+  }
+
+  document.addEventListener('submit', function (e) {
+    var form = e.target;
+    if (!form.matches || !form.matches('form[data-autumn-theme-toggle]')) return;
+    var button = e.submitter;
+    if (!button || button.name !== 'theme' || THEMES.indexOf(button.value) < 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    storeTheme(button.value);
+    applyTheme(button.value);
+  }, true);
+
   function initAll() {
     document.querySelectorAll('[data-ac-value-id]').forEach(initAutocomplete);
     document.querySelectorAll('[data-autumn-nav]').forEach(initNav);
+    // A cached page can carry a stale data-theme. The cookie wins.
+    var stored = readThemeCookie();
+    if (stored) applyTheme(stored);
   }
 
   if (document.readyState === 'loading') {

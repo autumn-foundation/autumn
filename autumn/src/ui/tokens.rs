@@ -3,8 +3,11 @@
 //! Embed [`TOKENS_CSS`] inside a `<style>` tag; subsequent rules can
 //! reference the custom properties via `var(--bg)`, `var(--primary)`, etc.
 //!
-//! The token set is light-mode only — surfaces that need dark mode should
-//! add their own `@media (prefers-color-scheme: dark)` overrides.
+//! Each color token is `light-dark(<light>, <dark>)` (#3396). The OS
+//! selects the scheme; `data-theme="light|dark"` overrides it on any element.
+//! `data-density="compact|comfortable|spacious"` scales the `--space-*`
+//! tokens. The set also has type, radius, z-index and breakpoint scales. See
+//! `docs/guide/widget-styling.md`.
 //!
 //! # Example
 //!
@@ -15,7 +18,9 @@
 //! assert!(stylesheet.contains("--bg"));
 //! ```
 
-/// `:root` CSS custom properties: colors, radius, shadow, and font stack.
+/// The design tokens: colors (light and dark), shadow, and the space, type,
+/// radius, z-index and breakpoint scales, plus the `data-theme` and
+/// `data-density` rules.
 ///
 /// Emitted inside a `<style>` block so downstream rules can reference the
 /// variables. Sourced from `tokens.css` so `include_str!` can share the
@@ -44,9 +49,138 @@ pub const FLASH_CSS: &str = "\
 .flash-info { background: var(--primary-light); color: var(--primary); border: 1px solid var(--primary); }
 ";
 
+/// Test helpers that read [`TOKENS_CSS`] the way a browser does.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::TOKENS_CSS;
+
+    /// A color scheme. Selects one side of `light-dark()`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Scheme {
+        Light,
+        Dark,
+    }
+
+    impl Scheme {
+        pub(crate) const BOTH: [Self; 2] = [Self::Light, Self::Dark];
+    }
+
+    /// The main `:root` block: the text before the first nested rule.
+    pub(crate) fn main_block() -> &'static str {
+        let start = TOKENS_CSS.find(":root {").expect(":root block");
+        let body = &TOKENS_CSS[start..];
+        &body[..body.find('}').expect("closed :root block")]
+    }
+
+    /// The body of the `@supports not (color: light-dark(...))` block.
+    pub(crate) fn fallback_block() -> &'static str {
+        let start = TOKENS_CSS
+            .find("@supports not (color: light-dark(")
+            .expect("@supports fallback block");
+        let body = &TOKENS_CSS[start..];
+        let body = &body[body.find(":root {").expect("fallback :root")..];
+        &body[..body.find('}').expect("closed fallback block")]
+    }
+
+    /// `(name, value)` for each custom property in `block`.
+    pub(crate) fn declarations(block: &str) -> Vec<(&str, &str)> {
+        block
+            .split(';')
+            .filter_map(|decl| {
+                // Drop a comment before the declaration.
+                let decl = decl.rsplit_once("*/").map_or(decl, |(_, rest)| rest);
+                let decl = &decl[decl.find("--")?..];
+                let (name, value) = decl.split_once(':')?;
+                Some((name.trim(), value.trim()))
+            })
+            .collect()
+    }
+
+    /// The `(light, dark)` pair of a `light-dark(a, b)` value.
+    pub(crate) fn light_dark(value: &str) -> Option<(&str, &str)> {
+        let args = value.strip_prefix("light-dark(")?.strip_suffix(')')?;
+        let (light, dark) = args.split_once(',')?;
+        Some((light.trim(), dark.trim()))
+    }
+
+    /// The `#rrggbb` value of color token `name` in `scheme`, or `None`.
+    pub(crate) fn color(name: &str, scheme: Scheme) -> Option<String> {
+        let value = declarations(main_block())
+            .into_iter()
+            .find(|(n, _)| *n == name)?
+            .1;
+        let (light, dark) = light_dark(value)?;
+        Some(
+            match scheme {
+                Scheme::Light => light,
+                Scheme::Dark => dark,
+            }
+            .to_owned(),
+        )
+    }
+
+    /// `#rrggbb` -> WCAG relative luminance.
+    pub(crate) fn luminance(hex: &str) -> f64 {
+        let channel = |i: usize| {
+            let c = f64::from(u8::from_str_radix(&hex[1 + i * 2..3 + i * 2], 16).unwrap()) / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.0722_f64.mul_add(
+            channel(2),
+            0.7152_f64.mul_add(channel(1), 0.2126 * channel(0)),
+        )
+    }
+
+    /// WCAG contrast ratio of two `#rrggbb` colors.
+    pub(crate) fn contrast(a: &str, b: &str) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// True for `#rrggbb`.
+    pub(crate) fn is_hex6(value: &str) -> bool {
+        value.len() == 7
+            && value.starts_with('#')
+            && value[1..].chars().all(|c| c.is_ascii_hexdigit())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::{
+        Scheme, contrast, declarations, fallback_block, is_hex6, light_dark, main_block,
+    };
     use super::*;
+
+    /// Every color token. Each must have a light and a dark value.
+    const COLOR_TOKENS: &[&str] = &[
+        "--bg",
+        "--surface",
+        "--surface-muted",
+        "--text",
+        "--text-muted",
+        "--border",
+        "--primary",
+        "--primary-hover",
+        "--primary-light",
+        "--on-primary",
+        "--danger",
+        "--danger-hover",
+        "--danger-light",
+        "--on-danger",
+        "--success",
+        "--success-light",
+        "--success-text",
+        "--warning",
+        "--warning-light",
+        "--warning-text",
+        "--info",
+        "--info-light",
+    ];
 
     #[test]
     fn tokens_defines_expected_vars() {
@@ -65,6 +199,176 @@ mod tests {
             "--font-family",
         ] {
             assert!(TOKENS_CSS.contains(v), "TOKENS_CSS is missing {v}");
+        }
+    }
+
+    /// Issue #3396 acceptance: each color token has a light and a dark value.
+    #[test]
+    fn every_color_token_defines_a_light_and_a_dark_value() {
+        let decls = declarations(main_block());
+        for token in COLOR_TOKENS {
+            let value = decls
+                .iter()
+                .find(|(name, _)| name == token)
+                .unwrap_or_else(|| panic!("{token} is not defined"))
+                .1;
+            let (light, dark) =
+                light_dark(value).unwrap_or_else(|| panic!("{token} is not light-dark(): {value}"));
+            assert!(is_hex6(light) && is_hex6(dark), "{token}: {value}");
+            assert_ne!(light, dark, "{token} has the same value in both schemes");
+        }
+        // A color token added later must also use light-dark().
+        for (name, value) in &decls {
+            let plain_color = ["#", "rgb", "hsl", "oklch"]
+                .iter()
+                .any(|prefix| value.starts_with(prefix));
+            assert!(!plain_color, "{name} is a plain color: {value}");
+            if value.starts_with("light-dark(") {
+                assert!(COLOR_TOKENS.contains(name), "add {name} to COLOR_TOKENS");
+            }
+        }
+    }
+
+    /// A browser without `light-dark()` gets the light values.
+    #[test]
+    fn fallback_block_repeats_every_light_value() {
+        let fallback = declarations(fallback_block());
+        // Every color token, plus --shadow (its colors use light-dark()).
+        assert_eq!(fallback.len(), COLOR_TOKENS.len() + 1, "{fallback:?}");
+        assert!(
+            fallback
+                .iter()
+                .any(|(name, value)| *name == "--shadow" && !value.contains("light-dark"))
+        );
+        for token in COLOR_TOKENS {
+            let light = test_support::color(token, Scheme::Light).unwrap();
+            assert!(
+                fallback.contains(&(token, light.as_str())),
+                "fallback must set {token}: {light}"
+            );
+        }
+    }
+
+    /// Issue #3396 acceptance: the token pairs pass WCAG AA in both schemes.
+    /// 4.5:1 for text; 3:1 for a focus ring or a mark.
+    #[test]
+    fn token_pairs_meet_wcag_aa_in_both_schemes() {
+        const TEXT: f64 = 4.5;
+        const UI: f64 = 3.0;
+        let pairs = [
+            ("--text", "--bg", TEXT),
+            ("--text", "--surface", TEXT),
+            ("--text", "--surface-muted", TEXT),
+            ("--text", "--primary-light", TEXT),
+            ("--text-muted", "--bg", TEXT),
+            ("--text-muted", "--surface", TEXT),
+            ("--text-muted", "--surface-muted", TEXT),
+            ("--primary", "--surface", TEXT),
+            ("--primary", "--bg", TEXT),
+            ("--primary", "--primary-light", TEXT),
+            ("--on-primary", "--primary", TEXT),
+            ("--on-primary", "--primary-hover", TEXT),
+            ("--danger", "--surface", TEXT),
+            ("--danger", "--bg", TEXT),
+            ("--danger-hover", "--danger-light", TEXT),
+            ("--on-danger", "--danger", TEXT),
+            ("--on-danger", "--danger-hover", TEXT),
+            ("--success-text", "--success-light", TEXT),
+            ("--success-text", "--surface", TEXT),
+            ("--warning-text", "--warning-light", TEXT),
+            ("--warning-text", "--surface", TEXT),
+            ("--info", "--info-light", TEXT),
+            ("--info", "--surface", TEXT),
+            ("--success", "--surface", UI),
+            ("--warning", "--surface", UI),
+        ];
+        let mut failures = Vec::new();
+        for scheme in Scheme::BOTH {
+            for (fg, bg, min) in pairs {
+                let ratio = contrast(
+                    &test_support::color(fg, scheme).unwrap(),
+                    &test_support::color(bg, scheme).unwrap(),
+                );
+                if ratio < min {
+                    failures.push(format!("{scheme:?} {fg} on {bg}: {ratio:.2}:1"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "below WCAG AA — {failures:?}");
+    }
+
+    /// The OS selects the scheme. `data-theme` overrides it on any element.
+    #[test]
+    fn color_scheme_follows_the_os_and_data_theme() {
+        assert!(main_block().contains("color-scheme: light dark;"));
+        for (selector, scheme) in [
+            ("[data-theme=\"light\"]", "light"),
+            ("[data-theme=\"dark\"]", "dark"),
+        ] {
+            let rule = format!("{selector} {{ color-scheme: {scheme}; }}");
+            assert!(TOKENS_CSS.contains(&rule), "missing `{rule}`");
+        }
+    }
+
+    #[test]
+    fn scales_are_defined() {
+        for token in [
+            "--space-1",
+            "--space-2",
+            "--space-3",
+            "--space-4",
+            "--space-6",
+            "--space-8",
+            "--font-size-xs",
+            "--font-size-sm",
+            "--font-size-md",
+            "--font-size-lg",
+            "--font-size-xl",
+            "--line-height-tight",
+            "--line-height-normal",
+            "--font-weight-normal",
+            "--font-weight-semibold",
+            "--font-weight-bold",
+            "--font-mono",
+            "--radius-sm",
+            "--radius-md",
+            "--radius-lg",
+            "--radius-full",
+            "--z-dropdown",
+            "--z-sticky",
+            "--z-banner",
+            "--z-toast",
+            "--breakpoint-sm",
+            "--breakpoint-md",
+            "--breakpoint-lg",
+        ] {
+            assert!(
+                TOKENS_CSS.contains(&format!("{token}:")),
+                "TOKENS_CSS is missing {token}"
+            );
+        }
+    }
+
+    /// Density scales the space tokens. The space scale is declared on each
+    /// `[data-density]` element too, so a subtree can set its own density.
+    #[test]
+    fn density_scales_the_space_tokens() {
+        assert!(TOKENS_CSS.contains(":root,\n[data-density] {"));
+        let space = TOKENS_CSS
+            .lines()
+            .filter(|l| l.trim_start().starts_with("--space-"))
+            .collect::<Vec<_>>();
+        assert!(space.len() >= 6, "{space:?}");
+        for line in space {
+            assert!(line.contains("var(--density-scale)"), "{line}");
+        }
+        for (density, scale) in [
+            ("compact", "0.75"),
+            ("comfortable", "1"),
+            ("spacious", "1.25"),
+        ] {
+            let rule = format!("[data-density=\"{density}\"] {{ --density-scale: {scale}; }}");
+            assert!(TOKENS_CSS.contains(&rule), "missing `{rule}`");
         }
     }
 

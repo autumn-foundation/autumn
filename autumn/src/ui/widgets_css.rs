@@ -48,6 +48,7 @@ pub const WIDGETS_CSS_PATH: &str = "/static/css/autumn-widgets.css";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::tokens::test_support::{Scheme, color, contrast};
     use std::fmt::Write as _;
 
     #[test]
@@ -82,6 +83,16 @@ mod tests {
         }
 
         for class in [
+            "autumn-alert",
+            "autumn-alert--info",
+            "autumn-alert__dismiss-toggle",
+            "autumn-badge",
+            "autumn-badge--neutral",
+            "autumn-wizard-progress",
+            "autumn-wizard-step",
+            "autumn-wizard-step__number",
+            "autumn-theme-toggle",
+            "autumn-theme-toggle__option",
             "autumn-card",
             "autumn-card__header",
             "autumn-card__title",
@@ -140,31 +151,10 @@ mod tests {
             "the transparent outline belongs on the four :focus rules only"
         );
     }
-    /// `#rrggbb` -> WCAG relative luminance.
-    fn luminance(hex: &str) -> f64 {
-        let channel = |i: usize| {
-            let c = f64::from(u8::from_str_radix(&hex[1 + i * 2..3 + i * 2], 16).unwrap()) / 255.0;
-            if c <= 0.03928 {
-                c / 12.92
-            } else {
-                ((c + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.0722_f64.mul_add(
-            channel(2),
-            0.7152_f64.mul_add(channel(1), 0.2126 * channel(0)),
-        )
-    }
-
-    fn contrast(a: &str, b: &str) -> f64 {
-        let (a, b) = (luminance(a), luminance(b));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
-    }
-
-    /// Resolve `#hex` / `var(--x)` / `var(--x, #hex)` against the shipped
-    /// tokens, the way a browser does: the token wins, the fallback only
-    /// applies when the token is undefined.
-    fn resolve(value: &str) -> String {
+    /// Resolve `#hex` / `var(--x)` / `var(--x, #hex)` / `color-mix(...)`
+    /// against the shipped tokens in `scheme`, the way a browser does: the
+    /// token wins, and the fallback applies only when the token is undefined.
+    fn resolve(value: &str, scheme: Scheme) -> String {
         let value = value.trim();
         if let Some(args) = value
             .strip_prefix("color-mix(in srgb,")
@@ -174,7 +164,7 @@ mod tests {
             let (first, second) = args.split_once("%,").unwrap();
             let (a, pct) = first.trim().rsplit_once(' ').unwrap();
             let weight = pct.parse::<u32>().unwrap();
-            let (a, b) = (resolve(a), resolve(second));
+            let (a, b) = (resolve(a, scheme), resolve(second, scheme));
             let channel =
                 |h: &str, i: usize| u32::from_str_radix(&h[1 + i * 2..3 + i * 2], 16).unwrap();
             let mixed = (0..3).fold(String::from("#"), |mut out, i| {
@@ -190,87 +180,116 @@ mod tests {
         let (name, fallback) = inner
             .split_once(',')
             .map_or((inner, None), |(n, f)| (n, Some(f)));
-        let tokens = crate::ui::tokens::TOKENS_CSS;
-        let def = format!("{}:", name.trim());
-        tokens
-            .find(&def)
-            .map(|at| {
-                let rest = &tokens[at + def.len()..];
-                rest[..rest.find(';').unwrap()].trim().to_owned()
-            })
-            .or_else(|| fallback.map(resolve))
+        color(name.trim(), scheme)
+            .or_else(|| fallback.map(|f| resolve(f, scheme)))
             .unwrap_or_else(|| panic!("`{name}` is neither a token nor has a fallback"))
     }
 
-    fn declared(selector: &str, prop: &str) -> String {
+    fn rule_body(selector: &str) -> &'static str {
         let at = WIDGETS_COMPONENT_CSS
             .find(&format!("{selector} {{"))
             .unwrap_or_else(|| panic!("missing `{selector}` rule"));
         let body = &WIDGETS_COMPONENT_CSS[at..];
-        let body = &body[..body.find('}').unwrap()];
-        let line = body
+        &body[..body.find('}').unwrap()]
+    }
+
+    fn declared(selector: &str, prop: &str, scheme: Scheme) -> String {
+        let line = rule_body(selector)
             .lines()
             .filter_map(|l| l.trim().strip_prefix(&format!("{prop}:")))
             .next_back()
             .unwrap_or_else(|| panic!("`{selector}` has no `{prop}`"));
-        resolve(line.trim_end_matches(';'))
+        resolve(line.trim_end_matches(';'), scheme)
     }
 
-    /// Status chips keep their light tint under dark themes (the Midnight
-    /// story re-themes `--text` but not `--*-light`), so their foreground must
-    /// not be derived from `--text`: mixing toward a light `--text` would
-    /// lighten it against a light chip (2.3:1 on Midnight).
+    /// Status chips must not derive their text from `--text`: a dark scheme
+    /// makes `--text` light. Each chip uses its own `-text` token.
     #[test]
     fn status_chip_text_is_independent_of_the_theme_foreground() {
         for selector in [
-            ".badge--success",
-            ".badge--warning",
-            ".alert-success",
-            ".alert-warning",
+            ".autumn-badge--success",
+            ".autumn-badge--warning",
+            ".autumn-alert--success",
+            ".autumn-alert--warning",
         ] {
-            let at = WIDGETS_COMPONENT_CSS
-                .find(&format!("{selector} {{"))
-                .unwrap();
-            let body = &WIDGETS_COMPONENT_CSS[at..];
-            let body = &body[..body.find('}').unwrap()];
-            assert!(!body.contains("var(--text"), "{selector} reads --text");
+            assert!(
+                !rule_body(selector).contains("var(--text"),
+                "{selector} reads --text"
+            );
         }
     }
 
-    /// Wayfinder audit (contrast, tier 1): computed text/background pairs of
-    /// the status chips and the wizard step number against the shipped
-    /// tokens. WCAG 1.4.3 needs 4.5:1 for normal-size text. Baseline before
-    /// the fix: badge/alert-success 3.58, badge/alert-warning 3.07,
-    /// badge/alert-error 3.95, job-status__success 3.77, upcoming wizard
-    /// step number 3.90 (8 failing pairs).
+    /// Wayfinder audit (contrast, tier 1), extended by #3396 to both schemes:
+    /// computed text/background pairs against the shipped tokens. WCAG 1.4.3
+    /// needs 4.5:1 for normal-size text.
     #[test]
     fn widget_text_meets_aa_contrast_against_its_own_background() {
-        let surface = "var(--surface)";
         let mut failures = Vec::new();
-        for (selector, bg) in [
-            (".badge--success", "background"),
-            (".badge--warning", "background"),
-            (".badge--danger", "background"),
-            (".alert-success", "background"),
-            (".alert-warning", "background"),
-            (".alert-error", "background"),
-            (".autumn-job-status__success", ""),
-            (".autumn-job-status__error", ""),
-            (
-                ".wizard-step--upcoming .wizard-step__number",
-                "background-color",
-            ),
-        ] {
-            let bg = if bg.is_empty() {
-                resolve(surface)
-            } else {
-                declared(selector, bg)
-            };
-            let ratio = contrast(&declared(selector, "color"), &bg);
-            if ratio < 4.5 {
-                failures.push(format!("{selector}: {ratio:.2}:1"));
+        for scheme in Scheme::BOTH {
+            for (selector, bg) in [
+                (".autumn-badge--neutral", "background"),
+                (".autumn-badge--info", "background"),
+                (".autumn-badge--success", "background"),
+                (".autumn-badge--warning", "background"),
+                (".autumn-badge--danger", "background"),
+                (".autumn-alert--info", "background"),
+                (".autumn-alert--success", "background"),
+                (".autumn-alert--warning", "background"),
+                (".autumn-alert--error", "background"),
+                (".autumn-job-status__success", ""),
+                (".autumn-job-status__error", ""),
+                (".autumn-submit", "background-color"),
+                (".autumn-pager__current", "background-color"),
+                (".autumn-modal__confirm", "background-color"),
+                (".autumn-modal__confirm--danger", "background-color"),
+                (".autumn-hero__cta--primary", "background-color"),
+                (
+                    ".autumn-theme-toggle__option[aria-pressed=\"true\"]",
+                    "background",
+                ),
+                (".autumn-wizard-step__number", "background-color"),
+                (
+                    ".autumn-wizard-step--completed .autumn-wizard-step__number",
+                    "background-color",
+                ),
+                (
+                    ".autumn-wizard-step--current .autumn-wizard-step__number",
+                    "background-color",
+                ),
+                (
+                    ".autumn-wizard-step--upcoming .autumn-wizard-step__number",
+                    "background-color",
+                ),
+            ] {
+                let bg = if bg.is_empty() {
+                    resolve("var(--surface)", scheme)
+                } else {
+                    declared(selector, bg, scheme)
+                };
+                let ratio = contrast(&declared(selector, "color", scheme), &bg);
+                if ratio < 4.5 {
+                    failures.push(format!("{scheme:?} {selector}: {ratio:.2}:1"));
+                }
             }
         }
         assert!(failures.is_empty(), "below 4.5:1 — {failures:?}");
+    }
+
+    /// Issue #3396: a dark scheme makes `--primary` and `--danger` light, so
+    /// text on a token fill must use `--on-primary` / `--on-danger`, not white.
+    #[test]
+    fn no_white_text_on_a_token_fill() {
+        for rule in WIDGETS_COMPONENT_CSS.split('}') {
+            let white = ["color: #fff;", "color: #ffffff;", "color: white;"]
+                .iter()
+                .any(|w| rule.contains(w));
+            let token_fill = rule
+                .lines()
+                .any(|l| l.trim().starts_with("background") && l.contains("var(--"));
+            assert!(
+                !(white && token_fill),
+                "white text on a token fill:{rule}}}"
+            );
+        }
     }
 }
