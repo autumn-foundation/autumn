@@ -1398,7 +1398,10 @@ autumn generate scaffold Post title:String comments:commentable
   created_at, deleted_at)` table, with an index covering the thread read and
   another for the delete cascade. It is emitted **once per project**: run the
   same token on a second model and the generator reuses the existing table and
-  says so.
+  says so. A `comments` table that does not have all of these columns (from a
+  `Comment` scaffold, for example) stops generation. The error tells you how
+  to correct it
+  ([details](commentable.md#a-comments-table-that-is-not-the-shared-one-2283)).
 - The **model** gets `#[commentable(by = User, counter_cache = comment_count)]`
   — `by` only when the project actually has a `User` model, since naming a
   missing one would be a compile error in a file you did not write. That
@@ -1418,10 +1421,6 @@ autumn generate scaffold Post title:String comments:commentable
 
   and render a thread with `autumn_web::widgets::comment_thread`. Adding a
   third commentable model needs no change there.
-
-If the project already has a `comments` table that is not the shared one,
-generation stops and writes no file. Rename that resource, or add every
-missing column of the shared table (`id`, `commentable_type`, `commentable_id`, `parent_id`, `author_id`, `body`, `created_at` and `deleted_at`), then run the command again.
 
 At most one `commentable` field per model, and it takes no `{…}` modifiers —
 everything else is configured on the model's `#[commentable(...)]` attribute.
