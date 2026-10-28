@@ -343,6 +343,23 @@ pub fn is_production(profile: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_stop_condition_is_checked_against_the_ppm_rules() {
+        assert!(FaultStopConfig::default().validate().is_ok());
+        let bad_objective = FaultStopConfig {
+            objective: 100.0,
+            ..FaultStopConfig::default()
+        };
+        assert!(bad_objective.validate().is_err());
+        let always_trips = FaultStopConfig {
+            objective: 50.0,
+            max_burn_rate: 2.0,
+            ..FaultStopConfig::default()
+        };
+        assert!(always_trips.validate().is_err());
+        assert_eq!(always_trips.max_error_ppm(), crate::ppm::PPM);
+    }
+
     fn enabled(rule: FaultRule) -> FaultInjectionConfig {
         FaultInjectionConfig {
             enabled: true,

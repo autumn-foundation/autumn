@@ -946,13 +946,15 @@ fn emit_binding_slice(pairs: &[(String, String)]) -> TokenStream {
 
 /// Emit the `inventory::submit!` for a `#[route]`/`#[static_get]` handler.
 #[must_use]
+#[cfg_attr(not(feature = "graph"), allow(unreachable_code, unused_variables))]
 pub fn emit_route_descriptor(
     input_fn: &syn::ItemFn,
     method: &str,
     path: &TokenStream,
     static_route: bool,
 ) -> TokenStream {
-    if !cfg!(feature = "graph") {
+    #[cfg(not(feature = "graph"))]
+    {
         return TokenStream::new();
     }
     let signature = emit_symbol_slice(&signature_symbols(&input_fn.sig));
@@ -983,13 +985,15 @@ pub fn emit_route_descriptor(
 
 /// Emit the `inventory::submit!` for a `#[job]`/`#[scheduled]`/`#[task]` handler.
 #[must_use]
+#[cfg_attr(not(feature = "graph"), allow(unreachable_code, unused_variables))]
 pub fn emit_job_descriptor(
     input_fn: &syn::ItemFn,
     name: &TokenStream,
     kind: &str,
     schedule: &TokenStream,
 ) -> TokenStream {
-    if !cfg!(feature = "graph") {
+    #[cfg(not(feature = "graph"))]
+    {
         return TokenStream::new();
     }
     let signature = emit_symbol_slice(&signature_symbols(&input_fn.sig));

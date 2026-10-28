@@ -1171,6 +1171,15 @@ mod tests {
         assert_eq!(result.unwrap(), "tenant1");
     }
 
+    #[cfg(feature = "custom-domains")]
+    #[tokio::test]
+    async fn the_domain_aware_entry_point_matches_the_plain_one_without_a_registry() {
+        let config = subdomain_config();
+        let mut parts = make_parts("tenant1.example.com");
+        let result = extract_tenant_from_parts_with_domains(&mut parts, &config, None).await;
+        assert_eq!(result.unwrap(), "tenant1");
+    }
+
     /// #2351 item 13: an active replay tape with no tenant entry fails closed.
     /// Live resolution would succeed here, and the run would depend on input
     /// the recording never had.
