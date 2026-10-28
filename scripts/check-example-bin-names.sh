@@ -219,7 +219,7 @@ def _autobins_enabled(manifest: dict, workspace_edition: str | None) -> bool:
     """Return True when cargo auto-discovers bins.
 
     An explicit `[package] autobins` wins. If it is unset, discovery is on.
-    Exception: edition 2015 (the default) with a `[[bin]]` entry turns it off.
+    Exception: edition 2015 (the default) with a `bin` key turns it off.
     `[lib]` has no effect. `edition.workspace = true` uses the root edition.
     """
     package = manifest.get("package", {})
@@ -233,7 +233,7 @@ def _autobins_enabled(manifest: dict, workspace_edition: str | None) -> bool:
         and workspace_edition is not None
     ):
         edition = workspace_edition
-    return not (str(edition) == "2015" and bool(manifest.get("bin")))
+    return not (str(edition) == "2015" and "bin" in manifest)
 
 
 def bin_target_names(member_dir: Path, workspace_edition: str | None = None) -> list[str]:
@@ -914,8 +914,8 @@ def self_test() -> int:
             bin_target_names(root / "a") == [],
         )
 
-    # Case 26 (issue #2745): the legacy opt-out needs a real `[[bin]]`
-    # entry. An empty `bin = []` declares none.
+    # Case 26 (issue #2745): cargo checks that the `bin` key exists. An empty
+    # `bin = []` also turns discovery off on edition 2015.
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         root = _make_workspace(tmp, ["a"])
@@ -925,8 +925,8 @@ def self_test() -> int:
             {"src/bin/extra.rs": "fn main() {}\n"},
         )
         expect(
-            "edition-2015 empty bin array keeps discovery",
-            bin_target_names(root / "a") == ["extra"],
+            "edition-2015 empty bin array disables discovery",
+            bin_target_names(root / "a") == [],
         )
 
     # Case 27 (issue #2745): edition 2018+ with a `[[bin]]` and no `autobins`
