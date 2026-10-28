@@ -11796,6 +11796,33 @@ async fn install_custom_domain_retention_pruner(
             as std::sync::Arc<dyn crate::custom_domain::CustomDomainPruner>);
 }
 
+/// Build the issuance limiter and register the `custom_domains` health
+/// indicator over it, so health reports the budget the task spends.
+#[cfg(feature = "acme")]
+fn register_custom_domain_health(
+    state: &AppState,
+    registry: &std::sync::Arc<crate::custom_domain::CustomDomainRegistry>,
+    config: &crate::config::CustomDomainsConfig,
+) -> std::sync::Arc<crate::custom_domain::IssuanceLimiter> {
+    let limiter = std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
+        config.issuance_per_domain_per_day,
+        config.issuance_global_per_hour,
+        config.failure_backoff_secs,
+        config.max_failure_backoff_secs,
+    ));
+    if let Err(e) = state.health_indicator_registry.register(
+        "custom_domains",
+        crate::actuator::IndicatorGroup::HealthOnly,
+        std::sync::Arc::new(
+            crate::custom_domain::CustomDomainHealthIndicator::new(std::sync::Arc::clone(registry))
+                .with_limiter(std::sync::Arc::clone(&limiter)),
+        ),
+    ) {
+        tracing::warn!("{e}");
+    }
+    limiter
+}
+
 /// Publish the custom-domain registry and spawn its orchestrator (#1635).
 ///
 /// The registry goes into `AppState` so tenancy resolution can route a
@@ -11821,24 +11848,7 @@ fn spawn_custom_domain_task(
     } = bind_state;
 
     state.insert_extension(std::sync::Arc::clone(&registry));
-    let limiter = std::sync::Arc::new(crate::custom_domain::IssuanceLimiter::new(
-        config.issuance_per_domain_per_day,
-        config.issuance_global_per_hour,
-        config.failure_backoff_secs,
-        config.max_failure_backoff_secs,
-    ));
-    if let Err(e) = state.health_indicator_registry.register(
-        "custom_domains",
-        crate::actuator::IndicatorGroup::HealthOnly,
-        std::sync::Arc::new(
-            crate::custom_domain::CustomDomainHealthIndicator::new(std::sync::Arc::clone(
-                &registry,
-            ))
-            .with_limiter(std::sync::Arc::clone(&limiter)),
-        ),
-    ) {
-        tracing::warn!("{e}");
-    }
+    let limiter = register_custom_domain_health(state, &registry, &config);
 
     let issuer = std::sync::Arc::new(crate::acme::tenant_domains::AcmeDomainIssuer::new(
         acme.clone(),
@@ -17019,6 +17029,32 @@ async fn canary_rollback_signal(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
+    /// Health reads the same limiter the task spends from.
+    #[cfg(feature = "acme")]
+    #[tokio::test]
+    async fn custom_domain_health_reports_the_limiter_the_task_spends() {
+        let state = AppState::for_test();
+        let registry = std::sync::Arc::new(crate::custom_domain::CustomDomainRegistry::new(
+            std::sync::Arc::new(crate::custom_domain::MemoryCustomDomainStore::new()),
+            10,
+        ));
+        let config = crate::config::CustomDomainsConfig::default();
+        let limiter = super::register_custom_domain_health(&state, &registry, &config);
+        let now = crate::custom_domain::now_unix();
+        limiter.record_attempt("a.example.test", now);
+
+        let results = state.health_indicator_registry.run_all().await;
+        let health = results
+            .iter()
+            .find(|r| r.name == "custom_domains")
+            .expect("the custom_domains indicator is registered");
+        assert_eq!(health.output.details["issuance_budget"]["global_used"], 1);
+        assert_eq!(
+            health.output.details["issuance_budget"]["global_limit"],
+            config.issuance_global_per_hour
+        );
+    }
+
     /// `mcp_catalog` and `mcp_instructions` set the MCP runtime. Each one
     /// mounts the endpoint at `/mcp`, and a later `mount_mcp` keeps both.
     #[cfg(feature = "mcp")]
