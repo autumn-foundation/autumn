@@ -2807,8 +2807,9 @@ impl<'a> ThemeToggleConfig<'a> {
     }
 
     /// Post to a different path (an app's own theme route). With JS, the
-    /// form then still posts, so the app can store the choice. Only a form
-    /// that posts to [`crate::ui::theme::THEME_PATH`] changes in place.
+    /// theme applies at once and the form still posts, so the app stores the
+    /// choice. The script writes the `autumn.theme` cookie only for a form
+    /// that posts to [`crate::ui::theme::THEME_PATH`].
     #[must_use]
     pub const fn action(mut self, action: &'a str) -> Self {
         self.action = action;

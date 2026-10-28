@@ -15,7 +15,8 @@ function run(initialCookie, action, hasToggle, initialTheme) {
     get cookie() { return cookie; }, set cookie(v) { cookie = v.split(';')[0]; },
     addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); },
     querySelectorAll: s => s.includes('theme-toggle') && hasToggle ? buttons : [],
-    querySelector: s => hasToggle && s.includes('theme-toggle') ? form : null,
+    querySelector: s => hasToggle && s.includes('theme-toggle')
+      && (!s.includes('[action=') || s.includes('"' + action + '"')) ? form : null,
   };
   const window = { addEventListener: (t, f) => { (winListeners[t] = winListeners[t] || []).push(f); } };
   new Function('document', 'window', 'HTMLButtonElement', 'location', src)(document, window, { prototype: { command: 1 } }, { protocol: 'http:' });
@@ -35,8 +36,15 @@ let ev = r.click('dark');
 assert.ok(ev.prevented && ev.stopped); assert.strictEqual(r.attrs['data-theme'], 'dark'); assert.strictEqual(r.cookie, 'autumn.theme=dark');
 assert.strictEqual(r.buttons[2].a['aria-pressed'], 'true');
 ev = r.click('system'); assert.strictEqual(r.attrs['data-theme'], undefined); assert.strictEqual(r.cookie, 'autumn.theme=');
-r = run('', '/settings/theme', true); ev = r.click('light');
+// A custom action stores the choice in the app (for example a profile).
+// The script applies it and lets the form post. It does not own a cookie.
+r = run('', '/settings/theme', true, 'dark');
+assert.strictEqual(r.attrs['data-theme'], 'dark', 'profile-backed theme survives load');
+ev = r.click('light');
 assert.ok(!ev.prevented && !ev.stopped, 'custom action posts'); assert.strictEqual(r.attrs['data-theme'], 'light');
+assert.strictEqual(r.cookie, '', 'custom action writes no cookie');
+r = run('', '/settings/theme', true, 'dark');
+r.pageshow(true); assert.strictEqual(r.attrs['data-theme'], 'dark', 'profile-backed theme survives restore');
 r = run('', '/_autumn/theme', false, 'light'); assert.strictEqual(r.attrs['data-theme'], 'light', 'app pin stays without toggle');
 r = run('x=1; autumn.theme=bad; autumn.theme=dark', '/_autumn/theme', true); assert.strictEqual(r.attrs['data-theme'], 'dark', 'first valid');
 // A page without a toggle may pin its theme. A cookie from elsewhere must not change it.

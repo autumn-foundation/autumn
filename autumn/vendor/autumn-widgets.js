@@ -240,10 +240,10 @@
 
   // ── theme_toggle (#3396) ──────────────────────────────────────────────────
   // autumn_web::widgets::theme_toggle is a no-JS POST form. This code applies
-  // the choice in place. It sets data-theme on <html>, writes the
-  // autumn.theme cookie (the cookie the server route writes) and sets
-  // aria-pressed on each toggle. For the framework route it sends no request.
-  // A form with an app action still posts, so the app can store the choice.
+  // the choice in place: data-theme on <html> and aria-pressed on each toggle.
+  // A toggle that posts to the framework route also writes the autumn.theme
+  // cookie (the cookie that route writes) and sends no request. A toggle with
+  // an app action posts as usual, so the app stores the choice its own way.
   var THEMES = ['system', 'light', 'dark'];
   var THEME_PATH = '/_autumn/theme';
 
@@ -282,20 +282,22 @@
     if (!form.matches || !form.matches('form[data-autumn-theme-toggle]')) return;
     var button = e.submitter;
     if (!button || button.name !== 'theme' || THEMES.indexOf(button.value) < 0) return;
-    storeTheme(button.value);
     applyTheme(button.value);
     if (form.getAttribute('action') === THEME_PATH) {
+      storeTheme(button.value);
       e.preventDefault();
       e.stopPropagation();
     }
   }, true);
 
-  // A cached page can carry a stale data-theme. Only a page with a toggle
-  // follows the cookie: its layout renders the stored preference, and no
-  // cookie means System. A page without a toggle keeps the data-theme its
-  // app set, for example a light-only page that pins "light".
+  // A cached page can carry a stale data-theme. Only a page with a
+  // cookie-backed toggle (one that posts to the framework route) follows the
+  // cookie: its layout renders the stored preference, and no cookie means
+  // System. Other pages keep the data-theme their app set, for example a
+  // light-only pin or a theme read from a user profile.
   function syncTheme() {
-    if (!document.querySelector('[data-autumn-theme-toggle]')) return;
+    var cookieBacked = 'form[data-autumn-theme-toggle][action="' + THEME_PATH + '"]';
+    if (!document.querySelector(cookieBacked)) return;
     applyTheme(readThemeCookie() || 'system');
   }
 

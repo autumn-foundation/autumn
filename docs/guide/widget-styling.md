@@ -79,9 +79,9 @@ on a light page:
 <html data-theme="light">
 ```
 
-The widget script changes `data-theme` only on a page that shows a theme
-toggle. A pinned page without a toggle keeps its scheme, even when the user
-picked "Dark" on another page.
+The widget script syncs `data-theme` from the cookie only on a page with a
+toggle that posts to `/_autumn/theme`. Other pages keep their own
+`data-theme`, even when the user picked "Dark" on another page.
 
 ### Let the user select the theme
 
@@ -136,7 +136,8 @@ the same cookie.
 
 To store the choice in a user profile, post to your own route with
 `.action("/settings/theme")`. The script then applies the theme and lets the
-form post.
+form post. It does not write the cookie, and it does not change the
+`data-theme` that your layout renders.
 
 If a shared cache stores pages that read the cookie, send `Vary: Cookie`.
 
