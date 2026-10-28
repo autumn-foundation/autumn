@@ -7270,6 +7270,9 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
             }
         },
     };
+    if let Some(detail) = client_auth_key_shape_error(section) {
+        return ClientAuthDoctorData::Invalid { detail };
+    }
     let required_path_count = section
         .get("required_paths")
         .and_then(toml::Value::as_array)
@@ -7308,7 +7311,54 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
         .and_then(toml::Value::as_str)
         .filter(|p| !p.is_empty());
 
+    // The runtime's own checks, so doctor and boot cannot disagree on a
+    // `required_paths` prefix that can never match.
+    let validated = toml::Value::Table(section.clone())
+        .try_into::<autumn_web::config::ClientAuthConfig>()
+        .map_err(|e| e.to_string())
+        .and_then(|c| c.validate());
+    if let Err(detail) = validated {
+        return ClientAuthDoctorData::Invalid { detail };
+    }
+
     grade_client_auth_trust_store(mode, bundle, crl, required_path_count)
+}
+
+/// The first `[server.tls.client_auth]` key whose value has the wrong shape.
+///
+/// Serde refuses each of these, so the app does not start. A key that is
+/// present but malformed must not read as absent. The detail names the key and
+/// the offending value.
+fn client_auth_key_shape_error(section: &toml::Table) -> Option<String> {
+    let bad = |key: &str, want: &str, value: &toml::Value| {
+        Some(format!(
+            "[server.tls.client_auth] {key} must be {want}; found {value}"
+        ))
+    };
+    if let Some(value) = section.get("required_paths") {
+        let all_strings = value
+            .as_array()
+            .is_some_and(|a| a.iter().all(toml::Value::is_str));
+        if !all_strings {
+            return bad("required_paths", "an array of path-prefix strings", value);
+        }
+    }
+    if let Some(value) = section.get("crl_path")
+        && value.as_str().is_none_or(|p| p.trim().is_empty())
+    {
+        return bad("crl_path", "a non-empty string path", value);
+    }
+    if let Some(value) = section.get("ca_bundle_path")
+        && !value.is_str()
+    {
+        return bad("ca_bundle_path", "a string path", value);
+    }
+    if let Some(value) = section.get("reload_interval_secs")
+        && value.as_integer().is_none_or(|n| n < 0)
+    {
+        return bad("reload_interval_secs", "a non-negative integer", value);
+    }
+    None
 }
 
 /// Read the CA bundle and any CRL, and grade what they hold.
@@ -13852,6 +13902,51 @@ pub struct Vault {
         let result = check_client_auth_impl(&data);
         assert!(matches!(result.status, CheckStatus::Fail));
         assert!(result.detail.unwrap().contains("required_paths"));
+    }
+
+    /// A `[server.tls.client_auth]` table holding `mode = "required"`, a bundle
+    /// path, and the one extra key under test.
+    fn client_auth_tls_with(key: &str, value: toml::Value) -> toml::Table {
+        let mut section = toml::Table::new();
+        section.insert(
+            "mode".to_owned(),
+            toml::Value::String("required".to_owned()),
+        );
+        section.insert(
+            "ca_bundle_path".to_owned(),
+            toml::Value::String("ca.pem".to_owned()),
+        );
+        section.insert(key.to_owned(), value);
+        let mut tls = toml::Table::new();
+        tls.insert("client_auth".to_owned(), toml::Value::Table(section));
+        tls
+    }
+
+    #[test]
+    fn client_auth_fails_on_malformed_key_shapes() {
+        // Serde or `validate` refuses each of these, so the app cannot start
+        // (#2706). The detail names the key and the offending value.
+        let cases: Vec<(&str, toml::Value, &str)> = vec![
+            ("required_paths", "/internal".into(), "\"/internal\""),
+            ("required_paths", toml::Value::Array(vec![1.into()]), "1"),
+            (
+                "required_paths",
+                toml::Value::Array(vec!["/users/{id}".into()]),
+                "/users/{id}",
+            ),
+            ("crl_path", "".into(), "crl_path"),
+            ("crl_path", 1.into(), "1"),
+            ("reload_interval_secs", "60".into(), "\"60\""),
+            ("reload_interval_secs", (-1).into(), "-1"),
+        ];
+        for (key, value, needle) in cases {
+            let tls = client_auth_tls_with(key, value.clone());
+            let data = resolve_client_auth_doctor_data(Some(&tls));
+            let ClientAuthDoctorData::Invalid { detail } = &data else {
+                panic!("{key} = {value} should be invalid, got {data:?}");
+            };
+            assert!(detail.contains(key) && detail.contains(needle), "{detail}");
+        }
     }
 
     #[test]

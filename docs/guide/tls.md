@@ -1018,6 +1018,10 @@ Prefixes are taken as written. Startup refuses a noncanonical entry — an empty
 segment (`//`) or a `.` / `..` segment — because it would protect less than it
 appears to. Write the resolved prefix.
 
+Startup also refuses a prefix with a `{}` route template or an encoded `%2F` or `%2e`. It can
+never match a request path. `autumn doctor` fails on the same entries, and on a
+`required_paths`, `crl_path` or `reload_interval_secs` value of the wrong type.
+
 **Per-route requirements** come from `required_paths`, matched at segment
 boundaries — so `/internal/` covers `/internal/keys` but not `/internal-tools`.
 A requirement matches the raw request path AND the normalized one, and demands

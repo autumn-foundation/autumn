@@ -9013,26 +9013,15 @@ impl ClientAuthConfig {
                      path prefix starting with `/`"
                 ));
             }
-            // Requests are normalized before matching (`security::path::clean_path`)
-            // but the configured prefix is not, so a noncanonical prefix silently
-            // matches less than it appears to: `/internal//` reduces to
-            // `/internal/` after the matcher strips ONE trailing slash, and
-            // `/internal/keys` then fails to match it. A prefix that protects
-            // less than the operator wrote is the failure this whole section
-            // exists to prevent, so refuse it rather than normalize it silently.
-            if path.contains("//") {
+            // The matcher compares a prefix with the normalized request path
+            // (`security::path::clean_path`). A prefix that normalization
+            // changes (`//`, dot segments, `%2F`) or that holds a route
+            // template can never match, so it protects nothing. Refuse it.
+            if path.contains(['{', '}']) || crate::security::path::clean_path(path) != *path {
                 return Err(format!(
-                    "[server.tls.client_auth] required_paths entry `{path}` contains an empty \
-                     path segment; write it as a canonical prefix like `/internal/`"
-                ));
-            }
-            if path
-                .split('/')
-                .any(|segment| segment == "." || segment == "..")
-            {
-                return Err(format!(
-                    "[server.tls.client_auth] required_paths entry `{path}` contains a dot \
-                     segment; write the resolved prefix instead"
+                    "[server.tls.client_auth] required_paths entry `{path}` can never match a \
+                     request path; write the canonical prefix, such as `/internal/`, with no \
+                     `{{}}` templates, encoded slashes or dots, empty segments or dot segments"
                 ));
             }
         }
@@ -19033,6 +19022,29 @@ path = "/healthz"
                 ..ClientAuthConfig::default()
             };
             assert!(ca.validate().is_ok(), "`{good}` should be accepted");
+        }
+    }
+
+    #[test]
+    fn client_auth_rejects_required_paths_the_matcher_cannot_match() {
+        // A prefix that `clean_path` rewrites, or that holds a route template,
+        // can never match a request path (#2706).
+        for bad in [
+            "/users/{id}",
+            "/files/{*rest}",
+            "/internal%2F",
+            "/a/%2e%2e/b",
+        ] {
+            let ca = ClientAuthConfig {
+                mode: ClientAuthMode::Required,
+                ca_bundle_path: Some(PathBuf::from("ca.pem")),
+                required_paths: vec![bad.to_owned()],
+                ..ClientAuthConfig::default()
+            };
+            let Err(err) = ca.validate() else {
+                panic!("`{bad}` should be rejected");
+            };
+            assert!(err.contains(bad), "message must name the entry: {err}");
         }
     }
 

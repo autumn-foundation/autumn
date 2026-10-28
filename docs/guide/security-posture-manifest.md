@@ -256,7 +256,8 @@ speaking, not a proof that every mutating request is checked.
 **Example — the `mtls` dimension** (schema v4). It mirrors the runtime
 `RequireClientCert` predicate against `[server.tls.client_auth]`: one entry per
 route, `mtls_required: true` when the listener requests client certificates
-*and* the route matches a configured `required_paths` prefix.
+*and* either `mode = "required"` (the handshake demands a certificate for
+every route) or the route matches a configured `required_paths` prefix.
 
 ```json
 { "path": "/internal/keys", "method": "GET", "mtls_required": true }
