@@ -2364,9 +2364,11 @@ jobs:
           # lib-test build.
           # `db::sqlite_types::` (#2582) measures the `SQLite` wrappers' schema
           # impls and their unit tests.
+          # `mail::db_suppression::` (#2697) measures the SQLite suppression store.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --lib -- db::tests::sqlite_ db::tests::percent_decode db::fleet \
-            fleet_layout:: app::fleet_boot_tests db::sqlite_types::
+            fleet_layout:: app::fleet_boot_tests db::sqlite_types:: \
+            mail::db_suppression::
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
