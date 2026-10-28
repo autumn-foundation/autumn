@@ -7311,8 +7311,7 @@ fn resolve_client_auth_doctor_data(tls: Option<&toml::Table>) -> ClientAuthDocto
         .and_then(toml::Value::as_str)
         .filter(|p| !p.is_empty());
 
-    // The runtime's own checks, so doctor and boot cannot disagree on a
-    // `required_paths` prefix that can never match.
+    // Run the runtime's own checks. Then doctor and startup always agree.
     let validated = toml::Value::Table(section.clone())
         .try_into::<autumn_web::config::ClientAuthConfig>()
         .map_err(|e| e.to_string())
@@ -13935,6 +13934,9 @@ pub struct Vault {
                 "/users/{id}",
             ),
             ("crl_path", "".into(), "crl_path"),
+            ("crl_path", "   ".into(), "crl_path"),
+            ("ca_bundle_path", 1.into(), "ca_bundle_path"),
+            ("reload_interval_secs", 1.5.into(), "1.5"),
             ("crl_path", 1.into(), "1"),
             ("reload_interval_secs", "60".into(), "\"60\""),
             ("reload_interval_secs", (-1).into(), "-1"),
@@ -13947,6 +13949,19 @@ pub struct Vault {
             };
             assert!(detail.contains(key) && detail.contains(needle), "{detail}");
         }
+    }
+
+    #[test]
+    fn client_auth_fails_on_malformed_key_under_mode_off() {
+        let mut tls = client_auth_tls_with("crl_path", 1.into());
+        if let Some(toml::Value::Table(t)) = tls.get_mut("client_auth") {
+            t.insert("mode".to_owned(), "off".into());
+        }
+        let data = resolve_client_auth_doctor_data(Some(&tls));
+        assert!(
+            matches!(data, ClientAuthDoctorData::Invalid { .. }),
+            "{data:?}"
+        );
     }
 
     #[test]

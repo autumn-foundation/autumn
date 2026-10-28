@@ -9019,8 +9019,8 @@ impl ClientAuthConfig {
             // template can never match, so it protects nothing. Refuse it.
             if path.contains(['{', '}']) || crate::security::path::clean_path(path) != *path {
                 return Err(format!(
-                    "[server.tls.client_auth] required_paths entry `{path}` can never match a \
-                     request path; write the canonical prefix, such as `/internal/`, with no \
+                    "[server.tls.client_auth] required_paths entry `{path}` is not canonical, so it does \
+                     not match the normalized request path; write the canonical prefix, such as `/internal/`, with no \
                      `{{}}` templates, encoded slashes or dots, empty segments or dot segments"
                 ));
             }

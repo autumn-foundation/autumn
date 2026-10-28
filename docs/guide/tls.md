@@ -1014,13 +1014,12 @@ A `process.role = "worker"` replica serves only the probes and the actuator,
 but it serves them over the same listener, so `required_paths` applies there
 too — a prefix covering `/actuator/` holds on every role.
 
-Prefixes are taken as written. Startup refuses a noncanonical entry — an empty
-segment (`//`) or a `.` / `..` segment — because it would protect less than it
-appears to. Write the resolved prefix.
+Prefixes are taken as written. Startup refuses a prefix that is not canonical, so it
+does not match the normalized request path. This covers an empty segment (`//`), a `.` or `..` segment, a `{}`
+route template, and an encoded `%2F` or `%2e`. Write the resolved prefix.
 
-Startup also refuses a prefix with a `{}` route template or an encoded `%2F` or `%2e`. It can
-never match a request path. `autumn doctor` fails on the same entries, and on a
-`required_paths`, `crl_path` or `reload_interval_secs` value of the wrong type.
+`autumn doctor` fails on the same prefixes. It also fails when `required_paths`,
+`crl_path` or `reload_interval_secs` has the wrong type.
 
 **Per-route requirements** come from `required_paths`, matched at segment
 boundaries — so `/internal/` covers `/internal/keys` but not `/internal-tools`.

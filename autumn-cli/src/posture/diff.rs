@@ -2424,6 +2424,20 @@ mod tests {
     }
 
     #[test]
+    fn required_to_optional_still_reports_dropped_prefixes() {
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let entry = mtls_entry("/a", "GET", false);
+        let findings = diff(
+            &manifest_mtls(&routes, "required", &["/internal"], &entry),
+            &manifest_mtls(&routes, "optional", &[], &entry),
+        );
+        assert!(
+            kinds(&findings).contains(&"mtls_required_path_removed"),
+            "{findings:#?}"
+        );
+    }
+
+    #[test]
     fn turning_the_listener_off_does_not_double_report_every_prefix() {
         // `mtls_mode_weakened` already says it in the strongest terms.
         let routes = route("/a", "GET", "public", &[], &[], false);
