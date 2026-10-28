@@ -326,9 +326,11 @@
     })[0] || null;
   }
 
+  // Guard on the tablist, not the root: an innerHTML swap into the root
+  // keeps the root but brings a new tablist and new panels.
   function initTabs(root) {
     var list = ownTablist(root);
-    if (!list || !once(root)) return;
+    if (!list || !once(list)) return;
     root.classList.add('autumn-tabs--enhanced');
     var tabs = listItems(list);
     if (!tabs.length) return;

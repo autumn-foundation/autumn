@@ -94,6 +94,9 @@ fn page_body() -> Markup {
         }
         div id="slot-outer" {}
         a id="jump" href="#t-billing" { "Go to billing" }
+        button id="swap-inner" hx-get="/fragment-inner" hx-target="#t" hx-swap="innerHTML" {
+            "Swap inner"
+        }
     }
 }
 
@@ -110,6 +113,15 @@ async fn rtl() -> Markup {
 #[get("/fragment")]
 async fn fragment() -> Markup {
     settings_tabs("s")
+}
+
+/// The inner HTML of tabs `t`, for an innerHTML swap into its root.
+#[get("/fragment-inner")]
+async fn fragment_inner() -> Markup {
+    let html = settings_tabs("t").into_string();
+    let start = html.find('>').map_or(0, |i| i + 1);
+    let end = html.rfind("</div>").unwrap_or(html.len());
+    maud::PreEscaped(html[start..end].to_owned())
 }
 
 #[get("/fragment-outer")]
@@ -150,6 +162,7 @@ async fn runner() -> SystemTestRunner {
                 index,
                 rtl,
                 fragment,
+                fragment_inner,
                 fragment_outer,
                 colors,
                 submitted
@@ -362,6 +375,31 @@ async fn tabs_swapped_in_with_outer_html_get_the_keyboard_model() {
     focus(&page, "o-tab-o-profile").await;
     press(&page, "ArrowRight").await;
     assert_selected_tab(&page, "o", "security").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tabs_whose_contents_htmx_replaces_init_again() {
+    // innerHTML into the root: the root stays, the tablist is new.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    eval_bool(
+        &page,
+        "window.__oldList = document.querySelector('#t > [role=tablist]'); true",
+    )
+    .await;
+    page.click("#swap-inner").await.expect("swap");
+    wait_for(
+        &page,
+        "document.querySelector('#t > [role=tablist]') !== window.__oldList \
+         && document.getElementById('t-tab-t-security').getAttribute('tabindex') === '-1'",
+    )
+    .await;
+    assert_selected_tab(&page, "t", "profile").await;
+    focus(&page, "t-tab-t-profile").await;
+    press(&page, "ArrowRight").await;
+    assert_selected_tab(&page, "t", "security").await;
 }
 
 #[tokio::test]
