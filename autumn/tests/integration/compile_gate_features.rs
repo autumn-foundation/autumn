@@ -125,7 +125,10 @@ fn every_gated_module_has_a_cfg() {
 fn psl_is_optional_and_owned_by_custom_domains() {
     let m = manifest();
     let psl = &m["dependencies"]["psl"];
-    assert_eq!(psl.get("optional").and_then(toml::Value::as_bool), Some(true));
+    assert_eq!(
+        psl.get("optional").and_then(toml::Value::as_bool),
+        Some(true)
+    );
     assert!(names(&features(&m)["custom-domains"]).contains("dep:psl"));
 }
 

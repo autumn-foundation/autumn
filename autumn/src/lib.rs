@@ -884,12 +884,12 @@ pub mod links;
 #[cfg(feature = "nested-form")]
 pub mod nested_form;
 pub mod payload_version;
+pub(crate) mod ppm;
 #[cfg(feature = "repl")]
 pub mod repl;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
-pub(crate) mod ppm;
 #[cfg(feature = "slo")]
 pub mod slo;
 

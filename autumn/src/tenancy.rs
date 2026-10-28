@@ -724,37 +724,36 @@ pub async fn tenancy_middleware(
 
     #[cfg(feature = "custom-domains")]
     let domains = crate::custom_domain::CustomDomainRegistry::from_state(&state);
-    let tenant_id =
-        match extract_tenant_impl(
-            &mut parts,
-            &config,
-            #[cfg(feature = "custom-domains")]
-            domains.as_deref(),
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                // For browser logins, bounce a missing/unauthenticated tenant to the
-                // configured login page instead of returning a raw 401. Only do this
-                // for clients that accept HTML (navigating browsers): API clients
-                // (e.g. `Accept: application/json`) expect the 401 so their error
-                // handling isn't broken by a 303 to a login page. Other error classes
-                // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
-                // are not masked as login redirects.
-                if e.status() == axum::http::StatusCode::UNAUTHORIZED
-                    && let Some(target) = &config.tenancy.login_redirect
-                    && parts
-                        .headers
-                        .get(axum::http::header::ACCEPT)
-                        .and_then(|v| v.to_str().ok())
-                        .is_some_and(|accept| accept.contains("text/html"))
-                {
-                    return axum::response::Redirect::to(target).into_response();
-                }
-                return e.into_response();
+    let tenant_id = match extract_tenant_impl(
+        &mut parts,
+        &config,
+        #[cfg(feature = "custom-domains")]
+        domains.as_deref(),
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            // For browser logins, bounce a missing/unauthenticated tenant to the
+            // configured login page instead of returning a raw 401. Only do this
+            // for clients that accept HTML (navigating browsers): API clients
+            // (e.g. `Accept: application/json`) expect the 401 so their error
+            // handling isn't broken by a 303 to a login page. Other error classes
+            // (e.g. a 500 misconfiguration) are surfaced unchanged so real bugs
+            // are not masked as login redirects.
+            if e.status() == axum::http::StatusCode::UNAUTHORIZED
+                && let Some(target) = &config.tenancy.login_redirect
+                && parts
+                    .headers
+                    .get(axum::http::header::ACCEPT)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|accept| accept.contains("text/html"))
+            {
+                return axum::response::Redirect::to(target).into_response();
             }
-        };
+            return e.into_response();
+        }
+    };
 
     // Tag the request-scoped log context (#1169) so every subsequent event
     // automatically carries the resolved tenant id.

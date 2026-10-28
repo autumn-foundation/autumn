@@ -22,9 +22,6 @@ use crate::config::AutumnConfig;
 use crate::error_pages::{self, SharedRenderer};
 #[cfg(feature = "idempotency")]
 use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
-/// With `idempotency` off no layer is ever built, so `Identity` stands in.
-#[cfg(not(feature = "idempotency"))]
-use tower::layer::util::Identity as IdempotencyLayer;
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
 use crate::middleware::exception_filter::{
@@ -35,6 +32,9 @@ use crate::state::AppState;
 use axum::response::IntoResponse;
 use http::{Request, StatusCode};
 use thiserror::Error;
+/// With `idempotency` off no layer is ever built, so `Identity` stands in.
+#[cfg(not(feature = "idempotency"))]
+use tower::layer::util::Identity as IdempotencyLayer;
 
 pub const DEFAULT_FAVICON_PATH: &str = "/favicon.ico";
 

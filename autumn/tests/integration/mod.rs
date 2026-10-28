@@ -22,7 +22,6 @@ mod api_versioning_openapi;
 mod api_versioning_unit;
 mod app_builder;
 mod app_metrics_facade;
-mod compile_gate_features;
 #[cfg(feature = "db")]
 mod auth_lockout_race;
 mod authorization_integration;
@@ -76,6 +75,7 @@ mod collab_session;
 mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
+mod compile_gate_features;
 mod compression_middleware;
 #[cfg(feature = "db")]
 mod confidential_model;

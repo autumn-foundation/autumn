@@ -144,7 +144,10 @@ pub fn write_owner_only(path: &Path, data: &[u8]) -> std::io::Result<()> {
     publish_staged(staged, path)
 }
 
-#[cfg_attr(not(any(feature = "gdpr", feature = "custom-domains", feature = "acme")), allow(dead_code))]
+#[cfg_attr(
+    not(any(feature = "gdpr", feature = "custom-domains", feature = "acme")),
+    allow(dead_code)
+)]
 /// Run a blocking `std::fs` operation on tokio's blocking thread pool,
 /// converting a task panic into an `io::Error`.
 ///

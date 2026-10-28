@@ -6638,7 +6638,7 @@ impl AppBuilder {
             #[cfg(feature = "reporting")]
             error_reporters,
             #[cfg(feature = "alerts")]
-            alert_channels: _,
+                alert_channels: _,
             #[cfg(feature = "openapi")]
             openapi,
             #[cfg(feature = "mcp")]

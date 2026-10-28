@@ -829,7 +829,8 @@ async fn apply_custom_domain_prune(
     _dry_run: bool,
     report: &mut RetentionDatasetReport,
 ) {
-    report.skipped = Some("custom domains are not compiled in (feature `custom-domains`)".to_owned());
+    report.skipped =
+        Some("custom domains are not compiled in (feature `custom-domains`)".to_owned());
 }
 
 #[cfg(feature = "custom-domains")]
