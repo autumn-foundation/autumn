@@ -13,9 +13,10 @@ categories = ["web-programming", "web-programming::http-server"]
 autotests = false
 
 [features]
-default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash",
-    # Compile gates (#2795, ADR 0027). Default-on; the no-DB daemon starter drops them.
-    "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph"]
+# The last 16 names are the compile gates (#2795, ADR 0027). Default-on; the
+# no-DB daemon starter drops them. Keep this on one line: the panic gate
+# (scripts/check-panic-gate.sh) reads it with grep.
+default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph"]
 # Compile gates (#2795, ADR 0027). Each gates one module. See the default list.
 ledger = ["version-history"]
 experiments = ["feature-flags"]
