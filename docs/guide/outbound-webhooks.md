@@ -66,7 +66,7 @@ let app = autumn_web::app().plugin(OutboundWebhookPlugin::sql());
 
 To use another pool, build the store yourself: `OutboundWebhookPlugin::new(Arc::new(SqlOutboundWebhookStore::new(pool)))`, and call `ensure_schema` (or apply `WEBHOOK_SCHEMA_SQL` before the deploy).
 
-The tables are `autumn_webhook_subscriptions` and `autumn_webhook_deliveries`. The `secret` column holds each signing secret. Limit read access to it. Nothing deletes delivery logs for you: call `purge_deliveries_before(cutoff)` on a schedule. It keeps DLQ logs.
+The tables are `autumn_webhook_subscriptions` and `autumn_webhook_deliveries`. The `secret` column holds each signing secret. Limit read access to it. Nothing deletes delivery logs for you: call `purge_deliveries_before(cutoff)` on a schedule. It deletes only delivered (2xx) logs: pending and retrying deliveries, DLQ logs, and logs of deliveries skipped for a disabled or failed subscription stay.
 
 ---
 
