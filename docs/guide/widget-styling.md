@@ -79,6 +79,10 @@ on a light page:
 <html data-theme="light">
 ```
 
+The widget script changes `data-theme` only on a page that shows a theme
+toggle. A pinned page without a toggle keeps its scheme, even when the user
+picked "Dark" on another page.
+
 ### Let the user select the theme
 
 1. Merge the theme route into the app:

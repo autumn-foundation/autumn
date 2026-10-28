@@ -38,10 +38,15 @@ ev = r.click('system'); assert.strictEqual(r.attrs['data-theme'], undefined); as
 r = run('', '/settings/theme', true); ev = r.click('light');
 assert.ok(!ev.prevented && !ev.stopped, 'custom action posts'); assert.strictEqual(r.attrs['data-theme'], 'light');
 r = run('', '/_autumn/theme', false, 'light'); assert.strictEqual(r.attrs['data-theme'], 'light', 'app pin stays without toggle');
-r = run('x=1; autumn.theme=bad; autumn.theme=dark', '/_autumn/theme', false); assert.strictEqual(r.attrs['data-theme'], 'dark', 'first valid');
+r = run('x=1; autumn.theme=bad; autumn.theme=dark', '/_autumn/theme', true); assert.strictEqual(r.attrs['data-theme'], 'dark', 'first valid');
+// A page without a toggle may pin its theme. A cookie from elsewhere must not change it.
+r = run('autumn.theme=dark', '/_autumn/theme', false, 'light'); assert.strictEqual(r.attrs['data-theme'], 'light', 'pin survives a dark cookie');
 // Back/forward cache: a restored page syncs with the cookie.
-r = run('', '/_autumn/theme', false, 'light');
+r = run('autumn.theme=light', '/_autumn/theme', true);
 r.cookie = 'autumn.theme=dark';
 r.pageshow(false); assert.strictEqual(r.attrs['data-theme'], 'light', 'normal load event is ignored');
 r.pageshow(true); assert.strictEqual(r.attrs['data-theme'], 'dark', 'restored page syncs');
+r = run('', '/_autumn/theme', false, 'light');
+r.cookie = 'autumn.theme=dark';
+r.pageshow(true); assert.strictEqual(r.attrs['data-theme'], 'light', 'restored pinned page stays');
 console.log("all passed");

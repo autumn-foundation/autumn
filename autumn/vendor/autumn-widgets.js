@@ -290,13 +290,13 @@
     }
   }, true);
 
-  // A cached page can carry a stale data-theme. The cookie wins. On a page
-  // with a toggle, no cookie means System. On other pages a data-theme set
-  // by the app stays.
+  // A cached page can carry a stale data-theme. Only a page with a toggle
+  // follows the cookie: its layout renders the stored preference, and no
+  // cookie means System. A page without a toggle keeps the data-theme its
+  // app set, for example a light-only page that pins "light".
   function syncTheme() {
-    var stored = readThemeCookie();
-    if (stored) applyTheme(stored);
-    else if (document.querySelector('[data-autumn-theme-toggle]')) applyTheme('system');
+    if (!document.querySelector('[data-autumn-theme-toggle]')) return;
+    applyTheme(readThemeCookie() || 'system');
   }
 
   // The back/forward cache restores a page without a new load.
