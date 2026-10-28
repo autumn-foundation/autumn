@@ -39,15 +39,11 @@ default = ["tls", "postgres"]
 # `tls`, so the resolved autumn-web set is a superset of what this feature
 # already selected.
 tls = ["autumn-web/tls", "autumn-web/acme"]
-# The pg-only `autumn-web` features the CLI enables that assume the Postgres
-# runtime and fail to compile under the `sqlite` backend-flip. Only `mail`
-# (its `DbSuppressionStore` is hard-typed to `Pool<AsyncPgConnection>`) is a
-# genuine breaker today; it is grouped here (rather than left unconditionally on)
-# so the `sqlite` build — which excludes the `postgres` bundle — resolves a
-# mail-free `autumn-web` set that mirrors what autumn-web's OWN sqlite CI builds.
-# The CLI's own source references NO `autumn_web::mail` symbol (only generated
-# string literals), so no source `#[cfg]` gating is needed. Kept in `default`,
-# so a normal `cargo build -p autumn-cli` is byte-for-byte identical to before.
+# Features that only the Postgres build needs. `mail` compiles on SQLite
+# (`DbSuppressionStore` follows the runtime backend), but the SQLite build
+# omits it so its `autumn-web` feature set matches autumn-web's own SQLite CI.
+# The CLI source uses no `autumn_web::mail` symbol, so no `#[cfg]` is needed.
+# It stays in `default`, so a normal build does not change.
 postgres = ["autumn-web/mail"]
 # Mirrors autumn-web's `acme` feature (issue #1608). The `autumn doctor` ACME
 # preflight checks compile in every build (they only need `std`), but enabling

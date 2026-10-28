@@ -2842,6 +2842,16 @@ jobs:
         # newly-added module rot the same way the pool tests did — silently,
         # because nothing runs it.
         run: cargo test -p autumn-web --features sqlite --lib
+      - name: Run the mail suppression store tests under sqlite
+        # Issue #2697. The tests need `mail`, which the bare `--lib` step
+        # above omits. The pass count is checked, because a filter that
+        # matches nothing exits 0.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-web --features "sqlite,mail" --lib \
+            mail::db_suppression:: | tee "${RUNNER_TEMP}/mail-suppression-sqlite.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/mail-suppression-sqlite.log" \
+            || { echo "::error::no mail suppression sqlite tests ran"; exit 1; }
       - name: Build autumn-admin-plugin under the sqlite backend
         # Issue #2108. The plugin has no `sqlite` feature of its own — a
         # manifest edge would flip the backend for the whole workspace, and
