@@ -581,6 +581,8 @@ mod widgets_badge;
 mod widgets_charts;
 #[cfg(feature = "maud")]
 mod widgets_infinite_feed;
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_keyboard_browser;
 mod widgets_modal;
 #[cfg(feature = "maud")]
 mod widgets_reaction_controls;

@@ -2,9 +2,9 @@
 
 `autumn_web::widgets::tabs` groups related content into switchable panels —
 "Profile / Security / Billing", "Overview / Comments / Activity" — with
-**zero hand-written JavaScript or CSS**. Switching is pure CSS (`:target`
-anchors), so it works with JavaScript disabled and each panel is
-deep-linkable via a URL fragment.
+**zero hand-written JavaScript or CSS**. Without JavaScript, switching is
+pure CSS (`:target` anchors), and each panel is deep-linkable via a URL
+fragment. With the shipped `autumn-widgets.js`, the tabs get APG arrow keys.
 
 Out of scope: lazy loading, dynamically-added tabs, visual variants, and
 related widgets like accordions or drawers.
@@ -26,20 +26,24 @@ async fn show(Path(id): Path<i64>) -> Markup {
     ];
     html! {
         h1 { "Post " (id) }
-        (tabs("post-tabs", &panels))
+        (tabs("post-tabs", None, &panels))
     }
 }
 ```
 
 That's the whole widget: 9 lines of Maud produce a full `tablist` strip and
 three panels. Visiting `/posts/42` shows the Overview panel by default;
-visiting `/posts/42#comments` shows the Comments panel on load — no
-JavaScript involved either way.
+visiting `/posts/42#comments` shows the Comments panel on load. Without
+JavaScript, `:target` CSS does this.
 
 ## Signature
 
 ```rust,ignore
-pub fn tabs(id: &str, panels: &[(&str, &str, maud::Markup)]) -> maud::Markup
+pub fn tabs(
+    id: &str,
+    active_id: Option<&str>,
+    panels: &[(&str, &str, maud::Markup)],
+) -> maud::Markup
 ```
 
 Each tuple is `(panel_id, label, body)`, in display order. `panel_id` and
@@ -50,7 +54,7 @@ Each tuple is `(panel_id, label, body)`, in display order. `panel_id` and
 - `panel_id` becomes the panel's own `id`, so `#<panel_id>` in the URL
   targets it directly.
 - The tab's element `id` is `"{id}-tab-{panel_id}"`.
-- The first tab/panel is marked active by default (`aria-selected="true"`,
+- The `active_id` panel, else the first, is marked active (`aria-selected="true"`,
   `autumn-tabs__tab--active` / `autumn-tabs__panel--active`), so a panel is
   always visible even before any fragment is present.
 - An empty `panels` slice renders the empty `autumn-tabs` container without
@@ -68,7 +72,7 @@ Each tuple is `(panel_id, label, body)`, in display order. `panel_id` and
   down to a deep-linked inner panel, so nested content is reachable no
   matter which outer panel it lives in. The outer widget's *active-tab
   highlight* can only sync when the shown outer panel is itself the direct
-  target, though — CSS forbids nesting `:has()` inside `:has()`, so a panel
+  target, though (without JavaScript) — CSS forbids nesting `:has()` inside `:has()`, so a panel
   shown only because it contains a nested target can't be tied back to a
   specific outer tab position. No outer tab is highlighted in that case,
   rather than the wrong one being highlighted.
@@ -80,9 +84,10 @@ Each tuple is `(panel_id, label, body)`, in display order. `panel_id` and
 | `.autumn-tabs` | Root wrapper |
 | `.autumn-tabs__list` | Tab strip (`role="tablist"`) |
 | `.autumn-tabs__tab` | Individual tab link |
-| `.autumn-tabs__tab--active` | The initially-selected tab |
+| `.autumn-tabs__tab--active` | The selected tab |
 | `.autumn-tabs__panel` | Individual panel |
-| `.autumn-tabs__panel--active` | The initially-visible panel |
+| `.autumn-tabs__panel--active` | The shown panel |
+| `.autumn-tabs--enhanced` | Root, after `autumn-widgets.js` runs |
 
 ---
 
@@ -93,12 +98,24 @@ Each tuple is `(panel_id, label, body)`, in display order. `panel_id` and
   `id`), and `aria-selected`.
 - Each panel carries `role="tabpanel"`, `aria-labelledby` (pointing at its
   tab's `id`), and `tabindex="0"` so it can receive keyboard focus directly.
-- **Known limitation:** `aria-selected` reflects the server's default
-  selection (the first tab) only. The server never sees the URL fragment,
-  so it can't know which tab a client-side `:target` navigation actually
-  landed on — fixing this would require JavaScript, which this widget
-  deliberately has none of. A screen reader always hears the first tab
-  announced as "selected", even when a different panel is what's shown.
+- **With `autumn-widgets.js`:** the tab strip follows the APG tabs pattern,
+  with automatic activation. `aria-selected`, the roving `tabindex` and the
+  shown panel follow the selected tab, also for a deep link.
+- **Without JavaScript:** `aria-selected` stays on the server's default tab.
+  The server never sees the URL fragment.
+
+## Keyboard
+
+Load `/static/js/autumn-widgets.js` once in your layout.
+
+| Key | Effect |
+|---|---|
+| ArrowRight / ArrowLeft | Select the next / previous tab. Wraps. RTL swaps them. |
+| Home / End | Select the first / last tab. |
+| Tab | Move focus to the shown panel. |
+
+The URL fragment follows the selected tab, so a copied URL opens the same
+tab. See [Widget Keyboard Core](keyboard.md).
 
 ## No-JavaScript switching
 

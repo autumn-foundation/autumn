@@ -1526,7 +1526,7 @@ middleware (tenant scoping, an auth shim, request enrichment) — mapping the
 layer onto individual handlers instead tests a stack the real app never
 serves.
 
-`Page`: `visit`, `fill`, `click`, `expect_text`, `expect_url`,
+`Page`: `visit`, `fill`, `click`, `press`, `set_javascript_enabled`, `expect_text`, `expect_url`,
 `expect_attribute`, `expect_hx_settle`, `expect_sse_event`,
 `expect_no_console_errors`, `console_errors`, `snapshot`, `evaluate`. The
 `expect_*` assertions poll to a deadline and ignore the transient CDP errors a

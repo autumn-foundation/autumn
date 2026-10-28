@@ -875,6 +875,21 @@ fn remote_object_to_string(obj: &chromiumoxide::cdp::js_protocol::runtime::Remot
         .unwrap_or_default()
 }
 
+/// Look up a DOM key name for [`Page::press`].
+///
+/// Prefers the main-keyboard entry (`code == key`, e.g. `ArrowDown`). The
+/// first entry with that key name can be the numpad one (`Numpad2`).
+fn known_key(key: &str) -> Result<&'static chromiumoxide::keys::KeyDefinition, SystemTestError> {
+    chromiumoxide::keys::USKEYBOARD_LAYOUT
+        .iter()
+        .find(|def| def.key == key && def.code == key)
+        .or_else(|| chromiumoxide::keys::get_key_definition(key))
+        .ok_or_else(|| SystemTestError::AssertionFailed {
+            message: format!("unknown key: {key}"),
+            artifact_path: None,
+        })
+}
+
 // ── Page ───────────────────────────────────────────────────────────────────
 
 /// Browser page with htmx-aware assertions.
@@ -999,6 +1014,69 @@ impl Page {
             }
         }
         self.wait_for_hx_settle().await?;
+        Ok(self)
+    }
+
+    /// Press one key on the focused element, as a user does.
+    ///
+    /// Sends real CDP `keyDown`/`keyUp` events, so the browser runs its
+    /// default actions (`Tab` moves focus, `Enter` follows a link). `key` is a
+    /// DOM key name, for example `"ArrowDown"`, `"Escape"`, `"Tab"` or `"g"`.
+    /// Auto-waits for htmx to settle.
+    ///
+    /// # Errors
+    /// [`SystemTestError::AssertionFailed`] for an unknown key, or CDP errors.
+    pub async fn press(&self, key: &str) -> Result<&Self, SystemTestError> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchKeyEventParams, DispatchKeyEventType,
+        };
+        let def = known_key(key)?;
+        let text = def
+            .text
+            .or_else(|| (def.key.chars().count() == 1).then_some(def.key));
+        let down_type = if text.is_some() {
+            DispatchKeyEventType::KeyDown
+        } else {
+            DispatchKeyEventType::RawKeyDown
+        };
+        let mut down = DispatchKeyEventParams::builder()
+            .r#type(down_type)
+            .key(def.key)
+            .code(def.code)
+            .windows_virtual_key_code(def.key_code)
+            .native_virtual_key_code(def.key_code);
+        if let Some(text) = text {
+            down = down.text(text);
+        }
+        let up = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::KeyUp)
+            .key(def.key)
+            .code(def.code)
+            .windows_virtual_key_code(def.key_code)
+            .native_virtual_key_code(def.key_code);
+        for params in [down.build(), up.build()] {
+            let params = params.map_err(|message| SystemTestError::AssertionFailed {
+                message,
+                artifact_path: None,
+            })?;
+            self.inner.execute(params).await?;
+        }
+        self.wait_for_hx_settle().await?;
+        Ok(self)
+    }
+
+    /// Turn page scripts on or off for this page.
+    ///
+    /// Call it before [`visit`](Self::visit) to load a page with JS off and
+    /// prove its no-JS fallback. [`evaluate`](Self::evaluate) still works.
+    ///
+    /// # Errors
+    /// CDP errors.
+    pub async fn set_javascript_enabled(&self, enabled: bool) -> Result<&Self, SystemTestError> {
+        use chromiumoxide::cdp::browser_protocol::emulation::SetScriptExecutionDisabledParams;
+        self.inner
+            .execute(SetScriptExecutionDisabledParams::new(!enabled))
+            .await?;
         Ok(self)
     }
 
@@ -1824,6 +1902,31 @@ mod tests {
             "a layer registered on SystemTest must see the request ID, as it \
              does under AppBuilder::layer"
         );
+    }
+
+    #[test]
+    fn known_key_accepts_dom_key_names() {
+        for key in [
+            "ArrowDown",
+            "ArrowUp",
+            "Home",
+            "End",
+            "Escape",
+            "Tab",
+            "Enter",
+            "g",
+        ] {
+            assert_eq!(known_key(key).expect(key).key, key);
+        }
+        for key in ["ArrowDown", "ArrowUp", "Home", "End"] {
+            assert_eq!(known_key(key).expect(key).code, key, "not the numpad key");
+        }
+    }
+
+    #[test]
+    fn known_key_refuses_an_unknown_key() {
+        let err = known_key("NotAKey").expect_err("unknown");
+        assert!(err.to_string().contains("NotAKey"), "{err}");
     }
 
     #[test]

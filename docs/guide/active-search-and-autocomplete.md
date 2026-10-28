@@ -231,13 +231,28 @@ async fn tags_autocomplete(
 `autocomplete_option(value, label)` renders:
 
 ```html
-<div role="option" tabindex="0" data-value="42">Tag Name</div>
+<div role="option" tabindex="-1" data-value="42">Tag Name</div>
 ```
 
-The `autumn-widgets.js` runtime handles click and keyboard (Enter/Space) selection
+The `autumn-widgets.js` runtime handles click and keyboard selection
 on the listbox. It copies the option's `textContent` into the visible input and
 its `data-value` into the hidden field, then clears the listbox. No additional
 wiring is needed beyond including the script in your layout.
+
+### Keyboard
+
+The widget follows the APG combobox pattern. Focus stays on the input.
+
+| Key | Effect |
+|---|---|
+| ArrowDown / ArrowUp | Move the active option. Wraps. Opens a closed popup. |
+| Enter | Selects the active option. It does not submit the form. |
+| Escape | Closes the popup. |
+| Tab, or a click outside | Closes the popup. |
+
+`aria-expanded` is `"true"` only while the popup shows an option.
+`aria-activedescendant` names the active option. See
+[Widget Keyboard Core](keyboard.md).
 
 ### Free-text mode (tag-style fields)
 
@@ -297,7 +312,8 @@ All widgets include:
 - `role="combobox"` + `aria-expanded` + `aria-autocomplete="list"` on the
   autocomplete visible input
 - `role="listbox"` on the autocomplete options container
-- `role="option"` + `tabindex="0"` on each autocomplete option
+- `role="option"` + `tabindex="-1"` on each autocomplete option (focus stays
+  on the input; `aria-activedescendant` names the active option)
 - `role="status"` + `aria-live="polite"` on empty-state partials
 
 ---
