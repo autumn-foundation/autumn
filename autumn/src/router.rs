@@ -20,7 +20,11 @@ use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 #[cfg(feature = "maud")]
 use crate::error_pages::{self, SharedRenderer};
+#[cfg(feature = "idempotency")]
 use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
+/// With `idempotency` off no layer is ever built, so `Identity` stands in.
+#[cfg(not(feature = "idempotency"))]
+use tower::layer::util::Identity as IdempotencyLayer;
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
 use crate::middleware::exception_filter::{
@@ -1882,6 +1886,7 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     // OpenAPI/MCP routers, so reserve it too (same rationale as unsubscribe
     // above): an OpenAPI/MCP mount at this path should surface the typed
     // collision instead of panicking in `router.merge`.
+    #[cfg(feature = "job-tracking")]
     if config.jobs.tracking.route_enabled {
         claimed.insert(crate::job_tracking::JOB_STATUS_ROUTE_PATH.to_owned());
     }
@@ -3595,6 +3600,7 @@ fn mount_framework_routes(
 
     // Tracked-job status endpoint (enqueue_tracked / #[job] JobContext) — on
     // by default; opt out via `jobs.tracking.route_enabled = false`.
+    #[cfg(feature = "job-tracking")]
     if config.jobs.tracking.route_enabled {
         router = router.merge(crate::job_tracking::status_router());
         tracing::debug!(
@@ -4090,6 +4096,7 @@ fn build_csrf_layer(
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Apply the one-time submit-token guard (issue #1360).
 ///
 /// Enabled by default. The layer is applied *inner* to the CSRF layer (it is
@@ -4124,11 +4131,12 @@ where
 /// composed ingress stack rather than costing its own nesting level
 /// (issue #2193). The production memory-backend guard still surfaces as an
 /// `Err`, before any layer is applied.
+#[cfg(feature = "idempotency")]
 fn build_submit_token_layer(
     config: &AutumnConfig,
     state: &AppState,
     is_production: bool,
-) -> Result<Option<crate::security::SubmitTokenLayer>, RouterBuildError> {
+) -> Result<Option<SubmitLayer>, RouterBuildError> {
     let cfg = &config.security.submit_token;
     if !cfg.enabled {
         return Ok(None);
@@ -5371,6 +5379,7 @@ fn deadline_exceeded_response(
     response
 }
 
+#[cfg(feature = "idempotency")]
 /// Build the store for `backend`. `label` names the config section in errors.
 fn build_idempotency_store(
     backend: crate::config::IdempotencyBackend,
@@ -5423,6 +5432,7 @@ fn build_idempotency_store(
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Tell the operator when a request can outlive its in-flight lock. Then a
 /// retry can run the handler while the first request still runs. Only a
 /// handler that uses `IdempotencyTx::commit` on the database store is fenced.
@@ -5455,10 +5465,11 @@ fn timeout_retry_after_secs(entropy: &dyn crate::entropy::Entropy) -> u64 {
 }
 
 struct BuiltIdempotencyLayers {
-    route: crate::idempotency::IdempotencyLayer,
-    manual: crate::idempotency::IdempotencyLayer,
+    route: IdempotencyLayer,
+    manual: IdempotencyLayer,
 }
 
+#[cfg(feature = "idempotency")]
 fn build_idempotency_layers(
     config: &AutumnConfig,
     state: &AppState,
@@ -5495,6 +5506,32 @@ fn build_idempotency_layers(
         route: base.clone().replay_through_inner(),
         manual: base.fail_closed_on_replay(),
     }))
+}
+
+#[cfg(not(feature = "idempotency"))]
+#[allow(clippy::unnecessary_wraps)]
+fn build_idempotency_layers(
+    _config: &AutumnConfig,
+    _state: &AppState,
+) -> Result<Option<BuiltIdempotencyLayers>, RouterBuildError> {
+    Ok(None)
+}
+
+/// The layer type `build_submit_token_layer` returns.
+#[cfg(feature = "idempotency")]
+type SubmitLayer = crate::security::SubmitTokenLayer;
+/// With `idempotency` off there is no submit-token layer.
+#[cfg(not(feature = "idempotency"))]
+type SubmitLayer = tower::layer::util::Identity;
+
+#[cfg(not(feature = "idempotency"))]
+#[allow(clippy::unnecessary_wraps)]
+fn build_submit_token_layer(
+    _config: &AutumnConfig,
+    _state: &AppState,
+    _is_production: bool,
+) -> Result<Option<SubmitLayer>, RouterBuildError> {
+    Ok(None)
 }
 
 /// A run of user-registered layers ([`AppBuilder::layer`](crate::app::AppBuilder::layer),
@@ -17026,6 +17063,7 @@ pub struct TrustedHostPolicy {
     /// time, after the router is built. `None` for a policy built without a
     /// state (the MCP unit tests); an app that does not enable custom domains
     /// publishes no registry, so the lookup finds nothing.
+    #[cfg(feature = "custom-domains")]
     custom_domains: Option<crate::state::LateExtensions>,
 }
 
@@ -17055,6 +17093,7 @@ impl TrustedHostPolicy {
             allow_any,
             allow_missing_host: !is_production,
             probe_bypass_paths: Arc::new(probe_bypass_paths),
+            #[cfg(feature = "custom-domains")]
             custom_domains: None,
         }
     }
@@ -17065,8 +17104,10 @@ impl TrustedHostPolicy {
     /// Every ingress policy is built this way. The state is read per request,
     /// so a domain connected — or offboarded — while the app runs takes effect
     /// without a restart.
+    #[cfg_attr(not(feature = "custom-domains"), allow(unused_variables))]
     pub(crate) fn from_config_with_state(config: &AutumnConfig, state: &AppState) -> Self {
         Self {
+            #[cfg(feature = "custom-domains")]
             custom_domains: Some(state.late_extensions()),
             ..Self::from_config(config)
         }
@@ -17107,6 +17148,13 @@ impl TrustedHostPolicy {
     /// comparison. Only a *servable* (`active`) domain passes, which is the
     /// rule SNI already applies at the handshake: a registration stuck at
     /// `pending_dns` must not become a way past host validation.
+    #[cfg(not(feature = "custom-domains"))]
+    #[allow(clippy::unused_self)]
+    fn is_connected_domain(&self, _host: &str) -> bool {
+        false
+    }
+
+    #[cfg(feature = "custom-domains")]
     fn is_connected_domain(&self, host: &str) -> bool {
         self.custom_domains.as_ref().is_some_and(|extensions| {
             extensions

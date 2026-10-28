@@ -15,7 +15,7 @@ categories = ["web-programming", "web-programming::http-server"]
 proc-macro = true
 
 [features]
-default = ["db"]
+default = ["db", "graph"]
 # A no-op kept so an existing `autumn-macros/db` dependant still RESOLVES.
 # It no longer switches anything on: the database-layer codegen (`#[model]`,
 # `#[commentable]`, `#[repository]`, `#[service]`) moved to the
@@ -28,6 +28,11 @@ default = ["db"]
 # `default-features = false` and pulls the shards in itself, so a no-database
 # app never compiles the database codegen at all.
 db = []
+# Emit the architecture-graph descriptor (`inventory::submit!`) beside each
+# route and job. `autumn-web`'s `graph` feature turns it on. Off, the macros
+# emit no `autumn_web::graph` path, so an app without the feature compiles
+# without that module (#2795).
+graph = []
 
 [dependencies]
 autumn-macros-support = { version = "0.9.0", path = "../autumn-macros-support" }

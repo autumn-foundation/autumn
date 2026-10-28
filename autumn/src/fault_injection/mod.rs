@@ -57,7 +57,7 @@ use crate::audit::{AuditEvent, AuditLogger, AuditStatus};
 use crate::entropy::{Entropy, SeededEntropy};
 use crate::route::RouteTimeout;
 use crate::router::RouteAttrTable;
-use crate::slo::PPM;
+use crate::ppm::PPM;
 
 pub use config::{FaultInjectionConfig, FaultKind, FaultRule, FaultStopConfig, FaultTarget};
 pub(crate) use layer::FaultScopeLayer;

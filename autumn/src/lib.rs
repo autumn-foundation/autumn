@@ -89,7 +89,17 @@ pub mod aggregate;
 /// indicators, 5xx-rate spikes, scheduled-task failures) to the app's
 /// configured mailer and signed outbound webhook behind `[alerts]` config —
 /// with zero application code. See [`mod@alerts`].
+#[cfg(feature = "alerts")]
 pub mod alerts;
+/// No-op alert hooks for builds without the `alerts` feature.
+#[cfg(not(feature = "alerts"))]
+pub(crate) mod alerts {
+    use crate::AppState;
+
+    pub fn notify_dead_lettered_job(_: &AppState, _: &str, _: &str, _: &str) {}
+    pub fn notify_scheduled_task_failure(_: &AppState, _: &str, _: &str) {}
+    pub fn notify_scheduled_task_recovered(_: &AppState, _: &str) {}
+}
 pub mod app;
 pub mod assets;
 pub mod audit;
@@ -183,6 +193,7 @@ pub mod constela;
 pub mod cost;
 pub mod credentials;
 pub mod current;
+#[cfg(feature = "custom-domains")]
 pub mod custom_domain;
 #[cfg(feature = "db")]
 pub mod db;
@@ -234,7 +245,98 @@ pub mod hooks;
 pub mod http_server;
 #[cfg(feature = "i18n")]
 pub mod i18n;
+#[cfg(feature = "idempotency")]
 pub mod idempotency;
+/// Stand-ins for the idempotency hooks when `idempotency` is off.
+///
+/// Macro-generated handler code and the session layer name these paths. With
+/// no layer there is nothing to replay, so each one does nothing.
+#[cfg(not(feature = "idempotency"))]
+#[doc(hidden)]
+pub mod idempotency {
+    use axum::body::Body;
+    use axum::http::Response;
+    use std::{future::Future, pin::Pin};
+
+    /// Never resolves: no deferred commit exists without the layer.
+    type Never<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    /// No replay exists without the layer. Nothing builds one.
+    #[derive(Clone)]
+    pub struct IdempotencyReplayResponse;
+
+    /// A route layer that passes every request through.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct IdempotencyReplayLayer;
+
+    impl<S> tower::Layer<S> for IdempotencyReplayLayer {
+        type Service = S;
+
+        fn layer(&self, inner: S) -> S {
+            inner
+        }
+    }
+
+    #[must_use]
+    pub fn __replay_response(
+        _: &Option<axum::extract::Extension<IdempotencyReplayResponse>>,
+    ) -> Option<Response<Body>> {
+        None
+    }
+
+    #[must_use]
+    pub fn __replay_finalized_session_response(
+        _: &Option<axum::extract::Extension<IdempotencyReplayResponse>>,
+    ) -> Option<Response<Body>> {
+        None
+    }
+
+    pub async fn __replay_finalized_session_response_for_anonymous(
+        _: &crate::session::Session,
+        _: &str,
+        _: &Option<axum::extract::Extension<IdempotencyReplayResponse>>,
+    ) -> Option<Response<Body>> {
+        None
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct IdempotencySessionScope;
+
+    impl IdempotencySessionScope {
+        pub(crate) fn new(_: Option<String>, _: Option<String>) -> Self {
+            Self
+        }
+    }
+
+    pub(crate) fn persistence_failed_response() -> Response<Body> {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = axum::http::StatusCode::SERVICE_UNAVAILABLE;
+        response
+    }
+
+    pub(crate) fn finalize_deferred_session_commit(_: &mut Response<Body>) -> Option<Never<'_>> {
+        None
+    }
+
+    pub(crate) fn add_deferred_session_replay_key(
+        _: &Response<Body>,
+        _: Option<&str>,
+        _: bool,
+        _: Option<&str>,
+    ) {
+    }
+
+    pub(crate) fn reserve_deferred_session_replay_key(
+        _: &Response<Body>,
+        _: Option<&str>,
+        _: bool,
+        _: Option<&str>,
+    ) -> Option<Never<'static>> {
+        None
+    }
+
+    pub(crate) fn keep_deferred_session_commit_locked(_: &mut Response<Body>) {}
+}
 pub mod range;
 // NOTE: no outer `///` doc here. rustdoc MERGES an outer doc on a `pub mod`
 // declaration with the module's own `//!` header and resolves the combined
@@ -404,7 +506,16 @@ pub mod route_listing;
 /// Documented from inside the module: the `SIGUSR2` handoff protocol, the
 /// designated live-state block, and the compile-checked
 /// [`state_migration!`](crate::state_migration) between shapes.
+#[cfg(feature = "upgrade")]
 pub mod upgrade;
+/// Stand-ins for the in-place upgrade hooks when `upgrade` is off.
+#[cfg(not(feature = "upgrade"))]
+pub(crate) mod upgrade {
+    /// No upgrade can hand over a socket, so no process is a successor.
+    pub const fn handoff_requested() -> bool {
+        false
+    }
+}
 
 /// Inbound (server-side) TLS support (issues #1603 and #1640).
 ///
@@ -469,6 +580,7 @@ pub mod retention;
 // merge into the module's own `//!` header and make its unqualified
 // intra-doc links resolve in `lib.rs`'s scope instead of the module's,
 // breaking `scripts/check-docs.sh`.
+#[cfg(feature = "data-retention")]
 pub mod data_retention;
 
 /// Read-your-own-writes routing support.
@@ -498,17 +610,20 @@ pub mod sync;
 // `MoneyError` are deliberately not re-exported at the crate root — `Money` is
 // too plausible an application type name to take — so every one of those links
 // would break. Same reason as `data_retention` above.
+#[cfg(feature = "money")]
 pub mod money;
 
 /// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
 ///
 /// See [`ledger`] module documentation for the full API (issue #1699). This
 /// records the history of a row. For money, see [`money`].
+#[cfg(feature = "ledger")]
 pub mod ledger;
 // The data types a caller handles. The two *evidence* enums the verification
 // entry point takes — `LedgerLiveState` and `LedgerHighWaterState` — are
 // deliberately not re-exported: they are arguments to one `ledger::` function,
 // and a caller reaching for them is already inside that module.
+#[cfg(feature = "ledger")]
 pub use ledger::{
     LedgerAsOf, LedgerBreak, LedgerBreakReport, LedgerDiff, LedgerError, LedgerHead,
     LedgerHighWater, LedgerPin, LedgerRevision, LedgerVerification, LedgeredRecord,
@@ -517,7 +632,9 @@ pub use ledger::{
 /// Automatic record version history for `#[repository]` writes.
 ///
 /// See [`version_history`] module documentation for the full API.
+#[cfg(feature = "version-history")]
 pub mod version_history;
+#[cfg(feature = "version-history")]
 pub use version_history::{
     ColumnChange, VersionEntry, VersionFilter, VersionOp, VersionPage, VersionedRecord,
     compute_delete_changes, compute_delete_changes_owned, compute_diff, compute_diff_owned,
@@ -746,20 +863,25 @@ pub mod time_zone;
 pub mod user_agent;
 
 pub mod events;
+#[cfg(feature = "experiments")]
 pub mod experiments;
+#[cfg(feature = "feature-flags")]
 pub mod feature_flags;
 pub mod form;
+#[cfg(feature = "gdpr")]
 pub mod gdpr;
 // A plain comment, not a doc comment, for the same reason `classify` carries
 // one: an outer `///` here is merged with the module's `//!` docs and the whole
 // block then resolves its intra-doc links in *this* scope. The module
 // documents itself.
+#[cfg(feature = "graph")]
 pub mod graph;
 pub mod job;
 pub mod job_tracking;
 /// Safe, method-aware link helpers: [`links::link_to`] anchors and
 /// [`links::button_to`] CSRF-protected action buttons.
 pub mod links;
+#[cfg(feature = "nested-form")]
 pub mod nested_form;
 pub mod payload_version;
 #[cfg(feature = "repl")]
@@ -767,6 +889,8 @@ pub mod repl;
 pub mod runtime_config;
 #[cfg(feature = "seed")]
 pub mod seed;
+pub(crate) mod ppm;
+#[cfg(feature = "slo")]
 pub mod slo;
 
 // ── #1343 AC4: fake-seeder registration forwarding ──────────────────────────
@@ -967,6 +1091,7 @@ pub mod widgets;
 ///
 /// See [`wizard`] for the full API including [`wizard::WizardContext`] and
 /// [`wizard::wizard_progress`].
+#[cfg(feature = "wizard")]
 pub mod wizard;
 /// Changeset type carrying submitted values + per-field errors.
 pub use form::Changeset;
@@ -974,9 +1099,10 @@ pub use form::Changeset;
 pub use form::ChangesetForm;
 /// Trait implemented for all `validator::Validate` types to produce a [`Changeset`].
 pub use form::IntoChangeset;
-#[cfg(feature = "maud")]
+#[cfg(all(feature = "maud", feature = "nested-form"))]
 pub use nested_form::{InputsForOptions, RowScope, inputs_for, nested_row_fragment};
 /// Nested (`has_many`) form binding: parent + one child collection.
+#[cfg(feature = "nested-form")]
 pub use nested_form::{
     NestedChangeset, NestedChangesetForm, NestedChild, NestedRow, decode_nested_urlencoded,
 };

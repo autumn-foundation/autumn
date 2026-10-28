@@ -1433,6 +1433,7 @@ pub struct AutumnConfig {
     /// Keep this field above `database`, for the same reason as `deploy`:
     /// strict validation then checks the keys in each table.
     #[serde(default)]
+    #[cfg(feature = "slo")]
     pub slo: Vec<crate::slo::SloConfig>,
 
     /// Deterministic replay capsule settings (`[failure_capture]` section,
@@ -1776,6 +1777,7 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub cost: CostConfig,
 
+    #[cfg(feature = "alerts")]
     /// Operator alerts settings (`[alerts]` section in `autumn.toml`).
     ///
     /// Configure an operator email and/or a webhook URL to receive alerts for
@@ -3999,8 +4001,11 @@ const fn default_idempotency_ttl_secs() -> u64 {
     86_400
 }
 
+/// Seconds an idempotency lock lives before a retry may take it.
+pub(crate) const DEFAULT_IDEMPOTENCY_IN_FLIGHT_TTL_SECS: u64 = 60;
+
 const fn default_idempotency_in_flight_ttl_secs() -> u64 {
-    crate::idempotency::DEFAULT_IN_FLIGHT_TTL.as_secs()
+    DEFAULT_IDEMPOTENCY_IN_FLIGHT_TTL_SECS
 }
 
 /// `OpenAPI` spec runtime exposure settings.
@@ -6062,6 +6067,7 @@ impl AutumnConfig {
         self.apply_stories_env_overrides_with_env(env);
         self.apply_resilience_env_overrides_with_env(env);
         self.apply_time_zone_env_overrides_with_env(env);
+        #[cfg(feature = "alerts")]
         self.apply_alerts_env_overrides_with_env(env);
         self.apply_tenancy_env_overrides_with_env(env);
         self.apply_cluster_env_overrides_with_env(env);
@@ -6253,6 +6259,7 @@ impl AutumnConfig {
         );
     }
 
+    #[cfg(feature = "alerts")]
     fn apply_alerts_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(env, "AUTUMN_ALERTS__ENABLED", &mut self.alerts.enabled);
         parse_env_option_string(env, "AUTUMN_ALERTS__EMAIL", &mut self.alerts.email);
@@ -9259,6 +9266,7 @@ impl CustomDomainsConfig {
     /// ingress would never resolve, and every subdomain domain would sit at
     /// `pending_dns` with nothing to explain why.
     fn validate_ingress_hostname(&self) -> Result<(), String> {
+        #[cfg(feature = "custom-domains")]
         if let Some(raw) = self
             .ingress_hostname
             .as_ref()
@@ -9390,6 +9398,7 @@ impl CustomDomainsConfig {
     /// A hostname or address that does not parse is dropped here;
     /// [`validate`](Self::validate) has already refused the configuration, so
     /// the app never reaches this with a bad value.
+    #[cfg(feature = "custom-domains")]
     #[must_use]
     pub fn ingress(&self) -> crate::custom_domain::ExpectedIngress {
         crate::custom_domain::ExpectedIngress {

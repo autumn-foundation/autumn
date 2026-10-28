@@ -1273,6 +1273,7 @@ impl TestApp {
         self
     }
 
+    #[cfg(feature = "upgrade")]
     /// Install a designated live-state block, so handlers that read it through
     /// [`AppState::live_state`](crate::AppState::live_state) can be tested.
     ///
@@ -1299,6 +1300,7 @@ impl TestApp {
         self
     }
 
+    #[cfg(feature = "feature-flags")]
     /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend so
     /// the [`Flags`](crate::feature_flags::Flags) extractor works in test handlers.
     ///
@@ -1313,6 +1315,7 @@ impl TestApp {
         self.with_flag_service(service)
     }
 
+    #[cfg(feature = "feature-flags")]
     /// Mirrors [`crate::app::AppBuilder::with_flag_service`]. The build
     /// preloads the store before the first request.
     #[must_use]

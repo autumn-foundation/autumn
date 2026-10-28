@@ -82,6 +82,57 @@ Repeat the block below for each breaking change. Keep changes grouped by
 area (routing / config / database / …) so readers can skip to what they
 care about.
 
+### Features: 16 modules are now optional
+
+**Why:** These modules made `autumn-web` slower to build for apps that do not
+use them (issue #2795, ADR 0027). Each one now has a feature. All of them are
+in `default`, so a default build is the same as before.
+
+**Who is affected:** An app that sets `default-features = false` and uses one
+of these modules. The compiler reports `unresolved import` or `cannot find
+module`. An app that keeps the default features does nothing.
+
+| Feature | Module or API |
+|---------|---------------|
+| `alerts` | `alerts`, `with_alert_channel`, `[alerts]` |
+| `custom-domains` | `custom_domain`, tenant custom domains |
+| `data-retention` | `data_retention`, `autumn db retention` (needs `gdpr`) |
+| `experiments` | `experiments` (needs `feature-flags`) |
+| `feature-flags` | `feature_flags`, `with_flag_store` |
+| `gdpr` | `gdpr`, data capsules |
+| `graph` | `graph`, `/actuator/graph` |
+| `idempotency` | `idempotency`, `SubmitTokenLayer` |
+| `job-tracking` | the `/_autumn/jobs/{token}` status route |
+| `ledger` | `ledger` (needs `version-history`) |
+| `money` | `money` |
+| `nested-form` | `nested_form` |
+| `slo` | `slo`, `[[slo]]` |
+| `upgrade` | `upgrade`, `with_live_state`, `SIGUSR2` hand-over |
+| `version-history` | `version_history` |
+| `wizard` | `wizard` |
+
+The `db` feature turns on `ledger`, `money`, `data-retention`,
+`idempotency` and `graph`. The `acme` feature turns on `custom-domains`.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y.Z}", default-features = false, features = ["maud"] }
+```
+
+**After:**
+
+```toml
+autumn-web = { version = "{X.Z.0}", default-features = false, features = ["maud", "feature-flags"] }
+```
+
+Without `idempotency`, the one-time submit token does nothing, because it
+stores its tokens in the idempotency store. The `SubmitToken` and
+`SubmitFormField` extractors still compile.
+
+**Automation:** `manual` — the right feature depends on which modules the app
+uses, so no codemod can choose it.
+
 ### {Area}: {Short description}
 
 **Why:** One or two sentences on the motivation.

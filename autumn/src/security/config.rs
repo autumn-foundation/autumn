@@ -929,6 +929,7 @@ impl SubmitTokenConfig {
         self.backend.unwrap_or(idempotency_backend)
     }
 
+    #[cfg(feature = "idempotency")]
     /// Decide the production safety action for the resolved consumed-token
     /// backend.
     ///
@@ -974,6 +975,7 @@ impl SubmitTokenConfig {
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Production safety decision for the resolved submit-token consumed-token
 /// backend. Produced by [`SubmitTokenConfig::production_memory_guard`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

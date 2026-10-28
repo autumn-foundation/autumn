@@ -22,6 +22,7 @@ mod api_versioning_openapi;
 mod api_versioning_unit;
 mod app_builder;
 mod app_metrics_facade;
+mod compile_gate_features;
 #[cfg(feature = "db")]
 mod auth_lockout_race;
 mod authorization_integration;

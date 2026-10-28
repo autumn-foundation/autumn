@@ -930,6 +930,7 @@ pub(crate) fn append_framework_routes_with_env(
     // `GET /_autumn/jobs/{token}` when `jobs.tracking.route_enabled` (default
     // true), gated identically to the router mount. List it so the manifest
     // reflects the mounted route.
+    #[cfg(feature = "job-tracking")]
     if config.jobs.tracking.route_enabled {
         infos.push(RouteInfo::framework_get(
             crate::job_tracking::JOB_STATUS_ROUTE_PATH.to_owned(),

@@ -456,6 +456,7 @@ pub(crate) async fn nul_field_message<S: Send + Sync>(
 /// extensions, is covered for the common case.
 const PLUMBING_FIELDS: &[&str] = &["_method", "_csrf", "_submit_token"];
 
+#[cfg_attr(not(feature = "nested-form"), allow(dead_code))]
 /// Whether `name` is one of the default [`PLUMBING_FIELDS`].
 pub(crate) fn is_plumbing_field(name: &str) -> bool {
     PLUMBING_FIELDS.contains(&name)
@@ -1260,6 +1261,7 @@ impl FormDecodeError {
         }
     }
 
+    #[cfg_attr(not(feature = "nested-form"), allow(dead_code))]
     /// The `serde_path_to_error` error of an invalid body. `None` for a
     /// repeated field.
     pub(crate) const fn invalid_error(
@@ -1984,11 +1986,13 @@ impl<'a> FieldOptions<'a> {
         self.with_extra("hx-", name, value.into())
     }
 
+    #[cfg_attr(not(feature = "nested-form"), allow(dead_code))]
     /// Whether [`required`](Self::required) is set.
     pub(crate) const fn is_required(&self) -> bool {
         self.required
     }
 
+    #[cfg_attr(not(feature = "nested-form"), allow(dead_code))]
     /// Clear [`required`](Self::required).
     pub(crate) const fn optional(mut self) -> Self {
         self.required = false;

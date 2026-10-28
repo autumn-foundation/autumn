@@ -38,6 +38,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
+#[cfg(feature = "job-tracking")]
 use axum::response::IntoResponse as _;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -82,6 +83,7 @@ impl TrackedJobOwner {
         Self::Session(session.id().await)
     }
 
+    #[cfg_attr(not(feature = "job-tracking"), allow(dead_code))]
     /// Whether a request authenticated as `session` may poll a record bound
     /// to this owner.
     async fn authorizes(&self, session: &crate::session::Session, state: &AppState) -> bool {
@@ -1361,10 +1363,12 @@ pub async fn enqueue_tracked_for(
 
 // ── Status route ───────────────────────────────────────────────────────────────
 
+#[cfg(feature = "job-tracking")]
 /// The built-in status route's axum path pattern (mounted at
 /// `mount_framework_routes` time when `jobs.tracking.route_enabled`).
 pub(crate) const JOB_STATUS_ROUTE_PATH: &str = "/_autumn/jobs/{token}";
 
+#[cfg(feature = "job-tracking")]
 /// JSON representation of a tracked job's status, returned by the built-in
 /// status route to API clients (and reused as the data behind the htmx
 /// fragment for browser clients).
@@ -1377,6 +1381,7 @@ struct JobStatusDto {
     error: Option<String>,
 }
 
+#[cfg(feature = "job-tracking")]
 impl From<&TrackedJobRecord> for JobStatusDto {
     fn from(record: &TrackedJobRecord) -> Self {
         Self {
@@ -1389,6 +1394,7 @@ impl From<&TrackedJobRecord> for JobStatusDto {
     }
 }
 
+#[cfg(feature = "job-tracking")]
 /// Router for the framework's built-in tracked-job status endpoint.
 ///
 /// Mounted automatically unless `jobs.tracking.route_enabled = false`.
@@ -1399,6 +1405,7 @@ pub(crate) fn status_router() -> axum::Router<AppState> {
     )
 }
 
+#[cfg(feature = "job-tracking")]
 /// `GET /_autumn/jobs/{token}`: resolve the tracked-job record for `token`
 /// and return it as JSON for API clients, or an htmx-pollable HTML fragment
 /// for browsers (content-negotiated). Unknown, expired, and unauthorized
@@ -1428,6 +1435,7 @@ async fn job_status_handler(
     Ok(response)
 }
 
+#[cfg(feature = "job-tracking")]
 /// Whether the request prefers an htmx-pollable HTML fragment over JSON:
 /// true for an htmx request (`HX-Request: true`) or an `Accept` header that
 /// explicitly prefers `text/html` over JSON, per
@@ -1461,6 +1469,7 @@ fn wants_html_response(headers: &axum::http::HeaderMap) -> bool {
         && crate::middleware::error_page_filter::accept_prefers_html(headers)
 }
 
+#[cfg(feature = "job-tracking")]
 #[cfg(feature = "maud")]
 fn render_status_response(
     record: &TrackedJobRecord,
@@ -1474,6 +1483,7 @@ fn render_status_response(
     }
 }
 
+#[cfg(feature = "job-tracking")]
 #[cfg(not(feature = "maud"))]
 fn render_status_response(
     record: &TrackedJobRecord,
@@ -1483,6 +1493,7 @@ fn render_status_response(
     axum::Json(JobStatusDto::from(record)).into_response()
 }
 
+#[cfg(feature = "job-tracking")]
 /// Render the htmx-pollable status fragment.
 ///
 /// While pending/running, the wrapper `div` carries

@@ -39,11 +39,13 @@ impl axum::extract::FromRequestParts<crate::AppState> for Tenant {
             .ok_or_else(|| {
                 crate::AutumnError::service_unavailable_msg("Config is not available")
             })?;
+        #[cfg(feature = "custom-domains")]
         let domains =
             state.extension::<std::sync::Arc<crate::custom_domain::CustomDomainRegistry>>();
-        let tenant_id = extract_tenant_from_parts_with_domains(
+        let tenant_id = extract_tenant_impl(
             parts,
             &config,
+            #[cfg(feature = "custom-domains")]
             domains.as_deref().map(AsRef::as_ref),
         )
         .await?;
@@ -90,7 +92,13 @@ pub async fn extract_tenant_from_parts(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
 ) -> Result<String, crate::AutumnError> {
-    extract_tenant_from_parts_with_domains(parts, config, None).await
+    extract_tenant_impl(
+        parts,
+        config,
+        #[cfg(feature = "custom-domains")]
+        None,
+    )
+    .await
 }
 
 /// [`extract_tenant_from_parts`], plus the custom-domain registry (#1635).
@@ -113,10 +121,19 @@ pub async fn extract_tenant_from_parts(
 ///
 /// Returns the same rejection as [`extract_tenant_from_parts`] when the
 /// configured source cannot resolve a tenant.
+#[cfg(feature = "custom-domains")]
 pub async fn extract_tenant_from_parts_with_domains(
     parts: &mut axum::http::request::Parts,
     config: &crate::config::AutumnConfig,
     domains: Option<&crate::custom_domain::CustomDomainRegistry>,
+) -> Result<String, crate::AutumnError> {
+    extract_tenant_impl(parts, config, domains).await
+}
+
+async fn extract_tenant_impl(
+    parts: &mut axum::http::request::Parts,
+    config: &crate::config::AutumnConfig,
+    #[cfg(feature = "custom-domains")] domains: Option<&crate::custom_domain::CustomDomainRegistry>,
 ) -> Result<String, crate::AutumnError> {
     let replayed = replayed_tenant();
     match &replayed {
@@ -138,6 +155,7 @@ pub async fn extract_tenant_from_parts_with_domains(
     // credential the client cannot forge, and letting a connected `Host`
     // outrank it would let any authenticated user reach another tenant's data
     // by setting one header.
+    #[cfg(feature = "custom-domains")]
     if config.tenancy.enabled
         && config.tenancy.source == "subdomain"
         && let Some(registry) = domains
@@ -704,9 +722,16 @@ pub async fn tenancy_middleware(
         return next.run(Request::from_parts(parts, body)).await;
     }
 
+    #[cfg(feature = "custom-domains")]
     let domains = crate::custom_domain::CustomDomainRegistry::from_state(&state);
     let tenant_id =
-        match extract_tenant_from_parts_with_domains(&mut parts, &config, domains.as_deref()).await
+        match extract_tenant_impl(
+            &mut parts,
+            &config,
+            #[cfg(feature = "custom-domains")]
+            domains.as_deref(),
+        )
+        .await
         {
             Ok(t) => t,
             Err(e) => {

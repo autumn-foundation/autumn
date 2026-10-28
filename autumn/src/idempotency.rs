@@ -56,7 +56,8 @@ const DEFAULT_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// Default in-flight lock TTL. It applies only after a crash, a cancelled
 /// request, or a failed record write. It is separate from the response TTL.
-pub const DEFAULT_IN_FLIGHT_TTL: Duration = Duration::from_secs(60);
+pub const DEFAULT_IN_FLIGHT_TTL: Duration =
+    Duration::from_secs(crate::config::DEFAULT_IDEMPOTENCY_IN_FLIGHT_TTL_SECS);
 
 const fn is_mutating_method(method: &Method) -> bool {
     matches!(

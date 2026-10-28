@@ -414,6 +414,7 @@ pub trait ProvideActuatorState {
         None
     }
 
+    #[cfg(feature = "graph")]
     /// Returns the serialized architecture graph served at `/actuator/graph`.
     ///
     /// The default returns `None`, and the endpoint answers `503`.
@@ -434,6 +435,7 @@ pub trait ProvideActuatorState {
         None
     }
 
+    #[cfg(feature = "gdpr")]
     /// Returns the data-capsule service of `{prefix}/capsules/*` (issue #1811).
     ///
     /// The default gives an error, so the endpoints answer `501`.
@@ -4802,6 +4804,7 @@ fn derivation_report(
         .collect()
 }
 
+#[cfg(feature = "graph")]
 /// `GET <actuator-prefix>/graph` -- the application's architecture graph
 /// (issue #1747).
 ///
@@ -4826,6 +4829,7 @@ pub(crate) async fn graph_endpoint<S: ProvideActuatorState + Send + Sync + 'stat
     graph_response(state.architecture_graph_json())
 }
 
+#[cfg(feature = "graph")]
 /// Render the `/actuator/graph` response for a given installed graph.
 ///
 /// This function is separate from the handler. Tests use it to examine the
@@ -4901,18 +4905,21 @@ pub(crate) async fn shadow_endpoint<S: ProvideActuatorState + Send + Sync + 'sta
 
 // ── Data capsules (issue #1811) ─────────────────────────────────────────────
 
+#[cfg(feature = "gdpr")]
 /// Request body for `POST <actuator-prefix>/capsules/export`.
 #[derive(Deserialize)]
 pub(crate) struct CapsuleExportRequest {
     subject: String,
 }
 
+#[cfg(feature = "gdpr")]
 /// Request body for `POST <actuator-prefix>/capsules/{import,verify}`.
 #[derive(Deserialize)]
 pub(crate) struct CapsuleNameRequest {
     capsule: String,
 }
 
+#[cfg(feature = "gdpr")]
 fn capsule_error(error: &crate::gdpr::portability::DataCapsuleError) -> axum::response::Response {
     use crate::gdpr::portability::DataCapsuleError as E;
     let status = match error {
@@ -4933,6 +4940,7 @@ fn capsule_error(error: &crate::gdpr::portability::DataCapsuleError) -> axum::re
         .into_response()
 }
 
+#[cfg(feature = "gdpr")]
 /// The service and the path of an existing capsule, or the error response.
 #[allow(
     clippy::result_large_err,
@@ -4958,6 +4966,7 @@ fn existing_capsule<S: ProvideActuatorState>(
     Ok((service, path))
 }
 
+#[cfg(feature = "gdpr")]
 /// `POST <actuator-prefix>/capsules/export` -- write a capsule for a subject.
 pub(crate) async fn capsules_export_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -4982,6 +4991,7 @@ pub(crate) async fn capsules_export_endpoint<S: ProvideActuatorState + Send + Sy
     }
 }
 
+#[cfg(feature = "gdpr")]
 /// `POST <actuator-prefix>/capsules/verify` -- check a capsule signature and hashes.
 pub(crate) async fn capsules_verify_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -5001,6 +5011,7 @@ pub(crate) async fn capsules_verify_endpoint<S: ProvideActuatorState + Send + Sy
     }
 }
 
+#[cfg(feature = "gdpr")]
 /// `POST <actuator-prefix>/capsules/import` -- verify, then import a capsule.
 pub(crate) async fn capsules_import_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -5356,6 +5367,7 @@ pub(crate) fn actuator_route_path(prefix: &str, suffix: &str) -> String {
     }
 }
 
+#[cfg(feature = "gdpr")]
 /// The data-capsule routes (issue #1811). All are `POST` and sensitive.
 const CAPSULE_ROUTES: [&str; 3] = ["/capsules/export", "/capsules/import", "/capsules/verify"];
 
@@ -5388,9 +5400,11 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/shadow"));
         paths.push(actuator_route_path(prefix, "/cost"));
+        #[cfg(feature = "graph")]
         paths.push(actuator_route_path(prefix, "/graph"));
         // POST-only, like `/webhooks/replay` below: listed so the startup
         // barrier lets them through.
+        #[cfg(feature = "gdpr")]
         for suffix in CAPSULE_ROUTES {
             paths.push(actuator_route_path(prefix, suffix));
         }
@@ -5442,6 +5456,7 @@ pub(crate) fn actuator_mutating_routes(
 
     if sensitive {
         routes.push(("PUT", actuator_route_path(prefix, "/loggers/{name}")));
+        #[cfg(feature = "gdpr")]
         for suffix in CAPSULE_ROUTES {
             routes.push(("POST", actuator_route_path(prefix, suffix)));
         }
@@ -5553,23 +5568,30 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/cost"),
                 axum::routing::get(cost_endpoint::<S>),
-            )
-            .route(
+            );
+        #[cfg(feature = "graph")]
+        {
+            router = router.route(
                 &actuator_route_path(prefix, "/graph"),
                 axum::routing::get(graph_endpoint::<S>),
-            )
-            .route(
-                &actuator_route_path(prefix, "/capsules/export"),
-                axum::routing::post(capsules_export_endpoint::<S>),
-            )
-            .route(
-                &actuator_route_path(prefix, "/capsules/import"),
-                axum::routing::post(capsules_import_endpoint::<S>),
-            )
-            .route(
-                &actuator_route_path(prefix, "/capsules/verify"),
-                axum::routing::post(capsules_verify_endpoint::<S>),
             );
+        }
+        #[cfg(feature = "gdpr")]
+        {
+            router = router
+                .route(
+                    &actuator_route_path(prefix, "/capsules/export"),
+                    axum::routing::post(capsules_export_endpoint::<S>),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/capsules/import"),
+                    axum::routing::post(capsules_import_endpoint::<S>),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/capsules/verify"),
+                    axum::routing::post(capsules_verify_endpoint::<S>),
+                );
+        }
         #[cfg(feature = "db")]
         {
             router = router.route(

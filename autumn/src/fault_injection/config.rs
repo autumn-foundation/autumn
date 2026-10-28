@@ -241,7 +241,7 @@ impl FaultInjectionConfig {
 
 impl FaultStopConfig {
     fn validate(&self) -> Result<(), String> {
-        crate::slo::objective_to_ppm(self.objective)
+        crate::ppm::objective_to_ppm(self.objective)
             .map_err(|error| format!("fault_injection.stop.{error}"))?;
         if !self.max_burn_rate.is_finite()
             || self.max_burn_rate <= 0.0
@@ -261,7 +261,7 @@ impl FaultStopConfig {
                 self.min_requests
             ));
         }
-        if self.max_error_ppm() >= crate::slo::PPM {
+        if self.max_error_ppm() >= crate::ppm::PPM {
             return Err(
                 "fault_injection.stop: objective and max_burn_rate allow 100% errors, so the \
                  stop condition can never trip; lower max_burn_rate"
@@ -274,11 +274,11 @@ impl FaultStopConfig {
     /// The largest error ratio, in ppm, that does not stop the faults:
     /// `budget * max_burn_rate`, to the nearest ppm, at most 100%.
     pub(crate) fn max_error_ppm(&self) -> u32 {
-        let budget = crate::slo::objective_to_ppm(self.objective)
-            .map_or(0, |objective| crate::slo::PPM.saturating_sub(objective));
+        let budget = crate::ppm::objective_to_ppm(self.objective)
+            .map_or(0, |objective| crate::ppm::PPM.saturating_sub(objective));
         let limit = (f64::from(budget) * self.max_burn_rate)
             .round()
-            .clamp(0.0, f64::from(crate::slo::PPM));
+            .clamp(0.0, f64::from(crate::ppm::PPM));
         // The clamp keeps the value in [0, PPM], so the cast cannot truncate.
         #[allow(
             clippy::cast_possible_truncation,
@@ -326,7 +326,7 @@ impl FaultRule {
             clippy::cast_sign_loss,
             reason = "rate is in [0, 1]"
         )]
-        let ppm = (self.rate.clamp(0.0, 1.0) * f64::from(crate::slo::PPM)).round() as u32;
+        let ppm = (self.rate.clamp(0.0, 1.0) * f64::from(crate::ppm::PPM)).round() as u32;
         ppm
     }
 }

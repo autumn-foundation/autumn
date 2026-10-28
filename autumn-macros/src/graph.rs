@@ -952,6 +952,9 @@ pub fn emit_route_descriptor(
     path: &TokenStream,
     static_route: bool,
 ) -> TokenStream {
+    if !cfg!(feature = "graph") {
+        return TokenStream::new();
+    }
     let signature = emit_symbol_slice(&signature_symbols(&input_fn.sig));
     let block = &input_fn.block;
     let body_tokens = quote! { #block };
@@ -986,6 +989,9 @@ pub fn emit_job_descriptor(
     kind: &str,
     schedule: &TokenStream,
 ) -> TokenStream {
+    if !cfg!(feature = "graph") {
+        return TokenStream::new();
+    }
     let signature = emit_symbol_slice(&signature_symbols(&input_fn.sig));
     let block = &input_fn.block;
     let body_tokens = quote! { #block };

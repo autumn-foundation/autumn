@@ -13,7 +13,26 @@ categories = ["web-programming", "web-programming::http-server"]
 autotests = false
 
 [features]
-default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash"]
+default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash",
+    # Compile gates (#2795, ADR 0027). Default-on; the no-DB daemon starter drops them.
+    "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph"]
+# Compile gates (#2795, ADR 0027). Each gates one module. See the default list.
+ledger = ["version-history"]
+experiments = ["feature-flags"]
+feature-flags = []
+idempotency = []
+custom-domains = ["dep:psl"]
+job-tracking = []
+upgrade = []
+nested-form = []
+alerts = []
+data-retention = ["gdpr"]
+version-history = []
+wizard = []
+money = []
+gdpr = []
+slo = []
+graph = ["autumn-macros/graph"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
 # Conflict-free collaborative editing (issue #1806). Adds
@@ -88,6 +107,12 @@ db = [
     "dep:scoped-futures",
     "diesel/chrono",
     "diesel/serde_json",
+    # The repository layer records history, money and retention itself.
+    "ledger",
+    "money",
+    "data-retention",
+    "idempotency",
+    "graph",
 ]
 # The Postgres backend (#2605): the Postgres client, its rustls TLS connector
 # and diesel's Postgres backend. On by default. A SQLite app turns default
@@ -271,7 +296,7 @@ tls = ["dep:tokio-rustls", "dep:x509-parser", "dep:rustls", "dep:rustls-pki-type
 # ACME order state machine) and `rcgen` (account/cert key + CSR + self-signed
 # placeholder), both pinned to `ring` so no second crypto backend enters the
 # graph.
-acme = ["tls", "dep:instant-acme", "dep:rcgen", "dep:socket2", "dep:reqwest"]
+acme = ["tls", "custom-domains", "dep:instant-acme", "dep:rcgen", "dep:socket2", "dep:reqwest"]
 # Real-ACME end-to-end coverage against a Pebble container (issue #1863).
 # Turns on `testcontainers`' `host-port-exposure` tunnel — the SSH sidecar
 # that lets a container reach a `127.0.0.1`-bound listener on this host —
@@ -504,7 +529,7 @@ getrandom = "0.4"
 hex = "0.4"
 # Public Suffix List for custom-domain apex detection (issue #2643, ADR 0026).
 # The crate contains the list as code. It shares `psl-types` with `publicsuffix`.
-psl = "2.1"
+psl = { version = "2.1", optional = true }
 include_dir = { version = "0.7", optional = true }
 csv = { workspace = true, optional = true }
 # Pure-Rust PDF writer for `autumn_web::pdf` (issue #1317). `default-features

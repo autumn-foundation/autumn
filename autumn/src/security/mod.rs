@@ -176,7 +176,9 @@ pub use rate_limit::{
     RateLimitEnvelopeCounted, RateLimitExempt, RateLimitLayer, RateLimitOverride,
     RateLimitPrincipal, ThrottleSpec,
 };
-pub use submit_token::{SubmitFormField, SubmitToken, SubmitTokenLayer};
+pub use submit_token::{SubmitFormField, SubmitToken};
+#[cfg(feature = "idempotency")]
+pub use submit_token::SubmitTokenLayer;
 pub use trusted_proxies::{ProxyResolver, ResolvedClientIdentity, TrustedProxiesLayer};
 
 /// Whether `req` is an HTTP/2 `WebSocket` upgrade (RFC 8441): a `CONNECT`
