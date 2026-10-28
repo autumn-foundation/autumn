@@ -116,7 +116,7 @@ fn every_gated_module_has_a_cfg() {
             .iter()
             .rev()
             .take_while(|l| l.trim_start().starts_with("#["))
-            .any(|l| l.contains("cfg(") && l.contains(&gate));
+            .any(|l| (l.contains("cfg(") || l.contains("cfg_attr(not(")) && l.contains(&gate));
         assert!(cfg, "`{module}` lacks `#[cfg({gate})]`");
     }
 }

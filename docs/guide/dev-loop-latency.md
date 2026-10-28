@@ -138,7 +138,11 @@ Issue #2309 fixed two problems:
    Dropping `http-client` also drops `reqwest` and its TLS stack from the
    build.
 
-Both fixes are real and measured. Neither brings cold start under the
+Issue #2795 then gated 16 more modules of `autumn-web` behind default-on
+features (ADR 0027). The daemon starter turns them off, and `psl` leaves its
+build. A default build does not change.
+
+Both #2309 fixes are real and measured. Neither brings cold start under the
 original 60s/90s target. The reason: `autumn-web`'s own hand-written source
 is now the largest single compile unit, at roughly 43-55s, and no feature
 gates it (unlike the generated macro code above). The budget above (p95 130s

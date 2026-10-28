@@ -1436,6 +1436,12 @@ pub struct AutumnConfig {
     #[cfg(feature = "slo")]
     pub slo: Vec<crate::slo::SloConfig>,
 
+    /// `[[slo]]` tables, kept so the file stays valid without the `slo`
+    /// feature. Nothing reads them.
+    #[serde(default)]
+    #[cfg(not(feature = "slo"))]
+    pub slo: Vec<toml::Value>,
+
     /// Deterministic replay capsule settings (`[failure_capture]` section,
     /// issue #1598).
     ///
@@ -1794,6 +1800,12 @@ pub struct AutumnConfig {
     /// reads/writes still work through `Deref`/`DerefMut`.
     #[serde(default)]
     pub alerts: Box<crate::alerts::AlertConfig>,
+
+    /// The `[alerts]` table, kept so the file stays valid without the
+    /// `alerts` feature. Nothing reads it.
+    #[serde(default)]
+    #[cfg(not(feature = "alerts"))]
+    pub alerts: Option<toml::Value>,
 
     /// Unified data-retention policy for framework-owned data
     /// (`[retention]` section in `autumn.toml`, issue #1605).
@@ -4787,6 +4799,21 @@ const MANUAL_SCHEMA_SECTIONS: &[(&str, &[&str])] = &[
 ];
 
 impl AutumnConfig {
+    /// Log a warning for each section whose feature is off.
+    ///
+    /// The file still parses, but the section does nothing.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
+    pub(crate) fn warn_on_inert_sections(&self) {
+        #[cfg(not(feature = "alerts"))]
+        if self.alerts.is_some() {
+            tracing::warn!("[alerts] is set, but this build lacks the `alerts` feature");
+        }
+        #[cfg(not(feature = "slo"))]
+        if !self.slo.is_empty() {
+            tracing::warn!("[[slo]] is set, but this build lacks the `slo` feature");
+        }
+    }
+
     /// Validate the `[push]` block, as `AppBuilder::run` does before binding.
     ///
     /// Factored out of the boot path so the rule it enforces — a VAPID key

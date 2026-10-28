@@ -5,7 +5,7 @@ pub const PPM: u32 = 1_000_000;
 
 /// Convert a percentage to ppm. Reject values outside `(0, 100)` and values
 /// with more than four decimals.
-pub(crate) fn objective_to_ppm(objective: f64) -> Result<u32, String> {
+pub fn objective_to_ppm(objective: f64) -> Result<u32, String> {
     if !objective.is_finite() || objective <= 0.0 || objective >= 100.0 {
         return Err(format!(
             "objective = {objective} must be greater than 0 and less than 100"

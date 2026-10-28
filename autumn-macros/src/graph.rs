@@ -1031,7 +1031,7 @@ pub fn emit_job_descriptor(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "graph"))]
 mod tests {
     use super::*;
     use quote::quote;

@@ -89,17 +89,8 @@ pub mod aggregate;
 /// indicators, 5xx-rate spikes, scheduled-task failures) to the app's
 /// configured mailer and signed outbound webhook behind `[alerts]` config —
 /// with zero application code. See [`mod@alerts`].
-#[cfg(feature = "alerts")]
+#[cfg_attr(not(feature = "alerts"), path = "alerts_off.rs")]
 pub mod alerts;
-/// No-op alert hooks for builds without the `alerts` feature.
-#[cfg(not(feature = "alerts"))]
-pub(crate) mod alerts {
-    use crate::AppState;
-
-    pub fn notify_dead_lettered_job(_: &AppState, _: &str, _: &str, _: &str) {}
-    pub fn notify_scheduled_task_failure(_: &AppState, _: &str, _: &str) {}
-    pub fn notify_scheduled_task_recovered(_: &AppState, _: &str) {}
-}
 pub mod app;
 pub mod assets;
 pub mod audit;
@@ -245,98 +236,8 @@ pub mod hooks;
 pub mod http_server;
 #[cfg(feature = "i18n")]
 pub mod i18n;
-#[cfg(feature = "idempotency")]
+#[cfg_attr(not(feature = "idempotency"), path = "idempotency_off.rs")]
 pub mod idempotency;
-/// Stand-ins for the idempotency hooks when `idempotency` is off.
-///
-/// Macro-generated handler code and the session layer name these paths. With
-/// no layer there is nothing to replay, so each one does nothing.
-#[cfg(not(feature = "idempotency"))]
-#[doc(hidden)]
-pub mod idempotency {
-    use axum::body::Body;
-    use axum::http::Response;
-    use std::{future::Future, pin::Pin};
-
-    /// Never resolves: no deferred commit exists without the layer.
-    type Never<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
-
-    /// No replay exists without the layer. Nothing builds one.
-    #[derive(Clone)]
-    pub struct IdempotencyReplayResponse;
-
-    /// A route layer that passes every request through.
-    #[derive(Clone, Copy, Debug, Default)]
-    pub struct IdempotencyReplayLayer;
-
-    impl<S> tower::Layer<S> for IdempotencyReplayLayer {
-        type Service = S;
-
-        fn layer(&self, inner: S) -> S {
-            inner
-        }
-    }
-
-    #[must_use]
-    pub fn __replay_response(
-        _: &Option<axum::extract::Extension<IdempotencyReplayResponse>>,
-    ) -> Option<Response<Body>> {
-        None
-    }
-
-    #[must_use]
-    pub fn __replay_finalized_session_response(
-        _: &Option<axum::extract::Extension<IdempotencyReplayResponse>>,
-    ) -> Option<Response<Body>> {
-        None
-    }
-
-    pub async fn __replay_finalized_session_response_for_anonymous(
-        _: &crate::session::Session,
-        _: &str,
-        _: &Option<axum::extract::Extension<IdempotencyReplayResponse>>,
-    ) -> Option<Response<Body>> {
-        None
-    }
-
-    #[derive(Clone)]
-    pub(crate) struct IdempotencySessionScope;
-
-    impl IdempotencySessionScope {
-        pub(crate) fn new(_: Option<String>, _: Option<String>) -> Self {
-            Self
-        }
-    }
-
-    pub(crate) fn persistence_failed_response() -> Response<Body> {
-        let mut response = Response::new(Body::empty());
-        *response.status_mut() = axum::http::StatusCode::SERVICE_UNAVAILABLE;
-        response
-    }
-
-    pub(crate) fn finalize_deferred_session_commit(_: &mut Response<Body>) -> Option<Never<'_>> {
-        None
-    }
-
-    pub(crate) fn add_deferred_session_replay_key(
-        _: &Response<Body>,
-        _: Option<&str>,
-        _: bool,
-        _: Option<&str>,
-    ) {
-    }
-
-    pub(crate) fn reserve_deferred_session_replay_key(
-        _: &Response<Body>,
-        _: Option<&str>,
-        _: bool,
-        _: Option<&str>,
-    ) -> Option<Never<'static>> {
-        None
-    }
-
-    pub(crate) fn keep_deferred_session_commit_locked(_: &mut Response<Body>) {}
-}
 pub mod range;
 // NOTE: no outer `///` doc here. rustdoc MERGES an outer doc on a `pub mod`
 // declaration with the module's own `//!` header and resolves the combined
@@ -506,16 +407,8 @@ pub mod route_listing;
 /// Documented from inside the module: the `SIGUSR2` handoff protocol, the
 /// designated live-state block, and the compile-checked
 /// [`state_migration!`](crate::state_migration) between shapes.
-#[cfg(feature = "upgrade")]
+#[cfg_attr(not(feature = "upgrade"), path = "upgrade_off.rs")]
 pub mod upgrade;
-/// Stand-ins for the in-place upgrade hooks when `upgrade` is off.
-#[cfg(not(feature = "upgrade"))]
-pub(crate) mod upgrade {
-    /// No upgrade can hand over a socket, so no process is a successor.
-    pub const fn handoff_requested() -> bool {
-        false
-    }
-}
 
 /// Inbound (server-side) TLS support (issues #1603 and #1640).
 ///
@@ -2074,6 +1967,7 @@ pub use autumn_macros::agent_operable;
 ///     html! { h1 { "Beta!" } }
 /// }
 /// ```
+#[cfg(feature = "feature-flags")]
 pub use autumn_macros::feature_flag;
 
 /// Enforce a record-level [`Policy`](crate::authorization::Policy)

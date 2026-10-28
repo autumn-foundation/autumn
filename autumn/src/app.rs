@@ -3902,6 +3902,11 @@ impl AppBuilder {
             self.run_dump_graph_mode().await;
             return;
         }
+        #[cfg(not(feature = "graph"))]
+        if std::env::var("AUTUMN_DUMP_GRAPH").as_deref() == Ok("1") {
+            eprintln!("AUTUMN_DUMP_GRAPH is set, but this build lacks the `graph` feature");
+            std::process::exit(2);
+        }
 
         // ── Jobs manifest dump mode ────────────────────────────────────
         // When AUTUMN_DUMP_JOBS=1, print the effective drained-queue manifest
@@ -3957,6 +3962,13 @@ impl AppBuilder {
             self.run_framework_retention_mode(mode).await;
             return;
         }
+        #[cfg(not(feature = "data-retention"))]
+        if std::env::var("AUTUMN_DB_RETENTION").is_ok_and(|v| !v.trim().is_empty()) {
+            eprintln!(
+                "AUTUMN_DB_RETENTION is set, but this build lacks the `data-retention` feature"
+            );
+            std::process::exit(2);
+        }
 
         // ── Data-capsule mode ───────────────────────────────────────────
         // With AUTUMN_DATA_CAPSULE=export|import|verify, export one subject
@@ -3967,6 +3979,11 @@ impl AppBuilder {
         if let Some(mode) = data_capsule_mode_from_env() {
             self.run_data_capsule_mode(mode).await;
             return;
+        }
+        #[cfg(not(feature = "gdpr"))]
+        if std::env::var("AUTUMN_DATA_CAPSULE").is_ok_and(|v| !v.trim().is_empty()) {
+            eprintln!("AUTUMN_DATA_CAPSULE is set, but this build lacks the `gdpr` feature");
+            std::process::exit(2);
         }
 
         // ── Capsule replay mode ────────────────────────────────────────
@@ -4012,6 +4029,18 @@ impl AppBuilder {
                     None
                 }
             };
+        // Without `upgrade` nothing consumes the signal. Catch and log it, so
+        // a deploy script that sends it does not end the process.
+        #[cfg(all(unix, not(feature = "upgrade")))]
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+        {
+            tokio::spawn(async move {
+                while signal.recv().await.is_some() {
+                    tracing::info!("SIGUSR2 ignored: this build has no `upgrade` feature");
+                }
+            });
+        }
 
         #[cfg_attr(not(feature = "data-retention"), allow(unused_mut))]
         let Self {
@@ -4139,6 +4168,7 @@ impl AppBuilder {
             plugin_config_roots,
         )
         .await;
+        config.warn_on_inert_sections();
 
         // #1605: the unified framework-owned data-retention sweep. Registered
         // here rather than with the `#[repository(..., retention(...))]` policies

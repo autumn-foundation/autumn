@@ -90,7 +90,7 @@ in `default`, so a default build is the same as before.
 
 **Who is affected:** An app that sets `default-features = false` and uses one
 of these modules. The compiler reports `unresolved import` or `cannot find
-module`. An app that keeps the default features does nothing.
+module`. An app that keeps the default features needs no change.
 
 | Feature | Module or API |
 |---------|---------------|
@@ -127,8 +127,12 @@ autumn-web = { version = "{X.Z.0}", default-features = false, features = ["maud"
 ```
 
 Without `idempotency`, the one-time submit token does nothing, because it
-stores its tokens in the idempotency store. The `SubmitToken` and
-`SubmitFormField` extractors still compile.
+stores its tokens in the idempotency store. In production the app logs a
+warning. The `SubmitToken` and `SubmitFormField` extractors still compile.
+
+Without `alerts` or `slo`, the `[alerts]` and `[[slo]]` sections still parse.
+They do nothing, and the app logs a warning. Without `job-tracking`, the
+status route is not mounted. Without `upgrade`, the app ignores `SIGUSR2`.
 
 **Automation:** `manual` — the right feature depends on which modules the app
 uses, so no codemod can choose it.

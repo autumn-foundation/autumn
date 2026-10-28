@@ -210,7 +210,6 @@ impl Session {
     }
 
     #[cfg_attr(not(feature = "idempotency"), allow(dead_code))]
-    #[cfg_attr(not(feature = "idempotency"), allow(dead_code))]
     pub(crate) async fn has_pending_changes(&self) -> bool {
         let inner = self.inner.read().await;
         inner.dirty || inner.destroyed

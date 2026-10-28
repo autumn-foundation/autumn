@@ -650,6 +650,11 @@ features = [
   # SLA obligations (#1826). Zero new dependencies. Without it, the `sla`
   # module and `#[obligation]` are missing from the published docs.
   "sla",
+  # The compile gates (#2795). Default-on, but named here so the published
+  # docs keep every module if docs.rs ever turns default features off.
+  "ledger", "experiments", "feature-flags", "idempotency", "custom-domains",
+  "job-tracking", "upgrade", "nested-form", "alerts", "data-retention",
+  "version-history", "wizard", "money", "gdpr", "slo", "graph",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 

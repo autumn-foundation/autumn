@@ -29,7 +29,7 @@
 # That reasoning is right, and it leaves a hole exactly the shape of its own
 # premise. The symbol gate proves `autumn_web::ws::WebSocket` EXISTS. It cannot
 # ask the only question the reader has, which is whether it exists **in their
-# build** — and `autumn-web`'s default feature set is eight features wide
+# build** — and `autumn-web`'s default feature set is wide
 # (`maud`, `htmx`, `tailwind`, `db`, `cache-moka`, `http-client`, `reporting`,
 # `flash`) out of fifty. `ws`, `mail`, `pdf`, `storage`, `i18n`, `presence`,
 # `markdown`, `mcp`, `seed`, `tls` and the rest are off unless the reader turns
@@ -155,7 +155,7 @@
 # moves with it in the same commit.
 #
 #   - The default closure is computed TRANSITIVELY from `[features]`, because
-#     `default` names eight features and those name more (`db` implies
+#     `default` names many features and those name more (`db` implies
 #     `autumn-macros/db`, `oauth2` implies `http-client`). Taking the literal
 #     `default = [...]` list instead would report `reporting`'s items — pulled
 #     in by nothing else — as needing to be enabled, on every page that shows a

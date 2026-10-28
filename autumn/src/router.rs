@@ -5527,10 +5527,16 @@ type SubmitLayer = tower::layer::util::Identity;
 #[cfg(not(feature = "idempotency"))]
 #[allow(clippy::unnecessary_wraps)]
 fn build_submit_token_layer(
-    _config: &AutumnConfig,
+    config: &AutumnConfig,
     _state: &AppState,
-    _is_production: bool,
+    is_production: bool,
 ) -> Result<Option<SubmitLayer>, RouterBuildError> {
+    if is_production && config.security.submit_token.enabled {
+        tracing::warn!(
+            "[security.submit_token] is enabled, but this build lacks the `idempotency` \
+             feature. Duplicate submits are not blocked"
+        );
+    }
     Ok(None)
 }
 

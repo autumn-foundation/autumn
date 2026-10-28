@@ -9,11 +9,12 @@
 
 - **Cold start**: `autumn new` to first HTTP 200, with a clean build.
 - **IR**: LLVM intermediate representation that rustc makes for a crate.
+- **Daemon starter**: the app that `autumn new --daemon` makes. It has no DB.
 
 ## Context
 
 Issue #2795: the cold-start build is too slow. `autumn-web` is the largest
-compile unit. Earlier work gated `test` and `sim`. That gave no change.
+compile unit. Earlier work gated `test` and `sim`. Build time did not change.
 Line count did not predict cost.
 
 New data (no-DB daemon feature set, self-profile and IR count):
@@ -36,7 +37,7 @@ the flag does nothing; hide the change from the changelog.
 Six hats:
 
 - White (facts): profile and IR numbers above.
-- Red (feeling): maintainers want a visible win. A pre-1.0 break is allowed.
+- Red (feeling): the team wants a clear win. A break before 1.0 is allowed.
 - Black (risk): a module used by `app.rs` or `router.rs` can break a
   build with some flags off. The feature matrix must compile.
 - Yellow (gain): apps that do not use a module do not build it. `psl` leaves
@@ -59,8 +60,8 @@ Rules:
 - Some features need others: `experiments` needs `feature-flags`, `ledger`
   needs `version-history`, `data-retention` needs `gdpr`, and `acme` needs
   `custom-domains`.
-- `db` turns on `ledger`, `money`, `data-retention`, `idempotency` and
-  `graph`. The `#[repository]` macros emit code that names them.
+- The `#[repository]` macros emit code that names `ledger`, `money`,
+  `data-retention`, `idempotency` and `graph`. So `db` turns them on.
 - `psl` is optional and `custom-domains` owns it.
 - `graph` also switches on a feature of `autumn-macros`. With it off, `#[get]`
   and `#[job]` emit no route descriptor.
@@ -79,5 +80,9 @@ Rules:
 - Without `idempotency`, the one-time submit token does nothing. The
   extractors still compile.
 - The feature-combination gate must build each feature alone.
-- Measured effect on `autumn-web` alone (4 vCPU, daemon feature set): see the
-  PR. The IR fell by 14%, but line count did not predict time.
+- The IR of `autumn-web` fell by 14%. Line count did not predict time.
+- Config sections `[alerts]` and `[[slo]]` still parse when their feature is
+  off. They do nothing, and the app logs a warning.
+- A one-shot mode (`AUTUMN_DUMP_GRAPH`, `AUTUMN_DB_RETENTION`,
+  `AUTUMN_DATA_CAPSULE`) exits with code 2 when its feature is off.
+- Without `upgrade`, the app catches `SIGUSR2` and ignores it.
