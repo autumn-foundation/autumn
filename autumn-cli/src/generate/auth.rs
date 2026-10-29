@@ -8770,7 +8770,7 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     div {{
                         label for="totp-code" {{ "Authenticator code" }}
                         input type="text" id="totp-code" name="totp_code" autocomplete="one-time-code"
-                            inputmode="numeric" pattern="[0-9 ]*" required
+                            inputmode="text" pattern="[0-9a-fA-F \\-]*" required
                             aria-describedby="totp-hint";
                         small id="totp-hint" {{ "Enter the 6-digit code or a recovery code. Required if your account uses two-factor authentication." }}
                     }}
@@ -8836,7 +8836,7 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     div {{
                         label for="totp-code" {{ "Authenticator code" }}
                         input type="text" id="totp-code" name="totp_code" autocomplete="one-time-code"
-                            inputmode="numeric" pattern="[0-9 ]*" required
+                            inputmode="text" pattern="[0-9a-fA-F \\-]*" required
                             aria-describedby="totp-hint";
                         small id="totp-hint" {{ "Enter the 6-digit code or a recovery code. Required if your account uses two-factor authentication." }}
                     }}
@@ -11388,27 +11388,23 @@ mod tests {
     fn totp_code_fields_link_a_visible_hint() {
         let routes = render_routes_file("User", "user", "users", &[], true, false);
         let sources = [routes, totp_reauth_field_src()];
-        let mut fields = 0;
+        let (mut fields, mut hints) = (0, 0);
         for src in &sources {
-            for (at, _) in src
-                .match_indices("id=\\\"totp-code\\\"")
-                .chain(src.match_indices("id=\"totp-code\""))
-            {
+            for (at, _) in src.match_indices("input type=\"text\" id=\"totp-code\"") {
                 let stmt = &src[at..at + src[at..].find(';').expect("input ends")];
                 fields += 1;
                 assert!(
-                    stmt.contains("aria-describedby=") && stmt.contains("totp-hint"),
+                    stmt.contains("aria-describedby=\"totp-hint\""),
                     "totp input has no aria-describedby:\n{stmt}"
                 );
-                assert!(
-                    !stmt.contains("6-digit"),
-                    "instruction lives in a placeholder:\n{stmt}"
-                );
+                assert!(!stmt.contains("placeholder="), "placeholder in:\n{stmt}");
             }
-            assert!(src.contains("id=\\\"totp-hint\\\"") || src.contains("id=\"totp-hint\""));
+            hints += src.matches("small id=\"totp-hint\"").count();
+            hints += src.matches("small id=\\\"totp-hint\\\"").count();
             assert!(src.contains("6-digit code or a recovery code"));
         }
-        assert!(fields >= 3, "expected 3 totp inputs, found {fields}");
+        assert!(fields >= 3, "expected 3 or more totp inputs, got {fields}");
+        assert_eq!(hints, fields, "each input needs its own hint");
     }
 
     /// Issue #3106: the session device-label input has a visible `<label>`
@@ -11416,7 +11412,11 @@ mod tests {
     #[test]
     fn device_label_input_has_a_bound_visible_label() {
         let routes = render_routes_file("User", "user", "users", &[], false, false);
-        let at = routes.find("name=\"label\"").expect("device label input");
+        let rows = routes.find("\"/account/sessions/\"").expect("session rows");
+        let at = rows
+            + routes[rows..]
+                .find("name=\"label\"")
+                .expect("device label input");
         let before = &routes[..at];
         let input = &before[before.rfind("input type=\"text\"").expect("input start")..];
         assert!(
