@@ -364,12 +364,15 @@ pub use crate::time::{Clock, MonotonicInstant};
 
 // ── Feature flags ─────────────────────────────────────────────────
 /// The main feature-flag service, typically stored as an `AppState` extension.
+#[cfg(feature = "feature-flags")]
 pub use crate::feature_flags::FeatureFlagService;
 /// Request-scoped feature flag extractor — call `flags.enabled("my_flag")`
 /// in handlers to gate behaviour without a redeploy.
+#[cfg(feature = "feature-flags")]
 pub use crate::feature_flags::Flags;
 /// In-memory flag store — use in tests and `dev` profile; swap for
 /// `autumn_web::feature_flags::pg::PgFlagStore` in production.
+#[cfg(feature = "feature-flags")]
 pub use crate::feature_flags::InMemoryFlagStore;
 
 // ── Internationalization ───────────────────────────────────────

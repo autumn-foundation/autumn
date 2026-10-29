@@ -273,6 +273,7 @@ where
             status = fleet_err.http_status();
         }
 
+        #[cfg(feature = "money")]
         if let Some(money_err) = any_err.downcast_ref::<crate::money::MoneyError>() {
             status = money_err.http_status();
         }
@@ -918,6 +919,7 @@ impl AutumnError {
 
     #[doc(hidden)]
     #[must_use]
+    #[cfg_attr(not(feature = "idempotency"), allow(dead_code))]
     pub(crate) const fn cache_idempotency_response(mut self) -> Self {
         self.cache_idempotency_response = true;
         self
@@ -1599,6 +1601,7 @@ impl IntoResponse for AutumnError {
         let (status, problem_type) = self.rendered_problem();
 
         let details = self.details.clone();
+        #[cfg(feature = "idempotency")]
         let cache_idempotency_response = self.cache_idempotency_response;
 
         // Stash error metadata for exception filters to inspect without
@@ -1634,6 +1637,7 @@ impl IntoResponse for AutumnError {
                 HeaderValue::from_static(r#"{"autumn:conflict":true}"#),
             );
         }
+        #[cfg(feature = "idempotency")]
         if cache_idempotency_response {
             response
                 .extensions_mut()

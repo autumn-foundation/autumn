@@ -271,8 +271,12 @@ pub fn route_macro(
     // route companion does: a route the edge lane compiles out has nothing to
     // say about the native binary's architecture, and the descriptor names
     // `::autumn_web`, which never compiles for that target.
-    let graph_descriptor =
-        crate::graph::emit_route_descriptor(&input_fn, http_method, &quote! { #path }, false);
+    // The cfg rides with the descriptor, so a build without the `graph`
+    // feature (an empty descriptor) leaves no cfg to attach to the next item.
+    let graph_descriptor = gate_graph_descriptor(
+        &native_cfg,
+        crate::graph::emit_route_descriptor(&input_fn, http_method, &quote! { #path }, false),
+    );
 
     // ── Path helper ─────────────────────────────────────────────
     // An `#[edge]` route's helper uses the `autumn_edge` encoders and is not
@@ -338,7 +342,6 @@ pub fn route_macro(
             }
         }
 
-        #native_cfg
         #graph_descriptor
 
         #path_helper
@@ -992,11 +995,26 @@ pub fn should_stringify_primitive_output(output: &ReturnType) -> bool {
     )
 }
 
+/// Put `native_cfg` on `descriptor`, or return nothing when it is empty.
+///
+/// An empty descriptor (the `graph` feature is off) must not leave the cfg
+/// behind. The cfg would attach to the next item in the expansion.
+fn gate_graph_descriptor(
+    native_cfg: &proc_macro2::TokenStream,
+    descriptor: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    if descriptor.is_empty() {
+        descriptor
+    } else {
+        quote! { #native_cfg #descriptor }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use quote::quote;
 
-    use super::{positional_format_string, route_macro};
+    use super::{gate_graph_descriptor, positional_format_string, route_macro};
 
     #[test]
     fn positional_plain_params() {
@@ -2262,6 +2280,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_empty_graph_descriptor_leaves_no_cfg_behind() {
+        let cfg = quote! { #[cfg(not(target_arch = "wasm32"))] };
+        let empty = gate_graph_descriptor(&cfg, proc_macro2::TokenStream::new());
+        assert!(empty.is_empty(), "the cfg would gate the next item");
+        let full = gate_graph_descriptor(&cfg, quote! { const X: u8 = 1; });
+        assert!(full.to_string().contains("wasm32"));
+    }
+
+    #[cfg(feature = "graph")]
     #[test]
     fn route_macro_edge_cfg_gates_native_companions() {
         let generated = route_macro(

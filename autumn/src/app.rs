@@ -121,6 +121,7 @@ pub fn app() -> AppBuilder {
         cache_backend: None,
         #[cfg(feature = "reporting")]
         error_reporters: Vec::new(),
+        #[cfg(feature = "alerts")]
         alert_channels: Vec::new(),
         #[cfg(feature = "openapi")]
         openapi: None,
@@ -521,6 +522,7 @@ pub struct AppBuilder {
     /// the built-in [`LogReporter`](crate::reporting::LogReporter) is used.
     #[cfg(feature = "reporting")]
     pub(crate) error_reporters: Vec<Arc<dyn crate::reporting::ErrorReporter>>,
+    #[cfg(feature = "alerts")]
     /// Operator-alert channels registered via [`AppBuilder::with_alert_channel`].
     /// Combined with the built-in mail/webhook channels derived from
     /// `[alerts]` config and installed onto `AppState` so the built-in
@@ -1981,6 +1983,7 @@ impl AppBuilder {
         })
     }
 
+    #[cfg(feature = "upgrade")]
     /// Designate a block of typed in-memory state to survive an in-place
     /// upgrade (issue #1674).
     ///
@@ -2029,6 +2032,7 @@ impl AppBuilder {
         })
     }
 
+    #[cfg(feature = "upgrade")]
     /// Designate a live-state block whose shape changed since the previous
     /// build, carrying an `Old` snapshot across through the
     /// [`state_migration!`](crate::state_migration) declared for it.
@@ -2685,6 +2689,7 @@ impl AppBuilder {
         self
     }
 
+    #[cfg(feature = "alerts")]
     /// Register an operator-alert delivery channel.
     ///
     /// Alerts for the built-in conditions (dead-lettered jobs, Down health
@@ -2727,6 +2732,7 @@ impl AppBuilder {
         self
     }
 
+    #[cfg(feature = "feature-flags")]
     /// Register a [`FlagStore`](crate::feature_flags::FlagStore) backend for
     /// feature-flag evaluation.
     ///
@@ -2787,6 +2793,7 @@ impl AppBuilder {
         self.with_flag_service(service)
     }
 
+    #[cfg(feature = "feature-flags")]
     /// Register a configured [`FeatureFlagService`](crate::feature_flags::FeatureFlagService),
     /// for example one with declared defaults.
     ///
@@ -2810,6 +2817,7 @@ impl AppBuilder {
         })
     }
 
+    #[cfg(feature = "feature-flags")]
     /// Register a feature-flag store with a group-membership resolver.
     ///
     /// The resolver is called during flag evaluation to check whether an actor
@@ -2845,6 +2853,7 @@ impl AppBuilder {
         self.with_flag_service(service)
     }
 
+    #[cfg(feature = "experiments")]
     /// Register an experiment store, enabling the [`Experiments`] extractor.
     ///
     /// Wrap any [`ExperimentStore`] implementation. Use [`InMemoryExperimentStore`]
@@ -3006,6 +3015,7 @@ impl AppBuilder {
         })
     }
 
+    #[cfg(feature = "experiments")]
     /// Register an experiment store with a custom [`ExposureSink`].
     ///
     /// Use when you want to forward exposure events to an analytics pipeline
@@ -3797,6 +3807,7 @@ impl AppBuilder {
         // can replace the file underneath it: an in-place upgrade (#1674) execs
         // that path, and `/proc/self/exe` reports "… (deleted)" once the file
         // has been swapped.
+        #[cfg(feature = "upgrade")]
         crate::upgrade::record_startup_exe();
 
         // ── Build mode ─────────────────────────────────────────────────
@@ -3886,9 +3897,15 @@ impl AppBuilder {
         // served path and resolved auth posture are facts about the mount and
         // not about the annotation alone. Runs before any database or port is
         // touched.
+        #[cfg(feature = "graph")]
         if crate::graph::manifest::is_dump_mode() {
             self.run_dump_graph_mode().await;
             return;
+        }
+        #[cfg(not(feature = "graph"))]
+        if std::env::var("AUTUMN_DUMP_GRAPH").as_deref() == Ok("1") {
+            eprintln!("AUTUMN_DUMP_GRAPH is set, but this build lacks the `graph` feature");
+            std::process::exit(2);
         }
 
         // ── Jobs manifest dump mode ────────────────────────────────────
@@ -3940,9 +3957,17 @@ impl AppBuilder {
         // (#1605). It runs inside the app rather than the standalone CLI, so the
         // report reflects the app's own resolved config, GDPR legal-hold
         // registrations, and audit sinks — the inputs the scheduled sweep uses.
+        #[cfg(feature = "data-retention")]
         if let Some(mode) = framework_retention_mode_from_env() {
             self.run_framework_retention_mode(mode).await;
             return;
+        }
+        #[cfg(not(feature = "data-retention"))]
+        if std::env::var("AUTUMN_DB_RETENTION").is_ok_and(|v| !v.trim().is_empty()) {
+            eprintln!(
+                "AUTUMN_DB_RETENTION is set, but this build lacks the `data-retention` feature"
+            );
+            std::process::exit(2);
         }
 
         // ── Data-capsule mode ───────────────────────────────────────────
@@ -3950,9 +3975,15 @@ impl AppBuilder {
         // to a signed capsule, import a capsule, or verify one, and exit.
         // Triggered by `autumn data capsule` (issue #1811). It runs inside the
         // app, so it uses the app's own registry, database, and secret.
+        #[cfg(feature = "gdpr")]
         if let Some(mode) = data_capsule_mode_from_env() {
             self.run_data_capsule_mode(mode).await;
             return;
+        }
+        #[cfg(not(feature = "gdpr"))]
+        if std::env::var("AUTUMN_DATA_CAPSULE").is_ok_and(|v| !v.trim().is_empty()) {
+            eprintln!("AUTUMN_DATA_CAPSULE is set, but this build lacks the `gdpr` feature");
+            std::process::exit(2);
         }
 
         // ── Capsule replay mode ────────────────────────────────────────
@@ -3986,7 +4017,7 @@ impl AppBuilder {
         // first runs. Until a handler is installed, `SIGUSR2`'s default
         // disposition is to *terminate* the process, so a deploy script that
         // signals a process that is still booting would kill it.
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "upgrade"))]
         let upgrade_signal =
             match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) {
                 Ok(signal) => Some(signal),
@@ -3998,7 +4029,20 @@ impl AppBuilder {
                     None
                 }
             };
+        // Without `upgrade` nothing consumes the signal. Catch and log it, so
+        // a deploy script that sends it does not end the process.
+        #[cfg(all(unix, not(feature = "upgrade")))]
+        if let Ok(mut signal) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2())
+        {
+            tokio::spawn(async move {
+                while signal.recv().await.is_some() {
+                    tracing::info!("SIGUSR2 ignored: this build has no `upgrade` feature");
+                }
+            });
+        }
 
+        #[cfg_attr(not(feature = "data-retention"), allow(unused_mut))]
         let Self {
             routes,
             api_versions,
@@ -4046,6 +4090,7 @@ impl AppBuilder {
             cache_backend,
             #[cfg(feature = "reporting")]
             error_reporters,
+            #[cfg(feature = "alerts")]
             alert_channels,
             #[cfg(feature = "openapi")]
             openapi,
@@ -4123,6 +4168,7 @@ impl AppBuilder {
             plugin_config_roots,
         )
         .await;
+        config.warn_on_inert_sections();
 
         // #1605: the unified framework-owned data-retention sweep. Registered
         // here rather than with the `#[repository(..., retention(...))]` policies
@@ -4130,7 +4176,9 @@ impl AppBuilder {
         // `framework_retention_task` returns `None` unless at least one
         // `[retention]` window is set, so an app that never mentions the section
         // gets no extra scheduler loop.
+        #[cfg(feature = "data-retention")]
         let retention_tasks = crate::data_retention::framework_retention_tasks(&config.retention);
+        #[cfg(feature = "data-retention")]
         if !retention_tasks.is_empty() {
             tasks.extend(retention_tasks);
             // Re-validate: the merged-name check above ran before this task
@@ -4818,6 +4866,7 @@ impl AppBuilder {
         // start the background evaluation loop. No-op when nothing is
         // configured. Installed after the mailer so the mail channel can bind
         // to the live `Mailer` extension.
+        #[cfg(feature = "alerts")]
         crate::alerts::install_from_config(&state, &config.alerts, alert_channels);
         // An MCP endpoint with no audit sink still serves tools; what it does
         // not do is leave a record that an agent called one. That is a property
@@ -4856,6 +4905,7 @@ impl AppBuilder {
         // not a silent fallback: the previous build is still serving and still
         // holds the only copy of that state (#1674). Checked here, in async
         // context, so a managed-Postgres child is stopped rather than orphaned.
+        #[cfg(feature = "upgrade")]
         if let Some(failure) = state.extension::<crate::upgrade::LiveStateInstallFailure>() {
             tracing::error!("refusing to start: {}", failure.0);
             #[cfg(feature = "managed-pg")]
@@ -5058,6 +5108,7 @@ impl AppBuilder {
         // are still compiled in; they simply report `mounted: false`, and the
         // completeness section names them, which is the honest answer to "what
         // does this process serve".
+        #[cfg(feature = "graph")]
         let (graph_mounted, graph_opaque) = if role.serves_http() {
             (
                 graph_mounted_routes(
@@ -5077,6 +5128,7 @@ impl AppBuilder {
         } else {
             (graph_worker_mounted_routes(&config), 0)
         };
+        #[cfg(feature = "graph")]
         crate::graph::install(
             &state,
             crate::graph::manifest::audit(&graph_mounted, graph_opaque),
@@ -5911,9 +5963,9 @@ impl AppBuilder {
         // handed over in this release. This runs up front, before the match
         // consumes `bound_listener` to build the (not yet spawned) accept-loop
         // future below.
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "upgrade"))]
         let mut handoff_socket: Option<crate::upgrade::HandoffSocket> = None;
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "upgrade"))]
         if let BoundListener::Tcp(listener) = &bound_listener {
             match crate::upgrade::HandoffSocket::from_listener(listener) {
                 Ok(socket) => handoff_socket = Some(socket),
@@ -6084,7 +6136,7 @@ impl AppBuilder {
         // listening socket and designated live state to a freshly-execed build
         // and, once that build is serving, cancel `upgrade_cutover` so the
         // drain below runs.
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "upgrade"))]
         {
             let upgrade_config = config.server.upgrade.clone();
             let upgrade_state = state.clone();
@@ -6328,7 +6380,7 @@ impl AppBuilder {
             // now, with startup hooks done and the router serving, is it safe
             // for the old process to stop accepting — and only if this build
             // actually took over everything it was handed.
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "upgrade"))]
             {
                 if let Err(reason) = crate::upgrade::verify_handover_complete() {
                     tracing::error!("{reason}");
@@ -6615,7 +6667,8 @@ impl AppBuilder {
             cache_backend,
             #[cfg(feature = "reporting")]
             error_reporters,
-            alert_channels: _,
+            #[cfg(feature = "alerts")]
+                alert_channels: _,
             #[cfg(feature = "openapi")]
             openapi,
             #[cfg(feature = "mcp")]
@@ -7017,14 +7070,15 @@ impl AppBuilder {
         let static_openapi = openapi
             .clone()
             .map(|api| api.openapi_json_path("/openapi.json").swagger_ui_path(None));
-        #[cfg(feature = "openapi")]
+        #[cfg(all(feature = "openapi", feature = "graph"))]
         let census_config = {
             let mut census = config.clone();
             census.openapi_runtime.enabled = true;
             census
         };
-        #[cfg(not(feature = "openapi"))]
+        #[cfg(all(not(feature = "openapi"), feature = "graph"))]
         let census_config = config.clone();
+        #[cfg(feature = "graph")]
         crate::graph::install(
             &state,
             crate::graph::manifest::audit(
@@ -7222,6 +7276,7 @@ impl AppBuilder {
         crate::managed_pg::emergency_stop_async().await;
     }
 
+    #[cfg(feature = "graph")]
     /// Dump the application's architecture graph as JSON and exit.
     ///
     /// Triggered when `AUTUMN_DUMP_GRAPH=1` is set (by `autumn graph`).
@@ -7233,6 +7288,7 @@ impl AppBuilder {
         ));
     }
 
+    #[cfg(feature = "graph")]
     /// The served surface the graph dump joins against.
     ///
     /// The framework's mounts depend on configuration, so this reads the app's
@@ -7265,6 +7321,7 @@ impl AppBuilder {
         (mounted, opaque)
     }
 
+    #[cfg(feature = "graph")]
     /// Raw `merge`/`nest` routers whose endpoints the graph cannot enumerate.
     ///
     /// The same count `autumn routes audit` hard-fails its coverage gate on
@@ -8025,6 +8082,7 @@ impl AppBuilder {
         }
     }
 
+    #[cfg(feature = "data-retention")]
     /// Report or enforce the unified `[retention]` policy over every
     /// framework-owned dataset, print the report as JSON, and exit
     /// (issue #1605).
@@ -8192,6 +8250,7 @@ impl AppBuilder {
         }
     }
 
+    #[cfg(feature = "gdpr")]
     /// Run `AUTUMN_DATA_CAPSULE=export|import|verify` and exit (issue #1811).
     ///
     /// All modes boot the app's state initializers, which install the
@@ -9088,6 +9147,7 @@ impl AppBuilder {
         let router_state = state.clone();
         // See the matching call in `run()`: the graph is published before the
         // router is built so `/actuator/graph` answers from the first request.
+        #[cfg(feature = "graph")]
         crate::graph::install(
             &state,
             crate::graph::manifest::audit(
@@ -9248,6 +9308,7 @@ pub(crate) fn is_dump_jobs_mode() -> bool {
     std::env::var("AUTUMN_DUMP_JOBS").as_deref() == Ok("1")
 }
 
+#[cfg(feature = "graph")]
 /// The mounted-route table the architecture graph joins against (issue #1747).
 ///
 /// Top-level routes carry their own path; a scoped group's children do not --
@@ -9293,6 +9354,7 @@ fn graph_mounted_routes(
         .collect()
 }
 
+#[cfg(feature = "graph")]
 /// The census of a process that does not serve HTTP routes (a worker).
 ///
 /// A worker builds `try_build_probe_only_router`: probes and actuator only.
@@ -9311,6 +9373,7 @@ fn graph_worker_mounted_routes(
         .collect()
 }
 
+#[cfg(feature = "graph")]
 /// The architecture-graph view of a route declared through
 /// `declare_plugin_routes` (issue #1747).
 ///
@@ -9362,6 +9425,7 @@ fn graph_declared_route_summary(
     }
 }
 
+#[cfg(feature = "graph")]
 /// The architecture-graph view of one mounted route (issue #1747).
 ///
 /// The *mounted* path, not the declared one: a scoped group's children carry
@@ -9521,6 +9585,7 @@ pub(crate) fn is_migrate_only_mode() -> bool {
     std::env::var("AUTUMN_MIGRATE").as_deref() == Ok("1")
 }
 
+#[cfg(feature = "data-retention")]
 /// The `autumn db retention` one-shot mode requested by
 /// `AUTUMN_DB_RETENTION`, if any (issue #1605).
 ///
@@ -9549,6 +9614,7 @@ pub(crate) fn framework_retention_mode_from_env() -> Option<FrameworkRetentionMo
     }
 }
 
+#[cfg(feature = "gdpr")]
 /// The `autumn data capsule` one-shot mode (issue #1811).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DataCapsuleMode {
@@ -9560,6 +9626,7 @@ pub(crate) enum DataCapsuleMode {
     Verify,
 }
 
+#[cfg(feature = "gdpr")]
 impl DataCapsuleMode {
     const fn as_str(self) -> &'static str {
         match self {
@@ -9570,15 +9637,20 @@ impl DataCapsuleMode {
     }
 }
 
+#[cfg(feature = "gdpr")]
 /// The env var `autumn data capsule` sets to select the one-shot mode.
 pub(crate) const DATA_CAPSULE_ENV: &str = "AUTUMN_DATA_CAPSULE";
+#[cfg(feature = "gdpr")]
 /// The subject id of `autumn data capsule export`.
 pub(crate) const DATA_CAPSULE_SUBJECT_ENV: &str = "AUTUMN_DATA_CAPSULE_SUBJECT";
+#[cfg(feature = "gdpr")]
 /// The capsule directory of `autumn data capsule`.
 pub(crate) const DATA_CAPSULE_PATH_ENV: &str = "AUTUMN_DATA_CAPSULE_PATH";
+#[cfg(feature = "gdpr")]
 /// Line prefix of the JSON report, matched by `autumn-cli/src/data_capsule.rs`.
 pub(crate) const DATA_CAPSULE_JSON_PREFIX: &str = "AUTUMN_DATA_CAPSULE_REPORT=";
 
+#[cfg(feature = "gdpr")]
 /// The `autumn data capsule` mode requested by `AUTUMN_DATA_CAPSULE`, if any.
 ///
 /// An unknown value gives a warning and a normal boot, the same as
@@ -9587,6 +9659,7 @@ pub(crate) fn data_capsule_mode_from_env() -> Option<DataCapsuleMode> {
     parse_data_capsule_mode(&std::env::var(DATA_CAPSULE_ENV).ok()?)
 }
 
+#[cfg(feature = "gdpr")]
 fn parse_data_capsule_mode(raw: &str) -> Option<DataCapsuleMode> {
     match raw.trim() {
         "" => None,
@@ -9603,6 +9676,7 @@ fn parse_data_capsule_mode(raw: &str) -> Option<DataCapsuleMode> {
     }
 }
 
+#[cfg(feature = "gdpr")]
 /// The JSON report line of `autumn data capsule`.
 fn data_capsule_report_line(
     mode: DataCapsuleMode,
@@ -9617,6 +9691,7 @@ fn data_capsule_report_line(
     format!("{DATA_CAPSULE_JSON_PREFIX}{body}")
 }
 
+#[cfg(feature = "gdpr")]
 /// Print the report line and exit: `0` on success, else `1`.
 fn emit_data_capsule_report(
     mode: DataCapsuleMode,
@@ -9629,6 +9704,7 @@ fn emit_data_capsule_report(
     std::process::exit(i32::from(result.is_err()));
 }
 
+#[cfg(feature = "gdpr")]
 /// The database state that verify gives to the state initializers.
 ///
 /// Verify runs no migration. It builds the pools as export and import do,
@@ -9672,7 +9748,9 @@ async fn verify_database_parts(
     (topology, shards)
 }
 
+#[cfg(feature = "gdpr")]
 #[cfg(test)]
+#[cfg(feature = "gdpr")]
 mod data_capsule_mode_tests {
     use super::*;
 
@@ -9775,9 +9853,11 @@ mod data_capsule_mode_tests {
     }
 }
 
+#[cfg(feature = "data-retention")]
 /// The env var `autumn db retention` sets to select the one-shot mode.
 pub(crate) const FRAMEWORK_RETENTION_ENV: &str = "AUTUMN_DB_RETENTION";
 
+#[cfg(feature = "data-retention")]
 /// Why an on-demand purge must stop, if it must. `force_env` is the value of
 /// [`FRAMEWORK_RETENTION_FORCE_ENV`]. Report mode is never refused.
 fn framework_purge_refusal(
@@ -9791,16 +9871,20 @@ fn framework_purge_refusal(
     crate::data_retention::purge_refusal(profile, force_env == Some("1"))
 }
 
+#[cfg(feature = "data-retention")]
 /// Set to `1` by `autumn db retention --force`.
 pub(crate) const FRAMEWORK_RETENTION_FORCE_ENV: &str = "AUTUMN_DB_RETENTION_FORCE";
 
+#[cfg(feature = "data-retention")]
 /// The env var `autumn db retention --dataset <key>` sets to narrow the run.
 pub(crate) const FRAMEWORK_RETENTION_DATASET_ENV: &str = "AUTUMN_DB_RETENTION_DATASET";
 
+#[cfg(feature = "data-retention")]
 /// Line prefix framing the framework retention report on stdout, matched
 /// verbatim by `autumn-cli/src/db/retention.rs`.
 pub(crate) const FRAMEWORK_RETENTION_JSON_PREFIX: &str = "AUTUMN_DB_RETENTION_REPORT=";
 
+#[cfg(feature = "data-retention")]
 /// What `autumn db retention` asked the app to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FrameworkRetentionMode {
@@ -9810,6 +9894,7 @@ pub(crate) enum FrameworkRetentionMode {
     Purge,
 }
 
+#[cfg(feature = "data-retention")]
 /// The `--dataset` filter, if one was passed. Blank is treated as absent so a
 /// wrapping script exporting an empty value cannot turn into a not-found
 /// error.
@@ -10918,6 +11003,7 @@ async fn run_startup_hooks(hooks: &[StartupHook], state: AppState) -> crate::Aut
     Ok(())
 }
 
+#[cfg(feature = "upgrade")]
 /// Install a designated live-state block into `state`, adopting the snapshot a
 /// predecessor handed over when this process was started by an in-place
 /// upgrade (issue #1674).
@@ -10990,6 +11076,7 @@ fn install_live_state<T>(
     state.insert_extension(handle);
 }
 
+#[cfg(feature = "upgrade")]
 /// Make an adopted live-state block writable, once this build has finished
 /// starting up and is about to release its predecessor (#1674).
 ///
@@ -11100,7 +11187,7 @@ fn initialize_job_runtime(
 /// predecessor still holds the real one and is still serving, so a successor
 /// that cannot adopt must abandon the upgrade, not race it for the port.
 async fn bind_or_adopt_tcp_listener(addr: &str) -> tokio::net::TcpListener {
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "upgrade"))]
     {
         if let Some(inherited) = crate::upgrade::adopt_inherited_listener() {
             match tokio::net::TcpListener::from_std(inherited) {
@@ -15195,6 +15282,7 @@ fn merge_framework_scheduled_tasks(
 ) -> Vec<crate::task::TaskInfo> {
     #[cfg(feature = "db")]
     tasks.extend(crate::retention::collect_retention_tasks());
+    #[cfg(feature = "data-retention")]
     tasks.extend(crate::data_retention::framework_retention_tasks(
         &config.retention,
     ));
@@ -16715,6 +16803,7 @@ pub(crate) fn project_dir(subdir: &str, env: &dyn crate::config::Env) -> std::pa
     )
 }
 
+#[cfg(feature = "upgrade")]
 /// Serve in-place upgrades for the lifetime of the process (issue #1674).
 ///
 /// Each `SIGUSR2` attempts one handover. A failed attempt is logged and the

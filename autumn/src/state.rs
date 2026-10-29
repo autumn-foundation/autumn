@@ -57,9 +57,11 @@ use tokio_util::sync::CancellationToken;
 /// lookup happens only on the path that needs it.
 ///
 /// Get one from [`AppState::late_extensions`].
+#[cfg_attr(not(feature = "custom-domains"), allow(dead_code))]
 #[derive(Clone)]
 pub struct LateExtensions(Arc<std::sync::RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>);
 
+#[cfg_attr(not(feature = "custom-domains"), allow(dead_code))]
 impl LateExtensions {
     /// The extension of type `T`, if one is installed now.
     ///
@@ -384,10 +386,12 @@ impl AppState {
     ///
     /// See [`LateExtensions`] for when a layer needs one.
     #[must_use]
+    #[cfg_attr(not(feature = "custom-domains"), allow(dead_code))]
     pub(crate) fn late_extensions(&self) -> LateExtensions {
         LateExtensions(Arc::clone(&self.extensions))
     }
 
+    #[cfg(feature = "upgrade")]
     /// Borrow the app's designated live-state block, if one was registered
     /// with [`AppBuilder::with_live_state`](crate::app::AppBuilder::with_live_state).
     ///
@@ -1268,10 +1272,12 @@ impl crate::actuator::ProvideActuatorState for AppState {
             .map(|handle| (*handle).clone())
     }
 
+    #[cfg(feature = "graph")]
     fn architecture_graph_json(&self) -> Option<bytes::Bytes> {
         crate::graph::served_json(self)
     }
 
+    #[cfg(feature = "gdpr")]
     fn data_capsules(
         &self,
     ) -> Result<crate::gdpr::portability::CapsuleService, crate::gdpr::portability::DataCapsuleError>

@@ -41,31 +41,51 @@
 //! }
 //! ```
 
+use axum::extract::{FromRequestParts, OptionalFromRequestParts};
+use axum::http::StatusCode;
+
+// The layer half below needs the idempotency store, so it is built only with
+// the `idempotency` feature. The extractors above it work without.
+#[cfg(feature = "idempotency")]
 use std::future::Future;
+#[cfg(feature = "idempotency")]
 use std::pin::Pin;
+#[cfg(feature = "idempotency")]
 use std::sync::Arc;
+#[cfg(feature = "idempotency")]
 use std::task::{Context, Poll};
+#[cfg(feature = "idempotency")]
 use std::time::Duration;
 
+#[cfg(feature = "idempotency")]
 use axum::body::{Body, Bytes};
-use axum::extract::{FromRequestParts, OptionalFromRequestParts};
-use axum::http::{HeaderMap, Method, Request, Response, StatusCode};
+#[cfg(feature = "idempotency")]
+use axum::http::{HeaderMap, Method, Request, Response};
+#[cfg(feature = "idempotency")]
 use futures::StreamExt as _;
+#[cfg(feature = "idempotency")]
 use sha2::Digest as _;
+#[cfg(feature = "idempotency")]
 use tower::{Layer, Service};
+#[cfg(feature = "idempotency")]
 use uuid::Uuid;
 
+#[cfg(feature = "idempotency")]
 use super::config::SubmitTokenConfig;
+#[cfg(feature = "idempotency")]
 use crate::idempotency::{IdempotencyRecord, IdempotencyStore};
 
+#[cfg(feature = "idempotency")]
 /// Response header set on a replayed submit-token response.
 const SUBMIT_TOKEN_REPLAYED: &str = "x-submit-token-replayed";
 
+#[cfg(feature = "idempotency")]
 /// Maximum response body size cached for replay. Scaffold create/update
 /// handlers redirect (303) with tiny bodies; larger responses stream through
 /// without caching.
 const MAX_CACHEABLE_RESPONSE_BODY: usize = 10 * 1024 * 1024; // 10 MiB
 
+#[cfg(feature = "idempotency")]
 /// Hard cap on the request body bytes buffered while scanning for the token.
 const MAX_SCAN_BYTES_CAP: usize = 2 * 1024 * 1024; // 2 MiB
 
@@ -167,6 +187,7 @@ where
     }
 }
 
+#[cfg(feature = "idempotency")]
 const fn is_mutating_method(method: &Method) -> bool {
     matches!(
         *method,
@@ -174,6 +195,7 @@ const fn is_mutating_method(method: &Method) -> bool {
     )
 }
 
+#[cfg(feature = "idempotency")]
 /// Release this attempt's in-flight lock for `key`. Each attempt has its own
 /// `owner`: an attempt that outlived its lock must not free the lock of a retry
 /// that took the token since. An error is logged; the lock then expires by its
@@ -184,6 +206,7 @@ async fn release_lock(store: &Arc<dyn IdempotencyStore>, key: &str, owner: &str)
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Derive the store key for a submitted token. The token is a per-render random
 /// UUID, so it is globally unique and needs no method/path/principal scoping —
 /// the token itself identifies the single logical submission.
@@ -196,6 +219,7 @@ fn storage_key(token: &str) -> String {
 
 // ── Multipart / body scanning helpers ─────────────────────────────────────────
 
+#[cfg(feature = "idempotency")]
 fn scan_for_token(
     bytes: &[u8],
     is_urlencoded: bool,
@@ -213,6 +237,7 @@ fn scan_for_token(
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Body collected up to a scan/cache limit.
 enum CollectedBody {
     /// The whole body fits within the limit and is fully buffered.
@@ -231,6 +256,7 @@ enum CollectedBody {
     Errored(axum::Error),
 }
 
+#[cfg(feature = "idempotency")]
 /// Buffer `body` up to `limit` bytes without corrupting oversized bodies.
 async fn collect_body(body: Body, limit: usize) -> CollectedBody {
     let mut buf = Vec::<u8>::new();
@@ -276,6 +302,7 @@ async fn collect_body(body: Body, limit: usize) -> CollectedBody {
     CollectedBody::Full(Bytes::from(buf))
 }
 
+#[cfg(feature = "idempotency")]
 /// Extract the submitted `_submit_token` from the request body, returning the
 /// token (if present) and a request whose body is preserved for the handler.
 ///
@@ -326,6 +353,7 @@ async fn extract_submitted_token(
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Headers to strip when caching a response for replay: hop-by-hop headers plus
 /// `set-cookie` (never resurrect a stale cookie on a replay) and our own marker.
 fn replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
@@ -348,6 +376,7 @@ fn replay_headers(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
+#[cfg(feature = "idempotency")]
 fn replay_response(record: &IdempotencyRecord) -> Response<Body> {
     let mut builder = Response::builder().status(record.status);
     for (name, value) in &record.headers {
@@ -364,6 +393,7 @@ fn replay_response(record: &IdempotencyRecord) -> Response<Body> {
         })
 }
 
+#[cfg(feature = "idempotency")]
 fn in_flight_conflict_response() -> Response<Body> {
     Response::builder()
         .status(StatusCode::CONFLICT)
@@ -374,6 +404,7 @@ fn in_flight_conflict_response() -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+#[cfg(feature = "idempotency")]
 /// `400` returned when the request body stream errors mid-read while scanning
 /// for the token. Failing here is safer than forwarding a truncated form to the
 /// handler (missing tail fields) after a leading token has already been consumed.
@@ -384,6 +415,7 @@ fn body_read_error_response() -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
+#[cfg(feature = "idempotency")]
 /// `500` returned when the handler's response body stream errors while it is
 /// being buffered for replay caching. The token is not recorded, and the
 /// in-flight lock is intentionally kept held (it expires via `in_flight_ttl`)
@@ -398,6 +430,7 @@ fn response_read_error_response() -> Response<Body> {
 
 // ── Layer / Service ───────────────────────────────────────────────────────────
 
+#[cfg(feature = "idempotency")]
 struct SubmitTokenSettings {
     store: Arc<dyn IdempotencyStore>,
     field_name: String,
@@ -407,6 +440,7 @@ struct SubmitTokenSettings {
     max_scan_bytes: usize,
 }
 
+#[cfg(feature = "idempotency")]
 // `Arc::make_mut` in the builder methods requires `Clone` on the inner value.
 impl Clone for SubmitTokenSettings {
     fn clone(&self) -> Self {
@@ -421,6 +455,7 @@ impl Clone for SubmitTokenSettings {
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Tower [`Layer`] that enforces at-most-once form submissions via one-time
 /// submit tokens.
 ///
@@ -433,6 +468,7 @@ pub struct SubmitTokenLayer {
     settings: Arc<SubmitTokenSettings>,
 }
 
+#[cfg(feature = "idempotency")]
 impl std::fmt::Debug for SubmitTokenLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SubmitTokenLayer")
@@ -442,6 +478,7 @@ impl std::fmt::Debug for SubmitTokenLayer {
     }
 }
 
+#[cfg(feature = "idempotency")]
 impl SubmitTokenLayer {
     /// Create a new submit-token layer backed by `store` and configured from
     /// `config`.
@@ -484,6 +521,7 @@ impl SubmitTokenLayer {
     }
 }
 
+#[cfg(feature = "idempotency")]
 impl<S> Layer<S> for SubmitTokenLayer {
     type Service = SubmitTokenService<S>;
 
@@ -495,6 +533,7 @@ impl<S> Layer<S> for SubmitTokenLayer {
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Tower [`Service`] produced by [`SubmitTokenLayer`].
 #[derive(Clone)]
 pub struct SubmitTokenService<S> {
@@ -502,6 +541,7 @@ pub struct SubmitTokenService<S> {
     settings: Arc<SubmitTokenSettings>,
 }
 
+#[cfg(feature = "idempotency")]
 impl<S> Service<Request<Body>> for SubmitTokenService<S>
 where
     S: Service<Request<Body>, Response = Response<Body>, Error = std::convert::Infallible>
@@ -655,6 +695,7 @@ where
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// The `409` for a submit whose lock lapsed before the handler ran, or `None`
 /// when the lock still covers the handler: renewed when the work since it was
 /// taken was slow (see `keep_lock_for_handler`). A renewal error fails closed.
@@ -687,6 +728,7 @@ async fn lapsed_lock_response(
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Run the handler's response through the consumed-token replay cache: buffer it
 /// (up to [`MAX_CACHEABLE_RESPONSE_BODY`]), record 2xx/3xx responses under `key`
 /// so a replay returns them verbatim, and release the in-flight lock. Kept out
@@ -770,6 +812,7 @@ async fn cache_consumed_token_response(
     }
 }
 
+#[cfg(feature = "idempotency")]
 #[cfg(test)]
 mod tests {
     use super::*;

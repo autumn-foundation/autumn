@@ -2800,7 +2800,7 @@ jobs:
         # step writes the tree to a file. Then a failed `cargo tree` fails the
         # step.
         env:
-          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile
+          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile,alerts,experiments,feature-flags,job-tracking,nested-form,slo,upgrade,wizard
         run: |
           cargo clippy -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" --lib -- -D warnings
           tree="${RUNNER_TEMP}/sqlite-only-tree.txt"

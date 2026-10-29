@@ -1433,7 +1433,14 @@ pub struct AutumnConfig {
     /// Keep this field above `database`, for the same reason as `deploy`:
     /// strict validation then checks the keys in each table.
     #[serde(default)]
+    #[cfg(feature = "slo")]
     pub slo: Vec<crate::slo::SloConfig>,
+
+    /// `[[slo]]` tables, kept so the file stays valid without the `slo`
+    /// feature. Nothing reads them.
+    #[serde(default)]
+    #[cfg(not(feature = "slo"))]
+    pub slo: Vec<toml::Value>,
 
     /// Deterministic replay capsule settings (`[failure_capture]` section,
     /// issue #1598).
@@ -1776,6 +1783,7 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub cost: CostConfig,
 
+    #[cfg(feature = "alerts")]
     /// Operator alerts settings (`[alerts]` section in `autumn.toml`).
     ///
     /// Configure an operator email and/or a webhook URL to receive alerts for
@@ -1792,6 +1800,12 @@ pub struct AutumnConfig {
     /// reads/writes still work through `Deref`/`DerefMut`.
     #[serde(default)]
     pub alerts: Box<crate::alerts::AlertConfig>,
+
+    /// The `[alerts]` table, kept so the file stays valid without the
+    /// `alerts` feature. Nothing reads it.
+    #[serde(default)]
+    #[cfg(not(feature = "alerts"))]
+    pub alerts: Option<toml::Value>,
 
     /// Unified data-retention policy for framework-owned data
     /// (`[retention]` section in `autumn.toml`, issue #1605).
@@ -3999,8 +4013,11 @@ const fn default_idempotency_ttl_secs() -> u64 {
     86_400
 }
 
+/// Seconds an idempotency lock lives before a retry may take it.
+pub(crate) const DEFAULT_IDEMPOTENCY_IN_FLIGHT_TTL_SECS: u64 = 60;
+
 const fn default_idempotency_in_flight_ttl_secs() -> u64 {
-    crate::idempotency::DEFAULT_IN_FLIGHT_TTL.as_secs()
+    DEFAULT_IDEMPOTENCY_IN_FLIGHT_TTL_SECS
 }
 
 /// `OpenAPI` spec runtime exposure settings.
@@ -4782,6 +4799,21 @@ const MANUAL_SCHEMA_SECTIONS: &[(&str, &[&str])] = &[
 ];
 
 impl AutumnConfig {
+    /// Log a warning for each section whose feature is off.
+    ///
+    /// The file still parses, but the section does nothing.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
+    pub(crate) fn warn_on_inert_sections(&self) {
+        #[cfg(not(feature = "alerts"))]
+        if self.alerts.is_some() {
+            tracing::warn!("[alerts] is set, but this build lacks the `alerts` feature");
+        }
+        #[cfg(not(feature = "slo"))]
+        if !self.slo.is_empty() {
+            tracing::warn!("[[slo]] is set, but this build lacks the `slo` feature");
+        }
+    }
+
     /// Validate the `[push]` block, as `AppBuilder::run` does before binding.
     ///
     /// Factored out of the boot path so the rule it enforces — a VAPID key
@@ -6062,6 +6094,7 @@ impl AutumnConfig {
         self.apply_stories_env_overrides_with_env(env);
         self.apply_resilience_env_overrides_with_env(env);
         self.apply_time_zone_env_overrides_with_env(env);
+        #[cfg(feature = "alerts")]
         self.apply_alerts_env_overrides_with_env(env);
         self.apply_tenancy_env_overrides_with_env(env);
         self.apply_cluster_env_overrides_with_env(env);
@@ -6253,6 +6286,7 @@ impl AutumnConfig {
         );
     }
 
+    #[cfg(feature = "alerts")]
     fn apply_alerts_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(env, "AUTUMN_ALERTS__ENABLED", &mut self.alerts.enabled);
         parse_env_option_string(env, "AUTUMN_ALERTS__EMAIL", &mut self.alerts.email);
@@ -9248,6 +9282,7 @@ impl CustomDomainsConfig {
     /// ingress would never resolve, and every subdomain domain would sit at
     /// `pending_dns` with nothing to explain why.
     fn validate_ingress_hostname(&self) -> Result<(), String> {
+        #[cfg(feature = "custom-domains")]
         if let Some(raw) = self
             .ingress_hostname
             .as_ref()
@@ -9379,6 +9414,7 @@ impl CustomDomainsConfig {
     /// A hostname or address that does not parse is dropped here;
     /// [`validate`](Self::validate) has already refused the configuration, so
     /// the app never reaches this with a bad value.
+    #[cfg(feature = "custom-domains")]
     #[must_use]
     pub fn ingress(&self) -> crate::custom_domain::ExpectedIngress {
         crate::custom_domain::ExpectedIngress {

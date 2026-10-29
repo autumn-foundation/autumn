@@ -68,6 +68,10 @@ autumn-web = { version = "0.9.0", path = "../autumn", default-features = false, 
     # Enable `postgres` with `db`. All CLI builds, including `sqlite`, call the
     # Postgres migrate API (#2605).
     "db", "postgres", "htmx", "maud", "storage", "i18n", "telemetry-otlp", "redis", "cache-moka", "http-client", "reporting",
+    # Modules the CLI links for its own commands (`autumn slo`, `deploy`,
+    # `alert`, `doctor`, `db scrub`, `generate wizard`). Each is default-on in
+    # `autumn-web`; this list turns defaults off, so name them here (#2795).
+    "slo", "alerts", "custom-domains", "wizard", "gdpr",
     # `autumn plugin package` / `autumn plugin inspect` read and write the
     # `.autumn-plugin` container and load the module into the same sandbox the
     # runtime uses, so the CLI's verdict is the runtime's verdict. Backend-neutral
