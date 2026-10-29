@@ -561,10 +561,8 @@ impl Ctx<'_> {
         occurred_at: DateTime<Utc>,
     ) -> Result<(), BillingError> {
         let (customer, write) = self.upsert_invoice(snapshot, occurred_at).await?;
-        let (invoice, applied) = match write {
-            StoreWrite::Applied(invoice) => (invoice, true),
-            StoreWrite::Unchanged(invoice) => (invoice, false),
-            StoreWrite::Stale(_) | StoreWrite::Tie(_) => return Ok(()),
+        let (StoreWrite::Applied(invoice) | StoreWrite::Unchanged(invoice)) = write else {
+            return Ok(());
         };
         self.relink(&invoice).await?;
         let store = self.service.store();
@@ -580,7 +578,9 @@ impl Ctx<'_> {
         let written = store
             .settle_dunning(&row.invoice_id, row.attempt, OPEN_STATES, recovered)
             .await?;
-        if !written || !applied {
+        // The row settle is the once-only gate: the retry job may have
+        // recorded the paid invoice already, so the write can be unchanged.
+        if !written {
             return Ok(());
         }
         notify::send_to_customer(
