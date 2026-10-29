@@ -897,4 +897,92 @@ mod tests {
             }
         }
     }
+
+    /// Compile and run the real `candidate_target_dirs` from `src` with the
+    /// given env. Returns the printed candidates (issue #3108).
+    fn run_candidate_target_dirs(
+        src: &str,
+        dir: &std::path::Path,
+        cargo_target_dir: Option<&str>,
+        out_dir: &str,
+    ) -> Vec<String> {
+        let start = src
+            .find("fn candidate_target_dirs()")
+            .expect("candidate_target_dirs present");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("function end") + 3;
+        let program = format!(
+            "{}\nfn main() {{ for c in candidate_target_dirs() {{ println!(\"{{}}\", c.display()); }} }}\n",
+            &body[..end]
+        );
+        let main_rs = dir.join("main.rs");
+        fs::write(&main_rs, program).unwrap();
+        let exe = dir.join("probe");
+        let status = std::process::Command::new("rustc")
+            .args(["--edition", "2021", "-o"])
+            .arg(&exe)
+            .arg(&main_rs)
+            .status()
+            .expect("rustc runs");
+        assert!(status.success(), "probe failed to compile");
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.env_remove("CARGO_TARGET_DIR").env("OUT_DIR", out_dir);
+        if let Some(v) = cargo_target_dir {
+            cmd.env("CARGO_TARGET_DIR", v);
+        }
+        let out = cmd.output().expect("probe runs");
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A relative `CARGO_TARGET_DIR` must not be a candidate. The build
+    /// script runs in the member dir, so it can match a stale member-local
+    /// binary (issue #3108). An absolute value stays first.
+    #[test]
+    fn build_scripts_skip_relative_cargo_target_dir() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = vec![root.join("src/templates/build.rs.tmpl")];
+        for name in [
+            "blog",
+            "bookmarks",
+            "bookmarks-distributed",
+            "cms",
+            "reddit-clone",
+            "saas",
+            "teams",
+            "todo-app",
+            "wiki",
+        ] {
+            files.push(root.join("../examples").join(name).join("build.rs"));
+        }
+        files.push(root.join("src/starters/cms/build.rs"));
+        files.push(root.join("src/starters/saas/build.rs"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = "/ws/target/debug/build/pkg-1/out";
+        let mut seen = std::collections::HashSet::new();
+        for file in files {
+            let src = fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", file.display()));
+            // Identical function text gives an identical probe; run it once.
+            let start = src.find("fn candidate_target_dirs()").unwrap();
+            if !seen.insert(src[start..].split("\n}\n").next().unwrap().to_owned()) {
+                continue;
+            }
+            let name = file.display();
+            let rel = run_candidate_target_dirs(&src, tmp.path(), Some("target"), out_dir);
+            assert_eq!(rel, ["/ws/target", "/ws"], "{name}: relative value kept");
+            let none = run_candidate_target_dirs(&src, tmp.path(), None, out_dir);
+            assert_eq!(none, rel, "{name}: unset differs");
+            let abs = run_candidate_target_dirs(&src, tmp.path(), Some("/abs/target"), out_dir);
+            assert_eq!(
+                abs,
+                ["/abs/target", "/ws/target", "/ws"],
+                "{name}: absolute lost"
+            );
+        }
+    }
 }
