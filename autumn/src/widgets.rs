@@ -27,7 +27,7 @@
 //!
 //! | Widget | Use |
 //! |--------|-----|
-//! | `toast` / `toast_region` | Transient, auto-dismissing htmx action feedback, appended out-of-band |
+//! | `toast` / `toast_with` / `toast_region` | htmx action feedback, appended out-of-band. Pauses on hover/focus, has a close button |
 //!
 //! # Interactive / search widgets
 //!
@@ -5269,7 +5269,7 @@ fn field_fragment(field: &str) -> Option<String> {
     ))
 }
 
-// ── toast / toast_region (#1320) ────────────────────────────────────────────
+// ── toast / toast_region (#1320, #3399) ─────────────────────────────────────
 
 /// The default id for the [`toast_region`] container, and the OOB target
 /// [`toast`] appends into.
@@ -5277,6 +5277,14 @@ fn field_fragment(field: &str) -> Option<String> {
 /// Drop `toast_region(DEFAULT_TOAST_REGION_ID)` once in your base layout;
 /// `toast(msg, variant)` then appends into it out-of-band.
 pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
+
+/// The time a toast shows before it fades out, when you do not set
+/// [`ToastConfig::duration`]. The shipped stylesheet holds the same value.
+pub const DEFAULT_TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The default accessible name of the toast close button.
+#[cfg(feature = "maud")]
+const DEFAULT_TOAST_CLOSE_LABEL: &str = "Dismiss notification";
 
 /// Render the persistent, fixed-position live region that toasts append into.
 ///
@@ -5290,6 +5298,14 @@ pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
 /// newly-appended toast is announced, not every toast still on screen. Position
 /// and stacking come from the shipped `.autumn-toast-region` rule — no inline
 /// styles.
+///
+/// **Top layer (#3399).** The region is `popover="manual"`.
+/// `autumn-widgets.js` opens it in the top layer, so a modal `<dialog>` does
+/// not cover the toasts. When a modal or a popover opens later, the runtime
+/// moves the region above it again. Without JS, the shipped stylesheet keeps
+/// the region visible as a fixed box. While a modal is open, the browser
+/// makes all content outside it inert. The toasts show, but hover, focus and
+/// the close button work again only after the modal closes.
 ///
 /// Non-error toasts inherit this region's politeness; error toasts announce
 /// assertively on their own via `role="alert"`. Use [`DEFAULT_TOAST_REGION_ID`]
@@ -5310,6 +5326,7 @@ pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
 /// let html = toast_region(DEFAULT_TOAST_REGION_ID).into_string();
 /// assert!(html.contains(r#"id="toast-region""#));
 /// assert!(html.contains(r#"class="autumn-toast-region""#));
+/// assert!(html.contains(r#"popover="manual""#));     // top layer
 /// assert!(html.contains(r#"aria-live="polite""#));   // persistent live region
 /// assert!(html.contains(r#"aria-atomic="false""#));  // announce only new toasts
 /// assert!(!html.contains(r#"role="status""#));       // role=status implies atomic
@@ -5331,7 +5348,77 @@ pub fn toast_region(id: &str) -> maud::Markup {
     // of them. Non-error toasts inherit this politeness (they carry no own
     // `aria-live`); error toasts announce assertively on their own.
     maud::html! {
-        div id=(id) class="autumn-toast-region" aria-live="polite" aria-atomic="false" {}
+        div id=(id) class="autumn-toast-region" popover="manual" data-autumn-toast-region
+            aria-live="polite" aria-atomic="false" {}
+    }
+}
+
+/// Builder options for [`toast_with`].
+///
+/// The defaults give the same toast as [`toast`]: the default region, a
+/// 5 s timer and the close label "Dismiss notification".
+///
+/// # Example
+///
+/// ```rust
+/// use std::time::Duration;
+/// use autumn_web::widgets::{toast_with, AlertVariant, ToastConfig};
+///
+/// let config = ToastConfig::new().duration(Duration::from_secs(10));
+/// let out = toast_with("Report ready", AlertVariant::Info, &config).into_string();
+/// assert!(out.contains(r#"data-autumn-toast-duration="10000""#));
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct ToastConfig<'a> {
+    region: Option<&'a str>,
+    duration: Option<std::time::Duration>,
+    persistent: bool,
+    close_label: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> ToastConfig<'a> {
+    /// A default config. See [`ToastConfig`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append into the region with this id, not [`DEFAULT_TOAST_REGION_ID`].
+    /// A leading `#` is removed.
+    #[must_use]
+    pub const fn region(mut self, id: &'a str) -> Self {
+        self.region = Some(id);
+        self
+    }
+
+    /// Show the toast for this time before it fades out. The default is
+    /// [`DEFAULT_TOAST_DURATION`].
+    ///
+    /// The runtime (`autumn-widgets.js`) applies this value. Without JS, the
+    /// stylesheet default applies. Hover or focus pauses the timer.
+    #[must_use]
+    pub const fn duration(mut self, duration: std::time::Duration) -> Self {
+        self.duration = Some(duration);
+        self
+    }
+
+    /// When `true`, the toast does not time out. The user closes it with the
+    /// close button. Use this for a message that the user must act on
+    /// (WCAG 2.2.1). The duration does not apply.
+    #[must_use]
+    pub const fn persistent(mut self, persistent: bool) -> Self {
+        self.persistent = persistent;
+        self
+    }
+
+    /// Set the accessible name of the close button. The default is
+    /// "Dismiss notification".
+    #[must_use]
+    pub const fn close_label(mut self, label: &'a str) -> Self {
+        self.close_label = Some(label);
+        self
     }
 }
 
@@ -5341,9 +5428,19 @@ pub fn toast_region(id: &str) -> maud::Markup {
 /// This is the common case: it targets [`DEFAULT_TOAST_REGION_ID`]. Drop
 /// [`toast_region`] once in your layout, then return this alongside your normal
 /// swapped fragment from an htmx handler; htmx appends it into the region via
-/// `hx-swap-oob="beforeend:#toast-region"` — no full page reload, no
-/// JavaScript. Auto-dismiss is CSS-only (a `@keyframes` fade in the shipped
-/// stylesheet); the widget emits **no `<script>`**.
+/// `hx-swap-oob="beforeend:#toast-region"` — no full page reload. The widget
+/// emits **no `<script>`**.
+///
+/// **Timer.** The toast fades out after [`DEFAULT_TOAST_DURATION`] (a CSS
+/// `@keyframes` animation). Hover or focus on a toast pauses the timer of all
+/// toasts in the region. This works without JS. Use [`toast_with`] to set the
+/// duration or to make the toast persistent.
+///
+/// **Close button.** Each toast has a close button with an accessible name.
+/// `autumn-widgets.js` shows it. When the user closes the focused toast,
+/// focus goes to the next toast, or back to the element that had focus
+/// before. Without JS, the button stays hidden. The runtime also removes a
+/// toast from the DOM when its fade ends.
 ///
 /// `variant` reuses the shared [`AlertVariant`] semantic enum (the alert/badge
 /// color lane) — no new color vocabulary. **Accessibility:** `Error` toasts
@@ -5363,7 +5460,9 @@ pub fn toast_region(id: &str) -> maud::Markup {
 /// |---|---|
 /// | `.autumn-toast` | Root toast (carries the auto-dismiss animation) |
 /// | `.autumn-toast--<variant>` | Per-variant accent (`success`/`info`/`warning`/`error`) |
+/// | `.autumn-toast--persistent` | A toast with no timer |
 /// | `.autumn-toast__message` | The message text |
+/// | `.autumn-toast__close` | The close button |
 ///
 /// # Example: end-to-end htmx recipe
 ///
@@ -5389,11 +5488,12 @@ pub fn toast_region(id: &str) -> maud::Markup {
 /// // but it is atomic so its message is announced as one unit.
 /// assert!(out.contains(r#"aria-atomic="true""#));
 /// assert!(!out.contains(r#"role="status""#));
+/// assert!(out.contains(r#"aria-label="Dismiss notification""#));
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn toast(message: &str, variant: AlertVariant) -> maud::Markup {
-    toast_in(DEFAULT_TOAST_REGION_ID, message, variant)
+    toast_with(message, variant, &ToastConfig::new())
 }
 
 /// Like [`toast`], but appends into a region with a caller-chosen id.
@@ -5414,6 +5514,26 @@ pub fn toast(message: &str, variant: AlertVariant) -> maud::Markup {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::Markup {
+    toast_with(message, variant, &ToastConfig::new().region(region_id))
+}
+
+/// Like [`toast`], with a [`ToastConfig`]: region, duration, persistent
+/// and close label.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{toast_with, AlertVariant, ToastConfig};
+///
+/// // A message the user must act on: no timer, close it by hand.
+/// let config = ToastConfig::new().persistent(true);
+/// let out = toast_with("Payment failed", AlertVariant::Error, &config).into_string();
+/// assert!(out.contains("autumn-toast--persistent"));
+/// assert!(out.contains(r#"role="alert""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn toast_with(message: &str, variant: AlertVariant, config: &ToastConfig<'_>) -> maud::Markup {
     // Error toasts announce assertively on their own — `role="alert"` elements
     // ARE reliably announced on insertion, so they don't depend on the
     // persistent region. Non-error toasts carry NO `role`/`aria-live`: they
@@ -5425,10 +5545,19 @@ pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::
         AlertVariant::Error => (Some("alert"), Some("assertive")),
         AlertVariant::Info | AlertVariant::Success | AlertVariant::Warning => (None, None),
     };
-    let class = format!("autumn-toast autumn-toast--{}", variant.as_str());
+    let mut class = format!("autumn-toast autumn-toast--{}", variant.as_str());
+    if config.persistent {
+        class.push_str(" autumn-toast--persistent");
+    }
+    // A persistent toast has no timer, so it has no duration.
+    let duration = config
+        .duration
+        .filter(|_| !config.persistent)
+        .map(|d| d.as_millis().to_string());
+    let close_label = config.close_label.unwrap_or(DEFAULT_TOAST_CLOSE_LABEL);
     // Accept a bare id or a `#selector`; strip one leading `#` so a caller
     // passing `"#toast-region"` doesn't produce an invalid `beforeend:##…`.
-    let region_id = selector_to_id(region_id);
+    let region_id = selector_to_id(config.region.unwrap_or(DEFAULT_TOAST_REGION_ID));
     let oob = format!("beforeend:#{region_id}");
     // For a POSITIONAL OOB swap (`beforeend:#…`) htmx inserts the carrier's
     // *children* into the target and discards the carrier itself, so the carrier
@@ -5452,10 +5581,18 @@ pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::
     // `.autumn-toast` element stays the carrier's CHILD; putting `hx-swap-oob`
     // directly on it would throw the wrapper away and append only the inner
     // `<span>`.
+    //
+    // The close button is `hidden` because it needs the runtime. The runtime
+    // shows it.
     maud::html! {
         div hx-swap-oob=(oob) {
-            div class=(class) role=[role] aria-live=[live] aria-atomic="true" {
+            div class=(class) data-autumn-toast data-autumn-toast-duration=[duration]
+                role=[role] aria-live=[live] aria-atomic="true" {
                 span class="autumn-toast__message" { (message) }
+                button type="button" class="autumn-toast__close" data-autumn-toast-close
+                    aria-label=(close_label) hidden {
+                    span aria-hidden="true" { "×" }
+                }
             }
         }
     }

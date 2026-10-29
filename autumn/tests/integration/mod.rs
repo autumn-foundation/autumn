@@ -598,6 +598,8 @@ mod widgets_tabs;
 mod widgets_theme_toggle;
 #[cfg(feature = "maud")]
 mod widgets_toast;
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_toast_browser;
 #[cfg(feature = "ws")]
 mod ws_integration;
 #[cfg(feature = "ws")]

@@ -1022,9 +1022,14 @@ Per-primitive setters (in addition to the shared set):
   focus moves to it on a failed submit — one per page). All prelude
   re-exported.
 - `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
-  `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
+  `toast_in(region_id, message, AlertVariant)` /
+  `toast_with(message, AlertVariant, &ToastConfig)` / `toast_region(id)` +
   `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
-  (`hx-swap-oob="beforeend:#<region-id>"`), CSS-only auto-dismiss (no JS).
+  (`hx-swap-oob="beforeend:#<region-id>"`), CSS auto-dismiss after
+  `DEFAULT_TOAST_DURATION` (5 s). Hover or focus pauses the timer.
+  `ToastConfig::new().region(id).duration(d).persistent(true).close_label(s)`.
+  Each toast has a close button; `autumn-widgets.js` shows it and moves focus
+  on close. The region is `popover="manual"`, so toasts show above a modal.
   `toast_region` is a persistent `aria-live="polite"` region; non-error toasts
   inherit its politeness (no own `role`/`aria-live`) while `Error` announces
   assertively via its own `role="alert"` (reuses the `AlertVariant` color

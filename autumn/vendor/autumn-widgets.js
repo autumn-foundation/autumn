@@ -653,6 +653,91 @@
     if (e.persisted) syncTheme();
   });
 
+  // ── toast (#3399) ─────────────────────────────────────────────────────────
+  // CSS runs the timer; hover and focus pause it. This shows the close
+  // button, applies the duration, removes ended toasts, and keeps the region
+  // above a modal.
+  var TOAST = '[data-autumn-toast]';
+  var REGION = '[data-autumn-toast-region]';
+  var CLOSE = '[data-autumn-toast-close]';
+
+  function initToast(el) {
+    var ms = parseInt(el.getAttribute('data-autumn-toast-duration'), 10);
+    // CSSOM, not a style attribute, so the CSP allows it.
+    if (ms >= 0) el.style.setProperty('--autumn-toast-duration', ms + 'ms');
+    var close = el.querySelector(CLOSE);
+    if (close) close.hidden = false;
+  }
+
+  // The top layer stacks in open order: open the region again to move it
+  // up. Then put back the animation times and the focus.
+  function raise(region) {
+    if (!region.showPopover || !region.isConnected) return;
+    var active = document.activeElement;
+    var saved = region.getAnimations({ subtree: true });
+    try {
+      if (region.matches(':popover-open')) region.hidePopover();
+      region.showPopover();
+    } catch (err) { return; }
+    region.getAnimations({ subtree: true }).forEach(function (a) {
+      saved.forEach(function (s) {
+        if (s !== a && s.animationName === a.animationName && s.effect.target === a.effect.target &&
+          s.currentTime !== null) a.currentTime = s.currentTime;
+      });
+    });
+    if (region.contains(active)) active.focus({ preventScroll: true });
+  }
+
+  function initRegion(region) {
+    if (!once(region)) return;
+    raise(region);
+    new MutationObserver(function (records) {
+      records.forEach(function (r) {
+        r.addedNodes.forEach(function (n) { if (n.nodeType === 1) each(n, TOAST, initToast); });
+      });
+      // A browser with no dialog `toggle` event.
+      if (document.querySelector('dialog[open]')) raise(region);
+    }).observe(region, { childList: true });
+  }
+
+  // `toggle` does not bubble: listen in the capture phase.
+  document.addEventListener('toggle', function (e) {
+    var t = e.target;
+    if (e.newState === 'open' && t.matches('dialog,[popover]') && !t.matches(REGION)) {
+      document.querySelectorAll(REGION).forEach(raise);
+    }
+  }, true);
+
+  // The last focus outside a toast.
+  var origin = null;
+  document.addEventListener('focusin', function (e) {
+    if (!e.target.closest(TOAST)) origin = e.target;
+  });
+
+  // Remove a toast. If it had focus, focus the next toast, else the one
+  // before, else the origin.
+  function closeToast(el) {
+    var had = el.contains(document.activeElement);
+    var all = Array.prototype.filter.call(
+      (el.closest(REGION) || document).querySelectorAll(TOAST), function (t) {
+        return t === el || getComputedStyle(t).visibility !== 'hidden';
+      });
+    var i = all.indexOf(el);
+    var next = all[i + 1] || all[i - 1];
+    el.remove();
+    var to = (next && next.querySelector(CLOSE)) || origin;
+    if (had && to && to.isConnected) to.focus();
+  }
+
+  document.addEventListener('click', function (e) {
+    var close = e.target.closest && e.target.closest(CLOSE);
+    if (close && close.closest(TOAST)) closeToast(close.closest(TOAST));
+  });
+
+  document.addEventListener('animationend', function (e) {
+    if (e.animationName === 'autumn-toast-out' && e.target.matches(TOAST)) closeToast(e.target);
+  });
+
   // Run `fn` on `root` (when it matches) and on each match inside it.
   function each(root, selector, fn) {
     if (root.matches && root.matches(selector)) fn(root);
@@ -665,6 +750,8 @@
     each(root, '[data-ac-value-id]', initAutocomplete);
     each(root, '[data-autumn-nav]', initNav);
     each(root, '[data-autumn-roving]', initRoving);
+    each(root, REGION, initRegion);
+    each(root, TOAST, initToast);
     // The theme is page state, so only a whole-page init syncs it.
     if (root === document) syncTheme();
   }

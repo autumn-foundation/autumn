@@ -1305,11 +1305,19 @@
 /* ── Toast (autumn-toast) ──────────────────────────────────────────────────── */
 
 /* Fixed stacking context dropped once in the layout; `pointer-events: none`
-   so the empty region never blocks clicks, re-enabled on each toast below. */
+   so the empty region never blocks clicks, re-enabled on each toast below.
+   The region is `popover="manual"` (#3399): the runtime opens it in the top
+   layer. These rules reset the UA popover box, and `display` overrides the
+   UA `display: none`, so the region also shows without JS. */
 .autumn-toast-region {
     position: fixed;
-    bottom: 1rem;
-    right: 1rem;
+    inset: auto 1rem 1rem auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    overflow: visible;
     z-index: var(--z-toast);
     display: flex;
     flex-direction: column;
@@ -1319,11 +1327,15 @@
 }
 
 /* Auto-dismiss is CSS-only: a slide/fade in, then a fade+collapse out after a
-   visible dwell — no JavaScript. The element stays in the DOM (CSS cannot
-   remove nodes) but ends `visibility: hidden` with zero height, so it neither
-   shows nor occupies space. */
+   visible dwell. The runtime sets `--autumn-toast-duration` from
+   `data-autumn-toast-duration`, and removes the toast when the fade ends.
+   Without JS the element stays in the DOM, `visibility: hidden` with zero
+   height. */
 .autumn-toast {
     pointer-events: auto;
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
     padding: var(--space-3) var(--space-4);
     border: 1px solid var(--border);
     border-left-width: 4px;
@@ -1338,11 +1350,51 @@
     max-height: 200px;
     animation:
         autumn-toast-in 200ms ease-out,
-        autumn-toast-out 400ms ease-in 5s forwards;
+        autumn-toast-out 400ms ease-in var(--autumn-toast-duration, 5s) forwards;
+}
+
+/* WCAG 2.2.1: hover or focus on a toast pauses the timer of every toast in
+   the region, so the user can read and act. */
+.autumn-toast-region:hover .autumn-toast,
+.autumn-toast-region:focus-within .autumn-toast,
+.autumn-toast:hover,
+.autumn-toast:focus-within {
+    animation-play-state: paused;
+}
+
+/* No timer: the user closes the toast. */
+.autumn-toast--persistent {
+    animation: autumn-toast-in 200ms ease-out;
 }
 
 .autumn-toast__message {
     display: block;
+    flex: 1 1 auto;
+}
+
+/* The runtime shows the button. Without JS it does nothing, so it stays
+   hidden. The target is at least 24 px (WCAG 2.5.8). */
+.autumn-toast__close {
+    flex: 0 0 auto;
+    min-width: 1.5rem;
+    min-height: 1.5rem;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius);
+    background: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: var(--font-size-xl);
+    line-height: 1;
+}
+
+.autumn-toast__close[hidden] {
+    display: none;
+}
+
+.autumn-toast__close:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
 }
 
 .autumn-toast--success {
@@ -1388,7 +1440,11 @@
    auto-hide after the dwell so toasts don't pile up. */
 @media (prefers-reduced-motion: reduce) {
     .autumn-toast {
-        animation: autumn-toast-out 0s linear 5s forwards;
+        animation: autumn-toast-out 0s linear var(--autumn-toast-duration, 5s) forwards;
+    }
+
+    .autumn-toast--persistent {
+        animation: none;
     }
 }
 

@@ -740,3 +740,42 @@ async fn keyboard_accessible_primitives() {
     assert_eq!(active_text(&page).await, "View", "typeahead");
     page.expect_no_console_errors().await.expect("no errors");
 }
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_toast() {
+    const CLOSE: &str = ".autumn-toast--persistent [data-autumn-toast-close]";
+    const LEFT: &str = "String(document.querySelectorAll('.autumn-toast--persistent').length)";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/toast").await;
+
+    assert_eq!(eval_string(&page, LEFT).await, "2", "two persistent toasts");
+    wait_for(&page, &format!("!document.querySelector({CLOSE:?}).hidden")).await;
+    assert_eq!(
+        attr(&page, CLOSE, "aria-label").await,
+        "Dismiss notification"
+    );
+    focus(&page, CLOSE).await;
+    press(&page, "Enter").await;
+    assert_eq!(
+        eval_string(&page, LEFT).await,
+        "1",
+        "Enter closes the toast"
+    );
+    assert!(
+        eval_bool(
+            &page,
+            "document.activeElement.matches('.autumn-toast--persistent [data-autumn-toast-close]')"
+        )
+        .await,
+        "focus moves to the next toast"
+    );
+    press(&page, " ").await;
+    assert_eq!(
+        eval_string(&page, LEFT).await,
+        "0",
+        "Space closes the toast"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}

@@ -100,11 +100,12 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 32 KiB |
-| `autumn-widgets.js`, gzip level 9 | 10 KiB |
+| `autumn-widgets.js`, raw | 36 KiB |
+| `autumn-widgets.js`, gzip level 9 | 11 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
-above the budget. Raise the budget only with a reason in the PR.
+above the budget. Raise the budget only with a reason in the PR. The toast
+runtime (#3399) raised it from 32 KiB and 10 KiB.
 
 ## Tests
 
