@@ -1,5 +1,6 @@
 use autumn_web::error::{AutumnError, AutumnResult};
 use autumn_web::pagination::{Page, PageRequest};
+use autumn_web::validation::{ValidateExt, Validated};
 use diesel::prelude::*;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -100,12 +101,66 @@ pub(crate) fn title_not_blank(s: &str) -> Result<(), validator::ValidationError>
 }
 
 impl NewTodo {
-    /// Validate and normalize the title. Returns 422 if the title is empty.
+    /// Trim the title, then run the derived [`Validate`] rules.
+    ///
+    /// Returns 422 on failure. The JSON API uses this method. It applies the
+    /// same rules as the HTML form.
     pub fn validated(self) -> AutumnResult<Self> {
-        let title = self.title.trim().to_owned();
-        if title.is_empty() {
-            return Err(AutumnError::unprocessable_msg("Title must not be empty"));
+        let trimmed = Self {
+            title: self.title.trim().to_owned(),
+        };
+        ValidateExt::validate(trimmed).map(Validated::into_inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use autumn_web::reexports::http::StatusCode;
+
+    fn todo(title: &str) -> NewTodo {
+        NewTodo {
+            title: title.to_owned(),
         }
-        Ok(Self { title })
+    }
+
+    #[test]
+    fn validated_accepts_max_length_title() {
+        let ok = todo(&"X".repeat(255)).validated().unwrap();
+        assert_eq!(ok.title.len(), 255);
+    }
+
+    #[test]
+    fn validated_rejects_title_over_max_length() {
+        let err = todo(&"X".repeat(256)).validated().err().unwrap();
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validated_trims_before_length_check() {
+        let padded = format!("  {}  ", "X".repeat(255));
+        let ok = todo(&padded).validated().unwrap();
+        assert_eq!(ok.title.len(), 255);
+    }
+
+    #[test]
+    fn validated_counts_characters_not_bytes() {
+        let ok = todo(&"é".repeat(255)).validated().unwrap();
+        assert_eq!(ok.title.chars().count(), 255);
+        let err = todo(&"é".repeat(256)).validated().err().unwrap();
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validated_stores_trimmed_title() {
+        assert_eq!(todo("  hi  ").validated().unwrap().title, "hi");
+    }
+
+    #[test]
+    fn validated_rejects_blank_title() {
+        for blank in ["", "   ", "\t\n"] {
+            let err = todo(blank).validated().err().unwrap();
+            assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
     }
 }
