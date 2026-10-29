@@ -1,8 +1,9 @@
-//! Isolated integration test: allocation gate for the futures of the public
-//! ingress services (issue #2830).
+//! Allocation gate for the futures of the public ingress services (issue
+//! #2830).
 //!
-//! It is in its own binary because `allocation-counter` installs a
-//! process-wide `#[global_allocator]` (see `config_alloc_gate`).
+//! It is a module of the `request_meta_alloc_gate` binary, which installs the
+//! `allocation-counter` global allocator. It is not a binary of its own: each
+//! test binary costs disk on the trybuild runners.
 //!
 //! # What is measured
 //!
