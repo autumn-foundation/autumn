@@ -207,11 +207,12 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
 - `restore` verifies the replica chain before it replaces the file, as
   `autumn db replica restore` does.
 - With `[replication]` on, `delete` also removes the replica, or keeps it for
-  `replica_retention_after_delete`, and prints which. If the purge fails, the
-  command prints the error and a tombstone records it: the app retries the
-  purge. See [Deleting a database's replica](#deleting-a-databases-replica).
+  `replica_retention_after_delete`, and prints which. It needs the replica
+  destination and the control database. If the purge fails, the command
+  prints the error and a tombstone records it: the app tries the purge
+  again. See [Deleting a database's replica](#deleting-a-databases-replica).
 - `restore` also brings back a deleted database whose replica is still
-  there. It drops the tombstone.
+  there. It drops the tombstone, so it needs the control database.
 - On Windows, another process can open the database while `delete` or
   `restore` removes files (see [Limits](#limits)). The command then
   stops with "open in another process" or "created ... during the restore".
@@ -339,21 +340,29 @@ and which database has it.
    and removes nothing.
 2. The delete removes the files.
 3. The delete writes a marker object, `<prefix>/tombstone`, in the replica.
-4. The delete purges the replica, and then drops the row. If
-   `replica_retention_after_delete` is set, it keeps the replica until then.
+4. The delete purges the replica, then drops the row. If
+   `replica_retention_after_delete` is set, the delete keeps the replica
+   until the retention ends.
+
+The purge sends one delete request for each object, and the delete call
+waits for it. On a versioned bucket, a delete request only adds a delete
+marker: add a lifecycle rule that removes old versions.
 
 If the purge fails, the local delete is not rolled back. The row stays. A
-task retries the purge every minute, with a backoff from 5 seconds to 1
-hour. `replication:fleet` shows the last pass under `tombstones` (`purged`,
-`failed`, `waiting`, `last_error`).
+task tries the purge again every minute. After each failure, it waits
+longer, up to 1 hour. If the marker write failed, the task writes the
+marker again. `replication:fleet` shows the last pass under `tombstones`
+(`purged`, `failed`, `waiting`, `failing`, `last_error`). A failed purge
+does not turn the indicator `Down`.
 
-A tombstone blocks the resurrection of a deleted database:
+A tombstone stops the restore of a deleted database:
 
 - `restore_missing` does not restore a key that has a row.
-- On a host with its own control database, the marker blocks it. It blocks
-  each generation that is not newer than the delete.
-- `fleet.restore(&key, at)` and `autumn fleet restore` override the
-  tombstone. They drop the row and the marker.
+- On a host with its own control database, the marker stops the restore.
+  The marker stops each generation that is not newer than the delete.
+- `fleet.restore(&key, at)` and `autumn fleet restore` ignore the
+  tombstone. They take the row first, and drop the marker after the
+  restore. If the restore fails, the row goes back.
 
 Use the retention as an undo window:
 
@@ -362,27 +371,39 @@ Use the retention as an undo window:
 replica_retention_after_delete = "30d"  # default "0s": purge at once
 ```
 
+Use a unit: a bare number is milliseconds. A value under one minute is
+refused.
+
 Rules:
 
-- A new database with the same key (`provision`, or `create_on_demand`)
-  purges the old replica first, and drops the row. This ends the undo window.
-  If the purge fails, the create fails with `503`: retry it.
+- During the retention, a create on demand (`create_on_demand`) of the key
+  answers `410`. `provision` makes a new database: it purges the old replica
+  first and drops the row. This ends the undo window. If the purge fails,
+  `provision` fails with `503`: try again.
 - A purge removes each generation that is not newer than the delete. A newer
-  generation is a new database with the same key, and it stays.
+  generation is a new database with the same key, and it stays. The delete
+  time is the later of the app clock and the newest generation, so a host
+  clock that is ahead does not keep the deleted data.
 - A host purges only a key whose slot it owns, and only when the file is not
-  on its disk.
+  on its disk. A row next to a live file is old: the task drops it.
 
 ### Restore check
 
 A replica that does not restore is not a backup. Every `[replication]
-verify_interval_secs` (default 6 hours), each process restores
+verify_interval_secs` (default 6 hours), each worker-role process restores
 `restore_check_sample` random databases (default `1`) into scratch files
-under `<root>/.fleet-locks/restore-check/`. For each one it checks
-`PRAGMA integrity_check` and the identity row, then removes the file.
+under `<root>/.fleet-locks/restore-check/`. The first check runs one
+interval after start. For each database, the check runs
+`PRAGMA integrity_check` and reads the identity row, then removes the file.
+A failed check is tried once more. Scratch files older than one day (from a
+process that stopped during a check) are removed. Each check needs free
+space for the largest sampled database on the fleet volume.
+
 `replication:fleet` shows the result under `restore_check` (`checked_at`,
 `passed`, `unreplicated`, `failed`). A failed check turns the indicator
-`Down`. A database with no replica yet counts as `unreplicated`, not as a
-failure. Set `restore_check_sample = 0` to turn the check off.
+`Down` until a check passes. A database with no replica yet counts as
+`unreplicated`, not as a failure. Set `restore_check_sample = 0` or
+`verify_interval_secs = 0` to turn the check off.
 `fleet.check_replica_sample(n)` runs one check now.
 
 ## Failover: slot ownership

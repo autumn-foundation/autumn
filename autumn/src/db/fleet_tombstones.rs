@@ -4,14 +4,18 @@
 //! database records the delete until the replica is purged:
 //!
 //! ```text
-//! delete  ─► record row (pending) ─► remove files ─► confirm row (deleted_at)
+//! delete  ─► record row (pending; reset when the file is there)
+//!         ─► remove files ─► confirm own row (deleted_at); row gone: stop
 //!            └ refused: no file ──► drop the pending row
 //!         ─► marker <root>/tombstone ─► retention 0: purge now
 //!            purge ok ──► drop row      purge failed ──► backoff, retry task
 //! open    ─► row, or a marker not older than the newest generation:
 //!            restore_missing restores nothing
-//! create  ─► row: purge the old replica first, then drop the row
-//! restore ─► explicit: drop the row and the marker
+//! create  ─► row in its retention: on demand 410, provision purges first
+//! restore ─► explicit: take the row, restore, drop the marker; failed: put
+//!            the row back
+//! retry   ─► every minute, every row: write a missing marker, purge a due
+//!            row, drop a row next to a live file
 //! ```
 //!
 //! The rules are pure functions here. The model and its proofs are in
@@ -63,7 +67,8 @@ CREATE TABLE IF NOT EXISTS _autumn_fleet_tombstones (
     purge_after  BIGINT  NOT NULL,
     attempts     INTEGER NOT NULL DEFAULT 0,
     next_attempt BIGINT  NOT NULL DEFAULT 0,
-    last_error   TEXT
+    last_error   TEXT,
+    marked       INTEGER NOT NULL DEFAULT 0
 );";
 
 // ── Rules ───────────────────────────────────────────────────────────────────
@@ -87,10 +92,12 @@ pub struct Tombstone {
     pub next_attempt_at: DateTime<Utc>,
     /// Why the last purge failed.
     pub last_error: Option<String>,
+    /// The marker object is written. Until then, the retry task writes it.
+    pub marked: bool,
 }
 
 impl Tombstone {
-    /// `fresh` in the model.
+    /// A new row for `key`, deleted at `now` (`fresh` in the model).
     #[must_use]
     pub fn new(key: &str, now: DateTime<Utc>, retention: Duration, confirmed: bool) -> Self {
         Self {
@@ -101,6 +108,7 @@ impl Tombstone {
             attempts: 0,
             next_attempt_at: DateTime::<Utc>::UNIX_EPOCH,
             last_error: None,
+            marked: false,
         }
     }
 
@@ -197,10 +205,14 @@ pub struct PurgeReport {
     pub purged: usize,
     /// Purges that failed. Each one waits for its backoff.
     pub failed: usize,
-    /// Rows not due yet: the retention, a backoff, a delete in progress, or
-    /// a slot this host does not own.
+    /// Rows not due yet: the retention, a backoff, a delete in progress, a
+    /// slot this host does not own, or another mode's key. A dropped stale
+    /// row counts in no field.
     pub waiting: usize,
-    /// The last error of the pass.
+    /// Rows with at least one failed purge, also the ones that wait for
+    /// their backoff.
+    pub failing: usize,
+    /// The last error of the pass, or else the newest error a row keeps.
     pub last_error: Option<String>,
 }
 
@@ -237,6 +249,8 @@ struct Row {
     next_attempt: i64,
     #[diesel(sql_type = Nullable<Text>)]
     last_error: Option<String>,
+    #[diesel(sql_type = Integer)]
+    marked: i32,
 }
 
 impl From<Row> for Tombstone {
@@ -249,6 +263,7 @@ impl From<Row> for Tombstone {
             attempts: u32::try_from(row.attempts).unwrap_or(0),
             next_attempt_at: from_millis(row.next_attempt),
             last_error: row.last_error,
+            marked: row.marked != 0,
         }
     }
 }
@@ -259,7 +274,8 @@ fn from_millis(millis: i64) -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
-const COLUMNS: &str = "key, deleted_at, confirmed, purge_after, attempts, next_attempt, last_error";
+const COLUMNS: &str =
+    "key, deleted_at, confirmed, purge_after, attempts, next_attempt, last_error, marked";
 
 /// The tombstone rows on the control database.
 pub struct FleetTombstones {
@@ -310,18 +326,32 @@ impl FleetTombstones {
         Ok(conn)
     }
 
-    /// Write a pending row before a delete removes the files. An existing
-    /// row stays as it is (`Record` in the model).
+    /// Write a pending row before a delete removes the files (`Record` in
+    /// the model). `present`: the file is on disk. Then an existing row is
+    /// stale (a restore or a re-create drops it first), and it is reset.
+    /// Else an existing row is an older delete's, and it stays.
     ///
     /// # Errors
     ///
     /// The control database cannot be written.
-    pub async fn record(&self, key: &str, retention: Duration) -> Result<(), TombstoneError> {
+    pub async fn record(
+        &self,
+        key: &str,
+        retention: Duration,
+        present: bool,
+    ) -> Result<(), TombstoneError> {
         let row = Tombstone::new(key, self.now(), retention, false);
+        let conflict = if present {
+            "DO UPDATE SET deleted_at = excluded.deleted_at, confirmed = 0, \
+             purge_after = excluded.purge_after, attempts = 0, next_attempt = 0, \
+             last_error = NULL, marked = 0"
+        } else {
+            "DO NOTHING"
+        };
         let mut conn = self.conn().await?;
         diesel::sql_query(format!(
-            "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, 0, ?, 0, 0, NULL) \
-             ON CONFLICT (key) DO NOTHING"
+            "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, 0, ?, 0, 0, NULL, 0) \
+             ON CONFLICT (key) {conflict}"
         ))
         .bind::<Text, _>(&row.key)
         .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
@@ -332,8 +362,41 @@ impl FleetTombstones {
         .map_err(store_error("record"))
     }
 
-    /// The files are gone: stamp `deleted_at` now. A confirmed row stays as
-    /// it is (`Confirm` in the model). Returns the row.
+    /// Write `row` as it is. An explicit restore puts back the row it took
+    /// when the restore fails.
+    ///
+    /// # Errors
+    ///
+    /// The control database cannot be written.
+    pub async fn put(&self, row: &Tombstone) -> Result<(), TombstoneError> {
+        let mut conn = self.conn().await?;
+        diesel::sql_query(format!(
+            "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (key) DO UPDATE SET deleted_at = excluded.deleted_at, \
+             confirmed = excluded.confirmed, purge_after = excluded.purge_after, \
+             attempts = excluded.attempts, next_attempt = excluded.next_attempt, \
+             last_error = excluded.last_error, marked = excluded.marked"
+        ))
+        .bind::<Text, _>(&row.key)
+        .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
+        .bind::<Integer, _>(i32::from(row.confirmed))
+        .bind::<BigInt, _>(row.purge_after.timestamp_millis())
+        .bind::<Integer, _>(i32::try_from(row.attempts).unwrap_or(i32::MAX))
+        .bind::<BigInt, _>(row.next_attempt_at.timestamp_millis())
+        .bind::<Nullable<Text>, _>(row.last_error.as_deref())
+        .bind::<Integer, _>(i32::from(row.marked))
+        .execute(&mut *conn)
+        .await
+        .map(drop)
+        .map_err(store_error("put"))
+    }
+
+    /// The files are gone: stamp `deleted_at` on the pending row of `key`
+    /// (`Confirm` in the model). `deleted_at` is now, or `floor` when that
+    /// is later: the newest generation of the deleted database, so a clock
+    /// that is behind does not keep it. A confirmed row stays as it is.
+    /// `None` when no row is left: a re-create or a restore took the key,
+    /// and no cutoff may cover its new database.
     ///
     /// # Errors
     ///
@@ -342,23 +405,46 @@ impl FleetTombstones {
         &self,
         key: &str,
         retention: Duration,
-    ) -> Result<Tombstone, TombstoneError> {
-        let row = Tombstone::new(key, self.now(), retention, true);
+        floor: Option<DateTime<Utc>>,
+    ) -> Result<Option<Tombstone>, TombstoneError> {
+        let now = self.now();
+        let row = Tombstone::new(
+            key,
+            floor.map_or(now, |floor| floor.max(now)),
+            retention,
+            true,
+        );
         let mut conn = self.conn().await?;
         diesel::sql_query(format!(
-            "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, 1, ?, 0, 0, NULL) \
-             ON CONFLICT (key) DO UPDATE SET deleted_at = excluded.deleted_at, confirmed = 1, \
-             purge_after = excluded.purge_after, attempts = 0, next_attempt = 0, \
-             last_error = NULL WHERE {TOMBSTONE_TABLE}.confirmed = 0"
+            "UPDATE {TOMBSTONE_TABLE} SET deleted_at = ?, confirmed = 1, purge_after = ?, \
+             attempts = 0, next_attempt = 0, last_error = NULL \
+             WHERE key = ? AND confirmed = 0"
         ))
-        .bind::<Text, _>(&row.key)
         .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
         .bind::<BigInt, _>(row.purge_after.timestamp_millis())
+        .bind::<Text, _>(&row.key)
         .execute(&mut *conn)
         .await
         .map_err(store_error("confirm"))?;
         drop(conn);
-        Ok(self.get(key).await?.unwrap_or(row))
+        self.get(key).await
+    }
+
+    /// Record that the marker object of `key` is written.
+    ///
+    /// # Errors
+    ///
+    /// The control database cannot be written.
+    pub async fn set_marked(&self, key: &str) -> Result<(), TombstoneError> {
+        let mut conn = self.conn().await?;
+        diesel::sql_query(format!(
+            "UPDATE {TOMBSTONE_TABLE} SET marked = 1 WHERE key = ?"
+        ))
+        .bind::<Text, _>(key)
+        .execute(&mut *conn)
+        .await
+        .map(drop)
+        .map_err(store_error("mark"))
     }
 
     /// The row of `key`.
@@ -378,16 +464,22 @@ impl FleetTombstones {
         Ok(rows.into_iter().next().map(Tombstone::from))
     }
 
-    /// Every row, the oldest delete first, at most `limit`.
+    /// At most `limit` rows in key order, after the key `after`. Page with
+    /// the last key of the previous page.
     ///
     /// # Errors
     ///
     /// The control database cannot be read.
-    pub async fn list(&self, limit: usize) -> Result<Vec<Tombstone>, TombstoneError> {
+    pub async fn list_after(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Tombstone>, TombstoneError> {
         let mut conn = self.conn().await?;
         let rows: Vec<Row> = diesel::sql_query(format!(
-            "SELECT {COLUMNS} FROM {TOMBSTONE_TABLE} ORDER BY deleted_at, key LIMIT ?"
+            "SELECT {COLUMNS} FROM {TOMBSTONE_TABLE} WHERE key > ? ORDER BY key LIMIT ?"
         ))
+        .bind::<Text, _>(after.unwrap_or(""))
         .bind::<BigInt, _>(i64::try_from(limit).unwrap_or(i64::MAX))
         .load(&mut *conn)
         .await
@@ -586,22 +678,30 @@ mod tests {
         let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
         let retention = Duration::from_secs(60);
-        store.record("tenant:acme", retention).await.unwrap();
+        store.record("tenant:acme", retention, false).await.unwrap();
         let pending = store.get("tenant:acme").await.unwrap().unwrap();
         assert!(!pending.confirmed);
         clock.advance(Duration::from_secs(1));
-        let confirmed = store.confirm("tenant:acme", retention).await.unwrap();
+        let confirmed = store
+            .confirm("tenant:acme", retention, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(confirmed.confirmed);
+        assert!(!confirmed.marked);
         assert_eq!(confirmed.deleted_at, at(2_000));
         assert_eq!(confirmed.purge_after, at(62_000));
         // A second confirm keeps the cutoff.
         clock.advance(Duration::from_secs(1));
         assert_eq!(
-            store.confirm("tenant:acme", retention).await.unwrap(),
-            confirmed
+            store.confirm("tenant:acme", retention, None).await.unwrap(),
+            Some(confirmed.clone())
         );
+        store.set_marked("tenant:acme").await.unwrap();
+        let confirmed = store.get("tenant:acme").await.unwrap().unwrap();
+        assert!(confirmed.marked);
         // A second delete that finds no file keeps it too.
-        store.record("tenant:acme", retention).await.unwrap();
+        store.record("tenant:acme", retention, false).await.unwrap();
         store.remove_pending("tenant:acme").await.unwrap();
         assert_eq!(store.get("tenant:acme").await.unwrap(), Some(confirmed));
         store.remove("tenant:acme").await.unwrap();
@@ -609,11 +709,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_confirm_without_its_pending_row_writes_nothing() {
+        // A re-create or a restore in another process took the key between
+        // the removal and the confirm: no cutoff may cover the new database.
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = crate::time::TickingClock::starting_at(at(1_000));
+        let store = store(tmp.path(), &clock);
+        store
+            .record("tenant:acme", Duration::ZERO, false)
+            .await
+            .unwrap();
+        store.remove("tenant:acme").await.unwrap();
+        assert_eq!(
+            store
+                .confirm("tenant:acme", Duration::ZERO, None)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.get("tenant:acme").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_list_pages_past_the_first_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = crate::time::TickingClock::starting_at(at(1_000));
+        let store = store(tmp.path(), &clock);
+        for i in 0..5 {
+            store
+                .record(&format!("tenant:t{i}"), Duration::ZERO, false)
+                .await
+                .unwrap();
+        }
+        let first = store.list_after(None, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        let second = store.list_after(Some(&first[1].key), 2).await.unwrap();
+        let third = store.list_after(Some(&second[1].key), 2).await.unwrap();
+        let keys: Vec<String> = first
+            .iter()
+            .chain(&second)
+            .chain(&third)
+            .map(|t| t.key.clone())
+            .collect();
+        assert_eq!(
+            keys,
+            (0..5).map(|i| format!("tenant:t{i}")).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
     async fn a_failure_is_durable_and_listed() {
         let tmp = tempfile::tempdir().unwrap();
         let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
-        let row = store.confirm("slot:00007", Duration::ZERO).await.unwrap();
+        store
+            .record("slot:00007", Duration::ZERO, false)
+            .await
+            .unwrap();
+        let row = store
+            .confirm("slot:00007", Duration::ZERO, None)
+            .await
+            .unwrap()
+            .unwrap();
         let failed = store
             .record_failure(row, "destination is down")
             .await
@@ -621,10 +778,13 @@ mod tests {
         assert_eq!(failed.attempts, 1);
         // A new store on the same file reads the same row.
         let again = FleetTombstones::new(control(tmp.path()), Arc::new(clock.clone()));
-        assert_eq!(again.list(10).await.unwrap(), vec![failed]);
-        store.record("slot:00008", Duration::ZERO).await.unwrap();
+        assert_eq!(again.list_after(None, 10).await.unwrap(), vec![failed]);
+        store
+            .record("slot:00008", Duration::ZERO, false)
+            .await
+            .unwrap();
         store.remove_pending("slot:00008").await.unwrap();
-        assert_eq!(again.list(10).await.unwrap().len(), 1);
+        assert_eq!(again.list_after(None, 10).await.unwrap().len(), 1);
     }
 
     /// The replica lifecycle against a local destination (issue #3235).
@@ -647,6 +807,8 @@ mod tests {
             inner: FileDestination,
             deletes_fail: AtomicBool,
             down: AtomicBool,
+            /// Deletes that still succeed; then each delete fails.
+            deletes_left: std::sync::atomic::AtomicUsize,
         }
 
         impl Switchable {
@@ -655,11 +817,18 @@ mod tests {
                     inner: FileDestination::new(dir).unwrap(),
                     deletes_fail: AtomicBool::new(false),
                     down: AtomicBool::new(false),
+                    deletes_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 })
             }
 
             fn check(&self, delete: bool) -> Result<(), DestinationError> {
+                let budget_spent = delete
+                    && self
+                        .deletes_left
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_err();
                 if AtomicBool::load(&self.down, Ordering::SeqCst)
+                    || budget_spent
                     || (delete && AtomicBool::load(&self.deletes_fail, Ordering::SeqCst))
                 {
                     return Err(DestinationError::Io {
@@ -722,13 +891,23 @@ mod tests {
         }
 
         fn host(setup: &Setup<'_>) -> Host {
+            host_with(setup, false, setup.clock)
+        }
+
+        /// A host that creates on demand, and whose replicators read
+        /// `replica_clock` (a host clock that is ahead, say).
+        fn host_with(
+            setup: &Setup<'_>,
+            create_on_demand: bool,
+            replica_clock: &crate::time::TickingClock,
+        ) -> Host {
             let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
                 mode: FleetMode::Tenant,
                 root: setup.volume.join("fleet").display().to_string(),
                 path: None,
                 max_open: 8,
                 pool_size: 2,
-                create_on_demand: Some(false),
+                create_on_demand: Some(create_on_demand),
                 idle_close_secs: 0,
                 restore_missing: setup.restore_missing,
                 ownership: None,
@@ -756,7 +935,7 @@ mod tests {
                     },
                     Duration::from_secs(30),
                     setup.restore_missing,
-                    clock,
+                    Arc::new(replica_clock.clone()),
                 )
                 .with_tombstones(Arc::clone(&tombstones))
                 .with_retention_after_delete(setup.retention),
@@ -885,6 +1064,13 @@ mod tests {
             let health = host.replication.indicator().check().await;
             let tombstones = &health.details["tombstones"];
             assert_eq!(tombstones["failed"], 1, "{tombstones}");
+            assert_eq!(tombstones["failing"], 1, "{tombstones}");
+            // A failed purge does not turn the indicator Down.
+            assert_eq!(health.status, HealthStatus::Up);
+            // In its backoff the row waits, and health keeps its error.
+            let report = host.fleet.purge_deleted_replicas().await;
+            assert_eq!((report.failed, report.failing), (0, 1));
+            assert!(report.last_error.is_some());
         }
 
         #[tokio::test]
@@ -908,14 +1094,120 @@ mod tests {
                 "the replica is still there"
             );
 
-            // This host: the row blocks the restore.
+            // Another host with its own control database: the marker blocks
+            // the restore.
+            let b = host(&Setup {
+                volume: &tmp.path().join("b"),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: true,
+                retention: Duration::ZERO,
+            });
+            assert!(a.replication.marker(&key).unwrap().is_some());
+            assert!(matches!(
+                b.fleet.open(&key).await,
+                Err(FleetError::NotFound { .. })
+            ));
+            assert!(!b.fleet.exists(&key));
+
+            // This host: the row alone blocks the restore.
+            destination.deletes_fail.store(false, Ordering::SeqCst);
+            destination
+                .inner
+                .delete(&format!("{}/{MARKER_OBJECT}", replica_root(ROOT, &key)))
+                .unwrap();
             assert!(matches!(
                 a.fleet.open(&key).await,
                 Err(FleetError::NotFound { .. })
             ));
             assert!(!a.fleet.exists(&key));
 
-            // Another host with its own control database: the marker does.
+            // An explicit restore overrides the tombstone and drops it.
+            let outcome = a.fleet.restore(&key, None).await.unwrap();
+            assert!(outcome.bytes > 0);
+            assert_eq!(a.tombstones.get(&key.name()).await.unwrap(), None);
+            assert_eq!(a.replication.marker(&key).unwrap(), None);
+            let db = a.fleet.open(&key).await.unwrap();
+            let mut conn = db.pool().get().await.unwrap();
+            diesel::sql_query("SELECT body FROM notes")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            drop(conn);
+            drop(db);
+            a.fleet.close(&key).await;
+            // Nothing purges the restored replica, and another host restores it.
+            let report = a.fleet.purge_deleted_replicas().await;
+            assert_eq!(report.purged, 0);
+            std::fs::remove_dir_all(b.fleet.root()).unwrap();
+            let b = host(&Setup {
+                volume: &tmp.path().join("b"),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: true,
+                retention: Duration::ZERO,
+            });
+            b.fleet.open(&key).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_failed_restore_puts_the_tombstone_back() {
+            let tmp = tempfile::tempdir().unwrap();
+            let replicas = tmp.path().join("replicas");
+            let destination = Switchable::new(&replicas);
+            let clock = clock();
+            let host = host(&Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::from_secs(3600),
+            });
+            let key = shipped(&host, "acme").await;
+            clock.advance(Duration::from_secs(1));
+            assert!(host.fleet.delete(&key).await.unwrap());
+            let row = host.tombstones.get(&key.name()).await.unwrap().unwrap();
+            let snapshot = destination
+                .keys(&key)
+                .into_iter()
+                .find(|k| k.ends_with(crate::replication::segment::SNAPSHOT_OBJECT))
+                .unwrap();
+            std::fs::write(replicas.join(snapshot), b"not a database").unwrap();
+            assert!(host.fleet.restore(&key, None).await.is_err());
+            assert_eq!(host.tombstones.get(&key.name()).await.unwrap(), Some(row));
+        }
+
+        #[tokio::test]
+        async fn a_partial_purge_keeps_the_marker_and_the_next_pass_ends_it() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let a = host(&Setup {
+                volume: &tmp.path().join("a"),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: true,
+                retention: Duration::ZERO,
+            });
+            let key = shipped(&a, "acme").await;
+            assert!(destination.keys(&key).len() >= 2);
+            clock.advance(Duration::from_secs(1));
+            // The first delete goes, then the destination fails.
+            destination.deletes_left.store(1, Ordering::SeqCst);
+            assert!(a.fleet.delete(&key).await.unwrap());
+            assert!(
+                a.replication.marker(&key).unwrap().is_some(),
+                "the marker goes last"
+            );
+            assert_eq!(
+                a.tombstones
+                    .get(&key.name())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .attempts,
+                1
+            );
             let b = host(&Setup {
                 volume: &tmp.path().join("b"),
                 destination: &destination,
@@ -927,18 +1219,136 @@ mod tests {
                 b.fleet.open(&key).await,
                 Err(FleetError::NotFound { .. })
             ));
-            assert!(!b.fleet.exists(&key));
 
-            // An explicit restore overrides the tombstone.
-            let outcome = a.fleet.restore(&key, None).await.unwrap();
-            assert!(outcome.bytes > 0);
-            assert_eq!(a.tombstones.get(&key.name()).await.unwrap(), None);
-            let db = a.fleet.open(&key).await.unwrap();
-            let mut conn = db.pool().get().await.unwrap();
-            diesel::sql_query("SELECT body FROM notes")
-                .execute(&mut *conn)
+            destination.deletes_left.store(usize::MAX, Ordering::SeqCst);
+            clock.advance(retry_delay(0));
+            assert_eq!(a.fleet.purge_deleted_replicas().await.purged, 1);
+            assert_eq!(destination.keys(&key), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_create_on_demand_does_not_end_the_retention() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let setup = Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::from_secs(3600),
+            };
+            let host = host_with(&setup, true, &clock);
+            let key = shipped(&host, "acme").await;
+            clock.advance(Duration::from_secs(1));
+            assert!(host.fleet.delete(&key).await.unwrap());
+            let kept = destination.keys(&key);
+            assert!(matches!(
+                host.fleet.open(&key).await,
+                Err(FleetError::Deleting { .. })
+            ));
+            assert_eq!(destination.keys(&key), kept, "the undo window stays");
+            // An explicit provision ends it.
+            host.fleet.provision(&key).await.unwrap();
+            assert_eq!(host.tombstones.get(&key.name()).await.unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn a_young_pending_row_waits_and_a_stale_confirmed_row_is_dropped() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let host = host(&Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::ZERO,
+            });
+            let live = shipped(&host, "acme").await;
+            // A delete of a missing file runs now: its row is pending.
+            host.tombstones
+                .record("tenant:ghost", Duration::ZERO, false)
                 .await
                 .unwrap();
+            // A restore left a confirmed row next to a live file.
+            host.tombstones
+                .record(&live.name(), Duration::ZERO, true)
+                .await
+                .unwrap();
+            host.tombstones
+                .confirm(&live.name(), Duration::ZERO, None)
+                .await
+                .unwrap();
+
+            let report = host.fleet.purge_deleted_replicas().await;
+            assert_eq!((report.purged, report.waiting), (0, 1), "{report:?}");
+            assert!(
+                !host
+                    .tombstones
+                    .get("tenant:ghost")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .confirmed
+            );
+            assert_eq!(host.tombstones.get(&live.name()).await.unwrap(), None);
+            assert!(
+                !destination.keys(&live).is_empty(),
+                "the live replica stays"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_second_delete_resets_a_stale_row() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let host = host(&Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::ZERO,
+            });
+            let key = shipped(&host, "acme").await;
+            // A stale confirmed row with a cutoff older than the live
+            // database's generation.
+            let old = Tombstone::new(
+                &key.name(),
+                clock.now() - chrono::Duration::hours(1),
+                Duration::ZERO,
+                true,
+            );
+            host.tombstones.put(&old).await.unwrap();
+            clock.advance(Duration::from_secs(5));
+            assert!(host.fleet.delete(&key).await.unwrap());
+            assert_eq!(
+                destination.keys(&key),
+                Vec::<String>::new(),
+                "the new cutoff covers it"
+            );
+            assert_eq!(host.tombstones.get(&key.name()).await.unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn a_replica_clock_ahead_of_the_app_clock_is_still_purged() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let ahead =
+                crate::time::TickingClock::starting_at(clock.now() + chrono::Duration::hours(1));
+            let setup = Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::ZERO,
+            };
+            let host = host_with(&setup, false, &ahead);
+            let key = shipped(&host, "acme").await;
+            assert!(host.fleet.delete(&key).await.unwrap());
+            assert_eq!(destination.keys(&key), Vec::<String>::new());
         }
 
         #[tokio::test]
@@ -971,6 +1381,81 @@ mod tests {
             clock.advance(retention);
             let report = host.fleet.purge_deleted_replicas().await;
             assert_eq!(report.purged, 1);
+            assert_eq!(destination.keys(&key), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_marker_that_failed_during_the_retention_is_written_again() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let a = host(&Setup {
+                volume: &tmp.path().join("a"),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: true,
+                retention: Duration::from_secs(3600),
+            });
+            let key = shipped(&a, "acme").await;
+            clock.advance(Duration::from_secs(1));
+            destination.down.store(true, Ordering::SeqCst);
+            assert!(a.fleet.delete(&key).await.unwrap());
+            assert!(!a.tombstones.get(&key.name()).await.unwrap().unwrap().marked);
+            destination.down.store(false, Ordering::SeqCst);
+            assert_eq!(a.replication.marker(&key).unwrap(), None);
+
+            let report = a.fleet.purge_deleted_replicas().await;
+            assert_eq!(report.waiting, 1, "the retention still keeps it");
+            assert!(a.tombstones.get(&key.name()).await.unwrap().unwrap().marked);
+            assert!(a.replication.marker(&key).unwrap().is_some());
+
+            // A host with its own control database does not restore it.
+            let b = host(&Setup {
+                volume: &tmp.path().join("b"),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: true,
+                retention: Duration::ZERO,
+            });
+            assert!(matches!(
+                b.fleet.open(&key).await,
+                Err(FleetError::NotFound { .. })
+            ));
+        }
+
+        #[tokio::test]
+        async fn a_pass_reaches_rows_past_a_full_batch_of_waiting_ones() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let host = host(&Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::ZERO,
+            });
+            // Rows that sort first and wait: their retention has not ended.
+            for i in 0..300 {
+                let name = format!("tenant:a{i:03}");
+                host.tombstones
+                    .record(&name, Duration::from_secs(3600), false)
+                    .await
+                    .unwrap();
+                host.tombstones
+                    .confirm(&name, Duration::from_secs(3600), None)
+                    .await
+                    .unwrap();
+            }
+            let key = shipped(&host, "zeta").await;
+            clock.advance(Duration::from_secs(1));
+            destination.deletes_fail.store(true, Ordering::SeqCst);
+            assert!(host.fleet.delete(&key).await.unwrap());
+            destination.deletes_fail.store(false, Ordering::SeqCst);
+            clock.advance(retry_delay(0));
+
+            let report = host.fleet.purge_deleted_replicas().await;
+            assert_eq!((report.purged, report.waiting), (1, 300), "{report:?}");
             assert_eq!(destination.keys(&key), Vec::<String>::new());
         }
 
@@ -1069,7 +1554,7 @@ mod tests {
                 retention: Duration::ZERO,
             });
             let key = shipped(&host, "acme").await;
-            // Make the control database read-only for this process.
+            // Replace the table with a view, so the insert fails.
             let mut conn = control(tmp.path()).get().await.unwrap();
             conn.batch_execute(&format!("DROP TABLE IF EXISTS {TOMBSTONE_TABLE}; CREATE VIEW {TOMBSTONE_TABLE} AS SELECT 1 AS key"))
                 .await
@@ -1094,9 +1579,8 @@ mod tests {
                 restore_missing: false,
                 retention: Duration::ZERO,
             });
-            let good = shipped(&host, "acme").await;
+            shipped(&host, "acme").await;
             let bad = shipped(&host, "globex").await;
-            let _ = good;
 
             let report = host.fleet.check_replica_sample(2).await.unwrap();
             assert_eq!(report.passed.len(), 2, "{report:?}");
@@ -1120,6 +1604,16 @@ mod tests {
             assert_eq!(report.failed[0].0, bad.name());
             let health = host.replication.indicator().check().await;
             assert_eq!(health.status, HealthStatus::Down);
+            // A clean check turns it Up again.
+            assert!(host.fleet.delete(&bad).await.unwrap());
+            let report = host.fleet.check_replica_sample(2).await.unwrap();
+            assert_eq!(
+                (report.passed.len(), report.failed.len()),
+                (1, 0),
+                "{report:?}"
+            );
+            let health = host.replication.indicator().check().await;
+            assert_eq!(health.status, HealthStatus::Up);
             // The scratch files are gone.
             let scratch = host.fleet.root().join(crate::fleet_layout::RESERVED_DIR);
             let left: Vec<_> = walk(&scratch)
@@ -1185,6 +1679,8 @@ mod tests {
             .unwrap();
             assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
             let stop = tokio_util::sync::CancellationToken::new();
+            // The first purge tick of the task is at once, on purpose: a
+            // later tick would turn this test into a 30-second timeout.
             let maintenance = fleet.spawn_maintenance(stop.clone());
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             loop {
@@ -1205,6 +1701,72 @@ mod tests {
             assert!(!destination.keys(&kept).is_empty());
             stop.cancel();
             maintenance.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn the_restore_check_names_a_wrong_identity_and_an_unreplicated_database() {
+            let tmp = tempfile::tempdir().unwrap();
+            let replicas = tmp.path().join("replicas");
+            let destination = Switchable::new(&replicas);
+            let clock = clock();
+            let host = host(&Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::ZERO,
+            });
+            let acme = shipped(&host, "acme").await;
+            // `globex` gets a copy of acme's replica: its identity is wrong.
+            let globex = host.fleet.key_for("globex").unwrap();
+            for object in destination.keys(&acme) {
+                let copy =
+                    object.replacen(&replica_root(ROOT, &acme), &replica_root(ROOT, &globex), 1);
+                let body = destination.inner.get(&object).unwrap();
+                destination.inner.put(&copy, &body).unwrap();
+            }
+            // Its file is on disk, made by a fleet with no replication.
+            let plain = DatabaseFleet::builder(DatabaseFleetConfig {
+                mode: FleetMode::Tenant,
+                root: tmp.path().join("fleet").display().to_string(),
+                path: None,
+                max_open: 8,
+                pool_size: 2,
+                create_on_demand: Some(false),
+                idle_close_secs: 0,
+                restore_missing: false,
+                ownership: None,
+                replica_retention_after_delete: Duration::ZERO,
+                restore_check_sample: 0,
+            })
+            .build()
+            .unwrap();
+            drop(plain.provision(&globex).await.unwrap());
+            let initech = plain.key_for("initech").unwrap();
+            drop(plain.provision(&initech).await.unwrap());
+            plain.close_all().await;
+
+            let report = host.fleet.check_replica_sample(3).await.unwrap();
+            assert_eq!(report.passed, vec![acme.name()], "{report:?}");
+            assert_eq!(report.unreplicated, vec![initech.name()]);
+            assert_eq!(report.failed.len(), 1);
+            assert_eq!(report.failed[0].0, globex.name());
+            assert!(report.failed[0].1.contains("identity"), "{report:?}");
+        }
+
+        #[tokio::test]
+        async fn a_huge_retention_round_trips_and_is_never_due() {
+            let tmp = tempfile::tempdir().unwrap();
+            let store = FleetTombstones::new(control(tmp.path()), Arc::new(clock()));
+            let retention = Duration::from_secs(u64::MAX / 2);
+            store.record("tenant:acme", retention, false).await.unwrap();
+            let row = store
+                .confirm("tenant:acme", retention, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(store.get("tenant:acme").await.unwrap(), Some(row.clone()));
+            assert!(!row.is_due(DateTime::<Utc>::MAX_UTC - chrono::Duration::days(1)));
         }
 
         fn walk(dir: &Path) -> Vec<std::path::PathBuf> {

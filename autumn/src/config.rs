@@ -10472,16 +10472,19 @@ pub struct DatabaseFleetConfig {
 
     /// With `[replication]` on, keep a deleted database's replica this long,
     /// then purge it (issue #3235). Default: `0`, purge at once. Use it as an
-    /// undo window: `fleet.restore` brings the database back until then. A
-    /// duration string (`"30d"`, `"12h"`) or milliseconds.
+    /// undo window: until the retention ends, `DatabaseFleet::restore` and
+    /// `autumn fleet restore` bring the database back. Use a duration string
+    /// (`"30d"`, `"12h"`). A bare number is milliseconds, and a value under
+    /// one minute is refused.
     #[serde(default, deserialize_with = "deserialize_duration")]
     pub replica_retention_after_delete: std::time::Duration,
 
-    /// With `[replication]` on, restore this many random databases into a
-    /// scratch directory every `[replication] verify_interval_secs`, and
-    /// check `PRAGMA integrity_check` and the identity row. `/actuator/health`
-    /// reports the result under `replication:fleet`. Default: `1`. `0` turns
-    /// the check off.
+    /// With `[replication]` on, each worker-role process restores this many
+    /// random databases into a scratch directory every `[replication]
+    /// verify_interval_secs`, and checks `PRAGMA integrity_check` and the
+    /// identity row. The first check runs one interval after start.
+    /// `/actuator/health` reports the result under `replication:fleet`.
+    /// Default: `1`. `0`, or `verify_interval_secs = 0`, turns the check off.
     #[serde(default = "default_fleet_restore_check_sample")]
     pub restore_check_sample: usize,
 }
@@ -10636,6 +10639,14 @@ impl DatabaseFleetConfig {
         }
         if let Some(ownership) = &self.ownership {
             ownership.validate()?;
+        }
+        // A bare number is milliseconds: `30` is not 30 days.
+        let retention = self.replica_retention_after_delete;
+        if !retention.is_zero() && retention < std::time::Duration::from_secs(60) {
+            return Err(ConfigError::Validation(format!(
+                "database.fleet.replica_retention_after_delete is {retention:?}; use at least \
+                 one minute with a unit (\"30d\", \"12h\"), or 0 to purge at once"
+            )));
         }
         Ok(())
     }
@@ -20568,13 +20579,16 @@ path = "/healthz"
     fn validate_rejects_malformed_fleet_sections() {
         use crate::fleet_layout::FleetMode;
         type Mutate = fn(&mut DatabaseFleetConfig);
-        let cases: [(&str, Mutate); 6] = [
+        let cases: [(&str, Mutate); 7] = [
             ("root", |f| f.root = "  ".to_owned()),
             ("not a database URL", |f| f.root = "sqlite:///x".to_owned()),
             ("{tenant}", |f| f.path = Some("{bucket}/all.db".to_owned())),
             ("..", |f| f.path = Some("../{tenant}.db".to_owned())),
             ("max_open", |f| f.max_open = 0),
             ("pool_size", |f| f.pool_size = 0),
+            ("replica_retention_after_delete", |f| {
+                f.replica_retention_after_delete = std::time::Duration::from_millis(30);
+            }),
         ];
         for (needle, mutate) in cases {
             let mut section = fleet(FleetMode::Tenant);

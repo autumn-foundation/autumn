@@ -14068,9 +14068,14 @@ fn start_fleet_replication(
     .with_retention_after_delete(fleet_config.map_or(std::time::Duration::ZERO, |f| {
         f.replica_retention_after_delete
     }))
+    // Worker roles only: the check downloads whole databases.
     .with_restore_check(
         runtime.settings.verify_interval,
-        fleet_config.map_or(0, |f| f.restore_check_sample),
+        if state.role().runs_workers() {
+            fleet_config.map_or(0, |f| f.restore_check_sample)
+        } else {
+            0
+        },
     )
     .with_entropy(state.entropy_arc());
     if let Some(control) = state.pool() {

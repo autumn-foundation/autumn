@@ -3019,8 +3019,8 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   and the maintenance task retries it (`purge_deleted_replicas`).
   `restore_missing` does not restore a tombstoned key; `restore` does, and
   drops the tombstone. `replica_retention_after_delete = "30d"` keeps the
-  replica for undo. A new database with the same key purges the old replica
-  first. `restore_check_sample` (default `1`) restores random databases every
+  replica for undo; during it, a create on demand answers `410` and
+  `provision` purges the old replica and ends it. `restore_check_sample` (default `1`) restores random databases every
   `[replication] verify_interval_secs`; a failure turns `replication:fleet`
   `Down`. Do not write an `on_delete` hook to delete replicas. Guide:
   "Deleting a database's replica" in `docs/guide/sqlite-fleet.md`.

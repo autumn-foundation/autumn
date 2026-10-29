@@ -809,6 +809,19 @@ mod sqlite {
     }
 
     #[test]
+    fn fleet_delete_names_why_it_needs_the_replica() {
+        let app = App::new(
+            "[replication]\nenabled = true\npath = \"replicas\"\n\n\
+             [replication.s3]\nbucket = \"b\"\naccess_key_id_env = \"K\"\n\
+             secret_access_key_env = \"S\"\n",
+        );
+        app.provision(&app.fleet(), &["acme"], 1);
+        let stderr = run_err(&app.dir, &["fleet", "delete", "tenant:acme", "--force"]);
+        assert!(stderr.contains("also removes the replica"), "{stderr}");
+        assert!(app.path("acme").is_file(), "nothing was removed");
+    }
+
+    #[test]
     fn fleet_delete_keeps_the_replica_for_the_retention_and_restore_brings_it_back() {
         let tmp = tempfile::tempdir().unwrap();
         let replicas = tmp.path().join("replicas");
@@ -827,6 +840,12 @@ mod sqlite {
         run_ok(&app.dir, &["fleet", "restore", "tenant:acme", "--force"]);
         assert_eq!(count_notes(&app.path("acme")), 1);
         assert_eq!(tombstones(&app), 0, "a restore drops the tombstone");
+        assert!(
+            !replicas
+                .join("app/dev/fleet/tenant/acme/tombstone")
+                .exists(),
+            "a restore removes the marker"
+        );
     }
 
     #[test]

@@ -557,6 +557,28 @@ impl FleetReplication {
         }
     }
 
+    /// When the newest generation of the replica of `key` was created.
+    /// `None` when there is none. Blocking: one list at the destination.
+    ///
+    /// # Errors
+    ///
+    /// The destination failed.
+    pub(crate) fn newest_generation(
+        &self,
+        key: &FleetDbKey,
+    ) -> Result<Option<DateTime<Utc>>, String> {
+        let root = self.root_for(key);
+        Ok(self
+            .destination
+            .list(&segment::generations_prefix(&root))
+            .map_err(|e| e.to_string())?
+            .iter()
+            .filter_map(|object| segment::generation_of_key(&root, object))
+            .filter_map(|generation| segment::parse_generation_id(&generation))
+            .filter_map(|info| DateTime::from_timestamp_millis(info.created_ms))
+            .max())
+    }
+
     /// Remove the tombstone marker of `key`. Blocking.
     pub(crate) fn delete_marker(&self, key: &FleetDbKey) -> Result<(), String> {
         self.destination
@@ -631,8 +653,16 @@ impl FleetReplication {
 
     /// Restore the replica of `key` into a scratch file under `scratch`,
     /// check its identity row, and remove the file. The restore itself runs
-    /// `PRAGMA integrity_check`. Blocking.
+    /// `PRAGMA integrity_check`. A failure is tried once more: a live
+    /// replicator can ship between the list and the head read. Blocking.
     pub(crate) fn check_restore(&self, key: &FleetDbKey, scratch: &Path) -> RestoreCheck {
+        match self.check_restore_once(key, scratch) {
+            RestoreCheck::Failed(_) => self.check_restore_once(key, scratch),
+            outcome => outcome,
+        }
+    }
+
+    fn check_restore_once(&self, key: &FleetDbKey, scratch: &Path) -> RestoreCheck {
         if let Err(error) = std::fs::create_dir_all(scratch) {
             return RestoreCheck::Failed(format!(
                 "could not create the scratch directory: {error}"
@@ -757,8 +787,13 @@ impl FleetReplication {
             let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
                 continue;
             };
-            // Closed since this pass began: its close shipped the last frames.
-            if replica.retired.load(Ordering::Acquire) {
+            // Closed since this pass began: its close shipped the last
+            // frames, or it is parked. A reopen puts it back in `active`.
+            let current = self
+                .active()
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &replica));
+            if !current {
                 continue;
             }
             if let Err(error) = replicator.tick() {
@@ -956,6 +991,7 @@ impl FleetReplication {
                     "purged": purge.purged,
                     "failed": purge.failed,
                     "waiting": purge.waiting,
+                    "failing": purge.failing,
                     "last_error": purge.last_error,
                 }),
             );
@@ -2134,6 +2170,24 @@ mod tests {
             std::thread::sleep(delay);
             flaky.down.store(false, Ordering::SeqCst);
         });
+    }
+
+    #[tokio::test]
+    async fn a_reopened_parked_replicator_keeps_shipping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication, flaky) = outage_fleet(tmp.path(), Duration::from_secs(5));
+        let key = park_one(&fleet).await;
+        assert_eq!(replication.closing(), 1);
+        // A request reopens it: the parked replicator goes back to work.
+        let db = fleet.open(&key).await.unwrap();
+        assert_eq!(replication.closing(), 0);
+        flaky.down.store(false, Ordering::SeqCst);
+        tick(&replication).await;
+        let health = replication.health();
+        assert_eq!(health.details["failing"], 0, "{health:?}");
+        assert_eq!(health.details["pending_bytes"], 0, "{health:?}");
+        drop(db);
+        fleet.close_all().await;
     }
 
     #[tokio::test]

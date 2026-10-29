@@ -88,8 +88,13 @@ It proves these properties:
   that is not newer than the delete. A newer generation restores.
 - A failed purge keeps the row, waits before the next try, and the wait is
   capped.
-- Only a purge, a restore, a re-create that purged, or a refused delete of
-  its own pending row drops the row. A second delete keeps the row.
+- Only a purge, a restore that worked, a re-create that purged, a refused
+  delete of its own pending row, or a confirmed row next to a live file
+  (`Stale`) drops the row. A second delete of a missing file keeps the
+  row. A delete of a present file resets a stale row.
+- A confirm never makes a row: after a re-create or a restore took the
+  key, no cutoff covers the new database. The retry task drops an old
+  pending row whose file is still there (`Refused`).
 - A row is never due before the retention ends, and a pending row is never
   due.
 - A purge never deletes a generation newer than the cutoff. With no newer

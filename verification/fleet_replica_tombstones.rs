@@ -23,11 +23,16 @@ pub struct Tombstone {
 }
 
 pub enum Op {
-    /// `delete` starts: the row is written before any file is removed. An
-    /// existing row stays as it is.
-    Record { now: int },
-    /// The file is gone (`delete`, or the retry task after a crash).
+    /// `delete` starts: the row is written before any file is removed.
+    /// `present`: the file is on disk, so an existing row is stale and is
+    /// reset. Else an existing row stays as it is.
+    Record { now: int, present: bool },
+    /// The file is gone (`delete`, or the retry task after a crash). `now`
+    /// is the later of the clock and the newest generation. A row that is
+    /// gone stays gone: a re-create or a restore took the key.
     Confirm { now: int },
+    /// The retry task finds the file on disk next to a confirmed row.
+    Stale,
     /// The delete removed nothing: a pending row goes. A confirmed row is
     /// an older delete's, and it stays.
     Refused,
@@ -35,13 +40,14 @@ pub enum Op {
     PurgeOk,
     /// A purge failed at `now`.
     PurgeFailed { now: int },
-    /// An explicit restore brought the database back.
-    Restore,
+    /// An explicit restore. It takes the row first, and puts it back when
+    /// nothing came back (`ok` is false).
+    Restore { ok: bool },
     /// A new database with the same key. `purged`: the old replica is gone.
     Recreate { purged: bool },
 }
 
-/// `retry_delay_ms`: `min(cap, base * 2^attempts)`.
+/// `retry_delay`: `min(cap, base * 2^attempts)`.
 pub open spec fn delay(base: nat, cap: nat, attempts: nat) -> nat {
     if base * pow2(attempts) < cap {
         base * pow2(attempts)
@@ -50,7 +56,7 @@ pub open spec fn delay(base: nat, cap: nat, attempts: nat) -> nat {
     }
 }
 
-/// `Tombstone::new` and `Tombstone::confirmed_at`.
+/// `Tombstone::new`.
 pub open spec fn fresh(now: int, retention: nat, confirmed: bool) -> Tombstone {
     Tombstone {
         deleted_at: now,
@@ -104,8 +110,12 @@ pub open spec fn apply(
     cap: nat,
 ) -> Option<Tombstone> {
     match op {
-        Op::Record { now } => match row {
-            Some(_) => row,
+        Op::Record { now, present } => match row {
+            Some(_) => if present {
+                Some(fresh(now, retention, false))
+            } else {
+                row
+            },
             None => Some(fresh(now, retention, false)),
         },
         Op::Confirm { now } => match row {
@@ -114,7 +124,15 @@ pub open spec fn apply(
             } else {
                 Some(fresh(now, retention, true))
             },
-            None => Some(fresh(now, retention, true)),
+            None => None,
+        },
+        Op::Stale => match row {
+            Some(t) => if t.confirmed {
+                None
+            } else {
+                row
+            },
+            None => None,
         },
         Op::Refused => match row {
             Some(t) => if t.confirmed {
@@ -129,7 +147,11 @@ pub open spec fn apply(
             Some(t) => Some(after_failure(t, now, base, cap)),
             None => None,
         },
-        Op::Restore => None,
+        Op::Restore { ok } => if ok {
+            None
+        } else {
+            row
+        },
         Op::Recreate { purged } => if purged {
             None
         } else {
@@ -220,8 +242,10 @@ pub proof fn only_these_ops_drop_the_row(t: Tombstone, op: Op, retention: nat, b
         apply(Some(t), op, retention, base, cap) is None,
     ensures
         match op {
-            Op::PurgeOk | Op::Restore => true,
+            Op::PurgeOk => true,
+            Op::Restore { ok } => ok,
             Op::Refused => !t.confirmed,
+            Op::Stale => t.confirmed,
             Op::Recreate { purged } => purged,
             _ => false,
         },
@@ -233,8 +257,37 @@ pub proof fn a_second_delete_keeps_a_confirmed_row(t: Tombstone, now: int, reten
     requires
         t.confirmed,
     ensures
-        apply(apply(Some(t), Op::Record { now }, retention, base, cap), Op::Refused, retention, base, cap)
-            == Some(t),
+        apply(
+            apply(Some(t), Op::Record { now, present: false }, retention, base, cap),
+            Op::Refused,
+            retention,
+            base,
+            cap,
+        ) == Some(t),
+{
+}
+
+/// A delete of a present file resets a stale row: the cutoff is the new
+/// delete's, not the old one's.
+pub proof fn a_delete_of_a_present_file_resets_a_stale_row(t: Tombstone, now: int, retention: nat, base: nat, cap: nat)
+    ensures
+        apply(Some(t), Op::Record { now, present: true }, retention, base, cap)
+            == Some(fresh(now, retention, false)),
+{
+}
+
+/// A confirm finds no row after a re-create or a restore took the key: it
+/// writes no cutoff that could cover the new database.
+pub proof fn a_confirm_never_makes_a_row(now: int, retention: nat, base: nat, cap: nat)
+    ensures
+        apply(None, Op::Confirm { now }, retention, base, cap) is None,
+{
+}
+
+/// A failed restore keeps the tombstone.
+pub proof fn a_failed_restore_keeps_the_row(t: Tombstone, retention: nat, base: nat, cap: nat)
+    ensures
+        apply(Some(t), Op::Restore { ok: false }, retention, base, cap) == Some(t),
 {
 }
 

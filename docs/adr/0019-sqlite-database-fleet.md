@@ -349,43 +349,57 @@ A replica that outlives its database breaks two things. A "delete my data"
 request leaves every snapshot and segment behind. And `restore_missing`
 brings a deleted tenant back on its next open. Litestream has the same gap.
 
-- **Delete.** With replication installed, `delete` writes a tombstone row
-  (`_autumn_fleet_tombstones`, pending) on the control database before any
-  file goes. No row, no delete: a crash after the removal must not leave a
-  replica that nothing blocks. After the removal, the row is confirmed: its
-  `deleted_at` is the purge cutoff. A delete that removed nothing drops only
-  its own pending row, never the confirmed row of an older delete. Then the
-  delete writes `<prefix>/tombstone` (a marker for hosts that do not share
-  the control database) and, with no retention, purges the replica. A failed
-  purge does not roll back the local delete. The row keeps the failure and a
-  backoff (`min(1 h, 5 s × 2^attempts)`).
+- **Delete.** With replication installed, `delete` writes a pending
+  tombstone row (`_autumn_fleet_tombstones`) on the control database before
+  any file goes. If the row cannot be written, the delete fails. Then a crash
+  after the removal cannot leave a replica that nothing blocks. When the file
+  is present, an existing row is stale, and the delete resets it. When the
+  file is missing, an existing row is an older delete's, and it stays. A
+  delete that removed nothing drops only a pending row.
+- **Confirm.** After the removal, the delete confirms its own pending row.
+  `deleted_at` is the purge cutoff: the later of the app clock and the
+  newest generation in the replica. The confirm never inserts a row: when
+  the row is gone, a re-create or a restore took the key, and nothing is
+  purged. Then the delete writes `<prefix>/tombstone` (a marker for hosts
+  that do not share the control database). With no retention, it purges the
+  replica. A failed purge does not roll back the local delete. The row
+  keeps the failure and a backoff (`min(1 h, 5 s × 2^attempts)`).
 - **Purge.** List `<prefix>/` (with the slash: `acme` is not a prefix of
   `acme2`). Delete each object of a generation created at or before the
   cutoff. Delete the other objects (epoch markers) only when no newer
-  generation exists, and the marker last, so a partial purge stays blocked.
-  A newer generation is a new database with the same key; it keeps its data.
+  generation exists, and delete the marker last, so a partial purge stays
+  blocked. A newer generation is a new database with the same key; it keeps
+  its data.
 - **No resurrection.** `restore_missing` restores nothing for a key with a
   row. On another host, the marker refuses each generation that is not newer
-  than `deleted_at`. An explicit `restore` overrides both and drops them.
-- **Re-create.** A create of a key with a row purges the old replica first
-  and drops the row, or fails with `503`. So a later purge never removes the
-  new database's data, and a later volume loss restores it.
-- **Retry.** The maintenance task runs a purge pass every minute. It purges
-  a due row only when the file is not on disk and this host owns the slot. A
-  pending row whose file is gone is confirmed (the delete stopped after the
-  removal). A pending row whose file is still there and that is older than
-  10 minutes is dropped (the delete stopped before the removal). One purge
-  runs at a time in a process, so a re-create and the pass do not race.
-- **Late ticks.** A tick that began before a close or a release skips the
-  replica, and the purge waits for a tick in flight. So nothing ships into
-  the prefix after the cutoff.
+  than `deleted_at`. An explicit `restore` takes the row under the purge
+  turn, restores, and drops the marker. If the restore fails, the row goes
+  back.
+- **Re-create.** During the retention, a create on demand answers `410`, so
+  a stale client cannot end the undo window. `provision`, and any create
+  after the retention, purges the old replica first and drops the row, or
+  fails with `503`. So a later purge never removes the new database's data,
+  and after a volume loss `restore_missing` restores the new database.
+- **Retry.** The maintenance task pages through every row each minute. It
+  rewrites a marker that failed. It purges a due row only when the file is
+  not on disk and this host owns the slot. A confirmed row next to a live
+  file is stale (a restore or a re-create drops the row first): the task
+  drops it. A pending row whose file is gone is confirmed only when it is
+  older than 10 minutes, so a delete in progress keeps it. A pending row
+  whose file is still there and that is older than 10 minutes is dropped.
+  One purge runs at a time in a process.
+- **Late ticks.** A tick that began before a close skips a replica that is
+  no longer the active one, a tick skips a released replica, and the purge
+  waits for a tick in flight. So nothing ships into the prefix after the
+  cutoff.
 - **Retention.** `replica_retention_after_delete` keeps the replica for undo.
   Until it ends, `restore` brings the database back.
-- **Restore check.** Every `[replication] verify_interval_secs`, each process
-  restores `restore_check_sample` random databases into scratch files under
-  the reserved directory. The restore checks the segment chain and
-  `PRAGMA integrity_check`; the check adds the identity row. A failure turns
-  `replication:fleet` `Down`.
+- **Restore check.** Every `[replication] verify_interval_secs`, each
+  worker-role process restores `restore_check_sample` random databases into
+  scratch files under the reserved directory. The restore checks the
+  segment chain and `PRAGMA integrity_check`; the check adds the identity
+  row. A failure is tried once more. A failure turns `replication:fleet`
+  `Down`. The indicator stays `Down` until a check passes.
 
 The rules are pure functions in `db/fleet_tombstones.rs`. The model and its
 proofs are in `verification/fleet_replica_tombstones.rs`.
