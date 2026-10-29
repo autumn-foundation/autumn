@@ -21531,8 +21531,6 @@ mod tests {
         #[ignore = "requires Docker (testcontainers)"]
         #[allow(clippy::cast_precision_loss)]
         async fn pg_multi_queue_claim_cost_stays_flat_as_the_backlog_grows() {
-            use diesel_async::SimpleAsyncConnection as _;
-
             #[derive(diesel::QueryableByName)]
             struct Stats {
                 #[diesel(sql_type = diesel::sql_types::BigInt)]
