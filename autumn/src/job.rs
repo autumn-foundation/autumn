@@ -28321,11 +28321,10 @@ mod lease_tests {
             })
         }
 
-        fn set_progress<'a>(
+        fn update_record<'a>(
             &'a self,
             _key: &'a str,
-            _pct: u8,
-            _message: Option<String>,
+            _f: &'a (dyn Fn(&mut crate::job_tracking::TrackedJobRecord) + Send + Sync),
         ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
             Box::pin(async { Ok(()) })
         }

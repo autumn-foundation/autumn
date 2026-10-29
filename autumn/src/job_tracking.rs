@@ -153,11 +153,9 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // ── Shared record-mutation logic ──────────────────────────────────────────────
 //
-// Each `JobTrackingStore` impl below applies these same transitions through
-// its own read-modify-write mechanics (in-memory mutex, Redis GET+SET,
-// Postgres SELECT+UPDATE); sharing the transition logic itself means the
-// three backends can never silently drift on what a given status change
-// actually does to a record.
+// The status methods of `JobTrackingStore` apply these transitions. A store
+// gives only `update_record`, its read-modify-write step. Thus the stores
+// cannot drift on what a status change does to a record (#3208).
 
 const fn apply_mark_running(record: &mut TrackedJobRecord) {
     if !record.status.is_terminal() {
@@ -193,8 +191,21 @@ pub trait JobTrackingStore: Send + Sync + 'static {
     /// Create a new pending record for `key` (the token hash).
     fn create<'a>(&'a self, key: &'a str, owner: TrackedJobOwner) -> BoxFut<'a, AutumnResult<()>>;
 
+    /// Apply `f` to the live record for `key`, then set `updated_at` and
+    /// write it. Do nothing if `key` is unknown or expired.
+    ///
+    /// A store can call `f` again after a lost compare-and-swap, so give it a
+    /// fresh read each time. The status methods below call this.
+    fn update_record<'a>(
+        &'a self,
+        key: &'a str,
+        f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
+    ) -> BoxFut<'a, AutumnResult<()>>;
+
     /// Transition a pending record to running.
-    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>>;
+    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
+        self.update_record(key, &apply_mark_running)
+    }
 
     /// Record progress. `pct` is clamped to `0..=100`.
     fn set_progress<'a>(
@@ -202,16 +213,36 @@ pub trait JobTrackingStore: Send + Sync + 'static {
         key: &'a str,
         pct: u8,
         message: Option<String>,
-    ) -> BoxFut<'a, AutumnResult<()>>;
+    ) -> BoxFut<'a, AutumnResult<()>> {
+        let pct = pct.min(100);
+        Box::pin(async move {
+            self.update_record(key, &|record| {
+                apply_set_progress(record, pct, message.clone());
+            })
+            .await
+        })
+    }
 
     /// Mark the record succeeded with a small JSON result payload.
-    fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>>;
+    fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            self.update_record(key, &|record| apply_complete(record, result.clone()))
+                .await
+        })
+    }
 
     /// Mark the record failed with a user-safe error message.
-    fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>>;
+    fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
+        Box::pin(async move {
+            self.update_record(key, &|record| apply_fail(record, error.clone()))
+                .await
+        })
+    }
 
     /// Fetch the current record, or `None` if unknown or expired.
-    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>>;
+    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
+        Box::pin(async move { Ok(self.get_with_token(key).await?.map(|(record, _)| record)) })
+    }
 
     /// Fetch the current record with its [`RetryToken`], or `None` if unknown
     /// or expired.
@@ -913,37 +944,12 @@ impl JobTrackingStore for SqliteJobTrackingStore {
         })
     }
 
-    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move { self.update(key, apply_mark_running).await })
-    }
-
-    fn set_progress<'a>(
+    fn update_record<'a>(
         &'a self,
         key: &'a str,
-        pct: u8,
-        message: Option<String>,
+        f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
     ) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            let pct = pct.min(100);
-            self.update(key, |record| {
-                apply_set_progress(record, pct, message.clone());
-            })
-            .await
-        })
-    }
-
-    fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| apply_complete(record, result.clone()))
-                .await
-        })
-    }
-
-    fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| apply_fail(record, error.clone()))
-                .await
-        })
+        Box::pin(self.update(key, f))
     }
 
     fn reset_for_retry<'a>(
@@ -981,10 +987,6 @@ impl JobTrackingStore for SqliteJobTrackingStore {
             })?;
             Ok(())
         })
-    }
-
-    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
-        Box::pin(async move { Ok(self.get_with_token(key).await?.map(|(record, _)| record)) })
     }
 
     fn get_with_token<'a>(
@@ -1716,38 +1718,13 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
         })
     }
 
-    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.with_record_mut(key, apply_mark_running);
-            Ok(())
-        })
-    }
-
-    fn set_progress<'a>(
+    fn update_record<'a>(
         &'a self,
         key: &'a str,
-        pct: u8,
-        message: Option<String>,
+        f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
     ) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            let pct = pct.min(100);
-            self.with_record_mut(key, |record| apply_set_progress(record, pct, message));
-            Ok(())
-        })
-    }
-
-    fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.with_record_mut(key, |record| apply_complete(record, result));
-            Ok(())
-        })
-    }
-
-    fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.with_record_mut(key, |record| apply_fail(record, error));
-            Ok(())
-        })
+        self.with_record_mut(key, f);
+        Box::pin(async { Ok(()) })
     }
 
     fn reset_for_retry<'a>(
@@ -1775,19 +1752,6 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
                 .get(key)
                 .filter(|entry| self.is_live(entry))
                 .map(|entry| (entry.record.clone(), RetryToken::new(entry.version))))
-        })
-    }
-
-    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
-        Box::pin(async move {
-            let guard = self
-                .entries
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Ok(guard
-                .get(key)
-                .filter(|entry| self.is_live(entry))
-                .map(|entry| entry.record.clone()))
         })
     }
 }
@@ -1972,37 +1936,12 @@ impl JobTrackingStore for RedisJobTrackingStore {
         })
     }
 
-    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move { self.update(key, apply_mark_running).await })
-    }
-
-    fn set_progress<'a>(
+    fn update_record<'a>(
         &'a self,
         key: &'a str,
-        pct: u8,
-        message: Option<String>,
+        f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
     ) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            let pct = pct.min(100);
-            self.update(key, |record| {
-                apply_set_progress(record, pct, message.clone());
-            })
-            .await
-        })
-    }
-
-    fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| apply_complete(record, result.clone()))
-                .await
-        })
-    }
-
-    fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| apply_fail(record, error.clone()))
-                .await
-        })
+        Box::pin(self.update(key, f))
     }
 
     fn reset_for_retry<'a>(
@@ -2025,10 +1964,6 @@ impl JobTrackingStore for RedisJobTrackingStore {
                 .await
                 .map(|_| ())
         })
-    }
-
-    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
-        Box::pin(async move { Ok(self.read(key).await?.map(|(record, _)| record)) })
     }
 
     fn get_with_token<'a>(
@@ -2242,37 +2177,12 @@ impl JobTrackingStore for PgJobTrackingStore {
         })
     }
 
-    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move { self.update(key, apply_mark_running).await })
-    }
-
-    fn set_progress<'a>(
+    fn update_record<'a>(
         &'a self,
         key: &'a str,
-        pct: u8,
-        message: Option<String>,
+        f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
     ) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            let pct = pct.min(100);
-            self.update(key, |record| {
-                apply_set_progress(record, pct, message.clone());
-            })
-            .await
-        })
-    }
-
-    fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| apply_complete(record, result.clone()))
-                .await
-        })
-    }
-
-    fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
-        Box::pin(async move {
-            self.update(key, |record| apply_fail(record, error.clone()))
-                .await
-        })
+        Box::pin(self.update(key, f))
     }
 
     fn reset_for_retry<'a>(
@@ -2325,10 +2235,6 @@ impl JobTrackingStore for PgJobTrackingStore {
             })?;
             Ok(())
         })
-    }
-
-    fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
-        Box::pin(async move { Ok(self.get_with_token(key).await?.map(|(record, _)| record)) })
     }
 
     fn get_with_token<'a>(
@@ -2664,7 +2570,7 @@ mod tests {
         crate::job::clear_global_job_client();
     }
 
-    // ── shared mutation logic (single source of truth for all 3 backends) ────
+    // ── shared mutation logic (single source of truth for all backends) ──────
 
     #[test]
     fn apply_functions_implement_the_documented_transitions() {
@@ -2700,6 +2606,105 @@ mod tests {
         assert_eq!(record.status, TrackedJobStatus::Failed);
         assert_eq!(record.error.as_deref(), Some("boom"));
         assert!(record.result.is_none());
+    }
+
+    // ── provided transition methods (#3208) ──────────────────────────────
+
+    /// A store with only the required methods. `update_record` applies `f`
+    /// to a discarded copy first, as a lost compare-and-swap does.
+    #[derive(Default)]
+    struct MinimalStore {
+        records: Mutex<HashMap<String, TrackedJobRecord>>,
+        updates: AtomicU64,
+    }
+
+    impl JobTrackingStore for MinimalStore {
+        fn create<'a>(
+            &'a self,
+            key: &'a str,
+            owner: TrackedJobOwner,
+        ) -> BoxFut<'a, AutumnResult<()>> {
+            let record = TrackedJobRecord {
+                status: TrackedJobStatus::Pending,
+                progress_pct: None,
+                progress_message: None,
+                result: None,
+                error: None,
+                owner,
+                updated_at: chrono::Utc::now(),
+            };
+            self.records.lock().unwrap().insert(key.to_owned(), record);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn update_record<'a>(
+            &'a self,
+            key: &'a str,
+            f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
+        ) -> BoxFut<'a, AutumnResult<()>> {
+            self.updates.fetch_add(1, Ordering::Relaxed);
+            if let Some(record) = self.records.lock().unwrap().get_mut(key) {
+                f(&mut record.clone());
+                f(record);
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn get_with_token<'a>(
+            &'a self,
+            key: &'a str,
+        ) -> BoxFut<'a, AutumnResult<Option<(TrackedJobRecord, RetryToken)>>> {
+            let found = self.records.lock().unwrap().get(key).cloned();
+            Box::pin(async move { Ok(found.map(|record| (record, RetryToken::new(0)))) })
+        }
+
+        fn reset_for_retry<'a>(
+            &'a self,
+            _key: &'a str,
+            _owner: TrackedJobOwner,
+            _expected: RetryToken,
+        ) -> BoxFut<'a, AutumnResult<()>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn provided_transitions_go_through_update_record() {
+        let store = MinimalStore::default();
+        store.create("k", TrackedJobOwner::Anonymous).await.unwrap();
+
+        store.mark_running("k").await.unwrap();
+        store
+            .set_progress("k", 250, Some("almost".to_owned()))
+            .await
+            .unwrap();
+        let record = store.get("k").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Running);
+        assert_eq!(record.progress_pct, Some(100), "pct is clamped once");
+        assert_eq!(record.progress_message.as_deref(), Some("almost"));
+
+        store
+            .complete("k", serde_json::json!({"rows": 3}))
+            .await
+            .unwrap();
+        let record = store.get("k").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Succeeded);
+        assert_eq!(record.result, Some(serde_json::json!({"rows": 3})));
+
+        store.fail("k", "boom".to_owned()).await.unwrap();
+        let record = store.get("k").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Failed);
+        assert_eq!(record.error.as_deref(), Some("boom"));
+
+        assert_eq!(store.updates.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn provided_get_returns_none_for_an_unknown_key() {
+        let store = MinimalStore::default();
+        assert!(store.get("missing").await.unwrap().is_none());
+        store.mark_running("missing").await.unwrap();
+        assert!(store.get("missing").await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3122,22 +3127,12 @@ mod tests {
                 *self.last_created_key.lock().unwrap() = Some(key.to_owned());
                 self.inner.create(key, owner)
             }
-            fn mark_running<'a>(&'a self, key: &'a str) -> BoxFut<'a, AutumnResult<()>> {
-                self.inner.mark_running(key)
-            }
-            fn set_progress<'a>(
+            fn update_record<'a>(
                 &'a self,
                 key: &'a str,
-                pct: u8,
-                message: Option<String>,
+                f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
             ) -> BoxFut<'a, AutumnResult<()>> {
-                self.inner.set_progress(key, pct, message)
-            }
-            fn complete<'a>(&'a self, key: &'a str, result: Value) -> BoxFut<'a, AutumnResult<()>> {
-                self.inner.complete(key, result)
-            }
-            fn fail<'a>(&'a self, key: &'a str, error: String) -> BoxFut<'a, AutumnResult<()>> {
-                self.inner.fail(key, error)
+                self.inner.update_record(key, f)
             }
             fn reset_for_retry<'a>(
                 &'a self,
@@ -3152,12 +3147,6 @@ mod tests {
                 key: &'a str,
             ) -> BoxFut<'a, AutumnResult<Option<(TrackedJobRecord, RetryToken)>>> {
                 self.inner.get_with_token(key)
-            }
-            fn get<'a>(
-                &'a self,
-                key: &'a str,
-            ) -> BoxFut<'a, AutumnResult<Option<TrackedJobRecord>>> {
-                self.inner.get(key)
             }
         }
 
