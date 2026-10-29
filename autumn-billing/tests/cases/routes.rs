@@ -227,6 +227,8 @@ async fn concurrent_checkouts_create_one_provider_session() {
     let mut statuses = [a.status.as_u16(), b.status.as_u16()];
     statuses.sort_unstable();
     assert_eq!(statuses, [303, 409], "{} / {}", a.text(), b.text());
+    let loser = if a.status.as_u16() == 409 { &a } else { &b };
+    assert!(loser.text().contains("in progress"), "{}", loser.text());
     assert_eq!(checkout_calls(&h.provider), 1);
 }
 

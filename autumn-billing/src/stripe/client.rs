@@ -19,7 +19,8 @@
 //! access to `AppState`, so it cannot draw a random key, and a key derived from
 //! the request fields would be wrong: two checkouts for the same customer and
 //! price are two distinct sessions (the first one may have expired), and a
-//! derived key would make Stripe return the stale one.
+//! derived key would make Stripe return the stale one. `POST /checkout` guards
+//! against duplicates with an in-process per-user slot instead.
 
 use serde_json::Value;
 

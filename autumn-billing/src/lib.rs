@@ -169,9 +169,9 @@ impl BillingService {
         }
     }
 
-    /// Claim the checkout slot for `user_id`. `None` when one is in progress.
+    /// Claim the checkout slot for `user_id`. It returns `None` when one is in progress.
     ///
-    /// The slot spans the live-subscription check and the provider call.
+    /// The slot stays held from the live-subscription check to the end of the provider call.
     /// It is per process. Replicas do not share it.
     pub(crate) fn begin_checkout(self: &Arc<Self>, user_id: &str) -> Option<CheckoutSlot> {
         let claimed = self
