@@ -324,7 +324,8 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
 
 /// `true` for a file of the plugin's own asset bundle.
 ///
-/// The path is under `/static/_plugins/` and the `middleware` labels carry the
+/// The path is under `/static/_plugins/` and `middleware` (the route's
+/// `RouteInfo::middleware` labels) carries the
 /// [`PLUGIN_ASSETS_ROUTE_MARKER`](crate::assets::PLUGIN_ASSETS_ROUTE_MARKER).
 /// See [`PluginAssets`](crate::assets::PluginAssets).
 ///
