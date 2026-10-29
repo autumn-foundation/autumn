@@ -515,6 +515,14 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 /// - A `<div role="listbox">` where the server renders option partials.
 /// - A `<noscript>` fallback `<select>`.
 ///
+/// # Keyboard (with `autumn-widgets.js`)
+///
+/// The listbox binds the keyboard core (`data-autumn-activedescendant`,
+/// `data-autumn-dismiss`). Focus stays on the input. `ArrowDown`/`ArrowUp` move
+/// `aria-activedescendant` (wrapping) and open a closed popup. `Enter` selects
+/// the active option. `Escape`, a click outside, or `Tab` closes the popup.
+/// `aria-expanded` is `"true"` only while the popup shows an option.
+///
 /// Set [`AutocompleteConfig::initial_value`] to pre-fill both inputs — e.g.
 /// re-rendering a form with this widget after a validation error, so text the
 /// user already typed isn't silently dropped.
@@ -590,7 +598,10 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 role="listbox"
                 aria-label=(label)
                 aria-live="polite"
-                class="autumn-autocomplete__options" {}
+                class="autumn-autocomplete__options"
+                data-autumn-activedescendant
+                data-autumn-orientation="vertical"
+                data-autumn-dismiss {}
             noscript {
                 select name=(config.value_name) aria-label=(label) {
                     option value="" { "— select —" }
@@ -608,8 +619,10 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
 /// Render a single autocomplete option partial returned by the server.
 ///
 /// The `data-value` attribute carries the record ID (or the value to submit).
-/// The `autumn-widgets.js` runtime listens for click and keyboard events on the
-/// listbox container and uses `data-value` to populate the hidden field.
+/// The `autumn-widgets.js` runtime handles clicks on the listbox and keys on
+/// the input, and uses `data-value` to populate the hidden field. The option
+/// has `tabindex="-1"`: focus stays on the input. The runtime gives the
+/// active option an `id` if it has none.
 ///
 /// # Example response fragment
 ///
@@ -628,7 +641,7 @@ pub fn autocomplete_option(value: &str, label: &str) -> maud::Markup {
     maud::html! {
         div
             role="option"
-            tabindex="0"
+            tabindex="-1"
             class="autumn-autocomplete__option"
             data-value=(value) {
             (label)
@@ -3209,8 +3222,18 @@ impl NavBarConfig {
 /// links stay visible with JavaScript off** — the framework's
 /// `/static/js/autumn-widgets.js` runtime (same-origin, CSP-safe under the
 /// default `script-src 'self'`) then reveals the hamburger and wires the
-/// toggle/dropdown/Escape-to-close behavior. No app-authored JavaScript, and
+/// toggle/dropdown behavior. No app-authored JavaScript, and
 /// no inline `<script>` or `style=` attributes, are ever required.
+///
+/// # Keyboard (with `autumn-widgets.js`)
+///
+/// Each dropdown becomes an APG menu button. The runtime adds
+/// `aria-haspopup="menu"`, `role="menu"` and `role="menuitem"`. The server
+/// does not send these roles, because they promise arrow keys that need JS.
+/// `Enter`, `Space` or `ArrowDown` opens the menu on the first item; `ArrowUp`
+/// opens it on the last. In the menu: `ArrowDown`/`ArrowUp` (wrapping),
+/// `Home`/`End`, a letter (typeahead), `Escape` (close, focus returns to the
+/// button) and `Tab` (close). The toggle id is `{menu-id}-toggle`.
 ///
 /// # CSS hooks
 ///
@@ -3342,11 +3365,12 @@ fn render_nav_menu(
     let menu_id = format!("{id}-menu-{menu_counter}");
     maud::html! {
         li class="autumn-nav__item autumn-nav__item--menu" {
-            button type="button" class="autumn-nav__menu-toggle" aria-expanded="true"
-                aria-controls=(menu_id) data-nav-menu-toggle {
+            button type="button" id=(format!("{menu_id}-toggle")) class="autumn-nav__menu-toggle"
+                aria-expanded="true" aria-controls=(menu_id) data-nav-menu-toggle {
                 (menu.label)
             }
-            ul id=(menu_id) class="autumn-nav__menu" {
+            ul id=(menu_id) class="autumn-nav__menu" data-autumn-roving
+                data-autumn-orientation="vertical" data-autumn-typeahead data-autumn-dismiss {
                 @for link in &menu.links {
                     li class="autumn-nav__item" { (render_nav_link_item(current_path, link)) }
                 }
@@ -4379,13 +4403,13 @@ pub fn confirm_action(
 /// matches one of the panels makes that panel default-active; `None` (or an
 /// id that matches no panel) falls back to the first panel.
 ///
-/// Switching is pure CSS: each tab is an `<a href="#panel-id">` and each
-/// panel is targeted by `:target` in `input.css`, so URL fragments
+/// Without JS, switching is pure CSS: each tab is an `<a href="#panel-id">` and each
+/// panel is targeted by `:target` in the widget stylesheet, so URL fragments
 /// (`/settings#security`) select a tab with zero JavaScript. The
 /// default-active panel additionally carries `autumn-tabs__panel--active` so
 /// a panel is always visible even when no fragment is present, and the
 /// active-tab highlight tracks the actually-`:target`ed panel by position for
-/// up to the first 6 tabs (see `input.css` — ids are arbitrary caller
+/// up to the first 6 tabs (see the widget stylesheet — ids are arbitrary caller
 /// strings, so this can only be done positionally in a shared stylesheet).
 ///
 /// # CSS hooks
@@ -4406,15 +4430,16 @@ pub fn confirm_action(
 /// panel carries `role="tabpanel"`, `aria-labelledby` pointing at its tab's
 /// `id`, and `tabindex="0"` so it can receive keyboard focus directly.
 ///
-/// `aria-selected` reflects the *server's default selection* (the
-/// `active_id` tab, or the first tab) only. The server never sees the URL
-/// fragment (fragments aren't
-/// sent in HTTP requests), so it cannot know which tab a client-side
-/// `:target` navigation actually landed on — correcting `aria-selected` on
-/// navigation would require JavaScript, which this widget deliberately has
-/// none of. This is a known, accepted limitation of fragment-based no-JS
-/// tabs: a screen reader always hears the first tab announced as
-/// "selected", even when a different panel is what's visually shown.
+/// # Keyboard (with `autumn-widgets.js`)
+///
+/// The tab strip binds the keyboard core (`data-autumn-roving`,
+/// `docs/guide/keyboard.md`). The runtime gives the APG tabs pattern with
+/// automatic activation: `ArrowLeft`/`ArrowRight` (wrapping), `Home`/`End`,
+/// and `Tab` to the panel. `aria-selected`, the roving `tabindex` and the shown panel follow
+/// the selected tab, also for a deep link. The URL fragment follows too.
+///
+/// With JS off, `aria-selected` stays on the server's default tab, because
+/// the server never sees the URL fragment.
 ///
 /// # Panel `id`s
 ///
@@ -4434,7 +4459,7 @@ pub fn confirm_action(
 ///
 /// # Nesting a `tabs()` widget inside another `tabs()` panel
 ///
-/// This is supported for panel *visibility*: `input.css` reveals the whole
+/// This is supported for panel *visibility*: the widget stylesheet reveals the whole
 /// ancestor chain down to a deep-linked inner panel, so content nested
 /// inside any outer panel (not just the outer widget's default one) is
 /// reachable via its own fragment. The outer widget's *active-tab visual
@@ -4486,8 +4511,9 @@ pub fn tabs(
         })
         .unwrap_or(0);
     maud::html! {
-        div id=(id) class="autumn-tabs" {
-            div class="autumn-tabs__list" role="tablist" {
+        div id=(id) class="autumn-tabs" data-autumn-tabs {
+            div class="autumn-tabs__list" role="tablist"
+                data-autumn-roving data-autumn-orientation="horizontal" {
                 @for (i, (panel_id, label, _)) in panels.iter().enumerate() {
                     @let tab_class = merge_class(
                         "autumn-tabs__tab",
@@ -7520,6 +7546,28 @@ mod tests {
         assert!(html.contains("tabindex"), "{html}");
     }
 
+    #[test]
+    fn option_is_not_a_tab_stop() {
+        // APG combobox: focus stays on the input. Options are not tab stops.
+        let html = autocomplete_option("1", "Option").into_string();
+        assert!(html.contains(r#"tabindex="-1""#), "{html}");
+    }
+
+    #[test]
+    fn autocomplete_listbox_binds_keyboard_core() {
+        let config = AutocompleteConfig::new("/ac", "value_field");
+        let html = autocomplete_input("x", "Label", &config).into_string();
+        let listbox = html
+            .split(r#"id="x-options""#)
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("listbox tag");
+        assert!(listbox.contains("data-autumn-activedescendant"), "{html}");
+        assert!(listbox.contains("data-autumn-dismiss"), "{html}");
+        // The core finds the controller through `aria-controls`.
+        assert!(html.contains(r#"aria-controls="x-options""#), "{html}");
+    }
+
     // ── autocomplete_empty_state ───────────────────────────────────────
 
     #[test]
@@ -7945,6 +7993,42 @@ mod tests {
             html.contains(r#"<ul id="autumn-nav-menu-1" class="autumn-nav__menu""#),
             "{html}"
         );
+    }
+
+    #[test]
+    fn nav_bar_menu_binds_keyboard_core() {
+        let config = NavBarConfig::new().item(NavItem::menu(
+            NavMenu::new("Products").link("/widgets", "Widgets"),
+        ));
+        let html = nav_bar("/", &config).into_string();
+        let menu = html
+            .split(r#"<ul id="autumn-nav-menu-1""#)
+            .nth(1)
+            .and_then(|rest| rest.split('>').next())
+            .expect("menu tag");
+        assert!(menu.contains("data-autumn-roving"), "{html}");
+        assert!(
+            menu.contains(r#"data-autumn-orientation="vertical""#),
+            "{html}"
+        );
+        assert!(menu.contains("data-autumn-typeahead"), "{html}");
+        assert!(menu.contains("data-autumn-dismiss"), "{html}");
+        // `aria-labelledby` on the menu needs a toggle id.
+        assert!(html.contains(r#"id="autumn-nav-menu-1-toggle""#), "{html}");
+    }
+
+    #[test]
+    fn nav_bar_menu_roles_need_js() {
+        // With JS off, `role="menu"` promises arrow keys that do not work.
+        // The runtime adds the menu roles. The server markup stays a
+        // disclosure.
+        let config = NavBarConfig::new().item(NavItem::menu(
+            NavMenu::new("Products").link("/widgets", "Widgets"),
+        ));
+        let html = nav_bar("/", &config).into_string();
+        assert!(!html.contains(r#"role="menu""#), "{html}");
+        assert!(!html.contains(r#"role="menuitem""#), "{html}");
+        assert!(!html.contains("aria-haspopup"), "{html}");
     }
 
     #[test]

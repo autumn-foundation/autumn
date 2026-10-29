@@ -435,6 +435,14 @@
     padding: var(--space-1) 0;
 }
 
+/* An empty listbox stays in the accessibility tree (its live region must
+   speak), so it gets no size, not `display: none`. */
+.autumn-autocomplete__options:empty {
+    border-width: 0;
+    padding: 0;
+    box-shadow: none;
+}
+
 .autumn-autocomplete__option {
     padding: var(--space-2) var(--space-3);
     font-size: var(--font-size-sm);
@@ -886,10 +894,10 @@
    `tabs()` call rendered inside another's panel body): without it, the
    ancestor panel that merely contains the nested widget would stay
    `display: none` and hide the correctly-targeted inner panel along with
-   it, even though the inner panel's own `:target` rule matched. This half
-   is deliberately unscoped (no `>`) since the target may be arbitrarily
-   deep. */
-.autumn-tabs__panel:is(:target, :has(:target)) {
+   it, even though the inner panel's own `:target` rule matched. The
+   `:has()` argument is deliberately unscoped, since the target may be
+   arbitrarily deep. */
+.autumn-tabs:not(.autumn-tabs--enhanced) > .autumn-tabs__panel:is(:target, :has(:target)) {
     display: block;
 }
 
@@ -914,7 +922,14 @@
    *consequent* (`> .autumn-tabs__panel--active`) IS scoped to direct
    children, so this rule only ever reveals THIS widget's own default
    panel, never a nested widget's. */
-.autumn-tabs:not(:has(:target)) > .autumn-tabs__panel--active {
+.autumn-tabs:not(.autumn-tabs--enhanced):not(:has(:target)) > .autumn-tabs__panel--active {
+    display: block;
+}
+
+/* With JS (issue #3397): autumn-widgets.js adds `autumn-tabs--enhanced` and
+   sets `hidden` on each panel that is not selected. The `:target` rules
+   above and below apply only without JS. */
+.autumn-tabs.autumn-tabs--enhanced > .autumn-tabs__panel:not([hidden]) {
     display: block;
 }
 
@@ -947,17 +962,17 @@
    nesting `:has()` inside `:has()`, which CSS disallows, so in that case
    no tab gets highlighted (a graceful degrade: no tab looks active,
    rather than the wrong one). */
-.autumn-tabs:has(:target) > .autumn-tabs__list > .autumn-tabs__tab--active {
+.autumn-tabs:not(.autumn-tabs--enhanced):has(:target) > .autumn-tabs__list > .autumn-tabs__tab--active {
     color: var(--text-muted);
     border-bottom-color: transparent;
 }
 
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(1):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(1),
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(2):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(2),
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(3):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(3),
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(4):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(4),
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(5):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(5),
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(6):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(6) {
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(1):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(1),
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(2):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(2),
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(3):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(3),
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(4):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(4),
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(5):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(5),
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(6):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(6) {
     color: var(--text);
     border-bottom-color: var(--primary);
 }

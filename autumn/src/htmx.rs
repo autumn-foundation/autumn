@@ -815,6 +815,69 @@ mod tests {
         assert!(!js.contains("window.confirm"), "{js}");
     }
 
+    /// Byte budget for `autumn-widgets.js` (issue #3397). See
+    /// `docs/guide/keyboard.md`. Raise it only with a reason in the PR.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 32 * 1024;
+    /// Gzip budget. Browsers download this size.
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 10 * 1024;
+
+    #[test]
+    fn widgets_js_stays_inside_its_size_budget() {
+        use std::io::Write as _;
+        let raw = AUTUMN_WIDGETS_JS.len();
+        assert!(
+            raw <= WIDGETS_JS_BUDGET_BYTES,
+            "autumn-widgets.js is {raw} bytes; budget {WIDGETS_JS_BUDGET_BYTES}"
+        );
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(AUTUMN_WIDGETS_JS).expect("gzip");
+        let gzip = gz.finish().expect("gzip").len();
+        assert!(
+            gzip <= WIDGETS_JS_BUDGET_GZIP_BYTES,
+            "autumn-widgets.js is {gzip} bytes gzipped; budget {WIDGETS_JS_BUDGET_GZIP_BYTES}"
+        );
+    }
+
+    #[test]
+    fn widgets_js_has_the_keyboard_core_contract() {
+        // The documented `data-*` contract (issue #3397). Plugins bind to
+        // these names, so a rename is a breaking change.
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        for name in [
+            "data-autumn-roving",
+            "data-autumn-orientation",
+            "data-autumn-wrap",
+            "data-autumn-typeahead",
+            "data-autumn-activedescendant",
+            "data-autumn-dismiss",
+            "autumn:navigate",
+            "autumn:dismiss",
+            "aria-activedescendant",
+            "Home",
+            "End",
+        ] {
+            assert!(js.contains(name), "missing `{name}`");
+        }
+    }
+
+    #[test]
+    fn widgets_js_needs_no_unsafe_eval() {
+        // CSP stays `script-src 'self'`: no eval, no string timers, no
+        // inline handlers written into the DOM.
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        for bad in [
+            "eval(",
+            "new Function",
+            "setTimeout('",
+            "setAttribute('on",
+            ".innerHTML = '<",
+        ] {
+            assert!(!js.contains(bad), "found `{bad}`");
+        }
+    }
+
     #[test]
     fn widgets_js_polyfills_light_dismiss_backdrop_click() {
         // PR review (chatgpt-codex-connector): closedby="any" (see

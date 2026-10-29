@@ -243,6 +243,20 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/webmcp-browser.log" \
             || { echo "::error::no WebMCP browser tests ran"; exit 1; }
 
+      # Widget keyboard core in a real browser (#3397): APG keys for tabs,
+      # combobox and menu button, the no-JS fallback and the default CSP.
+      # A filter that matches nothing exits 0, so check the count.
+      - name: Run the widget keyboard browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_keyboard_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-keyboard-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-keyboard-browser.log" \
+            || { echo "::error::no widget keyboard browser tests ran"; exit 1; }
+
   # ---------------------------------------------------------------------------
   # 1. Crate metadata
   # ---------------------------------------------------------------------------

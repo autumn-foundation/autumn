@@ -329,6 +329,8 @@ Perform this manual checklist before shipping any new page or component:
 - [ ] htmx-powered interactions do not silently replace content — the live
       region announces the change
 - [ ] No keyboard trap: pressing Escape or Tab always allows leaving a widget
+- [ ] Tabs, menus and listboxes use the APG arrow keys. See the
+      [keyboard core](keyboard.md).
 - [ ] Images have meaningful `alt` text; purely decorative images use `alt=""`
 - [ ] All form fields have a visible `<label>` (not just `placeholder`)
 

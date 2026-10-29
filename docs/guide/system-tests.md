@@ -108,6 +108,8 @@ All `Page` methods return `Result<&Self, SystemTestError>` and can be chained.
 | `page.visit(path)` | Navigate to a relative path |
 | `page.fill(selector, value)` | Fill a form input |
 | `page.click(selector)` | Click an element (CSS selector) |
+| `page.press(key)` | Press one key on the focused element (`"ArrowDown"`, `"Escape"`, `"g"`) |
+| `page.set_javascript_enabled(false)` | Turn page scripts off; call before `visit` to test a no-JS fallback |
 | `page.expect_text(text)` | Assert text appears in the DOM |
 | `page.expect_url(pattern)` | Assert URL contains pattern |
 | `page.expect_attribute(sel, attr, value)` | Assert element attribute value |
