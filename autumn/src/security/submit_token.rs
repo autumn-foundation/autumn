@@ -876,10 +876,8 @@ mod tests {
                 axum::http::header::CONTENT_TYPE,
                 axum::http::HeaderValue::from_str(content_type).unwrap(),
             );
-            let urlencoded = crate::media_type::is_media_type(
-                content_type,
-                "application/x-www-form-urlencoded",
-            );
+            let urlencoded =
+                crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded");
             let boundary = multer::parse_boundary(content_type).ok();
             let expected = if urlencoded {
                 Some(None)
