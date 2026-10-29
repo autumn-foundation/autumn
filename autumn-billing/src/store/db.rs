@@ -535,6 +535,7 @@ impl BillingStore for DbBillingStore {
                     {
                         Ok(_) => Ok(EventClaim::Claimed),
                         // Another delivery inserted first. It may still fail.
+                        // If it already finished, the retry gets `Applied`.
                         Err(err) if is_unique_violation(&err) => Ok(EventClaim::InFlight),
                         Err(err) => Err(db_err("claim_event", &err)),
                     }

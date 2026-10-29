@@ -1065,6 +1065,7 @@ async fn redelivery_during_a_failing_first_attempt_is_retried() {
     let ev = event("evt_fail", at(200), invoice_failed(1));
     let body = serde_json::to_vec(&ev).unwrap();
     // Attempt A fails after mirroring the invoice. Attempt B arrives first.
+    // `FailingStore` runs the hook before the injected failure.
     store.fail_on("upsert_dunning", 1);
     let state = h.client.state().clone();
     let service = autumn_billing::BillingService::require(&state).expect("plugin started");
@@ -1089,9 +1090,11 @@ async fn redelivery_during_a_failing_first_attempt_is_retried() {
         Some(ReconcileOutcome::InFlight),
         "the rival must not be acknowledged"
     );
+    assert_eq!(inner.applied_event_count().await.unwrap(), 0);
     let third = post_webhook(&h.client, &body).await;
     assert_eq!(third.status.as_u16(), 200, "{}", third.text());
     assert_eq!(third.json::<serde_json::Value>()["outcome"], "applied");
+    assert_eq!(inner.applied_event_count().await.unwrap(), 1);
 }
 
 /// The webhook route answers an in-flight event with a retryable 503.

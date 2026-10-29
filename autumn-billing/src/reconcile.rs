@@ -20,8 +20,9 @@
 //! Sequence: claim the event id in the ledger → upsert snapshots (the store
 //! applies the ordering guard) → open or close dunning → notify → mark
 //! applied. A failure after the claim releases it, so the provider's
-//! redelivery is applied again. A redelivery that meets an unfinished claim
-//! is not acknowledged ([`ReconcileOutcome::InFlight`]); every step is idempotent. A redelivery of a
+//! redelivery is applied again. Every step is idempotent. A redelivery that
+//! meets an unfinished claim is not acknowledged
+//! ([`ReconcileOutcome::InFlight`]). A redelivery of a
 //! snapshot already in the mirror (`Write::Unchanged`) repeats the idempotent
 //! steps (dunning row, job) but not notifications or hooks.
 

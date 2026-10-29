@@ -173,8 +173,9 @@ first attempt then failed, the provider had no reason to retry, and the event
 was lost (issue #3097).
 
 **You are affected only if you implement `BillingStore` or match on
-`EventClaim` or `ReconcileOutcome`.** `EventClaim` is now `#[non_exhaustive]`,
-and `ReconcileOutcome` has a new variant.
+`EventClaim` or `ReconcileOutcome`.** `EventClaim` is now `#[non_exhaustive]`.
+`ReconcileOutcome` has a new variant. It was already `#[non_exhaustive]`, so a
+wildcard arm covers it.
 
 **Before (`{X.Y}`):**
 
