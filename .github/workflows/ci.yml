@@ -2405,6 +2405,10 @@ jobs:
           # rebuild.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --test sqlite_fleet_sweeper
+          # Issue #3062: the outbox writers and the SQL webhook store
+          # (`webhook_outbound/sql_store.rs`). Same features, so no rebuild.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --test sqlite_outbox_writers
           # Issue #2663: the SQLite split-sum aggregate and bulk decrement in
           # `counter_cache.rs` are sqlite-only. Same features, so no rebuild.
           # A filter that matches nothing exits 0, so check the count.

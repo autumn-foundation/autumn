@@ -518,6 +518,44 @@ mod sql_webhook_store {
         );
     }
 
+    /// Codex review on #3473: retention deletes only delivered logs. A
+    /// pending or retrying log is still owed a send (its job reads the log),
+    /// and a DLQ log is kept for replay.
+    #[tokio::test]
+    async fn sql_store_purge_keeps_unfinished_deliveries() {
+        let substrate = substrate().await;
+        let store = SqlOutboundWebhookStore::new(substrate.pool());
+        store.ensure_schema().await.unwrap();
+        store
+            .create_subscription(subscription("sub-1"))
+            .await
+            .unwrap();
+        let mut dead = log("dead", Some(500), Some("500"));
+        dead.is_dlq = true;
+        let mut fresh = log("fresh", Some(200), None);
+        fresh.timestamp = chrono::Utc.timestamp_millis_opt(1_800_000_000_000).unwrap();
+        for entry in [
+            log("delivered", Some(204), None),
+            log("pending", None, None),
+            log("retrying", Some(503), Some("503")),
+            log("timed-out", None, Some("timeout")),
+            dead,
+            fresh,
+        ] {
+            store.replace_delivery_log(entry).await.unwrap();
+        }
+
+        let cutoff = chrono::Utc.timestamp_millis_opt(1_750_000_000_000).unwrap();
+        assert_eq!(store.purge_deliveries_before(cutoff).await.unwrap(), 1);
+        assert_eq!(store.get_delivery_log("delivered").await.unwrap(), None);
+        for kept in ["pending", "retrying", "timed-out", "dead", "fresh"] {
+            assert!(
+                store.get_delivery_log(kept).await.unwrap().is_some(),
+                "{kept} is kept"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn sql_store_counts_failures_like_the_in_memory_store() {
         let substrate = substrate().await;
