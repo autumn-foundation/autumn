@@ -2668,11 +2668,11 @@ mod tests {
 
         fn reset_for_retry<'a>(
             &'a self,
-            _key: &'a str,
-            _owner: TrackedJobOwner,
+            key: &'a str,
+            owner: TrackedJobOwner,
             _expected: RetryToken,
         ) -> BoxFut<'a, AutumnResult<()>> {
-            Box::pin(async { Ok(()) })
+            self.create(key, owner)
         }
     }
 
@@ -2704,7 +2704,16 @@ mod tests {
         assert_eq!(record.status, TrackedJobStatus::Failed);
         assert_eq!(record.error.as_deref(), Some("boom"));
 
-        assert_eq!(store.updates.load(Ordering::Relaxed), 4);
+        // A retried attempt starts again from pending.
+        store
+            .reset_for_retry("k", TrackedJobOwner::Anonymous, RetryToken::new(0))
+            .await
+            .unwrap();
+        store.mark_running("k").await.unwrap();
+        let record = store.get("k").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Running);
+
+        assert_eq!(store.updates.load(Ordering::Relaxed), 5);
     }
 
     #[tokio::test]
