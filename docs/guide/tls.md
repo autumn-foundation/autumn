@@ -953,7 +953,11 @@ The `custom_domains` health indicator reports how many domains are registered
 and active, and names every unhealthy one **with its tenant** — so an operator
 reading `/actuator/health` can act without a registry lookup. It is `Down` only
 when a certificate has actually expired: one tenant's pending retry is not a
-deployment outage. A failed order also raises the
+deployment outage. It also reports `issuance_budget`: `global_used` and
+`global_limit` (orders this hour), `global_retry_after_secs` (when room
+returns, `null` while there is room), `per_domain_limit`, and
+`domains_at_limit` (domains that spent their daily cap). A spent budget keeps
+the status `Up`. It means throttled, not broken. A failed order also raises the
 [`scheduled_task_failure`](./operator-alerts.md) alert for
 `custom_domain_certificates`, naming the domain and tenant, and that alert
 clears when the **last** failing domain recovers — or is offboarded, since a

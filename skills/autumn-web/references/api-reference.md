@@ -2204,7 +2204,9 @@ record lives in the tenant's zone, where autumn holds no credential.
 A failure names the domain AND its tenant in the `custom_domains` health
 indicator and raises #1610's `scheduled_task_failure` alert for
 `custom_domain_certificates`, while every other domain keeps serving and
-renewing. `autumn doctor` grades the section and, with `--online`, flags
+renewing. The same indicator reports `issuance_budget` (orders used this hour,
+both caps, `global_retry_after_secs`, `domains_at_limit`). A spent budget stays
+`Up`: it means throttled, not broken. `autumn doctor` grades the section and, with `--online`, flags
 registered domains whose DNS no longer points here. Offboarding stops routing,
 serving and renewal and deletes the stored certificate; the `custom_domains`
 retention dataset prunes abandoned registrations and orphaned certificates.
