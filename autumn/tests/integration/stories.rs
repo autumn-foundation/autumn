@@ -330,11 +330,13 @@ fn contains_identifier_requires_identifier_boundaries() {
     assert!(!contains_identifier("data_table(&config)", "table"));
 }
 
-/// Read a file relative to the `autumn` crate root.
+/// Read a file relative to the `autumn` crate root, with LF line endings.
+/// A Windows checkout can have CRLF.
 fn read_crate_file(path: &str) -> String {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     std::fs::read_to_string(manifest_dir.join(path))
         .unwrap_or_else(|err| panic!("failed to read {path}: {err}"))
+        .replace("\r\n", "\n")
 }
 
 /// Names of the top-level items that start with `prefix` (for example
