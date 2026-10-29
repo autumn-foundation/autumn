@@ -268,8 +268,9 @@ impl PruneOnlyCustomDomainPruner {
     /// Remove one hostname while `guard` holds for the stored record, then drop
     /// what this process holds for it.
     ///
-    /// Every offboarding path goes through here. The guard runs inside the
-    /// registry's per-hostname write gate, so a caller that chose this hostname
+    /// Every offboarding path goes through here. The removal and the purge run
+    /// in one section of the registry's per-hostname write gate. The guard runs
+    /// in it too, so a caller that chose this hostname
     /// before an `.await` — a retention sweep, a tenant-wide teardown — re-
     /// asserts that choice against the record as it is now rather than
     /// disconnecting whoever holds the hostname by the time its turn comes.
@@ -278,16 +279,27 @@ impl PruneOnlyCustomDomainPruner {
         host: &str,
         guard: impl FnOnce(&crate::custom_domain::CustomDomain) -> bool,
     ) -> std::io::Result<bool> {
-        let removed = self.registry.remove_if(host, guard).await?;
-        // Purge only while the hostname is still nobody's. A successor that
-        // registered in the gap owns whatever sits at this hostname's cache
-        // slot and certificate id now, and deleting those would leave THEIR
-        // domain recorded as active with nothing to serve.
-        let purged = if self.registry.get(host).is_none() {
-            self.purge_local(host).await
-        } else {
-            true
+        // One critical section: the record, the cache slot and the certificate
+        // go together. A successor cannot register, or save its certificate,
+        // until the purge is done, so the purge cannot take its pair.
+        let Some(outcome) = self
+            .registry
+            .with_hostname(host, async |gate| {
+                let removed = gate.remove_if(guard).await?;
+                // Purge only while the hostname is nobody's: after a rejected
+                // guard, the record belongs to a live domain.
+                let purged = if gate.get().is_none() {
+                    self.purge_local(host).await
+                } else {
+                    true
+                };
+                std::io::Result::Ok((removed, purged))
+            })
+            .await
+        else {
+            return Ok(false);
         };
+        let (removed, purged) = outcome?;
         // A cleanup that failed has just raised its own alert, naming a private
         // key still on disk. Retracting it here — because the registry is
         // empty and therefore "healthy" — would leave that key with nothing
@@ -436,39 +448,59 @@ impl PruneOnlyCustomDomainPruner {
             .stored_records()
             .await
             .map_err(|e| format!("failed to re-read the custom-domain registry: {e}"))?;
-        let live: std::collections::HashSet<String> = self
-            .registry
-            .list()
+        let candidates: Vec<_> = stored
             .into_iter()
-            .chain(fresh)
-            .map(|d| cert_id_for(&d.hostname).as_str().to_owned())
+            .map(|(id, _, _)| id)
+            .filter(|id| !self.retained_cert_ids.contains(id.as_str()))
             .collect();
-        let mut removed = 0;
-        for (id, chain, key) in stored {
-            if live.contains(id.as_str()) || self.retained_cert_ids.contains(id.as_str()) {
-                continue;
-            }
-            if dry_run {
-                removed += 1;
-                continue;
-            }
-            let mut deleted = true;
-            // The KEY first. `list_certs` discovers candidates from their
-            // `.chain.pem`, so a crash after removing the chain would strand a
-            // private key no later sweep can ever find again. This order leaves
-            // at worst a public chain behind, which the next sweep re-lists.
-            for path in [&key, &chain] {
-                if let Err(e) = std::fs::remove_file(path) {
-                    tracing::warn!(path = %path.display(), "failed to remove an orphaned certificate: {e}");
-                    deleted = false;
-                }
-            }
-            // Count only what actually went: the retention report must not
-            // claim a deletion that failed.
-            if deleted {
-                removed += 1;
-            }
+        let live_ids = |extra: Vec<crate::custom_domain::CustomDomain>| {
+            self.registry
+                .list()
+                .into_iter()
+                .chain(extra)
+                .map(|d| cert_id_for(&d.hostname).as_str().to_owned())
+                .collect::<std::collections::HashSet<String>>()
+        };
+        let live = live_ids(fresh.clone());
+        if dry_run {
+            return Ok(candidates
+                .iter()
+                .filter(|id| !live.contains(id.as_str()))
+                .count() as u64);
         }
+        if candidates.iter().all(|id| live.contains(id.as_str())) {
+            return Ok(0);
+        }
+        // Delete under the registry's exclusive section. An id is a hash, so
+        // the hostname that may own it is unknown and no single gate fits. The
+        // section keeps every install and offboard out. A hostname registered
+        // since the snapshot is seen by the fresh read of the index. One that
+        // registers after it cannot save a certificate until the section ends.
+        let removed = self
+            .registry
+            .exclusive(async || {
+                let live = live_ids(fresh);
+                let mut removed = 0_u64;
+                for id in &candidates {
+                    if live.contains(id.as_str()) {
+                        continue;
+                    }
+                    // The store deletes the key first. `list_certs` finds a
+                    // pair by its chain, so a crash after the chain went would
+                    // strand a key no later sweep can find.
+                    match self.certs.delete_cert(id).await {
+                        // Count only what went: the retention report must not
+                        // claim a deletion that failed.
+                        Ok(()) => removed += 1,
+                        Err(e) => tracing::warn!(
+                            id = id.as_str(),
+                            "failed to remove an orphaned certificate: {e}"
+                        ),
+                    }
+                }
+                removed
+            })
+            .await;
         Ok(removed)
     }
 }
@@ -990,26 +1022,6 @@ impl CustomDomainTask {
         issued: &IssuedCertificate,
         now_unix: i64,
     ) -> Result<(), String> {
-        // The order took a network round trip. If the app offboarded the domain
-        // — or another tenant registered it — meanwhile, installing would
-        // resurrect a deleted certificate and promote a record straight to
-        // active that was never verified, past the gate this module exists to
-        // enforce. Discard instead.
-        match self.registry.get(hostname) {
-            Some(record) if record.tenant == tenant => {}
-            Some(record) => {
-                return Err(format!(
-                    "discarding the certificate: {hostname} now belongs to tenant {}",
-                    record.tenant
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "discarding the certificate: {hostname} was offboarded while the order ran"
-                ));
-            }
-        }
-
         let stored = StoredCert {
             chain_pem: issued.chain_pem.clone(),
             key_pem: issued.key_pem.clone(),
@@ -1020,50 +1032,67 @@ impl CustomDomainTask {
             stored.key_pem.as_bytes(),
             &self.provider,
         )?;
-        self.certs
-            .save_cert(&cert_id_for(hostname), &stored)
-            .await
-            .map_err(|e| format!("failed to persist the certificate for {hostname}: {e}"))?;
-        // Activate only while `tenant` STILL owns the hostname. The ownership
-        // check above ran before `save_cert` awaited; an offboard plus a
-        // re-registration in that window would otherwise stamp `Active` onto
-        // the new tenant's record, carrying it from `pending_dns` to serving on
-        // a certificate issued for someone else. Losing the race means the
-        // certificate belongs to nobody: drop it rather than leave a private
-        // key on disk for a hostname its owner never verified.
-        let activated = self
-            .registry
-            .record_active_for(hostname, tenant, now_unix, not_after)
-            .await
-            .map_err(|e| format!("failed to persist the active state for {hostname}: {e}"))?;
-        if !activated {
-            self.cache.remove(hostname);
-            // Delete only the pair THIS order wrote. The certificate id is a
-            // hash of the hostname, so a successor that issued and saved its
-            // own pair in the meantime holds the same id: an unconditional
-            // delete here would take that valid certificate with it, leaving
-            // the successor recorded as active with nothing on disk.
-            match self.certs.load_cert(&cert_id_for(hostname)).await {
-                Ok(Some(current)) if current.chain_pem == stored.chain_pem => {
+        // Save, activate and cache in one critical section of the hostname's
+        // gate. An offboard, a successor or a cold load cannot run between
+        // the steps. Ownership is checked inside it, so what was checked is
+        // what is written. Persisting first still means a crash between the
+        // steps leaves the certificate on disk for the next boot to warm.
+        self.registry
+            .with_hostname(hostname, async |gate| {
+                // The order took a network round trip. If the app offboarded
+                // the domain, or another tenant registered it, installing would
+                // resurrect a deleted certificate and promote a record that
+                // was never verified, past the gate this module exists to
+                // enforce. Discard instead, before anything is written.
+                match gate.get() {
+                    Some(record) if record.tenant != tenant => {
+                        return Err(format!(
+                            "discarding the certificate: {hostname} now belongs to tenant {}",
+                            record.tenant
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "discarding the certificate: {hostname} was offboarded while the \
+                             order ran"
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                self.certs
+                    .save_cert(&cert_id_for(hostname), &stored)
+                    .await
+                    .map_err(|e| {
+                        format!("failed to persist the certificate for {hostname}: {e}")
+                    })?;
+                let activated = gate
+                    .record_active_for(tenant, now_unix, not_after)
+                    .await
+                    .map_err(|e| {
+                        format!("failed to persist the active state for {hostname}: {e}")
+                    })?;
+                if !activated {
+                    // The record changed hands, or a re-registration is still
+                    // unverified. The gate is ours, so the pair at this id is the
+                    // one just written: drop it rather than leave a private key
+                    // on disk for a hostname its owner never verified.
                     if let Err(e) = self.certs.delete_cert(&cert_id_for(hostname)).await {
                         tracing::warn!(hostname, "failed to delete a superseded certificate: {e}");
                     }
+                    return Err(format!(
+                        "discarding the certificate: {hostname} changed hands while it was being \
+                         issued"
+                    ));
                 }
-                Ok(Some(_)) => tracing::debug!(
-                    hostname,
-                    "leaving the stored certificate alone: it is the successor's, not this order's"
-                ),
-                Ok(None) => {}
-                Err(e) => tracing::warn!(
-                    hostname,
-                    "cannot tell whether the stored certificate is this order's, so leaving it: {e}"
-                ),
-            }
-            return Err(format!(
-                "discarding the certificate: {hostname} changed hands while it was being issued"
-            ));
-        }
-        self.cache.insert(hostname, certified);
+                self.cache.insert(hostname, certified);
+                Ok(())
+            })
+            .await
+            .unwrap_or_else(|| {
+                Err(format!(
+                    "discarding the certificate: {hostname} is unusable"
+                ))
+            })?;
         tracing::info!(hostname, not_after, "custom domain is active");
         // Backstop: a certificate already inside its renew-before window the
         // moment it is issued — a CA issuing a shorter lifetime than
@@ -1340,30 +1369,41 @@ impl CustomDomainTask {
         if !self.registry.is_servable(hostname) {
             return false;
         }
-        match self.certs.load_cert(&cert_id_for(hostname)).await {
-            Ok(Some(stored)) => match crate::tls::certified_key_from_pem(
-                stored.chain_pem.as_bytes(),
-                stored.key_pem.as_bytes(),
-                &self.provider,
-            ) {
-                Ok(certified) => {
-                    self.cache.insert(hostname, certified);
-                    true
+        // Load and publish inside the hostname's gate, so a renewal cannot
+        // persist and cache a new pair between the two. Only a cache refill
+        // takes it, never a handshake.
+        self.registry
+            .with_hostname(hostname, async |gate| {
+                if !gate.get().is_some_and(|d| d.is_servable()) {
+                    return false;
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        hostname,
-                        "stored custom-domain certificate is unusable: {e}"
-                    );
-                    false
+                match self.certs.load_cert(&cert_id_for(hostname)).await {
+                    Ok(Some(stored)) => match crate::tls::certified_key_from_pem(
+                        stored.chain_pem.as_bytes(),
+                        stored.key_pem.as_bytes(),
+                        &self.provider,
+                    ) {
+                        Ok(certified) => {
+                            self.cache.insert_if_not_older(hostname, certified);
+                            true
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                hostname,
+                                "stored custom-domain certificate is unusable: {e}"
+                            );
+                            false
+                        }
+                    },
+                    Ok(None) => false,
+                    Err(e) => {
+                        tracing::warn!(hostname, "failed to read a custom-domain certificate: {e}");
+                        false
+                    }
                 }
-            },
-            Ok(None) => false,
-            Err(e) => {
-                tracing::warn!(hostname, "failed to read a custom-domain certificate: {e}");
-                false
-            }
-        }
+            })
+            .await
+            .unwrap_or(false)
     }
 
     /// Warm as many active domains as the cache holds, newest activation

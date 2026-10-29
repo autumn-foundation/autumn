@@ -997,6 +997,102 @@ mod sni {
         assert!(resolver.certificate_for("app.clientco.com").is_none());
     }
 
+    /// A source whose load is overtaken by a renewal: the renewal lands while
+    /// the stale pair is still being read.
+    #[derive(Debug)]
+    struct OvertakenByRenewal {
+        registry: Arc<CustomDomainRegistry>,
+        cache: Arc<CustomDomainCertCache>,
+        /// Whether the renewal is also cached (and not evicted again).
+        renewal_cached: bool,
+    }
+
+    impl autumn_web::custom_domain::SniCertSource for OvertakenByRenewal {
+        fn load(&self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
+            let stale = key(CERT_PEM, KEY_PEM);
+            let not_after =
+                autumn_web::tls::leaf_not_after_from_pem(RENEWED_CERT_PEM.as_bytes()).unwrap();
+            futures::executor::block_on(self.registry.record_active(hostname, NOW, not_after))
+                .unwrap();
+            if self.renewal_cached {
+                self.cache
+                    .insert(hostname, key(RENEWED_CERT_PEM, RENEWED_KEY_PEM));
+            }
+            Some(stale)
+        }
+    }
+
+    async fn active_registry() -> Arc<CustomDomainRegistry> {
+        let registry = super::hydrate(CustomDomainRegistry::new(
+            Arc::new(MemoryCustomDomainStore::new()),
+            10,
+        ));
+        registry
+            .register("app.clientco.com", "tenant-a", NOW)
+            .await
+            .unwrap();
+        registry
+            .record_active("app.clientco.com", NOW, NOW + 86_400)
+            .await
+            .unwrap();
+        registry
+    }
+
+    fn resolver_over(
+        registry: &Arc<CustomDomainRegistry>,
+        cache: &Arc<CustomDomainCertCache>,
+        renewal_cached: bool,
+    ) -> SniCertResolver {
+        let base = Arc::new(autumn_web::tls::ReloadableCertResolver::new(key(
+            CERT_PEM, KEY_PEM,
+        )));
+        SniCertResolver::new(
+            base,
+            vec!["myapp.com".to_owned()],
+            Arc::clone(registry),
+            Arc::clone(cache),
+        )
+        .with_source(Arc::new(OvertakenByRenewal {
+            registry: Arc::clone(registry),
+            cache: Arc::clone(cache),
+            renewal_cached,
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_cache_miss_load_cannot_publish_the_older_pair_over_a_renewal() {
+        let registry = active_registry().await;
+        let cache = Arc::new(CustomDomainCertCache::new(4));
+        let resolver = resolver_over(&registry, &cache, true);
+
+        let served = resolver.certificate_for("app.clientco.com").unwrap();
+
+        let renewed = key(RENEWED_CERT_PEM, RENEWED_KEY_PEM);
+        assert_eq!(
+            cache.get("app.clientco.com").unwrap().cert[0],
+            renewed.cert[0],
+            "the cache must keep the renewed pair"
+        );
+        assert_eq!(served.cert[0], renewed.cert[0], "and serve it");
+    }
+
+    #[tokio::test]
+    async fn a_load_older_than_the_recorded_certificate_is_not_cached() {
+        // The renewal was cached and then evicted before the stale load
+        // published, so the cache has nothing to compare against. The record
+        // still says the loaded pair is out of date.
+        let registry = active_registry().await;
+        let cache = Arc::new(CustomDomainCertCache::new(4));
+        let resolver = resolver_over(&registry, &cache, false);
+
+        assert!(resolver.certificate_for("app.clientco.com").is_some());
+
+        assert!(
+            cache.get("app.clientco.com").is_none(),
+            "a pair older than the record must not be cached"
+        );
+    }
+
     #[test]
     fn the_certificate_cache_is_bounded_and_evicts_oldest_first() {
         let cache = CustomDomainCertCache::new(2);

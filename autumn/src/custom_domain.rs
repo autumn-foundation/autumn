@@ -1053,7 +1053,15 @@ pub struct CustomDomainRegistry {
     ///
     /// Keyed by hostname rather than global so a slow write for one tenant
     /// cannot stall every other tenant's.
+    ///
+    /// [`with_hostname`](Self::with_hostname) lends the gate to a caller, so
+    /// the certificate store and cache writes for the hostname join the
+    /// registry write in one critical section.
     writes: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Lets one task exclude every [`with_hostname`](Self::with_hostname)
+    /// section at once. A section holds it shared, taken before its hostname
+    /// gate; [`exclusive`](Self::exclusive) holds it alone.
+    sections: tokio::sync::RwLock<()>,
     max_domains: usize,
     /// Hostnames and wildcard patterns no tenant may claim.
     reserved: Vec<String>,
@@ -1074,6 +1082,7 @@ impl CustomDomainRegistry {
             store,
             index: RwLock::new(HashMap::new()),
             writes: tokio::sync::Mutex::new(HashMap::new()),
+            sections: tokio::sync::RwLock::new(()),
             max_domains,
             reserved: Vec::new(),
             hydrated: std::sync::atomic::AtomicBool::new(false),
@@ -1437,6 +1446,54 @@ impl CustomDomainRegistry {
         self.max_domains.saturating_add(64)
     }
 
+    /// Run `section` while holding `hostname`'s write gate.
+    ///
+    /// The gate covers the registry write. This lets a caller put the writes
+    /// that belong to it in the same critical section: the certificate store
+    /// and the certificate cache. Use the [`Gated`] handle for registry
+    /// writes inside the section.
+    ///
+    /// Returns `None`, without running `section`, for an unusable hostname.
+    ///
+    /// # Deadlocks
+    ///
+    /// A gate is not re-entrant. Inside `section`, do not call a method of this
+    /// registry that takes a gate (`register`, `remove`, `record_*`, or
+    /// another `with_hostname`). Use the [`Gated`] handle. Never hold two
+    /// sections at once: two tasks that take two hostnames in opposite order
+    /// deadlock. Do not wait on a CA or a network in `section`: it blocks
+    /// every writer for this hostname.
+    pub async fn with_hostname<T>(
+        &self,
+        hostname: &str,
+        section: impl AsyncFnOnce(&Gated<'_>) -> T,
+    ) -> Option<T> {
+        let host = normalize_hostname(hostname).ok()?;
+        // Order: sections lock, then the gate. The gate-map lock is only held
+        // inside `write_gate`, never while a gate is awaited.
+        let _shared = self.sections.read().await;
+        let gate = self.write_gate(&host).await;
+        let _write = gate.lock().await;
+        let gated = Gated {
+            registry: self,
+            host,
+        };
+        Some(section(&gated).await)
+    }
+
+    /// Run `section` while no [`with_hostname`](Self::with_hostname) section
+    /// runs, and none starts.
+    ///
+    /// For work that cannot name its hostname up front. The orphan prune finds
+    /// certificates by hashed id, so it cannot take the right gate.
+    /// Keep `section` short: every certificate write waits for it.
+    ///
+    /// Do not call `with_hostname` inside `section`.
+    pub async fn exclusive<T>(&self, section: impl AsyncFnOnce() -> T) -> T {
+        let _all = self.sections.write().await;
+        section().await
+    }
+
     /// The record for `hostname` (normalising the lookup key), if registered.
     #[must_use]
     pub fn get(&self, hostname: &str) -> Option<CustomDomain> {
@@ -1703,22 +1760,14 @@ impl CustomDomainRegistry {
     ) -> io::Result<bool> {
         self.mutate_if(
             hostname,
-            |d| tenant.is_none_or(|t| d.tenant == t && Self::is_orderable_state(d.status)),
-            |d| {
-                d.status = DomainStatus::Active;
-                if d.verified_at_unix.is_none() {
-                    d.verified_at_unix = Some(now_unix);
-                }
-                if d.activated_at_unix.is_none() {
-                    d.activated_at_unix = Some(now_unix);
-                }
-                d.cert_not_after_unix = Some(cert_not_after_unix);
-                d.failure_reason = None;
-                d.consecutive_failures = 0;
-                d.next_attempt_unix = None;
-            },
+            |d| Self::may_activate(d, tenant),
+            |d| apply_active_mutation(d, now_unix, cert_not_after_unix),
         )
         .await
+    }
+
+    fn may_activate(d: &CustomDomain, tenant: Option<&str>) -> bool {
+        tenant.is_none_or(|t| d.tenant == t && Self::is_orderable_state(d.status))
     }
 
     /// Record a failure with the reason to show and how long to wait.
@@ -1956,11 +2005,20 @@ impl CustomDomainRegistry {
         // at the next restart.
         let gate = self.write_gate(&host).await;
         let _write = gate.lock().await;
-        if !read_lock(&self.index).get(&host).is_none_or(guard) {
+        self.remove_if_locked(&host, guard).await
+    }
+
+    /// [`remove_if`](Self::remove_if) for a caller that holds `host`'s gate.
+    async fn remove_if_locked(
+        &self,
+        host: &str,
+        guard: impl FnOnce(&CustomDomain) -> bool,
+    ) -> io::Result<bool> {
+        if !read_lock(&self.index).get(host).is_none_or(guard) {
             return Ok(false);
         }
-        self.store.delete(&host).await?;
-        Ok(write_lock(&self.index).remove(&host).is_some())
+        self.store.delete(host).await?;
+        Ok(write_lock(&self.index).remove(host).is_some())
     }
 
     /// Offboard every domain a tenant owns. Returns how many were removed.
@@ -2038,6 +2096,16 @@ impl CustomDomainRegistry {
         };
         let gate = self.write_gate(&host).await;
         let _write = gate.lock().await;
+        self.mutate_if_locked(&host, guard, f).await
+    }
+
+    /// [`mutate_if`](Self::mutate_if) for a caller that holds `host`'s gate.
+    async fn mutate_if_locked(
+        &self,
+        host: &str,
+        guard: impl FnOnce(&CustomDomain) -> bool,
+        f: impl FnOnce(&mut CustomDomain),
+    ) -> io::Result<bool> {
         // Apply to a COPY, persist, and only then publish. Mutating the live
         // index first left a state the store had rejected routing and serving
         // anyway: `record_active` reported failure while the domain went on
@@ -2045,7 +2113,7 @@ impl CustomDomainRegistry {
         // restart with nothing to explain either half. Every writer for this
         // hostname holds this same gate, so nothing can change the record
         // between the copy and the publish.
-        let Some(current) = read_lock(&self.index).get(&host).cloned() else {
+        let Some(current) = read_lock(&self.index).get(host).cloned() else {
             return Ok(false);
         };
         if !guard(&current) {
@@ -2058,7 +2126,7 @@ impl CustomDomainRegistry {
         // An offboard cannot interleave under the gate, but the index is the
         // routing table: if the record is gone, leave it gone rather than
         // resurrecting a hostname nothing owns.
-        Ok(index.get_mut(&host).is_some_and(|slot| {
+        Ok(index.get_mut(host).is_some_and(|slot| {
             *slot = updated;
             true
         }))
@@ -2066,6 +2134,74 @@ impl CustomDomainRegistry {
 }
 
 // ── Issuance budget ──────────────────────────────────────────────────────
+
+/// The write half of [`CustomDomainRegistry::record_active_for`].
+fn apply_active_mutation(d: &mut CustomDomain, now_unix: i64, cert_not_after_unix: i64) {
+    d.status = DomainStatus::Active;
+    if d.verified_at_unix.is_none() {
+        d.verified_at_unix = Some(now_unix);
+    }
+    if d.activated_at_unix.is_none() {
+        d.activated_at_unix = Some(now_unix);
+    }
+    d.cert_not_after_unix = Some(cert_not_after_unix);
+    d.failure_reason = None;
+    d.consecutive_failures = 0;
+    d.next_attempt_unix = None;
+}
+
+/// A hostname's write gate, held by [`CustomDomainRegistry::with_hostname`].
+///
+/// Its methods are the registry writes that assume the gate is already held.
+#[derive(Debug)]
+pub struct Gated<'a> {
+    registry: &'a CustomDomainRegistry,
+    host: String,
+}
+
+impl Gated<'_> {
+    /// The normalised hostname this gate guards.
+    #[must_use]
+    pub fn hostname(&self) -> &str {
+        &self.host
+    }
+
+    /// The record for this hostname, if registered.
+    #[must_use]
+    pub fn get(&self) -> Option<CustomDomain> {
+        read_lock(&self.registry.index).get(&self.host).cloned()
+    }
+
+    /// [`CustomDomainRegistry::remove_if`] without taking the gate again.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's delete error.
+    pub async fn remove_if(&self, guard: impl FnOnce(&CustomDomain) -> bool) -> io::Result<bool> {
+        self.registry.remove_if_locked(&self.host, guard).await
+    }
+
+    /// [`CustomDomainRegistry::record_active_for`] without taking the gate
+    /// again.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_active_for(
+        &self,
+        tenant: &str,
+        now_unix: i64,
+        cert_not_after_unix: i64,
+    ) -> io::Result<bool> {
+        self.registry
+            .mutate_if_locked(
+                &self.host,
+                |d| CustomDomainRegistry::may_activate(d, Some(tenant)),
+                |d| apply_active_mutation(d, now_unix, cert_not_after_unix),
+            )
+            .await
+    }
+}
 
 /// The promotion half of [`CustomDomainRegistry::record_verified`]: shared by
 /// the unconditional variant and the registration-guarded
@@ -2718,6 +2854,11 @@ mod sni {
         inner: RwLock<CacheInner>,
     }
 
+    /// The `notAfter` of a certificate's leaf, if it parses.
+    fn leaf_not_after(key: &CertifiedKey) -> Option<i64> {
+        crate::tls::leaf_not_after_from_der(key.cert.first()?.as_ref())
+    }
+
     #[derive(Debug, Default)]
     struct CacheInner {
         certs: HashMap<String, Arc<CertifiedKey>>,
@@ -2752,6 +2893,34 @@ mod sni {
                 }
             }
             drop(inner);
+        }
+
+        /// Cache `key` for `hostname` unless the resident certificate expires
+        /// later. Returns whether `key` was stored.
+        ///
+        /// For a load that read the store without holding the hostname's gate
+        /// (the handshake path). A renewal can cache the new pair while that
+        /// load is in flight. Without this check, the load would then publish
+        /// the old pair over it. The check and the insert are one step.
+        pub fn insert_if_not_older(&self, hostname: &str, key: Arc<CertifiedKey>) -> bool {
+            let mut inner = write_lock(&self.inner);
+            if let Some(resident) = inner.certs.get(hostname)
+                && let (Some(resident), Some(incoming)) =
+                    (leaf_not_after(resident), leaf_not_after(&key))
+                && resident > incoming
+            {
+                return false;
+            }
+            if inner.certs.insert(hostname.to_owned(), key).is_none() {
+                inner.order.push_back(hostname.to_owned());
+            }
+            while inner.order.len() > self.capacity {
+                if let Some(oldest) = inner.order.pop_front() {
+                    inner.certs.remove(&oldest);
+                }
+            }
+            drop(inner);
+            true
         }
 
         /// Drop `hostname`'s certificate — called on offboarding, so a removed
@@ -2867,8 +3036,18 @@ mod sni {
                 return Some(cached);
             }
             let loaded = self.source.as_ref()?.load(&name)?;
-            self.cache.insert(&name, Arc::clone(&loaded));
-            Some(loaded)
+            // The load holds no gate. A renewal may have landed meanwhile, and
+            // the record already names its `notAfter`: a pair that expires
+            // sooner is stale. Serve it once; do not cache it.
+            let recorded = self.registry.get(&name).and_then(|d| d.cert_not_after_unix);
+            let stale = recorded
+                .zip(leaf_not_after(&loaded))
+                .is_some_and(|(recorded, loaded_until)| loaded_until < recorded);
+            if !stale && self.cache.insert_if_not_older(&name, Arc::clone(&loaded)) {
+                return Some(loaded);
+            }
+            // A newer pair is resident: serve that one.
+            self.cache.get(&name).or(Some(loaded))
         }
 
         /// Does the operator's own certificate cover `name`?
@@ -2956,6 +3135,191 @@ mod kani_proofs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn hydrated(max: usize) -> Arc<CustomDomainRegistry> {
+        let registry = Arc::new(CustomDomainRegistry::new(
+            Arc::new(MemoryCustomDomainStore::new()),
+            max,
+        ));
+        registry.load().await.unwrap();
+        registry
+    }
+
+    #[tokio::test]
+    async fn a_section_holds_its_hostname_but_not_the_others() {
+        let registry = hydrated(10).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let held = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .with_hostname("a.clientco.com", async |_| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                    })
+                    .await
+            }
+        });
+        entered_rx.await.unwrap();
+
+        // Another hostname is free.
+        registry
+            .register("b.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        // The held hostname is not.
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            registry.register("a.clientco.com", "tenant-a", 0),
+        )
+        .await;
+        assert!(blocked.is_err(), "a write must wait for the section");
+
+        release_tx.send(()).unwrap();
+        held.await.unwrap();
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_section_for_an_unusable_hostname_does_not_run() {
+        let registry = hydrated(10).await;
+        assert!(
+            registry
+                .with_hostname("not a host", async |_| unreachable!())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gated_handle_writes_without_retaking_the_gate() {
+        let registry = hydrated(10).await;
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        let seen = registry
+            .with_hostname("A.ClientCo.com.", async |gate| {
+                assert_eq!(gate.hostname(), "a.clientco.com");
+                // A record still `PendingDns` is not orderable.
+                assert!(!gate.record_active_for("tenant-a", 1, 9).await.unwrap());
+                assert!(!gate.record_active_for("tenant-b", 1, 9).await.unwrap());
+                assert!(!gate.remove_if(|_| false).await.unwrap());
+                assert!(gate.remove_if(|d| d.tenant == "tenant-a").await.unwrap());
+                gate.get()
+            })
+            .await
+            .unwrap();
+        assert!(seen.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_exclusive_section_excludes_hostname_sections_in_both_directions() {
+        let registry = hydrated(10).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let exclusive = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .exclusive(async || {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                    })
+                    .await;
+            }
+        });
+        entered_rx.await.unwrap();
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            registry.with_hostname("a.clientco.com", async |_| ()),
+        )
+        .await;
+        assert!(
+            waiting.is_err(),
+            "a section must wait for the exclusive one"
+        );
+        release_tx.send(()).unwrap();
+        exclusive.await.unwrap();
+
+        // And the reverse: a running section holds the exclusive one back.
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let section = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move {
+                registry
+                    .with_hostname("a.clientco.com", async |_| {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.await;
+                    })
+                    .await;
+            }
+        });
+        entered_rx.await.unwrap();
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            registry.exclusive(async || ()),
+        )
+        .await;
+        assert!(waiting.is_err(), "the exclusive section must wait");
+        release_tx.send(()).unwrap();
+        section.await.unwrap();
+    }
+
+    /// No lock-ordering hazard: sections over many hostnames, registrations,
+    /// offboards and exclusive sections, all at once on several threads, with
+    /// the gate map churning past its high-water mark, finish.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_sections_and_writes_never_deadlock() {
+        let registry = hydrated(8).await;
+        let mut tasks = Vec::new();
+        for worker in 0..8_usize {
+            let registry = Arc::clone(&registry);
+            tasks.push(tokio::spawn(async move {
+                for round in 0..60_usize {
+                    let host = format!("h{}.clientco.com", (worker + round) % 12);
+                    match round % 4 {
+                        0 => {
+                            let _ = registry.register(&host, "tenant-a", 0).await;
+                        }
+                        1 => {
+                            registry
+                                .with_hostname(&host, async |gate| {
+                                    tokio::task::yield_now().await;
+                                    let _ = gate.record_active_for("tenant-a", 1, 9).await;
+                                    gate.get()
+                                })
+                                .await;
+                        }
+                        2 => {
+                            registry
+                                .with_hostname(&host, async |gate| {
+                                    let _ = gate.remove_if(|_| true).await;
+                                })
+                                .await;
+                        }
+                        _ => {
+                            registry
+                                .exclusive(async || tokio::task::yield_now().await)
+                                .await;
+                        }
+                    }
+                }
+            }));
+        }
+        let all = futures::future::join_all(tasks);
+        let results = tokio::time::timeout(std::time::Duration::from_secs(30), all)
+            .await
+            .expect("deadlock: mixed sections did not finish");
+        for result in results {
+            result.unwrap();
+        }
+    }
 
     /// The write-gate map must stay bounded: every hostname ever gated used to
     /// keep an entry for the life of the process, and two paths made that
