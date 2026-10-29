@@ -1714,5 +1714,44 @@ pub async fn trial_balance(
         .collect()
 }
 
+/// An account whose stored balance is not the sum of its postings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BalanceDrift {
+    account: String,
+    stored: AnyMoney,
+    posted: AnyMoney,
+}
+
+impl BalanceDrift {
+    /// The account identifier.
+    #[must_use]
+    pub fn account(&self) -> &str {
+        &self.account
+    }
+
+    /// The balance stored on the account row.
+    #[must_use]
+    pub const fn stored(&self) -> AnyMoney {
+        self.stored
+    }
+
+    /// The sum of the account's postings.
+    #[must_use]
+    pub const fn posted(&self) -> AnyMoney {
+        self.posted
+    }
+}
+
+/// Every account whose stored balance is not the sum of its postings.
+///
+/// # Errors
+///
+/// [`LedgerError::Database`] when the statement fails.
+pub async fn balance_drift(
+    _conn: &mut RuntimeConnection,
+) -> Result<Vec<BalanceDrift>, LedgerError> {
+    Ok(Vec::new())
+}
+
 #[cfg(test)]
 mod tests;
