@@ -1118,16 +1118,19 @@ fn table_set_schema_target(statement: &str, table: &TableRef) -> Option<TableRef
     })
 }
 
-/// Split `text` at top-level commas: not inside parens or a `'…'` literal.
+/// Split `text` at top-level commas: not inside parens, a `'…'` literal or a
+/// `"…"` identifier. A `""` pair inside an identifier toggles twice, which is
+/// the escape.
 fn split_top_level(text: &str) -> Vec<&str> {
     let mut parts = Vec::new();
-    let (mut depth, mut in_literal, mut start) = (0usize, false, 0usize);
+    let (mut depth, mut in_literal, mut in_ident, mut start) = (0usize, false, false, 0usize);
     for (at, ch) in text.char_indices() {
         match ch {
-            '\'' => in_literal = !in_literal,
-            '(' if !in_literal => depth += 1,
-            ')' if !in_literal => depth = depth.saturating_sub(1),
-            ',' if !in_literal && depth == 0 => {
+            '"' if !in_literal => in_ident = !in_ident,
+            '\'' if !in_ident => in_literal = !in_literal,
+            '(' if !in_literal && !in_ident => depth += 1,
+            ')' if !in_literal && !in_ident => depth = depth.saturating_sub(1),
+            ',' if !in_literal && !in_ident && depth == 0 => {
                 parts.push(&text[start..at]);
                 start = at + 1;
             }
@@ -1138,20 +1141,25 @@ fn split_top_level(text: &str) -> Vec<&str> {
     parts
 }
 
+/// Words that start a table constraint, not a column, in a `CREATE TABLE`
+/// element or an `ALTER TABLE … ADD` action. Quoted, they are column names.
+const TABLE_CONSTRAINTS: &[&str] = &[
+    "constraint",
+    "primary",
+    "foreign",
+    "unique",
+    "check",
+    "exclude",
+    "like",
+];
+
 /// The [`REQUIRED_COLUMNS`] one `ALTER TABLE` action adds (`true`) or removes
-/// (`false`). `ADD [COLUMN] [IF NOT EXISTS] <name> …` adds `<name>` only;
-/// `ADD CONSTRAINT`, `ADD PRIMARY KEY` and the like add no column. Any other
-/// action is a drop or a rename. An action that only names a column
-/// (`ALTER COLUMN … SET NOT NULL`) changes nothing here.
+/// (`false`).
+///
+/// `ADD [COLUMN] [IF NOT EXISTS] <name> …` adds `<name>` only. Adding a table
+/// constraint adds no column. A drop removes a column. A column rename removes
+/// the old name and adds the new one. All other actions add and remove nothing.
 fn alter_action_columns(action: &str) -> Vec<(&'static str, bool)> {
-    const TABLE_CONSTRAINTS: &[&str] = &[
-        "constraint",
-        "primary",
-        "foreign",
-        "unique",
-        "check",
-        "exclude",
-    ];
     // The inheritance marker (`ALTER TABLE name *`) may lead the first action.
     let action = action.trim().trim_start_matches('*').trim_start();
     let after_add = strip_keyword(action, "add");
@@ -1167,19 +1175,14 @@ fn alter_action_columns(action: &str) -> Vec<(&'static str, bool)> {
             .collect();
     }
     let padded = format!(" {action} ");
-    let renamed_into = padded
-        .split_once(" to ")
-        .filter(|_| padded.contains(" rename "))
-        .map(|(_, to)| to);
+    let renamed_into = column_rename(&padded).map(|(_, to)| to);
     REQUIRED_COLUMNS
         .iter()
         .copied()
         .filter_map(|column| {
             if alter_removes_column(&padded, column) {
                 Some((column, false))
-            } else if renamed_into.is_some_and(|to| mentions_column(to, column))
-                && !padded.contains(" rename to ")
-            {
+            } else if renamed_into.is_some_and(|to| mentions_column(to, column)) {
                 Some((column, true))
             } else {
                 None
@@ -1188,14 +1191,17 @@ fn alter_action_columns(action: &str) -> Vec<(&'static str, bool)> {
         .collect()
 }
 
-/// Whether `haystack` mentions `column` as a complete SQL identifier.
-///
-/// A bare `contains` would accept `legacy_commentable_type` as
-/// `commentable_type`, classify a table that lacks the real columns as
-/// polymorphic, and make the generator skip the shared migration while
-/// reporting that it reused the table — with every helper then failing at
-/// runtime on columns that are not there. The same identifier-boundary rule the
-/// table name gets; columns had been left as substrings.
+/// The `(from, to)` text of an `ALTER … RENAME [COLUMN] <from> TO <to>`.
+/// `None` for a table rename (`RENAME TO`) and a constraint rename.
+fn column_rename(statement: &str) -> Option<(&str, &str)> {
+    let at = statement.find(" rename ")?;
+    let rest = statement[at + " rename ".len()..].trim_start();
+    if rest.starts_with("to ") || rest.starts_with("constraint ") {
+        return None;
+    }
+    Some(rest.split_once(" to ").unwrap_or((rest, "")))
+}
+
 /// Whether a `CREATE TABLE` column-list `body` DECLARES `column` — as the name
 /// at the head of one of its top-level elements — rather than merely
 /// mentioning it. A mention is not a declaration: `author_id BIGINT
@@ -1203,19 +1209,10 @@ fn alter_action_columns(action: &str) -> Vec<(&'static str, bool)> {
 /// reading it as one made a table lacking the key look like the shared
 /// comments table.
 ///
-/// Elements split at top-level commas (not inside parens or a `'…'` literal);
+/// Elements split at top-level commas (not inside parens, a `'…'` literal or a `"…"` identifier);
 /// table constraints (`PRIMARY KEY (…)`, `CONSTRAINT …`, `FOREIGN KEY`, …)
 /// declare no column and are skipped.
 fn declares_column(body: &str, column: &str) -> bool {
-    const TABLE_CONSTRAINTS: &[&str] = &[
-        "constraint",
-        "primary",
-        "foreign",
-        "unique",
-        "check",
-        "exclude",
-        "like",
-    ];
     split_top_level(body).into_iter().any(|element| {
         let element = element.trim_start();
         // A constraint keyword is only one when unquoted: `"check"` is a column.
@@ -1226,6 +1223,14 @@ fn declares_column(body: &str, column: &str) -> bool {
     })
 }
 
+/// Whether `haystack` mentions `column` as a complete SQL identifier.
+///
+/// A bare `contains` would accept `legacy_commentable_type` as
+/// `commentable_type`, classify a table that lacks the real columns as
+/// polymorphic, and make the generator skip the shared migration while
+/// reporting that it reused the table — with every helper then failing at
+/// runtime on columns that are not there. The same identifier-boundary rule the
+/// table name gets; columns had been left as substrings.
 fn mentions_column(haystack: &str, column: &str) -> bool {
     let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let mut base = 0usize;
@@ -1266,7 +1271,7 @@ const REQUIRED_COLUMNS: &[&str] = &[
     "deleted_at",
 ];
 
-/// Whether an `ALTER TABLE comments …` statement takes `column` away.
+/// Whether one `ALTER TABLE comments …` action takes `column` away.
 ///
 /// `DROP COLUMN <column>` removes it outright; `RENAME COLUMN <column> TO …`
 /// removes it under that name, which is all this scan cares about. A
@@ -1295,8 +1300,7 @@ fn alter_removes_column(statement: &str, column: &str) -> bool {
         {
             continue;
         }
-        // Only the name actually being dropped: `DROP COLUMN kind, ADD COLUMN
-        // commentable_type` must not read as dropping the discriminator.
+        // Only the name actually being dropped.
         let name = rest.strip_prefix("column ").unwrap_or(rest).trim_start();
         let name = name.strip_prefix("if exists ").unwrap_or(name).trim_start();
         let name = name.split([' ', ',', ';']).next().unwrap_or("");
@@ -1306,23 +1310,11 @@ fn alter_removes_column(statement: &str, column: &str) -> bool {
     }
     // PostgreSQL makes COLUMN optional: `RENAME commentable_type TO kind`
     // renames the column exactly as `RENAME COLUMN commentable_type TO kind`
-    // does. Matching only the spelled-out form read the bare one as "the column
-    // is still there", so the scan reported a polymorphic table, skipped the
-    // shared migration, and left every helper querying a column that had been
-    // renamed away — silently, at runtime.
-    //
-    // One branch serves both spellings: what follows `RENAME` is either
-    // `COLUMN <name>` or the bare `<name>`, and the `from` side covers each.
-    if let Some(at) = statement.find(" rename ") {
-        let rest = statement[at + " rename ".len()..].trim_start();
-        // `RENAME TO <table>` renames the TABLE and `RENAME CONSTRAINT …` a
-        // constraint. Neither one touches a column.
-        if !rest.starts_with("to ") && !rest.starts_with("constraint ") {
-            let (from, to) = rest.split_once(" to ").unwrap_or((rest, ""));
-            // Renaming the column AWAY removes it; renaming another column INTO
-            // the discriminator name adds it, so the `to` side has to be clear.
-            return mentions_column(from, column) && !mentions_column(to, column);
-        }
+    // does. The `from` side covers both spellings.
+    if let Some((from, to)) = column_rename(statement) {
+        // Renaming the column AWAY removes it; renaming another column INTO
+        // the discriminator name adds it, so the `to` side has to be clear.
+        return mentions_column(from, column) && !mentions_column(to, column);
     }
     false
 }
@@ -2683,7 +2675,7 @@ mod tests {
              ALTER TABLE archive . legacy_comments RENAME TO comments;\n"
         )));
         assert!(!migrated_after(&format!(
-            "CREATE TABLE archive. comments ({cols});\n"
+            "CREATE TABLE archive .comments ({cols});\n"
         )));
         assert!(migrated_after(&format!(
             "CREATE TABLE public . comments ({cols});\n"
@@ -2723,6 +2715,62 @@ mod tests {
         )));
         assert!(migrated_after(&format!(
             "{base}ALTER TABLE comments RENAME COLUMN uid TO id;\n"
+        )));
+    }
+
+    /// A full `comments` table, less `commentable_type`.
+    const LACKS_TYPE: &str = "CREATE TABLE comments (id BIGINT, commentable_id BIGINT, \
+        parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, \
+        deleted_at TIMESTAMP);\n";
+
+    /// A space before the dot works for `ALTER` too (#3035).
+    #[test]
+    fn a_spaced_schema_dot_works_on_alter_add() {
+        assert!(migrated_after(&format!(
+            "{LACKS_TYPE}ALTER TABLE public . comments ADD COLUMN commentable_type TEXT;\n"
+        )));
+    }
+
+    /// A quote, paren or comma inside `"…"` does not move an action boundary.
+    #[test]
+    fn quoted_identifiers_do_not_merge_alter_actions() {
+        for name in ["o'b", "a(b", "a)b", "a,b"] {
+            assert!(
+                !migrated_after(&format!(
+                    "{LACKS_TYPE}ALTER TABLE comments ADD COLUMN commentable_type TEXT, \
+                     ADD COLUMN \"{name}\" TEXT, DROP COLUMN body;\n"
+                )),
+                "`{name}` hid the DROP"
+            );
+        }
+        assert_eq!(
+            split_top_level("a \"x\"\"(,\" b, c"),
+            ["a \"x\"\"(,\" b", " c"]
+        );
+    }
+
+    /// An action that only names a column does not add it.
+    #[test]
+    fn other_alter_actions_add_nothing() {
+        assert!(!migrated_after(&format!(
+            "{LACKS_TYPE}ALTER TABLE comments ALTER COLUMN commentable_type SET NOT NULL;\n"
+        )));
+        assert!(!migrated_after(&format!(
+            "{LACKS_TYPE}ALTER TABLE comments RENAME CONSTRAINT ck TO commentable_type;\n"
+        )));
+    }
+
+    /// One `ALTER` may drop one column and add another.
+    #[test]
+    fn a_mixed_alter_applies_each_action() {
+        assert!(migrated_after(&format!(
+            "{LACKS_TYPE}ALTER TABLE comments DROP COLUMN kind, ADD COLUMN commentable_type TEXT;\n"
+        )));
+        assert!(!migrated_after(&format!(
+            "{LACKS_TYPE}ALTER TABLE comments ADD COLUMN commentable_type TEXT, DROP COLUMN body;\n"
+        )));
+        assert!(migrated_after(&format!(
+            "{LACKS_TYPE}ALTER TABLE comments RENAME COLUMN kind TO commentable_type;\n"
         )));
     }
 
