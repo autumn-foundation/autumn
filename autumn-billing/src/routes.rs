@@ -241,6 +241,14 @@ async fn checkout(
         .get(&PlanId::new(body.plan))
         .cloned()
         .ok_or_else(|| BillingError::NotFound("plan").into_autumn())?;
+    // The slot stays held until the provider call ends. Without it, a second
+    // POST for the same user passes the check below before the webhook lands.
+    let Some(_slot) = service.begin_checkout(&user_id) else {
+        return Err(BillingError::Conflict(
+            "a checkout for this user is already in progress".to_owned(),
+        )
+        .into_autumn());
+    };
     if has_live_subscription(&service, &user_id)
         .await
         .map_err(BillingError::into_autumn)?
