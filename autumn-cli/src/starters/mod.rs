@@ -898,8 +898,8 @@ mod tests {
         }
     }
 
-    /// Compile and run the real `candidate_target_dirs` from `src` with the
-    /// given env. Returns the printed candidates (issue #3108).
+    /// Compile `candidate_target_dirs` from `src` and run it with the given
+    /// env. Return the printed candidates.
     fn run_candidate_target_dirs(
         src: &str,
         dir: &std::path::Path,
@@ -939,8 +939,8 @@ mod tests {
     }
 
     /// A relative `CARGO_TARGET_DIR` must not be a candidate. The build
-    /// script runs in the member dir, so it can match a stale member-local
-    /// binary (issue #3108). An absolute value stays first.
+    /// script runs in the member directory. A relative path could match a
+    /// stale member-local binary (issue #3108). An absolute value stays first.
     #[test]
     fn build_scripts_skip_relative_cargo_target_dir() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

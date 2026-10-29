@@ -334,12 +334,12 @@ fn tailwind_bin_name() -> &'static str {
 /// every candidate below is tried rather than picking just one:
 ///
 /// - `CARGO_TARGET_DIR`, when the *user* set it as an env var (not via
-///   `.cargo/config.toml`), is inherited into this process and matches
-///   `cargo metadata` exactly, triple or not. It is used only when
-///   ABSOLUTE. A relative value resolves against the workspace root, but
-///   this script runs in the member directory. Joining it here would find
-///   a stale member-local binary before the real one (issue #3108), so it
-///   is skipped; the `OUT_DIR` candidates below cover that case.
+///   `.cargo/config.toml`), is inherited into this process. It matches
+///   `cargo metadata` exactly, triple or not. Use it only when it is
+///   ABSOLUTE. Cargo resolves a relative value against the workspace
+///   root, but runs this script in the member directory. Joining it here
+///   can find a stale member-local binary (issue #3108). So skip it. The
+///   `OUT_DIR` candidates below cover that case.
 /// - `OUT_DIR` is always absolute and already resolved by Cargo itself
 ///   (`<target_dir>[/<triple>]/<profile>/build/<pkg>/out`), so its ancestors
 ///   are tried unconditionally as well, not only when `CARGO_TARGET_DIR` is
