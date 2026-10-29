@@ -262,6 +262,13 @@ impl<S> tower::Layer<S> for TxTimeoutsLayer {
 }
 
 /// Tower service of [`TxTimeoutsLayer`].
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        dead_code,
+        reason = "`SET LOCAL` is Postgres-only; SQLite sends nothing"
+    )
+)]
 #[derive(Clone)]
 pub(crate) struct TxTimeoutsService<S> {
     inner: S,
