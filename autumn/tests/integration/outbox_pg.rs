@@ -244,13 +244,18 @@ mod docker {
 
     /// Sent rows that the purge did not delete yet. Their `seq` is lower than
     /// the `seq` of each pending row.
-    const SENT_ROWS: i64 = 20_000;
+    const SENT_ROWS: i64 = 30_000;
+
+    /// Pending rows in backoff, after the edge rows. With these rows, the
+    /// planner walks `autumn_outbox_pkey` when the claim index is missing.
+    /// Without them, it sorts the few pending rows and the test proves nothing.
+    const WAITING_ROWS: i64 = 500;
 
     #[derive(diesel::QueryableByName)]
-    struct TableStats {
-        /// Rows that scans of `autumn_outbox` read.
+    struct OutboxStats {
+        /// Index entries that scans of `autumn_outbox_pkey` read.
         #[diesel(sql_type = diesel::sql_types::BigInt)]
-        reads: i64,
+        pkey_reads: i64,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         inserts: i64,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -262,7 +267,7 @@ mod docker {
     /// Postgres 11 sends the counters of a connection at the end of a
     /// transaction, at most once in 500 ms. Thus each connection of `pool`
     /// (`max_size` 2) runs a query after a wait.
-    async fn table_stats(pool: &PgPool, ready: impl Fn(&TableStats) -> bool) -> TableStats {
+    async fn outbox_stats(pool: &PgPool, ready: impl Fn(&OutboxStats) -> bool) -> OutboxStats {
         use diesel_async::RunQueryDsl as _;
 
         for _ in 0..50 {
@@ -279,11 +284,13 @@ mod docker {
                 .await
                 .unwrap();
             let stats = diesel::sql_query(
-                "SELECT COALESCE(seq_tup_read, 0) + COALESCE(idx_tup_fetch, 0) AS reads, \
-                 n_tup_ins AS inserts, n_tup_upd AS updates \
-                 FROM pg_stat_user_tables WHERE relname = 'autumn_outbox'",
+                "SELECT i.idx_tup_read AS pkey_reads, t.n_tup_ins AS inserts, \
+                 t.n_tup_upd AS updates \
+                 FROM pg_stat_user_tables t \
+                 JOIN pg_stat_user_indexes i ON i.relid = t.relid \
+                 WHERE t.relname = 'autumn_outbox' AND i.indexrelname = 'autumn_outbox_pkey'",
             )
-            .get_result::<TableStats>(&mut *first)
+            .get_result::<OutboxStats>(&mut *first)
             .await
             .unwrap();
             if ready(&stats) {
@@ -301,7 +308,9 @@ mod docker {
     async fn pg_outbox_claim_reads_pending_rows_only() {
         use chrono::TimeZone as _;
         use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-        use diesel_async::{AsyncPgConnection, RunQueryDsl as _, SimpleAsyncConnection as _};
+        use diesel_async::{
+            AsyncConnection as _, AsyncPgConnection, RunQueryDsl as _, SimpleAsyncConnection as _,
+        };
 
         #[derive(diesel::QueryableByName)]
         struct Id {
@@ -310,8 +319,10 @@ mod docker {
         }
 
         // A database of its own: rows of other tests change the counters.
+        // Do not use the shared pool: a connection stops with the runtime
+        // that opened it, and other tests can get it from the pool.
         let db = autumn_web::test::TestDb::shared().await;
-        let mut admin = db.pool().get().await.unwrap();
+        let mut admin = AsyncPgConnection::establish(db.url()).await.unwrap();
         admin
             .batch_execute("DROP DATABASE IF EXISTS outbox_claim_cost")
             .await
@@ -346,6 +357,13 @@ mod docker {
         )
         .await
         .unwrap();
+        conn.batch_execute(&format!(
+            "INSERT INTO autumn_outbox (id, aggregate, topic, payload, created_at, available_at) \
+             SELECT 'waiting-' || g, 'waiting-' || g, 't', '{{}}', {ms}, {ms} + 3600000 \
+             FROM generate_series(1, {WAITING_ROWS}) g"
+        ))
+        .await
+        .unwrap();
         conn.batch_execute("ANALYZE autumn_outbox").await.unwrap();
         let expected: Vec<String> = diesel::sql_query(
             "SELECT id FROM autumn_outbox WHERE payload = '{\"claim\":true}' ORDER BY seq",
@@ -358,7 +376,7 @@ mod docker {
         .collect();
         assert_eq!(expected.len(), 5, "the fixture marks 5 rows");
         drop(conn);
-        let before = table_stats(&pool, |stats| stats.inserts >= SENT_ROWS).await;
+        let before = outbox_stats(&pool, |stats| stats.inserts >= SENT_ROWS + WAITING_ROWS).await;
 
         let log = Log::default();
         let state = TestApp::new()
@@ -389,11 +407,13 @@ mod docker {
 
         // Each sent message has two updates: the claim and the mark.
         let claimed = i64::try_from(expected.len()).unwrap();
-        let after = table_stats(&pool, |stats| stats.updates - before.updates >= 2 * claimed).await;
-        let reads = after.reads - before.reads;
+        let after =
+            outbox_stats(&pool, |stats| stats.updates - before.updates >= 2 * claimed).await;
+        let reads = after.pkey_reads - before.pkey_reads;
         assert!(
             reads < SENT_ROWS / 10,
-            "the relay read {reads} rows of autumn_outbox; it must not read the {SENT_ROWS} sent rows"
+            "the relay read {reads} entries of autumn_outbox_pkey; \
+             it must not walk the {SENT_ROWS} sent rows"
         );
     }
 }
