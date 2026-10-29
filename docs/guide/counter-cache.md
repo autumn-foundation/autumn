@@ -378,7 +378,7 @@ see the parent's fields — the same visibility limit that makes
 before. `#[derivation]` takes the same `parent_pk = "<column>"` key with the
 same default.
 
-`references = "<column>"` on `belongs_to` names the same key once for the whole
+Prefer `references = "<column>"` on `belongs_to`. It names the key once for the
 leg. The preload loader, the counter cache and any `#[derivation]` through
 that leg use it. A conflicting `parent_pk` is a compile error.
 

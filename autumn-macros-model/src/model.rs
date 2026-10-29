@@ -868,7 +868,7 @@ fn parse_assoc_attr(
                          `through = <join_table>`, `target_fk = <column>`, \
                          `helper = <singular>`, `counter_cache` / \
                          `counter_cache = <column>`, \
-                         `counter_cache_tenant = <column>`, or \
+                         `counter_cache_tenant = <column>`, \
                          `parent_pk = <column>`, or `references = <column>` \
                          in association attribute",
                 ));
@@ -1567,7 +1567,8 @@ fn derivation_parent_pk(
             decl.span,
             format!(
                 "`parent_pk = \"{pk}\"` conflicts with `references = \"{refs}\"` \
-                 on the `#[belongs_to({})]` it counts through: name the key once",
+                 on the `#[belongs_to({})]` it counts through (`parent_pk` on its \
+                 `counter_cache` counts as `references`): name the key once",
                 decl.target
             ),
         )),
@@ -2409,8 +2410,8 @@ fn emit_dependent_models(model_ident: &syn::Ident, deps: &[&Association]) -> Tok
 ///
 /// The parent's table is convention-derived from the target type
 /// (`Post` → `posts`), the same assumption the preload codegen already makes for
-/// `belongs_to`; the parent's primary key is assumed to be `id`, matching the
-/// dependent-cascade specs. `fk_of` is emitted as a plain `fn` item per leg,
+/// `belongs_to`; the parent's primary key is `id` unless the leg sets
+/// `references` or `parent_pk`. The dependent-cascade specs assume `id`. `fk_of` is emitted as a plain `fn` item per leg,
 /// which doubles as the type guard: a foreign-key field that is not `i64` /
 /// `Option<i64>` fails to coerce to `fn(&Model) -> Option<i64>`.
 // One resolution + validation arm per spec field (column, tenant column, the
@@ -6151,22 +6152,11 @@ fn diesel_column_name(field: &syn::Field) -> Option<String> {
     found
 }
 
-/// The model's primary-key field: the `#[id]` field, else the first `i32` /
-/// `i64` field (the historical default).
+/// The model's `#[id]` field. With none, callers keep the historical `id`.
 fn primary_key_field<'a>(
     fields: impl IntoIterator<Item = &'a syn::Field>,
 ) -> Option<&'a syn::Field> {
-    let fields: Vec<&syn::Field> = fields.into_iter().collect();
-    fields
-        .iter()
-        .copied()
-        .find(|f| has_attr(f, "id"))
-        .or_else(|| {
-            fields.iter().copied().find(|f| {
-                matches!(&f.ty, syn::Type::Path(tp)
-                    if tp.path.is_ident("i32") || tp.path.is_ident("i64"))
-            })
-        })
+    fields.into_iter().find(|f| has_attr(f, "id"))
 }
 
 /// A Rust identifier for a SQL column name: the plain identifier, or the raw
@@ -13324,7 +13314,7 @@ mod tests {
         );
     }
 
-    /// #3033: `references` steers the belongs_to loader.
+    /// #3033: `references` steers the `belongs_to` loader.
     #[test]
     fn references_steers_the_belongs_to_loader() {
         let generated = expand(
@@ -13442,6 +13432,123 @@ mod tests {
         );
         assert!(
             generated.contains("only valid on `belongs_to`"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn counter_cache_parent_pk_still_steers_the_loader() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, counter_cache, parent_pk = "post_uuid")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("posts :: post_uuid . eq_any"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn id_keyed_model_expansion_is_unchanged() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[has_many(Comment)]
+                #[has_one(Profile)]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.contains("on_conflict (posts :: id)"),
+            "{generated}"
+        );
+        assert!(generated.contains("__r . id"), "{generated}");
+    }
+
+    #[test]
+    fn no_id_attribute_keeps_the_historical_id_key() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                pub struct Post {
+                    pub author_id: i64,
+                    pub id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("on_conflict (posts :: id)"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn raw_ident_key_is_spliced_raw() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[has_many(Comment)]
+                pub struct Post {
+                    #[id]
+                    pub r#type: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.contains("on_conflict (posts :: r#type)"),
+            "{generated}"
+        );
+        assert!(generated.contains("__r . r#type"), "{generated}");
+    }
+
+    #[test]
+    fn has_one_and_through_loaders_read_the_key_field() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[has_one(Profile)]
+                #[has_many(Tag, through = post_tags)]
+                pub struct Post {
+                    #[id]
+                    pub post_uuid: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.matches("__r . post_uuid").count() >= 4,
+            "{generated}"
+        );
+        assert!(!generated.contains("__r . id"), "{generated}");
+    }
+
+    #[test]
+    fn renamed_column_keys_list_sort() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                pub struct Post {
+                    #[id]
+                    #[diesel(column_name = post_uuid)]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.contains("order (posts :: post_uuid . desc ())"),
             "{generated}"
         );
     }
