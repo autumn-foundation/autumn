@@ -93,8 +93,9 @@ It proves these properties:
   (`Stale`) drops the row. A second delete of a missing file keeps the
   row. A delete of a present file resets a stale row.
 - A confirm never makes a row: after a re-create or a restore took the
-  key, no cutoff covers the new database. The retry task drops an old
-  pending row whose file is still there (`Refused`).
+  key, no cutoff covers the new database.
+- Two deletes at once: the one that found no file keeps the pending row of
+  the one that removed the file.
 - A row is never due before the retention ends, and a pending row is never
   due.
 - A purge never deletes a generation newer than the cutoff. With no newer

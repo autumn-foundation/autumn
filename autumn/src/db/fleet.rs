@@ -2488,12 +2488,17 @@ impl DatabaseFleet {
         // Before any file goes: a crash after the removal must not leave
         // the replica with nothing that blocks its restore.
         let tombstones = self.replication().and_then(|r| r.tombstones()).cloned();
+        // Names this delete's pending row: a refusal drops only its own.
+        let owner = self
+            .replication()
+            .map(|r| format!("{:016x}", r.entropy().next_u64()))
+            .unwrap_or_default();
         if let Some(tombstones) = &tombstones {
             let retention = self
                 .replication()
                 .map_or(Duration::ZERO, |r| r.retention_after_delete());
             tombstones
-                .record(&name, retention, path.is_file())
+                .record(&name, retention, path.is_file(), &owner)
                 .await
                 .map_err(|error| FleetError::Unavailable {
                     name: name.clone(),
@@ -2536,7 +2541,7 @@ impl DatabaseFleet {
                 hook.on_delete(&key);
             }
         } else if let Some(tombstones) = &tombstones
-            && let Err(error) = tombstones.remove_pending(&key.name()).await
+            && let Err(error) = tombstones.remove_pending(&key.name(), Some(&owner)).await
         {
             // The retry task drops it later: the file is still there.
             tracing::warn!(database = %key, %error, "fleet delete: could not drop the pending tombstone");
@@ -2781,7 +2786,7 @@ impl DatabaseFleet {
             if row.confirmed {
                 let _ = tombstones.remove(name).await;
             } else if stale {
-                let _ = tombstones.remove_pending(name).await;
+                let _ = tombstones.remove_pending(name, None).await;
             } else {
                 report.waiting += 1;
             }

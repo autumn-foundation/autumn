@@ -20,22 +20,24 @@ pub struct Tombstone {
     pub attempts: nat,
     /// The earliest time of the next purge attempt.
     pub next_attempt: int,
+    /// The delete that wrote the pending row.
+    pub owner: nat,
 }
 
 pub enum Op {
     /// `delete` starts: the row is written before any file is removed.
     /// `present`: the file is on disk, so an existing row is stale and is
     /// reset. Else an existing row stays as it is.
-    Record { now: int, present: bool },
+    Record { now: int, present: bool, owner: nat },
     /// The file is gone (`delete`, or the retry task after a crash). `now`
     /// is the later of the clock and the newest generation. A row that is
     /// gone stays gone: a re-create or a restore took the key.
     Confirm { now: int },
     /// The retry task finds the file on disk next to a confirmed row.
     Stale,
-    /// The delete removed nothing: a pending row goes. A confirmed row is
-    /// an older delete's, and it stays.
-    Refused,
+    /// The delete `owner` removed nothing: its own pending row goes. A
+    /// confirmed row, or the pending row of another delete, stays.
+    Refused { owner: nat },
     /// A purge removed the replica.
     PurgeOk,
     /// A purge failed at `now`.
@@ -57,13 +59,14 @@ pub open spec fn delay(base: nat, cap: nat, attempts: nat) -> nat {
 }
 
 /// `Tombstone::new`.
-pub open spec fn fresh(now: int, retention: nat, confirmed: bool) -> Tombstone {
+pub open spec fn fresh(now: int, retention: nat, confirmed: bool, owner: nat) -> Tombstone {
     Tombstone {
         deleted_at: now,
         confirmed,
         purge_after: now + retention,
         attempts: 0,
         next_attempt: 0,
+        owner,
     }
 }
 
@@ -110,19 +113,19 @@ pub open spec fn apply(
     cap: nat,
 ) -> Option<Tombstone> {
     match op {
-        Op::Record { now, present } => match row {
+        Op::Record { now, present, owner } => match row {
             Some(_) => if present {
-                Some(fresh(now, retention, false))
+                Some(fresh(now, retention, false, owner))
             } else {
                 row
             },
-            None => Some(fresh(now, retention, false)),
+            None => Some(fresh(now, retention, false, owner)),
         },
         Op::Confirm { now } => match row {
             Some(t) => if t.confirmed {
                 row
             } else {
-                Some(fresh(now, retention, true))
+                Some(fresh(now, retention, true, t.owner))
             },
             None => None,
         },
@@ -134,11 +137,11 @@ pub open spec fn apply(
             },
             None => None,
         },
-        Op::Refused => match row {
-            Some(t) => if t.confirmed {
-                row
-            } else {
+        Op::Refused { owner } => match row {
+            Some(t) => if !t.confirmed && t.owner == owner {
                 None
+            } else {
+                row
             },
             None => None,
         },
@@ -244,7 +247,7 @@ pub proof fn only_these_ops_drop_the_row(t: Tombstone, op: Op, retention: nat, b
         match op {
             Op::PurgeOk => true,
             Op::Restore { ok } => ok,
-            Op::Refused => !t.confirmed,
+            Op::Refused { owner } => !t.confirmed && t.owner == owner,
             Op::Stale => t.confirmed,
             Op::Recreate { purged } => purged,
             _ => false,
@@ -253,13 +256,13 @@ pub proof fn only_these_ops_drop_the_row(t: Tombstone, op: Op, retention: nat, b
 }
 
 /// A delete that finds no file keeps the tombstone of an older delete.
-pub proof fn a_second_delete_keeps_a_confirmed_row(t: Tombstone, now: int, retention: nat, base: nat, cap: nat)
+pub proof fn a_second_delete_keeps_a_confirmed_row(t: Tombstone, now: int, owner: nat, retention: nat, base: nat, cap: nat)
     requires
         t.confirmed,
     ensures
         apply(
-            apply(Some(t), Op::Record { now, present: false }, retention, base, cap),
-            Op::Refused,
+            apply(Some(t), Op::Record { now, present: false, owner }, retention, base, cap),
+            Op::Refused { owner },
             retention,
             base,
             cap,
@@ -269,10 +272,20 @@ pub proof fn a_second_delete_keeps_a_confirmed_row(t: Tombstone, now: int, reten
 
 /// A delete of a present file resets a stale row: the cutoff is the new
 /// delete's, not the old one's.
-pub proof fn a_delete_of_a_present_file_resets_a_stale_row(t: Tombstone, now: int, retention: nat, base: nat, cap: nat)
+pub proof fn a_delete_of_a_present_file_resets_a_stale_row(t: Tombstone, now: int, owner: nat, retention: nat, base: nat, cap: nat)
     ensures
-        apply(Some(t), Op::Record { now, present: true }, retention, base, cap)
-            == Some(fresh(now, retention, false)),
+        apply(Some(t), Op::Record { now, present: true, owner }, retention, base, cap)
+            == Some(fresh(now, retention, false, owner)),
+{
+}
+
+/// Two deletes at once: the one that found no file keeps the pending row
+/// of the one that removed it.
+pub proof fn a_refused_delete_keeps_another_pending_row(t: Tombstone, owner: nat, retention: nat, base: nat, cap: nat)
+    requires
+        t.owner != owner,
+    ensures
+        apply(Some(t), Op::Refused { owner }, retention, base, cap) == Some(t),
 {
 }
 
@@ -304,7 +317,7 @@ pub proof fn retention_is_kept(t: Tombstone, now: int, retention: nat)
 /// A purge never runs while the delete removes the file.
 pub proof fn a_pending_row_is_never_due(now: int, retention: nat)
     ensures
-        !is_due(fresh(now, retention, false), now + retention),
+        !is_due(fresh(now, retention, false, 0), now + retention),
 {
 }
 

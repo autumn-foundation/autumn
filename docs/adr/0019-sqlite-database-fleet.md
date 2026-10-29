@@ -354,8 +354,9 @@ brings a deleted tenant back on its next open. Litestream has the same gap.
   any file goes. If the row cannot be written, the delete fails. Then a crash
   after the removal cannot leave a replica that nothing blocks. When the file
   is present, an existing row is stale, and the delete resets it. When the
-  file is missing, an existing row is an older delete's, and it stays. A
-  delete that removed nothing drops only a pending row.
+  file is missing, an existing row is an older or a concurrent delete's,
+  and it stays. A delete that removed nothing drops only the pending row
+  that it wrote (each pending row names its delete).
 - **Confirm.** After the removal, the delete confirms its own pending row.
   `deleted_at` is the purge cutoff: the later of the app clock and the
   newest generation in the replica. The confirm never inserts a row: when

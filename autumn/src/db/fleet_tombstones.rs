@@ -68,7 +68,8 @@ CREATE TABLE IF NOT EXISTS _autumn_fleet_tombstones (
     attempts     INTEGER NOT NULL DEFAULT 0,
     next_attempt BIGINT  NOT NULL DEFAULT 0,
     last_error   TEXT,
-    marked       INTEGER NOT NULL DEFAULT 0
+    marked       INTEGER NOT NULL DEFAULT 0,
+    owner        TEXT    NOT NULL DEFAULT ''
 );";
 
 // ── Rules ───────────────────────────────────────────────────────────────────
@@ -94,6 +95,9 @@ pub struct Tombstone {
     pub last_error: Option<String>,
     /// The marker object is written. Until then, the retry task writes it.
     pub marked: bool,
+    /// The delete that wrote the pending row. A refused delete drops only
+    /// its own row, never the row of another delete that runs at once.
+    pub owner: String,
 }
 
 impl Tombstone {
@@ -109,6 +113,7 @@ impl Tombstone {
             next_attempt_at: DateTime::<Utc>::UNIX_EPOCH,
             last_error: None,
             marked: false,
+            owner: String::new(),
         }
     }
 
@@ -251,6 +256,8 @@ struct Row {
     last_error: Option<String>,
     #[diesel(sql_type = Integer)]
     marked: i32,
+    #[diesel(sql_type = Text)]
+    owner: String,
 }
 
 impl From<Row> for Tombstone {
@@ -264,6 +271,7 @@ impl From<Row> for Tombstone {
             next_attempt_at: from_millis(row.next_attempt),
             last_error: row.last_error,
             marked: row.marked != 0,
+            owner: row.owner,
         }
     }
 }
@@ -275,7 +283,7 @@ fn from_millis(millis: i64) -> DateTime<Utc> {
 }
 
 const COLUMNS: &str =
-    "key, deleted_at, confirmed, purge_after, attempts, next_attempt, last_error, marked";
+    "key, deleted_at, confirmed, purge_after, attempts, next_attempt, last_error, marked, owner";
 
 /// The tombstone rows on the control database.
 pub struct FleetTombstones {
@@ -329,7 +337,8 @@ impl FleetTombstones {
     /// Write a pending row before a delete removes the files (`Record` in
     /// the model). `present`: the file is on disk. Then an existing row is
     /// stale (a restore or a re-create drops it first), and it is reset.
-    /// Else an existing row is an older delete's, and it stays.
+    /// Else an existing row is an older or a concurrent delete's, and it
+    /// stays. `owner` names this delete (see [`remove_pending`](Self::remove_pending)).
     ///
     /// # Errors
     ///
@@ -339,23 +348,25 @@ impl FleetTombstones {
         key: &str,
         retention: Duration,
         present: bool,
+        owner: &str,
     ) -> Result<(), TombstoneError> {
         let row = Tombstone::new(key, self.now(), retention, false);
         let conflict = if present {
             "DO UPDATE SET deleted_at = excluded.deleted_at, confirmed = 0, \
              purge_after = excluded.purge_after, attempts = 0, next_attempt = 0, \
-             last_error = NULL, marked = 0"
+             last_error = NULL, marked = 0, owner = excluded.owner"
         } else {
             "DO NOTHING"
         };
         let mut conn = self.conn().await?;
         diesel::sql_query(format!(
-            "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, 0, ?, 0, 0, NULL, 0) \
+            "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, 0, ?, 0, 0, NULL, 0, ?) \
              ON CONFLICT (key) {conflict}"
         ))
         .bind::<Text, _>(&row.key)
         .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
         .bind::<BigInt, _>(row.purge_after.timestamp_millis())
+        .bind::<Text, _>(owner)
         .execute(&mut *conn)
         .await
         .map(drop)
@@ -371,11 +382,12 @@ impl FleetTombstones {
     pub async fn put(&self, row: &Tombstone) -> Result<(), TombstoneError> {
         let mut conn = self.conn().await?;
         diesel::sql_query(format!(
-            "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+            "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT (key) DO UPDATE SET deleted_at = excluded.deleted_at, \
              confirmed = excluded.confirmed, purge_after = excluded.purge_after, \
              attempts = excluded.attempts, next_attempt = excluded.next_attempt, \
-             last_error = excluded.last_error, marked = excluded.marked"
+             last_error = excluded.last_error, marked = excluded.marked, \
+             owner = excluded.owner"
         ))
         .bind::<Text, _>(&row.key)
         .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
@@ -385,6 +397,7 @@ impl FleetTombstones {
         .bind::<BigInt, _>(row.next_attempt_at.timestamp_millis())
         .bind::<Nullable<Text>, _>(row.last_error.as_deref())
         .bind::<Integer, _>(i32::from(row.marked))
+        .bind::<Text, _>(&row.owner)
         .execute(&mut *conn)
         .await
         .map(drop)
@@ -502,22 +515,40 @@ impl FleetTombstones {
             .map_err(store_error("remove"))
     }
 
-    /// Drop the row of `key` only while it is pending: the delete removed
-    /// nothing (`Refused` in the model).
+    /// Drop the row of `key` only while it is pending (`Refused` in the
+    /// model). `owner`: drop it only when this delete wrote it; then a
+    /// delete that found no file keeps the row of a delete that runs at
+    /// once in another process. `None`: drop any pending row (the retry
+    /// task, for a stale one).
     ///
     /// # Errors
     ///
     /// The control database cannot be written.
-    pub async fn remove_pending(&self, key: &str) -> Result<(), TombstoneError> {
+    pub async fn remove_pending(
+        &self,
+        key: &str,
+        owner: Option<&str>,
+    ) -> Result<(), TombstoneError> {
         let mut conn = self.conn().await?;
-        diesel::sql_query(format!(
-            "DELETE FROM {TOMBSTONE_TABLE} WHERE key = ? AND confirmed = 0"
-        ))
-        .bind::<Text, _>(key)
-        .execute(&mut *conn)
-        .await
-        .map(drop)
-        .map_err(store_error("remove"))
+        let query =
+            match owner {
+                Some(owner) => diesel::sql_query(format!(
+                    "DELETE FROM {TOMBSTONE_TABLE} WHERE key = ? AND confirmed = 0 AND owner = ?"
+                ))
+                .bind::<Text, _>(key)
+                .bind::<Text, _>(owner)
+                .execute(&mut *conn)
+                .await,
+                None => {
+                    diesel::sql_query(format!(
+                        "DELETE FROM {TOMBSTONE_TABLE} WHERE key = ? AND confirmed = 0"
+                    ))
+                    .bind::<Text, _>(key)
+                    .execute(&mut *conn)
+                    .await
+                }
+            };
+        query.map(drop).map_err(store_error("remove"))
     }
 
     /// Record a failed purge of `tombstone` (`PurgeFailed` in the model).
@@ -678,7 +709,10 @@ mod tests {
         let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
         let retention = Duration::from_secs(60);
-        store.record("tenant:acme", retention, false).await.unwrap();
+        store
+            .record("tenant:acme", retention, false, "test")
+            .await
+            .unwrap();
         let pending = store.get("tenant:acme").await.unwrap().unwrap();
         assert!(!pending.confirmed);
         clock.advance(Duration::from_secs(1));
@@ -701,8 +735,14 @@ mod tests {
         let confirmed = store.get("tenant:acme").await.unwrap().unwrap();
         assert!(confirmed.marked);
         // A second delete that finds no file keeps it too.
-        store.record("tenant:acme", retention, false).await.unwrap();
-        store.remove_pending("tenant:acme").await.unwrap();
+        store
+            .record("tenant:acme", retention, false, "test")
+            .await
+            .unwrap();
+        store
+            .remove_pending("tenant:acme", Some("test"))
+            .await
+            .unwrap();
         assert_eq!(store.get("tenant:acme").await.unwrap(), Some(confirmed));
         store.remove("tenant:acme").await.unwrap();
         assert_eq!(store.get("tenant:acme").await.unwrap(), None);
@@ -716,7 +756,7 @@ mod tests {
         let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
         store
-            .record("tenant:acme", Duration::ZERO, false)
+            .record("tenant:acme", Duration::ZERO, false, "test")
             .await
             .unwrap();
         store.remove("tenant:acme").await.unwrap();
@@ -731,13 +771,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_delete_keeps_the_pending_row_of_another_delete() {
+        // Process A removed the file and has not confirmed yet. Process B
+        // finds no file: its refusal must not drop A's row.
+        let tmp = tempfile::tempdir().unwrap();
+        let clock = crate::time::TickingClock::starting_at(at(1_000));
+        let store = store(tmp.path(), &clock);
+        store
+            .record("tenant:acme", Duration::ZERO, true, "a")
+            .await
+            .unwrap();
+        store
+            .record("tenant:acme", Duration::ZERO, false, "b")
+            .await
+            .unwrap();
+        store
+            .remove_pending("tenant:acme", Some("b"))
+            .await
+            .unwrap();
+        let row = store.get("tenant:acme").await.unwrap().unwrap();
+        assert_eq!(row.owner, "a");
+        assert!(
+            store
+                .confirm("tenant:acme", Duration::ZERO, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn a_list_pages_past_the_first_batch() {
         let tmp = tempfile::tempdir().unwrap();
         let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
         for i in 0..5 {
             store
-                .record(&format!("tenant:t{i}"), Duration::ZERO, false)
+                .record(&format!("tenant:t{i}"), Duration::ZERO, false, "test")
                 .await
                 .unwrap();
         }
@@ -763,7 +833,7 @@ mod tests {
         let clock = crate::time::TickingClock::starting_at(at(1_000));
         let store = store(tmp.path(), &clock);
         store
-            .record("slot:00007", Duration::ZERO, false)
+            .record("slot:00007", Duration::ZERO, false, "test")
             .await
             .unwrap();
         let row = store
@@ -780,10 +850,13 @@ mod tests {
         let again = FleetTombstones::new(control(tmp.path()), Arc::new(clock.clone()));
         assert_eq!(again.list_after(None, 10).await.unwrap(), vec![failed]);
         store
-            .record("slot:00008", Duration::ZERO, false)
+            .record("slot:00008", Duration::ZERO, false, "test")
             .await
             .unwrap();
-        store.remove_pending("slot:00008").await.unwrap();
+        store
+            .remove_pending("slot:00008", Some("test"))
+            .await
+            .unwrap();
         assert_eq!(again.list_after(None, 10).await.unwrap().len(), 1);
     }
 
@@ -1268,12 +1341,12 @@ mod tests {
             let live = shipped(&host, "acme").await;
             // A delete of a missing file runs now: its row is pending.
             host.tombstones
-                .record("tenant:ghost", Duration::ZERO, false)
+                .record("tenant:ghost", Duration::ZERO, false, "test")
                 .await
                 .unwrap();
             // A restore left a confirmed row next to a live file.
             host.tombstones
-                .record(&live.name(), Duration::ZERO, true)
+                .record(&live.name(), Duration::ZERO, true, "test")
                 .await
                 .unwrap();
             host.tombstones
@@ -1439,7 +1512,7 @@ mod tests {
             for i in 0..300 {
                 let name = format!("tenant:a{i:03}");
                 host.tombstones
-                    .record(&name, Duration::from_secs(3600), false)
+                    .record(&name, Duration::from_secs(3600), false, "test")
                     .await
                     .unwrap();
                 host.tombstones
@@ -1759,7 +1832,10 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let store = FleetTombstones::new(control(tmp.path()), Arc::new(clock()));
             let retention = Duration::from_secs(u64::MAX / 2);
-            store.record("tenant:acme", retention, false).await.unwrap();
+            store
+                .record("tenant:acme", retention, false, "test")
+                .await
+                .unwrap();
             let row = store
                 .confirm("tenant:acme", retention, None)
                 .await
