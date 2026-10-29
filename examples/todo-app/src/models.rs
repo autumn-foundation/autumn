@@ -103,8 +103,8 @@ pub(crate) fn title_not_blank(s: &str) -> Result<(), validator::ValidationError>
 impl NewTodo {
     /// Trim the title, then run the derived [`Validate`] rules.
     ///
-    /// Returns 422 on failure. The JSON API uses this so it enforces the same
-    /// rules as the HTML form.
+    /// Returns 422 on failure. The JSON API uses this method. It applies the
+    /// same rules as the HTML form.
     pub fn validated(self) -> AutumnResult<Self> {
         let trimmed = Self {
             title: self.title.trim().to_owned(),
@@ -141,6 +141,19 @@ mod tests {
         let padded = format!("  {}  ", "X".repeat(255));
         let ok = todo(&padded).validated().unwrap();
         assert_eq!(ok.title.len(), 255);
+    }
+
+    #[test]
+    fn validated_counts_characters_not_bytes() {
+        let ok = todo(&"é".repeat(255)).validated().unwrap();
+        assert_eq!(ok.title.chars().count(), 255);
+        let err = todo(&"é".repeat(256)).validated().err().unwrap();
+        assert_eq!(err.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn validated_stores_trimmed_title() {
+        assert_eq!(todo("  hi  ").validated().unwrap().title, "hi");
     }
 
     #[test]
