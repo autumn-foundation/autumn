@@ -244,28 +244,32 @@ fn measure_per_request(
 /// `FromFn::call` also opens with `self.inner.clone()`, and cloning an erased
 /// `BoxCloneSyncService` is a recursive `clone_box` down the rest of the stack,
 /// so each conversion took a whole deep-clone cascade with it (plus the
-/// `String` `asset_cache_control` used to own its path in). The ceiling sits
-/// above the current measurement with about a tenth of headroom to spare.
+/// `String` `asset_cache_control` used to own its path in). The ceiling of
+/// that time had about a tenth of headroom over 140.
 ///
 /// **Feature sensitivity.** CI gates with `cargo test --workspace`, which
 /// unifies far more features than the 8 defaults a local `cargo test -p
 /// autumn-web` builds — so a ceiling derived under defaults alone would be a
-/// guess. This one is not: 140 was measured under the default set AND under a
-/// 13-feature build adding `oauth2`, `mail`, `storage`, `ws` and `openapi`.
-/// Blocks did not move at all between the two (bytes did — see the sibling
-/// gate). The remaining 6 blocks of headroom are for a feature neither build
-/// covers.
+/// guess. 140 was measured under the default set AND under a 13-feature build
+/// adding `oauth2`, `mail`, `storage`, `ws` and `openapi`. Blocks did not move
+/// at all between the two (bytes did — see the sibling gate).
 ///
 /// A ceiling this close to the measured value is a deliberate trade, and here
-/// it buys something specific: at 146 a single restored `axum::middleware::from_fn`
-/// on the ingress path (7 blocks, per the control test below) fails this gate.
+/// it buys something specific: a single restored `axum::middleware::from_fn`
+/// on the ingress path (per the control test below) fails this gate.
 /// A looser ceiling would only catch a wholesale revert. It can only stay
 /// honest while the number stays deterministic — if this ever fails with a
 /// count just over the line rather than a regression-sized jump, re-measure
 /// under both feature sets and re-derive it rather than nudging it upwards.
+///
+/// Re-derived for #2830: **95** blocks under the 8 default features and
+/// under the full `cargo test --workspace` set (133 before). A shared pointer
+/// now stops the deep clones, and eight more layers have named futures. A
+/// restored `from_fn` now costs 4 blocks (see the control test below). Thus
+/// the headroom is 3 blocks, so one restored `from_fn` still fails this gate.
 #[test]
 fn per_request_allocations_stay_under_the_ceiling() {
-    const CEILING: u64 = 146;
+    const CEILING: u64 = 98;
 
     let measured = measure_per_request(|app| app);
     println!(
@@ -276,7 +280,9 @@ fn per_request_allocations_stay_under_the_ceiling() {
     assert!(
         measured.blocks <= CEILING,
         "a request allocated {} blocks, over the {CEILING} ceiling ({} bytes \
-         per request). 172 was the pre-#2214 measurement: check whether an \
+         per request). 133 was the pre-#2830 measurement: check that \
+         `SharedServiceLayer` is still first in the merged tuple and that the \
+         ingress futures are not boxed. 172 was the pre-#2214 measurement: check whether an \
          `axum::middleware::from_fn` is back on the always-on ingress path — \
          each one costs a `Box::pin` per request.",
         measured.blocks,
@@ -326,9 +332,14 @@ fn per_request_allocations_stay_under_the_ceiling() {
 /// the stack, the workspace number is 30,430: the `Either` arms their
 /// `option_layer` adds cost 144 bytes when the section is off, with no new
 /// block. The ceiling is the workspace measurement plus about a tenth.
+///
+/// Re-derived for #2830: **12,954** under the 8 default features and
+/// **14,402** under the full `cargo test --workspace` set (28,270 and about
+/// 30,500 before). The ceiling is the workspace measurement plus about a
+/// tenth.
 #[test]
 fn per_request_allocated_bytes_stay_under_the_ceiling() {
-    const CEILING: u64 = 33_600;
+    const CEILING: u64 = 15_900;
 
     let measured = measure_per_request(|app| app);
     println!(
@@ -408,9 +419,13 @@ where
 /// same cascade #2193/#2198 measured. So a `from_fn` costs its own box PLUS a
 /// deep clone of everything beneath it, which is why converting one is worth
 /// more than the one allocation the issue title names. At the operator-layer
-/// position measured here (debug profile, default features) the difference is
+/// position measured here (debug profile, default features) the difference was
 /// **7 blocks / ~1.9 KB** per request; a `from_fn` further out costs more,
 /// because more of the stack sits below it.
+///
+/// Since #2830 the services below the erased seed sit behind one `Arc`, so a
+/// clone of the seed is one small box. The deep clone stops there. The
+/// difference is now **4 blocks / 864 bytes**.
 ///
 /// This test is green both before and after #2214 — that is the point. It
 /// proves the ceilings above are measured on an instrument that can see the
@@ -424,10 +439,10 @@ async fn noop_middleware(
 }
 
 /// A floor rather than `> 0`: the ceilings above were derived against a
-/// `from_fn` that costs 7 blocks at the position measured here, so an
-/// instrument that could only still see 1 of those 7 would leave them
+/// `from_fn` that costs 4 blocks at the position measured here (#2830), so an
+/// instrument that could only still see 1 of those 4 would leave them
 /// unmeetable while this control stayed green.
-const MIN_FROM_FN_BLOCKS: u64 = 5;
+const MIN_FROM_FN_BLOCKS: u64 = 3;
 
 #[test]
 fn a_from_fn_layer_costs_more_heap_blocks_per_request_than_a_named_future() {
@@ -449,7 +464,7 @@ fn a_from_fn_layer_costs_more_heap_blocks_per_request_than_a_named_future() {
         "an `axum::middleware::from_fn` must cost at least {MIN_FROM_FN_BLOCKS} \
          heap blocks per request more than the same no-op written as a \
          `tower::Service` with a named future (named = {} blocks, from_fn = {} \
-         blocks; 7 was the measurement the ceilings above were derived against). \
+         blocks; 4 was the measurement the ceilings above were derived against). \
          If the gap has shrunk, `from_fn` changed and those ceilings need \
          re-deriving, not this assertion loosening.",
         named.blocks,
@@ -461,5 +476,51 @@ fn a_from_fn_layer_costs_more_heap_blocks_per_request_than_a_named_future() {
          layer measured {} bytes and the `from_fn` one {} bytes",
         named.bytes,
         boxed.bytes,
+    );
+}
+
+/// Extra blocks for each request when the app registers one static gate:
+/// the erased seed of the gate run, and the one clone it makes for each call
+/// (#2830). Measured, debug profile, default and workspace features.
+const STATIC_GATE_BLOCKS: u64 = 4;
+
+/// Extra blocks for each request when `[compression]` is on and the request
+/// does not accept an encoding. Measured, as above.
+const COMPRESSION_BLOCKS: u64 = 1;
+
+/// A static gate and compression must not add a `Router::layer` call.
+///
+/// Since #2830 a `Route` level above the merged tuple clones only down to its
+/// `SharedService`. Thus the clone probes of `middleware_stack_depth` do not
+/// see such a level. It still costs blocks on each request: its box clone,
+/// and the box of its call future. This test pins the exact cost of each
+/// option, so a new level fails it.
+#[test]
+fn a_static_gate_and_compression_add_no_route_level() {
+    let bare = measure_per_request(|app| app);
+    let gated = measure_per_request(|app| app.static_gate(PassthroughLayer));
+    let compressed = measure_per_request(|app| {
+        let mut config = AutumnConfig {
+            profile: Some("test".to_owned()),
+            ..AutumnConfig::default()
+        };
+        config.compression.enabled = true;
+        app.config(config)
+    });
+    println!(
+        "bare: {} blocks; static gate: {} blocks; compression: {} blocks",
+        bare.blocks, gated.blocks, compressed.blocks
+    );
+    assert_eq!(
+        gated.blocks - bare.blocks,
+        STATIC_GATE_BLOCKS,
+        "a static gate must compose into the `SecurityHeadersLayer` call, not \
+         add its own `Router::layer` call"
+    );
+    assert_eq!(
+        compressed.blocks - bare.blocks,
+        COMPRESSION_BLOCKS,
+        "compression must compose into the merged tuple, not add its own \
+         `Router::layer` call (#2371)"
     );
 }

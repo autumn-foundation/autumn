@@ -210,6 +210,45 @@ A test that calls `.assert_selector(".wizard-progress")` must use
 **Automation:** `manual` — the selectors are in the app's own stylesheets,
 scripts and tests. A codemod cannot find them reliably.
 
+---
+
+### Middleware: ingress service futures are not boxed
+
+**Why:** a boxed future is one heap allocation on each request. The ingress
+services now return named futures (issue #2830).
+
+**You are affected only if your code names the future type of one of these
+services, or polls the future without pinning it:**
+
+- `LogContextService`
+- `SessionService`
+- `MethodOverrideService`
+- `IdempotencyReplayService`
+- the services of `TrustedProxiesLayer` and `SubmitTokenLayer`
+
+The futures of `LogContextService` and `SessionService` can be `!Unpin`.
+
+**Before (`{X.Y}`):**
+
+```rust
+let mut fut: Pin<Box<dyn Future<Output = _> + Send>> = service.call(request);
+let response = poll_fn(|cx| fut.as_mut().poll(cx)).await;
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let fut = service.call(request);
+let response = fut.await;
+// Or, to keep a boxed future:
+let mut fut = Box::pin(service.call(request));
+```
+
+To name the type, use `<S as Service<Request>>::Future`.
+
+**Automation:** `manual` — the code to change is in the app's own middleware.
+A codemod cannot find it reliably.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**

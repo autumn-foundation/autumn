@@ -921,6 +921,14 @@ path = "tests/trusted_proxies_alloc_gate.rs"
 name = "request_meta_alloc_gate"
 path = "tests/request_meta_alloc_gate.rs"
 
+# Allocation gate for the futures of the public ingress services (#2830): the
+# log context, session, method-override, idempotency-replay and submit-token
+# services return named futures, not a boxed future for each request. Own binary for the same
+# `allocation-counter` global-allocator reason as `config_alloc_gate` above.
+[[test]]
+name = "ingress_future_alloc_gate"
+path = "tests/ingress_future_alloc_gate.rs"
+
 # Allocation gate for recording a DB query sample: a query key the collector
 # already holds is found with a borrowed lookup, and `run_instrumented` composes
 # its `"{route} {verb}"` key on the stack instead of a `String` per query. Own

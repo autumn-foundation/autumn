@@ -579,7 +579,12 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    /// The inner future for a request that is not rewritten. A box only for
+    /// a form that this layer must read first (issue #2830).
+    type Future = futures::future::Either<
+        S::Future,
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>,
+    >;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -596,16 +601,10 @@ where
             || !is_form_urlencoded(req.headers())
             || !is_same_origin_form_request(&req)
         {
-            // Ineligible request (the overwhelming majority: every GET, every
-            // JSON POST, every cross-origin form): nothing here needs to run
-            // between now and the inner call, so `self.inner.call(req)` can be
-            // boxed directly. The previous clone-then-swap-then-`async move`
-            // wrapper cloned `self.inner` (a `BoxCloneSyncService` at this
-            // point in the stack, whose `Clone` impl allocates a fresh box) on
-            // every single one of these requests purely to move an owned
-            // value into an async block that immediately `.await`s it and
-            // does nothing else — a move `self.inner.call(req)` doesn't need.
-            return Box::pin(self.inner.call(req));
+            // Ineligible request (almost all: each GET, each JSON POST, each
+            // cross-origin form). Nothing runs before the inner call, so the
+            // inner future is the future of this service.
+            return futures::future::Either::Left(self.inner.call(req));
         }
 
         let config = Arc::clone(&self.config);
@@ -613,7 +612,7 @@ where
         let mut inner = self.inner.clone();
         std::mem::swap(&mut self.inner, &mut inner);
 
-        Box::pin(async move {
+        futures::future::Either::Right(Box::pin(async move {
             // Temporarily take ownership of the body so we can buffer it
             // for parsing without losing the bytes the handler will need.
             //
@@ -725,7 +724,7 @@ where
                     Ok(res)
                 }
             }
-        })
+        }))
     }
 }
 

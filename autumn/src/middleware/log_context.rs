@@ -17,13 +17,15 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
 
 use axum::http::{Request, Response};
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use pin_project_lite::pin_project;
+use tokio::task::futures::TaskLocalFuture;
 use tower::{Layer, Service};
 use tracing::Instrument as _;
+use tracing::instrument::Instrumented;
 
 use crate::log::context::{self, LogContext};
 use crate::log::filter::ParameterFilter;
@@ -92,6 +94,89 @@ pub struct LogContextService<S> {
     filter: Arc<ParameterFilter>,
 }
 
+/// The inner future in the two request scopes: the actor scope is outer, the
+/// log context is inner.
+type ScopedResponse<F> = TaskLocalFuture<
+    crate::current::ActorScope,
+    TaskLocalFuture<LogContext, WrapResponse<Instrumented<F>>>,
+>;
+
+pin_project! {
+    /// Future of [`LogContextService`].
+    ///
+    /// It holds the inner future inline, so a request allocates no box
+    /// (issue #2830).
+    pub struct LogContextFuture<F> {
+        // Private: `ActorScope` is not a public type.
+        #[pin]
+        inner: ScopedResponse<F>,
+    }
+}
+
+impl<F, B, E> Future for LogContextFuture<F>
+where
+    F: Future<Output = Result<Response<B>, E>>,
+{
+    type Output = Result<Response<LogContextBody<crate::current::CurrentActorBody<B>>>, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.project().inner.poll(cx)
+    }
+}
+
+pin_project! {
+    /// Polls the request future, then wraps the response body. It runs in
+    /// both request scopes, so the wrap sees the actor of the request.
+    struct WrapResponse<F> {
+        #[pin]
+        inner: F,
+        agent_call: bool,
+        body_ctx: Option<LogContext>,
+    }
+}
+
+impl<F, B, E> Future for WrapResponse<F>
+where
+    F: Future<Output = Result<Response<B>, E>>,
+{
+    type Output = Result<Response<LogContextBody<crate::current::CurrentActorBody<B>>>, E>;
+
+    #[allow(
+        clippy::expect_used,
+        reason = "unreachable: a future is not polled after it is ready"
+    )]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let response = ready!(this.inner.poll(cx))?;
+        let (mut parts, body) = response.into_parts();
+        // An MCP tool call reads the principal off the response: the scope is
+        // gone once this future ends.
+        if *this.agent_call
+            && let Some(actor) = crate::current::Current::scoped_actor()
+        {
+            parts
+                .extensions
+                .insert(crate::agent_authority::AgentActor(actor));
+        }
+        // Capture the request's *resolved* actor scope (the auth layer has
+        // published the principal by now) and re-establish it on every streamed
+        // frame, so a lazy/SSE body's writes stay attributed to the request
+        // actor rather than falling back to SYSTEM_ACTOR. Wrapped inside the
+        // log-context body so both scopes are active during frame production,
+        // consistent with the tenant body wrap.
+        let actor_body =
+            crate::current::CurrentActorBody::new(body, crate::current::current_scope());
+        let body_ctx = this
+            .body_ctx
+            .take()
+            .expect("LogContextFuture polled after completion");
+        Poll::Ready(Ok(Response::from_parts(
+            parts,
+            LogContextBody::new(actor_body, body_ctx),
+        )))
+    }
+}
+
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for LogContextService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>>,
@@ -101,7 +186,7 @@ where
 {
     type Response = Response<LogContextBody<crate::current::CurrentActorBody<ResBody>>>;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = LogContextFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -138,7 +223,7 @@ where
             LogContext::for_request(request_id, Arc::clone(&self.filter)).with_span(span.clone());
         #[cfg(feature = "telemetry-otlp")]
         record_trace_ids(&span, &ctx);
-        let body_ctx = ctx.clone();
+        let body_ctx = Some(ctx.clone());
 
         // Construct the inner future with the request span entered *and* the log
         // context installed, so any synchronous work a downstream layer performs
@@ -163,32 +248,16 @@ where
         // request so the auth layer can publish the resolved principal via
         // `Current::set_actor` after the request future has started, and the
         // generated repository/audit writes read it ambiently.
-        Box::pin(crate::current::scope_request(context::scoped(
-            ctx,
-            async move {
-                let response = inner.await?;
-                let (mut parts, body) = response.into_parts();
-                // An MCP tool call reads the principal off the response: the
-                // scope is gone once this future ends.
-                if agent_call && let Some(actor) = crate::current::Current::scoped_actor() {
-                    parts
-                        .extensions
-                        .insert(crate::agent_authority::AgentActor(actor));
-                }
-                // Capture the request's *resolved* actor scope (the auth layer has
-                // published the principal by now) and re-establish it on every
-                // streamed frame, so a lazy/SSE body's writes stay attributed to
-                // the request actor rather than falling back to SYSTEM_ACTOR.
-                // Wrapped inside the log-context body so both scopes are active
-                // during frame production, consistent with the tenant body wrap.
-                let actor_body =
-                    crate::current::CurrentActorBody::new(body, crate::current::current_scope());
-                Ok(Response::from_parts(
-                    parts,
-                    LogContextBody::new(actor_body, body_ctx),
-                ))
-            },
-        )))
+        LogContextFuture {
+            inner: crate::current::scope_request(context::scoped(
+                ctx,
+                WrapResponse {
+                    inner,
+                    agent_call,
+                    body_ctx,
+                },
+            )),
+        }
     }
 }
 
