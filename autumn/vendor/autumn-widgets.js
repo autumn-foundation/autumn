@@ -402,13 +402,21 @@
       getHidden().name = valueName;
     }
 
-    // New content (an htmx swap, or a clear) shows the popup again. An empty
-    // listbox stays in the accessibility tree, so its live region still
-    // speaks; the CSS gives it no size.
+    // A dismissal (Escape, Tab, a click outside) holds until the user types
+    // or presses ArrowDown/ArrowUp. Thus a late response stays closed.
+    var dismissed = false;
+    listbox.addEventListener('autumn:dismiss', function () { dismissed = true; });
+    queryInput.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') dismissed = false;
+    });
+
+    // New content (an htmx swap, or a clear) shows the popup again, unless
+    // the user dismissed it. An empty listbox stays in the accessibility
+    // tree, so its live region still speaks; the CSS gives it no size.
     function sync() {
       var options = listbox.querySelectorAll('[role="option"]');
       options.forEach(function (o) { o.tabIndex = -1; });
-      listbox.hidden = false;
+      listbox.hidden = dismissed;
       queryInput.setAttribute('aria-expanded', !listbox.hidden && options.length ? 'true' : 'false');
       queryInput.removeAttribute('aria-activedescendant');
     }
@@ -443,6 +451,7 @@
 
     queryInput.addEventListener('input', function () {
       var hidden = getHidden();
+      dismissed = false;
       // The highlight belongs to the old query. Enter must not commit it.
       setActive(queryInput, listbox, null);
       var minLen = parseInt(queryInput.dataset.acMinLength || '0', 10);

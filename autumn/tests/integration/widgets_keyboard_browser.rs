@@ -659,6 +659,41 @@ async fn editing_the_query_clears_the_active_option() {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
+async fn a_late_response_does_not_reopen_a_dismissed_popup() {
+    // Escape during the debounce: the pending response must stay closed.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    page.fill("#slow-query", "g").await.expect("fill");
+    wait_for(
+        &page,
+        "document.getElementById('slow-query').getAttribute('aria-expanded') === 'true'",
+    )
+    .await;
+    press(&page, "r").await;
+    press(&page, "Escape").await;
+    assert_eq!(attr(&page, "slow-query", "aria-expanded").await, "false");
+    // The 1500 ms debounce ends and the "gr" results arrive.
+    wait_for(
+        &page,
+        "[...document.querySelectorAll('#slow-options [role=option]')].every(o => \
+           o.textContent.trim().toLowerCase().startsWith('gr'))",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(attr(&page, "slow-query", "aria-expanded").await, "false");
+    assert!(
+        !shown(&page, "slow-options").await,
+        "the popup stays closed"
+    );
+
+    // ArrowDown is an explicit request to open it again.
+    press(&page, "ArrowDown").await;
+    assert_eq!(attr(&page, "slow-query", "aria-expanded").await, "true");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
 async fn combobox_closes_when_the_user_clicks_outside() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");
