@@ -1305,8 +1305,11 @@ Rules that matter:
   currency the account does not hold, and a balance that would leave `i64`.
 - The same key for *different* money is `LedgerError::KeyReuse` (409), never a
   silent replay of the wrong result.
-- `ledger::balance(conn, id)` sums an account. `ledger::trial_balance(conn)`
-  returns every currency's total, each of which must be zero — run it from a
+- `ledger::balance(conn, id)` reads the balance the account row stores. A
+  trigger keeps it, so the cost does not increase with the history.
+  `ledger::trial_balance(conn)` returns every currency's total, each of which
+  must be zero. `ledger::balance_drift(conn)` returns each account whose stored
+  balance is not the sum of its postings; it must be empty. Run both from a
   scheduled job or a health check.
 - The tables (`_autumn_money_*`) ship in Autumn's own migration set, in the
   **control** database. Nothing to add to the app's `migrations/`. They are

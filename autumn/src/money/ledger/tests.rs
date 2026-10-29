@@ -518,3 +518,94 @@ fn idempotency_key_derive_is_pinned_hex() {
         "f683f5c367fb84a014f99a1efc2e3f429b2e47bef3aea2158602c81bd7eeb1a6"
     );
 }
+
+// ── The balance check (issue #3339) ─────────────────────────────────────────
+//
+// `check_resulting_balances` does no I/O. `post` gives it the stored balances.
+
+fn stored_account(id: &str, allow_negative: bool) -> (String, StoredAccount) {
+    let mut account = Account::new(id, Usd::currency());
+    if !allow_negative {
+        account = account.disallow_negative();
+    }
+    (
+        id.to_owned(),
+        StoredAccount {
+            account,
+            balance: None,
+        },
+    )
+}
+
+fn transfer(postings: Vec<Posting>) -> Transaction {
+    Transaction::new(key("check"), postings)
+}
+
+#[test]
+fn the_check_adds_the_net_change_to_the_stored_balance() {
+    let accounts = BTreeMap::from([stored_account("float", false), stored_account("cash", true)]);
+    let stored = BTreeMap::from([("float".to_owned(), 100), ("cash".to_owned(), -100)]);
+    let payout = |amount| {
+        transfer(vec![
+            Posting::credit("float", usd(amount)),
+            Posting::debit("cash", usd(amount)),
+        ])
+    };
+
+    assert!(check_resulting_balances(&accounts, &stored, &payout(100)).is_ok());
+    assert!(matches!(
+        check_resulting_balances(&accounts, &stored, &payout(101)),
+        Err(LedgerError::NegativeBalance { ref account, balance: -1, .. }) if account == "float"
+    ));
+}
+
+#[test]
+fn the_check_reads_a_missing_stored_balance_as_zero() {
+    let accounts = BTreeMap::from([stored_account("float", false), stored_account("cash", true)]);
+    let payout = transfer(vec![
+        Posting::credit("float", usd(1)),
+        Posting::debit("cash", usd(1)),
+    ]);
+    assert!(matches!(
+        check_resulting_balances(&accounts, &BTreeMap::new(), &payout),
+        Err(LedgerError::NegativeBalance { balance: -1, .. })
+    ));
+}
+
+#[test]
+fn the_check_uses_the_net_change_not_the_posting_order() {
+    let accounts = BTreeMap::from([stored_account("cash", true)]);
+    let stored = BTreeMap::from([("cash".to_owned(), i64::MAX)]);
+    for postings in [
+        vec![
+            Posting::debit("cash", usd(i64::MAX)),
+            Posting::credit("cash", usd(i64::MAX)),
+        ],
+        vec![
+            Posting::credit("cash", usd(i64::MAX)),
+            Posting::debit("cash", usd(i64::MAX)),
+        ],
+    ] {
+        assert!(check_resulting_balances(&accounts, &stored, &transfer(postings)).is_ok());
+    }
+}
+
+#[test]
+fn the_check_refuses_a_balance_outside_i64() {
+    let accounts = BTreeMap::from([
+        stored_account("cash", true),
+        stored_account("revenue", true),
+    ]);
+    let stored = BTreeMap::from([
+        ("cash".to_owned(), i64::MAX),
+        ("revenue".to_owned(), i64::MIN + 1),
+    ]);
+    let one_more = transfer(vec![
+        Posting::debit("cash", usd(1)),
+        Posting::credit("revenue", usd(1)),
+    ]);
+    assert!(matches!(
+        check_resulting_balances(&accounts, &stored, &one_more),
+        Err(LedgerError::Money(MoneyError::Overflow))
+    ));
+}

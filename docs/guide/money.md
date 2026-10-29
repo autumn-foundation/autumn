@@ -28,6 +28,12 @@ the framework schema. There is nothing to add to your own `migrations/`.
 They live in the **control** database. A sharded app posts money against the
 control database, not against a shard.
 
+Each account row also stores its balance (issue #3339). The migration `20261029183512_add_money_account_balance` adds the
+column. Run `autumn migrate` before you deploy the new binary. The migration
+does not read the postings, so it is fast on a large ledger. An old binary and
+a new binary can post at the same time: the trigger keeps the balance for
+both.
+
 ## The money value
 
 `autumn_web::money::Money<C>` is an amount in one currency. The currency is a
@@ -273,6 +279,39 @@ for total in ledger::trial_balance(conn).await? {
 proof that something wrote around `post` — run it from a scheduled job or a
 health check.
 
+### The stored balance
+
+Each account row stores its balance in the `balance_minor` column. `post`
+reads the balance from that column, so the cost of a post does not increase
+with the history. A trigger on the postings table keeps the column. The
+trigger fires for each `INSERT`, also for an `INSERT` that does not come from
+`post`.
+
+`NULL` in `balance_minor` means "not known". Then `post` and `balance` sum the
+postings, and `post` writes the sum back. These rows start at `NULL`:
+
+- An account that existed before the migration.
+- An account that SQLite replaced with `INSERT OR REPLACE`.
+- An SQLite account where one step of a transaction went outside `i64`. The
+  net change of the transaction stays in range, so the post continues.
+
+A stored balance that is not the sum of the postings is drift. Only a manual
+`UPDATE` of `balance_minor` can cause it. `balance_drift` finds it:
+
+```rust,no_run
+use autumn_web::money::ledger;
+# async fn check(conn: &mut autumn_web::db::RuntimeConnection) -> Result<(), ledger::LedgerError> {
+for drift in ledger::balance_drift(conn).await? {
+    eprintln!("{}: stored {}, posted {}", drift.account(), drift.stored(), drift.posted());
+}
+# Ok(())
+# }
+```
+
+To repair an account, set `balance_minor` to `NULL`. The next `post` to that
+account sums the postings and stores the result. Like `trial_balance`,
+`balance_drift` reads every posting, so run it from a scheduled job.
+
 ## What the framework enforces
 
 | Rule | Where it is enforced |
@@ -286,6 +325,7 @@ health check.
 | The same key posts once | `UNIQUE (idempotency_key)`, with `ON CONFLICT DO NOTHING` |
 | The same key for different money is refused | a stored request hash |
 | No negative balance where forbidden | the balance the posting would leave, read before anything is written |
+| The stored balance is the sum of the postings | a trigger on the postings table, on both backends; `balance_drift` reports a difference |
 | Nothing is rewritten | database triggers on both backends, `TRUNCATE` and SQLite `REPLACE` included |
 | An account never changes currency | a trigger on both backends; only `allow_negative` stays editable |
 | A cancelled `post` never half-writes | the postings go in before their transaction row, behind a deferred foreign key |
