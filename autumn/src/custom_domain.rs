@@ -1788,6 +1788,34 @@ impl CustomDomainRegistry {
             .map(|_| ())
     }
 
+    /// Record a failed verification, only while `tenant` still owns the
+    /// hostname and the record carries `token`. Returns whether it applied.
+    ///
+    /// Unlike [`record_failure_for_registration`](Self::record_failure_for_registration),
+    /// it accepts a `PendingDns` record: that is the state a verification runs in.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_verification_failure_for(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        now_unix: i64,
+        reason: impl Into<String>,
+        backoff_secs: i64,
+    ) -> io::Result<bool> {
+        self.fail(
+            hostname,
+            |d| d.tenant == tenant && d.verification_token.as_deref() == token,
+            now_unix,
+            reason,
+            backoff_secs,
+        )
+        .await
+    }
+
     /// [`record_failure`](Self::record_failure), but only while `tenant` still
     /// owns the hostname AND the record is the generation the order ran
     /// against. Returns whether it applied.

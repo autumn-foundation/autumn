@@ -3449,10 +3449,17 @@ async fn hung_verifications_do_not_delay_issuance_or_renewal() {
     h.task.tick_within(NOW, budget).await;
 
     assert!(
-        started.elapsed() <= budget + std::time::Duration::from_secs(1),
+        started.elapsed() <= budget + std::time::Duration::from_millis(100),
         "the pass took {:?}",
         started.elapsed()
     );
+    for i in 0..64 {
+        let slow = h.registry.get(&format!("slow{i}.clientco.com")).unwrap();
+        assert!(
+            slow.failure_reason.is_none(),
+            "slow{i} was cut off, not failed"
+        );
+    }
     let calls = issuer.calls();
     assert!(
         calls.contains(&"ready.clientco.com".to_owned()),
@@ -3464,10 +3471,31 @@ async fn hung_verifications_do_not_delay_issuance_or_renewal() {
     );
 }
 
+/// Hangs `slow*` names while `hang` is set; every name points here.
+struct GateVerifier(std::sync::atomic::AtomicBool);
+
+impl DomainVerifier for GateVerifier {
+    fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+        Box::pin(async move {
+            if hostname.starts_with("slow") && self.0.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            points_here()
+        })
+    }
+    fn observe_txt<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+        Box::pin(async { ObservedTxt::Values(Vec::new()) })
+    }
+}
+
 #[tokio::test(start_paused = true)]
-async fn a_domain_the_budget_skipped_is_checked_on_the_next_tick() {
+async fn a_domain_the_budget_skipped_is_verified_on_the_next_tick() {
+    let gate = Arc::new(GateVerifier(std::sync::atomic::AtomicBool::new(true)));
     let issuer = ScriptedIssuer::new(&[]);
-    let h = harness(Arc::new(BlackholeVerifier), issuer as Arc<dyn DomainIssuer>);
+    let h = harness(
+        Arc::clone(&gate) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
     h.registry
         .register("slow.clientco.com", "tenant-a", NOW)
         .await
@@ -3476,10 +3504,51 @@ async fn a_domain_the_budget_skipped_is_checked_on_the_next_tick() {
     h.task
         .tick_within(NOW, std::time::Duration::from_secs(5))
         .await;
+    assert_eq!(h.registry.pending_verification(NOW).len(), 1);
+    assert!(
+        h.registry
+            .get("slow.clientco.com")
+            .unwrap()
+            .failure_reason
+            .is_none()
+    );
 
-    let still_pending = h.registry.pending_verification(NOW);
-    assert_eq!(still_pending.len(), 1, "the skipped domain stays pending");
-    assert!(still_pending[0].failure_reason.is_none());
+    gate.0.store(false, Ordering::SeqCst);
+    h.task.tick(NOW).await;
+    assert_eq!(issuer.calls(), vec!["slow.clientco.com".to_owned()]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_names_that_sort_first_cannot_starve_a_healthy_domain() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..32 {
+        h.registry
+            .register(&format!("slow{i:02}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("zhealthy.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    // Tick one times out the first 16 and cuts off the rest. Those 16 are in
+    // backoff on tick two, so the next 16 take the slots and the healthy
+    // domain is reached.
+    let budget = std::time::Duration::from_secs(30);
+    h.task.tick_within(NOW, budget).await;
+    h.task.tick_within(NOW + 100, budget).await;
+
+    assert_eq!(issuer.calls(), vec!["zhealthy.clientco.com".to_owned()]);
+    let timed_out = h.registry.get("slow00.clientco.com").unwrap();
+    assert_eq!(
+        timed_out.failure_reason.as_deref(),
+        Some("the DNS lookup timed out")
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -3498,11 +3567,19 @@ async fn hung_renewal_rechecks_run_at_the_same_time_and_time_out() {
     h.task.tick(NOW).await;
 
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(120),
+        started.elapsed() <= std::time::Duration::from_secs(30),
         "the pass took {:?}",
         started.elapsed()
     );
-    assert!(issuer.calls().contains(&"renew.clientco.com".to_owned()));
+    // A re-check that times out is a blip: the renewal goes ahead.
+    assert_eq!(issuer.calls().len(), 33);
+    assert!(
+        h.registry
+            .get("slow0.clientco.com")
+            .unwrap()
+            .failure_reason
+            .is_none()
+    );
 }
 
 // ── Certificate and cache writes sit inside the hostname gate (#2649) ────
