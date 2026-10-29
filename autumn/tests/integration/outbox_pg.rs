@@ -244,26 +244,26 @@ mod docker {
 
     /// Sent rows that the purge has not deleted yet. Their `seq` is lower than
     /// the `seq` of each pending row.
-    const SENT_ROWS: i64 = 30_000;
+    const SENT_ROWS: i64 = 50_000;
 
-    /// Pending rows in backoff, after the edge rows. With these rows, the
-    /// planner walks `autumn_outbox_pkey` when the claim index is missing.
-    /// Without them, the planner sorts the few pending rows, and the test passes
-    /// with no claim index.
+    /// Pending rows in backoff, after the edge rows. With these rows, Postgres 11
+    /// walks `autumn_outbox_pkey` when the claim index is missing. Without them,
+    /// it sorts the few pending rows, and the test passes with no claim index.
     const WAITING_ROWS: i64 = 500;
 
-    #[derive(diesel::QueryableByName)]
+    #[derive(diesel::QueryableByName, PartialEq, Eq)]
     struct OutboxStats {
-        /// Index entries that scans of `autumn_outbox_pkey` read.
+        /// Table rows that scans read: `seq_tup_read` plus `idx_tup_fetch`.
         #[diesel(sql_type = diesel::sql_types::BigInt)]
-        pkey_reads: i64,
+        heap_reads: i64,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         inserts: i64,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         updates: i64,
     }
 
-    /// The counters of `autumn_outbox`, when `ready` accepts them.
+    /// The counters of `autumn_outbox`, when `ready` accepts them and two
+    /// samples in a row are equal. A flush can send only part of the counters.
     ///
     /// Postgres 11 sends the counters of a connection at the end of a
     /// transaction, at most once in 500 ms. Thus this helper waits 600 ms, then
@@ -272,6 +272,7 @@ mod docker {
     async fn outbox_stats(pool: &PgPool, ready: impl Fn(&OutboxStats) -> bool) -> OutboxStats {
         use diesel_async::RunQueryDsl as _;
 
+        let mut last = None;
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(600)).await;
             let (first, second) = tokio::join!(pool.get(), pool.get());
@@ -286,18 +287,17 @@ mod docker {
                 .await
                 .unwrap();
             let stats = diesel::sql_query(
-                "SELECT i.idx_tup_read AS pkey_reads, t.n_tup_ins AS inserts, \
-                 t.n_tup_upd AS updates \
-                 FROM pg_stat_user_tables t \
-                 JOIN pg_stat_user_indexes i ON i.relid = t.relid \
-                 WHERE t.relname = 'autumn_outbox' AND i.indexrelname = 'autumn_outbox_pkey'",
+                "SELECT seq_tup_read + COALESCE(idx_tup_fetch, 0) AS heap_reads, \
+                 n_tup_ins AS inserts, n_tup_upd AS updates \
+                 FROM pg_stat_user_tables WHERE relname = 'autumn_outbox'",
             )
             .get_result::<OutboxStats>(&mut *first)
             .await
             .unwrap();
-            if ready(&stats) {
+            if ready(&stats) && last.as_ref() == Some(&stats) {
                 return stats;
             }
+            last = Some(stats);
         }
         panic!("the counters of autumn_outbox did not arrive");
     }
@@ -411,11 +411,11 @@ mod docker {
         let claimed = i64::try_from(expected.len()).unwrap();
         let after =
             outbox_stats(&pool, |stats| stats.updates - before.updates >= 2 * claimed).await;
-        let reads = after.pkey_reads - before.pkey_reads;
+        let reads = after.heap_reads - before.heap_reads;
         assert!(
             reads < SENT_ROWS / 10,
-            "the relay read {reads} entries of autumn_outbox_pkey; \
-             it must not walk the {SENT_ROWS} sent rows"
+            "the relay read {reads} rows of autumn_outbox; \
+             it must not read the {SENT_ROWS} sent rows"
         );
     }
 }

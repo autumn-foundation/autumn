@@ -1028,7 +1028,7 @@ mod sqlite {
                 .collect();
         assert!(
             plan.iter()
-                .any(|step| step == "SCAN o USING INDEX idx_autumn_outbox_claim"),
+                .any(|step| step.contains("USING INDEX idx_autumn_outbox_claim")),
             "{plan:#?}"
         );
     }
@@ -1037,6 +1037,11 @@ mod sqlite {
     /// `ensure_schema`.
     #[tokio::test]
     async fn ensure_schema_adds_the_claim_index_to_existing_tables() {
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = BigInt)]
+            n: i64,
+        }
         let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
         let pool = fx.state.pool().unwrap();
         let mut conn = pool.get().await.unwrap();
@@ -1047,11 +1052,6 @@ mod sqlite {
 
         ensure_schema(pool).await.unwrap();
 
-        #[derive(diesel::QueryableByName)]
-        struct Count {
-            #[diesel(sql_type = BigInt)]
-            n: i64,
-        }
         let mut conn = pool.get().await.unwrap();
         let index = diesel::sql_query(
             "SELECT COUNT(*) AS n FROM sqlite_master \
