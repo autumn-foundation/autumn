@@ -130,9 +130,9 @@ pub const MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// Stdout is the wire: complete NDJSON lines are consumed and cleared as they
 /// arrive, so this bounds only a line that never ends — a guest streaming
 /// bytes without `\n` would otherwise grow a host-owned buffer without limit,
-/// unmetered by fuel (host-side copies burn no guest fuel) or the linear-memory
-/// ceiling (which bounds each chunk, not their sum). Sized above any honest
-/// frame: a response with a 16 MiB body is ~22 MiB base64'd. Exceeding it
+/// unmetered by the linear-memory ceiling (which bounds each chunk, not their
+/// sum). Fuel meters the copy and parse work, not this size. Sized above any
+/// honest frame: a response with a 16 MiB body is ~22 MiB base64'd. Exceeding it
 /// fails the guest's `fd_write` with `ENOSPC`, which ends as a
 /// [`FallthroughReason::CapsuleError`].
 pub const STDOUT_LINE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
@@ -146,6 +146,13 @@ pub const STDOUT_LINE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// size instead, and the output budgets apply per chunk, so a runaway write
 /// fails long before its full length is copied.
 const HOST_IO_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Bytes of bulk host copy that cost one fuel unit.
+///
+/// A memcpy moves many bytes for what one instruction costs. Work that
+/// inspects each byte (the stdout line parser) is charged one unit per byte
+/// on top of this rate.
+const BYTES_PER_FUEL: u64 = 64;
 
 /// Cap on accumulated guest stderr, in bytes (1 MiB).
 ///
@@ -418,6 +425,10 @@ impl<'kv> HostState<'kv> {
         }
     }
 
+    const fn stderr_is_full(&self) -> bool {
+        self.stderr.len() >= STDERR_BUDGET_BYTES
+    }
+
     fn stderr_excerpt(&self) -> String {
         let text = String::from_utf8_lossy(&self.stderr);
         let trimmed = text.trim();
@@ -571,18 +582,21 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
              fd: i32,
              iovs: i32,
              iovs_len: i32,
-             nwritten: i32| {
+             nwritten: i32|
+             -> Result<i32, wasmi::Error> {
                 if fd != 1 && fd != 2 {
-                    return errno::BADF;
+                    return Ok(errno::BADF);
                 }
                 let Some(memory) = memory_of(&caller) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
 
                 let mut total: u32 = 0;
                 for index in 0..iovs_len {
+                    // Per-iovec descriptor work, even for a zero-length iovec.
+                    charge_units(&mut caller, 1)?;
                     let Some((pointer, length)) = iovec(&caller, memory, iovs, index) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     // Bounds-check BEFORE any copy: `length` is guest-chosen,
                     // and a `u32::MAX` iovec must fail with EINVAL. A range
@@ -591,13 +605,13 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                         .checked_add(length)
                         .is_some_and(|end| end <= memory.data_size(&caller));
                     if !in_bounds {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     }
                     let Ok(written) = u32::try_from(length) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     let Some(sum) = total.checked_add(written) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     total = sum;
 
@@ -608,13 +622,23 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                     // before its full length is copied.
                     let mut offset = 0usize;
                     while offset < length {
+                        // Stderr past its budget is discarded. Do not copy it.
+                        if fd == 2 && caller.data().stderr_is_full() {
+                            break;
+                        }
                         let step = HOST_IO_CHUNK_BYTES.min(length.saturating_sub(offset));
+                        // Host copy and line parse burn no guest fuel by
+                        // themselves, so charge them here (#3323).
+                        charge_bytes(&mut caller, step)?;
+                        if fd == 1 {
+                            charge_units(&mut caller, u64::try_from(step).unwrap_or(u64::MAX))?;
+                        }
                         let mut chunk = vec![0u8; step];
                         let Some(at) = pointer.checked_add(offset) else {
-                            return errno::INVAL;
+                            return Ok(errno::INVAL);
                         };
                         if memory.read(&caller, at, &mut chunk).is_err() {
-                            return errno::INVAL;
+                            return Ok(errno::INVAL);
                         }
                         let state = caller.data_mut();
                         if fd == 2 {
@@ -623,19 +647,19 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                             // A single stdout line has outgrown any honest
                             // frame: fail the write so the guest aborts and
                             // the request falls through.
-                            return errno::NOSPC;
+                            return Ok(errno::NOSPC);
                         }
                         offset = offset.saturating_add(step);
                     }
                 }
 
                 let Ok(at) = usize::try_from(nwritten) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
                 if write_u32(&mut caller, memory, at, total).is_none() {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 }
-                errno::SUCCESS
+                Ok(errno::SUCCESS)
             },
         )
         .map_err(host_error)?;
@@ -808,6 +832,25 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
     Ok(())
 }
 
+/// Charge fuel for a bulk host copy of `bytes`, with a floor of one unit.
+fn charge_bytes(caller: &mut Caller<'_, HostState<'_>>, bytes: usize) -> Result<(), wasmi::Error> {
+    charge_units(caller, copy_fuel(bytes))
+}
+
+/// Fuel for a bulk copy of `bytes`: [`BYTES_PER_FUEL`] bytes per unit, min 1.
+fn copy_fuel(bytes: usize) -> u64 {
+    (u64::try_from(bytes).unwrap_or(u64::MAX) / BYTES_PER_FUEL).saturating_add(1)
+}
+
+/// Debit `units` of fuel. Traps with `OutOfFuel` when the budget is short.
+fn charge_units(caller: &mut Caller<'_, HostState<'_>>, units: u64) -> Result<(), wasmi::Error> {
+    let left = caller.get_fuel()?;
+    let remaining = left
+        .checked_sub(units)
+        .ok_or_else(|| wasmi::Error::from(wasmi::core::TrapCode::OutOfFuel))?;
+    caller.set_fuel(remaining)
+}
+
 fn write_two_zeroes(mut caller: Caller<'_, HostState<'_>>, first: i32, second: i32) -> i32 {
     let Some(memory) = memory_of(&caller) else {
         return errno::INVAL;
@@ -945,6 +988,14 @@ mod tests {
         };
         assert_eq!(reason, FallthroughReason::CapsuleError);
         assert!(detail.contains("instantiated"), "{detail}");
+    }
+
+    #[test]
+    fn copy_fuel_is_one_unit_per_64_bytes_with_a_floor_of_one() {
+        assert_eq!(copy_fuel(0), 1);
+        assert_eq!(copy_fuel(63), 1);
+        assert_eq!(copy_fuel(64), 2);
+        assert_eq!(copy_fuel(HOST_IO_CHUNK_BYTES), 1025);
     }
 
     #[test]
