@@ -653,11 +653,12 @@ async fn settle_after_reconcile_closed_the_row_is_a_no_op() {
     run_retry_handler(&h.client, &invoice.id).await.unwrap();
     assert_eq!(h.provider.retry_calls(), 1);
     assert_eq!(store.calls("settle_dunning"), 1);
-    // The reconcile decision wins: no recovery written, no notification.
+    // The reconcile decision wins for the row; the provider did take the
+    // payment, so the mirror shows it paid. No notification.
     assert_eq!(row_on(h.store.as_ref()).await.state, DunningState::Canceled);
     assert_eq!(
         invoice_on(h.store.as_ref()).await.status,
-        InvoiceStatus::Open
+        InvoiceStatus::Paid
     );
     assert_eq!(
         notification_kinds(&h.client, RECIPIENT).await,
@@ -840,4 +841,120 @@ async fn second_process_does_not_double_retry() {
     perform_ok(&app_a).await;
     perform_ok(&app_b).await;
     assert_eq!(provider.retry_calls(), 1);
+}
+
+/// One 1h retry, so the first declined retry exhausts.
+fn single_retry() -> BillingConfig {
+    support::config()
+        .dunning(DunningPolicy::standard().with_retry_delays(vec![Duration::from_secs(3600)]))
+}
+
+async fn single_retry_harness_dyn(store: Arc<dyn BillingStore>) -> DynHarness {
+    let provider = FakeProvider::with_parser(FakeParser::BillingEventJson);
+    let h = harness_dyn(single_retry(), store, provider, clocked);
+    seed_failed_invoice(&h.client, h.store.as_ref()).await;
+    h
+}
+
+async fn sub_status_on(store: &dyn BillingStore) -> SubscriptionStatus {
+    store
+        .subscription_by_provider_id(&ProviderId::new("sub_1"))
+        .await
+        .unwrap()
+        .expect("subscription mirrored")
+        .status
+}
+
+#[tokio::test]
+async fn exhaustion_status_failure_stays_retryable() {
+    let store = FailingStore::wrap(MemoryBillingStore::shared());
+    store.fail_on("set_subscription_status", 1);
+    let h = single_retry_harness_dyn(store.clone()).await;
+    h.client.advance_clock(Duration::from_secs(3601));
+    let report = h.client.perform_enqueued_jobs().await;
+    assert_eq!(report.failures().len(), 1, "{report:?}");
+    // Not stranded: the row is open again at the same attempt.
+    let restored = row_on(h.store.as_ref()).await;
+    assert_eq!(restored.state, DunningState::Pending);
+    assert_eq!(
+        sub_status_on(h.store.as_ref()).await,
+        SubscriptionStatus::Active
+    );
+    assert_eq!(h.provider.cancel_calls(), 0);
+    // The re-run completes the mirror update and the provider cancel.
+    let invoice = invoice_on(h.store.as_ref()).await;
+    run_retry_handler(&h.client, &invoice.id).await.unwrap();
+    assert_eq!(
+        row_on(h.store.as_ref()).await.state,
+        DunningState::Exhausted
+    );
+    assert_eq!(
+        sub_status_on(h.store.as_ref()).await,
+        SubscriptionStatus::Unpaid
+    );
+    assert_eq!(h.provider.cancel_calls(), 1);
+}
+
+#[tokio::test]
+async fn recovery_during_exhaustion_does_not_leave_unpaid() {
+    let inner = MemoryBillingStore::shared();
+    let store = FailingStore::wrap(inner.clone());
+    let h = single_retry_harness_dyn(store.clone()).await;
+    h.client.advance_clock(Duration::from_secs(3601));
+    // A payment-recovered event settles the row after the mirror update and
+    // before the exhaustion settle.
+    let backing = inner.clone();
+    let mut recovered = row_on(h.store.as_ref()).await;
+    recovered.state = DunningState::Recovered;
+    recovered.updated_at = at(3601);
+    store.before(
+        "settle_dunning",
+        store.calls("settle_dunning") + 1,
+        Box::new(move || {
+            let backing = backing.clone();
+            let recovered = recovered.clone();
+            Box::pin(async move {
+                backing.upsert_dunning(recovered).await.unwrap();
+            })
+        }),
+    );
+    let invoice = invoice_on(h.store.as_ref()).await;
+    run_retry_handler(&h.client, &invoice.id).await.unwrap();
+    assert_eq!(
+        row_on(h.store.as_ref()).await.state,
+        DunningState::Recovered
+    );
+    assert_eq!(
+        sub_status_on(h.store.as_ref()).await,
+        SubscriptionStatus::Active
+    );
+    assert_eq!(h.provider.cancel_calls(), 0);
+}
+
+#[tokio::test]
+async fn recovery_upsert_failure_stays_retryable() {
+    let store = FailingStore::wrap(MemoryBillingStore::shared());
+    let h = dunning_harness_dyn(store.clone()).await;
+    store.fail_on("upsert_invoice", store.calls("upsert_invoice") + 1);
+    h.client.advance_clock(Duration::from_secs(3601));
+    h.provider.script_retry(Ok(PaymentAttemptOutcome::Paid));
+    let invoice = invoice_on(h.store.as_ref()).await;
+    assert!(run_retry_handler(&h.client, &invoice.id).await.is_err());
+    assert_eq!(row_on(h.store.as_ref()).await.state, DunningState::Pending);
+    assert_eq!(
+        invoice_on(h.store.as_ref()).await.status,
+        InvoiceStatus::Open
+    );
+    // The provider now reports the invoice paid; the re-run records it.
+    h.provider
+        .script_retry(Ok(PaymentAttemptOutcome::AlreadyPaid));
+    run_retry_handler(&h.client, &invoice.id).await.unwrap();
+    assert_eq!(
+        row_on(h.store.as_ref()).await.state,
+        DunningState::Recovered
+    );
+    assert_eq!(
+        invoice_on(h.store.as_ref()).await.status,
+        InvoiceStatus::Paid
+    );
 }

@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use crate::BillingService;
 use crate::config::ExhaustionAction;
 use crate::error::BillingError;
-use crate::model::{DunningAttempt, DunningState, Invoice, InvoiceStatus, SubscriptionStatus};
+use crate::model::{
+    DunningAttempt, DunningState, Invoice, InvoiceStatus, Subscription, SubscriptionStatus,
+};
 use crate::notify;
 use crate::provider::PaymentAttemptOutcome;
 use crate::store::InvoiceUpsert;
@@ -357,12 +359,6 @@ async fn recovered(
     now: DateTime<Utc>,
 ) -> Result<(), BillingError> {
     let store = service.store();
-    let mut settled = row.clone();
-    settled.state = DunningState::Recovered;
-    settled.updated_at = now;
-    if !settle(service, row, settled).await? {
-        return Ok(());
-    }
     let mut paid = InvoiceUpsert::new(
         state.entropy().uuid_v4().to_string(),
         invoice.customer_id.clone(),
@@ -377,7 +373,15 @@ async fn recovered(
     if let Some(subscription_id) = &invoice.subscription_id {
         paid = paid.with_subscription(subscription_id.clone());
     }
+    // Mirror first, settle last. A failure here leaves the row `Running`, so
+    // `run_retry` restores it and the next job repeats the idempotent write.
     let invoice = store.upsert_invoice(paid).await?.into_inner();
+    let mut settled = row.clone();
+    settled.state = DunningState::Recovered;
+    settled.updated_at = now;
+    if !settle(service, row, settled).await? {
+        return Ok(());
+    }
     tracing::info!(invoice_id = %invoice.id, "🍂 Autumn Billing: payment recovered");
     if let Some(customer) = store.customer_by_id(&invoice.customer_id).await? {
         notify::send_to_customer(
@@ -446,8 +450,12 @@ async fn declined(
     exhausted(state, service, row, invoice, reason, now).await
 }
 
-/// Every retry failed: the mirror stops entitlement first, then the
-/// provider is told.
+/// Every retry failed: the mirror stops entitlement first, then the row
+/// settles, then the provider is told.
+///
+/// The row stays `Running` until the mirror write lands. A store error
+/// therefore restores the row, and the next job repeats the write. If an event
+/// settles the row first, the mirror write is undone.
 async fn exhausted(
     state: &AppState,
     service: &BillingService,
@@ -460,9 +468,6 @@ async fn exhausted(
     let mut exhausted = row.clone();
     exhausted.state = DunningState::Exhausted;
     exhausted.updated_at = now;
-    if !settle(service, row, exhausted.clone()).await? {
-        return Ok(());
-    }
     let customer = store.customer_by_id(&invoice.customer_id).await?;
     let action = service.config().dunning.on_exhausted;
     // The row was opened before the subscription was mirrored when the
@@ -480,31 +485,43 @@ async fn exhausted(
             .await?
             .map(|subscription| subscription.id);
     }
+    let mut unpaid = None;
     if let Some(subscription_id) = &subscription_id {
-        let subscription = store
+        let previous = store.subscription_by_id(subscription_id).await?;
+        unpaid = store
             .set_subscription_status(subscription_id, SubscriptionStatus::Unpaid, now)
             .await?;
-        if action == ExhaustionAction::CancelSubscription {
-            if let Some(subscription) = subscription {
-                if let Err(error) = service
-                    .provider()
-                    .cancel_subscription(&subscription.provider_subscription_id)
-                    .await
-                {
-                    // The mirror says unpaid; the operator reconciles the provider.
-                    tracing::error!(
-                        subscription_id,
-                        provider_subscription_id = %subscription.provider_subscription_id,
-                        error = %error,
-                        "🍂 Autumn Billing: provider cancel failed after dunning exhausted"
-                    );
-                }
-            } else {
-                tracing::warn!(
+        if !settle(service, row, exhausted.clone()).await? {
+            // An event settled the row (payment recovered, subscription
+            // ended). Undo our write, unless a newer event replaced it.
+            undo_unpaid(service, subscription_id, previous, now).await?;
+            return Ok(());
+        }
+    } else if !settle(service, row, exhausted.clone()).await? {
+        return Ok(());
+    }
+    if action == ExhaustionAction::CancelSubscription
+        && let Some(subscription_id) = &subscription_id
+    {
+        if let Some(subscription) = unpaid {
+            if let Err(error) = service
+                .provider()
+                .cancel_subscription(&subscription.provider_subscription_id)
+                .await
+            {
+                // The mirror says unpaid; the operator reconciles the provider.
+                tracing::error!(
                     subscription_id,
-                    "🍂 Autumn Billing: dunning exhausted for an unknown subscription"
+                    provider_subscription_id = %subscription.provider_subscription_id,
+                    error = %error,
+                    "🍂 Autumn Billing: provider cancel failed after dunning exhausted"
                 );
             }
+        } else {
+            tracing::warn!(
+                subscription_id,
+                "🍂 Autumn Billing: dunning exhausted for an unknown subscription"
+            );
         }
     }
     tracing::warn!(
@@ -531,6 +548,31 @@ async fn exhausted(
         .hooks()
         .on_dunning_exhausted(&invoice, &exhausted)
         .await;
+    Ok(())
+}
+
+/// Put `previous` back after [`exhausted`] lost the settle. Only an `Unpaid`
+/// status is replaced: a newer event may have changed it.
+async fn undo_unpaid(
+    service: &BillingService,
+    subscription_id: &str,
+    previous: Option<Subscription>,
+    now: DateTime<Utc>,
+) -> Result<(), BillingError> {
+    let store = service.store();
+    let Some(previous) = previous.filter(|p| p.status != SubscriptionStatus::Unpaid) else {
+        return Ok(());
+    };
+    let current = store.subscription_by_id(subscription_id).await?;
+    if current.is_some_and(|c| c.status == SubscriptionStatus::Unpaid) {
+        store
+            .set_subscription_status(subscription_id, previous.status, now)
+            .await?;
+        tracing::info!(
+            subscription_id,
+            "🍂 Autumn Billing: dunning settled elsewhere; unpaid status undone"
+        );
+    }
     Ok(())
 }
 
