@@ -655,15 +655,15 @@ impl CustomDomainTask {
         // Each check can wait out a DNS timeout, so checks run
         // `VERIFY_CONCURRENCY` at a time instead of adding up. Each write goes
         // through the registry's per-hostname gate.
+        // Under a short budget the limit shrinks with it, so a check the
+        // budget would cut off still fails and backs off first.
+        let limit = VERIFY_TIMEOUT.min(verify_budget / 2);
         let verification = futures::StreamExt::for_each_concurrent(
             futures::stream::iter(self.registry.pending_verification(now_unix)),
             VERIFY_CONCURRENCY,
             |domain| async move {
-                let checked = tokio::time::timeout(
-                    VERIFY_TIMEOUT,
-                    self.verify_one(&domain.hostname, now_unix),
-                )
-                .await;
+                let checked =
+                    tokio::time::timeout(limit, self.verify_one(&domain.hostname, now_unix)).await;
                 if checked.is_err() {
                     self.record_lookup_timeout(&domain, now_unix).await;
                 }

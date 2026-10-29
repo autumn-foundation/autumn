@@ -3453,13 +3453,6 @@ async fn hung_verifications_do_not_delay_issuance_or_renewal() {
         "the pass took {:?}",
         started.elapsed()
     );
-    for i in 0..64 {
-        let slow = h.registry.get(&format!("slow{i}.clientco.com")).unwrap();
-        assert!(
-            slow.failure_reason.is_none(),
-            "slow{i} was cut off, not failed"
-        );
-    }
     let calls = issuer.calls();
     assert!(
         calls.contains(&"ready.clientco.com".to_owned()),
@@ -3489,7 +3482,7 @@ impl DomainVerifier for GateVerifier {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_domain_the_budget_skipped_is_verified_on_the_next_tick() {
+async fn a_timed_out_domain_is_verified_once_its_backoff_ends() {
     let gate = Arc::new(GateVerifier(std::sync::atomic::AtomicBool::new(true)));
     let issuer = ScriptedIssuer::new(&[]);
     let h = harness(
@@ -3504,17 +3497,15 @@ async fn a_domain_the_budget_skipped_is_verified_on_the_next_tick() {
     h.task
         .tick_within(NOW, std::time::Duration::from_secs(5))
         .await;
-    assert_eq!(h.registry.pending_verification(NOW).len(), 1);
-    assert!(
-        h.registry
-            .get("slow.clientco.com")
-            .unwrap()
-            .failure_reason
-            .is_none()
+    let record = h.registry.get("slow.clientco.com").unwrap();
+    assert_eq!(
+        record.failure_reason.as_deref(),
+        Some("the DNS lookup timed out")
     );
+    assert!(h.registry.pending_verification(NOW + 1).is_empty());
 
     gate.0.store(false, Ordering::SeqCst);
-    h.task.tick(NOW).await;
+    h.task.tick(NOW + 1_000).await;
     assert_eq!(issuer.calls(), vec!["slow.clientco.com".to_owned()]);
 }
 
@@ -3549,6 +3540,33 @@ async fn hung_names_that_sort_first_cannot_starve_a_healthy_domain() {
         timed_out.failure_reason.as_deref(),
         Some("the DNS lookup timed out")
     );
+}
+
+/// A short poll interval gives verification a budget below the per-domain
+/// limit. Cut-off checks must still back off, or the same names return first.
+#[tokio::test(start_paused = true)]
+async fn a_short_budget_still_lets_hung_names_yield_their_slots() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..20 {
+        h.registry
+            .register(&format!("slow{i:02}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("zhealthy.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    let budget = std::time::Duration::from_secs(12);
+    h.task.tick_within(NOW, budget).await;
+    h.task.tick_within(NOW + 100, budget).await;
+
+    assert_eq!(issuer.calls(), vec!["zhealthy.clientco.com".to_owned()]);
 }
 
 #[tokio::test(start_paused = true)]
