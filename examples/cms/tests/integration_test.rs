@@ -16642,3 +16642,58 @@ async fn moderation_queue_renders_a_pager() {
         .assert_body_contains("Page 2 of 2")
         .assert_body_contains("/admin/comments?status=pending&amp;page=1");
 }
+
+/// A refused timezone or date format redisplays the form with every other
+/// field intact, and the reason beside the field that caused it (#3098).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_setting_is_redisplayed_with_its_input() {
+    let client = db_client().await;
+    let cookie = register(&client, "owner").await;
+
+    let bad_zone = client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[
+            ("site_title", "Keep Me"),
+            ("tagline", "Keep Tagline"),
+            ("timezone", "Mars/Olympus"),
+        ]))
+        .send()
+        .await;
+    bad_zone.assert_status(422);
+    assert!(bad_zone.header("location").is_none());
+    bad_zone
+        .assert_body_contains("Mars/Olympus")
+        .assert_body_contains("not a timezone")
+        .assert_body_contains(r#"role="alert""#)
+        .assert_body_contains(r#"aria-describedby="timezone-error""#)
+        .assert_body_contains(r#"value="Keep Me""#)
+        .assert_body_contains(r#"value="Keep Tagline""#)
+        .assert_body_contains("autofocus");
+
+    let bad_format = client
+        .post("/admin/settings")
+        .header("cookie", &cookie)
+        .form(&settings_form(&[
+            ("site_title", "Keep Me"),
+            ("date_format", "%"),
+        ]))
+        .send()
+        .await;
+    bad_format.assert_status(422);
+    bad_format
+        .assert_body_contains("cannot be rendered")
+        .assert_body_contains(r#"aria-describedby="date_format-error""#)
+        .assert_body_contains(r#"value="%""#)
+        .assert_body_contains(r#"value="Keep Me""#);
+
+    // Nothing was saved by either refusal.
+    client
+        .get("/admin/settings")
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .assert_ok()
+        .assert_body_contains(r#"value="Autumn CMS""#);
+}
