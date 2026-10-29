@@ -397,25 +397,66 @@ fn without_parser_position(message: &str) -> String {
     out
 }
 
-/// Reader that notes whether the stream ends without a line terminator.
-///
-/// On an LF file the parser counts a record's last line break. A final record
-/// with no break is one line short, and the line fix needs to know. (A CRLF
-/// file counts that break late, so the calibration offset already covers it.)
-struct EndProbe<R> {
-    inner: R,
-    last: Option<u8>,
-    unterminated: std::rc::Rc<std::cell::Cell<bool>>,
+/// Count the line feeds in `bytes`.
+fn newline_count(bytes: &[u8]) -> u64 {
+    bytes.iter().map(|&b| u64::from(b == b'\n')).sum()
 }
 
-impl<R: io::Read> io::Read for EndProbe<R> {
+/// Reader that watches the two ends of the stream for the line count.
+///
+/// The parser skips blank lines before the header, but counts them. It also
+/// counts the last line break of a record, so a final record with no break is
+/// one line short on an LF file. A CRLF file counts that break late, so the
+/// calibration offset already covers it.
+struct EdgeProbe<R> {
+    inner: R,
+    /// Line feeds before the first byte that is not a line break.
+    leading_breaks: u64,
+    /// `true` until that first byte arrives.
+    in_lead: bool,
+    /// Last byte read so far.
+    last: Option<u8>,
+    /// `true` once the inner reader has no more bytes.
+    at_eof: bool,
+}
+
+impl<R> EdgeProbe<R> {
+    const fn new(inner: R) -> Self {
+        Self {
+            inner,
+            leading_breaks: 0,
+            in_lead: true,
+            last: None,
+            at_eof: false,
+        }
+    }
+
+    /// `true` when the whole stream was read and its last byte is no line break.
+    fn ends_open(&self) -> bool {
+        self.at_eof && self.last.is_some_and(|b| b != b'\n' && b != b'\r')
+    }
+}
+
+impl<R: io::Read> io::Read for EdgeProbe<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.inner.read(buf)?;
-        if n > 0 {
-            self.last = buf.get(n - 1).copied();
+        let read = &buf[..n];
+        self.at_eof = n == 0;
+        if let Some(&last) = read.last() {
+            self.last = Some(last);
         }
-        let open = n == 0 && self.last.is_some_and(|b| b != b'\n' && b != b'\r');
-        self.unterminated.set(open);
+        if self.in_lead {
+            for &b in read {
+                match b {
+                    b'\n' => self.leading_breaks += 1,
+                    b'\r' => {}
+                    _ => {
+                        self.in_lead = false;
+                        break;
+                    }
+                }
+            }
+        }
         Ok(n)
     }
 }
@@ -426,6 +467,10 @@ impl<R: io::Read> io::Read for EndProbe<R> {
 /// `HashMap<String, String>` mapping column name → value for every data row.
 /// It returns an [`ImportRowResult`] that is folded into the returned
 /// [`ImportReport`].
+///
+/// The line number is the line where the row starts. Blank lines count as
+/// lines. A quoted field with line breaks spans several lines. A file with
+/// only CR line endings has no line numbers: each row gets 2.
 ///
 /// In [`ImportMode::DryRun`], the handler is invoked but any
 /// `Inserted` / `Updated` results are counted but **not written**.
@@ -441,7 +486,8 @@ impl<R: io::Read> io::Read for EndProbe<R> {
 ///
 /// CSV parse errors (malformed quoting, wrong number of fields) are captured
 /// as [`CsvRowError`] entries rather than bubbling as a `Result` so that a
-/// single bad row does not abort the entire import.
+/// single bad row does not abort the entire import. Their `line` follows the
+/// same rule as the handler line.
 pub fn import_csv<R, F>(reader: R, opts: &ImportOptions, mut handler: F) -> ImportReport
 where
     R: io::Read,
@@ -449,14 +495,9 @@ where
 {
     let mut report = ImportReport::default();
 
-    let unterminated = std::rc::Rc::new(std::cell::Cell::new(false));
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
-        .from_reader(EndProbe {
-            inner: reader,
-            last: None,
-            unterminated: std::rc::Rc::clone(&unterminated),
-        });
+        .from_reader(EdgeProbe::new(reader));
 
     let headers: Vec<String> = match rdr.headers() {
         Ok(h) => h.iter().map(str::to_owned).collect(),
@@ -490,16 +531,15 @@ where
     // next to "the file came out of Excel", and the alternative (trusting a
     // counter that disagrees with itself across dialects) is wrong on the common
     // case instead of the exotic one.
-    // The header's TRUE span, so the shift is the dialect's alone. A header is
-    // normally one line, but a quoted header field may carry embedded newlines
-    // — and assuming one line there would push every data row's number back by
-    // however many lines the header really spans, turning numbers that were
-    // right before this calibration into ones that are wrong. Count the
-    // newlines the parser kept inside the header's own fields instead.
-    let header_lines: u64 = 1 + headers
-        .iter()
-        .map(|field| field.matches('\n').count() as u64)
-        .sum::<u64>();
+    // The header's true span, so the shift is the dialect's alone. Count the
+    // blank lines before the header and the line breaks inside its fields.
+    // Assuming one line would move every row number.
+    let header_lines: u64 = 1
+        + rdr.get_ref().leading_breaks
+        + headers
+            .iter()
+            .map(|field| newline_count(field.as_bytes()))
+            .sum::<u64>();
     // The first data row therefore starts at `header_lines + 1`; whatever the
     // parser calls that row is the convention to correct for.
     let line_offset: i64 = i64::try_from(header_lines.saturating_add(1)).unwrap_or(2)
@@ -509,51 +549,66 @@ where
         u64::try_from(raw.saturating_add(line_offset)).unwrap_or(0)
     };
 
-    // The parser sets a record's start line BEFORE it skips blank lines, so
-    // that start is too early by the number of blank lines. Its end line is
-    // exact: the record's true start is the end, less its own line breaks.
-    // The parser start is the floor, so this never reports an earlier line.
-    let missing_break_counts = line_offset == 0;
-    let start_of = |end: u64, record: &csv::StringRecord, parser: u64| -> u64 {
-        let breaks: u64 = record.iter().map(|f| f.matches('\n').count() as u64).sum();
-        let missing = unterminated.get() && missing_break_counts;
-        let own = breaks + u64::from(!missing);
-        absolute_line(end).saturating_sub(own).max(parser)
+    // The parser sets the start line of a record before it skips blank lines,
+    // so that line is too small by the number of blank lines. The end line is
+    // exact. Subtract the line breaks of the record to get its true start.
+    // Never report a line before the parser start.
+    let lf_file = line_offset == 0;
+    let start_line = |rdr_end: u64, raw: &csv::ByteRecord, parser: u64, open: bool| -> u64 {
+        let end_break = u64::from(!(open && lf_file));
+        let inner_breaks: u64 = raw.iter().map(newline_count).sum();
+        absolute_line(rdr_end)
+            .saturating_sub(inner_breaks + end_break)
+            .max(parser)
     };
-    let mut record = csv::StringRecord::new();
+    let mut raw = csv::ByteRecord::new();
     loop {
-        let result = rdr.read_record(&mut record);
-        let (line, record) = match result {
+        let read = rdr.read_byte_record(&mut raw);
+        let end = rdr.position().line();
+        let open = rdr.get_ref().ends_open();
+        let line = match &read {
             Ok(false) => break,
             Ok(true) => {
-                let parser = absolute_line(record.position().map_or(0, csv::Position::line));
-                (start_of(rdr.position().line(), &record, parser), &record)
+                let parser = absolute_line(raw.position().map_or(0, csv::Position::line));
+                start_line(end, &raw, parser, open)
             }
             Err(e) => {
                 let parser = absolute_line(e.position().map_or(0, csv::Position::line));
-                // Only a length error keeps its record; other errors keep the
-                // parser start.
-                let pos = if matches!(e.kind(), csv::ErrorKind::UnequalLengths { .. }) {
-                    start_of(rdr.position().line(), &record, parser)
+                // After a length error, `raw` holds the bad row.
+                let line = if matches!(e.kind(), csv::ErrorKind::UnequalLengths { .. }) {
+                    start_line(end, &raw, parser, open)
                 } else {
                     parser
                 };
                 report.errors.push(CsvRowError::row(
-                    pos,
+                    line,
                     format!(
                         "CSV parse error: {}",
                         without_parser_position(&e.to_string())
                     ),
                 ));
+                if matches!(e.kind(), csv::ErrorKind::Io(_)) {
+                    break;
+                }
                 continue;
             }
         };
 
-        let row: HashMap<String, String> = headers
+        let row: Result<HashMap<String, String>, _> = headers
             .iter()
-            .zip(record.iter())
-            .map(|(k, v)| (k.clone(), v.to_owned()))
+            .zip(raw.iter())
+            .map(|(k, v)| std::str::from_utf8(v).map(|v| (k.clone(), v.to_owned())))
             .collect();
+        let row = match row {
+            Ok(row) => row,
+            Err(e) => {
+                report.errors.push(CsvRowError::row(
+                    line,
+                    format!("CSV parse error: invalid utf-8: {e}"),
+                ));
+                continue;
+            }
+        };
 
         let outcome = handler(line, row, &opts.mode);
 
@@ -1051,19 +1106,107 @@ mod tests {
         assert_eq!(lines, vec![5, 7]);
     }
 
-    /// Old behaviour stays: a bare-CR file never counts lines.
-    #[test]
-    fn import_csv_bare_cr_lines_do_not_drop_below_two() {
+    /// Reads at most `n` bytes per call.
+    struct Chunked<'a>(&'a [u8], usize);
+
+    impl io::Read for Chunked<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.1.min(self.0.len()).min(buf.len());
+            buf[..n].copy_from_slice(&self.0[..n]);
+            self.0 = &self.0[n..];
+            Ok(n)
+        }
+    }
+
+    fn row_lines(csv: &[u8], chunk: usize) -> Vec<u64> {
         let mut seen = Vec::new();
         import_csv(
-            &b"a,b\r1,2\r3,4\r"[..],
+            Chunked(csv, chunk),
             &ImportOptions::default(),
             |line, _row, _mode| {
                 seen.push(line);
                 ImportRowResult::Inserted
             },
         );
-        assert!(seen.iter().all(|l| *l >= 2), "{seen:?}");
+        seen
+    }
+
+    /// Same lines for any read size, so the end probe holds across chunks.
+    #[test]
+    fn import_csv_blank_line_numbers_do_not_depend_on_read_size() {
+        for chunk in [1, 2, 3, 8192] {
+            assert_eq!(
+                row_lines(b"a,b\n1,2\n\n\n3,4", chunk),
+                vec![2, 5],
+                "{chunk}"
+            );
+            assert_eq!(
+                row_lines(b"a,b\r\n1,2\r\n\r\n3,4", chunk),
+                vec![2, 4],
+                "{chunk}"
+            );
+            assert_eq!(row_lines(b"\n\na,b\n1,2\n", chunk), vec![4], "{chunk}");
+        }
+    }
+
+    /// Blank lines before the header push every row down.
+    #[test]
+    fn import_csv_line_numbers_follow_leading_blank_lines() {
+        assert_eq!(row_lines(b"\n\na,b\n1,2\n3,4\n", 8192), vec![4, 5]);
+        assert_eq!(row_lines(b"\r\n\r\na,b\r\n1,2\r\n", 8192), vec![4]);
+        assert_eq!(row_lines(b"\n\"a\nb\",c\n\n1,2\n", 8192), vec![5]);
+        assert_eq!(row_lines(b"\"a\nb\",c\n\n1,2\n", 8192), vec![4]);
+    }
+
+    /// Blank lines inside a quoted field, and lines with only spaces, are data.
+    #[test]
+    fn import_csv_blank_lines_inside_data_still_count() {
+        for eol in ["\n", "\r\n"] {
+            let f = |s: &str| row_lines(s.replace('\n', eol).as_bytes(), 8192);
+            assert_eq!(f("a,b\n\"x\n\ny\",1\n\n3,4\n"), vec![2, 6], "{eol:?}");
+            assert_eq!(f("a\n  \nx\n"), vec![2, 3], "{eol:?}");
+        }
+    }
+
+    /// A row that is not valid UTF-8 gets the corrected line too.
+    #[test]
+    fn import_csv_utf8_error_line_skips_blank_lines() {
+        let mut seen = Vec::new();
+        let report = import_csv(
+            &b"a,b\n1,2\n\n\xff,x\n\n3,4\n"[..],
+            &ImportOptions::default(),
+            |line, _row, _mode| {
+                seen.push(line);
+                ImportRowResult::Inserted
+            },
+        );
+        assert_eq!(seen, vec![2, 6]);
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.errors[0].line, 4);
+    }
+
+    /// Blank lines keep the numbers right at scale.
+    #[test]
+    fn import_csv_blank_line_numbers_hold_for_large_files() {
+        let mut csv = String::from("a,b\n");
+        let mut want = Vec::new();
+        let mut line = 1u64;
+        for i in 0..3000 {
+            if i % 7 == 0 {
+                csv.push('\n');
+                line += 1;
+            }
+            csv.push_str("1,2\n");
+            line += 1;
+            want.push(line);
+        }
+        assert_eq!(row_lines(csv.as_bytes(), 8192), want);
+    }
+
+    /// A file with CR-only line endings reports 2 for each row.
+    #[test]
+    fn import_csv_bare_cr_rows_report_line_two() {
+        assert_eq!(row_lines(b"a,b\r1,2\r3,4\r", 8192), vec![2, 2]);
     }
 
     #[test]
