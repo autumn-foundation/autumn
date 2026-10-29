@@ -28357,19 +28357,6 @@ mod lease_tests {
             })
         }
 
-        fn get<'a>(
-            &'a self,
-            _key: &'a str,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = AutumnResult<Option<crate::job_tracking::TrackedJobRecord>>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async { Ok(None) })
-        }
-
         fn reset_for_retry<'a>(
             &'a self,
             _key: &'a str,

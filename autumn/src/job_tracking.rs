@@ -153,9 +153,9 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 // ── Shared record-mutation logic ──────────────────────────────────────────────
 //
-// The status methods of `JobTrackingStore` apply these transitions. A store
-// gives only `update_record`, its read-modify-write step. Thus the stores
-// cannot drift on what a status change does to a record (#3208).
+// The status methods of `JobTrackingStore` apply these transitions. Each
+// store implements only `update_record`. Thus all stores apply the same
+// status rules (#3208).
 
 const fn apply_mark_running(record: &mut TrackedJobRecord) {
     if !record.status.is_terminal() {
@@ -194,8 +194,12 @@ pub trait JobTrackingStore: Send + Sync + 'static {
     /// Apply `f` to the live record for `key`, then set `updated_at` and
     /// write it. Do nothing if `key` is unknown or expired.
     ///
-    /// A store can call `f` again after a lost compare-and-swap, so give it a
-    /// fresh read each time. The status methods below call this.
+    /// A store can call `f` more than one time, for example after a failed
+    /// compare-and-swap. Give `f` a fresh copy of the record each time.
+    /// Change the record's [`RetryToken`] and refresh its TTL on each write.
+    /// Return an error if the write cannot complete.
+    ///
+    /// Callers: use the status methods below. They apply the status rules.
     fn update_record<'a>(
         &'a self,
         key: &'a str,
@@ -1723,8 +1727,10 @@ impl JobTrackingStore for InMemoryJobTrackingStore {
         key: &'a str,
         f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
     ) -> BoxFut<'a, AutumnResult<()>> {
-        self.with_record_mut(key, f);
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            self.with_record_mut(key, f);
+            Ok(())
+        })
     }
 
     fn reset_for_retry<'a>(
@@ -2642,12 +2648,14 @@ mod tests {
             key: &'a str,
             f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
         ) -> BoxFut<'a, AutumnResult<()>> {
-            self.updates.fetch_add(1, Ordering::Relaxed);
-            if let Some(record) = self.records.lock().unwrap().get_mut(key) {
-                f(&mut record.clone());
-                f(record);
-            }
-            Box::pin(async { Ok(()) })
+            Box::pin(async move {
+                self.updates.fetch_add(1, Ordering::Relaxed);
+                if let Some(record) = self.records.lock().unwrap().get_mut(key) {
+                    f(&mut record.clone());
+                    f(record);
+                }
+                Ok(())
+            })
         }
 
         fn get_with_token<'a>(
@@ -2700,11 +2708,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provided_get_returns_none_for_an_unknown_key() {
-        let store = MinimalStore::default();
-        assert!(store.get("missing").await.unwrap().is_none());
+    async fn in_memory_update_record_writes_only_when_polled() {
+        let store = store();
+        store.create("k", TrackedJobOwner::Anonymous).await.unwrap();
+
+        drop(store.mark_running("k"));
+
+        let record = store.get("k").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Pending);
+    }
+
+    /// The status rules that each real store gets from the trait defaults.
+    async fn assert_status_contract(store: &dyn JobTrackingStore) {
+        store.create("k", TrackedJobOwner::Anonymous).await.unwrap();
+        store.mark_running("k").await.unwrap();
+        store
+            .set_progress("k", 250, Some("half".to_owned()))
+            .await
+            .unwrap();
+        let record = store.get("k").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Running);
+        assert_eq!(record.progress_pct, Some(100));
+        assert_eq!(record.progress_message.as_deref(), Some("half"));
+
+        store
+            .complete("k", serde_json::json!({"rows": 3}))
+            .await
+            .unwrap();
+        let record = store.get("k").await.unwrap().expect("record");
+        assert_eq!(record.status, TrackedJobStatus::Succeeded);
+        assert_eq!(record.result, Some(serde_json::json!({"rows": 3})));
+
+        // A write to an unknown key does nothing.
         store.mark_running("missing").await.unwrap();
+        store.fail("missing", "boom".to_owned()).await.unwrap();
         assert!(store.get("missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn in_memory_store_meets_the_status_contract() {
+        assert_status_contract(&store()).await;
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_store_meets_the_status_contract() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = crate::config::DatabaseConfig {
+            url: Some(format!("sqlite://{}", tmp.path().join("t.db").display())),
+            ..Default::default()
+        };
+        let pool = crate::db::create_pool(&config).unwrap().expect("pool");
+        assert_status_contract(&SqliteJobTrackingStore::new(pool, 60)).await;
     }
 
     #[tokio::test]

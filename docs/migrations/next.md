@@ -214,8 +214,8 @@ scripts and tests. A codemod cannot find them reliably.
 
 **Why:** Each built-in store had the same code for `mark_running`,
 `set_progress`, `complete` and `fail` (issue #3208). These methods now have
-default bodies that call `update_record`. A store gives one read-modify-write
-step. The trait applies the status rules and the `0..=100` progress clamp.
+default bodies that call `update_record`. A store implements only
+`update_record`. The trait applies the status rules and the `0..=100` progress clamp.
 `get` also has a default body, which calls `get_with_token`.
 
 **Who is affected:** Only code that implements `JobTrackingStore`. The
@@ -225,6 +225,8 @@ calls a store does not change.
 **Before (`{X.Y}`):**
 
 ```rust
+use futures::future::BoxFuture; // = Pin<Box<dyn Future<Output = T> + Send + 'a>>
+
 impl JobTrackingStore for MyStore {
     fn mark_running<'a>(&'a self, key: &'a str) -> BoxFuture<'a, AutumnResult<()>> {
         Box::pin(async move { self.write(key, |r| r.status = TrackedJobStatus::Running).await })
@@ -237,6 +239,8 @@ impl JobTrackingStore for MyStore {
 **After (`{(X+1).0}`):**
 
 ```rust
+use futures::future::BoxFuture; // = Pin<Box<dyn Future<Output = T> + Send + 'a>>
+
 impl JobTrackingStore for MyStore {
     fn update_record<'a>(
         &'a self,
@@ -250,8 +254,9 @@ impl JobTrackingStore for MyStore {
 ```
 
 `update_record` must do nothing when `key` is unknown or expired. It can call
-`f` again after a lost compare-and-swap; give `f` a fresh read each time. Set
-`updated_at` after `f`. Remove your `mark_running`, `set_progress`,
+`f` more than one time, for example after a failed compare-and-swap. Give `f`
+a fresh copy of the record each time. Set `updated_at` after `f`. Change the
+`RetryToken` and refresh the TTL on each write. Remove your `mark_running`, `set_progress`,
 `complete`, `fail` and `get`. If you keep them, they override the defaults.
 
 **Automation:** `manual` — `update_record` needs the store's own storage code.
