@@ -872,8 +872,12 @@ The column defaults to `{snake(child)}_count` — **singular**, matching
 caller's tenant (both tables must carry that column); without it no tenant
 predicate is emitted. `parent_pk = "<column>"` names the parent's primary-key
 column when it is not `id` (a renamed `#[id]` or `#[diesel(column_name)]`) —
-the child cannot see the parent's fields, so it is never inferred (#2662). It
-is a **`belongs_to`** option only — on a `has_many`, on
+the child cannot see the parent's fields, so it is never inferred (#2662).
+`#[belongs_to(Post, references = "<column>")]` names that key once for the
+leg (#3033): the preload loader, counter cache and derivations inherit it, and
+a conflicting `parent_pk` is a compile error. A `#[model]` may use any
+primary-key column; `#[repository]` still assumes `id`. `parent_pk` is a
+**`belongs_to`** option only — on a `has_many`, on
 a `through =` join table, with a non-identifier column, with two legs resolving
 onto one parent column, or on a composite `#[id]`, it is a directed compile
 error.
