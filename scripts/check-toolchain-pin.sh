@@ -27,7 +27,8 @@
 # A static `toolchain:` value must be the pin, the MSRV or `nightly`.
 # Quotes and a trailing comment do not count. `stable` is allowed only in
 # toolchain-drift.yml. The documented exception is allowed here too.
-# Flow lists and `${{ }}` expressions are not checked as static values.
+# Flow lists, `${{ }}` expressions and flow maps (`with: { toolchain: x }`) are
+# not checked as static values. Write matrix legs as flow lists.
 #
 # Called from the `msrv` job in ci.yml. Runs locally with:
 #
@@ -54,6 +55,7 @@ die() {
 # Strip a trailing `# comment`, trailing spaces and one pair of matching quotes. A lone quote stays, so it fails the allow-list.
 normalize_toolchain() {
   local v="$1"
+  [[ "$v" == \#* ]] && v=""
   v="${v%%[[:space:]]#*}"
   v="${v%"${v##*[![:space:]]}"}"
   if [[ "$v" =~ ^\"(.*)\"$ || "$v" =~ ^\'(.*)\'$ ]]; then v="${BASH_REMATCH[1]}"; fi
@@ -163,6 +165,7 @@ check_tree() {
 bump_tree() {
   local dir="$1" new="$2"
   [[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--bump needs MAJOR.MINOR.PATCH, got '$new'"
+  dir="$(cd "$dir" && pwd)"
   cd "$dir"
   [[ -f .github/RUST_TOOLCHAIN ]] || die ".github/RUST_TOOLCHAIN is missing"
   local old old_re wf rel stage changed=()
@@ -183,12 +186,12 @@ bump_tree() {
     # Rewrite via a temp file, not `sed -i`: BSD/macOS sed takes the word after
     # -i as a backup suffix, so `sed -i -E` would swallow -E and match nothing.
     # Only the three constructs the checker recognises, never prose in a comment;
-    # quotes and a trailing `# comment` on a pin line are kept. The delimiter is `|` because
-    # the comment pattern contains a literal `#`.
+    # quotes, a trailing `# comment` and line endings are kept. The delimiter
+    # is `~` because the patterns contain `#` and `|`.
     sed -E \
-      -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*dtolnay/rust-toolchain@)${old_re}([[:space:]]+#.*)?[[:space:]]*\$|\1${new}\2|" \
-      -e "s|^([[:space:]]*-?[[:space:]]*toolchain:[[:space:]]*[\"']?)${old_re}([\"']?)([[:space:]]+#.*)?[[:space:]]*\$|\1${new}\2\3|" \
-      -e "s|(matrix\\.toolchain == 'stable' && ')${old_re}(')|\1${new}\2|" \
+      -e "s~^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*dtolnay/rust-toolchain@)${old_re}([[:space:]]+#.*|[[:space:]]*)\$~\1${new}\2~" \
+      -e "s~^([[:space:]]*-?[[:space:]]*toolchain:[[:space:]]*[\"']?)${old_re}([\"']?)([[:space:]]+#.*|[[:space:]]*)\$~\1${new}\2\3~" \
+      -e "s~(matrix\\.toolchain == 'stable' && ')${old_re}(')~\1${new}\2~" \
       "$wf" > "$wf.new"
     mv "$wf.new" "$wf"
     cmp -s "$rel" "$wf" || changed+=("$rel")
@@ -283,6 +286,10 @@ self_test() {
   mk "$tmp/static-drift" 1.99.0 '- uses: dtolnay/rust-toolchain@master
   with:
     toolchain: "stable" # floats on purpose' "$DRIFT_WORKFLOW"
+  mk "$tmp/static-empty" 1.99.0 '- uses: dtolnay/rust-toolchain@master
+  with:
+    toolchain: # set below'
+  expect_ok "$tmp/static-empty" "an empty static toolchain with a comment"
   expect_ok "$tmp/static-drift" "a quoted static stable in the drift workflow"
   mk "$tmp/static-exc" 1.99.0 '- uses: dtolnay/rust-toolchain@master
   with:
@@ -362,6 +369,18 @@ self_test() {
     || die "self-test: --bump skipped a bare static pin"
   grep -q 'toolchain: 1.88.0$' "$tmp/static-bump/.github/workflows/ci.yml" \
     || die "self-test: --bump touched a static MSRV"
+
+  # --bump keeps CRLF endings and trailing spaces on rewritten lines.
+  mk "$tmp/crlf" 1.99.0 ''
+  printf -- '- uses: dtolnay/rust-toolchain@1.99.0\r\n- uses: dtolnay/rust-toolchain@master\r\n  with:\r\n    toolchain: "1.99.0"  \r\n' \
+    > "$tmp/crlf/.github/workflows/ci.yml"
+  ( "$0" --bump "$tmp/crlf" 1.100.0 > /dev/null 2>&1 ) || die "self-test: --bump should handle CRLF"
+  [[ "$(grep -c $'\r$' "$tmp/crlf/.github/workflows/ci.yml")" == 4 ]] \
+    || die "self-test: --bump dropped a CR or trailing space"
+
+  # --bump accepts a relative directory.
+  mk "$tmp/rel" 1.99.0 '- uses: dtolnay/rust-toolchain@1.99.0'
+  ( cd "$tmp" && "$root/scripts/check-toolchain-pin.sh" --bump rel 1.100.0 > /dev/null 2>&1 ) || die "self-test: --bump should accept a relative dir"
 
   # A reference the checker recognises but the rewrite cannot reach must fail
   # the bump AND leave every file byte-identical (the all-or-nothing promise).
