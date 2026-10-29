@@ -9,4 +9,4 @@
 
 - **custom domains:** `CustomDomainRegistry::with_hostname` and `exclusive` run
   code inside a hostname's write gate, or alone. `Gated` is the handle for
-  registry writes inside the gate.
+  registry writes inside the gate. [no-plugin]
