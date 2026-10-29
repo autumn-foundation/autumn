@@ -51,9 +51,9 @@ const LEDGER_UP: &str =
 
 /// The running-balance migration (issue #3339). It applies after `LEDGER_UP`.
 const BALANCE_UP: &str =
-    include_str!("../migrations_sqlite/20261029120000_add_money_account_balance/up.sql");
+    include_str!("../migrations_sqlite/20261029183512_add_money_account_balance/up.sql");
 const BALANCE_DOWN: &str =
-    include_str!("../migrations_sqlite/20261029120000_add_money_account_balance/down.sql");
+    include_str!("../migrations_sqlite/20261029183512_add_money_account_balance/down.sql");
 
 /// An app table, so the "commits with your rows" test has rows to commit.
 const ORDERS_UP: &str = "CREATE TABLE ml_orders (\

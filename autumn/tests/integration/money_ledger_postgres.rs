@@ -42,9 +42,9 @@ const LEDGER_UP: &str = include_str!("../../migrations/20260917120000_create_mon
 
 /// The running-balance migration (issue #3339). It applies after `LEDGER_UP`.
 const BALANCE_UP: &str =
-    include_str!("../../migrations/20261029120000_add_money_account_balance/up.sql");
+    include_str!("../../migrations/20261029183512_add_money_account_balance/up.sql");
 const BALANCE_DOWN: &str =
-    include_str!("../../migrations/20261029120000_add_money_account_balance/down.sql");
+    include_str!("../../migrations/20261029183512_add_money_account_balance/down.sql");
 
 async fn setup_pool() -> (
     Pool<AsyncPgConnection>,

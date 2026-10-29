@@ -86,7 +86,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
 
-use diesel::sql_types::{BigInt, Bool, Text};
+use diesel::sql_types::{BigInt, Bool, Nullable, Text};
 use diesel_async::RunQueryDsl as _;
 use sha2::Digest as _;
 
@@ -993,6 +993,9 @@ fn check_no_nul(field: &'static str, value: &str) -> Result<(), LedgerError> {
 
 // ── Rows ────────────────────────────────────────────────────────────────────
 
+/// The columns [`AccountRow`] reads.
+const ACCOUNT_COLUMNS: &str = "id, currency, allow_negative, balance_minor";
+
 #[derive(diesel::QueryableByName)]
 struct AccountRow {
     #[diesel(sql_type = Text)]
@@ -1001,6 +1004,9 @@ struct AccountRow {
     currency: String,
     #[diesel(sql_type = Bool)]
     allow_negative: bool,
+    /// The stored balance. `None` when it is not known.
+    #[diesel(sql_type = Nullable<BigInt>)]
+    balance_minor: Option<i64>,
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1048,6 +1054,20 @@ struct TotalRow {
 }
 
 #[derive(diesel::QueryableByName)]
+struct DriftRow {
+    #[diesel(sql_type = Text)]
+    id: String,
+    #[diesel(sql_type = Text)]
+    currency: String,
+    #[diesel(sql_type = BigInt)]
+    balance_minor: i64,
+    #[diesel(sql_type = BigInt)]
+    hi: i64,
+    #[diesel(sql_type = BigInt)]
+    lo: i64,
+}
+
+#[derive(diesel::QueryableByName)]
 struct CurrencyTotalRow {
     #[diesel(sql_type = Text)]
     currency: String,
@@ -1063,12 +1083,26 @@ fn parse_currency(code: &str) -> Result<CurrencyCode, LedgerError> {
 
 impl AccountRow {
     fn into_account(self) -> Result<Account, LedgerError> {
-        Ok(Account {
-            currency: parse_currency(&self.currency)?,
-            id: self.id,
-            allow_negative: self.allow_negative,
+        self.into_stored().map(|stored| stored.account)
+    }
+
+    fn into_stored(self) -> Result<StoredAccount, LedgerError> {
+        Ok(StoredAccount {
+            account: Account {
+                currency: parse_currency(&self.currency)?,
+                id: self.id,
+                allow_negative: self.allow_negative,
+            },
+            balance: self.balance_minor,
         })
     }
+}
+
+/// An account row with its stored balance.
+struct StoredAccount {
+    account: Account,
+    /// `None` when the stored balance is not known.
+    balance: Option<i64>,
 }
 
 impl PostingRow {
@@ -1208,22 +1242,29 @@ async fn load_account(
     conn: &mut RuntimeConnection,
     account_id: &str,
 ) -> Result<Option<Account>, LedgerError> {
+    load_account_row(conn, account_id)
+        .await?
+        .map(AccountRow::into_account)
+        .transpose()
+}
+
+async fn load_account_row(
+    conn: &mut RuntimeConnection,
+    account_id: &str,
+) -> Result<Option<AccountRow>, LedgerError> {
     let sql = format!(
-        "SELECT id, currency, allow_negative FROM {ACCOUNTS_TABLE} WHERE id = {}",
+        "SELECT {ACCOUNT_COLUMNS} FROM {ACCOUNTS_TABLE} WHERE id = {}",
         ph(1)
     );
     let rows: Vec<AccountRow> = diesel::sql_query(sql)
         .bind::<Text, _>(account_id)
         .load(conn)
         .await?;
-    rows.into_iter()
-        .next()
-        .map(AccountRow::into_account)
-        .transpose()
+    Ok(rows.into_iter().next())
 }
 
-/// Read every account in `ids` and hold its row until the enclosing
-/// transaction ends, in one round trip.
+/// Read every account in `ids`, with its stored balance, and hold its row until
+/// the enclosing transaction ends, in one round trip.
 ///
 /// The lock is what makes the negative-balance check exact: two concurrent
 /// postings against one account are serialized behind it, so neither can read
@@ -1238,13 +1279,13 @@ async fn load_account(
 async fn lock_accounts(
     conn: &mut RuntimeConnection,
     ids: &[&str],
-) -> Result<BTreeMap<String, Account>, LedgerError> {
+) -> Result<BTreeMap<String, StoredAccount>, LedgerError> {
     if ids.is_empty() {
         return Ok(BTreeMap::new());
     }
     let placeholders = (1..=ids.len()).map(ph).collect::<Vec<_>>().join(", ");
     let sql = format!(
-        "SELECT id, currency, allow_negative FROM {ACCOUNTS_TABLE} \
+        "SELECT {ACCOUNT_COLUMNS} FROM {ACCOUNTS_TABLE} \
          WHERE id IN ({placeholders}) ORDER BY id{FOR_UPDATE}"
     );
     let mut query = diesel::sql_query(sql).into_boxed();
@@ -1254,8 +1295,8 @@ async fn lock_accounts(
     let rows: Vec<AccountRow> = query.load(conn).await?;
     rows.into_iter()
         .map(|row| {
-            row.into_account()
-                .map(|account| (account.id.clone(), account))
+            row.into_stored()
+                .map(|stored| (stored.account.id.clone(), stored))
         })
         .collect()
 }
@@ -1282,11 +1323,16 @@ async fn lock_accounts(
 /// 3. The idempotency key is read. When it is taken, the money was already
 ///    posted: that transaction is returned as [`PostOutcome::Replayed`].
 /// 4. Any account that refuses a negative balance has the balance this
-///    transaction *would* leave checked against the locked rows.
-/// 5. Only now is anything written: the postings, then the transaction row
-///    they belong to, with `ON CONFLICT DO NOTHING` on the key.
+///    transaction *would* leave checked against the locked rows. The balance
+///    is the one the account row stores, so this step does not read the
+///    posting history. A stored balance that is not known is summed from the
+///    postings once.
+/// 5. Only now is anything written: a summed balance, then the postings, then
+///    the transaction row they belong to, with `ON CONFLICT DO NOTHING` on the
+///    key. A trigger on the postings table adds each posting to its account's
+///    stored balance, in the same statement.
 ///
-/// Every refusal happens before the first `INSERT`, so a rejected post leaves
+/// Every refusal happens before the first write, so a rejected post leaves
 /// no row behind, and a failure after it rolls back with the transaction.
 ///
 /// # Cancellation
@@ -1344,11 +1390,12 @@ pub async fn post(
     let ids: Vec<&str> = wanted.iter().copied().collect();
     let accounts = lock_accounts(conn, &ids).await?;
     for id in &wanted {
-        let account = accounts
+        let account = &accounts
             .get(*id)
             .ok_or_else(|| LedgerError::UnknownAccount {
                 id: (*id).to_owned(),
-            })?;
+            })?
+            .account;
         if account.currency != checked.currency {
             return Err(LedgerError::AccountCurrency {
                 account: account.id.clone(),
@@ -1370,7 +1417,11 @@ pub async fn post(
         return Ok(PostOutcome::Replayed(existing.transaction));
     }
 
-    check_resulting_balances(conn, &accounts, transfer).await?;
+    let balances = stored_balances(conn, &accounts).await?;
+    check_resulting_balances(&accounts, &balances, transfer)?;
+    // A summed balance is the true balance before this post. So it is correct
+    // also if this future is dropped before the postings go in.
+    store_summed_balances(conn, &accounts, &balances).await?;
 
     // The postings go in BEFORE the transaction row they belong to.
     //
@@ -1509,15 +1560,15 @@ async fn write_postings(
 ///
 /// The account rows are already locked and nothing is written yet, so the
 /// figure is exact and a refusal leaves no row to roll back.
-async fn check_resulting_balances(
-    conn: &mut RuntimeConnection,
-    accounts: &BTreeMap<String, Account>,
+///
+/// `stored` holds the balance of each account before this transaction. It
+/// comes from [`stored_balances`].
+fn check_resulting_balances(
+    accounts: &BTreeMap<String, StoredAccount>,
+    stored: &BTreeMap<String, i64>,
     transfer: &Transaction,
 ) -> Result<(), LedgerError> {
-    let ids: Vec<&str> = accounts.keys().map(String::as_str).collect();
-    let stored = sum_postings_by_account(conn, &ids).await?;
-
-    for account in accounts.values() {
+    for StoredAccount { account, .. } in accounts.values() {
         // Sum this transaction's own postings for the account first, in `i128`,
         // and apply the net delta once. Adding them to the stored balance one
         // at a time would make the range check depend on the order the postings
@@ -1549,7 +1600,62 @@ async fn check_resulting_balances(
     Ok(())
 }
 
-/// The stored balance of each named account, in one statement.
+/// The balance of each locked account before this post.
+///
+/// Uses the stored balance. Sums the postings, in one statement, only for an
+/// account whose stored balance is not known.
+async fn stored_balances(
+    conn: &mut RuntimeConnection,
+    accounts: &BTreeMap<String, StoredAccount>,
+) -> Result<BTreeMap<String, i64>, LedgerError> {
+    let unknown: Vec<&str> = accounts
+        .iter()
+        .filter(|(_, stored)| stored.balance.is_none())
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let summed = sum_postings_by_account(conn, &unknown).await?;
+    Ok(accounts
+        .iter()
+        .map(|(id, stored)| {
+            let balance = stored
+                .balance
+                .or_else(|| summed.get(id).copied())
+                .unwrap_or(0);
+            (id.clone(), balance)
+        })
+        .collect())
+}
+
+/// Write each summed balance back to its account row, so that the next post
+/// does not sum the postings again.
+async fn store_summed_balances(
+    conn: &mut RuntimeConnection,
+    accounts: &BTreeMap<String, StoredAccount>,
+    balances: &BTreeMap<String, i64>,
+) -> Result<(), LedgerError> {
+    let sql = format!(
+        "UPDATE {ACCOUNTS_TABLE} SET balance_minor = {} \
+         WHERE id = {} AND balance_minor IS NULL",
+        ph(1),
+        ph(2)
+    );
+    for (id, stored) in accounts {
+        if stored.balance.is_some() {
+            continue;
+        }
+        let Some(balance) = balances.get(id) else {
+            continue;
+        };
+        diesel::sql_query(sql.as_str())
+            .bind::<BigInt, _>(*balance)
+            .bind::<Text, _>(id.as_str())
+            .execute(conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// The sum of the postings of each named account, in one statement.
 ///
 /// An account with no postings is absent from the map rather than zero, which
 /// the caller reads as zero.
@@ -1578,6 +1684,9 @@ async fn sum_postings_by_account(
 
 /// The balance of `account_id`: the sum of its postings.
 ///
+/// Reads the balance that the account row stores. When that balance is not
+/// known, sums the postings.
+///
 /// # Errors
 ///
 /// [`LedgerError::UnknownAccount`] when there is no such account,
@@ -1587,14 +1696,17 @@ pub async fn balance(
     conn: &mut RuntimeConnection,
     account_id: &str,
 ) -> Result<AnyMoney, LedgerError> {
-    let account =
-        load_account(conn, account_id)
-            .await?
-            .ok_or_else(|| LedgerError::UnknownAccount {
-                id: account_id.to_owned(),
-            })?;
-    let total = sum_postings(conn, account_id).await?;
-    Ok(AnyMoney::new(total, account.currency))
+    let stored = load_account_row(conn, account_id)
+        .await?
+        .ok_or_else(|| LedgerError::UnknownAccount {
+            id: account_id.to_owned(),
+        })?
+        .into_stored()?;
+    let total = match stored.balance {
+        Some(total) => total,
+        None => sum_postings(conn, account_id).await?,
+    };
+    Ok(AnyMoney::new(total, stored.account.currency))
 }
 
 /// `CAST(... AS BIGINT)` because Postgres widens `SUM(BIGINT)` to `NUMERIC`,
@@ -1715,6 +1827,8 @@ pub async fn trial_balance(
 }
 
 /// An account whose stored balance is not the sum of its postings.
+///
+/// [`balance_drift`] reports these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BalanceDrift {
     account: String,
@@ -1744,13 +1858,42 @@ impl BalanceDrift {
 
 /// Every account whose stored balance is not the sum of its postings.
 ///
+/// A trigger keeps the stored balance, so this list must be empty. An entry is
+/// proof that something wrote the `balance_minor` column around [`post`]. Like
+/// [`trial_balance`], this reads every posting: run it from a scheduled job,
+/// not from a request.
+///
+/// To repair an account, set its `balance_minor` to `NULL`. The next [`post`]
+/// to the account sums the postings and stores the result. An account whose
+/// stored balance is `NULL` is not in this list.
+///
 /// # Errors
 ///
-/// [`LedgerError::Database`] when the statement fails.
-pub async fn balance_drift(
-    _conn: &mut RuntimeConnection,
-) -> Result<Vec<BalanceDrift>, LedgerError> {
-    Ok(Vec::new())
+/// [`LedgerError::Database`] when the statement fails, and
+/// [`LedgerError::Money`] when a stored currency code is not one this build
+/// knows or a sum leaves `i64`.
+pub async fn balance_drift(conn: &mut RuntimeConnection) -> Result<Vec<BalanceDrift>, LedgerError> {
+    let totals = split_sum("p.amount_minor");
+    let sql = format!(
+        "SELECT a.id AS id, a.currency AS currency, a.balance_minor AS balance_minor, {totals} \
+         FROM {ACCOUNTS_TABLE} a LEFT JOIN {POSTINGS_TABLE} p ON p.account_id = a.id \
+         WHERE a.balance_minor IS NOT NULL \
+         GROUP BY a.id, a.currency, a.balance_minor ORDER BY a.id"
+    );
+    let rows: Vec<DriftRow> = diesel::sql_query(sql).load(conn).await?;
+    let mut drift = Vec::new();
+    for row in rows {
+        let posted = join_split(row.hi, row.lo)?;
+        if posted != row.balance_minor {
+            let currency = parse_currency(&row.currency)?;
+            drift.push(BalanceDrift {
+                account: row.id,
+                stored: AnyMoney::new(row.balance_minor, currency),
+                posted: AnyMoney::new(posted, currency),
+            });
+        }
+    }
+    Ok(drift)
 }
 
 #[cfg(test)]
