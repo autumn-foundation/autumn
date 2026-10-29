@@ -123,16 +123,18 @@ impl FieldErrors {
         self.date_format.is_none() && self.timezone.is_none()
     }
 
-    /// Focus goes to the first field in page order that has an error.
+    /// Focus goes to the first field, in page order, that has an error.
     const fn focus_date_format(&self) -> bool {
         self.date_format.is_some()
     }
 
+    /// The timezone field takes focus only when the date format is valid.
     const fn focus_timezone(&self) -> bool {
         self.timezone.is_some() && self.date_format.is_none()
     }
 }
 
+/// An alert paragraph for one field. It renders nothing without a message.
 fn field_error(id: &str, message: Option<&str>) -> Markup {
     html! {
         @if let Some(message) = message {
@@ -334,8 +336,8 @@ pub async fn save(
 
     // Two fields are checked *before* the round trip below. `from_rows` keeps
     // the default for a value it cannot use. That is right for reading the
-    // options table, but wrong for a form: a typo in `timezone` would
-    // silently move a non-UTC site to UTC, and a typo in `date_format` would
+    // options table. It is wrong for a form. A typo in `timezone` would
+    // silently move a non-UTC site to UTC. A typo in `date_format` would
     // reset the date style. The current value is worth more than a guess.
     // A refusal redisplays the form, so the other fields are not lost.
     let view = SettingsView::from(&form);
