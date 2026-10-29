@@ -378,11 +378,17 @@ see the parent's fields — the same visibility limit that makes
 before. `#[derivation]` takes the same `parent_pk = "<column>"` key with the
 same default.
 
-The key also drives the `belongs_to` preload: the loader filters on and
-selects `parent_pk` instead of `<parent>::id`. Note that a `#[model]` parent
-still needs an `id` column today (#3033), so for a counter cache the override
-currently serves counting through an alternate unique key; derivations onto a
-parent that is not a `#[model]` are unaffected by that limit.
+`references = "<column>"` on `belongs_to` names the same key once for the whole
+leg. The preload loader, the counter cache and any `#[derivation]` through
+that leg use it. A conflicting `parent_pk` is a compile error.
+
+```rust,ignore
+#[belongs_to(Post, references = "post_uuid", counter_cache)]
+```
+
+A `#[model]` may use any primary-key column: a renamed `#[id]` field, or
+`#[diesel(column_name)]` on the field. `#[repository]` still assumes `id`
+(#3033 follow-up). A `through =` target must still be keyed on `id`.
 
 ## Filtered and weighted counts
 

@@ -358,6 +358,10 @@ struct Association {
     /// runtime [`AutumnCounterCaches`] impl `#[model]` emits, which the child's
     /// generated repository consults to keep `{parent}.{child}_count` current.
     counter_cache: Option<CounterCacheDecl>,
+    /// `references = "<column>"` on a `#[belongs_to]` (#3033): the parent
+    /// column the foreign key stores. `None` means `"id"`. The preload loader,
+    /// counter cache and derivations on this leg all use it.
+    references: Option<String>,
 }
 
 /// The join-table half of a many-to-many `has_many(..., through = ...)`
@@ -773,6 +777,7 @@ fn parse_assoc_attr(
         counter_cache,
         counter_cache_tenant,
         parent_pk,
+        references,
     ) = attr.parse_args_with(|input: ParseStream| {
         let target: syn::Ident = input.parse()?;
         let mut explicit_fk: Option<String> = None;
@@ -790,6 +795,7 @@ fn parse_assoc_attr(
         // `parent_pk` rides along with its span like `counter_cache_tenant`:
         // a later cross-key rejection points its caret at the offending key.
         let mut parent_pk: Option<(String, proc_macro2::Span)> = None;
+        let mut references: Option<String> = None;
         // Zero or more trailing `, key = value` pairs (`fk`, `name`,
         // `through`, `target_fk`, `helper`), any order — plus `counter_cache`,
         // the one key that is also legal as a bare flag.
@@ -833,6 +839,16 @@ fn parse_assoc_attr(
                 // that addresses the parent by key.
                 check_column_ident(&key, "parent_pk", &value)?;
                 parent_pk = Some((value, key.span()));
+            } else if key == "references" {
+                if kind != AssocKind::BelongsTo {
+                    return Err(syn::Error::new_spanned(
+                        &key,
+                        "`references = <column>` names the parent key a \
+                         foreign key stores, so it is only valid on `belongs_to`",
+                    ));
+                }
+                check_column_ident(&key, "references", &value)?;
+                references = Some(value);
             } else if key == "fk" {
                 explicit_fk = Some(value);
             } else if key == "name" {
@@ -853,8 +869,8 @@ fn parse_assoc_attr(
                          `helper = <singular>`, `counter_cache` / \
                          `counter_cache = <column>`, \
                          `counter_cache_tenant = <column>`, or \
-                         `parent_pk = <column>` in association \
-                         attribute",
+                         `parent_pk = <column>`, or `references = <column>` \
+                         in association attribute",
                 ));
             }
         }
@@ -869,6 +885,7 @@ fn parse_assoc_attr(
             counter_cache,
             counter_cache_tenant,
             parent_pk,
+            references,
         ))
     })?;
 
@@ -904,6 +921,27 @@ fn parse_assoc_attr(
             ));
         }
         (None, None, None) => None,
+    };
+
+    // `references` is the one source of truth for the parent key: a counter
+    // cache inherits it, and a conflicting `parent_pk` is rejected.
+    let counter_cache = match (counter_cache, references.as_deref()) {
+        (Some(decl), Some(refs)) => match decl.parent_pk.as_deref() {
+            Some(pk) if pk != refs => {
+                return Err(syn::Error::new(
+                    decl.span,
+                    format!(
+                        "`parent_pk = \"{pk}\"` conflicts with `references = \
+                         \"{refs}\"` on the same association: name the key once"
+                    ),
+                ));
+            }
+            _ => Some(CounterCacheDecl {
+                parent_pk: Some(refs.to_owned()),
+                ..decl
+            }),
+        },
+        (decl, _) => decl,
     };
 
     if let Some(decl) = counter_cache.as_ref()
@@ -997,6 +1035,13 @@ fn parse_assoc_attr(
         through,
         dependent: dependent.map(|(action, _span)| action),
         helper: explicit_helper,
+        // A counter cache's `parent_pk` names the same parent key, so the
+        // loader reads one value whichever spelling the author chose.
+        references: references.or_else(|| {
+            counter_cache
+                .as_ref()
+                .and_then(|decl| decl.parent_pk.clone())
+        }),
         counter_cache,
     })
 }
@@ -1498,6 +1543,37 @@ fn derivation_fk(
         return Ok(assoc.fk.clone());
     }
     Ok(format!("{}_id", pascal_to_snake(&decl.target.to_string())))
+}
+
+/// The parent key column a `#[derivation]` addresses: its own `parent_pk`,
+/// else the `references` of the `#[belongs_to]` leg it counts through. Naming
+/// both with different values is an error.
+fn derivation_parent_pk(
+    decl: &DerivationDecl,
+    assocs: &[Association],
+    fk: &str,
+) -> syn::Result<Option<String>> {
+    let inherited = assocs
+        .iter()
+        .find(|a| {
+            a.kind == AssocKind::BelongsTo
+                && a.target == decl.target
+                && a.through.is_none()
+                && a.fk == fk
+        })
+        .and_then(|a| a.references.as_deref());
+    match (decl.parent_pk.as_deref(), inherited) {
+        (Some(pk), Some(refs)) if pk != refs => Err(syn::Error::new(
+            decl.span,
+            format!(
+                "`parent_pk = \"{pk}\"` conflicts with `references = \"{refs}\"` \
+                 on the `#[belongs_to({})]` it counts through: name the key once",
+                decl.target
+            ),
+        )),
+        (Some(pk), _) => Ok(Some(pk.to_owned())),
+        (None, inherited) => Ok(inherited.map(ToOwned::to_owned)),
+    }
 }
 
 /// Reject a `#[derivation]` that maintains a `(parent table, column)` pair
@@ -2683,7 +2759,9 @@ fn emit_counter_caches_impl(
         // a derivation maintaining it would rewrite the parent's identity on
         // the first qualifying mutation. Compared against the EFFECTIVE key: an
         // override moves the forbidden column with it (#2662).
-        let effective_parent_pk = decl.parent_pk.as_deref().unwrap_or("id");
+        let pk_leg_fk = derivation_fk(model_ident, decl, assocs)?;
+        let derived_pk = derivation_parent_pk(decl, assocs, &pk_leg_fk)?;
+        let effective_parent_pk = derived_pk.as_deref().unwrap_or("id");
         if column == effective_parent_pk {
             return Err(syn::Error::new(
                 decl.span,
@@ -3026,7 +3104,9 @@ fn emit_counter_caches_impl(
         // The parent's physical primary-key column (#2662): the explicit
         // `parent_pk = "<column>"` override, else the `"id"` default — the
         // same visibility story as `parent_table`'s override above.
-        let parent_pk = decl.parent_pk.as_deref().unwrap_or("id");
+        let pk_leg_fk = derivation_fk(model_ident, decl, assocs)?;
+        let derived_pk = derivation_parent_pk(decl, assocs, &pk_leg_fk)?;
+        let parent_pk = derived_pk.as_deref().unwrap_or("id");
         derivation_items.push(quote! {
             /// The parent type is otherwise never named in the expansion: the
             /// parent table is a string and the maintenance is SQL. This makes
@@ -3134,6 +3214,7 @@ fn emit_counter_caches_impl(
 fn emit_association_items(
     model_ident: &syn::Ident,
     table_ident: &syn::Ident,
+    pk_field: &syn::Ident,
     vis: &syn::Visibility,
     assocs: &[Association],
 ) -> TokenStream {
@@ -3225,7 +3306,10 @@ fn emit_association_items(
                         (quote! { __r.#fk_ident }, quote! { #target_table::id })
                     }
                     // has_one: fk is on the *target*, points at this model's id.
-                    _ => (quote! { __r.id }, quote! { #target_table::#fk_ident }),
+                    _ => (
+                        quote! { __r.#pk_field },
+                        quote! { #target_table::#fk_ident },
+                    ),
                 };
                 // For has_one the lookup map keys on the target's fk column; for
                 // belongs_to it keys on the target's id.
@@ -3235,20 +3319,16 @@ fn emit_association_items(
                     quote! { __child.#fk_ident }
                 };
 
-                // A belongs_to whose counter cache names the parent's key with
-                // `parent_pk = "<column>"` (#2662): the parent is not keyed on
+                // A belongs_to that names the parent's key with
+                // `references = "<column>"` (#3033, or via its counter cache's
+                // `parent_pk`, #2662): the parent is not keyed on
                 // `id`, so neither `<parent>::id` nor `__child.id` exists. Filter
                 // on the named column and select it alongside each row, so the
                 // loader never needs the parent's Rust field name (which the
                 // child cannot see). Without the override the block below is
                 // emitted unchanged.
                 let overridden_pk = (assoc.kind == AssocKind::BelongsTo)
-                    .then(|| {
-                        assoc
-                            .counter_cache
-                            .as_ref()
-                            .and_then(|decl| decl.parent_pk.as_deref())
-                    })
+                    .then_some(assoc.references.as_deref())
                     .flatten()
                     .filter(|pk| *pk != "id")
                     .map(column_ident);
@@ -3370,7 +3450,7 @@ fn emit_association_items(
                 loader_blocks.push(quote! {
                     if let ::core::option::Option::Some(__child_spec) = &spec.#name_ident {
                         let mut __keys: ::std::vec::Vec<i64> =
-                            records.iter().map(|__r| __r.id).collect();
+                            records.iter().map(|__r| __r.#pk_field).collect();
                         __keys.sort_unstable();
                         __keys.dedup();
                         let __rows: ::std::vec::Vec<#target> = #target_table::table
@@ -3407,7 +3487,7 @@ fn emit_association_items(
                             }
                         }
                         for __r in records.iter_mut() {
-                            let __v: #stored_ty = __groups.remove(&__r.id).unwrap_or_default();
+                            let __v: #stored_ty = __groups.remove(&__r.#pk_field).unwrap_or_default();
                             __r.associations_mut().insert::<#stored_ty>(#key, __v);
                         }
                     }
@@ -3505,7 +3585,7 @@ fn emit_association_items(
                             #[allow(unused_imports)]
                             use ::autumn_web::reexports::diesel::query_dsl::JoinOnDsl as _;
                             let mut __keys: ::std::vec::Vec<i64> =
-                                records.iter().map(|__r| __r.id).collect();
+                                records.iter().map(|__r| __r.#pk_field).collect();
                             __keys.sort_unstable();
                             __keys.dedup();
                             let __pairs: ::std::vec::Vec<(i64, #target)> =
@@ -3584,7 +3664,7 @@ fn emit_association_items(
                                 }
                             }
                             for __r in records.iter_mut() {
-                                let __v: #stored_ty = __groups.get(&__r.id).cloned().unwrap_or_default();
+                                let __v: #stored_ty = __groups.get(&__r.#pk_field).cloned().unwrap_or_default();
                                 __r.associations_mut().insert::<#stored_ty>(#key, __v);
                             }
                         }
@@ -6071,6 +6151,24 @@ fn diesel_column_name(field: &syn::Field) -> Option<String> {
     found
 }
 
+/// The model's primary-key field: the `#[id]` field, else the first `i32` /
+/// `i64` field (the historical default).
+fn primary_key_field<'a>(
+    fields: impl IntoIterator<Item = &'a syn::Field>,
+) -> Option<&'a syn::Field> {
+    let fields: Vec<&syn::Field> = fields.into_iter().collect();
+    fields
+        .iter()
+        .copied()
+        .find(|f| has_attr(f, "id"))
+        .or_else(|| {
+            fields.iter().copied().find(|f| {
+                matches!(&f.ty, syn::Type::Path(tp)
+                    if tp.path.is_ident("i32") || tp.path.is_ident("i64"))
+            })
+        })
+}
+
 /// A Rust identifier for a SQL column name: the plain identifier, or the raw
 /// form (`r#type`) when the name is a Rust keyword, so a column recovered as an
 /// unrawed string can be spliced back into a `diesel::table!` or path.
@@ -6101,6 +6199,12 @@ fn physical_pk_column(pk_field: Option<&syn::Field>) -> String {
             diesel_column_name(field).or_else(|| field.ident.as_ref().map(unraw_ident))
         })
         .unwrap_or_else(|| "id".to_owned())
+}
+
+/// The table column of a field: its `#[diesel(column_name)]`, else its
+/// (unrawed) Rust name.
+fn physical_column(field: &syn::Field) -> String {
+    physical_pk_column(Some(field))
 }
 
 /// Build the `impl` block a model's `#[translatable]` fields contribute:
@@ -7995,7 +8099,11 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(assocs) => assocs,
         Err(err) => return err.to_compile_error(),
     };
-    let association_items = emit_association_items(name, &table_ident, vis, &associations);
+    let pk_rust_field = primary_key_field(fields.named.iter())
+        .and_then(|f| f.ident.clone())
+        .unwrap_or_else(|| format_ident!("id"));
+    let association_items =
+        emit_association_items(name, &table_ident, &pk_rust_field, vis, &associations);
     let dependents_impl = emit_dependents_impl(name, &associations);
 
     // `#[derivation(Parent, column = "...", ...)]` (#1769). Parsed here beside
@@ -8490,6 +8598,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
             .first()
             .and_then(|f| f.ident.as_ref().map(|id| (id, &f.ty)))
     };
+
+    // The physical key column, resolved once. Generated SQL addresses the
+    // key through this ident, never through a hard-coded `id` (#3033).
+    let pk_column_ident = column_ident(&physical_pk_column(primary_key_field(
+        all_fields.iter().copied(),
+    )));
 
     // Collect state machine specs from all fields (RED → GREEN: declarative SM
     // support). Emitted here — after the primary key is resolved — so an
@@ -9758,7 +9872,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     if upsert_columns.is_empty() {
         upsert_columns.push(quote! {
-            #table_ident::id.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::id))
+            #table_ident::#pk_column_ident.eq(::autumn_web::reexports::diesel::upsert::excluded(#table_ident::#pk_column_ident))
         });
     }
 
@@ -9785,8 +9899,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     if upsert_types.is_empty() {
         upsert_types.push(quote! {
             ::autumn_web::reexports::diesel::dsl::Eq<
-                #table_ident::id,
-                ::autumn_web::reexports::diesel::upsert::Excluded<#table_ident::id>
+                #table_ident::#pk_column_ident,
+                ::autumn_web::reexports::diesel::upsert::Excluded<#table_ident::#pk_column_ident>
             >
         });
     }
@@ -9869,7 +9983,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let build_stmt = quote! {
             let stmt = ::autumn_web::reexports::diesel::insert_into(#table_ident::table)
                 .values(__autumn_row)
-                .on_conflict(#table_ident::id)
+                .on_conflict(#table_ident::#pk_column_ident)
                 .do_update()
                 .set(Self::__autumn_upsert_set())
                 // #2854: explicit column list — never rely on physical column
@@ -11204,6 +11318,8 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
         let raw = ident.to_string();
         let col = raw.strip_prefix("r#").unwrap_or(&raw).to_string();
+        // The table column: `#[diesel(column_name)]` when renamed (#3033).
+        let col_ident = column_ident(&physical_column(field));
         let is_option = option_inner_type(&field.ty).is_some();
         let base_ty = option_inner_type(&field.ty).unwrap_or(&field.ty);
         let Some(last) = ty_last_ident(base_ty) else {
@@ -11238,14 +11354,16 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 // No redundant `ORDER BY id, id`, and no tie-break when the
                 // model has no single primary key.
                 (true, _) | (_, None) => quote! {},
-                (false, Some(pk)) => quote! { .then_order_by(#table_ident::#pk.desc()) },
+                (false, Some(_)) => {
+                    quote! { .then_order_by(#table_ident::#pk_column_ident.desc()) }
+                }
             };
             list_sort_arms.push(quote! {
                 ::core::option::Option::Some(#col) => match __dir {
                     ::autumn_web::pagination::SortDir::Asc =>
-                        __q.order(#table_ident::#ident.asc()) #tie_break,
+                        __q.order(#table_ident::#col_ident.asc()) #tie_break,
                     ::autumn_web::pagination::SortDir::Desc =>
-                        __q.order(#table_ident::#ident.desc()) #tie_break,
+                        __q.order(#table_ident::#col_ident.desc()) #tie_break,
                 },
             });
         }
@@ -11254,14 +11372,14 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         if !is_option {
             match last.as_str() {
                 "String" => list_filter_arms.push(quote! {
-                    #col => { __q = __q.filter(#table_ident::#ident.eq(__val.to_owned())); }
+                    #col => { __q = __q.filter(#table_ident::#col_ident.eq(__val.to_owned())); }
                 }),
                 "i16" | "i32" | "i64" | "bool" => {
                     let parse_ty = format_ident!("{last}");
                     list_filter_arms.push(quote! {
                         #col => {
                             if let ::core::result::Result::Ok(__v) = __val.parse::<#parse_ty>() {
-                                __q = __q.filter(#table_ident::#ident.eq(__v));
+                                __q = __q.filter(#table_ident::#col_ident.eq(__v));
                             }
                         }
                     });
@@ -11272,7 +11390,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
     let list_default_order = list_pk.map_or_else(
         || quote! { __q },
-        |pk| quote! { __q.order(#table_ident::#pk.desc()) },
+        |_| quote! { __q.order(#table_ident::#pk_column_ident.desc()) },
     );
     let list_filter_body = if list_filter_arms.is_empty() {
         quote! { let _ = &__query; __q }
@@ -11512,7 +11630,7 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                             // `serialize_as`, which only implements `Insertable` for owned
                             // values. `to_vec()` also works for plain models.
                             .values(chunk.to_vec())
-                            .on_conflict(#table_ident::id)
+                            .on_conflict(#table_ident::#pk_column_ident)
                             .do_update()
                             .set(Self::__autumn_upsert_set())
                             // #2854: explicit column list — never rely on physical
@@ -11568,12 +11686,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         impl ::autumn_web::repository::AutumnUpsertSetExt for #name {
             type UpsertSet = ::autumn_web::reexports::diesel::dsl::Eq<
-                #table_ident::id,
-                #table_ident::id,
+                #table_ident::#pk_column_ident,
+                #table_ident::#pk_column_ident,
             >;
             fn __autumn_upsert_set() -> Self::UpsertSet {
                 use ::autumn_web::reexports::diesel::ExpressionMethods as _;
-                #table_ident::id.eq(#table_ident::id)
+                #table_ident::#pk_column_ident.eq(#table_ident::#pk_column_ident)
             }
         }
 
@@ -13147,6 +13265,184 @@ mod tests {
         assert!(
             generated.contains("cannot maintain `posts.post_uuid`"),
             "the overridden parent primary key is not a maintainable column: {generated}"
+        );
+    }
+
+    fn expand(attrs: TokenStream, item: TokenStream) -> String {
+        model_macro(attrs, item).to_string()
+    }
+
+    /// #3033: a renamed `#[id]` field keys upserts and parent-side loaders.
+    #[test]
+    fn renamed_id_field_keys_upsert_and_loaders() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[has_many(Comment)]
+                pub struct Post {
+                    #[id]
+                    pub post_uuid: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.contains("on_conflict (posts :: post_uuid)"),
+            "upsert must conflict on the key column: {generated}"
+        );
+        assert!(
+            generated.contains("__r . post_uuid"),
+            "the loader must read the key field: {generated}"
+        );
+        assert!(
+            !generated.contains("posts :: id") && !generated.contains("__r . id"),
+            "no hard-coded `id` may remain: {generated}"
+        );
+    }
+
+    /// #3033: a renamed column on an `id` field keys SQL by the column.
+    #[test]
+    fn renamed_id_column_keys_upsert() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                pub struct Post {
+                    #[id]
+                    #[diesel(column_name = post_uuid)]
+                    pub id: i64,
+                    pub title: String,
+                }
+            },
+        );
+        assert!(
+            generated.contains("on_conflict (posts :: post_uuid)"),
+            "upsert must conflict on the column: {generated}"
+        );
+        assert!(
+            !generated.contains("posts :: id"),
+            "no hard-coded `id` column may remain: {generated}"
+        );
+    }
+
+    /// #3033: `references` steers the belongs_to loader.
+    #[test]
+    fn references_steers_the_belongs_to_loader() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, references = "post_uuid")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("posts :: post_uuid . eq_any"),
+            "the loader must filter on the referenced column: {generated}"
+        );
+        assert!(
+            !generated.contains("__child . id"),
+            "the loader must not read the parent's `id` field: {generated}"
+        );
+    }
+
+    /// #3033: `references` is the counter cache's default parent key.
+    #[test]
+    fn references_is_the_counter_cache_parent_key() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, references = "post_uuid", counter_cache)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("parent_pk : \"post_uuid\""),
+            "the counter cache must address the referenced key: {generated}"
+        );
+    }
+
+    /// #3033: a derivation inherits `references` from its leg.
+    #[test]
+    fn derivation_inherits_references() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, references = "post_uuid")]
+                #[derivation(Post, column = "total", transform = count)]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("parent_pk : \"post_uuid\""),
+            "the derivation must address the referenced key: {generated}"
+        );
+    }
+
+    #[test]
+    fn references_conflicting_with_parent_pk_is_rejected() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, references = "a", counter_cache, parent_pk = "b")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("conflicts with `references"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn derivation_parent_pk_conflicting_with_references_is_rejected() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[belongs_to(Post, references = "a")]
+                #[derivation(Post, column = "total", parent_pk = "b")]
+                pub struct Comment {
+                    #[id]
+                    pub id: i64,
+                    pub post_id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("conflicts with `references"),
+            "{generated}"
+        );
+    }
+
+    #[test]
+    fn references_is_only_valid_on_belongs_to() {
+        let generated = expand(
+            TokenStream::new(),
+            quote! {
+                #[has_many(Comment, references = "a")]
+                pub struct Post {
+                    #[id]
+                    pub id: i64,
+                }
+            },
+        );
+        assert!(
+            generated.contains("only valid on `belongs_to`"),
+            "{generated}"
         );
     }
 
