@@ -1754,8 +1754,9 @@ jobs:
             || { echo "::error::no pg relative-delay tests ran — the ci.yml filters no longer match"; exit 1; }
           # The Postgres claim tests are `--lib` too: they drive the
           # crate-private `pg_claim_next_job_except`. Cost deferral is #1720;
-          # the multi-queue claim is #3182. Named by full path, with an exact
-          # pass count, as above. `pg_claim_ci_coverage` checks the names.
+          # the multi-queue claim is #3182. Each test is named by full path.
+          # The step checks for exactly 4 passes. `pg_claim_ci_coverage`
+          # checks the names.
           (
             set -o pipefail
             cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
@@ -2551,10 +2552,10 @@ jobs:
             job::tests::pg::pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it \
             | tee "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
           grep -Eq "test result: ok\. 2 passed" "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
-          # Ledger (job claim, #1720 and #3182): the deferred and multi-queue
-          # claims run only in these `--lib` Docker tests, so the
-          # `Test (Docker)` sweep alone leaves them out of the patch gate.
-          # Check the count.
+          # Ledger (job claim, #1720 and #3182): these `--lib` Docker tests
+          # cover the deferred and multi-queue claims. The `Test (Docker)`
+          # sweep does not run them, so this step names each test and checks
+          # the count.
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --lib -- --ignored --test-threads=1 \
             job::tests::pg::pg_deferred_claim_skips_parked_names_and_keeps_run_at_order \

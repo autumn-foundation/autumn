@@ -11674,7 +11674,8 @@ fn pg_claim_sql_single_queue() -> String {
 /// so a name with a large saturated backlog is never scanned past the point the
 /// plain claim would have stopped at. The claimed row is the one
 /// `pg_claim_sql_single_queue` would pick (ties on `run_at` stay unordered, as
-/// before). Row locks are taken per probe and drop with the statement.
+/// before). Each probe locks one row. Postgres releases the locks when the
+/// transaction ends.
 ///
 /// `heads` is referenced twice (the walk's base term tests it) so Postgres 12+
 /// materializes it instead of inlining it into every iteration; `AS MATERIALIZED`
@@ -21399,9 +21400,12 @@ mod tests {
             ["critical", "default", "low"].map(str::to_owned).to_vec()
         }
 
-        /// Postgres 16 with `pg_stat_statements`. Set
-        /// `JOB_CLAIM_TEST_DATABASE_URL` to use a different server. These tests
-        /// drop `autumn_jobs` on that server.
+        /// Returns the URL of a Postgres 16 server that loads
+        /// `pg_stat_statements`.
+        ///
+        /// Set `JOB_CLAIM_TEST_DATABASE_URL` to use a different server. That
+        /// server must load `pg_stat_statements`. The claim tests drop
+        /// `autumn_jobs` on that server.
         async fn pg_claim_test_url() -> (
             String,
             Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
@@ -21428,10 +21432,16 @@ mod tests {
             (url, Some(container))
         }
 
-        /// Drop `autumn_jobs` and create it again from the migrations.
+        /// Drop `autumn_jobs` and create it again from the migrations, with
+        /// all of its indexes.
         async fn pg_reset_jobs_table(pool: &PgPool) {
             pg_exec(pool, "DROP TABLE IF EXISTS autumn_jobs").await;
             pg_run_migration(pool).await;
+            pg_exec(
+                pool,
+                include_str!("../migrations/20261026170000_add_jobs_queue_name_ready_index/up.sql"),
+            )
+            .await;
         }
 
         #[test]
@@ -21574,7 +21584,8 @@ mod tests {
                     "SELECT calls, (shared_blks_hit + shared_blks_read) AS buffers, \
                             temp_blks_written AS temp_written \
                      FROM pg_stat_statements \
-                     WHERE query LIKE 'UPDATE autumn_jobs%' AND query LIKE '%claimed_by%'",
+                     WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                       AND query LIKE 'UPDATE autumn_jobs%' AND query LIKE '%claimed_by%'",
                 )
                 .get_result::<Stats>(&mut *conn)
                 .await
@@ -21590,7 +21601,7 @@ mod tests {
             let small = per_claim[0].1;
             for (backlog, buffers) in &per_claim {
                 assert!(
-                    *buffers <= small * 2.0 + 16.0,
+                    *buffers <= small.mul_add(2.0, 16.0),
                     "buffers per claim grow with the backlog: {per_claim:?} \
                      (backlog {backlog})"
                 );

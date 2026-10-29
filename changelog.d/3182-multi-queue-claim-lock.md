@@ -1,5 +1,6 @@
 ### Fixed
 
 - **jobs:** a Postgres worker with two or more `[jobs] queues` no longer locks
-  the head job of a lower-priority queue while it claims a job (issue #3182).
-  Before, a second worker could skip that job and take a lower-priority job.
+  the first job of a lower-priority queue during a claim (issue #3182). Before
+  this fix, a second worker could skip that job and take a job of lower
+  priority.
