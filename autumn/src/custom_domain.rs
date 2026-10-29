@@ -3887,6 +3887,76 @@ mod tests {
         assert!(record.issuance_attempts_unix.is_empty());
     }
 
+    #[tokio::test]
+    async fn a_verification_failure_lands_on_a_pending_registration() {
+        let registry = hydrated(10).await;
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        let token = registry.get("a.clientco.com").unwrap().verification_token;
+
+        let applied = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-a",
+                token.as_deref(),
+                100,
+                "the DNS lookup timed out",
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(applied);
+        let record = registry.get("a.clientco.com").unwrap();
+        assert_eq!(record.status, DomainStatus::PendingDns);
+        assert_eq!(
+            record.failure_reason.as_deref(),
+            Some("the DNS lookup timed out")
+        );
+        assert_eq!(record.consecutive_failures, 1);
+        assert_eq!(record.next_attempt_unix, Some(400));
+    }
+
+    #[tokio::test]
+    async fn a_verification_failure_spares_another_tenant_or_registration() {
+        let registry = hydrated(10).await;
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        let token = registry.get("a.clientco.com").unwrap().verification_token;
+
+        let wrong_tenant = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-b",
+                token.as_deref(),
+                100,
+                "stale",
+                300,
+            )
+            .await
+            .unwrap();
+        let wrong_token = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-a",
+                Some("another-registration"),
+                100,
+                "stale",
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(!wrong_tenant && !wrong_token);
+        let record = registry.get("a.clientco.com").unwrap();
+        assert!(record.failure_reason.is_none());
+        assert_eq!(record.consecutive_failures, 0);
+    }
+
     #[test]
     fn the_budget_says_nothing_about_backoff() {
         // The retry deadline is the domain record's job; the limiter only ever
