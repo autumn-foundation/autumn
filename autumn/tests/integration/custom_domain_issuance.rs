@@ -3569,6 +3569,121 @@ async fn a_short_budget_still_lets_hung_names_yield_their_slots() {
     assert_eq!(issuer.calls(), vec!["zhealthy.clientco.com".to_owned()]);
 }
 
+/// A store whose saves take `delay` once armed.
+#[derive(Debug, Default)]
+struct SlowSaveStore {
+    inner: MemoryCustomDomainStore,
+    delay_secs: AtomicUsize,
+}
+
+impl autumn_web::custom_domain::CustomDomainStore for SlowSaveStore {
+    fn load_all(
+        &self,
+    ) -> autumn_web::custom_domain::StoreFuture<
+        '_,
+        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+    > {
+        self.inner.load_all()
+    }
+
+    fn save<'a>(
+        &'a self,
+        domain: &'a autumn_web::custom_domain::CustomDomain,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            let secs = self.delay_secs.load(Ordering::SeqCst) as u64;
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            self.inner.save(domain).await
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.delete(hostname)
+    }
+}
+
+/// The budget limits DNS work only. A save that starts must finish, or a
+/// detached write could land after a newer record or an offboard.
+#[tokio::test(start_paused = true)]
+async fn the_budget_never_cancels_a_registry_write() {
+    let store = Arc::new(SlowSaveStore::default());
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    registry.load().await.unwrap();
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    let task = CustomDomainTask {
+        registry: Arc::clone(&registry),
+        verifier: owner_publishes(Arc::new(BlackholeVerifier), &registry),
+        ..h.task
+    };
+
+    // DNS answers at once. The save then outlasts the 2 second budget.
+    store.delay_secs.store(3, Ordering::SeqCst);
+    task.tick_within(NOW, std::time::Duration::from_secs(2))
+        .await;
+
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_ne!(
+        record.status,
+        DomainStatus::PendingDns,
+        "the save was cut off"
+    );
+}
+
+/// A slow ingress lookup says nothing about the tenant's domain. The renewal
+/// goes ahead, as it does for any other slow lookup.
+#[tokio::test(start_paused = true)]
+async fn a_slow_ingress_lookup_does_not_skip_a_renewal() {
+    struct SlowIngress;
+    impl DomainVerifier for SlowIngress {
+        fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+            Box::pin(async move {
+                if hostname == "ingress.myapp.com" {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+                points_here()
+            })
+        }
+        fn observe_txt<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+            Box::pin(async { ObservedTxt::Values(Vec::new()) })
+        }
+    }
+
+    let issuer = ScriptedIssuer::new(&[]);
+    let mut h = harness(
+        Arc::new(SlowIngress),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.task.ingress = ExpectedIngress {
+        hostname: Some("ingress.myapp.com".to_owned()),
+        ipv4: vec![],
+        ipv6: vec![],
+    };
+    register_due_for_renewal(&h, "renew.clientco.com").await;
+
+    h.task.tick(NOW).await;
+
+    assert_eq!(issuer.calls(), vec!["renew.clientco.com".to_owned()]);
+    let record = h.registry.get("renew.clientco.com").unwrap();
+    assert!(
+        record.failure_reason.is_none(),
+        "{:?}",
+        record.failure_reason
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn hung_renewal_rechecks_run_at_the_same_time_and_time_out() {
     let issuer = ScriptedIssuer::new(&[]);
