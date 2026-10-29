@@ -2,9 +2,10 @@
 //!
 //! The `billing_dunning` row is the schedule. The job payload carries only the
 //! local invoice id; the job reads the row, so a duplicate or early run is a
-//! no-op and a restart re-arms from the store. Every write after the claim is
-//! a compare-and-set on the row's state and attempt, so a reconcile that
-//! settles the row while a retry is in flight wins.
+//! no-op and a restart re-arms from the store. Mirror writes come first. Every
+//! write to the row after the claim is a compare-and-set on its state and
+//! attempt, and the settle is last. A reconcile that settles the row while a
+//! retry is in flight wins.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -373,8 +374,9 @@ async fn recovered(
     if let Some(subscription_id) = &invoice.subscription_id {
         paid = paid.with_subscription(subscription_id.clone());
     }
-    // Mirror first, settle last. A failure here leaves the row `Running`, so
-    // `run_retry` restores it and the next job repeats the idempotent write.
+    // Write the mirror first and settle last. If the write fails, the row
+    // stays `Running`. `run_retry` then restores it, and the next job repeats
+    // the write.
     let invoice = store.upsert_invoice(paid).await?.into_inner();
     let mut settled = row.clone();
     settled.state = DunningState::Recovered;
@@ -450,12 +452,12 @@ async fn declined(
     exhausted(state, service, row, invoice, reason, now).await
 }
 
-/// Every retry failed: the mirror stops entitlement first, then the row
-/// settles, then the provider is told.
+/// Every retry failed. The code stops entitlement in the mirror, settles the
+/// row, and then tells the provider.
 ///
-/// The row stays `Running` until the mirror write lands. A store error
-/// therefore restores the row, and the next job repeats the write. If an event
-/// settles the row first, the mirror write is undone.
+/// The row stays `Running` until the mirror write ends. If the write fails,
+/// `run_retry` restores the row and the next job repeats the write. If an
+/// event settles the row first, the code undoes the mirror write.
 async fn exhausted(
     state: &AppState,
     service: &BillingService,
@@ -488,13 +490,18 @@ async fn exhausted(
     let mut unpaid = None;
     if let Some(subscription_id) = &subscription_id {
         let previous = store.subscription_by_id(subscription_id).await?;
-        unpaid = store
-            .set_subscription_status(subscription_id, SubscriptionStatus::Unpaid, now)
-            .await?;
+        // An ended subscription keeps its status. Its event closes the row.
+        if previous.as_ref().is_none_or(|p| !p.status.is_terminal()) {
+            unpaid = store
+                .set_subscription_status(subscription_id, SubscriptionStatus::Unpaid, now)
+                .await?;
+        }
         if !settle(service, row, exhausted.clone()).await? {
-            // An event settled the row (payment recovered, subscription
-            // ended). Undo our write, unless a newer event replaced it.
-            undo_unpaid(service, subscription_id, previous, now).await?;
+            // An event settled the row first. For example, a payment was
+            // recovered. Undo the `Unpaid` write.
+            if unpaid.is_some() {
+                undo_unpaid(service, subscription_id, previous, now).await?;
+            }
             return Ok(());
         }
     } else if !settle(service, row, exhausted.clone()).await? {
@@ -551,8 +558,11 @@ async fn exhausted(
     Ok(())
 }
 
-/// Put `previous` back after [`exhausted`] lost the settle. Only an `Unpaid`
-/// status is replaced: a newer event may have changed it.
+/// Undo the `Unpaid` write of [`exhausted`] after it loses the settle. Do this
+/// only if the status is still `Unpaid`: a newer event can change it. This is
+/// best effort, because the store has no compare-and-set for the status. A
+/// re-run sees its own earlier `Unpaid` write as `previous`. The fallback is
+/// then `Active`, and the next provider event corrects it.
 async fn undo_unpaid(
     service: &BillingService,
     subscription_id: &str,
@@ -560,17 +570,18 @@ async fn undo_unpaid(
     now: DateTime<Utc>,
 ) -> Result<(), BillingError> {
     let store = service.store();
-    let Some(previous) = previous.filter(|p| p.status != SubscriptionStatus::Unpaid) else {
-        return Ok(());
-    };
+    let restore = previous
+        .map(|p| p.status)
+        .filter(|status| *status != SubscriptionStatus::Unpaid)
+        .unwrap_or(SubscriptionStatus::Active);
     let current = store.subscription_by_id(subscription_id).await?;
     if current.is_some_and(|c| c.status == SubscriptionStatus::Unpaid) {
         store
-            .set_subscription_status(subscription_id, previous.status, now)
+            .set_subscription_status(subscription_id, restore, now)
             .await?;
         tracing::info!(
             subscription_id,
-            "🍂 Autumn Billing: dunning settled elsewhere; unpaid status undone"
+            "🍂 Autumn Billing: dunning settled by an event; unpaid status restored"
         );
     }
     Ok(())
