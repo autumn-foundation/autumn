@@ -23,7 +23,9 @@
 # `Compile-and-serve gates (stable)`, does not change) must map it with
 # `matrix.toolchain == 'stable' && '<pin>' || matrix.toolchain`, and `<pin>`
 # must be the canonical pin. A bare `toolchain: ${{ matrix.toolchain }}` or
-# `toolchain: stable` would float again, so both are rejected.
+# `toolchain: stable` would float again, so both are rejected. A static
+# `toolchain:` value (quotes and a trailing comment are ignored) must be the
+# pin, the MSRV or `nightly`; `stable` only in toolchain-drift.yml.
 #
 # Called from the `msrv` job in ci.yml. Runs locally with:
 #
@@ -45,6 +47,16 @@ EXCEPTIONS=("publish-gate.yml:1.94.1")
 die() {
   echo "error: $*" >&2
   exit 1
+}
+
+# Print a YAML scalar without its trailing `# comment`, spaces and one pair of
+# matching quotes. A lone quote stays, so it fails the allow-list.
+normalize_toolchain() {
+  local v="$1"
+  v="${v%%[[:space:]]#*}"
+  v="${v%"${v##*[![:space:]]}"}"
+  if [[ "$v" =~ ^\"(.*)\"$ || "$v" =~ ^\'(.*)\'$ ]]; then v="${BASH_REMATCH[1]}"; fi
+  printf '%s' "$v"
 }
 
 check_tree() {
@@ -72,7 +84,7 @@ check_tree() {
   [[ -n "$msrv" ]] || die "could not find [workspace.package].rust-version in Cargo.toml"
 
   local failures=0
-  local wf name line ref lineno exc ok
+  local wf name line ref lineno exc ok val
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     name="$(basename "$wf")"
     lineno=0
@@ -111,9 +123,26 @@ check_tree() {
         fi
       fi
 
-      if [[ "$name" != "$DRIFT_WORKFLOW" && "$line" =~ ^[[:space:]]*toolchain:[[:space:]]*stable[[:space:]]*$ ]]; then
-        echo "error: $wf:$lineno floats on 'toolchain: stable'; only $DRIFT_WORKFLOW may" >&2
-        failures=$((failures + 1))
+      # A static `toolchain:` input: quotes and a trailing comment do not
+      # change its meaning, so strip them before the comparison. Expressions
+      # and flow lists are covered by the matrix rules above.
+      if [[ "$line" =~ ^[[:space:]]*-?[[:space:]]*toolchain:[[:space:]]*([^[:space:]].*)$ ]]; then
+        val="$(normalize_toolchain "${BASH_REMATCH[1]}")"
+        if [[ -n "$val" && "$val" != \[* && "$val" != *'${{'* ]]; then
+          ok=0
+          case "$val" in
+            "$pin" | "$msrv" | nightly) ok=1 ;;
+            stable) [[ "$name" == "$DRIFT_WORKFLOW" ]] && ok=1 ;;
+          esac
+          for exc in "${EXCEPTIONS[@]}"; do
+            [[ "$name:$val" == "$exc" ]] && ok=1
+          done
+          if ((ok == 0)); then
+            echo "error: $wf:$lineno sets toolchain: $val; expected the pin ($pin)," \
+              "the MSRV ($msrv) or nightly ('stable' only in $DRIFT_WORKFLOW)" >&2
+            failures=$((failures + 1))
+          fi
+        fi
       fi
     done < "$wf"
   done
@@ -152,11 +181,12 @@ bump_tree() {
     rel="${wf#"$stage"/}"
     # Rewrite via a temp file, not `sed -i`: BSD/macOS sed takes the word after
     # -i as a backup suffix, so `sed -i -E` would swallow -E and match nothing.
-    # Only the two constructs the checker recognises, never prose in a comment;
+    # Only the three constructs the checker recognises, never prose in a comment;
     # a trailing `# comment` on a pin line is kept. The delimiter is `|` because
     # the comment pattern contains a literal `#`.
     sed -E \
       -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*dtolnay/rust-toolchain@)${old_re}([[:space:]]+#.*)?[[:space:]]*\$|\1${new}\2|" \
+      -e "s|^([[:space:]]*-?[[:space:]]*toolchain:[[:space:]]*[\"']?)${old_re}([\"']?)([[:space:]]+#.*)?[[:space:]]*\$|\1${new}\2\3|" \
       -e "s|(matrix\\.toolchain == 'stable' && ')${old_re}(')|\1${new}\2|" \
       "$wf" > "$wf.new"
     mv "$wf.new" "$wf"
@@ -230,6 +260,34 @@ self_test() {
   mk "$tmp/literal" 1.99.0 '    toolchain: stable'
   expect_fail "$tmp/literal" "a literal 'toolchain: stable'"
 
+  # A static `toolchain:` input is normalised (quotes and trailing comment
+  # stripped) and must be the pin, the MSRV or nightly.
+  local i=0 v
+  for v in '"stable"' "'stable'" 'stable # reason' '"stable" # reason' '1.98.0' '"1.98.0"' \
+           "'1.98.0' # old" '"1.99.0'; do
+    i=$((i + 1))
+    mk "$tmp/static-bad-$i" 1.99.0 "- uses: dtolnay/rust-toolchain@master
+  with:
+    toolchain: $v"
+    expect_fail "$tmp/static-bad-$i" "static toolchain: $v"
+  done
+  for v in 1.99.0 '"1.99.0"' "'1.99.0'" '1.99.0 # reason' '"1.88.0" # msrv' nightly "'nightly'" \
+           '"nightly" # edge' '[stable, "1.88.0"]'; do
+    i=$((i + 1))
+    mk "$tmp/static-ok-$i" 1.99.0 "- uses: dtolnay/rust-toolchain@master
+  with:
+    toolchain: $v"
+    expect_ok "$tmp/static-ok-$i" "static toolchain: $v"
+  done
+  mk "$tmp/static-drift" 1.99.0 '- uses: dtolnay/rust-toolchain@master
+  with:
+    toolchain: "stable" # floats on purpose' "$DRIFT_WORKFLOW"
+  expect_ok "$tmp/static-drift" "a quoted static stable in the drift workflow"
+  mk "$tmp/static-exc" 1.99.0 '- uses: dtolnay/rust-toolchain@master
+  with:
+    toolchain: "1.94.1"' publish-gate.yml
+  expect_ok "$tmp/static-exc" "the semver-checks exception as a static input"
+
   mk "$tmp/exception" 1.99.0 '- uses: dtolnay/rust-toolchain@1.94.1' publish-gate.yml
   expect_ok "$tmp/exception" "the documented semver-checks exception"
 
@@ -284,6 +342,25 @@ self_test() {
   ( "$0" --bump "$tmp/comment" 1.100.0 > /dev/null 2>&1 ) || die "self-test: --bump should handle a trailing comment"
   grep -q 'rust-toolchain@1.100.0 # reason$' "$tmp/comment/.github/workflows/ci.yml" \
     || die "self-test: --bump dropped or skipped a pin line with a trailing comment"
+
+  # --bump rewrites a static pin value, keeping quotes and comment; other
+  # static values (MSRV, nightly) stay.
+  mk "$tmp/static-bump" 1.99.0 '- uses: dtolnay/rust-toolchain@master
+  with:
+    toolchain: "1.99.0" # pin
+- uses: dtolnay/rust-toolchain@master
+  with:
+    toolchain: 1.99.0
+- uses: dtolnay/rust-toolchain@master
+  with:
+    toolchain: 1.88.0'
+  ( "$0" --bump "$tmp/static-bump" 1.100.0 > /dev/null 2>&1 ) || die "self-test: --bump should handle a static toolchain"
+  grep -q 'toolchain: "1.100.0" # pin$' "$tmp/static-bump/.github/workflows/ci.yml" \
+    || die "self-test: --bump dropped the quotes or comment of a static pin"
+  grep -q 'toolchain: 1.100.0$' "$tmp/static-bump/.github/workflows/ci.yml" \
+    || die "self-test: --bump skipped a bare static pin"
+  grep -q 'toolchain: 1.88.0$' "$tmp/static-bump/.github/workflows/ci.yml" \
+    || die "self-test: --bump touched a static MSRV"
 
   # A reference the checker recognises but the rewrite cannot reach must fail
   # the bump AND leave every file byte-identical (the all-or-nothing promise).
