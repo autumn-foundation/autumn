@@ -714,19 +714,17 @@ fn file_events(sql: &str) -> Vec<(usize, TableEvent, bool)> {
             events.push((at, TableEvent::Move { from: table, to }, if_exists));
             continue;
         }
-        // An ALTER naming the column may be adding it, dropping it, or
-        // renaming it away. Treating every mention as an add would let
-        // `DROP COLUMN commentable_type` read as proof the column is
-        // present.
+        // Read each comma-separated action alone: a column named inside an
+        // action (`REFERENCES users(id)`) is not a column the action adds.
         events.push((at, TableEvent::Touch(table.clone()), if_exists));
-        for column in REQUIRED_COLUMNS.iter().copied() {
-            if !mentions_column(statement, column) {
-                continue;
-            }
-            if alter_removes_column(statement, column) {
-                events.push((at, TableEvent::Remove(table.clone(), column), if_exists));
-            } else {
-                events.push((at, TableEvent::Add(table.clone(), column), if_exists));
+        for action in split_top_level(statement) {
+            for (column, added) in alter_action_columns(action) {
+                let event = if added {
+                    TableEvent::Add(table.clone(), column)
+                } else {
+                    TableEvent::Remove(table.clone(), column)
+                };
+                events.push((at, event, if_exists));
             }
         }
     }
@@ -920,7 +918,8 @@ fn parse_table_ref(text: &str) -> Option<(TableRef, usize)> {
     rest = strip_keyword(rest, "only");
     let (first, used) = parse_ident_segment(rest)?;
     rest = &rest[used..];
-    let (schema, name) = if let Some(dot) = rest.strip_prefix('.') {
+    // Whitespace may surround the dot: `archive . comments`.
+    let (schema, name) = if let Some(dot) = rest.trim_start().strip_prefix('.') {
         let (second, used) = parse_ident_segment(dot)?;
         rest = &dot[used..];
         (Some(first), second)
@@ -1119,6 +1118,76 @@ fn table_set_schema_target(statement: &str, table: &TableRef) -> Option<TableRef
     })
 }
 
+/// Split `text` at top-level commas: not inside parens or a `'…'` literal.
+fn split_top_level(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut depth, mut in_literal, mut start) = (0usize, false, 0usize);
+    for (at, ch) in text.char_indices() {
+        match ch {
+            '\'' => in_literal = !in_literal,
+            '(' if !in_literal => depth += 1,
+            ')' if !in_literal => depth = depth.saturating_sub(1),
+            ',' if !in_literal && depth == 0 => {
+                parts.push(&text[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// The [`REQUIRED_COLUMNS`] one `ALTER TABLE` action adds (`true`) or removes
+/// (`false`). `ADD [COLUMN] [IF NOT EXISTS] <name> …` adds `<name>` only;
+/// `ADD CONSTRAINT`, `ADD PRIMARY KEY` and the like add no column. Any other
+/// action is a drop or a rename. An action that only names a column
+/// (`ALTER COLUMN … SET NOT NULL`) changes nothing here.
+fn alter_action_columns(action: &str) -> Vec<(&'static str, bool)> {
+    const TABLE_CONSTRAINTS: &[&str] = &[
+        "constraint",
+        "primary",
+        "foreign",
+        "unique",
+        "check",
+        "exclude",
+    ];
+    // The inheritance marker (`ALTER TABLE name *`) may lead the first action.
+    let action = action.trim().trim_start_matches('*').trim_start();
+    let after_add = strip_keyword(action, "add");
+    if after_add.len() != action.len() {
+        let rest = strip_keyword(after_add, "column");
+        let rest = strip_keyword(rest, "if not exists");
+        let quoted = rest.starts_with('"');
+        return parse_ident_segment(rest)
+            .filter(|(name, _)| quoted || !TABLE_CONSTRAINTS.contains(&name.as_str()))
+            .and_then(|(name, _)| REQUIRED_COLUMNS.iter().copied().find(|c| *c == name))
+            .map(|column| (column, true))
+            .into_iter()
+            .collect();
+    }
+    let padded = format!(" {action} ");
+    let renamed_into = padded
+        .split_once(" to ")
+        .filter(|_| padded.contains(" rename "))
+        .map(|(_, to)| to);
+    REQUIRED_COLUMNS
+        .iter()
+        .copied()
+        .filter_map(|column| {
+            if alter_removes_column(&padded, column) {
+                Some((column, false))
+            } else if renamed_into.is_some_and(|to| mentions_column(to, column))
+                && !padded.contains(" rename to ")
+            {
+                Some((column, true))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Whether `haystack` mentions `column` as a complete SQL identifier.
 ///
 /// A bare `contains` would accept `legacy_commentable_type` as
@@ -1147,22 +1216,7 @@ fn declares_column(body: &str, column: &str) -> bool {
         "exclude",
         "like",
     ];
-    let mut elements = Vec::new();
-    let (mut depth, mut in_literal, mut start) = (0usize, false, 0usize);
-    for (at, ch) in body.char_indices() {
-        match ch {
-            '\'' => in_literal = !in_literal,
-            '(' if !in_literal => depth += 1,
-            ')' if !in_literal => depth = depth.saturating_sub(1),
-            ',' if !in_literal && depth == 0 => {
-                elements.push(&body[start..at]);
-                start = at + 1;
-            }
-            _ => {}
-        }
-    }
-    elements.push(&body[start..]);
-    elements.into_iter().any(|element| {
+    split_top_level(body).into_iter().any(|element| {
         let element = element.trim_start();
         // A constraint keyword is only one when unquoted: `"check"` is a column.
         let quoted = element.starts_with('"');
@@ -2609,6 +2663,67 @@ mod tests {
             !already_migrated(tmp.path()),
             "the renamed table is archive.comments, not the shared comments table"
         );
+    }
+
+    /// Write one migration and report whether the scan finds the shared table.
+    fn migrated_after(sql: &str) -> bool {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("migrations").join("0001_history");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join("up.sql"), sql).expect("write");
+        already_migrated(tmp.path())
+    }
+
+    /// Space around the schema dot does not drop the schema (#3035).
+    #[test]
+    fn a_spaced_schema_dot_keeps_the_schema() {
+        let cols = "commentable_type TEXT, commentable_id BIGINT, id BIGINT, parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP";
+        assert!(!migrated_after(&format!(
+            "CREATE TABLE archive . legacy_comments ({cols});\n\
+             ALTER TABLE archive . legacy_comments RENAME TO comments;\n"
+        )));
+        assert!(!migrated_after(&format!(
+            "CREATE TABLE archive. comments ({cols});\n"
+        )));
+        assert!(migrated_after(&format!(
+            "CREATE TABLE public . comments ({cols});\n"
+        )));
+    }
+
+    /// `ADD COLUMN <name> … REFERENCES t(id)` adds `<name>` only (#3035).
+    #[test]
+    fn an_added_column_does_not_add_the_columns_it_mentions() {
+        assert!(!migrated_after(
+            "CREATE TABLE legacy_comments (commentable_type TEXT, commentable_id BIGINT, \
+             parent_id BIGINT, body TEXT, created_at TIMESTAMP, deleted_at TIMESTAMP);\n\
+             ALTER TABLE legacy_comments ADD COLUMN author_id BIGINT REFERENCES users(id);\n\
+             ALTER TABLE legacy_comments RENAME TO comments;\n"
+        ));
+    }
+
+    /// Each comma-separated action is read alone; constraints add no column.
+    #[test]
+    fn alter_actions_are_read_one_by_one() {
+        let base = "CREATE TABLE comments (commentable_type TEXT, commentable_id BIGINT, \
+                    parent_id BIGINT, author_id BIGINT, body TEXT, created_at TIMESTAMP, \
+                    deleted_at TIMESTAMP);\n";
+        assert!(!migrated_after(&format!(
+            "{base}ALTER TABLE comments ADD CONSTRAINT id_ck CHECK (id > 0), \
+             ADD FOREIGN KEY (author_id) REFERENCES users(id);\n"
+        )));
+        assert!(!migrated_after(&format!(
+            "{base}ALTER TABLE comments ADD PRIMARY KEY (id);\n"
+        )));
+        assert!(migrated_after(&format!(
+            "{base}ALTER TABLE comments ADD COLUMN IF NOT EXISTS note NUMERIC(10, 2), \
+             ADD COLUMN id BIGSERIAL PRIMARY KEY;\n"
+        )));
+        assert!(migrated_after(&format!(
+            "{base}ALTER TABLE comments ADD COLUMN id BIGINT DEFAULT 1;\n"
+        )));
+        assert!(migrated_after(&format!(
+            "{base}ALTER TABLE comments RENAME COLUMN uid TO id;\n"
+        )));
     }
 
     /// A parenthesis-free `CREATE TABLE … AS` does not borrow the column list of
