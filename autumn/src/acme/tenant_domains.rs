@@ -463,14 +463,13 @@ impl PruneOnlyCustomDomainPruner {
                 .collect::<std::collections::HashSet<String>>()
         };
         let live = live_ids(fresh.clone());
+        // Only orphans take the exclusive section. A live pair never does.
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|id| !live.contains(id.as_str()))
+            .collect();
         if dry_run {
-            return Ok(candidates
-                .iter()
-                .filter(|id| !live.contains(id.as_str()))
-                .count() as u64);
-        }
-        if candidates.iter().all(|id| live.contains(id.as_str())) {
-            return Ok(0);
+            return Ok(candidates.len() as u64);
         }
         // Delete under `exclusive`. A cert id is a hash, so the hostname is
         // unknown and no single gate fits. No install or offboard runs during
