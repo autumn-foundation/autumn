@@ -4733,11 +4733,13 @@ pub mod db_suppression {
 
     use super::{MailError, SuppressionStore};
 
-    // No query here reads or writes `unsubscribed_at`. Without `postgres`,
-    // diesel has no `Timestamptz`, so use SQLite's type.
-    #[cfg(feature = "postgres")]
+    // The column type follows the runtime backend.
+    // Postgres uses TIMESTAMPTZ. SQLite uses TEXT.
+    // `Timestamptz` has no SQLite impl.
+    // The `postgres` feature can be on when SQLite is the runtime.
+    #[cfg(not(feature = "sqlite"))]
     type UnsubscribedAt = diesel::sql_types::Timestamptz;
-    #[cfg(not(feature = "postgres"))]
+    #[cfg(feature = "sqlite")]
     type UnsubscribedAt = diesel::sql_types::TimestamptzSqlite;
 
     diesel::table! {
@@ -4756,10 +4758,11 @@ pub mod db_suppression {
         list_id: &'a str,
     }
 
-    /// Postgres-backed suppression list keyed by `(subscriber, list_id)`.
+    /// Suppression list keyed by `(subscriber, list_id)`.
     ///
-    /// Backed by the `mail_unsubscribes` table provisioned by the migration that
-    /// `autumn generate mailer --list-unsubscribe` writes into the app.
+    /// It uses the runtime database backend (Postgres or `SQLite`). It stores
+    /// rows in the `mail_unsubscribes` table. `autumn generate mailer
+    /// --list-unsubscribe` writes the migration for that table.
     #[derive(Clone)]
     pub struct DbSuppressionStore {
         pool: Pool<crate::db::RuntimeConnection>,
@@ -4890,6 +4893,70 @@ pub mod db_suppression {
                     })?;
                 Ok(())
             })
+        }
+    }
+
+    // These tests run the SQLite DDL from `generate mailer --list-unsubscribe`.
+    // Keep `DDL` the same as the generator output.
+    #[cfg(all(test, feature = "sqlite"))]
+    mod sqlite_tests {
+        use super::*;
+        use chrono::{DateTime, Utc};
+        use diesel_async::SimpleAsyncConnection;
+
+        const DDL: &str = "CREATE TABLE mail_unsubscribes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subscriber TEXT NOT NULL,
+            list_id TEXT NOT NULL,
+            unsubscribed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (subscriber, list_id)
+        );";
+
+        async fn store() -> (DbSuppressionStore, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let url = format!("sqlite://{}", dir.path().join("mail.db").display());
+            let config = crate::config::DatabaseConfig {
+                url: Some(url),
+                ..Default::default()
+            };
+            let pool = crate::db::create_pool(&config)
+                .expect("pool builds")
+                .expect("url is set");
+            let mut conn = pool.get().await.expect("connection");
+            conn.batch_execute(DDL).await.expect("DDL runs");
+            drop(conn);
+            (DbSuppressionStore::new(pool), dir)
+        }
+
+        #[tokio::test]
+        async fn suppress_round_trips_on_sqlite() {
+            let (store, _dir) = store().await;
+            assert!(!store.is_suppressed("a@x.test", "news").await.unwrap());
+            store.suppress("a@x.test", "news").await.unwrap();
+            store.suppress("a@x.test", "news").await.unwrap();
+            assert!(store.is_suppressed("a@x.test", "news").await.unwrap());
+            assert!(!store.is_suppressed("a@x.test", "other").await.unwrap());
+            let hits = store
+                .is_suppressed_many(&["a@x.test", "b@x.test"], "news")
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert!(hits.contains("a@x.test"));
+        }
+
+        #[tokio::test]
+        async fn unsubscribed_at_is_readable_on_sqlite() {
+            let (store, _dir) = store().await;
+            store.suppress("a@x.test", "news").await.unwrap();
+            let mut conn = store.pool.get().await.expect("connection");
+            let at: Vec<DateTime<Utc>> = mail_unsubscribes::table
+                .select(mail_unsubscribes::unsubscribed_at)
+                .load(&mut conn)
+                .await
+                .expect("typed read of unsubscribed_at");
+            assert_eq!(at.len(), 1);
+            let age = Utc::now() - at[0];
+            assert!(age.num_seconds().abs() < 60, "default is not recent: {age}");
         }
     }
 }

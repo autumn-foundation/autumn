@@ -2345,16 +2345,13 @@ jobs:
             --lib -- plugin_sandbox
           cargo llvm-cov --no-report -p autumn-web --features "plugin-sandbox,test-support" \
             --test integration_tests -- plugin_sandbox
-          # Explicit sqlite+mail lane (#1614). Excluding autumn-cli from the
-          # catch-all removed the only place it compiled autumn-web under the
-          # `sqlite` + `mail` union — exactly the `DbSuppressionStore`
-          # backend-flip #1614 fixed, so coverage must keep compiling it.
-          # Isolated to `-p autumn-web` so the sqlite flip can never leak onto
-          # the Pg-assuming workspace crates. A named sqlite `[[test]]` target
-          # keeps THIS lane narrow; it is no longer "the same rule the
-          # `sqlite-runtime` job follows" — #1905 made the lib unit tests
-          # backend-parametric, so that job now runs a bare `--lib`. Those
-          # tests are executed there, just not measured for coverage here.
+          # Explicit sqlite+mail lane (#1614). It compiles autumn-web with the
+          # `sqlite` and `mail` features, so `DbSuppressionStore` keeps
+          # building on SQLite. The lane uses `-p autumn-web` only. This keeps
+          # the SQLite flip away from the Postgres-only workspace crates. It
+          # runs one named `[[test]]` target to stay narrow. The
+          # `sqlite-runtime` job runs the lib unit tests. They are not
+          # measured for coverage here.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --test sqlite_boot_serve
           # The sqlite URI helpers in `db.rs` (#3032) are covered by lib unit
@@ -2367,9 +2364,11 @@ jobs:
           # lib-test build.
           # `db::sqlite_types::` (#2582) measures the `SQLite` wrappers' schema
           # impls and their unit tests.
+          # `mail::db_suppression::` (#2697) measures the SQLite suppression store.
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,mail" \
             --lib -- db::tests::sqlite_ db::tests::percent_decode db::fleet \
-            fleet_layout:: app::fleet_boot_tests db::sqlite_types::
+            fleet_layout:: app::fleet_boot_tests db::sqlite_types:: \
+            mail::db_suppression::
           # The #1907 durable job queue and lease scheduler are a large slice of
           # sqlite-only code; without this lane Codecov reports all of it
           # uncovered.
@@ -2846,6 +2845,16 @@ jobs:
         # newly-added module rot the same way the pool tests did — silently,
         # because nothing runs it.
         run: cargo test -p autumn-web --features sqlite --lib
+      - name: Run the mail suppression store tests under sqlite
+        # Issue #2697. These tests need the `mail` feature.
+        # The bare `--lib` step above does not enable it.
+        # A filter that matches nothing exits 0, so the step checks the pass count.
+        run: |
+          set -o pipefail
+          cargo test -p autumn-web --features "sqlite,mail" --lib \
+            mail::db_suppression:: | tee "${RUNNER_TEMP}/mail-suppression-sqlite.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/mail-suppression-sqlite.log" \
+            || { echo "::error::no mail suppression sqlite tests ran"; exit 1; }
       - name: Build autumn-admin-plugin under the sqlite backend
         # Issue #2108. The plugin has no `sqlite` feature of its own — a
         # manifest edge would flip the backend for the whole workspace, and

@@ -177,7 +177,8 @@ preference center). Your handler keeps its own CSRF/CAPTCHA protections.
 
 The suppression list lives in **your app database** — no external ESP
 dependency. With the `db` feature and a configured pool, Autumn auto-wires a
-Diesel-backed `DbSuppressionStore` over the `mail_unsubscribes` table. To plug a
+Diesel-backed `DbSuppressionStore` over the `mail_unsubscribes` table. It
+works on Postgres and SQLite. To plug a
 custom backend (e.g. Redis), implement `SuppressionStore` and register it:
 
 ```rust
