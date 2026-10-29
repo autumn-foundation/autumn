@@ -172,6 +172,9 @@ codemod, or a rename-level change left `manual` with no reason (issue #1629).
 first attempt then failed, the provider had no reason to retry, and the event
 was lost (issue #3097).
 
+**Automation:** `manual` — a store must decide what `InFlight` means for it, so
+no codemod applies.
+
 **You are affected only if you implement `BillingStore` or match on
 `EventClaim` or `ReconcileOutcome`.** `EventClaim` is now `#[non_exhaustive]`.
 `ReconcileOutcome` has a new variant. It was already `#[non_exhaustive]`, so a
