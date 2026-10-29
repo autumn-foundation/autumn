@@ -210,6 +210,53 @@ A test that calls `.assert_selector(".wizard-progress")` must use
 **Automation:** `manual` — the selectors are in the app's own stylesheets,
 scripts and tests. A codemod cannot find them reliably.
 
+### Database: `DatabaseFleetConfig` has two new fields
+
+**Why:** a deleted fleet database's replica now goes with it (issue #3235).
+`replica_retention_after_delete` keeps it for an undo window.
+`restore_check_sample` sets the restore check.
+
+**You are affected only if your code builds a `DatabaseFleetConfig` with a
+struct literal** (tests and tools often do). TOML and `AUTUMN_*` config need
+no change: both keys have defaults.
+
+**Before (`{X.Y}`):**
+
+```rust
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    path: None,
+    max_open: 256,
+    pool_size: 2,
+    create_on_demand: None,
+    idle_close_secs: 300,
+    restore_missing: false,
+    ownership: None,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    path: None,
+    max_open: 256,
+    pool_size: 2,
+    create_on_demand: None,
+    idle_close_secs: 300,
+    restore_missing: false,
+    ownership: None,
+    replica_retention_after_delete: std::time::Duration::ZERO,
+    restore_check_sample: 1,
+}
+```
+
+**Automation:** `manual` — a struct literal needs the values the app wants.
+A codemod cannot choose them.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -279,6 +326,20 @@ If nothing changed, delete this section.
 
   To support both schemes, use the tokens (`var(--bg)`, `var(--text)`) for
   the page colors, and see `docs/guide/widget-styling.md#dark-mode`.
+
+- **A fleet delete removes the replica (#3235).** With `[replication]` on,
+  `DatabaseFleet::delete` and `autumn fleet delete` now delete the
+  database's objects in object storage too. Before, they stayed. To keep
+  them for a time, set `database.fleet.replica_retention_after_delete`. A
+  delete now needs the control database: when it cannot write the tombstone
+  row, it fails with `503` and removes nothing.
+- **`restore_missing` does not restore a deleted database (#3235).** Before,
+  the next open of a deleted key restored it from the leftover replica.
+  `fleet.restore` and `autumn fleet restore` still bring it back.
+- **The fleet runs a restore check (#3235).** Every `[replication]
+  verify_interval_secs` (default 6 hours), each process restores one random
+  database into a scratch file. Set `database.fleet.restore_check_sample = 0`
+  to turn it off.
 
 ## Deprecations retained from `{X.Y}`
 

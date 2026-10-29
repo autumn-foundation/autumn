@@ -14,6 +14,10 @@
 //!                                checkpoint run, with nothing unshipped
 //! missing ─► restore_missing = true: rebuild the file from its replica
 //!            before the open, so a fresh volume serves the database
+//! delete  ─► purge the replica, or keep it for the retention; a tombstone
+//!            blocks restore_missing until then (see `fleet_tombstones`)
+//! check   ─► every verify interval: restore a random sample into scratch
+//!            files, check integrity and the identity row
 //! ```
 //!
 //! The databases run with `wal_autocheckpoint = 0`; the replicator is the only
@@ -43,14 +47,19 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use crate::actuator::{HealthCheckOutput, HealthIndicator};
+use crate::entropy::Entropy;
 use crate::fleet_layout::FleetDbKey;
 use crate::replication::destination::ReplicaDestination;
 use crate::replication::engine::{ReplicationSettings, Replicator};
 use crate::replication::restore::{RestoreError, RestoreOutcome};
+use crate::replication::segment;
 use crate::replication::status::ReplicationStatus;
 use crate::time::ClockSource;
 
 use super::fleet::{FleetDatabase, FleetLifecycle};
+use super::fleet_tombstones::{
+    FleetTombstones, MARKER_OBJECT, Marker, PurgeReport, Tombstone, purge_deletes, restore_allowed,
+};
 
 /// Health indicator name of the fleet's replication.
 pub const FLEET_REPLICATION_INDICATOR: &str = "replication:fleet";
@@ -103,6 +112,9 @@ struct ActiveReplica {
     /// Set when a newer ownership epoch writes to the replica (issue #3233).
     /// Such a replica ships nothing more, not even at close.
     fenced: AtomicBool,
+    /// Set when a delete or a restore lets the parked replica go. A tick
+    /// that still holds it ships nothing more.
+    released: AtomicBool,
     /// The replicator's epoch, 0 for none. Written under the replicator
     /// lock; read without it, so a reopen under the same epoch does not wait
     /// for a tick in destination I/O.
@@ -216,6 +228,48 @@ pub struct FleetReplication {
     shutdown_cutoff: Mutex<Option<std::time::Instant>>,
     /// Told when a replicator sees a newer epoch (issue #3233).
     fence_hook: Mutex<Option<FenceHook>>,
+    /// The tombstone rows of deleted databases (issue #3235). `None`: a
+    /// failed purge is not retried.
+    tombstones: Option<Arc<FleetTombstones>>,
+    /// How long a deleted database's replica stays before its purge.
+    retention_after_delete: Duration,
+    /// How often the restore check runs, and how many databases it takes.
+    restore_check: Option<(Duration, usize)>,
+    /// Picks the restore-check sample and names its scratch files.
+    entropy: Arc<dyn Entropy>,
+    /// One purge at a time in this process: a re-create waits for the retry
+    /// task, and the other way round.
+    purge_turn: tokio::sync::Mutex<()>,
+    /// Parked replicas a delete or a restore let go. A purge waits for a
+    /// tick that still holds one.
+    released: Mutex<HashMap<FleetDbKey, std::sync::Weak<ActiveReplica>>>,
+    /// The last purge pass, for health.
+    last_purge: Mutex<Option<PurgeReport>>,
+    /// The last restore check, for health.
+    last_restore_check: Mutex<Option<RestoreCheckReport>>,
+}
+
+/// The result of one restore check (issue #3235). See
+/// [`DatabaseFleet::check_replica_sample`](super::fleet::DatabaseFleet::check_replica_sample).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RestoreCheckReport {
+    /// When the check ran (app clock).
+    pub checked_at: Option<DateTime<Utc>>,
+    /// Databases whose replica restored, passed `PRAGMA integrity_check`
+    /// and carries the right identity row.
+    pub passed: Vec<String>,
+    /// Databases with no replica yet (never opened while replicated).
+    pub unreplicated: Vec<String>,
+    /// Databases whose restore failed, with the reason.
+    pub failed: Vec<(String, String)>,
+}
+
+/// The result of one restore check of one database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RestoreCheck {
+    Passed,
+    NoReplica,
+    Failed(String),
 }
 
 /// Called with the database and the newer epoch a replicator saw.
@@ -249,7 +303,78 @@ impl FleetReplication {
             unshipped: Mutex::new(Vec::new()),
             shutdown_cutoff: Mutex::new(None),
             fence_hook: Mutex::new(None),
+            tombstones: None,
+            retention_after_delete: Duration::ZERO,
+            restore_check: None,
+            entropy: Arc::new(crate::entropy::OsEntropy),
+            purge_turn: tokio::sync::Mutex::new(()),
+            released: Mutex::new(HashMap::new()),
+            last_purge: Mutex::new(None),
+            last_restore_check: Mutex::new(None),
         }
+    }
+
+    /// Keep a tombstone row on the control database for each deleted
+    /// database until its replica is purged (issue #3235). Without it, a
+    /// failed purge is logged and not retried.
+    #[must_use]
+    pub fn with_tombstones(mut self, tombstones: Arc<FleetTombstones>) -> Self {
+        self.tombstones = Some(tombstones);
+        self
+    }
+
+    /// Keep a deleted database's replica for `retention`, then purge it.
+    /// The default, zero, purges at once.
+    #[must_use]
+    pub const fn with_retention_after_delete(mut self, retention: Duration) -> Self {
+        self.retention_after_delete = retention;
+        self
+    }
+
+    /// Restore `sample` random databases every `every` (issue #3235).
+    /// `None` or a sample of 0 turns the check off. The default is off.
+    #[must_use]
+    pub fn with_restore_check(mut self, every: Option<Duration>, sample: usize) -> Self {
+        self.restore_check = every.filter(|_| sample > 0).map(|every| (every, sample));
+        self
+    }
+
+    /// The entropy that picks the restore-check sample. Default: the OS.
+    #[must_use]
+    pub fn with_entropy(mut self, entropy: Arc<dyn Entropy>) -> Self {
+        self.entropy = entropy;
+        self
+    }
+
+    /// The tombstone store, if any.
+    #[must_use]
+    pub const fn tombstones(&self) -> Option<&Arc<FleetTombstones>> {
+        self.tombstones.as_ref()
+    }
+
+    /// How long a deleted database's replica stays.
+    #[must_use]
+    pub const fn retention_after_delete(&self) -> Duration {
+        self.retention_after_delete
+    }
+
+    /// How often the restore check runs, and its sample size.
+    #[must_use]
+    pub const fn restore_check(&self) -> Option<(Duration, usize)> {
+        self.restore_check
+    }
+
+    pub(crate) fn entropy(&self) -> &dyn Entropy {
+        self.entropy.as_ref()
+    }
+
+    pub(crate) const fn purge_turn(&self) -> &tokio::sync::Mutex<()> {
+        &self.purge_turn
+    }
+
+    /// The app clock.
+    pub(crate) fn now(&self) -> DateTime<Utc> {
+        self.clock.now()
     }
 
     /// Tell `hook` when a replicator sees a newer epoch. The fleet installs
@@ -399,6 +524,155 @@ impl FleetReplication {
             .max())
     }
 
+    fn marker_key(&self, key: &FleetDbKey) -> String {
+        format!("{}/{MARKER_OBJECT}", self.root_for(key))
+    }
+
+    /// Write the tombstone marker of `key`. Hosts that do not share the
+    /// control database read it. Blocking.
+    pub(crate) fn write_marker(
+        &self,
+        key: &FleetDbKey,
+        tombstone: &Tombstone,
+    ) -> Result<(), String> {
+        let body = serde_json::to_vec(&Marker::of(tombstone)).map_err(|e| e.to_string())?;
+        self.destination
+            .put(&self.marker_key(key), &body)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The tombstone marker of `key`, if any. Blocking.
+    ///
+    /// # Errors
+    ///
+    /// The destination failed, or the marker cannot be read. An unreadable
+    /// marker refuses the restore: it is not ignored.
+    pub fn marker(&self, key: &FleetDbKey) -> Result<Option<Marker>, String> {
+        match self.destination.get(&self.marker_key(key)) {
+            Ok(body) => serde_json::from_slice(&body)
+                .map(Some)
+                .map_err(|e| format!("unreadable tombstone marker: {e}")),
+            Err(error) if error.is_not_found() => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    /// Remove the tombstone marker of `key`. Blocking.
+    pub(crate) fn delete_marker(&self, key: &FleetDbKey) -> Result<(), String> {
+        self.destination
+            .delete(&self.marker_key(key))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Wait until no tick holds a replica that a delete or a restore of
+    /// `key` let go. Blocking.
+    pub(crate) fn quiesce_released(&self, key: &FleetDbKey) {
+        let released = self
+            .released
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(key);
+        if let Some(replica) = released.and_then(|weak| weak.upgrade()) {
+            drop(lock_replicator(&replica, &|| None));
+        }
+    }
+
+    /// Delete the replica of `key` up to `cutoff` (issue #3235). Blocking.
+    ///
+    /// Deletes each object of a generation created at or before `cutoff`.
+    /// When no newer generation exists, it also deletes the rest (epoch
+    /// markers, the tombstone marker last). A newer generation is a new
+    /// database with the same key: it keeps its objects. Returns the number
+    /// of objects deleted.
+    ///
+    /// # Errors
+    ///
+    /// The destination failed. Some objects can be gone: call again.
+    pub fn purge_replica(&self, key: &FleetDbKey, cutoff: DateTime<Utc>) -> Result<usize, String> {
+        self.quiesce_released(key);
+        let root = self.root_for(key);
+        // The slash: `tenant/acme` is not a prefix of `tenant/acme2`.
+        let objects = self
+            .destination
+            .list(&format!("{root}/"))
+            .map_err(|e| e.to_string())?;
+        let created = |object: &str| {
+            segment::generation_of_key(&root, object)
+                .and_then(|generation| segment::parse_generation_id(&generation))
+                .and_then(|info| DateTime::from_timestamp_millis(info.created_ms))
+        };
+        let newer = objects
+            .iter()
+            .filter_map(|object| created(object))
+            .any(|at| at > cutoff);
+        let marker = self.marker_key(key);
+        let mut deleted = 0;
+        let mut marker_goes = false;
+        for object in &objects {
+            if !purge_deletes(created(object), cutoff, newer) {
+                continue;
+            }
+            if *object == marker {
+                marker_goes = true;
+                continue;
+            }
+            self.destination
+                .delete(object)
+                .map_err(|e| format!("could not delete {object}: {e}"))?;
+            deleted += 1;
+        }
+        // Last: a purge that stops part way stays tombstoned.
+        if marker_goes {
+            self.delete_marker(key)?;
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+
+    /// Restore the replica of `key` into a scratch file under `scratch`,
+    /// check its identity row, and remove the file. The restore itself runs
+    /// `PRAGMA integrity_check`. Blocking.
+    pub(crate) fn check_restore(&self, key: &FleetDbKey, scratch: &Path) -> RestoreCheck {
+        if let Err(error) = std::fs::create_dir_all(scratch) {
+            return RestoreCheck::Failed(format!(
+                "could not create the scratch directory: {error}"
+            ));
+        }
+        let output = scratch.join(format!("{:016x}.db", self.entropy.next_u64()));
+        let name = key.name();
+        let result = match self.restore_to(key, None, &output) {
+            Ok(_) => match super::fleet::read_identity(&output, &name) {
+                Ok(Some(found)) if found == name => RestoreCheck::Passed,
+                Ok(Some(found)) => {
+                    RestoreCheck::Failed(format!("the identity row names {found}, not {name}"))
+                }
+                Ok(None) => RestoreCheck::Failed("the identity row is missing".to_owned()),
+                Err(error) => RestoreCheck::Failed(error.to_string()),
+            },
+            Err(RestoreError::NoReplica { .. }) => RestoreCheck::NoReplica,
+            Err(error) => RestoreCheck::Failed(error.to_string()),
+        };
+        let _ = std::fs::remove_file(&output);
+        for sidecar in crate::fleet_layout::sidecar_paths(&output) {
+            let _ = std::fs::remove_file(sidecar);
+        }
+        result
+    }
+
+    pub(crate) fn record_purge_report(&self, report: PurgeReport) {
+        *self
+            .last_purge
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(report);
+    }
+
+    pub(crate) fn record_restore_check(&self, report: RestoreCheckReport) {
+        *self
+            .last_restore_check
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(report);
+    }
+
     fn active(&self) -> std::sync::MutexGuard<'_, HashMap<FleetDbKey, Arc<ActiveReplica>>> {
         self.active.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -483,6 +757,10 @@ impl FleetReplication {
             let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
                 continue;
             };
+            // Closed since this pass began: its close shipped the last frames.
+            if replica.retired.load(Ordering::Acquire) {
+                continue;
+            }
             if let Err(error) = replicator.tick() {
                 tracing::warn!(database = %key, error = %error, "fleet replication tick failed");
             }
@@ -506,6 +784,10 @@ impl FleetReplication {
             let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
                 continue;
             };
+            // A delete or a restore let it go: its files are being removed.
+            if replica.released.load(Ordering::Acquire) {
+                continue;
+            }
             let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
             let fenced_by = replicator.fenced_by();
             if let Some(newest) = fenced_by {
@@ -648,13 +930,60 @@ impl FleetReplication {
         } else {
             true
         };
-        // A database whose lock cannot be taken is never replicated.
-        let healthy = lag_ok && lock_failures.is_empty();
+        let restore_ok = self.lifecycle_details(&mut details);
+        // A database whose lock cannot be taken is never replicated. A
+        // replica that does not restore is not a backup.
+        let healthy = lag_ok && lock_failures.is_empty() && restore_ok;
         if healthy {
             HealthCheckOutput::up().with_details(details)
         } else {
             HealthCheckOutput::down().with_details(details)
         }
+    }
+
+    /// The tombstone and restore-check details (issue #3235). `false` when
+    /// the last restore check failed.
+    fn lifecycle_details(&self, details: &mut HashMap<String, serde_json::Value>) -> bool {
+        if let Some(purge) = self
+            .last_purge
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            details.insert(
+                "tombstones".to_owned(),
+                serde_json::json!({
+                    "purged": purge.purged,
+                    "failed": purge.failed,
+                    "waiting": purge.waiting,
+                    "last_error": purge.last_error,
+                }),
+            );
+        }
+        let mut restore_ok = true;
+        if let Some(check) = self
+            .last_restore_check
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            restore_ok = check.failed.is_empty();
+            let failed: Vec<serde_json::Value> = check
+                .failed
+                .iter()
+                .map(|(database, error)| serde_json::json!({"database": database, "error": error}))
+                .collect();
+            details.insert(
+                "restore_check".to_owned(),
+                serde_json::json!({
+                    "checked_at": check.checked_at.map(|at| at.to_rfc3339()),
+                    "passed": check.passed.len(),
+                    "unreplicated": check.unreplicated.len(),
+                    "failed": failed,
+                }),
+            );
+        }
+        restore_ok
     }
 }
 
@@ -690,27 +1019,45 @@ impl FleetLifecycle for FleetReplication {
         if !self.restore_missing {
             return Ok(false);
         }
+        let root = self.root_for(key);
+        let plan = match crate::replication::restore::plan(self.destination.as_ref(), &root, None) {
+            Ok(plan) => plan,
+            Err(RestoreError::NoReplica { .. }) => return Ok(false),
+            Err(error) => return Err(format!("restore from replica failed: {error}")),
+        };
+        // A delete on another host leaves a marker. A generation that is
+        // not newer than it is the deleted database (issue #3235).
+        let marker = self.marker(key)?;
+        if !restore_allowed(
+            false,
+            marker.map(|marker| marker.deleted_at()),
+            plan.generation_started_at,
+        ) {
+            tracing::info!(database = %key, "fleet database was deleted: its replica is not restored");
+            return Ok(false);
+        }
         // Restore privately, then publish with a link that refuses an
         // existing target: when two processes restore the same database at
         // once, the first to publish wins and the other opens its file,
         // rather than replacing it under a process already serving it.
         let staging = super::fleet::staging_path(path, "restoring").map_err(|e| e.to_string())?;
-        let result = match self.restore_to(key, None, &staging) {
-            Ok(outcome) => match std::fs::hard_link(&staging, path) {
-                Ok(()) => {
-                    tracing::info!(
-                        database = %key,
-                        bytes = outcome.bytes,
-                        "fleet database restored from its replica"
-                    );
-                    Ok(true)
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(true),
-                Err(e) => Err(format!("could not publish the restored database: {e}")),
-            },
-            Err(RestoreError::NoReplica { .. }) => Ok(false),
-            Err(error) => Err(format!("restore from replica failed: {error}")),
-        };
+        let result =
+            match crate::replication::restore::apply(self.destination.as_ref(), &plan, &staging) {
+                Ok(outcome) => match std::fs::hard_link(&staging, path) {
+                    Ok(()) => {
+                        tracing::info!(
+                            database = %key,
+                            bytes = outcome.bytes,
+                            "fleet database restored from its replica"
+                        );
+                        Ok(true)
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(true),
+                    Err(e) => Err(format!("could not publish the restored database: {e}")),
+                },
+                Err(RestoreError::NoReplica { .. }) => Ok(false),
+                Err(error) => Err(format!("restore from replica failed: {error}")),
+            };
         super::fleet::discard_staging(&staging);
         result
     }
@@ -773,6 +1120,7 @@ impl FleetLifecycle for FleetReplication {
             lock_error: Mutex::new(None),
             retired: AtomicBool::new(false),
             fenced: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             epoch: AtomicU64::new(epoch.unwrap_or(0)),
             path: db.path().to_path_buf(),
             status,
@@ -837,8 +1185,15 @@ impl FleetLifecycle for FleetReplication {
 
     fn release(&self, key: &FleetDbKey) {
         // The files are about to be removed or replaced: a parked replicator
-        // must not hold them open.
-        self.parked().remove(key);
+        // must not hold them open, and must ship nothing more.
+        let Some(replica) = self.parked().remove(key) else {
+            return;
+        };
+        replica.released.store(true, Ordering::Release);
+        self.released
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(key.clone(), Arc::downgrade(&replica));
     }
 }
 
@@ -961,6 +1316,8 @@ mod tests {
             idle_close_secs: 0,
             restore_missing,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
         })
         .build()
         .unwrap();
@@ -1110,6 +1467,8 @@ mod tests {
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
         })
         .build()
         .unwrap();
@@ -1421,6 +1780,8 @@ mod tests {
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
         })
         .build()
         .unwrap();
@@ -1676,6 +2037,8 @@ mod tests {
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
         })
         .build()
         .unwrap();

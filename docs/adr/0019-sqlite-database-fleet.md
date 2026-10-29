@@ -343,6 +343,53 @@ database, a local SQLite file, so it fences the processes of one host only.
 Hosts on different machines need a `SlotOwnershipStore` on a store they all
 reach.
 
+### 8. Replica lifecycle: delete, tombstones, restore check (issue #3235)
+
+A replica that outlives its database breaks two things. A "delete my data"
+request leaves every snapshot and segment behind. And `restore_missing`
+brings a deleted tenant back on its next open. Litestream has the same gap.
+
+- **Delete.** With replication installed, `delete` writes a tombstone row
+  (`_autumn_fleet_tombstones`, pending) on the control database before any
+  file goes. No row, no delete: a crash after the removal must not leave a
+  replica that nothing blocks. After the removal, the row is confirmed: its
+  `deleted_at` is the purge cutoff. A delete that removed nothing drops only
+  its own pending row, never the confirmed row of an older delete. Then the
+  delete writes `<prefix>/tombstone` (a marker for hosts that do not share
+  the control database) and, with no retention, purges the replica. A failed
+  purge does not roll back the local delete. The row keeps the failure and a
+  backoff (`min(1 h, 5 s × 2^attempts)`).
+- **Purge.** List `<prefix>/` (with the slash: `acme` is not a prefix of
+  `acme2`). Delete each object of a generation created at or before the
+  cutoff. Delete the other objects (epoch markers) only when no newer
+  generation exists, and the marker last, so a partial purge stays blocked.
+  A newer generation is a new database with the same key; it keeps its data.
+- **No resurrection.** `restore_missing` restores nothing for a key with a
+  row. On another host, the marker refuses each generation that is not newer
+  than `deleted_at`. An explicit `restore` overrides both and drops them.
+- **Re-create.** A create of a key with a row purges the old replica first
+  and drops the row, or fails with `503`. So a later purge never removes the
+  new database's data, and a later volume loss restores it.
+- **Retry.** The maintenance task runs a purge pass every minute. It purges
+  a due row only when the file is not on disk and this host owns the slot. A
+  pending row whose file is gone is confirmed (the delete stopped after the
+  removal). A pending row whose file is still there and that is older than
+  10 minutes is dropped (the delete stopped before the removal). One purge
+  runs at a time in a process, so a re-create and the pass do not race.
+- **Late ticks.** A tick that began before a close or a release skips the
+  replica, and the purge waits for a tick in flight. So nothing ships into
+  the prefix after the cutoff.
+- **Retention.** `replica_retention_after_delete` keeps the replica for undo.
+  Until it ends, `restore` brings the database back.
+- **Restore check.** Every `[replication] verify_interval_secs`, each process
+  restores `restore_check_sample` random databases into scratch files under
+  the reserved directory. The restore checks the segment chain and
+  `PRAGMA integrity_check`; the check adds the identity row. A failure turns
+  `replication:fleet` `Down`.
+
+The rules are pure functions in `db/fleet_tombstones.rs`. The model and its
+proofs are in `verification/fleet_replica_tombstones.rs`.
+
 ## Consequences
 
 ### Positive
@@ -375,8 +422,11 @@ reach.
 - A replicated database pays one base snapshot per open/close cycle, because
   the replicator's generation state lives in memory. Size `max_open` so hot
   tenants stay open.
-- Replicas are not deleted with their database (Litestream has the same
-  gap). Lifecycle hooks can, and roadmap item 4 will.
+- A delete with replication needs the control database: the tombstone row
+  comes first. A create of a recently deleted key needs object storage: the
+  old replica is purged first.
+- The restore check downloads `restore_check_sample` databases per process
+  per interval.
 - On Windows, deleting or restoring an existing database fails: SQLite opens
   files without delete sharing, so the guard connection blocks the unlink.
   Tracked in issue 3227.
@@ -390,8 +440,8 @@ reach.
    ([#3233](https://github.com/autumn-foundation/autumn/issues/3233)).
 3. **Fleet sweeper.** Done: see section 6
    ([#3234](https://github.com/autumn-foundation/autumn/issues/3234)).
-4. **Replica lifecycle.** Delete a database's replica with it; verify
-   restores by sampling.
+4. **Replica lifecycle.** Done: see section 8
+   ([#3235](https://github.com/autumn-foundation/autumn/issues/3235)).
 5. **Query the lake.** Cross-tenant analytics over the replicas in object
    storage (snapshots plus WAL segments), in the spirit of Athena / DuckDB
    over S3, instead of opening every file on a production volume.
@@ -426,6 +476,12 @@ reach.
   the `fleet:sweeper` health indicator, a closed database not held back by
   busy open ones, and a full fleet that still relays its open ones
   (issue 3350).
+- `autumn/src/db/fleet_tombstones.rs` tests: the rules and a proptest of the
+  model's properties; the store; delete purges the replica and keeps its
+  neighbour; a failing destination leaves a tombstone that the retry purges;
+  `restore_missing` does not resurrect a tombstoned key, on this host or
+  another; retention; re-create; the generation cutoff; the restore check
+  finds a corrupt replica.
 - `autumn/src/db/fleet_ownership.rs` tests: the state machine (claim, renew,
   lapse, release, re-shape) and a proptest of its invariants; two hosts
   racing a claim on one store; the open path's `421`; an old owner closed

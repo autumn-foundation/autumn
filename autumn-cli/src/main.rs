@@ -3522,7 +3522,9 @@ enum FleetCommands {
     },
     /// Remove one database file and its sidecars.
     ///
-    /// Refused when another process has the file open.
+    /// With `[replication]` on, also remove its replica, or keep it for
+    /// `database.fleet.replica_retention_after_delete`. Refused when another
+    /// process has the file open.
     Delete {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]
