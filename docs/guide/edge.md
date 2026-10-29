@@ -396,7 +396,7 @@ web-standard). The conformance suite runs both and requires the same outcome.
   network; the only way out is the dialogue. The conformance suite asserts the
   artifact's import list against that allowlist, so it stays true.
 - **Bounded execution.** The reference host meters every request with a wasmi
-  fuel budget (`autumn_edge::host::FUEL_BUDGET`, ~10⁹ instructions): a capsule
+  fuel budget (`autumn_edge::host::FUEL_BUDGET`, ~10⁹ instructions; host work for `fd_write` also costs fuel): a capsule
   stuck in a loop becomes a `capsule_error` fallthrough — the origin serves the
   request — instead of a hung host. Any production shim should impose its own
   wall-clock or instruction limit the same way.
