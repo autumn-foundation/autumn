@@ -129,7 +129,8 @@ pub fn layout_with_seo(
         (PreEscaped("<!DOCTYPE html>"))
         // The page chrome is English. User content may be in any script, so
         // `lang` states the chrome only.
-        html lang="en" {
+        // Light-only page colors: pin the light scheme (#3396).
+        html lang="en" data-theme="light" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";

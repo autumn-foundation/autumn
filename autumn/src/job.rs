@@ -4354,6 +4354,20 @@ impl JobClient {
             shard_local: false,
         }
     }
+
+    /// A client with no backend that knows job `name` at schema `version`.
+    #[cfg(feature = "sqlite")]
+    pub(crate) fn versioned_for_test(name: &str, version: u32) -> Self {
+        let mut client = Self::bare_for_test(Arc::new(crate::time::SystemClock));
+        client.per_job_settings.insert(
+            name.to_owned(),
+            JobRuntimeSettings {
+                version,
+                ..JobRuntimeSettings::default()
+            },
+        );
+        client
+    }
 }
 
 impl JobClient {
@@ -5464,7 +5478,7 @@ impl JobClient {
     /// unversioned jobs or an unregistered name — registration is validated
     /// separately by each caller. Used by the transactional after-commit
     /// chokepoint, whose typed-args entry points would otherwise store raw args.
-    fn wrap_payload_version(&self, name: &str, payload: Value) -> Value {
+    pub(crate) fn wrap_payload_version(&self, name: &str, payload: Value) -> Value {
         match self.per_job_settings.get(name) {
             Some(settings) if settings.version > 1 => {
                 crate::payload_version::wrap(settings.version, payload)
@@ -23028,6 +23042,32 @@ mod tests {
         );
         let job = received.unwrap().expect("channel should not be closed");
         assert_eq!(job.name, "test_job");
+    }
+
+    /// Codex review on #3473: the outbox relay runs in its own task, so it
+    /// enqueues under the tenant the message stored, and a row from before
+    /// the tenant was stored enqueues with none.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn outbox_job_dispatch_restores_the_stored_tenant() {
+        let (client, mut rx) = make_test_client();
+        let state = AppState::for_test();
+        state.insert_extension(client);
+        for (body, tenant) in [
+            (
+                serde_json::json!({ "name": "test_job", "args": {}, "tenant": "acme" }),
+                Some("acme"),
+            ),
+            (serde_json::json!({ "name": "test_job", "args": {} }), None),
+        ] {
+            let message =
+                crate::outbox::OutboxMessage::new("m", "", "autumn.job", body, chrono::Utc::now());
+            crate::outbox::run_job_enqueue(state.clone(), message)
+                .await
+                .expect("relay enqueue");
+            let job = rx.recv().await.expect("queued job");
+            assert_eq!(job.tenant.as_deref(), tenant);
+        }
     }
 
     #[tokio::test]

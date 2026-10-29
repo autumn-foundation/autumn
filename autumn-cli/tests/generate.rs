@@ -7533,8 +7533,8 @@ fn generate_wizard_creates_expected_files() {
         "test file missing cancel test"
     );
     assert!(
-        test.contains(".wizard-progress"),
-        "test file must reference the .wizard-progress CSS selector"
+        test.contains(".autumn-wizard-progress"),
+        "test file must reference the .autumn-wizard-progress CSS selector"
     );
     assert!(
         test.contains("#[ignore"),

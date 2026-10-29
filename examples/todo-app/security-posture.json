@@ -20,7 +20,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:332",
+          "location": "examples/todo-app/src/routes/todos.rs:333",
           "provenance": "provable"
         },
         {
@@ -270,7 +270,7 @@
           "provenance": "provable"
         },
         {
-          "path": "/static/js/autumn-widgets.68220dec.js",
+          "path": "/static/js/autumn-widgets.d67cc7d4.js",
           "method": "GET",
           "name": "autumn_widgets",
           "classification": "framework",
@@ -377,7 +377,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:342",
+          "location": "examples/todo-app/src/routes/todos.rs:343",
           "provenance": "provable"
         },
         {
@@ -389,7 +389,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:467",
+          "location": "examples/todo-app/src/routes/todos.rs:468",
           "provenance": "provable"
         },
         {
@@ -413,7 +413,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:493",
+          "location": "examples/todo-app/src/routes/todos.rs:494",
           "provenance": "provable"
         },
         {
@@ -437,7 +437,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:457",
+          "location": "examples/todo-app/src/routes/todos.rs:458",
           "provenance": "provable"
         },
         {
@@ -449,7 +449,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:574",
+          "location": "examples/todo-app/src/routes/todos.rs:575",
           "provenance": "provable"
         },
         {
@@ -461,7 +461,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:424",
+          "location": "examples/todo-app/src/routes/todos.rs:425",
           "provenance": "provable"
         },
         {
@@ -473,7 +473,7 @@
           "scopes": [],
           "policy": false,
           "source": "user",
-          "location": "examples/todo-app/src/routes/todos.rs:541",
+          "location": "examples/todo-app/src/routes/todos.rs:542",
           "provenance": "provable"
         }
       ]
@@ -696,7 +696,7 @@
           "mtls_required": false
         },
         {
-          "path": "/static/js/autumn-widgets.68220dec.js",
+          "path": "/static/js/autumn-widgets.d67cc7d4.js",
           "method": "GET",
           "mtls_required": false
         },

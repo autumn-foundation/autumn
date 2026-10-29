@@ -335,6 +335,23 @@ pub(super) fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Navigation",
+            "Theme toggle",
+            {
+                use autumn_web::ui::theme::Theme;
+                use autumn_web::widgets::{BadgeVariant, ThemeToggleConfig, badge, theme_toggle};
+
+                // With autumn-widgets.js the choice applies in place. Without
+                // JS the form posts to THEME_PATH; mount ui::theme::router().
+                maud::html! {
+                    (theme_toggle(&ThemeToggleConfig::new(Theme::System)))
+                    div data-theme="dark" class="story-preview" {
+                        p { "data-theme=\"dark\" on a subtree: " (badge("Dark", BadgeVariant::Info)) }
+                    }
+                }
+            }
+        },
+        story! {
             "Marketing",
             "Hero",
             {

@@ -15,10 +15,26 @@ use maud::html;
 #[test]
 fn variant_maps_to_role_and_class() {
     for (variant, role, class) in [
-        (AlertVariant::Info, "status", "alert alert-info"),
-        (AlertVariant::Success, "status", "alert alert-success"),
-        (AlertVariant::Warning, "alert", "alert alert-warning"),
-        (AlertVariant::Error, "alert", "alert alert-error"),
+        (
+            AlertVariant::Info,
+            "status",
+            "autumn-alert autumn-alert--info",
+        ),
+        (
+            AlertVariant::Success,
+            "status",
+            "autumn-alert autumn-alert--success",
+        ),
+        (
+            AlertVariant::Warning,
+            "alert",
+            "autumn-alert autumn-alert--warning",
+        ),
+        (
+            AlertVariant::Error,
+            "alert",
+            "autumn-alert autumn-alert--error",
+        ),
     ] {
         let out = alert(variant, html! { "hi" }).into_string();
         assert!(out.contains(&format!(r#"role="{role}""#)), "{out}");
@@ -38,7 +54,7 @@ fn as_str_matches_flash_level_names() {
 fn body_is_rendered() {
     let out = alert(AlertVariant::Info, html! { p { "No posts yet." } }).into_string();
     assert!(out.contains("<p>No posts yet.</p>"), "{out}");
-    assert!(out.contains(r#"class="alert__body""#), "{out}");
+    assert!(out.contains(r#"class="autumn-alert__body""#), "{out}");
 }
 
 // ── builder: title / icon / dismiss ──────────────────────────────────────────
@@ -52,7 +68,7 @@ fn title_renders_as_heading() {
     )
     .into_string();
     assert!(
-        out.contains(r#"<h2 class="alert__title">Payment failed</h2>"#),
+        out.contains(r#"<h2 class="autumn-alert__title">Payment failed</h2>"#),
         "{out}"
     );
 }
@@ -78,7 +94,7 @@ fn icon_is_inline_svg_and_opt_in() {
 fn dismiss_control_is_opt_in_and_js_free() {
     let plain = alert(AlertVariant::Warning, html! { "b" }).into_string();
     assert!(
-        !plain.contains("alert__dismiss"),
+        !plain.contains("autumn-alert__dismiss"),
         "no close control by default: {plain}"
     );
     assert!(!plain.contains("<script"), "no JS: {plain}");
@@ -89,18 +105,21 @@ fn dismiss_control_is_opt_in_and_js_free() {
         &AlertConfig::new().dismissible(true),
     )
     .into_string();
-    assert!(dismissible.contains("alert__dismiss"), "{dismissible}");
+    assert!(
+        dismissible.contains("autumn-alert__dismiss"),
+        "{dismissible}"
+    );
     assert!(dismissible.contains(r#"type="checkbox""#), "{dismissible}");
     assert!(!dismissible.contains("<script"), "zero JS: {dismissible}");
     assert!(!dismissible.contains("onclick"), "zero JS: {dismissible}");
     // WCAG 2.1.1: the toggle must NOT be `hidden` (that removes it from tab
-    // order) — it stays focusable via the sr-only `alert__dismiss-toggle` class.
+    // order) — it stays focusable via the sr-only `autumn-alert__dismiss-toggle` class.
     assert!(
-        !dismissible.contains(r#"alert__dismiss-toggle" hidden"#),
+        !dismissible.contains(r#"autumn-alert__dismiss-toggle" hidden"#),
         "toggle must not be `hidden`: {dismissible}"
     );
     assert!(
-        dismissible.contains("alert__dismiss-toggle"),
+        dismissible.contains("autumn-alert__dismiss-toggle"),
         "sr-only focusable toggle class present: {dismissible}"
     );
     // The accessible name is on the focusable control itself.
@@ -110,7 +129,7 @@ fn dismiss_control_is_opt_in_and_js_free() {
     );
     // The sr-only rule is shipped (visually hidden but focusable, not display:none).
     assert!(
-        autumn_web::ui::WIDGETS_COMPONENT_CSS.contains(".alert__dismiss-toggle")
+        autumn_web::ui::WIDGETS_COMPONENT_CSS.contains(".autumn-alert__dismiss-toggle")
             && autumn_web::ui::WIDGETS_COMPONENT_CSS.contains("clip-path: inset(50%)"),
         "sr-only CSS for the toggle must ship"
     );
@@ -167,7 +186,10 @@ fn error_summary_lists_all_field_errors_as_error_alert() {
     let changeset = Changeset::from_errors((), errors);
 
     let out = error_summary(&changeset).unwrap().into_string();
-    assert!(out.contains(r#"class="alert alert-error""#), "{out}");
+    assert!(
+        out.contains(r#"class="autumn-alert autumn-alert--error""#),
+        "{out}"
+    );
     assert!(out.contains(r#"role="alert""#), "{out}");
     assert!(out.contains("<ul"), "{out}");
     assert!(out.contains("is invalid"), "{out}");

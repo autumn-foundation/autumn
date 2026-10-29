@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-/// Widget source files that emit `autumn-*`/`wizard-*` classes meant to be
+/// Widget source files that emit `autumn-*` classes meant to be
 /// styled by the shared framework stylesheet. Deliberately excludes:
 /// - `src/error_pages/dev_badge.rs` — ships its own inline `<style>`;
 ///   `autumn-dev-*` classes are self-styled, not part of the shared sheet.
@@ -26,11 +26,11 @@ const WIDGET_SOURCES: &[&str] = &[
     "src/job_tracking.rs",
 ];
 
-/// Class-name prefixes the shared stylesheet backs — `autumn-` for
-/// form/nav/modal/etc., `wizard-` for the wizard progress stepper.
-const CLASS_PREFIXES: &[&str] = &["autumn-", "wizard-"];
+/// Class-name prefixes the shared stylesheet backs. Since #3396 every widget
+/// class has the `autumn-` prefix.
+const CLASS_PREFIXES: &[&str] = &["autumn-"];
 
-/// Extracts every `autumn-*`/`wizard-*` token emitted as a CSS class by the
+/// Extracts every `autumn-*` token emitted as a CSS class by the
 /// production code in `source` (as opposed to a `data-*` attribute name,
 /// doc-comment prose, or a test-only fixture string).
 fn emitted_classes(source: &str) -> Vec<String> {
@@ -51,7 +51,7 @@ fn emitted_classes(source: &str) -> Vec<String> {
         let bytes = code.as_bytes();
         for prefix in CLASS_PREFIXES {
             for (start, _) in code.match_indices(prefix) {
-                // Skip `data-autumn-*`/`data-wizard-*` attribute names — not a CSS class.
+                // Skip `data-autumn-*` attribute names — not a CSS class.
                 if start > 0 && bytes[start - 1] == b'-' {
                     continue;
                 }
@@ -144,12 +144,72 @@ fn widgets_css_path_and_selectors_are_stable() {
         ".autumn-property-list",
         ".autumn-direct-upload",
         ".autumn-job-status",
-        ".wizard-progress",
-        ".wizard-step",
+        ".autumn-wizard-progress",
+        ".autumn-wizard-step",
+        ".autumn-alert",
+        ".autumn-badge",
+        ".autumn-theme-toggle",
     ] {
         assert!(
             autumn_web::ui::WIDGETS_COMPONENT_CSS.contains(selector),
             "missing selector {selector} in WIDGETS_COMPONENT_CSS"
         );
     }
+}
+
+/// Issue #3396: `alert`, `badge` and `wizard-*` got the `autumn-` prefix.
+/// Neither the widgets nor the stylesheet may use the old names.
+#[test]
+fn legacy_unprefixed_classes_are_gone() {
+    fn starts_legacy(rest: &str) -> bool {
+        ["alert", "badge", "wizard-"].iter().any(|old| {
+            rest.strip_prefix(old).is_some_and(|tail| {
+                old.ends_with('-')
+                    || tail.is_empty()
+                    || !tail.starts_with(|c: char| c.is_ascii_alphanumeric())
+            })
+        })
+    }
+
+    let css = autumn_web::ui::WIDGETS_COMPONENT_CSS;
+    let legacy_selectors: Vec<&str> = css
+        .match_indices('.')
+        .filter(|(i, _)| starts_legacy(&css[i + 1..]))
+        .map(|(i, _)| css[i..].lines().next().unwrap_or_default())
+        .collect();
+    assert!(
+        legacy_selectors.is_empty(),
+        "unprefixed selectors in widgets.css: {legacy_selectors:?}"
+    );
+
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for path in WIDGET_SOURCES {
+        let source = std::fs::read_to_string(manifest_dir.join(path)).unwrap();
+        for line in source.lines().take_while(|l| l.trim() != "mod tests {") {
+            let code = line.split("//").next().unwrap_or("");
+            for (i, _) in code.match_indices("class=\"") {
+                let value = &code[i + 7..];
+                let value = &value[..value.find('"').unwrap_or(value.len())];
+                for class in value.split_whitespace() {
+                    assert!(!starts_legacy(class), "{path} emits `{class}`: {line}");
+                }
+            }
+        }
+    }
+
+    let alert = autumn_web::widgets::alert(
+        autumn_web::widgets::AlertVariant::Error,
+        maud::html! { "x" },
+    )
+    .into_string();
+    assert!(
+        alert.contains(r#"class="autumn-alert autumn-alert--error""#),
+        "{alert}"
+    );
+    let badge =
+        autumn_web::widgets::badge("x", autumn_web::widgets::BadgeVariant::Danger).into_string();
+    assert!(
+        badge.contains(r#"class="autumn-badge autumn-badge--danger""#),
+        "{badge}"
+    );
 }

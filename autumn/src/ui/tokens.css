@@ -1,20 +1,122 @@
+/* Autumn design tokens v2 (#3396).
+   Colors: light-dark(<light>, <dark>). The OS selects the scheme.
+   data-theme="light|dark" overrides it on any element. */
 :root {
-    --bg: #f9fafb;
-    --surface: #ffffff;
-    --text: #111827;
-    --text-muted: #6b7280;
-    --border: #e5e7eb;
-    --primary: #7c3aed;
-    --primary-hover: #6d28d9;
-    --primary-light: #ede9fe;
-    --danger: #dc2626;
-    --danger-hover: #b91c1c;
-    --danger-light: #fee2e2;
-    --success: #059669;
-    --success-light: #ecfdf5;
-    --warning: #d97706;
-    --warning-light: #fffbeb;
-    --radius: 0.5rem;
-    --shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
+    color-scheme: light dark;
+
+    --bg: light-dark(#f9fafb, #0f1117);
+    --surface: light-dark(#ffffff, #181b24);
+    --surface-muted: light-dark(#f1f5f9, #262a38);
+    --text: light-dark(#111827, #e6e8ef);
+    --text-muted: light-dark(#666e7b, #a1a7b8);
+    --border: light-dark(#e5e7eb, #363c50);
+    /* A text input's only boundary: 3:1 on every surface (WCAG 1.4.11). */
+    --control-border: light-dark(#848b98, #70778e);
+    --primary: light-dark(#7c3aed, #a78bfa);
+    --primary-hover: light-dark(#6d28d9, #c4b5fd);
+    --primary-light: light-dark(#ede9fe, #2e1f5c);
+    --on-primary: light-dark(#ffffff, #1a1033);
+    --danger: light-dark(#dc2626, #f87171);
+    --danger-hover: light-dark(#b91c1c, #fca5a5);
+    --danger-light: light-dark(#fee2e2, #3f1518);
+    --on-danger: light-dark(#ffffff, #2a0a0a);
+    --success: light-dark(#059669, #34d399);
+    --success-light: light-dark(#ecfdf5, #0f2e24);
+    --success-text: light-dark(#065f46, #6ee7b7);
+    --warning: light-dark(#d97706, #fbbf24);
+    --warning-light: light-dark(#fffbeb, #33260a);
+    --warning-text: light-dark(#92400e, #fcd34d);
+    --info: light-dark(#1e3a8a, #93c5fd);
+    --info-light: light-dark(#eff6ff, #172036);
+
+    --shadow: 0 1px 3px light-dark(rgb(0 0 0 / 10%), rgb(0 0 0 / 50%)), 0 1px 2px light-dark(rgb(0 0 0 / 6%), rgb(0 0 0 / 30%));
+
+    /* Type scale. */
     --font-family: system-ui, -apple-system, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --font-size-xs: 0.75rem;
+    --font-size-sm: 0.875rem;
+    --font-size-md: 1rem;
+    --font-size-lg: 1.125rem;
+    --font-size-xl: 1.25rem;
+    --font-size-2xl: 1.5rem;
+    --line-height-tight: 1.25;
+    --line-height-normal: 1.5;
+    --font-weight-normal: 400;
+    --font-weight-medium: 500;
+    --font-weight-semibold: 600;
+    --font-weight-bold: 700;
+
+    /* Radius scale. --radius is the default control radius. */
+    --radius-sm: 0.25rem;
+    --radius-md: 0.5rem;
+    --radius-lg: 0.75rem;
+    --radius-full: 9999px;
+    --radius: var(--radius-md);
+
+    /* Z-index scale. */
+    --z-dropdown: 50;
+    --z-sticky: 100;
+    --z-banner: 1000;
+    --z-toast: 1100;
+
+    /* Breakpoints. For reference only: @media cannot read var(). */
+    --breakpoint-sm: 640px;
+    --breakpoint-md: 768px;
+    --breakpoint-lg: 1024px;
+    --breakpoint-xl: 1280px;
+
+    --density-scale: 1;
+}
+
+/* Space scale. The [data-density] rule declares it again. Thus a subtree
+   with its own density gets new values. */
+:root,
+[data-density] {
+    --space-1: calc(0.25rem * var(--density-scale));
+    --space-2: calc(0.5rem * var(--density-scale));
+    --space-3: calc(0.75rem * var(--density-scale));
+    --space-4: calc(1rem * var(--density-scale));
+    --space-5: calc(1.25rem * var(--density-scale));
+    --space-6: calc(1.5rem * var(--density-scale));
+    --space-8: calc(2rem * var(--density-scale));
+}
+
+[data-density="compact"] { --density-scale: 0.75; }
+[data-density="comfortable"] { --density-scale: 1; }
+[data-density="spacious"] { --density-scale: 1.25; }
+
+[data-theme="light"] { color-scheme: light; }
+[data-theme="dark"] { color-scheme: dark; }
+
+/* Browsers without light-dark(): the light values, in the light scheme. */
+@supports not (color: light-dark(#000, #fff)) {
+    :root {
+        color-scheme: light;
+        --bg: #f9fafb;
+        --surface: #ffffff;
+        --surface-muted: #f1f5f9;
+        --text: #111827;
+        --text-muted: #666e7b;
+        --border: #e5e7eb;
+        --control-border: #848b98;
+        --primary: #7c3aed;
+        --primary-hover: #6d28d9;
+        --primary-light: #ede9fe;
+        --on-primary: #ffffff;
+        --danger: #dc2626;
+        --danger-hover: #b91c1c;
+        --danger-light: #fee2e2;
+        --on-danger: #ffffff;
+        --success: #059669;
+        --success-light: #ecfdf5;
+        --success-text: #065f46;
+        --warning: #d97706;
+        --warning-light: #fffbeb;
+        --warning-text: #92400e;
+        --info: #1e3a8a;
+        --info-light: #eff6ff;
+        --shadow: 0 1px 3px rgb(0 0 0 / 10%), 0 1px 2px rgb(0 0 0 / 6%);
+    }
+    [data-theme] { color-scheme: light; }
 }

@@ -636,7 +636,7 @@ impl Outbox {
             .filter(|listener| listener.mode == crate::events::DispatchMode::Durable)
             .filter_map(|listener| listener.job_name.as_deref())
         {
-            let body = serde_json::json!({ "name": job_name, "args": payload });
+            let body = self.job_body(job_name, payload.clone());
             if let Err(error) = self.insert(conn, None, TOPIC_EVENT, &body).await {
                 first_error.get_or_insert(error);
             }
@@ -663,8 +663,30 @@ impl Outbox {
         args: &A,
     ) -> AutumnResult<String> {
         let args = to_json(args, &format!("job {name} args"))?;
-        let body = serde_json::json!({ "name": name, "args": args });
+        let body = self.job_body(name, args);
         self.insert(conn, None, TOPIC_JOB, &body).await
+    }
+
+    /// The stored body of a job enqueue, as the after-commit path keeps it.
+    ///
+    /// The args get the schema-version envelope of the job now, not at relay
+    /// time, so a message that outlives a deploy keeps the version it was
+    /// written at. The enqueuing tenant goes in too: the relay runs in its own
+    /// task, and without it the job loses its tenant lane and cost tenant.
+    fn job_body(&self, name: &str, args: Value) -> Value {
+        let client = self
+            .state
+            .extension::<crate::job::JobClient>()
+            .or_else(crate::job::global_job_client);
+        let args = match client {
+            Some(client) => client.wrap_payload_version(name, args),
+            None => args,
+        };
+        let mut body = serde_json::json!({ "name": name, "args": args });
+        if let Some(tenant) = crate::cost::enqueuing_tenant() {
+            body["tenant"] = Value::String(tenant);
+        }
+        body
     }
 
     /// Deliver `mail` through the outbox. Returns the message id.
@@ -1607,14 +1629,22 @@ pub(crate) fn start_relay_worker(
 struct JobBody {
     name: String,
     args: Value,
+    /// The enqueuing tenant. Rows written before it was stored have none.
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
-async fn run_job_enqueue(state: AppState, message: OutboxMessage) -> AutumnResult<()> {
+pub(crate) async fn run_job_enqueue(state: AppState, message: OutboxMessage) -> AutumnResult<()> {
     let body: JobBody = message.payload_as()?;
-    match state.extension::<crate::job::JobClient>() {
-        Some(client) => client.enqueue(&body.name, body.args).await,
-        None => crate::job::enqueue(&body.name, body.args).await,
-    }
+    // The enqueue tenant only: it sets the job's lane and cost tenant, and
+    // does not scope repository queries the way `CURRENT_TENANT` would.
+    crate::cost::with_enqueue_tenant(body.tenant, async move {
+        match state.extension::<crate::job::JobClient>() {
+            Some(client) => client.enqueue(&body.name, body.args).await,
+            None => crate::job::enqueue(&body.name, body.args).await,
+        }
+    })
+    .await
 }
 
 #[cfg(feature = "mail")]

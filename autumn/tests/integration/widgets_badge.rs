@@ -14,11 +14,11 @@ use maud::html;
 #[test]
 fn each_variant_emits_stable_semantic_class() {
     for (variant, class) in [
-        (BadgeVariant::Neutral, "badge badge--neutral"),
-        (BadgeVariant::Info, "badge badge--info"),
-        (BadgeVariant::Success, "badge badge--success"),
-        (BadgeVariant::Warning, "badge badge--warning"),
-        (BadgeVariant::Danger, "badge badge--danger"),
+        (BadgeVariant::Neutral, "autumn-badge autumn-badge--neutral"),
+        (BadgeVariant::Info, "autumn-badge autumn-badge--info"),
+        (BadgeVariant::Success, "autumn-badge autumn-badge--success"),
+        (BadgeVariant::Warning, "autumn-badge autumn-badge--warning"),
+        (BadgeVariant::Danger, "autumn-badge autumn-badge--danger"),
     ] {
         let out = badge("Label", variant).into_string();
         assert!(out.contains(&format!(r#"class="{class}""#)), "{out}");
@@ -45,7 +45,10 @@ fn badge_escapes_label() {
 #[test]
 fn status_tag_renders_neutral_badge() {
     let out = status_tag("Archived").into_string();
-    assert!(out.contains(r#"class="badge badge--neutral""#), "{out}");
+    assert!(
+        out.contains(r#"class="autumn-badge autumn-badge--neutral""#),
+        "{out}"
+    );
     assert!(out.contains(">Archived<"), "{out}");
 }
 
@@ -78,7 +81,7 @@ fn for_label_is_deterministic_for_unknown_values() {
     assert_eq!(a, b);
     // Unknown values still map to a colored (never inline-styled) variant.
     let out = badge("wibble-status-42", a).into_string();
-    assert!(out.contains("badge badge--"), "{out}");
+    assert!(out.contains("autumn-badge autumn-badge--"), "{out}");
 }
 
 // ── config: title / aria-label ───────────────────────────────────────────────
@@ -122,6 +125,12 @@ fn badge_renders_inside_a_data_table_cell() {
         }),
     ];
     let out = data_table(&posts, &cols, &DataTableConfig::new("No posts.")).into_string();
-    assert!(out.contains("badge--success"), "published → success: {out}");
-    assert!(out.contains("badge--warning"), "draft → warning: {out}");
+    assert!(
+        out.contains("autumn-badge--success"),
+        "published → success: {out}"
+    );
+    assert!(
+        out.contains("autumn-badge--warning"),
+        "draft → warning: {out}"
+    );
 }
