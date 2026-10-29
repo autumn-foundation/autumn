@@ -266,9 +266,9 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
 - **Experimental surface changed:** {the API and what changed — or "none".
   Experimental surface may change in any release, so this is a courtesy, not a
   promise. Plugins that declared it with `uses_experimental` are the audience.}
-- **New stable surface:** {additive APIs plugin authors can now rely on — or
-  "none". These are not breaking; they are why a plugin author reads this
-  section for the good news too.}
+- **New stable surface:** `plugin_conformance::is_sensitive_path`,
+  `normalize_path_for_collision` and `is_plugin_asset_path` are public.
+  The plugin-check CLI uses the same rules. Nothing else changed.
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
