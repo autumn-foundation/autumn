@@ -11578,12 +11578,12 @@ fn pg_claim_sql() -> String {
     // so `idx_autumn_jobs_queue_ready (queue, run_at)` serves the head of each
     // queue and the claim touches O(queues) rows instead of sorting the whole
     // ready backlog of every polled queue (`ORDER BY array_position(..)` is
-    // opaque to the planner). The outer `ORDER BY q.ord, picked.run_at` keeps
-    // the original order: earliest-listed queue first, oldest `run_at` within it.
-    // Row locks are taken per probe, so a probe may briefly lock the head of a
-    // lower-priority queue that the outer `LIMIT 1` then discards; the locks
-    // drop when the statement ends and only make a concurrent claim skip that
-    // row for that instant.
+    // opaque to the planner). Each probe returns one row at most, so the outer
+    // `ORDER BY q.ord` keeps the original order: first listed queue, then
+    // oldest `run_at`. `WITH ORDINALITY` output is sorted on `ord`, so Postgres
+    // does not sort and stops at the first probe that returns a row. Thus the
+    // claim locks only the row it claims (issue #3182). Do not add a second
+    // sort key: then Postgres also runs the next probe and locks its row.
     format!(
         "UPDATE autumn_jobs \
          SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
@@ -11607,7 +11607,7 @@ fn pg_claim_sql() -> String {
              LIMIT 1 \
              FOR UPDATE SKIP LOCKED \
            ) picked \
-           ORDER BY q.ord, picked.run_at \
+           ORDER BY q.ord \
            LIMIT 1 \
          ) \
          RETURNING {PG_JOB_SELECT_COLS}"
@@ -11674,8 +11674,7 @@ fn pg_claim_sql_single_queue() -> String {
 /// so a name with a large saturated backlog is never scanned past the point the
 /// plain claim would have stopped at. The claimed row is the one
 /// `pg_claim_sql_single_queue` would pick (ties on `run_at` stay unordered, as
-/// before). Row locks are taken per probe and drop with the statement, as in the
-/// multi-queue claim.
+/// before). Row locks are taken per probe and drop with the statement.
 ///
 /// `heads` is referenced twice (the walk's base term tests it) so Postgres 12+
 /// materializes it instead of inlining it into every iteration; `AS MATERIALIZED`
@@ -21405,9 +21404,7 @@ mod tests {
         /// drop `autumn_jobs` on that server.
         async fn pg_claim_test_url() -> (
             String,
-            Option<
-                testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>,
-            >,
+            Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
         ) {
             use testcontainers::ImageExt as _;
             use testcontainers::runners::AsyncRunner as _;
@@ -21583,7 +21580,10 @@ mod tests {
                 .await
                 .unwrap();
                 assert_eq!(stats.calls, CLAIMS);
-                assert_eq!(stats.temp_written, 0, "backlog {backlog}: the claim spilled");
+                assert_eq!(
+                    stats.temp_written, 0,
+                    "backlog {backlog}: the claim spilled"
+                );
                 per_claim.push((backlog, stats.buffers as f64 / CLAIMS as f64));
             }
 
