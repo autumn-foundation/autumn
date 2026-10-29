@@ -384,7 +384,7 @@ const STORY_TABS: [(&str, &str); 3] = [
 /// Press `key` and check that tab `want` has focus, is selected and shows
 /// its panel.
 async fn tab_step(page: &Page, key: &str, want: usize) -> Result<(), String> {
-    let (tab, panel) = STORY_TABS[want];
+    let (tab, _) = STORY_TABS[want];
     page.press(key).await.map_err(|e| e.to_string())?;
     let focused = active_id(page).await;
     let selected = eval_bool(
