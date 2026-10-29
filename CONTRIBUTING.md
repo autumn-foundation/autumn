@@ -480,7 +480,9 @@ the compiler's diagnostic text verbatim, are only valid for one compiler.
 - The pin is the single line in `.github/RUST_TOOLCHAIN`. Every
   `dtolnay/rust-toolchain@<version>` in `.github/workflows/` repeats it.
   `./scripts/check-toolchain-pin.sh` (run by the `MSRV` job) fails if any
-  reference disagrees, or if something floats on `stable` again.
+  reference disagrees, or if something floats on `stable` again. A static
+  `toolchain:` input must be the pin, the MSRV or `nightly`. Quotes and a
+  trailing comment do not hide a wrong value.
 - The matrix jobs keep `stable` as their *label*, so required-check names like
   `Compile-and-serve gates (stable)` do not change, and map it to the pin.
 - `.github/workflows/toolchain-drift.yml` is the only workflow that floats on
@@ -503,7 +505,8 @@ To move to a newer Rust, in one PR targeting `trunk-dev`:
    grandfather a lint in `[workspace.lints.clippy]` only with a written reason
    (the examples carry their own `[lints.clippy]` tables).
 3. `./scripts/check-toolchain-pin.sh --bump <version>` moves the pin and every
-   reference together and re-checks.
+   reference together and re-checks. It also rewrites a static
+   `toolchain: "<pin>"` value and keeps its quotes and comment.
 4. Re-bless any trybuild goldens whose wording changed:
    `TRYBUILD=overwrite cargo +<version> test --workspace --test integration_tests -- compile_fail::`
    (use `--workspace`; the cases depend on the unified feature set), and review

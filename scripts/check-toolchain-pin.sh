@@ -23,9 +23,11 @@
 # `Compile-and-serve gates (stable)`, does not change) must map it with
 # `matrix.toolchain == 'stable' && '<pin>' || matrix.toolchain`, and `<pin>`
 # must be the canonical pin. A bare `toolchain: ${{ matrix.toolchain }}` or
-# `toolchain: stable` would float again, so both are rejected. A static
-# `toolchain:` value (quotes and a trailing comment are ignored) must be the
-# pin, the MSRV or `nightly`; `stable` only in toolchain-drift.yml.
+# `toolchain: stable` would float again, so both are rejected.
+# A static `toolchain:` value must be the pin, the MSRV or `nightly`.
+# Quotes and a trailing comment do not count. `stable` is allowed only in
+# toolchain-drift.yml. The documented exception is allowed here too.
+# Flow lists and `${{ }}` expressions are not checked as static values.
 #
 # Called from the `msrv` job in ci.yml. Runs locally with:
 #
@@ -49,8 +51,7 @@ die() {
   exit 1
 }
 
-# Print a YAML scalar without its trailing `# comment`, spaces and one pair of
-# matching quotes. A lone quote stays, so it fails the allow-list.
+# Strip a trailing `# comment`, trailing spaces and one pair of matching quotes. A lone quote stays, so it fails the allow-list.
 normalize_toolchain() {
   local v="$1"
   v="${v%%[[:space:]]#*}"
@@ -138,8 +139,8 @@ check_tree() {
             [[ "$name:$val" == "$exc" ]] && ok=1
           done
           if ((ok == 0)); then
-            echo "error: $wf:$lineno sets toolchain: $val; expected the pin ($pin)," \
-              "the MSRV ($msrv) or nightly ('stable' only in $DRIFT_WORKFLOW)" >&2
+            echo "error: $wf:$lineno sets toolchain: $val; use the pin ($pin)," \
+              "the MSRV ($msrv) or nightly. Only $DRIFT_WORKFLOW may use 'stable'" >&2
             failures=$((failures + 1))
           fi
         fi
@@ -182,7 +183,7 @@ bump_tree() {
     # Rewrite via a temp file, not `sed -i`: BSD/macOS sed takes the word after
     # -i as a backup suffix, so `sed -i -E` would swallow -E and match nothing.
     # Only the three constructs the checker recognises, never prose in a comment;
-    # a trailing `# comment` on a pin line is kept. The delimiter is `|` because
+    # quotes and a trailing `# comment` on a pin line are kept. The delimiter is `|` because
     # the comment pattern contains a literal `#`.
     sed -E \
       -e "s|^([[:space:]]*-?[[:space:]]*uses:[[:space:]]*dtolnay/rust-toolchain@)${old_re}([[:space:]]+#.*)?[[:space:]]*\$|\1${new}\2|" \
