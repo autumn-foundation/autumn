@@ -166,6 +166,45 @@ codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
 ---
 
+### Billing: `EventClaim::Duplicate` is now `Applied` and `InFlight`
+
+**Why:** a redelivery that met an unfinished claim was acknowledged. If the
+first attempt then failed, the provider had no reason to retry, and the event
+was lost (issue #3097).
+
+**Automation:** `manual` — a store must decide what `InFlight` means for it, so
+no codemod applies.
+
+**You are affected only if you implement `BillingStore` or match on
+`EventClaim` or `ReconcileOutcome`.** `EventClaim` is now `#[non_exhaustive]`.
+`ReconcileOutcome` has a new variant. It was already `#[non_exhaustive]`, so a
+wildcard arm covers it.
+
+**Before (`{X.Y}`):**
+
+```rust
+match store.claim_event(id, kind, now, stale_after).await? {
+    EventClaim::Claimed => { /* apply */ }
+    EventClaim::Duplicate => { /* acknowledge */ }
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+match store.claim_event(id, kind, now, stale_after).await? {
+    EventClaim::Claimed => { /* apply */ }
+    EventClaim::Applied => { /* acknowledge */ }
+    EventClaim::InFlight => { /* do not acknowledge: ask for a retry */ }
+    _ => {}
+}
+```
+
+A store returns `Applied` for a finished row, and `InFlight` for an
+unfinished row that is not stale. `reconcile::apply` returns
+`ReconcileOutcome::InFlight` for `InFlight`. The webhook route answers `503`,
+so the provider redelivers.
+
 ### Widgets: alert, badge and wizard classes have the `autumn-` prefix
 
 **Why:** every other widget class has the `autumn-` prefix since 0.8.0.
