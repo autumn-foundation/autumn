@@ -11578,12 +11578,12 @@ fn pg_claim_sql() -> String {
     // so `idx_autumn_jobs_queue_ready (queue, run_at)` serves the head of each
     // queue and the claim touches O(queues) rows instead of sorting the whole
     // ready backlog of every polled queue (`ORDER BY array_position(..)` is
-    // opaque to the planner). The outer `ORDER BY q.ord, picked.run_at` keeps
-    // the original order: earliest-listed queue first, oldest `run_at` within it.
-    // Row locks are taken per probe, so a probe may briefly lock the head of a
-    // lower-priority queue that the outer `LIMIT 1` then discards; the locks
-    // drop when the statement ends and only make a concurrent claim skip that
-    // row for that instant.
+    // opaque to the planner). Each probe returns one row at most, so the outer
+    // `ORDER BY q.ord` keeps the original order: first listed queue, then
+    // oldest `run_at`. `WITH ORDINALITY` output is sorted on `ord`, so Postgres
+    // does not sort and stops at the first probe that returns a row. Thus the
+    // claim locks only the row it claims (issue #3182). Do not add a second
+    // sort key: then Postgres also runs the next probe and locks its row.
     format!(
         "UPDATE autumn_jobs \
          SET status = 'running', started_at = NOW(), claimed_by = $1, claimed_at = NOW(), \
@@ -11593,7 +11593,7 @@ fn pg_claim_sql() -> String {
            SELECT picked.id \
            FROM unnest($2::text[]) WITH ORDINALITY AS q(queue, ord) \
            CROSS JOIN LATERAL ( \
-             SELECT candidate.id, candidate.run_at FROM autumn_jobs candidate \
+             SELECT candidate.id FROM autumn_jobs candidate \
              WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
                AND candidate.queue = q.queue \
                AND (candidate.concurrency_limit IS NULL OR ( \
@@ -11607,7 +11607,7 @@ fn pg_claim_sql() -> String {
              LIMIT 1 \
              FOR UPDATE SKIP LOCKED \
            ) picked \
-           ORDER BY q.ord, picked.run_at \
+           ORDER BY q.ord \
            LIMIT 1 \
          ) \
          RETURNING {PG_JOB_SELECT_COLS}"
@@ -11674,8 +11674,8 @@ fn pg_claim_sql_single_queue() -> String {
 /// so a name with a large saturated backlog is never scanned past the point the
 /// plain claim would have stopped at. The claimed row is the one
 /// `pg_claim_sql_single_queue` would pick (ties on `run_at` stay unordered, as
-/// before). Row locks are taken per probe and drop with the statement, as in the
-/// multi-queue claim.
+/// before). Each probe locks one row. Postgres releases the locks when the
+/// transaction ends.
 ///
 /// `heads` is referenced twice (the walk's base term tests it) so Postgres 12+
 /// materializes it instead of inlining it into every iteration; `AS MATERIALIZED`
@@ -21393,6 +21393,224 @@ mod tests {
                 .expect("second claim");
             assert_eq!(second.id, "low-1");
             assert_eq!(second.queue, "low");
+        }
+
+        /// Queue order for the multi-queue claim tests (issue #3182).
+        fn pg_three_queues() -> Vec<String> {
+            ["critical", "default", "low"].map(str::to_owned).to_vec()
+        }
+
+        /// Returns the URL of a Postgres 16 server that loads
+        /// `pg_stat_statements`.
+        ///
+        /// Set `JOB_CLAIM_TEST_DATABASE_URL` to use a different server. That
+        /// server must load `pg_stat_statements`. The claim tests drop
+        /// `autumn_jobs` on that server.
+        async fn pg_claim_test_url() -> (
+            String,
+            Option<testcontainers::ContainerAsync<testcontainers_modules::postgres::Postgres>>,
+        ) {
+            use testcontainers::ImageExt as _;
+            use testcontainers::runners::AsyncRunner as _;
+
+            if let Ok(url) = std::env::var("JOB_CLAIM_TEST_DATABASE_URL") {
+                return (url, None);
+            }
+            let container = testcontainers_modules::postgres::Postgres::default()
+                .with_tag("16-alpine")
+                .with_cmd([
+                    "-c",
+                    "fsync=off",
+                    "-c",
+                    "shared_preload_libraries=pg_stat_statements",
+                ])
+                .start()
+                .await
+                .unwrap();
+            let port = container.get_host_port_ipv4(5432).await.unwrap();
+            let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+            (url, Some(container))
+        }
+
+        /// Drop `autumn_jobs` and create it again from the migrations, with
+        /// all of its indexes.
+        async fn pg_reset_jobs_table(pool: &PgPool) {
+            pg_exec(pool, "DROP TABLE IF EXISTS autumn_jobs").await;
+            pg_run_migration(pool).await;
+            pg_exec(
+                pool,
+                include_str!("../migrations/20261026170000_add_jobs_queue_name_ready_index/up.sql"),
+            )
+            .await;
+        }
+
+        /// The generic plan of the multi-queue claim. Diesel binds parameters,
+        /// so Postgres can use this plan.
+        async fn pg_multi_queue_claim_generic_plan(pool: &PgPool) -> String {
+            use diesel_async::SimpleAsyncConnection as _;
+
+            #[derive(diesel::QueryableByName)]
+            struct Line {
+                #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+                line: String,
+            }
+
+            let mut conn = pool.get().await.unwrap();
+            conn.batch_execute(&format!(
+                "SET plan_cache_mode = force_generic_plan; \
+                 PREPARE claim(text, text[], text[]) AS {}",
+                pg_claim_sql()
+            ))
+            .await
+            .unwrap();
+            let plan = diesel::sql_query(
+                "EXPLAIN (COSTS OFF) EXECUTE claim('w', '{critical,default,low}', '{}')",
+            )
+            .load::<Line>(&mut *conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.line)
+            .collect::<Vec<_>>()
+            .join("\n");
+            conn.batch_execute("DEALLOCATE claim; RESET plan_cache_mode")
+                .await
+                .unwrap();
+            plan
+        }
+
+        #[test]
+        fn pg_multi_queue_claim_orders_only_by_queue_position() {
+            // Each probe returns one row at most. A second sort key makes
+            // Postgres run (and lock) the probe of the next queue too.
+            assert!(
+                pg_claim_sql().contains("ORDER BY q.ord LIMIT 1"),
+                "the claim must stop at the first queue that has a row"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        async fn pg_multi_queue_claim_does_not_lock_lower_queue_heads() {
+            use diesel_async::SimpleAsyncConnection as _;
+
+            let (url, _container) = pg_claim_test_url().await;
+            let pool = pg_test_pool(&url);
+            pg_reset_jobs_table(&pool).await;
+            pg_exec(
+                &pool,
+                "INSERT INTO autumn_jobs (id, name, queue) VALUES \
+                 ('c1', 'j', 'critical'), ('d1', 'j', 'default'), ('l1', 'j', 'low')",
+            )
+            .await;
+
+            // Worker 1 claims and keeps its transaction open.
+            let mut held = pool.get().await.unwrap();
+            held.batch_execute("BEGIN").await.unwrap();
+            let first = diesel::sql_query(pg_claim_sql())
+                .bind::<diesel::sql_types::Text, _>("w1")
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(pg_three_queues())
+                .bind::<diesel::sql_types::Array<diesel::sql_types::Text>, _>(Vec::<String>::new())
+                .get_result::<PgJobRow>(&mut *held)
+                .await
+                .unwrap();
+            assert_eq!(first.id, "c1");
+
+            // Worker 2 must get the default head, not skip it for `low`.
+            let second = pg_claim_next_job(&pool, "w2", false, &pg_three_queues())
+                .await
+                .expect("a job is claimable");
+            assert_eq!(
+                second.id, "d1",
+                "the claim locked the head of a queue it did not claim from"
+            );
+            held.batch_execute("ROLLBACK").await.unwrap();
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Docker (testcontainers)"]
+        #[allow(clippy::cast_precision_loss)]
+        async fn pg_multi_queue_claim_cost_stays_flat_as_the_backlog_grows() {
+            #[derive(diesel::QueryableByName)]
+            struct Stats {
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                calls: i64,
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                buffers: i64,
+                #[diesel(sql_type = diesel::sql_types::BigInt)]
+                temp_written: i64,
+            }
+            const CLAIMS: i64 = 20;
+            let (url, _container) = pg_claim_test_url().await;
+            let pool = pg_test_pool(&url);
+            pg_exec(&pool, "CREATE EXTENSION IF NOT EXISTS pg_stat_statements").await;
+
+            // `critical` is empty, so each claim must fall through to `default`.
+            let mut per_claim = Vec::new();
+            for backlog in [2_000, 20_000, 100_000] {
+                pg_reset_jobs_table(&pool).await;
+                pg_exec(
+                    &pool,
+                    &format!(
+                        "INSERT INTO autumn_jobs (id, name, queue, run_at) \
+                         SELECT 'j' || g, 'n' || (g % 7), \
+                                CASE WHEN g % 50 = 0 THEN 'low' ELSE 'default' END, \
+                                NOW() - g * interval '1 second' \
+                         FROM generate_series(1, {backlog}) g"
+                    ),
+                )
+                .await;
+                pg_exec(&pool, "ANALYZE autumn_jobs").await;
+
+                let plan = pg_multi_queue_claim_generic_plan(&pool).await;
+                assert!(
+                    plan.contains("idx_autumn_jobs_queue_ready"),
+                    "backlog {backlog}: each queue probe must use the queue index:\n{plan}"
+                );
+                assert!(
+                    !plan.contains("Sort"),
+                    "backlog {backlog}: the claim must not sort:\n{plan}"
+                );
+
+                pg_exec(&pool, "SELECT pg_stat_statements_reset()").await;
+                let mut previous = None;
+                for _ in 0..CLAIMS {
+                    let job = pg_claim_next_job(&pool, "w", false, &pg_three_queues())
+                        .await
+                        .expect("the backlog has ready jobs");
+                    assert_eq!(job.queue, "default");
+                    let run_at = job.run_at.expect("a claimed row has run_at");
+                    assert!(previous <= Some(run_at), "oldest job first");
+                    previous = Some(run_at);
+                }
+
+                let mut conn = pool.get().await.unwrap();
+                let stats = diesel::sql_query(
+                    "SELECT calls, (shared_blks_hit + shared_blks_read) AS buffers, \
+                            temp_blks_written AS temp_written \
+                     FROM pg_stat_statements \
+                     WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                       AND query LIKE 'UPDATE autumn_jobs%' AND query LIKE '%claimed_by%'",
+                )
+                .get_result::<Stats>(&mut *conn)
+                .await
+                .unwrap();
+                assert_eq!(stats.calls, CLAIMS);
+                assert_eq!(
+                    stats.temp_written, 0,
+                    "backlog {backlog}: the claim spilled"
+                );
+                per_claim.push((backlog, stats.buffers as f64 / CLAIMS as f64));
+            }
+
+            let small = per_claim[0].1;
+            for (backlog, buffers) in &per_claim {
+                assert!(
+                    *buffers <= small.mul_add(2.0, 16.0),
+                    "buffers per claim grow with the backlog: {per_claim:?} \
+                     (backlog {backlog})"
+                );
+            }
         }
 
         #[tokio::test]

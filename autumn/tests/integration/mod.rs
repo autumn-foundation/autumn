@@ -375,6 +375,10 @@ mod redis_job_admin_ci_coverage;
 // path; this fails if either is renamed (#2111 follow-up). No feature gate:
 // it only reads job.rs and ci.yml as text.
 mod pg_relative_delay_ci_coverage;
+// ci.yml names the `--lib` Postgres claim Docker tests by full path. This
+// module fails if a test gets a new name (#3182). It has no feature gate,
+// because it reads job.rs and ci.yml as text.
+mod pg_claim_ci_coverage;
 // Postgres tier of the bitemporal, tamper-evident record ledger (issue #1699).
 // The Docker-free golden test lives in `tests/sqlite_ledger.rs`; this proves the
 // Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).
