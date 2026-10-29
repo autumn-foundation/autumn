@@ -16668,6 +16668,7 @@ async fn a_refused_setting_is_redisplayed_with_its_input() {
         .assert_body_contains("not a timezone")
         .assert_body_contains(r#"role="alert""#)
         .assert_body_contains(r#"aria-describedby="timezone-error""#)
+        .assert_body_contains(r#"aria-invalid="true""#)
         .assert_body_contains(r#"value="Keep Me""#)
         .assert_body_contains(r#"value="Keep Tagline""#)
         .assert_body_contains("autofocus");

@@ -40,7 +40,7 @@ pub struct SettingsForm {
 /// What the form shows: the stored settings, or the rejected submission.
 ///
 /// Strings stay raw so a refused value is redisplayed as typed.
-pub struct SettingsView {
+struct SettingsView {
     site_title: String,
     tagline: String,
     posts_per_page: String,
@@ -92,7 +92,7 @@ impl From<&SettingsForm> for SettingsView {
 
 /// Reasons a submission is refused, one per free-text field.
 #[derive(Default)]
-pub struct FieldErrors {
+struct FieldErrors {
     date_format: Option<String>,
     timezone: Option<String>,
 }
@@ -103,10 +103,14 @@ impl FieldErrors {
         let timezone = view.timezone.trim();
         Self {
             timezone: (!crate::settings::is_known_timezone(timezone)).then(|| {
-                format!(
-                    "`{timezone}` is not a timezone this site knows — use an IANA name \
-                     such as Europe/London"
-                )
+                if timezone.is_empty() {
+                    "Enter a timezone — use an IANA name such as Europe/London".to_owned()
+                } else {
+                    format!(
+                        "`{timezone}` is not a timezone this site knows — use an IANA name \
+                         such as Europe/London"
+                    )
+                }
             }),
             date_format: (!crate::settings::is_renderable_date_format(view.date_format.trim()))
                 .then(|| {
@@ -434,6 +438,25 @@ mod tests {
         v.date_format = "%".to_owned();
         let errors = FieldErrors::check(&v);
         assert!(errors.timezone.is_some() && errors.date_format.is_some());
+    }
+
+    #[test]
+    fn a_blank_timezone_gets_its_own_message() {
+        let mut v = view();
+        v.timezone = String::new();
+        let message = FieldErrors::check(&v).timezone.unwrap();
+        assert!(message.starts_with("Enter a timezone"));
+    }
+
+    #[test]
+    fn only_one_field_takes_focus() {
+        let mut v = view();
+        v.timezone = "nope".to_owned();
+        let errors = FieldErrors::check(&v);
+        assert!(errors.focus_timezone() && !errors.focus_date_format());
+        v.date_format = "%".to_owned();
+        let errors = FieldErrors::check(&v);
+        assert!(errors.focus_date_format() && !errors.focus_timezone());
     }
 
     #[test]
