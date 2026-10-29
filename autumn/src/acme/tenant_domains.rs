@@ -663,9 +663,14 @@ impl CustomDomainTask {
         // short still fails and backs off first.
         let deadline = tokio::time::Instant::now() + verify_budget;
         let limit = VERIFY_TIMEOUT.min(verify_budget / 2);
+        // Domains that keep failing go last. A short backoff can expire before
+        // the next tick, and hostname order alone would then put the same hung
+        // names first again. The sort is stable, so ties stay in hostname order.
+        let mut pending = self.registry.pending_verification(now_unix);
+        pending.sort_by_key(|domain| domain.consecutive_failures);
         let skipped = std::sync::atomic::AtomicUsize::new(0);
         futures::StreamExt::for_each_concurrent(
-            futures::stream::iter(self.registry.pending_verification(now_unix)),
+            futures::stream::iter(pending),
             VERIFY_CONCURRENCY,
             |domain| {
                 let skipped = &skipped;

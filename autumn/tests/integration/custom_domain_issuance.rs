@@ -3684,6 +3684,35 @@ async fn a_slow_ingress_lookup_does_not_skip_a_renewal() {
     );
 }
 
+/// With a tiny backoff, a failure expires before the next tick. Repeat
+/// offenders must still go behind domains that have not failed.
+#[tokio::test(start_paused = true)]
+async fn domains_that_keep_timing_out_go_behind_the_rest() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness_with_limiter(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+        IssuanceLimiter::new(5, 50, 1, 1),
+    );
+    for i in 0..64 {
+        h.registry
+            .register(&format!("slow{i:02}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("zhealthy.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    let budget = std::time::Duration::from_secs(30);
+    for tick in 0..4 {
+        h.task.tick_within(NOW + tick * 100, budget).await;
+    }
+
+    assert_eq!(issuer.calls(), vec!["zhealthy.clientco.com".to_owned()]);
+}
+
 #[tokio::test(start_paused = true)]
 async fn hung_renewal_rechecks_run_at_the_same_time_and_time_out() {
     let issuer = ScriptedIssuer::new(&[]);
