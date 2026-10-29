@@ -449,11 +449,6 @@ impl PruneOnlyCustomDomainPruner {
             .stored_records()
             .await
             .map_err(|e| format!("failed to re-read the custom-domain registry: {e}"))?;
-        let candidates: Vec<_> = stored
-            .into_iter()
-            .map(|(id, _, _)| id)
-            .filter(|id| !self.retained_cert_ids.contains(id.as_str()))
-            .collect();
         let live_ids = |extra: Vec<crate::custom_domain::CustomDomain>| {
             self.registry
                 .list()
@@ -464,9 +459,12 @@ impl PruneOnlyCustomDomainPruner {
         };
         let live = live_ids(fresh.clone());
         // Only orphans take the exclusive section. A live pair never does.
-        let candidates: Vec<_> = candidates
+        let candidates: Vec<_> = stored
             .into_iter()
-            .filter(|id| !live.contains(id.as_str()))
+            .map(|(id, _, _)| id)
+            .filter(|id| {
+                !self.retained_cert_ids.contains(id.as_str()) && !live.contains(id.as_str())
+            })
             .collect();
         if dry_run {
             return Ok(candidates.len() as u64);
