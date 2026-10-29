@@ -397,6 +397,29 @@ fn without_parser_position(message: &str) -> String {
     out
 }
 
+/// Reader that notes whether the stream ends without a line terminator.
+///
+/// On an LF file the parser counts a record's last line break. A final record
+/// with no break is one line short, and the line fix needs to know. (A CRLF
+/// file counts that break late, so the calibration offset already covers it.)
+struct EndProbe<R> {
+    inner: R,
+    last: Option<u8>,
+    unterminated: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl<R: io::Read> io::Read for EndProbe<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.last = buf.get(n - 1).copied();
+        }
+        let open = n == 0 && self.last.is_some_and(|b| b != b'\n' && b != b'\r');
+        self.unterminated.set(open);
+        Ok(n)
+    }
+}
+
 /// Parse CSV from `reader`, validate rows, and drive import via `handler`.
 ///
 /// The `handler` closure receives the **1-based CSV line number** and a
@@ -426,9 +449,14 @@ where
 {
     let mut report = ImportReport::default();
 
+    let unterminated = std::rc::Rc::new(std::cell::Cell::new(false));
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
-        .from_reader(reader);
+        .from_reader(EndProbe {
+            inner: reader,
+            last: None,
+            unterminated: std::rc::Rc::clone(&unterminated),
+        });
 
     let headers: Vec<String> = match rdr.headers() {
         Ok(h) => h.iter().map(str::to_owned).collect(),
@@ -481,14 +509,35 @@ where
         u64::try_from(raw.saturating_add(line_offset)).unwrap_or(0)
     };
 
-    for result in rdr.records() {
+    // The parser sets a record's start line BEFORE it skips blank lines, so
+    // that start is too early by the number of blank lines. Its end line is
+    // exact: the record's true start is the end, less its own line breaks.
+    // The parser start is the floor, so this never reports an earlier line.
+    let missing_break_counts = line_offset == 0;
+    let start_of = |end: u64, record: &csv::StringRecord, parser: u64| -> u64 {
+        let breaks: u64 = record.iter().map(|f| f.matches('\n').count() as u64).sum();
+        let missing = unterminated.get() && missing_break_counts;
+        let own = breaks + u64::from(!missing);
+        absolute_line(end).saturating_sub(own).max(parser)
+    };
+    let mut record = csv::StringRecord::new();
+    loop {
+        let result = rdr.read_record(&mut record);
         let (line, record) = match result {
-            Ok(r) => {
-                let pos = absolute_line(r.position().map_or(0, csv::Position::line));
-                (pos, r)
+            Ok(false) => break,
+            Ok(true) => {
+                let parser = absolute_line(record.position().map_or(0, csv::Position::line));
+                (start_of(rdr.position().line(), &record, parser), &record)
             }
             Err(e) => {
-                let pos = absolute_line(e.position().map_or(0, csv::Position::line));
+                let parser = absolute_line(e.position().map_or(0, csv::Position::line));
+                // Only a length error keeps its record; other errors keep the
+                // parser start.
+                let pos = if matches!(e.kind(), csv::ErrorKind::UnequalLengths { .. }) {
+                    start_of(rdr.position().line(), &record, parser)
+                } else {
+                    parser
+                };
                 report.errors.push(CsvRowError::row(
                     pos,
                     format!(
@@ -956,6 +1005,65 @@ mod tests {
             lines(b"title,note\r\n\"a\r\nb\",fine\r\nsecond,x\r\n"),
             vec![2, 4]
         );
+    }
+
+    /// Blank lines are skipped by the parser, but they still take up lines.
+    /// A row after them is reported on its own line (#3328).
+    #[test]
+    fn import_csv_line_numbers_skip_blank_lines() {
+        let lines = |csv: &[u8]| -> Vec<u64> {
+            let mut seen = Vec::new();
+            import_csv(csv, &ImportOptions::default(), |line, _row, _mode| {
+                seen.push(line);
+                ImportRowResult::Inserted
+            });
+            seen
+        };
+        for eol in ["\n", "\r\n"] {
+            let f = |s: &str| lines(s.replace('\n', eol).as_bytes());
+            assert_eq!(f("a,b\n\n1,2\n"), vec![3], "{eol:?}");
+            assert_eq!(f("a,b\n1,2\n\n3,4\n5,6\n"), vec![2, 4, 5], "{eol:?}");
+            assert_eq!(f("a,b\n\n\n\n1,2\n3,4\n"), vec![5, 6], "{eol:?}");
+            assert_eq!(f("a,b\n\"x\ny\",1\n\n3,4\n"), vec![2, 5], "{eol:?}");
+            // Last row has no terminator.
+            assert_eq!(f("a,b\n1,2\n\n\n3,4"), vec![2, 5], "{eol:?}");
+            assert_eq!(f("a,b\n\n1,2"), vec![3], "{eol:?}");
+            // Trailing blank lines add no rows.
+            assert_eq!(f("a,b\n1,2\n\n\n"), vec![2], "{eol:?}");
+        }
+    }
+
+    /// Parse errors and handler errors use the same corrected line.
+    #[test]
+    fn import_csv_error_lines_skip_blank_lines() {
+        let report = import_csv(
+            &b"a,b\n1,2\n\n\nx,y,z\n\n3,4\n"[..],
+            &ImportOptions::default(),
+            |line, row, _mode| {
+                if row["a"] == "3" {
+                    ImportRowResult::RowError(format!("bad at {line}"))
+                } else {
+                    ImportRowResult::Inserted
+                }
+            },
+        );
+        let lines: Vec<u64> = report.errors.iter().map(|e| e.line).collect();
+        assert_eq!(lines, vec![5, 7]);
+    }
+
+    /// Old behaviour stays: a bare-CR file never counts lines.
+    #[test]
+    fn import_csv_bare_cr_lines_do_not_drop_below_two() {
+        let mut seen = Vec::new();
+        import_csv(
+            &b"a,b\r1,2\r3,4\r"[..],
+            &ImportOptions::default(),
+            |line, _row, _mode| {
+                seen.push(line);
+                ImportRowResult::Inserted
+            },
+        );
+        assert!(seen.iter().all(|l| *l >= 2), "{seen:?}");
     }
 
     #[test]
