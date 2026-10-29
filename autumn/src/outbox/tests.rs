@@ -1000,4 +1000,118 @@ mod sqlite {
         let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
         ensure_schema(fx.state.pool().unwrap()).await.unwrap();
     }
+
+    /// The claim reads pending rows through `idx_autumn_outbox_claim`. A full
+    /// scan reads each sent row that the purge did not delete (#3203).
+    #[tokio::test]
+    async fn claim_reads_pending_rows_through_the_claim_index() {
+        #[derive(diesel::QueryableByName)]
+        struct Step {
+            #[diesel(sql_type = Text)]
+            detail: String,
+        }
+        let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
+        let mut conn = fx.state.pool().unwrap().get().await.unwrap();
+        let plan: Vec<String> =
+            diesel::sql_query(format!("EXPLAIN QUERY PLAN {}", claim_sql("'t'")))
+                .bind::<Text, _>("token")
+                .bind::<BigInt, _>(0)
+                .bind::<BigInt, _>(0)
+                .bind::<BigInt, _>(0)
+                .bind::<BigInt, _>(1)
+                .load::<Step>(&mut conn)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|step| step.detail)
+                .collect();
+        assert!(
+            plan.iter()
+                .any(|step| step == "SCAN o USING INDEX idx_autumn_outbox_claim"),
+            "{plan:#?}"
+        );
+    }
+
+    /// Tables made before the claim index existed get it at the next boot.
+    #[tokio::test]
+    async fn ensure_schema_adds_the_claim_index_to_existing_tables() {
+        let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
+        let pool = fx.state.pool().unwrap();
+        let mut conn = pool.get().await.unwrap();
+        conn.batch_execute("DROP INDEX IF EXISTS idx_autumn_outbox_claim")
+            .await
+            .unwrap();
+        drop(conn);
+
+        ensure_schema(pool).await.unwrap();
+
+        #[derive(diesel::QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = BigInt)]
+            n: i64,
+        }
+        let mut conn = pool.get().await.unwrap();
+        let index = diesel::sql_query(
+            "SELECT COUNT(*) AS n FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_autumn_outbox_claim'",
+        )
+        .get_result::<Count>(&mut conn)
+        .await
+        .unwrap();
+        assert_eq!(index.n, 1);
+    }
+
+    /// Edge rows for the claim. Each row holds its expected result.
+    const CLAIM_EDGES_SQL: &str = include_str!("../../tests/fixtures/outbox/claim_edges.sql");
+
+    /// The ids that one claim takes from [`CLAIM_EDGES_SQL`], and the ids it
+    /// must take. Both lists are in `seq` order.
+    async fn claim_edges(with_claim_index: bool) -> (Vec<String>, Vec<String>) {
+        #[derive(diesel::QueryableByName)]
+        struct Id {
+            #[diesel(sql_type = Text)]
+            id: String,
+        }
+        let mut handlers = OutboxHandlers::default();
+        handlers.insert("t", |_, _| async { Ok(()) });
+        let fx = fixture(OutboxConfig::default(), handlers).await;
+        let pool = fx.state.pool().unwrap().clone();
+        let now = to_millis(fx.clock.now()).to_string();
+        let mut conn = pool.get().await.unwrap();
+        if !with_claim_index {
+            conn.batch_execute("DROP INDEX IF EXISTS idx_autumn_outbox_claim")
+                .await
+                .unwrap();
+        }
+        conn.batch_execute(&CLAIM_EDGES_SQL.replace("__NOW__", &now))
+            .await
+            .unwrap();
+        let expected = diesel::sql_query(
+            "SELECT id FROM autumn_outbox WHERE payload = '{\"claim\":true}' ORDER BY seq",
+        )
+        .load::<Id>(&mut conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+        drop(conn);
+
+        let relay = fx.state.extension::<OutboxRelay>().unwrap();
+        let mut rows = claim(&relay, &pool, &fx.state, "relay", 100).await.unwrap();
+        rows.sort_by_key(|row| row.seq);
+        (rows.into_iter().map(|row| row.id).collect(), expected)
+    }
+
+    /// The claim takes the same rows with and without the claim index: the
+    /// `available_at` and lease bounds, a lease of a crashed relay, and the
+    /// aggregate order (#3203).
+    #[tokio::test]
+    async fn claim_takes_the_same_edge_rows_with_and_without_the_claim_index() {
+        for with_claim_index in [true, false] {
+            let (claimed, expected) = claim_edges(with_claim_index).await;
+            assert_eq!(expected.len(), 5, "the fixture marks 5 rows");
+            assert_eq!(claimed, expected, "with_claim_index = {with_claim_index}");
+        }
+    }
 }
