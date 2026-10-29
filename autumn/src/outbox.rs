@@ -163,10 +163,11 @@ const SCHEMA_LOCK_KEY: i64 = 0x0A17_0B0C_0000_3062;
 ///
 /// On Postgres, it sends no DDL when both tables exist. Thus a role that
 /// cannot create or own tables can use tables made by a migration. An
-/// advisory lock serializes replicas that create the tables together.
+/// advisory lock serializes replicas that create the tables together. It
+/// then builds `idx_autumn_outbox_claim` in a background task.
 ///
-/// On `SQLite`, it sends all the DDL each time. Thus older tables get new
-/// indexes.
+/// On `SQLite`, it sends all the DDL at each call. Thus tables from an older
+/// release get new indexes.
 ///
 /// # Errors
 ///

@@ -1,8 +1,8 @@
--- Edge rows for the outbox claim (#3203). Postgres and SQLite read this file.
+-- Edge rows for the outbox claim (#3203). The Postgres and SQLite tests use
+-- this file.
 -- `__NOW__` is the relay clock in epoch ms. Topic `t` has a handler; `u` has
--- none. `payload` holds the result that one claim must give the row:
--- `{"claim":true}` or `{"claim":false}`. Rows go in in this order, so `seq`
--- follows it.
+-- none. `payload` holds the expected result of one claim: `{"claim":true}` or
+-- `{"claim":false}`. Rows get their `seq` in the order of this list.
 INSERT INTO autumn_outbox
     (id, aggregate, topic, payload, created_at, available_at,
      claim_token, locked_until, dispatched_at, dead_at)
@@ -25,6 +25,6 @@ VALUES
     ('behind-sent', 'a6', 't', '{"claim":true}', __NOW__, __NOW__ - 1, NULL, NULL, NULL, NULL),
     ('dead', 'a7', 't', '{"claim":false}', __NOW__, __NOW__ - 1, NULL, NULL, NULL, __NOW__ - 1),
     ('behind-dead', 'a7', 't', '{"claim":true}', __NOW__, __NOW__ - 1, NULL, NULL, NULL, NULL),
-    -- No handler here. The pending row still blocks its aggregate.
+    -- Topic `u` has no handler. The pending row still blocks its aggregate.
     ('other-topic', 'a8', 'u', '{"claim":false}', __NOW__, __NOW__ - 1, NULL, NULL, NULL, NULL),
     ('behind-other-topic', 'a8', 't', '{"claim":false}', __NOW__, __NOW__ - 1, NULL, NULL, NULL, NULL);

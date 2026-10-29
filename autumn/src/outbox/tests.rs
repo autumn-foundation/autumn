@@ -1001,8 +1001,9 @@ mod sqlite {
         ensure_schema(fx.state.pool().unwrap()).await.unwrap();
     }
 
-    /// The claim reads pending rows through `idx_autumn_outbox_claim`. A full
-    /// scan reads each sent row that the purge did not delete (#3203).
+    /// The claim reads pending rows through `idx_autumn_outbox_claim`. Without
+    /// it, the claim can read each sent row that the purge has not deleted yet
+    /// (#3203).
     #[tokio::test]
     async fn claim_reads_pending_rows_through_the_claim_index() {
         #[derive(diesel::QueryableByName)]
@@ -1032,7 +1033,8 @@ mod sqlite {
         );
     }
 
-    /// Tables made before the claim index existed get it at the next boot.
+    /// Tables made before `idx_autumn_outbox_claim` existed get the index from
+    /// `ensure_schema`.
     #[tokio::test]
     async fn ensure_schema_adds_the_claim_index_to_existing_tables() {
         let fx = fixture(OutboxConfig::default(), OutboxHandlers::default()).await;
@@ -1061,7 +1063,8 @@ mod sqlite {
         assert_eq!(index.n, 1);
     }
 
-    /// Edge rows for the claim. Each row holds its expected result.
+    /// Edge rows for the claim. The `payload` of each row holds its expected
+    /// result.
     const CLAIM_EDGES_SQL: &str = include_str!("../../tests/fixtures/outbox/claim_edges.sql");
 
     /// The ids that one claim takes from [`CLAIM_EDGES_SQL`], and the ids it
@@ -1103,9 +1106,8 @@ mod sqlite {
         (rows.into_iter().map(|row| row.id).collect(), expected)
     }
 
-    /// The claim takes the same rows with and without the claim index: the
-    /// `available_at` and lease bounds, a lease of a crashed relay, and the
-    /// aggregate order (#3203).
+    /// With and without the claim index, the claim takes only the rows that the
+    /// fixture marks (#3203).
     #[tokio::test]
     async fn claim_takes_the_same_edge_rows_with_and_without_the_claim_index() {
         for with_claim_index in [true, false] {

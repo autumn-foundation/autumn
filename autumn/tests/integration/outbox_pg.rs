@@ -242,13 +242,14 @@ mod docker {
         outbox::ensure_schema(&single).await.unwrap();
     }
 
-    /// Sent rows that the purge did not delete yet. Their `seq` is lower than
+    /// Sent rows that the purge has not deleted yet. Their `seq` is lower than
     /// the `seq` of each pending row.
     const SENT_ROWS: i64 = 30_000;
 
     /// Pending rows in backoff, after the edge rows. With these rows, the
     /// planner walks `autumn_outbox_pkey` when the claim index is missing.
-    /// Without them, it sorts the few pending rows and the test proves nothing.
+    /// Without them, the planner sorts the few pending rows, and the test passes
+    /// with no claim index.
     const WAITING_ROWS: i64 = 500;
 
     #[derive(diesel::QueryableByName)]
@@ -265,8 +266,9 @@ mod docker {
     /// The counters of `autumn_outbox`, when `ready` accepts them.
     ///
     /// Postgres 11 sends the counters of a connection at the end of a
-    /// transaction, at most once in 500 ms. Thus each connection of `pool`
-    /// (`max_size` 2) runs a query after a wait.
+    /// transaction, at most once in 500 ms. Thus this helper waits 600 ms, then
+    /// runs a query on each connection of `pool` (`max_size` 2). The query sends
+    /// the counters of that connection.
     async fn outbox_stats(pool: &PgPool, ready: impl Fn(&OutboxStats) -> bool) -> OutboxStats {
         use diesel_async::RunQueryDsl as _;
 
@@ -301,7 +303,7 @@ mod docker {
     }
 
     /// The claim reads the pending rows only, not the sent rows that the purge
-    /// did not delete yet. It takes the edge rows that the fixture marks
+    /// has not deleted yet. It takes the edge rows that the fixture marks
     /// (#3203).
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
