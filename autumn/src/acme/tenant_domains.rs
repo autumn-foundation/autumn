@@ -53,6 +53,12 @@ pub const CUSTOM_DOMAIN_TASK: &str = "custom_domain_certificates";
 /// How many pending domains one tick verifies at the same time.
 const VERIFY_CONCURRENCY: usize = 16;
 
+/// How long one renewal DNS re-check may run before it counts as a blip.
+const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Verification time per tick when the caller sets no budget.
+const DEFAULT_VERIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Callback that dispatches a custom-domain failure to the operator (#1610).
 pub type ReporterFn = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -610,8 +616,10 @@ impl CustomDomainTask {
         loop {
             // The tick is inside the `select!`: a pass over a thousand domains
             // is long, and shutdown must not wait for it.
+            // Verification gets half the interval; issuance and renewal
+            // always start in time.
             tokio::select! {
-                () = self.tick(crate::custom_domain::now_unix()) => {}
+                () = self.tick_within(crate::custom_domain::now_unix(), interval / 2) => {}
                 () = shutdown.cancelled() => break,
             }
             tokio::select! {
@@ -623,6 +631,14 @@ impl CustomDomainTask {
 
     /// One pass over every registered domain.
     pub async fn tick(&self, now_unix: i64) {
+        self.tick_within(now_unix, DEFAULT_VERIFY_BUDGET).await;
+    }
+
+    /// One pass. The verification step stops after `verify_budget`.
+    ///
+    /// Domains it did not reach stay pending for the next tick. This keeps
+    /// one tenant's slow DNS from delaying issuance and renewal for others.
+    pub async fn tick_within(&self, now_unix: i64, verify_budget: std::time::Duration) {
         // `now_unix` is when the pass began. A pass over many domains, each a
         // CA round trip, runs for minutes, so an order late in it must not be
         // stamped with the start time: its budget entry would age early and a
@@ -634,12 +650,20 @@ impl CustomDomainTask {
         // Each check can wait out a DNS timeout, so checks run
         // `VERIFY_CONCURRENCY` at a time instead of adding up. Each write goes
         // through the registry's per-hostname gate.
-        futures::StreamExt::for_each_concurrent(
+        let verification = futures::StreamExt::for_each_concurrent(
             futures::stream::iter(self.registry.pending_verification(now_unix)),
             VERIFY_CONCURRENCY,
             |domain| async move { self.verify_one(&domain.hostname, now_unix).await },
-        )
-        .await;
+        );
+        if tokio::time::timeout(verify_budget, verification)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                budget_secs = verify_budget.as_secs(),
+                "custom-domain verification hit its time budget; the rest wait for the next tick"
+            );
+        }
         for domain in self.registry.due_for_issuance(now_unix) {
             self.issue_one(
                 &domain.hostname,
@@ -653,11 +677,25 @@ impl CustomDomainTask {
         // domain would otherwise be renewed forever: every cycle spends an
         // order plus a failed validation against the shared ACME account, for a
         // certificate that reaches nobody.
-        for domain in self
+        // The re-checks run `VERIFY_CONCURRENCY` at a time, and one that
+        // hangs counts as a blip, so a slow zone cannot hold up the renewals.
+        let due = self
             .registry
-            .due_for_renewal(now_unix, self.renew_before_days)
-        {
-            if !self.still_points_here(&domain, now_unix).await {
+            .due_for_renewal(now_unix, self.renew_before_days);
+        let mut checked = futures::StreamExt::buffered(
+            futures::StreamExt::map(futures::stream::iter(due), |domain| async move {
+                let here = tokio::time::timeout(
+                    RECHECK_TIMEOUT,
+                    self.still_points_here(&domain, now_unix),
+                )
+                .await
+                .unwrap_or(true);
+                (domain, here)
+            }),
+            VERIFY_CONCURRENCY,
+        );
+        while let Some((domain, here)) = futures::StreamExt::next(&mut checked).await {
+            if !here {
                 continue;
             }
             self.issue_one(

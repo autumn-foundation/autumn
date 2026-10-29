@@ -3382,6 +3382,129 @@ async fn pending_domains_are_verified_at_the_same_time() {
     }
 }
 
+// ── One tenant's slow DNS cannot stall the others (#2650) ────────────────
+
+/// Names starting `slow` never answer; every other name points here.
+struct BlackholeVerifier;
+
+impl DomainVerifier for BlackholeVerifier {
+    fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+        Box::pin(async move {
+            if hostname.starts_with("slow") {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            points_here()
+        })
+    }
+    fn observe_txt<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+        Box::pin(async { ObservedTxt::Values(Vec::new()) })
+    }
+}
+
+/// Registers `host` as active with a stored certificate inside its renew window.
+async fn register_due_for_renewal(h: &Harness, host: &str) {
+    h.task
+        .certs
+        .save_cert(
+            &CertId::from_domains(&[host.to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    h.registry.register(host, "tenant-b", NOW).await.unwrap();
+    h.registry
+        .record_active(host, NOW, NOW + 10 * 86_400)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_verifications_do_not_delay_issuance_or_renewal() {
+    let budget = std::time::Duration::from_secs(5);
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..64 {
+        h.registry
+            .register(&format!("slow{i}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("ready.clientco.com", "tenant-c", NOW)
+        .await
+        .unwrap();
+    h.registry
+        .record_verified("ready.clientco.com", NOW)
+        .await
+        .unwrap();
+    register_due_for_renewal(&h, "renew.clientco.com").await;
+
+    let started = tokio::time::Instant::now();
+    h.task.tick_within(NOW, budget).await;
+
+    assert!(
+        started.elapsed() <= budget + std::time::Duration::from_secs(1),
+        "the pass took {:?}",
+        started.elapsed()
+    );
+    let calls = issuer.calls();
+    assert!(
+        calls.contains(&"ready.clientco.com".to_owned()),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&"renew.clientco.com".to_owned()),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_domain_the_budget_skipped_is_checked_on_the_next_tick() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(Arc::new(BlackholeVerifier), issuer as Arc<dyn DomainIssuer>);
+    h.registry
+        .register("slow.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task
+        .tick_within(NOW, std::time::Duration::from_secs(5))
+        .await;
+
+    let still_pending = h.registry.pending_verification(NOW);
+    assert_eq!(still_pending.len(), 1, "the skipped domain stays pending");
+    assert!(still_pending[0].failure_reason.is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_renewal_rechecks_run_at_the_same_time_and_time_out() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..32 {
+        register_due_for_renewal(&h, &format!("slow{i}.clientco.com")).await;
+    }
+    register_due_for_renewal(&h, "renew.clientco.com").await;
+
+    let started = tokio::time::Instant::now();
+    h.task.tick(NOW).await;
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(120),
+        "the pass took {:?}",
+        started.elapsed()
+    );
+    assert!(issuer.calls().contains(&"renew.clientco.com".to_owned()));
+}
+
 // ── Certificate and cache writes sit inside the hostname gate (#2649) ────
 
 /// Time for a spawned task to run into whatever it will block on.
