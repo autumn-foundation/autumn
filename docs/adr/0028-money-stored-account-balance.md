@@ -63,7 +63,9 @@ balance in Rust; keep it in a trigger; `NULL` as "not known".
 | A dropped `post` future | The trigger runs in the posting `INSERT`; a written-back sum is true before the post |
 | A manual `UPDATE` of the column | `balance_drift` reports it; `NULL` repairs it |
 | A slow migration on a large ledger | Existing rows start at `NULL`; no scan |
-| Postgres `REPEATABLE READ` reads a stale balance | The trigger updates the account row, so a second poster gets `40001` |
+| Postgres `REPEATABLE READ` reads a stale balance | The trigger updates the account row, also a `NULL` one, so a second poster gets `40001` |
+| A session with another `search_path` (a `pg_dump` restore) | The trigger function sets its own `search_path` |
+| A data-only restore or an `INSERT` with triggers off | Documented: set `balance_minor` to `NULL`, then run `balance_drift` |
 
 **Six thinking hats.**
 
@@ -87,6 +89,8 @@ balance in Rust; keep it in a trigger; `NULL` as "not known".
   versions on a hot account. The column has no index, so the updates can be
   HOT updates.
 - Apps must run `autumn migrate` before they deploy the new binary.
-- A manual `UPDATE` of `balance_minor` can make drift. `balance_drift` finds
-  it. The triggers are a guard-rail against accidents, as in the rest of the
-  ledger. They are not a boundary against all SQL.
+- A write around the trigger can make drift: a manual `UPDATE` of
+  `balance_minor`, or an `INSERT` with triggers off. `balance_drift` finds it.
+  The triggers stop accidents, as in the rest of the ledger. They do not stop
+  all SQL.
+- To roll back, deploy the old binary first, then run `down.sql`.

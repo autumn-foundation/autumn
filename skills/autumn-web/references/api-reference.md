@@ -710,7 +710,7 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
   `.validate()`; `IdempotencyKey::new(s)` / `::derive(namespace, &postings)`;
   `PostOutcome::{Posted, Replayed}` with `is_posted` / `is_replayed` /
   `transaction`; `PostedTransaction`, `CurrencyTotal`, `BalanceDrift`
-  (`account` / `stored` / `posted`), `Side`.
+  (`account_id` / `stored` / `posted`), `Side`.
 - `LedgerError` {`Money`, `Unbalanced`, `PostingCount`, `OneSided`,
   `ZeroPosting`, `MixedCurrencies`, `NegativeAmount`, `UnknownAccount`,
   `AccountCurrency`, `KeyReuse`, `InvalidText`, `NegativeBalance`,
@@ -721,7 +721,8 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
   (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
   framework migration set. The account row stores the balance
   (`balance_minor`, #3339). A trigger keeps it, so `post` and `balance` do not
-  read the posting history. `NULL` means "not known": the next `post` sums the
+  read the posting history, except one time for each account after the
+  migration. `NULL` means "not known": the next `post` sums the
   postings and stores the result.
 
 ## SLA obligations (`autumn_web::sla`, 0.8.0, #1826)

@@ -1323,14 +1323,14 @@ async fn lock_accounts(
 /// 3. The idempotency key is read. When it is taken, the money was already
 ///    posted: that transaction is returned as [`PostOutcome::Replayed`].
 /// 4. Any account that refuses a negative balance has the balance this
-///    transaction *would* leave checked against the locked rows. The balance
-///    is the one the account row stores, so this step does not read the
-///    posting history. A stored balance that is not known is summed from the
+///    transaction *would* leave checked against the locked rows. The check
+///    uses the balance that the account row stores, so it does not read the
+///    posting history. When the stored balance is not known, `post` sums the
 ///    postings once.
 /// 5. Only now is anything written: a summed balance, then the postings, then
 ///    the transaction row they belong to, with `ON CONFLICT DO NOTHING` on the
-///    key. A trigger on the postings table adds each posting to its account's
-///    stored balance, in the same statement.
+///    key. A trigger on the postings table adds the postings to each
+///    account's stored balance.
 ///
 /// Every refusal happens before the first write, so a rejected post leaves
 /// no row behind, and a failure after it rolls back with the transaction.
@@ -1419,8 +1419,8 @@ pub async fn post(
 
     let balances = stored_balances(conn, &accounts).await?;
     check_resulting_balances(&accounts, &balances, transfer)?;
-    // A summed balance is the true balance before this post. So it is correct
-    // also if this future is dropped before the postings go in.
+    // A summed balance is the true balance before this post. It stays correct
+    // if the caller drops this future before the postings go in.
     store_summed_balances(conn, &accounts, &balances).await?;
 
     // The postings go in BEFORE the transaction row they belong to.
@@ -1549,12 +1549,13 @@ async fn write_postings(
 
 /// Check what this transaction would leave in every account it touches.
 ///
-/// Two things are checked, in one query rather than one per account:
+/// Checks two things. It does no I/O.
 ///
-/// * **Range.** A balance that leaves `i64` cannot be read back — the `SUM`
-///   cast fails on both backends — and the tables are append-only, so the
-///   account would stay unreadable for ever. Refused here instead, which keeps
-///   every stored balance inside `i64` by induction from an empty ledger.
+/// * **Range.** A balance that leaves `i64` cannot be stored in the `BIGINT`
+///   column or read back — the `SUM` cast fails on both backends — and the
+///   tables are append-only, so the account would stay unreadable for ever.
+///   Refused here instead, which keeps every balance inside `i64` by induction
+///   from an empty ledger.
 /// * **Sign.** An account that refuses a negative balance gets the balance this
 ///   transaction would leave, not the one it has.
 ///
@@ -1682,10 +1683,10 @@ async fn sum_postings_by_account(
         .collect()
 }
 
-/// The balance of `account_id`: the sum of its postings.
+/// The balance of `account_id`.
 ///
-/// Reads the balance that the account row stores. When that balance is not
-/// known, sums the postings.
+/// Reads the balance that the account row stores. When it is not known, sums
+/// the postings. Does not store the sum.
 ///
 /// # Errors
 ///
@@ -1839,7 +1840,7 @@ pub struct BalanceDrift {
 impl BalanceDrift {
     /// The account identifier.
     #[must_use]
-    pub fn account(&self) -> &str {
+    pub fn account_id(&self) -> &str {
         &self.account
     }
 
@@ -1858,8 +1859,9 @@ impl BalanceDrift {
 
 /// Every account whose stored balance is not the sum of its postings.
 ///
-/// A trigger keeps the stored balance, so this list must be empty. An entry is
-/// proof that something wrote the `balance_minor` column around [`post`]. Like
+/// A trigger keeps the stored balance, so this list is empty. An entry shows
+/// a write around the trigger: for example a manual `UPDATE` of
+/// `balance_minor`, or an `INSERT` while the trigger is off. Like
 /// [`trial_balance`], this reads every posting: run it from a scheduled job,
 /// not from a request.
 ///

@@ -284,10 +284,15 @@ If nothing changed, delete this section.
   migration `20261029183512_add_money_account_balance` adds the
   `_autumn_money_accounts.balance_minor` column and a trigger. Run
   `autumn migrate` before you deploy the new binary. The new binary reads the
-  column. The migration does not read the postings, so it is fast. Old and new
-  binaries can post at the same time, because the trigger keeps the balance
-  for both. Do not write `balance_minor` yourself. `ledger::balance_drift`
-  reports a difference. See `docs/guide/money.md#the-stored-balance`.
+  column. Without the migration, each ledger call fails with
+  `LedgerError::Database`. The migration does not read the postings, so it is
+  fast. Old and new binaries can post at the same time, because the trigger
+  keeps the balance for both. The migration holds a short exclusive lock on
+  `_autumn_money_accounts` and `_autumn_money_postings`. To roll back, deploy
+  the old binary first, then run `down.sql`. Do not write `balance_minor`
+  yourself. `ledger::balance_drift` reports a difference. After a data-only
+  restore, set `balance_minor` to `NULL`. See
+  `docs/guide/money.md#the-stored-balance`.
 
 ## Deprecations retained from `{X.Y}`
 

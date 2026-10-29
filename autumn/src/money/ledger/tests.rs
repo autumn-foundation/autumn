@@ -560,19 +560,6 @@ fn the_check_adds_the_net_change_to_the_stored_balance() {
 }
 
 #[test]
-fn the_check_reads_a_missing_stored_balance_as_zero() {
-    let accounts = BTreeMap::from([stored_account("float", false), stored_account("cash", true)]);
-    let payout = transfer(vec![
-        Posting::credit("float", usd(1)),
-        Posting::debit("cash", usd(1)),
-    ]);
-    assert!(matches!(
-        check_resulting_balances(&accounts, &BTreeMap::new(), &payout),
-        Err(LedgerError::NegativeBalance { balance: -1, .. })
-    ));
-}
-
-#[test]
 fn the_check_uses_the_net_change_not_the_posting_order() {
     let accounts = BTreeMap::from([stored_account("cash", true)]);
     let stored = BTreeMap::from([("cash".to_owned(), i64::MAX)]);

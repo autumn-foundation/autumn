@@ -879,7 +879,23 @@ async fn an_offsetting_pair_is_checked_on_its_net_delta_not_posting_order() {
         post_tx(&mut conn, &Transaction::new(key, postings))
             .await
             .unwrap_or_else(|err| panic!("{label} must post: {err}"));
+        if label == "debit first" {
+            // MAX + MAX leaves `i64`. The trigger writes NULL, not a REAL.
+            assert_eq!(stored_balance(&mut conn, "platform:cash").await, None);
+        }
     }
+
+    // The same on the negative side: revenue is at -MAX, and a credit first
+    // takes a step below `i64::MIN`.
+    let pair = vec![
+        Posting::credit("platform:revenue", usd(i64::MAX)),
+        Posting::debit("platform:revenue", usd(i64::MAX)),
+    ];
+    let key = IdempotencyKey::new("net:revenue").expect("key");
+    post_tx(&mut conn, &Transaction::new(key, pair))
+        .await
+        .expect("an offsetting pair on revenue posts");
+    assert_eq!(stored_balance(&mut conn, "platform:revenue").await, None);
 
     // The balance is untouched, and the books still balance.
     assert_eq!(
@@ -1221,12 +1237,7 @@ async fn duplicated_retried_and_killed_charges_post_exactly_once() {
     );
 
     // Per transaction: debits equal credits.
-    #[derive(diesel::QueryableByName)]
-    struct ImbalanceRow {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        count: i64,
-    }
-    let rows: Vec<ImbalanceRow> = diesel::sql_query(
+    let rows: Vec<CountRow> = diesel::sql_query(
         "SELECT COUNT(*) AS count FROM (\
            SELECT transaction_id FROM _autumn_money_postings \
            GROUP BY transaction_id HAVING SUM(amount_minor) <> 0\
@@ -1805,9 +1816,10 @@ async fn a_drifted_balance_is_reported_and_null_repairs_it() {
     .await
     .expect("drift the cash account");
     let drift = ledger::balance_drift(&mut conn).await.expect("drift");
-    assert_eq!(drift.len(), 1, "{drift:?}");
-    let cash = drift.iter().next().expect("one drifted account");
-    assert_eq!(cash.account(), "platform:cash");
+    let [cash] = drift.as_slice() else {
+        panic!("expected one drifted account: {drift:?}");
+    };
+    assert_eq!(cash.account_id(), "platform:cash");
     assert_eq!(cash.stored().minor(), 1);
     assert_eq!(cash.posted().minor(), 2500);
     assert_eq!(cash.posted().currency(), Usd::currency());
@@ -1829,6 +1841,54 @@ async fn a_drifted_balance_is_reported_and_null_repairs_it() {
         .expect("post");
     assert_eq!(stored_balance(&mut conn, "platform:cash").await, Some(3500));
     assert_books_balance(&mut conn).await;
+
+    // An account with no postings is in the report too.
+    ledger::ensure_account(&mut conn, Account::new("platform:idle", Usd::currency()))
+        .await
+        .expect("open an idle account");
+    conn.batch_execute(
+        "UPDATE _autumn_money_accounts SET balance_minor = 5 WHERE id = 'platform:idle'",
+    )
+    .await
+    .expect("drift the idle account");
+    let drift = ledger::balance_drift(&mut conn).await.expect("drift");
+    let [idle] = drift.as_slice() else {
+        panic!("expected one drifted account: {drift:?}");
+    };
+    assert_eq!(idle.account_id(), "platform:idle");
+    assert_eq!(idle.posted().minor(), 0);
+}
+
+/// `post` reads the stored balance, not the posting history. That is the fix
+/// for the cost that grew with the history (issue #3339). A drifted value is
+/// what `post` uses, which is why `balance_drift` exists.
+#[tokio::test]
+async fn post_reads_the_stored_balance_not_the_history() {
+    let pool = boot_pool("mlg_stored_hot_path").await;
+    let mut conn = pool.get().await.expect("checkout");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("fund the float");
+    conn.batch_execute(
+        "UPDATE _autumn_money_accounts SET balance_minor = 0 WHERE id = 'platform:float'",
+    )
+    .await
+    .expect("drift the float");
+
+    let error = post_tx(&mut conn, &payout(6000, "fits-the-history"))
+        .await
+        .expect_err("the stored balance says the float is empty");
+    assert!(
+        matches!(error, LedgerError::NegativeBalance { balance: -6000, .. }),
+        "{error}"
+    );
+    assert_eq!(
+        ledger::balance(&mut conn, "platform:float")
+            .await
+            .expect("balance")
+            .minor(),
+        0
+    );
 }
 
 /// `INSERT OR REPLACE` of an account row puts the column default in place of
@@ -1857,9 +1917,13 @@ async fn insert_or_replace_of_an_account_keeps_the_balance_honest() {
             .minor(),
         10_000
     );
-    post_tx(&mut conn, &payout(15_000, "too-much"))
+    let error = post_tx(&mut conn, &payout(15_000, "too-much"))
         .await
         .expect_err("the float holds 100.00 only");
+    assert!(
+        matches!(error, LedgerError::NegativeBalance { balance: -5000, .. }),
+        "{error}"
+    );
     assert_books_balance(&mut conn).await;
 }
 
