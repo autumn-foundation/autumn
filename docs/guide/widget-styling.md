@@ -24,20 +24,152 @@ No Tailwind build step is required to get styled widgets: the stylesheet is
 plain CSS, not `@apply` rules, so linking it is enough even in a non-Tailwind
 app.
 
+## Design tokens
+
+The widget stylesheet uses the design tokens in `autumn_web::ui::tokens`
+(#3396). The admin plugin, the actuator dashboard and the error pages use the
+same tokens.
+
+| Group | Tokens |
+| --- | --- |
+| Surface | `--bg`, `--surface`, `--surface-muted`, `--border`, `--control-border` |
+| Text | `--text`, `--text-muted` |
+| Accent | `--primary`, `--primary-hover`, `--primary-light`, `--on-primary` |
+| Status | `--danger*`, `--on-danger`, `--success*`, `--warning*`, `--info*` |
+| Space | `--space-1` … `--space-8` (0.25rem … 2rem, scaled by density) |
+| Type | `--font-size-xs` … `--font-size-2xl`, `--font-weight-*`, `--line-height-*`, `--font-family`, `--font-mono` |
+| Radius | `--radius-sm`, `--radius-md`, `--radius-lg`, `--radius-full`, `--radius` |
+| Z-index | `--z-dropdown`, `--z-sticky`, `--z-banner`, `--z-toast` |
+| Breakpoints | `--breakpoint-sm` … `--breakpoint-xl` |
+
+`--on-primary` and `--on-danger` are the text colors on a `--primary` or a
+`--danger` fill. Do not use white text on a fill: in the dark scheme the fill
+is light.
+
+`--control-border` is the border of a text input. It has 3:1 contrast on
+every surface in both schemes (WCAG 1.4.11). `--border` is for decoration.
+
+The breakpoint tokens are for reference only. `@media` cannot read `var()`.
+The stylesheet uses `768px` for its one breakpoint, the same as
+`--breakpoint-md`.
+
+## Dark mode
+
+Each color token is `light-dark(<light>, <dark>)`. The tokens set
+`color-scheme: light dark` on `:root`, so the OS setting selects the scheme.
+No JavaScript is necessary.
+
+To set the scheme, put `data-theme` on `<html>`:
+
+```html
+<html data-theme="dark">   <!-- or "light"; omit it to follow the OS -->
+```
+
+`data-theme` also works on a subtree. On a subtree, also set `color` and
+`background`, because an inherited color can keep the parent scheme:
+
+```css
+.promo[data-theme="dark"] { color: var(--text); background: var(--surface); }
+```
+
+A browser without `light-dark()` gets the light values.
+
+A page with light-only colors of its own (for example Tailwind `bg-gray-50`
+on `<body>`) must pin the light scheme. Otherwise a dark OS shows dark widgets
+on a light page:
+
+```html
+<html data-theme="light">
+```
+
+The widget script syncs `data-theme` from the cookie only on a page with a
+toggle that posts to `/_autumn/theme`. Other pages keep their own
+`data-theme`, even when the user picked "Dark" on another page.
+
+### Let the user select the theme
+
+1. Merge the theme route into the app:
+
+   ```rust
+   autumn_web::app()
+       .merge(autumn_web::ui::theme::router())
+   ```
+
+2. Read the cookie in the layout. Render `data-theme` on `<html>`, so the first
+   paint has the correct theme:
+
+   ```rust
+   use autumn_web::security::{CsrfFormField, CsrfToken};
+   use autumn_web::ui::theme::Theme;
+   use autumn_web::widgets::{ThemeToggleConfig, theme_toggle};
+
+   fn layout(
+       theme: Theme,
+       csrf: Option<&CsrfToken>,
+       field: Option<&CsrfFormField>,
+       body: maud::Markup,
+   ) -> maud::Markup {
+       maud::html! {
+           html lang="en" data-theme=[theme.data_theme()] {
+               body {
+                   (theme_toggle(&ThemeToggleConfig::new(theme).csrf(csrf, field)))
+                   (body)
+               }
+           }
+       }
+   }
+   ```
+
+   `Theme` is an extractor. Add `theme: Theme` to the handler arguments.
+   Without the CSRF token, the no-JS post gets `403`.
+
+3. Load the widget script once in the layout:
+
+   ```html
+   <script src="/static/js/autumn-widgets.js" defer></script>
+   ```
+
+   With the script, a click applies the theme at once and sends no request.
+   Without the script, the form posts to `/_autumn/theme`. The route stores
+   the cookie and redirects back.
+
+The cookie is `autumn.theme`. It holds `light` or `dark`. "System" deletes it.
+It is not `HttpOnly`, because the script writes it. The admin plugin reads
+the same cookie.
+
+To store the choice in a user profile, post to your own route with
+`.action("/settings/theme")`. The script then applies the theme and lets the
+form post. It does not write the cookie, and it does not change the
+`data-theme` that your layout renders.
+
+If a shared cache stores pages that read the cookie, send `Vary: Cookie`.
+
+## Density
+
+Put `data-density` on `<html>` or on a subtree:
+
+```html
+<main data-density="compact">   <!-- compact | comfortable | spacious -->
+```
+
+Density scales the `--space-*` tokens by 0.75, 1 or 1.25. Type sizes do not
+change. `autumn_web::ui::theme::Density` has the three words.
+
 ## Re-theme via tokens, not by forking the CSS
 
-Colors, borders, and radius in the widget stylesheet reference the framework's
-shared design tokens (`autumn_web::ui::tokens`) — `var(--primary)`,
-`var(--border)`, `var(--radius)`, etc. Re-theme by overriding the token
-variables on `:root` in your own stylesheet, loaded after the widget one:
+Override the tokens on `:root` in your own stylesheet. Load it after the
+widget stylesheet. Use `light-dark()` to keep both schemes:
 
 ```css
 :root {
-    --primary: #0ea5e9;
-    --primary-hover: #0284c7;
-    --radius: 0.25rem;
+    --primary: light-dark(#0369a1, #7dd3fc);
+    --primary-hover: light-dark(#075985, #bae6fd);
+    --on-primary: light-dark(#ffffff, #082f49);
+    --radius: var(--radius-sm);
 }
 ```
+
+A plain value (`--primary: #0ea5e9;`) sets the token for both schemes.
 
 This changes the accent color and corner radius everywhere at once — the
 submit button, focus rings, the active tab underline, the current-page pager
@@ -55,12 +187,29 @@ you would override a third-party component library:
 }
 ```
 
+## Class names
+
+Every widget class has the `autumn-` prefix. Since #3396 this includes the
+alert, the badge and the wizard stepper:
+
+| Old | New |
+| --- | --- |
+| `alert`, `alert-info` … `alert-error` | `autumn-alert`, `autumn-alert--info` … `autumn-alert--error` |
+| `alert__title`, `alert__body`, … | `autumn-alert__title`, `autumn-alert__body`, … |
+| `badge`, `badge--neutral` … `badge--danger` | `autumn-badge`, `autumn-badge--neutral` … `autumn-badge--danger` |
+| `wizard-progress`, `wizard-step`, `wizard-step--current`, … | `autumn-wizard-progress`, `autumn-wizard-step`, `autumn-wizard-step--current`, … |
+
+See the [migration guide](../migrations/next.md) for the full map.
+
 ## Coverage
 
 A build-time test (`autumn/tests/integration/widget_css_coverage.rs`) scans
-every widget source file for emitted `autumn-*`/`wizard-*` classes and asserts
-each has a backing rule in the shipped stylesheet — so a new widget class
-can't ship unstyled without failing the build.
+each widget source file for `autumn-*` classes. Each class must have a rule in
+the stylesheet. A new class without a rule fails the build. A second test
+fails when a widget emits, or the stylesheet styles, an old unprefixed class.
+
+Contrast tests check the token pairs and the widget text in the light and the
+dark scheme against WCAG AA.
 
 ## Migrating from a per-app `input.css`
 

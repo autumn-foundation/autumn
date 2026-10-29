@@ -586,6 +586,8 @@ mod widgets_modal;
 mod widgets_reaction_controls;
 mod widgets_tabs;
 #[cfg(feature = "maud")]
+mod widgets_theme_toggle;
+#[cfg(feature = "maud")]
 mod widgets_toast;
 #[cfg(feature = "ws")]
 mod ws_integration;

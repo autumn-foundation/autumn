@@ -176,6 +176,7 @@ const ORIGIN_ONLY_EXTRACTORS: &[(&str, &str)] = &[
     ("CsrfTokenHeader", "a session"),
     ("CsrfFormField", "a session"),
     ("Consent", "a session"),
+    ("Theme", "cookies"),
     ("Auth", "auth state"),
     ("ApiToken", "auth state"),
     ("RequestPrincipal", "auth state"),

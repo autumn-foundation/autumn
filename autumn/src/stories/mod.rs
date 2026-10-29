@@ -542,17 +542,10 @@ fn story_detail_response(
 /// (`WIDGETS_CSS_PATH`, linked before this `<style>` in `<head>`, so this
 /// block's declarations win the cascade at equal specificity).
 ///
-/// Themed with the shared [`crate::ui::tokens`] custom properties
-/// (`var(--bg)`, `var(--primary)`, …) rather than hardcoded grays, so the
-/// gallery reads as a real Autumn surface instead of bare unstyled HTML —
-/// and so every `autumn-*` widget previewed inside a story re-themes too,
-/// since custom properties inherit down from `body`.
-///
-/// The `body { --bg: …; }` block below sets the gallery's own default
-/// ("Autumn": warm, not the framework's violet default) by overriding the
-/// tokens locally; it doesn't touch `tokens.css` itself, so apps embedding
-/// these widgets elsewhere are unaffected. [`theme_switch`] adds three more
-/// presets, swapped live by the same tokens — see its doc comment.
+/// The chrome uses the shipped [`crate::ui::tokens`] and does not redefine a
+/// color token, so each preview shows the widgets as an app gets them, in
+/// both schemes. [`theme_switch`] and [`density_switch`] change the scheme
+/// and the density with `:root:has(#… :checked)` rules (#3396).
 const STORY_GALLERY_CSS: &str = r"
 body {
     margin: 0;
@@ -560,243 +553,20 @@ body {
     color: var(--text);
     background: var(--bg);
     transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
-
-    /* The pale first-draft --border and --primary here both failed contrast
-       (review follow-up, verified independently across all three light
-       themes, none of it yet flagged when this comment was written):
-       --border read at ~1.3:1 against --surface in every one of them
-       (pastel-on-near-white, picked to look subtle, not checked against
-       what it sits on) — WCAG 1.4.11 wants 3:1. And unlike Midnight,
-       darkening --primary here has no downside to weigh: --primary-light
-       is the *light* end of the pair already, so a darker --primary only
-       ever increases contrast, for both the white-text button case and
-       the primary-on-primary-light case (e.g. #c2540a on #fbe4cd was
-       3.74:1, short of text's 4.5:1). No role conflict like Midnight's —
-       just needed darkening. Ocean and Forest below get the same two
-       fixes, values picked the same way. */
-    --bg: #fdf8f2;
-    --surface: #fffaf4;
-    --text: #2b1c10;
-    --text-muted: #7a6a58;
-    --border: #8a6f52;
-    --primary: #a8470c;
-    --primary-hover: #83380a;
-    --primary-light: #fbe4cd;
-    --radius: 0.6rem;
-    --shadow: 0 1px 3px rgba(43, 28, 16, 0.12), 0 4px 14px rgba(43, 28, 16, 0.08);
 }
 
-body:has(#story-theme-ocean:checked) {
-    --bg: #f0f7fb; --surface: #ffffff; --text: #0f2a3d; --text-muted: #52717f;
-    --border: #6b93a6; --primary: #0a5f78; --primary-hover: #084c60; --primary-light: #d7f0f5;
-    --shadow: 0 1px 3px rgba(15, 42, 61, 0.12), 0 4px 14px rgba(15, 42, 61, 0.08);
-}
-body:has(#story-theme-forest:checked) {
-    --bg: #f3f8f1; --surface: #ffffff; --text: #1b2e18; --text-muted: #5c7256;
-    --border: #5c8a52; --primary: #256829; --primary-hover: #1d5320; --primary-light: #dcefdb;
-    --shadow: 0 1px 3px rgba(27, 46, 24, 0.12), 0 4px 14px rgba(27, 46, 24, 0.08);
-}
-body:has(#story-theme-midnight:checked) {
-    /* Reuses tokens.css's own default violet (not a lighter #8b7cf6-family
-       shade) because white text sits directly on --primary throughout the
-       widget set (checked pills, buttons, …): #7c3aed keeps that pairing at
-       ~5.7:1 contrast, comfortably above WCAG AA's 4.5:1 for normal text —
-       a lighter violet dropped as low as 3.33:1 (review follow-up).
+:root:has(#story-theme-light:checked) { color-scheme: light; }
+:root:has(#story-theme-dark:checked) { color-scheme: dark; }
+:root:has(#story-density-compact:checked) { --density-scale: 0.75; }
+:root:has(#story-density-spacious:checked) { --density-scale: 1.25; }
 
-       --primary-light also needed its own override here, NOT a darker tint
-       to match this theme's dark surfaces: text=var(--primary) on
-       bg=var(--primary-light) (hovered sidebar links, the selected
-       autocomplete option) needs the *opposite* of the button pairing above
-       — with primary that dark, only a light background clears 4.5:1
-       (review follow-up: the dark tint this carried before was 2.46:1). So
-       this reuses tokens.css's own default --primary-light (#ede9fe)
-       unchanged — the identical pairing already proven in the light theme
-       — rendering as a deliberately bright chip against the dark chrome,
-       ~4.8:1.
-
-       --danger stays at tokens.css's own default (#dc2626,
-       --danger-hover #b91c1c, --danger-light #fee2e2, all unset here) for
-       the identical reason: `.autumn-modal__confirm--danger` fills with
-       --danger under white text, the same button-fill role --primary
-       plays above, so it needs to stay dark (review follow-up: lightening
-       it to fix the Comment thread error text below dropped the confirm
-       button to 2.77:1). --danger-light is the same primary-light-chip
-       role as above too — dark text (--danger) on a light chip is already
-       proven in the light theme, so it also stays at the default.
-
-       --surface-muted isn't a tokens.css variable at all — widgets.css's
-       badge component reads it as `var(--surface-muted, #f1f5f9)`, a
-       standalone fallback nothing else declares. Every other theme here
-       leaves it unset and gets that light fallback, which is fine paired
-       with their (dark-ish, light-surface-appropriate) --text-muted. Dark
-       mode needs its own dark fallback for the same reason --primary-light
-       needed its own value above: --text-muted is light here, so it
-       reads at only 2.64:1 on the undeclared light default (review
-       follow-up).
-
-       --border needed lightening too: form controls (e.g.
-       .autumn-autocomplete__input) sit on --surface with only this border
-       as their visible boundary, and the original tint (matched to the
-       other dark surfaces, not against them) was 1.26:1 — WCAG 1.4.11
-       wants 3:1 for a UI component boundary, not the 4.5:1 text threshold
-       above (review follow-up). */
-    --bg: #14151c; --surface: #1d1f2b; --text: #e7e7ee; --text-muted: #9497ab;
-    --border: #666b8c; --primary: #7c3aed; --primary-hover: #6d28d9; --primary-light: #ede9fe;
-    --surface-muted: #23253a;
-    --shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 14px rgba(0, 0, 0, 0.3);
-}
-/* --primary (#7c3aed) and --danger (#dc2626, from tokens.css's default,
-   unset above) are each also the *only* colors widgets.css ships for text
-   and graphical marks that aren't inside a button or a chip — e.g.
-   `.autumn-feed__more`, `.autumn-comment-reply-toggle`, this file's own
-   `.story-breadcrumb a` (all `color: var(--primary)`), the chart line/
-   point/bar SVG marks (`stroke`/`fill: var(--primary)` — deliberately, per
-   widgets.css's own comment: 'charts re-theme by overriding --primary'),
-   and `.autumn-comments-error` (`color: var(--danger)`) — a role with no
-   token of its own, alongside the button-fill role above and the
-   *-light-chip role before it. All three roles read the same variable but
-   need different lightness in dark mode: button-fill wants it dark (for
-   white text), plain text/marks want it light (for surface contrast) —
-   mutually exclusive for one shared value (review follow-up, three
-   rounds: --primary at the button-fill shade was 2.87:1 on --surface for
-   text and, separately, 2.87:1 again for the chart marks, which only need
-   WCAG 1.4.11's 3:1 graphical-object threshold rather than 4.5:1 but still
-   fell short; --danger lightened to fix its own text case promptly broke
-   its confirm button the same way, 2.77:1). Giving plain text/marks their
-   own token is a widgets.css-wide change well past this PR's scope of
-   theming the gallery, so this overrides plain-text-color usage instead —
-   every `color: var(--primary)` rule in widgets.css that isn't paired
-   with `background: var(--primary-light)` (that pairing is the
-   already-fixed chip role, e.g. the selected autocomplete option) — a
-   real fix for the actual gap, not a one-off patch for whichever
-   selector a story happened to render and review happened to catch
-   first (four of these eight were found that way, across four rounds).
-   See PR #2887 for the proposed follow-up (dedicated text/mark-color
-   tokens in tokens.css, so this whole list stops needing upkeep by
-   hand). */
-body:has(#story-theme-midnight:checked) .autumn-feed__more,
-body:has(#story-theme-midnight:checked) .autumn-comment-reply-toggle,
-body:has(#story-theme-midnight:checked) .autumn-nav__item a:hover,
-body:has(#story-theme-midnight:checked) .autumn-locale-switcher a:hover,
-body:has(#story-theme-midnight:checked) .autumn-breadcrumb__link:hover,
-body:has(#story-theme-midnight:checked) .autumn-reaction-active,
-body:has(#story-theme-midnight:checked) .wizard-step--completed .wizard-step__label,
-body:has(#story-theme-midnight:checked) .story-breadcrumb a {
-    color: #a78bfa;
-}
-body:has(#story-theme-midnight:checked) .autumn-reaction-active {
-    border-color: #a78bfa;
-}
-body:has(#story-theme-midnight:checked) .autumn-comments-error,
-body:has(#story-theme-midnight:checked) .autumn-field__error,
-body:has(#story-theme-midnight:checked) .autumn-job-status__error {
-    color: #f87171;
-}
-body:has(#story-theme-midnight:checked) .autumn-comments-error {
-    border-color: #f87171;
-}
-/* Same text-on-surface conflict as --danger above, mirrored for --success:
-   `.autumn-job-status__success` is the only widgets.css rule that renders
-   var(--success) as direct text rather than in a self-contained chip
-   (badge--success/alert-success pair it with --success-light, which stays
-   unaffected by this theme), and the default shade is 4.34:1 on Midnight's
-   --surface, just short of 4.5:1. */
-body:has(#story-theme-midnight:checked) .autumn-job-status__success {
-    color: #34d399;
-}
-/* Charts and the upload progress fill both read `var(--primary)` directly
-   for a non-text mark (stroke/fill, and `::before`'s background-color —
-   by design, see the comment above), so redeclaring the custom property
-   itself, scoped to the mark's container, re-themes it in one declaration
-   instead of overriding each individual rule. */
-body:has(#story-theme-midnight:checked) .autumn-chart,
-body:has(#story-theme-midnight:checked) .autumn-upload-bar {
-    --primary: #a78bfa;
-}
-/* The wizard's own completed-step connector (`.wizard-step--completed +
-   .wizard-step::before`) is the same non-text `var(--primary)` mark as
-   the two above (2.87:1 on --surface, short of the 3:1 floor), but can't
-   use the same custom-property redeclare trick: it's a sibling
-   combinator, not a descendant, so a property set on the completed step
-   wouldn't inherit to it. Overriding the resolved background-color
-   directly instead. */
-body:has(#story-theme-midnight:checked) .wizard-step--completed + .wizard-step::before {
-    background-color: #a78bfa;
-}
-/* Every `:focus-visible` keyboard outline in widgets.css is `2px solid
-   var(--primary)` too — a fourth role hitting the same conflict (review
-   follow-up: 2.87:1 on --surface, short of WCAG 1.4.11's 3:1 non-text
-   floor), unfixed by any of the overrides above since none of them touch
-   `outline-color`. Swept every such selector in widgets.css, plus this
-   gallery's own theme-switch pill below. */
-body:has(#story-theme-midnight:checked) .alert__dismiss:has(.alert__dismiss-toggle:focus-visible),
-body:has(#story-theme-midnight:checked) .autumn-feed__more:focus-visible,
-body:has(#story-theme-midnight:checked) .autumn-reaction-button:focus-visible,
-body:has(#story-theme-midnight:checked) .autumn-consent-banner__button:focus-visible,
-body:has(#story-theme-midnight:checked) .autumn-bulk-actions button:focus-visible,
-body:has(#story-theme-midnight:checked) .autumn-bulk-select:focus-visible,
-body:has(#story-theme-midnight:checked) .autumn-comment-reply-toggle:focus-visible,
-body:has(#story-theme-midnight:checked) .autumn-comment-input:focus-visible,
-body:has(#story-theme-midnight:checked) .autumn-comment-submit:focus-visible,
-body:has(#story-theme-midnight:checked) .story-theme-switch input[type='radio']:focus-visible + label {
-    outline-color: #a78bfa;
-}
-/* Same conflict again, fifth and sixth roles: :focus/:hover border-color
-   (input focus rings, hover borders) and the tabs active-indicator
-   border-bottom-color — both non-text UI, same 3:1 floor, same 2.87:1
-   shortfall (review follow-up). Doing every remaining `var(--primary)`
-   usage in widgets.css in one pass this time, rather than per-round:
-   between this block, the outline block above, and the color block
-   below, every such usage widgets.css has is now covered. */
-body:has(#story-theme-midnight:checked) .autumn-field__input:focus,
-body:has(#story-theme-midnight:checked) .autumn-search__input:focus,
-body:has(#story-theme-midnight:checked) .autumn-autocomplete__input:focus,
-body:has(#story-theme-midnight:checked) .autumn-feed__more:hover,
-body:has(#story-theme-midnight:checked) .autumn-consent-banner__button:hover,
-body:has(#story-theme-midnight:checked) .autumn-bulk-actions button:hover,
-body:has(#story-theme-midnight:checked) .autumn-comment-submit:hover {
-    border-color: #a78bfa;
-}
-body:has(#story-theme-midnight:checked) .autumn-tabs__tab--active,
-body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(1):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(1),
-body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(2):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(2),
-body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(3):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(3),
-body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(4):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(4),
-body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(5):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(5),
-body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(6):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(6) {
-    border-bottom-color: #a78bfa;
-}
-/* Unlike the --primary/--danger conflicts above, this one isn't Midnight-
-   specific: `.wizard-step__number`'s idle state pairs `var(--border)`
-   (background) with `var(--text-muted)` (text), and in every one of the
-   four gallery palettes those two tokens land within a few points of the
-   same luminance (1.11:1 up to 1.8:1, all far short of the 4.5:1 text
-   floor) — even pure black text on the Autumn border color only reaches
-   4.48:1, so no foreground swap alone can fix it; the background itself
-   has to change. `var(--surface-muted)` is already far enough from
-   `var(--text-muted)` in every theme (it's the near-white widgets.css
-   fallback in the three light themes, and Midnight's own dark override),
-   so using it here instead of `var(--border)` clears 4.5:1 everywhere
-   without per-theme fixed colors (review follow-up). Both the bare
-   `.wizard-step__number` and widgets.css's own two-class
-   `.wizard-step--upcoming .wizard-step__number` need the override: the
-   upcoming-state rule redeclares the identical `var(--border)` background
-   explicitly (the widget always renders one of --completed/--current/
-   --upcoming, never the bare class alone) and its two-class selector
-   otherwise outranks this one on specificity regardless of source order,
-   so leaving it out left the actual rendered state unfixed (review
-   follow-up). */
-.wizard-step__number,
-.wizard-step--upcoming .wizard-step__number {
-    background-color: var(--surface-muted, #f1f5f9);
-}
-
-.story-theme-switch { display: flex; align-items: center; gap: 0.4rem; padding: 0.6rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--surface); }
-.story-theme-switch legend { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-right: 0.25rem; padding: 0; }
-.story-theme-switch input[type='radio'] { position: absolute; opacity: 0; width: 1px; height: 1px; }
-.story-theme-switch label { padding: 0.3rem 0.75rem; border-radius: 999px; border: 1px solid var(--border); font-size: 0.8rem; line-height: 1; cursor: pointer; color: var(--text-muted); }
-.story-theme-switch input[type='radio']:checked + label { background: var(--primary); border-color: var(--primary); color: #fff; }
-.story-theme-switch input[type='radio']:focus-visible + label { outline: 2px solid var(--primary); outline-offset: 2px; }
+.story-switches { display: flex; flex-wrap: wrap; gap: var(--space-4); padding: 0.6rem 1.25rem; border-bottom: 1px solid var(--border); background: var(--surface); }
+.story-switch { display: flex; align-items: center; gap: 0.4rem; margin: 0; padding: 0; border: 0; }
+.story-switch legend { float: left; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-right: 0.25rem; padding: 0; }
+.story-switch input[type='radio'] { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.story-switch label { padding: 0.3rem 0.75rem; border-radius: var(--radius-full); border: 1px solid var(--control-border); font-size: 0.8rem; line-height: 1; cursor: pointer; color: var(--text-muted); }
+.story-switch input[type='radio']:checked + label { background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
+.story-switch input[type='radio']:focus-visible + label { outline: 2px solid var(--primary); outline-offset: 2px; }
 
 .story-layout { display: flex; gap: 2rem; align-items: flex-start; }
 .story-sidebar { flex: 0 0 14rem; padding: 1.25rem; border-right: 1px solid var(--border); min-height: 100vh; background: var(--surface); }
@@ -810,45 +580,56 @@ body:has(#story-theme-midnight:checked) .autumn-tabs:has(> .autumn-tabs__panel:n
 .story-content h1 { margin-top: 0; }
 .story-breadcrumb { color: var(--text-muted); font-size: 0.85rem; }
 .story-breadcrumb a { color: var(--primary); }
-.story-preview { padding: 1.75rem; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 1.5rem; background: var(--surface); box-shadow: var(--shadow); }
+.story-preview { padding: 1.75rem; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 1.5rem; background: var(--surface); color: var(--text); box-shadow: var(--shadow); }
 .story-content pre { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 1rem; overflow-x: auto; }
 .story-empty { padding: 2rem; border: 1px dashed var(--border); border-radius: var(--radius); color: var(--text-muted); }
 ";
 
-/// The gallery's theme presets: `(radio value / id suffix, visible label)`.
-/// `"autumn"` is the default (checked server-side so the page never renders
-/// themeless before CSS applies).
-const STORY_THEMES: [(&str, &str); 4] = [
-    ("autumn", "Autumn"),
-    ("ocean", "Ocean"),
-    ("forest", "Forest"),
-    ("midnight", "Midnight"),
+/// Scheme options: `(radio id suffix, visible label)`. `"system"` is checked
+/// by default and follows the OS.
+const STORY_THEMES: [(&str, &str); 3] =
+    [("system", "System"), ("light", "Light"), ("dark", "Dark")];
+
+/// Density options: `(radio id suffix, visible label)`. `"comfortable"` is
+/// checked by default.
+const STORY_DENSITIES: [(&str, &str); 3] = [
+    ("compact", "Compact"),
+    ("comfortable", "Comfortable"),
+    ("spacious", "Spacious"),
 ];
 
-/// Live theme switcher: a `fieldset` of radio buttons that re-theme the
-/// whole page — including every `autumn-*` widget previewed in a story —
-/// with **no JavaScript**.
-///
-/// Each radio's `:checked` state is matched by a `body:has(#story-theme-…
-/// :checked)` rule in [`STORY_GALLERY_CSS`] that overrides the shared
-/// design tokens (`--bg`, `--primary`, …); because custom properties
-/// inherit, every rule referencing `var(--primary)` — in this stylesheet
-/// *and* in the linked `WIDGETS_CSS_PATH` bundle — re-resolves live the
-/// moment a different radio is checked. Same `:has()`-driven, script-free
-/// pattern as the alert widget's dismiss toggle and the tabs widget's
-/// `:target` deep-linking; safe under a strict `script-src 'self'` CSP with
-/// no `'unsafe-inline'` and no nonce, since nothing here executes.
-fn theme_switch() -> maud::Markup {
+/// One radio group. Each radio's `:checked` state is matched by a
+/// `:root:has(#story-{group}-… :checked)` rule in [`STORY_GALLERY_CSS`].
+/// No JavaScript, so it holds under a strict `script-src` CSP.
+fn radio_switch(
+    group: &str,
+    legend: &str,
+    options: &[(&str, &str)],
+    default: &str,
+) -> maud::Markup {
     maud::html! {
-        fieldset class="story-theme-switch" {
-            legend { "Theme" }
-            @for (value, label) in STORY_THEMES {
-                input type="radio" name="story-theme" id=(format!("story-theme-{value}"))
-                    checked[value == "autumn"];
-                label for=(format!("story-theme-{value}")) { (label) }
+        fieldset class=(format!("story-switch story-{group}-switch")) {
+            legend { (legend) }
+            @for (value, label) in options {
+                @let id = format!("story-{group}-{value}");
+                input type="radio" name=(format!("story-{group}")) id=(id)
+                    checked[*value == default];
+                label for=(id) { (label) }
             }
         }
     }
+}
+
+/// Scheme switcher: System / Light / Dark. Sets `color-scheme` on `:root`,
+/// which selects one side of each `light-dark()` token.
+fn theme_switch() -> maud::Markup {
+    radio_switch("theme", "Theme", &STORY_THEMES, "system")
+}
+
+/// Density switcher: Compact / Comfortable / Spacious. Sets
+/// `--density-scale` on `:root`, which scales the `--space-*` tokens.
+fn density_switch() -> maud::Markup {
+    radio_switch("density", "Density", &STORY_DENSITIES, "comfortable")
 }
 
 /// Full HTML document shell: framework widget stylesheet + htmx + widget
@@ -920,7 +701,10 @@ fn story_page(
                 }
             }
             body {
-                (theme_switch())
+                div class="story-switches" {
+                    (theme_switch())
+                    (density_switch())
+                }
                 (body)
             }
         }
@@ -1484,71 +1268,96 @@ mod tests {
         );
     }
 
-    // U11 (theming/interactivity follow-up): every story page renders a live
-    // theme switcher — one radio per `STORY_THEMES` entry, "autumn" checked
-    // by default — and each radio's `id` matches a `body:has(#story-theme-…
-    // :checked)` override in `STORY_GALLERY_CSS`, so picking a theme needs no
-    // JavaScript. This also guards the CSP: the switcher must never grow an
-    // inline `<script>`/`on*=` handler, only the pure-CSS `:has()` pattern.
+    // U11, reworked by #3396: every story page has a scheme switcher
+    // (System / Light / Dark) and a density switcher (Compact / Comfortable /
+    // Spacious). Each radio id matches a `:root:has(#… :checked)` rule in
+    // `STORY_GALLERY_CSS`, so a switch needs no JavaScript and no inline
+    // script or event handler (strict `script-src` CSP).
     #[test]
-    fn theme_switch_renders_radios_wired_to_css_overrides() {
+    fn theme_and_density_switchers_are_radios_wired_to_css() {
         let registry = StoryRegistry::new(vec![demo_story("Display", "Card")]);
         let index = render_story_index(&registry, None).into_string();
         let dom = crate::test_html::parse(&index);
 
-        let fieldset = crate::test_html::SelectorList::parse("fieldset.story-theme-switch")
-            .expect("selector parses");
-        assert!(
-            !fieldset.matches(&dom).is_empty(),
-            "index must render the theme switcher: {index}"
-        );
-
-        for (value, label) in STORY_THEMES {
-            let radio_id = format!("story-theme-{value}");
-            let radio_selector = crate::test_html::SelectorList::parse(&format!(
-                "input[type=\"radio\"][name=\"story-theme\"]#{radio_id}"
-            ))
-            .expect("selector parses");
-            assert!(
-                !radio_selector.matches(&dom).is_empty(),
-                "missing theme radio for {value:?}: {index}"
-            );
-
-            let label_selector =
-                crate::test_html::SelectorList::parse(&format!("label[for=\"{radio_id}\"]"))
+        for (group, options, default, css) in [
+            (
+                "theme",
+                &STORY_THEMES[..],
+                "system",
+                &[
+                    ("light", "color-scheme: light;"),
+                    ("dark", "color-scheme: dark;"),
+                ][..],
+            ),
+            (
+                "density",
+                &STORY_DENSITIES[..],
+                "comfortable",
+                &[
+                    ("compact", "--density-scale: 0.75;"),
+                    ("spacious", "--density-scale: 1.25;"),
+                ][..],
+            ),
+        ] {
+            let fieldset =
+                crate::test_html::SelectorList::parse(&format!("fieldset.story-{group}-switch"))
                     .expect("selector parses");
-            let label_matches = label_selector.matches(&dom);
             assert!(
-                !label_matches.is_empty(),
-                "missing theme label for {value:?}: {index}"
-            );
-            assert!(
-                label_matches[0].text().contains(label),
-                "theme label for {value:?} should read {label:?}: {index}"
+                !fieldset.matches(&dom).is_empty(),
+                "no {group} switcher: {index}"
             );
 
-            // "autumn" is the base `body {}` rule's own default — it needs no
-            // `:has()` override, only the other three presets do.
-            if value != "autumn" {
+            for (value, label) in options {
+                let radio_id = format!("story-{group}-{value}");
+                let radio = crate::test_html::SelectorList::parse(&format!(
+                    "input[type=\"radio\"][name=\"story-{group}\"]#{radio_id}"
+                ))
+                .expect("selector parses");
                 assert!(
-                    STORY_GALLERY_CSS.contains(&format!("#story-theme-{value}:checked")),
-                    "STORY_GALLERY_CSS must override tokens when #{radio_id} is checked"
+                    !radio.matches(&dom).is_empty(),
+                    "no radio {radio_id}: {index}"
+                );
+                let label_el =
+                    crate::test_html::SelectorList::parse(&format!("label[for=\"{radio_id}\"]"))
+                        .expect("selector parses");
+                let labels = label_el.matches(&dom);
+                assert!(
+                    labels.first().is_some_and(|l| l.text().contains(label)),
+                    "label for {radio_id} must read {label:?}: {index}"
                 );
             }
+            assert!(
+                index.contains(&format!(r#"id="story-{group}-{default}" checked"#)),
+                "{default} must be checked server-side: {index}"
+            );
+            for (value, declaration) in css {
+                let rule = format!(":root:has(#story-{group}-{value}:checked) {{ {declaration} }}");
+                assert!(STORY_GALLERY_CSS.contains(&rule), "missing `{rule}`");
+            }
         }
-
-        assert!(
-            index.contains(r#"id="story-theme-autumn" checked"#),
-            "the default theme (autumn) must be checked server-side so the \
-             page never renders themeless before CSS applies: {index}"
-        );
 
         assert!(
             !index.contains("<script>")
                 && !index.contains(" onclick=")
                 && !index.contains(" onchange="),
-            "the theme switcher must stay pure-CSS (:has()), no inline script \
-             or event handler, to hold under a strict script-src CSP: {index}"
+            "the switchers must stay pure CSS: {index}"
+        );
+    }
+
+    /// #3396: the gallery shows the shipped tokens. It must not redefine a
+    /// color token, or the dark scheme would not show.
+    #[test]
+    fn gallery_css_does_not_override_color_tokens() {
+        for line in STORY_GALLERY_CSS.lines() {
+            let line = line.trim_start();
+            assert!(
+                !line.starts_with("--") || line.starts_with("--density-scale"),
+                "gallery redefines a token: {line}"
+            );
+        }
+        assert!(
+            !STORY_GALLERY_CSS.contains("color: #fff"),
+            "use var(--on-primary)"
         );
     }
 

@@ -111,6 +111,50 @@ codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
 ---
 
+### Widgets: alert, badge and wizard classes have the `autumn-` prefix
+
+**Why:** every other widget class has the `autumn-` prefix since 0.8.0.
+Three families did not. A generic class such as `alert` or `badge` can
+collide with app CSS (issue #3396).
+
+**You are affected only if your own CSS, JS or tests target the old class
+names.** The markup is the same apart from the class names.
+
+**Before (`{X.Y}`):**
+
+```css
+.alert-error { border-width: 2px; }
+.badge--success { text-transform: uppercase; }
+.wizard-step--current .wizard-step__label { color: red; }
+```
+
+**After (`{(X+1).0}`):**
+
+```css
+.autumn-alert--error { border-width: 2px; }
+.autumn-badge--success { text-transform: uppercase; }
+.autumn-wizard-step--current .autumn-wizard-step__label { color: red; }
+```
+
+Full map:
+
+| Old | New |
+| --- | --- |
+| `alert` | `autumn-alert` |
+| `alert-info`, `alert-success`, `alert-warning`, `alert-error` | `autumn-alert--info`, `autumn-alert--success`, `autumn-alert--warning`, `autumn-alert--error` |
+| `alert__icon`, `alert__content`, `alert__title`, `alert__body`, `alert__errors`, `alert__dismiss`, `alert__dismiss-toggle` | `autumn-alert__icon`, `autumn-alert__content`, `autumn-alert__title`, `autumn-alert__body`, `autumn-alert__errors`, `autumn-alert__dismiss`, `autumn-alert__dismiss-toggle` |
+| `badge` | `autumn-badge` |
+| `badge--neutral`, `badge--info`, `badge--success`, `badge--warning`, `badge--danger` | `autumn-badge--neutral`, `autumn-badge--info`, `autumn-badge--success`, `autumn-badge--warning`, `autumn-badge--danger` |
+| `wizard-progress`, `wizard-progress__summary` | `autumn-wizard-progress`, `autumn-wizard-progress__summary` |
+| `wizard-step`, `wizard-step--completed`, `wizard-step--current`, `wizard-step--upcoming` | `autumn-wizard-step`, `autumn-wizard-step--completed`, `autumn-wizard-step--current`, `autumn-wizard-step--upcoming` |
+| `wizard-step__number`, `wizard-step__label` | `autumn-wizard-step__number`, `autumn-wizard-step__label` |
+
+A test that calls `.assert_selector(".wizard-progress")` must use
+`.autumn-wizard-progress`. `autumn generate wizard` writes the new name.
+
+**Automation:** `manual` — the selectors are in the app's own stylesheets,
+scripts and tests. A codemod cannot find them reliably.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -166,6 +210,20 @@ Changes that still compile but behave differently at runtime. Examples:
 - A scheduled task now runs on a different worker.
 
 If nothing changed, delete this section.
+
+- **Widgets follow the OS dark mode (#3396).** The widget stylesheet sets
+  `color-scheme: light dark`, and each color token has a dark value. On a
+  dark OS, fields, cards, alerts, modals and toasts become dark. A page whose
+  own colors are light only (for example Tailwind `bg-gray-50` on `<body>`)
+  then shows dark widgets on a light page. To keep the light scheme, set it
+  on `<html>`:
+
+  ```rust
+  html lang="en" data-theme="light" { /* … */ }
+  ```
+
+  To support both schemes, use the tokens (`var(--bg)`, `var(--text)`) for
+  the page colors, and see `docs/guide/widget-styling.md#dark-mode`.
 
 ## Deprecations retained from `{X.Y}`
 

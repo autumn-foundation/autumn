@@ -74,7 +74,8 @@ pub fn layout_with_seo(
 ) -> Markup {
     html! {
         (autumn_web::PreEscaped("<!DOCTYPE html>"))
-        html lang=(locale.tag()) {
+        // Light-only page colors: pin the light scheme (#3396).
+        html lang=(locale.tag()) data-theme="light" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";

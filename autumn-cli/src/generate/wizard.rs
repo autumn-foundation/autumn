@@ -443,7 +443,7 @@ async fn {snake_name}_wizard_happy_path() {{
     // // Step 1: GET renders progress indicator
     // client.get("/{snake_name}/{first_step}").send().await
     //     .assert_ok()
-    //     .assert_selector(".wizard-progress")
+    //     .assert_selector(".autumn-wizard-progress")
     //     .assert_selector("li[aria-current='step']");
 
     // // Step 1: POST valid data → redirect to step 2
@@ -476,7 +476,7 @@ async fn {snake_name}_step2_invalid_rerender_with_errors() {{
     //     .form("") // missing required fields
     //     .send().await
     //     .assert_status(422)
-    //     .assert_selector(".wizard-progress"); // progress still shown
+    //     .assert_selector(".autumn-wizard-progress"); // progress still shown
 
     todo!("fill in step fields and form values, then remove #[ignore]");
 }}
@@ -710,7 +710,8 @@ mod tests {
     #[test]
     fn test_file_references_wizard_progress_selector() {
         let content = render_wizard_test("checkout", "Checkout", &steps3());
-        assert!(content.contains(".wizard-progress"));
+        assert!(content.contains(".autumn-wizard-progress"));
+        assert!(!content.contains("\".wizard-progress"), "{content}");
     }
 
     // ── validation ──────────────────────────────────────────────────

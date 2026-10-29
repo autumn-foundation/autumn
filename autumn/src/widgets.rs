@@ -21,6 +21,7 @@
 //! | `reaction_controls` | No-JS vote/like toggle buttons + live aggregate for `#[votable]` |
 //! | `comment_thread` | No-JS/htmx nested comment list with an inline reply form per node, for `#[commentable]` |
 //! | `locale_switcher` | Path-preserving language switcher for locale-prefixed routing (issue #1251) |
+//! | `theme_toggle` | No-JS System / Light / Dark switch that stores the `autumn.theme` cookie (issue #3396) |
 //!
 //! # Feedback widgets
 //!
@@ -2771,6 +2772,163 @@ pub fn locale_switcher(
     }
 }
 
+// ── theme_toggle (#3396) ────────────────────────────────────────────────────
+
+/// Settings for [`theme_toggle`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy)]
+pub struct ThemeToggleConfig<'a> {
+    current: crate::ui::theme::Theme,
+    action: &'a str,
+    return_to: Option<&'a str>,
+    csrf_token: Option<&'a str>,
+    csrf_field: &'a str,
+    label: &'a str,
+    option_labels: [&'a str; 3],
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> ThemeToggleConfig<'a> {
+    /// A toggle that marks `current` as pressed and posts to
+    /// [`crate::ui::theme::THEME_PATH`].
+    #[must_use]
+    pub const fn new(current: crate::ui::theme::Theme) -> Self {
+        Self {
+            current,
+            action: crate::ui::theme::THEME_PATH,
+            return_to: None,
+            csrf_token: None,
+            csrf_field: "_csrf",
+            label: "Theme",
+            option_labels: ["System", "Light", "Dark"],
+            class: None,
+        }
+    }
+
+    /// Post to a different path (an app's own theme route). With JS, the
+    /// theme applies at once and the form still posts, so the app stores the
+    /// choice. The script writes the `autumn.theme` cookie only for a form
+    /// that posts to [`crate::ui::theme::THEME_PATH`].
+    #[must_use]
+    pub const fn action(mut self, action: &'a str) -> Self {
+        self.action = action;
+        self
+    }
+
+    /// The local path to go back to after the change. When omitted, the
+    /// handler uses the `Referer` path.
+    #[must_use]
+    pub const fn return_to(mut self, path: &'a str) -> Self {
+        self.return_to = Some(path);
+        self
+    }
+
+    /// Set the CSRF token. Without a token no hidden field is rendered,
+    /// and the no-JS post gets `403` from the CSRF layer.
+    #[must_use]
+    pub const fn csrf_token(mut self, token: &'a str) -> Self {
+        self.csrf_token = Some(token);
+        self
+    }
+
+    /// Set the CSRF field name. Default: `"_csrf"`.
+    #[must_use]
+    pub const fn csrf_field(mut self, field: &'a str) -> Self {
+        self.csrf_field = field;
+        self
+    }
+
+    /// Set both from the handler's extractors. A `None` token renders no
+    /// field; a `None` field keeps `"_csrf"`. Same as `ReactionControls::csrf`.
+    #[must_use]
+    pub fn csrf(
+        mut self,
+        token: Option<&'a crate::security::CsrfToken>,
+        field: Option<&'a crate::security::CsrfFormField>,
+    ) -> Self {
+        if let Some(token) = token {
+            self.csrf_token = Some(token.token());
+        }
+        if let Some(field) = field {
+            self.csrf_field = field.0.as_str();
+        }
+        self
+    }
+
+    /// The accessible name of the button group (default `"Theme"`).
+    #[must_use]
+    pub const fn label(mut self, label: &'a str) -> Self {
+        self.label = label;
+        self
+    }
+
+    /// The button texts, in the order System, Light, Dark.
+    #[must_use]
+    pub const fn option_labels(mut self, system: &'a str, light: &'a str, dark: &'a str) -> Self {
+        self.option_labels = [system, light, dark];
+        self
+    }
+
+    /// Append an extra class to the root `<form>`.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render a System / Light / Dark theme switch (issue #3396).
+///
+/// Emits a `POST` form with one submit button per theme. The current theme
+/// has `aria-pressed="true"`. Without JS, the form posts to
+/// [`crate::ui::theme::THEME_PATH`] (mount [`crate::ui::theme::router`]).
+/// The route stores the `autumn.theme` cookie and redirects back.
+/// `autumn-widgets.js` finds the `data-autumn-theme-toggle` hook. It applies
+/// `data-theme` on `<html>` and writes the cookie. It sends no request.
+///
+/// Read the cookie in the layout with [`crate::ui::theme::Theme`]. Render
+/// `data-theme` on `<html>`. Thus the first paint shows the correct theme.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::ui::theme::Theme;
+/// use autumn_web::widgets::{ThemeToggleConfig, theme_toggle};
+///
+/// let html = theme_toggle(&ThemeToggleConfig::new(Theme::Dark).csrf_token("tok"))
+///     .into_string();
+/// assert!(html.contains(r#"value="dark" class="autumn-theme-toggle__option" aria-pressed="true""#));
+/// assert!(html.contains(r#"name="_csrf" value="tok""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn theme_toggle(config: &ThemeToggleConfig<'_>) -> maud::Markup {
+    use crate::ui::theme::Theme;
+
+    let root = merge_class("autumn-theme-toggle", config.class);
+    maud::html! {
+        form method="post" action=(config.action) class=(root) data-autumn-theme-toggle {
+            @if let Some(token) = config.csrf_token {
+                input type="hidden" name=(config.csrf_field) value=(token);
+            }
+            @if let Some(path) = config.return_to {
+                input type="hidden" name="return_to" value=(path);
+            }
+            div class="autumn-theme-toggle__group" role="group" aria-label=(config.label) {
+                @for (theme, text) in Theme::ALL.into_iter().zip(config.option_labels) {
+                    button type="submit" name="theme" value=(theme.as_str())
+                        class="autumn-theme-toggle__option"
+                        aria-pressed=(if theme == config.current { "true" } else { "false" })
+                    {
+                        (text)
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── nav_bar ──────────────────────────────────────────────────────────────────
 
 /// Layout variant for [`nav_bar`] — selects a modifier class on the root
@@ -4374,7 +4532,7 @@ fn fnv1a_hash(s: &str) -> u64 {
 
 /// Semantic color for a [`badge`] / [`status_tag`].
 ///
-/// Each variant emits a stable, documented class (`badge--<variant>`) so the
+/// Each variant emits a stable, documented class (`autumn-badge--<variant>`) so the
 /// framework stylesheet themes it; there are no inline styles. Color is never
 /// the *only* signal — the badge's text label always communicates the state.
 #[cfg(feature = "maud")]
@@ -4485,9 +4643,9 @@ impl<'a> BadgeConfig<'a> {
 
 /// Render a small semantic status pill.
 ///
-/// Emits `<span class="badge badge--<variant>">label</span>`. The label is
+/// Emits `<span class="autumn-badge autumn-badge--<variant>">label</span>`. The label is
 /// text content (screen-reader legible) and HTML-escaped by Maud; color is
-/// never the sole signal. Style the `.badge` / `.badge--*` classes via the
+/// never the sole signal. Style the `.autumn-badge` / `.autumn-badge--*` classes via the
 /// framework stylesheet — no inline styles are emitted.
 ///
 /// For a tooltip / accessible name on an abbreviated label, use
@@ -4501,7 +4659,7 @@ impl<'a> BadgeConfig<'a> {
 ///
 /// // Inline in a template — color chosen deterministically from the value:
 /// let pill = badge("published", BadgeVariant::for_label("published"));
-/// assert!(pill.into_string().contains(r#"class="badge badge--success""#));
+/// assert!(pill.into_string().contains(r#"class="autumn-badge autumn-badge--success""#));
 ///
 /// // Inside a `data_table` cell:
 /// struct Post { title: String, status: String }
@@ -4511,7 +4669,7 @@ impl<'a> BadgeConfig<'a> {
 ///     Column::new("Status", |p: &Post| badge(&p.status, BadgeVariant::for_label(&p.status))),
 /// ];
 /// let table = data_table(&posts, &cols, &DataTableConfig::new("No posts.")).into_string();
-/// assert!(table.contains("badge--warning")); // "draft" → Warning
+/// assert!(table.contains("autumn-badge--warning")); // "draft" → Warning
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
@@ -4524,7 +4682,10 @@ pub fn badge(label: &str, variant: BadgeVariant) -> maud::Markup {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn badge_with(label: &str, variant: BadgeVariant, config: &BadgeConfig<'_>) -> maud::Markup {
-    let root = merge_class(&format!("badge badge--{}", variant.as_str()), config.class);
+    let root = merge_class(
+        &format!("autumn-badge autumn-badge--{}", variant.as_str()),
+        config.class,
+    );
     maud::html! {
         span class=(root) title=[config.title] aria-label=[config.aria_label] { (label) }
     }
@@ -4537,7 +4698,7 @@ pub fn badge_with(label: &str, variant: BadgeVariant, config: &BadgeConfig<'_>) 
 /// the value, use `badge(label, BadgeVariant::for_label(label))`.
 ///
 /// The admin plugin's hand-rolled `badge badge-{op}` audit-log spans are the
-/// migration target for this helper; the `.badge` class contract here is a
+/// migration target for this helper; the `.autumn-badge` class contract here is a
 /// superset that can replace them.
 #[cfg(feature = "maud")]
 #[must_use]
@@ -4811,8 +4972,10 @@ impl AlertVariant {
             svg class="autumn-alert__icon-svg" viewBox="0 0 20 20" width="20" height="20"
                 aria-hidden="true" focusable="false" {
                 circle cx="10" cy="10" r="10" fill="currentColor" {}
-                text x="10" y="15" text-anchor="middle" font-size="13"
-                    font-family="sans-serif" fill="#fff" { (glyph) }
+                // `fill` is the no-CSS fallback. The stylesheet sets
+                // `--surface`, which stays visible on the dark-scheme circle.
+                text class="autumn-alert__icon-glyph" x="10" y="15" text-anchor="middle"
+                    font-size="13" font-family="sans-serif" fill="#fff" { (glyph) }
             }
         }
     }
@@ -4836,7 +4999,7 @@ impl<'a> AlertConfig<'a> {
         Self::default()
     }
 
-    /// Set a heading rendered above the body (an `<h2 class="alert__title">`).
+    /// Set a heading rendered above the body (an `<h2 class="autumn-alert__title">`).
     #[must_use]
     pub const fn title(mut self, title: &'a str) -> Self {
         self.title = Some(title);
@@ -4869,7 +5032,7 @@ impl<'a> AlertConfig<'a> {
 
 /// Render an inline, block-level contextual message box.
 ///
-/// Emits `<div class="alert alert-<variant>" role="...">` wrapping `body`.
+/// Emits `<div class="autumn-alert autumn-alert--<variant>" role="...">` wrapping `body`.
 /// `role` is `alert` for `Error`/`Warning`, `status` for `Info`/`Success`. All
 /// caller-supplied markup is escaped by Maud. No inline `style=` is emitted and
 /// no JavaScript is required. For a title, icon, or dismiss control use
@@ -4883,7 +5046,7 @@ impl<'a> AlertConfig<'a> {
 ///
 /// let box_ = alert(AlertVariant::Info, html! { "No posts yet — create your first one." });
 /// let out = box_.into_string();
-/// assert!(out.contains(r#"class="alert alert-info""#));
+/// assert!(out.contains(r#"class="autumn-alert autumn-alert--info""#));
 /// assert!(out.contains(r#"role="status""#));
 /// ```
 #[cfg(feature = "maud")]
@@ -4907,8 +5070,8 @@ pub fn alert(variant: AlertVariant, body: maud::Markup) -> maud::Markup {
 /// )
 /// .into_string();
 /// assert!(out.contains(r#"role="alert""#));
-/// assert!(out.contains(r#"<h2 class="alert__title">Payment failed</h2>"#));
-/// assert!(out.contains("alert__dismiss"));
+/// assert!(out.contains(r#"<h2 class="autumn-alert__title">Payment failed</h2>"#));
+/// assert!(out.contains("autumn-alert__dismiss"));
 /// assert!(!out.contains("<script")); // no JS
 /// ```
 // `body` is taken by value to match the issue's `alert(variant, body: Markup)`
@@ -4935,26 +5098,29 @@ fn alert_root(
     config: &AlertConfig<'_>,
     focus_id: Option<&str>,
 ) -> maud::Markup {
-    let root = merge_class(&format!("alert alert-{}", variant.as_str()), config.class);
+    let root = merge_class(
+        &format!("autumn-alert autumn-alert--{}", variant.as_str()),
+        config.class,
+    );
     maud::html! {
         div id=[focus_id] class=(root) role=(variant.role())
             tabindex=[focus_id.map(|_| "-1")] autofocus[focus_id.is_some()] {
             @if config.icon {
-                span class="alert__icon" { (variant.icon()) }
+                span class="autumn-alert__icon" { (variant.icon()) }
             }
-            div class="alert__content" {
+            div class="autumn-alert__content" {
                 @if let Some(title) = config.title {
-                    (heading(HeadingLevel::H2, None, "alert__title", &maud::html! { (title) }))
+                    (heading(HeadingLevel::H2, None, "autumn-alert__title", &maud::html! { (title) }))
                 }
-                div class="alert__body" { (body) }
+                div class="autumn-alert__body" { (body) }
             }
             @if config.dismissible {
                 // The checkbox stays in tab order (visually hidden but focusable
-                // via `.alert__dismiss-toggle`, never `hidden`/`display:none`) so
+                // via `.autumn-alert__dismiss-toggle`, never `hidden`/`display:none`) so
                 // keyboard and screen-reader users can dismiss; the accessible
                 // name is on the control itself.
-                label class="alert__dismiss" {
-                    input type="checkbox" class="alert__dismiss-toggle"
+                label class="autumn-alert__dismiss" {
+                    input type="checkbox" class="autumn-alert__dismiss-toggle"
                         aria-label="Dismiss this message";
                     span aria-hidden="true" { "×" }
                 }
@@ -5001,7 +5167,7 @@ pub const ERROR_SUMMARY_ID: &str = "error-summary";
 /// errs.insert("name".to_string(), vec!["must be <set>".to_string()]);
 /// let invalid = Changeset::from_errors((), errs);
 /// let out = error_summary(&invalid).unwrap().into_string();
-/// assert!(out.contains(r#"class="alert alert-error""#));
+/// assert!(out.contains(r#"class="autumn-alert autumn-alert--error""#));
 /// assert!(out.contains(r##"<a href="#email">is invalid</a>"##));
 /// assert!(out.contains("must be &lt;set&gt;")); // caller text escaped
 /// assert!(out.contains(r#"tabindex="-1""#));
@@ -5017,7 +5183,7 @@ pub fn error_summary<T>(changeset: &crate::form::Changeset<T>) -> Option<maud::M
     let mut fields: Vec<&String> = changeset.all_errors().keys().collect();
     fields.sort();
     let body = maud::html! {
-        ul class="alert__errors" {
+        ul class="autumn-alert__errors" {
             @for field in fields {
                 @let href = field_fragment(field);
                 @for msg in &changeset.all_errors()[field] {
@@ -8583,6 +8749,12 @@ mod tests {
         .into_string();
         assert!(html.contains(r#"class="autumn-alert__icon-svg""#), "{html}");
         assert!(!html.contains(r#"class="alert__icon-svg""#), "{html}");
+        // #3396: the glyph color comes from CSS (`--surface`), so it stays
+        // visible on the light dark-scheme circle.
+        assert!(
+            html.contains(r#"class="autumn-alert__icon-glyph""#),
+            "{html}"
+        );
     }
 
     // ── hero ─────────────────────────────────────────────────────────────

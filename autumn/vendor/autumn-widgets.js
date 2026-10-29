@@ -238,9 +238,78 @@
     if (t.matches && t.matches('dialog[closedby="any"][open]')) t.close();
   });
 
+  // ── theme_toggle (#3396) ──────────────────────────────────────────────────
+  // autumn_web::widgets::theme_toggle is a no-JS POST form. This code applies
+  // the choice in place: data-theme on <html> and aria-pressed on each toggle.
+  // A toggle that posts to the framework route also writes the autumn.theme
+  // cookie (the cookie that route writes) and sends no request. A toggle with
+  // an app action posts as usual, so the app stores the choice its own way.
+  var THEMES = ['system', 'light', 'dark'];
+  var THEME_PATH = '/_autumn/theme';
+
+  // The first valid stored theme, or null. The server reads it the same way.
+  function readThemeCookie() {
+    var pairs = document.cookie.split(';');
+    for (var i = 0; i < pairs.length; i++) {
+      var pair = pairs[i].trim();
+      if (pair.indexOf('autumn.theme=') !== 0) continue;
+      var value = pair.slice('autumn.theme='.length);
+      if (THEMES.indexOf(value) >= 0) return value;
+    }
+    return null;
+  }
+
+  function applyTheme(theme) {
+    var root = document.documentElement;
+    if (theme === 'system') root.removeAttribute('data-theme');
+    else root.setAttribute('data-theme', theme);
+    document.querySelectorAll('[data-autumn-theme-toggle] button[name="theme"]')
+      .forEach(function (button) {
+        button.setAttribute('aria-pressed', button.value === theme ? 'true' : 'false');
+      });
+  }
+
+  function storeTheme(theme) {
+    document.cookie = theme === 'system'
+      ? 'autumn.theme=; Max-Age=0; Path=/; SameSite=Lax'
+      : 'autumn.theme=' + theme + '; Max-Age=31536000; Path=/; SameSite=Lax';
+  }
+
+  // The listener uses the capture phase. Thus an htmx-boosted form also
+  // sends nothing for the framework route.
+  document.addEventListener('submit', function (e) {
+    var form = e.target;
+    if (!form.matches || !form.matches('form[data-autumn-theme-toggle]')) return;
+    var button = e.submitter;
+    if (!button || button.name !== 'theme' || THEMES.indexOf(button.value) < 0) return;
+    applyTheme(button.value);
+    if (form.getAttribute('action') === THEME_PATH) {
+      storeTheme(button.value);
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, true);
+
+  // A cached page can carry a stale data-theme. Only a page with a
+  // cookie-backed toggle (one that posts to the framework route) follows the
+  // cookie: its layout renders the stored preference, and no cookie means
+  // System. Other pages keep the data-theme their app set, for example a
+  // light-only pin or a theme read from a user profile.
+  function syncTheme() {
+    var cookieBacked = 'form[data-autumn-theme-toggle][action="' + THEME_PATH + '"]';
+    if (!document.querySelector(cookieBacked)) return;
+    applyTheme(readThemeCookie() || 'system');
+  }
+
+  // The back/forward cache restores a page without a new load.
+  window.addEventListener('pageshow', function (e) {
+    if (e.persisted) syncTheme();
+  });
+
   function initAll() {
     document.querySelectorAll('[data-ac-value-id]').forEach(initAutocomplete);
     document.querySelectorAll('[data-autumn-nav]').forEach(initNav);
+    syncTheme();
   }
 
   if (document.readyState === 'loading') {

@@ -432,7 +432,7 @@ struct OobFragment {
 /// use maud::Render;
 ///
 /// let primary = html! { div { "Task created successfully!" } };
-/// let flash = html! { div id="flash-message" class="alert alert-success" { "Succesfully saved!" } };
+/// let flash = html! { div id="flash-message" class="autumn-alert autumn-alert--success" { "Succesfully saved!" } };
 /// let counter = html! { span { "5" } };
 ///
 /// let response = HtmxFragments::new(primary)
