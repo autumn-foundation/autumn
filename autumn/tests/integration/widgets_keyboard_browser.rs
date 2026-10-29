@@ -100,6 +100,9 @@ fn page_body() -> Markup {
         button id="swap-inner" hx-get="/fragment-inner" hx-target="#t" hx-swap="innerHTML" {
             "Swap inner"
         }
+        button id="swap-same" hx-get="/fragment-same" hx-target="#t" hx-swap="outerHTML" {
+            "Swap same"
+        }
     }
 }
 
@@ -116,6 +119,12 @@ async fn rtl() -> Markup {
 #[get("/fragment")]
 async fn fragment() -> Markup {
     settings_tabs("s")
+}
+
+/// Tabs `t` again, for an outerHTML swap that replaces the same root id.
+#[get("/fragment-same")]
+async fn fragment_same() -> Markup {
+    settings_tabs("t")
 }
 
 /// The inner HTML of tabs `t`, for an innerHTML swap into its root.
@@ -167,6 +176,7 @@ async fn runner() -> SystemTestRunner {
                 fragment,
                 fragment_inner,
                 fragment_outer,
+                fragment_same,
                 colors,
                 submitted
             ])
@@ -279,6 +289,17 @@ async fn assert_selected_tab(page: &Page, id: &str, selected: &str) {
             "roving tabindex on {tab}"
         );
         assert_eq!(shown(page, &panel).await, want, "panel {panel} shown");
+        assert_eq!(
+            eval_bool(
+                page,
+                &format!(
+                    "document.getElementById('{tab}').classList.contains('autumn-tabs__tab--active')"
+                ),
+            )
+            .await,
+            want,
+            "active class on {tab}"
+        );
     }
 }
 
@@ -403,6 +424,62 @@ async fn tabs_whose_contents_htmx_replaces_init_again() {
     focus(&page, "t-tab-t-profile").await;
     press(&page, "ArrowRight").await;
     assert_selected_tab(&page, "t", "security").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn replaced_tabs_keep_the_selection_after_htmx_settles() {
+    // htmx puts the response's `class` back after afterSwap. The selected
+    // tab must keep its highlight when that happens.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/#t-billing").await;
+    assert_selected_tab(&page, "t", "billing").await;
+    eval_bool(
+        &page,
+        "window.__oldList = document.querySelector('#t > [role=tablist]'); true",
+    )
+    .await;
+    page.click("#swap-inner").await.expect("swap");
+    wait_for(
+        &page,
+        "document.querySelector('#t > [role=tablist]') !== window.__oldList",
+    )
+    .await;
+    page.expect_hx_settle().await.expect("settle");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_selected_tab(&page, "t", "billing").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tabs_replaced_by_the_same_root_stay_enhanced_after_settle() {
+    // outerHTML with the same id: htmx puts the response's root `class`
+    // back after afterSwap, which drops `autumn-tabs--enhanced`.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/#t-security").await;
+    eval_bool(
+        &page,
+        "window.__oldRoot = document.getElementById('t'); true",
+    )
+    .await;
+    page.click("#swap-same").await.expect("swap");
+    wait_for(&page, "document.getElementById('t') !== window.__oldRoot").await;
+    page.expect_hx_settle().await.expect("settle");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        eval_bool(
+            &page,
+            "document.getElementById('t').classList.contains('autumn-tabs--enhanced')"
+        )
+        .await,
+        "the replaced root keeps the enhanced class"
+    );
+    assert_selected_tab(&page, "t", "security").await;
+    focus(&page, "t-tab-t-security").await;
+    press(&page, "ArrowRight").await;
+    assert_selected_tab(&page, "t", "billing").await;
 }
 
 #[tokio::test]

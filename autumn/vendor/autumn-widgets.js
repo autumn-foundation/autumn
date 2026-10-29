@@ -674,4 +674,23 @@
   });
   // A history restore (hx-boost, Back) brings back nodes without listeners.
   document.addEventListener('htmx:historyRestore', function () { initAll(document); });
+
+  // htmx puts the response's `class` back after afterSwap (its settle step).
+  // That can drop the enhanced classes and move the tab highlight. Apply
+  // them again from state that settle keeps: the init guard and aria-selected.
+  document.addEventListener('htmx:afterSettle', function (e) {
+    if (!e.target || !e.target.querySelectorAll) return;
+    each(e.target, '[data-autumn-nav]', function (nav) {
+      nav.classList.add('autumn-nav--enhanced');
+    });
+    each(e.target, '[data-autumn-tabs]', function (root) {
+      var list = ownTablist(root);
+      if (!list || !ready.has(list)) return;
+      root.classList.add('autumn-tabs--enhanced');
+      var tab = listItems(list).filter(function (t) {
+        return t.getAttribute('aria-selected') === 'true';
+      })[0];
+      if (tab) selectTab(list, tab, false);
+    });
+  });
 })();
