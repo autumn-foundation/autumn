@@ -522,6 +522,8 @@ mod step_up_route;
 mod storage_local_integration;
 #[cfg(feature = "maud")]
 mod stories;
+#[cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
+mod stories_browser;
 #[cfg(feature = "system-tests")]
 mod system_test_api;
 #[cfg(feature = "db")]

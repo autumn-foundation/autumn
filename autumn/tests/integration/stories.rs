@@ -234,12 +234,16 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "data-table",
     // Form field wrapper (`autumn_web::form`, #3395), not a `widgets.rs` fn.
     "field",
+    // `autumn_web::a11y` primitives (#3398).
+    "accessible-primitives",
     "hero",
     "infinite-feed",
     "locale-switcher",
     "modal",
     "nav-bar",
     "nav-link",
+    // `ui::pagination` (#3398).
+    "pagination",
     "property-list",
     "reaction-controls",
     "stat-card",
@@ -250,13 +254,25 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "translated-transition-controls",
 ];
 
+/// Slugs of stories for feature-gated modules (#3398).
+fn expected_story_slugs() -> Vec<&'static str> {
+    #[allow(unused_mut)]
+    let mut slugs = EXPECTED_STORY_SLUGS.to_vec();
+    #[cfg(feature = "flash")]
+    slugs.push("flash");
+    #[cfg(feature = "wizard")]
+    slugs.push("wizard-progress");
+    slugs
+}
+
 #[test]
 fn story_coverage_inventory_matches_registry() {
     let registry = stories::builtin();
     let actual: std::collections::BTreeSet<&str> =
         registry.stories().iter().map(Story::slug).collect();
+    let expected_slugs = expected_story_slugs();
 
-    for expected in EXPECTED_STORY_SLUGS {
+    for expected in &expected_slugs {
         assert!(
             actual.contains(expected),
             "widget `{expected}` has no builtin story — add a story! for it in \
@@ -265,7 +281,7 @@ fn story_coverage_inventory_matches_registry() {
     }
     for slug in &actual {
         assert!(
-            EXPECTED_STORY_SLUGS.contains(slug),
+            expected_slugs.contains(slug),
             "builtin story `{slug}` is missing from EXPECTED_STORY_SLUGS — add it to the \
              inventory in autumn/tests/integration/stories.rs (or remove the stale story)"
         );
@@ -314,51 +330,230 @@ fn contains_identifier_requires_identifier_boundaries() {
     assert!(!contains_identifier("data_table(&config)", "table"));
 }
 
-#[test]
-fn every_public_widget_fn_is_exercised_by_a_story() {
+/// Read a file relative to the `autumn` crate root.
+fn read_crate_file(path: &str) -> String {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = std::fs::read_to_string(manifest_dir.join("src/widgets.rs"))
-        .expect("failed to read src/widgets.rs");
+    std::fs::read_to_string(manifest_dir.join(path))
+        .unwrap_or_else(|err| panic!("failed to read {path}: {err}"))
+}
 
-    // Production lines only (widget_css_coverage.rs discipline), stripped of
-    // `//` comments. Top-level widget fns start at column 0; config-struct
-    // methods are indented and deliberately excluded.
-    let mut widget_fns = Vec::new();
+/// Names of the top-level items that start with `prefix` (for example
+/// `"pub fn "`) in the production part of `source`.
+///
+/// Only column-0 items count, so methods are not included. The scan stops at
+/// `mod tests {` and ignores `//` comments.
+fn top_level_items(source: &str, prefix: &str) -> Vec<String> {
+    let mut names = Vec::new();
     for line in source.lines().take_while(|l| l.trim() != "mod tests {") {
         let code = line.split("//").next().unwrap_or("");
-        if let Some(rest) = code.strip_prefix("pub fn ") {
+        if let Some(rest) = code.strip_prefix(prefix) {
             let name_len = rest
                 .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                 .unwrap_or(rest.len());
             let name = &rest[..name_len];
             if !name.is_empty() {
-                widget_fns.push(name.to_owned());
+                names.push(name.to_owned());
             }
         }
     }
-    assert!(
-        widget_fns.len() >= 20,
-        "widgets.rs scan looks broken; found only {widget_fns:?}"
-    );
+    names
+}
 
-    let all_sources: String = stories::builtin()
+/// All builtin story sources, joined.
+fn all_story_sources() -> String {
+    stories::builtin()
         .stories()
         .iter()
         .map(Story::source)
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
 
-    let missing: Vec<&String> = widget_fns
+/// Source files whose top-level `pub fn`s each need a story.
+fn render_fn_sources() -> Vec<&'static str> {
+    // `ui::pagination`, `flash` and `wizard` joined in #3398.
+    #[allow(unused_mut)]
+    let mut files = vec!["src/widgets.rs", "src/ui/pagination.rs"];
+    #[cfg(feature = "flash")]
+    files.push("src/flash.rs");
+    #[cfg(feature = "wizard")]
+    files.push("src/wizard.rs");
+    files
+}
+
+#[test]
+fn every_public_widget_fn_is_exercised_by_a_story() {
+    let all_sources = all_story_sources();
+    for file in render_fn_sources() {
+        let fns = top_level_items(&read_crate_file(file), "pub fn ");
+        let minimum = if file == "src/widgets.rs" { 20 } else { 1 };
+        assert!(
+            fns.len() >= minimum,
+            "{file} scan looks broken; found only {fns:?}"
+        );
+
+        let missing: Vec<&String> = fns
+            .iter()
+            .filter(|name| !contains_identifier(&all_sources, name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{file}: fn(s) with no story mentioning them: {missing:?}\n\
+             Add a story!{{}} block that calls them in autumn/src/stories/builtin.rs and, for a \
+             new top-level widget, add its slug to EXPECTED_STORY_SLUGS in \
+             autumn/tests/integration/stories.rs."
+        );
+    }
+}
+
+/// Type-state markers in `a11y.rs`. They have no markup of their own.
+const A11Y_MARKER_TYPES: &[&str] = &["NoLabel", "Labeled"];
+
+#[test]
+fn every_a11y_primitive_is_exercised_by_a_story() {
+    let all_sources = all_story_sources();
+    let primitives: Vec<String> = top_level_items(&read_crate_file("src/a11y.rs"), "pub struct ")
+        .into_iter()
+        .filter(|name| !A11Y_MARKER_TYPES.contains(&name.as_str()))
+        .collect();
+    assert!(
+        primitives.len() >= 10,
+        "a11y.rs scan looks broken; found only {primitives:?}"
+    );
+    let missing: Vec<&String> = primitives
         .iter()
         .filter(|name| !contains_identifier(&all_sources, name))
         .collect();
     assert!(
         missing.is_empty(),
-        "widget fn(s) with no story mentioning them: {missing:?}\n\
-         Add a story!{{}} block exercising them in autumn/src/stories/builtin.rs and, for a \
-         new top-level widget, add its slug to EXPECTED_STORY_SLUGS in \
-         autumn/tests/integration/stories.rs."
+        "a11y primitive(s) with no story: {missing:?}. Use them in the \
+         \"Accessible primitives\" story in autumn/src/stories/builtin.rs."
     );
+}
+
+// ── #3398: every interactive story has a browser keyboard test ──────────
+
+/// Markup that needs `autumn-widgets.js` or a CSS state to work. A story
+/// whose render contains one of these is interactive.
+const INTERACTIVE_MARKERS: &[&str] = &[
+    "data-autumn-",
+    "data-modal-open",
+    "data-nav-menu-toggle",
+    "autumn-flash__dismiss-toggle",
+];
+
+/// Stories with a `keyboard_<slug>` test in `stories_browser.rs`.
+/// `active-search` has no marker. It is here because typing drives it.
+const KEYBOARD_STORY_SLUGS: &[&str] = &[
+    "accessible-primitives",
+    "active-search",
+    "autocomplete",
+    "confirm-action",
+    "flash",
+    "modal",
+    "nav-bar",
+    "tabs",
+    "theme-toggle",
+];
+
+/// The browser test fn name for `slug`.
+fn keyboard_test_name(slug: &str) -> String {
+    format!("keyboard_{}", slug.replace('-', "_"))
+}
+
+#[test]
+fn every_interactive_story_has_a_keyboard_test() {
+    let registry = stories::builtin();
+    let browser_suite = read_crate_file("tests/integration/stories_browser.rs");
+
+    for story in registry.stories() {
+        let html = story
+            .render()
+            .unwrap_or_else(|err| panic!("story `{}` failed: {err}", story.slug()))
+            .into_string();
+        if let Some(marker) = INTERACTIVE_MARKERS.iter().find(|m| html.contains(*m)) {
+            assert!(
+                KEYBOARD_STORY_SLUGS.contains(&story.slug()),
+                "story `{}` is interactive (`{marker}`) but has no keyboard test. Add \
+                 `async fn {}()` to autumn/tests/integration/stories_browser.rs and the slug \
+                 to KEYBOARD_STORY_SLUGS.",
+                story.slug(),
+                keyboard_test_name(story.slug()),
+            );
+        }
+    }
+
+    for slug in KEYBOARD_STORY_SLUGS {
+        if !registry.stories().iter().any(|s| s.slug() == *slug) {
+            // `flash` is absent when its feature is off.
+            assert_eq!(
+                *slug, "flash",
+                "KEYBOARD_STORY_SLUGS names unknown story `{slug}`"
+            );
+            continue;
+        }
+        let name = keyboard_test_name(slug);
+        assert!(
+            browser_suite.contains(&format!(
+                "#[ignore = \"requires Chromium\"]\nasync fn {name}() {{"
+            )),
+            "stories_browser.rs has no browser test `async fn {name}()` for story `{slug}`"
+        );
+    }
+}
+
+// ── #3398: the browser gate runs in CI and is documented ─────────────────
+
+/// Paths that must start the widget browser workflow (issue #3398).
+const BROWSER_GATE_PATHS: &[&str] = &[
+    "autumn/src/widgets.rs",
+    "autumn/src/ui/**",
+    "autumn/vendor/autumn-widgets.js",
+    "autumn/src/stories/**",
+    "autumn/src/htmx.rs",
+    "autumn/vendor/htmx.min.js",
+];
+
+#[test]
+fn widget_browser_workflow_runs_on_widget_changes() {
+    let workflow = read_crate_file("../.github/workflows/widgets-browser.yml");
+    for trigger in ["pull_request:", "push:"] {
+        assert!(
+            workflow.contains(trigger),
+            "workflow has no `{trigger}` trigger"
+        );
+    }
+    for path in BROWSER_GATE_PATHS {
+        // Once in the `pull_request` filter and once in the `push` filter.
+        assert!(
+            workflow.matches(&format!("\"{path}\"")).count() >= 2,
+            "widgets-browser.yml does not run on changes to {path} for both triggers"
+        );
+    }
+    for suite in ["stories_browser", "widgets_keyboard_browser"] {
+        assert!(
+            workflow.contains(&format!(
+                "--test integration_tests {suite} -- --include-ignored"
+            )),
+            "widgets-browser.yml does not run the `{suite}` browser suite"
+        );
+    }
+    // A filter that matches nothing exits 0. Each suite needs a count check.
+    assert!(
+        workflow.matches("passed' ").count() >= 2,
+        "widgets-browser.yml must check a non-zero pass count for each suite"
+    );
+}
+
+#[test]
+fn widget_browser_gate_is_documented() {
+    for doc in ["../CONTRIBUTING.md", "../CLAUDE.md"] {
+        let text = read_crate_file(doc);
+        assert!(
+            text.contains("widgets-browser"),
+            "{doc} does not document the widget browser gate (widgets-browser.yml)"
+        );
+    }
 }
 
 // ── T12 (AC1): stories are zero-arg pure fn pointers ─────────────────────

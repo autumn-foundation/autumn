@@ -39,3 +39,6 @@ fuzz/corpus/** binary
 # Same reason: the react-graphql example diff-tests this committed SDL against
 # the schema it serves via include_str!; CRLF on checkout would fail the gate.
 examples/react-graphql/schema.graphql text eol=lf
+
+# Vendored test fixture (#3398): minified, not reviewed as a diff.
+autumn/tests/fixtures/axe-core/axe.min.js -diff linguist-vendored

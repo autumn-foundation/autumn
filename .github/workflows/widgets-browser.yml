@@ -1,0 +1,144 @@
+name: Widget browser gate
+
+# Widgets in a real browser (issue #3398). Chromium loads every
+# `/_stories/{slug}` page:
+#
+#   * axe-core (vendored in autumn/tests/fixtures/axe-core) checks each page
+#     in the light scheme and again in the dark scheme. A serious or critical
+#     violation fails the job.
+#   * Each interactive story has a keyboard test.
+#   * The #3397 keyboard suite runs on its own fixture page.
+#
+# The tests are `#[ignore]`d and need the `system-tests` feature, so neither
+# the `test` job nor the Docker sweep in ci.yml runs them. The path filter
+# keeps this job off PRs that do not touch widget code. A weekly run catches
+# changes outside the filter.
+#
+# `stories.rs` (`widget_browser_workflow_runs_on_widget_changes`) checks the
+# paths and the steps below. Update both together.
+
+on:
+  pull_request:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "autumn/src/widgets.rs"
+      - "autumn/src/ui/**"
+      - "autumn/vendor/autumn-widgets.js"
+      - "autumn/src/stories/**"
+      - "autumn/src/htmx.rs"
+      - "autumn/vendor/htmx.min.js"
+      - "autumn/vendor/idiomorph.min.js"
+      - "autumn/src/pagination.rs"
+      - "autumn-macros/src/story_macro.rs"
+      - "autumn/src/a11y.rs"
+      - "autumn/src/flash.rs"
+      - "autumn/src/form.rs"
+      - "autumn/src/wizard.rs"
+      - "autumn/src/system_test.rs"
+      - "autumn/tests/integration/stories.rs"
+      - "autumn/tests/integration/stories_browser.rs"
+      - "autumn/tests/integration/widgets_keyboard_browser.rs"
+      - "autumn/tests/fixtures/axe-core/**"
+      - ".github/workflows/widgets-browser.yml"
+  push:
+    branches: [trunk, trunk-dev]
+    paths:
+      - "autumn/src/widgets.rs"
+      - "autumn/src/ui/**"
+      - "autumn/vendor/autumn-widgets.js"
+      - "autumn/src/stories/**"
+      - "autumn/src/htmx.rs"
+      - "autumn/vendor/htmx.min.js"
+      - "autumn/vendor/idiomorph.min.js"
+      - "autumn/src/pagination.rs"
+      - "autumn-macros/src/story_macro.rs"
+      - "autumn/src/a11y.rs"
+      - "autumn/src/flash.rs"
+      - "autumn/src/form.rs"
+      - "autumn/src/wizard.rs"
+      - "autumn/src/system_test.rs"
+      - "autumn/tests/integration/stories.rs"
+      - "autumn/tests/integration/stories_browser.rs"
+      - "autumn/tests/integration/widgets_keyboard_browser.rs"
+      - "autumn/tests/fixtures/axe-core/**"
+      - ".github/workflows/widgets-browser.yml"
+  # Weekly, for changes the path filter does not see (router, CSP, Cargo.lock).
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  widgets-browser:
+    name: Widget browser (axe + keyboard)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space
+        run: |
+          # The default-feature integration_tests binary plus system-tests is
+          # close to the runner's disk limit (see ci.yml `test-features`).
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+        with:
+          key: widgets-browser
+
+      - name: Install Chromium
+        id: setup-chrome
+        uses: browser-actions/setup-chrome@v2
+
+      - name: Build the browser suites
+        run: cargo test -p autumn-web --features system-tests --test integration_tests --no-run
+
+      # A filter that matches nothing exits 0, so check the pass count.
+      - name: Run axe and keyboard checks over /_stories
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests stories_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/stories-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/stories-browser.log" \
+            || { echo "::error::no stories browser tests ran"; exit 1; }
+
+      - name: Run the widget keyboard suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_keyboard_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-keyboard-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-keyboard-browser.log" \
+            || { echo "::error::no widget keyboard browser tests ran"; exit 1; }
+
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: widgets-browser-artifacts
+          path: target/system-tests/
+          if-no-files-found: ignore
