@@ -21444,6 +21444,41 @@ mod tests {
             .await;
         }
 
+        /// The generic plan of the multi-queue claim. Diesel binds parameters,
+        /// so Postgres can use this plan.
+        async fn pg_multi_queue_claim_generic_plan(pool: &PgPool) -> String {
+            use diesel_async::SimpleAsyncConnection as _;
+
+            #[derive(diesel::QueryableByName)]
+            struct Line {
+                #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
+                line: String,
+            }
+
+            let mut conn = pool.get().await.unwrap();
+            conn.batch_execute(&format!(
+                "SET plan_cache_mode = force_generic_plan; \
+                 PREPARE claim(text, text[], text[]) AS {}",
+                pg_claim_sql()
+            ))
+            .await
+            .unwrap();
+            let plan = diesel::sql_query(
+                "EXPLAIN (COSTS OFF) EXECUTE claim('w', '{critical,default,low}', '{}')",
+            )
+            .load::<Line>(&mut *conn)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|l| l.line)
+            .collect::<Vec<_>>()
+            .join("\n");
+            conn.batch_execute("DEALLOCATE claim; RESET plan_cache_mode")
+                .await
+                .unwrap();
+            plan
+        }
+
         #[test]
         fn pg_multi_queue_claim_orders_only_by_queue_position() {
             // Each probe returns one row at most. A second sort key makes
@@ -21507,12 +21542,6 @@ mod tests {
                 #[diesel(sql_type = diesel::sql_types::BigInt)]
                 temp_written: i64,
             }
-            #[derive(diesel::QueryableByName)]
-            struct Line {
-                #[diesel(sql_type = diesel::sql_types::Text, column_name = "QUERY PLAN")]
-                line: String,
-            }
-
             const CLAIMS: i64 = 20;
             let (url, _container) = pg_claim_test_url().await;
             let pool = pg_test_pool(&url);
@@ -21535,29 +21564,7 @@ mod tests {
                 .await;
                 pg_exec(&pool, "ANALYZE autumn_jobs").await;
 
-                // Diesel binds parameters, so check the generic plan.
-                let mut conn = pool.get().await.unwrap();
-                conn.batch_execute(&format!(
-                    "SET plan_cache_mode = force_generic_plan; \
-                     PREPARE claim(text, text[], text[]) AS {}",
-                    pg_claim_sql()
-                ))
-                .await
-                .unwrap();
-                let plan = diesel::sql_query(
-                    "EXPLAIN (COSTS OFF) EXECUTE claim('w', '{critical,default,low}', '{}')",
-                )
-                .load::<Line>(&mut *conn)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|l| l.line)
-                .collect::<Vec<_>>()
-                .join("\n");
-                conn.batch_execute("DEALLOCATE claim; RESET plan_cache_mode")
-                    .await
-                    .unwrap();
-                drop(conn);
+                let plan = pg_multi_queue_claim_generic_plan(&pool).await;
                 assert!(
                     plan.contains("idx_autumn_jobs_queue_ready"),
                     "backlog {backlog}: each queue probe must use the queue index:\n{plan}"
