@@ -11593,7 +11593,7 @@ fn pg_claim_sql() -> String {
            SELECT picked.id \
            FROM unnest($2::text[]) WITH ORDINALITY AS q(queue, ord) \
            CROSS JOIN LATERAL ( \
-             SELECT candidate.id, candidate.run_at FROM autumn_jobs candidate \
+             SELECT candidate.id FROM autumn_jobs candidate \
              WHERE candidate.status = 'enqueued' AND candidate.run_at <= NOW() \
                AND candidate.queue = q.queue \
                AND (candidate.concurrency_limit IS NULL OR ( \
@@ -21574,7 +21574,7 @@ mod tests {
                     "SELECT calls, (shared_blks_hit + shared_blks_read) AS buffers, \
                             temp_blks_written AS temp_written \
                      FROM pg_stat_statements \
-                     WHERE query LIKE 'UPDATE autumn_jobs%' AND query LIKE '%ORDINALITY%'",
+                     WHERE query LIKE 'UPDATE autumn_jobs%' AND query LIKE '%claimed_by%'",
                 )
                 .get_result::<Stats>(&mut *conn)
                 .await
