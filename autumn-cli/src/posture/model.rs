@@ -386,6 +386,13 @@ impl MtlsDimension {
     pub fn requests_certificate(&self) -> bool {
         !(self.mode.is_empty() || self.mode == "off")
     }
+
+    /// Whether the handshake fails without a certificate, which protects every
+    /// route whatever `required_paths` holds.
+    #[must_use]
+    pub fn mandates_certificate(&self) -> bool {
+        self.mode == "required"
+    }
 }
 
 impl MtlsEntry {

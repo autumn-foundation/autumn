@@ -1859,6 +1859,11 @@ fn diff_mtls_required_paths(
     if !base.dimensions.mtls.requests_certificate() {
         return;
     }
+    // `required` already demands a certificate for every route, so no prefix
+    // change can widen access. `diff_mtls_mode` reports a mode change.
+    if head.dimensions.mtls.mandates_certificate() {
+        return;
+    }
     let head_requests = head.dimensions.mtls.requests_certificate();
     let before: BTreeSet<&String> = base.dimensions.mtls.required_paths.iter().collect();
     let after: BTreeSet<&String> = head.dimensions.mtls.required_paths.iter().collect();
@@ -2398,6 +2403,38 @@ mod tests {
             &manifest_mtls(&routes, "optional", &["/internal/"], &entry),
         );
         assert!(findings.is_empty(), "{findings:#?}");
+    }
+
+    #[test]
+    fn required_mode_head_makes_prefix_changes_neutral() {
+        // `required` demands a certificate everywhere, so a prefix change
+        // cannot widen access (#2706).
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let entry = mtls_entry("/a", "GET", true);
+        for base_mode in ["required", "optional"] {
+            let findings = diff(
+                &manifest_mtls(&routes, base_mode, &["/internal"], &entry),
+                &manifest_mtls(&routes, "required", &[], &entry),
+            );
+            assert!(
+                !kinds(&findings).contains(&"mtls_required_path_removed"),
+                "{base_mode}: {findings:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn required_to_optional_still_reports_dropped_prefixes() {
+        let routes = route("/a", "GET", "public", &[], &[], false);
+        let entry = mtls_entry("/a", "GET", false);
+        let findings = diff(
+            &manifest_mtls(&routes, "required", &["/internal"], &entry),
+            &manifest_mtls(&routes, "optional", &[], &entry),
+        );
+        assert!(
+            kinds(&findings).contains(&"mtls_required_path_removed"),
+            "{findings:#?}"
+        );
     }
 
     #[test]
