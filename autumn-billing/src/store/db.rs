@@ -534,16 +534,17 @@ impl BillingStore for DbBillingStore {
                         .await
                     {
                         Ok(_) => Ok(EventClaim::Claimed),
-                        Err(err) if is_unique_violation(&err) => Ok(EventClaim::Duplicate),
+                        // Another delivery inserted first. It may still fail.
+                        Err(err) if is_unique_violation(&err) => Ok(EventClaim::InFlight),
                         Err(err) => Err(db_err("claim_event", &err)),
                     }
                 }
-                Some(Some(_)) => Ok(EventClaim::Duplicate),
+                Some(Some(_)) => Ok(EventClaim::Applied),
                 // In flight: re-claim only when the claim is stale. One
                 // conditional update, so two re-claimers cannot both win.
                 Some(None) => {
                     let Some(cutoff) = stale_cutoff(now, stale_after) else {
-                        return Ok(EventClaim::Duplicate);
+                        return Ok(EventClaim::InFlight);
                     };
                     let updated = diesel::update(
                         billing_events::table.filter(
@@ -560,7 +561,7 @@ impl BillingStore for DbBillingStore {
                     Ok(if updated == 1 {
                         EventClaim::Claimed
                     } else {
-                        EventClaim::Duplicate
+                        EventClaim::InFlight
                     })
                 }
             }

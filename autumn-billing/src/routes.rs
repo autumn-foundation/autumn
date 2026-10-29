@@ -323,7 +323,8 @@ async fn subscription(
 /// `POST {prefix}/webhook` — verified provider events.
 ///
 /// A body the provider cannot decode answers `500`, so the replay key is
-/// released and the provider redelivers. The webhook extractor must stay the
+/// released and the provider redelivers. An event another delivery is still
+/// applying answers `503` for the same reason. The webhook extractor must stay the
 /// last argument: it consumes the body.
 async fn webhook(
     State(state): State<AppState>,
@@ -346,6 +347,13 @@ async fn webhook(
     let label = match outcome {
         ReconcileOutcome::Applied { .. } => "applied",
         ReconcileOutcome::Duplicate => "duplicate",
+        // Not a success: the provider must redeliver until the first
+        // attempt finishes or its claim goes stale.
+        ReconcileOutcome::InFlight => {
+            return Err(AutumnError::service_unavailable_msg(
+                "billing event is being applied; retry",
+            ));
+        }
         ReconcileOutcome::Ignored { .. } => "ignored",
     };
     Ok(Json(json!({
