@@ -3764,3 +3764,62 @@ async fn a_cold_load_that_overlaps_a_renewal_cannot_publish_the_older_pair() {
         "the cache must hold the renewed certificate"
     );
 }
+
+#[tokio::test]
+async fn a_dry_run_prune_counts_what_a_real_one_deletes() {
+    let h = harness(
+        TableVerifier::new(&[]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    for host in ["gone-a.clientco.com", "gone-b.clientco.com"] {
+        h.store
+            .save_cert(
+                &cert_id(host),
+                &autumn_web::acme::store::StoredCert {
+                    chain_pem: CERT_PEM.to_owned(),
+                    key_pem: KEY_PEM.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let prune =
+        |dry_run| autumn_web::custom_domain::CustomDomainPruner::prune(&h.task, NOW, dry_run);
+
+    assert_eq!(prune(true).await.unwrap(), 2);
+    assert_eq!(
+        h.store.list_certs().unwrap().len(),
+        2,
+        "a dry run deletes nothing"
+    );
+    assert_eq!(prune(false).await.unwrap(), 2);
+    assert!(h.store.list_certs().unwrap().is_empty());
+    assert_eq!(prune(false).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_prune_does_not_count_a_certificate_it_could_not_delete() {
+    let mut h = harness(
+        TableVerifier::new(&[]),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    h.task.certs = Arc::new(UndeletableCertStore(Arc::clone(&h.store)))
+        as Arc<dyn autumn_web::acme::store::AcmeStore>;
+    h.store
+        .save_cert(
+            &cert_id("gone.clientco.com"),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let removed = autumn_web::custom_domain::CustomDomainPruner::prune(&h.task, NOW, false)
+        .await
+        .unwrap();
+
+    assert_eq!(removed, 0);
+    assert_eq!(h.store.list_certs().unwrap().len(), 1);
+}

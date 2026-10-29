@@ -1058,9 +1058,8 @@ pub struct CustomDomainRegistry {
     /// the certificate store and cache writes for the hostname join the
     /// registry write in one critical section.
     writes: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Lets one task exclude every [`with_hostname`](Self::with_hostname)
-    /// section at once. A section holds it shared, taken before its hostname
-    /// gate; [`exclusive`](Self::exclusive) holds it alone.
+    /// Held shared by each [`with_hostname`](Self::with_hostname) section.
+    /// Held alone by [`exclusive`](Self::exclusive).
     sections: tokio::sync::RwLock<()>,
     max_domains: usize,
     /// Hostnames and wildcard patterns no tenant may claim.
@@ -1448,10 +1447,9 @@ impl CustomDomainRegistry {
 
     /// Run `section` while holding `hostname`'s write gate.
     ///
-    /// The gate covers the registry write. This lets a caller put the writes
-    /// that belong to it in the same critical section: the certificate store
-    /// and the certificate cache. Use the [`Gated`] handle for registry
-    /// writes inside the section.
+    /// The gate covers registry writes. Use this to add the certificate store
+    /// and cache writes to the same critical section. Inside `section`, write
+    /// to the registry through the [`Gated`] handle.
     ///
     /// Returns `None`, without running `section`, for an unusable hostname.
     ///
@@ -1469,8 +1467,8 @@ impl CustomDomainRegistry {
         section: impl AsyncFnOnce(&Gated<'_>) -> T,
     ) -> Option<T> {
         let host = normalize_hostname(hostname).ok()?;
-        // Order: sections lock, then the gate. The gate-map lock is only held
-        // inside `write_gate`, never while a gate is awaited.
+        // Lock order: `sections`, then the hostname gate. The gate-map lock is
+        // released before the gate is awaited.
         let _shared = self.sections.read().await;
         let gate = self.write_gate(&host).await;
         let _write = gate.lock().await;
@@ -2898,10 +2896,9 @@ mod sni {
         /// Cache `key` for `hostname` unless the resident certificate expires
         /// later. Returns whether `key` was stored.
         ///
-        /// For a load that read the store without holding the hostname's gate
-        /// (the handshake path). A renewal can cache the new pair while that
-        /// load is in flight. Without this check, the load would then publish
-        /// the old pair over it. The check and the insert are one step.
+        /// Use this for a load that holds no gate (the handshake path). A
+        /// renewal can cache a new pair during that load. This check stops the
+        /// old pair from replacing it. The check and the insert are one step.
         pub fn insert_if_not_older(&self, hostname: &str, key: Arc<CertifiedKey>) -> bool {
             let mut inner = write_lock(&self.inner);
             if let Some(resident) = inner.certs.get(hostname)
@@ -3036,9 +3033,14 @@ mod sni {
                 return Some(cached);
             }
             let loaded = self.source.as_ref()?.load(&name)?;
-            // The load holds no gate. A renewal may have landed meanwhile, and
-            // the record already names its `notAfter`: a pair that expires
-            // sooner is stale. Serve it once; do not cache it.
+            // An offboard may have landed during the load. Do not cache or
+            // serve a pair for a hostname that is no longer servable.
+            if !self.registry.is_servable(&name) {
+                return None;
+            }
+            // This load holds no gate. A renewal may land during it. The
+            // record then has the new `notAfter`. A pair that expires sooner is
+            // stale: serve it once, do not cache it.
             let recorded = self.registry.get(&name).and_then(|d| d.cert_not_after_unix);
             let stale = recorded
                 .zip(leaf_not_after(&loaded))

@@ -269,11 +269,9 @@ impl PruneOnlyCustomDomainPruner {
     /// what this process holds for it.
     ///
     /// Every offboarding path goes through here. The removal and the purge run
-    /// in one section of the registry's per-hostname write gate. The guard runs
-    /// in it too, so a caller that chose this hostname
-    /// before an `.await` — a retention sweep, a tenant-wide teardown — re-
-    /// asserts that choice against the record as it is now rather than
-    /// disconnecting whoever holds the hostname by the time its turn comes.
+    /// in one gate section. The guard runs in it too. It checks the record as
+    /// it is now, not as it was before an `.await`. A retention sweep or a
+    /// tenant teardown therefore never disconnects a new owner.
     async fn offboard_guarded(
         &self,
         host: &str,
@@ -350,6 +348,9 @@ impl PruneOnlyCustomDomainPruner {
     /// else retries it: the orphan prune only runs when a `[retention]
     /// custom_domains` window is configured, and it is unset by default.
     /// Returns whether everything local actually went.
+    ///
+    /// Runs inside the hostname's gate. The reporter must not call the
+    /// registry.
     async fn purge_local(&self, host: &str) -> bool {
         self.cache.remove(host);
         self.limiter.forget(host);
@@ -471,36 +472,39 @@ impl PruneOnlyCustomDomainPruner {
         if candidates.iter().all(|id| live.contains(id.as_str())) {
             return Ok(0);
         }
-        // Delete under the registry's exclusive section. An id is a hash, so
-        // the hostname that may own it is unknown and no single gate fits. The
-        // section keeps every install and offboard out. A hostname registered
-        // since the snapshot is seen by the fresh read of the index. One that
-        // registers after it cannot save a certificate until the section ends.
-        let removed = self
-            .registry
-            .exclusive(async || {
-                let live = live_ids(fresh);
-                let mut removed = 0_u64;
-                for id in &candidates {
-                    if live.contains(id.as_str()) {
-                        continue;
+        // Delete under `exclusive`. A cert id is a hash, so the hostname is
+        // unknown and no single gate fits. No install or offboard runs during
+        // a delete. Each id gets its own section, so writers wait for one
+        // delete, not for the whole sweep. The live set is read again inside
+        // the section: a hostname registered since the snapshot keeps its pair.
+        let mut removed = 0_u64;
+        for id in &candidates {
+            let deleted = self
+                .registry
+                .exclusive(async || {
+                    if live_ids(fresh.clone()).contains(id.as_str()) {
+                        return false;
                     }
                     // The store deletes the key first. `list_certs` finds a
                     // pair by its chain, so a crash after the chain went would
-                    // strand a key no later sweep can find.
+                    // strand a key that no later sweep can find.
                     match self.certs.delete_cert(id).await {
-                        // Count only what went: the retention report must not
-                        // claim a deletion that failed.
-                        Ok(()) => removed += 1,
-                        Err(e) => tracing::warn!(
-                            id = id.as_str(),
-                            "failed to remove an orphaned certificate: {e}"
-                        ),
+                        Ok(()) => true,
+                        Err(e) => {
+                            tracing::warn!(
+                                id = id.as_str(),
+                                "failed to remove an orphaned certificate: {e}"
+                            );
+                            false
+                        }
                     }
-                }
-                removed
-            })
-            .await;
+                })
+                .await;
+            // Count only what went. The report must not claim a failed delete.
+            if deleted {
+                removed += 1;
+            }
+        }
         Ok(removed)
     }
 }
@@ -1032,11 +1036,10 @@ impl CustomDomainTask {
             stored.key_pem.as_bytes(),
             &self.provider,
         )?;
-        // Save, activate and cache in one critical section of the hostname's
-        // gate. An offboard, a successor or a cold load cannot run between
-        // the steps. Ownership is checked inside it, so what was checked is
-        // what is written. Persisting first still means a crash between the
-        // steps leaves the certificate on disk for the next boot to warm.
+        // Save, activate and cache in one gate section. No offboard, successor
+        // or cold load can run between the steps. The owner is checked inside
+        // the section, so the check still holds at the write. The save comes
+        // first: after a crash, the next boot finds the certificate on disk.
         self.registry
             .with_hostname(hostname, async |gate| {
                 // The order took a network round trip. If the app offboarded
@@ -1072,10 +1075,10 @@ impl CustomDomainTask {
                         format!("failed to persist the active state for {hostname}: {e}")
                     })?;
                 if !activated {
-                    // The record changed hands, or a re-registration is still
-                    // unverified. The gate is ours, so the pair at this id is the
-                    // one just written: drop it rather than leave a private key
-                    // on disk for a hostname its owner never verified.
+                    // The record changed hands, or is not verified yet. We hold
+                    // the gate, so the pair at this id is the one just written.
+                    // Delete it: do not leave an unverified key on disk.
+                    self.cache.remove(hostname);
                     if let Err(e) = self.certs.delete_cert(&cert_id_for(hostname)).await {
                         tracing::warn!(hostname, "failed to delete a superseded certificate: {e}");
                     }
