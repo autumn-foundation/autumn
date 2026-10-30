@@ -273,7 +273,9 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 /// Backticks and brackets are not Postgres quotes.
 fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
     let after_prefix = normalized.strip_prefix("alter table ").unwrap_or("");
-    let subcommands_start = after_prefix.find(' ').map_or(after_prefix.len(), |i| i + 1);
+    let subcommands_start = table_name_len(after_prefix)
+        .saturating_add(1)
+        .min(after_prefix.len());
     let subcommands = &after_prefix[subcommands_start..];
 
     let mut result = Vec::new();
@@ -316,6 +318,20 @@ fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
         result.push(last);
     }
     result
+}
+
+/// Byte length of the table name at the start of `text`: up to the first
+/// space outside `"name"` quotes.
+fn table_name_len(text: &str) -> usize {
+    let mut i = 0;
+    while let Some(c) = text[i..].chars().next() {
+        match c {
+            ' ' => break,
+            '"' => i += quoted_name_len(&text[i..]),
+            _ => i += c.len_utf8(),
+        }
+    }
+    i
 }
 
 /// Byte length of the Postgres literal that starts at byte `i` of `text`, or 0.
@@ -3362,6 +3378,36 @@ mod tests {
         let subs =
             pg_subs("alter table t add column a int default $1$, add column b int, drop column c$");
         assert_eq!(subs.len(), 3, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_reads_a_quoted_table_name_with_spaces() {
+        for table in [r#""my table""#, r#""x add column y""#, r#"s."my table""#] {
+            let sql = format!(
+                "alter table {table} add column a text default 'ok', add column b int not null"
+            );
+            let subs = pg_subs(&sql);
+            assert_eq!(
+                subs,
+                [
+                    "add column a text default 'ok'",
+                    "add column b int not null"
+                ],
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_table_name_with_spaces_keeps_the_not_null_finding() {
+        let sql =
+            r#"ALTER TABLE "my table" ADD COLUMN a text DEFAULT 'ok', ADD COLUMN b int NOT NULL;"#;
+        let f = classify_sql_for(DatabaseBackend::Postgres, sql);
+        assert!(
+            f.iter()
+                .any(|f| f.operation == "ADD COLUMN NOT NULL (no default)"),
+            "{f:?}"
+        );
     }
 
     #[test]
