@@ -1,7 +1,8 @@
 ### Fixed
 
-- **destroy:** on a case-insensitive file system (macOS, Windows), `autumn
-  destroy` now handles a template that changes only the case of a file or of
-  its directory (issue #3382). An untouched `Foo.rs` that is now `foo.rs` is
-  removed, not reported as diverged, and its manifest entry is dropped. An
-  orphan in `src/widgets` is swept when the plan writes to `src/Widgets`.
+- **destroy:** on a case-insensitive file system (macOS, Windows), a template
+  can change only the case of a file or directory name (issue #3382).
+  `autumn destroy` removes an untouched `Foo.rs` when the template now names
+  it `foo.rs`. It no longer reports the file as diverged, and it drops the
+  manifest entry. It sweeps an orphan in `src/widgets` when the plan writes
+  to `src/Widgets`.

@@ -108,35 +108,24 @@ impl Planned {
 
 /// A set of project keys, each with its path.
 #[derive(Default)]
-struct Spellings {
-    /// Every key, exactly as spelled.
-    exact: HashSet<String>,
-    /// Every key in lowercase, with its path.
-    folded: Vec<(String, PathBuf)>,
-}
+struct Spellings(HashMap<String, PathBuf>);
 
 impl Spellings {
     fn insert(&mut self, key: String, path: &Path) {
-        let lower = key.to_ascii_lowercase();
-        if self.exact.insert(key) {
-            self.folded.push((lower, path.to_path_buf()));
-        }
+        self.0.entry(key).or_insert_with(|| path.to_path_buf());
     }
 
     /// Whether the set holds `key`, the key of `path`.
     ///
-    /// An exact match does. A match that differs only in ASCII case does when
-    /// both spellings reach one directory entry, as on a case-insensitive
-    /// file system (issue #3382). Two entries are two names, even when they
-    /// are hard links to one file.
+    /// An exact match does. Another spelling of the same directory entry does
+    /// too, as on a case-insensitive file system (issue #3382). Two entries
+    /// are two names, even when they are hard links to one file.
     fn holds(&self, key: &str, path: &Path) -> bool {
-        if self.exact.contains(key) {
-            return true;
-        }
-        let lower = key.to_ascii_lowercase();
-        self.folded
-            .iter()
-            .any(|(k, other)| *k == lower && spelling::one_entry(path, other))
+        self.0.contains_key(key)
+            || self
+                .0
+                .iter()
+                .any(|(k, other)| k.eq_ignore_ascii_case(key) && spelling::one_entry(path, other))
     }
 }
 
@@ -170,7 +159,6 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
         return;
     }
     let warn = |sweep: &mut Sweep, why: &str| sweep.warnings.push(format!("{shown}: {why}"));
-    let dir = path.parent().unwrap_or(project_root);
     if lower.starts_with("migrations/") {
         // The plan matches migrations by suffix, not by timestamp. Only the
         // applied-migration guard of that pass may remove one.
@@ -203,6 +191,7 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
         );
         return;
     }
+    let dir = path.parent().unwrap_or(project_root);
     match entry.scope {
         None => warn(
             sweep,

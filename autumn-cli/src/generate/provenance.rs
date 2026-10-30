@@ -375,11 +375,13 @@ impl Provenance {
     ///
     /// False when nothing is recorded — an unproven file is never assumed ours
     /// — and false when a different command recorded it (see [`Entry`]).
-    /// Looks up every key of [`Self::keys_for`].
+    /// Reads the entry of another spelling when there is no exact entry
+    /// (issue #3382).
     #[must_use]
     pub fn is_ours(&self, root: &Path, path: &Path, digest: &str, invocation: &str) -> bool {
-        self.entries_for(root, path)
-            .any(|(_, e)| e.digest == digest && e.invocation == invocation)
+        self.owners(root, path)
+            .iter()
+            .any(|e| e.digest == digest && e.invocation == invocation)
     }
 
     /// Whether ANY command wrote exactly `digest` to `path`.
@@ -392,8 +394,7 @@ impl Provenance {
     /// does before it asks.
     #[must_use]
     pub fn was_written(&self, root: &Path, path: &Path, digest: &str) -> bool {
-        self.entries_for(root, path)
-            .any(|(_, e)| e.digest == digest)
+        self.owners(root, path).iter().any(|e| e.digest == digest)
     }
 
     /// Every entry `invocation` wrote, for the orphan sweep (issue #2557).
@@ -426,7 +427,8 @@ impl Provenance {
         if let Some(k) = key(root, path) {
             // Keyed by path, so the newest writer replaces the previous one:
             // a file has exactly one owner, and the manifest cannot grow an
-            // entry per regeneration.
+            // entry per regeneration. Another spelling of the file goes too.
+            self.forget(root, path);
             self.entries.insert(
                 k,
                 Entry {
@@ -492,8 +494,8 @@ impl Provenance {
 
     /// Drop the entries of [`Self::keys_for`].
     ///
-    /// A case-only alias resolves only while the file exists. After a delete,
-    /// use [`Self::forget_key`] with the keys read before it.
+    /// Another spelling resolves only while the file exists. After a delete,
+    /// use [`Self::forget_key`] with the keys you read before the delete.
     pub fn forget(&mut self, root: &Path, path: &Path) {
         for k in self.keys_for(root, path) {
             self.entries.remove(&k);
@@ -502,36 +504,43 @@ impl Provenance {
 
     /// Every recorded key for the file at `path` (issue #3382).
     ///
-    /// Its own key, and each key that differs only in ASCII case and reaches
-    /// the same directory entry (see [`spelling::one_entry`]). Thus, on a
+    /// The key of `path`, and each key that is another spelling of the same
+    /// directory entry (see [`spelling::one_entry`]). For example, on a
     /// case-insensitive file system, `foo.rs` finds the entry for `Foo.rs`.
-    /// A case-sensitive host keeps exact matching.
+    /// On a case-sensitive host, only the exact key matches.
     #[must_use]
     pub fn keys_for(&self, root: &Path, path: &Path) -> Vec<String> {
-        self.entries_for(root, path)
-            .map(|(k, _)| k.clone())
+        let Some(own) = key(root, path) else {
+            return Vec::new();
+        };
+        self.entries
+            .keys()
+            .filter(|k| **k == own || is_alias(root, k, &own, path))
+            .cloned()
             .collect()
     }
 
-    /// The entries of [`Self::keys_for`].
-    fn entries_for<'a>(
-        &'a self,
-        root: &'a Path,
-        path: &'a Path,
-    ) -> impl Iterator<Item = (&'a String, &'a Entry)> {
-        let own = key(root, path);
-        self.entries.iter().filter(move |(k, _)| {
-            own.as_deref().is_some_and(|own| {
-                *k == own
-                    || (k.eq_ignore_ascii_case(own)
-                        && spelling::one_entry(&root.join(k.as_str()), path))
-            })
-        })
+    /// The entries that tell who wrote `path`.
+    ///
+    /// The exact entry, when there is one: the newest writer is recorded
+    /// under it. Otherwise, the entries of [`Self::keys_for`].
+    fn owners(&self, root: &Path, path: &Path) -> Vec<&Entry> {
+        let Some(own) = key(root, path) else {
+            return Vec::new();
+        };
+        if let Some(entry) = self.entries.get(&own) {
+            return vec![entry];
+        }
+        self.entries
+            .iter()
+            .filter(|(k, _)| is_alias(root, k, &own, path))
+            .map(|(_, e)| e)
+            .collect()
     }
 
-    /// Drop the entry with exactly this key, if any.
-    pub fn forget_key(&mut self, key: &str) {
-        self.entries.remove(key);
+    /// Drop the entry with exactly the key `k`, if any.
+    pub fn forget_key(&mut self, k: &str) {
+        self.entries.remove(k);
     }
 
     /// Drop every entry for a file under `dir` — what removing a whole
@@ -637,6 +646,12 @@ fn refuse_symlink(root: &Path, path: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether the recorded key `k` is another spelling of `own`, the key of
+/// `path` (issue #3382).
+fn is_alias(root: &Path, k: &str, own: &str, path: &Path) -> bool {
+    k.eq_ignore_ascii_case(own) && spelling::one_entry(&root.join(k), path)
 }
 
 /// `path` as a project-relative, forward-slashed manifest key.
@@ -1413,6 +1428,86 @@ mod tests {
 
         p.forget(root, &new);
 
+        assert!(!p.contains("src/Foo.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_case_only_name_is_not_an_alias() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if new.exists() {
+            return; // case-insensitive: one name, no room for a link.
+        }
+        std::os::unix::fs::symlink(&old, &new).unwrap();
+
+        assert!(!p.is_ours(root, &new, &text_digest("// v1\n"), OWNER));
+        assert!(p.keys_for(root, &new).is_empty());
+    }
+
+    #[test]
+    fn the_exact_entry_decides_when_both_spellings_are_recorded() {
+        // An older manifest can hold `Foo.rs` and `foo.rs` for one file. The
+        // newest writer is under the exact key, so only it owns the file.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if !new.exists() {
+            return; // case-sensitive: two files, see the tests above.
+        }
+        p.entries.insert(
+            "src/foo.rs".to_owned(),
+            Entry {
+                digest: text_digest("// v1\n"),
+                invocation: "newer".to_owned(),
+                scope: None,
+            },
+        );
+        let digest = text_digest("// v1\n");
+
+        assert!(p.is_ours(root, &new, &digest, "newer"));
+        assert!(!p.is_ours(root, &new, &digest, OWNER), "a stale alias");
+        let mut keys = p.keys_for(root, &new);
+        keys.sort();
+        assert_eq!(keys, vec!["src/Foo.rs".to_owned(), "src/foo.rs".to_owned()]);
+    }
+
+    #[test]
+    fn record_replaces_the_entry_of_another_spelling() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        let one_entry = new.exists();
+        if !one_entry {
+            std::fs::write(&new, "// v2\n").unwrap(); // a second file.
+        }
+
+        p.record(root, &new, text_digest("// v2\n"), OWNER, None);
+
+        assert!(p.contains("src/foo.rs"));
+        assert_eq!(p.contains("src/Foo.rs"), !one_entry);
+    }
+
+    #[test]
+    fn forget_after_the_delete_finds_only_the_exact_key() {
+        // Why `destroy` reads the keys before it deletes a file.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        std::fs::remove_file(&old).unwrap();
+
+        p.forget(root, &new);
+        assert!(p.contains("src/Foo.rs"));
+        p.forget_key("src/Foo.rs");
         assert!(!p.contains("src/Foo.rs"));
     }
 

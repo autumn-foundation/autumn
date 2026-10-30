@@ -7,14 +7,32 @@
 use std::fs;
 use std::path::Path;
 
-/// Whether `a` and `b` reach one directory entry.
+/// Whether `a` and `b` are two spellings of one directory entry.
 ///
-/// Both must reach one file, and the directory must not list both names.
-/// Two listed names (a hard link, a symlink) are two entries, so this is
-/// false. False also when `a` or `b` does not exist. Compare the exact
-/// spellings before you call this.
+/// The paths must differ only in ASCII case, and both must reach one file.
+/// At each name that differs, the directory must not list both names. Two
+/// listed names (a hard link, a symlink) are two entries. The result is also
+/// false for two equal paths, and when `a` or `b` does not exist.
 pub(super) fn one_entry(a: &Path, b: &Path) -> bool {
-    same_file(a, b) && !(listed(a) && listed(b))
+    a != b && same_file(a, b) && case_only(a, b)
+}
+
+/// Walk `a` and `b` up to their common directory. At each name that
+/// differs, the names must match in ASCII case, and the directory must not
+/// list both.
+fn case_only(mut a: &Path, mut b: &Path) -> bool {
+    while a != b {
+        match (a.file_name(), b.file_name(), a.parent(), b.parent()) {
+            (Some(x), Some(y), Some(next_a), Some(next_b)) => {
+                if x != y && (!x.eq_ignore_ascii_case(y) || (listed(a) && listed(b))) {
+                    return false;
+                }
+                (a, b) = (next_a, next_b);
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Whether `dir` holds an entry named exactly `name`, byte for byte.
@@ -111,6 +129,27 @@ mod tests {
         std::os::unix::fs::symlink(&upper, &lower).unwrap();
 
         assert!(!one_entry(&upper, &lower));
+    }
+
+    #[test]
+    fn a_file_in_two_spellings_of_a_directory_follows_the_same_rule() {
+        // Only the directory changes case. The file name is the same.
+        let dir = tmp();
+        let upper = dir.path().join("Widgets/foo.rs");
+        fs::create_dir(dir.path().join("Widgets")).unwrap();
+        fs::write(&upper, "x").unwrap();
+        let lower = dir.path().join("widgets/foo.rs");
+
+        assert_eq!(one_entry(&upper, &lower), lower.exists());
+    }
+
+    #[test]
+    fn two_equal_paths_are_not_two_spellings() {
+        let dir = tmp();
+        let file = dir.path().join("Foo.rs");
+        fs::write(&file, "x").unwrap();
+
+        assert!(!one_entry(&file, &file));
     }
 
     #[test]

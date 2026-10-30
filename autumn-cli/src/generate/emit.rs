@@ -1246,9 +1246,9 @@ impl Plan {
                 other => other?,
             }
             removed.files.push(path.clone());
-            removed
-                .keys
-                .extend(plan.recorded_keys.get(path).into_iter().flatten().cloned());
+            if let Some(keys) = plan.recorded_keys.get(path) {
+                removed.keys.extend_from_slice(keys);
+            }
             println!(
                 "  Removed {}{}",
                 relative_display(path, &self.project_root),
@@ -4988,6 +4988,58 @@ mod tests {
         let mut newer = sole(Plan::new(tmp.path()));
         newer.create(tmp.path().join("src/models/foo.rs"), v2);
         (old, newer)
+    }
+
+    /// Like [`case_renamed`], but only the directory changes case:
+    /// `src/models/foo.rs` becomes `src/Models/foo.rs`.
+    fn dir_case_renamed(tmp: &tempfile::TempDir, v1: &str, v2: &str) -> (PathBuf, Plan) {
+        let old = tmp.path().join("src/models/foo.rs");
+        let mut first = sole(Plan::new(tmp.path()));
+        first.create(old.clone(), v1);
+        first.execute(Flags::default()).unwrap();
+        let mut newer = sole(Plan::new(tmp.path()));
+        newer.create(tmp.path().join("src/Models/foo.rs"), v2);
+        (old, newer)
+    }
+
+    #[test]
+    fn a_directory_case_rename_removes_the_untouched_file() {
+        for (v1, v2) in [("// v1\n", "// v2\n"), ("// same\n", "// same\n")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (old, newer) = dir_case_renamed(&tmp, v1, v2);
+            let one_dir = tmp.path().join("src/Models").exists();
+
+            newer.revert(Flags::default()).unwrap();
+
+            // A case-sensitive host has no `src/Models`, so the sweep keeps
+            // the orphan with a warning.
+            assert_eq!(old.exists(), !one_dir, "{v1:?} -> {v2:?}");
+            assert_eq!(
+                provenance::Provenance::load(tmp.path()).contains("src/models/foo.rs"),
+                !one_dir,
+                "{v1:?} -> {v2:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_destroy_still_drops_the_alias_of_a_removed_file() {
+        // The second removal fails (a directory is no file). The first file
+        // is gone, so its entry, under any spelling, must go too.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, mut newer) = case_renamed(&tmp, "// v1\n", "// v2\n");
+        let blocker = tmp.path().join("src/models/zz.rs");
+        fs::create_dir_all(&blocker).unwrap();
+        newer.create(blocker, "// zz\n");
+
+        let result = newer.revert(Flags {
+            force: true,
+            ..Flags::default()
+        });
+
+        assert!(result.is_err(), "removing a directory as a file fails");
+        assert!(!old.exists());
+        assert!(!provenance::Provenance::load(tmp.path()).contains("src/models/Foo.rs"));
     }
 
     #[test]
