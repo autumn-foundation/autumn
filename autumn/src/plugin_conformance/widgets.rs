@@ -703,7 +703,7 @@ fn tags(html: &str) -> Vec<Tag> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        if html[i..].starts_with("<!--") {
+        if bytes[i..].starts_with(b"<!--") {
             i = html[i + 4..]
                 .find("-->")
                 .map_or(bytes.len(), |end| i + 4 + end + 3);
@@ -1090,6 +1090,29 @@ mod tests {
             &check_widget_pack_name(&WidgetPack::new("cns").assets(&WRONG_NAMESPACE)),
             "`not-cns`",
         );
+    }
+
+    fn localized_story() -> maud::Markup {
+        maud::html! {
+            span class="autumn-cutf-x" title="Crème" { "Café ☕ — naïve" }
+            // A comment after multi-byte text.
+            (maud::PreEscaped("<!-- é --><b class=\"autumn-cutf-b\">ü</b>"))
+        }
+    }
+
+    /// Regression: the tag scanner moves one byte at a time and must not
+    /// slice inside a UTF-8 character.
+    #[test]
+    fn non_ascii_story_text_does_not_panic() {
+        let pack = WidgetPack::new("cutf").extend([Story::new("G", "Cutf x", localized_story, "")]);
+        let report = run_widget_conformance(&pack);
+        assert_eq!(
+            status(&report, "widget-class-names"),
+            CheckStatus::Pass,
+            "{}",
+            report.to_text_report()
+        );
+        assert_eq!(status(&report, "widget-markup-csp"), CheckStatus::Pass);
     }
 
     #[test]
