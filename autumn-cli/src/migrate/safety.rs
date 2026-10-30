@@ -22,7 +22,8 @@
 //! - A `--` comment, a `'` literal, a `"` identifier and a dollar-quoted
 //!   block each hide `--`, `/*` and `;` inside them. The `E'\''` escape is
 //!   not handled.
-//! - Block comments do not nest. Nested input can only report more.
+//! - Block comments do not nest. The first `*/` ends the comment. A nested
+//!   comment shows more SQL, never less.
 
 use std::fmt;
 
@@ -802,8 +803,7 @@ fn line_comment_len(rest: &str) -> Option<usize> {
 /// A `/*` inside a `--` comment, a single-quoted literal or a dollar-quoted
 /// block starts nothing, and those spans stay as they are. Line comments stay
 /// because `has_review_suppression` reads them. Unclosed block comments run to
-/// end-of-input. Block comments do not nest, so nested input can only report
-/// more, never less.
+/// end-of-input. Block comments do not nest (see the module limits).
 pub fn strip_block_comments(sql: &str) -> String {
     let mut result = String::with_capacity(sql.len());
     let mut i = 0;
@@ -829,7 +829,7 @@ pub fn strip_block_comments(sql: &str) -> String {
 }
 
 /// Remove `--` line comments from `sql`, keeping newlines. A `--` inside a
-/// single-quoted literal is text, not a comment.
+/// quoted span or a dollar-quoted block is text, not a comment.
 fn strip_line_comments(sql: &str) -> String {
     let mut result = String::with_capacity(sql.len());
     let mut i = 0;
@@ -837,8 +837,9 @@ fn strip_line_comments(sql: &str) -> String {
         let rest = &sql[i..];
         if let Some(len) = line_comment_len(rest) {
             i += len;
-        } else if starts_quote(rest) {
-            let len = quote_len(rest);
+        } else if let Some(len) =
+            dollar_quote_len(rest).or_else(|| starts_quote(rest).then(|| quote_len(rest)))
+        {
             result.push_str(&rest[..len]);
             i += len;
         } else {
@@ -2410,6 +2411,73 @@ mod tests {
         assert!(!contains_concurrent_index(
             "/* x; CREATE INDEX CONCURRENTLY i ON t (c) */"
         ));
+    }
+
+    #[test]
+    fn apostrophe_in_dollar_quote_does_not_keep_later_comment() {
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT $$it's$$ -- drop column b\n;";
+        assert!(
+            classify_sql(sql)
+                .iter()
+                .all(|f| f.operation != "DROP COLUMN")
+        );
+    }
+
+    #[test]
+    fn unclosed_spans_run_to_end_of_input() {
+        let sql = "DROP TABLE a; SELECT 'oops --/* DROP TABLE b;";
+        assert_eq!(classify_sql(sql).len(), 1);
+        assert_eq!(strip_line_comments("SELECT 'a -- b"), "SELECT 'a -- b");
+        assert_eq!(
+            strip_block_comments("DROP TABLE a; /* open\nDROP TABLE b;"),
+            "DROP TABLE a;  "
+        );
+        assert_eq!(strip_block_comments("/*/"), " ");
+        let dollar = "SELECT $$ /* x\nDROP TABLE t;";
+        assert_eq!(strip_block_comments(dollar), dollar);
+    }
+
+    #[test]
+    fn nested_looking_block_comment_reports_more() {
+        let findings = classify_sql("/* a /* b */ DROP TABLE t; */");
+        assert!(findings.iter().any(|f| f.risk == RiskLevel::Destructive));
+    }
+
+    #[test]
+    fn multibyte_text_does_not_break_scanning() {
+        let sql = "-- é/*\nDROP TABLE tést; /* ü */ SELECT '日本--', $é$ ; $é$;";
+        let findings = classify_sql(sql);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn lexer_helpers_measure_spans() {
+        assert_eq!(quote_len("'a''b'x"), 6);
+        assert_eq!(dollar_quote_len("$1 AND"), None);
+        assert_eq!(dollar_quote_len("$$x$$y"), Some(5));
+        assert_eq!(line_comment_len("--a\nb"), Some(3));
+        assert_eq!(line_comment_len("a--"), None);
+    }
+
+    #[test]
+    fn quote_in_line_comment_opens_no_literal() {
+        let findings = classify_sql("-- don't\nDROP TABLE t;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(strip_line_comments("-- don't\nx"), "\nx");
+    }
+
+    #[test]
+    fn dollar_quote_hides_line_comment_marker() {
+        let sql = "DO $$ BEGIN -- x\n END $$";
+        assert_eq!(normalize_statement(sql), "do $$ begin -- x end $$");
+    }
+
+    #[test]
+    fn has_executable_sql_edge_inputs() {
+        assert!(has_executable_sql("SELECT '--';"));
+        assert!(!has_executable_sql(""));
+        assert!(!has_executable_sql("/* only */"));
     }
 
     #[test]
