@@ -129,7 +129,7 @@ pub fn classify_sql_for(backend: DatabaseBackend, sql: &str) -> Vec<SafetyFindin
             findings.retain(|f| {
                 (f.operation != CREATE_INDEX_PG_OP && f.operation != CREATE_INDEX_SQLITE_OP)
                     || extract_index_table_name(&normalized)
-                        .is_none_or(|t| !newly_created.iter().any(|c| c == t))
+                        .is_none_or(|t| !newly_created.iter().any(|c| same_table(backend, c, t)))
             });
             findings
         })
@@ -164,18 +164,25 @@ pub fn has_unsafe_findings(findings: &[SafetyFinding]) -> bool {
 /// only comments is treated as absent — the command refuses to proceed and
 /// names the offending migration.
 ///
-/// The dialect does not change the result. All dialects read comments the same
-/// way up to the first SQL character, so the scan uses Postgres.
-pub fn has_executable_sql(sql: &str) -> bool {
-    statements(DatabaseBackend::Postgres, sql)
-        .iter()
-        .any(|stmt| {
-            stmt.lines()
-                .any(|line| !line.trim().is_empty() && !line.trim().starts_with("--"))
-        })
+/// The comment rules are those of `backend`: a nested `/*` differs.
+pub fn has_executable_sql(backend: DatabaseBackend, sql: &str) -> bool {
+    statements(backend, sql).iter().any(|stmt| {
+        stmt.lines()
+            .any(|line| !line.trim().is_empty() && !line.trim().starts_with("--"))
+    })
 }
 
 // ── internals ────────────────────────────────────────────────────────────────
+
+/// Whether two table names from normalized statements name one table.
+/// `SQLite` names ignore ASCII case, also in quotes. A quoted Postgres name
+/// keeps its case.
+fn same_table(backend: DatabaseBackend, a: &str, b: &str) -> bool {
+    match backend {
+        DatabaseBackend::Postgres => a == b,
+        DatabaseBackend::Sqlite => a.eq_ignore_ascii_case(b),
+    }
+}
 
 /// Extract the table name from a normalized `CREATE TABLE name …` statement.
 /// Only unconditional creates that are known to create a fresh table are matched.
@@ -1078,7 +1085,7 @@ fn classify_statement(
     // set: SQLite rejects them on an empty table too.
     let fresh_table = sqlite
         && extract_altered_table_name(normalized)
-            .is_some_and(|t| newly_created.iter().any(|c| *c == t));
+            .is_some_and(|t| newly_created.iter().any(|c| same_table(backend, c, t)));
 
     // DROP TABLE — check first; it subsumes DROP COLUMN detection
     if normalized.starts_with("drop table") {
@@ -2520,8 +2527,14 @@ mod tests {
 
     #[test]
     fn has_executable_sql_sees_statement_after_line_comment_with_block_open() {
-        assert!(has_executable_sql("-- x /* y\nDROP TABLE t;"));
-        assert!(!has_executable_sql("-- x /* y\n-- z"));
+        assert!(has_executable_sql(
+            DatabaseBackend::Postgres,
+            "-- x /* y\nDROP TABLE t;"
+        ));
+        assert!(!has_executable_sql(
+            DatabaseBackend::Postgres,
+            "-- x /* y\n-- z"
+        ));
     }
 
     #[test]
@@ -2629,10 +2642,36 @@ mod tests {
     }
 
     #[test]
+    fn has_executable_sql_follows_the_dialect() {
+        // A `SQLite` comment ends at the first `*/`. A Postgres comment nests.
+        let sql = "/* a /* */ DROP TABLE t;";
+        assert!(has_executable_sql(DatabaseBackend::Sqlite, sql));
+        assert!(!has_executable_sql(DatabaseBackend::Postgres, sql));
+    }
+
+    #[test]
+    fn quoted_table_names_follow_the_dialect_case_rule() {
+        // `SQLite` names ignore case, also in quotes. Postgres quoted names do not.
+        let lite = DatabaseBackend::Sqlite;
+        let sql =
+            r#"CREATE TABLE "Users" (id int); ALTER TABLE "users" ADD COLUMN z int NOT NULL;"#;
+        assert!(is_safe(&classify_sql_for(lite, sql)), "{sql}");
+        let sql = r#"CREATE TABLE "Users" (id int); CREATE INDEX i ON "users" (id);"#;
+        assert_eq!(ops(lite, sql), Vec::<String>::new());
+        assert_eq!(
+            ops(DatabaseBackend::Postgres, sql),
+            ["CREATE INDEX (non-concurrent)"]
+        );
+    }
+
+    #[test]
     fn has_executable_sql_edge_inputs() {
-        assert!(has_executable_sql("SELECT '--';"));
-        assert!(!has_executable_sql(""));
-        assert!(!has_executable_sql("/* only */"));
+        assert!(has_executable_sql(
+            DatabaseBackend::Postgres,
+            "SELECT '--';"
+        ));
+        assert!(!has_executable_sql(DatabaseBackend::Postgres, ""));
+        assert!(!has_executable_sql(DatabaseBackend::Postgres, "/* only */"));
     }
 
     #[test]
@@ -3060,39 +3099,55 @@ mod tests {
 
     #[test]
     fn has_executable_sql_empty_string_is_false() {
-        assert!(!has_executable_sql(""));
+        assert!(!has_executable_sql(DatabaseBackend::Postgres, ""));
     }
 
     #[test]
     fn has_executable_sql_whitespace_only_is_false() {
-        assert!(!has_executable_sql("   \n\t\n  "));
+        assert!(!has_executable_sql(
+            DatabaseBackend::Postgres,
+            "   \n\t\n  "
+        ));
     }
 
     #[test]
     fn has_executable_sql_line_comment_only_is_false() {
-        assert!(!has_executable_sql("-- nothing here\n-- just comments"));
+        assert!(!has_executable_sql(
+            DatabaseBackend::Postgres,
+            "-- nothing here\n-- just comments"
+        ));
     }
 
     #[test]
     fn has_executable_sql_block_comment_only_is_false() {
-        assert!(!has_executable_sql("/* block comment only */"));
+        assert!(!has_executable_sql(
+            DatabaseBackend::Postgres,
+            "/* block comment only */"
+        ));
     }
 
     #[test]
     fn has_executable_sql_real_sql_is_true() {
-        assert!(has_executable_sql("DROP TABLE posts;"));
+        assert!(has_executable_sql(
+            DatabaseBackend::Postgres,
+            "DROP TABLE posts;"
+        ));
     }
 
     #[test]
     fn has_executable_sql_comment_plus_sql_is_true() {
         assert!(has_executable_sql(
+            DatabaseBackend::Postgres,
             "-- undo the migration\nDROP TABLE posts;"
         ));
     }
 
     #[test]
     fn has_executable_sql_no_trailing_semicolon_is_true() {
-        assert!(has_executable_sql("DROP TABLE posts"));
+        assert!(has_executable_sql(
+            DatabaseBackend::Postgres,
+            "DROP TABLE posts"
+        ));
     }
 
     // ── SQLite dialect (#1906) ────────────────────────────────────────────────
