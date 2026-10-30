@@ -16,7 +16,7 @@
 //!    [`&FieldOptions`](crate::form::FieldOptions). A form input binds with
 //!    [`FieldRenderer`](crate::form::FieldRenderer): the app sets the hint,
 //!    `required`, the typed attributes and `data-*`/`hx-*`. Another widget
-//!    writes its root with [`element`], which adds the `data-*`/`hx-*`
+//!    writes its root with [`element`](crate::widget_pack::element), which adds the `data-*`/`hx-*`
 //!    passthrough. The app cannot set `id`, `name` or `aria-*` through the
 //!    options.
 //! 3. **Tokens.** Pack CSS uses only the public tokens

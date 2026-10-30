@@ -27,7 +27,7 @@
 //! | `widget-tokens` | Pack CSS uses `@import`, reads an unknown custom property, sets a property that is not `--autumn-<pack>-*`, or has a raw color. |
 //! | `widget-scripts` | Pack JS uses `eval(`, `Function(`, a string timer or `document.write(`. |
 //!
-//! With the `system-tests` feature, [`browser::run_widget_browser_conformance`]
+//! With the `system-tests` feature, `browser::run_widget_browser_conformance`
 //! adds the axe, console and keyboard checks in Chromium.
 
 use std::collections::BTreeSet;
