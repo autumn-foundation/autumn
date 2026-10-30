@@ -262,14 +262,15 @@ fn measure_per_request(
 /// count just over the line rather than a regression-sized jump, re-measure
 /// under both feature sets and re-derive it rather than nudging it upwards.
 ///
-/// Re-derived for #2830: **95** blocks under the 8 default features and
+/// Re-derived for #2830: **98** blocks under the 8 default features and
 /// under the full `cargo test --workspace` set (133 before). A shared pointer
-/// now stops the deep clones, and eight more layers have named futures. A
-/// restored `from_fn` now costs 4 blocks (see the control test below). Thus
-/// the headroom is 3 blocks, so one restored `from_fn` still fails this gate.
+/// at the erased seed now stops the deep clones, and eight more layers have
+/// named futures. A restored `from_fn` now costs 4 blocks (see the control
+/// test below). Thus the headroom is 3 blocks, so one restored `from_fn` still
+/// fails this gate.
 #[test]
 fn per_request_allocations_stay_under_the_ceiling() {
-    const CEILING: u64 = 98;
+    const CEILING: u64 = 101;
 
     let measured = measure_per_request(|app| app);
     println!(
@@ -280,9 +281,9 @@ fn per_request_allocations_stay_under_the_ceiling() {
     assert!(
         measured.blocks <= CEILING,
         "a request allocated {} blocks, over the {CEILING} ceiling ({} bytes \
-         per request). 133 was the pre-#2830 measurement: check that \
-         `SharedServiceLayer` is still first in the merged tuple and that the \
-         ingress futures are not boxed. 172 was the pre-#2214 measurement: check whether an \
+         per request). 133 was the pre-#2830 measurement: check that the \
+         erased seed still holds a `SharedService` and that the ingress \
+         futures are not boxed. 172 was the pre-#2214 measurement: check whether an \
          `axum::middleware::from_fn` is back on the always-on ingress path — \
          each one costs a `Box::pin` per request.",
         measured.blocks,
@@ -333,13 +334,13 @@ fn per_request_allocations_stay_under_the_ceiling() {
 /// `option_layer` adds cost 144 bytes when the section is off, with no new
 /// block. The ceiling is the workspace measurement plus about a tenth.
 ///
-/// Re-derived for #2830: **12,954** under the 8 default features and
-/// **14,402** under the full `cargo test --workspace` set (28,270 and about
+/// Re-derived for #2830: **15,666** under the 8 default features and
+/// **17,306** under the full `cargo test --workspace` set (28,270 and about
 /// 30,500 before). The ceiling is the workspace measurement plus about a
 /// tenth.
 #[test]
 fn per_request_allocated_bytes_stay_under_the_ceiling() {
-    const CEILING: u64 = 15_900;
+    const CEILING: u64 = 19_000;
 
     let measured = measure_per_request(|app| app);
     println!(
@@ -482,7 +483,7 @@ fn a_from_fn_layer_costs_more_heap_blocks_per_request_than_a_named_future() {
 /// Extra blocks for each request when the app registers one static gate:
 /// the erased seed of the gate run, and the one clone it makes for each call
 /// (#2830). Measured, debug profile, default and workspace features.
-const STATIC_GATE_BLOCKS: u64 = 4;
+const STATIC_GATE_BLOCKS: u64 = 3;
 
 /// Extra blocks for each request when `[compression]` is on and the request
 /// does not accept an encoding. Measured, as above.

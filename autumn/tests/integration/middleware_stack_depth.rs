@@ -70,19 +70,17 @@
 //!
 //! # Since #2830: the cascade stops at a shared pointer
 //!
-//! The merged tuple now starts with a `SharedService`, and the erased seed of
-//! the operator layers holds the services below it in one too. A clone of a
-//! `SharedService` is one reference count. Thus a `Route` level above the
-//! merged tuple clones only down to it, and each call clones the services
-//! below each boundary one time. The leaf probe now counts only what is
+//! The erased seed of the operator layers holds the services below it in a
+//! `SharedService`. A clone of it is one reference count. Thus the deep clones
+//! from the outer `Route` levels stop at the seed, and each call clones the
+//! services below the seed one time. The leaf probe now counts only what is
 //! below the seed: the seed call, plus the base `Route` box. It measures
 //! **2**.
 //!
-//! The leaf probe no longer sees a `Route` level above the merged tuple. A
-//! second probe, registered as an operator layer, sits between the two
-//! boundaries. It counts the clone-on-call services in the merged tuple above
-//! the operator layers. A `Route` level above the merged tuple costs one small
-//! box per traversal now; `tests/config_alloc_gate.rs` gates that by blocks.
+//! The leaf probe no longer sees a `Route` level above the seed. A second
+//! probe, registered as an operator layer, sits just above the seed. It counts
+//! each outer `Route` level and each clone-on-call service in the merged
+//! tuple. See [`OPERATOR_TRAVERSALS`].
 //!
 //! The old lower bound found a probe that fell out of the framework stack (1-3
 //! traversals). The real count is now 2, so a lower bound cannot do that. The
@@ -296,9 +294,7 @@ async fn ingress_traversals_with(customize: impl FnOnce(TestApp) -> TestApp) -> 
 /// The clones of an operator-layer probe for one request.
 ///
 /// The probe is registered with `AppBuilder::layer`, so it sits in the merged
-/// tuple, below its `SharedService` and above the erased seed. It counts the
-/// call of that `SharedService` plus each clone-on-call service between the
-/// two. See [`OPERATOR_TRAVERSALS`].
+/// tuple, just above the erased seed. See [`OPERATOR_TRAVERSALS`].
 async fn operator_traversals_with(customize: impl FnOnce(TestApp) -> TestApp) -> usize {
     let clones = Arc::new(AtomicUsize::new(0));
     let probe = CloneCountLayer {
@@ -313,13 +309,14 @@ async fn operator_traversals_with(customize: impl FnOnce(TestApp) -> TestApp) ->
 
 /// Clones of the operator-layer probe for one request (#2830).
 ///
-/// It is 1: the call of the `SharedService` at the start of the merged
-/// tuple. Each service in the merged tuple above the operator layers calls
-/// its inner service at once, with no clone. A service that clones its inner
-/// service on call (an `axum::middleware::from_fn`, or a boxed future that
-/// owns the inner service) adds one. So does a `Router::layer` call that
-/// lands between the two `SharedService` boundaries.
-const OPERATOR_TRAVERSALS: usize = 1;
+/// It is 4: one for each `Route` level above the probe. Those are the merged
+/// tuple, the event-context group, the security-header group and the
+/// response-side fallbacks of `TestApp`. Each service in the merged tuple
+/// above the operator layers calls its inner service at once, with no clone.
+/// A service that clones its inner service on call (an
+/// `axum::middleware::from_fn`, or a boxed future that owns the inner service)
+/// adds one. So does a new `Router::layer` call above the probe.
+const OPERATOR_TRAVERSALS: usize = 4;
 
 /// App-wide operator layer whose service forwards without cloning its inner —
 /// so the ONLY thing registering it can add to the traversal count is the box
@@ -405,17 +402,17 @@ async fn ingress_stack_depth_stays_within_budget() {
 }
 
 #[tokio::test]
-async fn operator_probe_sees_one_traversal_per_request() {
+async fn operator_probe_sees_one_traversal_per_outer_route_level() {
     let traversals = operator_traversals_with(|app| app).await;
     println!("operator-layer traversals/request: {traversals}");
     assert_eq!(
         traversals, OPERATOR_TRAVERSALS,
         "an operator layer was cloned {traversals} times for one request \
          (expected {OPERATOR_TRAVERSALS}). A service in the merged tuple above \
-         the operator layers now clones its inner service on call, or a \
-         `Router::layer` call landed inside the merged tuple. Give the service a \
-         named future that calls its inner service at once (issues #2214, \
-         #2830)."
+         the operator layers now clones its inner service on call, or a new \
+         `Router::layer` call is above them. Give the service a named future \
+         that calls its inner service at once, or put the layer in an existing \
+         `Router::layer` call (issues #2214, #2830)."
     );
 }
 
@@ -544,10 +541,9 @@ async fn merged_stack_preserves_ingress_order() {
 /// single merged application, so the box-level count `D` — and with it this
 /// probe's traversal count — does not move at all.
 ///
-/// Since #2830 the leaf probe cannot see a `Route` level above the merged
-/// tuple. The operator-layer probe below sees a level inside it. A static gate
-/// sits above it, so `a_static_gate_and_compression_add_no_route_level` in
-/// `tests/config_alloc_gate.rs` gates the gate by blocks.
+/// Since #2830 the leaf probe cannot see a `Route` level above the seed. The
+/// operator-layer probe below sees each one. `a_static_gate_and_compression_add_no_route_level`
+/// in `tests/config_alloc_gate.rs` also gates a static gate by blocks.
 ///
 /// The passthrough layers here neither box nor clone on call, so the ONLY
 /// thing their registration can contribute is composition overhead — which is
@@ -615,10 +611,10 @@ async fn operator_layers_do_not_deepen_the_framework_cascade() {
 /// disabled, before and after #2371) — only the enabled case is expected to
 /// change.
 ///
-/// Since #2830 this probe sees a `Router::layer` call below the merged tuple
-/// only. A call above it costs blocks, not clones of the probe:
+/// Since #2830 this probe sees a `Router::layer` call below the seed only. The
+/// operator-layer probe sees a call above the seed, and
 /// `a_static_gate_and_compression_add_no_route_level` in
-/// `tests/config_alloc_gate.rs` gates that case.
+/// `tests/config_alloc_gate.rs` gates the same case by blocks.
 #[tokio::test]
 async fn compression_enabled_does_not_deepen_the_framework_cascade() {
     let bare = ingress_traversals_per_request().await;

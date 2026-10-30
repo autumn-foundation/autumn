@@ -5672,18 +5672,6 @@ where
     }
 }
 
-/// Puts the services below it behind a [`SharedService`].
-#[derive(Clone, Copy)]
-struct SharedServiceLayer;
-
-impl<S> tower::Layer<S> for SharedServiceLayer {
-    type Service = SharedService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        SharedService::new(inner)
-    }
-}
-
 /// Re-normalize a group's response body back to `axum::body::Body`.
 ///
 /// Every `Router::layer` call ends in `Route::new`, which maps the produced
@@ -6433,10 +6421,11 @@ fn apply_middleware(
     // even with no layer registered — see its docs for why an empty run still
     // earns its boxing adapter.
     //
-    // `SharedServiceLayer` is first, so a clone of this group by an outer
-    // `Route` level is one reference count, not a deep clone (#2830).
+    // Do not put a `SharedService` at the start of this group too. It saves 3
+    // blocks for each request, but it makes a second set of generic code over
+    // the full type of this group. That added 223 MB of debug info to each
+    // app binary (#2830).
     let router = router.layer((
-        SharedServiceLayer,
         compression_layer,
         outer_stack,
         session_layer,
