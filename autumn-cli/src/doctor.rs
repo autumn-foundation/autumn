@@ -1929,13 +1929,16 @@ pub fn check_custom_domains_config_impl(
             name: "custom_domains",
             status: CheckStatus::Warn,
             detail: Some(format!(
-                "{} of {} custom-domain records will not load ({}); the runtime skips them and \
-                 serves the rest, so those tenants' domains stop routing",
+                "{} of {} custom-domain records will not load ({}); the runtime serves the \
+                 rest, those tenants' domains stop routing, and no new domain can be connected \
+                 until they are fixed",
                 registry.skipped.len(),
                 registry.skipped.len() + registered,
                 registry.skipped.join(", ")
             )),
-            hint: Some("Re-register the affected hostnames, or restore the records from a backup"),
+            hint: Some(
+                "Restore the affected records from a backup, or delete the files, then restart",
+            ),
         });
     }
     if registered > cd.max_domains {
@@ -2453,7 +2456,7 @@ pub fn read_custom_domain_registry(store_dir: &std::path::Path) -> CustomDomainR
                 domain.status.as_str().to_owned(),
                 domain.verification_token,
             )),
-            // The runtime skips a record it cannot read and serves the rest, so
+            // The runtime serves the rest and refuses new domains, so
             // doctor counts it rather than failing the run over it.
             Err(e) => read.skipped.push(format!("{}: {e}", path.display())),
         }
@@ -15218,7 +15221,7 @@ pub struct Vault {
         assert!(detail.contains("cannot be read"), "{detail}");
 
         // A single unparseable record is a Warn, not a Fail: the runtime skips
-        // it and serves the rest.
+        // it, serves the rest, and refuses new domains.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("good.json"),

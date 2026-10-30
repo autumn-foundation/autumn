@@ -1884,3 +1884,89 @@ async fn a_token_upgrade_that_fails_to_persist_stays_in_the_verification_pass() 
         .collect();
     assert_eq!(hosts, vec!["verified.clientco.com".to_owned()]);
 }
+
+// ── Partial hydration (#2654) ────────────────────────────────────────────
+
+/// A store with tenant A's record on disk, A's file truncated, and B's intact.
+async fn store_with_one_corrupt_record() -> (tempfile::TempDir, Arc<FsCustomDomainStore>, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FsCustomDomainStore::new(dir.path()));
+    let writer = hydrate(CustomDomainRegistry::new(store.clone(), 10));
+    writer
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    writer
+        .register("ok.clientco.com", "tenant-ok", NOW)
+        .await
+        .unwrap();
+    let bad = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| std::fs::read_to_string(p).is_ok_and(|s| s.contains("app.clientco.com")))
+        .unwrap();
+    std::fs::write(&bad, b"{\"hostname\": \"app.cli").unwrap();
+    let name = bad.display().to_string();
+    (dir, store, name)
+}
+
+#[tokio::test]
+async fn a_partial_load_refuses_register_and_names_the_file() {
+    let (_dir, store, bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store.clone(), 10);
+    assert_eq!(registry.load().await.unwrap(), 1);
+
+    let err = registry
+        .register("app.clientco.com", "tenant-evil", NOW)
+        .await
+        .expect_err("a registry that skipped a record must not accept a registration");
+    let RegisterError::Incomplete { files } = &err else {
+        panic!("expected Incomplete, got {err:?}");
+    };
+    assert_eq!(files, &[bad.clone()]);
+    assert!(err.to_string().contains(&bad), "{err}");
+    // A's corrupt file was not overwritten.
+    assert_eq!(std::fs::read(&bad).unwrap(), b"{\"hostname\": \"app.cli");
+}
+
+#[tokio::test]
+async fn a_partial_load_still_serves_the_records_that_loaded() {
+    let (_dir, store, _bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load().await.unwrap();
+
+    assert!(registry.get("ok.clientco.com").is_some());
+    // Renewal and status changes for a loaded record still write.
+    registry
+        .record_verified("ok.clientco.com", NOW + 1)
+        .await
+        .unwrap();
+    // Re-registering a loaded hostname for its own tenant is a read, not a claim.
+    assert!(
+        registry
+            .register("ok.clientco.com", "tenant-ok", NOW + 2)
+            .await
+            .is_ok(),
+        "an idempotent re-register of a loaded record is safe"
+    );
+}
+
+#[tokio::test]
+async fn a_clean_load_is_unaffected_and_a_reload_clears_the_refusal() {
+    let (dir, store, bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load().await.unwrap();
+    assert!(!registry.is_complete());
+    assert_eq!(registry.skipped_records(), vec![bad.clone()]);
+
+    // The operator deletes the bad file; the next load is complete.
+    std::fs::remove_file(&bad).unwrap();
+    registry.load().await.unwrap();
+    assert!(registry.is_complete());
+    assert!(registry.skipped_records().is_empty());
+    registry
+        .register("new.clientco.com", "tenant-b", NOW)
+        .await
+        .expect("a complete load accepts registrations");
+    drop(dir);
+}

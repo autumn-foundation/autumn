@@ -2559,6 +2559,64 @@ async fn the_prune_refuses_to_run_when_the_registry_never_hydrated() {
     );
 }
 
+#[tokio::test]
+async fn the_prune_refuses_to_run_after_a_partial_load() {
+    use autumn_web::custom_domain::{CustomDomainPruner as _, FsCustomDomainStore};
+
+    // A skipped record leaves its tenant's certificate looking orphaned.
+    let dir = tempfile::tempdir().unwrap();
+    let domains = dir.path().join("domains");
+    std::fs::create_dir_all(&domains).unwrap();
+    std::fs::write(domains.join("bad.json"), b"{").unwrap();
+    let store = Arc::new(FsAcmeStore::new(dir.path().join("acme"), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(FsCustomDomainStore::new(&domains)),
+        10,
+    ));
+    registry.load().await.unwrap();
+    store
+        .save_cert(
+            &CertId::from_domains(&["app.clientco.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let task = CustomDomainTask {
+        registry,
+        cache: Arc::new(CustomDomainCertCache::new(4)),
+        certs: Arc::clone(&store) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        provider: autumn_web::tls::crypto_provider(),
+        verifier: TableVerifier::new(&[]),
+        issuer: ScriptedIssuer::new(&[]),
+        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        ingress: ExpectedIngress::default(),
+        renew_before_days: 30,
+        reporter: Arc::new(|_| {}),
+        recovery: None,
+        coordinator: Arc::new(autumn_web::scheduler::InProcessSchedulerCoordinator::new(
+            "test-replica",
+        )),
+        leadership_degraded: false,
+        cert_store_paths: Some(store.clone()),
+        retained_cert_ids: HashSet::new(),
+    };
+
+    let err = task.prune(NOW + 86_400, false).await.unwrap_err();
+    assert!(err.contains("bad.json"), "{err}");
+    assert!(
+        store
+            .load_cert(&CertId::from_domains(&["app.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_some(),
+        "nothing may be deleted"
+    );
+}
+
 // ── AC5/AC6: restart and scale, against the real on-disk stores ──────────
 
 #[tokio::test]

@@ -670,6 +670,16 @@ impl CustomDomain {
 
 // ── Persistence ──────────────────────────────────────────────────────────
 
+/// The result of reading a store: the records that loaded, and the ones that
+/// did not.
+#[derive(Debug, Default)]
+pub struct StoreLoad {
+    /// Records that decoded.
+    pub records: Vec<CustomDomain>,
+    /// Where each record that did not decode is kept (a file path).
+    pub skipped: Vec<String>,
+}
+
 /// Durable storage for the domain registry.
 ///
 /// Records must survive a restart: a lost registry silently stops routing
@@ -677,6 +687,20 @@ impl CustomDomain {
 pub trait CustomDomainStore: Send + Sync + std::fmt::Debug {
     /// Every stored record. Called once at boot to hydrate the index.
     fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>>;
+
+    /// Every record that loads, and the records that do not.
+    ///
+    /// Override this if the store can skip a record. The default trusts
+    /// [`load_all`](Self::load_all) and reports nothing skipped.
+    fn load_report(&self) -> StoreFuture<'_, io::Result<StoreLoad>> {
+        let all = self.load_all();
+        Box::pin(async move {
+            Ok(StoreLoad {
+                records: all.await?,
+                skipped: Vec::new(),
+            })
+        })
+    }
     /// Insert or replace one record.
     fn save<'a>(&'a self, domain: &'a CustomDomain) -> StoreFuture<'a, io::Result<()>>;
     /// Delete one record. Deleting an absent record succeeds.
@@ -856,13 +880,18 @@ fn file_stem(hostname: &str) -> String {
 
 impl CustomDomainStore for FsCustomDomainStore {
     fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>> {
+        let report = self.load_report();
+        Box::pin(async move { Ok(report.await?.records) })
+    }
+
+    fn load_report(&self) -> StoreFuture<'_, io::Result<StoreLoad>> {
         Box::pin(async move {
             let mut entries = match tokio::fs::read_dir(&self.dir).await {
                 Ok(entries) => entries,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(StoreLoad::default()),
                 Err(e) => return Err(e),
             };
-            let mut out = Vec::new();
+            let mut out = StoreLoad::default();
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
                 if path.extension().is_none_or(|ext| ext != "json") {
@@ -870,14 +899,18 @@ impl CustomDomainStore for FsCustomDomainStore {
                 }
                 let bytes = tokio::fs::read(&path).await?;
                 match serde_json::from_slice::<CustomDomain>(&bytes) {
-                    Ok(domain) => out.push(domain),
-                    // A corrupt record must not stop the other 999 domains from
-                    // being served; it is logged and skipped, and the app can
-                    // re-register the hostname to repair it.
-                    Err(e) => tracing::warn!(
-                        path = %path.display(),
-                        "skipping unreadable custom-domain record: {e}"
-                    ),
+                    Ok(domain) => out.records.push(domain),
+                    // One corrupt record must not stop the other 999 domains
+                    // from serving. The caller learns of it, and the registry
+                    // then refuses new registrations (#2654).
+                    Err(e) => {
+                        tracing::error!(
+                            path = %path.display(),
+                            "custom-domain record will not load: {e}; restore or delete the file, \
+                             then restart"
+                        );
+                        out.skipped.push(path.display().to_string());
+                    }
                 }
             }
             Ok(out)
@@ -1001,6 +1034,12 @@ pub enum RegisterError {
     /// The registry has not hydrated from its store, so it cannot tell whether
     /// another tenant already owns the hostname.
     NotReady,
+    /// The load skipped records it could not decode, so a hostname may belong
+    /// to a tenant whose record is among them.
+    Incomplete {
+        /// The files that did not load.
+        files: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for RegisterError {
@@ -1025,6 +1064,13 @@ impl std::fmt::Display for RegisterError {
                 f,
                 "the custom-domain registry has not loaded, so a hostname cannot be connected \
                  without risking another tenant's record; check the server log for the load error"
+            ),
+            Self::Incomplete { files } => write!(
+                f,
+                "{} custom-domain record(s) will not load ({}), so a hostname cannot be connected \
+                 without risking another tenant's record; restore or delete them, then restart",
+                files.len(),
+                files.join(", ")
             ),
         }
     }
@@ -1071,6 +1117,9 @@ pub struct CustomDomainRegistry {
     /// hydrate: that index knows nothing, and every tenant certificate would
     /// read as an orphan.
     hydrated: std::sync::atomic::AtomicBool,
+    /// Files the last load could not decode. While any exist, the index is
+    /// partial: it serves what loaded but does not accept new registrations.
+    skipped: RwLock<Vec<String>>,
 }
 
 impl CustomDomainRegistry {
@@ -1085,6 +1134,7 @@ impl CustomDomainRegistry {
             max_domains,
             reserved: Vec::new(),
             hydrated: std::sync::atomic::AtomicBool::new(false),
+            skipped: RwLock::new(Vec::new()),
         }
     }
 
@@ -1155,6 +1205,27 @@ impl CustomDomainRegistry {
         self.hydrated.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Whether `host` is loaded and belongs to `tenant`.
+    fn owned_by(&self, host: &str, tenant: &str) -> bool {
+        read_lock(&self.index)
+            .get(host)
+            .is_some_and(|d| d.tenant == tenant)
+    }
+
+    /// Whether the last load read every stored record.
+    ///
+    /// `false` before a load, and after a load that skipped a record.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.is_hydrated() && read_lock(&self.skipped).is_empty()
+    }
+
+    /// The files the last load could not decode.
+    #[must_use]
+    pub fn skipped_records(&self) -> Vec<String> {
+        read_lock(&self.skipped).clone()
+    }
+
     /// Replace the index with `records`, skipping reserved names. Returns how
     /// many loaded and which ones [need a token](CustomDomain::needs_verification_token).
     ///
@@ -1202,8 +1273,9 @@ impl CustomDomainRegistry {
     ///
     /// Propagates the store's read error.
     pub async fn load(&self) -> io::Result<usize> {
-        let records = self.store.load_all().await?;
-        let (loaded, legacy) = self.hydrate_index(records);
+        let report = self.store.load_report().await?;
+        *write_lock(&self.skipped) = report.skipped;
+        let (loaded, legacy) = self.hydrate_index(report.records);
         self.hydrated
             .store(true, std::sync::atomic::Ordering::Release);
         // A record stored before ownership tokens, and not yet serving, has
@@ -1236,8 +1308,9 @@ impl CustomDomainRegistry {
     ///
     /// Propagates the store's read error.
     pub async fn load_without_migration(&self) -> io::Result<usize> {
-        let records = self.store.load_all().await?;
-        let (loaded, _legacy) = self.hydrate_index(records);
+        let report = self.store.load_report().await?;
+        *write_lock(&self.skipped) = report.skipped;
+        let (loaded, _legacy) = self.hydrate_index(report.records);
         self.hydrated
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(loaded)
@@ -1359,6 +1432,13 @@ impl CustomDomainRegistry {
         // for a load that succeeded.
         if !self.is_hydrated() {
             return Err(RegisterError::NotReady);
+        }
+        // A record that did not load may own this hostname, and saving would
+        // overwrite its file. Re-registering a loaded hostname for its own
+        // tenant writes only that hostname's file, so it stays safe.
+        let skipped = self.skipped_records();
+        if !skipped.is_empty() && !self.owned_by(&host, tenant) {
+            return Err(RegisterError::Incomplete { files: skipped });
         }
 
         // Refuse a full registry BEFORE creating this hostname's write gate.
