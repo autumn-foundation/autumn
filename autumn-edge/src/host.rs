@@ -700,7 +700,12 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                             let accepted = state.write_stdout(&chunk);
                             // Pay fuel for `kv_get` answers made while parsing (#3502).
                             let owed = std::mem::take(&mut state.pending_fuel);
-                            charge_units(&mut caller, owed)?;
+                            if let Err(err) = charge_units(&mut caller, owed) {
+                                // An unpaid budget beats a frame from the same
+                                // chunk. Else the guest gets free work.
+                                caller.data_mut().terminal = None;
+                                return Err(err);
+                            }
                             if !accepted {
                                 // A single stdout line has outgrown any honest
                                 // frame: fail the write so the guest aborts and
@@ -1247,6 +1252,32 @@ mod tests {
             .run(&EdgeRequest::get("/meter"), &[EdgeCapability::Kv], &kv)
             .expect("host setup succeeds");
         assert_out_of_fuel(&outcome, "a kv_get answer");
+    }
+
+    /// A `kv_get` and a response in one write (#3502). The `kv_get` charge
+    /// fails, so the budget error wins over the response.
+    #[test]
+    fn an_unpaid_kv_get_beats_a_response_in_the_same_write() {
+        let wasm = wat::parse_str(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{\"op\":\"kv_get\",\"key\":\"k\"}\n{\"op\":\"response\",\"status\":200,\"headers\":[],\"body_b64\":\"\"}\n")
+  (func (export "_start")
+    (i32.store (i32.const 100) (i32.const 0))
+    (i32.store (i32.const 104) (i32.const 84))
+    (drop (call $fd_write (i32.const 1) (i32.const 100) (i32.const 1) (i32.const 120)))))
+"#,
+        )
+        .expect("valid WAT");
+        let mut artifact = EdgeArtifact::from_bytes(&wasm).expect("valid module");
+        artifact.fuel_budget = 500_000;
+        let kv = InMemoryEdgeKv::new().with("k", vec![7u8; 1024 * 1024]);
+        let outcome = artifact
+            .run(&EdgeRequest::get("/meter"), &[EdgeCapability::Kv], &kv)
+            .expect("host setup succeeds");
+        assert_out_of_fuel(&outcome, "a kv_get beside a response");
     }
 
     #[test]
