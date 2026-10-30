@@ -45,11 +45,18 @@ pub(super) fn has_exact_entry(dir: &Path, name: &str) -> bool {
 }
 
 /// Whether the directory of `path` lists an entry with exactly its name.
+///
+/// True when the directory cannot be read. An unknown listing must not make
+/// two names one entry.
 fn listed(path: &Path) -> bool {
-    match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
-        (Some(dir), Some(name)) => has_exact_entry(dir, name),
-        _ => false,
-    }
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return true;
+    };
+    fs::read_dir(dir).map_or(true, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name() == name)
+    })
 }
 
 /// Whether `a` and `b` are one file on disk.
@@ -163,6 +170,13 @@ mod tests {
             &dir.path().join("Bar.rs"),
             &dir.path().join("bar.rs")
         ));
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_read_lists_every_name() {
+        // Fail closed: an unknown listing must not make two names one entry.
+        assert!(listed(Path::new("Foo.rs")), "the parent is \"\"");
+        assert!(listed(&tmp().path().join("gone/Foo.rs")));
     }
 
     #[test]
