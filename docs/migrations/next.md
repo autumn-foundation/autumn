@@ -385,14 +385,15 @@ If nothing changed, delete this section.
   restore, set `balance_minor` to `NULL`. See
   `docs/guide/money.md#the-stored-balance`.
 
-- **Radio choice ids: a name with `-`, `.` or a space has a new id (#3454).**
-  Before, two groups could give the same choice id, which breaks the
-  `<label for>` link. Now `_` and letters and digits stay. Each other byte is
-  written `--HH` (upper-case hex): `plan-type` gives `plan--2Dtype-x`, and
-  `plan type` gives `plan--20type-x`. An id from a plain name such as
-  `speed` or `first_name` does not change. A second choice with an equal value
-  ends in `--n1`, not `-1`. Update a CSS rule, a test or a `getElementById`
-  call that uses the old id of such a name.
+- **Radio choice ids: a name or value with a special character has a new id
+  (#3454).** Before, two groups could give the same choice id, which breaks
+  the `<label for>` link. Now letters, digits and `_` stay. Each other byte
+  (`-`, `.`, a space, non-ASCII) is written `--HH` (upper-case hex): the name
+  `plan-type` gives `plan--2Dtype-x`, and the value `next-day` gives
+  `…-next--2Dday`. An id made only of letters, digits and `_` does not change.
+  An empty name after an `id_prefix` is now `--`. A second choice with an
+  equal value ends in `--n1`, not `-<index>`. Update a CSS rule, a test or a
+  `getElementById` call that uses an old id.
 
 ## Deprecations retained from `{X.Y}`
 

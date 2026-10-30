@@ -6,7 +6,7 @@ verus! {
 //
 // The runtime is `radio_option_ids`, `id_part` and `selector_safe` in
 // `autumn/src/a11y.rs`. An id is parts joined by `-`. `id_part` reduces each
-// part to the bytes `[A-Za-z0-9_-]` (a `-` only in a `--HH` escape). `selector_safe` then makes the lead part
+// part to the bytes `[A-Za-z0-9_-]`; a `-` is only in a `--HH` escape. `selector_safe` then makes the lead part
 // start a CSS identifier: it adds one `_` when the part, without its leading
 // `_` bytes, does not start with a letter.
 //
@@ -23,7 +23,7 @@ pub open spec fn is_letter(b: u8) -> bool {
     (65 <= b && b <= 90) || (97 <= b && b <= 122)
 }
 
-/// `[A-Za-z0-9_-]`, the bytes `id_part` keeps.
+/// `[A-Za-z0-9_-]`, the bytes `id_part` can write.
 pub open spec fn in_alphabet(b: u8) -> bool {
     is_letter(b) || (48 <= b && b <= 57) || b == 95 || b == 45
 }
