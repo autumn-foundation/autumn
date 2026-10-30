@@ -273,9 +273,13 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 /// Backticks and brackets are not Postgres quotes.
 fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
     let after_prefix = normalized.strip_prefix("alter table ").unwrap_or("");
-    let subcommands_start = table_name_len(after_prefix)
-        .saturating_add(1)
-        .min(after_prefix.len());
+    // SQLite quotes names with backticks and brackets, so a `"` may be plain text.
+    let name_len = if quote_aware {
+        after_prefix.find(' ').unwrap_or(after_prefix.len())
+    } else {
+        table_name_len(after_prefix)
+    };
+    let subcommands_start = name_len.saturating_add(1).min(after_prefix.len());
     let subcommands = &after_prefix[subcommands_start..];
 
     let mut result = Vec::new();
@@ -936,12 +940,41 @@ fn strip_line_comments(sql: &str) -> String {
 }
 
 /// Strip comments, collapse whitespace, and lowercase a single statement.
+///
+/// A `$tag$` token keeps its case: Postgres matches dollar-quote tags
+/// case-sensitively, and the literal scanners must see the same text.
 pub fn normalize_statement(stmt: &str) -> String {
-    strip_line_comments(&strip_block_comments(stmt))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    lowercase_except_dollar_tags(
+        &strip_line_comments(&strip_block_comments(stmt))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Lowercase `text`, but copy each `$tag$` token as it is.
+fn lowercase_except_dollar_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(c) = text[i..].chars().next() {
+        let tag_len = (c == '$')
+            .then(|| {
+                let body = &text[i + 1..];
+                let n = body
+                    .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+                    .unwrap_or(body.len());
+                body[n..].starts_with('$').then_some(n + 2)
+            })
+            .flatten();
+        if let Some(n) = tag_len {
+            out.push_str(&text[i..i + n]);
+            i += n;
+        } else {
+            out.extend(c.to_lowercase());
+            i += c.len_utf8();
+        }
+    }
+    out
 }
 
 /// Returns `true` when `sql` contains an executable concurrent index operation
@@ -3408,6 +3441,40 @@ mod tests {
                 .any(|f| f.operation == "ADD COLUMN NOT NULL (no default)"),
             "{f:?}"
         );
+    }
+
+    #[test]
+    fn dollar_tag_case_does_not_close_a_literal_early() {
+        for lit in [
+            "$tag$ $TAG$ $tag$",
+            "$tag$ x$TAG$y $tag$",
+            "$Tag$ $tag$ $Tag$",
+        ] {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a text DEFAULT {lit}, ADD COLUMN b int NOT NULL;"
+            );
+            let f = classify_sql_for(DatabaseBackend::Postgres, &sql);
+            assert!(
+                f.iter()
+                    .any(|f| f.operation == "ADD COLUMN NOT NULL (no default)"),
+                "{lit}: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_the_case_of_dollar_tags_only() {
+        assert_eq!(
+            normalize_statement("SELECT $Tag$ ABC $tag$ $$ X $$"),
+            "select $Tag$ abc $tag$ $$ x $$"
+        );
+    }
+
+    #[test]
+    fn sqlite_table_name_with_a_double_quote_inside_backticks() {
+        let sql = "ALTER TABLE `a\"b` ADD COLUMN c INT NOT NULL;";
+        let f = classify_sql_for(DatabaseBackend::Sqlite, sql);
+        assert!(!f.is_empty(), "{f:?}");
     }
 
     #[test]
