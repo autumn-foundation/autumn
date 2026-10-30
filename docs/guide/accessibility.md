@@ -706,7 +706,8 @@ path **as declared**: mount-time prefixes (a `scope`, a nested router) are
 applied at runtime and are not resolved here.
 
 An item, statement, match arm or field under `#[cfg(…)]` is used only when the
-predicate is true for the enabled features. Thus a gated handler is not a
+predicate is true for the enabled features. A `#[cfg_attr(…, cfg(…))]` counts
+when its condition holds. Thus a gated handler is not a
 route, a gated helper is not a target, and a gated call is not followed. The
 scan reads `[features] default` from the nearest `Cargo.toml`. `--features a,b`
 adds features in every crate of the scan, `--all-features` turns on every
@@ -715,7 +716,10 @@ not a feature), and `--no-default-features` turns the default
 set off. A predicate the scan cannot decide (`target_os = "linux"`), or a file
 with no package manifest, keeps the item. A finding inside a gated item or
 statement that is off has no route. The features change only the route
-attribution. They do not change the findings or the exit code.
+attribution. They do not change the findings or the exit code. A `--features`
+name that no crate declares gets a warning on stderr. The scan cannot read a
+gated statement inside a custom macro, or a feature that a dependent crate
+turns on. It keeps those.
 
 Attribution is therefore a lower bound. `status: "pass"` means no finding was
 attributed to that route, not that the page is proven clean — read it alongside
