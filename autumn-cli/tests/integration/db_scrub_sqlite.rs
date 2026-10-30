@@ -577,6 +577,82 @@ fn rows_with_a_null_non_integer_key_get_distinct_tokens() {
     );
 }
 
+/// Scrub `ddl` plus a `legacy` table config. Returns `(db, output, exit code)`.
+fn scrub_legacy(ddl: &str, safe: &str) -> (PathBuf, tempfile::TempDir, String, Option<i32>) {
+    let toml = format!(
+        "{SCRUB_TOML}\n[tables.legacy]\nsafe = [{safe}]\n\n[tables.legacy.pii]\nemail = \"email\"\n"
+    );
+    let project = project(&toml);
+    let db = project.path().join("app.db");
+    open(&db).batch_execute(ddl).expect("legacy");
+    let (out, _, code) = run(project.path(), "dev", &["db", "scrub"]);
+    (db, project, out, code)
+}
+
+#[test]
+fn text_keys_that_differ_after_a_nul_get_distinct_tokens() {
+    let (db, _p, out, code) = scrub_legacy(
+        "CREATE TABLE legacy (code TEXT PRIMARY KEY, email TEXT UNIQUE); \
+         INSERT INTO legacy VALUES (char(97, 0, 120), 'a@real-corp.example'), \
+                                   (char(97, 0, 121), 'b@real-corp.example');",
+        "\"code\"",
+    );
+    assert_eq!(code, Some(0), "unique column stays unique:\n{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM legacy"),
+        2
+    );
+}
+
+#[test]
+fn a_user_column_named_rowid_does_not_collapse_tokens() {
+    let (db, _p, out, code) = scrub_legacy(
+        "CREATE TABLE legacy (rowid INTEGER, email TEXT UNIQUE); \
+         INSERT INTO legacy VALUES (1, 'a@real-corp.example'), (1, 'b@real-corp.example'), \
+                                   (NULL, 'c@real-corp.example'), (NULL, 'd@real-corp.example');",
+        "\"rowid\"",
+    );
+    assert_eq!(code, Some(0), "unique column stays unique:\n{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM legacy"),
+        4
+    );
+}
+
+#[test]
+fn a_null_key_fallback_skips_a_shadowed_rowid() {
+    let (db, _p, out, code) = scrub_legacy(
+        "CREATE TABLE legacy (code TEXT PRIMARY KEY, rowid INTEGER, email TEXT UNIQUE); \
+         INSERT INTO legacy VALUES (NULL, 1, 'a@real-corp.example'), \
+                                   (NULL, 1, 'b@real-corp.example');",
+        "\"code\", \"rowid\"",
+    );
+    assert_eq!(code, Some(0), "unique column stays unique:\n{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM legacy"),
+        2
+    );
+}
+
+#[test]
+fn a_table_that_shadows_every_rowid_alias_is_refused() {
+    let (db, _p, out, code) = scrub_legacy(
+        "CREATE TABLE legacy (rowid INTEGER, _rowid_ INTEGER, oid INTEGER, email TEXT UNIQUE); \
+         INSERT INTO legacy VALUES (1, 1, 1, 'a@real-corp.example');",
+        "\"rowid\", \"_rowid_\", \"oid\"",
+    );
+    assert_ne!(code, Some(0), "must refuse:\n{out}");
+    assert!(out.contains("legacy") && out.contains("rowid"), "{out}");
+    assert!(out.contains("Nothing was written"), "{out}");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) AS n FROM legacy WHERE email LIKE '%real-corp%'"
+        ),
+        1
+    );
+}
+
 #[test]
 fn a_purge_that_cascades_into_an_app_table_is_refused() {
     let toml = format!(

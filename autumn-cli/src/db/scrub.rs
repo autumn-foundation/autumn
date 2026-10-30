@@ -1689,10 +1689,8 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                     let token = token_expr(table, &column.name, unique);
                     replacement_expr(plan.strategy, column, &token, unique)
                 }
-                Dialect::Sqlite => {
-                    let token = sqlite::token_expr(table, inputs.facts, &column.name, unique);
-                    sqlite::replacement_expr(plan.strategy, column, &token)
-                }
+                Dialect::Sqlite => sqlite::token_expr(table, inputs.facts, &column.name, unique)
+                    .and_then(|token| sqlite::replacement_expr(plan.strategy, column, &token)),
             }
             .map_err(|e| qualify(e, &qualified))?;
             assignments.push(assignment(column, &value, plan.strategy));
@@ -1702,7 +1700,7 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             Dialect::Postgres => (qualified_ident(&table.name), row_key_expr(table)),
             Dialect::Sqlite => (
                 quote_ident(&table.name),
-                sqlite::row_key_expr(table, inputs.facts),
+                sqlite::row_key_expr(table, inputs.facts)?,
             ),
         };
         out.tables.push(TablePlan {
@@ -4804,6 +4802,10 @@ pub struct DatabaseFacts {
     /// Such a table can hold several rows whose non-integer primary key is
     /// `NULL`, so the row key falls back to `rowid`. Empty on Postgres.
     pub rowid_tables: BTreeSet<String>,
+    /// The name that reads a rowid table's hidden row id. A user column can
+    /// shadow `rowid`, `_rowid_` or `oid`. `None` means all three are shadowed.
+    /// A table not listed uses `rowid`. Empty on Postgres.
+    pub rowid_aliases: BTreeMap<String, Option<&'static str>>,
     /// Every column on either side of any foreign key, all components of a
     /// composite key included, as `(table, column)`. Rewriting any of them
     /// breaks referential integrity (or is silently cascaded into a child).
@@ -5903,6 +5905,7 @@ fn probe_database_facts(
     Ok(DatabaseFacts {
         dialect: Dialect::Postgres,
         rowid_tables: BTreeSet::new(),
+        rowid_aliases: BTreeMap::new(),
         foreign_key_columns,
         checked_columns,
         generated_columns,
