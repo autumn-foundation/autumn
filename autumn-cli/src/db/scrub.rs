@@ -1700,7 +1700,13 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             Dialect::Postgres => (qualified_ident(&table.name), row_key_expr(table)),
             Dialect::Sqlite => (
                 quote_ident(&table.name),
-                sqlite::row_key_expr(table, inputs.facts)?,
+                // Only an encrypted rewrite reads the key. Build it then, so a
+                // table the scrub does not rewrite is never refused for it.
+                if encrypted_rewrites.is_empty() {
+                    String::new()
+                } else {
+                    sqlite::row_key_expr(table, inputs.facts)?
+                },
             ),
         };
         out.tables.push(TablePlan {
@@ -9734,6 +9740,54 @@ mod tests {
             matches!(err, ScrubError::PlaintextIntoEncrypted { ref columns } if columns[0].starts_with("users.email")),
             "got {err:?}"
         );
+    }
+
+    /// `SQLite` facts for `users`: a rowid table with no free row id name.
+    fn shadowed_rowid_facts() -> DatabaseFacts {
+        DatabaseFacts {
+            dialect: Dialect::Sqlite,
+            rowid_tables: BTreeSet::from(["users".to_owned()]),
+            rowid_aliases: BTreeMap::from([("users".to_owned(), None)]),
+            ..DatabaseFacts::default()
+        }
+    }
+
+    #[test]
+    fn sqlite_refuses_an_encrypted_table_with_no_free_rowid_name() {
+        let config = parse_config_str(
+            "[defaults]\nsafe_columns = [\"id\", \"created_at\", \"full_name\", \"bio\"]",
+        )
+        .unwrap();
+        let encrypted = encrypted_columns_of("users", &["email"]);
+        let err = plan_with_facts(
+            &[users_table()],
+            &config,
+            &encrypted,
+            &no_anonymize(),
+            &shadowed_rowid_facts(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ScrubError::UnsupportedOnSqlite { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn sqlite_does_not_refuse_a_table_it_never_rewrites() {
+        let config = parse_config_str(
+            "[defaults]\nsafe_columns = [\"id\", \"email\", \"created_at\", \"full_name\", \"bio\"]",
+        )
+        .unwrap();
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &shadowed_rowid_facts(),
+        )
+        .expect("nothing to rewrite, nothing to refuse");
+        assert!(plan.tables.is_empty(), "no rewrite, no table plan");
     }
 
     #[test]
