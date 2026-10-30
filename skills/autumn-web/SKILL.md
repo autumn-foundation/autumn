@@ -1305,14 +1305,18 @@ Rules that matter:
   currency the account does not hold, and a balance that would leave `i64`.
 - The same key for *different* money is `LedgerError::KeyReuse` (409), never a
   silent replay of the wrong result.
-- `ledger::balance(conn, id)` sums an account. `ledger::trial_balance(conn)`
-  returns every currency's total, each of which must be zero — run it from a
-  scheduled job or a health check.
+- `ledger::balance(conn, id)` reads the balance the account row stores. A
+  trigger keeps it, so the cost does not increase with the history.
+  `ledger::trial_balance(conn)` returns every currency's total, each of which
+  must be zero — run it from a scheduled job or a health check.
+  `ledger::balance_drift(conn)` returns each account whose stored balance is
+  not the sum of its postings; it must be empty. It reads every posting, so
+  run it from a scheduled job only.
 - The tables (`_autumn_money_*`) ship in Autumn's own migration set, in the
   **control** database. Nothing to add to the app's `migrations/`. They are
   append-only by trigger — `UPDATE`, `DELETE`, `TRUNCATE` and an SQLite
   `INSERT OR REPLACE` all abort. An account's currency is fixed the same way;
-  only `allow_negative` stays editable. The SQLite half uses
+  only `allow_negative` and `balance_minor` change. The SQLite half uses
   `BEFORE INSERT` guards on the row keys, because SQLite skips `DELETE`
   triggers for the row a `REPLACE` removes and the pragma that changes that
   would alter every application trigger's recursion semantics.
@@ -2263,6 +2267,7 @@ for the common cases:
 | `active_search(id, label, &ActiveSearchConfig)` / `active_search_empty_state(msg)` | Search box whose results appear as the user types — htmx-driven, server-rendered Maud fragments; you author no JavaScript, but the page must load htmx. The handler returns the results fragment; `active_search_empty_state` is the no-matches body. Emits a `<noscript>` GET-form fallback (`docs/guide/active-search-and-autocomplete.md`) |
 | `autocomplete_input(id, label, &AutocompleteConfig)` / `autocomplete_option(value, label)` / `autocomplete_empty_state(msg)` | Typeahead/autocomplete picker for choosing a related record and storing its ID — the companion to `active_search` when the user must pick one row rather than browse matches. Selection and input sync need the shipped `autumn-widgets.js` runtime (`<script src="/static/js/autumn-widgets.js" defer>`, no inline JS, CSP-compatible) on top of htmx; include it once in the layout or the picker will not select. Its `<noscript>` fallback is a bare `<select>`, NOT a form like `active_search`'s — it has to sit inside the surrounding application form to submit (`docs/guide/active-search-and-autocomplete.md`) |
 | `local_datetime(dt, tz)` (`autumn_web::time_zone`) | Render a `DateTime<Utc>` in a user's IANA zone. Pair with the `TimeZone` extractor (resolves the requesting user's zone) and `set_time_zone_in_session` / `parse_iana`; take "now" from the `Clock` extractor rather than `Utc::now()` so rendering stays test-injectable (`docs/guide/time-zones.md`) |
+| `wizard_progress(&ctx, step).await` / `wizard_progress_from_steps(&[WizardProgressStep])` (`autumn_web::wizard`) | Accessible step-progress `<nav>` (`aria-current="step"`, "Step N of M"). `wizard_progress` reads step states from the session; `wizard_progress_from_steps` is the sync form for steps you already have (#3398). The `/_stories` gallery shows it with pagination, flash and the `a11y` primitives |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
 | `theme_toggle(&ThemeToggleConfig::new(theme).csrf(token, "_csrf"))` + `ui::theme::{Theme, Density, router}` | Dark mode (#3396). Tokens are `light-dark()`: the OS selects the scheme, `data-theme="light\|dark"` overrides it, `data-density="compact\|comfortable\|spacious"` scales `--space-*`. `Theme` is an extractor for the `autumn.theme` cookie — render `html data-theme=[theme.data_theme()]` in the layout. `.merge(ui::theme::router())` mounts the no-JS `POST /_autumn/theme`; `autumn-widgets.js` applies it in place. Classes are `autumn-alert--<v>`, `autumn-badge--<v>`, `autumn-wizard-*` (no unprefixed `alert`/`badge`/`wizard-*`). Text on a `--primary`/`--danger` fill uses `--on-primary`/`--on-danger`, never white (`docs/guide/widget-styling.md`) |
 

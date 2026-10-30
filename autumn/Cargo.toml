@@ -11,6 +11,8 @@ readme = "../README.md"
 keywords = ["web", "composable", "axum", "htmx", "fullstack"]
 categories = ["web-programming", "web-programming::http-server"]
 autotests = false
+# Test-only fixture (652 KB). Do not publish it (#3398).
+exclude = ["tests/fixtures/axe-core/"]
 
 [features]
 # The last 16 names are the compile gates (#2795, ADR 0027). Default-on; the

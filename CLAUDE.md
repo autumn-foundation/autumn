@@ -75,6 +75,12 @@ so it is usually automatic:
 | `test-features` | Linux | one job per non-default feature set (markdown, i18n, tls, …) |
 | `test-docker` | Linux | the `#[ignore]`d Docker/testcontainer sweep |
 | `test-docker-deploy` | Linux | `deploy_e2e` alone, on a fresh disk (#2547) |
+| `widgets-browser` (own workflow) | Linux | Chromium: axe + keyboard over `/_stories`, and the #3397 keyboard suite (#3398). Runs only when widget paths change. |
+
+`widgets-browser` is not in `ci.yml`. It is
+`.github/workflows/widgets-browser.yml`, with a `paths:` filter. Its tests are
+`#[ignore]`d and need the `system-tests` feature, so no other job runs them.
+See CONTRIBUTING.md "Widget browser gate".
 
 Only `test` runs on all three OSes. `trybuild` and `test-features` are Linux
 only: a trybuild golden is pinned to the rustc *version*, not the OS (the same

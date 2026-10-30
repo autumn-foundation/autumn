@@ -1752,18 +1752,23 @@ jobs:
           )
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-relative-delay.log" \
             || { echo "::error::no pg relative-delay tests ran — the ci.yml filters no longer match"; exit 1; }
-          # The cost-deferral claim (#1720) is `--lib` too: it drives the
-          # crate-private `pg_claim_next_job_except`. Named by full path with a
-          # pass count, as above.
+          # The Postgres claim tests are `--lib` too: they drive the
+          # crate-private `pg_claim_next_job_except`. Cost deferral is #1720;
+          # the multi-queue claim is #3182. Each test is named by full path.
+          # The step checks for exactly 4 passes. `pg_claim_ci_coverage`
+          # checks the names.
           (
             set -o pipefail
             cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n" --lib -- \
               --ignored --test-threads=1 \
               job::tests::pg::pg_deferred_claim_skips_parked_names_and_keeps_run_at_order \
-              | tee "${RUNNER_TEMP}/pg-deferred-claim.log"
+              job::tests::pg::pg_claim_drains_higher_priority_queue_first \
+              job::tests::pg::pg_multi_queue_claim_does_not_lock_lower_queue_heads \
+              job::tests::pg::pg_multi_queue_claim_cost_stays_flat_as_the_backlog_grows \
+              | tee "${RUNNER_TEMP}/pg-claim.log"
           )
-          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/pg-deferred-claim.log" \
-            || { echo "::error::no pg deferred-claim test ran — the ci.yml filter no longer matches"; exit 1; }
+          grep -qE 'test result: ok\. 4 passed' "${RUNNER_TEMP}/pg-claim.log" \
+            || { echo "::error::the pg claim tests did not all run — the ci.yml filters no longer match"; exit 1; }
           # Issue #2576: the Postgres admin-retry unique-key tests are `--lib`
           # (they drive the crate-private `PgJobAdminBackend`). Named by full
           # path, with a pass count, as above.
@@ -2389,6 +2394,12 @@ jobs:
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --lib -- idempotency:: | tee "$RUNNER_TEMP/idempotency-sqlite-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-sqlite-cov.log"
+          # Issue #3208: the SQLite tracking store's status-contract test is a
+          # lib unit test. No other lane runs it with `sqlite`. Same features,
+          # so no rebuild. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --lib -- job_tracking:: | tee "$RUNNER_TEMP/job-tracking-sqlite-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/job-tracking-sqlite-cov.log"
           # The fleet's HTTP suite: `ShardedDb`, sharded repositories and fan-out
           # resolving to fleet databases (the fleet arms of `sharding.rs`).
           # Shares the build above (same package and features).
@@ -2547,14 +2558,18 @@ jobs:
             job::tests::pg::pg_admin_retry_leaves_pending_key_when_a_live_twin_holds_it \
             | tee "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
           grep -Eq "test result: ok\. 2 passed" "$RUNNER_TEMP/pg-admin-retry-key-cov.log"
-          # Ledger (deferred job claim, #1720): the skip-scan claim runs only
-          # in this `--lib` Docker test, so the `Test (Docker)` sweep alone
-          # leaves it out of the patch gate. Check the count.
+          # Ledger (job claim, #1720 and #3182): these `--lib` Docker tests
+          # cover the deferred and multi-queue claims. The `Test (Docker)`
+          # sweep does not run them, so this step names each test and checks
+          # the count.
           cargo llvm-cov --no-report -p autumn-web --features "$PG_FEATURES" \
             --lib -- --ignored --test-threads=1 \
             job::tests::pg::pg_deferred_claim_skips_parked_names_and_keeps_run_at_order \
-            | tee "$RUNNER_TEMP/pg-deferred-claim-cov.log"
-          grep -Eq "test result: ok\. 1 passed" "$RUNNER_TEMP/pg-deferred-claim-cov.log"
+            job::tests::pg::pg_claim_drains_higher_priority_queue_first \
+            job::tests::pg::pg_multi_queue_claim_does_not_lock_lower_queue_heads \
+            job::tests::pg::pg_multi_queue_claim_cost_stays_flat_as_the_backlog_grows \
+            | tee "$RUNNER_TEMP/pg-claim-cov.log"
+          grep -Eq "test result: ok\. 4 passed" "$RUNNER_TEMP/pg-claim-cov.log"
           cargo llvm-cov --no-report -p autumn-admin-plugin \
             --test token_admin_db -- --ignored
           cargo llvm-cov --no-report -p autumn-admin-plugin \

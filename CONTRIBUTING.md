@@ -90,6 +90,50 @@ edits `CHANGELOG.md`. `./scripts/update-changelog.sh` folds the fragments into
 the changelog when a release is cut. See
 [`changelog.d/README.md`](changelog.d/README.md).
 
+## Widget browser gate
+
+`.github/workflows/widgets-browser.yml` runs the widgets in headless Chromium
+(issue #3398). It runs when a PR changes widget code: `autumn/src/widgets.rs`,
+`autumn/src/ui/`, `autumn/vendor/autumn-widgets.js`, `autumn/src/stories/`
+and the other paths in its `paths:` filter. It also runs each week.
+
+The job runs two suites:
+
+- `stories_browser` loads each `/_stories/{slug}` page. It injects axe-core
+  and fails on a `serious` or `critical` violation. It checks each page in
+  the light scheme and again in the dark scheme. It also fails on a browser
+  console error. Each interactive story has a `keyboard_<slug>` test, which
+  also checks open dialogs, menus and popups with axe.
+- `widgets_keyboard_browser` checks the #3397 keyboard core on its own page.
+
+Two canary tests make sure that the gate can fail: a page with an unlabelled
+input must fail axe, and tabs without `autumn-widgets.js` must fail the
+keyboard check.
+
+Run the suites locally (set `AUTUMN_CHROMIUM` if Chromium is not on `PATH`):
+
+```sh
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests stories_browser -- --include-ignored
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests widgets_keyboard_browser -- --include-ignored
+```
+
+When you add a widget:
+
+1. Add a story in `autumn/src/stories/builtin.rs`. The default `test` lane
+   fails when a public render fn in `widgets.rs`, `ui/pagination.rs`,
+   `flash.rs` or `wizard.rs`, or an `a11y` primitive, has no story.
+2. If the story needs `autumn-widgets.js` or a CSS state, add
+   `async fn keyboard_<slug>()` to
+   `autumn/tests/integration/stories_browser.rs` and the slug to
+   `KEYBOARD_STORY_SLUGS` in `autumn/tests/integration/stories.rs`. The
+   `test` lane fails if you forget.
+3. Fix each axe violation in the widget. Do not disable an axe rule.
+
+axe-core is vendored at `autumn/tests/fixtures/axe-core/`. See
+`autumn/vendor/README.md` to update it.
+
 ## Generator conformance gate
 
 Autumn's headline DX promise is that `autumn new` and `autumn generate` emit
@@ -480,7 +524,9 @@ the compiler's diagnostic text verbatim, are only valid for one compiler.
 - The pin is the single line in `.github/RUST_TOOLCHAIN`. Every
   `dtolnay/rust-toolchain@<version>` in `.github/workflows/` repeats it.
   `./scripts/check-toolchain-pin.sh` (run by the `MSRV` job) fails if any
-  reference disagrees, or if something floats on `stable` again.
+  reference disagrees, or if something floats on `stable` again. A static
+  `toolchain:` input must be the pin, the MSRV or `nightly`. Quotes and a
+  trailing comment do not hide a wrong value.
 - The matrix jobs keep `stable` as their *label*, so required-check names like
   `Compile-and-serve gates (stable)` do not change, and map it to the pin.
 - `.github/workflows/toolchain-drift.yml` is the only workflow that floats on
@@ -503,7 +549,8 @@ To move to a newer Rust, in one PR targeting `trunk-dev`:
    grandfather a lint in `[workspace.lints.clippy]` only with a written reason
    (the examples carry their own `[lints.clippy]` tables).
 3. `./scripts/check-toolchain-pin.sh --bump <version>` moves the pin and every
-   reference together and re-checks.
+   reference together and re-checks. It also rewrites a static
+   `toolchain: "<pin>"` value and keeps its quotes and comment.
 4. Re-bless any trybuild goldens whose wording changed:
    `TRYBUILD=overwrite cargo +<version> test --workspace --test integration_tests -- compile_fail::`
    (use `--workspace`; the cases depend on the unified feature set), and review

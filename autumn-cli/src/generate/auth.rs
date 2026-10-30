@@ -3713,7 +3713,8 @@ fn sessions_list_fragment(
                             @if let Some(csrf) = csrf {{
                                 input type="hidden" name=(csrf_name) value=(csrf.token());
                             }}
-                            input type="text" name="label" aria-label="Device label" placeholder="Device label"
+                            label for={{ "device-label-" (s.id) }} {{ "Device label" }}
+                            input type="text" id={{ "device-label-" (s.id) }} name="label"
                                 value=[s.label.as_deref()];
                             button type="submit" {{ "Save label" }}
                         }}
@@ -8739,8 +8740,8 @@ fn totp_reauth_field_src() -> String {
     "            div {{\n\
      \x20               label for=\"totp-code\" {{ \"Authenticator code\" }}\n\
      \x20               input type=\"text\" id=\"totp-code\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
-     \x20                   inputmode=\"text\" pattern=\"[0-9a-fA-F \\\\-]*\" placeholder=\"6-digit code or recovery code\";\n\
-     \x20               small {{ \"Required if your account uses two-factor authentication.\" }}\n\
+     \x20                   inputmode=\"text\" pattern=\"[0-9a-fA-F \\\\-]*\" aria-describedby=\"totp-hint\";\n\
+     \x20               small id=\"totp-hint\" {{ \"Enter the 6-digit code or a recovery code. Required if your account uses two-factor authentication.\" }}\n\
      \x20           }}\n"
         .to_owned()
 }
@@ -8769,9 +8770,9 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     div {{
                         label for="totp-code" {{ "Authenticator code" }}
                         input type="text" id="totp-code" name="totp_code" autocomplete="one-time-code"
-                            inputmode="numeric" pattern="[0-9 ]*" required
-                            placeholder="6-digit code or recovery code";
-                        small {{ "Required if your account uses two-factor authentication." }}
+                            inputmode="text" pattern="[0-9a-fA-F \\-]*" required
+                            aria-describedby="totp-hint";
+                        small id="totp-hint" {{ "Enter the 6-digit code or a recovery code. Required if your account uses two-factor authentication." }}
                     }}
                     button type="submit" {{ "Confirm" }}
                 }}
@@ -8835,9 +8836,9 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     div {{
                         label for="totp-code" {{ "Authenticator code" }}
                         input type="text" id="totp-code" name="totp_code" autocomplete="one-time-code"
-                            inputmode="numeric" pattern="[0-9 ]*" required
-                            placeholder="6-digit code or recovery code";
-                        small {{ "Required if your account uses two-factor authentication." }}
+                            inputmode="text" pattern="[0-9a-fA-F \\-]*" required
+                            aria-describedby="totp-hint";
+                        small id="totp-hint" {{ "Enter the 6-digit code or a recovery code. Required if your account uses two-factor authentication." }}
                     }}
                     button type="submit" {{ "Confirm" }}
                 }}
@@ -11369,13 +11370,66 @@ mod tests {
                         continue;
                     }
                     assert!(
-                        stmt.contains("id=\"") || stmt.contains("aria-label="),
+                        stmt.contains("id=\"")
+                            || stmt.contains("id={")
+                            || stmt.contains("aria-label="),
                         "input has no id or aria-label:\n{stmt}"
                     );
                 }
             }
         }
         assert!(bound >= 40, "scan found too few labels: {bound}");
+    }
+
+    /// Issue #3106: a placeholder is not a label or an instruction. The TOTP
+    /// code fields keep their hint in a `<small id>` that the input names with
+    /// `aria-describedby`. The placeholder holds no instruction.
+    #[test]
+    fn totp_code_fields_link_a_visible_hint() {
+        let routes = render_routes_file("User", "user", "users", &[], true, false);
+        let sources = [routes, totp_reauth_field_src()];
+        let (mut fields, mut hints) = (0, 0);
+        for src in &sources {
+            for (at, _) in src.match_indices("input type=\"text\" id=\"totp-code\"") {
+                let stmt = &src[at..at + src[at..].find(';').expect("input ends")];
+                fields += 1;
+                assert!(
+                    stmt.contains("aria-describedby=\"totp-hint\""),
+                    "totp input has no aria-describedby:\n{stmt}"
+                );
+                assert!(!stmt.contains("placeholder="), "placeholder in:\n{stmt}");
+            }
+            hints += src.matches("small id=\"totp-hint\"").count();
+            hints += src.matches("small id=\\\"totp-hint\\\"").count();
+            assert!(src.contains("6-digit code or a recovery code"));
+        }
+        assert!(fields >= 3, "expected 3 or more totp inputs, got {fields}");
+        assert_eq!(hints, fields, "each input needs its own hint");
+    }
+
+    /// Issue #3106: the session device-label input has a visible `<label>`
+    /// bound by `for`/`id`. A row id keeps the id unique on the page.
+    #[test]
+    fn device_label_input_has_a_bound_visible_label() {
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        let rows = routes.find("\"/account/sessions/\"").expect("session rows");
+        let at = rows
+            + routes[rows..]
+                .find("name=\"label\"")
+                .expect("device label input");
+        let before = &routes[..at];
+        let input = &before[before.rfind("input type=\"text\"").expect("input start")..];
+        assert!(
+            input.contains("id={ \"device-label-\" (s.id) }"),
+            "no row id:\n{input}"
+        );
+        let form = &before[before
+            .rfind("form action={ \"/account/sessions/\"")
+            .expect("form")..];
+        assert!(
+            form.contains("label for={ \"device-label-\" (s.id) }"),
+            "no bound label:\n{form}"
+        );
     }
 
     /// Issue #2347: while impersonating, `{snake}_id` is the target but the

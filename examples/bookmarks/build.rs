@@ -89,15 +89,20 @@ fn tailwind_bin_name() -> &'static str {
 
 /// Candidate Cargo target directories to look for `autumn setup`'s download
 /// in, most-likely first. Mirrors `candidate_target_dirs` in
-/// `autumn-cli/src/templates/build.rs.tmpl`: `CARGO_TARGET_DIR` (when the
-/// user set it as an env var) first, then `OUT_DIR`'s ancestors at both
+/// `autumn-cli/src/templates/build.rs.tmpl`: an absolute `CARGO_TARGET_DIR`
+/// (set by the user as an env var) first, then `OUT_DIR`'s ancestors at
 /// offset 4 and 5 (`cargo build` vs `cargo build --target <triple>`, which
 /// inserts an extra path segment).
 fn candidate_target_dirs() -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
-        candidates.push(std::path::PathBuf::from(dir));
+        let dir = std::path::PathBuf::from(dir);
+        // A relative path resolves against the workspace root, but this
+        // script runs in the member dir. Skip it; `OUT_DIR` covers it.
+        if dir.is_absolute() {
+            candidates.push(dir);
+        }
     }
 
     if let Ok(out_dir) = std::env::var("OUT_DIR") {

@@ -241,6 +241,14 @@ async fn checkout(
         .get(&PlanId::new(body.plan))
         .cloned()
         .ok_or_else(|| BillingError::NotFound("plan").into_autumn())?;
+    // The slot stays held until the provider call ends. Without it, a second
+    // POST for the same user passes the check below before the webhook lands.
+    let Some(_slot) = service.begin_checkout(&user_id) else {
+        return Err(BillingError::Conflict(
+            "a checkout for this user is already in progress".to_owned(),
+        )
+        .into_autumn());
+    };
     if has_live_subscription(&service, &user_id)
         .await
         .map_err(BillingError::into_autumn)?
@@ -323,8 +331,9 @@ async fn subscription(
 /// `POST {prefix}/webhook` — verified provider events.
 ///
 /// A body the provider cannot decode answers `500`, so the replay key is
-/// released and the provider redelivers. The webhook extractor must stay the
-/// last argument: it consumes the body.
+/// released and the provider redelivers. An event that another delivery is
+/// still applying answers `503`. The provider redelivers it. The webhook
+/// extractor must stay the last argument: it consumes the body.
 async fn webhook(
     State(state): State<AppState>,
     NestedWebhook(webhook): NestedWebhook,
@@ -346,6 +355,12 @@ async fn webhook(
     let label = match outcome {
         ReconcileOutcome::Applied { .. } => "applied",
         ReconcileOutcome::Duplicate => "duplicate",
+        // Not a success. The provider must redeliver.
+        ReconcileOutcome::InFlight => {
+            return Err(AutumnError::service_unavailable_msg(
+                "billing event is being applied; retry",
+            ));
+        }
         ReconcileOutcome::Ignored { .. } => "ignored",
     };
     Ok(Json(json!({

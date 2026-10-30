@@ -33,11 +33,15 @@ pub type StoreFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, BillingError
 
 /// Result of claiming an event id in the ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EventClaim {
     /// First delivery: the caller owns processing.
     Claimed,
-    /// Already applied, or in flight elsewhere.
-    Duplicate,
+    /// Already applied. Acknowledge the redelivery.
+    Applied,
+    /// Claimed by another delivery that has not finished. Do not
+    /// acknowledge: that delivery can still fail and release the claim.
+    InFlight,
 }
 
 /// Result of a guarded upsert.
@@ -452,8 +456,10 @@ impl InvoiceUpsert {
 pub trait BillingStore: Send + Sync + 'static {
     // ── Event ledger ────────────────────────────────────────────────────
 
-    /// Claim `event_id`. A row in `processing` older than `stale_after` is
-    /// re-claimable (the previous owner died).
+    /// Claim `event_id`. Returns [`EventClaim::Applied`] for a finished row
+    /// and [`EventClaim::InFlight`] for an unfinished one. A row in
+    /// `processing` older than `stale_after` is re-claimable (the previous
+    /// owner died).
     fn claim_event<'a>(
         &'a self,
         event_id: &'a str,

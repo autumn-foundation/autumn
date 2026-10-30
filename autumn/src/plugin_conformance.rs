@@ -274,7 +274,10 @@ const SENSITIVE_KEYWORDS: &[&str] = &[
 
 /// Returns `true` when `path` contains a segment that is or starts with a
 /// sensitive keyword (case-insensitive).
-fn is_sensitive_path(path: &str) -> bool {
+///
+/// `autumn plugin-check` uses this same rule.
+#[must_use]
+pub fn is_sensitive_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     SENSITIVE_KEYWORDS.iter().any(|kw| {
         lower
@@ -319,10 +322,12 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
     }
 }
 
-/// `true` for a file of the plugin's own
-/// [`PluginAssets`](crate::assets::PluginAssets) bundle: a route under
-/// `/static/_plugins/` that carries the
+/// `true` for a file of the plugin's own asset bundle.
+///
+/// The path is under `/static/_plugins/` and `middleware` (the route's
+/// `RouteInfo::middleware` labels) carries the
 /// [`PLUGIN_ASSETS_ROUTE_MARKER`](crate::assets::PLUGIN_ASSETS_ROUTE_MARKER).
+/// See [`PluginAssets`](crate::assets::PluginAssets).
 ///
 /// The framework mounts those, not the plugin's router: they live outside the
 /// plugin's prefix by design, and they are public static bytes, so a name like
@@ -330,15 +335,19 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
 /// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets) can
 /// attach the marker (`declare_plugin_routes` strips it), so a route a plugin
 /// merely declares at such a path gets no exemption.
-fn is_plugin_asset_route(route: &RouteInfo) -> bool {
-    route
-        .path
-        .strip_prefix(crate::assets::PLUGIN_ASSETS_PREFIX)
+///
+/// `autumn plugin-check` uses this same rule.
+#[must_use]
+pub fn is_plugin_asset_path(path: &str, middleware: &[String]) -> bool {
+    path.strip_prefix(crate::assets::PLUGIN_ASSETS_PREFIX)
         .is_some_and(|rest| rest.starts_with('/'))
-        && route
-            .middleware
+        && middleware
             .iter()
             .any(|label| label == crate::assets::PLUGIN_ASSETS_ROUTE_MARKER)
+}
+
+fn is_plugin_asset_route(route: &RouteInfo) -> bool {
+    is_plugin_asset_path(&route.path, &route.middleware)
 }
 
 /// Check that all plugin routes live under `prefix`.
@@ -403,7 +412,10 @@ pub fn check_route_prefix(
 /// Both named params (`{id}`) and catch-all params (`{*rest}`) normalize to
 /// `{}`. matchit (Axum's router) treats a named param and a catch-all at the
 /// same path position as a conflict, so they must map to the same key.
-fn normalize_path_for_collision(path: &str) -> String {
+///
+/// `autumn plugin-check` uses this same rule.
+#[must_use]
+pub fn normalize_path_for_collision(path: &str) -> String {
     path.split('/')
         .map(|seg| {
             if seg.starts_with('{') && seg.ends_with('}') {
@@ -1369,6 +1381,18 @@ mod tests {
         let report: ConformanceReport = serde_json::from_str(json).unwrap();
         assert_eq!(report.plugin_name, "test");
         assert_eq!(report.checks[0].status, CheckStatus::Pass);
+    }
+
+    // ── is_plugin_asset_path ───────────────────────────────────────────────
+
+    /// The shared predicate needs both the prefix and the framework marker.
+    #[test]
+    fn plugin_asset_path_needs_prefix_and_marker() {
+        let marked = vec![crate::assets::PLUGIN_ASSETS_ROUTE_MARKER.to_owned()];
+        assert!(is_plugin_asset_path("/static/_plugins/a/admin.js", &marked));
+        assert!(!is_plugin_asset_path("/static/_plugins/a/admin.js", &[]));
+        assert!(!is_plugin_asset_path("/static/_plugins", &marked));
+        assert!(!is_plugin_asset_path("/admin/admin.js", &marked));
     }
 
     // ── is_sensitive_path ──────────────────────────────────────────────────

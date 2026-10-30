@@ -152,12 +152,18 @@ then enforces that widgets cannot ship without examples:
 
 1. an `EXPECTED_STORY_SLUGS` inventory is diffed both ways against
    `stories::builtin()`, and
-2. every public widget fn in `src/widgets.rs` must appear in at least one
-   builtin story's source.
+2. every public render fn in `src/widgets.rs`, `src/ui/pagination.rs`,
+   `src/flash.rs` and `src/wizard.rs`, and every `src/a11y.rs` primitive, must
+   appear in at least one builtin story's source.
 
 Adding a widget without a story fails CI with instructions: add a `story!`
 block in `autumn/src/stories/builtin.rs` and, for a new top-level widget, add
 its slug to the inventory.
+
+The `widgets-browser.yml` job also loads each story page in Chromium
+(issue #3398). The job fails when axe-core finds a serious or critical
+violation, in the light scheme or in the dark scheme. Each interactive story
+has a keyboard test. See CONTRIBUTING.md "Widget browser gate".
 
 ## Reference
 

@@ -8,15 +8,24 @@
 //! capture compiles.
 //!
 //! The CI coverage gate (`autumn/tests/integration/stories.rs`) enforces that
-//! every public widget fn in `src/widgets.rs` is exercised by at least one
-//! story's source. When you add a widget, add (or extend) a story here and
-//! add the new top-level widget's slug to `EXPECTED_STORY_SLUGS` in that test.
+//! every public render fn in `src/widgets.rs`, `src/ui/pagination.rs`,
+//! `src/flash.rs` and `src/wizard.rs`, and every `src/a11y.rs` primitive, is
+//! used by at least one story's source. When you add a widget, add (or extend)
+//! a story here and add the new top-level widget's slug to
+//! `EXPECTED_STORY_SLUGS` in that test.
 
 use super::{Story, story};
 
-/// The built-in story set, in gallery display order.
+/// Every built-in story: the ungated set, then the feature-gated set.
+pub(super) fn all_stories() -> Vec<Story> {
+    let mut stories = builtin_stories();
+    stories.extend(gated_stories());
+    stories
+}
+
+/// The ungated story set, in gallery display order.
 #[allow(clippy::too_many_lines)]
-pub(super) fn builtin_stories() -> Vec<Story> {
+fn builtin_stories() -> Vec<Story> {
     vec![
         story! {
             "Forms",
@@ -89,8 +98,11 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                     }
                     (autocomplete_input("tag-picker", "Tag", &config))
                     p { em { "For reference — not live — the two shapes your handler returns:" } }
-                    // One matching option, as your handler would render it:
-                    (autocomplete_option("42", "rust"))
+                    // One matching option, as your handler would render it. An
+                    // option needs a listbox parent; the live box above has one.
+                    div role="listbox" aria-label="Example options" {
+                        (autocomplete_option("42", "rust"))
+                    }
                     // And the empty state when nothing matches:
                     (autocomplete_empty_state("No matching tags."))
                 }
@@ -437,10 +449,10 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 use autumn_web::widgets::{AvatarConfig, AvatarSize, avatar};
 
                 maud::html! {
-                    // With an image (the demo URL is synthetic — a served
-                    // gallery has nothing mounted there):
+                    // With an image. A data: URI, so the served gallery has
+                    // no broken image:
                     (avatar("Ada Lovelace", &AvatarConfig::new()
-                        .image("/_stories/demo/ada.png")
+                        .image("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3Crect width='1' height='1' fill='%23c2410c'/%3E%3C/svg%3E")
                         .size(AvatarSize::Large)))
                     // Deterministic colored-initials fallback, no image:
                     (avatar("Ada Lovelace", &AvatarConfig::new()))
@@ -764,5 +776,137 @@ pub(super) fn builtin_stories() -> Vec<Story> {
                 }
             }
         },
+        story! {
+            "Navigation",
+            "Pagination",
+            {
+                use autumn_web::pagination::{CursorPage, CursorRequest, Page, PageRequest};
+                use autumn_web::ui::pagination::{
+                    PagerOptions, cursor_pagination_nav, pagination_nav,
+                };
+
+                // Page 5 of 20. The pager keeps the `q` filter on every link.
+                let page: Page<u32> = Page::new((41..=50).collect(), 200, &PageRequest::new(5, 10));
+                let offset = PagerOptions::new("/posts").query("q=rust");
+
+                // A cursor page has no total: only Previous and Next.
+                let request = CursorRequest::new(None, 20);
+                let feed: CursorPage<u32> =
+                    CursorPage::from_overfetched((1..=21).collect(), &request, |n| *n);
+                let cursor = PagerOptions::new("/feed").aria_label("Feed pages");
+
+                maud::html! {
+                    (pagination_nav(&page, &offset))
+                    (cursor_pagination_nav(&feed, &cursor))
+                }
+            }
+        },
+        story! {
+            "Primitives",
+            "Accessible primitives",
+            {
+                use autumn_web::a11y::{
+                    Button, Checkbox, FileField, Img, Link, MenuItem, RadioGroup, RadioOption,
+                    Select, SelectOption, TextArea, TextField,
+                };
+
+                // Each primitive needs an accessible name before it renders.
+                let icon = maud::html! { span aria-hidden="true" { "✎" } };
+                maud::html! {
+                    (Img::new(
+                        "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3Crect width='1' height='1' fill='%23c2410c'/%3E%3C/svg%3E",
+                        "Orange square",
+                    )
+                    .width(32)
+                    .height(32))
+                    (Img::decorative("data:image/gif;base64,R0lGODlhAQABAAAAACw="))
+                    p {
+                        (Button::new("Save").submit())
+                        " "
+                        (Button::icon(icon.clone(), "Edit post"))
+                    }
+                    p {
+                        (Link::new("/posts", "All posts"))
+                        " "
+                        (Link::icon("/posts/1/edit", icon, "Edit post 1"))
+                    }
+                    // A menu item needs a `role="menu"` parent. The data-autumn-*
+                    // attributes give the menu its arrow keys (autumn-widgets.js).
+                    ul role="menu" aria-label="Post actions" data-autumn-roving
+                        data-autumn-orientation="vertical" data-autumn-typeahead {
+                        li role="none" { (MenuItem::new("Archive")) }
+                        li role="none" { (MenuItem::new("View").href("/posts/1")) }
+                    }
+                    (TextField::new("email").input_type("email").label("Email address").required())
+                    (TextArea::new("bio").label("Bio").rows(3))
+                    (Select::new("plan").label("Plan")
+                        .options([SelectOption::new("free", "Free"), SelectOption::new("pro", "Pro")])
+                        .selected_value("pro"))
+                    (Checkbox::new("terms").label("I accept the terms"))
+                    (FileField::new("avatar").label("Avatar").accept("image/*"))
+                    (RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+                        .option(RadioOption::new("express", "Express"))
+                        .label("Delivery speed"))
+                }
+            }
+        },
     ]
+}
+
+/// Stories for feature-gated modules (#3398). `vec!` cannot hold a
+/// `#[cfg]` element, so these are pushed one by one.
+fn gated_stories() -> Vec<Story> {
+    #[allow(
+        unused_mut,
+        clippy::vec_init_then_push,
+        reason = "each push has its own #[cfg]; vec! cannot hold one"
+    )]
+    let mut stories = Vec::new();
+    #[cfg(feature = "flash")]
+    stories.push(story! {
+        "Feedback",
+        "Flash",
+        {
+            use autumn_web::flash::{
+                FlashLevel, FlashMessage, FlashMessagesConfig, flash_message_divs,
+                flash_messages, flash_messages_with,
+            };
+
+            let messages = vec![
+                FlashMessage { level: FlashLevel::Success, message: "Post saved.".into() },
+                FlashMessage { level: FlashLevel::Error, message: "Title is required.".into() },
+            ];
+            maud::html! {
+                // An error or a warning interrupts the screen reader. A success
+                // or an info message waits until the screen reader is idle.
+                (flash_messages(&messages))
+                p { em { "With a no-JS dismiss control (Space or click):" } }
+                (flash_messages_with(&messages, &FlashMessagesConfig::new().dismissible(true)))
+                p { em { "The markup inside Flash::render:" } }
+                (flash_message_divs(&messages[..1]))
+            }
+        }
+    });
+    #[cfg(feature = "wizard")]
+    stories.push(story! {
+        "Forms",
+        "Wizard progress",
+        {
+            use autumn_web::wizard::{StepState, WizardProgressStep, wizard_progress_from_steps};
+
+            // In a handler, `wizard_progress(&ctx, "payment").await` reads the
+            // step states from the session. Here they are fixed.
+            let step = |name: &str, label: &str, state| WizardProgressStep {
+                name: name.into(),
+                label: label.into(),
+                state,
+            };
+            wizard_progress_from_steps(&[
+                step("shipping", "Shipping", StepState::Completed),
+                step("payment", "Payment", StepState::Current),
+                step("review", "Review", StepState::Upcoming),
+            ])
+        }
+    });
+    stories
 }
