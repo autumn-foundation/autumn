@@ -104,6 +104,19 @@ fn kgood_closed_list() -> Markup {
     }
 }
 
+/// A radio group with a hidden first radio and no checked radio. The Tab
+/// stop is the first visible radio.
+fn kgood_hidden_radio() -> Markup {
+    html! {
+        fieldset {
+            legend { "Size" }
+            label hidden { input type="radio" name="size" value="xs" hidden; "Extra small" }
+            label { input type="radio" name="size" value="s"; "Small" }
+            label { input type="radio" name="size" value="m"; "Medium" }
+        }
+    }
+}
+
 /// A text input bound with `FieldRenderer`.
 struct KgoodInput;
 
@@ -154,6 +167,12 @@ fn kgood_pack() -> WidgetPack {
                 "Kgood closed list",
                 kgood_closed_list,
                 "kgood_closed_list()",
+            ),
+            Story::new(
+                "Kgood",
+                "Kgood hidden radio",
+                kgood_hidden_radio,
+                "kgood_hidden_radio()",
             ),
         ])
         .assets(&KGOOD_ASSETS)

@@ -164,24 +164,25 @@ async fn select_scheme(page: &Page, scheme: &str) -> Result<(), SystemTestError>
 
 /// Mark each Tab stop in the story preview.
 ///
-/// Each stop gets `data-conformance-stop`. Return a label for each one. A radio group is one stop: the checked
-/// radio, else the first. An `<iframe>` is not a stop: its own document
-/// holds the focus.
+/// Each stop gets `data-conformance-stop`. Return a label for each one. A
+/// radio group is one stop: the checked radio, else the first tabbable one.
+/// An `<iframe>` is not a stop: its own document holds the focus.
 const MARK_STOPS_JS: &str = r#"(() => {
   const preview = document.querySelector('.story-preview');
   if (!preview) return '[]';
   const sel = 'a[href],area[href],button,input:not([type=hidden]),select,textarea,summary,[tabindex],[contenteditable=""],[contenteditable="true"]';
+  const tabbable = el => !el.matches(':disabled') && el.tabIndex >= 0 && !el.closest('[inert]')
+    && el.checkVisibility({ visibilityProperty: true });
   const groups = new Set();
   const stops = [];
   for (const el of preview.querySelectorAll(sel)) {
-    if (el.matches(':disabled') || el.tabIndex < 0 || el.closest('[inert]')) continue;
-    if (!el.checkVisibility({ visibilityProperty: true })) continue;
+    if (!tabbable(el)) continue;
     if (el.type === 'radio' && el.name) {
       const key = el.name + '|' + (el.form ? el.form.id : '');
       if (groups.has(key)) continue;
       groups.add(key);
       const all = [...preview.querySelectorAll('input[type=radio]')]
-        .filter(r => r.name === el.name && r.form === el.form && !r.matches(':disabled'));
+        .filter(r => r.name === el.name && r.form === el.form && tabbable(r));
       const pick = all.find(r => r.checked) || all[0];
       if (pick !== el) { pick.setAttribute('data-conformance-stop', String(stops.length)); stops.push(pick); continue; }
     }
