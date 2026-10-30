@@ -690,8 +690,9 @@ pub trait CustomDomainStore: Send + Sync + std::fmt::Debug {
 
     /// Every record that loads, and the records that do not.
     ///
-    /// Override this if the store can skip a record. The default trusts
-    /// [`load_all`](Self::load_all) and reports nothing skipped.
+    /// A store that skips records MUST override this. The default trusts
+    /// [`load_all`](Self::load_all) and reports nothing skipped. A store that
+    /// wraps another store MUST forward this method.
     fn load_report(&self) -> StoreFuture<'_, io::Result<StoreLoad>> {
         let all = self.load_all();
         Box::pin(async move {
@@ -1319,6 +1320,9 @@ impl CustomDomainRegistry {
     /// Read every record straight from the store, bypassing the in-memory
     /// index.
     ///
+    /// This read hides records that do not decode. Use
+    /// [`skipped_records`](Self::skipped_records) to see them.
+    ///
     /// The index is only as fresh as this process's own writes. Another
     /// process sharing the store — a serving app while a one-shot
     /// `autumn db retention` runs — registers, verifies and issues without
@@ -1433,9 +1437,9 @@ impl CustomDomainRegistry {
         if !self.is_hydrated() {
             return Err(RegisterError::NotReady);
         }
-        // A record that did not load may own this hostname, and saving would
-        // overwrite its file. Re-registering a loaded hostname for its own
-        // tenant writes only that hostname's file, so it stays safe.
+        // A record that did not load may own this hostname. A save would
+        // overwrite its file. A loaded hostname of the same tenant is safe:
+        // it writes only its own file.
         let skipped = self.skipped_records();
         if !skipped.is_empty() && !self.owned_by(&host, tenant) {
             return Err(RegisterError::Incomplete { files: skipped });
@@ -2120,7 +2124,16 @@ impl CustomDomainRegistry {
         host: &str,
         guard: impl FnOnce(&CustomDomain) -> bool,
     ) -> io::Result<bool> {
-        if !read_lock(&self.index).get(host).is_none_or(guard) {
+        let (known, allowed) = {
+            let index = read_lock(&self.index);
+            (index.contains_key(host), index.get(host).is_none_or(guard))
+        };
+        if !allowed {
+            return Ok(false);
+        }
+        // An unknown host may own a record that did not load. Its file is the
+        // only copy, so a delete would erase it (#2654).
+        if !known && !read_lock(&self.skipped).is_empty() {
             return Ok(false);
         }
         self.store.delete(host).await?;

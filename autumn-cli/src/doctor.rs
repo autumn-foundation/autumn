@@ -15249,7 +15249,12 @@ pub struct Vault {
             check_custom_domains_config_impl(Some(&custom_domains_config(true)), None, &read)
                 .unwrap();
         assert_eq!(partial.status, CheckStatus::Warn);
-        assert!(partial.detail.unwrap().contains("will not load"));
+        let detail = partial.detail.unwrap();
+        assert!(detail.contains("will not load"), "{detail}");
+        assert!(
+            detail.contains("no new domain can be connected"),
+            "{detail}"
+        );
     }
 
     #[test]

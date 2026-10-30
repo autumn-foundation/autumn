@@ -1923,7 +1923,7 @@ async fn a_partial_load_refuses_register_and_names_the_file() {
     let RegisterError::Incomplete { files } = &err else {
         panic!("expected Incomplete, got {err:?}");
     };
-    assert_eq!(files, &[bad.clone()]);
+    assert_eq!(files, std::slice::from_ref(&bad));
     assert!(err.to_string().contains(&bad), "{err}");
     // A's corrupt file was not overwritten.
     assert_eq!(std::fs::read(&bad).unwrap(), b"{\"hostname\": \"app.cli");
@@ -1953,7 +1953,7 @@ async fn a_partial_load_still_serves_the_records_that_loaded() {
 
 #[tokio::test]
 async fn a_clean_load_is_unaffected_and_a_reload_clears_the_refusal() {
-    let (dir, store, bad) = store_with_one_corrupt_record().await;
+    let (_dir, store, bad) = store_with_one_corrupt_record().await;
     let registry = CustomDomainRegistry::new(store, 10);
     registry.load().await.unwrap();
     assert!(!registry.is_complete());
@@ -1968,5 +1968,65 @@ async fn a_clean_load_is_unaffected_and_a_reload_clears_the_refusal() {
         .register("new.clientco.com", "tenant-b", NOW)
         .await
         .expect("a complete load accepts registrations");
-    drop(dir);
+}
+
+#[tokio::test]
+async fn a_partial_load_names_every_skipped_file() {
+    let (dir, store, bad) = store_with_one_corrupt_record().await;
+    let second = dir.path().join("second.json");
+    std::fs::write(&second, b"{").unwrap();
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load().await.unwrap();
+    let mut want = vec![bad, second.display().to_string()];
+    want.sort();
+    let mut got = registry.skipped_records();
+    got.sort();
+    assert_eq!(got, want);
+}
+
+#[tokio::test]
+async fn load_without_migration_also_reports_skipped_files() {
+    let (_dir, store, bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load_without_migration().await.unwrap();
+    assert_eq!(registry.skipped_records(), vec![bad]);
+    assert!(matches!(
+        registry.register("x.clientco.com", "t", NOW).await,
+        Err(RegisterError::Incomplete { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_partial_load_keeps_a_loaded_hostname_taken_by_its_tenant() {
+    let (_dir, store, _bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load().await.unwrap();
+    let err = registry
+        .register("ok.clientco.com", "tenant-evil", NOW)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RegisterError::Incomplete { .. }), "{err:?}");
+    assert_eq!(registry.get("ok.clientco.com").unwrap().tenant, "tenant-ok");
+}
+
+#[tokio::test]
+async fn a_partial_load_never_deletes_the_file_of_an_unloaded_hostname() {
+    let (_dir, store, bad) = store_with_one_corrupt_record().await;
+    let registry = CustomDomainRegistry::new(store, 10);
+    registry.load().await.unwrap();
+
+    assert!(!registry.remove("app.clientco.com").await.unwrap());
+    assert!(
+        !registry
+            .remove_if("app.clientco.com", |_| true)
+            .await
+            .unwrap()
+    );
+    assert!(std::path::Path::new(&bad).exists(), "the only copy stays");
+}
+
+#[tokio::test]
+async fn the_default_load_report_skips_nothing() {
+    let report = MemoryCustomDomainStore::new().load_report().await.unwrap();
+    assert!(report.records.is_empty() && report.skipped.is_empty());
 }
