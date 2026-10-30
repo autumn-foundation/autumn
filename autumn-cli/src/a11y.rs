@@ -6294,4 +6294,19 @@ mod tests {
         let scan = scan_project_with(dir.path(), &selection).unwrap();
         assert!(scan.unknown_features.is_empty());
     }
+
+    #[test]
+    fn an_unknown_feature_warns_but_keeps_the_exit_code() {
+        let dir = cfg_crate();
+        let opts = || A11yVerifyOptions {
+            format: OutputFormat::Text,
+            strict: false,
+        };
+        let plain = run_in_with(dir.path(), opts(), &CargoFeatures::default());
+        let typo = CargoFeatures {
+            features: vec!["typo".to_owned()],
+            ..CargoFeatures::default()
+        };
+        assert_eq!(run_in_with(dir.path(), opts(), &typo), plain);
+    }
 }
