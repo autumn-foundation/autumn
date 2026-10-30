@@ -2188,50 +2188,63 @@ impl<State> RadioGroup<State> {
     }
 }
 
-/// One `id` per choice, unique within the group and, for most names, across
-/// groups. Some names still collide across groups (#3454).
+/// One `id` per choice, unique within the group and across groups (#3454).
 ///
 /// The id pairs each `<input>` with its `<label for=…>`, so a duplicate would
-/// break the very association the primitive exists to guarantee. Each part is
-/// reduced to the safe `[A-Za-z0-9_-]` alphabet, and a `-` inside a part is
-/// doubled so the single `-` that joins the parts cannot be mistaken for one:
-/// without that, group `a-b` choice `c` and group `a` choice `b-c` would both
-/// read `a-b-c`, and no per-group check can see the other group. Two choices
-/// that still reduce to the same text within one group are separated by an
-/// index suffix, so those ids depend on the order they were added. The lead
-/// part goes through [`selector_safe`], so every id is a valid CSS selector.
+/// break the very association the primitive exists to guarantee. The id is
+/// the parts joined by a single `-`: `prefix-name-value`, or `name-value`
+/// with no prefix. [`id_part`] keeps `[A-Za-z0-9_]` and writes every other
+/// byte as `--HH`. Thus a part never holds a lone `-`, and no two groups
+/// give the same id.
+///
+/// An empty name after a prefix is written `--`. A choice with the same value
+/// as an earlier one gets `--n` and its place in the repeats at the end. The
+/// `n` is not a hex digit, so that tail never reads as an escape. The lead part goes through [`selector_safe`], so every
+/// id is a valid CSS selector.
 fn radio_option_ids(prefix: Option<&str>, name: &str, options: &[RadioOption]) -> Vec<String> {
     let group = prefix.map_or_else(
         || selector_safe(&id_part(name)),
-        |prefix| format!("{}-{}", selector_safe(&id_part(prefix)), id_part(name)),
+        |prefix| {
+            // An empty middle part is `--`, so `p--v` never reads as `p`, ``, `v`.
+            let name = id_part(name);
+            let name = if name.is_empty() {
+                "--".to_owned()
+            } else {
+                name
+            };
+            format!("{}-{name}", selector_safe(&id_part(prefix)))
+        },
     );
-    let mut seen = std::collections::HashSet::new();
-    let mut ids = Vec::with_capacity(options.len());
-    for (index, option) in options.iter().enumerate() {
-        let base = format!("{group}-{}", id_part(&option.value));
-        let mut id = base.clone();
-        let mut suffix = index;
-        while !seen.insert(id.clone()) {
-            id = format!("{base}-{suffix}");
-            suffix += 1;
-        }
-        ids.push(id);
-    }
-    ids
+    let mut repeats = std::collections::HashMap::<String, usize>::new();
+    options
+        .iter()
+        .map(|option| {
+            let base = format!("{group}-{}", id_part(&option.value));
+            let seen = repeats.entry(base.clone()).or_insert(0);
+            let id = if *seen == 0 {
+                base
+            } else {
+                format!("{base}--n{seen}")
+            };
+            *seen += 1;
+            id
+        })
+        .collect()
 }
 
-/// One part of a choice `id`: reduced to the `[A-Za-z0-9_-]` alphabet an HTML
-/// `id` can safely carry, with every `-` doubled so a part never contains the
-/// single `-` that separates parts.
+/// One part of a choice `id`. Keeps `[A-Za-z0-9_]`. Writes each other byte
+/// as `--HH` (upper-case hex), so two different parts never give one result.
 fn id_part(text: &str) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c == '-' {
-            out.push_str("--");
-        } else if c.is_ascii_alphanumeric() || c == '_' {
+        if c.is_ascii_alphanumeric() || c == '_' {
             out.push(c);
         } else {
-            out.push_str("--");
+            let mut buf = [0; 4];
+            for byte in c.encode_utf8(&mut buf).bytes() {
+                let _ = write!(out, "--{byte:02X}");
+            }
         }
     }
     out
@@ -2634,14 +2647,13 @@ mod tests {
 
     #[test]
     fn radio_group_disambiguates_colliding_option_ids() {
-        // Two values that sanitize to the same id must not produce duplicate
-        // ids: a duplicate id breaks the `for=`/`id=` label association.
+        // Two equal values must not give equal ids: a duplicate id breaks the
+        // `for=`/`id=` label association.
         let markup = RadioGroup::new("plan", RadioOption::new("a b", "A B"))
             .options([
                 RadioOption::new("a-b", "A-B"),
-                // Collides with the disambiguated id of the pair above, so the
-                // retry loop must run more than once.
                 RadioOption::new("a b", "A B again"),
+                RadioOption::new("a b", "A B third"),
             ])
             .label("Plan")
             .render()
@@ -2653,11 +2665,14 @@ mod tests {
                 &rest[..rest.find('"').expect("id closes")]
             })
             .collect();
-        // A `-` inside a part is doubled, so all three reduce to `plan-a--b`
-        // and the index suffix separates them.
         assert_eq!(
             ids,
-            vec!["plan-a--b", "plan-a--b-1", "plan-a--b-2"],
+            vec![
+                "plan-a--20b",
+                "plan-a--2Db",
+                "plan-a--20b--n1",
+                "plan-a--20b--n2"
+            ],
             "{markup}"
         );
         for id in &ids {
@@ -2703,9 +2718,12 @@ mod tests {
             .label("Shipping speed")
             .render()
             .into_string();
-        assert!(markup.contains(r#"id="row--7-speed-standard""#), "{markup}");
         assert!(
-            markup.contains(r#"for="row--7-speed-standard""#),
+            markup.contains(r#"id="row--2D7-speed-standard""#),
+            "{markup}"
+        );
+        assert!(
+            markup.contains(r#"for="row--2D7-speed-standard""#),
             "{markup}"
         );
     }
@@ -3124,7 +3142,115 @@ mod tests {
         }
     }
 
+    /// All ids of a group with one choice per value in `values`.
+    fn ids_of(prefix: Option<&str>, name: &str, values: &[&str]) -> Vec<String> {
+        let options: Vec<RadioOption> = values
+            .iter()
+            .map(|v| RadioOption::new(*v, "Choice"))
+            .collect();
+        radio_option_ids(prefix, name, &options)
+    }
+
+    /// Issue #3454: a run of `-` next to the join was ambiguous.
+    #[test]
+    fn dash_runs_next_to_the_join_do_not_collide() {
+        let left = ids_of(None, "a-", &["b"]);
+        let right = ids_of(None, "a", &["-b"]);
+        assert_ne!(left, right);
+    }
+
+    /// Issue #3454: `-`, `.` and a space all gave `--`.
+    #[test]
+    fn dash_dot_and_space_give_different_ids() {
+        let ids: Vec<String> = ["plan type", "plan-type", "plan.type"]
+            .iter()
+            .map(|name| ids_of(None, name, &["x"]).remove(0))
+            .collect();
+        assert_eq!(ids[0], "plan--20type-x");
+        assert_eq!(ids[1], "plan--2Dtype-x");
+        assert_eq!(ids[2], "plan--2Etype-x");
+    }
+
+    /// Issue #3454: the repeat suffix looked like a prefix, name and value.
+    #[test]
+    fn a_repeat_suffix_does_not_collide_with_a_prefixed_group() {
+        let repeated = ids_of(None, "a", &["b", "b"]);
+        assert_eq!(repeated[0], "a-b");
+        assert_ne!(repeated[1], "a-b-1");
+        assert_ne!(repeated[1], ids_of(Some("a"), "b", &["1"])[0]);
+    }
+
+    /// A non-ASCII char escapes per UTF-8 byte.
+    #[test]
+    fn a_non_ascii_char_escapes_per_byte() {
+        assert_eq!(ids_of(None, "é", &["x"])[0], "_--C3--A9-x");
+    }
+
+    /// Exhaustive over a small alphabet: no two different groups share an id.
+    /// The alphabet holds the chars that matter: the join, the escape, a hex
+    /// digit, the repeat marker, `_`, a digit, a space.
+    #[test]
+    fn no_two_groups_share_a_choice_id() {
+        let alphabet = ['a', 'A', '1', '2', '0', '-', '_', 'n', ' '];
+        let mut words = vec![String::new()];
+        for c in alphabet {
+            words.push(c.to_string());
+            for d in alphabet {
+                words.push(format!("{c}{d}"));
+            }
+        }
+        let mut prefixes: Vec<Option<&str>> = vec![None];
+        prefixes.extend(words.iter().map(|w| Some(w.as_str())));
+        let mut owner = std::collections::HashMap::new();
+        for prefix in &prefixes {
+            for name in &words {
+                for value in &words {
+                    // The second choice repeats the first.
+                    let ids = ids_of(*prefix, name, &[value, value]);
+                    for (index, id) in ids.into_iter().enumerate() {
+                        let who = (*prefix, name.as_str(), value.as_str(), index);
+                        if let Some(other) = owner.insert(id.clone(), who) {
+                            panic!("{id:?} is {other:?} and {who:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     proptest::proptest! {
+        /// Two groups with a different prefix or name never share a choice id,
+        /// whatever the choices are.
+        #[test]
+        fn groups_never_share_a_choice_id(
+            prefix_a in proptest::option::of("[a-fA-Fn0-9_ .-]{0,5}"),
+            prefix_b in proptest::option::of("[a-fA-Fn0-9_ .-]{0,5}"),
+            name_a in "[a-fA-Fn0-9_ .é-]{0,5}",
+            name_b in "[a-fA-Fn0-9_ .é-]{0,5}",
+            values_a in proptest::collection::vec("[a-fA-Fn0-9_ .é-]{0,5}", 1..4),
+            values_b in proptest::collection::vec("[a-fA-Fn0-9_ .é-]{0,5}", 1..4),
+        ) {
+            proptest::prop_assume!((&prefix_a, &name_a) != (&prefix_b, &name_b));
+            let refs_a: Vec<&str> = values_a.iter().map(String::as_str).collect();
+            let refs_b: Vec<&str> = values_b.iter().map(String::as_str).collect();
+            let a = ids_of(prefix_a.as_deref(), &name_a, &refs_a);
+            let b = ids_of(prefix_b.as_deref(), &name_b, &refs_b);
+            for id in &a {
+                proptest::prop_assert!(!b.contains(id), "{id:?}");
+            }
+        }
+
+        /// Every id in one group is different, even for equal values.
+        #[test]
+        fn a_group_never_repeats_a_choice_id(
+            values in proptest::collection::vec("[a-fA-Fn0-9_ .-]{0,3}", 1..6),
+        ) {
+            let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+            let ids = ids_of(None, "g", &refs);
+            let unique: std::collections::HashSet<_> = ids.iter().collect();
+            proptest::prop_assert_eq!(unique.len(), ids.len());
+        }
+
         /// Every choice id is a valid CSS identifier, so `#id` is a valid
         /// selector.
         #[test]

@@ -6,7 +6,7 @@ verus! {
 //
 // The runtime is `radio_option_ids`, `id_part` and `selector_safe` in
 // `autumn/src/a11y.rs`. An id is parts joined by `-`. `id_part` reduces each
-// part to the bytes `[A-Za-z0-9_-]`. `selector_safe` then makes the lead part
+// part to the bytes `[A-Za-z0-9_-]` (a `-` only in a `--HH` escape). `selector_safe` then makes the lead part
 // start a CSS identifier: it adds one `_` when the part, without its leading
 // `_` bytes, does not start with a letter.
 //

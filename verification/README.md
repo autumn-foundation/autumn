@@ -185,7 +185,9 @@ verus verification/radio_choice_id.rs
 It proves that the first part of a choice id starts with a letter or `_`, so
 `#id` is a valid CSS selector. It also proves that two different parts never
 give the same result, so the rule adds no collision of its own. It does not
-prove that the joined id is unique (see #3454). The proptests
+prove that the joined id is unique (#3454). The tests
+`no_two_groups_share_a_choice_id` (exhaustive) and
+`groups_never_share_a_choice_id` check that. The proptests
 `every_choice_id_is_a_css_identifier`, `the_selector_safe_rule_is_injective`
 and `an_escaped_part_never_meets_its_underscored_twin` check the runtime
 against the same rules.
