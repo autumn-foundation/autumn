@@ -138,15 +138,16 @@ pub const MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// [`FallthroughReason::CapsuleError`].
 pub const STDOUT_LINE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// Cap on host→guest bytes the guest has not read yet, in bytes (64 MiB).
+/// Cap on host-to-guest bytes the guest has not read yet (64 MiB).
 ///
 /// Each `kv_get` answer is appended to `stdin`. A guest that asks and never
-/// reads would grow it without limit. Sized like the stdout cap: a 16 MiB
-/// value is about 22 MiB base64. An answer that does not fit ends the request
+/// reads would grow it without limit. The cap equals the stdout cap. A 16 MiB
+/// value is about 22 MiB in base64. An answer that does not fit ends the request
 /// as a [`FallthroughReason::CapsuleError`].
 pub const STDIN_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// Bytes a `kv_value` frame adds around the base64 value. Rounded up.
+/// Bytes that a `kv_value` frame adds around the base64 value. The number is
+/// rounded up.
 const KV_FRAME_OVERHEAD_BYTES: usize = 64;
 
 /// Scratch-buffer size for host-side copies of guest-supplied ranges (64 KiB).
@@ -421,7 +422,7 @@ impl<'kv> HostState<'kv> {
                 }
                 match to_line(&HostFrame::KvValue { value }) {
                     Ok(line) => {
-                        // One unit per value byte encoded, plus the copy.
+                        // Charge one unit per value byte, plus the copy cost.
                         self.pending_fuel = self
                             .pending_fuel
                             .saturating_add(u64::try_from(value_len).unwrap_or(u64::MAX))
@@ -697,7 +698,7 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                             state.write_stderr(&chunk);
                         } else {
                             let accepted = state.write_stdout(&chunk);
-                            // Pay for `kv_get` answers made while parsing (#3502).
+                            // Pay fuel for `kv_get` answers made while parsing (#3502).
                             let owed = std::mem::take(&mut state.pending_fuel);
                             charge_units(&mut caller, owed)?;
                             if !accepted {

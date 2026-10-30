@@ -1,5 +1,6 @@
 ### Fixed
 
-- **edge:** a `kv_get` answer now costs fuel by value size, and unread host
-  answers are capped at 64 MiB (issue #3502). A guest that loops on a large
-  value now falls through to the origin.
+- **autumn-edge:** the reference host now charges fuel for each `kv_get`
+  answer, by value size (issue #3502). It also caps unread host answers at
+  64 MiB. A capsule that loops on a large value now falls through to the
+  origin.

@@ -396,9 +396,12 @@ web-standard). The conformance suite runs both and requires the same outcome.
   network; the only way out is the dialogue. The conformance suite asserts the
   artifact's import list against that allowlist, so it stays true.
 - **Bounded execution.** The reference host meters every request with a wasmi
-  fuel budget (`autumn_edge::host::FUEL_BUDGET`, ~10⁹ instructions; host work for `fd_write` also costs fuel): a capsule
+  fuel budget (`autumn_edge::host::FUEL_BUDGET`, ~10⁹ instructions; host work for `fd_write`, including `kv_get`
+  answers, also costs fuel): a capsule
   stuck in a loop becomes a `capsule_error` fallthrough — the origin serves the
-  request — instead of a hung host. Any production shim should impose its own
+  request — instead of a hung host. Unread host answers are capped at 64 MiB
+  (`STDIN_BUDGET_BYTES`). More ends the request as a `capsule_error`.
+  Any production shim should impose its own
   wall-clock or instruction limit the same way.
 - **Fallthrough details never leak.** A declining response's body is a message
   for a developer; it is not forwarded, and neither is the sentinel header.
