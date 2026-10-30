@@ -2436,6 +2436,7 @@ mod tests {
     fn lexer_helpers_measure_spans() {
         assert_eq!(quote_len("'a''b'x"), 6);
         assert_eq!(dollar_quote_len("$1 AND"), None);
+        assert_eq!(dollar_quote_len("$a b$ x"), None);
         assert_eq!(dollar_quote_len("$$x$$y"), Some(5));
         assert_eq!(line_comment_len("--a\nb"), Some(3));
         assert_eq!(line_comment_len("a--"), None);
