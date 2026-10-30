@@ -2193,19 +2193,21 @@ impl<State> RadioGroup<State> {
 /// The id pairs each `<input>` with its `<label for=…>`, so a duplicate would
 /// break the very association the primitive exists to guarantee. The id is
 /// the parts joined by a single `-`: `prefix-name-value`, or `name-value`
-/// with no prefix. [`id_part`] keeps `[A-Za-z0-9_]` and writes every other
-/// byte as `--HH`. Thus a part never holds a lone `-`, and no two groups
-/// give the same id.
+/// with no prefix. [`id_part`] keeps `[A-Za-z0-9_]`. It writes each other
+/// byte as `--HH`. A part never holds a single `-`. Thus two different
+/// groups never give the same id.
 ///
 /// An empty name after a prefix is written `--`. A choice with the same value
-/// as an earlier one gets `--n` and its place in the repeats at the end. The
-/// `n` is not a hex digit, so that tail never reads as an escape. The lead part goes through [`selector_safe`], so every
-/// id is a valid CSS selector.
+/// as an earlier choice gets `--n1`, `--n2`, and so on. The letter `n` is not
+/// a hex digit, so the suffix cannot look like an escape.
+///
+/// The first part goes through [`selector_safe`]. Thus every id is a valid
+/// CSS selector.
 fn radio_option_ids(prefix: Option<&str>, name: &str, options: &[RadioOption]) -> Vec<String> {
     let group = prefix.map_or_else(
         || selector_safe(&id_part(name)),
         |prefix| {
-            // An empty middle part is `--`, so `p--v` never reads as `p`, ``, `v`.
+            // An empty name is `--`. Thus `p----v` cannot mean prefix `p`, name `-`, value `v`.
             let name = id_part(name);
             let name = if name.is_empty() {
                 "--".to_owned()
@@ -2682,9 +2684,8 @@ mod tests {
 
     #[test]
     fn radio_group_ids_do_not_collide_across_groups() {
-        // `("a-b", "c")` and `("a", "b-c")` would both reduce to `a-b-c` if the
-        // separator were ambiguous. Two groups cannot see each other's `seen`
-        // set, so the derivation itself has to keep them apart.
+        // Groups `a-b`/`c` and `a`/`b-c` once gave the same id. A group cannot
+        // see the ids of another group. The id rule itself must keep them apart.
         let one = RadioGroup::new("a-b", RadioOption::new("c", "C"))
             .label("One")
             .render()
@@ -2697,7 +2698,8 @@ mod tests {
             let at = markup.find(r#" id=""#).expect("an id") + 5;
             markup[at..][..markup[at..].find('"').expect("id closes")].to_owned()
         };
-        assert_ne!(id_of(&one), id_of(&two), "{one}\n{two}");
+        assert_eq!(id_of(&one), "a--2Db-c", "{one}");
+        assert_eq!(id_of(&two), "a-b--2Dc", "{two}");
     }
 
     #[test]
@@ -3151,7 +3153,8 @@ mod tests {
         radio_option_ids(prefix, name, &options)
     }
 
-    /// Issue #3454: a run of `-` next to the join was ambiguous.
+    /// Issue #3454: group `a-` with choice `b`, and group `a` with choice
+    /// `-b`, gave the same id.
     #[test]
     fn dash_runs_next_to_the_join_do_not_collide() {
         let left = ids_of(None, "a-", &["b"]);
@@ -3159,7 +3162,8 @@ mod tests {
         assert_ne!(left, right);
     }
 
-    /// Issue #3454: `-`, `.` and a space all gave `--`.
+    /// Issue #3454: `-`, `.` and a space all gave `--`. Now each gives a
+    /// different id.
     #[test]
     fn dash_dot_and_space_give_different_ids() {
         let ids: Vec<String> = ["plan type", "plan-type", "plan.type"]
@@ -3171,13 +3175,37 @@ mod tests {
         assert_eq!(ids[2], "plan--2Etype-x");
     }
 
-    /// Issue #3454: the repeat suffix looked like a prefix, name and value.
+    /// Issue #3454: the old repeat suffix `-1` matched a group with prefix
+    /// `a`, name `b` and value `1`.
     #[test]
     fn a_repeat_suffix_does_not_collide_with_a_prefixed_group() {
         let repeated = ids_of(None, "a", &["b", "b"]);
         assert_eq!(repeated[0], "a-b");
-        assert_ne!(repeated[1], "a-b-1");
+        assert_eq!(repeated[1], "a-b--n1");
         assert_ne!(repeated[1], ids_of(Some("a"), "b", &["1"])[0]);
+    }
+
+    /// An empty name after a prefix, and an empty repeated value.
+    #[test]
+    fn empty_parts_have_fixed_ids() {
+        assert_eq!(ids_of(Some("p"), "", &["v"])[0], "p----v");
+        assert_eq!(ids_of(None, "g", &["", ""]), ["g-", "g---n1"]);
+        assert_eq!(ids_of(None, "", &["v", "v"]), ["_-v", "_-v--n1"]);
+    }
+
+    /// An escape in the first part keeps the id a CSS identifier.
+    #[test]
+    fn an_escaped_lead_is_a_css_identifier() {
+        for (prefix, name, id) in [
+            (None, "-x", "_--2Dx-v"),
+            (None, ".x", "_--2Ex-v"),
+            (None, "é", "_--C3--A9-v"),
+            (Some("-"), "x", "_--2D-x-v"),
+        ] {
+            let ids = ids_of(prefix, name, &["v"]);
+            assert_eq!(ids[0], id);
+            assert!(is_css_ident(&ids[0]), "{ids:?}");
+        }
     }
 
     /// A non-ASCII char escapes per UTF-8 byte.
@@ -3252,12 +3280,12 @@ mod tests {
         }
 
         /// Every choice id is a valid CSS identifier, so `#id` is a valid
-        /// selector.
+        /// selector. Escapes such as `--2D` stay valid.
         #[test]
         fn every_choice_id_is_a_css_identifier(
-            prefix in proptest::option::of("[a-z0-9_ .-]{0,6}"),
-            name in "[A-Za-z0-9_ .\\[\\]-]{0,8}",
-            values in proptest::collection::vec("[A-Za-z0-9_ .-]{0,6}", 1..4),
+            prefix in proptest::option::of("[a-z0-9_ .é-]{0,6}"),
+            name in "[A-Za-z0-9_ .é\\[\\]-]{0,8}",
+            values in proptest::collection::vec("[A-Za-z0-9_ .é-]{0,6}", 1..4),
         ) {
             let options: Vec<RadioOption> =
                 values.iter().map(|v| RadioOption::new(v.as_str(), "Choice")).collect();
