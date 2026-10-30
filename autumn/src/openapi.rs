@@ -594,29 +594,46 @@ pub fn decimal_scalar_schema() -> serde_json::Value {
 ///
 /// `Decimal` writes a string, but reads a string or a number. A request
 /// schema must name both. A `oneOf` property keeps its other branches, such as
-/// `null`. Any other schema is not changed. Response schemas do not use this.
-pub fn widen_decimal_request(prop: &mut serde_json::Value) {
+/// `null`. An array property widens its `items`. Any other schema is not
+/// changed. Response schemas do not use this.
+fn widen_decimal_request(
+    prop: &mut serde_json::Value,
+    decimal: &serde_json::Value,
+    number: &serde_json::Value,
+) {
+    if !prop.is_object() {
+        return;
+    }
+    if prop == decimal {
+        *prop = serde_json::json!({ "oneOf": [decimal, number] });
+    } else if let Some(branches) = prop.get_mut("oneOf").and_then(|b| b.as_array_mut()) {
+        if let Some(at) = branches.iter().position(|b| b == decimal)
+            && !branches.contains(number)
+        {
+            branches.insert(at + 1, number.clone());
+        }
+        for branch in branches.iter_mut().filter(|b| b.get("items").is_some()) {
+            widen_decimal_request(branch, decimal, number);
+        }
+    } else if let Some(items) = prop.get_mut("items") {
+        widen_decimal_request(items, decimal, number);
+    }
+}
+
+/// Widen every `Decimal` property of an object schema to admit a JSON number.
+///
+/// `#[model]` calls this on the `New*` and `Update*` schemas (issue #3427).
+#[doc(hidden)]
+pub fn widen_decimal_request_properties(schema: &mut serde_json::Value) {
     let decimal = decimal_scalar_schema();
     let number = serde_json::json!({ "type": "number" });
     if decimal == number {
         return;
     }
-    if *prop == decimal {
-        *prop = serde_json::json!({ "oneOf": [decimal, number] });
-    } else if let Some(branches) = prop.get_mut("oneOf").and_then(|b| b.as_array_mut()) {
-        let Some(at) = branches.iter().position(|b| *b == decimal) else {
-            return;
-        };
-        if !branches.contains(&number) {
-            branches.insert(at + 1, number);
-        }
-    }
-}
-
-/// Apply [`widen_decimal_request`] to every property of an object schema.
-pub fn widen_decimal_request_properties(schema: &mut serde_json::Value) {
     if let Some(props) = schema.get_mut("properties").and_then(|p| p.as_object_mut()) {
-        props.values_mut().for_each(widen_decimal_request);
+        for prop in props.values_mut() {
+            widen_decimal_request(prop, &decimal, &number);
+        }
     }
 }
 
@@ -3299,10 +3316,25 @@ mod scalar_schema_tests {
         serde_json::json!({"type": "string", "format": "decimal"})
     }
 
+    /// Widen one property through the public entry point.
+    fn widen(prop: &mut serde_json::Value) {
+        let mut schema = serde_json::json!({ "properties": { "p": prop.clone() } });
+        widen_decimal_request_properties(&mut schema);
+        *prop = schema["properties"]["p"].clone();
+    }
+
+    /// The widening tests need the default string wire.
+    fn string_wire() -> bool {
+        decimal_scalar_schema() == decimal_string()
+    }
+
     #[test]
     fn widen_replaces_a_bare_decimal_with_string_or_number() {
+        if !string_wire() {
+            return;
+        }
         let mut prop = decimal_string();
-        widen_decimal_request(&mut prop);
+        widen(&mut prop);
         assert_eq!(
             prop,
             serde_json::json!({"oneOf": [decimal_string(), {"type": "number"}]})
@@ -3311,8 +3343,11 @@ mod scalar_schema_tests {
 
     #[test]
     fn widen_splices_into_a_nullable_one_of() {
+        if !string_wire() {
+            return;
+        }
         let mut prop = serde_json::json!({"oneOf": [decimal_string(), {"type": "null"}]});
-        widen_decimal_request(&mut prop);
+        widen(&mut prop);
         assert_eq!(
             prop,
             serde_json::json!({"oneOf": [decimal_string(), {"type": "number"}, {"type": "null"}]})
@@ -3328,22 +3363,57 @@ mod scalar_schema_tests {
             serde_json::json!({"oneOf": [{"type": "integer"}, {"type": "null"}]}),
         ] {
             let mut prop = original.clone();
-            widen_decimal_request(&mut prop);
+            widen(&mut prop);
             assert_eq!(prop, original);
         }
     }
 
     #[test]
+    fn widen_keeps_an_already_widened_nullable_one_of() {
+        let original =
+            serde_json::json!({"oneOf": [decimal_string(), {"type": "number"}, {"type": "null"}]});
+        let mut prop = original.clone();
+        widen(&mut prop);
+        assert_eq!(prop, original);
+    }
+
+    #[test]
+    fn widen_widens_the_items_of_an_array() {
+        if !string_wire() {
+            return;
+        }
+        let mut prop = serde_json::json!({"type": "array", "items": decimal_string()});
+        widen(&mut prop);
+        assert_eq!(prop["items"]["oneOf"][1]["type"], "number");
+    }
+
+    #[test]
+    fn widen_widens_the_items_of_a_nullable_array() {
+        if !string_wire() {
+            return;
+        }
+        let mut prop = serde_json::json!({"oneOf": [
+            {"type": "array", "items": decimal_string()}, {"type": "null"}
+        ]});
+        widen(&mut prop);
+        assert_eq!(prop["oneOf"][0]["items"]["oneOf"][1]["type"], "number");
+        assert_eq!(prop["oneOf"][1]["type"], "null");
+    }
+
+    #[test]
     fn widen_is_idempotent() {
         let mut once = decimal_string();
-        widen_decimal_request(&mut once);
+        widen(&mut once);
         let mut twice = once.clone();
-        widen_decimal_request(&mut twice);
+        widen(&mut twice);
         assert_eq!(once, twice);
     }
 
     #[test]
     fn widen_widens_every_property_of_an_object_schema() {
+        if !string_wire() {
+            return;
+        }
         let mut schema = serde_json::json!({
             "type": "object",
             "properties": {"a": decimal_string(), "b": {"type": "string"}},
