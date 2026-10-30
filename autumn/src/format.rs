@@ -69,6 +69,8 @@ impl<'a> CurrencyOptions<'a> {
     }
 
     /// Set the number of decimal places to round and display (default `2`).
+    ///
+    /// A value above 28 (`Decimal::MAX_SCALE`) is treated as 28.
     #[must_use]
     pub const fn precision(mut self, precision: u32) -> Self {
         self.precision = precision;
@@ -113,24 +115,22 @@ pub fn number_to_currency(value: Decimal) -> maud::Markup {
 
 #[cfg(feature = "maud")]
 fn format_currency(value: Decimal, options: &CurrencyOptions<'_>) -> String {
-    // `round_dp` rounds but does not pad trailing zeros onto a shorter scale
-    // (e.g. 1234.5 stays scale=1), so the digit string is built by rounding
-    // first, then formatting with an explicit precision to force zero-padding.
+    // `Decimal`'s `Display` panics when a requested precision overflows its
+    // 32-char buffer. Round, print without a precision, then pad zeros here.
+    // A `Decimal` has at most `MAX_SCALE` places, so clamp to that.
+    let precision = options.precision.min(Decimal::MAX_SCALE);
     let rounded = value.round_dp_with_strategy(
-        options.precision,
+        precision,
         rust_decimal::RoundingStrategy::MidpointAwayFromZero,
     );
     let negative = rounded.is_sign_negative() && !rounded.is_zero();
-    let digits = format!(
-        "{:.prec$}",
-        rounded.abs(),
-        prec = options.precision as usize
-    );
+    let digits = rounded.abs().to_string();
     let (int_part, frac_part) = split_decimal_string(&digits);
+    let frac = format!("{frac_part:0<width$}", width = precision as usize);
     assemble_signed_grouped(
         negative,
         int_part,
-        frac_part,
+        &frac,
         options.thousands_separator,
         options.decimal_separator,
         options.symbol,
@@ -442,6 +442,91 @@ mod tests {
     fn currency_zero_precision_omits_decimal_separator() {
         let opts = CurrencyOptions::new().precision(0);
         assert_eq!(opts.format(dec("42.6")).into_string(), "$43");
+    }
+
+    #[test]
+    fn currency_high_precision_large_value_does_not_panic() {
+        // Issue #3432: 4 integer digits + '.' + 28 places is 33 chars.
+        let opts = CurrencyOptions::new().precision(28);
+        assert_eq!(
+            opts.format(dec("1000")).into_string(),
+            "$1,000.0000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn currency_wei_precision_with_many_integer_digits() {
+        let opts = CurrencyOptions::new().precision(18);
+        assert_eq!(
+            opts.format(dec("12345678901234")).into_string(),
+            "$12,345,678,901,234.000000000000000000"
+        );
+    }
+
+    #[test]
+    fn currency_precision_above_decimal_scale_is_clamped() {
+        let opts = CurrencyOptions::new().precision(40);
+        let clamped = CurrencyOptions::new().precision(28);
+        assert_eq!(
+            opts.format(dec("1.5")).into_string(),
+            clamped.format(dec("1.5")).into_string()
+        );
+        assert_eq!(
+            opts.format(Decimal::MAX).into_string(),
+            clamped.format(Decimal::MAX).into_string()
+        );
+    }
+
+    #[test]
+    fn currency_boundary_32_chars_still_works() {
+        let opts = CurrencyOptions::new().precision(28);
+        assert_eq!(
+            opts.format(dec("999")).into_string(),
+            "$999.0000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn currency_negative_large_high_precision() {
+        let opts = CurrencyOptions::new().precision(28);
+        assert_eq!(
+            opts.format(dec("-1000")).into_string(),
+            "-$1,000.0000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn currency_zero_at_max_precision() {
+        let opts = CurrencyOptions::new().precision(28);
+        assert_eq!(
+            opts.format(dec("-0")).into_string(),
+            "$0.0000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn currency_rounding_carry_grows_integer_part() {
+        let opts = CurrencyOptions::new().precision(3);
+        assert_eq!(opts.format(dec("999.9995")).into_string(), "$1,000.000");
+        assert_eq!(opts.format(dec("-999.9995")).into_string(), "-$1,000.000");
+    }
+
+    #[test]
+    fn currency_decimal_extremes_are_exact() {
+        let p0 = CurrencyOptions::new().precision(0);
+        assert_eq!(
+            p0.format(Decimal::MAX).into_string(),
+            "$79,228,162,514,264,337,593,543,950,335"
+        );
+        assert_eq!(
+            p0.format(Decimal::MIN).into_string(),
+            "-$79,228,162,514,264,337,593,543,950,335"
+        );
+        let max = CurrencyOptions::new().precision(u32::MAX);
+        assert_eq!(
+            max.format(Decimal::MAX).into_string(),
+            "$79,228,162,514,264,337,593,543,950,335.0000000000000000000000000000"
+        );
     }
 
     #[test]
