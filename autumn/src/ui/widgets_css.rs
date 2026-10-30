@@ -404,7 +404,11 @@ mod tests {
             WIDGETS_COMPONENT_CSS.contains(list),
             "missing pause selectors"
         );
-        assert!(rule_body(".autumn-toast:focus-within").contains("animation-play-state: paused;"));
+        // Only the exit animation pauses. The entrance of a new toast runs.
+        assert!(
+            rule_body(".autumn-toast:focus-within")
+                .contains("animation-play-state: running, paused;")
+        );
     }
 
     /// A persistent toast fades in and never fades out.
@@ -423,13 +427,14 @@ mod tests {
     #[test]
     fn reduced_motion_keeps_the_dwell_and_the_persistent_toast() {
         let at = WIDGETS_COMPONENT_CSS
-            .find("@media (prefers-reduced-motion: reduce) {\n    .autumn-toast {")
+            .find("@media (prefers-reduced-motion: reduce) {\n    /* A 0s entrance")
             .expect("reduced-motion toast block");
         let rest = &WIDGETS_COMPONENT_CSS[at..];
         let block = &rest[..rest.find("\n}\n").expect("block end")];
         assert!(
             block.contains(
-                "animation: autumn-toast-out 0s linear var(--autumn-toast-duration, 5s) forwards;"
+                "autumn-toast-in 0s,\n            \
+                 autumn-toast-out 0s linear var(--autumn-toast-duration, 5s) forwards;"
             ),
             "{block}"
         );

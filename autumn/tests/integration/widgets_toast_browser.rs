@@ -307,6 +307,37 @@ async fn hover_pauses_dismissal() {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
+async fn a_toast_that_arrives_during_hover_still_fades_in() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    page.click("#sticky").await.expect("click");
+    wait_for(
+        &page,
+        "!!document.querySelector('#toast-region [data-autumn-toast]')",
+    )
+    .await;
+    page.hover(FIRST_TOAST).await.expect("hover");
+    // A new toast arrives while the region is hovered. The pause must not
+    // hold its entrance at `opacity: 0`.
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { htmx.ajax('GET', '/toast/short', { swap: 'none' }); return true; })()"
+        )
+        .await
+    );
+    wait_for(
+        &page,
+        "(() => { const t = document.querySelectorAll('#toast-region [data-autumn-toast]')[1]; \
+         return !!t && getComputedStyle(t).opacity === '1'; })()",
+    )
+    .await;
+    wait_paused(&page).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
 async fn focus_within_pauses_dismissal() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");

@@ -1361,12 +1361,13 @@
 }
 
 /* WCAG 2.2.1: hover or focus on a toast pauses the timer of every toast in
-   the region. Then the user can read and act. */
+   the region. Then the user can read and act. Only the exit animation (the
+   second one) pauses. A toast that arrives during the pause still fades in. */
 .autumn-toast-region:hover .autumn-toast,
 .autumn-toast-region:focus-within .autumn-toast,
 .autumn-toast:hover,
 .autumn-toast:focus-within {
-    animation-play-state: paused;
+    animation-play-state: running, paused;
 }
 
 /* No timer: the user closes the toast. */
@@ -1451,8 +1452,11 @@
 /* Reduced motion: no slide or fade. A timed toast still hides after the
    dwell, so toasts do not pile up. A persistent toast has no animation. */
 @media (prefers-reduced-motion: reduce) {
+    /* A 0s entrance keeps the exit animation second, as the pause needs. */
     .autumn-toast {
-        animation: autumn-toast-out 0s linear var(--autumn-toast-duration, 5s) forwards;
+        animation:
+            autumn-toast-in 0s,
+            autumn-toast-out 0s linear var(--autumn-toast-duration, 5s) forwards;
     }
 
     .autumn-toast--persistent {
