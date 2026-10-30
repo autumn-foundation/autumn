@@ -121,8 +121,8 @@ fn free_rowid_name(columns: &[String]) -> Option<&'static str> {
         .find(|name| !columns.iter().any(|c| c.eq_ignore_ascii_case(name)))
 }
 
-/// One key column as text. `typeof` keeps the storage class apart. `hex` reads
-/// every byte, which `quote` does not: it stops at a NUL.
+/// One key column as text. `quote` stops at a NUL byte. `hex` reads every
+/// byte. `typeof` keeps the storage classes apart.
 fn key_part(column: &str) -> String {
     let column = quote_ident(column);
     format!("typeof({column}) || ':' || hex({column})")
@@ -1584,6 +1584,13 @@ mod tests {
         facts.rowid_tables.insert("t".to_owned());
         let key = row_key_expr(&table, &facts).expect("key");
         assert!(key.contains("THEN 'rowid:' || _rowid_ ELSE"), "{key}");
+    }
+
+    #[test]
+    fn rowid_name_falls_through_to_oid() {
+        let names = ["rowid", "_ROWID_"].map(str::to_owned);
+        assert_eq!(free_rowid_name(&names), Some("oid"));
+        assert_eq!(free_rowid_name(&[]), Some("rowid"));
     }
 
     #[test]

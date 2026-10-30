@@ -605,12 +605,47 @@ fn text_keys_that_differ_after_a_nul_get_distinct_tokens() {
 }
 
 #[test]
+fn real_keys_that_differ_past_15_digits_get_distinct_tokens() {
+    let (db, _p, out, code) = scrub_legacy(
+        "CREATE TABLE legacy (code REAL PRIMARY KEY, email TEXT UNIQUE); \
+         INSERT INTO legacy VALUES (0.1 + 0.2, 'a@real-corp.example'), \
+                                   (0.3, 'b@real-corp.example');",
+        "\"code\"",
+    );
+    assert_eq!(code, Some(0), "unique column stays unique:\n{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM legacy"),
+        2
+    );
+}
+
+#[test]
+fn composite_keys_with_a_nul_and_mixed_types_get_distinct_tokens() {
+    let (db, _p, out, code) = scrub_legacy(
+        "CREATE TABLE legacy (a, b, email TEXT UNIQUE, PRIMARY KEY (a, b)); \
+         INSERT INTO legacy VALUES (char(97, 0, 120), 1, 'a@real-corp.example'), \
+                                   (char(97, 0, 121), 1, 'b@real-corp.example'), \
+                                   ('6162', 1, 'c@real-corp.example'), \
+                                   (6162, 1, 'd@real-corp.example'), \
+                                   (x'6162', 1, 'e@real-corp.example'), \
+                                   ('1', 1, 'f@real-corp.example'), \
+                                   (1, 1, 'g@real-corp.example');",
+        "\"a\", \"b\"",
+    );
+    assert_eq!(code, Some(0), "unique column stays unique:\n{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM legacy"),
+        7
+    );
+}
+
+#[test]
 fn a_user_column_named_rowid_does_not_collapse_tokens() {
     let (db, _p, out, code) = scrub_legacy(
-        "CREATE TABLE legacy (rowid INTEGER, email TEXT UNIQUE); \
-         INSERT INTO legacy VALUES (1, 'a@real-corp.example'), (1, 'b@real-corp.example'), \
-                                   (NULL, 'c@real-corp.example'), (NULL, 'd@real-corp.example');",
-        "\"rowid\"",
+        "CREATE TABLE legacy (RowID INTEGER, _rowid_ INTEGER, email TEXT UNIQUE); \
+         INSERT INTO legacy VALUES (1, 1, 'a@real-corp.example'), (1, 1, 'b@real-corp.example'), \
+                                   (NULL, NULL, 'c@real-corp.example'), (NULL, NULL, 'd@real-corp.example');",
+        "\"RowID\", \"_rowid_\"",
     );
     assert_eq!(code, Some(0), "unique column stays unique:\n{out}");
     assert_eq!(
