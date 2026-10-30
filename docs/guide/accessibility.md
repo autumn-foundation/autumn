@@ -543,8 +543,10 @@ least one. A visible group name renders `<fieldset><legend>`; `.aria_label(..)` 
 `.labelled_by(..)` render a `<div>` instead. Both carry `role="radiogroup"` —
 `<fieldset>` alone maps to role `group`, which does not support `aria-required`.
 Each choice gets an `id` that pairs it with its own `<label for=…>`, derived
-from the group name and the choice value. A `-` inside either is doubled, so
-group `a-b` choice `c` and group `a` choice `b-c` cannot collide. The same group
+from the group name and the choice value. Each byte other than a
+letter, digit or `_` is written `--HH` (upper-case hex), so two groups never
+give the same id: `plan-type` gives `plan--2Dtype-…`. The second choice with the
+same value ends in `--n1`. The third ends in `--n2`. The same group
 rendered repeatedly — one per table row — shares its form name by design, so
 `.id_prefix(..)` supplies the discriminator. An id is also a valid CSS selector,
 so `hx-target="#…"` and `querySelector` work on it. If the first part of the
