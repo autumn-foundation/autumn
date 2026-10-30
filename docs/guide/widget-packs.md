@@ -122,6 +122,8 @@ impl FieldRenderer for DatePicker {
 `aria-*` links and the app passthrough. It removes an attribute that the
 framework writes, an `on*` or `hx-on*` handler, and `style`. It does not put
 the changeset value on a `password`, `file`, `checkbox` or `radio` input.
+The app passthrough is not filtered. It works as on a core field, and the
+app owns its CSP.
 
 Use the control in two ways:
 

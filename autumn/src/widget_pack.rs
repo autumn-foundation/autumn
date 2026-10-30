@@ -73,7 +73,8 @@ use crate::stories::{Story, StoryGallery};
 /// from `options`. Values are escaped. When a widget attribute and a
 /// passthrough attribute have one name, the widget attribute applies. The
 /// function removes a malformed name, an `on*` or `hx-on*` handler and
-/// `style` from `attrs`. A void tag ignores `body`.
+/// `style` from `attrs`. It does not filter the app passthrough: that works
+/// as on a core helper, and the app owns its CSP. A void tag ignores `body`.
 ///
 /// ```rust
 /// use autumn_web::form::FieldOptions;

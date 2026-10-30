@@ -4958,7 +4958,9 @@ impl<'a> FieldContext<'a> {
     /// `type`. The method removes these names from `attrs`: a name that is
     /// not `[a-z][a-z0-9:-]*`, a name that the framework writes, an `on*` or
     /// `hx-on*` handler, and `style`. When a name occurs two times, the
-    /// first one applies. A void tag (`input`) ignores `body`.
+    /// first one applies. A void tag (`input`) ignores `body`. The app
+    /// passthrough in [`FieldOptions`] is not filtered: it works as on a core
+    /// helper, and the app owns its CSP.
     ///
     /// # Panics
     ///
@@ -10391,6 +10393,29 @@ mod custom_control_tests {
                 widget_element(tag, &[], &FieldOptions::new(), maud::html! {})
             });
             assert!(result.is_err(), "`{tag}` must be refused");
+        }
+    }
+
+    /// The app passthrough works as on a core helper: the app owns its CSP
+    /// and may allow `hx-on:*`. Only the attributes of the widget pack are
+    /// filtered, because the widget contract promises CSP-safe pack markup.
+    #[test]
+    fn app_passthrough_matches_core_helpers_and_pack_attrs_are_filtered() {
+        let options = FieldOptions::new().hx("on:click", "app()").hx("get", "/ok");
+        let core = text_input_with(&Changeset::new(task()), "due", "Due", &options).into_string();
+        let control = custom_input_with(&Changeset::new(task()), "due", "Due", &DateLike, &options)
+            .into_string();
+        let element = widget_element(
+            "div",
+            &[("hx-on:click", "pack()"), ("onclick", "pack()")],
+            &options,
+            maud::html! {},
+        )
+        .into_string();
+        for html in [&core, &control, &element] {
+            assert!(html.contains(r#"hx-on:click="app()""#), "{html}");
+            assert!(html.contains(r#"hx-get="/ok""#), "{html}");
+            assert!(!html.contains("pack()"), "pack handler leaked: {html}");
         }
     }
 
