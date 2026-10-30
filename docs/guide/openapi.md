@@ -116,7 +116,7 @@ an `ApiDoc` at compile time from the path and the handler signature:
 | `Vec<T>` in either position | `type: array` with `items` from `T` |
 | `Option<T>` in either position | Nullable — `type: ["string", "null"]` for primitives, `oneOf: [{$ref}, {type: "null"}]` for refs |
 | `String`/`str`, `bool`, `i8`–`i64`, `u8`–`u64`, `isize`/`usize`, `f32`/`f64` | Inline primitive schemas, never a `$ref`. **`i128`/`u128` are not in the list** — they fall through to a named `$ref` and land on the object placeholder |
-| `Uuid`, `DateTime<Utc>`, `NaiveDate`, `NaiveDateTime`, `Decimal`, `SqliteUuid`, `SqliteDecimal` | Inline schema, never a `$ref`. `Uuid` has `format: uuid`. `DateTime<Utc>` has `date-time`. `NaiveDate` has `date`. `NaiveDateTime` has no `format`. `Decimal` is `string` with `format: decimal`, or `number` if serde writes a number. This holds for model fields and `#[derive(OpenApiSchema)]` fields, not for a bare `Json<Uuid>` |
+| `Uuid`, `DateTime<Utc>`, `NaiveDate`, `NaiveDateTime`, `Decimal`, `SqliteUuid`, `SqliteDecimal` | Inline schema, never a `$ref`. `Uuid` has `format: uuid`. `DateTime<Utc>` has `date-time`. `NaiveDate` has `date`. `NaiveDateTime` has no `format`. `Decimal` is `string` with `format: decimal`, or `number` if serde writes a number. In a `New*` or `Update*` request schema, `Decimal` is `oneOf` string and number, because it reads both. The model's own read schema stays string. This holds for model fields and `#[derive(OpenApiSchema)]` fields, not for a bare `Json<Uuid>` |
 | Anything else named | A `$ref` into `#/components/schemas/…` (see [§4](#4-component-schemas)) |
 
 Only these shapes are recognized deliberately: an unknown wrapper type is left
