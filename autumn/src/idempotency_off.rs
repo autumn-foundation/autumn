@@ -62,6 +62,10 @@ pub(crate) fn persistence_failed_response() -> Response<Body> {
     response
 }
 
+pub(crate) const fn has_deferred_session_commit(_: &Response<Body>) -> bool {
+    false
+}
+
 pub(crate) fn finalize_deferred_session_commit(_: &mut Response<Body>) -> Option<Never<'_>> {
     None
 }
