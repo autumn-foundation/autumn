@@ -70,14 +70,14 @@
 //!
 //! # Known heuristic limits
 //!
-//! The `cfg` reader (issue #3458) finds where a gated thing ends by tokens.
-//! These limits remain. Each one can lose or keep an attribution. None changes
-//! a finding or the exit code:
+//! The `cfg` reader finds the end of a gated item by reading tokens. It has
+//! these limits (issue #3458). Each one can lose or keep an attribution. None
+//! changes a finding or the exit code:
 //!
 //! - A gated statement inside a custom macro (not `html!`) is scanned as live
 //!   code.
-//! - `--features` applies to every crate in a workspace scan. A name that no
-//!   crate declares gets a warning.
+//! - `--features` applies to every crate in a workspace scan. Cargo applies it
+//!   per package. A name that no crate declares gets a warning.
 //! - Features that a crate gets from its dependents are not seen.
 //!
 //! A full fix parses bodies with `syn::visit`.
@@ -487,6 +487,8 @@ impl<'a> CrateFeatures<'a> {
         requested_names(self.selection)
             .into_iter()
             .filter(|name| !name.contains(['/', ':']) && !declared.contains(name))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 
@@ -826,6 +828,12 @@ const ROUTE_ATTRS: [(&str, &str); 6] = [
 ];
 
 /// Rust keywords that can precede a parenthesized group without being a call.
+/// Keywords whose condition can hold a block.
+const CONDITION_KEYWORDS: [&str; 3] = ["if", "while", "match"];
+
+/// Keywords that lead a block inside a condition (`if unsafe { c() } { … }`).
+const BLOCK_KEYWORDS: [&str; 4] = ["unsafe", "const", "async", "loop"];
+
 const CALL_KEYWORDS: [&str; 6] = ["if", "while", "match", "return", "for", "in"];
 
 /// Item keywords whose following identifier is a declaration, not a call.
@@ -1269,35 +1277,20 @@ fn collect_paths_passed(args: &proc_macro2::Group, out: &mut BTreeSet<String>) {
     }
 }
 
-/// Whether the attribute body `attr` (`cfg(…)` or `cfg_attr(…)`) is false for
-/// `features`. A predicate the scan cannot decide, or no known features, is
-/// not false.
+/// Whether the attribute body `attr` (`cfg(…)` or `cfg_attr(…)`) turns its
+/// item off for `features`. The scan keeps the item when it cannot decide the
+/// predicate, or has no known features.
 ///
-/// A `cfg_attr` is false when its condition holds and it injects a false
-/// `cfg`, as [`crate::edge_scan`] reads it for items.
+/// A `cfg_attr` turns the item off when its condition holds and it injects a
+/// false `cfg`, as [`crate::edge_scan::meta_cfg_excludes`] reads it.
 fn cfg_is_off(attr: &proc_macro2::Group, features: Option<&BTreeSet<String>>) -> bool {
     let Some(features) = features else {
         return false;
     };
     // Most attributes are neither (a doc comment, a derive): skip the parse.
-    let Some(TokenTree::Ident(head)) = attr.stream().into_iter().next() else {
-        return false;
-    };
-    if head == "cfg_attr" {
-        let mut outer = TokenStream::new();
-        outer.extend([
-            TokenTree::Punct(proc_macro2::Punct::new('#', proc_macro2::Spacing::Alone)),
-            TokenTree::Group(attr.clone()),
-        ]);
-        return syn::parse::Parser::parse2(syn::Attribute::parse_outer, outer).is_ok_and(|attrs| {
-            attrs
-                .iter()
-                .any(|attr| crate::edge_scan::attr_cfg_excludes(attr, features))
-        });
-    }
-    head == "cfg"
+    matches!(attr.stream().into_iter().next(), Some(TokenTree::Ident(id)) if id == "cfg" || id == "cfg_attr")
         && syn::parse2::<syn::Meta>(attr.stream())
-            .is_ok_and(|meta| crate::edge_scan::eval_cfg_meta(&meta, features) == Some(false))
+            .is_ok_and(|meta| crate::edge_scan::meta_cfg_excludes(&meta, features))
 }
 
 /// Skip the statement, match arm, field or item after an attribute, from
@@ -1392,7 +1385,7 @@ fn skip_expr(trees: &[TokenTree], start: usize, has_generics: bool) -> usize {
         let at = i;
         i += 1;
         match tree {
-            TokenTree::Ident(id) if ["if", "while", "match"].iter().any(|kw| id == kw) => {
+            TokenTree::Ident(id) if CONDITION_KEYWORDS.iter().any(|kw| id == kw) => {
                 in_condition = true;
             }
             TokenTree::Punct(p) => match p.as_char() {
@@ -1436,11 +1429,15 @@ fn skip_expr(trees: &[TokenTree], start: usize, has_generics: bool) -> usize {
 }
 
 /// Whether a block after `prev` is an operand of a condition, not its body:
-/// `prev` is the keyword, or an operator. A `>`, `?` or `.` can end a type or
-/// an operand (`x as Vec<u8> {`), so those do not count.
+/// `prev` is the keyword, a block keyword (`unsafe`), or an operator. A `>`,
+/// `?` or `.` can end a type or an operand (`x as Vec<u8> {`), so those do not
+/// count. `;` and `,` end the expression.
 fn is_condition_operand_lead(prev: &TokenTree) -> bool {
     match prev {
-        TokenTree::Ident(id) => ["if", "while", "match"].iter().any(|kw| id == kw),
+        TokenTree::Ident(id) => CONDITION_KEYWORDS
+            .iter()
+            .chain(&BLOCK_KEYWORDS)
+            .any(|kw| id == kw),
         TokenTree::Punct(p) => !['>', '?', '.', ';', ','].contains(&p.as_char()),
         _ => false,
     }
@@ -6066,7 +6063,20 @@ mod tests {
     }
 
     #[test]
-    fn a_cfg_attr_drops_a_match_arm_and_a_field() {
+    fn a_false_cfg_after_other_injected_attrs_drops_the_statement() {
+        for attr in [
+            r#"#[cfg_attr(feature = "db", allow(unused), cfg(feature = "admin"))]"#,
+            r#"#[cfg_attr(all(feature = "db", not(feature = "x")), cfg(feature = "admin"))]"#,
+            r#"#[cfg_attr(feature = "db", cfg(not(feature = "db")))]"#,
+            r#"#[cfg(feature = "db")] #[cfg_attr(feature = "db", cfg(feature = "admin"))]"#,
+        ] {
+            let src = attr_stmt(attr);
+            assert!(routes_with_features(&src, &["db"]).is_empty(), "{attr}");
+        }
+    }
+
+    #[test]
+    fn a_cfg_attr_drops_a_match_arm() {
         let arm = r#"
             #[get("/a")]
             async fn a(k: Kind) -> Markup {
@@ -6080,6 +6090,24 @@ mod tests {
             fn admin() -> Markup { html! { img src="/x.png"; } }
         "#;
         assert!(routes_with_features(arm, &["db"]).is_empty());
+    }
+
+    #[test]
+    fn a_cfg_attr_drops_a_field() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                let v = Row {
+                    #[cfg_attr(feature = "db", cfg(feature = "admin"))]
+                    side: admin(),
+                    id: 1,
+                };
+                html! { span { "a" } }
+            }
+
+            fn admin() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        assert!(routes_with_features(src, &["db"]).is_empty());
     }
 
     #[test]
@@ -6141,6 +6169,28 @@ mod tests {
     }
 
     #[test]
+    fn a_keyword_block_in_a_condition_does_not_end_a_gated_statement() {
+        for cond in [
+            "if unsafe { f() }",
+            "if const { true }",
+            "while unsafe { f() }",
+            "match unsafe { f() }",
+        ] {
+            let src = format!(
+                r#"
+                #[get("/a")]
+                async fn a() -> Markup {{
+                    #[cfg(feature = "admin")]
+                    {cond} {{ let _x = html! {{ img src="/x.png"; }}; }}
+                    html! {{ span {{ "a" }} }}
+                }}
+                "#
+            );
+            assert!(routes_with_features(&src, &[]).is_empty(), "{cond}");
+        }
+    }
+
+    #[test]
     fn a_plain_if_does_not_swallow_the_next_statement() {
         // `if x { … }` ends at its body. The statement after it is live.
         for stmt in [
@@ -6197,6 +6247,9 @@ mod tests {
     fn a_feature_that_no_crate_declares_is_reported() {
         assert_eq!(unknown_in(&["admin", "typo"]), vec!["typo".to_owned()]);
         assert_eq!(unknown_in(&["a,b"]), vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(unknown_in(&["a b"]), vec!["a".to_owned(), "b".to_owned()]);
+        // A repeated name is reported once.
+        assert_eq!(unknown_in(&["typo", "typo"]), vec!["typo".to_owned()]);
     }
 
     #[test]
