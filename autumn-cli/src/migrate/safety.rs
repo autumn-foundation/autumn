@@ -11,20 +11,19 @@
 //! grants. A statement the backend cannot parse is
 //! [`RiskLevel::Unsupported`].
 //!
+//! # Lexing
+//!
+//! One tokenizer reads the SQL for the backend (see [`quoted_len`]). A `;`,
+//! `--` or `/*` in a comment, literal or quoted identifier is text. Postgres
+//! quotes are `'..'`, `E'..'`, `".."` and `$tag$..$tag$`. `SQLite` quotes are
+//! `'..'`, `".."`, `` `..` `` and `[..]`.
+//!
 //! # Known limitations
 //!
-//! - Statement splitting uses `;` as the delimiter with awareness of
-//!   `PostgreSQL` dollar-quoted blocks (`$$…$$` and `$tag$…$tag$`), `--` line
-//!   comments, and single-quoted string literals (including the standard
-//!   `''`-doubled escaped quote). Semicolons inside any of these are kept
-//!   intact so they do not produce spurious statement fragments -- e.g. a
-//!   `DEFAULT 'hello; world'` clause splits as one statement, not two.
-//! - A `--` comment, a `'` literal and a dollar-quoted block each hide
-//!   `--`, `/*` and `;` inside them. A `--`, `/*` or `;` inside a double-quoted
-//!   identifier is not handled, and an unclosed `/*` there hides the rest of
-//!   the file. The `E'\''` escape is not handled either.
 //! - Block comments do not nest. The first `*/` ends the comment. A nested
 //!   comment shows more SQL, never less.
+//! - In a plain `'..'` literal, `\` does not escape a quote. This is Postgres
+//!   with `standard_conforming_strings = on`, the default since 9.1.
 
 use std::fmt;
 
@@ -242,39 +241,30 @@ pub fn split_statements(backend: DatabaseBackend, sql: &str) -> Vec<String> {
 /// Split a normalized `ALTER TABLE` statement into individual subcommand strings.
 ///
 /// Strips the `alter table <name>` prefix and splits the remaining text on
-/// commas outside parentheses, trimming each segment. With `quote_aware`, a
-/// comma in quoted text does not split. Only `SQLite` input sets it. The
-/// scanner does not know Postgres dollar quotes or `E'..\'` escapes, and a
-/// wrong guess there could merge a `DROP COLUMN` into its neighbour.
-fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
+/// commas outside parentheses, trimming each segment. A comma in a quoted span
+/// of the `backend` dialect does not split.
+fn alter_table_subcommands(backend: DatabaseBackend, normalized: &str) -> Vec<&str> {
     let after_prefix = normalized.strip_prefix("alter table ").unwrap_or("");
     let subcommands_start = after_prefix.find(' ').map_or(after_prefix.len(), |i| i + 1);
     let subcommands = &after_prefix[subcommands_start..];
 
     let mut result = Vec::new();
     let mut depth: i32 = 0;
-    let mut quote: Option<char> = None;
     let mut start = 0;
-    for (i, c) in subcommands.char_indices() {
-        // In quoted text, only the closing quote counts. A doubled quote
-        // closes and reopens the text.
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
+    let mut i = 0;
+    for (token, text) in tokens(backend, subcommands) {
+        if token == Token::Plain {
+            match text {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                "," if depth == 0 => {
+                    result.push(subcommands[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
             }
-            continue;
         }
-        match c {
-            '\'' | '"' | '`' if quote_aware => quote = Some(c),
-            '[' if quote_aware => quote = Some(']'),
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                result.push(subcommands[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
+        i += text.len();
     }
     let last = subcommands[start..].trim();
     if !last.is_empty() {
@@ -315,7 +305,7 @@ fn canonical_sqlite_alter(normalized: &str) -> String {
     if !normalized.starts_with("alter table ") {
         return normalized.to_owned();
     }
-    let subcommands = alter_table_subcommands(normalized, true);
+    let subcommands = alter_table_subcommands(DatabaseBackend::Sqlite, normalized);
     if subcommands.is_empty() {
         return normalized.to_owned();
     }
@@ -758,17 +748,16 @@ fn tokens(backend: DatabaseBackend, sql: &str) -> impl Iterator<Item = (Token, &
 /// when `rest` is empty. `prev` is the character before `rest`.
 fn token_at(backend: DatabaseBackend, rest: &str, prev: Option<char>) -> Option<(Token, usize)> {
     let first = rest.chars().next()?;
-    Some(if let Some(len) = line_comment_len(rest) {
-        (Token::LineComment, len)
-    } else if let Some(body) = rest.strip_prefix("/*") {
+    if let Some(len) = line_comment_len(rest) {
+        return Some((Token::LineComment, len));
+    }
+    if let Some(body) = rest.strip_prefix("/*") {
         // An unclosed comment runs to the end.
         let len = body.find("*/").map_or(rest.len(), |p| p + 4);
-        (Token::BlockComment, len)
-    } else if let Some(len) = quoted_len(backend, rest, prev) {
-        (Token::Quoted, len)
-    } else {
-        (Token::Plain, first.len_utf8())
-    })
+        return Some((Token::BlockComment, len));
+    }
+    let plain = (Token::Plain, first.len_utf8());
+    Some(quoted_len(backend, rest, prev).map_or(plain, |len| (Token::Quoted, len)))
 }
 
 /// Byte length of the quoted span at the start of `rest`, or `None`. `prev` is
@@ -776,12 +765,12 @@ fn token_at(backend: DatabaseBackend, rest: &str, prev: Option<char>) -> Option<
 ///
 /// The span forms follow the dialect:
 ///
-/// | Form | Escape | Postgres | `SQLite` |
+/// | Form | Escaped quote | Postgres | `SQLite` |
 /// | --- | --- | --- | --- |
-/// | `'..'` literal | `''` | yes | yes |
-/// | `E'..'` literal | `''` and `\'` | yes | no |
-/// | `".."` identifier | `""` | yes | yes |
-/// | `` `..` `` identifier | ` `` ` | no | yes |
+/// | `'..'` literal | doubled | yes | yes |
+/// | `E'..'` literal | doubled or `\'` | yes | no |
+/// | `".."` identifier | doubled | yes | yes |
+/// | `` `..` `` identifier | doubled | no | yes |
 /// | `[..]` identifier | none | no | yes |
 /// | `$tag$..$tag$` block | none | yes | no |
 ///
@@ -1101,7 +1090,7 @@ fn classify_statement(
     // spelling, ADD/DROP CONSTRAINT, SET SCHEMA, OWNER TO — is a parse error, so
     // one rule covers them all rather than a list that can fall behind Postgres.
     if sqlite && normalized.starts_with("alter table") {
-        let subcommands = alter_table_subcommands(normalized, sqlite);
+        let subcommands = alter_table_subcommands(backend, normalized);
         // SQLite takes exactly one action per ALTER TABLE; Postgres allows a
         // comma-separated list.
         if subcommands.len() > 1 {
@@ -1160,7 +1149,7 @@ fn classify_statement(
     //     function per-row and cannot use the fast constant-default path (PG 11+),
     //     so the table is still rewritten under the exclusive lock.
     if normalized.starts_with("alter table") {
-        for subcommand in alter_table_subcommands(normalized, sqlite) {
+        for subcommand in alter_table_subcommands(backend, normalized) {
             if subcommand.starts_with("add column ") && subcommand.contains("not null") {
                 // SQLite drops a literal `DEFAULT NULL` before applying the
                 // NOT NULL check, so it is not a default there.
@@ -1235,7 +1224,7 @@ fn classify_statement(
     // ADD COLUMN with inline UNIQUE — implicitly builds a non-concurrent unique index
     // ADD COLUMN with inline REFERENCES — scans existing rows to validate the FK
     if normalized.starts_with("alter table") {
-        for subcommand in alter_table_subcommands(normalized, sqlite) {
+        for subcommand in alter_table_subcommands(backend, normalized) {
             if !subcommand.starts_with("add column ") {
                 continue;
             }
@@ -1330,7 +1319,7 @@ fn classify_statement(
     // prevents a known-safe subcommand (e.g. ADD COLUMN) from hiding an unknown one
     // (e.g. DROP CONSTRAINT) in the same multi-action ALTER TABLE.
     if normalized.starts_with("alter table") {
-        let subcommands = alter_table_subcommands(normalized, sqlite);
+        let subcommands = alter_table_subcommands(backend, normalized);
         let all_known = subcommands
             .iter()
             .all(|s| is_known_alter_subcommand(backend, s));
@@ -2673,6 +2662,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn comma_in_quoted_span_splits_no_alter_subcommand() {
+        // A `,` in a literal or identifier is text on both backends.
+        for (backend, sql) in [
+            (
+                DatabaseBackend::Postgres,
+                r#"ALTER TABLE t ADD COLUMN "a,b" text DEFAULT 'x, y', DROP COLUMN c;"#,
+            ),
+            (
+                DatabaseBackend::Postgres,
+                r"ALTER TABLE t ADD COLUMN a text DEFAULT E'\', y', DROP COLUMN c;",
+            ),
+            (
+                DatabaseBackend::Postgres,
+                "ALTER TABLE t ADD COLUMN a text DEFAULT $$x, y$$, DROP COLUMN c;",
+            ),
+            (DatabaseBackend::Sqlite, "ALTER TABLE t DROP COLUMN [a,b];"),
+        ] {
+            assert_eq!(ops(backend, sql), ["DROP COLUMN"], "{backend:?} {sql}");
+        }
+    }
+
     mod quoted_identifier_proptest {
         use super::*;
         use proptest::prelude::*;
@@ -3413,31 +3424,36 @@ mod tests {
 
     #[test]
     fn alter_table_subcommands_ignores_a_comma_in_a_string_literal() {
-        let subs =
-            alter_table_subcommands("alter table posts add column l text default 'a,b'", true);
+        let subs = alter_table_subcommands(
+            DatabaseBackend::Sqlite,
+            "alter table posts add column l text default 'a,b'",
+        );
         assert_eq!(subs, ["add column l text default 'a,b'"]);
         let subs = alter_table_subcommands(
+            DatabaseBackend::Sqlite,
             "alter table posts add column l text default 'it''s,x'",
-            true,
         );
         assert_eq!(subs.len(), 1, "{subs:?}");
-        let subs = alter_table_subcommands("alter table posts drop column \"a,b\"", true);
+        let subs = alter_table_subcommands(
+            DatabaseBackend::Sqlite,
+            "alter table posts drop column \"a,b\"",
+        );
         assert_eq!(subs.len(), 1, "{subs:?}");
     }
 
     #[test]
     fn alter_table_subcommands_splits_after_an_escaped_quote() {
         let subs = alter_table_subcommands(
+            DatabaseBackend::Sqlite,
             "alter table posts add column a text default 'it''s', add column b text",
-            true,
         );
         assert_eq!(
             subs,
             ["add column a text default 'it''s'", "add column b text"]
         );
         let subs = alter_table_subcommands(
+            DatabaseBackend::Sqlite,
             "alter table posts add column a text default 'it''s,x'",
-            true,
         );
         assert_eq!(subs, ["add column a text default 'it''s,x'"]);
     }
@@ -3448,7 +3464,11 @@ mod tests {
             "alter table posts drop `a,b`",
             "alter table posts drop [a,b]",
         ] {
-            assert_eq!(alter_table_subcommands(sql, true).len(), 1, "{sql}");
+            assert_eq!(
+                alter_table_subcommands(DatabaseBackend::Sqlite, sql).len(),
+                1,
+                "{sql}"
+            );
         }
     }
 
