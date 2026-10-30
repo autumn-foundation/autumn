@@ -3515,6 +3515,33 @@ mod tests {
     }
 
     #[test]
+    fn normalize_handles_unclosed_and_escaped_literals() {
+        assert_eq!(normalize_statement("SELECT $Tag$ ABC"), "select $Tag$ abc");
+        assert_eq!(normalize_statement("SELECT $Tag$"), "select $Tag$");
+        assert_eq!(normalize_statement("SELECT E'A''B'"), "select e'a''b'");
+        assert_eq!(
+            normalize_statement("SELECT E'A\\'B' X"),
+            "select e'a\\'b' x"
+        );
+        assert_eq!(normalize_statement("SELECT E'AB"), "select e'ab");
+    }
+
+    #[test]
+    fn pg_split_handles_unclosed_and_escaped_names_and_e_strings() {
+        assert_eq!(
+            pg_subs(r#"alter table t drop column "a, drop column b"#).len(),
+            1
+        );
+        assert!(pg_subs(r#"alter table "t, add column a int"#).is_empty());
+        let subs = pg_subs("alter table t add column a text default e'x''(', drop column b");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        assert_eq!(
+            pg_subs("alter table t add column a text default e'x(, y").len(),
+            1
+        );
+    }
+
+    #[test]
     fn normalize_keeps_the_case_of_dollar_tags_only() {
         assert_eq!(
             normalize_statement("SELECT $Tag$ ABC $tag$ $$ X $$"),
