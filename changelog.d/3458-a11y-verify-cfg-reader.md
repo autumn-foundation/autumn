@@ -9,4 +9,4 @@
 ### Changed
 
 - **a11y:** `autumn a11y verify` prints a warning when a `--features` name is
-  declared by no scanned crate (issue #3458).
+  declared by no scanned crate (issue #3458). [no-plugin]
