@@ -191,6 +191,11 @@ impl Output {
         }
     }
 
+    /// The bytes that can still be written.
+    pub fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.written.get())
+    }
+
     /// Fail if `extra` more bytes would go over the limit. Writes nothing.
     ///
     /// Call this before an allocation whose result is written later, such as

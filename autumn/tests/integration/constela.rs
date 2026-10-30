@@ -702,6 +702,27 @@ fn a_markdown_node_renders_through_the_user_content_sanitizer() {
     assert!(rendered.contains("<strong>bold</strong>"), "{rendered}");
 }
 
+/// The source fits the output limit, but its HTML does not. The render must
+/// fail with a limit diagnostic, and must stop while it writes the HTML.
+#[cfg(feature = "markdown")]
+#[test]
+fn a_markdown_node_whose_html_is_over_the_output_limit_is_refused() {
+    let source = "*a* ".repeat(500);
+    let document = document(&view(&format!(
+        r#"{{"kind":"markdown","content":{{"expr":"lit","value":"{source}"}}}}"#
+    )));
+    let ctx = RenderContext {
+        state: document.initial_state(),
+        limits: RenderLimits {
+            max_output_bytes: 4096,
+            ..RenderLimits::default()
+        },
+        ..RenderContext::default()
+    };
+    let err = document.render(&ctx).expect_err("HTML is over the limit");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
 /// The whole reason the `markdown` node routes through
 /// `markdown::render_user_content` rather than a plain Markdown renderer: its
 /// source is a document a model wrote, so raw HTML in it must not survive.
