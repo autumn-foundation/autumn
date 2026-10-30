@@ -2394,6 +2394,12 @@ jobs:
           cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
             --lib -- idempotency:: | tee "$RUNNER_TEMP/idempotency-sqlite-cov.log"
           grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/idempotency-sqlite-cov.log"
+          # Issue #3208: the SQLite tracking store's status-contract test is a
+          # lib unit test. No other lane runs it with `sqlite`. Same features,
+          # so no rebuild. Check the count.
+          cargo llvm-cov --no-report -p autumn-web --features "sqlite,test-support" \
+            --lib -- job_tracking:: | tee "$RUNNER_TEMP/job-tracking-sqlite-cov.log"
+          grep -Eq "test result: ok\. [1-9][0-9]* passed" "$RUNNER_TEMP/job-tracking-sqlite-cov.log"
           # The fleet's HTTP suite: `ShardedDb`, sharded repositories and fan-out
           # resolving to fleet databases (the fleet arms of `sharding.rs`).
           # Shares the build above (same package and features).
