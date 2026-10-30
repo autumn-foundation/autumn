@@ -19,9 +19,10 @@
 //!   `''`-doubled escaped quote). Semicolons inside any of these are kept
 //!   intact so they do not produce spurious statement fragments -- e.g. a
 //!   `DEFAULT 'hello; world'` clause splits as one statement, not two.
-//! - A `--` comment, a `'` literal, a `"`, backtick or `[..]` identifier and a
-//!   dollar-quoted block each hide `--`, `/*` and `;` inside them. The `E'\''` escape is
-//!   not handled.
+//! - A `--` comment, a `'` literal and a dollar-quoted block each hide
+//!   `--`, `/*` and `;` inside them. A `--`, `/*` or `;` inside a double-quoted
+//!   identifier is not handled, and an unclosed `/*` there hides the rest of
+//!   the file. The `E'\''` escape is not handled either.
 //! - Block comments do not nest. The first `*/` ends the comment. A nested
 //!   comment shows more SQL, never less.
 
@@ -748,16 +749,15 @@ fn has_inline_unique_constraint(subcommand: &str) -> bool {
     subcommand.contains(" unique ") || subcommand.ends_with(" unique")
 }
 
-/// Byte length of the `'`, `"` or backtick span at the start of `rest`.
+/// Byte length of the single-quoted literal at the start of `rest`.
 ///
-/// `rest` must start with the quote. A doubled quote is an escaped quote. An
-/// unclosed span runs to the end of `rest`.
+/// `rest` must start with `'`. A doubled `''` is an escaped quote. An unclosed
+/// literal runs to the end of `rest`.
 fn quote_len(rest: &str) -> usize {
-    let q = rest.chars().next().unwrap_or('\'');
     let mut j = 1;
-    while let Some(rel) = rest[j..].find(q) {
+    while let Some(rel) = rest[j..].find('\'') {
         let abs = j + rel;
-        if rest[abs + 1..].starts_with(q) {
+        if rest[abs + 1..].starts_with('\'') {
             j = abs + 2;
         } else {
             return abs + 1;
@@ -784,19 +784,9 @@ fn dollar_quote_len(rest: &str) -> Option<usize> {
     )
 }
 
-/// Byte length of the quoted span at the start of `rest`, or `None`.
-///
-/// A span is a `'` literal, a `"` or backtick identifier, or a `SQLite`
-/// `[name]` identifier. A bracket span ends at the first `]`. It must hold no
-/// `'`, `;` or newline, so `Postgres` array text such as `ARRAY['a]']` stays
-/// a normal literal.
+/// Byte length of the `'` literal at the start of `rest`, or `None`.
 fn quoted_len(rest: &str) -> Option<usize> {
-    if rest.starts_with(['\'', '"', '`']) {
-        return Some(quote_len(rest));
-    }
-    let body = rest.strip_prefix('[')?;
-    let end = body.find(']')?;
-    (!body[..end].contains(['\'', ';', '\n'])).then_some(end + 2)
+    rest.starts_with('\'').then(|| quote_len(rest))
 }
 
 /// Byte length of the line comment at the start of `rest`, or `None`. The
@@ -837,7 +827,7 @@ pub fn strip_block_comments(sql: &str) -> String {
 }
 
 /// Remove `--` line comments from `sql`, keeping newlines. A `--` inside a
-/// quoted span or a dollar-quoted block is text, not a comment.
+/// single-quoted literal or a dollar-quoted block is text, not a comment.
 fn strip_line_comments(sql: &str) -> String {
     let mut result = String::with_capacity(sql.len());
     let mut i = 0;
@@ -2395,21 +2385,6 @@ mod tests {
     }
 
     #[test]
-    fn double_quoted_identifier_hides_block_open_and_quote() {
-        for sql in [
-            "CREATE TABLE \"a/*b\" (id int);\nDROP TABLE x;",
-            "CREATE TABLE \"it's\" (a int); DROP TABLE t;",
-            "CREATE TABLE \"a--b\" (id int); DROP TABLE t;",
-        ] {
-            let f = classify_sql(sql);
-            assert!(
-                f.iter().any(|f| f.risk == RiskLevel::Destructive),
-                "{sql}: {f:?}"
-            );
-        }
-    }
-
-    #[test]
     fn concurrent_index_scan_strips_block_comments_first() {
         assert!(contains_concurrent_index(
             "CREATE INDEX /* a; b */ CONCURRENTLY idx ON t (c);"
@@ -2487,27 +2462,31 @@ mod tests {
     }
 
     #[test]
-    fn quote_inside_sqlite_identifier_hides_nothing() {
-        for sql in [
-            "CREATE TABLE `a\"b` (id int); DROP TABLE t;",
-            "CREATE TABLE [a\"b] (id int); DROP TABLE t;",
+    fn identifier_quoting_forms_do_not_hide_later_statements() {
+        for (backend, sql) in [
+            (
+                DatabaseBackend::Postgres,
+                "SELECT ARRAY[$$]$$]; DROP TABLE t;",
+            ),
+            (
+                DatabaseBackend::Postgres,
+                "SELECT ARRAY['a]']; DROP TABLE t;",
+            ),
+            (
+                DatabaseBackend::Sqlite,
+                "CREATE TABLE `a\"b` (id int); DROP TABLE t;",
+            ),
+            (
+                DatabaseBackend::Sqlite,
+                "CREATE TABLE [a\"b] (id int); DROP TABLE t;",
+            ),
         ] {
-            let f = classify_sql_for(DatabaseBackend::Sqlite, sql);
+            let f = classify_sql_for(backend, sql);
             assert!(
                 f.iter().any(|f| f.risk == RiskLevel::Destructive),
                 "{sql}: {f:?}"
             );
         }
-    }
-
-    #[test]
-    fn bracket_with_literal_is_not_an_identifier() {
-        let sql = "SELECT ARRAY['a]']; DROP TABLE t;";
-        assert!(
-            classify_sql(sql)
-                .iter()
-                .any(|f| f.risk == RiskLevel::Destructive)
-        );
     }
 
     #[test]
