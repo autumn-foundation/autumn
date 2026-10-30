@@ -81,6 +81,9 @@ let price: Decimal = "1234.5".parse().unwrap();
 assert_eq!(opts.format(price).into_string(), "€1.234,50");
 ```
 
+`precision` accepts up to 28 places, the most a `Decimal` can hold. A larger
+value is treated as 28.
+
 ## Pluralize and truncate escape hatches
 
 `pluralize` covers common English rules (sibilant endings, consonant+`y`,
