@@ -20,7 +20,7 @@ function = "autumn_web::job::pg_insert_job"
 [plan]
 status = "ok"
 method = "EXPLAIN (GENERIC_PLAN, COSTS OFF)"
-planned_on = "schema mirror of a Postgres 11 test database"
+planned_on = "test database, Postgres 16"
 generic = [
   "Insert on autumn_jobs",
   "  Conflict Resolution: NOTHING",

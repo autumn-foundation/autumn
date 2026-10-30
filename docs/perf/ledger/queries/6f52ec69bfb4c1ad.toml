@@ -8,7 +8,7 @@ tables = [
   "autumn_repository_commit_hooks",
 ]
 indexes = [
-  "autumn_repository_commit_hooks_pkey",
+  "idx_autumn_repository_commit_hooks_stale_recovery",
 ]
 findings = []
 notes = ""
@@ -23,13 +23,11 @@ method = "EXPLAIN (GENERIC_PLAN, COSTS OFF)"
 planned_on = "schema mirror of a Postgres 11 test database"
 generic = [
   "Update on autumn_repository_commit_hooks",
-  "  ->  Index Scan using autumn_repository_commit_hooks_pkey on autumn_repository_commit_hooks",
-  "        Index Cond: (id = $1)",
-  "        Filter: ((claimed_by = $2) AND (status = 'running'::text))",
+  "  ->  Index Scan using idx_autumn_repository_commit_hooks_stale_recovery on autumn_repository_commit_hooks",
+  "        Filter: ((id = $1) AND (claimed_by = $2) AND (status = 'running'::text))",
 ]
 index_forced = [
   "Update on autumn_repository_commit_hooks",
-  "  ->  Index Scan using autumn_repository_commit_hooks_pkey on autumn_repository_commit_hooks",
-  "        Index Cond: (id = $1)",
-  "        Filter: ((claimed_by = $2) AND (status = 'running'::text))",
+  "  ->  Index Scan using idx_autumn_repository_commit_hooks_stale_recovery on autumn_repository_commit_hooks",
+  "        Filter: ((id = $1) AND (claimed_by = $2) AND (status = 'running'::text))",
 ]

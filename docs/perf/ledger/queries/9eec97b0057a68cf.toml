@@ -10,6 +10,10 @@ findings = []
 notes = ""
 
 [[site]]
+file = "autumn/src/app.rs"
+function = "autumn_web::app::run_shard_map_guard"
+
+[[site]]
 file = "autumn/src/data_retention.rs"
 function = "autumn_web::data_retention::sweep_postgres"
 
@@ -128,6 +132,14 @@ function = "autumn_web::repository_commit_hooks::pg_claim_next_repository_commit
 [[site]]
 file = "autumn/src/repository_commit_hooks.rs"
 function = "autumn_web::repository_commit_hooks::recover_stale_repository_commit_hooks"
+
+[[site]]
+file = "autumn/src/scheduler.rs"
+function = "autumn_web::scheduler::PostgresTickRow::free"
+
+[[site]]
+file = "autumn/src/scheduler.rs"
+function = "autumn_web::scheduler::PostgresTickSchedulerCoordinator::try_acquire_for_period"
 
 [[site]]
 file = "autumn/src/sharding.rs"

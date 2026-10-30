@@ -6,10 +6,9 @@ backend = "postgres"
 statement = "SELECT queue, name, COUNT(*) AS count, CAST(EXTRACT(EPOCH FROM (NOW() - MIN(run_at))) * ? AS BIGINT) AS oldest_wait_ms FROM autumn_jobs WHERE status = ? AND run_at <= NOW() GROUP BY queue, name"
 tables = [
   "autumn_jobs",
+  "idx_autumn_jobs_enqueued_dashboard",
 ]
-indexes = [
-  "idx_autumn_jobs_queue_name_ready",
-]
+indexes = []
 findings = []
 notes = ""
 
@@ -20,16 +19,20 @@ function = "autumn_web::job::pg_update_queue_depth_gauges"
 [plan]
 status = "ok"
 method = "EXPLAIN (GENERIC_PLAN, COSTS OFF)"
-planned_on = "schema mirror of a Postgres 11 test database"
+planned_on = "test database, Postgres 16"
 generic = [
-  "GroupAggregate",
+  "HashAggregate",
   "  Group Key: queue, name",
-  "  ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on autumn_jobs",
-  "        Index Cond: (run_at <= now())",
+  "  ->  Bitmap Heap Scan on autumn_jobs",
+  "        Recheck Cond: (status = 'enqueued'::text)",
+  "        Filter: (run_at <= now())",
+  "        ->  Bitmap Index Scan on idx_autumn_jobs_enqueued_dashboard",
 ]
 index_forced = [
-  "GroupAggregate",
+  "HashAggregate",
   "  Group Key: queue, name",
-  "  ->  Index Only Scan using idx_autumn_jobs_queue_name_ready on autumn_jobs",
-  "        Index Cond: (run_at <= now())",
+  "  ->  Bitmap Heap Scan on autumn_jobs",
+  "        Recheck Cond: (status = 'enqueued'::text)",
+  "        Filter: (run_at <= now())",
+  "        ->  Bitmap Index Scan on idx_autumn_jobs_enqueued_dashboard",
 ]

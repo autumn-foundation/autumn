@@ -9,11 +9,9 @@ tables = [
 ]
 indexes = [
   "autumn_repository_commit_hooks_pkey",
+  "idx_autumn_repository_commit_hooks_ready",
 ]
-findings = [
-  "full-scan: autumn_repository_commit_hooks (no index serves it, even with enable_seqscan = off)",
-  "sort: no index provides the order",
-]
+findings = []
 notes = ""
 
 [[site]]
@@ -29,10 +27,9 @@ generic = [
   "  InitPlan 1 (returns $1)",
   "    ->  Limit",
   "          ->  LockRows",
-  "                ->  Sort",
-  "                      Sort Key: autumn_repository_commit_hooks_1.run_at, autumn_repository_commit_hooks_1.enqueued_at",
-  "                      ->  Seq Scan on autumn_repository_commit_hooks autumn_repository_commit_hooks_1",
-  "                            Filter: ((status = 'enqueued'::text) AND (run_at <= now()) AND (handler_key = ANY ($1)))",
+  "                ->  Index Scan using idx_autumn_repository_commit_hooks_ready on autumn_repository_commit_hooks autumn_repository_commit_hooks_1",
+  "                      Index Cond: (run_at <= now())",
+  "                      Filter: ((status = 'enqueued'::text) AND (handler_key = ANY ($1)))",
   "  ->  Index Scan using autumn_repository_commit_hooks_pkey on autumn_repository_commit_hooks",
   "        Index Cond: (id = $1)",
 ]
@@ -41,10 +38,9 @@ index_forced = [
   "  InitPlan 1 (returns $1)",
   "    ->  Limit",
   "          ->  LockRows",
-  "                ->  Sort",
-  "                      Sort Key: autumn_repository_commit_hooks_1.run_at, autumn_repository_commit_hooks_1.enqueued_at",
-  "                      ->  Seq Scan on autumn_repository_commit_hooks autumn_repository_commit_hooks_1",
-  "                            Filter: ((status = 'enqueued'::text) AND (run_at <= now()) AND (handler_key = ANY ($1)))",
+  "                ->  Index Scan using idx_autumn_repository_commit_hooks_ready on autumn_repository_commit_hooks autumn_repository_commit_hooks_1",
+  "                      Index Cond: (run_at <= now())",
+  "                      Filter: ((status = 'enqueued'::text) AND (handler_key = ANY ($1)))",
   "  ->  Index Scan using autumn_repository_commit_hooks_pkey on autumn_repository_commit_hooks",
   "        Index Cond: (id = $1)",
 ]
