@@ -10,6 +10,16 @@ version, folding the changelog fragments in, dating the changelog section,
 updating install instructions) is a separate, deliberate step the user asks for
 by name.
 
+## Security defaults, not security blocks
+
+Autumn is a framework. Make the safe path the default. Do not block the app
+from a choice it makes on purpose.
+
+- Filter and check what the framework or a plugin writes itself.
+- Pass through what the app gives explicitly (for example `FieldOptions`
+  `hx-on`). The app owns its CSP.
+- An unsafe path is an explicit opt-in with a clear name. It is never removed.
+
 ## Performance agents (Bolt)
 
 **Do not profile or optimize the `request_pipeline` workload**
