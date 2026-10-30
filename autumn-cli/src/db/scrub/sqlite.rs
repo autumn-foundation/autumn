@@ -221,6 +221,35 @@ fn token_expr_from(row_key: &str, column: &str, unique: bool) -> String {
     }
 }
 
+/// [`replacement_expr`] for a token that may be unavailable.
+///
+/// A constant strategy such as `null` never reads the token, so it works on a
+/// table with no usable row id. A strategy that reads the token returns the
+/// token error.
+///
+/// # Errors
+///
+/// The token error when the strategy reads the token, else as
+/// [`replacement_expr`].
+pub(super) fn replacement_for(
+    strategy: Strategy,
+    column: &Column,
+    token: Result<String, ScrubError>,
+) -> Result<String, ScrubError> {
+    match token {
+        Ok(token) => replacement_expr(strategy, column, &token),
+        Err(error) => {
+            const MARK: &str = "\u{0}token\u{0}";
+            let expr = replacement_expr(strategy, column, MARK)?;
+            if expr.contains(MARK) {
+                Err(error)
+            } else {
+                Ok(expr)
+            }
+        }
+    }
+}
+
 /// Pick a strategy from the column type alone (`#[encrypted]`, GDPR anonymize).
 ///
 /// # Errors

@@ -1689,8 +1689,11 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                     let token = token_expr(table, &column.name, unique);
                     replacement_expr(plan.strategy, column, &token, unique)
                 }
-                Dialect::Sqlite => sqlite::token_expr(table, inputs.facts, &column.name, unique)
-                    .and_then(|token| sqlite::replacement_expr(plan.strategy, column, &token)),
+                Dialect::Sqlite => sqlite::replacement_for(
+                    plan.strategy,
+                    column,
+                    sqlite::token_expr(table, inputs.facts, &column.name, unique),
+                ),
             }
             .map_err(|e| qualify(e, &qualified))?;
             assignments.push(assignment(column, &value, plan.strategy));
@@ -9797,6 +9800,42 @@ mod tests {
         assert!(sql.contains("autumn_sha256("), "{sql}");
         assert!(sql.contains("THEN 'rowid:' || oid"), "{sql}");
         assert!(plan.tables[0].row_key.is_empty(), "no encrypted rewrite");
+    }
+
+    #[test]
+    fn sqlite_constant_strategies_need_no_rowid_name() {
+        let config = parse_config_str(
+            "[defaults]\nsafe_columns = [\"id\", \"email\", \"created_at\", \"full_name\"]\n\
+             [tables.users.pii]\nbio = \"null\"",
+        )
+        .unwrap();
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &shadowed_rowid_facts(),
+        )
+        .expect("NULL reads no row id");
+        assert!(sql_of(&plan, "users").contains("NULL"));
+        // A strategy that reads the token still needs one.
+        let config = parse_config_str(
+            "[defaults]\nsafe_columns = [\"id\", \"email\", \"created_at\", \"full_name\"]\n\
+             [tables.users.pii]\nbio = \"redact\"",
+        )
+        .unwrap();
+        let err = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &shadowed_rowid_facts(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ScrubError::UnsupportedOnSqlite { .. }),
+            "{err}"
+        );
     }
 
     #[test]
