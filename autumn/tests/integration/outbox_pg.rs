@@ -241,6 +241,183 @@ mod docker {
         .unwrap();
         outbox::ensure_schema(&single).await.unwrap();
     }
+
+    /// Sent rows that the purge has not deleted yet. Their `seq` is lower than
+    /// the `seq` of each pending row.
+    const SENT_ROWS: i64 = 50_000;
+
+    /// Pending rows in backoff, after the edge rows. With these rows, Postgres 11
+    /// walks `autumn_outbox_pkey` when the claim index is missing. Without them,
+    /// it sorts the few pending rows, and the test passes with no claim index.
+    const WAITING_ROWS: i64 = 500;
+
+    #[derive(diesel::QueryableByName, PartialEq, Eq)]
+    struct OutboxStats {
+        /// Table rows that scans read: `seq_tup_read` plus `idx_tup_fetch`.
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        heap_reads: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        inserts: i64,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        updates: i64,
+    }
+
+    /// The counters of `autumn_outbox`, when `ready` accepts them and two
+    /// samples in a row are equal. A flush can send only part of the counters.
+    ///
+    /// Postgres 11 sends the counters of a connection at the end of a
+    /// transaction, at most once in 500 ms. Thus this helper waits 600 ms, then
+    /// runs a query on each connection of `pool` (`max_size` 2). The query sends
+    /// the counters of that connection.
+    async fn outbox_stats(pool: &PgPool, ready: impl Fn(&OutboxStats) -> bool) -> OutboxStats {
+        use diesel_async::RunQueryDsl as _;
+
+        let mut last = None;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let (first, second) = tokio::join!(pool.get(), pool.get());
+            let (mut first, mut second) = (first.unwrap(), second.unwrap());
+            diesel::sql_query("SELECT 1")
+                .execute(&mut *second)
+                .await
+                .unwrap();
+            drop(second);
+            diesel::sql_query("SELECT 1")
+                .execute(&mut *first)
+                .await
+                .unwrap();
+            let stats = diesel::sql_query(
+                "SELECT seq_tup_read + COALESCE(idx_tup_fetch, 0) AS heap_reads, \
+                 n_tup_ins AS inserts, n_tup_upd AS updates \
+                 FROM pg_stat_user_tables WHERE relname = 'autumn_outbox'",
+            )
+            .get_result::<OutboxStats>(&mut *first)
+            .await
+            .unwrap();
+            if ready(&stats) && last.as_ref() == Some(&stats) {
+                return stats;
+            }
+            last = Some(stats);
+        }
+        panic!("the counters of autumn_outbox did not arrive");
+    }
+
+    /// The claim reads the pending rows only, not the sent rows that the purge
+    /// has not deleted yet. It takes the edge rows that the fixture marks
+    /// (#3203).
+    #[tokio::test]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn pg_outbox_claim_reads_pending_rows_only() {
+        use chrono::TimeZone as _;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::{
+            AsyncConnection as _, AsyncPgConnection, RunQueryDsl as _, SimpleAsyncConnection as _,
+        };
+
+        #[derive(diesel::QueryableByName)]
+        struct Id {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            id: String,
+        }
+
+        // A database of its own: rows of other tests change the counters.
+        // Do not use the shared pool: a connection stops with the runtime
+        // that opened it, and other tests can get it from the pool.
+        let db = autumn_web::test::TestDb::shared().await;
+        let mut admin = AsyncPgConnection::establish(db.url()).await.unwrap();
+        admin
+            .batch_execute("DROP DATABASE IF EXISTS outbox_claim_cost")
+            .await
+            .unwrap();
+        admin
+            .batch_execute("CREATE DATABASE outbox_claim_cost")
+            .await
+            .unwrap();
+        drop(admin);
+        let (server, _) = db.url().rsplit_once('/').unwrap();
+        let pool: PgPool = Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            format!("{server}/outbox_claim_cost"),
+        ))
+        .max_size(2)
+        .build()
+        .unwrap();
+        outbox::ensure_schema(&pool).await.unwrap();
+
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let ms = now.timestamp_millis();
+        let mut conn = pool.get().await.unwrap();
+        conn.batch_execute(&format!(
+            "INSERT INTO autumn_outbox \
+             (id, aggregate, topic, payload, created_at, available_at, dispatched_at) \
+             SELECT 'sent-' || g, 'sent-' || (g % 500), 't', '{{}}', {ms}, {ms}, {ms} \
+             FROM generate_series(1, {SENT_ROWS}) g"
+        ))
+        .await
+        .unwrap();
+        conn.batch_execute(
+            &include_str!("../fixtures/outbox/claim_edges.sql").replace("__NOW__", &ms.to_string()),
+        )
+        .await
+        .unwrap();
+        conn.batch_execute(&format!(
+            "INSERT INTO autumn_outbox (id, aggregate, topic, payload, created_at, available_at) \
+             SELECT 'waiting-' || g, 'waiting-' || g, 't', '{{}}', {ms}, {ms} + 3600000 \
+             FROM generate_series(1, {WAITING_ROWS}) g"
+        ))
+        .await
+        .unwrap();
+        conn.batch_execute("ANALYZE autumn_outbox").await.unwrap();
+        let expected: Vec<String> = diesel::sql_query(
+            "SELECT id FROM autumn_outbox WHERE payload = '{\"claim\":true}' ORDER BY seq",
+        )
+        .load::<Id>(&mut *conn)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+        assert_eq!(expected.len(), 5, "the fixture marks 5 rows");
+        drop(conn);
+        let before = outbox_stats(&pool, |stats| stats.inserts >= SENT_ROWS + WAITING_ROWS).await;
+
+        let log = Log::default();
+        let state = TestApp::new()
+            .with_db(pool.clone())
+            .with_clock(autumn_web::time::FixedClock::at(now))
+            .with_outbox(OutboxConfig::default())
+            .outbox_handler("t", {
+                let log = log.clone();
+                move |_, message: OutboxMessage| {
+                    let log = log.clone();
+                    async move {
+                        log.lock().unwrap().push((message.aggregate, message.id));
+                        Ok::<_, AutumnError>(())
+                    }
+                }
+            })
+            .build()
+            .state()
+            .clone();
+        assert_eq!(outbox::drain(&state, 100).await.unwrap(), expected.len());
+        let sent: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect();
+        assert_eq!(sent, expected);
+
+        // Each sent message has two updates: the claim and the mark.
+        let claimed = i64::try_from(expected.len()).unwrap();
+        let after =
+            outbox_stats(&pool, |stats| stats.updates - before.updates >= 2 * claimed).await;
+        let reads = after.heap_reads - before.heap_reads;
+        assert!(
+            reads < SENT_ROWS / 10,
+            "the relay read {reads} rows of autumn_outbox; \
+             it must not read the {SENT_ROWS} sent rows"
+        );
+    }
 }
 
 #[cfg(feature = "test-support")]
