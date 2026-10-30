@@ -360,6 +360,109 @@ mod tests {
         );
     }
 
+    /// The region is a popover. The UA popover box (centred, bordered,
+    /// `Canvas` background) is reset, and `display` wins over the UA
+    /// `display: none`, so toasts also show without JS (#3399).
+    #[test]
+    fn toast_region_resets_the_popover_box() {
+        let body = rule_body(".autumn-toast-region");
+        for declaration in [
+            "display: flex;",
+            "inset: auto 1rem 1rem auto;",
+            "margin: 0;",
+            "padding: 0;",
+            "border: 0;",
+            "background: transparent;",
+            "color: inherit;",
+            "overflow: visible;",
+        ] {
+            assert!(body.contains(declaration), "missing `{declaration}`:{body}");
+        }
+        assert!(rule_body(".autumn-toast-region::backdrop").contains("display: none;"));
+    }
+
+    /// The runtime sets `--autumn-toast-duration`. The default is 5 s.
+    #[test]
+    fn toast_dwell_reads_the_duration_property() {
+        assert!(
+            rule_body(".autumn-toast").contains(
+                "autumn-toast-out 400ms ease-in var(--autumn-toast-duration, 5s) forwards"
+            ),
+            "{}",
+            rule_body(".autumn-toast")
+        );
+    }
+
+    /// The stylesheet with LF line ends. A Windows checkout can have CRLF.
+    fn lf_css() -> String {
+        WIDGETS_COMPONENT_CSS.replace("\r\n", "\n")
+    }
+
+    /// WCAG 2.2.1: hover or focus on a toast pauses every toast timer.
+    #[test]
+    fn toast_timer_pauses_on_hover_and_focus() {
+        let list = ".autumn-toast-region:hover .autumn-toast,\n\
+                    .autumn-toast-region:focus-within .autumn-toast,\n\
+                    .autumn-toast:hover,\n\
+                    .autumn-toast:focus-within {";
+        assert!(lf_css().contains(list), "missing pause selectors");
+        // Only the exit animation pauses. The entrance of a new toast runs.
+        assert!(
+            rule_body(".autumn-toast:focus-within")
+                .contains("animation-play-state: running, paused;")
+        );
+    }
+
+    /// A persistent toast fades in and never fades out.
+    #[test]
+    fn persistent_toast_has_no_exit_animation() {
+        let body = rule_body(".autumn-toast--persistent");
+        assert!(
+            body.contains("animation: autumn-toast-in 200ms ease-out;"),
+            "{body}"
+        );
+        assert!(!body.contains("autumn-toast-out"), "{body}");
+    }
+
+    /// Reduced motion: no slide, the same dwell, and no animation at all on
+    /// a persistent toast.
+    #[test]
+    fn reduced_motion_keeps_the_dwell_and_the_persistent_toast() {
+        let css = lf_css();
+        let at = css
+            .find("@media (prefers-reduced-motion: reduce) {\n    /* A 0s entrance")
+            .expect("reduced-motion toast block");
+        let rest = &css[at..];
+        let block = &rest[..rest.find("\n}\n").expect("block end")];
+        assert!(
+            block.contains(
+                "autumn-toast-in 0s,\n            \
+                 autumn-toast-out 0s linear var(--autumn-toast-duration, 5s) forwards;"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains(".autumn-toast--persistent {\n        animation: none;"),
+            "{block}"
+        );
+    }
+
+    /// The close button stays hidden until the runtime shows it, and its
+    /// target is at least 24 px (WCAG 2.5.8).
+    #[test]
+    fn toast_close_button_is_hidden_without_js_and_large_enough() {
+        assert!(rule_body(".autumn-toast__close[hidden]").contains("display: none;"));
+        // The toast sets `display: flex`, which beats the UA `[hidden]` rule.
+        assert!(rule_body(".autumn-toast[hidden]").contains("display: none;"));
+        let body = rule_body(".autumn-toast__close");
+        assert!(body.contains("min-width: 1.5rem;"), "{body}");
+        assert!(body.contains("min-height: 1.5rem;"), "{body}");
+        assert!(
+            rule_body(".autumn-toast__close:focus-visible")
+                .contains("outline: 2px solid var(--primary);")
+        );
+    }
+
     /// WCAG 1.4.11: a text input's border is its only visible boundary, so
     /// it uses `--control-border` (3:1), not the decorative `--border`.
     #[test]

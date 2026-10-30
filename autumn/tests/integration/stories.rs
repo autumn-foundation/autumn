@@ -456,6 +456,7 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "nav-bar",
     "tabs",
     "theme-toggle",
+    "toast",
 ];
 
 /// The browser test fn name for `slug`.
@@ -514,6 +515,7 @@ const BROWSER_GATE_PATHS: &[&str] = &[
     "autumn/src/stories/**",
     "autumn/src/htmx.rs",
     "autumn/vendor/htmx.min.js",
+    "autumn/tests/integration/widgets_toast_browser.rs",
 ];
 
 #[test]
@@ -532,7 +534,11 @@ fn widget_browser_workflow_runs_on_widget_changes() {
             "widgets-browser.yml does not run on changes to {path} for both triggers"
         );
     }
-    for suite in ["stories_browser", "widgets_keyboard_browser"] {
+    for suite in [
+        "stories_browser",
+        "widgets_keyboard_browser",
+        "widgets_toast_browser",
+    ] {
         assert!(
             workflow.contains(&format!(
                 "--test integration_tests {suite} -- --include-ignored"
@@ -542,7 +548,7 @@ fn widget_browser_workflow_runs_on_widget_changes() {
     }
     // A filter that matches nothing exits 0. Each suite needs a count check.
     assert!(
-        workflow.matches("passed' ").count() >= 2,
+        workflow.matches("passed' ").count() >= 3,
         "widgets-browser.yml must check a non-zero pass count for each suite"
     );
 }
