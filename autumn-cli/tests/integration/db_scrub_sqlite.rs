@@ -672,6 +672,37 @@ fn a_null_key_fallback_skips_a_shadowed_rowid() {
 }
 
 #[test]
+fn a_key_that_cannot_be_null_needs_no_rowid_name() {
+    let (db, _p, out, code) = scrub_legacy(
+        "CREATE TABLE legacy (id INTEGER PRIMARY KEY, rowid, _rowid_, oid, \
+                              email TEXT UNIQUE); \
+         INSERT INTO legacy (email) VALUES ('a@real-corp.example'), ('b@real-corp.example');",
+        "\"id\", \"rowid\", \"_rowid_\", \"oid\"",
+    );
+    assert_eq!(code, Some(0), "id identifies each row:\n{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM legacy"),
+        2
+    );
+}
+
+#[test]
+fn a_not_null_text_key_needs_no_rowid_name() {
+    let (db, _p, out, code) = scrub_legacy(
+        "CREATE TABLE legacy (code TEXT NOT NULL PRIMARY KEY, rowid, _rowid_, oid, \
+                              email TEXT UNIQUE); \
+         INSERT INTO legacy (code, email) VALUES ('a', 'a@real-corp.example'), \
+                                                 ('b', 'b@real-corp.example');",
+        "\"code\", \"rowid\", \"_rowid_\", \"oid\"",
+    );
+    assert_eq!(code, Some(0), "code identifies each row:\n{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM legacy"),
+        2
+    );
+}
+
+#[test]
 fn a_table_that_shadows_every_rowid_alias_is_refused() {
     let (db, _p, out, code) = scrub_legacy(
         "CREATE TABLE legacy (rowid INTEGER, _rowid_ INTEGER, oid INTEGER, email TEXT UNIQUE); \

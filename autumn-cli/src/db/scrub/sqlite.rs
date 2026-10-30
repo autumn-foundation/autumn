@@ -569,6 +569,10 @@ struct ColumnRow {
     hidden: i32,
     #[diesel(sql_type = Integer)]
     pk: i32,
+    #[diesel(sql_type = Integer)]
+    not_null: i32,
+    #[diesel(sql_type = Text)]
+    decl_type: String,
 }
 
 #[derive(QueryableByName)]
@@ -636,15 +640,19 @@ fn probe(conn: &mut SqliteConnection, config: &super::ScrubConfig) -> Result<Pro
     let mut generated_columns = BTreeSet::new();
     let mut columns_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut pk_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut key_never_null: BTreeSet<String> = BTreeSet::new();
     let mut virtual_tables = Vec::new();
     for table in &tables {
         let rows: Vec<ColumnRow> = sql_query(format!(
-            "SELECT name, hidden, pk FROM pragma_table_xinfo({})",
+            "SELECT name, hidden, pk, \"notnull\" AS not_null, type AS decl_type \
+             FROM pragma_table_xinfo({})",
             quote_literal(&table.name)
         ))
         .load(conn)
         .map_err(|e| sql_err(&e))?;
         let mut pk: Vec<(i32, String)> = Vec::new();
+        let mut pk_not_null = true;
+        let mut integer_pk = false;
         for row in rows {
             // 1 = a virtual table's internal column.
             if row.hidden == 1 {
@@ -655,12 +663,18 @@ fn probe(conn: &mut SqliteConnection, config: &super::ScrubConfig) -> Result<Pro
             }
             if row.pk > 0 {
                 pk.push((row.pk, row.name.clone()));
+                pk_not_null &= row.not_null != 0;
+                integer_pk = row.decl_type.eq_ignore_ascii_case("INTEGER");
             }
             columns_of
                 .entry(table.name.clone())
                 .or_default()
                 .push(row.name.clone());
             public_columns.insert((table.name.clone(), row.name));
+        }
+        // `INTEGER PRIMARY KEY` is the row id itself, so it is never NULL.
+        if !pk.is_empty() && (pk_not_null || (pk.len() == 1 && integer_pk)) {
+            key_never_null.insert(table.name.clone());
         }
         pk.sort();
         pk_of.insert(table.name.clone(), pk.into_iter().map(|(_, n)| n).collect());
@@ -779,17 +793,23 @@ fn probe(conn: &mut SqliteConnection, config: &super::ScrubConfig) -> Result<Pro
         }
     }
 
-    let rowid_tables: BTreeSet<String> = tables
+    let has_rowid: Vec<&str> = tables
         .iter()
         .filter(|t| !t.sql.as_deref().is_some_and(is_without_rowid))
-        .map(|t| t.name.clone())
+        .map(|t| t.name.as_str())
         .collect();
-    let rowid_aliases: BTreeMap<String, Option<&'static str>> = rowid_tables
+    let rowid_aliases: BTreeMap<String, Option<&'static str>> = has_rowid
         .iter()
-        .map(|t| {
+        .map(|&t| {
             let columns = columns_of.get(t).map_or(&[][..], Vec::as_slice);
-            (t.clone(), free_rowid_name(columns))
+            (t.to_owned(), free_rowid_name(columns))
         })
+        .collect();
+    // A key that cannot be NULL never falls back to the row id.
+    let rowid_tables: BTreeSet<String> = has_rowid
+        .iter()
+        .filter(|t| !key_never_null.contains(**t))
+        .map(|&t| t.to_owned())
         .collect();
     let present: BTreeSet<String> = canon_table.values().cloned().collect();
     let framework_tables = probe_table_names(config)
@@ -1705,6 +1725,28 @@ mod tests {
             .expect("fts5");
         let probed = probe(&mut conn, &super::super::ScrubConfig::default()).expect("probe");
         assert_eq!(probed.virtual_tables, ["docs"]);
+    }
+
+    #[test]
+    fn the_probe_finds_the_rowid_name_and_which_keys_can_be_null() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("memory db");
+        conn.batch_execute(
+            "CREATE TABLE int_key (id INTEGER PRIMARY KEY, rowid, _rowid_, oid); \
+             CREATE TABLE nn_key (k TEXT NOT NULL PRIMARY KEY); \
+             CREATE TABLE text_key (k TEXT PRIMARY KEY, RowID); \
+             CREATE TABLE no_key (a); \
+             CREATE TABLE no_rowid (k TEXT PRIMARY KEY) WITHOUT ROWID;",
+        )
+        .expect("schema");
+        let probed = probe(&mut conn, &super::super::ScrubConfig::default()).expect("probe");
+        let f = &probed.facts;
+        assert_eq!(f.rowid_aliases["int_key"], None);
+        assert_eq!(f.rowid_aliases["text_key"], Some("_rowid_"));
+        assert_eq!(f.rowid_aliases["no_key"], Some("rowid"));
+        assert!(!f.rowid_aliases.contains_key("no_rowid"));
+        // Only a key that can be NULL needs the row id as a fallback.
+        let nullable: Vec<&str> = f.rowid_tables.iter().map(String::as_str).collect();
+        assert_eq!(nullable, ["no_key", "text_key"]);
     }
 
     #[test]

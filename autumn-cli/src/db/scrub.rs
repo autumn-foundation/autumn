@@ -4804,9 +4804,9 @@ pub enum Dialect {
 pub struct DatabaseFacts {
     /// The dialect the plan's SQL is written in. Defaults to Postgres.
     pub dialect: Dialect,
-    /// `SQLite` tables that have a `rowid` (all but `WITHOUT ROWID` tables).
-    /// Such a table can hold several rows whose non-integer primary key is
-    /// `NULL`, so the row key falls back to `rowid`. Empty on Postgres.
+    /// `SQLite` tables that have a `rowid` and a primary key that can be
+    /// `NULL`. Such a table can hold several rows with a `NULL` key, so the row
+    /// key falls back to `rowid`. Empty on Postgres.
     pub rowid_tables: BTreeSet<String>,
     /// The name that reads a rowid table's hidden row id. A user column can
     /// shadow `rowid`, `_rowid_` or `oid`. `None` means all three are shadowed.
