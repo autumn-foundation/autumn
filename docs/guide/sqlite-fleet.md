@@ -377,7 +377,8 @@ refused.
 Rules:
 
 - During the retention, a create on demand (`create_on_demand`) of the key
-  answers `410`. `provision` makes a new database: it purges the old replica
+  answers `410`. With `restore_missing`, this is also true on a host with its
+  own control database: it reads the retention from the marker. `provision` makes a new database: it purges the old replica
   first and drops the row. This ends the undo window. If the purge fails,
   `provision` fails with `503`: try again.
 - A purge removes each generation that is not newer than the delete. A newer

@@ -97,7 +97,7 @@ It proves these properties:
 - Two deletes at once: the one that found no file keeps the pending row of
   the one that removed the file.
 - A row is never due before the retention ends, and a pending row is never
-  due.
+  due. The cutoff is at or after both the removal and the newest generation.
 - A purge never deletes a generation newer than the cutoff. With no newer
   generation, it deletes everything.
 

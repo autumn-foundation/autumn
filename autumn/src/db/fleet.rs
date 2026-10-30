@@ -2565,7 +2565,15 @@ impl DatabaseFleet {
         }
         let retention = replication.retention_after_delete();
         let tombstones = replication.tombstones().cloned();
-        let floor = newest_generation(&replication, key).await;
+        let floor = match (newest_generation(&replication, key).await, &tombstones) {
+            (Ok(floor), _) => floor,
+            (Err(error), Some(_)) => {
+                // The retry task confirms the pending row once the lookup works.
+                tracing::warn!(database = %key, %error, "fleet delete: could not read the replica's generations; the tombstone stays pending and the retry task purges the replica");
+                return;
+            }
+            (Err(_), None) => None,
+        };
         let confirmed = match &tombstones {
             Some(tombstones) => match tombstones.confirm(&name, retention, floor).await {
                 Ok(Some(row)) => Some(row),
@@ -2678,7 +2686,9 @@ impl DatabaseFleet {
             row.map_err(|error| unavailable(error.to_string()))
         };
         if read(tombstones.get(&name).await)?.is_none() {
-            return Ok(());
+            return self
+                .check_remote_retention(&replication, key, explicit)
+                .await;
         }
         let _turn = replication.purge_turn().lock().await;
         let Some(row) = read(tombstones.get(&name).await)? else {
@@ -2708,6 +2718,38 @@ impl DatabaseFleet {
             .await
             .map_err(|error| unavailable(error.to_string()))?;
         tracing::info!(database = %key, "fleet database made again: the old replica is purged");
+        Ok(())
+    }
+
+    /// A create on demand with no local tombstone: another host may have
+    /// deleted the key and keep its replica for undo. Its marker says until
+    /// when. Only with `restore_missing`, which reads the replicas already.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Deleting`] during that retention.
+    /// [`FleetError::Unavailable`] when the marker cannot be read.
+    async fn check_remote_retention(
+        &self,
+        replication: &Arc<super::fleet_replication::FleetReplication>,
+        key: &FleetDbKey,
+        explicit: bool,
+    ) -> Result<(), FleetError> {
+        if explicit || !replication.restores_missing() {
+            return Ok(());
+        }
+        let (reader, marker_key) = (Arc::clone(replication), key.clone());
+        let marker = crate::time::spawn_blocking(move || reader.marker(&marker_key))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+            .map_err(|detail| FleetError::Unavailable {
+                name: key.name(),
+                detail: format!("could not read the tombstone marker: {detail}"),
+            })?;
+        if marker.is_some_and(|marker| replication.now() < marker.purge_after()) {
+            return Err(FleetError::Deleting { name: key.name() });
+        }
         Ok(())
     }
 
@@ -2801,7 +2843,10 @@ impl DatabaseFleet {
             row
         } else {
             // The delete stopped after the removal.
-            let floor = newest_generation(replication, &key).await;
+            let floor = match newest_generation(replication, &key).await {
+                Ok(floor) => floor,
+                Err(error) => return fail(report, error),
+            };
             match tombstones
                 .confirm(name, replication.retention_after_delete(), floor)
                 .await
@@ -3715,18 +3760,21 @@ fn sweep_scratch(dir: &Path, now: chrono::DateTime<chrono::Utc>) {
 }
 
 /// The newest generation in the replica of `key`, read on the blocking
-/// pool. `None` when there is none or the destination fails: the cutoff is
-/// then the app clock alone.
+/// pool. `Ok(None)` when there is none.
+///
+/// # Errors
+///
+/// The destination failed. Then no cutoff can be set: a generation of a
+/// host clock that is ahead could be newer than the app clock.
 async fn newest_generation(
     replication: &Arc<super::fleet_replication::FleetReplication>,
     key: &FleetDbKey,
-) -> Option<chrono::DateTime<chrono::Utc>> {
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
     let (reader, key) = (Arc::clone(replication), key.clone());
     crate::time::spawn_blocking(move || reader.newest_generation(&key))
         .await
-        .ok()
-        .and_then(Result::ok)
-        .flatten()
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
 }
 
 /// The identity row of the database file at `path`, read on a query-only

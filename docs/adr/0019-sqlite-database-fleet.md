@@ -359,7 +359,9 @@ brings a deleted tenant back on its next open. Litestream has the same gap.
   that it wrote (each pending row names its delete).
 - **Confirm.** After the removal, the delete confirms its own pending row.
   `deleted_at` is the purge cutoff: the later of the app clock and the
-  newest generation in the replica. The confirm never inserts a row: when
+  newest generation in the replica. The retention runs from the removal. If
+  the generations cannot be read, the row stays pending, and the retry task
+  confirms it later. The confirm never inserts a row: when
   the row is gone, a re-create or a restore took the key, and nothing is
   purged. Then the delete writes `<prefix>/tombstone` (a marker for hosts
   that do not share the control database). With no retention, it purges the
@@ -377,7 +379,8 @@ brings a deleted tenant back on its next open. Litestream has the same gap.
   turn, restores, and drops the marker. If the restore fails, the row goes
   back.
 - **Re-create.** During the retention, a create on demand answers `410`, so
-  a stale client cannot end the undo window. `provision`, and any create
+  a stale client cannot end the undo window. With `restore_missing`, a host
+  with its own control database reads the retention from the marker. `provision`, and any create
   after the retention, purges the old replica first and drops the row, or
   fails with `503`. So a later purge never removes the new database's data,
   and after a volume loss `restore_missing` restores the new database.

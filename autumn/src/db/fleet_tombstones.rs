@@ -80,12 +80,13 @@ pub struct Tombstone {
     /// The database name, as [`FleetDbKey::name`](crate::fleet_layout::FleetDbKey::name)
     /// gives it.
     pub key: String,
-    /// When the files were removed. The purge cutoff: a generation created
-    /// later belongs to a new database with the same key.
+    /// The purge cutoff: when the files were removed, or the newest
+    /// generation of the deleted database when that is later. A generation
+    /// created later belongs to a new database with the same key.
     pub deleted_at: DateTime<Utc>,
     /// `false` while the delete still removes the files.
     pub confirmed: bool,
-    /// The earliest purge: `deleted_at` plus the retention.
+    /// The earliest purge: the time of the removal plus the retention.
     pub purge_after: DateTime<Utc>,
     /// Failed purges so far.
     pub attempts: u32,
@@ -199,6 +200,12 @@ impl Marker {
     #[must_use]
     pub fn deleted_at(&self) -> DateTime<Utc> {
         from_millis(self.deleted_at_ms)
+    }
+
+    /// [`Tombstone::purge_after`].
+    #[must_use]
+    pub fn purge_after(&self) -> DateTime<Utc> {
+        from_millis(self.purge_after_ms)
     }
 }
 
@@ -421,12 +428,9 @@ impl FleetTombstones {
         floor: Option<DateTime<Utc>>,
     ) -> Result<Option<Tombstone>, TombstoneError> {
         let now = self.now();
-        let row = Tombstone::new(
-            key,
-            floor.map_or(now, |floor| floor.max(now)),
-            retention,
-            true,
-        );
+        // The retention runs from now; the cutoff can be later.
+        let mut row = Tombstone::new(key, now, retention, true);
+        row.deleted_at = floor.map_or(now, |floor| floor.max(now));
         let mut conn = self.conn().await?;
         diesel::sql_query(format!(
             "UPDATE {TOMBSTONE_TABLE} SET deleted_at = ?, confirmed = 1, purge_after = ?, \
@@ -882,6 +886,8 @@ mod tests {
             down: AtomicBool,
             /// Deletes that still succeed; then each delete fails.
             deletes_left: std::sync::atomic::AtomicUsize,
+            /// Lists of generations fail (the cutoff lookup).
+            lists_fail: AtomicBool,
         }
 
         impl Switchable {
@@ -891,6 +897,7 @@ mod tests {
                     deletes_fail: AtomicBool::new(false),
                     down: AtomicBool::new(false),
                     deletes_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                    lists_fail: AtomicBool::new(false),
                 })
             }
 
@@ -941,6 +948,14 @@ mod tests {
             }
             fn list(&self, prefix: &str) -> Result<Vec<String>, DestinationError> {
                 self.check(false)?;
+                if prefix.ends_with("/generations/")
+                    && AtomicBool::load(&self.lists_fail, Ordering::SeqCst)
+                {
+                    return Err(DestinationError::Io {
+                        op: "list",
+                        detail: "list failed".to_owned(),
+                    });
+                }
                 self.inner.list(prefix)
             }
             fn delete(&self, key: &str) -> Result<(), DestinationError> {
@@ -1327,6 +1342,71 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_failed_cutoff_lookup_leaves_the_row_pending() {
+            // The replica clock is ahead, so the deleted generation is newer
+            // than the app clock. Without the lookup the cutoff would keep it.
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let ahead =
+                crate::time::TickingClock::starting_at(clock.now() + chrono::Duration::hours(1));
+            let setup = Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::ZERO,
+            };
+            let host = host_with(&setup, false, &ahead);
+            let key = shipped(&host, "acme").await;
+            destination.lists_fail.store(true, Ordering::SeqCst);
+            assert!(host.fleet.delete(&key).await.unwrap());
+            let row = host.tombstones.get(&key.name()).await.unwrap().unwrap();
+            assert!(!row.confirmed, "no cutoff without the lookup");
+            assert!(!destination.keys(&key).is_empty());
+
+            destination.lists_fail.store(false, Ordering::SeqCst);
+            clock.advance(STALE_PENDING + Duration::from_secs(1));
+            let report = host.fleet.purge_deleted_replicas().await;
+            assert_eq!(report.purged, 1, "{report:?}");
+            assert_eq!(destination.keys(&key), Vec::<String>::new());
+        }
+
+        #[tokio::test]
+        async fn a_create_on_demand_respects_another_hosts_retention() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let a = host(&Setup {
+                volume: &tmp.path().join("a"),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: true,
+                retention: Duration::from_secs(3600),
+            });
+            let key = shipped(&a, "acme").await;
+            clock.advance(Duration::from_secs(1));
+            assert!(a.fleet.delete(&key).await.unwrap());
+            // Another host, its own control database, creates on demand.
+            let b_setup = Setup {
+                volume: &tmp.path().join("b"),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: true,
+                retention: Duration::ZERO,
+            };
+            let b = host_with(&b_setup, true, &clock);
+            assert!(matches!(
+                b.fleet.open(&key).await,
+                Err(FleetError::Deleting { .. })
+            ));
+            assert!(!b.fleet.exists(&key));
+            // After the retention, the create goes through.
+            clock.advance(Duration::from_secs(3600));
+            b.fleet.open(&key).await.unwrap();
+        }
+
+        #[tokio::test]
         async fn a_young_pending_row_waits_and_a_stale_confirmed_row_is_dropped() {
             let tmp = tempfile::tempdir().unwrap();
             let destination = Switchable::new(&tmp.path().join("replicas"));
@@ -1476,6 +1556,9 @@ mod tests {
             assert!(!a.tombstones.get(&key.name()).await.unwrap().unwrap().marked);
             destination.down.store(false, Ordering::SeqCst);
             assert_eq!(a.replication.marker(&key).unwrap(), None);
+            // The delete could not read the cutoff: the row is pending. The
+            // pass confirms it once it is old.
+            clock.advance(STALE_PENDING + Duration::from_secs(1));
 
             let report = a.fleet.purge_deleted_replicas().await;
             assert_eq!(report.waiting, 1, "the retention still keeps it");

@@ -11,11 +11,11 @@ verus! {
 
 /// One tombstone row.
 pub struct Tombstone {
-    /// When the database was deleted. The purge cutoff.
+    /// The purge cutoff: the removal, or the newest generation when later.
     pub deleted_at: int,
     /// `false` while the delete is still removing the file.
     pub confirmed: bool,
-    /// The earliest time of a purge: `deleted_at + retention`.
+    /// The earliest time of a purge: the removal plus the retention.
     pub purge_after: int,
     pub attempts: nat,
     /// The earliest time of the next purge attempt.
@@ -32,7 +32,7 @@ pub enum Op {
     /// The file is gone (`delete`, or the retry task after a crash). `now`
     /// is the later of the clock and the newest generation. A row that is
     /// gone stays gone: a re-create or a restore took the key.
-    Confirm { now: int },
+    Confirm { now: int, floor: int },
     /// The retry task finds the file on disk next to a confirmed row.
     Stale,
     /// The delete `owner` removed nothing: its own pending row goes. A
@@ -67,6 +67,19 @@ pub open spec fn fresh(now: int, retention: nat, confirmed: bool, owner: nat) ->
         attempts: 0,
         next_attempt: 0,
         owner,
+    }
+}
+
+/// `FleetTombstones::confirm`: the retention runs from the removal `now`;
+/// the cutoff is the later of `now` and the newest generation `floor`.
+pub open spec fn confirmed(now: int, floor: int, retention: nat, owner: nat) -> Tombstone {
+    Tombstone {
+        deleted_at: if floor > now {
+            floor
+        } else {
+            now
+        },
+        ..fresh(now, retention, true, owner)
     }
 }
 
@@ -121,11 +134,11 @@ pub open spec fn apply(
             },
             None => Some(fresh(now, retention, false, owner)),
         },
-        Op::Confirm { now } => match row {
+        Op::Confirm { now, floor } => match row {
             Some(t) => if t.confirmed {
                 row
             } else {
-                Some(fresh(now, retention, true, t.owner))
+                Some(confirmed(now, floor, retention, t.owner))
             },
             None => None,
         },
@@ -166,7 +179,7 @@ pub open spec fn apply(
 /// The row invariant: the purge time is the delete time plus the retention.
 pub open spec fn inv(row: Option<Tombstone>, retention: nat) -> bool {
     match row {
-        Some(t) => t.purge_after == t.deleted_at + retention,
+        Some(t) => t.purge_after <= t.deleted_at + retention,
         None => true,
     }
 }
@@ -291,9 +304,9 @@ pub proof fn a_refused_delete_keeps_another_pending_row(t: Tombstone, owner: nat
 
 /// A confirm finds no row after a re-create or a restore took the key: it
 /// writes no cutoff that could cover the new database.
-pub proof fn a_confirm_never_makes_a_row(now: int, retention: nat, base: nat, cap: nat)
+pub proof fn a_confirm_never_makes_a_row(now: int, floor: int, retention: nat, base: nat, cap: nat)
     ensures
-        apply(None, Op::Confirm { now }, retention, base, cap) is None,
+        apply(None, Op::Confirm { now, floor }, retention, base, cap) is None,
 {
 }
 
@@ -304,13 +317,22 @@ pub proof fn a_failed_restore_keeps_the_row(t: Tombstone, retention: nat, base: 
 {
 }
 
-/// The retention is kept: a row is never due before `deleted_at + retention`.
-pub proof fn retention_is_kept(t: Tombstone, now: int, retention: nat)
+/// The retention is kept: a confirmed row is never due before the removal
+/// plus the retention.
+pub proof fn retention_is_kept(removed: int, floor: int, owner: nat, now: int, retention: nat)
     requires
-        inv(Some(t), retention),
-        is_due(t, now),
+        is_due(confirmed(removed, floor, retention, owner), now),
     ensures
-        now >= t.deleted_at + retention,
+        now >= removed + retention,
+{
+}
+
+/// The cutoff covers the deleted database: its newest generation and the
+/// removal are both at or before it.
+pub proof fn the_cutoff_covers_the_newest_generation(removed: int, floor: int, owner: nat, retention: nat)
+    ensures
+        confirmed(removed, floor, retention, owner).deleted_at >= floor,
+        confirmed(removed, floor, retention, owner).deleted_at >= removed,
 {
 }
 
@@ -323,11 +345,11 @@ pub proof fn a_pending_row_is_never_due(now: int, retention: nat)
 
 /// A confirm keeps a confirmed row: a second confirm does not move the
 /// cutoff past a re-created database.
-pub proof fn confirm_is_idempotent(t: Tombstone, now: int, retention: nat, base: nat, cap: nat)
+pub proof fn confirm_is_idempotent(t: Tombstone, now: int, floor: int, retention: nat, base: nat, cap: nat)
     requires
         t.confirmed,
     ensures
-        apply(Some(t), Op::Confirm { now }, retention, base, cap) == Some(t),
+        apply(Some(t), Op::Confirm { now, floor }, retention, base, cap) == Some(t),
 {
 }
 

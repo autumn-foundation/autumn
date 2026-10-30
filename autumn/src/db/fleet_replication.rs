@@ -364,6 +364,12 @@ impl FleetReplication {
         self.restore_check
     }
 
+    /// Whether a missing database is restored from its replica.
+    #[must_use]
+    pub const fn restores_missing(&self) -> bool {
+        self.restore_missing
+    }
+
     pub(crate) fn entropy(&self) -> &dyn Entropy {
         self.entropy.as_ref()
     }
