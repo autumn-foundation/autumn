@@ -2341,40 +2341,7 @@ fn vh_insert_ts(
     // field on the audit-trail write path of every versioned repository. Output is
     // identical (`autumn/src/version_history.rs` holds the owned and borrowed
     // functions to an exact parity matrix); do not reintroduce a borrow here.
-    let changes_ts = match op {
-        "insert" => quote! {
-            {
-                use ::autumn_web::version_history::VersionedRecord as _;
-                let __vh_json = (#record_expr).version_column_values();
-                let __vh_changes = ::autumn_web::version_history::compute_insert_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
-                ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
-                    .unwrap_or_else(|_| "[]".to_string())
-            }
-        },
-        "delete" => quote! {
-            {
-                use ::autumn_web::version_history::VersionedRecord as _;
-                let __vh_json = (#record_expr).version_column_values();
-                let __vh_changes = ::autumn_web::version_history::compute_delete_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
-                ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
-                    .unwrap_or_else(|_| "[]".to_string())
-            }
-        },
-        _ => {
-            // "update" — needs before and after
-            let before = before_expr.unwrap_or(record_expr);
-            quote! {
-                {
-                    use ::autumn_web::version_history::VersionedRecord as _;
-                    let __vh_before_json = (#before).version_column_values();
-                    let __vh_after_json = (#record_expr).version_column_values();
-                    let __vh_changes = ::autumn_web::version_history::compute_diff_owned(__vh_before_json, __vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
-                    ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
-                        .unwrap_or_else(|_| "[]".to_string())
-                }
-            }
-        }
-    };
+    let changes_ts = vh_changes_ts(op, record_expr, before_expr, model_ident);
 
     let table_name_ts = table_name_str.to_string();
     let op_variant = version_op_variant(op);
@@ -2432,6 +2399,320 @@ fn vh_insert_ts(
     }
 }
 
+/// The serialized column diff of one version-history row. Expands to a
+/// `String` expression.
+fn vh_changes_ts(
+    op: &str,
+    record_expr: &TokenStream,
+    before_expr: Option<&TokenStream>,
+    model_ident: &proc_macro2::Ident,
+) -> TokenStream {
+    match op {
+        "insert" => quote! {
+            {
+                use ::autumn_web::version_history::VersionedRecord as _;
+                let __vh_json = (#record_expr).version_column_values();
+                let __vh_changes = ::autumn_web::version_history::compute_insert_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
+                    .unwrap_or_else(|_| "[]".to_string())
+            }
+        },
+        "delete" => quote! {
+            {
+                use ::autumn_web::version_history::VersionedRecord as _;
+                let __vh_json = (#record_expr).version_column_values();
+                let __vh_changes = ::autumn_web::version_history::compute_delete_changes_owned(__vh_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
+                    .unwrap_or_else(|_| "[]".to_string())
+            }
+        },
+        _ => {
+            // "update" — needs before and after
+            let before = before_expr.unwrap_or(record_expr);
+            quote! {
+                {
+                    use ::autumn_web::version_history::VersionedRecord as _;
+                    let __vh_before_json = (#before).version_column_values();
+                    let __vh_after_json = (#record_expr).version_column_values();
+                    let __vh_changes = ::autumn_web::version_history::compute_diff_owned(__vh_before_json, __vh_after_json, <#model_ident as ::autumn_web::version_history::VersionedRecord>::version_sensitive_columns());
+                    ::autumn_web::reexports::serde_json::to_string(&__vh_changes)
+                        .unwrap_or_else(|_| "[]".to_string())
+                }
+            }
+        }
+    }
+}
+
+/// Collect one row of a bulk write into the batch that [`vh_batch_ts`] opens
+/// (#3345).
+///
+/// Same inputs as [`vh_insert_ts`]. Sends no statement. The flush
+/// ([`ledger_flush_ts`]) runs the checks after the reload, in the order of
+/// [`ledger_append_ts`].
+fn vh_collect_ts(
+    op: &str,
+    with_ctx: bool,
+    record_expr: &TokenStream,
+    before_expr: Option<&TokenStream>,
+    model_ident: &proc_macro2::Ident,
+    ledgered: bool,
+) -> TokenStream {
+    let changes_ts = vh_changes_ts(op, record_expr, before_expr, model_ident);
+    let op_variant = version_op_variant(op);
+    let (actor_ts, request_id_ts) = if with_ctx {
+        (
+            quote! {
+                ctx.actor
+                    .as_deref()
+                    .unwrap_or(::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR)
+            },
+            quote! { ctx.request_id.as_deref() },
+        )
+    } else {
+        // `vh_batch_ts` reads the ambient actor one time for the batch.
+        (
+            quote! {
+                __vh_actor_scoped
+                    .as_deref()
+                    .unwrap_or(::autumn_web::version_history::VersionEntry::SYSTEM_ACTOR)
+            },
+            quote! { ::core::option::Option::None::<&str> },
+        )
+    };
+
+    let ledger_push = if ledgered {
+        // #2319: an update or restore must not move the record to another tenant.
+        let before_tenant = if let ("update" | "restore", Some(before)) = (op, before_expr) {
+            quote! {
+                ::core::option::Option::Some(
+                    <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#before)),
+                )
+            }
+        } else {
+            quote! { ::core::option::Option::None }
+        };
+        // #2326: a delete or restore writes no float. Check the reloaded row only
+        // when the row was finite before the write.
+        let before_write = match (op, before_expr) {
+            ("delete", _) => Some(record_expr),
+            ("restore", Some(before)) => Some(before),
+            _ => None,
+        };
+        let check_non_finite = before_write.map_or_else(
+            || quote! { true },
+            |before| quote! { (#before).__autumn_ledger_non_finite_column().is_none() },
+        );
+        // #2326: a delete or restore is valid from the moment it is made.
+        let model_valid_time = !matches!(op, "delete" | "restore");
+        quote! {
+            __lg_batch.push(::autumn_web::ledger::LedgerPending {
+                tenant_id: <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(&(#record_expr)),
+                before_tenant_id: #before_tenant,
+                check_non_finite: #check_non_finite,
+                model_valid_time: #model_valid_time,
+            });
+        }
+    } else {
+        quote! {}
+    };
+
+    quote! {
+        {
+            use ::autumn_web::version_history::VersionedRecord as _;
+            __vh_batch.push(::autumn_web::version_history::VersionHistoryRow {
+                tenant_id: (#record_expr).version_tenant_id(),
+                record_id: (#record_expr).version_record_id(),
+                op: #op_variant,
+                actor: #actor_ts,
+                request_id: #request_id_ts,
+                changes_json: #changes_ts,
+            });
+            #ledger_push
+        }
+    }
+}
+
+/// Collect the rows of one bulk write and write them in batches (#3345).
+///
+/// `rows_loop` pushes each row with [`vh_collect_ts`]. Then the repository's
+/// `__autumn_history_flush` ([`history_flush_method_ts`]) writes the batch.
+/// Before, each row sent 5 statements.
+fn vh_batch_ts(with_ctx: bool, conn_ident: &TokenStream, rows_loop: &TokenStream) -> TokenStream {
+    let ambient_actor = if with_ctx {
+        quote! {}
+    } else {
+        quote! {
+            let __vh_actor_scoped: ::core::option::Option<::std::string::String> =
+                ::autumn_web::current::Current::actor();
+        }
+    };
+    quote! {
+        {
+            #ambient_actor
+            let mut __vh_batch: ::std::vec::Vec<::autumn_web::version_history::VersionHistoryRow<'_>> =
+                ::std::vec::Vec::new();
+            #[allow(unused_mut)]
+            let mut __lg_batch: ::std::vec::Vec<::autumn_web::ledger::LedgerPending<'_>> =
+                ::std::vec::Vec::new();
+            #rows_loop
+            Self::__autumn_history_flush(&mut *#conn_ident, __vh_batch, __lg_batch).await?;
+        }
+    }
+}
+
+/// The `__autumn_history_flush` method of a versioned repository (#3345).
+///
+/// Emitted one time for each repository, not at each bulk site, so the
+/// expansion stays small. Writes the history rows in one batch, then the
+/// ledger flush ([`ledger_flush_ts`]) when the repository is ledgered.
+fn history_flush_method_ts(config: &RepoConfig) -> TokenStream {
+    if !config.versioned {
+        return quote! {};
+    }
+    let table_name = &config.table_name;
+    let ledger_flush = if config.ledgered {
+        ledger_flush_ts(table_name, &quote! { conn }, &config.model_name)
+    } else {
+        quote! { let _ = __lg_batch; }
+    };
+    quote! {
+        /// Write the history rows and ledger revisions of one bulk write.
+        /// Generated; not a public API.
+        #[doc(hidden)]
+        pub async fn __autumn_history_flush(
+            conn: &mut ::autumn_web::RuntimeConnection,
+            __vh_batch: ::std::vec::Vec<::autumn_web::version_history::VersionHistoryRow<'_>>,
+            __lg_batch: ::std::vec::Vec<::autumn_web::ledger::LedgerPending<'_>>,
+        ) -> ::autumn_web::AutumnResult<()> {
+            ::autumn_web::version_history::append_version_history_many(
+                &mut *conn,
+                #table_name,
+                &__vh_batch,
+            )
+            .await?;
+            #ledger_flush
+            ::core::result::Result::Ok(())
+        }
+    }
+}
+
+/// The ledger half of [`vh_batch_ts`]: reload the written rows, run the model
+/// checks of [`ledger_append_ts`] for each row, and append all revisions.
+///
+/// `__lg_batch[i]` belongs to `__vh_batch[i]`: [`vh_collect_ts`] pushes both.
+fn ledger_flush_ts(
+    table_name_str: &str,
+    conn_ident: &TokenStream,
+    model_ident: &proc_macro2::Ident,
+) -> TokenStream {
+    let table_ident = format_ident!("{table_name_str}");
+    quote! {
+        if !__lg_batch.is_empty() {
+            use ::autumn_web::reexports::diesel::prelude::*;
+            // Named, not glob-aliased: the sync prelude also brings a `load`.
+            use ::autumn_web::reexports::diesel_async::RunQueryDsl;
+            use ::autumn_web::version_history::VersionedRecord as _;
+            // #2326: reload the rows as the write left them, after any trigger.
+            let __lg_ids: ::std::vec::Vec<i64> = __vh_batch.iter().map(|__r| __r.record_id).collect();
+            let mut __lg_rows: ::std::collections::HashMap<i64, #model_ident> =
+                ::std::collections::HashMap::with_capacity(__lg_ids.len());
+            for __lg_chunk in __lg_ids.chunks(::autumn_web::ledger::RELOAD_CHUNK) {
+                let __lg_loaded: ::std::vec::Vec<#model_ident> = #table_ident::table
+                    .filter(#table_ident::id.eq_any(__lg_chunk))
+                    .select(#model_ident::as_select())
+                    .load::<#model_ident>(&mut *#conn_ident)
+                    .await
+                    .map_err(::autumn_web::AutumnError::from)?;
+                for __lg_row in __lg_loaded {
+                    __lg_rows.insert(__lg_row.version_record_id(), __lg_row);
+                }
+            }
+            let mut __lg_appends: ::std::vec::Vec<::autumn_web::ledger::LedgerAppend<'_>> =
+                ::std::vec::Vec::with_capacity(__lg_batch.len());
+            // The model checks of one row. On a failure, an earlier row's
+            // chain guard still comes first, as in the per-row path.
+            let mut __lg_failed: ::core::option::Option<::autumn_web::AutumnError> =
+                ::core::option::Option::None;
+            for (__vh_row, __lg_pending) in __vh_batch.iter().zip(&__lg_batch) {
+                let __lg_checked: ::autumn_web::AutumnResult<::autumn_web::ledger::LedgerAppend<'_>> = (|| {
+                    let __lg_record_id = __vh_row.record_id;
+                    // A missing row would leave a stale snapshot. Refuse.
+                    let ::core::option::Option::Some(__lg_row) = __lg_rows.get(&__lg_record_id) else {
+                        return ::core::result::Result::Err(
+                            ::autumn_web::AutumnError::internal_server_error(
+                                ::autumn_web::ledger::LedgerError::ChainUnreadable {
+                                    table: #table_name_str.to_string(),
+                                    record_id: __lg_record_id,
+                                    detail: "the row cannot be read back after the write".to_string(),
+                                },
+                            ),
+                        );
+                    };
+                    if __lg_pending.check_non_finite {
+                        ::autumn_web::ledger::refuse_non_finite(
+                            #table_name_str,
+                            __lg_record_id,
+                            __lg_row.__autumn_ledger_non_finite_column(),
+                        )?;
+                    }
+                    let __lg_tenant_id: ::core::option::Option<&str> = __lg_pending.tenant_id;
+                    if let ::core::option::Option::Some(__lg_before) = __lg_pending.before_tenant_id {
+                        ::autumn_web::ledger::refuse_tenant_change(
+                            #table_name_str,
+                            __lg_record_id,
+                            __lg_before,
+                            __lg_tenant_id,
+                        )?;
+                    }
+                    // #2319: a trigger that rewrote `tenant_id` would split the chain.
+                    ::autumn_web::ledger::refuse_tenant_change(
+                        #table_name_str,
+                        __lg_record_id,
+                        __lg_tenant_id,
+                        <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_tenant_id(__lg_row),
+                    )?;
+                    let mut __lg_snapshot: ::autumn_web::reexports::serde_json::Value =
+                        __lg_row.__autumn_commit_hook_to_value()?;
+                    // #2326: a model past schema version 1 records the version it wrote.
+                    ::autumn_web::ledger::stamp_schema_version(
+                        &mut __lg_snapshot,
+                        <#model_ident as ::autumn_web::ledger::LedgeredRecord>::LEDGER_SCHEMA_VERSION,
+                    );
+                    let __lg_valid_from = if __lg_pending.model_valid_time {
+                        <#model_ident as ::autumn_web::ledger::LedgeredRecord>::ledger_valid_from(__lg_row)
+                    } else {
+                        ::core::option::Option::None
+                    };
+                    ::core::result::Result::Ok(::autumn_web::ledger::LedgerAppend {
+                        table_name: #table_name_str,
+                        tenant_id: __lg_tenant_id,
+                        record_id: __lg_record_id,
+                        op: __vh_row.op,
+                        actor: __vh_row.actor,
+                        request_id: __vh_row.request_id,
+                        snapshot: __lg_snapshot,
+                        valid_from: __lg_valid_from,
+                    })
+                })();
+                match __lg_checked {
+                    ::core::result::Result::Ok(__lg_append) => __lg_appends.push(__lg_append),
+                    ::core::result::Result::Err(__lg_error) => {
+                        __lg_failed = ::core::option::Option::Some(__lg_error);
+                        break;
+                    }
+                }
+            }
+            if let ::core::option::Option::Some(__lg_error) = __lg_failed {
+                return ::core::result::Result::Err(
+                    ::autumn_web::ledger::first_batch_error(&mut *#conn_ident, __lg_appends, __lg_error)
+                        .await,
+                );
+            }
+            ::autumn_web::ledger::append_revisions(&mut *#conn_ident, __lg_appends).await?;
+        }
+    }
+}
+
 /// The [`VersionOp`] variant path for one of the three op strings this macro
 /// passes around (`"insert"`, `"update"`, `"delete"`).
 ///
@@ -2450,9 +2731,9 @@ fn version_op_variant(op: &str) -> TokenStream {
 /// holds shows it reliably. A delete holds its pre-delete load; an insert,
 /// update or restore holds the statement's `RETURNING` row, which does not
 /// show what an AFTER trigger changed. A trigger or a default may change any
-/// column (#2326), `tenant_id` included, so reload the whole row. The bulk
-/// paths share this builder. The reload is one indexed lookup per ledgered
-/// write, in the transaction that already reads the chain head.
+/// column (#2326), `tenant_id` included, so reload the whole row. The reload is
+/// one indexed lookup per ledgered write, in the transaction that already reads
+/// the chain head. The bulk paths reload in batches: see [`ledger_flush_ts`].
 ///
 /// Everything the revision takes from the row is read from this reload: the
 /// snapshot, the tenant check, the non-finite check and the valid time.
@@ -3054,6 +3335,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let table_ident = format_ident!("{table_name}");
     let trait_name = &trait_def.ident;
     let pg_name = format_ident!("Pg{trait_name}");
+    let history_flush_method = history_flush_method_ts(&config);
     let new_name = format_ident!("New{model_name}");
     let update_name = format_ident!("Update{model_name}");
     let vis = &trait_def.vis;
@@ -6425,6 +6707,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[allow(clippy::useless_let_if_seq)]
         impl #pg_name {
+            #history_flush_method
             #across_tenants_method
             #for_shard_method
             #find_all_one_shard_helper
@@ -8881,23 +9164,25 @@ fn emit_hooked_insert_many(
         };
 
         let vh_create_many_in_hooks = if config.versioned {
-            let vh = vh_insert_ts(
-                table_name,
+            let collect = vh_collect_ts(
                 "insert",
                 true,
                 &quote! { record },
                 None,
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! {
-                for (idx, record) in chunk_inserted.iter().enumerate() {
-                    let global_idx = offset + idx;
-                    let ctx = &contexts_ref[global_idx];
-                    #vh
-                }
-            }
+            vh_batch_ts(
+                true,
+                &quote! { conn },
+                &quote! {
+                    for (idx, record) in chunk_inserted.iter().enumerate() {
+                        let global_idx = offset + idx;
+                        let ctx = &contexts_ref[global_idx];
+                        #collect
+                    }
+                },
+            )
         } else {
             quote! {}
         };
@@ -9826,6 +10111,31 @@ fn emit_hooked_mutate_many(
     let update_many_body = {
         let draft_ext_trait = format_ident!("{}DraftExt", model_name);
 
+        // `current_rows[i]` is the row before `chunk_updated[i - offset]`.
+        let vh_update_many_in_hooks = if config.versioned {
+            let collect = vh_collect_ts(
+                "update",
+                true,
+                &quote! { record },
+                Some(&quote! { current_rows[global_idx] }),
+                model_name,
+                config.ledgered,
+            );
+            vh_batch_ts(
+                true,
+                &quote! { conn },
+                &quote! {
+                    for (idx, record) in chunk_updated.iter().enumerate() {
+                        let global_idx = offset + idx;
+                        let ctx = &contexts[global_idx];
+                        #collect
+                    }
+                },
+            )
+        } else {
+            quote! {}
+        };
+
         let tenant_id_setup = if config.tenant_scoped {
             quote! {
                 let tenant_id = if self.across_tenants {
@@ -10265,6 +10575,8 @@ fn emit_hooked_mutate_many(
                             chunk_updated.push(updated);
                         }
 
+                        #vh_update_many_in_hooks
+
                         #commit_hooks_enqueue_block
 
                         #cc_after_update_chunk
@@ -10470,21 +10782,23 @@ fn emit_hooked_mutate_many(
         };
 
         let vh_delete_write = if config.versioned {
-            let vh = vh_insert_ts(
-                table_name,
+            let collect = vh_collect_ts(
                 "delete",
                 false,
                 &quote! { r },
                 None,
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! {
-                for r in &__vh_deleted_records {
-                    #vh
-                }
-            }
+            vh_batch_ts(
+                false,
+                &quote! { conn },
+                &quote! {
+                    for r in &__vh_deleted_records {
+                        #collect
+                    }
+                },
+            )
         } else {
             quote! {}
         };
@@ -12337,16 +12651,21 @@ fn emit_plain_insert_many(
     let tenant_extra = usize::from(config.tenant_scoped);
 
     let save_many_body = if config.tenant_scoped && config.versioned {
-        let vh_r = vh_insert_ts(
-            table_name,
-            "insert",
-            false,
-            &quote! { r },
-            None,
-            &quote! { conn },
-            model_name,
-            config.ledgered,
-        );
+        let vh_r = vh_batch_ts(false, &quote! { conn }, &{
+            let collect = vh_collect_ts(
+                "insert",
+                false,
+                &quote! { r },
+                None,
+                model_name,
+                config.ledgered,
+            );
+            quote! {
+                for r in &chunk_inserted {
+                    #collect
+                }
+            }
+        });
         quote! {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -12427,9 +12746,7 @@ fn emit_plain_insert_many(
                 }
                         }
                         .map_err(::autumn_web::AutumnError::from)?;
-                        for r in &chunk_inserted {
-                            #vh_r
-                        }
+                        #vh_r
                         #cc_after_insert_chunk
                         inserted.extend(chunk_inserted);
                     }
@@ -12530,16 +12847,21 @@ fn emit_plain_insert_many(
             .await
         }
     } else if config.versioned {
-        let vh_r = vh_insert_ts(
-            table_name,
-            "insert",
-            false,
-            &quote! { r },
-            None,
-            &quote! { conn },
-            model_name,
-            config.ledgered,
-        );
+        let vh_r = vh_batch_ts(false, &quote! { conn }, &{
+            let collect = vh_collect_ts(
+                "insert",
+                false,
+                &quote! { r },
+                None,
+                model_name,
+                config.ledgered,
+            );
+            quote! {
+                for r in &chunk_inserted {
+                    #collect
+                }
+            }
+        });
         quote! {
             use ::autumn_web::reexports::diesel::prelude::*;
             use ::autumn_web::reexports::diesel_async::RunQueryDsl;
@@ -12584,9 +12906,7 @@ fn emit_plain_insert_many(
                     },
                 }
                             .map_err(::autumn_web::AutumnError::from)?;
-                        for r in &chunk_inserted {
-                            #vh_r
-                        }
+                        #vh_r
                         #cc_after_insert_chunk
                         inserted.extend(chunk_inserted);
                     }
@@ -12654,17 +12974,19 @@ fn emit_plain_insert_many(
 
     let save_many_skip_invalid_body = {
         let vh_skip_batch = if config.versioned {
-            let vh = vh_insert_ts(
-                table_name,
+            let collect = vh_collect_ts(
                 "insert",
                 false,
                 &quote! { r },
                 None,
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! { for r in &results { #vh } }
+            vh_batch_ts(
+                false,
+                &quote! { conn },
+                &quote! { for r in &results { #collect } },
+            )
         } else {
             quote! {}
         };
@@ -13003,23 +13325,25 @@ fn emit_plain_mutate_many(
         // trigger firing sees a settled table (#1358).
         let update_chunk_size: usize = if config.position.is_some() { 1 } else { 1000 };
         let vh_update_pair = if config.versioned {
-            let vh = vh_insert_ts(
-                table_name,
+            let collect = vh_collect_ts(
                 "update",
                 false,
                 &quote! { after_rec },
                 Some(&quote! { before_rec }),
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! {
-                for after_rec in &chunk_updated {
-                    if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&after_rec.id) {
-                        #vh
+            vh_batch_ts(
+                false,
+                &quote! { conn },
+                &quote! {
+                    for after_rec in &chunk_updated {
+                        if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&after_rec.id) {
+                            #collect
+                        }
                     }
-                }
-            }
+                },
+            )
         } else {
             quote! {}
         };
@@ -13267,21 +13591,23 @@ fn emit_plain_mutate_many(
             quote! {}
         };
         let vh_delete_write = if config.versioned {
-            let vh = vh_insert_ts(
-                table_name,
+            let collect = vh_collect_ts(
                 "delete",
                 false,
                 &quote! { r },
                 None,
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! {
-                for r in &__vh_deleted_records {
-                    #vh
-                }
-            }
+            vh_batch_ts(
+                false,
+                &quote! { conn },
+                &quote! {
+                    for r in &__vh_deleted_records {
+                        #collect
+                    }
+                },
+            )
         } else {
             quote! {}
         };
@@ -13524,35 +13850,35 @@ fn emit_plain_mutate_many(
             }
         };
         let vh_upsert_write = if config.versioned {
-            let vh_ins = vh_insert_ts(
-                table_name,
+            let vh_ins = vh_collect_ts(
                 "insert",
                 false,
                 &quote! { r },
                 None,
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            let vh_upd = vh_insert_ts(
-                table_name,
+            let vh_upd = vh_collect_ts(
                 "update",
                 false,
                 &quote! { r },
                 Some(&quote! { before_rec }),
-                &quote! { conn },
                 model_name,
                 config.ledgered,
             );
-            quote! {
-                for r in &chunk_upserted {
-                    if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&r.id) {
-                        #vh_upd
-                    } else {
-                        #vh_ins
+            vh_batch_ts(
+                false,
+                &quote! { conn },
+                &quote! {
+                    for r in &chunk_upserted {
+                        if let ::core::option::Option::Some(before_rec) = __vh_before_map.get(&r.id) {
+                            #vh_upd
+                        } else {
+                            #vh_ins
+                        }
                     }
-                }
-            }
+                },
+            )
         } else {
             quote! {}
         };
@@ -23960,7 +24286,7 @@ mod tests {
             .find("let chunk_inserted =")
             .expect("hooked save_many should insert chunks");
         let history_pos = section
-            .find("append_version_history")
+            .find("Self :: __autumn_history_flush")
             .expect("hooked versioned save_many must write create history");
         let extend_pos = section
             .find("inserted . extend (chunk_inserted)")
@@ -24039,7 +24365,7 @@ mod tests {
             .find("let chunk_inserted =")
             .expect("commit-hook save_many should insert chunks");
         let history_pos = section
-            .find("append_version_history")
+            .find("Self :: __autumn_history_flush")
             .expect("commit-hook versioned save_many must write create history");
         let enqueue_pos = section
             .find("enqueue_repository_commit_hooks_pending_bulk_on_conn")
@@ -24065,7 +24391,7 @@ mod tests {
         let section = &generated[delete_many_pos..];
 
         let history_pos = section
-            .find("append_version_history")
+            .find("Self :: __autumn_history_flush")
             .expect("hooked versioned delete_many must write delete history");
 
         let delete_pos = section
@@ -27344,7 +27670,7 @@ mod tests {
             .find("let __vh_before_map")
             .expect("versioned upsert_many should snapshot before images for history");
         let history_pos = upsert_section
-            .find("append_version_history")
+            .find("Self :: __autumn_history_flush")
             .expect("versioned upsert_many should write history entries");
 
         assert!(
@@ -29425,7 +29751,8 @@ mod tests {
             generated
                 .matches("ledger :: stamp_schema_version (")
                 .count(),
-            generated.matches("ledger :: append_revision (").count(),
+            generated.matches("ledger :: append_revision (").count()
+                + generated.matches("ledger :: append_revisions (").count(),
             "every append site stamps its snapshot"
         );
         assert!(
@@ -29498,7 +29825,10 @@ mod tests {
         );
         // Parity, not a floor: the ledger append is emitted from the same token
         // builder as the version-history write, so every history write site must
-        // carry exactly one ledger append. A `>= 2` check would pass with 27 of
+        // carry exactly one ledger append. The bulk sites call one flush, which
+        // holds one of each batched call (#3345); these patterns also match them.
+        // `repository_macro_ledgered_bulk_writes_append_in_batches` checks that
+        // each bulk site collects a ledger row for each history row. A `>= 2` check would pass with 27 of
         // 28 write paths silently unledgered.
         let ledger_appends = generated.matches("ledger :: append_revision").count();
         let history_appends = generated
@@ -29528,6 +29858,87 @@ mod tests {
             assert!(
                 generated.contains(field),
                 "the ledger append must pass `{field}`: {generated}"
+            );
+        }
+    }
+
+    /// The bulk paths batch the history and ledger writes (#3345). A per-row
+    /// call there costs 5 statements for each row.
+    #[test]
+    fn repository_macro_ledgered_bulk_writes_append_in_batches() {
+        let cases = [
+            (
+                quote! { Post, soft_delete, ledgered = true },
+                &[
+                    "async fn save_many (",
+                    "async fn update_many (",
+                    "async fn delete_many (",
+                    "async fn upsert_many (",
+                ][..],
+            ),
+            (
+                quote! { Post, hooks = PostHooks, soft_delete, ledgered = true },
+                &[
+                    "async fn save_many (",
+                    "async fn update_many (",
+                    "async fn delete_many (",
+                ][..],
+            ),
+        ];
+        for (attrs, methods) in cases {
+            let generated =
+                repository_macro(attrs, quote! { pub trait PostRepository {} }).to_string();
+            for method in methods {
+                let body = generated_fn(&generated, method);
+                assert!(
+                    body.contains("Self :: __autumn_history_flush"),
+                    "{method} must flush one batch: {body}"
+                );
+                // Each history row has its ledger row, so no bulk site skips
+                // the ledger.
+                let history_rows = body.matches("__vh_batch . push (").count();
+                assert!(history_rows > 0, "{method} must collect rows: {body}");
+                assert_eq!(
+                    history_rows,
+                    body.matches("__lg_batch . push (").count(),
+                    "{method} must collect a ledger row for each history row: {body}"
+                );
+                for per_row in [
+                    "ledger :: append_revision (",
+                    "version_history :: append_version_history (",
+                ] {
+                    assert!(
+                        !body.contains(per_row),
+                        "{method} must not call `{per_row}`: {body}"
+                    );
+                }
+            }
+        }
+
+        // The batch path of `save_many_skip_invalid` batches. Its per-row
+        // fallback writes one row at a time.
+        let generated = repository_macro(
+            quote! { Post, soft_delete, ledgered = true },
+            quote! { pub trait PostRepository {} },
+        )
+        .to_string();
+        let body = generated_fn(&generated, "async fn save_many_skip_invalid (");
+        assert!(body.contains("Self :: __autumn_history_flush"), "{body}");
+
+        // The flush is emitted one time, and it sends the batched statements.
+        assert_eq!(
+            generated.matches("async fn __autumn_history_flush").count(),
+            1
+        );
+        let flush = generated_fn(&generated, "async fn __autumn_history_flush");
+        for batched in [
+            "ledger :: append_revisions (",
+            "version_history :: append_version_history_many (",
+            "eq_any (__lg_chunk)",
+        ] {
+            assert!(
+                flush.contains(batched),
+                "the flush must call `{batched}`: {flush}"
             );
         }
     }
