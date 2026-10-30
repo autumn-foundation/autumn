@@ -3018,6 +3018,17 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `restore_missing = true` serves a missing database from its replica on a
   fresh volume. A replicated fleet root is served by one process (one
   replicator per database).
+- Delete with replication (issue #3235): `delete` also purges the replica.
+  It writes a tombstone row (`_autumn_fleet_tombstones`) on the control
+  database first; no row, no delete (`503`). A failed purge keeps the row,
+  and the maintenance task retries it (`purge_deleted_replicas`).
+  `restore_missing` does not restore a tombstoned key; `restore` does, and
+  drops the tombstone. `replica_retention_after_delete = "30d"` keeps the
+  replica for undo; during it, a create on demand answers `410` and
+  `provision` purges the old replica and ends it. `restore_check_sample` (default `1`) restores random databases every
+  `[replication] verify_interval_secs`; a failure turns `replication:fleet`
+  `Down`. Do not write an `on_delete` hook to delete replicas. Guide:
+  "Deleting a database's replica" in `docs/guide/sqlite-fleet.md`.
 - Failover: turn on `[database.fleet.ownership]` (`owner` unique per volume,
   `slots = ["0-8191"]`, `lease_secs = 30`) with `restore_missing`. A host
   serves only the slot ranges it claims; an unowned slot is `421`

@@ -72,6 +72,38 @@ clock bound in the guide. The epoch makes a late write of the old owner
 harmless to the replicas. The proptest `the_table_keeps_its_invariants`
 checks the same rules on the runtime table.
 
+## Fleet replica tombstones
+
+`fleet_replica_tombstones.rs` models the replica tombstones of a SQLite fleet
+(the rules in `autumn/src/db/fleet_tombstones.rs`, issue #3235). Verify it
+with:
+
+```sh
+verus verification/fleet_replica_tombstones.rs
+```
+
+It proves these properties:
+
+- A tombstone row blocks `restore_missing`. A marker blocks each generation
+  that is not newer than the delete. A newer generation restores.
+- A failed purge keeps the row, waits before the next try, and the wait is
+  capped.
+- Only a purge, a restore that worked, a re-create that purged, a refused
+  delete of its own pending row, or a confirmed row next to a live file
+  (`Stale`) drops the row. A second delete of a missing file keeps the
+  row. A delete of a present file resets a stale row.
+- A confirm never makes a row: after a re-create or a restore took the
+  key, no cutoff covers the new database.
+- Two deletes at once: the one that found no file keeps the pending row of
+  the one that removed the file.
+- A row is never due before the retention ends, and a pending row is never
+  due. The cutoff is at or after both the removal and the newest generation.
+- A purge never deletes a generation newer than the cutoff. With no newer
+  generation, it deletes everything.
+
+The proptest `the_rules_keep_the_model_properties` checks the same rules on
+the runtime functions.
+
 ## Billing plan gate
 
 `billing_gate.rs` models the plan gate selection in

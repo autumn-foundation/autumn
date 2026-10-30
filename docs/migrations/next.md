@@ -338,6 +338,53 @@ To name the type, use `<S as Service<Request>>::Future`.
 **Automation:** `manual` — the code to change is in the app's own middleware.
 A codemod cannot find it reliably.
 
+### Database: `DatabaseFleetConfig` has two new fields
+
+**Why:** a deleted fleet database's replica now goes with it (issue #3235).
+`replica_retention_after_delete` keeps it for an undo window.
+`restore_check_sample` sets the restore check.
+
+**You are affected only if your code builds a `DatabaseFleetConfig` with a
+struct literal** (tests and tools often do). TOML and `AUTUMN_*` config need
+no change: both keys have defaults.
+
+**Before (`{X.Y}`):**
+
+```rust
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    path: None,
+    max_open: 256,
+    pool_size: 2,
+    create_on_demand: None,
+    idle_close_secs: 300,
+    restore_missing: false,
+    ownership: None,
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+DatabaseFleetConfig {
+    mode: FleetMode::Tenant,
+    root: "/var/lib/app/fleet".to_owned(),
+    path: None,
+    max_open: 256,
+    pool_size: 2,
+    create_on_demand: None,
+    idle_close_secs: 300,
+    restore_missing: false,
+    ownership: None,
+    replica_retention_after_delete: std::time::Duration::ZERO,
+    restore_check_sample: 1,
+}
+```
+
+**Automation:** `manual` — a struct literal needs the values the app wants.
+A codemod cannot choose them.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -441,6 +488,25 @@ If nothing changed, delete this section.
   second of two equal values now ends in `--n1`. It ended in `-<index>`
   before. Update a CSS rule, a test or a `getElementById` call that uses an
   old id.
+
+- **A fleet delete removes the replica (#3235).** With `[replication]` on,
+  `DatabaseFleet::delete` and `autumn fleet delete` now delete the
+  database's objects in object storage too. Before, they stayed. To keep
+  them for a time, set `database.fleet.replica_retention_after_delete`. A
+  delete now needs the control database: when it cannot write the tombstone
+  row, it fails with `503` and removes nothing. `autumn fleet delete` also
+  needs the replica destination and its credentials, and `autumn fleet
+  restore` needs the control database.
+- **A create on demand of a deleted key answers `410` during the retention
+  (#3235).** With `replica_retention_after_delete` set, `create_on_demand`
+  does not make the key again until the retention ends. `provision` does.
+- **`restore_missing` does not restore a deleted database (#3235).** Before,
+  the next open of a deleted key restored it from the leftover replica.
+  `fleet.restore` and `autumn fleet restore` still bring it back.
+- **The fleet runs a restore check (#3235).** Every `[replication]
+  verify_interval_secs` (default 6 hours), each worker-role process restores
+  one random database into a scratch file. The first check runs one interval
+  after start. Set `database.fleet.restore_check_sample = 0` to turn it off.
 
 ## Deprecations retained from `{X.Y}`
 

@@ -93,6 +93,8 @@
 //! | `AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND` | `database.fleet.create_on_demand` | `Option<bool>` |
 //! | `AUTUMN_DATABASE__FLEET__IDLE_CLOSE_SECS` | `database.fleet.idle_close_secs` | `u64` |
 //! | `AUTUMN_DATABASE__FLEET__RESTORE_MISSING` | `database.fleet.restore_missing` | `bool` |
+//! | `AUTUMN_DATABASE__FLEET__REPLICA_RETENTION_AFTER_DELETE` | `database.fleet.replica_retention_after_delete` | duration; empty is `0` |
+//! | `AUTUMN_DATABASE__FLEET__RESTORE_CHECK_SAMPLE` | `database.fleet.restore_check_sample` | `usize` |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER` | `database.fleet.ownership.owner` | `String` (creates the section) |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS` | `database.fleet.ownership.slots` | comma-separated `N` / `A-B` |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS` | `database.fleet.ownership.lease_secs` | `u64` |
@@ -6862,6 +6864,8 @@ impl AutumnConfig {
                 idle_close_secs: default_fleet_idle_close_secs(),
                 restore_missing: false,
                 ownership: None,
+                replica_retention_after_delete: std::time::Duration::ZERO,
+                restore_check_sample: default_fleet_restore_check_sample(),
             });
         }
         let Some(fleet) = self.database.fleet.as_mut() else {
@@ -6891,6 +6895,7 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__FLEET__RESTORE_MISSING",
             &mut fleet.restore_missing,
         );
+        apply_fleet_replica_env_overrides(fleet, env);
         // Setting `..._OWNER` creates the ownership section.
         if fleet.ownership.is_none() {
             if let Ok(owner) = env.var("AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER") {
@@ -10464,6 +10469,24 @@ pub struct DatabaseFleetConfig {
     /// host serves every slot and nothing fences it.
     #[serde(default)]
     pub ownership: Option<FleetOwnershipConfig>,
+
+    /// With `[replication]` on, keep a deleted database's replica this long,
+    /// then purge it (issue #3235). Default: `0`, purge at once. Use it as an
+    /// undo window: until the retention ends, `DatabaseFleet::restore` and
+    /// `autumn fleet restore` bring the database back. Use a duration string
+    /// (`"30d"`, `"12h"`). A bare number is milliseconds, and a value under
+    /// one minute is refused.
+    #[serde(default, deserialize_with = "deserialize_duration")]
+    pub replica_retention_after_delete: std::time::Duration,
+
+    /// With `[replication]` on, each worker-role process restores this many
+    /// random databases into a scratch directory every `[replication]
+    /// verify_interval_secs`, and checks `PRAGMA integrity_check` and the
+    /// identity row. The first check runs one interval after start.
+    /// `/actuator/health` reports the result under `replication:fleet`.
+    /// Default: `1`. `0`, or `verify_interval_secs = 0`, turns the check off.
+    #[serde(default = "default_fleet_restore_check_sample")]
+    pub restore_check_sample: usize,
 }
 
 /// `[database.fleet.ownership]`: the slot ranges this host claims on the
@@ -10617,6 +10640,14 @@ impl DatabaseFleetConfig {
         if let Some(ownership) = &self.ownership {
             ownership.validate()?;
         }
+        // A bare number is milliseconds: `30` is not 30 days.
+        let retention = self.replica_retention_after_delete;
+        if !retention.is_zero() && retention < std::time::Duration::from_secs(60) {
+            return Err(ConfigError::Validation(format!(
+                "database.fleet.replica_retention_after_delete is {retention:?}; use at least \
+                 one minute with a unit (\"30d\", \"12h\"), or 0 to purge at once"
+            )));
+        }
         Ok(())
     }
 }
@@ -10631,6 +10662,10 @@ const fn default_fleet_pool_size() -> usize {
 
 const fn default_fleet_idle_close_secs() -> u64 {
     300
+}
+
+const fn default_fleet_restore_check_sample() -> usize {
+    1
 }
 
 /// Decide whether the aggregate connection count warrants a startup warning.
@@ -12034,6 +12069,22 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     parse_env_option(env, "AUTUMN_DEPLOY__BAKE__MAX_P99_MS", &mut bake.max_p99_ms);
 }
 
+/// The replica lifecycle keys of `[database.fleet]` (issue #3235).
+fn apply_fleet_replica_env_overrides(fleet: &mut DatabaseFleetConfig, env: &dyn Env) {
+    let mut retention = Some(fleet.replica_retention_after_delete);
+    parse_env_option_duration(
+        env,
+        "AUTUMN_DATABASE__FLEET__REPLICA_RETENTION_AFTER_DELETE",
+        &mut retention,
+    );
+    fleet.replica_retention_after_delete = retention.unwrap_or_default();
+    parse_env(
+        env,
+        "AUTUMN_DATABASE__FLEET__RESTORE_CHECK_SAMPLE",
+        &mut fleet.restore_check_sample,
+    );
+}
+
 /// Parse an environment variable into a typed target, logging a warning on failure.
 fn parse_env<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut T) {
     if let Ok(val) = env.var(key) {
@@ -12655,7 +12706,7 @@ const fn default_slow_query_threshold() -> std::time::Duration {
     std::time::Duration::from_millis(500)
 }
 
-/// Parses a duration string like "500ms", "5s", "2m", "1h",
+/// Parses a duration string like "500ms", "5s", "2m", "1h", "30d",
 /// or a plain integer representing milliseconds.
 ///
 /// # Errors
@@ -12701,6 +12752,16 @@ pub fn parse_duration_str(s: &str) -> Result<std::time::Duration, String> {
             .parse::<u64>()
             .map_err(|e| format!("invalid duration integer: {e}"))?;
         let secs = val.checked_mul(3600).ok_or_else(|| {
+            format!("duration overflow: '{s}' exceeds maximum representable value")
+        })?;
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+
+    if let Some(val_str) = s.strip_suffix('d') {
+        let val = val_str
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration integer: {e}"))?;
+        let secs = val.checked_mul(86_400).ok_or_else(|| {
             format!("duration overflow: '{s}' exceeds maximum representable value")
         })?;
         return Ok(std::time::Duration::from_secs(secs));
@@ -20360,6 +20421,8 @@ path = "/healthz"
             idle_close_secs: 300,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
         }
     }
 
@@ -20516,13 +20579,16 @@ path = "/healthz"
     fn validate_rejects_malformed_fleet_sections() {
         use crate::fleet_layout::FleetMode;
         type Mutate = fn(&mut DatabaseFleetConfig);
-        let cases: [(&str, Mutate); 6] = [
+        let cases: [(&str, Mutate); 7] = [
             ("root", |f| f.root = "  ".to_owned()),
             ("not a database URL", |f| f.root = "sqlite:///x".to_owned()),
             ("{tenant}", |f| f.path = Some("{bucket}/all.db".to_owned())),
             ("..", |f| f.path = Some("../{tenant}.db".to_owned())),
             ("max_open", |f| f.max_open = 0),
             ("pool_size", |f| f.pool_size = 0),
+            ("replica_retention_after_delete", |f| {
+                f.replica_retention_after_delete = std::time::Duration::from_millis(30);
+            }),
         ];
         for (needle, mutate) in cases {
             let mut section = fleet(FleetMode::Tenant);
@@ -20561,6 +20627,49 @@ path = "/healthz"
         assert!(fleet.effective_create_on_demand());
         assert_eq!(fleet.idle_close_secs, 0);
         assert!(fleet.restore_missing);
+        // Issue #3235: the defaults, then the overrides.
+        assert_eq!(
+            fleet.replica_retention_after_delete,
+            std::time::Duration::ZERO
+        );
+        assert_eq!(fleet.restore_check_sample, 1);
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(
+            &env.with(
+                "AUTUMN_DATABASE__FLEET__REPLICA_RETENTION_AFTER_DELETE",
+                "30d",
+            )
+            .with("AUTUMN_DATABASE__FLEET__RESTORE_CHECK_SAMPLE", "0"),
+        );
+        let fleet = config.database.fleet.expect("env creates the fleet");
+        assert_eq!(
+            fleet.replica_retention_after_delete,
+            std::time::Duration::from_secs(30 * 86_400)
+        );
+        assert_eq!(fleet.restore_check_sample, 0);
+    }
+
+    #[test]
+    fn fleet_replica_lifecycle_keys_deserialize() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [database]
+            url = "sqlite:///var/lib/app/control.db"
+
+            [database.fleet]
+            mode = "tenant"
+            root = "/var/lib/app/fleet"
+            replica_retention_after_delete = "30d"
+            restore_check_sample = 3
+            "#,
+        )
+        .unwrap();
+        let fleet = config.database.fleet.unwrap();
+        assert_eq!(
+            fleet.replica_retention_after_delete,
+            std::time::Duration::from_secs(30 * 86_400)
+        );
+        assert_eq!(fleet.restore_check_sample, 3);
     }
 
     #[test]
@@ -21988,6 +22097,12 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             parse_duration_str("1000").unwrap(),
             std::time::Duration::from_secs(1)
         );
+        assert_eq!(
+            parse_duration_str("30d").unwrap(),
+            std::time::Duration::from_secs(30 * 86_400)
+        );
+        assert!(parse_duration_str("1x").is_err());
+        assert!(parse_duration_str(&format!("{}d", u64::MAX)).is_err());
         assert!(parse_duration_str("abc").is_err());
         assert!(parse_duration_str("").is_err());
     }

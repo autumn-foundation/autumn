@@ -14054,19 +14054,43 @@ fn start_fleet_replication(
              fences the previous owner, so two hosts can write one database and diverge"
         );
     }
-    let replication = Arc::new(
-        crate::db::fleet_replication::FleetReplication::new(
-            Arc::clone(runtime.replicator.destination()),
-            runtime.settings.clone(),
-            lag_alert_after,
-            restore_missing,
-            state.clock_arc(),
-        )
-        // The server path sets a tighter cutoff from the budget left.
-        .with_final_flush(std::time::Duration::from_secs(
-            config.server.shutdown_timeout_secs,
-        )),
-    );
+    let fleet_config = config.database.fleet.as_ref();
+    let mut replication = crate::db::fleet_replication::FleetReplication::new(
+        Arc::clone(runtime.replicator.destination()),
+        runtime.settings.clone(),
+        lag_alert_after,
+        restore_missing,
+        state.clock_arc(),
+    )
+    // The server path sets a tighter cutoff from the budget left.
+    .with_final_flush(std::time::Duration::from_secs(
+        config.server.shutdown_timeout_secs,
+    ))
+    // Issue #3235: a deleted database's replica goes with it.
+    .with_retention_after_delete(fleet_config.map_or(std::time::Duration::ZERO, |f| {
+        f.replica_retention_after_delete
+    }))
+    // Worker roles only: the check downloads whole databases.
+    .with_restore_check(
+        runtime.settings.verify_interval,
+        if state.role().runs_workers() {
+            fleet_config.map_or(0, |f| f.restore_check_sample)
+        } else {
+            0
+        },
+    )
+    .with_entropy(state.entropy_arc());
+    if let Some(control) = state.pool() {
+        replication = replication.with_tombstones(Arc::new(
+            crate::db::fleet_tombstones::FleetTombstones::new(control.clone(), state.clock_arc()),
+        ));
+    } else {
+        tracing::warn!(
+            "SQLite fleet replication has no control database: a failed purge of a deleted \
+             database's replica is not retried"
+        );
+    }
+    let replication = Arc::new(replication);
     fleet
         .install_replication(Arc::clone(&replication))
         .map_err(|_| "the fleet already replicates".to_owned())?;
@@ -15758,6 +15782,8 @@ mod fleet_boot_tests {
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
         });
         config
             .database
@@ -15802,6 +15828,8 @@ mod fleet_boot_tests {
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
         });
         let resolved = format!("sqlite://{}", root.join("control.db").display());
         let Err(err) = crate::db::fleet::build_for_app(
@@ -15863,6 +15891,8 @@ mod fleet_boot_tests {
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
         });
         let all = Arc::new(vec![
             ("framework", crate::migrate::FRAMEWORK_MIGRATIONS),
@@ -15911,6 +15941,8 @@ mod fleet_boot_tests {
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
         });
         let all = Arc::new(vec![("framework", crate::migrate::FRAMEWORK_MIGRATIONS)]);
         let fleet = crate::db::fleet::build_for_app(&config, None, &all, |set| {
