@@ -703,6 +703,20 @@ fn a_not_null_text_key_needs_no_rowid_name() {
 }
 
 #[test]
+fn a_descending_integer_key_keeps_the_rowid_fallback() {
+    let (db, _p, out, code) = scrub_legacy(
+        "CREATE TABLE legacy (id INTEGER PRIMARY KEY DESC, email TEXT UNIQUE); \
+         INSERT INTO legacy (email) VALUES ('a@real-corp.example'), ('b@real-corp.example');",
+        "\"id\"",
+    );
+    assert_eq!(code, Some(0), "NULL keys fall back to rowid:\n{out}");
+    assert_eq!(
+        count(&db, "SELECT COUNT(DISTINCT email) AS n FROM legacy"),
+        2
+    );
+}
+
+#[test]
 fn a_table_that_shadows_every_rowid_alias_is_refused() {
     let (db, _p, out, code) = scrub_legacy(
         "CREATE TABLE legacy (rowid INTEGER, _rowid_ INTEGER, oid INTEGER, email TEXT UNIQUE); \

@@ -672,8 +672,18 @@ fn probe(conn: &mut SqliteConnection, config: &super::ScrubConfig) -> Result<Pro
                 .push(row.name.clone());
             public_columns.insert((table.name.clone(), row.name));
         }
-        // `INTEGER PRIMARY KEY` is the row id itself, so it is never NULL.
-        if !pk.is_empty() && (pk_not_null || (pk.len() == 1 && integer_pk)) {
+        // A rowid alias is never NULL. Only that form has no `pk` index:
+        // `INTEGER PRIMARY KEY DESC` gets one, and it can hold NULL keys.
+        let rowid_alias = pk.len() == 1 && integer_pk && {
+            let indexes: Vec<CountRow> = sql_query(format!(
+                "SELECT COUNT(*) AS n FROM pragma_index_list({}) WHERE origin = 'pk'",
+                quote_literal(&table.name)
+            ))
+            .load(conn)
+            .map_err(|e| sql_err(&e))?;
+            indexes.first().is_some_and(|r| r.n == 0)
+        };
+        if !pk.is_empty() && (pk_not_null || rowid_alias) {
             key_never_null.insert(table.name.clone());
         }
         pk.sort();
@@ -1734,6 +1744,7 @@ mod tests {
             "CREATE TABLE int_key (id INTEGER PRIMARY KEY, rowid, _rowid_, oid); \
              CREATE TABLE nn_key (k TEXT NOT NULL PRIMARY KEY); \
              CREATE TABLE text_key (k TEXT PRIMARY KEY, RowID); \
+             CREATE TABLE desc_key (id INTEGER PRIMARY KEY DESC); \
              CREATE TABLE no_key (a); \
              CREATE TABLE no_rowid (k TEXT PRIMARY KEY) WITHOUT ROWID;",
         )
@@ -1746,7 +1757,7 @@ mod tests {
         assert!(!f.rowid_aliases.contains_key("no_rowid"));
         // Only a key that can be NULL needs the row id as a fallback.
         let nullable: Vec<&str> = f.rowid_tables.iter().map(String::as_str).collect();
-        assert_eq!(nullable, ["no_key", "text_key"]);
+        assert_eq!(nullable, ["desc_key", "no_key", "text_key"]);
     }
 
     #[test]
