@@ -1305,14 +1305,18 @@ Rules that matter:
   currency the account does not hold, and a balance that would leave `i64`.
 - The same key for *different* money is `LedgerError::KeyReuse` (409), never a
   silent replay of the wrong result.
-- `ledger::balance(conn, id)` sums an account. `ledger::trial_balance(conn)`
-  returns every currency's total, each of which must be zero — run it from a
-  scheduled job or a health check.
+- `ledger::balance(conn, id)` reads the balance the account row stores. A
+  trigger keeps it, so the cost does not increase with the history.
+  `ledger::trial_balance(conn)` returns every currency's total, each of which
+  must be zero — run it from a scheduled job or a health check.
+  `ledger::balance_drift(conn)` returns each account whose stored balance is
+  not the sum of its postings; it must be empty. It reads every posting, so
+  run it from a scheduled job only.
 - The tables (`_autumn_money_*`) ship in Autumn's own migration set, in the
   **control** database. Nothing to add to the app's `migrations/`. They are
   append-only by trigger — `UPDATE`, `DELETE`, `TRUNCATE` and an SQLite
   `INSERT OR REPLACE` all abort. An account's currency is fixed the same way;
-  only `allow_negative` stays editable. The SQLite half uses
+  only `allow_negative` and `balance_minor` change. The SQLite half uses
   `BEFORE INSERT` guards on the row keys, because SQLite skips `DELETE`
   triggers for the row a `REPLACE` removes and the pragma that changes that
   would alter every application trigger's recursion semantics.

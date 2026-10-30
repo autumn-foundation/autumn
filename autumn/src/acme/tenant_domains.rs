@@ -53,6 +53,18 @@ pub const CUSTOM_DOMAIN_TASK: &str = "custom_domain_certificates";
 /// How many pending domains one tick verifies at the same time.
 const VERIFY_CONCURRENCY: usize = 16;
 
+/// How long one renewal DNS lookup may run before it counts as a blip.
+const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one verification may run. A longer one is a failure with backoff.
+///
+/// Without it, hung names sort first, fill every slot each tick, and are
+/// never backed off. Domains behind them would never be checked.
+const VERIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Verification time per tick when the caller sets no budget.
+const DEFAULT_VERIFY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Callback that dispatches a custom-domain failure to the operator (#1610).
 pub type ReporterFn = Arc<dyn Fn(String) + Send + Sync>;
 
@@ -609,9 +621,10 @@ impl CustomDomainTask {
         self.hydrate_limiter(crate::custom_domain::now_unix()).await;
         loop {
             // The tick is inside the `select!`: a pass over a thousand domains
-            // is long, and shutdown must not wait for it.
+            // is long, and shutdown must not wait for it. Verification gets
+            // half the interval, so issuance and renewal start in time.
             tokio::select! {
-                () = self.tick(crate::custom_domain::now_unix()) => {}
+                () = self.tick_within(crate::custom_domain::now_unix(), interval / 2) => {}
                 () = shutdown.cancelled() => break,
             }
             tokio::select! {
@@ -623,6 +636,14 @@ impl CustomDomainTask {
 
     /// One pass over every registered domain.
     pub async fn tick(&self, now_unix: i64) {
+        self.tick_within(now_unix, DEFAULT_VERIFY_BUDGET).await;
+    }
+
+    /// One pass. The verification step stops after `verify_budget`.
+    ///
+    /// Domains it did not reach stay pending for the next tick. This keeps
+    /// one tenant's slow DNS from delaying issuance and renewal for others.
+    pub async fn tick_within(&self, now_unix: i64, verify_budget: std::time::Duration) {
         // `now_unix` is when the pass began. A pass over many domains, each a
         // CA round trip, runs for minutes, so an order late in it must not be
         // stamped with the start time: its budget entry would age early and a
@@ -634,12 +655,44 @@ impl CustomDomainTask {
         // Each check can wait out a DNS timeout, so checks run
         // `VERIFY_CONCURRENCY` at a time instead of adding up. Each write goes
         // through the registry's per-hostname gate.
+        //
+        // The budget is a deadline for DNS work only. A write that has begun
+        // always finishes: cancelling one can leave a detached save that lands
+        // after a newer record or an offboard. Under a short budget the
+        // per-check limit shrinks with it, so a check the deadline would cut
+        // short still fails and backs off first.
+        let deadline = tokio::time::Instant::now() + verify_budget;
+        let limit = VERIFY_TIMEOUT.min(verify_budget / 2);
+        // Domains that keep failing go last. A short backoff can expire before
+        // the next tick, and hostname order alone would then put the same hung
+        // names first again. The sort is stable, so ties stay in hostname order.
+        let mut pending = self.registry.pending_verification(now_unix);
+        pending.sort_by_key(|domain| domain.consecutive_failures);
+        let skipped = std::sync::atomic::AtomicUsize::new(0);
         futures::StreamExt::for_each_concurrent(
-            futures::stream::iter(self.registry.pending_verification(now_unix)),
+            futures::stream::iter(pending),
             VERIFY_CONCURRENCY,
-            |domain| async move { self.verify_one(&domain.hostname, now_unix).await },
+            |domain| {
+                let skipped = &skipped;
+                async move {
+                    if !self
+                        .verify_one(&domain.hostname, now_unix, limit, deadline)
+                        .await
+                    {
+                        skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            },
         )
         .await;
+        let skipped = skipped.into_inner();
+        if skipped > 0 {
+            tracing::warn!(
+                skipped,
+                budget_ms = verify_budget.as_millis(),
+                "custom-domain verification hit its time budget; the rest wait for the next tick"
+            );
+        }
         for domain in self.registry.due_for_issuance(now_unix) {
             self.issue_one(
                 &domain.hostname,
@@ -653,11 +706,23 @@ impl CustomDomainTask {
         // domain would otherwise be renewed forever: every cycle spends an
         // order plus a failed validation against the shared ACME account, for a
         // certificate that reaches nobody.
-        for domain in self
+
+        // The re-checks run `VERIFY_CONCURRENCY` at a time and finish before
+        // any order starts: an order takes minutes, and a re-check left half
+        // done would be stale by then.
+        let due = self
             .registry
-            .due_for_renewal(now_unix, self.renew_before_days)
-        {
-            if !self.still_points_here(&domain, now_unix).await {
+            .due_for_renewal(now_unix, self.renew_before_days);
+        let checked: Vec<_> = futures::StreamExt::collect(futures::StreamExt::buffered(
+            futures::StreamExt::map(futures::stream::iter(due), |domain| async move {
+                let here = self.still_points_here(&domain, now_unix).await;
+                (domain, here)
+            }),
+            VERIFY_CONCURRENCY,
+        ))
+        .await;
+        for (domain, here) in checked {
+            if !here {
                 continue;
             }
             self.issue_one(
@@ -752,11 +817,21 @@ impl CustomDomainTask {
         now_unix: i64,
     ) -> bool {
         let hostname = domain.hostname.as_str();
-        let observed = self.verifier.observe(hostname).await;
+        // A lookup past `RECHECK_TIMEOUT`, for the tenant's name or for the
+        // ingress, proves nothing. The renewal goes ahead.
+        let Ok(observed) =
+            tokio::time::timeout(RECHECK_TIMEOUT, self.verifier.observe(hostname)).await
+        else {
+            return true;
+        };
         if matches!(observed, crate::custom_domain::ObservedTarget::None) {
             return true;
         }
-        let outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
+        let Ok(ingress) = tokio::time::timeout(RECHECK_TIMEOUT, self.effective_ingress()).await
+        else {
+            return true;
+        };
+        let outcome = grade_dns_verification(&observed, &ingress);
         if outcome.is_verified() {
             return true;
         }
@@ -782,15 +857,55 @@ impl CustomDomainTask {
         false
     }
 
+    /// Back off a domain whose verification ran past `VERIFY_TIMEOUT`.
+    async fn record_lookup_timeout(
+        &self,
+        domain: &crate::custom_domain::CustomDomain,
+        now_unix: i64,
+    ) {
+        let backoff = i64::try_from(
+            self.limiter
+                .backoff_for(domain.consecutive_failures.saturating_add(1)),
+        )
+        .unwrap_or(i64::MAX);
+        let recorded = self
+            .registry
+            .record_verification_failure_for(
+                &domain.hostname,
+                &domain.tenant,
+                domain.verification_token.as_deref(),
+                now_unix,
+                "the DNS lookup timed out",
+                backoff,
+            )
+            .await;
+        if let Err(e) = recorded {
+            tracing::warn!(
+                hostname = %domain.hostname,
+                "failed to persist custom-domain lookup timeout: {e}"
+            );
+        }
+    }
+
     /// Check where one hostname points, and that its owner published this
     /// registration's token, and record the result.
     ///
     /// Pointing here is not enough on its own: a record another tenant left
     /// behind also points here, and HTTP-01 would then issue to whoever
     /// registered the hostname next (#2642).
-    async fn verify_one(&self, hostname: &str, now_unix: i64) {
+    ///
+    /// Only the DNS lookups are time-limited: by `limit`, and by `deadline`.
+    /// A lookup past `limit` fails the domain with a backoff. One cut short by
+    /// `deadline` is left for the next tick. Returns `false` for the latter.
+    async fn verify_one(
+        &self,
+        hostname: &str,
+        now_unix: i64,
+        limit: std::time::Duration,
+        deadline: tokio::time::Instant,
+    ) -> bool {
         let Some(mut domain) = self.registry.get(hostname) else {
-            return;
+            return true;
         };
         // `load` gives a pre-token record its token; this retries a load whose
         // write failed.
@@ -804,22 +919,24 @@ impl CustomDomainTask {
                     hostname,
                     "could not give a custom domain its verification token: {e}"
                 );
-                return;
+                return true;
             }
             match self.registry.get(hostname) {
                 Some(adopted) if adopted.verification_token.is_some() => domain = adopted,
-                _ => return,
+                _ => return true,
             }
         }
-        let observed = self.verifier.observe(hostname).await;
-        let mut outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
-        if outcome.is_verified() {
-            let txt = self
-                .verifier
-                .observe_txt(&domain.verification_record_name())
-                .await;
-            outcome = grade_ownership(&domain, &txt);
+        let allowed = limit.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if allowed.is_zero() {
+            return false;
         }
+        let Ok(outcome) = tokio::time::timeout(allowed, self.grade_lookups(&domain)).await else {
+            if allowed < limit {
+                return false;
+            }
+            self.record_lookup_timeout(&domain, now_unix).await;
+            return true;
+        };
         let backoff = i64::try_from(
             self.limiter
                 .backoff_for(domain.consecutive_failures.saturating_add(1)),
@@ -833,6 +950,26 @@ impl CustomDomainTask {
                 "failed to persist custom-domain verification: {e}"
             );
         }
+        true
+    }
+
+    /// Look up where `domain` points, and whether its owner published the
+    /// token, and grade both. This is the only part of a verification that
+    /// waits on DNS.
+    async fn grade_lookups(
+        &self,
+        domain: &crate::custom_domain::CustomDomain,
+    ) -> crate::custom_domain::VerificationOutcome {
+        let observed = self.verifier.observe(&domain.hostname).await;
+        let outcome = grade_dns_verification(&observed, &self.effective_ingress().await);
+        if !outcome.is_verified() {
+            return outcome;
+        }
+        let txt = self
+            .verifier
+            .observe_txt(&domain.verification_record_name())
+            .await;
+        grade_ownership(domain, &txt)
     }
 
     /// The ingress to compare a tenant's DNS against.

@@ -1788,6 +1788,34 @@ impl CustomDomainRegistry {
             .map(|_| ())
     }
 
+    /// Record a failed verification, only while `tenant` still owns the
+    /// hostname and the record carries `token`. Returns whether it applied.
+    ///
+    /// Unlike [`record_failure_for_registration`](Self::record_failure_for_registration),
+    /// it accepts a `PendingDns` record: that is the state a verification runs in.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_verification_failure_for(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        now_unix: i64,
+        reason: impl Into<String>,
+        backoff_secs: i64,
+    ) -> io::Result<bool> {
+        self.fail(
+            hostname,
+            |d| d.tenant == tenant && d.verification_token.as_deref() == token,
+            now_unix,
+            reason,
+            backoff_secs,
+        )
+        .await
+    }
+
     /// [`record_failure`](Self::record_failure), but only while `tenant` still
     /// owns the hostname AND the record is the generation the order ran
     /// against. Returns whether it applied.
@@ -3857,6 +3885,76 @@ mod tests {
             "cert_not_after_unix":null,"consecutive_failures":0,"next_attempt_unix":null}"#;
         let record: CustomDomain = serde_json::from_str(old).unwrap();
         assert!(record.issuance_attempts_unix.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_verification_failure_lands_on_a_pending_registration() {
+        let registry = hydrated(10).await;
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        let token = registry.get("a.clientco.com").unwrap().verification_token;
+
+        let applied = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-a",
+                token.as_deref(),
+                100,
+                "the DNS lookup timed out",
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(applied);
+        let record = registry.get("a.clientco.com").unwrap();
+        assert_eq!(record.status, DomainStatus::PendingDns);
+        assert_eq!(
+            record.failure_reason.as_deref(),
+            Some("the DNS lookup timed out")
+        );
+        assert_eq!(record.consecutive_failures, 1);
+        assert_eq!(record.next_attempt_unix, Some(400));
+    }
+
+    #[tokio::test]
+    async fn a_verification_failure_spares_another_tenant_or_registration() {
+        let registry = hydrated(10).await;
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        let token = registry.get("a.clientco.com").unwrap().verification_token;
+
+        let wrong_tenant = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-b",
+                token.as_deref(),
+                100,
+                "stale",
+                300,
+            )
+            .await
+            .unwrap();
+        let wrong_token = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-a",
+                Some("another-registration"),
+                100,
+                "stale",
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(!wrong_tenant && !wrong_token);
+        let record = registry.get("a.clientco.com").unwrap();
+        assert!(record.failure_reason.is_none());
+        assert_eq!(record.consecutive_failures, 0);
     }
 
     #[test]

@@ -249,6 +249,58 @@ A test that calls `.assert_selector(".wizard-progress")` must use
 **Automation:** `manual` — the selectors are in the app's own stylesheets,
 scripts and tests. A codemod cannot find them reliably.
 
+### Jobs: `JobTrackingStore` has a required `update_record` method
+
+**Why:** Each built-in store had the same code for `mark_running`,
+`set_progress`, `complete` and `fail` (issue #3208). These methods now have
+default bodies that call `update_record`. A store implements only
+`update_record`. The trait applies the status rules and the `0..=100` progress clamp.
+`get` also has a default body, which calls `get_with_token`.
+
+**Who is affected:** Only code that implements `JobTrackingStore`. The
+compiler reports error `E0046` (`update_record` is missing). Code that only
+calls a store does not change.
+
+**Before (`{X.Y}`):**
+
+```rust
+use futures::future::BoxFuture; // = Pin<Box<dyn Future<Output = T> + Send + 'a>>
+
+impl JobTrackingStore for MyStore {
+    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFuture<'a, AutumnResult<()>> {
+        Box::pin(async move { self.write(key, |r| r.status = TrackedJobStatus::Running).await })
+    }
+    // set_progress, complete, fail, get: the same shape
+    // create, get_with_token, reset_for_retry
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use futures::future::BoxFuture; // = Pin<Box<dyn Future<Output = T> + Send + 'a>>
+
+impl JobTrackingStore for MyStore {
+    fn update_record<'a>(
+        &'a self,
+        key: &'a str,
+        f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
+    ) -> BoxFuture<'a, AutumnResult<()>> {
+        Box::pin(async move { self.write(key, f).await })
+    }
+    // create, get_with_token, reset_for_retry
+}
+```
+
+`update_record` must do nothing when `key` is unknown or expired. It can call
+`f` more than one time, for example after a failed compare-and-swap. Give `f`
+a fresh copy of the record each time. Set `updated_at` after `f`. Change the
+`RetryToken` and refresh the TTL on each write. Remove your `mark_running`, `set_progress`,
+`complete`, `fail` and `get`. If you keep them, they override the defaults.
+
+**Automation:** `manual` — `update_record` needs the store's own storage code.
+A codemod cannot write it.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -328,6 +380,19 @@ If nothing changed, delete this section.
   `.autumn-toast`. A page with neither the widget CSS nor the JS no longer
   shows the region: the browser hides a closed popover. Link
   `/static/css/autumn-widgets.css`.
+- **Money: each account row stores its balance (#3339).** The framework
+  migration `20261029183512_add_money_account_balance` adds the
+  `_autumn_money_accounts.balance_minor` column and a trigger. Run
+  `autumn migrate` before you deploy the new binary. The new binary reads the
+  column. Without the migration, each ledger call fails with
+  `LedgerError::Database`. The migration does not read the postings, so it is
+  fast. Old and new binaries can post at the same time, because the trigger
+  keeps the balance for both. The migration holds a short exclusive lock on
+  `_autumn_money_accounts` and `_autumn_money_postings`. To roll back, deploy
+  the old binary first, then run `down.sql`. Do not write `balance_minor`
+  yourself. `ledger::balance_drift` reports a difference. After a data-only
+  restore, set `balance_minor` to `NULL`. See
+  `docs/guide/money.md#the-stored-balance`.
 
 ## Deprecations retained from `{X.Y}`
 
