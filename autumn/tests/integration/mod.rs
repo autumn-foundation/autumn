@@ -578,6 +578,8 @@ mod webmcp_browser;
 mod webmcp_shim;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
+#[cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
+mod widget_pack_browser;
 #[cfg(feature = "maud")]
 mod widgets_alert;
 #[cfg(feature = "maud")]

@@ -97,7 +97,7 @@ the changelog when a release is cut. See
 `autumn/src/ui/`, `autumn/vendor/autumn-widgets.js`, `autumn/src/stories/`
 and the other paths in its `paths:` filter. It also runs each week.
 
-The job runs two suites:
+The job runs four suites:
 
 - `stories_browser` loads each `/_stories/{slug}` page. It injects axe-core
   and fails on a `serious` or `critical` violation. It checks each page in
@@ -105,6 +105,11 @@ The job runs two suites:
   console error. Each interactive story has a `keyboard_<slug>` test, which
   also checks open dialogs, menus and popups with axe.
 - `widgets_keyboard_browser` checks the #3397 keyboard core on its own page.
+- `widget_pack_browser` checks widget pack conformance (#3400): a good
+  pack passes, three canary packs fail (axe, keyboard trap, console), and
+  pack JS gets `autumn:init`.
+- `the_swatch_pack_passes_widget_browser_conformance` runs the reference
+  `swatch` pack (`autumn-plugin-reference`) through the same gate.
 
 Two canary tests make sure that the gate can fail: a page with an unlabelled
 input must fail axe, and tabs without `autumn-widgets.js` must fail the
@@ -117,6 +122,10 @@ cargo test -p autumn-web --features system-tests \
   --test integration_tests stories_browser -- --include-ignored
 cargo test -p autumn-web --features system-tests \
   --test integration_tests widgets_keyboard_browser -- --include-ignored
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests widget_pack_browser -- --include-ignored
+cargo test -p autumn-plugin-reference --features system-tests --lib \
+  the_swatch_pack_passes_widget_browser_conformance -- --include-ignored
 ```
 
 When you add a widget:

@@ -1986,10 +1986,28 @@ impl<'a> FieldOptions<'a> {
         self.with_extra("hx-", name, value.into())
     }
 
-    #[cfg_attr(not(feature = "nested-form"), allow(dead_code))]
     /// Whether [`required`](Self::required) is set.
-    pub(crate) const fn is_required(&self) -> bool {
+    #[must_use]
+    pub const fn is_required(&self) -> bool {
         self.required
+    }
+
+    /// Whether [`disabled`](Self::disabled) is set.
+    #[must_use]
+    pub const fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
+    /// Whether [`readonly`](Self::readonly) is set.
+    #[must_use]
+    pub const fn is_readonly(&self) -> bool {
+        self.readonly
+    }
+
+    /// The hint text, if set.
+    #[must_use]
+    pub fn hint_text(&self) -> Option<&str> {
+        self.hint.as_deref()
     }
 
     #[cfg_attr(not(feature = "nested-form"), allow(dead_code))]
@@ -2136,7 +2154,7 @@ impl<'a> FieldSpec<'a> {
 
 /// Append ` {name}="{value}"` with the value escaped.
 #[cfg(feature = "maud")]
-fn push_attr(out: &mut String, name: &str, value: &str) {
+pub(crate) fn push_attr(out: &mut String, name: &str, value: &str) {
     out.push(' ');
     out.push_str(name);
     out.push_str("=\"");
@@ -2167,29 +2185,35 @@ fn push_label(out: &mut String, field_html: &str, label: &str, required: bool) {
 #[cfg(feature = "maud")]
 fn push_option_attrs(
     out: &mut String,
-    kind: FieldKind,
+    kind: Option<FieldKind>,
     opts: &FieldOptions<'_>,
     reserved: &[&str],
 ) {
+    // `None` is a custom control: it gets each option the app set.
+    let takes = |accepts: fn(FieldKind) -> bool| kind.is_none_or(accepts);
     let typed = [
         (
             "placeholder",
             opts.placeholder.as_deref(),
-            kind.takes_text_entry(),
+            takes(FieldKind::takes_text_entry),
         ),
         (
             "autocomplete",
             opts.autocomplete.as_deref(),
-            kind.takes_autocomplete(),
+            takes(FieldKind::takes_autocomplete),
         ),
         (
             "inputmode",
             opts.inputmode.as_deref(),
-            kind.takes_text_entry(),
+            takes(FieldKind::takes_text_entry),
         ),
-        ("pattern", opts.pattern.as_deref(), kind.takes_pattern()),
-        ("min", opts.min.as_deref(), kind.takes_range()),
-        ("max", opts.max.as_deref(), kind.takes_range()),
+        (
+            "pattern",
+            opts.pattern.as_deref(),
+            takes(FieldKind::takes_pattern),
+        ),
+        ("min", opts.min.as_deref(), takes(FieldKind::takes_range)),
+        ("max", opts.max.as_deref(), takes(FieldKind::takes_range)),
     ];
     for (name, value, accepted) in typed {
         if accepted && let Some(value) = value {
@@ -2199,7 +2223,7 @@ fn push_option_attrs(
     if opts.disabled {
         out.push_str(" disabled");
     }
-    if opts.readonly && kind.takes_readonly() {
+    if opts.readonly && takes(FieldKind::takes_readonly) {
         out.push_str(" readonly");
     }
     for (prefix, name, value) in &opts.extra {
@@ -2375,7 +2399,7 @@ pub(crate) fn render_field(
     } else {
         &[]
     };
-    push_option_attrs(&mut out, kind, opts, reserved);
+    push_option_attrs(&mut out, Some(kind), opts, reserved);
     out.push('>');
 
     match kind {
@@ -3311,7 +3335,7 @@ fn rich_text_area_inner<T: Serialize>(
     } else {
         &[]
     };
-    push_option_attrs(&mut editor, FieldKind::Textarea, options, reserved);
+    push_option_attrs(&mut editor, Some(FieldKind::Textarea), options, reserved);
     editor.push('>');
     write_escaped(&value, &mut editor);
     editor.push_str("</textarea>");
@@ -4121,6 +4145,9 @@ pub fn skip_link(target: &str, label: &str) -> maud::Markup {
 /// The enum is `#[non_exhaustive]`: new control kinds will be added without
 /// a semver-major bump, so external `match`es need a wildcard arm. All
 /// existing variants remain freely constructible.
+///
+/// A plugin control uses [`FieldControl::Custom`] (issue #3400). It needs
+/// the `maud` feature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FieldControl {
@@ -4151,6 +4178,32 @@ pub enum FieldControl {
     /// `<input type="file">`. The presence of any `File` field makes
     /// [`FormFor::render`] emit `enctype="multipart/form-data"`.
     File,
+    /// A control from a widget pack (issue #3400).
+    ///
+    /// The [`FieldRenderer`]
+    /// writes the control. The framework writes the wrapper, the label, the
+    /// hint and the errors. Make one with [`FieldControl::custom`].
+    #[cfg(feature = "maud")]
+    Custom(CustomControl),
+}
+
+#[cfg(feature = "maud")]
+impl FieldControl {
+    /// A [`FieldControl::Custom`] that `renderer` writes.
+    #[must_use]
+    pub fn custom(renderer: impl FieldRenderer) -> Self {
+        Self::Custom(CustomControl::new(renderer))
+    }
+
+    /// `true` when the control posts a file, so the form must be
+    /// `multipart/form-data`.
+    fn is_multipart(&self) -> bool {
+        match self {
+            Self::File => true,
+            Self::Custom(control) => control.renderer().multipart(),
+            _ => false,
+        }
+    }
 }
 
 /// One field descriptor consumed by [`form_for`].
@@ -4507,10 +4560,7 @@ impl<'a, T: Serialize + FormModel> FormFor<'a, T> {
         let no_options = FieldOptions::new();
 
         let fields = effective_form_fields::<T>(&excluded, &field_overrides, &label_overrides);
-        let is_multipart = force_multipart
-            || fields
-                .iter()
-                .any(|f| matches!(f.control, FieldControl::File));
+        let is_multipart = force_multipart || fields.iter().any(|f| f.control.is_multipart());
 
         let inner = maud::html! {
             @for markup in prepended {
@@ -4694,7 +4744,621 @@ fn render_form_control<T: Serialize>(
             let spec = FieldSpec::new(FieldKind::File, name, label);
             render_field(&spec, changeset.errors_for(name), options)
         }
+        FieldControl::Custom(control) => {
+            custom_input_with(changeset, name, label, control.renderer(), options)
+        }
     }
+}
+
+// ── Custom controls (issue #3400) ───────────────────────────────────
+
+/// Writes the control of a plugin form field.
+///
+/// A widget pack implements this trait to bind its input to a
+/// [`Changeset<T>`] ([`custom_input_with`]) and to [`form_for`]
+/// ([`FieldControl::custom`]). The framework writes the wrapper `<div>`, the
+/// `<label>`, the hint and the errors. The renderer writes only the control.
+/// Use [`FieldContext::control`] for the control tag: it sets `id`, `name`,
+/// `value`, `required`, the `aria-*` links and the passthrough.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::form::{Changeset, FieldContext, FieldOptions, FieldRenderer, custom_input_with};
+///
+/// struct ColorInput;
+///
+/// impl FieldRenderer for ColorInput {
+///     fn name(&self) -> &'static str {
+///         "color"
+///     }
+///
+///     fn render(&self, field: &FieldContext<'_>) -> maud::Markup {
+///         field.control("input", &[("type", "color")], maud::html! {})
+///     }
+/// }
+///
+/// #[derive(serde::Serialize)]
+/// struct Theme { accent: String }
+///
+/// let changeset = Changeset::new(Theme { accent: "#7c3aed".into() });
+/// let html = custom_input_with(&changeset, "accent", "Accent", &ColorInput, &FieldOptions::new())
+///     .into_string();
+/// assert!(html.contains(r#"<label id="accent-label" for="accent" class="autumn-field__label">Accent</label>"#));
+/// assert!(html.contains(r##"<input type="color" id="accent" name="accent" value="#7c3aed""##));
+/// ```
+#[cfg(feature = "maud")]
+pub trait FieldRenderer: Send + Sync + 'static {
+    /// A short name for `Debug` output, for example `"datepicker"`.
+    fn name(&self) -> &'static str;
+
+    /// Write the control for `field`.
+    fn render(&self, field: &FieldContext<'_>) -> maud::Markup;
+
+    /// `true` when the control posts a file. Then [`form_for`] sets
+    /// `enctype="multipart/form-data"`. The default is `false`.
+    fn multipart(&self) -> bool {
+        false
+    }
+
+    /// `true` when the control is a group of inputs (for example radios).
+    ///
+    /// Then the wrapper is a `<fieldset>` with a `<legend>`, and the
+    /// `aria-*` links go on the `<fieldset>`. The default is `false`.
+    fn grouped(&self) -> bool {
+        false
+    }
+}
+
+/// A shared [`FieldRenderer`], held by [`FieldControl::Custom`].
+///
+/// Two values are equal only when they share one renderer (a clone).
+#[cfg(feature = "maud")]
+#[derive(Clone)]
+pub struct CustomControl(std::sync::Arc<dyn FieldRenderer>);
+
+#[cfg(feature = "maud")]
+impl CustomControl {
+    /// Wrap `renderer`.
+    #[must_use]
+    pub fn new(renderer: impl FieldRenderer) -> Self {
+        Self(std::sync::Arc::new(renderer))
+    }
+
+    /// The renderer.
+    #[must_use]
+    pub fn renderer(&self) -> &dyn FieldRenderer {
+        &*self.0
+    }
+}
+
+#[cfg(feature = "maud")]
+impl std::fmt::Debug for CustomControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CustomControl")
+            .field(&self.0.name())
+            .finish()
+    }
+}
+
+#[cfg(feature = "maud")]
+impl PartialEq for CustomControl {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+#[cfg(feature = "maud")]
+impl Eq for CustomControl {}
+
+/// What a [`FieldRenderer`] gets: the field ids, the current value, the
+/// errors and the [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[derive(Debug)]
+pub struct FieldContext<'a> {
+    field: &'a str,
+    label: &'a str,
+    value: Option<&'a str>,
+    values: &'a [String],
+    errors: &'a [String],
+    options: &'a FieldOptions<'a>,
+    /// The wrapper is a `<fieldset>` that holds the `aria-*` links.
+    grouped: bool,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> FieldContext<'a> {
+    /// The control `id`. The label, hint and error ids start with it.
+    #[must_use]
+    pub const fn id(&self) -> &'a str {
+        self.field
+    }
+
+    /// The control `name`, the key the browser posts.
+    #[must_use]
+    pub const fn name(&self) -> &'a str {
+        self.field
+    }
+
+    /// The label text. The framework writes the `<label>`.
+    #[must_use]
+    pub const fn label(&self) -> &'a str {
+        self.label
+    }
+
+    /// The `id` of the `<label>`: `{field}-label`. A control that is not a
+    /// form element points `aria-labelledby` at it.
+    #[must_use]
+    pub fn label_id(&self) -> String {
+        concat_suffix(self.field, "-label")
+    }
+
+    /// The current value from the changeset, or `None`.
+    #[must_use]
+    pub const fn value(&self) -> Option<&'a str> {
+        self.value
+    }
+
+    /// All values of a repeated field (for example a multi-select).
+    #[must_use]
+    pub const fn values(&self) -> &'a [String] {
+        self.values
+    }
+
+    /// The validation errors for the field.
+    #[must_use]
+    pub const fn errors(&self) -> &'a [String] {
+        self.errors
+    }
+
+    /// `true` when the field has errors.
+    #[must_use]
+    pub const fn is_invalid(&self) -> bool {
+        !self.errors.is_empty()
+    }
+
+    /// `true` when the field is required.
+    #[must_use]
+    pub const fn is_required(&self) -> bool {
+        self.options.required
+    }
+
+    /// The options the app set: hint, typed attributes and passthrough.
+    #[must_use]
+    pub const fn options(&self) -> &'a FieldOptions<'a> {
+        self.options
+    }
+
+    /// The `aria-describedby` value (hint id, then error id), or `None`.
+    /// The value is not HTML-escaped.
+    #[must_use]
+    pub fn described_by(&self) -> Option<String> {
+        described_by(self.field, self.options.hint.is_some(), self.is_invalid())
+    }
+
+    /// Write the control element: `<{tag} …>{body}</{tag}>`.
+    ///
+    /// The method writes these attributes:
+    ///
+    /// - `id` and, on a form element, `name`.
+    /// - `value` on an `input`, from the changeset. A `password`, `file`,
+    ///   `checkbox` or `radio` input gets no changeset value.
+    /// - `required` on `input`, `select` and `textarea`. `aria-required` on
+    ///   those tags, or when `attrs` sets a `role`.
+    /// - `class="autumn-field__input"`, with `--invalid` when the field has
+    ///   errors.
+    /// - `aria-invalid` and `aria-describedby`. A tag that is not a form
+    ///   element also gets `aria-labelledby` to the label. A grouped control
+    ///   has these links on the `<fieldset>`.
+    /// - The [`FieldOptions`] attributes.
+    ///
+    /// `attrs` adds attributes, and their values are escaped. A `class`
+    /// value goes after the framework class. A `value` replaces the
+    /// changeset value. A `button` gets `type="button"` when `attrs` has no
+    /// `type`. The method removes these names from `attrs`: a name that is
+    /// not `[a-z][a-z0-9:-]*`, a name that the framework writes, an `on*` or
+    /// `hx-on*` handler, and `style`. When a name occurs two times, the
+    /// first one applies. A void tag (`input`) ignores `body`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `tag` is not `[a-z][a-z0-9]*`, or is a tag that loads
+    /// code (`script`, `style`, `iframe`, `object`, …). A tag is fixed
+    /// code, so this is a programmer error.
+    #[must_use]
+    pub fn control(
+        &self,
+        tag: &'static str,
+        attrs: &[(&str, &str)],
+        body: maud::Markup,
+    ) -> maud::Markup {
+        assert!(
+            is_valid_control_tag(tag),
+            "control tag {tag:?} is not [a-z][a-z0-9]* or loads code"
+        );
+        let attrs = clean_attrs(attrs, CONTROL_OWNED);
+        let find = |wanted: &str| attrs.iter().find(|(name, _)| *name == wanted).map(|a| a.1);
+        let form_element = is_form_element(tag);
+        let input_type = find("type").or_else(|| (tag == "button").then_some("button"));
+        let mut out = String::with_capacity(240usize.saturating_add(body.0.len()));
+
+        out.push('<');
+        out.push_str(tag);
+        if let Some(input_type) = input_type {
+            push_attr(&mut out, "type", input_type);
+        }
+        push_attr(&mut out, "id", self.field);
+        if form_element {
+            push_attr(&mut out, "name", self.field);
+        }
+        let prefill = tag == "input"
+            && !input_type.is_some_and(|t| {
+                ["password", "file", "checkbox", "radio"]
+                    .iter()
+                    .any(|no| t.eq_ignore_ascii_case(no))
+            });
+        match (find("value"), self.value) {
+            (Some(value), _) => push_attr(&mut out, "value", value),
+            (None, Some(value)) if prefill => push_attr(&mut out, "value", value),
+            _ => {}
+        }
+        if self.is_required() {
+            let native = matches!(tag, "input" | "select" | "textarea");
+            if native {
+                out.push_str(" required");
+            }
+            if native || find("role").is_some() {
+                out.push_str(r#" aria-required="true""#);
+            }
+        }
+        out.push_str(if self.is_invalid() {
+            r#" class="autumn-field__input autumn-field__input--invalid"#
+        } else {
+            r#" class="autumn-field__input"#
+        });
+        if let Some(class) = find("class") {
+            out.push(' ');
+            write_escaped(class, &mut out);
+        }
+        out.push('"');
+        if !self.grouped {
+            out.push_str(if self.is_invalid() {
+                r#" aria-invalid="true""#
+            } else {
+                r#" aria-invalid="false""#
+            });
+            if let Some(ids) = self.described_by() {
+                push_attr(&mut out, "aria-describedby", &ids);
+            }
+            if !form_element && find("aria-label").is_none() && find("aria-labelledby").is_none() {
+                push_attr(&mut out, "aria-labelledby", &self.label_id());
+            }
+        }
+        push_option_attrs(&mut out, None, self.options, &[]);
+        let skip = option_attr_names(self.options);
+        for (name, value) in &attrs {
+            if !matches!(*name, "type" | "value" | "class") && !skip.iter().any(|s| s == name) {
+                push_attr(&mut out, name, value);
+            }
+        }
+        close_element(&mut out, tag, body);
+        maud::PreEscaped(out)
+    }
+
+    /// Write one input of a grouped control, for example one radio.
+    ///
+    /// The element gets `id="{field}-{suffix}"`, `name` (on a form
+    /// element), `required` (on `input`, `select` and `textarea`),
+    /// `aria-invalid="true"` when the field has errors, and the
+    /// [`FieldOptions`] attributes. Set `type`, `value`, `class` and
+    /// `checked` in `attrs`. The method removes the same names from `attrs`
+    /// as [`control`](Self::control).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `tag` is not `[a-z][a-z0-9]*`, or loads code.
+    #[must_use]
+    pub fn group_item(
+        &self,
+        tag: &'static str,
+        suffix: &str,
+        attrs: &[(&str, &str)],
+        body: maud::Markup,
+    ) -> maud::Markup {
+        assert!(
+            is_valid_control_tag(tag),
+            "control tag {tag:?} is not [a-z][a-z0-9]* or loads code"
+        );
+        let attrs = clean_attrs(attrs, CONTROL_OWNED);
+        let mut out = String::with_capacity(160usize.saturating_add(body.0.len()));
+        out.push('<');
+        out.push_str(tag);
+        if let Some((_, input_type)) = attrs.iter().find(|(name, _)| *name == "type") {
+            push_attr(&mut out, "type", input_type);
+        }
+        let mut id = String::with_capacity(
+            self.field
+                .len()
+                .saturating_add(suffix.len())
+                .saturating_add(1),
+        );
+        id.push_str(self.field);
+        id.push('-');
+        id.push_str(suffix);
+        push_attr(&mut out, "id", &id);
+        if is_form_element(tag) {
+            push_attr(&mut out, "name", self.field);
+        }
+        if self.is_required() && matches!(tag, "input" | "select" | "textarea") {
+            out.push_str(" required");
+        }
+        if self.is_invalid() {
+            out.push_str(r#" aria-invalid="true""#);
+        }
+        push_option_attrs(&mut out, None, self.options, &[]);
+        let skip = option_attr_names(self.options);
+        for (name, value) in &attrs {
+            if *name != "type" && !skip.iter().any(|s| s == name) {
+                push_attr(&mut out, name, value);
+            }
+        }
+        close_element(&mut out, tag, body);
+        maud::PreEscaped(out)
+    }
+}
+
+/// Write the root element of a widget that is not a form input.
+///
+/// The element gets `attrs`, then the app `data-*` and `hx-*` passthrough from `options`. See
+/// [`crate::widget_pack::element`].
+#[cfg(feature = "maud")]
+pub(crate) fn widget_element(
+    tag: &'static str,
+    attrs: &[(&str, &str)],
+    options: &FieldOptions<'_>,
+    body: maud::Markup,
+) -> maud::Markup {
+    assert!(
+        is_valid_control_tag(tag),
+        "widget tag {tag:?} is not [a-z][a-z0-9]*"
+    );
+    let attrs = clean_attrs(attrs, &[]);
+    let mut out = String::with_capacity(120usize.saturating_add(body.0.len()));
+    out.push('<');
+    out.push_str(tag);
+    for (name, value) in &attrs {
+        push_attr(&mut out, name, value);
+    }
+    for (prefix, name, value) in &options.extra {
+        let full = format!("{prefix}{name}");
+        if !attrs.iter().any(|(n, _)| *n == full) {
+            push_attr(&mut out, &full, value);
+        }
+    }
+    close_element(&mut out, tag, body);
+    maud::PreEscaped(out)
+}
+
+/// The names [`FieldContext::control`] and [`FieldContext::group_item`]
+/// write. A caller cannot set them.
+#[cfg(feature = "maud")]
+const CONTROL_OWNED: &[&str] = &[
+    "id",
+    "name",
+    "required",
+    "aria-required",
+    "aria-invalid",
+    "aria-describedby",
+];
+
+/// `true` for an element the browser submits and a `<label for>` names.
+#[cfg(feature = "maud")]
+fn is_form_element(tag: &str) -> bool {
+    matches!(tag, "input" | "select" | "textarea" | "button")
+}
+
+/// Close a tag: the body and the end tag, or nothing for a void tag.
+#[cfg(feature = "maud")]
+fn close_element(out: &mut String, tag: &str, body: maud::Markup) {
+    out.push('>');
+    if !is_void_tag(tag) {
+        out.push_str(&body.into_string());
+        out.push_str("</");
+        out.push_str(tag);
+        out.push('>');
+    }
+}
+
+/// The attribute names [`push_option_attrs`] writes for `opts` on a custom
+/// control.
+#[cfg(feature = "maud")]
+fn option_attr_names(opts: &FieldOptions<'_>) -> Vec<String> {
+    let typed = [
+        ("placeholder", opts.placeholder.is_some()),
+        ("autocomplete", opts.autocomplete.is_some()),
+        ("inputmode", opts.inputmode.is_some()),
+        ("pattern", opts.pattern.is_some()),
+        ("min", opts.min.is_some()),
+        ("max", opts.max.is_some()),
+        ("disabled", opts.disabled),
+        ("readonly", opts.readonly),
+    ];
+    typed
+        .into_iter()
+        .filter(|(_, set)| *set)
+        .map(|(name, _)| name.to_owned())
+        .chain(
+            opts.extra
+                .iter()
+                .map(|(prefix, name, _)| format!("{prefix}{name}")),
+        )
+        .collect()
+}
+
+/// `true` when `tag` is `[a-z][a-z0-9]*` and is not a tag that loads or
+/// runs code or changes the page (`script`, `style`, `iframe`, …).
+#[cfg(feature = "maud")]
+fn is_valid_control_tag(tag: &str) -> bool {
+    tag.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && !matches!(
+            tag,
+            "script"
+                | "style"
+                | "iframe"
+                | "frame"
+                | "object"
+                | "embed"
+                | "base"
+                | "link"
+                | "meta"
+                | "template"
+        )
+}
+
+/// `true` for an HTML void element: it has no body and no end tag.
+#[cfg(feature = "maud")]
+fn is_void_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+/// Keep the attributes a widget may set.
+///
+/// Drop a malformed name, a name in
+/// `owned`, an `on*` or `hx-on*` handler and `style`, and a second copy of
+/// a name. An inline handler and `style` break a strict CSP.
+#[cfg(feature = "maud")]
+pub(crate) fn clean_attrs<'v>(
+    attrs: &[(&'v str, &'v str)],
+    owned: &[&str],
+) -> Vec<(&'v str, &'v str)> {
+    let mut kept: Vec<(&str, &str)> = Vec::with_capacity(attrs.len());
+    for &(name, value) in attrs {
+        let well_formed = name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b':');
+        let handler =
+            name.starts_with("on") || name.starts_with("hx-on") || name.starts_with("data-hx-on");
+        if well_formed
+            && !handler
+            && name != "style"
+            && !owned.contains(&name)
+            && !kept.iter().any(|(k, _)| *k == name)
+        {
+            kept.push((name, value));
+        }
+    }
+    kept
+}
+
+/// Render a [`FieldRenderer`] control bound to `changeset[field]`, with the
+/// same wrapper, label, hint and errors as the core helpers.
+///
+/// A widget pack wraps this in its own helper, for example
+/// `date_picker(changeset, "due", "Due", &options)`. In [`form_for`], use
+/// [`FieldControl::custom`] instead.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn custom_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    renderer: &dyn FieldRenderer,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = changeset.field_value(field);
+    let values = changeset.field_values(field);
+    let context = FieldContext {
+        field,
+        label,
+        value: value.as_deref(),
+        values: &values,
+        errors: changeset.errors_for(field),
+        options,
+        grouped: renderer.grouped(),
+    };
+    let control = renderer.render(&context);
+    render_custom_field(&context, &control)
+}
+
+/// Write the wrapper, label, hint and errors around a custom `control`.
+///
+/// A grouped control gets a `<fieldset>` and a `<legend>`, and the
+/// `<fieldset>` holds the `aria-*` links.
+#[cfg(feature = "maud")]
+fn render_custom_field(context: &FieldContext<'_>, control: &maud::Markup) -> maud::Markup {
+    let field_html = fast_escape(context.field);
+    let field_html = field_html.as_ref();
+    let hint = context.options.hint.as_deref();
+    let mut out = String::with_capacity(
+        240usize
+            .saturating_add(field_html.len().saturating_mul(4))
+            .saturating_add(context.label.len())
+            .saturating_add(control.0.len()),
+    );
+    let wrapper = if context.grouped { "fieldset" } else { "div" };
+    out.push('<');
+    out.push_str(wrapper);
+    out.push_str(r#" id=""#);
+    out.push_str(field_html);
+    out.push_str(r#"-field" class="autumn-field"#);
+    if context.grouped {
+        out.push_str(r#" autumn-field--group""#);
+        if context.is_invalid() {
+            out.push_str(r#" aria-invalid="true""#);
+        }
+        if let Some(ids) = context.described_by() {
+            push_attr(&mut out, "aria-describedby", &ids);
+        }
+        out.push_str(r#"><legend class="autumn-field__label">"#);
+        write_escaped(context.label, &mut out);
+        if context.is_required() {
+            out.push_str(REQUIRED_MARKER);
+        }
+        out.push_str("</legend>");
+    } else {
+        // A label with an id: a control that is not a form element points
+        // `aria-labelledby` at it.
+        out.push_str(r#""><label id=""#);
+        out.push_str(field_html);
+        out.push_str(r#"-label" for=""#);
+        out.push_str(field_html);
+        out.push_str(r#"" class="autumn-field__label">"#);
+        write_escaped(context.label, &mut out);
+        if context.is_required() {
+            out.push_str(REQUIRED_MARKER);
+        }
+        out.push_str("</label>");
+    }
+    if let Some(hint) = hint {
+        push_hint(&mut out, field_html, hint);
+    }
+    out.push_str(&control.0);
+    if context.is_invalid() {
+        push_errors(&mut out, field_html, context.errors);
+    }
+    out.push_str("</");
+    out.push_str(wrapper);
+    out.push('>');
+    maud::PreEscaped(out)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────
@@ -9195,5 +9859,550 @@ mod tests {
         async fn assert_body(resp: axum::response::Response, expected: &str) {
             assert_eq!(body_text(resp).await, expected);
         }
+    }
+}
+
+// ── Custom control tests (issue #3400) ─────────────────────────────
+
+#[cfg(all(test, feature = "maud"))]
+mod custom_control_tests {
+    use super::*;
+
+    /// A one-element control, as a date picker would write it.
+    struct DateLike;
+
+    impl FieldRenderer for DateLike {
+        fn name(&self) -> &'static str {
+            "datelike"
+        }
+
+        fn render(&self, field: &FieldContext<'_>) -> maud::Markup {
+            field.control(
+                "input",
+                &[("type", "text"), ("class", "autumn-datelike-input")],
+                maud::html! {},
+            )
+        }
+    }
+
+    /// A renderer that tries to set owned and unsafe attributes.
+    struct Hostile;
+
+    impl FieldRenderer for Hostile {
+        fn name(&self) -> &'static str {
+            "hostile"
+        }
+
+        fn render(&self, field: &FieldContext<'_>) -> maud::Markup {
+            field.control(
+                "div",
+                &[
+                    ("id", "evil"),
+                    ("name", "evil"),
+                    ("required", ""),
+                    ("aria-invalid", "false"),
+                    ("aria-describedby", "evil"),
+                    ("onclick", "alert(1)"),
+                    ("ONCLICK", "alert(1)"),
+                    ("hx-on:click", "alert(1)"),
+                    ("hx-on--click", "alert(1)"),
+                    ("data-hx-on:click", "alert(1)"),
+                    ("role", "first"),
+                    ("style", "color:red"),
+                    ("bad name", "x"),
+                    ("x\"y", "x"),
+                    ("role", "listbox"),
+                    ("aria-haspopup", "listbox"),
+                    ("data-autumn-roving", ""),
+                    ("value", "<b>\"quoted\"</b>"),
+                ],
+                maud::html! { span { "body" } },
+            )
+        }
+    }
+
+    /// A radio group: the wrapper must be a fieldset.
+    struct Radios;
+
+    impl FieldRenderer for Radios {
+        fn name(&self) -> &'static str {
+            "radios"
+        }
+
+        fn grouped(&self) -> bool {
+            true
+        }
+
+        fn render(&self, field: &FieldContext<'_>) -> maud::Markup {
+            maud::html! {
+                @for choice in ["a", "b"] {
+                    label {
+                        @let checked: &[(&str, &str)] = if field.value() == Some(choice) {
+                            &[("checked", "")]
+                        } else {
+                            &[]
+                        };
+                        @let attrs: Vec<(&str, &str)> = [("type", "radio"), ("value", choice)]
+                            .into_iter()
+                            .chain(checked.iter().copied())
+                            .collect();
+                        (field.group_item("input", choice, &attrs, maud::html! {}))
+                        (choice)
+                    }
+                }
+            }
+        }
+    }
+
+    /// A file-like control.
+    struct Upload;
+
+    impl FieldRenderer for Upload {
+        fn name(&self) -> &'static str {
+            "upload"
+        }
+
+        fn multipart(&self) -> bool {
+            true
+        }
+
+        fn render(&self, field: &FieldContext<'_>) -> maud::Markup {
+            field.control("input", &[("type", "file")], maud::html! {})
+        }
+    }
+
+    #[derive(Serialize)]
+    struct Task {
+        due: String,
+        title: String,
+    }
+
+    impl FormModel for Task {
+        fn form_fields() -> Vec<FormField> {
+            vec![
+                FormField::new("title", "Title", FieldControl::Text, false),
+                FormField::new("due", "Due", FieldControl::Text, true),
+            ]
+        }
+    }
+
+    fn task() -> Task {
+        Task {
+            due: "2026-10-29".into(),
+            title: "Ship".into(),
+        }
+    }
+
+    fn invalid_task() -> Changeset<Task> {
+        let mut changeset = Changeset::new(task());
+        changeset.add_error("due", "is in the past");
+        changeset
+    }
+
+    #[test]
+    fn custom_input_writes_wrapper_label_hint_and_errors() {
+        let html = custom_input_with(
+            &invalid_task(),
+            "due",
+            "Due",
+            &DateLike,
+            &FieldOptions::new().hint("Pick a day."),
+        )
+        .into_string();
+        assert!(
+            html.starts_with(r#"<div id="due-field" class="autumn-field">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"<label id="due-label" for="due" class="autumn-field__label">Due</label>"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<p id="due-hint" class="autumn-field__hint">Pick a day.</p>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"<input type="text" id="due" name="due" value="2026-10-29" class="autumn-field__input autumn-field__input--invalid autumn-datelike-input" aria-invalid="true" aria-describedby="due-hint due-error">"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<div id="due-error" role="alert" class="autumn-field__errors"><p class="autumn-field__error">is in the past</p></div>"#),
+            "{html}"
+        );
+        assert!(html.ends_with("</div>"), "{html}");
+    }
+
+    #[test]
+    fn custom_input_renders_the_passthrough_on_the_control() {
+        let html = custom_input_with(
+            &Changeset::new(task()),
+            "due",
+            "Due",
+            &DateLike,
+            &FieldOptions::new()
+                .required()
+                .placeholder("YYYY-MM-DD")
+                .autocomplete("off")
+                .disabled()
+                .data("test-id", "due")
+                .hx("get", "/check"),
+        )
+        .into_string();
+        for want in [
+            r#" required aria-required="true""#,
+            r#" placeholder="YYYY-MM-DD""#,
+            r#" autocomplete="off""#,
+            " disabled",
+            r#" data-test-id="due""#,
+            r#" hx-get="/check""#,
+            r#"aria-invalid="false""#,
+            r#"<span class="autumn-field__required" aria-hidden="true">*</span>"#,
+        ] {
+            assert!(html.contains(want), "missing `{want}`: {html}");
+        }
+    }
+
+    #[test]
+    fn control_drops_owned_and_unsafe_attributes() {
+        let html = custom_input_with(
+            &invalid_task(),
+            "due",
+            "Due",
+            &Hostile,
+            &FieldOptions::new(),
+        )
+        .into_string();
+        for banned in [
+            "evil",
+            "onclick",
+            "ONCLICK",
+            "alert(1)",
+            "hx-on",
+            r#"role="listbox""#,
+            "style=",
+            "bad name",
+            "x\"y",
+            r#"aria-invalid="false""#,
+        ] {
+            assert!(!html.contains(banned), "`{banned}` leaked: {html}");
+        }
+        assert!(!html.contains(" required"), "required leaked: {html}");
+        assert!(!html.contains(" name="), "a div has no name: {html}");
+        for kept in [
+            r#"<div id="due" value="&lt;b&gt;&quot;quoted&quot;&lt;/b&gt;" class="autumn-field__input autumn-field__input--invalid" aria-invalid="true" aria-describedby="due-error" aria-labelledby="due-label" role="first""#,
+            r#" aria-haspopup="listbox""#,
+            r#" data-autumn-roving="""#,
+            r#" value="&lt;b&gt;&quot;quoted&quot;&lt;/b&gt;""#,
+            r#"aria-describedby="due-error""#,
+            "><span>body</span></div>",
+        ] {
+            assert!(html.contains(kept), "missing `{kept}`: {html}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "tag")]
+    fn control_panics_on_a_bad_tag() {
+        struct BadTag;
+        impl FieldRenderer for BadTag {
+            fn name(&self) -> &'static str {
+                "bad"
+            }
+            fn render(&self, field: &FieldContext<'_>) -> maud::Markup {
+                field.control("div onclick=x", &[], maud::html! {})
+            }
+        }
+        let _ = custom_input_with(
+            &Changeset::new(task()),
+            "due",
+            "Due",
+            &BadTag,
+            &FieldOptions::new(),
+        );
+    }
+
+    #[test]
+    fn grouped_control_uses_fieldset_and_legend() {
+        let mut changeset = Changeset::new(Task {
+            due: "b".into(),
+            title: String::new(),
+        });
+        changeset.add_error("due", "pick one");
+        let html = custom_input_with(
+            &changeset,
+            "due",
+            "Due",
+            &Radios,
+            &FieldOptions::new().hint("One only.").required(),
+        )
+        .into_string();
+        assert!(
+            html.starts_with(
+                r#"<fieldset id="due-field" class="autumn-field autumn-field--group" aria-invalid="true" aria-describedby="due-hint due-error"><legend class="autumn-field__label">Due<span class="autumn-field__required" aria-hidden="true">*</span></legend>"#
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("<label id="), "{html}");
+        assert!(
+            html.contains(
+                r#"<input type="radio" id="due-b" name="due" required aria-invalid="true" value="b" checked="">"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<input type="radio" id="due-a" name="due" required aria-invalid="true" value="a">"#),
+            "{html}"
+        );
+        assert!(html.ends_with("</div></fieldset>"), "{html}");
+    }
+
+    #[test]
+    fn form_for_renders_a_custom_override_with_model_required() {
+        let changeset = Changeset::new(task());
+        let html = form_for(&changeset, "/tasks", "post")
+            .override_field("due", FieldControl::custom(DateLike))
+            .render()
+            .into_string();
+        assert!(
+            html.contains(
+                r#"<input type="text" id="due" name="due" value="2026-10-29" required aria-required="true" class="autumn-field__input autumn-datelike-input""#
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("multipart"), "{html}");
+    }
+
+    #[test]
+    fn form_for_is_multipart_for_a_multipart_custom_control() {
+        let changeset = Changeset::new(task());
+        let html = form_for(&changeset, "/tasks", "post")
+            .override_field("due", FieldControl::custom(Upload))
+            .render()
+            .into_string();
+        assert!(html.contains(r#"enctype="multipart/form-data""#), "{html}");
+    }
+
+    #[test]
+    fn form_for_prefills_a_custom_control_through_a_serde_rename() {
+        #[derive(Serialize)]
+        struct Renamed {
+            #[serde(rename = "dueOn")]
+            due: String,
+        }
+        impl FormModel for Renamed {
+            fn form_fields() -> Vec<FormField> {
+                vec![
+                    FormField::new("due", "Due", FieldControl::custom(DateLike), false)
+                        .with_value_name("dueOn"),
+                ]
+            }
+        }
+        let changeset = Changeset::new(Renamed {
+            due: "2026-11-01".into(),
+        });
+        let html = form_for(&changeset, "/t", "post").render().into_string();
+        assert!(html.contains(r#"name="due" value="2026-11-01""#), "{html}");
+    }
+
+    #[test]
+    fn custom_control_equality_is_by_shared_renderer() {
+        let a = FieldControl::custom(DateLike);
+        assert_eq!(a, a.clone());
+        assert_ne!(a, FieldControl::custom(DateLike));
+        assert_ne!(a, FieldControl::Text);
+        assert_eq!(format!("{a:?}"), r#"Custom(CustomControl("datelike"))"#);
+    }
+
+    #[test]
+    fn field_context_reports_ids_and_state() {
+        let changeset = invalid_task();
+        let options = FieldOptions::new().hint("h").required();
+        let value = changeset.field_value("due");
+        let context = FieldContext {
+            field: "due",
+            label: "Due",
+            value: value.as_deref(),
+            values: &[],
+            errors: changeset.errors_for("due"),
+            options: &options,
+            grouped: false,
+        };
+        assert_eq!(context.id(), "due");
+        assert_eq!(context.name(), "due");
+        assert_eq!(context.label(), "Due");
+        assert_eq!(context.value(), Some("2026-10-29"));
+        assert!(context.is_invalid());
+        assert!(context.is_required());
+        assert_eq!(context.errors(), ["is in the past"]);
+        assert_eq!(
+            context.described_by().as_deref(),
+            Some("due-hint due-error")
+        );
+        assert!(context.options().is_required());
+    }
+
+    /// A control that must not echo a value: the browser does not fill it.
+    struct Secret;
+
+    impl FieldRenderer for Secret {
+        fn name(&self) -> &'static str {
+            "secret"
+        }
+
+        fn render(&self, field: &FieldContext<'_>) -> maud::Markup {
+            maud::html! {
+                (field.control("input", &[("type", "PASSWORD")], maud::html! {}))
+                (field.control("button", &[("aria-label", "Show")], maud::html! { "Show" }))
+            }
+        }
+    }
+
+    #[test]
+    fn control_does_not_prefill_a_password_and_gives_a_button_a_type() {
+        let html = custom_input_with(&invalid_task(), "due", "Due", &Secret, &FieldOptions::new())
+            .into_string();
+        assert!(!html.contains("2026-10-29"), "password echoed: {html}");
+        assert!(
+            html.contains(r#"<button type="button" id="due" name="due""#),
+            "{html}"
+        );
+        assert!(!html.contains("aria-labelledby"), "{html}");
+    }
+
+    /// Sets attributes that the options also set, two times.
+    struct Duplicates;
+
+    impl FieldRenderer for Duplicates {
+        fn name(&self) -> &'static str {
+            "duplicates"
+        }
+
+        fn render(&self, field: &FieldContext<'_>) -> maud::Markup {
+            field.control(
+                "div",
+                &[
+                    ("role", "listbox"),
+                    ("data-x", "renderer"),
+                    ("data-x", "second"),
+                    ("placeholder", "renderer"),
+                ],
+                maud::html! {},
+            )
+        }
+    }
+
+    #[test]
+    fn control_writes_each_name_once_and_aria_required_with_a_role() {
+        let html = custom_input_with(
+            &Changeset::new(task()),
+            "due",
+            "Due",
+            &Duplicates,
+            &FieldOptions::new()
+                .required()
+                .placeholder("app")
+                .data("x", "app"),
+        )
+        .into_string();
+        assert_eq!(html.matches("data-x=").count(), 1, "{html}");
+        assert_eq!(html.matches("placeholder=").count(), 1, "{html}");
+        assert!(html.contains(r#"data-x="app""#), "{html}");
+        assert!(html.contains(r#"placeholder="app""#), "{html}");
+        assert!(html.contains(r#" aria-required="true""#), "{html}");
+        assert!(!html.contains(" required "), "{html}");
+    }
+
+    #[test]
+    fn described_by_is_escaped_once() {
+        #[derive(Serialize)]
+        struct Odd {
+            #[serde(rename = "a&b")]
+            value: String,
+        }
+        let mut changeset = Changeset::new(Odd {
+            value: String::new(),
+        });
+        changeset.add_error("a&b", "bad");
+        let html = custom_input_with(&changeset, "a&b", "A", &DateLike, &FieldOptions::new())
+            .into_string();
+        assert!(
+            html.contains(r#"aria-describedby="a&amp;b-error""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"<div id="a&amp;b-error""#), "{html}");
+    }
+
+    #[test]
+    fn field_context_exposes_all_values_of_a_repeated_field() {
+        struct Tags;
+        impl FieldRenderer for Tags {
+            fn name(&self) -> &'static str {
+                "tags"
+            }
+            fn render(&self, field: &FieldContext<'_>) -> maud::Markup {
+                maud::html! { span { (field.values().join(",")) } }
+            }
+        }
+        #[derive(Serialize)]
+        struct Post {
+            tags: Vec<String>,
+        }
+        let changeset = Changeset::new(Post {
+            tags: vec!["rust".into(), "web".into()],
+        });
+        let html = custom_input_with(&changeset, "tags", "Tags", &Tags, &FieldOptions::new())
+            .into_string();
+        assert!(html.contains("<span>rust,web</span>"), "{html}");
+    }
+
+    #[test]
+    fn widget_element_writes_attrs_then_the_passthrough() {
+        let html = widget_element(
+            "div",
+            &[
+                ("class", "autumn-x-bar"),
+                ("role", "toolbar"),
+                ("data-x", "widget"),
+                ("onclick", "alert(1)"),
+                ("hx-on:click", "alert(1)"),
+                ("style", "color:red"),
+            ],
+            &FieldOptions::new()
+                .data("x", "app")
+                .data("y", "app")
+                .hx("get", "/y"),
+            maud::html! { "body" },
+        )
+        .into_string();
+        assert_eq!(
+            html,
+            r#"<div class="autumn-x-bar" role="toolbar" data-x="widget" data-y="app" hx-get="/y">body</div>"#
+        );
+    }
+
+    #[test]
+    fn code_loading_tags_are_refused() {
+        for tag in ["script", "style", "iframe", "object", "base"] {
+            let result = std::panic::catch_unwind(|| {
+                widget_element(tag, &[], &FieldOptions::new(), maud::html! {})
+            });
+            assert!(result.is_err(), "`{tag}` must be refused");
+        }
+    }
+
+    #[test]
+    fn field_options_getters_report_the_state() {
+        let options = FieldOptions::new()
+            .hint("h")
+            .required()
+            .disabled()
+            .readonly();
+        assert!(options.is_required() && options.is_disabled() && options.is_readonly());
+        assert_eq!(options.hint_text(), Some("h"));
+        assert_eq!(FieldOptions::new().hint_text(), None);
     }
 }

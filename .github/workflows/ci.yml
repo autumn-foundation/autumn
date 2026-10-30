@@ -796,6 +796,9 @@ jobs:
         # DEFAULT features, so a cold cache is a full framework build (tens of
         # minutes), and this job name gets its own `rust-cache` entry against
         # the repo's shared cache budget. Warm runs are a couple of minutes.
+        # `--all-features` also turns on `system-tests` (#3400): the swatch
+        # pack browser test compiles here, and stays `#[ignore]`d. The
+        # `widgets-browser` workflow runs it in Chromium.
         run: cargo test -p autumn-plugin-reference --all-features
       - name: Check the flagship first-party plugin still builds
         # The success metric in issue #1601 names both the reference plugin and

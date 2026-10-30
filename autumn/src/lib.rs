@@ -974,6 +974,12 @@ pub mod stories;
 pub mod task;
 pub mod telemetry;
 pub mod ui;
+/// Widget packs: the plugin seam for widgets (issue #3400).
+///
+/// See [`widget_pack`] for the widget contract and
+/// [`widget_pack::WidgetPack`].
+#[cfg(feature = "maud")]
+pub mod widget_pack;
 /// Active search and autocomplete form primitives with htmx integration.
 ///
 /// See [`widgets`] for the full API including [`widgets::active_search`],

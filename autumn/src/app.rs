@@ -73,6 +73,10 @@ use crate::state::AppState;
 /// }
 /// ```
 #[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one field initialiser per builder field; splitting it hides the defaults"
+)]
 pub fn app() -> AppBuilder {
     let builder = AppBuilder {
         routes: Vec::new(),
@@ -151,6 +155,8 @@ pub fn app() -> AppBuilder {
         mail_previews: Vec::new(),
         #[cfg(feature = "maud")]
         story_gallery: None,
+        #[cfg(feature = "maud")]
+        widget_packs: Vec::new(),
         declared_routes: Vec::new(),
         plugin_asset_bundles: Vec::new(),
         idempotency_enabled: false,
@@ -595,6 +601,10 @@ pub struct AppBuilder {
     /// Widget story gallery registered for the `/_stories` UI (#1526).
     #[cfg(feature = "maud")]
     story_gallery: Option<crate::stories::StoryGallery>,
+    /// Names of the widget packs installed via
+    /// [`widget_pack`](Self::widget_pack) (#3400).
+    #[cfg(feature = "maud")]
+    widget_packs: Vec<(&'static str, Option<&'static crate::assets::PluginAssets>)>,
     /// Routes explicitly declared by plugins for listing purposes, to complement
     /// opaque `nest_routers`. Included in `autumn routes` output even though
     /// the underlying Axum router is not enumerable, and handed to the router
@@ -3208,11 +3218,74 @@ impl AppBuilder {
     /// the framework widget set and
     /// [`extend`](crate::stories::StoryGallery::extend) it with your app's
     /// own `story!{...}` entries. See `docs/guide/stories.md`.
+    ///
+    /// Each call adds to the gallery (#3400), so a plugin can add its own
+    /// stories. Start a plugin gallery from
+    /// [`StoryGallery::new`](crate::stories::StoryGallery::new), not
+    /// `builtin`. If two stories have the same slug, the app panics at
+    /// startup.
     #[cfg(feature = "maud")]
     #[must_use]
     pub fn with_story_gallery(mut self, gallery: crate::stories::StoryGallery) -> Self {
-        self.story_gallery = Some(gallery);
+        self.story_gallery = Some(match self.story_gallery.take() {
+            Some(existing) => existing.merge(gallery),
+            None => gallery,
+        });
         self
+    }
+
+    /// Install a [`WidgetPack`](crate::widget_pack::WidgetPack) (#3400).
+    ///
+    /// Call this from [`Plugin::build`](crate::plugin::Plugin::build). It
+    /// serves the pack [`PluginAssets`](crate::assets::PluginAssets) bundle
+    /// (see [`plugin_assets`](Self::plugin_assets)) and adds the pack stories
+    /// and asset links to the story gallery (see
+    /// [`with_story_gallery`](Self::with_story_gallery)). If you install a
+    /// pack two times, the second install does nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a different pack with the same name is already
+    /// installed: a pack with a different asset bundle.
+    ///
+    /// ```rust
+    /// use autumn_web::app::AppBuilder;
+    /// use autumn_web::plugin::Plugin;
+    /// use autumn_web::widget_pack::WidgetPack;
+    ///
+    /// struct SwatchPlugin;
+    ///
+    /// impl Plugin for SwatchPlugin {
+    ///     fn build(self, app: AppBuilder) -> AppBuilder {
+    ///         app.widget_pack(WidgetPack::new("swatch"))
+    ///     }
+    /// }
+    /// ```
+    #[cfg(feature = "maud")]
+    #[must_use]
+    pub fn widget_pack(mut self, pack: crate::widget_pack::WidgetPack) -> Self {
+        if let Some((_, assets)) = self
+            .widget_packs
+            .iter()
+            .find(|(name, _)| *name == pack.name())
+        {
+            let same = match (assets, pack.asset_bundle()) {
+                (Some(a), Some(b)) => std::ptr::eq(*a, b),
+                (None, None) => true,
+                _ => false,
+            };
+            assert!(
+                same,
+                "two different widget packs use the name `{}`; each pack needs its own name",
+                pack.name()
+            );
+            return self;
+        }
+        self.widget_packs.push((pack.name(), pack.asset_bundle()));
+        if let Some(assets) = pack.asset_bundle() {
+            self = self.plugin_assets(assets);
+        }
+        self.with_story_gallery(pack.into_gallery())
     }
 
     /// Register an additional audit sink for structured audit events.
@@ -4120,6 +4193,8 @@ impl AppBuilder {
             mail_previews,
             #[cfg(feature = "maud")]
             story_gallery,
+            #[cfg(feature = "maud")]
+                widget_packs: _,
             declared_routes,
             plugin_asset_bundles: _,
             idempotency_enabled,
@@ -6697,6 +6772,8 @@ impl AppBuilder {
             mail_previews,
             #[cfg(feature = "maud")]
             story_gallery,
+            #[cfg(feature = "maud")]
+                widget_packs: _,
             declared_routes: _,
             plugin_asset_bundles: _,
             idempotency_enabled,
@@ -24083,6 +24160,154 @@ mod tests {
                 .extension::<crate::http_client::SharedReqwestClient>()
                 .is_some(),
             "build_state must register a SharedReqwestClient for connection-pool sharing"
+        );
+    }
+
+    // #3400 gap 1: a plugin adds its own stories. A second
+    // `with_story_gallery` call merges; it does not replace.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn with_story_gallery_accumulates_across_calls() {
+        let plugin_story = crate::stories::story! {
+            "Pack",
+            "Pack demo",
+            {
+                maud::html! { span class="autumn-pack-demo" { "pack" } }
+            }
+        };
+        let builtin_count = crate::stories::StoryGallery::builtin().stories().len();
+        let builder = crate::app()
+            .with_story_gallery(crate::stories::StoryGallery::builtin())
+            .with_story_gallery(
+                crate::stories::StoryGallery::new()
+                    .extend([plugin_story])
+                    .stylesheet("/pack.css"),
+            );
+        let gallery = builder.story_gallery.expect("gallery stored");
+        assert_eq!(gallery.stories().len(), builtin_count + 1);
+        assert_eq!(
+            gallery.stories().last().map(crate::stories::Story::slug),
+            Some("pack-demo")
+        );
+        assert_eq!(gallery.stylesheets(), ["/pack.css"]);
+    }
+
+    // #3400 gap 1: the merge keeps the duplicate-slug panic. It fires when
+    // the registry is installed.
+    #[cfg(feature = "maud")]
+    #[test]
+    #[should_panic(expected = "duplicate story slug")]
+    fn with_story_gallery_keeps_the_duplicate_slug_panic() {
+        let builder = crate::app()
+            .with_story_gallery(crate::stories::StoryGallery::builtin())
+            .with_story_gallery(crate::stories::StoryGallery::builtin());
+        let state = build_state(
+            &AutumnConfig::default(),
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        install_story_registry(&state, builder.story_gallery);
+    }
+
+    #[cfg(feature = "maud")]
+    static WIDGET_PACK_ASSETS: crate::assets::PluginAssets =
+        crate::assets::PluginAssets::from_files(
+            "apppacktest",
+            &[
+                (
+                    "apppacktest.css",
+                    b".autumn-apppacktest-x { color: var(--text); }",
+                ),
+                ("apppacktest.js", b"void 0;"),
+            ],
+        );
+
+    #[cfg(feature = "maud")]
+    fn widget_pack_story() -> maud::Markup {
+        maud::html! { span class="autumn-apppacktest-x" { "x" } }
+    }
+
+    #[cfg(feature = "maud")]
+    fn test_widget_pack() -> crate::widget_pack::WidgetPack {
+        crate::widget_pack::WidgetPack::new("apppacktest")
+            .extend([crate::stories::Story::new(
+                "Pack",
+                "Apppacktest demo",
+                widget_pack_story,
+                "widget_pack_story()",
+            )])
+            .assets(&WIDGET_PACK_ASSETS)
+    }
+
+    // #3400: one call installs the asset bundle and merges the pack
+    // stories and asset links into the gallery.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn widget_pack_installs_assets_and_stories() {
+        let builder = crate::app()
+            .with_story_gallery(crate::stories::StoryGallery::builtin())
+            .widget_pack(test_widget_pack());
+        assert!(
+            builder
+                .plugin_asset_bundles
+                .iter()
+                .any(|bundle| std::ptr::eq(*bundle, &raw const WIDGET_PACK_ASSETS)),
+            "the pack bundle must be installed"
+        );
+        let gallery = builder.story_gallery.expect("gallery stored");
+        assert!(
+            gallery
+                .stories()
+                .iter()
+                .any(|story| story.slug() == "apppacktest-demo"),
+            "the pack story must be in the gallery"
+        );
+        assert!(gallery.stories().len() > 1, "the builtin stories must stay");
+        assert_eq!(
+            gallery.stylesheets(),
+            test_widget_pack().stylesheet_urls().as_slice()
+        );
+        assert_eq!(
+            gallery.scripts(),
+            test_widget_pack().script_urls().as_slice()
+        );
+    }
+
+    #[cfg(feature = "maud")]
+    static OTHER_WIDGET_PACK_ASSETS: crate::assets::PluginAssets =
+        crate::assets::PluginAssets::from_files("apppackother", &[("x.css", b"")]);
+
+    // #3400: two different packs with one name panic.
+    #[cfg(feature = "maud")]
+    #[test]
+    #[should_panic(expected = "two different widget packs use the name `apppacktest`")]
+    fn widget_pack_name_clash_panics() {
+        let _ = crate::app().widget_pack(test_widget_pack()).widget_pack(
+            crate::widget_pack::WidgetPack::new("apppacktest").assets(&OTHER_WIDGET_PACK_ASSETS),
+        );
+    }
+
+    // #3400: a second install of one pack name does nothing, so a pack
+    // that two plugins install does not panic on duplicate slugs.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn widget_pack_twice_is_a_no_op() {
+        let builder = crate::app()
+            .widget_pack(test_widget_pack())
+            .widget_pack(test_widget_pack());
+        let gallery = builder.story_gallery.expect("gallery stored");
+        assert_eq!(gallery.stories().len(), 1);
+        assert_eq!(
+            builder
+                .plugin_asset_bundles
+                .iter()
+                .filter(|bundle| std::ptr::eq(**bundle, &raw const WIDGET_PACK_ASSETS))
+                .count(),
+            1
         );
     }
 

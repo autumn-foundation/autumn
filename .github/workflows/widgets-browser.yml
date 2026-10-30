@@ -8,6 +8,8 @@ name: Widget browser gate
 #     violation fails the job.
 #   * Each interactive story has a keyboard test.
 #   * The #3397 keyboard suite runs on its own fixture page.
+#   * Widget pack conformance (#3400): the canary packs, `autumn:init`, and
+#     the reference `swatch` pack through the same axe gate.
 #
 # The tests are `#[ignore]`d and need the `system-tests` feature, so neither
 # the `test` job nor the Docker sweep in ci.yml runs them. The path filter
@@ -39,6 +41,12 @@ on:
       - "autumn/tests/integration/stories_browser.rs"
       - "autumn/tests/integration/widgets_keyboard_browser.rs"
       - "autumn/tests/fixtures/axe-core/**"
+      - "autumn/src/widget_pack.rs"
+      - "autumn/src/plugin_conformance.rs"
+      - "autumn/src/plugin_conformance/**"
+      - "autumn/tests/integration/widget_pack_browser.rs"
+      - "autumn-plugin-reference/src/**"
+      - "autumn-plugin-reference/Cargo.toml"
       - ".github/workflows/widgets-browser.yml"
   push:
     branches: [trunk, trunk-dev]
@@ -61,6 +69,12 @@ on:
       - "autumn/tests/integration/stories_browser.rs"
       - "autumn/tests/integration/widgets_keyboard_browser.rs"
       - "autumn/tests/fixtures/axe-core/**"
+      - "autumn/src/widget_pack.rs"
+      - "autumn/src/plugin_conformance.rs"
+      - "autumn/src/plugin_conformance/**"
+      - "autumn/tests/integration/widget_pack_browser.rs"
+      - "autumn-plugin-reference/src/**"
+      - "autumn-plugin-reference/Cargo.toml"
       - ".github/workflows/widgets-browser.yml"
   # Weekly, for changes the path filter does not see (router, CSP, Cargo.lock).
   schedule:
@@ -134,6 +148,30 @@ jobs:
             | tee "${RUNNER_TEMP}/widgets-keyboard-browser.log"
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-keyboard-browser.log" \
             || { echo "::error::no widget keyboard browser tests ran"; exit 1; }
+
+      # Widget pack conformance (#3400): canaries, `autumn:init`, and the
+      # reference `swatch` pack through the same axe gate.
+      - name: Run the widget pack browser checks
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widget_pack_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widget-pack-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widget-pack-browser.log" \
+            || { echo "::error::no widget pack browser tests ran"; exit 1; }
+
+      - name: Run the reference widget pack browser check
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-plugin-reference --features system-tests --lib \
+            the_swatch_pack_passes_widget_browser_conformance -- --include-ignored \
+            | tee "${RUNNER_TEMP}/reference-pack-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/reference-pack-browser.log" \
+            || { echo "::error::the reference pack browser test did not run"; exit 1; }
 
       - name: Upload failure screenshots
         if: failure()

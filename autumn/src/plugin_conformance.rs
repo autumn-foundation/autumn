@@ -23,6 +23,9 @@ use serde::{Deserialize, Serialize};
 use crate::plugin_contract::{PluginContract, SurfaceTier, surface};
 use crate::route_listing::{RouteInfo, RouteSource};
 
+#[cfg(feature = "maud")]
+pub mod widgets;
+
 // ── Configuration ──────────────────────────────────────────────────────────
 
 /// Configuration for a conformance run against a specific plugin.

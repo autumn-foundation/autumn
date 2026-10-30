@@ -75,7 +75,7 @@ so it is usually automatic:
 | `test-features` | Linux | one job per non-default feature set (markdown, i18n, tls, …) |
 | `test-docker` | Linux | the `#[ignore]`d Docker/testcontainer sweep |
 | `test-docker-deploy` | Linux | `deploy_e2e` alone, on a fresh disk (#2547) |
-| `widgets-browser` (own workflow) | Linux | Chromium: axe + keyboard over `/_stories`, and the #3397 keyboard suite (#3398). Runs only when widget paths change. |
+| `widgets-browser` (own workflow) | Linux | Chromium: axe + keyboard over `/_stories`, the #3397 keyboard suite (#3398), and widget pack conformance (#3400). Runs only when widget paths change. |
 
 `widgets-browser` is not in `ci.yml`. It is
 `.github/workflows/widgets-browser.yml`, with a `paths:` filter. Its tests are

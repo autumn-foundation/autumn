@@ -514,6 +514,9 @@ const BROWSER_GATE_PATHS: &[&str] = &[
     "autumn/src/stories/**",
     "autumn/src/htmx.rs",
     "autumn/vendor/htmx.min.js",
+    "autumn/src/widget_pack.rs",
+    "autumn/src/plugin_conformance/**",
+    "autumn-plugin-reference/src/**",
 ];
 
 #[test]
@@ -532,7 +535,11 @@ fn widget_browser_workflow_runs_on_widget_changes() {
             "widgets-browser.yml does not run on changes to {path} for both triggers"
         );
     }
-    for suite in ["stories_browser", "widgets_keyboard_browser"] {
+    for suite in [
+        "stories_browser",
+        "widgets_keyboard_browser",
+        "widget_pack_browser",
+    ] {
         assert!(
             workflow.contains(&format!(
                 "--test integration_tests {suite} -- --include-ignored"
@@ -542,7 +549,11 @@ fn widget_browser_workflow_runs_on_widget_changes() {
     }
     // A filter that matches nothing exits 0. Each suite needs a count check.
     assert!(
-        workflow.matches("passed' ").count() >= 2,
+        workflow.contains("the_swatch_pack_passes_widget_browser_conformance -- --include-ignored"),
+        "widgets-browser.yml does not run the reference widget pack (#3400)"
+    );
+    assert!(
+        workflow.matches("passed' ").count() >= 4,
         "widgets-browser.yml must check a non-zero pass count for each suite"
     );
 }

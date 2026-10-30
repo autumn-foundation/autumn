@@ -66,6 +66,7 @@ Events (they bubble):
 |---|---|---|
 | `autumn:navigate` | the list | `{ item }`, the new active item |
 | `autumn:dismiss` | the layer | `{ item: null }` |
+| `autumn:init` | `document` or the new root | none |
 
 Example: a plugin listbox. Your code opens it; the core closes it.
 
@@ -77,6 +78,62 @@ Example: a plugin listbox. Your code opens it; the core closes it.
   <li role="option">Apple</li>
   <li role="option">Banana</li>
 </ul>
+```
+
+## Plugin JavaScript
+
+A widget pack (see [Widget Packs](widget-packs.md)) reuses the core. It does
+not write arrow-key, Home/End, typeahead or Escape code.
+
+Do these steps:
+
+1. Write the server markup with the `data-*` attributes above. Write the
+   roles and the selection (`aria-selected`, `aria-checked`) that work with
+   JavaScript off.
+2. Load the pack script with `defer`, after `autumn-widgets.js`.
+3. Do the pack set-up in an `autumn:init` listener. Do not listen for
+   `htmx:afterSwap` yourself.
+4. Listen for `autumn:navigate` and `autumn:dismiss` to update your state.
+5. To open a layer, remove `hidden` and set `aria-expanded="true"` on the
+   trigger. The core closes it.
+
+`autumn:init` fires on each new root. The root is the event target:
+
+| When | `event.target` |
+|---|---|
+| Page load (`DOMContentLoaded`) | `document` |
+| An `outerHTML` swap | the new element |
+| An `innerHTML` or `beforeend` swap | the target element, which also holds the old children |
+| An htmx history restore | `document` |
+
+The event comes after core set-up and before roving set-up. Your listener
+can set a role or a selection before the core selects the tab stop.
+
+The runtime starts on `DOMContentLoaded`. All deferred scripts run before
+it. Thus a pack script gets the page-load event.
+
+The target can be the widget itself. The target can also hold widgets that
+you set up before. Thus match the target and its children, and set up each
+widget one time only:
+
+```js
+(function () {
+  var ready = new WeakSet();
+  function setUp(picker) {
+    if (ready.has(picker)) return;
+    ready.add(picker);
+    // Set-up for one picker. The core does the keys.
+  }
+  document.addEventListener('autumn:init', function (e) {
+    var root = e.target;
+    if (!root.querySelectorAll) return;
+    if (root.matches && root.matches('[data-datepicker]')) setUp(root);
+    root.querySelectorAll('[data-datepicker]').forEach(setUp);
+  });
+  document.addEventListener('autumn:navigate', function (e) {
+    // e.detail.item is the new active item.
+  });
+})();
 ```
 
 ## No JavaScript

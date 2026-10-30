@@ -23,6 +23,8 @@
   //
   // The controller (or trigger) is the element whose aria-controls names the
   // list (or layer). Events: `autumn:navigate` (detail.item), `autumn:dismiss`.
+  // `autumn:init` fires on each new root (the page, an htmx swap) before
+  // roving init, so plugin JS can set roles that roving reads (#3400).
 
   var ITEMS = '[role="tab"],[role="menuitem"],[role="option"],[role="radio"],[role="treeitem"]';
   var LIST = '[data-autumn-roving],[data-autumn-activedescendant]';
@@ -664,15 +666,28 @@
     each(root, '[data-autumn-tabs]', initTabs);
     each(root, '[data-ac-value-id]', initAutocomplete);
     each(root, '[data-autumn-nav]', initNav);
+    root.dispatchEvent(new CustomEvent('autumn:init', { bubbles: true }));
     each(root, '[data-autumn-roving]', initRoving);
     // The theme is page state, so only a whole-page init syncs it.
     if (root === document) syncTheme();
   }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function () { initAll(document); });
-  } else {
+  // A parser-run copy boots on DOMContentLoaded. Deferred plugin scripts run
+  // before it, so their `autumn:init` listeners see the page-load event. An
+  // async or injected copy that runs after parsing boots at once.
+  var booted = false;
+  function boot() {
+    if (booted) return;
+    booted = true;
     initAll(document);
+  }
+  var me = document.currentScript;
+  if (document.readyState === 'loading' ||
+      (document.readyState === 'interactive' && me && me.defer && !me.async)) {
+    document.addEventListener('DOMContentLoaded', boot);
+    window.addEventListener('load', boot);
+  } else {
+    boot();
   }
 
   // Re-initialize after htmx swaps in new widgets. htmx fires afterSwap on
