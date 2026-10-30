@@ -19,10 +19,9 @@
 //!   `''`-doubled escaped quote). Semicolons inside any of these are kept
 //!   intact so they do not produce spurious statement fragments -- e.g. a
 //!   `DEFAULT 'hello; world'` clause splits as one statement, not two.
-//! - A `--` comment, a single-quoted literal and a dollar-quoted block each
-//!   hide `--` and `/*` inside them. A `--` or `;` inside a double-quoted
-//!   identifier (e.g. a quoted column name) is not handled; this pattern is
-//!   essentially absent from real migration files.
+//! - A `--` comment, a `'` literal, a `"` identifier and a dollar-quoted
+//!   block each hide `--`, `/*` and `;` inside them. The `E'\''` escape is
+//!   not handled.
 //! - Block comments do not nest. Nested input can only report more.
 
 use std::fmt;
@@ -106,8 +105,7 @@ pub fn classify_sql_for(backend: DatabaseBackend, sql: &str) -> Vec<SafetyFindin
     // Strip block comments at the whole-SQL level before splitting so that a
     // semicolon inside a block comment (e.g. `/* note; end */`) does not produce
     // a spurious empty statement fragment.
-    let without_block_comments = strip_block_comments(sql);
-    let stmts = split_statements(&without_block_comments);
+    let stmts = statements(sql);
 
     // Tables created within this migration have no existing rows or live traffic,
     // so a non-concurrent index build on them is safe.  Collect the names upfront
@@ -165,13 +163,10 @@ pub fn has_unsafe_findings(findings: &[SafetyFinding]) -> bool {
 /// only comments is treated as absent — the command refuses to proceed and
 /// names the offending migration.
 pub fn has_executable_sql(sql: &str) -> bool {
-    let without_block_comments = strip_block_comments(sql);
-    split_statements(&without_block_comments)
-        .iter()
-        .any(|stmt| {
-            stmt.lines()
-                .any(|line| !line.trim().is_empty() && !line.trim().starts_with("--"))
-        })
+    statements(sql).iter().any(|stmt| {
+        stmt.lines()
+            .any(|line| !line.trim().is_empty() && !line.trim().starts_with("--"))
+    })
 }
 
 // ── internals ────────────────────────────────────────────────────────────────
@@ -207,6 +202,11 @@ fn extract_altered_table_name(normalized: &str) -> Option<&str> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+/// Strip block comments, then split `sql` into statements.
+fn statements(sql: &str) -> Vec<String> {
+    split_statements(&strip_block_comments(sql))
+}
+
 /// Split `sql` into individual statements, using `;` as the delimiter. Each
 /// returned statement has its terminating `;` stripped.
 ///
@@ -228,7 +228,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         }
 
         // Single-quoted literal: keep whole, so `;` inside is not a separator.
-        if rest.starts_with('\'') {
+        if starts_quote(rest) {
             let len = quote_len(rest);
             current.push_str(&rest[..len]);
             i += len;
@@ -748,15 +748,17 @@ fn has_inline_unique_constraint(subcommand: &str) -> bool {
     subcommand.contains(" unique ") || subcommand.ends_with(" unique")
 }
 
-/// Byte length of the single-quoted literal at the start of `rest`.
+/// Byte length of the quoted span at the start of `rest`: a `'` literal or a
+/// `"` identifier.
 ///
-/// `rest` must start with `'`. A doubled `''` is an escaped quote. An unclosed
-/// literal runs to the end of `rest`.
+/// `rest` must start with the quote. A doubled quote is an escaped quote. An
+/// unclosed span runs to the end of `rest`.
 fn quote_len(rest: &str) -> usize {
+    let q = rest.chars().next().unwrap_or('\'');
     let mut j = 1;
-    while let Some(rel) = rest[j..].find('\'') {
+    while let Some(rel) = rest[j..].find(q) {
         let abs = j + rel;
-        if rest[abs + 1..].starts_with('\'') {
+        if rest[abs + 1..].starts_with(q) {
             j = abs + 2;
         } else {
             return abs + 1;
@@ -783,6 +785,11 @@ fn dollar_quote_len(rest: &str) -> Option<usize> {
     )
 }
 
+/// True when `rest` starts a `'` literal or a `"` identifier.
+fn starts_quote(rest: &str) -> bool {
+    rest.starts_with(['\'', '"'])
+}
+
 /// Byte length of the line comment at the start of `rest`, or `None`. The
 /// newline is not part of the comment.
 fn line_comment_len(rest: &str) -> Option<usize> {
@@ -804,7 +811,7 @@ pub fn strip_block_comments(sql: &str) -> String {
         let rest = &sql[i..];
         let keep = line_comment_len(rest)
             .or_else(|| dollar_quote_len(rest))
-            .or_else(|| rest.starts_with('\'').then(|| quote_len(rest)));
+            .or_else(|| starts_quote(rest).then(|| quote_len(rest)));
         if let Some(len) = keep {
             result.push_str(&rest[..len]);
             i += len;
@@ -830,7 +837,7 @@ fn strip_line_comments(sql: &str) -> String {
         let rest = &sql[i..];
         if let Some(len) = line_comment_len(rest) {
             i += len;
-        } else if rest.starts_with('\'') {
+        } else if starts_quote(rest) {
             let len = quote_len(rest);
             result.push_str(&rest[..len]);
             i += len;
@@ -859,7 +866,7 @@ pub fn normalize_statement(stmt: &str) -> String {
 /// [`classify_sql_for`] so that concurrent index keywords mentioned only inside a
 /// SQL comment (e.g. `-- CREATE INDEX CONCURRENTLY ...`) are not counted.
 pub fn contains_concurrent_index(sql: &str) -> bool {
-    split_statements(sql).iter().any(|stmt| {
+    statements(sql).iter().any(|stmt| {
         let normalized = normalize_statement(stmt);
         normalized.contains("create index concurrently ")
             || normalized.contains("create unique index concurrently ")
@@ -2378,6 +2385,31 @@ mod tests {
     fn has_executable_sql_sees_statement_after_line_comment_with_block_open() {
         assert!(has_executable_sql("-- x /* y\nDROP TABLE t;"));
         assert!(!has_executable_sql("-- x /* y\n-- z"));
+    }
+
+    #[test]
+    fn double_quoted_identifier_hides_block_open_and_quote() {
+        for sql in [
+            "CREATE TABLE \"a/*b\" (id int);\nDROP TABLE x;",
+            "CREATE TABLE \"it's\" (a int); DROP TABLE t;",
+            "CREATE TABLE \"a--b\" (id int); DROP TABLE t;",
+        ] {
+            let f = classify_sql(sql);
+            assert!(
+                f.iter().any(|f| f.risk == RiskLevel::Destructive),
+                "{sql}: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_index_scan_strips_block_comments_first() {
+        assert!(contains_concurrent_index(
+            "CREATE INDEX /* a; b */ CONCURRENTLY idx ON t (c);"
+        ));
+        assert!(!contains_concurrent_index(
+            "/* x; CREATE INDEX CONCURRENTLY i ON t (c) */"
+        ));
     }
 
     #[test]
