@@ -19,13 +19,11 @@
 //!   `''`-doubled escaped quote). Semicolons inside any of these are kept
 //!   intact so they do not produce spurious statement fragments -- e.g. a
 //!   `DEFAULT 'hello; world'` clause splits as one statement, not two.
-//! - Line comment stripping matches `--` by position on each line, checked
-//!   only *outside* single-quoted literals and dollar-quoted blocks (both
-//!   handled above). A `--` or `;` sequence inside a double-quoted identifier
-//!   (e.g. a quoted column name) is not handled; this pattern is essentially
-//!   absent from real migration files.
-//! - Block comment stripping (`/* … */`) similarly does not handle `/*` or `*/`
-//!   tokens that appear inside string literals.
+//! - A `--` comment, a single-quoted literal and a dollar-quoted block each
+//!   hide `--` and `/*` inside them. A `--` or `;` inside a double-quoted
+//!   identifier (e.g. a quoted column name) is not handled; this pattern is
+//!   essentially absent from real migration files.
+//! - Block comments do not nest. Nested input can only report more.
 
 use std::fmt;
 
@@ -222,52 +220,18 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     while i < sql.len() {
         let rest = &sql[i..];
 
-        // Detect a dollar-quote opening: $identifier$ (identifier may be empty → $$).
-        // When found, consume everything up to and including the matching closing tag
-        // so that semicolons inside the body are not treated as statement separators.
-        if let Some(after_dollar) = rest.strip_prefix('$')
-            && let Some(close_in_rest1) = after_dollar.find('$')
-        {
-            let tag_body = &after_dollar[..close_in_rest1];
-            if tag_body.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                let tag_len = 1 + close_in_rest1 + 1; // opening $ + body + closing $
-                let tag = &rest[..tag_len];
-                if let Some(close_pos) = rest[tag_len..].find(tag) {
-                    // Push opening tag + body + closing tag as one chunk.
-                    current.push_str(&rest[..tag_len + close_pos + tag_len]);
-                    i += tag_len + close_pos + tag_len;
-                } else {
-                    // Unclosed dollar-quote: consume to end of input.
-                    current.push_str(rest);
-                    i = sql.len();
-                }
-                continue;
-            }
+        // Dollar-quoted block: keep whole, so `;` inside is not a separator.
+        if let Some(len) = dollar_quote_len(rest) {
+            current.push_str(&rest[..len]);
+            i += len;
+            continue;
         }
 
-        // Single-quoted string literal: consume to the closing quote, treating
-        // a doubled `''` as an escaped quote (the standard SQL convention --
-        // matches how `sql_default_literal` escapes user-supplied defaults) so
-        // a semicolon inside a literal (e.g. a `DEFAULT 'hello; world'`) is
-        // never treated as a statement separator.
+        // Single-quoted literal: keep whole, so `;` inside is not a separator.
         if rest.starts_with('\'') {
-            let mut j = 1;
-            loop {
-                if let Some(rel) = rest[j..].find('\'') {
-                    let abs = j + rel;
-                    if rest[abs + 1..].starts_with('\'') {
-                        j = abs + 2; // escaped '' -- keep scanning
-                    } else {
-                        j = abs + 1; // closing quote
-                        break;
-                    }
-                } else {
-                    j = rest.len(); // unclosed literal: consume to end of input
-                    break;
-                }
-            }
-            current.push_str(&rest[..j]);
-            i += j;
+            let len = quote_len(rest);
+            current.push_str(&rest[..len]);
+            i += len;
             continue;
         }
 
@@ -784,42 +748,105 @@ fn has_inline_unique_constraint(subcommand: &str) -> bool {
     subcommand.contains(" unique ") || subcommand.ends_with(" unique")
 }
 
+/// Byte length of the single-quoted literal at the start of `rest`.
+///
+/// `rest` must start with `'`. A doubled `''` is an escaped quote. An unclosed
+/// literal runs to the end of `rest`.
+fn quote_len(rest: &str) -> usize {
+    let mut j = 1;
+    while let Some(rel) = rest[j..].find('\'') {
+        let abs = j + rel;
+        if rest[abs + 1..].starts_with('\'') {
+            j = abs + 2;
+        } else {
+            return abs + 1;
+        }
+    }
+    rest.len()
+}
+
+/// Byte length of the dollar-quoted block (`$$…$$`, `$tag$…$tag$`) at the
+/// start of `rest`, or `None` when `rest` does not start one. An unclosed
+/// block runs to the end of `rest`.
+fn dollar_quote_len(rest: &str) -> Option<usize> {
+    let after = rest.strip_prefix('$')?;
+    let tag_body = &after[..after.find('$')?];
+    if !tag_body.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let tag_len = tag_body.len() + 2;
+    let tag = &rest[..tag_len];
+    Some(
+        rest[tag_len..]
+            .find(tag)
+            .map_or(rest.len(), |p| p + 2 * tag_len),
+    )
+}
+
+/// Byte length of the line comment at the start of `rest`, or `None`. The
+/// newline is not part of the comment.
+fn line_comment_len(rest: &str) -> Option<usize> {
+    rest.starts_with("--")
+        .then(|| rest.find('\n').unwrap_or(rest.len()))
+}
+
 /// Remove `/* ... */` block comments from `sql`.
 ///
-/// Handles single-line and multi-line block comments. Unclosed block comments
-/// are consumed to end-of-input. Block comments inside string literals are an
-/// edge case not handled here (same limitation as `--` in strings).
+/// A `/*` inside a `--` comment, a single-quoted literal or a dollar-quoted
+/// block starts nothing, and those spans stay as they are. Line comments stay
+/// because `has_review_suppression` reads them. Unclosed block comments run to
+/// end-of-input. Block comments do not nest, so nested input can only report
+/// more, never less.
 pub fn strip_block_comments(sql: &str) -> String {
     let mut result = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '/' && chars.peek() == Some(&'*') {
-            chars.next(); // consume '*'
-            loop {
-                match chars.next() {
-                    Some('*') if chars.peek() == Some(&'/') => {
-                        chars.next(); // consume '/'
-                        result.push(' '); // preserve token boundary where the comment was
-                        break;
-                    }
-                    None => break, // unclosed block comment
-                    _ => {}
-                }
-            }
+    let mut i = 0;
+    while i < sql.len() {
+        let rest = &sql[i..];
+        let keep = line_comment_len(rest)
+            .or_else(|| dollar_quote_len(rest))
+            .or_else(|| rest.starts_with('\'').then(|| quote_len(rest)));
+        if let Some(len) = keep {
+            result.push_str(&rest[..len]);
+            i += len;
+        } else if let Some(body) = rest.strip_prefix("/*") {
+            // Unclosed: drop to end-of-input.
+            i += body.find("*/").map_or(rest.len(), |p| p + 4);
+            result.push(' '); // keep the token boundary
         } else {
+            let c = rest.chars().next().unwrap_or(' ');
             result.push(c);
+            i += c.len_utf8();
         }
     }
     result
 }
 
-/// Strip line comments, collapse whitespace, and lowercase a single statement.
+/// Remove `--` line comments from `sql`, keeping newlines. A `--` inside a
+/// single-quoted literal is text, not a comment.
+fn strip_line_comments(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut i = 0;
+    while i < sql.len() {
+        let rest = &sql[i..];
+        if let Some(len) = line_comment_len(rest) {
+            i += len;
+        } else if rest.starts_with('\'') {
+            let len = quote_len(rest);
+            result.push_str(&rest[..len]);
+            i += len;
+        } else {
+            let c = rest.chars().next().unwrap_or(' ');
+            result.push(c);
+            i += c.len_utf8();
+        }
+    }
+    result
+}
+
+/// Strip comments, collapse whitespace, and lowercase a single statement.
 pub fn normalize_statement(stmt: &str) -> String {
-    let without_block_comments = strip_block_comments(stmt);
-    without_block_comments
-        .lines()
-        .map(|line| line.find("--").map_or(line, |i| &line[..i]))
-        .flat_map(str::split_whitespace)
+    strip_line_comments(&strip_block_comments(stmt))
+        .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
@@ -2301,6 +2328,56 @@ mod tests {
             "DROP TABLE after a block comment containing ';' must still be classified"
         );
         assert_eq!(findings[0].risk, RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn block_open_inside_line_comment_does_not_hide_statements() {
+        // Issue #3437: `/*` in a `--` comment has no meaning.
+        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+            for sql in [
+                "--/*\nDROP TABLE t;",
+                "-- load /var/data/*.csv later\nDROP TABLE t;",
+            ] {
+                let findings = classify_sql_for(backend, sql);
+                assert_eq!(findings.len(), 1, "{backend:?} {sql:?}");
+                assert_eq!(findings[0].risk, RiskLevel::Destructive);
+            }
+        }
+    }
+
+    #[test]
+    fn block_open_inside_literal_does_not_hide_statements() {
+        let sql = "INSERT INTO t VALUES ('/*');\nDROP TABLE t;";
+        let findings = classify_sql(sql);
+        assert!(findings.iter().any(|f| f.risk == RiskLevel::Destructive));
+    }
+
+    #[test]
+    fn line_comment_marker_inside_literal_does_not_hide_clause() {
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT '--', DROP COLUMN b;";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.iter().any(|f| f.operation == "DROP COLUMN"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn review_marker_survives_block_stripping() {
+        let sql = "-- autumn-safety: reviewed /* ok\nDROP TABLE t;";
+        assert!(classify_sql(sql).is_empty());
+    }
+
+    #[test]
+    fn block_comment_after_line_comment_is_still_stripped() {
+        let sql = "-- note\n/* DROP TABLE a; */ SELECT 1;";
+        assert!(classify_sql(sql).is_empty());
+    }
+
+    #[test]
+    fn has_executable_sql_sees_statement_after_line_comment_with_block_open() {
+        assert!(has_executable_sql("-- x /* y\nDROP TABLE t;"));
+        assert!(!has_executable_sql("-- x /* y\n-- z"));
     }
 
     #[test]
