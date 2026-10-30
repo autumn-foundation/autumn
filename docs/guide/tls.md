@@ -744,6 +744,19 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 # resolvers = ["1.1.1.1:53", "8.8.8.8:53"]  # read ownership TXT records
 ```
 
+Each tick checks pending domains 16 at a time, for at most half of
+`poll_interval_secs`. A check that takes more than 20 seconds fails and backs
+off. Domains the tick did not reach wait for the next tick. Issuance and
+renewal then start on time, even when one tenant's DNS is slow.
+
+A renewal DNS check that takes more than 10 seconds is treated as a DNS error.
+Autumn renews the certificate anyway.
+
+With the default 60-second interval, verification gets 30 seconds per tick.
+Each round of 16 checks takes at most 20 seconds. With an interval under 40
+seconds, the limit for one check is half of the verification time. A sweep of 1,000 new domains
+can therefore take several ticks.
+
 `ingress_hostname` is what tenants CNAME at. An **apex** domain
 (`clientco.com`) cannot carry a CNAME, so it needs `ingress_ipv4` /
 `ingress_ipv6` instead; set both kinds if you accept both.
