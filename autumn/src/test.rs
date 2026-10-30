@@ -825,6 +825,9 @@ impl TestApp {
     /// Create a new test app builder with default configuration.
     #[must_use]
     pub fn new() -> Self {
+        // Connections the test opens from here on are in the Ledger capture.
+        #[cfg(feature = "ledger-capture")]
+        crate::ledger_capture::install();
         let mut config = AutumnConfig::default();
         config.profile = Some("test".into());
         // Disable CSRF for tests by default (like Spring Security's test support)

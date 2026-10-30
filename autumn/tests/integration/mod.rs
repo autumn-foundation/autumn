@@ -379,6 +379,27 @@ mod pg_relative_delay_ci_coverage;
 // module fails if a test gets a new name (#3182). It has no feature gate,
 // because it reads job.rs and ci.yml as text.
 mod pg_claim_ci_coverage;
+// The Ledger capture covers only connections established after it installs,
+// and nothing can run before `main` under `unsafe_code = "forbid"`. libtest
+// starts tests in name order, and `__` sorts before every module here, so
+// this test installs the capture before any other test connects. It is
+// `#[ignore]`d so the `--ignored` Docker sweep runs it. It also fails when
+// AUTUMN_LEDGER_CAPTURE_DIR is set and the capture did not turn on.
+#[cfg(feature = "ledger-capture")]
+#[test]
+#[ignore = "installs the Ledger capture for the Docker sweep"]
+fn __ledger_capture_installs_first() {
+    autumn_web::ledger_capture::install();
+    if std::env::var_os(autumn_web::ledger_capture::CAPTURE_DIR_ENV).is_some() {
+        assert!(
+            autumn_web::ledger_capture::enabled(),
+            "AUTUMN_LEDGER_CAPTURE_DIR is set, but the capture could not open its output file"
+        );
+    }
+}
+// ci.yml runs the Bolt and Ledger profile gates (docs/perf/README.md). Reads
+// ci.yml as text, so no feature gate.
+mod perf_profile_gates_ci_coverage;
 // Postgres tier of the bitemporal, tamper-evident record ledger (issue #1699).
 // The Docker-free golden test lives in `tests/sqlite_ledger.rs`; this proves the
 // Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).
