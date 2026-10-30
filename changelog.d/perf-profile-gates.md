@@ -1,6 +1,7 @@
 ### Added
 
-- **ledger-capture:** a new off-by-default cargo feature. With
+- **ledger-capture [no-plugin]:** a new off-by-default cargo feature for
+  framework contributors. With
   `AUTUMN_LEDGER_CAPTURE_DIR` set, it records every SQL statement the
   framework issues, with its production call site and two generic plans
   (`EXPLAIN (GENERIC_PLAN)` as planned, and with `enable_seqscan = off`).
