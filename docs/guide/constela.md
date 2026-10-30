@@ -345,6 +345,7 @@ A 2 KB document that loops over a 100 000-element list is small and expensive:
 | `max_nodes` | 50 000 |
 | `max_each_items` | 5 000 |
 | `max_output_bytes` | 4 MiB |
+| `max_fuel` | 16 000 000 |
 
 `max_output_bytes` is not implied by the node or iteration counts, which is why
 it is its own budget: a *single* text node can emit as much as
@@ -355,6 +356,13 @@ budget spans the body **and** every portal together, and it also caps what a
 single expression may *build* — `concat`, `array`, `obj` and string `+` assemble
 a finished value inside the evaluator before any of it reaches the output
 buffer, so bounding only the output would leave the allocation unbounded.
+
+`max_fuel` bounds the **work** of a render. One unit pays for one node, one
+expression, or 64 bytes that a comparison, a string index or a path lookup
+reads. Nested loops multiply, and a comparison of two large values is one node,
+so the other bounds do not see either. A render that spends all its fuel fails
+with `constela.render_limit`. A dispatch uses the default. Paths are built only
+when a diagnostic is made, so a long name costs nothing until then.
 
 The same 4 MiB also bounds what one render *keeps*: each value an expression
 builds or copies, route metadata, handler payloads, portal targets and

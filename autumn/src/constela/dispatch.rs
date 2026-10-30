@@ -59,6 +59,7 @@ use super::error::{ConstelaError, Diagnostic, codes, excerpt};
 use super::eval::{
     Env, EvalCtx, RouteValues, coerce, eval, eval_ref, js_string, number_value, truthy,
 };
+use super::path::Path;
 
 /// A browser-side step [`dispatch`] declined to perform, with its operands
 /// already evaluated.
@@ -198,7 +199,7 @@ const fn eval_ctx<'c>(
 ///
 /// Charged once: a borrowed string when it is copied, another value when it
 /// is converted.
-fn kept_text(expr: &Expr, eval_ctx: &EvalCtx<'_>, path: &str) -> Result<String, ConstelaError> {
+fn kept_text(expr: &Expr, eval_ctx: &EvalCtx<'_>, path: Path<'_>) -> Result<String, ConstelaError> {
     let value = eval_ref(expr, eval_ctx, path)?;
     eval_ctx
         .budget
@@ -218,11 +219,11 @@ pub fn run_steps(
     state: &mut Map<String, Value>,
     env: &Env<'_>,
     ctx: &DispatchCtx<'_>,
-    path: &str,
+    path: Path<'_>,
     out: &mut Dispatched,
 ) -> Result<(), ConstelaError> {
     for (i, step) in steps.iter().enumerate() {
-        run_step(step, state, env, ctx, &format!("{path}[{i}]"), out)?;
+        run_step(step, state, env, ctx, path.index(i), out)?;
         // Also catches a suspension inside an `if` branch, which recurses
         // through this same loop.
         if out.is_suspended() {
@@ -237,7 +238,7 @@ fn run_step(
     state: &mut Map<String, Value>,
     env: &Env<'_>,
     ctx: &DispatchCtx<'_>,
-    path: &str,
+    path: Path<'_>,
     out: &mut Dispatched,
 ) -> Result<(), ConstelaError> {
     // Each expression is evaluated against the state as it stands *now*, so a
@@ -246,8 +247,8 @@ fn run_step(
     // only reads.
     match step {
         ActionStep::Set { target, value } => {
-            let value = eval(value, &eval_ctx(state, env, ctx), &format!("{path}.value"))?;
-            check_write_depth(&value, 0, ctx.depth, &format!("{path}.value"))?;
+            let value = eval(value, &eval_ctx(state, env, ctx), path.key("value"))?;
+            check_write_depth(&value, 0, ctx.depth, path.key("value"))?;
             state.insert(target.clone(), value);
         }
         ActionStep::Update {
@@ -258,18 +259,14 @@ fn run_step(
             delete_count,
         } => {
             let operand = match value {
-                Some(expr) => Some(eval(
-                    expr,
-                    &eval_ctx(state, env, ctx),
-                    &format!("{path}.value"),
-                )?),
+                Some(expr) => Some(eval(expr, &eval_ctx(state, env, ctx), path.key("value"))?),
                 None => None,
             };
             let index = match index {
                 Some(expr) => array_index(&*eval_ref(
                     expr,
                     &eval_ctx(state, env, ctx),
-                    &format!("{path}.index"),
+                    path.key("index"),
                 )?),
                 None => None,
             };
@@ -277,14 +274,22 @@ fn run_step(
                 Some(expr) => array_index(&*eval_ref(
                     expr,
                     &eval_ctx(state, env, ctx),
-                    &format!("{path}.deleteCount"),
+                    path.key("deleteCount"),
                 )?),
                 None => None,
             };
             if let Some(operand) = operand.as_ref() {
                 // One extra level: the operand lands *inside* the list or
                 // object the operation mutates.
-                check_write_depth(operand, 1, ctx.depth, &format!("{path}.value"))?;
+                check_write_depth(operand, 1, ctx.depth, path.key("value"))?;
+            }
+            // Search and shift walk the whole target.
+            if matches!(
+                operation,
+                UpdateOperation::Remove | UpdateOperation::InsertAt | UpdateOperation::Splice
+            ) && let Some(current) = state.get(target)
+            {
+                ctx.budget.burn_value(current, path.key("target"))?;
             }
             apply_update(state, target, *operation, operand, index, count);
         }
@@ -293,13 +298,13 @@ fn run_step(
             path: target_path,
             value,
         } => {
-            let segments_path = format!("{path}.path");
-            let segments = eval_ref(target_path, &eval_ctx(state, env, ctx), &segments_path)?;
+            let segments_path = path.key("path");
+            let segments = eval_ref(target_path, &eval_ctx(state, env, ctx), segments_path)?;
             // The conversion allocates one string per segment, so the path is
             // charged before it is split.
-            ctx.budget.charge_value(&segments, &segments_path)?;
+            ctx.budget.charge_value(&segments, segments_path)?;
             let segments = path_segments(&segments, ctx.depth);
-            let value = eval(value, &eval_ctx(state, env, ctx), &format!("{path}.value"))?;
+            let value = eval(value, &eval_ctx(state, env, ctx), path.key("value"))?;
 
             // The depth of the *structure*, not just of the walk. `set_at_path`
             // is iterative, so writing through a long path is cheap — but it
@@ -312,7 +317,7 @@ fn run_step(
             // hundred thousand levels down.
             let Some(segments) = segments else {
                 return Err(ConstelaError::Render(Diagnostic::new(
-                    format!("{path}.path"),
+                    path.key("path").to_string(),
                     codes::RENDER_LIMIT,
                     format!(
                         "`setPath` path has more than the {} segments the depth limit allows",
@@ -323,7 +328,7 @@ fn run_step(
 
             // The path's own length plus the value's depth is what the
             // written state ends up nesting to.
-            check_write_depth(&value, segments.len(), ctx.depth, &format!("{path}.value"))?;
+            check_write_depth(&value, segments.len(), ctx.depth, path.key("value"))?;
 
             if let Some(slot) = state.get_mut(target) {
                 set_at_path(slot, &segments, value);
@@ -337,15 +342,15 @@ fn run_step(
             let test = truthy(&*eval_ref(
                 condition,
                 &eval_ctx(state, env, ctx),
-                &format!("{path}.condition"),
+                path.key("condition"),
             )?);
             let branch = if test { then } else { otherwise };
             let branch_path = if test {
-                format!("{path}.then")
+                path.key("then")
             } else {
-                format!("{path}.else")
+                path.key("else")
             };
-            run_steps(branch, state, env, ctx, &branch_path, out)?;
+            run_steps(branch, state, env, ctx, branch_path, out)?;
         }
         effectful => record_effect(effectful, state, env, ctx, path, out)?,
     }
@@ -366,7 +371,7 @@ fn record_effect(
     state: &Map<String, Value>,
     env: &Env<'_>,
     ctx: &DispatchCtx<'_>,
-    path: &str,
+    path: Path<'_>,
     out: &mut Dispatched,
 ) -> Result<(), ConstelaError> {
     let effect = match step {
@@ -377,14 +382,10 @@ fn record_effect(
             result,
             ..
         } => {
-            let url = kept_text(url, &eval_ctx(state, env, ctx), &format!("{path}.url"))?;
-            check_url(&url, &format!("{path}.url"))?;
+            let url = kept_text(url, &eval_ctx(state, env, ctx), path.key("url"))?;
+            check_url(&url, path.key("url"))?;
             let body = match body {
-                Some(expr) => Some(eval(
-                    expr,
-                    &eval_ctx(state, env, ctx),
-                    &format!("{path}.body"),
-                )?),
+                Some(expr) => Some(eval(expr, &eval_ctx(state, env, ctx), path.key("body"))?),
                 None => None,
             };
             Effect::Fetch {
@@ -402,13 +403,9 @@ fn record_effect(
             result,
             ..
         } => {
-            let key = kept_text(key, &eval_ctx(state, env, ctx), &format!("{path}.key"))?;
+            let key = kept_text(key, &eval_ctx(state, env, ctx), path.key("key"))?;
             let value = match value {
-                Some(expr) => Some(eval(
-                    expr,
-                    &eval_ctx(state, env, ctx),
-                    &format!("{path}.value"),
-                )?),
+                Some(expr) => Some(eval(expr, &eval_ctx(state, env, ctx), path.key("value"))?),
                 None => None,
             };
             Effect::Storage {
@@ -420,30 +417,26 @@ fn record_effect(
             }
         }
         ActionStep::Navigate { url, replace } => {
-            let url = kept_text(url, &eval_ctx(state, env, ctx), &format!("{path}.url"))?;
-            check_url(&url, &format!("{path}.url"))?;
+            let url = kept_text(url, &eval_ctx(state, env, ctx), path.key("url"))?;
+            check_url(&url, path.key("url"))?;
             Effect::Navigate {
                 url,
                 replace: *replace,
             }
         }
         ActionStep::Delay { ms, .. } => Effect::Delay {
-            ms: eval_ref(ms, &eval_ctx(state, env, ctx), &format!("{path}.ms"))?
+            ms: eval_ref(ms, &eval_ctx(state, env, ctx), path.key("ms"))?
                 .as_f64()
                 .unwrap_or(0.0),
         },
         ActionStep::Interval { ms, action } => Effect::Interval {
-            ms: eval_ref(ms, &eval_ctx(state, env, ctx), &format!("{path}.ms"))?
+            ms: eval_ref(ms, &eval_ctx(state, env, ctx), path.key("ms"))?
                 .as_f64()
                 .unwrap_or(0.0),
             action: action.clone(),
         },
         ActionStep::Focus { target, operation } => Effect::Focus {
-            target: kept_text(
-                target,
-                &eval_ctx(state, env, ctx),
-                &format!("{path}.target"),
-            )?,
+            target: kept_text(target, &eval_ctx(state, env, ctx), path.key("target"))?,
             operation: operation.clone(),
         },
         // The pure steps are handled by `run_step` and never reach here.
@@ -501,12 +494,12 @@ fn check_write_depth(
     value: &Value,
     nesting: usize,
     limit: usize,
-    path: &str,
+    path: Path<'_>,
 ) -> Result<(), ConstelaError> {
     let room = limit.saturating_sub(nesting);
     if room == 0 || depth_exceeds(value, room) {
         return Err(ConstelaError::Render(Diagnostic::new(
-            path,
+            path.to_string(),
             codes::RENDER_LIMIT,
             format!("the value written here nests deeper than the {limit}-level state depth limit"),
         )));
@@ -518,12 +511,12 @@ fn check_write_depth(
 ///
 /// The document's *literal* URLs were checked during validation; this covers
 /// the ones built by `concat` out of state, which validation could not see.
-fn check_url(url: &str, path: &str) -> Result<(), ConstelaError> {
+fn check_url(url: &str, path: Path<'_>) -> Result<(), ConstelaError> {
     if super::policy::is_allowed_url(url) {
         Ok(())
     } else {
         Err(ConstelaError::Render(Diagnostic::new(
-            path,
+            path.to_string(),
             codes::URL_SCHEME,
             format!(
                 "computed URL {:?} uses a scheme that is not allowed",

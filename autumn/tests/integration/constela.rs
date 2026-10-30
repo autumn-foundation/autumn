@@ -1783,3 +1783,93 @@ fn ids_derived_from_the_loop_index_render() {
     );
     assert_eq!(rendered, r#"<input id="c-row-0"><input id="c-row-1">"#);
 }
+
+// ---------------------------------------------------------------------------
+// Work meter (#3445)
+// ---------------------------------------------------------------------------
+
+fn render_with_fuel(source: &str, state: Map<String, Value>, max_fuel: u64) -> ConstelaError {
+    let document = document(source);
+    let ctx = RenderContext {
+        state,
+        limits: RenderLimits {
+            max_fuel,
+            ..RenderLimits::default()
+        },
+        ..RenderContext::default()
+    };
+    document.render(&ctx).expect_err("fuel runs out")
+}
+
+/// Nested `each` with a cheap leaf: the node count is small, the work is not.
+const NESTED_EACH: &str = r#"{"version":"1.0",
+  "state":{"outer":{"type":"list","initial":[]},"inner":{"type":"list","initial":[]}},
+  "view":{"kind":"each","items":{"expr":"state","name":"outer"},"as":"a",
+    "body":{"kind":"each","items":{"expr":"state","name":"inner"},"as":"b",
+      "body":{"kind":"text","value":{"expr":"concat","items":[{"expr":"lit","value":""},{"expr":"lit","value":""}]}}}}}"#;
+
+fn list(len: usize) -> Value {
+    Value::Array(vec![json!(0); len])
+}
+
+#[test]
+fn fuel_stops_nested_loops_under_the_node_limit() {
+    let mut state = Map::new();
+    state.insert("outer".into(), list(100));
+    state.insert("inner".into(), list(100));
+    let err = render_with_fuel(NESTED_EACH, state, 1_000);
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    assert!(err.diagnostics()[0].message.contains("fuel"));
+}
+
+#[test]
+fn the_default_fuel_allows_a_normal_render() {
+    let document = document(NESTED_EACH);
+    let mut state = document.initial_state();
+    state.insert("outer".into(), list(50));
+    state.insert("inner".into(), list(50));
+    let ctx = RenderContext {
+        state,
+        ..RenderContext::default()
+    };
+    document.render(&ctx).expect("default fuel is enough");
+}
+
+#[test]
+fn fuel_charges_the_bytes_that_a_comparison_scans() {
+    let source = r#"{"version":"1.0",
+      "state":{"s":{"type":"string","initial":""},"rows":{"type":"list","initial":[]}},
+      "view":{"kind":"each","items":{"expr":"state","name":"rows"},"as":"r",
+        "body":{"kind":"text","value":{"expr":"cond","if":{"expr":"bin","op":"==",
+          "left":{"expr":"state","name":"s"},"right":{"expr":"state","name":"s"}},
+          "then":{"expr":"lit","value":"a"},"else":{"expr":"lit","value":"b"}}}}}"#;
+    let mut state = Map::new();
+    state.insert("s".into(), Value::String("x".repeat(400_000)));
+    state.insert("rows".into(), list(100));
+    // 100 passes x ~6 evals is under 1 000 units. 100 x 800 KB of memcmp is not.
+    let err = render_with_fuel(source, state, 1_000);
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+#[test]
+fn a_long_component_name_does_not_slow_a_render() {
+    let name = "a".repeat(20_000);
+    let source = format!(
+        r#"{{"version":"1.0",
+          "state":{{"rows":{{"type":"list","initial":[]}}}},
+          "components":{{"{name}":{{"view":{{"kind":"each","items":{{"expr":"state","name":"rows"}},"as":"r",
+            "body":{{"kind":"text","value":{{"expr":"lit","value":"x"}}}}}}}}}},
+          "view":{{"kind":"component","name":"{name}"}}}}"#
+    );
+    let document = document(&source);
+    let mut state = document.initial_state();
+    state.insert("rows".into(), list(4_000));
+    let ctx = RenderContext {
+        state,
+        ..RenderContext::default()
+    };
+    let start = std::time::Instant::now();
+    document.render(&ctx).expect("renders");
+    // Eager paths copied the name once for each node: 4 000 x 20 KB x depth.
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+}

@@ -630,7 +630,7 @@ steps read, and the server has no value to bind, so running on would write
 `null` over good state.
 
 Bound untrusted input with `Limits` (document: bytes/depth/nodes) and
-`RenderLimits` (expansion: depth/nodes/`max_each_items`/`max_output_bytes`).
+`RenderLimits` (expansion: depth/nodes/`max_each_items`/`max_output_bytes`/`max_fuel`).
 `max_output_bytes` covers the body plus portals *and* what a single expression
 may build; `max_depth` also caps the shape of state on every mutation, since
 state persists between dispatches. See

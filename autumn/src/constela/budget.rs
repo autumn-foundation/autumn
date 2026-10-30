@@ -7,12 +7,14 @@
 //! a path that does not. They do not prove that each path charges. See
 //! `docs/adr/0025-constela-retention-accounting.md`.
 //!
-//! Two meters, because they bound two different things:
+//! Two byte meters, because they bound two different things:
 //!
 //! - [`Budget`]: values that the evaluator builds or copies, and values a
 //!   render keeps outside its markup (metadata, payloads, portal targets,
 //!   ids).
 //! - [`Output`]: markup bytes, for the body and every portal together.
+//!
+//! A third meter, fuel, bounds work and not bytes. See [`Budget::burn`].
 
 // autumn-panic-gate: request-path module — it parses, validates and renders a
 // document written by a language model, so every panic in it is reachable by
@@ -41,6 +43,7 @@ use std::cell::Cell;
 use serde_json::Value;
 
 use super::error::{ConstelaError, Diagnostic, codes};
+use super::path::Path;
 
 /// The nominal bytes one value slot costs, before its contents.
 ///
@@ -48,6 +51,12 @@ use super::error::{ConstelaError, Diagnostic, codes};
 /// JSON size of the value, which is what a document author can see. The
 /// bound stays linear in the real size, which is what it is for.
 pub const SLOT_BYTES: usize = 8;
+
+/// Bytes of scanning that cost one unit of fuel.
+///
+/// A comparison or a search runs at memory speed. One unit buys about as much
+/// time as one `eval_ref` call when it covers this many bytes.
+pub const SCAN_BLOCK_BYTES: usize = 64;
 
 /// Bytes that a render or a dispatch may build, copy or keep.
 ///
@@ -57,6 +66,8 @@ pub const SLOT_BYTES: usize = 8;
 pub struct Budget {
     remaining: Cell<usize>,
     limit: usize,
+    fuel: Cell<u64>,
+    fuel_limit: u64,
 }
 
 impl Budget {
@@ -65,15 +76,89 @@ impl Budget {
         Self {
             remaining: Cell::new(limit),
             limit,
+            fuel: Cell::new(u64::MAX),
+            fuel_limit: u64::MAX,
         }
     }
 
+    /// The same budget, with `fuel` units of work. Without this call, work is
+    /// not metered.
+    #[must_use]
+    pub const fn with_fuel(mut self, fuel: u64) -> Self {
+        self.fuel = Cell::new(fuel);
+        self.fuel_limit = fuel;
+        self
+    }
+
+    /// Spend `units` of work, or fail with [`codes::RENDER_LIMIT`] at `path`.
+    ///
+    /// Byte charges bound what a render keeps. Fuel bounds what it does.
+    pub fn burn(&self, units: u64, path: Path<'_>) -> Result<(), ConstelaError> {
+        let left = self.fuel.get();
+        if units > left {
+            return Err(ConstelaError::Render(Diagnostic::new(
+                path.to_string(),
+                codes::RENDER_LIMIT,
+                format!(
+                    "the document asks for more than the {}-unit work fuel limit",
+                    self.fuel_limit
+                ),
+            )));
+        }
+        self.fuel.set(left.saturating_sub(units));
+        Ok(())
+    }
+
+    /// Spend fuel for `bytes` that a comparison or a scan reads.
+    ///
+    /// One unit for each started [`SCAN_BLOCK_BYTES`]. Call it before the scan.
+    pub fn burn_scan(&self, bytes: usize, path: Path<'_>) -> Result<(), ConstelaError> {
+        let units = u64::try_from(bytes.div_ceil(SCAN_BLOCK_BYTES)).unwrap_or(u64::MAX);
+        self.burn(units, path)
+    }
+
+    /// The most bytes the fuel left can pay to scan.
+    fn scan_cap(&self) -> usize {
+        usize::try_from(self.fuel.get())
+            .unwrap_or(usize::MAX)
+            .saturating_mul(SCAN_BLOCK_BYTES)
+    }
+
+    /// Spend fuel for walking all of `value`, as a search or a shift does.
+    ///
+    /// Measured up to what the fuel left can pay for. Free when work is not
+    /// metered.
+    pub fn burn_value(&self, value: &Value, path: Path<'_>) -> Result<(), ConstelaError> {
+        if self.fuel_limit == u64::MAX {
+            return Ok(());
+        }
+        self.burn_scan(approx_bytes(value, self.scan_cap()), path)
+    }
+
+    /// Spend fuel for comparing two values: the size of the smaller one.
+    ///
+    /// Each value is measured up to what the fuel left can pay for, so the
+    /// measuring is bounded too. Free when work is not metered.
+    pub fn burn_compare(
+        &self,
+        left: &Value,
+        right: &Value,
+        path: Path<'_>,
+    ) -> Result<(), ConstelaError> {
+        if self.fuel_limit == u64::MAX {
+            return Ok(());
+        }
+        let cap = self.scan_cap();
+        let smaller = approx_bytes(left, cap).min(approx_bytes(right, cap));
+        self.burn_scan(smaller, path)
+    }
+
     /// Spend `bytes`, or fail with [`codes::RENDER_LIMIT`] at `path`.
-    pub fn charge(&self, bytes: usize, path: &str) -> Result<(), ConstelaError> {
+    pub fn charge(&self, bytes: usize, path: Path<'_>) -> Result<(), ConstelaError> {
         let remaining = self.remaining.get();
         if bytes > remaining {
             return Err(ConstelaError::Render(Diagnostic::new(
-                path,
+                path.to_string(),
                 codes::RENDER_LIMIT,
                 format!(
                     "values built or kept here go over the {}-byte allocation budget",
@@ -86,13 +171,13 @@ impl Budget {
     }
 
     /// Spend the approximate size of `value`.
-    pub fn charge_value(&self, value: &Value, path: &str) -> Result<(), ConstelaError> {
+    pub fn charge_value(&self, value: &Value, path: Path<'_>) -> Result<(), ConstelaError> {
         self.charge(approx_bytes(value, self.remaining.get()), path)
     }
 
     /// Own `value`. A borrowed value is charged, then copied. An owned value
     /// was charged when it was built.
-    pub fn own(&self, value: Cow<'_, Value>, path: &str) -> Result<Value, ConstelaError> {
+    pub fn own(&self, value: Cow<'_, Value>, path: Path<'_>) -> Result<Value, ConstelaError> {
         match value {
             Cow::Owned(value) => Ok(value),
             Cow::Borrowed(value) => {
@@ -104,7 +189,7 @@ impl Budget {
 
     /// Own `text`. Borrowed text is charged, then copied. Owned text was
     /// charged when it was built.
-    pub fn own_str(&self, text: Cow<'_, str>, path: &str) -> Result<String, ConstelaError> {
+    pub fn own_str(&self, text: Cow<'_, str>, path: Path<'_>) -> Result<String, ConstelaError> {
         match text {
             Cow::Owned(text) => Ok(text),
             Cow::Borrowed(text) => {
@@ -121,14 +206,14 @@ impl Budget {
 /// serialized payload. The charge is exact.
 pub struct ChargingWriter<'b> {
     budget: &'b Budget,
-    path: &'b str,
+    path: Path<'b>,
     out: Vec<u8>,
     refused: Option<ConstelaError>,
 }
 
 impl<'b> ChargingWriter<'b> {
     /// A writer that charges `budget`, and reports at `path`.
-    pub const fn new(budget: &'b Budget, path: &'b str) -> Self {
+    pub const fn new(budget: &'b Budget, path: Path<'b>) -> Self {
         Self {
             budget,
             path,
@@ -149,8 +234,9 @@ impl<'b> ChargingWriter<'b> {
             return Err(refused);
         }
         let path = self.path;
-        let failed =
-            |message: String| ConstelaError::Render(Diagnostic::new(path, codes::EVAL, message));
+        let failed = |message: String| {
+            ConstelaError::Render(Diagnostic::new(path.to_string(), codes::EVAL, message))
+        };
         written.map_err(|err| failed(format!("value could not be serialized: {err}")))?;
         String::from_utf8(self.out)
             .map_err(|err| failed(format!("serialized value is not UTF-8: {err}")))
@@ -195,10 +281,10 @@ impl Output {
     ///
     /// Call this before an allocation whose result is written later, such as
     /// an escaped copy.
-    pub fn check(&self, extra: usize, path: &str) -> Result<(), ConstelaError> {
+    pub fn check(&self, extra: usize, path: Path<'_>) -> Result<(), ConstelaError> {
         if self.written.get().saturating_add(extra) > self.limit {
             return Err(ConstelaError::Render(Diagnostic::new(
-                path,
+                path.to_string(),
                 codes::RENDER_LIMIT,
                 format!(
                     "render would produce more than {} bytes of markup",
@@ -210,7 +296,7 @@ impl Output {
     }
 
     /// Append `text` to `out`. The only way markup reaches a buffer.
-    pub fn write(&self, out: &mut String, text: &str, path: &str) -> Result<(), ConstelaError> {
+    pub fn write(&self, out: &mut String, text: &str, path: Path<'_>) -> Result<(), ConstelaError> {
         self.check(text.len(), path)?;
         self.written
             .set(self.written.get().saturating_add(text.len()));
@@ -259,9 +345,9 @@ mod tests {
     #[test]
     fn a_charge_spends_and_an_overdraft_fails() {
         let budget = Budget::new(10);
-        budget.charge(6, "a").expect("fits");
-        budget.charge(4, "b").expect("fits exactly");
-        let err = budget.charge(1, "c").expect_err("over");
+        budget.charge(6, Path::root("a")).expect("fits");
+        budget.charge(4, Path::root("b")).expect("fits exactly");
+        let err = budget.charge(1, Path::root("c")).expect_err("over");
         assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
         assert_eq!(err.diagnostics()[0].path, "c");
     }
@@ -269,9 +355,9 @@ mod tests {
     #[test]
     fn a_failed_charge_spends_nothing() {
         let budget = Budget::new(10);
-        budget.charge(11, "a").expect_err("over");
+        budget.charge(11, Path::root("a")).expect_err("over");
         budget
-            .charge(10, "b")
+            .charge(10, Path::root("b"))
             .expect("the full budget is still there");
     }
 
@@ -279,10 +365,12 @@ mod tests {
     fn owning_a_borrowed_value_charges_its_size() {
         let budget = Budget::new(100);
         let value = json!("x".repeat(60));
-        let owned = budget.own(Cow::Borrowed(&value), "p").expect("fits");
+        let owned = budget
+            .own(Cow::Borrowed(&value), Path::root("p"))
+            .expect("fits");
         assert_eq!(owned, value);
         budget
-            .own(Cow::Borrowed(&value), "p")
+            .own(Cow::Borrowed(&value), Path::root("p"))
             .expect_err("second copy is over");
     }
 
@@ -290,7 +378,7 @@ mod tests {
     fn owning_an_owned_value_charges_nothing() {
         let budget = Budget::new(0);
         let owned = budget
-            .own(Cow::Owned(json!("x".repeat(60))), "p")
+            .own(Cow::Owned(json!("x".repeat(60))), Path::root("p"))
             .expect("built values were charged when built");
         assert_eq!(owned.as_str().map(str::len), Some(60));
     }
@@ -298,20 +386,20 @@ mod tests {
     #[test]
     fn a_charging_writer_charges_the_exact_text() {
         let budget = Budget::new(100);
-        let text = ChargingWriter::new(&budget, "p")
+        let text = ChargingWriter::new(&budget, Path::root("p"))
             .serialize(&json!({"a": "x\"y"}))
             .expect("fits");
         assert_eq!(text, r#"{"a":"x\"y"}"#);
         budget
-            .charge(100 - text.len(), "p")
+            .charge(100 - text.len(), Path::root("p"))
             .expect("charged exactly");
-        budget.charge(1, "p").expect_err("nothing left");
+        budget.charge(1, Path::root("p")).expect_err("nothing left");
     }
 
     #[test]
     fn a_charging_writer_stops_at_the_budget() {
         let budget = Budget::new(10);
-        let err = ChargingWriter::new(&budget, "p")
+        let err = ChargingWriter::new(&budget, Path::root("p"))
             .serialize(&json!("x".repeat(100)))
             .expect_err("over");
         assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
@@ -322,11 +410,15 @@ mod tests {
         let output = Output::new(8);
         let mut body = String::new();
         let mut portal = String::new();
-        output.write(&mut body, "abcd", "a").expect("fits");
         output
-            .write(&mut portal, "efgh", "b")
+            .write(&mut body, "abcd", Path::root("a"))
+            .expect("fits");
+        output
+            .write(&mut portal, "efgh", Path::root("b"))
             .expect("fits exactly");
-        output.write(&mut body, "i", "c").expect_err("over");
+        output
+            .write(&mut body, "i", Path::root("c"))
+            .expect_err("over");
         assert_eq!(body, "abcd");
         assert_eq!(portal, "efgh");
     }
@@ -343,5 +435,58 @@ mod tests {
         let value = json!(["x".repeat(100), "y".repeat(100)]);
         assert!(approx_bytes(&value, 50) > 50);
         assert!(approx_bytes(&value, 50) < 2 * SLOT_BYTES + 200);
+    }
+
+    #[test]
+    fn fuel_spends_and_an_overdraft_fails() {
+        let budget = Budget::new(0).with_fuel(10);
+        budget.burn(6, Path::root("a")).expect("fits");
+        budget.burn(4, Path::root("b")).expect("fits exactly");
+        let err = budget.burn(1, Path::root("c")).expect_err("over");
+        assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+        assert_eq!(err.diagnostics()[0].path, "c");
+    }
+
+    #[test]
+    fn a_scan_burns_one_unit_for_each_started_block() {
+        let budget = Budget::new(0).with_fuel(3);
+        budget.burn_scan(0, Path::root("p")).expect("free");
+        budget.burn_scan(1, Path::root("p")).expect("one block");
+        budget
+            .burn_scan(SCAN_BLOCK_BYTES + 1, Path::root("p"))
+            .expect("two blocks");
+        budget
+            .burn_scan(1, Path::root("p"))
+            .expect_err("fuel is spent");
+    }
+
+    #[test]
+    fn a_comparison_burns_the_smaller_value() {
+        let budget = Budget::new(0).with_fuel(10);
+        let big = json!("x".repeat(100_000));
+        budget
+            .burn_compare(&big, &json!("y"), Path::root("p"))
+            .expect("the small side sets the cost");
+        let err = budget
+            .burn_compare(&big, &big, Path::root("p"))
+            .expect_err("two big values");
+        assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    }
+
+    #[test]
+    fn unmetered_work_is_free() {
+        let budget = Budget::new(0);
+        let big = json!("x".repeat(100_000));
+        budget.burn_value(&big, Path::root("p")).expect("free");
+        budget
+            .burn_compare(&big, &big, Path::root("p"))
+            .expect("free");
+    }
+
+    #[test]
+    fn a_failed_burn_names_the_fuel_limit() {
+        let budget = Budget::new(0).with_fuel(0);
+        let err = budget.burn(1, Path::root("p")).expect_err("over");
+        assert!(err.diagnostics()[0].message.contains("fuel"));
     }
 }

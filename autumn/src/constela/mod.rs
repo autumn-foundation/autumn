@@ -141,11 +141,14 @@ mod dispatch;
 mod error;
 pub mod eval;
 mod parse;
+mod path;
 pub mod policy;
 mod render;
 mod validate;
 
 use serde_json::{Map, Value};
+
+use self::path::Path;
 
 pub use ast::Program;
 pub use dispatch::{Dispatched, Effect};
@@ -309,7 +312,8 @@ impl Document {
             ..eval::Env::default()
         };
 
-        let budget = budget::Budget::new(RenderLimits::default().max_output_bytes);
+        let limits = RenderLimits::default();
+        let budget = budget::Budget::new(limits.max_output_bytes).with_fuel(limits.max_fuel);
         let ctx = dispatch::DispatchCtx {
             route,
             styles: &self.program.styles,
@@ -328,7 +332,7 @@ impl Document {
             state,
             &env,
             &ctx,
-            &format!("actions.{action}.steps"),
+            Path::root("actions").name(action).key("steps"),
             &mut outcome,
         )?;
         Ok(outcome)
