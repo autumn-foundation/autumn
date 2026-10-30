@@ -122,10 +122,15 @@ fn free_rowid_name(columns: &[String]) -> Option<&'static str> {
 }
 
 /// One key column as text. `quote` stops at a NUL byte. `hex` reads every
-/// byte. `typeof` keeps the storage classes apart.
+/// byte. `typeof` keeps the storage classes apart. A REAL uses `quote`, which
+/// keeps all digits. `hex` turns a REAL into text first, and that text can lose
+/// digits in some `SQLite` versions.
 fn key_part(column: &str) -> String {
     let column = quote_ident(column);
-    format!("typeof({column}) || ':' || hex({column})")
+    format!(
+        "CASE typeof({column}) WHEN 'real' THEN 'real:' || quote({column}) \
+         ELSE typeof({column}) || ':' || hex({column}) END"
+    )
 }
 
 /// The SQL expression that identifies a row: its primary key, else its row id.
@@ -1527,7 +1532,8 @@ mod tests {
         assert_eq!(auto_strategy(&text).expect("auto"), Strategy::Redact);
     }
 
-    const ID_KEY: &str = "typeof(\"id\") || ':' || hex(\"id\")";
+    const ID_KEY: &str = "CASE typeof(\"id\") WHEN 'real' THEN 'real:' || quote(\"id\") \
+         ELSE typeof(\"id\") || ':' || hex(\"id\") END";
 
     #[test]
     fn row_key_uses_the_key_columns_or_rowid() {
@@ -1542,7 +1548,7 @@ mod tests {
         table.primary_key = vec!["a".to_owned(), "b".to_owned()];
         assert_eq!(
             row_key_expr(&table, &facts).expect("key"),
-            "typeof(\"a\") || ':' || hex(\"a\") || ',' || typeof(\"b\") || ':' || hex(\"b\")"
+            format!("{} || ',' || {}", key_part("a"), key_part("b"))
         );
         // A rowid table can hold several NULL keys. They fall back to rowid.
         facts.rowid_tables.insert("t".to_owned());
@@ -1562,10 +1568,15 @@ mod tests {
         let mut table = Table::new("t", Backend::Sqlite);
         table.primary_key = vec!["id".to_owned()];
         let key = row_key_expr(&table, &DatabaseFacts::default()).expect("key");
-        // `quote()` stops at a NUL. `hex()` does not.
-        assert!(!key.contains("quote("), "{key}");
-        assert!(key.contains("hex("), "{key}");
-        assert!(key.contains("typeof("), "{key}");
+        // `quote()` stops at a NUL. `hex()` does not. A REAL keeps `quote()`.
+        assert!(
+            key.contains("ELSE typeof(\"id\") || ':' || hex(\"id\")"),
+            "{key}"
+        );
+        assert!(
+            key.contains("WHEN 'real' THEN 'real:' || quote(\"id\")"),
+            "{key}"
+        );
     }
 
     #[test]

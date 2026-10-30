@@ -609,13 +609,15 @@ fn real_keys_that_differ_past_15_digits_get_distinct_tokens() {
     let (db, _p, out, code) = scrub_legacy(
         "CREATE TABLE legacy (code REAL PRIMARY KEY, email TEXT UNIQUE); \
          INSERT INTO legacy VALUES (0.1 + 0.2, 'a@real-corp.example'), \
-                                   (0.3, 'b@real-corp.example');",
+                                   (0.3, 'b@real-corp.example'), \
+                                   (1.000000000000001, 'c@real-corp.example'), \
+                                   (1.000000000000002, 'd@real-corp.example');",
         "\"code\"",
     );
     assert_eq!(code, Some(0), "unique column stays unique:\n{out}");
     assert_eq!(
         count(&db, "SELECT COUNT(DISTINCT email) AS n FROM legacy"),
-        2
+        4
     );
 }
 
