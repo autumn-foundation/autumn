@@ -94,6 +94,10 @@ const ALLOWED_TEXT_ALIGN: &[&str] = &["left", "right", "center"];
 ///
 /// See the [`markdown` module documentation](crate::markdown) for the exact
 /// guarantee and allowlist.
+///
+/// The render reads at most 1,048,576 parser events. Later content is dropped.
+/// For a size limit that returns an error, use
+/// [`render_user_content_html_bounded`].
 /// Prefer `render_user_content` (the `maud` feature) when you are emitting into
 /// a Maud template.
 ///
@@ -108,6 +112,37 @@ const ALLOWED_TEXT_ALIGN: &[&str] = &["left", "right", "center"];
 /// ```
 #[must_use]
 pub fn render_user_content_html(source: &str) -> String {
+    // `usize::MAX` cannot be exceeded, so the error arm never runs.
+    render_user_content_html_bounded(source, usize::MAX).unwrap_or_default()
+}
+
+/// Like [`render_user_content_html`], but fails when the intermediate HTML
+/// (before sanitizing) exceeds `max_html_bytes`.
+///
+/// The check runs while the HTML is written, so the render stops at the limit.
+/// Use it where the caller has its own size budget. The limit does not apply
+/// to the sanitized output, which can be smaller or larger.
+///
+/// Parser events past a fixed cap (1,048,576) are dropped, as in
+/// [`render_user_content_html`]. The result is then cut, not an error.
+///
+/// # Errors
+///
+/// Returns [`HtmlTooLarge`] when the intermediate HTML would exceed
+/// `max_html_bytes`.
+///
+/// # Example
+///
+/// ```
+/// use autumn_web::markdown::render_user_content_html_bounded;
+///
+/// assert!(render_user_content_html_bounded("hi", 1024).is_ok());
+/// assert!(render_user_content_html_bounded("hi", 4).is_err());
+/// ```
+pub fn render_user_content_html_bounded(
+    source: &str,
+    max_html_bytes: usize,
+) -> Result<String, HtmlTooLarge> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
@@ -115,10 +150,46 @@ pub fn render_user_content_html(source: &str) -> String {
     let events = Parser::new_ext(source, opts);
     let safe = SafeEvents::new(events);
 
-    let mut html = String::with_capacity(source.len() + source.len() / 2);
-    pulldown_cmark::html::push_html(&mut html, safe);
+    let mut writer = BoundedWriter {
+        buf: String::with_capacity((source.len() + source.len() / 2).min(max_html_bytes)),
+        limit: max_html_bytes,
+    };
+    pulldown_cmark::html::write_html_fmt(&mut writer, safe).map_err(|_| HtmlTooLarge {
+        limit: max_html_bytes,
+    })?;
 
-    sanitize_user_html(&html)
+    Ok(sanitize_user_html(&writer.buf))
+}
+
+/// The intermediate HTML of a render exceeded the caller's limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("rendered HTML exceeds the {limit}-byte limit")]
+pub struct HtmlTooLarge {
+    limit: usize,
+}
+
+impl HtmlTooLarge {
+    /// The limit, in bytes, that the HTML exceeded.
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+/// A `String` writer that fails once it would hold more than `limit` bytes.
+struct BoundedWriter {
+    buf: String,
+    limit: usize,
+}
+
+impl std::fmt::Write for BoundedWriter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if s.len() > self.limit - self.buf.len() {
+            return Err(std::fmt::Error);
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
 }
 
 /// Render user-submitted Markdown to sanitized [`maud::Markup`].
@@ -245,6 +316,13 @@ fn build_sanitizer() -> ammonia::Builder<'static> {
 /// of nesting; documents below the cap render byte-identically.
 const MAX_BLOCK_NESTING_DEPTH: usize = 100;
 
+/// The most pulldown-cmark events one render reads. Later events are dropped.
+/// Small in tests, so the cap is quick to reach.
+#[cfg(not(test))]
+const MAX_EVENTS: usize = 1 << 20;
+#[cfg(test)]
+const MAX_EVENTS: usize = 1 << 12;
+
 /// Streaming adapter over pulldown-cmark events that removes every avenue for
 /// attacker-controlled markup *before* the HTML writer runs:
 ///
@@ -253,6 +331,7 @@ const MAX_BLOCK_NESTING_DEPTH: usize = 100;
 ///   has its anchor dropped; the link text survives as plain text.
 /// - Images are always dropped in favour of their alt text (image embedding is
 ///   out of scope for this field).
+/// - Reading stops after [`MAX_EVENTS`] events.
 /// - Block nesting past [`MAX_BLOCK_NESTING_DEPTH`] is flattened, bounding the
 ///   sanitizer's per-start-tag stack walk (see that constant).
 struct SafeEvents<'a, I: Iterator<Item = Event<'a>>> {
@@ -266,6 +345,8 @@ struct SafeEvents<'a, I: Iterator<Item = Event<'a>>> {
     /// Stack of open block containers, `true` when that container was dropped
     /// for exceeding the depth cap and its matching `End` must be dropped too.
     dropped_blocks: Vec<bool>,
+    /// Events read so far, checked against [`MAX_EVENTS`].
+    seen: usize,
 }
 
 impl<'a, I: Iterator<Item = Event<'a>>> SafeEvents<'a, I> {
@@ -275,6 +356,7 @@ impl<'a, I: Iterator<Item = Event<'a>>> SafeEvents<'a, I> {
             image_depth: 0,
             dropped_links: Vec::new(),
             dropped_blocks: Vec::new(),
+            seen: 0,
         }
     }
 }
@@ -317,6 +399,10 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SafeEvents<'a, I> {
 
     fn next(&mut self) -> Option<Event<'a>> {
         loop {
+            if self.seen >= MAX_EVENTS {
+                return None;
+            }
+            self.seen += 1;
             let event = self.inner.next()?;
             match event {
                 // Raw HTML never reaches the writer as markup.
@@ -479,6 +565,54 @@ mod tests {
             "<table><tr><td style=\"text-align:left;position:fixed\">1</td></tr></table>",
         );
         assert!(!smuggled.contains("position"), "{smuggled}");
+    }
+
+    #[test]
+    fn bounded_render_returns_html_within_the_limit() {
+        let html = render_user_content_html_bounded("hi **there**", 1024).unwrap();
+        assert_eq!(html, render_user_content_html("hi **there**"));
+    }
+
+    #[test]
+    fn bounded_render_rejects_html_over_the_limit() {
+        // `a` is 1 byte of source; the HTML is `<p>a</p>\n`, 9 bytes.
+        let err = render_user_content_html_bounded("a", 8).unwrap_err();
+        assert_eq!(err.limit(), 8);
+        assert!(render_user_content_html_bounded("a", 9).is_ok());
+    }
+
+    #[test]
+    fn bounded_render_rejects_large_output_from_small_source() {
+        // 4 bytes of source give 11 bytes of HTML per repeat.
+        let source = "*a* ".repeat(MAX_EVENTS / 8);
+        let err = render_user_content_html_bounded(&source, 64).unwrap_err();
+        assert_eq!(err.limit(), 64);
+    }
+
+    #[test]
+    fn bounded_writer_stops_at_the_limit() {
+        use std::fmt::Write;
+        let mut writer = BoundedWriter {
+            buf: String::new(),
+            limit: 5,
+        };
+        assert!(writer.write_str("abc").is_ok());
+        assert!(writer.write_str("defg").is_err());
+        // A refused write leaves the buffer as it was.
+        assert_eq!(writer.buf, "abc");
+        assert!(writer.write_str("de").is_ok());
+        assert_eq!(writer.buf, "abcde");
+    }
+
+    #[test]
+    fn event_count_is_capped() {
+        // Each repeat of `*a* ` gives four events, so this has twice the cap.
+        let repeats = MAX_EVENTS / 2;
+        let source = "*a* ".repeat(repeats);
+        let html = render_user_content_html(&source);
+        let full = "<em>a</em> ".len() * repeats;
+        assert!(html.len() < full * 3 / 4, "{} >= {}", html.len(), full);
+        assert!(html.contains("<em>a</em>"));
     }
 
     #[test]

@@ -490,8 +490,7 @@ impl<'a> Renderer<'a> {
                 // Checked on the source before rendering: the sanitizer would
                 // otherwise build the whole HTML string first.
                 self.output.check(source.len(), path)?;
-                let mut rendered = String::new();
-                render_markdown(&source, &mut rendered);
+                let rendered = render_markdown(&source, self.output.remaining(), path)?;
                 self.write(out, &rendered, path)?;
             }
             Node::Portal { target, children } => {
@@ -1075,17 +1074,27 @@ impl<'a> Renderer<'a> {
 
 /// Render a Markdown node through the sanitizing user-content path — the same
 /// allowlist Autumn's user-submitted rich text goes through.
+///
+/// `max_html` bounds the intermediate HTML. A small source cannot build a
+/// large string before the output meter sees it.
 #[cfg(feature = "markdown")]
-fn render_markdown(source: &str, out: &mut String) {
-    out.push_str(&crate::markdown::render_user_content_html(source));
+fn render_markdown(source: &str, max_html: usize, path: &str) -> Result<String, ConstelaError> {
+    crate::markdown::render_user_content_html_bounded(source, max_html).map_err(|err| {
+        ConstelaError::Render(Diagnostic::new(path, codes::RENDER_LIMIT, err.to_string()))
+    })
 }
 
 /// Without the `markdown` feature this is unreachable: validation rejects a
 /// `markdown` node with [`codes::FEATURE_REQUIRED`] before a document
 /// containing one can become a [`Document`](super::Document).
 #[cfg(not(feature = "markdown"))]
-const fn render_markdown(source: &str, out: &mut String) {
-    let _ = (source, out);
+const fn render_markdown(
+    source: &str,
+    max_html: usize,
+    path: &str,
+) -> Result<String, ConstelaError> {
+    let _ = (source, max_html, path);
+    Ok(String::new())
 }
 
 /// Reduce a language hint to something safe to put in a `language-*` class.
