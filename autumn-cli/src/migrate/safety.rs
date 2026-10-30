@@ -2490,6 +2490,146 @@ mod tests {
         }
     }
 
+    /// Operations found in `sql` for `backend`.
+    fn ops(backend: DatabaseBackend, sql: &str) -> Vec<String> {
+        classify_sql_for(backend, sql)
+            .into_iter()
+            .map(|f| f.operation)
+            .collect()
+    }
+
+    #[test]
+    fn markers_in_quoted_identifiers_hide_no_statement() {
+        // Issue #3518. Each identifier holds a `/*`, `--`, `'` or `;`.
+        let pg = DatabaseBackend::Postgres;
+        let lite = DatabaseBackend::Sqlite;
+        let mut cases = Vec::new();
+        for backend in [pg, lite] {
+            for ident in [
+                r#""a/*b""#,
+                r#""a--b""#,
+                r#""a'b""#,
+                r#""a;drop table y""#,
+                r#""a""/*b""#,
+            ] {
+                cases.push((backend, ident));
+            }
+        }
+        for ident in [
+            "`a/*b`",
+            "`a--b`",
+            "`a'b`",
+            "`a;drop table y`",
+            "`a``/*b`",
+            "[a/*b]",
+            "[a--b]",
+            "[a'b]",
+            "[a;drop table y]",
+        ] {
+            cases.push((lite, ident));
+        }
+        for (backend, ident) in cases {
+            let sql = format!("CREATE TABLE {ident} (id int); DROP TABLE x;");
+            assert_eq!(ops(backend, &sql), ["DROP TABLE"], "{backend:?} {sql}");
+            let sql = format!("CREATE TABLE {ident} (id int);\nDROP TABLE x;");
+            assert_eq!(ops(backend, &sql), ["DROP TABLE"], "{backend:?} {sql}");
+        }
+    }
+
+    #[test]
+    fn escape_string_hides_no_statement() {
+        // Issue #3518. In a Postgres `E'..'` string, `\'` is a quote.
+        for lit in [
+            r"E'\''",
+            r"e'\''",
+            r"E'a\'b'",
+            r"E'\\'",
+            r"E'\'--/*;'",
+            r"U&'\0041'",
+            r"'C:\'",
+            r"xe'\'",
+        ] {
+            let sql = format!("SELECT {lit}; DROP TABLE x;");
+            assert_eq!(
+                ops(DatabaseBackend::Postgres, &sql),
+                ["DROP TABLE"],
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn dollar_quote_rules_follow_the_dialect() {
+        // Issue #3518. `a$b$` is one identifier. `SQLite` has no dollar quotes.
+        let sql = "CREATE TABLE t (a$b$ int); DROP TABLE x;";
+        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+            assert_eq!(ops(backend, sql), ["DROP TABLE"], "{backend:?}");
+        }
+        let sql = "SELECT $y$z; DROP TABLE x;";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"]);
+        // Postgres still keeps a function body whole.
+        let sql = "CREATE FUNCTION f() RETURNS int AS $b$ SELECT 1; $b$ LANGUAGE sql;";
+        assert_eq!(ops(DatabaseBackend::Postgres, sql).len(), 1);
+    }
+
+    #[test]
+    fn quote_in_identifier_hides_no_clause() {
+        // Issue #3518. A `'` in an identifier opens no literal.
+        assert!(
+            ops(
+                DatabaseBackend::Postgres,
+                r#"ALTER TABLE t ADD COLUMN "it's" text UNIQUE;"#
+            )
+            .contains(&"ADD COLUMN UNIQUE (inline constraint)".to_owned())
+        );
+        assert!(
+            ops(
+                DatabaseBackend::Sqlite,
+                "ALTER TABLE t ADD COLUMN [it's] text UNIQUE;"
+            )
+            .contains(&"ADD COLUMN UNIQUE (unsupported on SQLite)".to_owned())
+        );
+        assert!(
+            classify_sql_for(
+                DatabaseBackend::Sqlite,
+                r#"CREATE TABLE "it's" (id int) PARTITION BY RANGE (id);"#
+            )
+            .iter()
+            .any(|f| f.risk == RiskLevel::Unsupported)
+        );
+        // `\'` in an escape string ends no literal.
+        assert!(
+            ops(
+                DatabaseBackend::Postgres,
+                r"ALTER TABLE t ADD COLUMN a text DEFAULT E'\' unique ';"
+            )
+            .is_empty()
+        );
+    }
+
+    mod quoted_identifier_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Issue #3518. No identifier text hides a later statement.
+            #[test]
+            fn quoted_identifier_hides_no_statement(
+                body in "[a-z;'\"`\\[$/*\\- \n]{0,12}",
+                form in 0..4usize,
+            ) {
+                let (backend, ident) = match form {
+                    0 => (DatabaseBackend::Postgres, format!("\"{}\"", body.replace('"', "\"\""))),
+                    1 => (DatabaseBackend::Sqlite, format!("\"{}\"", body.replace('"', "\"\""))),
+                    2 => (DatabaseBackend::Sqlite, format!("`{}`", body.replace('`', "``"))),
+                    _ => (DatabaseBackend::Sqlite, format!("[{}]", body.replace(']', ""))),
+                };
+                let sql = format!("CREATE TABLE {ident} (id int); DROP TABLE x;");
+                prop_assert_eq!(ops(backend, &sql), ["DROP TABLE"], "{}", sql);
+            }
+        }
+    }
+
     #[test]
     fn block_comment_between_keywords_preserves_token_boundary() {
         // `DROP/* note */TABLE posts` must not concatenate to `DROPTABLE posts`,
