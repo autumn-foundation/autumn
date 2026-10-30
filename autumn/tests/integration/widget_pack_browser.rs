@@ -77,6 +77,20 @@ fn kgood_toolbar() -> Markup {
     }
 }
 
+/// A right-to-left toolbar that does not wrap. ArrowLeft moves forward,
+/// so the keyboard check must not press ArrowRight on the first item.
+fn kgood_rtl_toolbar() -> Markup {
+    html! {
+        div dir="rtl" class="autumn-kgood-toolbar" role="toolbar" aria-label="Colors (RTL)"
+            data-autumn-roving="button" data-autumn-orientation="horizontal"
+            data-autumn-wrap="false" {
+            @for name in ["Primary", "Success", "Danger"] {
+                button type="button" class="autumn-kgood-chip" aria-pressed="false" { (name) }
+            }
+        }
+    }
+}
+
 /// A closed popup list. The keyboard check skips a list that is not shown.
 fn kgood_closed_list() -> Markup {
     html! {
@@ -129,6 +143,12 @@ fn kgood_pack() -> WidgetPack {
         .extend([
             Story::new("Kgood", "Kgood toolbar", kgood_toolbar, "kgood_toolbar()"),
             Story::new("Kgood", "Kgood field", kgood_field, "kgood_field()"),
+            Story::new(
+                "Kgood",
+                "Kgood rtl toolbar",
+                kgood_rtl_toolbar,
+                "kgood_rtl_toolbar()",
+            ),
             Story::new(
                 "Kgood",
                 "Kgood closed list",

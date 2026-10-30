@@ -280,7 +280,7 @@ const ROVING_LISTS_JS: &str = r#"(() => {
 ///
 /// Return the arrow key to
 /// press: forward, or back when the stop is the last item of a list that
-/// does not wrap. Return `""` when the list has no tab stop.
+/// does not wrap. A right-to-left list swaps ArrowLeft and ArrowRight. Return `""` when the list has no tab stop.
 const FOCUS_LIST_JS: &str = r#"(() => {
   const ITEMS = '[role="tab"],[role="menuitem"],[role="option"],[role="radio"],[role="treeitem"]';
   const LIST = '[data-autumn-roving],[data-autumn-activedescendant]';
@@ -295,7 +295,9 @@ const FOCUS_LIST_JS: &str = r#"(() => {
   stop.setAttribute('data-conformance-from', '');
   const horizontal = list.getAttribute('data-autumn-orientation') === 'horizontal';
   const back = list.getAttribute('data-autumn-wrap') === 'false' && items.indexOf(stop) === items.length - 1;
-  if (horizontal) return back ? 'ArrowLeft' : 'ArrowRight';
+  // In a right-to-left list, ArrowLeft moves forward (as the core does).
+  const rtl = getComputedStyle(list).direction === 'rtl';
+  if (horizontal) return back !== rtl ? 'ArrowLeft' : 'ArrowRight';
   return back ? 'ArrowUp' : 'ArrowDown';
 })()"#;
 
