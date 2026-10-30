@@ -269,9 +269,8 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 /// Strips the `alter table <name>` prefix and splits the remaining text on
 /// commas outside parentheses, trimming each segment. With `quote_aware`
 /// (`SQLite`), a comma in any quoted text does not split. Without it
-/// (Postgres), only `'..'`, `E'..'` and dollar-quoted text are skipped.
-/// A `"name"` is not, because a wrong guess there could merge a
-/// `DROP COLUMN` into its neighbour.
+/// (Postgres), `'..'`, `E'..'`, `"name"` and dollar-quoted text are skipped.
+/// Backticks and brackets are not Postgres quotes.
 fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
     let after_prefix = normalized.strip_prefix("alter table ").unwrap_or("");
     let subcommands_start = after_prefix.find(' ').map_or(after_prefix.len(), |i| i + 1);
@@ -321,8 +320,9 @@ fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
 
 /// Byte length of the Postgres literal that starts at byte `i` of `text`, or 0.
 ///
-/// A literal is `'..'` (`''` escapes), `E'..'` (`\'` escapes) or a dollar
-/// quote. A name that ends in `e` or `$` does not start one.
+/// A literal is `'..'` (`''` escapes), `E'..'` (`\'` escapes), `"name"`
+/// (`""` escapes) or a dollar quote. A name that ends in `e` or `$` does not
+/// start one.
 fn pg_literal_len(text: &str, i: usize) -> usize {
     let rest = &text[i..];
     let at_boundary = |end: usize| {
@@ -333,12 +333,28 @@ fn pg_literal_len(text: &str, i: usize) -> usize {
     };
     match rest.as_bytes()[0] {
         b'\'' => quote_len(rest),
+        b'"' => quoted_name_len(rest),
         b'e' | b'E' if rest.as_bytes().get(1) == Some(&b'\'') && at_boundary(i) => {
             1 + escaped_quote_len(&rest[1..])
         }
         b'$' if at_boundary(i) => dollar_quote_len(rest).unwrap_or(0),
         _ => 0,
     }
+}
+
+/// Byte length of the `"name"` at the start of `rest`. `""` is a quote. An
+/// unclosed name runs to the end.
+fn quoted_name_len(rest: &str) -> usize {
+    let mut j = 1;
+    while let Some(rel) = rest[j..].find('"') {
+        let abs = j + rel;
+        if rest[abs + 1..].starts_with('"') {
+            j = abs + 2;
+        } else {
+            return abs + 1;
+        }
+    }
+    rest.len()
 }
 
 /// Byte length of the `E'..'` body at the start of `rest` (`rest` starts with
@@ -824,7 +840,11 @@ fn quote_len(rest: &str) -> usize {
 fn dollar_quote_len(rest: &str) -> Option<usize> {
     let after = rest.strip_prefix('$')?;
     let tag_body = &after[..after.find('$')?];
-    if !tag_body.chars().all(|c| c.is_alphanumeric() || c == '_') {
+    let mut tag_chars = tag_body.chars();
+    let starts_ok = tag_chars
+        .next()
+        .is_none_or(|c| c.is_alphabetic() || c == '_');
+    if !starts_ok || !tag_body.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
     let tag_len = tag_body.len() + 2;
@@ -3314,6 +3334,34 @@ mod tests {
         assert_eq!(subs.len(), 2, "{subs:?}");
         let subs = pg_subs("alter table t add column a text default e'\\'(', add column b int");
         assert_eq!(subs.len(), 2, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_ignores_a_quote_inside_a_quoted_name() {
+        for name in [r#""a'b""#, r#""$$""#, r#""e'""#, r#""a""'b""#, r#""a(b""#] {
+            let sql = format!("alter table t add column {name} int, drop column c");
+            let subs = pg_subs(&sql);
+            assert_eq!(subs.len(), 2, "{name}: {subs:?}");
+        }
+    }
+
+    #[test]
+    fn quote_in_a_quoted_name_does_not_hide_a_drop_column() {
+        let sql = r#"ALTER TABLE t ADD COLUMN "a'b" int, DROP COLUMN c;"#;
+        let f = classify_sql_for(DatabaseBackend::Postgres, sql);
+        assert!(
+            f.iter().any(|f| f.operation.starts_with("DROP COLUMN")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn dollar_tag_cannot_start_with_a_digit() {
+        assert_eq!(dollar_quote_len("$1$ x $1$"), None);
+        assert_eq!(dollar_quote_len("$a1$ x $a1$"), Some(11));
+        let subs =
+            pg_subs("alter table t add column a int default $1$, add column b int, drop column c$");
+        assert_eq!(subs.len(), 3, "{subs:?}");
     }
 
     #[test]
