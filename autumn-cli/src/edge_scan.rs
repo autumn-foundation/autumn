@@ -3357,7 +3357,7 @@ pub fn eval_cfg_meta(meta: &syn::Meta, default_features: &BTreeSet<String>) -> O
 /// `edge_routes![]` registrations were credited as active (Codex review on
 /// #2739, round 33, P2; [`edge_fn`]'s own version of this check, added in
 /// round 29, was the only one already correct).
-fn attr_cfg_excludes(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> bool {
+pub fn attr_cfg_excludes(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> bool {
     if eval_cfg_attr(attr, default_features) == Some(false) {
         return true;
     }
