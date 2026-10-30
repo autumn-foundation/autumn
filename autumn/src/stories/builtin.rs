@@ -494,19 +494,43 @@ fn builtin_stories() -> Vec<Story> {
             "Feedback",
             "Toast",
             {
+                use std::time::Duration;
+
                 use autumn_web::widgets::{
-                    AlertVariant, DEFAULT_TOAST_REGION_ID, toast, toast_in, toast_region,
+                    AlertVariant, DEFAULT_TOAST_REGION_ID, ToastConfig, toast, toast_in,
+                    toast_region, toast_with,
                 };
 
                 maud::html! {
-                    // Drop the region once in your base layout:
+                    // Drop the region once in your base layout. It opens in
+                    // the top layer, above a modal <dialog>.
                     (toast_region(DEFAULT_TOAST_REGION_ID))
-                    // Then return toasts from htmx handlers — appended OOB into
-                    // the region. `Error` announces assertively, others politely.
+                    // Return toasts from htmx handlers. htmx appends them OOB.
+                    // `Error` announces assertively, others politely. Hover or
+                    // focus pauses the timer.
                     (toast("Saved successfully", AlertVariant::Success))
-                    (toast("Could not save — please retry", AlertVariant::Error))
-                    // Target a differently-named region with `toast_in`:
-                    (toast_in(DEFAULT_TOAST_REGION_ID, "Heads up: trial ends soon", AlertVariant::Warning))
+                    // `toast_in` takes the region id. Use it when the page
+                    // has more than one region.
+                    (toast_in(DEFAULT_TOAST_REGION_ID, "Upload finished", AlertVariant::Info))
+                    // Set a longer timer.
+                    (toast_with(
+                        "Report export started",
+                        AlertVariant::Info,
+                        &ToastConfig::new().duration(Duration::from_secs(10)),
+                    ))
+                    // A message the user must act on: no timer.
+                    (toast_with(
+                        "Could not save — please retry",
+                        AlertVariant::Error,
+                        &ToastConfig::new().persistent(true),
+                    ))
+                    // `ToastConfig::region` does the same as `toast_in`.
+                    // This toast is also persistent.
+                    (toast_with(
+                        "Heads up: trial ends soon",
+                        AlertVariant::Warning,
+                        &ToastConfig::new().region(DEFAULT_TOAST_REGION_ID).persistent(true),
+                    ))
                 }
             }
         },

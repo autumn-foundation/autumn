@@ -55,9 +55,7 @@
 )]
 
 use std::borrow::Cow;
-use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
@@ -607,7 +605,7 @@ where
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = S::Future;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -654,16 +652,9 @@ where
             });
         }
 
-        // No `.await` happens in this middleware itself — everything above is
-        // synchronous prep on `req` — so the `Self::Future`'s `'static` bound
-        // is satisfied by `self.inner.call(req)` directly: no need to clone
-        // `self.inner` into an owned value first. `inner`'s previous
-        // clone-then-swap dance cloned `self.inner` (a
-        // `BoxCloneSyncService` at this point in the stack, whose `Clone`
-        // impl allocates a fresh box) on every request purely to satisfy a
-        // move that was never required, since nothing here captures `self`
-        // past this statement.
-        Box::pin(self.inner.call(req))
+        // All work above is synchronous. Thus the inner future is the future
+        // of this service, with no box and no clone (issue #2830).
+        self.inner.call(req)
     }
 }
 

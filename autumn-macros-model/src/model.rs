@@ -7244,6 +7244,16 @@ fn form_control_tokens(inner_ty: &syn::Type, nullable: bool) -> TokenStream {
     }
 }
 
+/// Wrap a schema-building block so every `Decimal` property also admits a
+/// JSON number (#3427).
+fn widen_decimals_tokens(body: &TokenStream) -> TokenStream {
+    quote! {{
+        let mut __autumn_schema = { #body };
+        ::autumn_web::openapi::widen_decimal_request_properties(&mut __autumn_schema);
+        __autumn_schema
+    }}
+}
+
 /// For a `NewX` field whose column `form_for` renders as an HTML
 /// `datetime-local` control (see `form_control_tokens`), emit the serde
 /// attribute wiring the matching datetime-local-tolerant deserializer from
@@ -10906,6 +10916,12 @@ pub fn model_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         let extra: &[&&Field] = lock_version_field.as_slice();
         emit_schema_fn_body_named(&fields_for_new, true, extra, None, &|_| false, true, true)
     };
+    // `Decimal` writes a string but reads a string or a number (#3427). The
+    // request schemas name both; the read schema is not touched. The helper
+    // acts only on a property equal to the decimal schema, so no type test
+    // is needed here.
+    let new_struct_schema_body = widen_decimals_tokens(&new_struct_schema_body);
+    let update_struct_schema_body = widen_decimals_tokens(&update_struct_schema_body);
     let commit_hook_serialize_fields: Vec<TokenStream> = all_fields
         .iter()
         .map(|f| {

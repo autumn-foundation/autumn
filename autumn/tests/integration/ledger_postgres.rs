@@ -1206,3 +1206,137 @@ async fn a_before_trigger_cannot_move_a_ledgered_row_during_restore() {
     })
     .await;
 }
+
+/// Records the SQL of each statement on one connection (#3345).
+#[derive(Clone, Default)]
+struct StatementLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl diesel::connection::Instrumentation for StatementLog {
+    fn on_connection_event(&mut self, event: diesel::connection::InstrumentationEvent<'_>) {
+        if let diesel::connection::InstrumentationEvent::StartQuery { query, .. } = event {
+            self.0
+                .lock()
+                .expect("statement log lock")
+                .push(query.to_string());
+        }
+    }
+}
+
+impl StatementLog {
+    /// Run `write`, then count its history, ledger and reload statements.
+    async fn bookkeeping<F: std::future::Future<Output = ()>>(&self, write: F) -> usize {
+        self.0.lock().expect("statement log lock").clear();
+        write.await;
+        self.0
+            .lock()
+            .expect("statement log lock")
+            .iter()
+            .filter(|sql| {
+                sql.contains("_autumn_version_history")
+                    || sql.contains("_autumn_ledger_")
+                    || (sql.trim_start().starts_with("SELECT")
+                        && sql.contains("FROM \"test_ledger_invoices\""))
+            })
+            .count()
+    }
+}
+
+/// The history, ledger and reload statements of a bulk write do not grow with
+/// the batch size on Postgres. Before #3345 each row cost 5 statements.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn bulk_ledger_statements_do_not_grow_with_the_batch_on_postgres() {
+    use diesel_async::AsyncConnection as _;
+
+    let (_shared, container) = setup_pool().await;
+    let host = container.get_host().await.expect("host");
+    let port = container.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    // One connection, so the log sees every statement of the repository.
+    let pool = Pool::builder(AsyncDieselConnectionManager::<AsyncPgConnection>::new(&url))
+        .max_size(1)
+        .build()
+        .expect("pool");
+    let log = StatementLog::default();
+    pool.get()
+        .await
+        .expect("conn")
+        .set_instrumentation(log.clone());
+    let repo = build_repo(pool);
+
+    let invoices = |prefix: &str, n: i64| -> Vec<NewLedgerInvoice> {
+        (0..n)
+            .map(|i| NewLedgerInvoice {
+                reference: format!("{prefix}-{i}"),
+                amount_cents: i,
+                amount_rate: 1e16,
+            })
+            .collect()
+    };
+
+    let mut small = Vec::new();
+    let save_small = log
+        .bookkeeping(async {
+            small = repo.save_many(&invoices("S", 3)).await.expect("save_many");
+        })
+        .await;
+    let mut large = Vec::new();
+    let save_large = log
+        .bookkeeping(async {
+            large = repo
+                .save_many(&invoices("L", 400))
+                .await
+                .expect("save_many");
+        })
+        .await;
+    assert_eq!(save_small, save_large, "save_many");
+    // History INSERT, reload, chain-state read, revision INSERT, mark upsert.
+    assert_eq!(save_small, 5, "save_many");
+
+    let small_ids: Vec<i64> = small.iter().map(|r| r.id).collect();
+    let large_ids: Vec<i64> = large.iter().map(|r| r.id).collect();
+    let changes = UpdateLedgerInvoice {
+        amount_cents: Patch::Set(9),
+        ..Default::default()
+    };
+    let update_small = log
+        .bookkeeping(async {
+            repo.update_many(&small_ids, &changes)
+                .await
+                .expect("update_many");
+        })
+        .await;
+    let update_large = log
+        .bookkeeping(async {
+            repo.update_many(&large_ids, &changes)
+                .await
+                .expect("update_many");
+        })
+        .await;
+    assert_eq!(update_small, update_large, "update_many");
+    assert!(update_small >= 5, "update_many: {update_small}");
+
+    let delete_small = log
+        .bookkeeping(async {
+            repo.delete_many(&small_ids).await.expect("delete_many");
+        })
+        .await;
+    let delete_large = log
+        .bookkeeping(async {
+            repo.delete_many(&large_ids).await.expect("delete_many");
+        })
+        .await;
+    assert_eq!(delete_small, delete_large, "delete_many");
+    assert!(delete_small >= 5, "delete_many: {delete_small}");
+
+    for id in small_ids.iter().chain(&large_ids) {
+        let chain = repo.ledger_revisions(*id).await.expect("revisions");
+        assert_eq!(
+            chain.iter().map(|r| r.op).collect::<Vec<_>>(),
+            vec![VersionOp::Insert, VersionOp::Update, VersionOp::Delete],
+            "record {id}"
+        );
+        let report = repo.ledger_verify(*id).await.expect("verify");
+        assert!(report.is_intact(), "record {id}: {report:?}");
+    }
+}

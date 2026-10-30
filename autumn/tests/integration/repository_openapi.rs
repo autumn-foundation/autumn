@@ -963,6 +963,108 @@ fn the_read_schema_keeps_the_precise_datetime_format() {
     );
 }
 
+// ── Request schemas admit the JSON number a Decimal reads (issue #3427) ─
+
+mod schema_priced {
+    autumn_web::reexports::diesel::table! {
+        priced_rows (id) {
+            id -> Int8,
+            title -> Text,
+            price -> Numeric,
+            maybe_price -> Nullable<Numeric>,
+        }
+    }
+}
+
+use schema_priced::priced_rows;
+
+#[autumn_web::model(table = "priced_rows")]
+pub struct PricedRow {
+    #[id]
+    pub id: i64,
+    pub title: String,
+    pub price: rust_decimal::Decimal,
+    pub maybe_price: Option<rust_decimal::Decimal>,
+}
+
+fn priced_schema<T>() -> serde_json::Value {
+    autumn_web::openapi::registered_derived_schema(std::any::type_name::<T>())
+        .expect("the companion registers its schema")
+}
+
+/// The branch types of a property that is a `oneOf`, or its own type.
+fn branch_types(prop: &serde_json::Value) -> Vec<String> {
+    let branches = prop["oneOf"]
+        .as_array()
+        .map_or_else(|| vec![prop.clone()], Clone::clone);
+    branches
+        .iter()
+        .map(|b| {
+            let ty = b["type"].as_str().unwrap_or("?");
+            b["format"]
+                .as_str()
+                .map_or_else(|| ty.to_owned(), |f| format!("{ty}/{f}"))
+        })
+        .collect()
+}
+
+/// The claim behind the fix: `Decimal` reads a JSON number as well as a string.
+#[test]
+fn decimal_deserializes_from_a_json_number_and_a_json_string() {
+    let from_number: rust_decimal::Decimal =
+        serde_json::from_value(serde_json::json!(12.34)).expect("a JSON number is accepted");
+    let from_string: rust_decimal::Decimal =
+        serde_json::from_value(serde_json::json!("12.34")).expect("a JSON string is accepted");
+    assert_eq!(from_number, from_string);
+}
+
+#[test]
+fn the_new_schema_admits_a_decimal_as_string_or_number() {
+    let schema = priced_schema::<NewPricedRow>();
+    assert_eq!(
+        branch_types(&schema["properties"]["price"]),
+        ["string/decimal", "number"],
+        "{schema}"
+    );
+    assert_eq!(
+        schema["properties"]["title"]["type"], "string",
+        "other properties stay as they were"
+    );
+}
+
+/// An optional column keeps its `null` branch.
+#[test]
+fn the_new_schema_keeps_null_on_an_optional_decimal() {
+    let schema = priced_schema::<NewPricedRow>();
+    assert_eq!(
+        branch_types(&schema["properties"]["maybe_price"]),
+        ["string/decimal", "number", "null"],
+        "{schema}"
+    );
+}
+
+/// `Patch<T>` fields are nullable. The number branch must not remove that.
+#[test]
+fn the_update_schema_admits_a_decimal_as_string_or_number_or_null() {
+    let schema = priced_schema::<UpdatePricedRow>();
+    assert_eq!(
+        branch_types(&schema["properties"]["price"]),
+        ["string/decimal", "number", "null"],
+        "{schema}"
+    );
+}
+
+/// A response only ever holds the string, so its schema stays exact.
+#[test]
+fn the_read_schema_keeps_the_exact_decimal_type() {
+    let schema = priced_schema::<PricedRow>();
+    assert_eq!(
+        branch_types(&schema["properties"]["price"]),
+        ["string/decimal"],
+        "{schema}"
+    );
+}
+
 // ── The Update* patch schema is nullable on both sides (issue #802) ────
 
 /// Every mutable field of an `Update*` companion is a `Patch<T>`, and `null`

@@ -45,7 +45,7 @@ pub use exception_filter::{AutumnErrorInfo, ExceptionFilter, ExceptionFilterLaye
 #[cfg(feature = "mcp")]
 pub(crate) use load_shed::{EnvelopeAdmission, LoadShedEnvelope};
 pub use load_shed::{LoadShedExempt, LoadShedLayer, LoadShedService};
-pub use log_context::{LogContextLayer, LogContextService};
+pub use log_context::{LogContextFuture, LogContextLayer, LogContextService};
 pub use maintenance::{DEFAULT_HEALTH_PREFIX, MaintenanceLayer, MaintenanceService};
 pub use method_override::{
     DEFAULT_METHOD_OVERRIDE_FIELD, MethodOverrideConfig, MethodOverrideLayer,

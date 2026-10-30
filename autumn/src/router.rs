@@ -5558,9 +5558,12 @@ fn build_submit_token_layer(
 ///
 /// The fold costs exactly one boxing adapter for the whole run (the
 /// `ErasedAppService::new` seed), regardless of how many layers it contains.
-/// That box does NOT clone on call — `BoxCloneSyncService::call` forwards to
-/// the inner service — so it adds no traversal to the cascade either; its
-/// runtime cost is one `Box::pin` per request.
+/// Its runtime cost is one `Box::pin` per request.
+///
+/// The seed holds the services below it in a [`SharedService`]. Thus a clone
+/// of the seed, which each outer `Route` level makes on each request, is one
+/// small box and one reference count. The services below the seed are cloned
+/// one time for each call (#2830).
 ///
 /// # Why an EMPTY run is still composed in `apply_middleware`
 ///
@@ -5619,11 +5622,53 @@ where
         // outermost. Getting this backwards still compiles, because every layer
         // here is `Request -> Response` with `Error = Infallible`, so only
         // behavioural tests catch it.
-        let mut svc = crate::app::ErasedAppService::new(inner);
+        let mut svc = crate::app::ErasedAppService::new(SharedService::new(inner));
         for registered in self.0.iter().rev() {
             svc = registered.layer(svc);
         }
         svc
+    }
+}
+
+/// A service behind an `Arc`. A clone is one reference count.
+///
+/// Each outer `Route` level clones all the services below it on each request
+/// (issue #2830). This type stops that deep clone. A call clones the service
+/// one time and drives the clone with `Oneshot`, as `axum::routing::Route`
+/// does. The future has a name, so the call adds no box.
+struct SharedService<S>(Arc<S>);
+
+impl<S> SharedService<S> {
+    fn new(inner: S) -> Self {
+        Self(Arc::new(inner))
+    }
+}
+
+impl<S> Clone for SharedService<S> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<S, Req> tower::Service<Req> for SharedService<S>
+where
+    S: tower::Service<Req> + Clone,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = tower::util::Oneshot<S, Req>;
+
+    /// Always ready. The clone that `call` makes is made ready in its
+    /// `Oneshot`, as in `axum::routing::Route`.
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Req) -> Self::Future {
+        tower::util::Oneshot::new(S::clone(&self.0), req)
     }
 }
 
@@ -6124,11 +6169,8 @@ fn apply_middleware(
     // when no global timeout is set.
     #[cfg(all(feature = "db", not(feature = "sqlite")))]
     let tx_timeouts_layer = {
-        let timeouts = crate::db::TxTimeouts::from_config(&config.database);
-        Some(axum::middleware::from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                timeouts.scope_request(next.run(req))
-            },
+        Some(crate::db::TxTimeoutsLayer::new(
+            crate::db::TxTimeouts::from_config(&config.database),
         ))
     };
     #[cfg(not(all(feature = "db", not(feature = "sqlite"))))]
@@ -6378,6 +6420,11 @@ fn apply_middleware(
     // `ComposedRegisteredLayers` occupies the user-layer slot unconditionally,
     // even with no layer registered — see its docs for why an empty run still
     // earns its boxing adapter.
+    //
+    // Do not put a `SharedService` at the start of this group too. It saves 3
+    // blocks for each request, but it makes a second set of generic code over
+    // the full type of this group. That added 223 MB of debug info to each
+    // app binary (#2830).
     let router = router.layer((
         compression_layer,
         outer_stack,
@@ -16893,9 +16940,10 @@ mod trusted_host_tests {
     ///
     /// A hand-rolled `tower::Service` fixes it only if its `Future` associated
     /// type is genuinely named all the way down. Writing one that still returns
-    /// `Pin<Box<dyn Future>>` — the shape `SessionService`, `LogContextService`
-    /// and `TrustedProxiesService` use — would satisfy every behavioural test in
-    /// the suite while allocating exactly as much as before. This test is what
+    /// `Pin<Box<dyn Future>>` — the shape `RequireAuthService` keeps, because it
+    /// must wait for the session before it calls the inner service — would
+    /// satisfy every behavioural test in the suite while allocating exactly as
+    /// much as before. This test is what
     /// makes that impossible to do by accident: the sibling allocation gate in
     /// `tests/config_alloc_gate.rs` pins the *total*, and this pins *where* the
     /// total comes from.
@@ -16943,6 +16991,20 @@ mod trusted_host_tests {
             "MethodOverrideRejectionService",
         );
         assert_unboxed::<crate::aeo::negotiate::NegotiateService<Inner>>("NegotiateService");
+        // #2830.
+        assert_unboxed::<crate::middleware::LogContextService<Inner>>("LogContextService");
+        assert_unboxed::<crate::session::SessionService<crate::session::MemoryStore, Inner>>(
+            "SessionService",
+        );
+        assert_unboxed::<crate::security::trusted_proxies::TrustedProxiesService<Inner>>(
+            "TrustedProxiesService",
+        );
+        #[cfg(feature = "idempotency")]
+        assert_unboxed::<crate::idempotency::IdempotencyReplayService<Inner>>(
+            "IdempotencyReplayService",
+        );
+        #[cfg(feature = "db")]
+        assert_unboxed::<crate::db::TxTimeoutsService<Inner>>("TxTimeoutsService");
         #[cfg(feature = "oauth2")]
         assert_unboxed::<super::HttpInterceptorService<Inner>>("HttpInterceptorService");
     }
@@ -16982,6 +17044,286 @@ mod trusted_host_tests {
              allocation on every request rather than only on a failed webhook \
              delivery (issue #2214)"
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // #2830: no boxed future and no deep clone of the inner service
+    // ----------------------------------------------------------------------
+
+    /// A ready future that holds 1 KiB. A future that holds it inline is at
+    /// least 1 KiB. A boxed future is only a pointer.
+    struct LargeFuture(#[allow(dead_code)] [u8; LARGE_FUTURE_BYTES]);
+
+    const LARGE_FUTURE_BYTES: usize = 1024;
+
+    impl std::future::Future for LargeFuture {
+        type Output = Result<axum::response::Response, std::convert::Infallible>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Ready(Ok(axum::response::Response::new(Body::empty())))
+        }
+    }
+
+    /// An inner service that returns a [`LargeFuture`] and counts its clones.
+    struct LargeFutureService {
+        clones: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LargeFutureService {
+        fn new() -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let clones = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    clones: Arc::clone(&clones),
+                },
+                clones,
+            )
+        }
+    }
+
+    impl Clone for LargeFutureService {
+        fn clone(&self) -> Self {
+            self.clones
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self {
+                clones: Arc::clone(&self.clones),
+            }
+        }
+    }
+
+    impl tower::Service<axum::extract::Request> for LargeFutureService {
+        type Response = axum::response::Response;
+        type Error = std::convert::Infallible;
+        type Future = LargeFuture;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: axum::extract::Request) -> Self::Future {
+            LargeFuture([0; LARGE_FUTURE_BYTES])
+        }
+    }
+
+    /// The future of `Svc` must hold the inner future inline.
+    ///
+    /// A `type_name` check does not see a box in a private field. This check
+    /// does: a boxed inner future makes the future smaller than the inner one.
+    fn assert_inner_future_inline<Svc>(what: &str)
+    where
+        Svc: tower::Service<axum::extract::Request>,
+    {
+        let size = std::mem::size_of::<Svc::Future>();
+        assert!(
+            size >= LARGE_FUTURE_BYTES,
+            "{what} must hold the inner future inline, but its future is only \
+             {size} bytes. A boxed future is one heap allocation on each \
+             request (issue #2830)."
+        );
+    }
+
+    /// The ingress services of issue #2830 hold the inner future inline.
+    #[test]
+    fn ingress_services_hold_the_inner_future_inline() {
+        type Inner = LargeFutureService;
+
+        assert_inner_future_inline::<crate::middleware::LogContextService<Inner>>(
+            "LogContextService",
+        );
+        assert_inner_future_inline::<
+            crate::session::SessionService<crate::session::MemoryStore, Inner>,
+        >("SessionService");
+        assert_inner_future_inline::<crate::security::trusted_proxies::TrustedProxiesService<Inner>>(
+            "TrustedProxiesService",
+        );
+        assert_inner_future_inline::<crate::middleware::MethodOverrideService<Inner>>(
+            "MethodOverrideService",
+        );
+        assert_inner_future_inline::<
+            crate::middleware::error_page_filter::ErrorPageContextService<Inner>,
+        >("ErrorPageContextService");
+        #[cfg(feature = "idempotency")]
+        {
+            assert_inner_future_inline::<crate::idempotency::IdempotencyReplayService<Inner>>(
+                "IdempotencyReplayService",
+            );
+            assert_inner_future_inline::<crate::security::submit_token::SubmitTokenService<Inner>>(
+                "SubmitTokenService",
+            );
+        }
+    }
+
+    /// Calls `svc` once with `req`, then returns the clones of the inner
+    /// service that the call made.
+    async fn inner_clones_for_one_call<Svc>(
+        mut svc: Svc,
+        clones: &std::sync::atomic::AtomicUsize,
+        req: axum::extract::Request,
+    ) -> usize
+    where
+        Svc: tower::Service<axum::extract::Request>,
+        Svc::Error: std::fmt::Debug,
+    {
+        use tower::ServiceExt as _;
+
+        svc.ready().await.expect("service is ready");
+        let before = clones.load(std::sync::atomic::Ordering::Relaxed);
+        let _response = svc.call(req).await.expect("infallible");
+        clones.load(std::sync::atomic::Ordering::Relaxed) - before
+    }
+
+    fn get_request() -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .expect("request builds")
+    }
+
+    fn json_post_request() -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .method("POST")
+            .uri("/users")
+            .header("content-type", "application/json")
+            .header("content-length", "2")
+            .body(Body::from("{}"))
+            .expect("request builds")
+    }
+
+    /// A clone of the erased seed of the merged stack must not clone the
+    /// services below it. Each outer `Route` level clones the stack on each
+    /// request, so a deep clone here repeats once for each level.
+    #[tokio::test]
+    async fn erased_seed_clone_stops_at_a_shared_pointer() {
+        use tower::Layer as _;
+
+        let (inner, clones) = LargeFutureService::new();
+        let seed = super::ComposedRegisteredLayers::new(Vec::new()).layer(inner);
+        let copies: Vec<_> = (0..5).map(|_| seed.clone()).collect();
+        assert_eq!(
+            clones.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a clone of the erased seed must not clone the inner service"
+        );
+
+        let per_call = inner_clones_for_one_call(seed, &clones, get_request()).await;
+        assert!(
+            per_call <= 1,
+            "one call through the erased seed may clone the inner service once, \
+             not {per_call} times"
+        );
+        drop(copies);
+    }
+
+    /// A session request without a cookie does not wait before it calls the
+    /// inner service. Thus it must not clone the inner service.
+    #[tokio::test]
+    async fn session_does_not_clone_the_inner_service_without_a_cookie() {
+        use tower::Layer as _;
+
+        let (inner, clones) = LargeFutureService::new();
+        let layer = crate::session::SessionLayer::new(
+            crate::session::MemoryStore::new(),
+            crate::session::SessionConfig::default(),
+        );
+        let without_cookie =
+            inner_clones_for_one_call(layer.layer(inner.clone()), &clones, get_request()).await;
+        assert_eq!(
+            without_cookie, 0,
+            "no cookie: no clone of the inner service"
+        );
+
+        // A cookie makes the layer load the session first. That path clones.
+        let mut with_cookie = get_request();
+        with_cookie.headers_mut().insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("autumn.sid=unknown-id"),
+        );
+        let with_cookie = inner_clones_for_one_call(layer.layer(inner), &clones, with_cookie).await;
+        assert_eq!(with_cookie, 1, "a cookie: one clone, for the load");
+    }
+
+    /// Outside body capture, the error-page context does not wait before it
+    /// calls the inner service. Thus it must not clone the inner service.
+    #[tokio::test]
+    async fn error_page_context_does_not_clone_the_inner_service() {
+        use tower::Layer as _;
+
+        let layer = crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev: false };
+        for (name, req) in [("GET", get_request()), ("POST", json_post_request())] {
+            let (inner, clones) = LargeFutureService::new();
+            let per_call = inner_clones_for_one_call(layer.layer(inner), &clones, req).await;
+            assert_eq!(per_call, 0, "{name}: no clone of the inner service");
+        }
+    }
+
+    /// The error-page context boxes its future only when dev mode reads the
+    /// request body. Each other request holds the inner future inline.
+    #[test]
+    fn error_page_context_boxes_only_for_dev_body_capture() {
+        use tower::{Layer as _, Service as _};
+
+        /// Dev mode, method, request, and if the future is boxed.
+        type Case = (bool, &'static str, fn() -> axum::extract::Request, bool);
+
+        let cases: [Case; 4] = [
+            (false, "GET", get_request, false),
+            (false, "POST", json_post_request, false),
+            (true, "GET", get_request, false),
+            (true, "POST", json_post_request, true),
+        ];
+        for (is_dev, name, request, boxed) in cases {
+            let (inner, _) = LargeFutureService::new();
+            let mut svc =
+                crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev }.layer(inner);
+            let future = svc.call(request());
+            assert_eq!(
+                matches!(future, futures::future::Either::Right(_)),
+                boxed,
+                "is_dev = {is_dev}, {name}: only a dev body capture takes the box"
+            );
+        }
+    }
+
+    /// A request that is not a form has no submit token to read. Thus the
+    /// submit-token layer must not clone the inner service for it.
+    #[cfg(feature = "idempotency")]
+    #[tokio::test]
+    async fn submit_token_does_not_clone_the_inner_service_without_a_form() {
+        use tower::Layer as _;
+
+        let layer = crate::security::SubmitTokenLayer::new(
+            Arc::new(crate::idempotency::MemoryIdempotencyStore::new(
+                std::time::Duration::from_secs(60),
+            )),
+            &crate::security::config::SubmitTokenConfig::default(),
+        );
+        for (name, req) in [("GET", get_request()), ("JSON POST", json_post_request())] {
+            let (inner, clones) = LargeFutureService::new();
+            let per_call = inner_clones_for_one_call(layer.layer(inner), &clones, req).await;
+            assert_eq!(per_call, 0, "{name}: no clone of the inner service");
+        }
+    }
+
+    /// The request transaction timeouts were an `axum::middleware::from_fn`.
+    /// It cloned the inner service and boxed a future on each request.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn tx_timeouts_layer_does_not_box_or_clone() {
+        use tower::Layer as _;
+
+        assert_inner_future_inline::<crate::db::TxTimeoutsService<LargeFutureService>>(
+            "TxTimeoutsService",
+        );
+        let (inner, clones) = LargeFutureService::new();
+        let svc = crate::db::TxTimeoutsLayer::new(crate::db::TxTimeouts::default()).layer(inner);
+        let per_call = inner_clones_for_one_call(svc, &clones, get_request()).await;
+        assert_eq!(per_call, 0, "no clone of the inner service");
     }
 
     /// The startup barrier's short-circuit branch: until the app reports startup

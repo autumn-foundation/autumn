@@ -1246,6 +1246,9 @@ impl Plan {
                 other => other?,
             }
             removed.files.push(path.clone());
+            if let Some(keys) = plan.recorded_keys.get(path) {
+                removed.keys.extend_from_slice(keys);
+            }
             println!(
                 "  Removed {}{}",
                 relative_display(path, &self.project_root),
@@ -1303,6 +1306,10 @@ impl Plan {
         }
         for path in removed.files.iter().chain(&removed.stale) {
             recorded.forget(&self.project_root, path);
+        }
+        // A removed file can be recorded under another spelling (issue #3382).
+        for key in &removed.keys {
+            recorded.forget_key(key);
         }
         for dir in &removed.dirs {
             recorded.forget_dir(&self.project_root, dir);
@@ -1581,6 +1588,10 @@ impl Plan {
         }
 
         RevertPlan {
+            recorded_keys: files_to_remove
+                .iter()
+                .map(|path| (path.clone(), recorded.keys_for(&self.project_root, path)))
+                .collect(),
             files_to_remove,
             migrations_to_remove,
             modifies,
@@ -1606,6 +1617,8 @@ struct Removed {
     dirs: Vec<PathBuf>,
     /// Entries for files that were already gone (issue #2557).
     stale: Vec<PathBuf>,
+    /// The manifest keys of `files`, from [`RevertPlan::recorded_keys`].
+    keys: Vec<String>,
 }
 
 /// The concrete result of [`Plan::compute_revert_plan`] — everything
@@ -1626,6 +1639,10 @@ struct RevertPlan {
     swept: HashMap<PathBuf, String>,
     /// Entries whose file is already gone. Dropped from the manifest.
     stale: Vec<PathBuf>,
+    /// The manifest keys of each file in `files_to_remove`, read before the
+    /// delete. A case-only alias resolves only while the file exists (issue
+    /// #3382).
+    recorded_keys: HashMap<PathBuf, Vec<String>>,
 }
 
 impl RevertPlan {
@@ -4959,6 +4976,118 @@ mod tests {
         v2.create(tmp.path().join("src/widgets/new.rs"), "// v2 new\n");
         v2.create(tmp.path().join("src/kept.rs"), "// kept\n");
         v2
+    }
+
+    /// Generate `src/models/Foo.rs` with `v1`. Return it and the plan of a
+    /// newer CLI that writes `v2` to `src/models/foo.rs` (issue #3382).
+    fn case_renamed(tmp: &tempfile::TempDir, v1: &str, v2: &str) -> (PathBuf, Plan) {
+        let old = tmp.path().join("src/models/Foo.rs");
+        let mut first = sole(Plan::new(tmp.path()));
+        first.create(old.clone(), v1);
+        first.execute(Flags::default()).unwrap();
+        let mut newer = sole(Plan::new(tmp.path()));
+        newer.create(tmp.path().join("src/models/foo.rs"), v2);
+        (old, newer)
+    }
+
+    /// Like [`case_renamed`], but only the directory changes case:
+    /// `src/models/foo.rs` becomes `src/Models/foo.rs`.
+    fn dir_case_renamed(tmp: &tempfile::TempDir, v1: &str, v2: &str) -> (PathBuf, Plan) {
+        let old = tmp.path().join("src/models/foo.rs");
+        let mut first = sole(Plan::new(tmp.path()));
+        first.create(old.clone(), v1);
+        first.execute(Flags::default()).unwrap();
+        let mut newer = sole(Plan::new(tmp.path()));
+        newer.create(tmp.path().join("src/Models/foo.rs"), v2);
+        (old, newer)
+    }
+
+    #[test]
+    fn a_directory_case_rename_removes_the_untouched_file() {
+        for (v1, v2) in [("// v1\n", "// v2\n"), ("// same\n", "// same\n")] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let (old, newer) = dir_case_renamed(&tmp, v1, v2);
+            let one_dir = tmp.path().join("src/Models").exists();
+
+            newer.revert(Flags::default()).unwrap();
+
+            // A case-sensitive host has no `src/Models`, so the sweep keeps
+            // the orphan with a warning.
+            assert_eq!(old.exists(), !one_dir, "{v1:?} -> {v2:?}");
+            assert_eq!(
+                provenance::Provenance::load(tmp.path()).contains("src/models/foo.rs"),
+                !one_dir,
+                "{v1:?} -> {v2:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_destroy_still_drops_the_alias_of_a_removed_file() {
+        // The second removal fails (a directory is no file). The first file
+        // is gone, so its entry, under any spelling, must go too.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, mut newer) = case_renamed(&tmp, "// v1\n", "// v2\n");
+        let blocker = tmp.path().join("src/models/zz.rs");
+        fs::create_dir_all(&blocker).unwrap();
+        newer.create(blocker, "// zz\n");
+
+        let result = newer.revert(Flags {
+            force: true,
+            ..Flags::default()
+        });
+
+        assert!(result.is_err(), "removing a directory as a file fails");
+        assert!(!old.exists());
+        assert!(!provenance::Provenance::load(tmp.path()).contains("src/models/Foo.rs"));
+    }
+
+    #[test]
+    fn a_case_only_rename_with_new_contents_removes_the_untouched_file() {
+        // On a case-insensitive host the normal pass removes it. On a
+        // case-sensitive host the sweep does.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, newer) = case_renamed(&tmp, "// v1\n", "// v2\n");
+
+        newer.revert(Flags::default()).unwrap();
+
+        assert!(!old.exists());
+        assert!(
+            !tmp.path().join(provenance::MANIFEST_PATH).exists(),
+            "no stale entry"
+        );
+    }
+
+    #[test]
+    fn a_case_only_rename_with_same_contents_drops_the_recorded_entry() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, newer) = case_renamed(&tmp, "// same\n", "// same\n");
+
+        newer.revert(Flags::default()).unwrap();
+
+        assert!(!old.exists());
+        assert!(
+            !tmp.path().join(provenance::MANIFEST_PATH).exists(),
+            "no stale entry"
+        );
+    }
+
+    #[test]
+    fn a_case_only_rename_still_keeps_an_edited_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let (old, newer) = case_renamed(&tmp, "// v1\n", "// v2\n");
+        fs::write(&old, "// mine\n").unwrap();
+        let one_entry = tmp.path().join("src/models/foo.rs").exists();
+
+        let result = newer.revert(Flags::default());
+
+        if one_entry {
+            assert!(matches!(result, Err(GenerateError::Diverged(_))));
+        } else {
+            result.unwrap(); // the sweep keeps it with a warning.
+        }
+        assert!(old.exists());
+        assert!(provenance::Provenance::load(tmp.path()).contains("src/models/Foo.rs"));
     }
 
     #[test]

@@ -301,6 +301,43 @@ a fresh copy of the record each time. Set `updated_at` after `f`. Change the
 **Automation:** `manual` — `update_record` needs the store's own storage code.
 A codemod cannot write it.
 
+### Middleware: ingress service futures are not boxed
+
+**Why:** a boxed future is one heap allocation on each request. The ingress
+services now return named futures (issue #2830).
+
+**You are affected only if your code names the future type of one of these
+services, or polls the future without pinning it:**
+
+- `LogContextService`
+- `SessionService`
+- `MethodOverrideService`
+- `IdempotencyReplayService`
+- the services of `TrustedProxiesLayer` and `SubmitTokenLayer`
+
+The futures of `LogContextService` and `SessionService` can be `!Unpin`.
+
+**Before (`{X.Y}`):**
+
+```rust
+let mut fut: Pin<Box<dyn Future<Output = _> + Send>> = service.call(request);
+let response = poll_fn(|cx| fut.as_mut().poll(cx)).await;
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let fut = service.call(request);
+let response = fut.await;
+// Or, to keep a boxed future:
+let mut fut = Box::pin(service.call(request));
+```
+
+To name the type, use `<S as Service<Request>>::Future`.
+
+**Automation:** `manual` — the code to change is in the app's own middleware.
+A codemod cannot find it reliably.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -371,6 +408,15 @@ If nothing changed, delete this section.
   To support both schemes, use the tokens (`var(--bg)`, `var(--text)`) for
   the page colors, and see `docs/guide/widget-styling.md#dark-mode`.
 
+- **Toasts use the top layer (#3399).** With `autumn-widgets.js`,
+  `toast_region` opens as a popover in the top layer. `--z-toast` and
+  `z-index` do not apply there. The runtime removes a toast from the DOM
+  when its fade ends. Before, the toast stayed hidden in the DOM.
+  `.autumn-toast` is now `display: flex` and holds a close button. An
+  `Error` toast has `role="alert"` on `.autumn-toast__message`, not on
+  `.autumn-toast`. A page with neither the widget CSS nor the JS no longer
+  shows the region: the browser hides a closed popover. Link
+  `/static/css/autumn-widgets.css`.
 - **Money: each account row stores its balance (#3339).** The framework
   migration `20261029183512_add_money_account_balance` adds the
   `_autumn_money_accounts.balance_minor` column and a trigger. Run
@@ -384,6 +430,17 @@ If nothing changed, delete this section.
   yourself. `ledger::balance_drift` reports a difference. After a data-only
   restore, set `balance_minor` to `NULL`. See
   `docs/guide/money.md#the-stored-balance`.
+
+- **Radio choice ids: a name or value with a special character has a new id
+  (#3454).** Before, two groups could give the same choice id. That breaks the
+  `<label for>` link. Now letters, digits and `_` do not change. Each other
+  byte (`-`, `.`, a space, non-ASCII) is written `--HH` (upper-case hex). The
+  name `plan-type` gives `plan--2Dtype-x`. In group `speed`, the value
+  `next-day` gives `speed-next--2Dday`. An id of only letters, digits and `_`
+  does not change. An empty name after an `id_prefix` is now written `--`. The
+  second of two equal values now ends in `--n1`. It ended in `-<index>`
+  before. Update a CSS rule, a test or a `getElementById` call that uses an
+  old id.
 
 ## Deprecations retained from `{X.Y}`
 

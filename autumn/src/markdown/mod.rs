@@ -113,6 +113,6 @@ pub use types::{
 #[cfg(feature = "maud")]
 pub use user_content::render_user_content;
 pub use user_content::{
-    RICH_TEXT_ALLOWED_TAGS, RICH_TEXT_ALLOWED_URL_SCHEMES, render_user_content_html,
-    sanitize_user_html,
+    HtmlTooLarge, RICH_TEXT_ALLOWED_TAGS, RICH_TEXT_ALLOWED_URL_SCHEMES, render_user_content_html,
+    render_user_content_html_bounded, sanitize_user_html,
 };

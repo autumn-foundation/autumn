@@ -109,10 +109,12 @@ All `Page` methods return `Result<&Self, SystemTestError>` and can be chained.
 | `page.fill(selector, value)` | Fill a form input |
 | `page.click(selector)` | Click an element (CSS selector) |
 | `page.press(key)` | Press one key on the focused element (`"ArrowDown"`, `"Escape"`, `"g"`) |
+| `page.hover(selector)` | Move the mouse to the element center, so CSS `:hover` applies |
 | `page.set_javascript_enabled(false)` | Turn page scripts off; call before `visit` to test a no-JS fallback |
 | `page.expect_text(text)` | Assert text appears in the DOM |
 | `page.expect_url(pattern)` | Assert URL contains pattern |
 | `page.expect_attribute(sel, attr, value)` | Assert element attribute value |
+| `page.expect_on_top(selector)` | Assert no other element covers the element at its center (sees inert content too) |
 | `page.snapshot()` | Save a PNG screenshot to artifact dir |
 | `page.expect_hx_settle()` | Explicitly wait for htmx to finish |
 | `page.expect_sse_event(id, predicate)` | Wait for SSE content in DOM |

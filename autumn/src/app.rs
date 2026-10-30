@@ -11482,6 +11482,8 @@ async fn build_acme_tls_listener(
                 .with_reserved(reserved),
             );
             match registry.load().await {
+                // The store logs each record it skipped. `register` then
+                // refuses new domains until the files are fixed (#2654).
                 Ok(count) => tracing::info!(count, "loaded tenant custom domains"),
                 // A registry that cannot be read is not fatal to the
                 // deployment: its own certificate still serves. It IS fatal to

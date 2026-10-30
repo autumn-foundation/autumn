@@ -917,7 +917,10 @@ path = "tests/trusted_proxies_alloc_gate.rs"
 # Allocation gate for the layers that carry a request's matched route and
 # request id (the access log, primary and fallback, and the log context): they
 # keep axum's shared `MatchedPath` and the `RequestId` itself, not a per-request
-# `String` copy. Own binary for the same `allocation-counter` global-allocator
+# `String` copy. Its `ingress_futures` module also gates the futures of the
+# public ingress services (#2830): no boxed future for each request. It is a
+# module, not a binary, because each test binary costs disk on the trybuild
+# runners. Own binary for the same `allocation-counter` global-allocator
 # reason as `config_alloc_gate` above.
 [[test]]
 name = "request_meta_alloc_gate"
