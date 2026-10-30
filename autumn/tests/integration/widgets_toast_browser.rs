@@ -338,6 +338,41 @@ async fn a_toast_that_arrives_during_hover_still_fades_in() {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
+async fn a_restored_message_id_is_not_reused() {
+    // An htmx history restore can bring back a toast with an id that the
+    // runtime counter gives out again after a reload.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { for (let i = 1; i <= 100; i++) { const old = document.createElement('span'); \
+             old.id = 'autumn-toast-' + i; document.body.prepend(old); } return true; })()"
+        )
+        .await
+    );
+    page.click("#sticky").await.expect("click");
+    wait_for(
+        &page,
+        "(() => { const b = document.querySelector('#toast-region [data-autumn-toast-close]'); \
+         return !!b && !b.hidden; })()",
+    )
+    .await;
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.getElementById(document.querySelector('#toast-region \
+             [data-autumn-toast-close]').getAttribute('aria-describedby')).textContent"
+        )
+        .await,
+        "Sticky",
+        "the close button describes its own message"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
 async fn focus_within_pauses_dismissal() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");

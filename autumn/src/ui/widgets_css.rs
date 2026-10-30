@@ -393,6 +393,11 @@ mod tests {
         );
     }
 
+    /// The stylesheet with LF line ends. A Windows checkout can have CRLF.
+    fn lf_css() -> String {
+        WIDGETS_COMPONENT_CSS.replace("\r\n", "\n")
+    }
+
     /// WCAG 2.2.1: hover or focus on a toast pauses every toast timer.
     #[test]
     fn toast_timer_pauses_on_hover_and_focus() {
@@ -400,10 +405,7 @@ mod tests {
                     .autumn-toast-region:focus-within .autumn-toast,\n\
                     .autumn-toast:hover,\n\
                     .autumn-toast:focus-within {";
-        assert!(
-            WIDGETS_COMPONENT_CSS.contains(list),
-            "missing pause selectors"
-        );
+        assert!(lf_css().contains(list), "missing pause selectors");
         // Only the exit animation pauses. The entrance of a new toast runs.
         assert!(
             rule_body(".autumn-toast:focus-within")
@@ -426,10 +428,11 @@ mod tests {
     /// a persistent toast.
     #[test]
     fn reduced_motion_keeps_the_dwell_and_the_persistent_toast() {
-        let at = WIDGETS_COMPONENT_CSS
+        let css = lf_css();
+        let at = css
             .find("@media (prefers-reduced-motion: reduce) {\n    /* A 0s entrance")
             .expect("reduced-motion toast block");
-        let rest = &WIDGETS_COMPONENT_CSS[at..];
+        let rest = &css[at..];
         let block = &rest[..rest.find("\n}\n").expect("block end")];
         assert!(
             block.contains(

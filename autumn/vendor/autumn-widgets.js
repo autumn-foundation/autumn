@@ -670,9 +670,10 @@
     var close = el.querySelector(CLOSE);
     var msg = el.querySelector('.autumn-toast__message');
     if (!close) return;
-    // Each close button names its own message.
+    // Each close button names its own message. Skip ids in use: an htmx
+    // history restore can bring back an id the counter gives out again.
     if (msg) {
-      msg.id = msg.id || 'autumn-toast-' + (++uid);
+      while (!msg.id || document.getElementById(msg.id) !== msg) msg.id = 'autumn-toast-' + (++uid);
       close.setAttribute('aria-describedby', msg.id);
     }
     close.hidden = false;
