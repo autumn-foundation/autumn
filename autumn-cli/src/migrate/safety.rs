@@ -19,8 +19,8 @@
 //!   `''`-doubled escaped quote). Semicolons inside any of these are kept
 //!   intact so they do not produce spurious statement fragments -- e.g. a
 //!   `DEFAULT 'hello; world'` clause splits as one statement, not two.
-//! - A `--` comment, a `'` literal, a `"` identifier and a dollar-quoted
-//!   block each hide `--`, `/*` and `;` inside them. The `E'\''` escape is
+//! - A `--` comment, a `'` literal, a `"`, backtick or `[..]` identifier and a
+//!   dollar-quoted block each hide `--`, `/*` and `;` inside them. The `E'\''` escape is
 //!   not handled.
 //! - Block comments do not nest. The first `*/` ends the comment. A nested
 //!   comment shows more SQL, never less.
@@ -229,8 +229,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         }
 
         // Single-quoted literal: keep whole, so `;` inside is not a separator.
-        if starts_quote(rest) {
-            let len = quote_len(rest);
+        if let Some(len) = quoted_len(rest) {
             current.push_str(&rest[..len]);
             i += len;
             continue;
@@ -749,8 +748,7 @@ fn has_inline_unique_constraint(subcommand: &str) -> bool {
     subcommand.contains(" unique ") || subcommand.ends_with(" unique")
 }
 
-/// Byte length of the quoted span at the start of `rest`: a `'` literal or a
-/// `"` identifier.
+/// Byte length of the `'`, `"` or backtick span at the start of `rest`.
 ///
 /// `rest` must start with the quote. A doubled quote is an escaped quote. An
 /// unclosed span runs to the end of `rest`.
@@ -786,9 +784,19 @@ fn dollar_quote_len(rest: &str) -> Option<usize> {
     )
 }
 
-/// True when `rest` starts a `'` literal or a `"` identifier.
-fn starts_quote(rest: &str) -> bool {
-    rest.starts_with(['\'', '"'])
+/// Byte length of the quoted span at the start of `rest`, or `None`.
+///
+/// A span is a `'` literal, a `"` or backtick identifier, or a `SQLite`
+/// `[name]` identifier. A bracket span ends at the first `]`. It must hold no
+/// `'`, `;` or newline, so `Postgres` array text such as `ARRAY['a]']` stays
+/// a normal literal.
+fn quoted_len(rest: &str) -> Option<usize> {
+    if rest.starts_with(['\'', '"', '`']) {
+        return Some(quote_len(rest));
+    }
+    let body = rest.strip_prefix('[')?;
+    let end = body.find(']')?;
+    (!body[..end].contains(['\'', ';', '\n'])).then_some(end + 2)
 }
 
 /// Byte length of the line comment at the start of `rest`, or `None`. The
@@ -811,7 +819,7 @@ pub fn strip_block_comments(sql: &str) -> String {
         let rest = &sql[i..];
         let keep = line_comment_len(rest)
             .or_else(|| dollar_quote_len(rest))
-            .or_else(|| starts_quote(rest).then(|| quote_len(rest)));
+            .or_else(|| quoted_len(rest));
         if let Some(len) = keep {
             result.push_str(&rest[..len]);
             i += len;
@@ -837,9 +845,7 @@ fn strip_line_comments(sql: &str) -> String {
         let rest = &sql[i..];
         if let Some(len) = line_comment_len(rest) {
             i += len;
-        } else if let Some(len) =
-            dollar_quote_len(rest).or_else(|| starts_quote(rest).then(|| quote_len(rest)))
-        {
+        } else if let Some(len) = dollar_quote_len(rest).or_else(|| quoted_len(rest)) {
             result.push_str(&rest[..len]);
             i += len;
         } else {
@@ -2478,6 +2484,30 @@ mod tests {
         assert!(has_executable_sql("SELECT '--';"));
         assert!(!has_executable_sql(""));
         assert!(!has_executable_sql("/* only */"));
+    }
+
+    #[test]
+    fn quote_inside_sqlite_identifier_hides_nothing() {
+        for sql in [
+            "CREATE TABLE `a\"b` (id int); DROP TABLE t;",
+            "CREATE TABLE [a\"b] (id int); DROP TABLE t;",
+        ] {
+            let f = classify_sql_for(DatabaseBackend::Sqlite, sql);
+            assert!(
+                f.iter().any(|f| f.risk == RiskLevel::Destructive),
+                "{sql}: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bracket_with_literal_is_not_an_identifier() {
+        let sql = "SELECT ARRAY['a]']; DROP TABLE t;";
+        assert!(
+            classify_sql(sql)
+                .iter()
+                .any(|f| f.risk == RiskLevel::Destructive)
+        );
     }
 
     #[test]
