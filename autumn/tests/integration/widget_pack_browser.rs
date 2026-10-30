@@ -77,8 +77,8 @@ fn kgood_toolbar() -> Markup {
     }
 }
 
-/// A right-to-left toolbar that does not wrap. ArrowLeft moves forward,
-/// so the keyboard check must not press ArrowRight on the first item.
+/// A right-to-left toolbar that does not wrap. `ArrowLeft` moves forward,
+/// so the keyboard check must not press `ArrowRight` on the first item.
 fn kgood_rtl_toolbar() -> Markup {
     html! {
         div dir="rtl" class="autumn-kgood-toolbar" role="toolbar" aria-label="Colors (RTL)"

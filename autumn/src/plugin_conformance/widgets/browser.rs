@@ -278,9 +278,9 @@ const ROVING_LISTS_JS: &str = r#"(() => {
 
 /// Focus and mark the tab stop of list `LIST_INDEX`.
 ///
-/// Return the arrow key to
-/// press: forward, or back when the stop is the last item of a list that
-/// does not wrap. A right-to-left list swaps ArrowLeft and ArrowRight. Return `""` when the list has no tab stop.
+/// Return the arrow key to press: forward, or back when the stop is the
+/// last item of a list that does not wrap. A right-to-left list swaps
+/// `ArrowLeft` and `ArrowRight`. Return `""` when the list has no tab stop.
 const FOCUS_LIST_JS: &str = r#"(() => {
   const ITEMS = '[role="tab"],[role="menuitem"],[role="option"],[role="radio"],[role="treeitem"]';
   const LIST = '[data-autumn-roving],[data-autumn-activedescendant]';
