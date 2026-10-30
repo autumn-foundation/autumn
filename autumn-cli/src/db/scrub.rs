@@ -9774,6 +9774,32 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_builds_a_token_from_the_row_key_and_a_free_rowid_name() {
+        let config = parse_config_str(
+            "[defaults]\nsafe_columns = [\"id\", \"created_at\", \"full_name\", \"bio\"]\n[tables.users.pii]\nemail = \"email\"",
+        )
+        .unwrap();
+        let facts = DatabaseFacts {
+            dialect: Dialect::Sqlite,
+            rowid_tables: BTreeSet::from(["users".to_owned()]),
+            rowid_aliases: BTreeMap::from([("users".to_owned(), Some("oid"))]),
+            ..DatabaseFacts::default()
+        };
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .unwrap();
+        let sql = sql_of(&plan, "users");
+        assert!(sql.contains("autumn_sha256("), "{sql}");
+        assert!(sql.contains("THEN 'rowid:' || oid"), "{sql}");
+        assert!(plan.tables[0].row_key.is_empty(), "no encrypted rewrite");
+    }
+
+    #[test]
     fn sqlite_does_not_refuse_a_table_it_never_rewrites() {
         let config = parse_config_str(
             "[defaults]\nsafe_columns = [\"id\", \"email\", \"created_at\", \"full_name\", \"bio\"]",
