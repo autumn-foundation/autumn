@@ -145,11 +145,14 @@ impl Budget {
         right: &Value,
         path: Path<'_>,
     ) -> Result<(), ConstelaError> {
-        if self.fuel_limit == u64::MAX {
+        if self.fuel_limit == u64::MAX || !same_shape(left, right) {
             return Ok(());
         }
         let cap = self.scan_cap();
-        let smaller = approx_bytes(left, cap).min(approx_bytes(right, cap));
+        // Measure one side, then stop the other at that size: the walk of
+        // the larger value is bounded by the smaller.
+        let first = approx_bytes(left, cap);
+        let smaller = first.min(approx_bytes(right, first));
         self.burn_scan(smaller, path)
     }
 
@@ -302,6 +305,19 @@ impl Output {
             .set(self.written.get().saturating_add(text.len()));
         out.push_str(text);
         Ok(())
+    }
+}
+
+/// Whether `==` on these values must read their contents.
+///
+/// Values of two kinds, or containers and strings of two lengths, are
+/// unequal at once. That compare reads nothing.
+fn same_shape(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::String(a), Value::String(b)) => a.len() == b.len(),
+        (Value::Array(a), Value::Array(b)) => a.len() == b.len(),
+        (Value::Object(a), Value::Object(b)) => a.len() == b.len(),
+        _ => std::mem::discriminant(left) == std::mem::discriminant(right),
     }
 }
 
@@ -466,11 +482,23 @@ mod tests {
         let big = json!("x".repeat(100_000));
         budget
             .burn_compare(&big, &json!("y"), Path::root("p"))
-            .expect("the small side sets the cost");
+            .expect("different lengths: nothing is read");
         let err = budget
             .burn_compare(&big, &big, Path::root("p"))
             .expect_err("two big values");
         assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    }
+
+    #[test]
+    fn a_comparison_of_two_kinds_reads_nothing() {
+        let budget = Budget::new(0).with_fuel(1);
+        let items = json!(vec![0; 100_000]);
+        budget
+            .burn_compare(&items, &json!(1), Path::root("p"))
+            .expect("kinds differ");
+        budget
+            .burn_compare(&items, &json!([1]), Path::root("p"))
+            .expect("lengths differ");
     }
 
     #[test]
@@ -481,6 +509,38 @@ mod tests {
         budget
             .burn_compare(&big, &big, Path::root("p"))
             .expect("free");
+    }
+
+    #[test]
+    fn a_scan_of_a_full_block_costs_one_unit() {
+        let budget = Budget::new(0).with_fuel(1);
+        budget
+            .burn_scan(SCAN_BLOCK_BYTES, Path::root("p"))
+            .expect("one block is one unit");
+        budget.burn(1, Path::root("p")).expect_err("spent");
+
+        let budget = Budget::new(0).with_fuel(1);
+        budget
+            .burn_scan(SCAN_BLOCK_BYTES + 1, Path::root("p"))
+            .expect_err("one byte more is a second unit");
+    }
+
+    #[test]
+    fn a_failed_burn_spends_nothing() {
+        let budget = Budget::new(0).with_fuel(5);
+        budget.burn(6, Path::root("p")).expect_err("over");
+        budget
+            .burn(5, Path::root("p"))
+            .expect("all the fuel is left");
+    }
+
+    #[test]
+    fn measuring_a_huge_value_stops_at_the_fuel() {
+        let budget = Budget::new(0).with_fuel(2);
+        let huge = json!(vec!["x".repeat(1000); 10_000]);
+        budget
+            .burn_value(&huge, Path::root("p"))
+            .expect_err("far over two units");
     }
 
     #[test]

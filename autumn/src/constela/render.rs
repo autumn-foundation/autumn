@@ -97,14 +97,6 @@ pub struct RenderLimits {
     /// metadata, handler payloads, portal targets and rendered ids. A
     /// dispatch uses the default for its own budget.
     pub max_output_bytes: usize,
-    /// Units of work one render may spend. Default 16 000 000.
-    ///
-    /// One unit pays for one expression evaluation, or for 64 bytes that a
-    /// comparison, a string index or a path lookup reads. The node and
-    /// iteration counts do not imply this one: nested loops multiply, and a
-    /// comparison of two large values is one node. A dispatch uses the
-    /// default for its own meter.
-    pub max_fuel: u64,
 }
 
 impl Default for RenderLimits {
@@ -114,9 +106,24 @@ impl Default for RenderLimits {
             max_nodes: 50_000,
             max_each_items: 5_000,
             max_output_bytes: 4 * 1024 * 1024,
-            max_fuel: 16_000_000,
         }
     }
+}
+
+/// Units of fuel for each node that [`RenderLimits::max_nodes`] allows.
+///
+/// With the default 50 000 nodes, a render has 16 000 000 units. One unit pays
+/// for one node, one expression, or 64 bytes that a comparison, a string
+/// index or a path lookup reads. Nested loops multiply work, and one
+/// comparison of two large values is one node, so the node count alone does
+/// not bound the work. A dispatch uses the default.
+const FUEL_PER_NODE: u64 = 320;
+
+/// The fuel that `limits` allow. `u64::MAX` turns metering off.
+pub fn fuel_for(limits: &RenderLimits) -> u64 {
+    u64::try_from(limits.max_nodes)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(FUEL_PER_NODE)
 }
 
 /// Everything a render reads that is not in the document.
@@ -280,7 +287,16 @@ pub fn render(
     document: &super::Document,
     ctx: &RenderContext,
 ) -> Result<RenderedUi, ConstelaError> {
-    let budget = Budget::new(ctx.limits.max_output_bytes).with_fuel(ctx.limits.max_fuel);
+    render_with_fuel(document, ctx, fuel_for(&ctx.limits))
+}
+
+/// [`render`], with `fuel` units of work.
+pub fn render_with_fuel(
+    document: &super::Document,
+    ctx: &RenderContext,
+    fuel: u64,
+) -> Result<RenderedUi, ConstelaError> {
+    let budget = Budget::new(ctx.limits.max_output_bytes).with_fuel(fuel);
     let output = Output::new(ctx.limits.max_output_bytes);
     let mut renderer = Renderer {
         document,
@@ -513,6 +529,7 @@ impl<'a> Renderer<'a> {
                 // Checked on the source before rendering: the sanitizer would
                 // otherwise build the whole HTML string first.
                 self.output.check(source.len(), path)?;
+                self.budget.burn_scan(source.len(), path)?;
                 let mut rendered = String::new();
                 render_markdown(&source, &mut rendered);
                 self.write(out, &rendered, path)?;
@@ -913,11 +930,12 @@ impl<'a> Renderer<'a> {
             )));
         }
         let prefix = &self.ctx.id_prefix;
+        let first_use = path.render_clipped(ID_PATH_BYTES);
         self.budget.charge(
             prefix
                 .len()
                 .saturating_add(id.len())
-                .saturating_add(ID_PATH_BYTES)
+                .saturating_add(first_use.len())
                 .saturating_add(size_of::<String>().saturating_mul(2)),
             path,
         )?;
@@ -934,8 +952,7 @@ impl<'a> Renderer<'a> {
                 ),
             )));
         }
-        self.ids
-            .insert(rendered, path.render_clipped(ID_PATH_BYTES));
+        self.ids.insert(rendered, first_use);
         Ok(true)
     }
 
@@ -1077,7 +1094,9 @@ impl<'a> Renderer<'a> {
         let language = self.eval_ref(language, env, path.key("language"), depth)?;
         let content = self.eval_ref(content, env, path.key("content"), depth)?;
         self.write(out, "<pre><code", path)?;
-        let language = sanitize_language(&self.text(&language, path)?);
+        let language = self.text(&language, path)?;
+        self.budget.burn_scan(language.len(), path)?;
+        let language = sanitize_language(&language);
         if !language.is_empty() {
             // The class is derived from a document value, so it is escaped like
             // any other attribute.
@@ -1189,6 +1208,77 @@ fn harden_blank_target(attrs: &mut Vec<(String, Option<String>)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render_fuel(source: &str, rows: usize, fuel: u64) -> Result<RenderedUi, ConstelaError> {
+        let document =
+            crate::constela::Document::parse(source, &crate::constela::Limits::default())
+                .expect("valid document");
+        let mut state = document.initial_state();
+        for name in ["outer", "inner", "rows"] {
+            if state.contains_key(name) {
+                state.insert(name.into(), Value::Array(vec![Value::Null; rows]));
+            }
+        }
+        let ctx = RenderContext {
+            state,
+            ..RenderContext::default()
+        };
+        render_with_fuel(&document, &ctx, fuel)
+    }
+
+    const NESTED_EACH: &str = r#"{"version":"1.0",
+      "state":{"outer":{"type":"list","initial":[]},"inner":{"type":"list","initial":[]}},
+      "view":{"kind":"each","items":{"expr":"state","name":"outer"},"as":"a",
+        "body":{"kind":"each","items":{"expr":"state","name":"inner"},"as":"b",
+          "body":{"kind":"text","value":{"expr":"concat","items":[
+            {"expr":"lit","value":""},{"expr":"lit","value":""}]}}}}}"#;
+
+    #[test]
+    fn default_fuel_is_320_units_for_each_node() {
+        assert_eq!(fuel_for(&RenderLimits::default()), 16_000_000);
+        let unbounded = RenderLimits {
+            max_nodes: usize::MAX,
+            ..RenderLimits::default()
+        };
+        assert_eq!(fuel_for(&unbounded), u64::MAX);
+    }
+
+    #[test]
+    fn fuel_stops_nested_loops_under_the_node_limit() {
+        let err = render_fuel(NESTED_EACH, 100, 1_000).expect_err("10 000 passes");
+        assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+        assert!(err.diagnostics()[0].message.contains("fuel"));
+    }
+
+    #[test]
+    fn a_render_passes_at_exactly_the_fuel_it_needs() {
+        assert!(render_fuel(NESTED_EACH, 3, 0).is_err());
+        let needed = (1..10_000)
+            .find(|fuel| render_fuel(NESTED_EACH, 3, *fuel).is_ok())
+            .expect("a small render");
+        assert!(render_fuel(NESTED_EACH, 3, needed.saturating_sub(1)).is_err());
+        assert!(render_fuel(NESTED_EACH, 3, needed).is_ok());
+    }
+
+    #[test]
+    fn markdown_and_code_text_burn_fuel_for_their_size() {
+        let mut kinds = vec![
+            r#"{"kind":"code","language":{"expr":"state","name":"s"},"content":{"expr":"lit","value":""}}"#,
+        ];
+        if cfg!(feature = "markdown") {
+            kinds.push(r#"{"kind":"markdown","content":{"expr":"state","name":"s"}}"#);
+        }
+        for kind in kinds {
+            let source = format!(
+                r#"{{"version":"1.0",
+                  "state":{{"s":{{"type":"string","initial":"{}"}}}},
+                  "view":{kind}}}"#,
+                "!".repeat(64 * 1024)
+            );
+            let err = render_fuel(&source, 0, 100).expect_err("1 024 units of scan");
+            assert!(err.diagnostics()[0].message.contains("fuel"), "{kind}");
+        }
+    }
 
     #[test]
     fn escaping_covers_the_five_character_set() {

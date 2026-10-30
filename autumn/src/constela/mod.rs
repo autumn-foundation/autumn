@@ -313,7 +313,8 @@ impl Document {
         };
 
         let limits = RenderLimits::default();
-        let budget = budget::Budget::new(limits.max_output_bytes).with_fuel(limits.max_fuel);
+        let budget =
+            budget::Budget::new(limits.max_output_bytes).with_fuel(render::fuel_for(&limits));
         let ctx = dispatch::DispatchCtx {
             route,
             styles: &self.program.styles,

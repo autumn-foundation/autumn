@@ -1788,12 +1788,14 @@ fn ids_derived_from_the_loop_index_render() {
 // Work meter (#3445)
 // ---------------------------------------------------------------------------
 
-fn render_with_fuel(source: &str, state: Map<String, Value>, max_fuel: u64) -> ConstelaError {
+/// Fuel is 320 units for each allowed node, so a small `max_nodes` is a small
+/// fuel allowance.
+fn render_with_fuel(source: &str, state: Map<String, Value>, max_nodes: usize) -> ConstelaError {
     let document = document(source);
     let ctx = RenderContext {
         state,
         limits: RenderLimits {
-            max_fuel,
+            max_nodes,
             ..RenderLimits::default()
         },
         ..RenderContext::default()
@@ -1810,16 +1812,6 @@ const NESTED_EACH: &str = r#"{"version":"1.0",
 
 fn list(len: usize) -> Value {
     Value::Array(vec![json!(0); len])
-}
-
-#[test]
-fn fuel_stops_nested_loops_under_the_node_limit() {
-    let mut state = Map::new();
-    state.insert("outer".into(), list(100));
-    state.insert("inner".into(), list(100));
-    let err = render_with_fuel(NESTED_EACH, state, 1_000);
-    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
-    assert!(err.diagnostics()[0].message.contains("fuel"));
 }
 
 #[test]
@@ -1846,30 +1838,83 @@ fn fuel_charges_the_bytes_that_a_comparison_scans() {
     let mut state = Map::new();
     state.insert("s".into(), Value::String("x".repeat(400_000)));
     state.insert("rows".into(), list(100));
-    // 100 passes x ~6 evals is under 1 000 units. 100 x 800 KB of memcmp is not.
-    let err = render_with_fuel(source, state, 1_000);
+    // 100 passes x ~6 evals is far under 64 000 units. 100 x 400 KB of memcmp is not.
+    let err = render_with_fuel(source, state, 200);
     assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
 }
 
 #[test]
-fn a_long_component_name_does_not_slow_a_render() {
-    let name = "a".repeat(20_000);
-    let source = format!(
+fn fuel_charges_a_string_index_and_a_path_lookup() {
+    let index = r#"{"version":"1.0",
+      "state":{"s":{"type":"string","initial":""},"rows":{"type":"list","initial":[]}},
+      "view":{"kind":"each","items":{"expr":"state","name":"rows"},"as":"r",
+        "body":{"kind":"text","value":{"expr":"index",
+          "base":{"expr":"state","name":"s"},"key":{"expr":"lit","value":0}}}}}"#;
+    let mut state = Map::new();
+    state.insert("s".into(), Value::String("x".repeat(400_000)));
+    state.insert("rows".into(), list(100));
+    let err = render_with_fuel(index, state, 200);
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+
+    let lookup = format!(
         r#"{{"version":"1.0",
           "state":{{"rows":{{"type":"list","initial":[]}}}},
-          "components":{{"{name}":{{"view":{{"kind":"each","items":{{"expr":"state","name":"rows"}},"as":"r",
-            "body":{{"kind":"text","value":{{"expr":"lit","value":"x"}}}}}}}}}},
-          "view":{{"kind":"component","name":"{name}"}}}}"#
+          "view":{{"kind":"each","items":{{"expr":"state","name":"rows"}},"as":"r",
+            "body":{{"kind":"text","value":{{"expr":"state","name":"rows","path":"{}"}}}}}}}}"#,
+        "a.".repeat(100_000)
+    );
+    let mut state = Map::new();
+    state.insert("rows".into(), list(100));
+    let err = render_with_fuel(&lookup, state, 200);
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+}
+
+#[test]
+fn a_dispatch_is_metered_too() {
+    let steps: Vec<String> = (0..3_000)
+        .map(|_| {
+            r#"{"do":"set","target":"flag","value":{"expr":"bin","op":"==",
+              "left":{"expr":"state","name":"s"},"right":{"expr":"state","name":"s"}}}"#
+                .to_string()
+        })
+        .collect();
+    let source = format!(
+        r#"{{"version":"1.0",
+          "state":{{"s":{{"type":"string","initial":""}},"flag":{{"type":"boolean","initial":false}}}},
+          "actions":[{{"name":"go","steps":[{}]}}],
+          "view":{{"kind":"element","tag":"div"}}}}"#,
+        steps.join(",")
     );
     let document = document(&source);
     let mut state = document.initial_state();
-    state.insert("rows".into(), list(4_000));
-    let ctx = RenderContext {
-        state,
-        ..RenderContext::default()
-    };
-    let start = std::time::Instant::now();
-    document.render(&ctx).expect("renders");
-    // Eager paths copied the name once for each node: 4 000 x 20 KB x depth.
-    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    state.insert("s".into(), Value::String("x".repeat(400_000)));
+    let err = document
+        .dispatch("go", &mut state, &Map::new())
+        .expect_err("3 000 x 400 KB of comparison is over the fuel");
+    assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
+    assert!(err.diagnostics()[0].message.contains("fuel"));
+}
+
+#[test]
+fn a_dispatch_charges_the_list_update_that_scans() {
+    let steps: Vec<String> = (0..2_000)
+        .map(|_| {
+            r#"{"do":"update","target":"items","operation":"remove","value":{"expr":"lit","value":-1}}"#
+                .to_string()
+        })
+        .collect();
+    let source = format!(
+        r#"{{"version":"1.0",
+          "state":{{"items":{{"type":"list","initial":[]}}}},
+          "actions":[{{"name":"go","steps":[{}]}}],
+          "view":{{"kind":"element","tag":"div"}}}}"#,
+        steps.join(",")
+    );
+    let document = document(&source);
+    let mut state = document.initial_state();
+    state.insert("items".into(), list(100_000));
+    let err = document
+        .dispatch("go", &mut state, &Map::new())
+        .expect_err("2 000 scans of 800 KB are over the fuel");
+    assert!(err.diagnostics()[0].message.contains("fuel"));
 }

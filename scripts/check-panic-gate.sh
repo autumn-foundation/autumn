@@ -180,6 +180,7 @@ REQUEST_PATH_MODULES=(
   autumn/src/constela/render.rs:constela
   autumn/src/constela/dispatch.rs:constela
   autumn/src/constela/budget.rs:constela
+  autumn/src/constela/path.rs:constela
   autumn-billing/src/money.rs:default
   autumn-billing/src/reconcile.rs:default
   autumn-billing/src/gate.rs:default

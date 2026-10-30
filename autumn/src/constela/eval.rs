@@ -552,24 +552,38 @@ pub(crate) fn eval_ref<'a>(
             Ok(Cow::Owned(Value::Object(out)))
         }
         Expr::Bin { op, left, right } => eval_binary(*op, left, right, &inner, path),
-        Expr::Style { name, variants } => {
-            let Some(preset) = ctx.styles.get(name) else {
-                return Ok(Cow::Owned(Value::String(String::new())));
-            };
-            let mut values = Vec::with_capacity(variants.len());
-            for (axis, expr) in variants {
-                let value = eval_ref(expr, &inner, path.key("variants").name(axis))?;
-                values.push((axis.as_str(), value));
-            }
-            let mut selected = BTreeMap::new();
-            for (axis, value) in &values {
-                selected.insert(*axis, text_coerce(value, ctx.budget, path)?);
-            }
-            let classes = resolve_style(preset, &selected);
-            ctx.budget.charge(classes.len(), path)?;
-            Ok(Cow::Owned(Value::String(classes)))
-        }
+        Expr::Style { name, variants } => eval_style(name, variants, &inner, ctx, path),
     }
+}
+
+/// Evaluate a style expression: the preset's classes for the selected variants.
+fn eval_style<'a>(
+    name: &str,
+    variants: &'a BTreeMap<String, Expr>,
+    inner: &EvalCtx<'a>,
+    ctx: &EvalCtx<'a>,
+    path: Path<'_>,
+) -> Result<Cow<'a, Value>, ConstelaError> {
+    let Some(preset) = ctx.styles.get(name) else {
+        return Ok(Cow::Owned(Value::String(String::new())));
+    };
+    let mut values = Vec::with_capacity(variants.len());
+    for (axis, expr) in variants {
+        let value = eval_ref(expr, inner, path.key("variants").name(axis))?;
+        values.push((axis.as_str(), value));
+    }
+    let mut selected = BTreeMap::new();
+    for (axis, value) in &values {
+        selected.insert(*axis, text_coerce(value, ctx.budget, path)?);
+    }
+    // `resolve_style` visits every axis of the preset.
+    ctx.budget.burn(
+        u64::try_from(preset.variants.len()).unwrap_or(u64::MAX),
+        path,
+    )?;
+    let classes = resolve_style(preset, &selected);
+    ctx.budget.charge(classes.len(), path)?;
+    Ok(Cow::Owned(Value::String(classes)))
 }
 
 /// `null`, borrowed.
@@ -596,6 +610,16 @@ fn array_slot(key: &Value) -> Option<usize> {
 ///
 /// JS indexes a string by code unit; indexing by chars is the closest total
 /// equivalent that cannot split a UTF-8 sequence.
+/// Bytes that `string_char` can walk: at most four for each character up to
+/// the index, and never more than the text.
+fn string_walk(text: &str, key: &Value) -> usize {
+    key.as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .map_or(0, |index| {
+            index.saturating_add(1).saturating_mul(4).min(text.len())
+        })
+}
+
 fn string_char<'a>(text: &str, key: &Value) -> Cow<'a, Value> {
     key.as_u64()
         .and_then(|index| usize::try_from(index).ok())
@@ -619,10 +643,11 @@ fn index_into<'a>(
                 .map_or_else(null, Cow::Borrowed),
             Value::Object(map) => {
                 let key = coerce(key, budget, path)?;
+                budget.burn_scan(key.len(), path)?;
                 map.get(key.as_ref()).map_or_else(null, Cow::Borrowed)
             }
             Value::String(text) => {
-                budget.burn_scan(text.len(), path)?;
+                budget.burn_scan(string_walk(text, key), path)?;
                 string_char(text, key)
             }
             _ => null(),
@@ -633,10 +658,11 @@ fn index_into<'a>(
                 .map_or_else(null, Cow::Owned),
             Value::Object(mut map) => {
                 let key = coerce(key, budget, path)?;
+                budget.burn_scan(key.len(), path)?;
                 map.remove(key.as_ref()).map_or_else(null, Cow::Owned)
             }
             Value::String(text) => {
-                budget.burn_scan(text.len(), path)?;
+                budget.burn_scan(string_walk(&text, key), path)?;
                 string_char(&text, key)
             }
             _ => null(),
