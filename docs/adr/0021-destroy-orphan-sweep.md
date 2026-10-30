@@ -50,7 +50,7 @@ Reverse brainstorm (how can the sweep delete the wrong file?):
   comments, attributes and macros can stand between `mod` and the name.
 - Another spelling of one file (case, Windows aliases). → Each segment must be
   the exact name on disk. A case-only match counts as the plan's own file
-  only when both paths reach one file.
+  only when both paths reach one directory entry (see Decision 5).
 - An entry from 0.8.0 (no ownership). → Cannot tell owned from shared. Warn
   and keep.
 
@@ -87,6 +87,23 @@ Six hats:
    nothing. `--dry-run` lists the sweep. Before it changes anything,
    `destroy` checks each swept file again. If one changed, it refuses, because
    the dependency reverts assumed that file was gone.
+5. Case-only spellings (issue #3382). Two keys that differ only in ASCII
+   case name one directory entry when both paths reach one file and no
+   directory lists both differing names (`spelling::one_entry`). A
+   case-insensitive file system gives this result. A hard link or a symlink
+   is two entries. The rule applies to:
+   - the sweep's check that the plan names a file;
+   - the sweep's check that the plan creates a file in the orphan's
+     directory (`src/widgets` and `src/Widgets`);
+   - the manifest lookups `is_ours` and `was_written`. When there is no
+     exact entry, they read the entry of the other spelling. An exact entry
+     always decides, because it holds the newest writer;
+   - `record` and `forget`, which drop the entries of each spelling.
+     `destroy` reads the keys before it deletes a file, because the rule
+     needs the file on disk. It drops the keys after the delete.
+
+   On a case-sensitive host, only the exact key matches. A non-ASCII case
+   change (`É`, `é`) also needs the exact key.
 
 ## Consequences
 
