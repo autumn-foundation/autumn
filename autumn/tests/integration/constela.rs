@@ -1849,7 +1849,7 @@ fn fuel_charges_a_string_index_and_a_path_lookup() {
       "state":{"s":{"type":"string","initial":""},"rows":{"type":"list","initial":[]}},
       "view":{"kind":"each","items":{"expr":"state","name":"rows"},"as":"r",
         "body":{"kind":"text","value":{"expr":"index",
-          "base":{"expr":"state","name":"s"},"key":{"expr":"lit","value":0}}}}}"#;
+          "base":{"expr":"state","name":"s"},"key":{"expr":"lit","value":399999}}}}}"#;
     let mut state = Map::new();
     state.insert("s".into(), Value::String("x".repeat(400_000)));
     state.insert("rows".into(), list(100));
@@ -1871,7 +1871,7 @@ fn fuel_charges_a_string_index_and_a_path_lookup() {
 
 #[test]
 fn a_dispatch_is_metered_too() {
-    let steps: Vec<String> = (0..3_000)
+    let steps: Vec<String> = (0..1_000)
         .map(|_| {
             r#"{"do":"set","target":"flag","value":{"expr":"bin","op":"==",
               "left":{"expr":"state","name":"s"},"right":{"expr":"state","name":"s"}}}"#
@@ -1887,10 +1887,10 @@ fn a_dispatch_is_metered_too() {
     );
     let document = document(&source);
     let mut state = document.initial_state();
-    state.insert("s".into(), Value::String("x".repeat(400_000)));
+    state.insert("s".into(), Value::String("x".repeat(2_000_000)));
     let err = document
         .dispatch("go", &mut state, &Map::new())
-        .expect_err("3 000 x 400 KB of comparison is over the fuel");
+        .expect_err("1 000 x 2 MB of comparison is over the fuel");
     assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
     assert!(err.diagnostics()[0].message.contains("fuel"));
 }
