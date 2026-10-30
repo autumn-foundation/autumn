@@ -817,7 +817,8 @@ mod tests {
 
     /// Byte budget for `autumn-widgets.js` (issue #3397). See
     /// `docs/guide/keyboard.md`. Raise it only with a reason in the PR.
-    /// #3399 raised it from 32 KiB and 10 KiB for the toast runtime.
+    /// Issue #3399 added the toast runtime. It increased the budgets from
+    /// 32 KiB and 10 KiB.
     const WIDGETS_JS_BUDGET_BYTES: usize = 36 * 1024;
     /// Gzip budget. Browsers download this size.
     const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 11 * 1024;

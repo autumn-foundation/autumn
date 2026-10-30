@@ -378,6 +378,7 @@ mod tests {
         ] {
             assert!(body.contains(declaration), "missing `{declaration}`:{body}");
         }
+        assert!(rule_body(".autumn-toast-region::backdrop").contains("display: none;"));
     }
 
     /// The runtime sets `--autumn-toast-duration`. The default is 5 s.
@@ -424,7 +425,8 @@ mod tests {
         let at = WIDGETS_COMPONENT_CSS
             .find("@media (prefers-reduced-motion: reduce) {\n    .autumn-toast {")
             .expect("reduced-motion toast block");
-        let block = &WIDGETS_COMPONENT_CSS[at..at + 400];
+        let rest = &WIDGETS_COMPONENT_CSS[at..];
+        let block = &rest[..rest.find("\n}\n").expect("block end")];
         assert!(
             block.contains(
                 "animation: autumn-toast-out 0s linear var(--autumn-toast-duration, 5s) forwards;"
@@ -442,6 +444,8 @@ mod tests {
     #[test]
     fn toast_close_button_is_hidden_without_js_and_large_enough() {
         assert!(rule_body(".autumn-toast__close[hidden]").contains("display: none;"));
+        // The toast sets `display: flex`, which beats the UA `[hidden]` rule.
+        assert!(rule_body(".autumn-toast[hidden]").contains("display: none;"));
         let body = rule_body(".autumn-toast__close");
         assert!(body.contains("min-width: 1.5rem;"), "{body}");
         assert!(body.contains("min-height: 1.5rem;"), "{body}");

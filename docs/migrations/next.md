@@ -319,6 +319,16 @@ If nothing changed, delete this section.
   To support both schemes, use the tokens (`var(--bg)`, `var(--text)`) for
   the page colors, and see `docs/guide/widget-styling.md#dark-mode`.
 
+- **Toasts use the top layer (#3399).** With `autumn-widgets.js`,
+  `toast_region` opens as a popover in the top layer. `--z-toast` and
+  `z-index` do not apply there. The runtime removes a toast from the DOM
+  when its fade ends. Before, the toast stayed hidden in the DOM.
+  `.autumn-toast` is now `display: flex` and holds a close button. An
+  `Error` toast has `role="alert"` on `.autumn-toast__message`, not on
+  `.autumn-toast`. A page with neither the widget CSS nor the JS no longer
+  shows the region: the browser hides a closed popover. Link
+  `/static/css/autumn-widgets.css`.
+
 ## Deprecations retained from `{X.Y}`
 
 Items that were deprecated during the `{X.Y}` line and have now been

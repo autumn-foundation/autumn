@@ -777,5 +777,15 @@ async fn keyboard_toast() {
         "0",
         "Space closes the toast"
     );
+    // No toast after it: focus goes to the toast before.
+    assert_eq!(
+        eval_string(
+            &page,
+            "(() => { const t = document.activeElement.closest('[data-autumn-toast]'); \
+             return t ? t.querySelector('.autumn-toast__message').textContent : ''; })()"
+        )
+        .await,
+        "Report export started"
+    );
     page.expect_no_console_errors().await.expect("no errors");
 }

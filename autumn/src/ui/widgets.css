@@ -1306,9 +1306,10 @@
 
 /* Fixed stacking context dropped once in the layout; `pointer-events: none`
    so the empty region never blocks clicks, re-enabled on each toast below.
-   The region is `popover="manual"` (#3399): the runtime opens it in the top
-   layer. These rules reset the UA popover box, and `display` overrides the
-   UA `display: none`, so the region also shows without JS. */
+   The region is `popover="manual"` (#3399). The runtime opens it in the top
+   layer, where `z-index` does not apply. These rules reset the UA popover
+   box. `display` overrides the UA `display: none`, so the region also shows
+   without JS. */
 .autumn-toast-region {
     position: fixed;
     inset: auto 1rem 1rem auto;
@@ -1326,10 +1327,16 @@
     pointer-events: none;
 }
 
-/* Auto-dismiss is CSS-only: a slide/fade in, then a fade+collapse out after a
-   visible dwell. The runtime sets `--autumn-toast-duration` from
+/* A popover has a transparent full-page `::backdrop`. The region does not
+   need one. */
+.autumn-toast-region::backdrop {
+    display: none;
+}
+
+/* CSS runs the timer: a slide and fade in, then a fade and collapse out
+   after the dwell. The runtime sets `--autumn-toast-duration` from
    `data-autumn-toast-duration`, and removes the toast when the fade ends.
-   Without JS the element stays in the DOM, `visibility: hidden` with zero
+   Without JS the toast stays in the DOM, `visibility: hidden` with zero
    height. */
 .autumn-toast {
     pointer-events: auto;
@@ -1354,7 +1361,7 @@
 }
 
 /* WCAG 2.2.1: hover or focus on a toast pauses the timer of every toast in
-   the region, so the user can read and act. */
+   the region. Then the user can read and act. */
 .autumn-toast-region:hover .autumn-toast,
 .autumn-toast-region:focus-within .autumn-toast,
 .autumn-toast:hover,
@@ -1365,6 +1372,11 @@
 /* No timer: the user closes the toast. */
 .autumn-toast--persistent {
     animation: autumn-toast-in 200ms ease-out;
+}
+
+/* `display: flex` above overrides the UA `[hidden]` rule. */
+.autumn-toast[hidden] {
+    display: none;
 }
 
 .autumn-toast__message {
@@ -1436,8 +1448,8 @@
     }
 }
 
-/* Respect reduced-motion: skip the entrance/exit transforms but still
-   auto-hide after the dwell so toasts don't pile up. */
+/* Reduced motion: no slide or fade. A timed toast still hides after the
+   dwell, so toasts do not pile up. A persistent toast has no animation. */
 @media (prefers-reduced-motion: reduce) {
     .autumn-toast {
         animation: autumn-toast-out 0s linear var(--autumn-toast-duration, 5s) forwards;

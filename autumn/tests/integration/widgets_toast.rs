@@ -367,3 +367,24 @@ fn configured_toast_emits_no_script_or_inline_style() {
     assert!(!out.contains("style="), "{out}");
     assert!(!out.contains("onclick"), "{out}");
 }
+
+#[test]
+fn error_alert_wraps_the_message_not_the_close_button() {
+    // The close label must not be part of the alert announcement.
+    let out = toast("Boom", AlertVariant::Error).into_string();
+    let message = tag(&out, r#"<span class="autumn-toast__message""#);
+    assert!(message.contains(r#"role="alert""#), "{message}");
+    assert!(message.contains(r#"aria-live="assertive""#), "{message}");
+    assert!(message.contains(r#"aria-atomic="true""#), "{message}");
+    let root = tag(&out, r#"<div class="autumn-toast"#);
+    assert!(!root.contains("role="), "{root}");
+    let alert_end = out.find("</span>").expect("message end");
+    assert!(out.find("<button").expect("button") > alert_end, "{out}");
+}
+
+#[test]
+fn zero_duration_renders_zero_ms() {
+    let config = ToastConfig::new().duration(Duration::ZERO);
+    let out = toast_with("x", AlertVariant::Info, &config).into_string();
+    assert!(out.contains(r#"data-autumn-toast-duration="0""#), "{out}");
+}

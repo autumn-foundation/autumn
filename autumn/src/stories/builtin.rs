@@ -509,7 +509,8 @@ fn builtin_stories() -> Vec<Story> {
                     // `Error` announces assertively, others politely. Hover or
                     // focus pauses the timer.
                     (toast("Saved successfully", AlertVariant::Success))
-                    // Target a region with a different id.
+                    // `toast_in` takes the region id. Use it when the page
+                    // has more than one region.
                     (toast_in(DEFAULT_TOAST_REGION_ID, "Upload finished", AlertVariant::Info))
                     // Set a longer timer.
                     (toast_with(
@@ -523,7 +524,8 @@ fn builtin_stories() -> Vec<Story> {
                         AlertVariant::Error,
                         &ToastConfig::new().persistent(true),
                     ))
-                    // `region` does the same as `toast_in`.
+                    // `ToastConfig::region` does the same as `toast_in`.
+                    // This toast is also persistent.
                     (toast_with(
                         "Heads up: trial ends soon",
                         AlertVariant::Warning,

@@ -27,7 +27,7 @@
 //!
 //! | Widget | Use |
 //! |--------|-----|
-//! | `toast` / `toast_with` / `toast_region` | htmx action feedback, appended out-of-band. Pauses on hover/focus, has a close button |
+//! | `toast` / `toast_with` / `toast_region` | htmx action feedback, appended out-of-band. Pauses on hover or focus. Has a close button |
 //!
 //! # Interactive / search widgets
 //!
@@ -5279,7 +5279,7 @@ fn field_fragment(field: &str) -> Option<String> {
 pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
 
 /// The time a toast shows before it fades out, when you do not set
-/// [`ToastConfig::duration`]. The shipped stylesheet holds the same value.
+/// `ToastConfig::duration`. The stylesheet default (`5s`) must match.
 pub const DEFAULT_TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The default accessible name of the toast close button.
@@ -5300,17 +5300,20 @@ const DEFAULT_TOAST_CLOSE_LABEL: &str = "Dismiss notification";
 /// styles.
 ///
 /// **Top layer (#3399).** The region is `popover="manual"`.
-/// `autumn-widgets.js` opens it in the top layer, so a modal `<dialog>` does
-/// not cover the toasts. When a modal or a popover opens later, the runtime
-/// moves the region above it again. Without JS, the shipped stylesheet keeps
-/// the region visible as a fixed box. While a modal is open, the browser
-/// makes all content outside it inert. The toasts show, but hover, focus and
-/// the close button work again only after the modal closes.
+/// `autumn-widgets.js` opens it in the top layer, above a modal `<dialog>`.
+/// When a modal or a popover opens later, the runtime moves the region above
+/// it again. Without JS, the stylesheet shows the region as a fixed box.
+///
+/// **Toasts from a modal.** An open modal makes all content outside it inert.
+/// A region outside the modal still shows its toasts, but screen readers do
+/// not announce them, and the user cannot pause or close them. For feedback
+/// from a modal, put a second region inside the `<dialog>`, and send the
+/// toast there with [`toast_in`] or [`ToastConfig::region`].
 ///
 /// Non-error toasts inherit this region's politeness; error toasts announce
 /// assertively on their own via `role="alert"`. Use [`DEFAULT_TOAST_REGION_ID`]
 /// unless you need more than one region; a custom id must be paired with
-/// [`toast_in`] so the OOB target matches.
+/// [`toast_in`] or [`ToastConfig::region`] so the OOB target matches.
 ///
 /// # CSS hooks
 ///
@@ -5396,6 +5399,8 @@ impl<'a> ToastConfig<'a> {
     /// Show the toast for this time before it fades out. The default is
     /// [`DEFAULT_TOAST_DURATION`].
     ///
+    /// The value rounds down to whole milliseconds. A zero duration hides the
+    /// toast at once. For no timer, use [`persistent`](Self::persistent).
     /// The runtime (`autumn-widgets.js`) applies this value. Without JS, the
     /// stylesheet default applies. Hover or focus pauses the timer.
     #[must_use]
@@ -5404,9 +5409,12 @@ impl<'a> ToastConfig<'a> {
         self
     }
 
-    /// When `true`, the toast does not time out. The user closes it with the
+    /// When `true`, the toast has no timer. The user closes it with the
     /// close button. Use this for a message that the user must act on
     /// (WCAG 2.2.1). The duration does not apply.
+    ///
+    /// The close button needs `autumn-widgets.js`. Without JS, the toast
+    /// stays until the page changes.
     #[must_use]
     pub const fn persistent(mut self, persistent: bool) -> Self {
         self.persistent = persistent;
@@ -5433,19 +5441,21 @@ impl<'a> ToastConfig<'a> {
 ///
 /// **Timer.** The toast fades out after [`DEFAULT_TOAST_DURATION`] (a CSS
 /// `@keyframes` animation). Hover or focus on a toast pauses the timer of all
-/// toasts in the region. This works without JS. Use [`toast_with`] to set the
+/// toasts in the region. Hover also works without JS. The runtime removes a
+/// toast from the DOM when its fade ends. Use [`toast_with`] to set the
 /// duration or to make the toast persistent.
 ///
 /// **Close button.** Each toast has a close button with an accessible name.
-/// `autumn-widgets.js` shows it. When the user closes the focused toast,
-/// focus goes to the next toast, or back to the element that had focus
-/// before. Without JS, the button stays hidden. The runtime also removes a
-/// toast from the DOM when its fade ends.
+/// `autumn-widgets.js` shows it and links it to the message with
+/// `aria-describedby`. After a keyboard close, focus goes to the next toast.
+/// After the last toast, or after a mouse close, focus goes back to the
+/// element that had focus before. Without JS, the button stays hidden.
 ///
 /// `variant` reuses the shared [`AlertVariant`] semantic enum (the alert/badge
 /// color lane) — no new color vocabulary. **Accessibility:** `Error` toasts
-/// announce assertively on their own (`role="alert"`, `aria-live="assertive"`),
-/// which is reliably read on insertion; all other variants carry **no own
+/// announce assertively on their own (`role="alert"`, `aria-live="assertive"`
+/// on the message, so the close button is not read), which is reliably read
+/// on insertion; all other variants carry **no own
 /// `role`/`aria-live`** and instead inherit the persistent
 /// `aria-live="polite"` of the [`toast_region`] they're appended into (an
 /// already-populated polite element inserted fresh is otherwise not reliably
@@ -5536,7 +5546,8 @@ pub fn toast_in(region_id: &str, message: &str, variant: AlertVariant) -> maud::
 pub fn toast_with(message: &str, variant: AlertVariant, config: &ToastConfig<'_>) -> maud::Markup {
     // Error toasts announce assertively on their own — `role="alert"` elements
     // ARE reliably announced on insertion, so they don't depend on the
-    // persistent region. Non-error toasts carry NO `role`/`aria-live`: they
+    // persistent region. The alert is on the message only, so the close
+    // button label is not part of the announcement. Non-error toasts carry NO `role`/`aria-live`: they
     // inherit the `aria-live="polite"` of the `toast_region` they're appended
     // into (a freshly-inserted, already-populated polite element is otherwise
     // not reliably announced). Every toast keeps `aria-atomic="true"` so its
@@ -5587,8 +5598,9 @@ pub fn toast_with(message: &str, variant: AlertVariant, config: &ToastConfig<'_>
     maud::html! {
         div hx-swap-oob=(oob) {
             div class=(class) data-autumn-toast data-autumn-toast-duration=[duration]
-                role=[role] aria-live=[live] aria-atomic="true" {
-                span class="autumn-toast__message" { (message) }
+                aria-atomic="true" {
+                span class="autumn-toast__message" role=[role] aria-live=[live]
+                    aria-atomic=[role.map(|_| "true")] { (message) }
                 button type="button" class="autumn-toast__close" data-autumn-toast-close
                     aria-label=(close_label) hidden {
                     span aria-hidden="true" { "×" }

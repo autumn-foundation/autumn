@@ -1027,9 +1027,9 @@ Per-primitive setters (in addition to the shared set):
   `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
   (`hx-swap-oob="beforeend:#<region-id>"`), CSS auto-dismiss after
   `DEFAULT_TOAST_DURATION` (5 s). Hover or focus pauses the timer.
-  `ToastConfig::new().region(id).duration(d).persistent(true).close_label(s)`.
-  Each toast has a close button; `autumn-widgets.js` shows it and moves focus
-  on close. The region is `popover="manual"`, so toasts show above a modal.
+  `ToastConfig` setters: `region`, `duration`, `persistent`, `close_label`.
+  A persistent toast ignores `duration`. Each toast has a close button;
+  `autumn-widgets.js` shows it and moves focus on close (no JS: no button). The region is `popover="manual"`, so toasts show above a modal.
   `toast_region` is a persistent `aria-live="polite"` region; non-error toasts
   inherit its politeness (no own `role`/`aria-live`) while `Error` announces
   assertively via its own `role="alert"` (reuses the `AlertVariant` color
@@ -1531,8 +1531,8 @@ middleware (tenant scoping, an auth shim, request enrichment) — mapping the
 layer onto individual handlers instead tests a stack the real app never
 serves.
 
-`Page`: `visit`, `fill`, `click`, `press`, `set_javascript_enabled`, `expect_text`, `expect_url`,
-`expect_attribute`, `expect_hx_settle`, `expect_sse_event`,
+`Page`: `visit`, `fill`, `click`, `press`, `hover`, `set_javascript_enabled`, `expect_text`, `expect_url`,
+`expect_attribute`, `expect_on_top`, `expect_hx_settle`, `expect_sse_event`,
 `expect_no_console_errors`, `console_errors`, `snapshot`, `evaluate`. The
 `expect_*` assertions poll to a deadline and ignore the transient CDP errors a
 mid-poll navigation produces; `evaluate` is a single raw call that does not.

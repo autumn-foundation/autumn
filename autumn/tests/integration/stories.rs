@@ -515,6 +515,7 @@ const BROWSER_GATE_PATHS: &[&str] = &[
     "autumn/src/stories/**",
     "autumn/src/htmx.rs",
     "autumn/vendor/htmx.min.js",
+    "autumn/tests/integration/widgets_toast_browser.rs",
 ];
 
 #[test]

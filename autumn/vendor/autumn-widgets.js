@@ -559,6 +559,8 @@
       if (opener) {
         var toOpen = document.getElementById(opener.getAttribute('data-modal-open'));
         if (toOpen && toOpen.showModal) toOpen.showModal();
+        // These browsers send no `toggle` event for a dialog.
+        raiseAll();
         return;
       }
       var closer = e.target.closest('[data-modal-close]');
@@ -654,7 +656,7 @@
   });
 
   // ── toast (#3399) ─────────────────────────────────────────────────────────
-  // CSS runs the timer; hover and focus pause it. This shows the close
+  // CSS runs the timer. Hover and focus pause it. This code shows the close
   // button, applies the duration, removes ended toasts, and keeps the region
   // above a modal.
   var TOAST = '[data-autumn-toast]';
@@ -666,11 +668,19 @@
     // CSSOM, not a style attribute, so the CSP allows it.
     if (ms >= 0) el.style.setProperty('--autumn-toast-duration', ms + 'ms');
     var close = el.querySelector(CLOSE);
-    if (close) close.hidden = false;
+    var msg = el.querySelector('.autumn-toast__message');
+    if (!close) return;
+    // Each close button names its own message.
+    if (msg) {
+      msg.id = msg.id || 'autumn-toast-' + (++uid);
+      close.setAttribute('aria-describedby', msg.id);
+    }
+    close.hidden = false;
   }
 
-  // The top layer stacks in open order: open the region again to move it
-  // up. Then put back the animation times and the focus.
+  // The top layer stacks in open order. Open the region again to move it up.
+  // Hiding a popover can restart its CSS animations and move focus, so put
+  // back the animation times and the focus.
   function raise(region) {
     if (!region.showPopover || !region.isConnected) return;
     var active = document.activeElement;
@@ -688,6 +698,10 @@
     if (region.contains(active)) active.focus({ preventScroll: true });
   }
 
+  function raiseAll() {
+    document.querySelectorAll(REGION).forEach(raise);
+  }
+
   function initRegion(region) {
     if (!once(region)) return;
     raise(region);
@@ -695,47 +709,62 @@
       records.forEach(function (r) {
         r.addedNodes.forEach(function (n) { if (n.nodeType === 1) each(n, TOAST, initToast); });
       });
-      // A browser with no dialog `toggle` event.
-      if (document.querySelector('dialog[open]')) raise(region);
+      // Fallback: some browsers send no `toggle` event for a dialog.
+      try {
+        if (document.querySelector('dialog:modal')) raise(region);
+      } catch (err) { /* no :modal */ }
     }).observe(region, { childList: true });
   }
 
-  // `toggle` does not bubble: listen in the capture phase.
+  // A modal or a popover opened. `toggle` does not bubble, so listen in the
+  // capture phase.
   document.addEventListener('toggle', function (e) {
     var t = e.target;
-    if (e.newState === 'open' && t.matches('dialog,[popover]') && !t.matches(REGION)) {
-      document.querySelectorAll(REGION).forEach(raise);
-    }
+    if (e.newState === 'open' && t.matches('dialog,[popover]') && !t.matches(REGION)) raiseAll();
   }, true);
 
-  // The last focus outside a toast.
+  // The last element outside a toast that had focus.
   var origin = null;
   document.addEventListener('focusin', function (e) {
     if (!e.target.closest(TOAST)) origin = e.target;
   });
 
-  // Remove a toast. If it had focus, focus the next toast, else the one
-  // before, else the origin.
-  function closeToast(el) {
+  // Remove a toast. If it had focus, go back to the origin. After a keyboard
+  // close, go to the next toast, else the one before. (Focus in a toast
+  // pauses all timers, so a mouse close does not keep focus there.)
+  function closeToast(el, keyboard) {
     var had = el.contains(document.activeElement);
     var all = Array.prototype.filter.call(
       (el.closest(REGION) || document).querySelectorAll(TOAST), function (t) {
         return t === el || getComputedStyle(t).visibility !== 'hidden';
       });
     var i = all.indexOf(el);
-    var next = all[i + 1] || all[i - 1];
+    var next = keyboard && (all[i + 1] || all[i - 1]);
     el.remove();
     var to = (next && next.querySelector(CLOSE)) || origin;
     if (had && to && to.isConnected) to.focus();
   }
 
+  // `detail` is 0 for a click from Enter or Space.
   document.addEventListener('click', function (e) {
     var close = e.target.closest && e.target.closest(CLOSE);
-    if (close && close.closest(TOAST)) closeToast(close.closest(TOAST));
+    if (close && close.closest(TOAST)) closeToast(close.closest(TOAST), e.detail === 0);
   });
 
   document.addEventListener('animationend', function (e) {
     if (e.animationName === 'autumn-toast-out' && e.target.matches(TOAST)) closeToast(e.target);
+  });
+
+  // htmx keeps a copy of the page as HTML. The CSP blocks a style attribute
+  // when htmx restores that copy. So remove the duration style before the
+  // copy, and set it again after (a microtask runs after the copy).
+  document.addEventListener('htmx:beforeHistorySave', function () {
+    var toasts = document.querySelectorAll(TOAST);
+    toasts.forEach(function (t) {
+      t.style.removeProperty('--autumn-toast-duration');
+      if (!t.getAttribute('style')) t.removeAttribute('style');
+    });
+    queueMicrotask(function () { toasts.forEach(initToast); });
   });
 
   // Run `fn` on `root` (when it matches) and on each match inside it.

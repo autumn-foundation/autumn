@@ -1121,13 +1121,16 @@ impl Page {
     /// Assert that the element that matches `selector` paints on top at its
     /// center: no other element, for example a modal backdrop, covers it.
     ///
-    /// The hit test sees content that a modal `<dialog>` makes inert, and
-    /// content with `pointer-events: none`. `document.elementFromPoint`
-    /// skips both. Auto-waits.
+    /// The hit test includes content that a modal `<dialog>` makes inert,
+    /// and content with `pointer-events: none`. It does not use
+    /// `document.elementFromPoint`, because that call skips both. The element
+    /// is scrolled into view first. Auto-waits until the element is found
+    /// and on top. A transparent layer above the element, such as the
+    /// `::backdrop` of another open popover, also counts as a cover.
     ///
     /// # Errors
-    /// [`SystemTestError::AssertionFailed`] when the element stays covered,
-    /// or CDP errors.
+    /// [`SystemTestError::AssertionFailed`] when the element is not found,
+    /// not visible, or covered until the timeout. CDP errors.
     pub async fn expect_on_top(&self, selector: &str) -> Result<&Self, SystemTestError> {
         let deadline = tokio::time::Instant::now() + ASSERTION_TIMEOUT;
         if poll_until_deadline(deadline, false, || self.on_top(selector)).await? {
@@ -1135,7 +1138,7 @@ impl Page {
         }
         let artifact = self.write_failure_artifacts("expect_on_top").await.ok();
         Err(SystemTestError::AssertionFailed {
-            message: format!("{selector} is covered at its center"),
+            message: format!("{selector} is not found, not visible, or covered at its center"),
             artifact_path: artifact,
         })
     }
@@ -1403,15 +1406,23 @@ impl Page {
     }
 
     /// True when the node at the center of `selector` is that element or a
-    /// node in it. A pseudo-element (such as `::backdrop`) does not resolve,
-    /// so it reads as covered.
+    /// node in it. A missing or hidden element reads as `false`, so the
+    /// caller polls again. A pseudo-element (such as `::backdrop`) does not
+    /// resolve, so it reads as covered.
     async fn on_top(&self, selector: &str) -> Result<bool, chromiumoxide::error::CdpError> {
         use chromiumoxide::cdp::browser_protocol::dom::{
             GetNodeForLocationParams, ResolveNodeParams,
         };
         use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
-        let element = self.inner.find_element(selector).await?;
-        let point = element.clickable_point().await?;
+        let Ok(element) = self.inner.find_element(selector).await else {
+            return Ok(false);
+        };
+        if element.scroll_into_view().await.is_err() {
+            return Ok(false);
+        }
+        let Ok(point) = element.clickable_point().await else {
+            return Ok(false);
+        };
         // CDP takes whole CSS pixels.
         #[allow(clippy::cast_possible_truncation)]
         let hit = GetNodeForLocationParams::builder()
