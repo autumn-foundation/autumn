@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/form_render
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+           6,260   13.1%  autumn_web::form::write_escaped
+           5,575   11.7%  autumn_web::form::render_field
+           4,664    9.8%  _int_free
+           3,488    7.3%  __memcpy_avx_unaligned_erms
+           3,259    6.8%  malloc
+           2,294    4.8%  free
+           2,074    4.3%  <serde_json::value::ser::SerializeMap as serde_core::ser::SerializeStruct>::serialize_field
+           1,953    4.1%  __memcmp_avx2_movbe
+           1,659    3.5%  <str as serde_json::value::index::Index>::index_into
+           1,372    2.9%  _int_malloc
+           1,155    2.4%  <alloc::collections::btree::map::entry::VacantEntry>::insert_entry
+           1,148    2.4%  <core::hash::sip::Hasher as core::hash::Hasher>::write
+           1,080    2.3%  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one
+           1,044    2.2%  autumn_web::form::push_option_attrs
+             901    1.9%  core::ptr::drop_glue
+             888    1.9%  autumn_web::form::push_label
+             666    1.4%  __rustc::__rdl_alloc
+             651    1.4%  <alloc::collections::btree::map::IntoIter>::dying_next
+             465    1.0%  <chrono::format::strftime::StrftimeItems as core::iter::traits::iterator::Iterator>::next
+             407    0.9%  form_render::render_form
+             388    0.8%  <hashbrown::map::HashMap>::insert
+             369    0.8%  autumn_web::form::number_input
+             364    0.8%  autumn_web::form::text_input
+             363    0.8%  <alloc::string::String as core::clone::Clone>::clone
+             358    0.8%  chrono::format::parse::parse_internal
+             338    0.7%  autumn_web::form::textarea_input
+             297    0.6%  core::ptr::drop_glue'2
+             290    0.6%  form_render::sample_changeset
+             282    0.6%  realloc
+             264    0.6%  autumn_web::form::json_scalar_to_string
+
+          47,686  100.0%  TOTAL

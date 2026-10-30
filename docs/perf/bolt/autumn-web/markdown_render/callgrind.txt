@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/markdown_render
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+          35,300    6.0%  _int_malloc
+          31,379    5.4%  <html5ever::tokenizer::Tokenizer>::step
+          30,004    5.1%  <tendril::tendril::Tendril>::pop_front_char
+          23,438    4.0%  __memcpy_avx_unaligned_erms
+          19,289    3.3%  <ammonia::Builder>::clean_dom
+          17,328    3.0%  <html5ever::tree_builder::TreeBuilder as html5ever::tokenizer::interface::TokenSink>::process_token
+          16,489    2.8%  _int_free
+          16,029    2.7%  <tendril::tendril::Tendril>::push_bytes_without_validating
+          13,539    2.3%  <markup5ever::util::buffer_queue::BufferQueue>::next
+          12,994    2.2%  <markup5ever::util::buffer_queue::BufferQueue>::pop_except_from
+          11,949    2.0%  <pulldown_cmark::firstpass::FirstPass>::parse_line
+          11,547    2.0%  malloc
+          11,217    1.9%  pulldown_cmark_escape::escape_html_scalar
+          10,174    1.7%  <html5ever::tree_builder::TreeBuilder>::step
+          10,057    1.7%  <html5ever::tokenizer::Tokenizer>::get_preprocessed_char
+           9,950    1.7%  <pulldown_cmark::parse::Parser as core::iter::traits::iterator::Iterator>::next
+           9,732    1.7%  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one
+           9,040    1.5%  <ammonia::rcdom::SerializableHandle as markup5ever::serialize::Serialize>::serialize
+           7,812    1.3%  free
+           7,416    1.3%  _int_free_merge_chunk
+           7,355    1.3%  <core::hash::sip::Hasher as core::hash::Hasher>::write
+           7,297    1.2%  <html5ever::tokenizer::Tokenizer>::data_state_simd_fast_path
+           7,235    1.2%  <ammonia::Builder>::adjust_node_attributes
+           7,119    1.2%  <autumn_web::markdown::user_content::SafeEvents as core::iter::traits::iterator::Iterator>::next
+           6,565    1.1%  <ammonia::rcdom::RcDom as markup5ever::interface::tree_builder::TreeSink>::append
+           6,080    1.0%  <alloc::raw_vec::RawVecInner>::finish_grow
+           6,074    1.0%  core::ptr::drop_glue
+           5,940    1.0%  <html5ever::tokenizer::Tokenizer>::emit_current_tag
+           5,756    1.0%  <pulldown_cmark::html::HtmlWriter>::run
+           5,647    1.0%  <html5ever::serialize::HtmlSerializer as markup5ever::serialize::Serializer>::start_elem
+
+         585,041  100.0%  TOTAL

@@ -1,0 +1,13 @@
+# Bolt profile: autumn-search/keyword_search
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 387,601
+blocks allocated: 8,582
+peak live bytes (whole run): 43,769,654
+
+         bytes      blocks  site
+
+       387,556       8,580  <autumn_search::memory::MemorySearchBackend as autumn_search::backend::SearchBackend>::keyword_search::{closure#0}
+            32           1  <autumn_search::memory::MemorySearchBackend as autumn_search::backend::SearchBackend>::keyword_search
+            13           1  <tokio::runtime::scheduler::current_thread::Context>::enter

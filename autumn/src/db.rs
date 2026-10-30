@@ -781,6 +781,12 @@ impl diesel::connection::Instrumentation for RequestQueryTimer {
         use diesel::connection::InstrumentationEvent;
         match event {
             InstrumentationEvent::StartQuery { query, .. } => {
+                // This timer replaces the capture on the connection, so it
+                // forwards the statement.
+                #[cfg(feature = "ledger-capture")]
+                if crate::ledger_capture::enabled() {
+                    crate::ledger_capture::observe(&query.to_string(), None);
+                }
                 // `query` is an opaque `&dyn DebugQuery`; its `Display` impl
                 // renders the SQL text, which we inspect to skip housekeeping /
                 // transaction-control statements (see the type-level docs). The
@@ -1732,6 +1738,8 @@ fn build_pool(
     pool_size: usize,
     connect_timeout_secs: u64,
 ) -> Result<Pool<RuntimeConnection>, PoolError> {
+    #[cfg(feature = "ledger-capture")]
+    crate::ledger_capture::install();
     // Under the `sqlite` feature `RuntimeConnection` is a SQLite connection, so
     // the pool must be built over `SyncConnectionWrapper<SqliteConnection>`
     // rather than the Postgres manager below. Route to the dedicated SQLite

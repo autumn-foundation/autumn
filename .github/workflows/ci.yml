@@ -170,6 +170,14 @@ jobs:
         # #2690/#2691) and fails on a duplicate name. No toolchain, ~1
         # second, self-testing.
         run: ./scripts/check-example-bin-names.sh
+      - name: Bolt profile gate (every workload has a profile)
+        # Every `[[bench]]` target must have an entry in
+        # docs/perf/bolt/workloads.toml and a committed callgrind + dhat
+        # profile under docs/perf/bolt/<package>/<bench>/. A new bench without
+        # one fails here. `scripts/bolt-profile.sh <package>/<bench>` writes
+        # it. `cargo metadata` lists the targets, so auto-discovered benches
+        # count too. No build, a few seconds. See docs/perf/README.md.
+        run: python3 scripts/check-perf-profiles.py bolt
 
       - name: Accessibility gate (raw html! escape hatches across the repo)
         # `autumn a11y verify` statically audits raw `html!` markup for fields
@@ -1181,6 +1189,7 @@ jobs:
             sla,
             repl,
             webmcp,
+            ledger-capture,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1209,6 +1218,19 @@ jobs:
         with:
           # One target dir per feature set; see the note on the trybuild job.
           key: ${{ matrix.lane }}
+      - name: Run ledger-capture unit tests (statement normalization)
+        if: matrix.lane == 'ledger-capture'
+        # `ledger-capture` is off by default, so `cargo test --workspace`
+        # never compiles `ledger_capture.rs` or its tests. Its normalization
+        # decides each query's fingerprint, and the Ledger profile gate keys
+        # on that fingerprint. `assert_ran`: a filter that matches nothing
+        # exits 0.
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features ledger-capture --lib ledger_capture:: \
+            | tee "${RUNNER_TEMP}/ledger-capture-lib.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/ledger-capture-lib.log" \
+            || { echo "::error::no ledger_capture unit tests ran"; exit 1; }
       - name: Run markdown-gated tests (user-content sanitizer)
         if: matrix.lane == 'markdown'
         # `markdown` is not a default feature, so the `test` job's `cargo test
@@ -1645,6 +1667,21 @@ jobs:
         # (`bytes remaining on stream`), failing `db_hooks_lifecycle` before its
         # body ran. Pull once, with retries, so every test starts from a cache.
         run: ./scripts/ci-prepull-images.sh postgres:11-alpine postgres:16-alpine
+      - name: Start the Ledger plan server
+        if: runner.os == 'Linux'
+        # The Ledger capture plans each statement with `EXPLAIN (GENERIC_PLAN)`,
+        # which needs Postgres 16. Most testcontainers run `postgres:11-alpine`,
+        # so the capture copies such a database's schema into this server and
+        # plans there (autumn/src/ledger_capture.rs). `pg_dump` comes from the
+        # postgresql-client package installed above.
+        run: |
+          docker run -d --name ledger-plan -p 55432:5432 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust postgres:16-alpine
+          for _ in $(seq 1 60); do
+            docker exec ledger-plan pg_isready -U postgres -q && exit 0
+            sleep 1
+          done
+          echo "::error::the Ledger plan server did not start"; exit 1
       - name: Run Docker-dependent tests
         if: runner.os == 'Linux'
         # 45 -> 75 (#1945): 46 more container-spinning `cli_tests` Docker
@@ -1665,6 +1702,13 @@ jobs:
           # rate limit, as the `coverage` job and the Windows Tier 1 journey job
           # already do.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The `integration_tests` sweep below builds with `ledger-capture`.
+          # With this set, it records every statement the framework issues,
+          # and the "Ledger profile gate" step after this one checks each has
+          # a profile in docs/perf/ledger/queries/. Binaries built without the
+          # feature ignore it.
+          AUTUMN_LEDGER_CAPTURE_DIR: ${{ runner.temp }}/ledger-capture
+          AUTUMN_LEDGER_PLAN_URL: postgres://postgres@127.0.0.1:55432/postgres
         run: |
           cargo test -p autumn-web --test db_hooks_lifecycle -- --ignored
           cargo test -p autumn-web --test repository_shard_replica_routing -- --ignored
@@ -2048,9 +2092,9 @@ jobs:
           # merge/codegen feature — no extra runner service, no backend flip.
           # Its non-Docker tests are named below so they run here rather than
           # nowhere.
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab" --test integration_tests offline_sync
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab" --test integration_tests collab_offline_merge
-          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab" --test integration_tests -- \
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab,ledger-capture" --test integration_tests offline_sync
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab,ledger-capture" --test integration_tests collab_offline_merge
+          cargo test -p autumn-web --features "test-support,offline-sync,ws,mail,redis,i18n,collab,ledger-capture" --test integration_tests -- \
             --ignored \
             --test-threads=1 \
             --skip per_request_overhead_is_under_50_microseconds_p99 \
@@ -2122,6 +2166,24 @@ jobs:
           # this job does not provide (it is `system-tests`-gated and so does
           # not even compile here).
           cargo test -p cms --test integration_test -- --ignored --test-threads=1
+      - name: Ledger profile gate (every query has a profile)
+        if: runner.os == 'Linux'
+        # The sweep above ran with `ledger-capture`, so the capture holds
+        # every statement autumn-web issued from production code, by
+        # fingerprint. A statement with no docs/perf/ledger/queries/<fp>.toml
+        # fails here: run `scripts/ledger-profile.sh` and commit the new
+        # files. The capture is uploaded below for `ledger_catalog.py report`.
+        run: |
+          test -n "$(ls "${RUNNER_TEMP}/ledger-capture"/capture-*.jsonl 2>/dev/null)" \
+            || { echo "::error::the sweep wrote no Ledger capture; is ledger-capture still in its feature list?"; exit 1; }
+          python3 scripts/check-perf-profiles.py ledger "${RUNNER_TEMP}/ledger-capture"
+      - name: Upload the Ledger capture
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v7
+        with:
+          name: ledger-capture
+          path: ${{ runner.temp }}/ledger-capture
+          if-no-files-found: ignore
 
 
   # AC-7 deploy end-to-end (#1607). It builds its own fixture image on top of

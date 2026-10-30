@@ -1,0 +1,24 @@
+# Bolt profile: autumn-web/version_history
+# unit: whole process
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 422,257,918
+blocks allocated: 6,901,045
+peak live bytes (whole run): 4,892
+
+         bytes      blocks  site
+
+   125,760,000   2,080,000  version_history::main::{closure#0}
+    66,906,000   1,053,000  autumn_web::version_history::compute_insert_changes
+    66,080,000   1,040,000  autumn_web::version_history::compute_delete_changes
+    62,880,000   1,040,000  version_history::main::{closure#2}
+    62,880,000   1,040,000  version_history::main::{closure#4}
+    37,746,000     648,000  autumn_web::version_history::compute_diff
+         3,298          36  version_history::main
+         1,024           1  _IO_file_doallocate
+           548           2  main
+           472           1  __fopen_internal
+           360           2  getdelim
+           152           1  __pthread_attr_extension
+            32           1  pthread_getattr_np@@GLIBC_2.32
+            32           1  pthread_attr_setaffinity_np@@GLIBC_2.32

@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/ledger_post
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+         410,286    9.4%  sha2::sha256::compress256
+         385,254    8.8%  sqlite3VdbeExec
+         292,516    6.7%  _int_malloc
+         183,198    4.2%  _int_free
+         142,950    3.3%  malloc
+         128,987    3.0%  pthread_mutex_lock@@GLIBC_2.2.5
+         125,437    2.9%  __memcpy_avx_unaligned_erms
+         124,225    2.8%  vdbeRecordCompareString
+         104,157    2.4%  __memcmp_avx2_movbe
+         100,036    2.3%  pthread_mutex_unlock@@GLIBC_2.2.5
+          91,320    2.1%  sqlite3BtreeIndexMoveto
+          90,372    2.1%  free
+          86,703    2.0%  sqlite3RunParser
+          75,249    1.7%  <autumn_web::money::CurrencyCode>::parse
+          68,663    1.6%  malloc_consolidate
+          61,695    1.4%  yy_reduce.isra.0
+          49,152    1.1%  sqlite3VdbeRecordCompareWithSkip
+          46,915    1.1%  sqlite3BtreeInsert
+          42,285    1.0%  unlink_chunk.isra.0
+          39,406    0.9%  sqlite3FindFunction
+          38,463    0.9%  sqlite3Malloc.part.0
+          34,449    0.8%  balance_nonroot
+          33,901    0.8%  sqlite3VdbeMemGrow
+          32,240    0.7%  sqlite3BtreeTableMoveto
+          26,299    0.6%  __memset_avx2_unaligned_erms
+          25,981    0.6%  findElementWithHash.constprop.0
+          25,783    0.6%  sqlite3GetToken
+          25,619    0.6%  autumn_web::money::ledger::check_resulting_balances
+          24,974    0.6%  autumn_web::money::ledger::push_field
+          24,165    0.6%  autumn_web::money::ledger::post::{closure#0}
+
+       4,369,150  100.0%  TOTAL

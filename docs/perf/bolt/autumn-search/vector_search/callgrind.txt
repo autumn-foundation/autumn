@@ -1,0 +1,38 @@
+# Bolt profile: autumn-search/vector_search
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+      18,778,673   87.6%  <autumn_search::memory::MemorySearchBackend as autumn_search::backend::SearchBackend>::vector_search::{closure#0}
+         669,436    3.1%  _int_malloc
+         375,406    1.8%  _int_free
+         308,802    1.4%  core::slice::sort::unstable::quicksort::partition
+         276,427    1.3%  malloc_consolidate
+         265,000    1.2%  <autumn_search::backend::SearchFilter>::permits
+         235,118    1.1%  malloc
+         173,124    0.8%  __memcpy_avx_unaligned_erms
+         155,093    0.7%  free
+         107,129    0.5%  unlink_chunk.isra.0
+          45,027    0.2%  __rustc::__rdl_alloc
+          19,657    0.1%  alloc_perturb
+           5,518    0.0%  core::slice::sort::shared::pivot::median3_rec'2
+           5,003    0.0%  __rustc::__rust_dealloc
+           5,003    0.0%  __rustc::__rdl_dealloc
+           5,003    0.0%  __rustc::__rust_no_alloc_shim_is_unstable_v2
+           5,003    0.0%  __rustc::__rust_alloc
+           1,645    0.0%  core::slice::sort::select::partition_at_index
+             880    0.0%  realloc
+             818    0.0%  _int_realloc
+             647    0.0%  _int_free_merge_chunk
+             584    0.0%  core::slice::sort::shared::pivot::median3_rec
+             480    0.0%  <alloc::raw_vec::RawVecInner>::finish_grow
+             357    0.0%  core::slice::sort::shared::smallsort::insertion_sort_shift_left
+             288    0.0%  <alloc::raw_vec::RawVec>::grow_one
+             271    0.0%  _int_free_maybe_consolidate
+             242    0.0%  __rustc::__rdl_realloc
+             239    0.0%  vector_search::main::{closure#3}
+             117    0.0%  <core::hash::sip::Hasher as core::hash::Hasher>::write
+              90    0.0%  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one
+
+      21,441,241  100.0%  TOTAL
