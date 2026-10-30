@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/pdf_render
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+       1,221,552   13.8%  miniz_oxide::deflate::core::compress_inner
+         863,345    9.8%  __memset_avx2_unaligned_erms
+         839,039    9.5%  _int_malloc
+         614,189    7.0%  __memcpy_avx_unaligned_erms
+         610,285    6.9%  _int_free
+         427,014    4.8%  malloc
+         299,088    3.4%  free
+         292,562    3.3%  core::num::imp::flt2dec::strategy::grisu::format_shortest_opt
+         243,927    2.8%  malloc_consolidate
+         231,552    2.6%  printpdf::serialize::translate_operations
+         192,958    2.2%  core::ptr::drop_glue
+         176,490    2.0%  core::fmt::float::float_to_decimal_common_shortest
+         138,357    1.6%  <lopdf::writer::Writer>::write_object
+         134,573    1.5%  core::fmt::write
+         133,788    1.5%  unlink_chunk.isra.0
+         122,589    1.4%  <core::fmt::Formatter>::write_formatted_parts
+         117,798    1.3%  autumn_web::pdf::html::parse
+         111,620    1.3%  <std::io::default_write_fmt::Adapter as core::fmt::Write>::write_str
+         108,141    1.2%  <lopdf::content::Content>::encode
+         106,255    1.2%  _int_free_merge_chunk
+         101,527    1.1%  miniz_oxide::deflate::core::flush_block
+          88,556    1.0%  autumn_web::pdf::metrics::char_width_1000em
+          86,733    1.0%  __rustc::__rdl_alloc
+          82,896    0.9%  <lopdf::content::Operation>::new
+          82,453    0.9%  core::slice::memchr::memchr_aligned
+          73,878    0.8%  autumn_web::pdf::layout::words_of
+          69,118    0.8%  <autumn_web::pdf::layout::Writer>::draw_word
+          63,027    0.7%  <alloc::raw_vec::RawVecInner>::finish_grow
+          62,034    0.7%  <alloc::vec::Vec as alloc::vec::spec_from_iter_nested::SpecFromIterNested>::from_iter
+          59,586    0.7%  autumn_web::pdf::layout::wrap
+
+       8,832,688  100.0%  TOTAL

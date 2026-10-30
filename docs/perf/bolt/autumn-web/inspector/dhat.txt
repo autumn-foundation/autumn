@@ -1,0 +1,30 @@
+# Bolt profile: autumn-web/inspector
+# unit: whole process
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 189,847,468
+blocks allocated: 2,474,804
+peak live bytes (whole run): 80,172
+
+         bytes      blocks  site
+
+    55,146,000     303,000  <autumn_web::inspector::InspectorMiddleware as tower_service::Service>::call
+    46,813,500     454,500  <autumn_web::inspector::InspectorMiddleware as tower_service::Service>::call::{closure#4}
+    33,128,000     101,000  <http::header::map::HeaderMap>::try_reserve_one
+    29,492,000     404,000  <http::extensions::Extensions>::insert
+     4,747,000     151,500  <<axum::routing::method_routing::MethodRouter>::layer::{closure#0} as axum::boxed::LayerFn>::clone_box
+     4,040,640      50,508  <axum::routing::route::Route>::layer
+     2,424,000     101,000  <http::uri::Uri as core::clone::Clone>::clone
+     2,424,000      50,500  <autumn_web::inspector::RequestQueryList>::new
+     2,121,000     151,500  <tower::util::map_future::MapFuture as tower_service::Service>::call
+     1,616,000     101,000  axum::extract::matched_path::set_matched_path_for_request
+     1,616,000      50,500  <axum_core::body::Body as core::convert::From>::from
+     1,616,000      50,500  <axum::boxed::Map as axum::boxed::ErasedIntoRoute>::clone_box
+     1,515,240     101,016  <autumn_web::inspector::InspectorLayer as tower_layer::Layer>::layer
+     1,515,060     101,004  <<axum::routing::method_routing::MethodRouter>::layer::{closure#0} as core::ops::function::FnOnce>::call_once
+       808,000     101,000  <axum::boxed::MakeErasedHandler as axum::boxed::ErasedIntoRoute>::clone_box
+       606,000     101,000  <http::request::Builder>::and_then
+       101,000     101,000  axum::routing::route::set_content_length
+        44,944           4  <autumn_web::inspector::InspectorBuffer>::new
+        21,504          64  <tokio::signal::registry::EventInfo as core::default::Default>::default
+        12,288           1  <mio::event::events::Events>::with_capacity

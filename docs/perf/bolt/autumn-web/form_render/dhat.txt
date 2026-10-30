@@ -1,0 +1,17 @@
+# Bolt profile: autumn-web/form_render
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 19,170
+blocks allocated: 78
+peak live bytes (whole run): 9,609
+
+         bytes      blocks  site
+
+        10,260           4  form_render::render_form
+         5,397          12  autumn_web::form::render_field
+         2,445          27  autumn_web::form::text_input
+           674          19  form_render::sample_changeset
+           338          11  autumn_web::form::json_scalar_to_string
+            34           3  autumn_web::form::normalize_date_value
+            22           2  autumn_web::form::concat_suffix

@@ -1,0 +1,21 @@
+# Bolt profile: autumn-web/pdf_render
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 2,547,976
+blocks allocated: 9,800
+peak live bytes (whole run): 827,910
+
+         bytes      blocks  site
+
+     1,571,655       5,712  <autumn_web::pdf::Pdf>::render
+       797,169         647  <autumn_web::pdf::layout::Writer>::draw_word
+        48,561         715  autumn_web::pdf::layout::wrap
+        37,935         376  autumn_web::pdf::html::push_text
+        28,593         512  autumn_web::pdf::layout::words_of
+        26,470         943  autumn_web::pdf::layout::inline_spans
+        19,722         573  autumn_web::pdf::html::parse
+        11,334         128  autumn_web::pdf::layout::extract_table_rows
+         4,104           1  pdf_render::main
+         1,839         188  autumn_web::pdf::html::decode_entities
+           594           5  autumn_web::pdf::layout::flatten_blocks
