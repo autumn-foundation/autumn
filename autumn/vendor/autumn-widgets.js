@@ -664,6 +664,8 @@
   var CLOSE = '[data-autumn-toast-close]';
 
   function initToast(el) {
+    // htmx can remove a toast before a queued init runs.
+    if (!el.isConnected) return;
     var ms = parseInt(el.getAttribute('data-autumn-toast-duration'), 10);
     // CSSOM, not a style attribute, so the CSP allows it.
     if (ms >= 0) el.style.setProperty('--autumn-toast-duration', ms + 'ms');
@@ -673,7 +675,7 @@
     // Each close button names its own message. Skip ids in use: an htmx
     // history restore can bring back an id the counter gives out again.
     if (msg) {
-      while (!msg.id || document.getElementById(msg.id) !== msg) msg.id = 'autumn-toast-' + (++uid);
+      while (msg.isConnected && (!msg.id || document.getElementById(msg.id) !== msg)) msg.id = 'autumn-toast-' + (++uid);
       close.setAttribute('aria-describedby', msg.id);
     }
     close.hidden = false;

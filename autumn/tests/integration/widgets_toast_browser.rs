@@ -373,6 +373,41 @@ async fn a_restored_message_id_is_not_reused() {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
+async fn a_toast_removed_after_the_history_copy_does_not_hang() {
+    // htmx saves the history copy, then removes the old page before the
+    // runtime's microtask runs. A removed toast must not freeze the tab.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    page.click("#sticky").await.expect("click");
+    wait_for(
+        &page,
+        "(() => { const b = document.querySelector('#toast-region [data-autumn-toast-close]'); \
+         return !!b && !b.hidden; })()",
+    )
+    .await;
+    let save_then_remove = eval_bool(
+        &page,
+        "(() => { document.body.dispatchEvent(new CustomEvent('htmx:beforeHistorySave', \
+         { bubbles: true })); \
+         document.querySelector('#toast-region [data-autumn-toast]').remove(); return true; })()",
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), save_then_remove)
+            .await
+            .unwrap_or(false),
+        "the page froze"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), eval_bool(&page, "true"))
+            .await
+            .unwrap_or(false),
+        "the page froze"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
 async fn focus_within_pauses_dismissal() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");
