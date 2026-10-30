@@ -54,6 +54,10 @@ type SqlitePool = Pool<RuntimeConnection>;
 const LEDGER_UP: &str =
     include_str!("../migrations_sqlite/20260917120000_create_money_ledger/up.sql");
 
+/// The stored-balance migration (issue #3339). It applies after `LEDGER_UP`.
+const BALANCE_UP: &str =
+    include_str!("../migrations_sqlite/20261029183512_add_money_account_balance/up.sql");
+
 /// Destinations one payout transaction splits across — a payroll run's
 /// per-employee legs, or a marketplace charge's revenue-share legs. Well
 /// inside `MAX_POSTINGS` (1024), and large enough that a per-posting cost
@@ -78,9 +82,11 @@ async fn boot_pool() -> SqlitePool {
         .expect("a url is configured");
 
     let mut conn = pool.get().await.expect("checkout");
-    conn.batch_execute(LEDGER_UP)
-        .await
-        .expect("apply the ledger migration");
+    for ddl in [LEDGER_UP, BALANCE_UP] {
+        conn.batch_execute(ddl)
+            .await
+            .expect("apply the ledger migrations");
+    }
 
     ledger::ensure_account(&mut conn, Account::new("payout:pool", Usd::currency()))
         .await

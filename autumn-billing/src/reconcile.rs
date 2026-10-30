@@ -20,7 +20,9 @@
 //! Sequence: claim the event id in the ledger → upsert snapshots (the store
 //! applies the ordering guard) → open or close dunning → notify → mark
 //! applied. A failure after the claim releases it, so the provider's
-//! redelivery is applied again; every step is idempotent. A redelivery of a
+//! redelivery is applied again. Every step is idempotent. A redelivery that
+//! meets an unfinished claim is not acknowledged
+//! ([`ReconcileOutcome::InFlight`]). A redelivery of a
 //! snapshot already in the mirror (`Write::Unchanged`) repeats the idempotent
 //! steps (dunning row, job) but not notifications or hooks.
 
@@ -60,6 +62,9 @@ pub enum ReconcileOutcome {
     },
     /// The event id was already applied. Nothing changed.
     Duplicate,
+    /// Another delivery of the event id is still being applied. Nothing
+    /// changed. Ask the provider to redeliver: that delivery can still fail.
+    InFlight,
     /// The provider event type is not mirrored. Recorded only.
     Ignored {
         /// Provider event type.
@@ -83,9 +88,16 @@ pub async fn apply(
     let claim = store
         .claim_event(&event.id, kind, now, EVENT_CLAIM_STALE_AFTER)
         .await?;
-    if claim == EventClaim::Duplicate {
-        tracing::debug!(event_id = %event.id, kind, "🍂 Autumn Billing: duplicate event");
-        return Ok(ReconcileOutcome::Duplicate);
+    match claim {
+        EventClaim::Claimed => {}
+        EventClaim::Applied => {
+            tracing::debug!(event_id = %event.id, kind, "🍂 Autumn Billing: duplicate event");
+            return Ok(ReconcileOutcome::Duplicate);
+        }
+        EventClaim::InFlight => {
+            tracing::debug!(event_id = %event.id, kind, "🍂 Autumn Billing: event in flight");
+            return Ok(ReconcileOutcome::InFlight);
+        }
     }
     let event_id = event.id.clone();
     let ctx = Ctx {

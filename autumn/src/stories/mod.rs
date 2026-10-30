@@ -246,7 +246,7 @@ impl StoryRegistry {
 /// (`autumn/tests/integration/stories.rs`).
 #[must_use]
 pub fn builtin() -> StoryRegistry {
-    StoryRegistry::new(builtin::builtin_stories())
+    StoryRegistry::new(builtin::all_stories())
 }
 
 /// Builder-side collection of stories, registered with
@@ -271,7 +271,7 @@ impl StoryGallery {
     #[must_use]
     pub fn builtin() -> Self {
         Self {
-            stories: builtin::builtin_stories(),
+            stories: builtin::all_stories(),
         }
     }
 
@@ -682,6 +682,11 @@ fn story_page(
     ];
     #[cfg(not(feature = "htmx"))]
     let scripts: &[&str] = &[];
+    // The Flash story needs the flash stylesheet (#3398).
+    #[cfg(feature = "flash")]
+    let stylesheets: &[&str] = &[crate::flash::FLASH_CSS_PATH];
+    #[cfg(not(feature = "flash"))]
+    let stylesheets: &[&str] = &[];
     maud::html! {
         (maud::DOCTYPE)
         html lang="en" {
@@ -690,6 +695,9 @@ fn story_page(
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) " — Autumn stories" }
                 link rel="stylesheet" href=(crate::ui::WIDGETS_CSS_PATH);
+                @for href in stylesheets {
+                    link rel="stylesheet" href=(href);
+                }
                 @if let Some(n) = nonce {
                     meta name="htmx-config" content=(format!(r#"{{"inlineStyleNonce":"{}"}}"#, n.value()));
                 }
@@ -790,12 +798,22 @@ fn render_story_detail(
                         (
                             "story-source",
                             "Source",
-                            maud::html! { pre { code { (story.source()) } } },
+                            // A focusable, named region: a keyboard user can scroll a
+                            // wide snippet.
+                            maud::html! {
+                                pre tabindex="0" role="region" aria-label="Source code" {
+                                    code { (story.source()) }
+                                }
+                            },
                         ),
                         (
                             "story-html",
                             "Rendered HTML",
-                            maud::html! { pre { code { (rendered_html) } } },
+                            maud::html! {
+                                pre tabindex="0" role="region" aria-label="Rendered HTML code" {
+                                    code { (rendered_html) }
+                                }
+                            },
                         ),
                     ],
                 ))

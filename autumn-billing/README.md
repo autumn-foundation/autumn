@@ -185,7 +185,7 @@ event applied to the row. Every missing piece denies.
 | POST | `/billing/checkout` | session | `303` to checkout, or JSON `{ "url", "id" }` with `Accept: application/json`. `404` unknown plan, `409` live subscription exists, or a checkout for the user is in progress. |
 | POST | `/billing/portal` | session | `303` to the portal, or JSON `{ "url", "id" }`. `404` when the user has no customer. |
 | GET | `/billing/subscription` | session | JSON `{subscription, plan, entitled}` from the mirror. |
-| POST | `/billing/webhook` | Stripe signature | JSON `{accepted, outcome, event_id}`. |
+| POST | `/billing/webhook` | Stripe signature | JSON `{accepted, outcome, event_id}`. `503` while another delivery of the event is being applied: the provider retries. |
 
 `checkout` takes `{"plan": "pro"}` as JSON or `plan=pro` as a form. Redirect
 URLs come from the config only. Each process runs one checkout per user at a

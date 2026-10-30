@@ -166,6 +166,45 @@ codemod, or a rename-level change left `manual` with no reason (issue #1629).
 
 ---
 
+### Billing: `EventClaim::Duplicate` is now `Applied` and `InFlight`
+
+**Why:** a redelivery that met an unfinished claim was acknowledged. If the
+first attempt then failed, the provider had no reason to retry, and the event
+was lost (issue #3097).
+
+**Automation:** `manual` — a store must decide what `InFlight` means for it, so
+no codemod applies.
+
+**You are affected only if you implement `BillingStore` or match on
+`EventClaim` or `ReconcileOutcome`.** `EventClaim` is now `#[non_exhaustive]`.
+`ReconcileOutcome` has a new variant. It was already `#[non_exhaustive]`, so a
+wildcard arm covers it.
+
+**Before (`{X.Y}`):**
+
+```rust
+match store.claim_event(id, kind, now, stale_after).await? {
+    EventClaim::Claimed => { /* apply */ }
+    EventClaim::Duplicate => { /* acknowledge */ }
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+match store.claim_event(id, kind, now, stale_after).await? {
+    EventClaim::Claimed => { /* apply */ }
+    EventClaim::Applied => { /* acknowledge */ }
+    EventClaim::InFlight => { /* do not acknowledge: ask for a retry */ }
+    _ => {}
+}
+```
+
+A store returns `Applied` for a finished row, and `InFlight` for an
+unfinished row that is not stale. `reconcile::apply` returns
+`ReconcileOutcome::InFlight` for `InFlight`. The webhook route answers `503`,
+so the provider redelivers.
+
 ### Widgets: alert, badge and wizard classes have the `autumn-` prefix
 
 **Why:** every other widget class has the `autumn-` prefix since 0.8.0.
@@ -209,6 +248,58 @@ A test that calls `.assert_selector(".wizard-progress")` must use
 
 **Automation:** `manual` — the selectors are in the app's own stylesheets,
 scripts and tests. A codemod cannot find them reliably.
+
+### Jobs: `JobTrackingStore` has a required `update_record` method
+
+**Why:** Each built-in store had the same code for `mark_running`,
+`set_progress`, `complete` and `fail` (issue #3208). These methods now have
+default bodies that call `update_record`. A store implements only
+`update_record`. The trait applies the status rules and the `0..=100` progress clamp.
+`get` also has a default body, which calls `get_with_token`.
+
+**Who is affected:** Only code that implements `JobTrackingStore`. The
+compiler reports error `E0046` (`update_record` is missing). Code that only
+calls a store does not change.
+
+**Before (`{X.Y}`):**
+
+```rust
+use futures::future::BoxFuture; // = Pin<Box<dyn Future<Output = T> + Send + 'a>>
+
+impl JobTrackingStore for MyStore {
+    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFuture<'a, AutumnResult<()>> {
+        Box::pin(async move { self.write(key, |r| r.status = TrackedJobStatus::Running).await })
+    }
+    // set_progress, complete, fail, get: the same shape
+    // create, get_with_token, reset_for_retry
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use futures::future::BoxFuture; // = Pin<Box<dyn Future<Output = T> + Send + 'a>>
+
+impl JobTrackingStore for MyStore {
+    fn update_record<'a>(
+        &'a self,
+        key: &'a str,
+        f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
+    ) -> BoxFuture<'a, AutumnResult<()>> {
+        Box::pin(async move { self.write(key, f).await })
+    }
+    // create, get_with_token, reset_for_retry
+}
+```
+
+`update_record` must do nothing when `key` is unknown or expired. It can call
+`f` more than one time, for example after a failed compare-and-swap. Give `f`
+a fresh copy of the record each time. Set `updated_at` after `f`. Change the
+`RetryToken` and refresh the TTL on each write. Remove your `mark_running`, `set_progress`,
+`complete`, `fail` and `get`. If you keep them, they override the defaults.
+
+**Automation:** `manual` — `update_record` needs the store's own storage code.
+A codemod cannot write it.
 
 ### Database: `DatabaseFleetConfig` has two new fields
 
@@ -274,9 +365,9 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
 - **Experimental surface changed:** {the API and what changed — or "none".
   Experimental surface may change in any release, so this is a courtesy, not a
   promise. Plugins that declared it with `uses_experimental` are the audience.}
-- **New stable surface:** {additive APIs plugin authors can now rely on — or
-  "none". These are not breaking; they are why a plugin author reads this
-  section for the good news too.}
+- **New stable surface:** `plugin_conformance::is_sensitive_path`,
+  `normalize_path_for_collision` and `is_plugin_asset_path` are public.
+  The plugin-check CLI uses the same rules. Nothing else changed.
 - **Declared range to move to:** each release, bump the literal in
   `Plugin::contract`'s `.autumn_web("…")` to the new series (or write it with
   `lockstep_range(env!("CARGO_PKG_VERSION"))` if the plugin releases in
@@ -327,6 +418,19 @@ If nothing changed, delete this section.
   To support both schemes, use the tokens (`var(--bg)`, `var(--text)`) for
   the page colors, and see `docs/guide/widget-styling.md#dark-mode`.
 
+- **Money: each account row stores its balance (#3339).** The framework
+  migration `20261029183512_add_money_account_balance` adds the
+  `_autumn_money_accounts.balance_minor` column and a trigger. Run
+  `autumn migrate` before you deploy the new binary. The new binary reads the
+  column. Without the migration, each ledger call fails with
+  `LedgerError::Database`. The migration does not read the postings, so it is
+  fast. Old and new binaries can post at the same time, because the trigger
+  keeps the balance for both. The migration holds a short exclusive lock on
+  `_autumn_money_accounts` and `_autumn_money_postings`. To roll back, deploy
+  the old binary first, then run `down.sql`. Do not write `balance_minor`
+  yourself. `ledger::balance_drift` reports a difference. After a data-only
+  restore, set `balance_minor` to `NULL`. See
+  `docs/guide/money.md#the-stored-balance`.
 - **A fleet delete removes the replica (#3235).** With `[replication]` on,
   `DatabaseFleet::delete` and `autumn fleet delete` now delete the
   database's objects in object storage too. Before, they stayed. To keep

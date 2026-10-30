@@ -28321,11 +28321,10 @@ mod lease_tests {
             })
         }
 
-        fn set_progress<'a>(
+        fn update_record<'a>(
             &'a self,
             _key: &'a str,
-            _pct: u8,
-            _message: Option<String>,
+            _f: &'a (dyn Fn(&mut crate::job_tracking::TrackedJobRecord) + Send + Sync),
         ) -> Pin<Box<dyn Future<Output = AutumnResult<()>> + Send + 'a>> {
             Box::pin(async { Ok(()) })
         }
@@ -28356,19 +28355,6 @@ mod lease_tests {
                 }
                 Ok(())
             })
-        }
-
-        fn get<'a>(
-            &'a self,
-            _key: &'a str,
-        ) -> Pin<
-            Box<
-                dyn Future<Output = AutumnResult<Option<crate::job_tracking::TrackedJobRecord>>>
-                    + Send
-                    + 'a,
-            >,
-        > {
-            Box::pin(async { Ok(None) })
         }
 
         fn reset_for_retry<'a>(

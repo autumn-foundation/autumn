@@ -1016,3 +1016,109 @@ fn invoice_json_without_the_provider_subscription_id_reads() {
     let read: Invoice = serde_json::from_value(json).unwrap();
     assert_eq!(read.provider_subscription_id, None);
 }
+
+/// An in-flight claim is not an applied event (#3097).
+#[tokio::test]
+async fn in_flight_claim_is_not_acknowledged_as_a_duplicate() {
+    let h = linked_harness().await;
+    let ev = event("evt_1", at(100), sub_changed(SubscriptionStatus::Active));
+    h.store
+        .claim_event(
+            "evt_1",
+            "subscription_changed",
+            at(0),
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    let outcome = apply_event(&h.client, ev.clone()).await.unwrap();
+    assert_eq!(outcome, ReconcileOutcome::InFlight);
+    assert_eq!(h.store.applied_event_count().await.unwrap(), 0);
+    h.store.release_event("evt_1").await.unwrap();
+    let outcome = apply_event(&h.client, ev).await.unwrap();
+    assert!(matches!(outcome, ReconcileOutcome::Applied { .. }));
+}
+
+/// A redelivery during a failing first attempt gets a retryable status, and
+/// the redelivery after the release is applied (#3097).
+#[tokio::test]
+async fn redelivery_during_a_failing_first_attempt_is_retried() {
+    let inner = MemoryBillingStore::shared();
+    let store = FailingStore::wrap(inner.clone());
+    let h = harness_dyn(
+        support::config(),
+        store.clone(),
+        FakeProvider::with_parser(FakeParser::BillingEventJson),
+        |app| {
+            app.with_clock(TickingClock::starting_at(support::base_time()))
+                .routes(notification_routes())
+        },
+    );
+    inner
+        .upsert_customer(
+            CustomerUpsert::new("local-1", "fake", "cus_1", at(0))
+                .with_user(USER)
+                .with_email("a@example.test"),
+        )
+        .await
+        .unwrap();
+    let ev = event("evt_fail", at(200), invoice_failed(1));
+    let body = serde_json::to_vec(&ev).unwrap();
+    // Attempt A fails after mirroring the invoice. Attempt B arrives first.
+    // `FailingStore` runs the hook before the injected failure.
+    store.fail_on("upsert_dunning", 1);
+    let state = h.client.state().clone();
+    let service = autumn_billing::BillingService::require(&state).expect("plugin started");
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let seen_hook = seen.clone();
+    store.before(
+        "upsert_dunning",
+        1,
+        Box::new(move || {
+            let (state, service, ev) = (state.clone(), service.clone(), ev.clone());
+            let seen = seen_hook.clone();
+            Box::pin(async move {
+                let outcome = autumn_billing::reconcile::apply(&state, &service, ev).await;
+                *seen.lock().unwrap() = Some(outcome.unwrap());
+            })
+        }),
+    );
+    let first = post_webhook(&h.client, &body).await;
+    assert_eq!(first.status.as_u16(), 500, "{}", first.text());
+    assert_eq!(
+        seen.lock().unwrap().take(),
+        Some(ReconcileOutcome::InFlight),
+        "the rival must not be acknowledged"
+    );
+    assert_eq!(inner.applied_event_count().await.unwrap(), 0);
+    let third = post_webhook(&h.client, &body).await;
+    assert_eq!(third.status.as_u16(), 200, "{}", third.text());
+    assert_eq!(third.json::<serde_json::Value>()["outcome"], "applied");
+    assert_eq!(inner.applied_event_count().await.unwrap(), 1);
+}
+
+/// The webhook route answers an in-flight event with a retryable 503.
+#[tokio::test]
+async fn webhook_route_answers_an_in_flight_event_with_503() {
+    let h = linked_harness().await;
+    let body = serde_json::to_vec(&event(
+        "evt_1",
+        at(100),
+        sub_changed(SubscriptionStatus::Active),
+    ))
+    .unwrap();
+    h.store
+        .claim_event(
+            "evt_1",
+            "subscription_changed",
+            at(0),
+            Duration::from_secs(300),
+        )
+        .await
+        .unwrap();
+    let busy = post_webhook(&h.client, &body).await;
+    assert_eq!(busy.status.as_u16(), 503, "{}", busy.text());
+    h.store.release_event("evt_1").await.unwrap();
+    let retry = post_webhook(&h.client, &body).await;
+    assert_eq!(retry.status.as_u16(), 200, "{}", retry.text());
+}

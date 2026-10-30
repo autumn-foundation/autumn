@@ -110,7 +110,7 @@ pub async fn ledger_claim_finish_and_release(store: &dyn BillingStore) {
     );
     assert_eq!(
         store.claim_event(id, "k", at(1), STALE).await.unwrap(),
-        EventClaim::Duplicate,
+        EventClaim::InFlight,
         "an in-flight claim blocks redelivery"
     );
     store.release_event(id).await.unwrap();
@@ -122,12 +122,12 @@ pub async fn ledger_claim_finish_and_release(store: &dyn BillingStore) {
     store.finish_event(id, at(3)).await.unwrap();
     assert_eq!(
         store.claim_event(id, "k", at(4), STALE).await.unwrap(),
-        EventClaim::Duplicate
+        EventClaim::Applied
     );
     store.release_event(id).await.unwrap();
     assert_eq!(
         store.claim_event(id, "k", at(5), STALE).await.unwrap(),
-        EventClaim::Duplicate,
+        EventClaim::Applied,
         "release never drops an applied row"
     );
 }
@@ -141,7 +141,7 @@ pub async fn ledger_stale_claim_is_reclaimable(store: &dyn BillingStore) {
     );
     assert_eq!(
         store.claim_event(id, "k", at(299), STALE).await.unwrap(),
-        EventClaim::Duplicate,
+        EventClaim::InFlight,
         "younger than stale_after"
     );
     assert_eq!(
@@ -151,7 +151,7 @@ pub async fn ledger_stale_claim_is_reclaimable(store: &dyn BillingStore) {
     );
     assert_eq!(
         store.claim_event(id, "k", at(302), STALE).await.unwrap(),
-        EventClaim::Duplicate,
+        EventClaim::InFlight,
         "the re-claim refreshed claimed_at"
     );
 }
@@ -1631,7 +1631,7 @@ pub async fn prune_events_deletes_applied_rows_before(store: &dyn BillingStore) 
             .claim_event("prune-a-new", "k", at(60), STALE)
             .await
             .unwrap(),
-        EventClaim::Duplicate
+        EventClaim::Applied
     );
     // Re-claimed inside `STALE` of the claim, so only the prune could have
     // freed it.
@@ -1640,7 +1640,7 @@ pub async fn prune_events_deletes_applied_rows_before(store: &dyn BillingStore) 
             .claim_event("prune-a-inflight", "k", at(-999_999), STALE)
             .await
             .unwrap(),
-        EventClaim::Duplicate,
+        EventClaim::InFlight,
         "an in-flight claim is kept"
     );
     assert_eq!(store.prune_events(at(-800_000)).await.unwrap(), 0);

@@ -25,6 +25,9 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use autumn_web::plugin_conformance::{
+    is_plugin_asset_path, is_sensitive_path, normalize_path_for_collision,
+};
 use autumn_web::plugin_contract::{
     ContractVerdict, PLUGIN_CONTRACT_MARKER, PluginContract, SurfaceTier, evaluate, surface,
 };
@@ -876,7 +879,7 @@ fn check_route_prefix(
             p != prefix
                 && !p.starts_with(&format!("{prefix}/"))
                 && !intentional_root.contains(p)
-                && !is_plugin_asset_route(r)
+                && !is_plugin_asset_path(&r.path, &r.middleware)
         })
         .map(|r| format!("{} {}", r.method, r.path))
         .collect();
@@ -901,44 +904,6 @@ fn check_route_prefix(
     }
 }
 
-/// `true` for a file of the plugin's own `PluginAssets` bundle: a route under
-/// `/static/_plugins/` carrying the marker label `AppBuilder::plugin_assets`
-/// attaches.
-///
-/// The framework mounts those, not the plugin's router: they live outside the
-/// plugin's prefix by design and are public static bytes, so a file named
-/// `admin.js` is not a sensitive surface. Both conditions are required:
-/// `declare_plugin_routes` strips the marker, so a route a plugin merely
-/// declares at such a path gets no exemption.
-fn is_plugin_asset_route(route: &RouteInfo) -> bool {
-    route
-        .path
-        .strip_prefix(autumn_web::assets::PLUGIN_ASSETS_PREFIX)
-        .is_some_and(|rest| rest.starts_with('/'))
-        && route
-            .middleware
-            .iter()
-            .any(|label| label == autumn_web::assets::PLUGIN_ASSETS_ROUTE_MARKER)
-}
-
-const SENSITIVE_KEYWORDS: &[&str] = &[
-    "admin",
-    "debug",
-    "credential",
-    "operator",
-    "secret",
-    "metrics",
-];
-
-fn is_sensitive_path(path: &str) -> bool {
-    let lower = path.to_lowercase();
-    SENSITIVE_KEYWORDS.iter().any(|kw| {
-        lower
-            .split('/')
-            .any(|segment| segment == *kw || segment.starts_with(kw))
-    })
-}
-
 fn check_sensitive_surfaces(
     plugin_name: &str,
     routes: &[RouteInfo],
@@ -947,7 +912,11 @@ fn check_sensitive_surfaces(
     let expected = format!("plugin:{plugin_name}");
     let sensitive: Vec<&RouteInfo> = routes
         .iter()
-        .filter(|r| r.source == expected && is_sensitive_path(&r.path) && !is_plugin_asset_route(r))
+        .filter(|r| {
+            r.source == expected
+                && is_sensitive_path(&r.path)
+                && !is_plugin_asset_path(&r.path, &r.middleware)
+        })
         .collect();
 
     if sensitive.is_empty() {
@@ -1043,19 +1012,6 @@ fn check_duplicate_registration(plugin_name: &str, routes: &[RouteInfo]) -> Chec
     }
 }
 
-fn normalize_path_for_collision(path: &str) -> String {
-    path.split('/')
-        .map(|seg| {
-            if seg.starts_with('{') && seg.ends_with('}') {
-                "{}"
-            } else {
-                seg
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
-
 fn check_collisions(routes: &[RouteInfo]) -> CheckResult {
     use std::collections::HashMap;
 
@@ -1104,6 +1060,25 @@ fn check_collisions(routes: &[RouteInfo]) -> CheckResult {
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod shared_rules_tests {
+    /// The CLI must reuse the library's pure rule helpers (issue #2828).
+    /// A local copy would drift from `autumn_web::plugin_conformance`.
+    #[test]
+    fn pure_rule_helpers_are_not_redefined_here() {
+        let src = include_str!("plugin_check.rs");
+        let body = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for name in [
+            "fn is_sensitive_path",
+            "fn normalize_path_for_collision",
+            "fn is_plugin_asset_route",
+            "const SENSITIVE_KEYWORDS",
+        ] {
+            assert!(!body.contains(name), "`{name}` must live in the library");
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

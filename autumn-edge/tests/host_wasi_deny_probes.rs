@@ -233,3 +233,34 @@ fn args_are_actually_empty_not_just_documented() {
          documented empty-argv contract did not hold as tested: {detail}"
     );
 }
+
+/// F1 (#3323): host-side `fd_write` work is metered. The guest writes a
+/// 1 MiB whitespace-padded `kv_get` line 1100 times. Each write costs few
+/// guest instructions, but the host copies and parses every byte. Unmetered,
+/// the guest finishes. Metered, it runs out of fuel and falls through.
+#[test]
+fn padded_stdout_lines_burn_fuel() {
+    let outcome = run(r#"(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 17)
+  (data (i32.const 1048550) "{\"op\":\"kv_get\",\"key\":\"k\"}\n")
+  (func (export "_start")
+    (local $i i32)
+    (memory.fill (i32.const 0) (i32.const 32) (i32.const 1048550))
+    (i32.store (i32.const 1048576) (i32.const 0))
+    (i32.store (i32.const 1048580) (i32.const 1048576))
+    (loop $again
+      (drop (call $fd_write (i32.const 1) (i32.const 1048576) (i32.const 1) (i32.const 1048592)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $again (i32.lt_u (local.get $i) (i32.const 1100))))))
+"#);
+    let EdgeOutcome::Fallthrough { reason, detail } = outcome else {
+        panic!("expected a fallthrough, the guest was served: {outcome:?}");
+    };
+    assert_eq!(reason, FallthroughReason::CapsuleError);
+    assert!(
+        detail.contains("execution budget"),
+        "host-side stdout work must burn fuel, got: {detail}"
+    );
+}

@@ -49,6 +49,12 @@ type SqlitePool = Pool<RuntimeConnection>;
 const LEDGER_UP: &str =
     include_str!("../migrations_sqlite/20260917120000_create_money_ledger/up.sql");
 
+/// The running-balance migration (issue #3339). It applies after `LEDGER_UP`.
+const BALANCE_UP: &str =
+    include_str!("../migrations_sqlite/20261029183512_add_money_account_balance/up.sql");
+const BALANCE_DOWN: &str =
+    include_str!("../migrations_sqlite/20261029183512_add_money_account_balance/down.sql");
+
 /// An app table, so the "commits with your rows" test has rows to commit.
 const ORDERS_UP: &str = "CREATE TABLE ml_orders (\
      id TEXT PRIMARY KEY, \
@@ -67,6 +73,11 @@ async fn boot_pool(db_name: &str) -> SqlitePool {
 /// been a test in this file where two `SQLite` connections actually raced the
 /// ledger at the same time. This exists for the one test that does that.
 async fn boot_pool_sized(db_name: &str, pool_size: usize) -> SqlitePool {
+    boot_pool_with(db_name, pool_size, &[LEDGER_UP, BALANCE_UP, ORDERS_UP]).await
+}
+
+/// A pool with only the `ddl` applied, so a test can stop before a migration.
+async fn boot_pool_with(db_name: &str, pool_size: usize, ddl: &[&str]) -> SqlitePool {
     let config = DatabaseConfig {
         url: Some(format!("sqlite://file:{db_name}?mode=memory&cache=shared")),
         primary_pool_size: Some(pool_size),
@@ -77,7 +88,7 @@ async fn boot_pool_sized(db_name: &str, pool_size: usize) -> SqlitePool {
         .expect("a url is configured");
     {
         let mut conn = pool.get().await.expect("checkout");
-        for ddl in [LEDGER_UP, ORDERS_UP] {
+        for ddl in ddl {
             conn.batch_execute(ddl)
                 .await
                 .unwrap_or_else(|err| panic!("apply DDL: {err}\n{ddl}"));
@@ -135,6 +146,28 @@ async fn assert_books_balance(conn: &mut RuntimeConnection) {
             total.total()
         );
     }
+    let drift = ledger::balance_drift(conn).await.expect("balance drift");
+    assert!(drift.is_empty(), "stored balances drifted: {drift:?}");
+}
+
+#[derive(diesel::QueryableByName)]
+struct StoredBalanceRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    balance_minor: Option<i64>,
+}
+
+/// The `balance_minor` column of one account. `None` means "not known".
+async fn stored_balance(conn: &mut RuntimeConnection, account: &str) -> Option<i64> {
+    let rows: Vec<StoredBalanceRow> = diesel::sql_query(format!(
+        "SELECT balance_minor FROM _autumn_money_accounts WHERE id = '{account}'"
+    ))
+    .load(conn)
+    .await
+    .expect("read the stored balance");
+    rows.into_iter()
+        .next()
+        .expect("the account exists")
+        .balance_minor
 }
 
 // ── The golden test ─────────────────────────────────────────────────────────
@@ -846,7 +879,23 @@ async fn an_offsetting_pair_is_checked_on_its_net_delta_not_posting_order() {
         post_tx(&mut conn, &Transaction::new(key, postings))
             .await
             .unwrap_or_else(|err| panic!("{label} must post: {err}"));
+        if label == "debit first" {
+            // MAX + MAX leaves `i64`. The trigger writes NULL, not a REAL.
+            assert_eq!(stored_balance(&mut conn, "platform:cash").await, None);
+        }
     }
+
+    // The same on the negative side: revenue is at -MAX, and a credit first
+    // takes a step below `i64::MIN`.
+    let pair = vec![
+        Posting::credit("platform:revenue", usd(i64::MAX)),
+        Posting::debit("platform:revenue", usd(i64::MAX)),
+    ];
+    let key = IdempotencyKey::new("net:revenue").expect("key");
+    post_tx(&mut conn, &Transaction::new(key, pair))
+        .await
+        .expect("an offsetting pair on revenue posts");
+    assert_eq!(stored_balance(&mut conn, "platform:revenue").await, None);
 
     // The balance is untouched, and the books still balance.
     assert_eq!(
@@ -855,6 +904,22 @@ async fn an_offsetting_pair_is_checked_on_its_net_delta_not_posting_order() {
             .expect("balance")
             .minor(),
         i64::MAX
+    );
+    assert_books_balance(&mut conn).await;
+
+    // A step of the pair leaves `i64`, so the stored balance can be unknown.
+    // The next post sums the postings and stores the result.
+    let spend = vec![
+        Posting::credit("platform:cash", usd(1)),
+        Posting::debit("platform:revenue", usd(1)),
+    ];
+    let key = IdempotencyKey::derive("spend", &spend);
+    post_tx(&mut conn, &Transaction::new(key, spend))
+        .await
+        .expect("a post after the pair");
+    assert_eq!(
+        stored_balance(&mut conn, "platform:cash").await,
+        Some(i64::MAX - 1)
     );
     assert_books_balance(&mut conn).await;
 }
@@ -1172,12 +1237,7 @@ async fn duplicated_retried_and_killed_charges_post_exactly_once() {
     );
 
     // Per transaction: debits equal credits.
-    #[derive(diesel::QueryableByName)]
-    struct ImbalanceRow {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        count: i64,
-    }
-    let rows: Vec<ImbalanceRow> = diesel::sql_query(
+    let rows: Vec<CountRow> = diesel::sql_query(
         "SELECT COUNT(*) AS count FROM (\
            SELECT transaction_id FROM _autumn_money_postings \
            GROUP BY transaction_id HAVING SUM(amount_minor) <> 0\
@@ -1537,7 +1597,7 @@ async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet_f
         .expect("a url is configured");
     {
         let mut conn = pool.get().await.expect("checkout");
-        for ddl in [LEDGER_UP, ORDERS_UP] {
+        for ddl in [LEDGER_UP, BALANCE_UP, ORDERS_UP] {
             conn.batch_execute(ddl)
                 .await
                 .unwrap_or_else(|err| panic!("apply DDL: {err}\n{ddl}"));
@@ -1548,4 +1608,348 @@ async fn concurrent_withdrawals_cannot_double_spend_a_disallow_negative_wallet_f
 
     // The tempdir must outlive every connection's use of the file.
     drop(tmp);
+}
+
+// ── The stored balance (issue #3339) ────────────────────────────────────────
+//
+// `post` reads the balance from the account row, not from the posting history.
+// A trigger on the postings table keeps that balance. `NULL` means "not known":
+// `post` then sums the postings once and stores the result.
+
+/// Legacy rows, written as a ledger from before the stored balance holds them:
+/// a funded `platform:float` (100.00) that refuses a negative balance.
+const LEGACY_ROWS: &str = "\
+    INSERT INTO _autumn_money_accounts (id, currency, allow_negative) \
+    VALUES ('platform:cash', 'USD', 1), ('platform:float', 'USD', 0); \
+    INSERT INTO _autumn_money_transactions (id, idempotency_key, request_hash, currency) \
+    VALUES ('legacy-1', 'legacy:1', 'legacy', 'USD'); \
+    INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency) \
+    VALUES ('legacy-1', 0, 'platform:float', 10000, 'USD'), \
+           ('legacy-1', 1, 'platform:cash', -10000, 'USD');";
+
+fn payout(amount: i64, label: &str) -> Transaction {
+    let postings = vec![
+        Posting::credit("platform:float", usd(amount)),
+        Posting::debit("platform:cash", usd(amount)),
+    ];
+    let key = IdempotencyKey::derive(label, &postings);
+    Transaction::new(key, postings)
+}
+
+#[tokio::test]
+async fn the_stored_balance_moves_with_every_post() {
+    let pool = boot_pool("mlg_stored_moves").await;
+    let mut conn = pool.get().await.expect("checkout");
+    open_accounts(&mut conn).await;
+    assert_eq!(stored_balance(&mut conn, "platform:cash").await, Some(0));
+
+    for (amount, order) in [(2500_i64, "order:1"), (1000, "order:2"), (75, "order:3")] {
+        post_tx(&mut conn, &charge(amount, order))
+            .await
+            .expect("post");
+    }
+    // A replay writes nothing, so it does not move the balance.
+    post_tx(&mut conn, &charge(2500, "order:1"))
+        .await
+        .expect("replay");
+
+    assert_eq!(stored_balance(&mut conn, "platform:cash").await, Some(3575));
+    assert_eq!(
+        stored_balance(&mut conn, "platform:revenue").await,
+        Some(-3575)
+    );
+    assert_books_balance(&mut conn).await;
+}
+
+#[tokio::test]
+async fn a_refused_or_rolled_back_post_does_not_move_the_stored_balance() {
+    let pool = boot_pool("mlg_stored_refused").await;
+    let mut conn = pool.get().await.expect("checkout");
+    ledger::ensure_account(&mut conn, Account::new("platform:cash", Usd::currency()))
+        .await
+        .expect("open the cash account");
+    ledger::ensure_account(
+        &mut conn,
+        Account::new("platform:float", Usd::currency()).disallow_negative(),
+    )
+    .await
+    .expect("open the float");
+
+    post_tx(&mut conn, &payout(2500, "refused"))
+        .await
+        .expect_err("the empty float refuses");
+    assert_eq!(stored_balance(&mut conn, "platform:float").await, Some(0));
+
+    // The post succeeds, then the transaction rolls back.
+    let rolled_back = conn
+        .transaction::<(), LedgerError, _>(async move |conn| {
+            ledger::set_allow_negative(conn, "platform:float", true).await?;
+            ledger::post(conn, &payout(2500, "rolled-back")).await?;
+            Err(LedgerError::Conflict {
+                key: "roll back".to_owned(),
+            })
+        })
+        .await;
+    assert!(rolled_back.is_err());
+    assert_eq!(stored_balance(&mut conn, "platform:float").await, Some(0));
+    assert_books_balance(&mut conn).await;
+}
+
+#[tokio::test]
+async fn two_posts_in_one_transaction_see_each_other() {
+    let pool = boot_pool("mlg_stored_two_posts").await;
+    let mut conn = pool.get().await.expect("checkout");
+    ledger::ensure_account(&mut conn, Account::new("platform:cash", Usd::currency()))
+        .await
+        .expect("open the cash account");
+    ledger::ensure_account(
+        &mut conn,
+        Account::new("platform:float", Usd::currency()).disallow_negative(),
+    )
+    .await
+    .expect("open the float");
+    let funding = vec![
+        Posting::debit("platform:float", usd(10_000)),
+        Posting::credit("platform:cash", usd(10_000)),
+    ];
+    let key = IdempotencyKey::derive("funding", &funding);
+    post_tx(&mut conn, &Transaction::new(key, funding))
+        .await
+        .expect("fund the float");
+
+    // Each payout fits on its own. The two together do not.
+    let error = conn
+        .transaction::<(), LedgerError, _>(async move |conn| {
+            ledger::post(conn, &payout(6000, "first")).await?;
+            ledger::post(conn, &payout(6000, "second")).await?;
+            Ok(())
+        })
+        .await
+        .expect_err("the second payout sees the first");
+    assert!(
+        matches!(error, LedgerError::NegativeBalance { balance: -2000, .. }),
+        "{error}"
+    );
+    assert_eq!(
+        stored_balance(&mut conn, "platform:float").await,
+        Some(10_000)
+    );
+    assert_books_balance(&mut conn).await;
+}
+
+#[tokio::test]
+async fn a_posting_written_around_post_still_moves_the_stored_balance() {
+    let pool = boot_pool("mlg_stored_around").await;
+    let mut conn = pool.get().await.expect("checkout");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("write rows around post");
+
+    assert_eq!(
+        stored_balance(&mut conn, "platform:float").await,
+        Some(10_000)
+    );
+    assert_eq!(
+        stored_balance(&mut conn, "platform:cash").await,
+        Some(-10_000)
+    );
+    assert_books_balance(&mut conn).await;
+}
+
+#[tokio::test]
+async fn an_account_from_before_the_stored_balance_is_summed_once() {
+    // The ledger as an app on 0.9 left it: the first migration and its rows.
+    let pool = boot_pool_with("mlg_stored_legacy", 1, &[LEDGER_UP]).await;
+    let mut conn = pool.get().await.expect("checkout");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("write legacy rows");
+    conn.batch_execute(BALANCE_UP)
+        .await
+        .expect("the balance migration applies over existing rows");
+
+    assert_eq!(stored_balance(&mut conn, "platform:float").await, None);
+    assert_eq!(
+        ledger::balance(&mut conn, "platform:float")
+            .await
+            .expect("balance")
+            .minor(),
+        10_000,
+        "an unknown stored balance reads as the sum of the postings"
+    );
+
+    // The negative-balance check uses the sum, not a zero.
+    let error = post_tx(&mut conn, &payout(15_000, "too-much"))
+        .await
+        .expect_err("the float holds 100.00 only");
+    assert!(
+        matches!(error, LedgerError::NegativeBalance { balance: -5000, .. }),
+        "{error}"
+    );
+    post_tx(&mut conn, &payout(6000, "fits"))
+        .await
+        .expect("a payout that fits");
+
+    assert_eq!(
+        stored_balance(&mut conn, "platform:float").await,
+        Some(4000)
+    );
+    assert_eq!(
+        stored_balance(&mut conn, "platform:cash").await,
+        Some(-4000)
+    );
+    assert_books_balance(&mut conn).await;
+}
+
+#[tokio::test]
+async fn a_drifted_balance_is_reported_and_null_repairs_it() {
+    let pool = boot_pool("mlg_stored_drift").await;
+    let mut conn = pool.get().await.expect("checkout");
+    open_accounts(&mut conn).await;
+    post_tx(&mut conn, &charge(2500, "order:1"))
+        .await
+        .expect("post");
+
+    conn.batch_execute(
+        "UPDATE _autumn_money_accounts SET balance_minor = 1 WHERE id = 'platform:cash'",
+    )
+    .await
+    .expect("drift the cash account");
+    let drift = ledger::balance_drift(&mut conn).await.expect("drift");
+    let [cash] = drift.as_slice() else {
+        panic!("expected one drifted account: {drift:?}");
+    };
+    assert_eq!(cash.account_id(), "platform:cash");
+    assert_eq!(cash.stored().minor(), 1);
+    assert_eq!(cash.posted().minor(), 2500);
+    assert_eq!(cash.posted().currency(), Usd::currency());
+
+    // NULL means "not known". The next post sums the postings again.
+    conn.batch_execute(
+        "UPDATE _autumn_money_accounts SET balance_minor = NULL WHERE id = 'platform:cash'",
+    )
+    .await
+    .expect("forget the cash balance");
+    assert!(
+        ledger::balance_drift(&mut conn)
+            .await
+            .expect("drift")
+            .is_empty()
+    );
+    post_tx(&mut conn, &charge(1000, "order:2"))
+        .await
+        .expect("post");
+    assert_eq!(stored_balance(&mut conn, "platform:cash").await, Some(3500));
+    assert_books_balance(&mut conn).await;
+
+    // An account with no postings is in the report too.
+    ledger::ensure_account(&mut conn, Account::new("platform:idle", Usd::currency()))
+        .await
+        .expect("open an idle account");
+    conn.batch_execute(
+        "UPDATE _autumn_money_accounts SET balance_minor = 5 WHERE id = 'platform:idle'",
+    )
+    .await
+    .expect("drift the idle account");
+    let drift = ledger::balance_drift(&mut conn).await.expect("drift");
+    let [idle] = drift.as_slice() else {
+        panic!("expected one drifted account: {drift:?}");
+    };
+    assert_eq!(idle.account_id(), "platform:idle");
+    assert_eq!(idle.posted().minor(), 0);
+}
+
+/// `post` reads the stored balance, not the posting history. That is the fix
+/// for the cost that grew with the history (issue #3339). A drifted value is
+/// what `post` uses, which is why `balance_drift` exists.
+#[tokio::test]
+async fn post_reads_the_stored_balance_not_the_history() {
+    let pool = boot_pool("mlg_stored_hot_path").await;
+    let mut conn = pool.get().await.expect("checkout");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("fund the float");
+    conn.batch_execute(
+        "UPDATE _autumn_money_accounts SET balance_minor = 0 WHERE id = 'platform:float'",
+    )
+    .await
+    .expect("drift the float");
+
+    let error = post_tx(&mut conn, &payout(6000, "fits-the-history"))
+        .await
+        .expect_err("the stored balance says the float is empty");
+    assert!(
+        matches!(error, LedgerError::NegativeBalance { balance: -6000, .. }),
+        "{error}"
+    );
+    assert_eq!(
+        ledger::balance(&mut conn, "platform:float")
+            .await
+            .expect("balance")
+            .minor(),
+        0
+    );
+}
+
+/// `INSERT OR REPLACE` of an account row puts the column default in place of
+/// the stored balance. The ledger must not then read a funded account as empty,
+/// or an empty one as funded.
+#[tokio::test]
+async fn insert_or_replace_of_an_account_keeps_the_balance_honest() {
+    let pool = boot_pool("mlg_stored_replace").await;
+    let mut conn = pool.get().await.expect("checkout");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("fund the float");
+
+    // The same currency, so the currency guard lets it through, as before.
+    conn.batch_execute(
+        "INSERT OR REPLACE INTO _autumn_money_accounts (id, currency, allow_negative) \
+         VALUES ('platform:float', 'USD', 0)",
+    )
+    .await
+    .expect("a same-currency REPLACE is allowed");
+
+    assert_eq!(
+        ledger::balance(&mut conn, "platform:float")
+            .await
+            .expect("balance")
+            .minor(),
+        10_000
+    );
+    let error = post_tx(&mut conn, &payout(15_000, "too-much"))
+        .await
+        .expect_err("the float holds 100.00 only");
+    assert!(
+        matches!(error, LedgerError::NegativeBalance { balance: -5000, .. }),
+        "{error}"
+    );
+    assert_books_balance(&mut conn).await;
+}
+
+#[tokio::test]
+async fn the_balance_migration_reverts_and_applies_again() {
+    let pool = boot_pool_with("mlg_stored_down", 1, &[LEDGER_UP]).await;
+    let mut conn = pool.get().await.expect("checkout");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("write legacy rows");
+    conn.batch_execute(BALANCE_UP).await.expect("up");
+    conn.batch_execute(BALANCE_DOWN).await.expect("down");
+    assert!(
+        conn.batch_execute("SELECT balance_minor FROM _autumn_money_accounts")
+            .await
+            .is_err(),
+        "down drops the column"
+    );
+    conn.batch_execute(BALANCE_UP).await.expect("up again");
+
+    post_tx(&mut conn, &payout(6000, "after-redo"))
+        .await
+        .expect("post after up, down, up");
+    assert_eq!(
+        stored_balance(&mut conn, "platform:float").await,
+        Some(4000)
+    );
+    assert_books_balance(&mut conn).await;
 }
