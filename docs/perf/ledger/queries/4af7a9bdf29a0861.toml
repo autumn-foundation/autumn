@@ -6,9 +6,10 @@ backend = "postgres"
 statement = "UPDATE \"cmt_comments\" SET \"deleted_at\" = $? WHERE \"id\" IN (?, ...) AND \"deleted_at\" IS NULL"
 tables = [
   "cmt_comments",
+]
+indexes = [
   "cmt_comments_pkey",
 ]
-indexes = []
 findings = []
 notes = ""
 

@@ -6,9 +6,10 @@ backend = "postgres"
 statement = "SELECT queue, name, COUNT(*) AS count, CAST(EXTRACT(EPOCH FROM (NOW() - MIN(run_at))) * ? AS BIGINT) AS oldest_wait_ms FROM autumn_jobs WHERE status = ? AND run_at <= NOW() GROUP BY queue, name"
 tables = [
   "autumn_jobs",
+]
+indexes = [
   "idx_autumn_jobs_enqueued_dashboard",
 ]
-indexes = []
 findings = []
 notes = ""
 

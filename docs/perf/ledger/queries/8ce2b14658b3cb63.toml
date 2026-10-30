@@ -6,11 +6,12 @@ backend = "postgres"
 statement = "SELECT \"id\" AS id FROM \"cc_pages\" WHERE \"id\" > $? ORDER BY \"id\" LIMIT ?"
 tables = [
   "cc_pages",
+]
+indexes = [
   "cc_pages_pkey",
 ]
-indexes = []
 findings = [
-  "sort: no index provides the order",
+  "sort: id (the plan sorts, even with enable_seqscan = off)",
 ]
 notes = ""
 

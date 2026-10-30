@@ -6,9 +6,10 @@ backend = "postgres"
 statement = "DELETE FROM autumn_sync_rows WHERE deleted AND version <= $? RETURNING scope, version"
 tables = [
   "autumn_sync_rows",
+]
+indexes = [
   "autumn_sync_rows_scope_version_idx",
 ]
-indexes = []
 findings = []
 notes = ""
 

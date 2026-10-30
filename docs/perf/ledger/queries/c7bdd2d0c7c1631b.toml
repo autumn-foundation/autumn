@@ -6,9 +6,10 @@ backend = "postgres"
 statement = "DELETE FROM \"cmt_hard_comments\" WHERE \"id\" IN (?, ...)"
 tables = [
   "cmt_hard_comments",
+]
+indexes = [
   "cmt_hard_comments_pkey",
 ]
-indexes = []
 findings = []
 notes = ""
 

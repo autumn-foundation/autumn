@@ -6,9 +6,10 @@ backend = "postgres"
 statement = "DELETE FROM \"autumn_idempotency_keys\" WHERE ((\"autumn_idempotency_keys\".\"expires_at_ms\" <= $?) AND (\"autumn_idempotency_keys\".\"locked_until_ms\" <= $?))"
 tables = [
   "autumn_idempotency_keys",
+]
+indexes = [
   "autumn_idempotency_keys_expires_at_idx",
 ]
-indexes = []
 findings = []
 notes = ""
 

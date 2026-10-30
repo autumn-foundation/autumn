@@ -6,7 +6,6 @@ backend = "postgres"
 statement = "DELETE FROM autumn_job_tracking WHERE updated_at < $? AND key IN (SELECT key FROM autumn_job_tracking WHERE updated_at < $? LIMIT $?)"
 tables = [
   "autumn_job_tracking",
-  "idx_autumn_job_tracking_updated_at",
 ]
 indexes = [
   "idx_autumn_job_tracking_updated_at",

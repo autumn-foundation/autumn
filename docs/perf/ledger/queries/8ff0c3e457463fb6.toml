@@ -14,7 +14,8 @@ indexes = [
   "idx_autumn_jobs_stale_recovery",
 ]
 findings = [
-  "sort: no index provides the order",
+  "sort: autumn_jobs_3.run_at, names_1.n (the plan sorts, even with enable_seqscan = off)",
+  "sort: walk_1.i DESC (the plan sorts, even with enable_seqscan = off)",
 ]
 notes = ""
 

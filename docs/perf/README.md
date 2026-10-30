@@ -116,8 +116,9 @@ uploads it as the `ledger-capture` artifact.
 * `findings`:
   * `full-scan: <table>` when a sequential scan survives
     `enable_seqscan = off`. No index can serve that scan.
-  * `sort` when the order needs a sort node, even with index scans
-    preferred.
+  * `sort: <key>` when the plan still sorts with index scans preferred.
+    That is what the planner chose, not proof that no index has the order:
+    a bitmap scan and a sort can beat an ordered index scan.
 * `[[site]]`: each production function that issues the statement.
 * `[plan]`: both plans, or why there is none.
 * `notes`: free text for a person. A refresh keeps it.

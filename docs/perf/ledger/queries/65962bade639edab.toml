@@ -7,10 +7,11 @@ statement = "SELECT COUNT(*) AS count FROM autumn_experiment_assignments WHERE a
 tables = [
   "autumn_experiment_assignments",
   "autumn_experiments",
+]
+indexes = [
   "idx_autumn_exp_assignments_assigned_at",
   "idx_autumn_experiments_state",
 ]
-indexes = []
 findings = []
 notes = ""
 

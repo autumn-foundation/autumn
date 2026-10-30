@@ -131,16 +131,25 @@ def findings(plan: dict | None) -> tuple[list[str], list[str], list[str]]:
     for lines in (plan.get("plan") or [], plan.get("plan_index_forced") or []):
         for line in lines:
             for m in SCAN.finditer(line):
-                if m.group(2):
-                    indexes.add(m.group(2))
-                tables.add(m.group(3))
+                node, using, target = m.groups()
+                if using:
+                    indexes.add(using)
+                # A bitmap index scan names the index after `on`, not a table.
+                if node == "Bitmap Index Scan":
+                    indexes.add(target)
+                else:
+                    tables.add(target)
     forced = plan.get("plan_index_forced") or []
-    for line in forced:
+    for k, line in enumerate(forced):
         m = re.search(r"Seq Scan on (\S+)", line)
         if m:
             out.append(f"full-scan: {m.group(1)} (no index serves it, even with enable_seqscan = off)")
-        if re.search(r"->\s+(Incremental )?Sort\b|^\s*(Incremental )?Sort\b", line):
-            out.append("sort: no index provides the order")
+        if re.match(r"^\s*(?:->\s+)?(?:Incremental )?Sort\s*$", line):
+            # A sort here is what the planner chose, not proof that no index
+            # has the order: a bitmap scan and a sort can beat an ordered
+            # index scan. Name the key so a reader can check.
+            key = next((x.split("Sort Key:", 1)[1].strip() for x in forced[k + 1 : k + 3] if "Sort Key:" in x), "?")
+            out.append(f"sort: {key} (the plan sorts, even with enable_seqscan = off)")
     return sorted(tables), sorted(indexes), sorted(set(out))
 
 

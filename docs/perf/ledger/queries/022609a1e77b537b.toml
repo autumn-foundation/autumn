@@ -8,9 +8,10 @@ tables = [
   "autumn_experiment_assignments",
   "autumn_experiment_changes",
   "autumn_experiments",
+]
+indexes = [
   "idx_autumn_exp_assignments_experiment",
 ]
-indexes = []
 findings = []
 notes = ""
 

@@ -6,9 +6,10 @@ backend = "postgres"
 statement = "SELECT COUNT(*) AS count FROM autumn_job_tracking WHERE updated_at < $?"
 tables = [
   "autumn_job_tracking",
+]
+indexes = [
   "idx_autumn_job_tracking_updated_at",
 ]
-indexes = []
 findings = []
 notes = ""
 

@@ -6,11 +6,12 @@ backend = "postgres"
 statement = "SELECT \"__diesel_schema_migrations\".\"version\" FROM \"__diesel_schema_migrations\" ORDER BY \"__diesel_schema_migrations\".\"version\" DESC"
 tables = [
   "__diesel_schema_migrations",
+]
+indexes = [
   "__diesel_schema_migrations_pkey",
 ]
-indexes = []
 findings = [
-  "sort: no index provides the order",
+  "sort: version DESC (the plan sorts, even with enable_seqscan = off)",
 ]
 notes = ""
 

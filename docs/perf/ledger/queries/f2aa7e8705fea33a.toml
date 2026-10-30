@@ -7,12 +7,12 @@ statement = "DELETE FROM autumn_experiment_assignments WHERE assigned_at < $? AN
 tables = [
   "autumn_experiment_assignments",
   "autumn_experiments",
-  "idx_autumn_exp_assignments_assigned_at",
-  "idx_autumn_experiments_state",
 ]
 indexes = [
+  "idx_autumn_exp_assignments_assigned_at",
   "idx_autumn_exp_assignments_experiment",
   "idx_autumn_experiments_name",
+  "idx_autumn_experiments_state",
 ]
 findings = []
 notes = ""

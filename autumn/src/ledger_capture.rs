@@ -499,6 +499,12 @@ fn lex(sql: &str) -> String {
         if c.is_ascii_whitespace() {
             space = true;
             i += 1;
+        } else if c == b',' {
+            // One spelling of every separator, so `(1,2)` and `(1, 2)` lex
+            // alike and the list collapse sees both.
+            out.push(',');
+            space = true;
+            i += 1;
         } else if c == b'\'' {
             i = skip_string(b, i);
             push(&mut out, "?", &mut space);
@@ -1001,6 +1007,28 @@ mod tests {
         let b = normalize("SELECT * FROM t WHERE id IN ($1, $2)").unwrap();
         assert_eq!(a, b);
         assert_eq!(a, "SELECT * FROM t WHERE id IN ($?, ...)");
+    }
+
+    #[test]
+    fn lists_without_spaces_collapse_like_spaced_ones() {
+        let tight = normalize("SELECT * FROM t WHERE id IN (1,2)").unwrap();
+        let three = normalize("SELECT * FROM t WHERE id IN (1,2,3)").unwrap();
+        let spaced = normalize("SELECT * FROM t WHERE id IN (1 , 2, 3)").unwrap();
+        assert_eq!(tight, three);
+        assert_eq!(tight, spaced);
+        assert_eq!(tight, "SELECT * FROM t WHERE id IN (?, ...)");
+    }
+
+    #[test]
+    fn normalizing_twice_changes_nothing() {
+        for sql in [
+            "SELECT a, 'x' FROM t0 WHERE id IN (1,2,3) AND n = $1",
+            "INSERT INTO t (a, b) VALUES ($1, $2), ($3, $4)",
+            "UPDATE t SET n = n + 1 WHERE id = ANY($1) -- tail",
+        ] {
+            let once = normalize(sql).unwrap();
+            assert_eq!(normalize(&once).unwrap(), once, "{sql}");
+        }
     }
 
     #[test]

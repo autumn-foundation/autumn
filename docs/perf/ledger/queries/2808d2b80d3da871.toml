@@ -6,9 +6,10 @@ backend = "postgres"
 statement = "SELECT CAST(COALESCE(SUM(amount_minor / ?), ?) AS BIGINT) AS hi, CAST(COALESCE(SUM(amount_minor % ?), ?) AS BIGINT) AS lo FROM _autumn_money_postings WHERE account_id = $?"
 tables = [
   "_autumn_money_postings",
+]
+indexes = [
   "_autumn_money_postings_account_idx",
 ]
-indexes = []
 findings = []
 notes = ""
 

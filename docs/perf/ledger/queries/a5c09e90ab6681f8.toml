@@ -6,9 +6,10 @@ backend = "postgres"
 statement = "DELETE FROM autumn_scheduler_ticks WHERE expires_at < now()"
 tables = [
   "autumn_scheduler_ticks",
+]
+indexes = [
   "idx_autumn_scheduler_ticks_expires_at",
 ]
-indexes = []
 findings = []
 notes = ""
 

@@ -6,11 +6,12 @@ backend = "postgres"
 statement = "SELECT id, currency, allow_negative, balance_minor FROM _autumn_money_accounts WHERE id IN ($?, ...) ORDER BY id FOR UPDATE"
 tables = [
   "_autumn_money_accounts",
+]
+indexes = [
   "_autumn_money_accounts_pkey",
 ]
-indexes = []
 findings = [
-  "sort: no index provides the order",
+  "sort: id (the plan sorts, even with enable_seqscan = off)",
 ]
 notes = ""
 

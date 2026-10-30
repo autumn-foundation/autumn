@@ -7,9 +7,9 @@ statement = "SELECT EXISTS ( SELECT ? FROM autumn_experiment_assignments a JOIN 
 tables = [
   "autumn_experiment_assignments",
   "autumn_experiments",
-  "idx_autumn_exp_assignments_actor",
 ]
 indexes = [
+  "idx_autumn_exp_assignments_actor",
   "idx_autumn_experiments_name",
 ]
 findings = []
