@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use super::emit::{Action, split_migration_dir_name};
 use super::provenance::{self, MANIFEST_PATH, Provenance, Recorded, Scope};
+use super::spelling::{self, has_exact_entry};
 
 /// Files the sweep never deletes, lowercase. Generators edit them in place
 /// and never own them, so the sweep does not trust an `owned` entry for one.
@@ -58,10 +59,7 @@ pub(super) fn plan_sweep(
     // A revert can rewrite or delete its target. Leave that file to it.
     for path in revert_targets {
         if let Some(key) = provenance::key(project_root, path) {
-            planned
-                .folded
-                .push((key.to_ascii_lowercase(), path.to_path_buf()));
-            planned.keys.insert(key);
+            planned.files.insert(key, path);
         }
     }
     let mut sweep = Sweep::default();
@@ -73,12 +71,10 @@ pub(super) fn plan_sweep(
 
 /// What the plan names, in the forms the sweep compares against.
 struct Planned {
-    /// Every key, exactly as spelled.
-    keys: HashSet<String>,
-    /// Every key in lowercase, with its path.
-    folded: Vec<(String, PathBuf)>,
-    /// The parent directory key of each `Create`/`CreateBytes`, exact case.
-    owned_dirs: HashSet<String>,
+    /// The path of each action and revert.
+    files: Spellings,
+    /// The parent directory of each `Create`/`CreateBytes`.
+    owned_dirs: Spellings,
     /// The suffix of each migration directory, lowercase.
     migration_suffixes: HashSet<String>,
 }
@@ -86,78 +82,67 @@ struct Planned {
 impl Planned {
     fn new(project_root: &Path, actions: &[Action]) -> Self {
         let mut planned = Self {
-            keys: HashSet::new(),
-            folded: Vec::new(),
-            owned_dirs: HashSet::new(),
+            files: Spellings::default(),
+            owned_dirs: Spellings::default(),
             migration_suffixes: HashSet::new(),
         };
         for action in actions {
-            let Some(key) = provenance::key(project_root, action.path()) else {
+            let path = action.path();
+            let Some(key) = provenance::key(project_root, path) else {
                 continue;
             };
-            let lower = key.to_ascii_lowercase();
-            if matches!(action, Action::Create { .. } | Action::CreateBytes { .. }) {
-                planned.owned_dirs.insert(parent_key(&key).to_owned());
+            if matches!(action, Action::Create { .. } | Action::CreateBytes { .. })
+                && let Some(dir) = path.parent()
+            {
+                planned.owned_dirs.insert(parent_key(&key).to_owned(), dir);
             }
+            let lower = key.to_ascii_lowercase();
             if let ["migrations", dir, _] = lower.split('/').collect::<Vec<_>>().as_slice() {
                 planned.migration_suffixes.insert(migration_suffix(dir));
             }
-            planned.folded.push((lower, action.path().to_path_buf()));
-            planned.keys.insert(key);
+            planned.files.insert(key, path);
         }
         planned
     }
+}
 
-    /// Whether the plan handles the file at `key`.
+/// A set of project keys, each with its path.
+#[derive(Default)]
+struct Spellings {
+    /// Every key, exactly as spelled.
+    exact: HashSet<String>,
+    /// Every key in lowercase, with its path.
+    folded: Vec<(String, PathBuf)>,
+}
+
+impl Spellings {
+    fn insert(&mut self, key: String, path: &Path) {
+        let lower = key.to_ascii_lowercase();
+        if self.exact.insert(key) {
+            self.folded.push((lower, path.to_path_buf()));
+        }
+    }
+
+    /// Whether the set holds `key`, the key of `path`.
     ///
     /// An exact match does. A match that differs only in ASCII case does when
     /// both spellings reach one directory entry, as on a case-insensitive
-    /// file system. Two entries are two names to remove, even when they are
-    /// hard links to one file, so the old one is then an orphan.
-    fn names(&self, key: &str, path: &Path) -> bool {
-        if self.keys.contains(key) {
+    /// file system (issue #3382). Two entries are two names, even when they
+    /// are hard links to one file.
+    fn holds(&self, key: &str, path: &Path) -> bool {
+        if self.exact.contains(key) {
             return true;
         }
         let lower = key.to_ascii_lowercase();
-        self.folded.iter().any(|(k, planned)| {
-            *k == lower && same_file(path, planned) && !(listed(path) && listed(planned))
-        })
-    }
-}
-
-/// Whether the directory of `path` lists an entry with exactly its name.
-fn listed(path: &Path) -> bool {
-    match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
-        (Some(dir), Some(name)) => has_exact_entry(dir, name),
-        _ => false,
+        self.folded
+            .iter()
+            .any(|(k, other)| *k == lower && spelling::one_entry(path, other))
     }
 }
 
 /// The directory part of a key, or `""` for a top-level file.
 fn parent_key(key: &str) -> &str {
     key.rsplit_once('/').map_or("", |(dir, _)| dir)
-}
-
-/// Whether `a` and `b` are one file on disk.
-///
-/// On Unix this compares device and inode. Elsewhere it compares the
-/// canonical paths, which ignore case only where the file system does.
-fn same_file(a: &Path, b: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        match (fs::metadata(a), fs::metadata(b)) {
-            (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
-            _ => false,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        match (fs::canonicalize(a), fs::canonicalize(b)) {
-            (Ok(x), Ok(y)) => x == y,
-            _ => false,
-        }
-    }
 }
 
 /// Decide what to do with one entry.
@@ -175,7 +160,7 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
     let path = parts
         .iter()
         .fold(project_root.to_path_buf(), |p, part| p.join(part));
-    if planned.names(shown, &path) {
+    if planned.files.holds(shown, &path) {
         return;
     }
     let found = inspect(project_root, &parts);
@@ -185,6 +170,7 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
         return;
     }
     let warn = |sweep: &mut Sweep, why: &str| sweep.warnings.push(format!("{shown}: {why}"));
+    let dir = path.parent().unwrap_or(project_root);
     if lower.starts_with("migrations/") {
         // The plan matches migrations by suffix, not by timestamp. Only the
         // applied-migration guard of that pass may remove one.
@@ -234,7 +220,7 @@ fn sweep_one(project_root: &Path, entry: Recorded<'_>, planned: &Planned, sweep:
         // file and its digest. Delete only in a directory where the current
         // templates also create a file. Then a forged entry cannot reach a
         // file outside the generator's own directories.
-        Some(Scope::Owned) if !planned.owned_dirs.contains(parent_key(shown)) => warn(
+        Some(Scope::Owned) if !planned.owned_dirs.holds(parent_key(shown), dir) => warn(
             sweep,
             "the current templates do not make this file, and they create no file in its \
              directory. autumn destroy keeps it. Delete it by hand if you do not need it.",
@@ -399,15 +385,6 @@ fn inspect(project_root: &Path, parts: &[&str]) -> Inspect {
         }
     }
     Inspect::File
-}
-
-/// Whether `dir` holds an entry named exactly `name`, byte for byte.
-fn has_exact_entry(dir: &Path, name: &str) -> bool {
-    fs::read_dir(dir).is_ok_and(|entries| {
-        entries
-            .filter_map(Result::ok)
-            .any(|entry| entry.file_name() == std::ffi::OsStr::new(name))
-    })
 }
 
 /// Whether `path` is still a regular file, reached through no symlink, that
@@ -672,6 +649,39 @@ mod tests {
         let sweep = plan_sweep(root, &p, ME, &[create(root, "src/models/post.rs")], &[]);
 
         assert_eq!(sweep.remove, vec![old]);
+    }
+
+    #[test]
+    fn an_orphan_in_a_case_only_renamed_directory_is_swept_only_when_it_is_one_directory() {
+        // Issue #3382: a template moved `src/widgets/old.rs` to
+        // `src/Widgets/new.rs`.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = generated(
+            root,
+            &mut p,
+            "src/widgets/old.rs",
+            "x",
+            ME,
+            Some(Scope::Owned),
+        );
+        let upper = root.join("src/Widgets");
+        let one_dir = upper.exists();
+        if !one_dir {
+            fs::create_dir(&upper).unwrap(); // a second, real directory.
+        }
+
+        let sweep = plan_sweep(root, &p, ME, &[create(root, "src/Widgets/new.rs")], &[]);
+
+        if one_dir {
+            assert_eq!(sweep.remove, vec![old]);
+            assert!(sweep.warnings.is_empty(), "{:?}", sweep.warnings);
+        } else {
+            assert!(sweep.remove.is_empty(), "{:?}", sweep.remove);
+            assert_eq!(sweep.warnings.len(), 1, "{:?}", sweep.warnings);
+            assert!(sweep.warnings[0].contains("no file in its directory"));
+        }
     }
 
     #[test]

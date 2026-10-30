@@ -2263,6 +2263,12 @@ plan does not name the old file, but the manifest does. `destroy` sweeps it:
   `src/main.rs`, a path with a dot segment (`.env`, `.git/`), a file under
   `target/`, or a path through a symlink.
 
+On a case-insensitive file system (macOS, Windows), a template that changes
+only the case of a name (`Foo.rs` to `foo.rs`, `src/widgets` to
+`src/Widgets`) still points at the same file. `destroy` finds the entry that
+the manifest recorded under the old spelling. On a case-sensitive file system,
+the two spellings are two files.
+
 The manifest decides what the sweep can delete, so review changes to
 `.autumn/generated.toml` as you review code.
 
