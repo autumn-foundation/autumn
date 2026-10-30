@@ -536,6 +536,17 @@ impl crate::custom_domain::CustomDomainPruner for PruneOnlyCustomDomainPruner {
                         .to_owned(),
                 );
             }
+            // A record that did not load leaves its certificate looking
+            // orphaned, and the prune would delete a live tenant's key.
+            let skipped = self.registry.skipped_records();
+            if !skipped.is_empty() {
+                return Err(format!(
+                    "refusing to prune: {} custom-domain record(s) will not load ({}), so their \
+                     certificates would look orphaned",
+                    skipped.len(),
+                    skipped.join(", ")
+                ));
+            }
             let mut removed = 0_u64;
             // What the store holds NOW, not only what this process's index
             // saw at load: another process sharing the store (a serving app

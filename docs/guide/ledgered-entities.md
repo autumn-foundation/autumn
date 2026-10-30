@@ -542,11 +542,17 @@ clock, the chain head (`ORDER BY seq DESC LIMIT 1`) and the high-water mark
 together — plus the revision `INSERT` and the mark's upsert, inside the
 transaction the write already opened; a ledgered **delete** adds a fourth
 statement, reading back the `deleted_at` the update wrote so the revision
-snapshots the post-delete row exactly. Bulk paths (`save_many`,
-`upsert_many`, `delete_many`) pay this per row, inside the transaction that
-already holds their row locks — a `delete_many` over 1000 ids goes from a couple
-of statements to a few thousand. Chunk accordingly, or keep bulk writes off
-ledgered entities where throughput matters.
+snapshots the post-delete row exactly.
+
+Bulk paths (`save_many`, `save_many_skip_invalid`, `update_many`,
+`delete_many`, `upsert_many`) write in batches (#3345). A chunk holds 1,000
+rows or fewer. Each chunk adds 5 statements: one history `INSERT`, one
+reload, one chain-state read, one revision `INSERT` and one mark upsert. The
+count grows with the chunks, not with the rows. A record that occurs two
+times in one batch has one chain, in input order, and the two revisions can
+have the same `recorded_at`. When one row fails a check, the batch writes no
+revision and the transaction rolls back. See
+[ADR 0029](../adr/0029-ledger-batched-bulk-append.md).
 
 `ledger_pin` is one statement over two indexed rows — and `ledger_head` /
 `ledger_high_water` are that same statement projected — so pinning on a schedule

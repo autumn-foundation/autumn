@@ -301,6 +301,43 @@ a fresh copy of the record each time. Set `updated_at` after `f`. Change the
 **Automation:** `manual` — `update_record` needs the store's own storage code.
 A codemod cannot write it.
 
+### Middleware: ingress service futures are not boxed
+
+**Why:** a boxed future is one heap allocation on each request. The ingress
+services now return named futures (issue #2830).
+
+**You are affected only if your code names the future type of one of these
+services, or polls the future without pinning it:**
+
+- `LogContextService`
+- `SessionService`
+- `MethodOverrideService`
+- `IdempotencyReplayService`
+- the services of `TrustedProxiesLayer` and `SubmitTokenLayer`
+
+The futures of `LogContextService` and `SessionService` can be `!Unpin`.
+
+**Before (`{X.Y}`):**
+
+```rust
+let mut fut: Pin<Box<dyn Future<Output = _> + Send>> = service.call(request);
+let response = poll_fn(|cx| fut.as_mut().poll(cx)).await;
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let fut = service.call(request);
+let response = fut.await;
+// Or, to keep a boxed future:
+let mut fut = Box::pin(service.call(request));
+```
+
+To name the type, use `<S as Service<Request>>::Future`.
+
+**Automation:** `manual` — the code to change is in the app's own middleware.
+A codemod cannot find it reliably.
+
 ### Database: `DatabaseFleetConfig` has two new fields
 
 **Why:** a deleted fleet database's replica now goes with it (issue #3235).
@@ -431,6 +468,18 @@ If nothing changed, delete this section.
   yourself. `ledger::balance_drift` reports a difference. After a data-only
   restore, set `balance_minor` to `NULL`. See
   `docs/guide/money.md#the-stored-balance`.
+
+- **Radio choice ids: a name or value with a special character has a new id
+  (#3454).** Before, two groups could give the same choice id. That breaks the
+  `<label for>` link. Now letters, digits and `_` do not change. Each other
+  byte (`-`, `.`, a space, non-ASCII) is written `--HH` (upper-case hex). The
+  name `plan-type` gives `plan--2Dtype-x`. In group `speed`, the value
+  `next-day` gives `speed-next--2Dday`. An id of only letters, digits and `_`
+  does not change. An empty name after an `id_prefix` is now written `--`. The
+  second of two equal values now ends in `--n1`. It ended in `-<index>`
+  before. Update a CSS rule, a test or a `getElementById` call that uses an
+  old id.
+
 - **A fleet delete removes the replica (#3235).** With `[replication]` on,
   `DatabaseFleet::delete` and `autumn fleet delete` now delete the
   database's objects in object storage too. Before, they stayed. To keep

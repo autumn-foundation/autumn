@@ -215,27 +215,93 @@ impl TxTimeouts {
         TX_TIMEOUTS.scope(self, fut).await
     }
 
-    /// Run a request `fut` with these timeouts as its defaults. A route's
-    /// [`StatementTimeout`] replaces the statement value when an extractor
-    /// sees it (see [`note_route_statement_timeout`]).
-    pub(crate) async fn scope_request<F: std::future::Future>(self, fut: F) -> F::Output {
-        REQUEST_TX_TIMEOUTS
-            .scope(Arc::new(Mutex::new(self)), fut)
-            .await
-    }
-
     /// The timeouts in scope for this task: the innermost `Db` scope, else
     /// the request defaults, else `None`.
     pub(crate) fn current() -> Option<Self> {
-        TX_TIMEOUTS.try_with(|t| *t).ok().or_else(|| {
-            REQUEST_TX_TIMEOUTS
-                .try_with(|cell| {
-                    *cell
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                })
-                .ok()
-        })
+        TX_TIMEOUTS
+            .try_with(|t| *t)
+            .ok()
+            .or_else(|| REQUEST_TX_TIMEOUTS.try_with(std::cell::Cell::get).ok())
+    }
+}
+
+/// Tower layer that puts the request defaults of [`TxTimeouts`] in scope for
+/// each request (#3057).
+///
+/// It has a named future, so a request allocates no box and does not clone
+/// the inner service (#2830).
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        dead_code,
+        reason = "`SET LOCAL` is Postgres-only; SQLite sends nothing"
+    )
+)]
+#[derive(Clone, Copy)]
+pub(crate) struct TxTimeoutsLayer(TxTimeouts);
+
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        dead_code,
+        reason = "`SET LOCAL` is Postgres-only; SQLite sends nothing"
+    )
+)]
+impl TxTimeoutsLayer {
+    pub(crate) const fn new(timeouts: TxTimeouts) -> Self {
+        Self(timeouts)
+    }
+}
+
+impl<S> tower::Layer<S> for TxTimeoutsLayer {
+    type Service = TxTimeoutsService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        TxTimeoutsService {
+            inner,
+            timeouts: self.0,
+        }
+    }
+}
+
+/// Tower service of [`TxTimeoutsLayer`].
+#[cfg_attr(
+    feature = "sqlite",
+    allow(
+        dead_code,
+        reason = "`SET LOCAL` is Postgres-only; SQLite sends nothing"
+    )
+)]
+#[derive(Clone)]
+pub(crate) struct TxTimeoutsService<S> {
+    inner: S,
+    timeouts: TxTimeouts,
+}
+
+impl<S, Req> tower::Service<Req> for TxTimeoutsService<S>
+where
+    S: tower::Service<Req>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = tokio::task::futures::TaskLocalFuture<std::cell::Cell<TxTimeouts>, S::Future>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Req) -> Self::Future {
+        // The inner call can record a route override. The future starts with
+        // the value that the call left.
+        let (fut, timeouts) =
+            REQUEST_TX_TIMEOUTS.sync_scope(std::cell::Cell::new(self.timeouts), || {
+                let fut = self.inner.call(req);
+                (fut, REQUEST_TX_TIMEOUTS.with(std::cell::Cell::get))
+            });
+        REQUEST_TX_TIMEOUTS.scope(std::cell::Cell::new(timeouts), fut)
     }
 }
 
@@ -273,9 +339,9 @@ pub fn note_route_statement_timeout(parts: &axum::http::request::Parts) {
 pub(crate) fn note_statement_timeout(timeout: StatementTimeout) {
     let ms = pg_timeout_ms(Some(timeout.0));
     let _ = REQUEST_TX_TIMEOUTS.try_with(|cell| {
-        cell.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .statement_ms = Some(ms);
+        let mut timeouts = cell.get();
+        timeouts.statement_ms = Some(ms);
+        cell.set(timeouts);
     });
 }
 
@@ -298,7 +364,7 @@ tokio::task_local! {
     /// The request's [`TxTimeouts`], for code that opens a transaction on a
     /// connection of its own (generated repositories). Set by the request
     /// layer. Mutable so that a route override can replace the default.
-    static REQUEST_TX_TIMEOUTS: Arc<Mutex<TxTimeouts>>;
+    static REQUEST_TX_TIMEOUTS: std::cell::Cell<TxTimeouts>;
 }
 
 /// Issue the in-scope [`TxTimeouts`] as `SET LOCAL`, at transaction depth 1
@@ -4589,6 +4655,46 @@ mod tests {
                 "SET LOCAL statement_timeout = 30000; \
                  SET LOCAL idle_in_transaction_session_timeout = DEFAULT"
             )
+        );
+    }
+
+    /// The request defaults are in scope for the synchronous inner call and
+    /// for the inner future. A route override in the future changes them.
+    #[tokio::test]
+    async fn tx_timeouts_layer_scopes_the_inner_call_and_future() {
+        use std::time::Duration;
+        use tower::{Layer as _, Service as _, ServiceExt as _};
+
+        let defaults = super::TxTimeouts::new(Some(Duration::from_secs(30)), None);
+        let mut svc = super::TxTimeoutsLayer::new(defaults).layer(tower::service_fn(
+            |_req: axum::extract::Request| {
+                let at_call = super::TxTimeouts::current();
+                async move {
+                    let before = super::TxTimeouts::current();
+                    super::note_statement_timeout(super::StatementTimeout(Duration::from_secs(90)));
+                    Ok::<_, std::convert::Infallible>((
+                        at_call,
+                        before,
+                        super::TxTimeouts::current(),
+                    ))
+                }
+            },
+        ));
+
+        let request = axum::extract::Request::new(axum::body::Body::empty());
+        let (at_call, before, after) = svc.ready().await.unwrap().call(request).await.unwrap();
+
+        assert_eq!(at_call, Some(defaults), "in scope for the inner call");
+        assert_eq!(before, Some(defaults), "in scope for the inner future");
+        assert_eq!(
+            after,
+            Some(super::TxTimeouts::new(Some(Duration::from_secs(90)), None)),
+            "a route override changes the request value"
+        );
+        assert_eq!(
+            super::TxTimeouts::current(),
+            None,
+            "no scope after the request"
         );
     }
 

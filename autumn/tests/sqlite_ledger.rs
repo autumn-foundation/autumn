@@ -97,6 +97,14 @@ mod schema {
     }
 
     autumn_web::reexports::diesel::table! {
+        lg_hooked_notes (id) {
+            id -> Int8,
+            body -> Text,
+            deleted_at -> Nullable<Timestamp>,
+        }
+    }
+
+    autumn_web::reexports::diesel::table! {
         lg_cascade_parents (id) {
             id -> Int8,
             name -> Text,
@@ -141,8 +149,9 @@ mod schema {
 }
 
 use schema::{
-    lg_cascade_children, lg_cascade_parents, lg_effective_notes, lg_invoices, lg_movable_invoices,
-    lg_renamed_notes, lg_sealed_notes, lg_secret_notes, lg_tenant_invoices, lg_vault_notes,
+    lg_cascade_children, lg_cascade_parents, lg_effective_notes, lg_hooked_notes, lg_invoices,
+    lg_movable_invoices, lg_renamed_notes, lg_sealed_notes, lg_secret_notes, lg_tenant_invoices,
+    lg_vault_notes,
 };
 
 #[autumn_web::model(table = "lg_invoices")]
@@ -380,6 +389,36 @@ pub struct LgSecretNote {
 #[autumn_web::repository(LgSecretNote, table = "lg_secret_notes", soft_delete, ledgered = true)]
 pub trait LgSecretNoteRepository {}
 
+/// A ledgered model with mutation hooks. The hooked bulk paths are other
+/// generated code than the plain ones (#3345).
+#[autumn_web::model(table = "lg_hooked_notes")]
+pub struct LgHookedNote {
+    #[id]
+    pub id: i64,
+    pub body: String,
+    #[default]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+/// Hooks that do nothing. They only select the hooked code path.
+#[derive(Clone, Default)]
+pub struct LgHookedNoteHooks;
+
+impl autumn_web::hooks::MutationHooks for LgHookedNoteHooks {
+    type Model = LgHookedNote;
+    type NewModel = NewLgHookedNote;
+    type UpdateModel = UpdateLgHookedNote;
+}
+
+#[autumn_web::repository(
+    LgHookedNote,
+    table = "lg_hooked_notes",
+    hooks = LgHookedNoteHooks,
+    soft_delete,
+    ledgered = true
+)]
+pub trait LgHookedNoteRepository {}
+
 /// The migration SQL Autumn actually ships, applied verbatim.
 ///
 /// Included rather than hand-copied so a syntax error or a schema change in
@@ -476,6 +515,11 @@ async fn boot_pool_without_high_water(db_name: &str) -> SqlitePool {
                  id INTEGER PRIMARY KEY AUTOINCREMENT, \
                  body TEXT NOT NULL, \
                  secret TEXT NOT NULL, \
+                 deleted_at TIMESTAMP\
+             )",
+            "CREATE TABLE lg_hooked_notes (\
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                 body TEXT NOT NULL, \
                  deleted_at TIMESTAMP\
              )",
             "CREATE TABLE lg_cascade_parents (\
@@ -4503,4 +4547,588 @@ async fn a_diff_across_a_schema_boundary_compares_both_sides_in_the_current_shap
     assert_eq!((diff.from_seq, diff.to_seq), (Some(1), Some(3)));
     let fields: Vec<&str> = diff.changes.iter().map(|c| c.column.as_str()).collect();
     assert_eq!(fields, vec!["title"], "only the real change: {fields:?}");
+}
+
+// ── Bulk writes batch the ledger statements (#3345) ──────────────────
+
+/// Records the SQL of each statement on one connection.
+#[derive(Clone, Default)]
+struct StatementLog(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl diesel::connection::Instrumentation for StatementLog {
+    fn on_connection_event(&mut self, event: diesel::connection::InstrumentationEvent<'_>) {
+        if let diesel::connection::InstrumentationEvent::StartQuery { query, .. } = event {
+            self.0
+                .lock()
+                .expect("statement log lock")
+                .push(query.to_string());
+        }
+    }
+}
+
+impl StatementLog {
+    /// Install the log on the one pooled connection.
+    async fn install(pool: &SqlitePool) -> Self {
+        use diesel_async::AsyncConnection as _;
+        let log = Self::default();
+        let mut conn = pool.get().await.expect("conn");
+        conn.set_instrumentation(log.clone());
+        log
+    }
+
+    /// Run `write`, then count its history, ledger and reload statements.
+    ///
+    /// The data write itself is not counted: on `SQLite` it is one statement
+    /// for each row.
+    async fn bookkeeping<F: std::future::Future<Output = ()>>(
+        &self,
+        table: &str,
+        write: F,
+    ) -> usize {
+        self.0.lock().expect("statement log lock").clear();
+        write.await;
+        let reload = format!("FROM `{table}`");
+        self.0
+            .lock()
+            .expect("statement log lock")
+            .iter()
+            .filter(|sql| {
+                sql.contains("_autumn_version_history")
+                    || sql.contains("_autumn_ledger_")
+                    || (sql.trim_start().starts_with("SELECT") && sql.contains(&reload))
+            })
+            .count()
+    }
+}
+
+fn new_invoices(prefix: &str, n: usize) -> Vec<NewLgInvoice> {
+    (0..n)
+        .map(|i| NewLgInvoice {
+            reference: format!("{prefix}-{i}"),
+            amount_cents: i64::try_from(i).expect("small index"),
+            amount_rate: 1.5,
+            metadata: "{}".to_string(),
+        })
+        .collect()
+}
+
+async fn assert_every_chain_intact(repo: &PgLgInvoiceRepository, ids: &[i64], revisions: usize) {
+    for id in ids {
+        let chain = repo.ledger_revisions(*id).await.expect("revisions");
+        assert_eq!(chain.len(), revisions, "record {id}");
+        let report = repo.ledger_verify(*id).await.expect("verify");
+        assert!(report.is_intact(), "record {id}: {report:?}");
+    }
+}
+
+/// The history, ledger and reload statements of a bulk write do not grow with
+/// the batch size. Before #3345 each row cost 5 statements.
+#[tokio::test]
+async fn bulk_ledger_statements_do_not_grow_with_the_batch() {
+    let pool = boot_pool("lg_bulk_count").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let log = StatementLog::install(&pool).await;
+
+    let mut small = Vec::new();
+    let save_small = log
+        .bookkeeping("lg_invoices", async {
+            small = repo
+                .save_many(&new_invoices("S", 3))
+                .await
+                .expect("save_many small");
+        })
+        .await;
+    let mut large = Vec::new();
+    let save_large = log
+        .bookkeeping("lg_invoices", async {
+            large = repo
+                .save_many(&new_invoices("L", 30))
+                .await
+                .expect("save_many large");
+        })
+        .await;
+    assert_eq!(
+        save_small, save_large,
+        "save_many: 3 rows cost {save_small} statements, 30 rows cost {save_large}"
+    );
+    // History INSERT, reload, chain-state read, revision INSERT, mark upsert.
+    assert_eq!(save_small, 5, "save_many");
+
+    let small_ids: Vec<i64> = small.iter().map(|r| r.id).collect();
+    let large_ids: Vec<i64> = large.iter().map(|r| r.id).collect();
+    let changes = UpdateLgInvoice {
+        amount_cents: Patch::Set(7),
+        ..Default::default()
+    };
+    let update_small = log
+        .bookkeeping("lg_invoices", async {
+            repo.update_many(&small_ids, &changes)
+                .await
+                .expect("update_many small");
+        })
+        .await;
+    let update_large = log
+        .bookkeeping("lg_invoices", async {
+            repo.update_many(&large_ids, &changes)
+                .await
+                .expect("update_many large");
+        })
+        .await;
+    assert_eq!(
+        update_small, update_large,
+        "update_many: 3 rows cost {update_small} statements, 30 rows cost {update_large}"
+    );
+    assert!(update_small >= 5, "update_many: {update_small}");
+
+    let delete_small = log
+        .bookkeeping("lg_invoices", async {
+            repo.delete_many(&small_ids)
+                .await
+                .expect("delete_many small");
+        })
+        .await;
+    let delete_large = log
+        .bookkeeping("lg_invoices", async {
+            repo.delete_many(&large_ids)
+                .await
+                .expect("delete_many large");
+        })
+        .await;
+    assert_eq!(
+        delete_small, delete_large,
+        "delete_many: 3 rows cost {delete_small} statements, 30 rows cost {delete_large}"
+    );
+    assert!(delete_small >= 5, "delete_many: {delete_small}");
+
+    assert_every_chain_intact(&repo, &small_ids, 3).await;
+    assert_every_chain_intact(&repo, &large_ids, 3).await;
+}
+
+/// The hooked bulk paths batch too, and the hooked `update_many` appends a
+/// revision for each row.
+#[tokio::test]
+async fn hooked_bulk_ledger_statements_do_not_grow_with_the_batch() {
+    let pool = boot_pool("lg_bulk_count_hooked").await;
+    let repo = PgLgHookedNoteRepository::with_pool_untracked(pool.clone());
+    let log = StatementLog::install(&pool).await;
+    let notes = |n: usize| -> Vec<NewLgHookedNote> {
+        (0..n)
+            .map(|i| NewLgHookedNote {
+                body: format!("note {i}"),
+            })
+            .collect()
+    };
+
+    let mut small = Vec::new();
+    let save_small = log
+        .bookkeeping("lg_hooked_notes", async {
+            small = repo.save_many(&notes(3)).await.expect("save_many small");
+        })
+        .await;
+    let mut large = Vec::new();
+    let save_large = log
+        .bookkeeping("lg_hooked_notes", async {
+            large = repo.save_many(&notes(30)).await.expect("save_many large");
+        })
+        .await;
+    assert_eq!(save_small, save_large, "hooked save_many");
+    assert_eq!(save_small, 5, "hooked save_many");
+
+    let small_ids: Vec<i64> = small.iter().map(|r| r.id).collect();
+    let large_ids: Vec<i64> = large.iter().map(|r| r.id).collect();
+    let changes = UpdateLgHookedNote {
+        body: Patch::Set("changed".to_string()),
+    };
+    let update_small = log
+        .bookkeeping("lg_hooked_notes", async {
+            repo.update_many(&small_ids, &changes)
+                .await
+                .expect("update_many small");
+        })
+        .await;
+    let update_large = log
+        .bookkeeping("lg_hooked_notes", async {
+            repo.update_many(&large_ids, &changes)
+                .await
+                .expect("update_many large");
+        })
+        .await;
+    assert_eq!(update_small, update_large, "hooked update_many");
+    assert!(update_small >= 5, "hooked update_many: {update_small}");
+
+    let delete_small = log
+        .bookkeeping("lg_hooked_notes", async {
+            repo.delete_many(&small_ids)
+                .await
+                .expect("delete_many small");
+        })
+        .await;
+    let delete_large = log
+        .bookkeeping("lg_hooked_notes", async {
+            repo.delete_many(&large_ids)
+                .await
+                .expect("delete_many large");
+        })
+        .await;
+    assert_eq!(delete_small, delete_large, "hooked delete_many");
+    assert!(delete_small >= 5, "hooked delete_many: {delete_small}");
+
+    for id in small_ids.iter().chain(&large_ids) {
+        let chain = repo.ledger_revisions(*id).await.expect("revisions");
+        assert_eq!(
+            chain.iter().map(|r| r.op).collect::<Vec<_>>(),
+            vec![VersionOp::Insert, VersionOp::Update, VersionOp::Delete],
+            "the hooked update_many appends a revision too: record {id}"
+        );
+        assert_eq!(chain[1].snapshot["body"], "changed", "record {id}");
+        let report = repo.ledger_verify(*id).await.expect("verify");
+        assert!(report.is_intact(), "record {id}: {report:?}");
+
+        // The history diff pairs each row with its own before-row.
+        let history = repo
+            .version_history(*id, autumn_web::version_history::VersionFilter::default())
+            .await
+            .expect("history");
+        let update = &history.entries[1];
+        assert_eq!(update.op, VersionOp::Update);
+        let body = update
+            .changes
+            .iter()
+            .find(|c| c.column == "body")
+            .expect("the body change");
+        assert_eq!(
+            body.before,
+            Some(serde_json::json!(chain[0].snapshot["body"]))
+        );
+        assert_eq!(body.after, Some(serde_json::json!("changed")));
+    }
+}
+
+/// A bulk write over many data chunks chains every row.
+#[tokio::test]
+async fn a_bulk_write_over_many_chunks_chains_every_row() {
+    let pool = boot_pool("lg_bulk_large").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+
+    let created = repo
+        .save_many(&new_invoices("BIG", 3_000))
+        .await
+        .expect("save_many");
+    let ids: Vec<i64> = created.iter().map(|r| r.id).collect();
+    repo.delete_many(&ids).await.expect("delete_many");
+
+    assert_every_chain_intact(&repo, &ids, 2).await;
+    let history = repo
+        .version_history(
+            ids[2_999],
+            autumn_web::version_history::VersionFilter::default(),
+        )
+        .await
+        .expect("history");
+    assert_eq!(history.total, 2, "one history row for each write");
+}
+
+fn update_append(record_id: i64, title: &str) -> autumn_web::ledger::LedgerAppend<'static> {
+    autumn_web::ledger::LedgerAppend {
+        table_name: "lg_invoices",
+        tenant_id: None,
+        record_id,
+        op: VersionOp::Update,
+        actor: "batch",
+        request_id: None,
+        snapshot: serde_json::json!({ "id": record_id, "reference": title }),
+        valid_from: None,
+    }
+}
+
+/// Two appends for one record in one batch make one chain, in input order.
+#[tokio::test]
+async fn a_repeated_record_in_one_batch_gets_one_chain() {
+    let pool = boot_pool("lg_bulk_repeat").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save(&new_invoices("R", 1).remove(0))
+        .await
+        .expect("save");
+
+    {
+        let mut conn = pool.get().await.expect("conn");
+        autumn_web::ledger::append_revisions(
+            &mut conn,
+            vec![
+                update_append(created.id, "first"),
+                update_append(created.id, "second"),
+            ],
+        )
+        .await
+        .expect("append a repeated record");
+    }
+
+    let chain = repo.ledger_revisions(created.id).await.expect("revisions");
+    assert_eq!(
+        chain.iter().map(|r| r.seq).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(chain[1].snapshot["reference"], "first");
+    assert_eq!(chain[2].snapshot["reference"], "second");
+    assert_eq!(chain[2].prev_hash.as_deref(), Some(chain[1].hash.as_str()));
+    assert!(chain[2].recorded_at >= chain[1].recorded_at);
+    assert!(
+        autumn_web::ledger::verify_chain(created.id, &chain).is_intact(),
+        "the batch must make the chain two single appends make"
+    );
+
+    let mark: i64 = {
+        #[derive(diesel::QueryableByName)]
+        struct Mark {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            high_seq: i64,
+        }
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "SELECT high_seq FROM _autumn_ledger_high_water \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(created.id)
+        .get_result::<Mark>(&mut *conn)
+        .await
+        .expect("mark")
+        .high_seq
+    };
+    assert_eq!(mark, 3, "the mark names the last revision of the batch");
+}
+
+/// One row that fails a #2323 guard refuses the whole batch.
+#[tokio::test]
+async fn one_refused_row_refuses_the_whole_batch() {
+    let pool = boot_pool("lg_bulk_refuse").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save_many(&new_invoices("G", 2))
+        .await
+        .expect("save_many");
+    let (good, bad) = (created[0].id, created[1].id);
+
+    let mut conn = pool.get().await.expect("conn");
+    diesel::sql_query(
+        "DELETE FROM _autumn_ledger_high_water \
+         WHERE table_name = 'lg_invoices' AND record_id = ?",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(bad)
+    .execute(&mut *conn)
+    .await
+    .expect("delete one mark");
+
+    let err = autumn_web::ledger::append_revisions(
+        &mut conn,
+        vec![update_append(good, "good"), update_append(bad, "bad")],
+    )
+    .await
+    .expect_err("a missing mark must refuse the batch");
+    drop(conn);
+    let detail = err.to_string();
+    assert!(
+        detail.contains("no high-water mark"),
+        "the single-row guard text: {detail}"
+    );
+    assert_eq!(
+        repo.ledger_revisions(good).await.expect("revisions").len(),
+        1,
+        "no revision is written when one row of the batch is refused"
+    );
+}
+
+/// Batches past the `SQLite` bind limit split into chunks and lose no row.
+/// No generated path sends a batch this large: each data chunk holds 1,000
+/// rows or fewer.
+#[tokio::test]
+async fn batches_past_the_bind_limit_write_every_row() {
+    const N: i64 = 11_000;
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let pool = boot_pool("lg_bulk_bind_limit").await;
+    let mut conn = pool.get().await.expect("conn");
+
+    let rows: Vec<autumn_web::version_history::VersionHistoryRow<'_>> = (1..=N)
+        .map(|record_id| autumn_web::version_history::VersionHistoryRow {
+            tenant_id: None,
+            record_id,
+            op: VersionOp::Insert,
+            actor: "batch",
+            request_id: None,
+            changes_json: "[]".to_string(),
+        })
+        .collect();
+    autumn_web::version_history::append_version_history_many(&mut conn, "lg_invoices", &rows)
+        .await
+        .expect("history batch");
+    // Two appends for the last record cross a chunk edge of the revision INSERT.
+    let mut appends: Vec<_> = (1..=N).map(|id| update_append(id, "one")).collect();
+    appends.push(update_append(N, "two"));
+    autumn_web::ledger::append_revisions(&mut conn, appends)
+        .await
+        .expect("revision batch");
+
+    let count = |sql: &'static str| diesel::sql_query(sql);
+    let history: Count = count("SELECT COUNT(*) AS n FROM _autumn_version_history")
+        .get_result(&mut *conn)
+        .await
+        .expect("count history");
+    let revisions: Count = count("SELECT COUNT(*) AS n FROM _autumn_ledger_revisions")
+        .get_result(&mut *conn)
+        .await
+        .expect("count revisions");
+    let marks: Count = count(
+        "SELECT COUNT(*) AS n FROM _autumn_ledger_high_water \
+         WHERE high_seq = CASE WHEN record_id = 11000 THEN 2 ELSE 1 END",
+    )
+    .get_result(&mut *conn)
+    .await
+    .expect("count marks");
+    drop(conn);
+    assert_eq!((history.n, revisions.n, marks.n), (N, N + 1, N));
+
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    for id in [1, 10_921, 10_922, N] {
+        let chain = repo.ledger_revisions(id).await.expect("revisions");
+        assert!(
+            autumn_web::ledger::verify_chain(id, &chain).is_intact(),
+            "record {id}"
+        );
+    }
+}
+
+/// Tenant-scoped bulk writes chain each row inside its tenant.
+#[tokio::test]
+async fn tenant_scoped_bulk_writes_chain_every_row() {
+    let pool = boot_pool("lg_bulk_tenant").await;
+    let repo = PgLgTenantInvoiceRepository::with_pool_untracked(pool);
+    with_tenant("tenant-a".to_string(), async {
+        let created = repo
+            .save_many(&[
+                NewLgTenantInvoice {
+                    reference: "T-1".to_string(),
+                },
+                NewLgTenantInvoice {
+                    reference: "T-2".to_string(),
+                },
+            ])
+            .await
+            .expect("save_many");
+        let ids: Vec<i64> = created.iter().map(|r| r.id).collect();
+        repo.delete_many(&ids).await.expect("delete_many");
+        for id in &ids {
+            let chain = repo.ledger_revisions(*id).await.expect("revisions");
+            assert_eq!(chain.len(), 2, "record {id}");
+            assert!(
+                chain
+                    .iter()
+                    .all(|r| r.tenant_id.as_deref() == Some("tenant-a")),
+                "record {id}"
+            );
+            let report = repo.ledger_verify(*id).await.expect("verify");
+            assert!(report.is_intact(), "record {id}: {report:?}");
+        }
+    })
+    .await;
+}
+
+/// One `upsert_many` that inserts and updates appends the right op for each
+/// row.
+#[tokio::test]
+async fn a_mixed_upsert_many_appends_an_insert_or_an_update() {
+    let pool = boot_pool("lg_bulk_upsert").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let mut existing = repo
+        .save(&new_invoices("U", 1).remove(0))
+        .await
+        .expect("save");
+    existing.amount_cents = 99;
+    let mut fresh = existing.clone();
+    fresh.id = 900_001;
+    fresh.reference = "U-new".to_string();
+
+    repo.upsert_many(&[existing.clone(), fresh])
+        .await
+        .expect("upsert_many");
+
+    let old = repo.ledger_revisions(existing.id).await.expect("revisions");
+    assert_eq!(
+        old.iter().map(|r| r.op).collect::<Vec<_>>(),
+        vec![VersionOp::Insert, VersionOp::Update]
+    );
+    assert_eq!(old[1].snapshot["amount_cents"], 99);
+    let new = repo.ledger_revisions(900_001).await.expect("revisions");
+    assert_eq!(
+        new.iter().map(|r| r.op).collect::<Vec<_>>(),
+        vec![VersionOp::Insert]
+    );
+    for id in [existing.id, 900_001] {
+        let report = repo.ledger_verify(id).await.expect("verify");
+        assert!(report.is_intact(), "record {id}: {report:?}");
+    }
+}
+
+/// The batch path of `save_many_skip_invalid` chains every row.
+#[tokio::test]
+async fn save_many_skip_invalid_chains_every_row() {
+    let pool = boot_pool("lg_bulk_skip").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool);
+    let (saved, failed) = repo
+        .save_many_skip_invalid(&new_invoices("K", 3))
+        .await
+        .expect("save_many_skip_invalid");
+    assert!(failed.is_empty(), "{failed:?}");
+    let ids: Vec<i64> = saved.iter().map(|r| r.id).collect();
+    assert_every_chain_intact(&repo, &ids, 1).await;
+}
+
+/// A refused row in a generated bulk write rolls back the whole write: the
+/// data, the history and the other rows' revisions.
+#[tokio::test]
+async fn a_refused_bulk_delete_rolls_back_every_row() {
+    let pool = boot_pool("lg_bulk_rollback").await;
+    let repo = PgLgInvoiceRepository::with_pool_untracked(pool.clone());
+    let created = repo
+        .save_many(&new_invoices("B", 2))
+        .await
+        .expect("save_many");
+    let ids: Vec<i64> = created.iter().map(|r| r.id).collect();
+    {
+        let mut conn = pool.get().await.expect("conn");
+        diesel::sql_query(
+            "DELETE FROM _autumn_ledger_high_water \
+             WHERE table_name = 'lg_invoices' AND record_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(ids[1])
+        .execute(&mut *conn)
+        .await
+        .expect("delete one mark");
+    }
+
+    let err = repo
+        .delete_many(&ids)
+        .await
+        .expect_err("a missing mark must refuse the bulk delete");
+    assert!(err.to_string().contains("no high-water mark"), "{err}");
+    for id in &ids {
+        let row = repo.find_by_id(*id).await.expect("find").expect("row");
+        assert!(row.deleted_at.is_none(), "record {id} must not be deleted");
+        let history = repo
+            .version_history(*id, autumn_web::version_history::VersionFilter::default())
+            .await
+            .expect("history");
+        assert_eq!(history.total, 1, "record {id}: no delete history row");
+    }
+    assert_eq!(
+        repo.ledger_revisions(ids[0])
+            .await
+            .expect("revisions")
+            .len(),
+        1,
+        "the good row gets no revision either"
+    );
 }

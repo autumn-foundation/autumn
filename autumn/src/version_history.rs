@@ -694,9 +694,149 @@ pub async fn append_version_history(
     }
 }
 
+/// One version-history row of a bulk write (#3345).
+///
+/// The generated code collects a batch of these, then
+/// [`append_version_history_many`] writes it. The strings are borrowed from the
+/// records and contexts the bulk write holds.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct VersionHistoryRow<'a> {
+    /// Active tenant for a `tenant_scoped` repository, else `None`.
+    pub tenant_id: Option<&'a str>,
+    /// Primary key of the mutated record.
+    pub record_id: i64,
+    /// Which mutation produced this entry.
+    pub op: VersionOp,
+    /// Resolved actor, as for [`VersionHistoryWrite::actor`].
+    pub actor: &'a str,
+    /// Originating request id, when one is in scope.
+    pub request_id: Option<&'a str>,
+    /// Pre-serialized `Vec<ColumnChange>` JSON.
+    pub changes_json: String,
+}
+
+/// Postgres form of the batched history INSERT (#3345).
+///
+/// One array for each column, so the SQL does not change with the batch size.
+/// `ORDER BY u.ord` gives the rows their ids in input order.
+#[cfg(feature = "db")]
+#[allow(
+    dead_code,
+    reason = "exactly one of the two backend forms is reachable in any given build; \
+              both are asserted by this module's tests so neither can drift unseen"
+)]
+pub(crate) const PG_INSERT_MANY_SQL: &str = "INSERT INTO _autumn_version_history \
+     (table_name, tenant_id, record_id, op, actor, request_id, changes) \
+     SELECT $1, u.tenant_id, u.record_id, u.op, u.actor, u.request_id, u.changes::jsonb \
+     FROM unnest($2::text[], $3::int8[], $4::text[], $5::text[], $6::text[], $7::text[]) \
+     WITH ORDINALITY AS u(tenant_id, record_id, op, actor, request_id, changes, ord) \
+     ORDER BY u.ord";
+
+/// Write the history rows of one bulk write inside the caller's transaction.
+///
+/// Postgres sends one statement. `SQLite` sends one statement for each chunk
+/// of rows below [`crate::repository::MAX_BIND_PARAMS`]. Each row stores the
+/// same values as [`append_version_history`] stores.
+///
+/// # Errors
+///
+/// Returns the database error if an INSERT fails.
+#[cfg(feature = "db")]
+#[doc(hidden)]
+pub async fn append_version_history_many(
+    conn: &mut crate::db::RuntimeConnection,
+    table_name: &'static str,
+    rows: &[VersionHistoryRow<'_>],
+) -> crate::AutumnResult<()> {
+    use diesel::sql_types::{BigInt, Nullable, Text};
+    use diesel_async::RunQueryDsl;
+
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "sqlite"))]
+    {
+        use diesel::sql_types::Array;
+
+        diesel::sql_query(PG_INSERT_MANY_SQL)
+            .bind::<Text, _>(table_name)
+            .bind::<Array<Nullable<Text>>, _>(rows.iter().map(|r| r.tenant_id).collect::<Vec<_>>())
+            .bind::<Array<BigInt>, _>(rows.iter().map(|r| r.record_id).collect::<Vec<_>>())
+            .bind::<Array<Text>, _>(rows.iter().map(|r| r.op.as_str()).collect::<Vec<_>>())
+            .bind::<Array<Text>, _>(rows.iter().map(|r| r.actor).collect::<Vec<_>>())
+            .bind::<Array<Nullable<Text>>, _>(rows.iter().map(|r| r.request_id).collect::<Vec<_>>())
+            .bind::<Array<Text>, _>(
+                rows.iter()
+                    .map(|r| r.changes_json.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .execute(conn)
+            .await
+            .map_err(crate::AutumnError::from)?;
+        Ok(())
+    }
+
+    #[cfg(feature = "sqlite")]
+    {
+        use diesel::sql_types::TimestamptzSqlite;
+
+        const COLUMNS: usize = 8;
+        for chunk in rows.chunks(crate::repository::MAX_BIND_PARAMS / COLUMNS) {
+            let sql = format!(
+                "INSERT INTO _autumn_version_history \
+                 (table_name, tenant_id, record_id, op, actor, request_id, changes, recorded_at) \
+                 VALUES {}",
+                vec!["(?, ?, ?, ?, ?, ?, ?, ?)"; chunk.len()].join(", ")
+            );
+            let mut query = diesel::sql_query(sql).into_boxed();
+            for row in chunk {
+                // The same bind as the single-row path: see `append_version_history`.
+                let recorded_at = crate::time::ambient_now();
+                query = query
+                    .bind::<Text, _>(table_name)
+                    .bind::<Nullable<Text>, _>(row.tenant_id)
+                    .bind::<BigInt, _>(row.record_id)
+                    .bind::<Text, _>(row.op.as_str())
+                    .bind::<Text, _>(row.actor)
+                    .bind::<Nullable<Text>, _>(row.request_id)
+                    .bind::<Text, _>(row.changes_json.as_str())
+                    .bind::<TimestamptzSqlite, _>(recorded_at);
+            }
+            query
+                .execute(&mut *conn)
+                .await
+                .map_err(crate::AutumnError::from)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn the_batched_history_insert_keeps_the_single_row_shape() {
+        // #3345: the same columns and the same jsonb cast as the single-row
+        // form, and a fixed SQL text for every batch size.
+        assert!(
+            PG_INSERT_MANY_SQL
+                .contains("(table_name, tenant_id, record_id, op, actor, request_id, changes)"),
+            "{PG_INSERT_MANY_SQL}"
+        );
+        assert!(
+            PG_INSERT_MANY_SQL.contains("u.changes::jsonb"),
+            "{PG_INSERT_MANY_SQL}"
+        );
+        assert!(
+            PG_INSERT_MANY_SQL.contains("unnest("),
+            "{PG_INSERT_MANY_SQL}"
+        );
+    }
 
     /// The two backend forms of the version-history INSERT (#1996).
     ///

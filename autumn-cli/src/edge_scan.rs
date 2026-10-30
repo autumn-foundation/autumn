@@ -1053,7 +1053,7 @@ fn package_name_from_manifest(table: &toml::Table) -> Option<String> {
 /// is resolved; anything else (an OS-family shorthand like `windows`/`unix`,
 /// a key this table does not list, or a predicate this scan cannot parse) is
 /// treated as NOT applying. That is the opposite
-/// default from function-level `#[cfg(...)]` evaluation ([`eval_cfg_attr`],
+/// default from function-level `#[cfg(...)]` evaluation ([`eval_cfg_meta`],
 /// which stays conservative by assuming *true*): crediting an inapplicable
 /// target here produces a phantom route, not a merely missed one, so
 /// "cannot resolve" must mean "does not match."
@@ -2830,7 +2830,7 @@ fn attr_name(attr: &syn::Attribute) -> Option<String> {
 /// `#[edge]` marker arrived this way was invisible to the scan entirely:
 /// not merely excluded, but never even considered a candidate `EdgeFn` no
 /// matter how the build was configured (Codex review on #2739, round 27,
-/// P1). Conservative in the same direction as [`eval_cfg_attr`]: only a
+/// P1). Conservative in the same direction as [`eval_cfg_meta`]: only a
 /// condition that DEFINITELY resolves false drops the payload's names — an
 /// unparseable condition (`target_os`, ...) still lets them through, since
 /// wrongly hiding a real `#[edge]` marker is the dangerous direction here.
@@ -2856,7 +2856,7 @@ fn attr_names_including_cfg_attr(
 
 /// Parses a `cfg_attr(condition, meta1, meta2, ...)` meta list's tokens into
 /// the condition's resolution — `None` for "unresolvable", the same
-/// convention [`eval_cfg_attr`] uses for a plain `#[cfg(...)]` — and its
+/// convention [`eval_cfg_meta`] uses for a plain `#[cfg(...)]` — and its
 /// meta list (empty if the part after the condition fails to parse as one).
 /// `None` overall means the tokens aren't shaped like a `cfg_attr` payload
 /// at all (no top-level `,`).
@@ -3317,18 +3317,13 @@ impl CfgPredicate {
     }
 }
 
-/// Try to fully resolve one `#[cfg(...)]` attribute against `default_features`.
+/// Try to fully resolve the body of one `#[cfg(...)]` attribute against
+/// `default_features`.
 ///
 /// `None` means "stay conservative": a non-`cfg` attribute, a predicate this
 /// scan does not parse (`target_os`, ...), or one with trailing tokens it does
-/// not understand. A caller treats `None` the same as `Some(true)` — kept in
-/// the scan — so only `Some(false)` ever excludes a function.
-fn eval_cfg_attr(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> Option<bool> {
-    eval_cfg_meta(&attr.meta, default_features)
-}
-
-/// [`eval_cfg_attr`] on the body of an attribute (`cfg(...)`). `autumn a11y
-/// verify` reads tokens, not a `syn` AST, so it calls this directly.
+/// not understand. A caller treats `None` the same as `Some(true)`: only
+/// `Some(false)` ever excludes an item.
 pub fn eval_cfg_meta(meta: &syn::Meta, default_features: &BTreeSet<String>) -> Option<bool> {
     if !meta.path().is_ident("cfg") {
         return None;
@@ -3342,11 +3337,11 @@ pub fn eval_cfg_meta(meta: &syn::Meta, default_features: &BTreeSet<String>) -> O
 }
 
 /// Whether `attr`, on its own, excludes whatever it's attached to: either a
-/// literal `#[cfg(...)]` that [`eval_cfg_attr`] resolves as definitely
+/// literal `#[cfg(...)]` that [`eval_cfg_meta`] resolves as definitely
 /// false, or an active `#[cfg_attr(condition, cfg(inner), ...)]` whose
 /// injected `cfg(...)` [`cfg_attr_injects_a_false_cfg`] resolves as
 /// definitely false the same way. Every AST-level cfg-exclusion check in
-/// this module should go through this rather than `eval_cfg_attr` alone —
+/// this module should go through this rather than `eval_cfg_meta` alone —
 /// `mod`-level exclusion checks (inline-module discovery in [`scan_items`]
 /// and out-of-line discovery in [`collect_out_of_line_mods`]) previously
 /// only checked the literal form, so `#[cfg_attr(feature = "outer",
@@ -3358,13 +3353,20 @@ pub fn eval_cfg_meta(meta: &syn::Meta, default_features: &BTreeSet<String>) -> O
 /// #2739, round 33, P2; [`edge_fn`]'s own version of this check, added in
 /// round 29, was the only one already correct).
 fn attr_cfg_excludes(attr: &syn::Attribute, default_features: &BTreeSet<String>) -> bool {
-    if eval_cfg_attr(attr, default_features) == Some(false) {
+    meta_cfg_excludes(&attr.meta, default_features)
+}
+
+/// [`attr_cfg_excludes`] on the body of an attribute (`cfg(…)` or
+/// `cfg_attr(…)`). `autumn a11y verify` reads tokens, not a `syn` AST, so it
+/// calls this directly.
+pub fn meta_cfg_excludes(meta: &syn::Meta, default_features: &BTreeSet<String>) -> bool {
+    if eval_cfg_meta(meta, default_features) == Some(false) {
         return true;
     }
-    let syn::Meta::List(list) = &attr.meta else {
+    let syn::Meta::List(list) = meta else {
         return false;
     };
-    attr.path().is_ident("cfg_attr") && cfg_attr_injects_a_false_cfg(list, default_features)
+    meta.path().is_ident("cfg_attr") && cfg_attr_injects_a_false_cfg(list, default_features)
 }
 
 /// Find every `edge_routes![...]` invocation in a token stream and record the
@@ -4481,7 +4483,7 @@ fn simple_fn_body_index(trees: &[TokenTree], fn_index: usize) -> Option<usize> {
 
 /// Whether the tokens immediately preceding `trees[item_index]` form one or
 /// more attributes (`#[...]`), at least one of which is a `#[cfg(...)]` that
-/// [`eval_cfg_attr`]'s own predicate grammar resolves as definitely false —
+/// [`eval_cfg_meta`]'s own predicate grammar resolves as definitely false —
 /// the token-level counterpart [`collect_registrations`] needs since it
 /// walks a raw `TokenStream`, never a `syn::Attribute` list.
 fn preceding_cfg_excludes(
@@ -4514,7 +4516,7 @@ fn preceding_cfg_excludes(
 /// Whether `group` — the bracketed contents of one `#[...]` attribute — is a
 /// `cfg(...)` whose predicate resolves as definitely false, using the same
 /// grammar and safe-direction fallback (unparseable stays *true*, i.e. not
-/// excluded) as [`eval_cfg_attr`] — or an active `#[cfg_attr(condition,
+/// excluded) as [`eval_cfg_meta`] — or an active `#[cfg_attr(condition,
 /// cfg(inner), ...)]` whose injected `cfg(...)` resolves as definitely
 /// false the same way [`cfg_attr_injects_a_false_cfg`] does at the
 /// `syn::Attribute` level. Every other cfg-check in [`collect_registrations`]
@@ -4727,7 +4729,7 @@ mod tests {
 
     /// An unresolvable `cfg_attr` condition (a key this scan's `CfgPredicate`
     /// grammar does not parse) stays conservative — the same "unresolvable
-    /// stays visible" direction `eval_cfg_attr` already uses for a plain
+    /// stays visible" direction `eval_cfg_meta` already uses for a plain
     /// `#[cfg(...)]` — since wrongly hiding a real `#[edge]` marker is the
     /// dangerous direction here, not wrongly keeping one.
     #[test]

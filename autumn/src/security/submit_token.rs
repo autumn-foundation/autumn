@@ -220,20 +220,66 @@ fn storage_key(token: &str) -> String {
 // ── Multipart / body scanning helpers ─────────────────────────────────────────
 
 #[cfg(feature = "idempotency")]
-fn scan_for_token(
-    bytes: &[u8],
-    is_urlencoded: bool,
-    boundary: Option<&str>,
-    field: &str,
-) -> Option<String> {
-    if is_urlencoded {
-        url::form_urlencoded::parse(bytes)
+const MULTIPART_PREFIX: &str = "multipart/";
+
+#[cfg(feature = "idempotency")]
+/// A request body that can carry a submit token.
+enum TokenForm {
+    UrlEncoded,
+    Multipart { boundary: String },
+}
+
+#[cfg(feature = "idempotency")]
+impl TokenForm {
+    /// The token form of a request, or `None` for a body that is not a form.
+    ///
+    /// The layer and the body scan both use this one check. If they did not
+    /// agree, a form could reach the handler with its token not read, and the
+    /// request would stay replayable.
+    fn of(headers: &HeaderMap) -> Option<Self> {
+        let content_type = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded") {
+            return Some(Self::UrlEncoded);
+        }
+        // Parse the boundary with `multer::parse_boundary` — the exact parser
+        // `axum::extract::Multipart` uses downstream (via `mime`) — so the guard
+        // and the extractor can never disagree about the boundary. A hand-rolled
+        // `split(';')` diverges on quoted values: `mime` permits a `;` inside a
+        // quoted parameter value, so `boundary="x;y"` parses to the boundary
+        // `x;y` in the real extractor while a split truncates it to `x`, leaving
+        // the form to be handled while its `_submit_token` is never
+        // scanned/consumed (the request stays REPLAYABLE). `parse_boundary` is
+        // case-insensitive on the media type / `boundary` param name and
+        // preserves the boundary VALUE's case; it returns `Err` for a
+        // non-multipart type.
+        //
+        // The parse allocates. Only a type that starts with `multipart/` can
+        // parse as multipart, so skip the parse for each other type.
+        let maybe_multipart = content_type
+            .trim_start()
+            .get(..MULTIPART_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(MULTIPART_PREFIX));
+        if !maybe_multipart {
+            return None;
+        }
+        multer::parse_boundary(content_type)
+            .ok()
+            .map(|boundary| Self::Multipart { boundary })
+    }
+}
+
+#[cfg(feature = "idempotency")]
+fn scan_for_token(bytes: &[u8], form: &TokenForm, field: &str) -> Option<String> {
+    match form {
+        TokenForm::UrlEncoded => url::form_urlencoded::parse(bytes)
             .find(|(key, _)| key == field)
-            .map(|(_, value)| value.into_owned())
-    } else if let Some(boundary) = boundary {
-        super::multipart_scan::scan_multipart_field(bytes, boundary, field).map(str::to_owned)
-    } else {
-        None
+            .map(|(_, value)| value.into_owned()),
+        TokenForm::Multipart { boundary } => {
+            super::multipart_scan::scan_multipart_field(bytes, boundary, field).map(str::to_owned)
+        }
     }
 }
 
@@ -303,50 +349,27 @@ async fn collect_body(body: Body, limit: usize) -> CollectedBody {
 }
 
 #[cfg(feature = "idempotency")]
-/// Extract the submitted `_submit_token` from the request body, returning the
-/// token (if present) and a request whose body is preserved for the handler.
+/// Extract the submitted `_submit_token` from the form body of `req`,
+/// returning the token (if present) and a request whose body is preserved for
+/// the handler.
 ///
 /// Returns `Err` when the body stream errors mid-read while scanning: the caller
 /// must reject the request rather than forward a truncated form (see
 /// [`CollectedBody::Errored`]).
 async fn extract_submitted_token(
     req: Request<Body>,
+    form: &TokenForm,
     field: &str,
     max_scan_bytes: usize,
 ) -> Result<(Option<String>, Request<Body>), axum::Error> {
     let (parts, body) = req.into_parts();
-
-    let content_type = parts
-        .headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
-    let is_urlencoded =
-        crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded");
-    // Parse the boundary with `multer::parse_boundary` — the exact parser
-    // `axum::extract::Multipart` uses downstream (via `mime`) — so the guard and
-    // the extractor can never disagree about the boundary. A hand-rolled
-    // `split(';')` diverges on quoted values: `mime` permits a `;` inside a
-    // quoted parameter value, so `boundary="x;y"` parses to the boundary `x;y`
-    // in the real extractor while a split truncates it to `x`, leaving the form
-    // to be handled while its `_submit_token` is never scanned/consumed (the
-    // request stays REPLAYABLE). `parse_boundary` is case-insensitive on the
-    // media type / `boundary` param name and preserves the boundary VALUE's
-    // case; it returns `Err` for a non-multipart type, so `.ok()` yields `None`.
-    let boundary = multer::parse_boundary(content_type).ok();
-    // content_type borrow ends here.
-
-    if !is_urlencoded && boundary.is_none() {
-        return Ok((None, Request::from_parts(parts, body)));
-    }
-
     match collect_body(body, max_scan_bytes).await {
         CollectedBody::Full(bytes) => {
-            let token = scan_for_token(&bytes, is_urlencoded, boundary.as_deref(), field);
+            let token = scan_for_token(&bytes, form, field);
             Ok((token, Request::from_parts(parts, Body::from(bytes))))
         }
         CollectedBody::Oversized { prefix, body } => {
-            let token = scan_for_token(&prefix, is_urlencoded, boundary.as_deref(), field);
+            let token = scan_for_token(&prefix, form, field);
             Ok((token, Request::from_parts(parts, body)))
         }
         CollectedBody::Errored(err) => Err(err),
@@ -552,7 +575,12 @@ where
 {
     type Response = Response<Body>;
     type Error = std::convert::Infallible;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    /// The inner future for a request with no token to read. A box only for a
+    /// guarded form (issue #2830).
+    type Future = futures::future::Either<
+        S::Future,
+        Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>,
+    >;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -576,39 +604,39 @@ where
                 !crate::security::path::is_exempt_path(clean.as_str(), &self.settings.exempt_paths)
             });
 
-        // Every GET (and every exempt/non-mutating request) takes this branch:
-        // nothing below needs `self.inner` cloned into an owned value, so
-        // `self.inner.call(req)` can be boxed directly rather than cloning
-        // `self.inner` (a `BoxCloneSyncService` at this point in the stack,
-        // whose `Clone` impl allocates a fresh box) just to move the clone
-        // into an `async move` block that would immediately `.await` it and
-        // do nothing else.
-        if !is_guarded {
-            return Box::pin(self.inner.call(req));
-        }
+        // A GET, an exempt request, and a body that is not a form have no token
+        // to read. Nothing runs before the inner call, so the inner future is
+        // the future of this service: no clone and no box.
+        let Some(form) = is_guarded.then(|| TokenForm::of(req.headers())).flatten() else {
+            return futures::future::Either::Left(self.inner.call(req));
+        };
 
         let settings = Arc::clone(&self.settings);
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        Box::pin(async move {
-            let (submitted, req) =
-                match extract_submitted_token(req, &settings.field_name, settings.max_scan_bytes)
-                    .await
-                {
-                    Ok(pair) => pair,
-                    Err(error) => {
-                        // A body-stream read error while scanning must reject the
-                        // request: forwarding the bytes read so far would hand the
-                        // handler a truncated form whose leading token we already
-                        // scanned, silently dropping tail fields.
-                        tracing::warn!(
-                            error = %error,
-                            "Submit-token body scan failed on a read error; rejecting the request"
-                        );
-                        return Ok(body_read_error_response());
-                    }
-                };
+        futures::future::Either::Right(Box::pin(async move {
+            let (submitted, req) = match extract_submitted_token(
+                req,
+                &form,
+                &settings.field_name,
+                settings.max_scan_bytes,
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(error) => {
+                    // A body-stream read error while scanning must reject the
+                    // request: forwarding the bytes read so far would hand the
+                    // handler a truncated form whose leading token we already
+                    // scanned, silently dropping tail fields.
+                    tracing::warn!(
+                        error = %error,
+                        "Submit-token body scan failed on a read error; rejecting the request"
+                    );
+                    return Ok(body_read_error_response());
+                }
+            };
 
             let Some(token) = submitted.filter(|t| !t.is_empty()) else {
                 // No submit token present — pass through unchanged.
@@ -691,7 +719,7 @@ where
 
             let response = inner.call(req).await?;
             Ok(cache_consumed_token_response(response, &settings, &key, &owner).await)
-        })
+        }))
     }
 }
 
@@ -821,6 +849,48 @@ mod tests {
     };
     use axum::Router;
     use axum::routing::{get, post};
+
+    /// `TokenForm::of` must agree with the parsers of the extractors. A form
+    /// that it does not find skips the token scan and stays replayable.
+    #[test]
+    fn token_form_agrees_with_the_extractor_parsers() {
+        let cases = [
+            "application/json",
+            "application/json; charset=utf-8",
+            "text/plain",
+            "",
+            "application/x-www-form-urlencoded",
+            "Application/X-WWW-Form-Urlencoded; charset=utf-8",
+            "multipart/form-data; boundary=x",
+            "Multipart/Form-Data; Boundary=AbC",
+            "  multipart/form-data; boundary=x",
+            "multipart/form-data; boundary=\"x;y\"",
+            "multipart/form-data",
+            "multipart/mixed; boundary=x",
+            "multipart",
+            "multipart/",
+        ];
+        for content_type in cases {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_str(content_type).unwrap(),
+            );
+            let urlencoded =
+                crate::media_type::is_media_type(content_type, "application/x-www-form-urlencoded");
+            let boundary = multer::parse_boundary(content_type).ok();
+            let expected = if urlencoded {
+                Some(None)
+            } else {
+                boundary.map(Some)
+            };
+            let actual = TokenForm::of(&headers).map(|form| match form {
+                TokenForm::UrlEncoded => None,
+                TokenForm::Multipart { boundary } => Some(boundary),
+            });
+            assert_eq!(actual, expected, "content type {content_type:?}");
+        }
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
 
