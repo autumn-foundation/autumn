@@ -952,29 +952,66 @@ pub fn normalize_statement(stmt: &str) -> String {
     )
 }
 
-/// Lowercase `text`, but copy each `$tag$` token as it is.
+/// Lowercase `text`, but keep the case a dollar-quote tag needs.
+///
+/// The literal scanner decides what is a literal, as it does for splitting.
+/// In a dollar-quoted span, the two delimiters and any body text that equals
+/// the tag in a different case keep their case. Postgres compares tags
+/// case-sensitively, so the scanners must see the same text.
 fn lowercase_except_dollar_tags(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while let Some(c) = text[i..].chars().next() {
-        let tag_len = (c == '$')
-            .then(|| {
-                let body = &text[i + 1..];
-                let n = body
-                    .find(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
-                    .unwrap_or(body.len());
-                body[n..].starts_with('$').then_some(n + 2)
-            })
-            .flatten();
-        if let Some(n) = tag_len {
-            out.push_str(&text[i..i + n]);
-            i += n;
-        } else {
+        let n = pg_literal_len(text, i);
+        if n == 0 {
             out.extend(c.to_lowercase());
             i += c.len_utf8();
+            continue;
         }
+        let span = &text[i..i + n];
+        if span.starts_with('$') {
+            push_dollar_span(&mut out, span);
+        } else {
+            out.extend(span.chars().flat_map(char::to_lowercase));
+        }
+        i += n;
     }
     out
+}
+
+/// Append the dollar-quoted `span`, lowercased except for its tag text.
+fn push_dollar_span(out: &mut String, span: &str) {
+    let tag_len = span[1..].find('$').map_or(span.len(), |p| p + 2);
+    let tag = &span[..tag_len];
+    let closed = span.len() >= 2 * tag_len && span.ends_with(tag);
+    let body_end = if closed {
+        span.len() - tag_len
+    } else {
+        span.len()
+    };
+    let body = &span[tag_len..body_end];
+    // Mark every body byte inside a case-variant of the tag, overlaps included.
+    let tag_lower = tag.to_lowercase();
+    let mut keep = vec![false; body.len()];
+    for (j, _) in body.char_indices() {
+        let hit = body
+            .get(j..j + tag_len)
+            .is_some_and(|w| w.to_lowercase() == tag_lower);
+        if hit {
+            keep[j..j + tag_len].fill(true);
+        }
+    }
+    out.push_str(tag);
+    for (j, c) in body.char_indices() {
+        if keep[j] {
+            out.push(c);
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    if closed {
+        out.push_str(tag);
+    }
 }
 
 /// Returns `true` when `sql` contains an executable concurrent index operation
@@ -3450,6 +3487,21 @@ mod tests {
             "$tag$ x$TAG$y $tag$",
             "$Tag$ $tag$ $Tag$",
         ] {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a text DEFAULT {lit}, ADD COLUMN b int NOT NULL;"
+            );
+            let f = classify_sql_for(DatabaseBackend::Postgres, &sql);
+            assert!(
+                f.iter()
+                    .any(|f| f.operation == "ADD COLUMN NOT NULL (no default)"),
+                "{lit}: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dollar_tag_overlapping_an_inner_token_keeps_its_closing_tag() {
+        for lit in ["$Tag$ $X$Tag$", "$a$ $A$A$ $a$", "'$A$', $B$ $b$ $B$"] {
             let sql = format!(
                 "ALTER TABLE t ADD COLUMN a text DEFAULT {lit}, ADD COLUMN b int NOT NULL;"
             );
