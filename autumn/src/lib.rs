@@ -506,6 +506,11 @@ pub mod sync;
 #[cfg(feature = "money")]
 pub mod money;
 
+// Ledger capture of every SQL statement the framework issues. The module
+// carries its own `//!` docs.
+#[cfg(feature = "ledger-capture")]
+pub mod ledger_capture;
+
 /// Bitemporal, tamper-evident record ledger for `#[repository]` writes.
 ///
 /// See [`ledger`] module documentation for the full API (issue #1699). This

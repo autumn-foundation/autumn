@@ -147,6 +147,8 @@ Each widget works with JavaScript off:
 - **`NavMenu`** renders open, as a disclosure. The runtime adds
   `role="menu"`, `role="menuitem"` and `aria-haspopup`. These roles promise
   arrow keys, so the server does not send them.
+- **Toast** fades out on its CSS timer. Hover pauses the timer. The close
+  button stays hidden. A persistent toast stays until the page changes.
 
 ## Content Security Policy
 
@@ -157,11 +159,13 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 32 KiB |
-| `autumn-widgets.js`, gzip level 9 | 10 KiB |
+| `autumn-widgets.js`, raw | 36 KiB |
+| `autumn-widgets.js`, gzip level 9 | 11 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
-above the budget. Raise the budget only with a reason in the PR.
+above the budget. Raise the budget only with a reason in the PR. Issue
+#3399 added the toast runtime. It increased the budgets from 32 KiB and
+10 KiB.
 
 ## Tests
 

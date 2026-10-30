@@ -111,12 +111,40 @@ fn connect(label: &str, url: &str) -> Result<SqliteConnection, ScrubError> {
 
 // ─── SQL builders ───────────────────────────────────────────────────────────
 
-/// The SQL expression that identifies a row: its primary key, else `rowid`.
+/// The names `SQLite` accepts for a rowid table's hidden row id.
+const ROWID_NAMES: [&str; 3] = ["rowid", "_rowid_", "oid"];
+
+/// The first rowid name no column of `columns` shadows, or `None`.
+fn free_rowid_name(columns: &[String]) -> Option<&'static str> {
+    ROWID_NAMES
+        .into_iter()
+        .find(|name| !columns.iter().any(|c| c.eq_ignore_ascii_case(name)))
+}
+
+/// One key column as text. `quote` stops at a NUL byte. `hex` reads every
+/// byte. `typeof` keeps the storage classes apart. A REAL uses `quote`, which
+/// keeps all digits. `hex` turns a REAL into text first, and that text can lose
+/// digits in some `SQLite` versions.
+fn key_part(column: &str) -> String {
+    let column = quote_ident(column);
+    format!(
+        "CASE typeof({column}) WHEN 'real' THEN 'real:' || quote({column}) \
+         ELSE typeof({column}) || ':' || hex({column}) END"
+    )
+}
+
+/// The SQL expression that identifies a row: its primary key, else its row id.
 ///
 /// A rowid table can hold several rows with a `NULL` non-integer key. Those fall
-/// back to `rowid`, or they would share one seed and one token. Both branches
-/// carry a prefix, so a real key such as `rowid:1` cannot equal a fallback key.
-pub(super) fn row_key_expr(table: &Table, facts: &DatabaseFacts) -> String {
+/// back to the row id, or they would share one seed and one token. Both
+/// branches carry a prefix, so a real key such as `rowid:1` cannot equal a
+/// fallback key.
+///
+/// # Errors
+///
+/// [`ScrubError::UnsupportedOnSqlite`] when the row id is needed and a column
+/// shadows all of its names.
+pub(super) fn row_key_expr(table: &Table, facts: &DatabaseFacts) -> Result<String, ScrubError> {
     let mut keys: Vec<&str> = table.primary_key.iter().map(String::as_str).collect();
     if keys.is_empty() {
         keys = table
@@ -126,37 +154,58 @@ pub(super) fn row_key_expr(table: &Table, facts: &DatabaseFacts) -> String {
             .map(|c| c.name.as_str())
             .collect();
     }
-    let key = match keys.as_slice() {
-        [] => return "CAST(rowid AS TEXT)".to_owned(),
-        // `quote()` keeps the storage class: the text '6162', the integer 6162 and
-        // the blob x'6162' stay distinct, and a blob never has to be valid text.
-        [key] => format!("quote({})", quote_ident(key)),
-        many => many
-            .iter()
-            .map(|key| format!("quote({})", quote_ident(key)))
-            .collect::<Vec<_>>()
-            .join(" || ',' || "),
+    let rowid = || {
+        facts
+            .rowid_aliases
+            .get(&table.name)
+            .map_or(Some("rowid"), |alias| *alias)
+            .ok_or_else(|| ScrubError::UnsupportedOnSqlite {
+                what: "A table whose columns shadow rowid, _rowid_ and oid",
+                detail: format!(
+                    "table {:?} has no free row id name. Rename one of those columns.",
+                    table.name
+                ),
+            })
     };
+    if keys.is_empty() {
+        return Ok(format!("CAST({} AS TEXT)", rowid()?));
+    }
+    let key = keys
+        .iter()
+        .map(|key| key_part(key))
+        .collect::<Vec<_>>()
+        .join(" || ',' || ");
     if !facts.rowid_tables.contains(&table.name) {
-        return key;
+        return Ok(key);
     }
     let any_null = keys
         .iter()
         .map(|key| format!("{} IS NULL", quote_ident(key)))
         .collect::<Vec<_>>()
         .join(" OR ");
-    format!("CASE WHEN {any_null} THEN 'rowid:' || rowid ELSE 'key:' || {key} END")
+    Ok(format!(
+        "CASE WHEN {any_null} THEN 'rowid:' || {} ELSE 'key:' || {key} END",
+        rowid()?
+    ))
 }
 
 /// The per-row, per-column token every replacement derives from. The column
 /// name salts it, so two PII columns of one row differ.
+///
+/// # Errors
+///
+/// As [`row_key_expr`].
 pub(super) fn token_expr(
     table: &Table,
     facts: &DatabaseFacts,
     column: &str,
     unique: bool,
-) -> String {
-    token_expr_from(&row_key_expr(table, facts), column, unique)
+) -> Result<String, ScrubError> {
+    Ok(token_expr_from(
+        &row_key_expr(table, facts)?,
+        column,
+        unique,
+    ))
 }
 
 fn token_expr_from(row_key: &str, column: &str, unique: bool) -> String {
@@ -169,6 +218,35 @@ fn token_expr_from(row_key: &str, column: &str, unique: bool) -> String {
         hash
     } else {
         format!("substr({hash}, 1, {TOKEN_HEX_LEN})")
+    }
+}
+
+/// [`replacement_expr`] for a token that may be unavailable.
+///
+/// A constant strategy such as `null` never reads the token, so it works on a
+/// table with no usable row id. A strategy that reads the token returns the
+/// token error.
+///
+/// # Errors
+///
+/// The token error when the strategy reads the token, else as
+/// [`replacement_expr`].
+pub(super) fn replacement_for(
+    strategy: Strategy,
+    column: &Column,
+    token: Result<String, ScrubError>,
+) -> Result<String, ScrubError> {
+    match token {
+        Ok(token) => replacement_expr(strategy, column, &token),
+        Err(error) => {
+            const MARK: &str = "\u{0}token\u{0}";
+            let expr = replacement_expr(strategy, column, MARK)?;
+            if expr.contains(MARK) {
+                Err(error)
+            } else {
+                Ok(expr)
+            }
+        }
     }
 }
 
@@ -520,6 +598,10 @@ struct ColumnRow {
     hidden: i32,
     #[diesel(sql_type = Integer)]
     pk: i32,
+    #[diesel(sql_type = Integer)]
+    not_null: i32,
+    #[diesel(sql_type = Text)]
+    decl_type: String,
 }
 
 #[derive(QueryableByName)]
@@ -587,15 +669,19 @@ fn probe(conn: &mut SqliteConnection, config: &super::ScrubConfig) -> Result<Pro
     let mut generated_columns = BTreeSet::new();
     let mut columns_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut pk_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut key_never_null: BTreeSet<String> = BTreeSet::new();
     let mut virtual_tables = Vec::new();
     for table in &tables {
         let rows: Vec<ColumnRow> = sql_query(format!(
-            "SELECT name, hidden, pk FROM pragma_table_xinfo({})",
+            "SELECT name, hidden, pk, \"notnull\" AS not_null, type AS decl_type \
+             FROM pragma_table_xinfo({})",
             quote_literal(&table.name)
         ))
         .load(conn)
         .map_err(|e| sql_err(&e))?;
         let mut pk: Vec<(i32, String)> = Vec::new();
+        let mut pk_not_null = true;
+        let mut integer_pk = false;
         for row in rows {
             // 1 = a virtual table's internal column.
             if row.hidden == 1 {
@@ -606,12 +692,28 @@ fn probe(conn: &mut SqliteConnection, config: &super::ScrubConfig) -> Result<Pro
             }
             if row.pk > 0 {
                 pk.push((row.pk, row.name.clone()));
+                pk_not_null &= row.not_null != 0;
+                integer_pk = row.decl_type.eq_ignore_ascii_case("INTEGER");
             }
             columns_of
                 .entry(table.name.clone())
                 .or_default()
                 .push(row.name.clone());
             public_columns.insert((table.name.clone(), row.name));
+        }
+        // A rowid alias is never NULL. Only that form has no `pk` index:
+        // `INTEGER PRIMARY KEY DESC` gets one, and it can hold NULL keys.
+        let rowid_alias = pk.len() == 1 && integer_pk && {
+            let indexes: Vec<CountRow> = sql_query(format!(
+                "SELECT COUNT(*) AS n FROM pragma_index_list({}) WHERE origin = 'pk'",
+                quote_literal(&table.name)
+            ))
+            .load(conn)
+            .map_err(|e| sql_err(&e))?;
+            indexes.first().is_some_and(|r| r.n == 0)
+        };
+        if !pk.is_empty() && (pk_not_null || rowid_alias) {
+            key_never_null.insert(table.name.clone());
         }
         pk.sort();
         pk_of.insert(table.name.clone(), pk.into_iter().map(|(_, n)| n).collect());
@@ -730,10 +832,23 @@ fn probe(conn: &mut SqliteConnection, config: &super::ScrubConfig) -> Result<Pro
         }
     }
 
-    let rowid_tables: BTreeSet<String> = tables
+    let has_rowid: Vec<&str> = tables
         .iter()
         .filter(|t| !t.sql.as_deref().is_some_and(is_without_rowid))
-        .map(|t| t.name.clone())
+        .map(|t| t.name.as_str())
+        .collect();
+    let rowid_aliases: BTreeMap<String, Option<&'static str>> = has_rowid
+        .iter()
+        .map(|&t| {
+            let columns = columns_of.get(t).map_or(&[][..], Vec::as_slice);
+            (t.to_owned(), free_rowid_name(columns))
+        })
+        .collect();
+    // A key that cannot be NULL never falls back to the row id.
+    let rowid_tables: BTreeSet<String> = has_rowid
+        .iter()
+        .filter(|t| !key_never_null.contains(**t))
+        .map(|&t| t.to_owned())
         .collect();
     let present: BTreeSet<String> = canon_table.values().cloned().collect();
     let framework_tables = probe_table_names(config)
@@ -745,6 +860,7 @@ fn probe(conn: &mut SqliteConnection, config: &super::ScrubConfig) -> Result<Pro
         facts: DatabaseFacts {
             dialect: Dialect::Sqlite,
             rowid_tables,
+            rowid_aliases,
             foreign_key_columns,
             checked_columns,
             generated_columns,
@@ -1475,21 +1591,27 @@ mod tests {
         assert_eq!(auto_strategy(&text).expect("auto"), Strategy::Redact);
     }
 
+    const ID_KEY: &str = "CASE typeof(\"id\") WHEN 'real' THEN 'real:' || quote(\"id\") \
+         ELSE typeof(\"id\") || ':' || hex(\"id\") END";
+
     #[test]
     fn row_key_uses_the_key_columns_or_rowid() {
         let mut table = Table::new("t", Backend::Sqlite);
         let mut facts = DatabaseFacts::default();
-        assert_eq!(row_key_expr(&table, &facts), "CAST(rowid AS TEXT)");
+        assert_eq!(
+            row_key_expr(&table, &facts).expect("key"),
+            "CAST(rowid AS TEXT)"
+        );
         table.primary_key = vec!["id".to_owned()];
-        assert_eq!(row_key_expr(&table, &facts), "quote(\"id\")");
+        assert_eq!(row_key_expr(&table, &facts).expect("key"), ID_KEY);
         table.primary_key = vec!["a".to_owned(), "b".to_owned()];
         assert_eq!(
-            row_key_expr(&table, &facts),
-            "quote(\"a\") || ',' || quote(\"b\")"
+            row_key_expr(&table, &facts).expect("key"),
+            format!("{} || ',' || {}", key_part("a"), key_part("b"))
         );
         // A rowid table can hold several NULL keys. They fall back to rowid.
         facts.rowid_tables.insert("t".to_owned());
-        let key = row_key_expr(&table, &facts);
+        let key = row_key_expr(&table, &facts).expect("key");
         assert!(
             key.starts_with("CASE WHEN \"a\" IS NULL OR \"b\" IS NULL THEN 'rowid:' || rowid"),
             "{key}"
@@ -1498,6 +1620,66 @@ mod tests {
             key.contains("ELSE 'key:' || "),
             "both branches are prefixed: {key}"
         );
+    }
+
+    #[test]
+    fn row_key_reads_every_byte_of_a_key() {
+        let mut table = Table::new("t", Backend::Sqlite);
+        table.primary_key = vec!["id".to_owned()];
+        let key = row_key_expr(&table, &DatabaseFacts::default()).expect("key");
+        // `quote()` stops at a NUL. `hex()` does not. A REAL keeps `quote()`.
+        assert!(
+            key.contains("ELSE typeof(\"id\") || ':' || hex(\"id\")"),
+            "{key}"
+        );
+        assert!(
+            key.contains("WHEN 'real' THEN 'real:' || quote(\"id\")"),
+            "{key}"
+        );
+    }
+
+    #[test]
+    fn row_key_uses_a_rowid_name_no_column_shadows() {
+        let mut table = Table::new("t", Backend::Sqlite);
+        let mut facts = DatabaseFacts::default();
+        facts
+            .rowid_aliases
+            .insert("t".to_owned(), free_rowid_name(&["RowId".to_owned()]));
+        assert_eq!(
+            row_key_expr(&table, &facts).expect("key"),
+            "CAST(_rowid_ AS TEXT)"
+        );
+        // The NULL-key fallback uses the same name.
+        table.primary_key = vec!["id".to_owned()];
+        facts.rowid_tables.insert("t".to_owned());
+        let key = row_key_expr(&table, &facts).expect("key");
+        assert!(key.contains("THEN 'rowid:' || _rowid_ ELSE"), "{key}");
+    }
+
+    #[test]
+    fn rowid_name_falls_through_to_oid() {
+        let names = ["rowid", "_ROWID_"].map(str::to_owned);
+        assert_eq!(free_rowid_name(&names), Some("oid"));
+        assert_eq!(free_rowid_name(&[]), Some("rowid"));
+    }
+
+    #[test]
+    fn row_key_refuses_a_table_that_shadows_every_rowid_name() {
+        let names = ["rowid", "_rowid_", "OID"].map(str::to_owned);
+        assert_eq!(free_rowid_name(&names), None);
+        let mut table = Table::new("t", Backend::Sqlite);
+        let mut facts = DatabaseFacts::default();
+        facts.rowid_aliases.insert("t".to_owned(), None);
+        let err = row_key_expr(&table, &facts).expect_err("refused");
+        assert!(
+            matches!(err, ScrubError::UnsupportedOnSqlite { .. }),
+            "{err}"
+        );
+        // A real key needs no row id, unless it can be NULL.
+        table.primary_key = vec!["id".to_owned()];
+        assert!(row_key_expr(&table, &facts).is_ok());
+        facts.rowid_tables.insert("t".to_owned());
+        assert!(row_key_expr(&table, &facts).is_err());
     }
 
     #[test]
@@ -1582,6 +1764,29 @@ mod tests {
             .expect("fts5");
         let probed = probe(&mut conn, &super::super::ScrubConfig::default()).expect("probe");
         assert_eq!(probed.virtual_tables, ["docs"]);
+    }
+
+    #[test]
+    fn the_probe_finds_the_rowid_name_and_which_keys_can_be_null() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("memory db");
+        conn.batch_execute(
+            "CREATE TABLE int_key (id INTEGER PRIMARY KEY, rowid, _rowid_, oid); \
+             CREATE TABLE nn_key (k TEXT NOT NULL PRIMARY KEY); \
+             CREATE TABLE text_key (k TEXT PRIMARY KEY, RowID); \
+             CREATE TABLE desc_key (id INTEGER PRIMARY KEY DESC); \
+             CREATE TABLE no_key (a); \
+             CREATE TABLE no_rowid (k TEXT PRIMARY KEY) WITHOUT ROWID;",
+        )
+        .expect("schema");
+        let probed = probe(&mut conn, &super::super::ScrubConfig::default()).expect("probe");
+        let f = &probed.facts;
+        assert_eq!(f.rowid_aliases["int_key"], None);
+        assert_eq!(f.rowid_aliases["text_key"], Some("_rowid_"));
+        assert_eq!(f.rowid_aliases["no_key"], Some("rowid"));
+        assert!(!f.rowid_aliases.contains_key("no_rowid"));
+        // Only a key that can be NULL needs the row id as a fallback.
+        let nullable: Vec<&str> = f.rowid_tables.iter().map(String::as_str).collect();
+        assert_eq!(nullable, ["desc_key", "no_key", "text_key"]);
     }
 
     #[test]

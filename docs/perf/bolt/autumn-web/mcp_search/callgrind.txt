@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/mcp_search
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+         386,364   19.9%  autumn_web::mcp::catalog::score
+         365,761   18.8%  __memcmp_avx2_movbe
+         184,723    9.5%  _int_malloc
+         102,396    5.3%  serde_json::ser::format_escaped_str_contents
+          92,450    4.8%  _int_free
+          60,481    3.1%  malloc
+          59,577    3.1%  __memcpy_avx_unaligned_erms
+          57,731    3.0%  <serde_json::read::SliceRead>::skip_to_escape
+          41,323    2.1%  free
+          38,791    2.0%  malloc_consolidate
+          34,784    1.8%  serde_json::ser::format_escaped_str
+          28,866    1.5%  <serde_json::read::SliceRead as serde_json::read::Read>::parse_str
+          27,412    1.4%  <alloc::string::String as core::fmt::Write>::write_str
+          27,285    1.4%  core::str::converts::from_utf8
+          26,738    1.4%  <alloc::collections::btree::map::IntoIter>::dying_next
+          24,550    1.3%  <<serde_json::value::Value as core::fmt::Display>::fmt::WriterFormatter as std::io::Write>::write_all
+          22,048    1.1%  unlink_chunk.isra.0
+          20,702    1.1%  core::ptr::drop_glue'2
+          20,134    1.0%  <serde_json::value::Value as serde_core::ser::Serialize>::serialize'2
+          18,124    0.9%  <serde_json::value::Value as serde_core::de::Deserialize>::deserialize'2
+          15,914    0.8%  <alloc::collections::btree::map::BTreeMap>::entry
+          15,130    0.8%  <alloc::collections::btree::map::BTreeMap>::insert
+          14,998    0.8%  <alloc::collections::btree::map::entry::VacantEntry>::insert_entry
+          14,952    0.8%  core::ptr::drop_glue
+          14,690    0.8%  serde_json::read::parse_escape
+          13,388    0.7%  _int_free_merge_chunk
+          12,960    0.7%  <serde_json::ser::Compound as serde_core::ser::SerializeMap>::serialize_entry'2
+          11,997    0.6%  __rustc::__rdl_alloc
+           9,970    0.5%  <alloc::vec::Vec as alloc::vec::spec_from_iter_nested::SpecFromIterNested>::from_iter
+           9,534    0.5%  <<serde_json::value::Value as serde_core::de::Deserialize>::deserialize::ValueVisitor as serde_core::de::Visitor>::visit_map'2
+
+       1,941,964  100.0%  TOTAL

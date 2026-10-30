@@ -97,7 +97,7 @@ the changelog when a release is cut. See
 `autumn/src/ui/`, `autumn/vendor/autumn-widgets.js`, `autumn/src/stories/`
 and the other paths in its `paths:` filter. It also runs each week.
 
-The job runs four suites:
+The job runs five suites:
 
 - `stories_browser` loads each `/_stories/{slug}` page. It injects axe-core
   and fails on a `serious` or `critical` violation. It checks each page in
@@ -105,6 +105,9 @@ The job runs four suites:
   console error. Each interactive story has a `keyboard_<slug>` test, which
   also checks open dialogs, menus and popups with axe.
 - `widgets_keyboard_browser` checks the #3397 keyboard core on its own page.
+- `widgets_toast_browser` checks the #3399 toast: hover and focus pause the
+  timer, the close button removes the toast and moves focus, and toasts
+  show above a modal.
 - `widget_pack_browser` checks widget pack conformance (#3400): a good
   pack passes, three canary packs fail (axe, keyboard trap, console), and
   pack JS gets `autumn:init`.
@@ -122,6 +125,8 @@ cargo test -p autumn-web --features system-tests \
   --test integration_tests stories_browser -- --include-ignored
 cargo test -p autumn-web --features system-tests \
   --test integration_tests widgets_keyboard_browser -- --include-ignored
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests widgets_toast_browser -- --include-ignored
 cargo test -p autumn-web --features system-tests \
   --test integration_tests widget_pack_browser -- --include-ignored
 cargo test -p autumn-plugin-reference --features system-tests --lib \

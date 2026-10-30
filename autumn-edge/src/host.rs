@@ -106,7 +106,8 @@ impl fmt::Display for EdgeHostError {
 impl std::error::Error for EdgeHostError {}
 
 /// Fuel budget for one request's guest execution (roughly one unit per
-/// instruction). Host work in `fd_write` also costs fuel.
+/// instruction). Host work in `fd_write`, including `kv_get` answers, also
+/// costs fuel.
 ///
 /// Sized for headroom, not precision: rendering a page costs on the order of
 /// millions of instructions, so a billion-unit budget is ~100× slack for any
@@ -136,6 +137,18 @@ pub const MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// fails the guest's `fd_write` with `ENOSPC`, which ends as a
 /// [`FallthroughReason::CapsuleError`].
 pub const STDOUT_LINE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Cap on host-to-guest bytes the guest has not read yet (64 MiB).
+///
+/// Each `kv_get` answer is appended to `stdin`. A guest that asks and never
+/// reads would grow it without limit. The cap equals the stdout cap. A 16 MiB
+/// value is about 22 MiB in base64. An answer that does not fit ends the request
+/// as a [`FallthroughReason::CapsuleError`].
+pub const STDIN_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bytes that a `kv_value` frame adds around the base64 value. The number is
+/// rounded up.
+const KV_FRAME_OVERHEAD_BYTES: usize = 64;
 
 /// Scratch-buffer size for host-side copies of guest-supplied ranges (64 KiB).
 ///
@@ -325,6 +338,9 @@ struct HostState<'kv> {
     /// Whether this host offered the `kv` capability for this request.
     kv_provided: bool,
     terminal: Option<EdgeOutcome>,
+    /// Fuel owed for host work done in `on_guest_line`, which has no `Caller`.
+    /// `fd_write` pays it after the write returns.
+    pending_fuel: u64,
     /// Fixed-seed PRNG state, so `random_get` is reproducible.
     random_state: u64,
     /// Resource ceilings ([`MEMORY_BUDGET_BYTES`]) the store's limiter answers
@@ -345,6 +361,7 @@ impl<'kv> HostState<'kv> {
             kv,
             kv_provided,
             terminal: None,
+            pending_fuel: 0,
             random_state: Self::RANDOM_SEED,
             limits: StoreLimitsBuilder::new()
                 .memory_size(MEMORY_BUDGET_BYTES)
@@ -386,8 +403,32 @@ impl<'kv> HostState<'kv> {
                     // than deadlocking it.
                     None
                 };
+                let value_len = value.as_ref().map_or(0, Vec::len);
+                // Check the size before encoding, so a refused answer costs no
+                // large allocation.
+                let answer_len = value_len
+                    .div_ceil(3)
+                    .saturating_mul(4)
+                    .saturating_add(KV_FRAME_OVERHEAD_BYTES);
+                if self.stdin.len().saturating_add(answer_len) > STDIN_BUDGET_BYTES {
+                    self.terminal = Some(EdgeOutcome::fallthrough(
+                        FallthroughReason::CapsuleError,
+                        format!(
+                            "the capsule left too many kv answers unread: \
+                             stdin is capped at {STDIN_BUDGET_BYTES} bytes"
+                        ),
+                    ));
+                    return;
+                }
                 match to_line(&HostFrame::KvValue { value }) {
-                    Ok(line) => self.feed(&line),
+                    Ok(line) => {
+                        // Charge one unit per value byte, plus the copy cost.
+                        self.pending_fuel = self
+                            .pending_fuel
+                            .saturating_add(u64::try_from(value_len).unwrap_or(u64::MAX))
+                            .saturating_add(copy_fuel(line.len()));
+                        self.feed(&line);
+                    }
                     Err(err) => {
                         self.terminal = Some(EdgeOutcome::fallthrough(
                             FallthroughReason::CapsuleError,
@@ -655,11 +696,22 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                         let state = caller.data_mut();
                         if fd == 2 {
                             state.write_stderr(&chunk);
-                        } else if !state.write_stdout(&chunk) {
-                            // A single stdout line has outgrown any honest
-                            // frame: fail the write so the guest aborts and
-                            // the request falls through.
-                            return Ok(errno::NOSPC);
+                        } else {
+                            let accepted = state.write_stdout(&chunk);
+                            // Pay fuel for `kv_get` answers made while parsing (#3502).
+                            let owed = std::mem::take(&mut state.pending_fuel);
+                            if let Err(err) = charge_units(&mut caller, owed) {
+                                // An unpaid budget beats a frame from the same
+                                // chunk. Else the guest gets free work.
+                                caller.data_mut().terminal = None;
+                                return Err(err);
+                            }
+                            if !accepted {
+                                // A single stdout line has outgrown any honest
+                                // frame: fail the write so the guest aborts and
+                                // the request falls through.
+                                return Ok(errno::NOSPC);
+                            }
                         }
                         offset = offset.saturating_add(step);
                     }
@@ -1169,6 +1221,113 @@ mod tests {
 
         let answer: String = state.stdin.iter().map(|byte| char::from(*byte)).collect();
         assert_eq!(answer.trim_end(), r#"{"op":"kv_value","value_b64":null}"#);
+    }
+
+    /// Host work for a `kv_get` answer costs fuel (#3502). The guest sends a
+    /// 26-byte line 20 times. Each answer encodes a 1 MiB value. A 5M budget
+    /// ends the guest after about 5 answers.
+    #[test]
+    fn kv_get_answers_cost_fuel_by_value_size() {
+        let wasm = wat::parse_str(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{\"op\":\"kv_get\",\"key\":\"k\"}\n")
+  (func (export "_start")
+    (local $i i32)
+    (i32.store (i32.const 100) (i32.const 0))
+    (i32.store (i32.const 104) (i32.const 26))
+    (loop $again
+      (drop (call $fd_write (i32.const 1) (i32.const 100) (i32.const 1) (i32.const 120)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $again (i32.lt_u (local.get $i) (i32.const 20))))))
+"#,
+        )
+        .expect("valid WAT");
+        let mut artifact = EdgeArtifact::from_bytes(&wasm).expect("valid module");
+        artifact.fuel_budget = 5_000_000;
+        let kv = InMemoryEdgeKv::new().with("k", vec![7u8; 1024 * 1024]);
+        let outcome = artifact
+            .run(&EdgeRequest::get("/meter"), &[EdgeCapability::Kv], &kv)
+            .expect("host setup succeeds");
+        assert_out_of_fuel(&outcome, "a kv_get answer");
+    }
+
+    /// A `kv_get` and a response in one write (#3502). The `kv_get` charge
+    /// fails, so the budget error wins over the response.
+    #[test]
+    fn an_unpaid_kv_get_beats_a_response_in_the_same_write() {
+        let wasm = wat::parse_str(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{\"op\":\"kv_get\",\"key\":\"k\"}\n{\"op\":\"response\",\"status\":200,\"headers\":[],\"body_b64\":\"\"}\n")
+  (func (export "_start")
+    (i32.store (i32.const 100) (i32.const 0))
+    (i32.store (i32.const 104) (i32.const 84))
+    (drop (call $fd_write (i32.const 1) (i32.const 100) (i32.const 1) (i32.const 120)))))
+"#,
+        )
+        .expect("valid WAT");
+        let mut artifact = EdgeArtifact::from_bytes(&wasm).expect("valid module");
+        artifact.fuel_budget = 500_000;
+        let kv = InMemoryEdgeKv::new().with("k", vec![7u8; 1024 * 1024]);
+        let outcome = artifact
+            .run(&EdgeRequest::get("/meter"), &[EdgeCapability::Kv], &kv)
+            .expect("host setup succeeds");
+        assert_out_of_fuel(&outcome, "a kv_get beside a response");
+    }
+
+    #[test]
+    fn a_kv_get_records_a_fuel_charge_for_the_value() {
+        let kv = InMemoryEdgeKv::new().with("k", vec![1u8; 4096]);
+        let mut state = state_with(&kv, true);
+
+        assert!(state.write_stdout(b"{\"op\":\"kv_get\",\"key\":\"k\"}\n"));
+
+        assert!(state.pending_fuel >= 4096, "{}", state.pending_fuel);
+    }
+
+    #[test]
+    fn a_miss_still_records_a_fuel_charge() {
+        let kv = InMemoryEdgeKv::new();
+        let mut state = state_with(&kv, true);
+
+        assert!(state.write_stdout(b"{\"op\":\"kv_get\",\"key\":\"k\"}\n"));
+
+        assert!(state.pending_fuel >= 1, "{}", state.pending_fuel);
+    }
+
+    /// Unread answers pile up in `stdin` (#3502). The cap ends the request.
+    #[test]
+    fn unread_kv_answers_hit_the_stdin_cap() {
+        let big = vec![0u8; STDIN_BUDGET_BYTES / 2];
+        let kv = InMemoryEdgeKv::new().with("k", big);
+        let mut state = state_with(&kv, true);
+        let get = b"{\"op\":\"kv_get\",\"key\":\"k\"}\n";
+
+        assert!(state.write_stdout(get));
+        assert_eq!(state.terminal, None);
+        assert!(state.write_stdout(get));
+
+        let Some(EdgeOutcome::Fallthrough { reason, detail }) = state.terminal.clone() else {
+            panic!("expected a fallthrough: {:?}", state.terminal);
+        };
+        assert_eq!(reason, FallthroughReason::CapsuleError);
+        assert!(detail.contains("stdin"), "{detail}");
+        assert!(state.stdin.len() <= STDIN_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn a_16_mib_value_fits_under_the_stdin_cap() {
+        let kv = InMemoryEdgeKv::new().with("k", vec![0u8; 16 * 1024 * 1024]);
+        let mut state = state_with(&kv, true);
+
+        assert!(state.write_stdout(b"{\"op\":\"kv_get\",\"key\":\"k\"}\n"));
+
+        assert_eq!(state.terminal, None);
     }
 
     #[test]

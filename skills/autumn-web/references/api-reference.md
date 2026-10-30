@@ -703,13 +703,14 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
 - `MoneyError` {`Overflow`, `CurrencyMismatch`, `UnknownCurrency`, `Inexact`,
   `InvalidWeights`} → 422, except `Overflow` → 500.
 - `money::ledger::{ensure_account, set_allow_negative, account, post, balance,
-  transaction_by_key, trial_balance}` — all take `&mut RuntimeConnection`, so
+  transaction_by_key, trial_balance, balance_drift}` — all take `&mut RuntimeConnection`, so
   they nest inside `Db::tx`. `post` **requires** a transaction.
 - `Account::new(id, currency)` / `.disallow_negative()`; `Posting::debit(...)` /
   `::credit(...)`; `Transaction::new(key, postings).memo(...)` /
   `.validate()`; `IdempotencyKey::new(s)` / `::derive(namespace, &postings)`;
   `PostOutcome::{Posted, Replayed}` with `is_posted` / `is_replayed` /
-  `transaction`; `PostedTransaction`, `CurrencyTotal`, `Side`.
+  `transaction`; `PostedTransaction`, `CurrencyTotal`, `BalanceDrift`
+  (`account_id` / `stored` / `posted`), `Side`.
 - `LedgerError` {`Money`, `Unbalanced`, `PostingCount`, `OneSided`,
   `ZeroPosting`, `MixedCurrencies`, `NegativeAmount`, `UnknownAccount`,
   `AccountCurrency`, `KeyReuse`, `InvalidText`, `NegativeBalance`,
@@ -718,7 +719,11 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
   `EmptyTransaction` / `Database`, 422 for the rest.
 - Tables `ACCOUNTS_TABLE` / `TRANSACTIONS_TABLE` / `POSTINGS_TABLE`
   (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
-  framework migration set.
+  framework migration set. The account row stores the balance
+  (`balance_minor`, #3339). A trigger keeps it, so `post` and `balance` do not
+  read the posting history, except one time for each account after the
+  migration. `NULL` means "not known": the next `post` sums the
+  postings and stores the result.
 
 ## SLA obligations (`autumn_web::sla`, 0.8.0, #1826)
 
@@ -1022,9 +1027,14 @@ Per-primitive setters (in addition to the shared set):
   focus moves to it on a failed submit — one per page). All prelude
   re-exported.
 - `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
-  `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
+  `toast_in(region_id, message, AlertVariant)` /
+  `toast_with(message, AlertVariant, &ToastConfig)` / `toast_region(id)` +
   `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
-  (`hx-swap-oob="beforeend:#<region-id>"`), CSS-only auto-dismiss (no JS).
+  (`hx-swap-oob="beforeend:#<region-id>"`), CSS auto-dismiss after
+  `DEFAULT_TOAST_DURATION` (5 s). Hover or focus pauses the timer.
+  `ToastConfig` setters: `region`, `duration`, `persistent`, `close_label`.
+  A persistent toast ignores `duration`. Each toast has a close button;
+  `autumn-widgets.js` shows it and moves focus on close (no JS: no button). The region is `popover="manual"`, so toasts show above a modal.
   `toast_region` is a persistent `aria-live="polite"` region; non-error toasts
   inherit its politeness (no own `role`/`aria-live`) while `Error` announces
   assertively via its own `role="alert"` (reuses the `AlertVariant` color
@@ -1545,8 +1555,8 @@ middleware (tenant scoping, an auth shim, request enrichment) — mapping the
 layer onto individual handlers instead tests a stack the real app never
 serves.
 
-`Page`: `visit`, `fill`, `click`, `press`, `set_javascript_enabled`, `expect_text`, `expect_url`,
-`expect_attribute`, `expect_hx_settle`, `expect_sse_event`,
+`Page`: `visit`, `fill`, `click`, `press`, `hover`, `set_javascript_enabled`, `expect_text`, `expect_url`,
+`expect_attribute`, `expect_on_top`, `expect_hx_settle`, `expect_sse_event`,
 `expect_no_console_errors`, `console_errors`, `snapshot`, `evaluate`. The
 `expect_*` assertions poll to a deadline and ignore the transient CDP errors a
 mid-poll navigation produces; `evaluate` is a single raw call that does not.

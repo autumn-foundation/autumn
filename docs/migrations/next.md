@@ -249,6 +249,95 @@ A test that calls `.assert_selector(".wizard-progress")` must use
 **Automation:** `manual` — the selectors are in the app's own stylesheets,
 scripts and tests. A codemod cannot find them reliably.
 
+### Jobs: `JobTrackingStore` has a required `update_record` method
+
+**Why:** Each built-in store had the same code for `mark_running`,
+`set_progress`, `complete` and `fail` (issue #3208). These methods now have
+default bodies that call `update_record`. A store implements only
+`update_record`. The trait applies the status rules and the `0..=100` progress clamp.
+`get` also has a default body, which calls `get_with_token`.
+
+**Who is affected:** Only code that implements `JobTrackingStore`. The
+compiler reports error `E0046` (`update_record` is missing). Code that only
+calls a store does not change.
+
+**Before (`{X.Y}`):**
+
+```rust
+use futures::future::BoxFuture; // = Pin<Box<dyn Future<Output = T> + Send + 'a>>
+
+impl JobTrackingStore for MyStore {
+    fn mark_running<'a>(&'a self, key: &'a str) -> BoxFuture<'a, AutumnResult<()>> {
+        Box::pin(async move { self.write(key, |r| r.status = TrackedJobStatus::Running).await })
+    }
+    // set_progress, complete, fail, get: the same shape
+    // create, get_with_token, reset_for_retry
+}
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+use futures::future::BoxFuture; // = Pin<Box<dyn Future<Output = T> + Send + 'a>>
+
+impl JobTrackingStore for MyStore {
+    fn update_record<'a>(
+        &'a self,
+        key: &'a str,
+        f: &'a (dyn Fn(&mut TrackedJobRecord) + Send + Sync),
+    ) -> BoxFuture<'a, AutumnResult<()>> {
+        Box::pin(async move { self.write(key, f).await })
+    }
+    // create, get_with_token, reset_for_retry
+}
+```
+
+`update_record` must do nothing when `key` is unknown or expired. It can call
+`f` more than one time, for example after a failed compare-and-swap. Give `f`
+a fresh copy of the record each time. Set `updated_at` after `f`. Change the
+`RetryToken` and refresh the TTL on each write. Remove your `mark_running`, `set_progress`,
+`complete`, `fail` and `get`. If you keep them, they override the defaults.
+
+**Automation:** `manual` — `update_record` needs the store's own storage code.
+A codemod cannot write it.
+
+### Middleware: ingress service futures are not boxed
+
+**Why:** a boxed future is one heap allocation on each request. The ingress
+services now return named futures (issue #2830).
+
+**You are affected only if your code names the future type of one of these
+services, or polls the future without pinning it:**
+
+- `LogContextService`
+- `SessionService`
+- `MethodOverrideService`
+- `IdempotencyReplayService`
+- the services of `TrustedProxiesLayer` and `SubmitTokenLayer`
+
+The futures of `LogContextService` and `SessionService` can be `!Unpin`.
+
+**Before (`{X.Y}`):**
+
+```rust
+let mut fut: Pin<Box<dyn Future<Output = _> + Send>> = service.call(request);
+let response = poll_fn(|cx| fut.as_mut().poll(cx)).await;
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let fut = service.call(request);
+let response = fut.await;
+// Or, to keep a boxed future:
+let mut fut = Box::pin(service.call(request));
+```
+
+To name the type, use `<S as Service<Request>>::Future`.
+
+**Automation:** `manual` — the code to change is in the app's own middleware.
+A codemod cannot find it reliably.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -336,6 +425,40 @@ If nothing changed, delete this section.
   deferred `autumn-widgets.js` started immediately. Now all deferred scripts
   run first. Thus a widget pack script gets the page-load `autumn:init`
   event. An async or injected copy still starts immediately.
+
+- **Toasts use the top layer (#3399).** With `autumn-widgets.js`,
+  `toast_region` opens as a popover in the top layer. `--z-toast` and
+  `z-index` do not apply there. The runtime removes a toast from the DOM
+  when its fade ends. Before, the toast stayed hidden in the DOM.
+  `.autumn-toast` is now `display: flex` and holds a close button. An
+  `Error` toast has `role="alert"` on `.autumn-toast__message`, not on
+  `.autumn-toast`. A page with neither the widget CSS nor the JS no longer
+  shows the region: the browser hides a closed popover. Link
+  `/static/css/autumn-widgets.css`.
+- **Money: each account row stores its balance (#3339).** The framework
+  migration `20261029183512_add_money_account_balance` adds the
+  `_autumn_money_accounts.balance_minor` column and a trigger. Run
+  `autumn migrate` before you deploy the new binary. The new binary reads the
+  column. Without the migration, each ledger call fails with
+  `LedgerError::Database`. The migration does not read the postings, so it is
+  fast. Old and new binaries can post at the same time, because the trigger
+  keeps the balance for both. The migration holds a short exclusive lock on
+  `_autumn_money_accounts` and `_autumn_money_postings`. To roll back, deploy
+  the old binary first, then run `down.sql`. Do not write `balance_minor`
+  yourself. `ledger::balance_drift` reports a difference. After a data-only
+  restore, set `balance_minor` to `NULL`. See
+  `docs/guide/money.md#the-stored-balance`.
+
+- **Radio choice ids: a name or value with a special character has a new id
+  (#3454).** Before, two groups could give the same choice id. That breaks the
+  `<label for>` link. Now letters, digits and `_` do not change. Each other
+  byte (`-`, `.`, a space, non-ASCII) is written `--HH` (upper-case hex). The
+  name `plan-type` gives `plan--2Dtype-x`. In group `speed`, the value
+  `next-day` gives `speed-next--2Dday`. An id of only letters, digits and `_`
+  does not change. An empty name after an `id_prefix` is now written `--`. The
+  second of two equal values now ends in `--n1`. It ended in `-<index>`
+  before. Update a CSS rule, a test or a `getElementById` call that uses an
+  old id.
 
 ## Deprecations retained from `{X.Y}`
 

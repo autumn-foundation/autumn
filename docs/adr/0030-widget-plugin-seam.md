@@ -1,4 +1,4 @@
-# ADR 0028: Widget Packs Are Plugins with One Contract and One Gate
+# ADR 0030: Widget Packs Are Plugins with One Contract and One Gate
 
 - Status: Accepted
 - Date: 2026-10-29

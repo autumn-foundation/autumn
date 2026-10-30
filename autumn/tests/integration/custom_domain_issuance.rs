@@ -2559,6 +2559,64 @@ async fn the_prune_refuses_to_run_when_the_registry_never_hydrated() {
     );
 }
 
+#[tokio::test]
+async fn the_prune_refuses_to_run_after_a_partial_load() {
+    use autumn_web::custom_domain::{CustomDomainPruner as _, FsCustomDomainStore};
+
+    // A skipped record leaves its tenant's certificate looking orphaned.
+    let dir = tempfile::tempdir().unwrap();
+    let domains = dir.path().join("domains");
+    std::fs::create_dir_all(&domains).unwrap();
+    std::fs::write(domains.join("bad.json"), b"{").unwrap();
+    let store = Arc::new(FsAcmeStore::new(dir.path().join("acme"), "staging"));
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::new(FsCustomDomainStore::new(&domains)),
+        10,
+    ));
+    registry.load().await.unwrap();
+    store
+        .save_cert(
+            &CertId::from_domains(&["app.clientco.com".to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let task = CustomDomainTask {
+        registry,
+        cache: Arc::new(CustomDomainCertCache::new(4)),
+        certs: Arc::clone(&store) as Arc<dyn autumn_web::acme::store::AcmeStore>,
+        provider: autumn_web::tls::crypto_provider(),
+        verifier: TableVerifier::new(&[]),
+        issuer: ScriptedIssuer::new(&[]),
+        limiter: Arc::new(IssuanceLimiter::new(5, 50, 300, 86_400)),
+        ingress: ExpectedIngress::default(),
+        renew_before_days: 30,
+        reporter: Arc::new(|_| {}),
+        recovery: None,
+        coordinator: Arc::new(autumn_web::scheduler::InProcessSchedulerCoordinator::new(
+            "test-replica",
+        )),
+        leadership_degraded: false,
+        cert_store_paths: Some(store.clone()),
+        retained_cert_ids: HashSet::new(),
+    };
+
+    let err = task.prune(NOW + 86_400, false).await.unwrap_err();
+    assert!(err.contains("bad.json"), "{err}");
+    assert!(
+        store
+            .load_cert(&CertId::from_domains(&["app.clientco.com".to_owned()]))
+            .await
+            .unwrap()
+            .is_some(),
+        "nothing may be deleted"
+    );
+}
+
 // ── AC5/AC6: restart and scale, against the real on-disk stores ──────────
 
 #[tokio::test]
@@ -3380,6 +3438,368 @@ async fn pending_domains_are_verified_at_the_same_time() {
         let domain = h.registry.get(&format!("app{i}.clientco.com")).unwrap();
         assert!(domain.failure_reason.is_some(), "app{i} was not verified");
     }
+}
+
+// ── One tenant's slow DNS cannot stall the others (#2650) ────────────────
+
+/// Names starting `slow` never answer; every other name points here.
+struct BlackholeVerifier;
+
+impl DomainVerifier for BlackholeVerifier {
+    fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+        Box::pin(async move {
+            if hostname.starts_with("slow") {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            points_here()
+        })
+    }
+    fn observe_txt<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+        Box::pin(async { ObservedTxt::Values(Vec::new()) })
+    }
+}
+
+/// Registers `host` as active with a stored certificate inside its renew window.
+async fn register_due_for_renewal(h: &Harness, host: &str) {
+    h.task
+        .certs
+        .save_cert(
+            &CertId::from_domains(&[host.to_owned()]),
+            &autumn_web::acme::store::StoredCert {
+                chain_pem: CERT_PEM.to_owned(),
+                key_pem: KEY_PEM.to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    h.registry.register(host, "tenant-b", NOW).await.unwrap();
+    h.registry
+        .record_active(host, NOW, NOW + 10 * 86_400)
+        .await
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_verifications_do_not_delay_issuance_or_renewal() {
+    let budget = std::time::Duration::from_secs(5);
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..64 {
+        h.registry
+            .register(&format!("slow{i}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("ready.clientco.com", "tenant-c", NOW)
+        .await
+        .unwrap();
+    h.registry
+        .record_verified("ready.clientco.com", NOW)
+        .await
+        .unwrap();
+    register_due_for_renewal(&h, "renew.clientco.com").await;
+
+    let started = tokio::time::Instant::now();
+    h.task.tick_within(NOW, budget).await;
+
+    assert!(
+        started.elapsed() <= budget + std::time::Duration::from_millis(100),
+        "the pass took {:?}",
+        started.elapsed()
+    );
+    let calls = issuer.calls();
+    assert!(
+        calls.contains(&"ready.clientco.com".to_owned()),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&"renew.clientco.com".to_owned()),
+        "{calls:?}"
+    );
+}
+
+/// Hangs `slow*` names while `hang` is set; every name points here.
+struct GateVerifier(std::sync::atomic::AtomicBool);
+
+impl DomainVerifier for GateVerifier {
+    fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+        Box::pin(async move {
+            if hostname.starts_with("slow") && self.0.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+            points_here()
+        })
+    }
+    fn observe_txt<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+        Box::pin(async { ObservedTxt::Values(Vec::new()) })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_domain_is_verified_once_its_backoff_ends() {
+    let gate = Arc::new(GateVerifier(std::sync::atomic::AtomicBool::new(true)));
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::clone(&gate) as Arc<dyn DomainVerifier>,
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.registry
+        .register("slow.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+
+    h.task
+        .tick_within(NOW, std::time::Duration::from_secs(5))
+        .await;
+    let record = h.registry.get("slow.clientco.com").unwrap();
+    assert_eq!(
+        record.failure_reason.as_deref(),
+        Some("the DNS lookup timed out")
+    );
+    assert!(h.registry.pending_verification(NOW + 1).is_empty());
+
+    gate.0.store(false, Ordering::SeqCst);
+    h.task.tick(NOW + 1_000).await;
+    assert_eq!(issuer.calls(), vec!["slow.clientco.com".to_owned()]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_names_that_sort_first_cannot_starve_a_healthy_domain() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..32 {
+        h.registry
+            .register(&format!("slow{i:02}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("zhealthy.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    // Tick one times out the first 16 and cuts off the rest. Those 16 are in
+    // backoff on tick two, so the next 16 take the slots and the healthy
+    // domain is reached.
+    let budget = std::time::Duration::from_secs(30);
+    h.task.tick_within(NOW, budget).await;
+    h.task.tick_within(NOW + 100, budget).await;
+
+    assert_eq!(issuer.calls(), vec!["zhealthy.clientco.com".to_owned()]);
+    let timed_out = h.registry.get("slow00.clientco.com").unwrap();
+    assert_eq!(
+        timed_out.failure_reason.as_deref(),
+        Some("the DNS lookup timed out")
+    );
+}
+
+/// A short poll interval gives verification a budget below the per-domain
+/// limit. Cut-off checks must still back off, or the same names return first.
+#[tokio::test(start_paused = true)]
+async fn a_short_budget_still_lets_hung_names_yield_their_slots() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..20 {
+        h.registry
+            .register(&format!("slow{i:02}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("zhealthy.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    let budget = std::time::Duration::from_secs(12);
+    h.task.tick_within(NOW, budget).await;
+    h.task.tick_within(NOW + 100, budget).await;
+
+    assert_eq!(issuer.calls(), vec!["zhealthy.clientco.com".to_owned()]);
+}
+
+/// A store whose saves take `delay` once armed.
+#[derive(Debug, Default)]
+struct SlowSaveStore {
+    inner: MemoryCustomDomainStore,
+    delay_secs: AtomicUsize,
+}
+
+impl autumn_web::custom_domain::CustomDomainStore for SlowSaveStore {
+    fn load_all(
+        &self,
+    ) -> autumn_web::custom_domain::StoreFuture<
+        '_,
+        std::io::Result<Vec<autumn_web::custom_domain::CustomDomain>>,
+    > {
+        self.inner.load_all()
+    }
+
+    fn save<'a>(
+        &'a self,
+        domain: &'a autumn_web::custom_domain::CustomDomain,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        Box::pin(async move {
+            let secs = self.delay_secs.load(Ordering::SeqCst) as u64;
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+            self.inner.save(domain).await
+        })
+    }
+
+    fn delete<'a>(
+        &'a self,
+        hostname: &'a str,
+    ) -> autumn_web::custom_domain::StoreFuture<'a, std::io::Result<()>> {
+        self.inner.delete(hostname)
+    }
+}
+
+/// The budget limits DNS work only. A save that starts must finish, or a
+/// detached write could land after a newer record or an offboard.
+#[tokio::test(start_paused = true)]
+async fn the_budget_never_cancels_a_registry_write() {
+    let store = Arc::new(SlowSaveStore::default());
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        ScriptedIssuer::new(&[]) as Arc<dyn DomainIssuer>,
+    );
+    let registry = Arc::new(CustomDomainRegistry::new(
+        Arc::clone(&store) as Arc<dyn autumn_web::custom_domain::CustomDomainStore>,
+        100,
+    ));
+    registry.load().await.unwrap();
+    registry
+        .register("app.clientco.com", "tenant-a", NOW)
+        .await
+        .unwrap();
+    let task = CustomDomainTask {
+        registry: Arc::clone(&registry),
+        verifier: owner_publishes(Arc::new(BlackholeVerifier), &registry),
+        ..h.task
+    };
+
+    // DNS answers at once. The save then outlasts the 2 second budget.
+    store.delay_secs.store(3, Ordering::SeqCst);
+    task.tick_within(NOW, std::time::Duration::from_secs(2))
+        .await;
+
+    let record = registry.get("app.clientco.com").unwrap();
+    assert_ne!(
+        record.status,
+        DomainStatus::PendingDns,
+        "the save was cut off"
+    );
+}
+
+/// A slow ingress lookup says nothing about the tenant's domain. The renewal
+/// goes ahead, as it does for any other slow lookup.
+#[tokio::test(start_paused = true)]
+async fn a_slow_ingress_lookup_does_not_skip_a_renewal() {
+    struct SlowIngress;
+    impl DomainVerifier for SlowIngress {
+        fn observe<'a>(&'a self, hostname: &'a str) -> BoxFuture<'a, ObservedTarget> {
+            Box::pin(async move {
+                if hostname == "ingress.myapp.com" {
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+                points_here()
+            })
+        }
+        fn observe_txt<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, ObservedTxt> {
+            Box::pin(async { ObservedTxt::Values(Vec::new()) })
+        }
+    }
+
+    let issuer = ScriptedIssuer::new(&[]);
+    let mut h = harness(
+        Arc::new(SlowIngress),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    h.task.ingress = ExpectedIngress {
+        hostname: Some("ingress.myapp.com".to_owned()),
+        ipv4: vec![],
+        ipv6: vec![],
+    };
+    register_due_for_renewal(&h, "renew.clientco.com").await;
+
+    h.task.tick(NOW).await;
+
+    assert_eq!(issuer.calls(), vec!["renew.clientco.com".to_owned()]);
+    let record = h.registry.get("renew.clientco.com").unwrap();
+    assert!(
+        record.failure_reason.is_none(),
+        "{:?}",
+        record.failure_reason
+    );
+}
+
+/// With a tiny backoff, a failure expires before the next tick. Repeat
+/// offenders must still go behind domains that have not failed.
+#[tokio::test(start_paused = true)]
+async fn domains_that_keep_timing_out_go_behind_the_rest() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness_with_limiter(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+        IssuanceLimiter::new(5, 50, 1, 1),
+    );
+    for i in 0..64 {
+        h.registry
+            .register(&format!("slow{i:02}.clientco.com"), "tenant-a", NOW)
+            .await
+            .unwrap();
+    }
+    h.registry
+        .register("zhealthy.clientco.com", "tenant-b", NOW)
+        .await
+        .unwrap();
+
+    let budget = std::time::Duration::from_secs(30);
+    for tick in 0..4 {
+        h.task.tick_within(NOW + tick * 100, budget).await;
+    }
+
+    assert_eq!(issuer.calls(), vec!["zhealthy.clientco.com".to_owned()]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn hung_renewal_rechecks_run_at_the_same_time_and_time_out() {
+    let issuer = ScriptedIssuer::new(&[]);
+    let h = harness(
+        Arc::new(BlackholeVerifier),
+        Arc::clone(&issuer) as Arc<dyn DomainIssuer>,
+    );
+    for i in 0..32 {
+        register_due_for_renewal(&h, &format!("slow{i}.clientco.com")).await;
+    }
+    register_due_for_renewal(&h, "renew.clientco.com").await;
+
+    let started = tokio::time::Instant::now();
+    h.task.tick(NOW).await;
+
+    assert!(
+        started.elapsed() <= std::time::Duration::from_secs(30),
+        "the pass took {:?}",
+        started.elapsed()
+    );
+    // A re-check that times out is a blip: the renewal goes ahead.
+    assert_eq!(issuer.calls().len(), 33);
+    assert!(
+        h.registry
+            .get("slow0.clientco.com")
+            .unwrap()
+            .failure_reason
+            .is_none()
+    );
 }
 
 // ── Certificate and cache writes sit inside the hostname gate (#2649) ────

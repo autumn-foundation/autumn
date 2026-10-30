@@ -670,6 +670,16 @@ impl CustomDomain {
 
 // ── Persistence ──────────────────────────────────────────────────────────
 
+/// The result of reading a store: the records that loaded, and the ones that
+/// did not.
+#[derive(Debug, Default)]
+pub struct StoreLoad {
+    /// Records that decoded.
+    pub records: Vec<CustomDomain>,
+    /// Where each record that did not decode is kept (a file path).
+    pub skipped: Vec<String>,
+}
+
 /// Durable storage for the domain registry.
 ///
 /// Records must survive a restart: a lost registry silently stops routing
@@ -677,6 +687,21 @@ impl CustomDomain {
 pub trait CustomDomainStore: Send + Sync + std::fmt::Debug {
     /// Every stored record. Called once at boot to hydrate the index.
     fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>>;
+
+    /// Every record that loads, and the records that do not.
+    ///
+    /// A store that skips records MUST override this. The default trusts
+    /// [`load_all`](Self::load_all) and reports nothing skipped. A store that
+    /// wraps another store MUST forward this method.
+    fn load_report(&self) -> StoreFuture<'_, io::Result<StoreLoad>> {
+        let all = self.load_all();
+        Box::pin(async move {
+            Ok(StoreLoad {
+                records: all.await?,
+                skipped: Vec::new(),
+            })
+        })
+    }
     /// Insert or replace one record.
     fn save<'a>(&'a self, domain: &'a CustomDomain) -> StoreFuture<'a, io::Result<()>>;
     /// Delete one record. Deleting an absent record succeeds.
@@ -856,13 +881,18 @@ fn file_stem(hostname: &str) -> String {
 
 impl CustomDomainStore for FsCustomDomainStore {
     fn load_all(&self) -> StoreFuture<'_, io::Result<Vec<CustomDomain>>> {
+        let report = self.load_report();
+        Box::pin(async move { Ok(report.await?.records) })
+    }
+
+    fn load_report(&self) -> StoreFuture<'_, io::Result<StoreLoad>> {
         Box::pin(async move {
             let mut entries = match tokio::fs::read_dir(&self.dir).await {
                 Ok(entries) => entries,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(StoreLoad::default()),
                 Err(e) => return Err(e),
             };
-            let mut out = Vec::new();
+            let mut out = StoreLoad::default();
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
                 if path.extension().is_none_or(|ext| ext != "json") {
@@ -870,14 +900,18 @@ impl CustomDomainStore for FsCustomDomainStore {
                 }
                 let bytes = tokio::fs::read(&path).await?;
                 match serde_json::from_slice::<CustomDomain>(&bytes) {
-                    Ok(domain) => out.push(domain),
-                    // A corrupt record must not stop the other 999 domains from
-                    // being served; it is logged and skipped, and the app can
-                    // re-register the hostname to repair it.
-                    Err(e) => tracing::warn!(
-                        path = %path.display(),
-                        "skipping unreadable custom-domain record: {e}"
-                    ),
+                    Ok(domain) => out.records.push(domain),
+                    // One corrupt record must not stop the other 999 domains
+                    // from serving. The caller learns of it, and the registry
+                    // then refuses new registrations (#2654).
+                    Err(e) => {
+                        tracing::error!(
+                            path = %path.display(),
+                            "custom-domain record will not load: {e}; restore or delete the file, \
+                             then restart"
+                        );
+                        out.skipped.push(path.display().to_string());
+                    }
                 }
             }
             Ok(out)
@@ -1001,6 +1035,12 @@ pub enum RegisterError {
     /// The registry has not hydrated from its store, so it cannot tell whether
     /// another tenant already owns the hostname.
     NotReady,
+    /// The load skipped records it could not decode, so a hostname may belong
+    /// to a tenant whose record is among them.
+    Incomplete {
+        /// The files that did not load.
+        files: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for RegisterError {
@@ -1025,6 +1065,13 @@ impl std::fmt::Display for RegisterError {
                 f,
                 "the custom-domain registry has not loaded, so a hostname cannot be connected \
                  without risking another tenant's record; check the server log for the load error"
+            ),
+            Self::Incomplete { files } => write!(
+                f,
+                "{} custom-domain record(s) will not load ({}), so a hostname cannot be connected \
+                 without risking another tenant's record; restore or delete them, then restart",
+                files.len(),
+                files.join(", ")
             ),
         }
     }
@@ -1071,6 +1118,9 @@ pub struct CustomDomainRegistry {
     /// hydrate: that index knows nothing, and every tenant certificate would
     /// read as an orphan.
     hydrated: std::sync::atomic::AtomicBool,
+    /// Files the last load could not decode. While any exist, the index is
+    /// partial: it serves what loaded but does not accept new registrations.
+    skipped: RwLock<Vec<String>>,
 }
 
 impl CustomDomainRegistry {
@@ -1085,6 +1135,7 @@ impl CustomDomainRegistry {
             max_domains,
             reserved: Vec::new(),
             hydrated: std::sync::atomic::AtomicBool::new(false),
+            skipped: RwLock::new(Vec::new()),
         }
     }
 
@@ -1155,6 +1206,27 @@ impl CustomDomainRegistry {
         self.hydrated.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Whether `host` is loaded and belongs to `tenant`.
+    fn owned_by(&self, host: &str, tenant: &str) -> bool {
+        read_lock(&self.index)
+            .get(host)
+            .is_some_and(|d| d.tenant == tenant)
+    }
+
+    /// Whether the last load read every stored record.
+    ///
+    /// `false` before a load, and after a load that skipped a record.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.is_hydrated() && read_lock(&self.skipped).is_empty()
+    }
+
+    /// The files the last load could not decode.
+    #[must_use]
+    pub fn skipped_records(&self) -> Vec<String> {
+        read_lock(&self.skipped).clone()
+    }
+
     /// Replace the index with `records`, skipping reserved names. Returns how
     /// many loaded and which ones [need a token](CustomDomain::needs_verification_token).
     ///
@@ -1202,8 +1274,9 @@ impl CustomDomainRegistry {
     ///
     /// Propagates the store's read error.
     pub async fn load(&self) -> io::Result<usize> {
-        let records = self.store.load_all().await?;
-        let (loaded, legacy) = self.hydrate_index(records);
+        let report = self.store.load_report().await?;
+        *write_lock(&self.skipped) = report.skipped;
+        let (loaded, legacy) = self.hydrate_index(report.records);
         self.hydrated
             .store(true, std::sync::atomic::Ordering::Release);
         // A record stored before ownership tokens, and not yet serving, has
@@ -1236,8 +1309,9 @@ impl CustomDomainRegistry {
     ///
     /// Propagates the store's read error.
     pub async fn load_without_migration(&self) -> io::Result<usize> {
-        let records = self.store.load_all().await?;
-        let (loaded, _legacy) = self.hydrate_index(records);
+        let report = self.store.load_report().await?;
+        *write_lock(&self.skipped) = report.skipped;
+        let (loaded, _legacy) = self.hydrate_index(report.records);
         self.hydrated
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(loaded)
@@ -1245,6 +1319,9 @@ impl CustomDomainRegistry {
 
     /// Read every record straight from the store, bypassing the in-memory
     /// index.
+    ///
+    /// This read hides records that do not decode. Use
+    /// [`skipped_records`](Self::skipped_records) to see them.
     ///
     /// The index is only as fresh as this process's own writes. Another
     /// process sharing the store — a serving app while a one-shot
@@ -1359,6 +1436,13 @@ impl CustomDomainRegistry {
         // for a load that succeeded.
         if !self.is_hydrated() {
             return Err(RegisterError::NotReady);
+        }
+        // A record that did not load may own this hostname. A save would
+        // overwrite its file. A loaded hostname of the same tenant is safe:
+        // it writes only its own file.
+        let skipped = self.skipped_records();
+        if !skipped.is_empty() && !self.owned_by(&host, tenant) {
+            return Err(RegisterError::Incomplete { files: skipped });
         }
 
         // Refuse a full registry BEFORE creating this hostname's write gate.
@@ -1788,6 +1872,34 @@ impl CustomDomainRegistry {
             .map(|_| ())
     }
 
+    /// Record a failed verification, only while `tenant` still owns the
+    /// hostname and the record carries `token`. Returns whether it applied.
+    ///
+    /// Unlike [`record_failure_for_registration`](Self::record_failure_for_registration),
+    /// it accepts a `PendingDns` record: that is the state a verification runs in.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the store's write error.
+    pub async fn record_verification_failure_for(
+        &self,
+        hostname: &str,
+        tenant: &str,
+        token: Option<&str>,
+        now_unix: i64,
+        reason: impl Into<String>,
+        backoff_secs: i64,
+    ) -> io::Result<bool> {
+        self.fail(
+            hostname,
+            |d| d.tenant == tenant && d.verification_token.as_deref() == token,
+            now_unix,
+            reason,
+            backoff_secs,
+        )
+        .await
+    }
+
     /// [`record_failure`](Self::record_failure), but only while `tenant` still
     /// owns the hostname AND the record is the generation the order ran
     /// against. Returns whether it applied.
@@ -2012,7 +2124,16 @@ impl CustomDomainRegistry {
         host: &str,
         guard: impl FnOnce(&CustomDomain) -> bool,
     ) -> io::Result<bool> {
-        if !read_lock(&self.index).get(host).is_none_or(guard) {
+        let (known, allowed) = {
+            let index = read_lock(&self.index);
+            (index.contains_key(host), index.get(host).is_none_or(guard))
+        };
+        if !allowed {
+            return Ok(false);
+        }
+        // An unknown host may own a record that did not load. Its file is the
+        // only copy, so a delete would erase it (#2654).
+        if !known && !read_lock(&self.skipped).is_empty() {
             return Ok(false);
         }
         self.store.delete(host).await?;
@@ -3857,6 +3978,76 @@ mod tests {
             "cert_not_after_unix":null,"consecutive_failures":0,"next_attempt_unix":null}"#;
         let record: CustomDomain = serde_json::from_str(old).unwrap();
         assert!(record.issuance_attempts_unix.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_verification_failure_lands_on_a_pending_registration() {
+        let registry = hydrated(10).await;
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        let token = registry.get("a.clientco.com").unwrap().verification_token;
+
+        let applied = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-a",
+                token.as_deref(),
+                100,
+                "the DNS lookup timed out",
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(applied);
+        let record = registry.get("a.clientco.com").unwrap();
+        assert_eq!(record.status, DomainStatus::PendingDns);
+        assert_eq!(
+            record.failure_reason.as_deref(),
+            Some("the DNS lookup timed out")
+        );
+        assert_eq!(record.consecutive_failures, 1);
+        assert_eq!(record.next_attempt_unix, Some(400));
+    }
+
+    #[tokio::test]
+    async fn a_verification_failure_spares_another_tenant_or_registration() {
+        let registry = hydrated(10).await;
+        registry
+            .register("a.clientco.com", "tenant-a", 0)
+            .await
+            .unwrap();
+        let token = registry.get("a.clientco.com").unwrap().verification_token;
+
+        let wrong_tenant = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-b",
+                token.as_deref(),
+                100,
+                "stale",
+                300,
+            )
+            .await
+            .unwrap();
+        let wrong_token = registry
+            .record_verification_failure_for(
+                "a.clientco.com",
+                "tenant-a",
+                Some("another-registration"),
+                100,
+                "stale",
+                300,
+            )
+            .await
+            .unwrap();
+
+        assert!(!wrong_tenant && !wrong_token);
+        let record = registry.get("a.clientco.com").unwrap();
+        assert!(record.failure_reason.is_none());
+        assert_eq!(record.consecutive_failures, 0);
     }
 
     #[test]

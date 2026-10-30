@@ -1,0 +1,30 @@
+# Bolt profile: autumn-web/metrics_record
+# unit: whole process (criterion --profile-time: the iteration count is wall-clock bound; read the shares)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 55,323,798
+blocks allocated: 1,180,496
+peak live bytes (whole run): 45,684
+
+         bytes      blocks  site
+
+    53,411,631     720,893  autumn_web::metrics::insert_label
+     1,769,447     458,746  <autumn_web::metrics::Counter>::with_label
+        72,000           8  <clap_builder::builder::command::Command>::arg_internal
+        14,400          16  <clap_builder::util::flat_map::Entry>::or_insert
+         8,512          76  <clap_builder::parser::matches::matched_arg::MatchedArg>::append_val
+         7,296          76  <clap_builder::parser::matches::matched_arg::MatchedArg>::new_val_group
+         6,144           4  <clap_builder::mkeymap::MKeyMap>::_build
+         5,286          73  <criterion::Criterion>::configure_from_args
+         4,308          44  <clap_builder::builder::styled_str::StyledStr as core::convert::From>::from
+         2,605          41  <criterion::benchmark_group::BenchmarkGroup>::bench_function
+         2,432          52  autumn_web::metrics::collides_with_registered
+         2,324          10  <clap_builder::builder::command::Command>::_build_self
+         1,851          16  autumn_web::metrics::instrument
+         1,604          37  <autumn_web::metrics::Instrument>::series_for
+         1,488          16  <clap_builder::builder::arg::Arg>::value_parser
+         1,216          38  <clap_builder::parser::arg_matcher::ArgMatcher>::add_index_to
+         1,102          13  <criterion::report::CliReport as criterion::report::Report>::profile
+         1,024           1  _IO_file_doallocate
+           992          68  <clap_builder::parser::parser::Parser>::add_defaults
+           896          56  <clap_builder::builder::arg::Arg>::_build

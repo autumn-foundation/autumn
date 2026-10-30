@@ -160,6 +160,17 @@ impl Session {
     }
 
     fn with_cookie_state(id: String, data: HashMap<String, String>, cookie_backed: bool) -> Self {
+        Self::for_request(id, data, cookie_backed, Arc::new(crate::entropy::OsEntropy))
+    }
+
+    /// A session for a request. `entropy` is the source of the session
+    /// layer, so a simulation replays session-id rotation deterministically.
+    fn for_request(
+        id: String,
+        data: HashMap<String, String>,
+        cookie_backed: bool,
+        entropy: Arc<dyn crate::entropy::Entropy>,
+    ) -> Self {
         Self {
             inner: Arc::new(RwLock::new(SessionInner {
                 id,
@@ -170,18 +181,24 @@ impl Session {
                 dirty: false,
                 destroyed: false,
             })),
-            entropy: Arc::new(crate::entropy::OsEntropy),
+            entropy,
         }
     }
 
     /// Attach the entropy source used to mint rotated session ids.
-    ///
-    /// The session layer calls this with the app's injected source so a
-    /// simulation replays session-id rotation deterministically.
+    #[cfg(test)]
     #[must_use]
     fn with_entropy(mut self, entropy: Arc<dyn crate::entropy::Entropy>) -> Self {
         self.entropy = entropy;
         self
+    }
+
+    /// `true` when the session has no change to save. `false` also when a
+    /// task holds the write lock, because the session can still change.
+    fn is_clean_now(&self) -> bool {
+        self.inner
+            .try_read()
+            .is_ok_and(|inner| !inner.dirty && !inner.destroyed)
     }
 
     /// Returns the session ID.
@@ -959,26 +976,34 @@ impl<S: SessionStore + Clone, Inner> Layer<Inner> for SessionLayer<S> {
     fn layer(&self, inner: Inner) -> Self::Service {
         SessionService {
             inner,
-            store: Arc::clone(&self.store),
-            config: Arc::clone(&self.config),
-            signing_keys: self.signing_keys.clone(),
-            entropy: self.entropy.clone(),
-            tenancy_session_key: self.tenancy_session_key.clone(),
-            rotation_hooks: self.rotation_hooks.clone(),
+            shared: Arc::new(SessionShared {
+                store: Arc::clone(&self.store),
+                config: Arc::clone(&self.config),
+                signing_keys: self.signing_keys.clone(),
+                entropy: self.entropy.clone(),
+                tenancy_session_key: self.tenancy_session_key.clone(),
+                rotation_hooks: self.rotation_hooks.clone(),
+            }),
         }
     }
 }
 
-/// Tower [`Service`] produced by [`SessionLayer`].
-#[derive(Clone)]
-pub struct SessionService<S: SessionStore, Inner> {
-    inner: Inner,
+/// The settings of a [`SessionService`]. One `Arc` for all of them, so a
+/// request clones one pointer, not six.
+struct SessionShared<S> {
     store: Arc<S>,
     config: Arc<SessionConfig>,
     signing_keys: Option<Arc<crate::security::config::ResolvedSigningKeys>>,
     entropy: Arc<dyn crate::entropy::Entropy>,
     tenancy_session_key: Option<Arc<str>>,
     rotation_hooks: Option<SessionRotationHooks>,
+}
+
+/// Tower [`Service`] produced by [`SessionLayer`].
+#[derive(Clone)]
+pub struct SessionService<S: SessionStore, Inner> {
+    inner: Inner,
+    shared: Arc<SessionShared<S>>,
 }
 
 /// `true` when the response was produced by the request-timeout layer
@@ -998,6 +1023,181 @@ fn response_was_deadline_cancelled(response: &Response) -> bool {
         .is_some()
 }
 
+type BoxedResponse<E> = Pin<Box<dyn Future<Output = Result<Response, E>> + Send>>;
+
+pin_project_lite::pin_project! {
+    /// Future of [`SessionService`].
+    ///
+    /// A request without a session cookie calls the inner service at once,
+    /// so this future holds the inner future inline: no box and no clone of
+    /// the inner service (issue #2830). A box is necessary only to load a
+    /// session, to save a changed session, or to finalize an idempotency
+    /// commit. A session that a task still locks is also saved.
+    pub struct SessionFuture<St, F, E> {
+        // Private: `SessionState` is not a public type.
+        #[pin]
+        state: SessionState<St, F, E>,
+    }
+}
+
+pin_project_lite::pin_project! {
+    #[project = SessionStateProj]
+    enum SessionState<St, F, E> {
+        /// No cookie: the inner future, then the session to check.
+        Serving {
+            #[pin]
+            inner: F,
+            pending: Option<(Arc<SessionShared<St>>, Session)>,
+        },
+        /// The session changed: save it.
+        Saving {
+            fut: Pin<Box<dyn Future<Output = Response> + Send>>,
+        },
+        /// A cookie: load the session, call the inner service, save.
+        Loading {
+            fut: BoxedResponse<E>,
+        },
+    }
+}
+
+impl<St, F, E> Future for SessionFuture<St, F, E>
+where
+    St: SessionStore,
+    F: Future<Output = Result<Response, E>>,
+{
+    type Output = Result<Response, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut state = self.project().state;
+        loop {
+            match state.as_mut().project() {
+                SessionStateProj::Serving { inner, pending } => {
+                    let response = std::task::ready!(inner.poll(cx))?;
+                    let Some((shared, session)) = pending.take() else {
+                        return Poll::Ready(Ok(response));
+                    };
+                    // A deadline stop saves nothing. A clean session saves
+                    // nothing, unless an idempotency commit waits for it.
+                    if response_was_deadline_cancelled(&response)
+                        || (session.is_clean_now()
+                            && !crate::idempotency::has_deferred_session_commit(&response))
+                    {
+                        return Poll::Ready(Ok(response));
+                    }
+                    state.set(SessionState::Saving {
+                        fut: Box::pin(save_session(shared, session, response)),
+                    });
+                }
+                SessionStateProj::Saving { fut } => return fut.as_mut().poll(cx).map(Ok),
+                SessionStateProj::Loading { fut } => return fut.as_mut().poll(cx),
+            }
+        }
+    }
+}
+
+/// Save or destroy the session after the inner service, and add the cookie
+/// to `response`. Also finalize a deferred idempotency commit.
+///
+/// The caller does not call this for a response that a deadline stopped:
+/// the handler can have left a partial change.
+async fn save_session<St: SessionStore>(
+    shared: Arc<SessionShared<St>>,
+    session: Session,
+    mut response: Response,
+) -> Response {
+    let inner_guard = session.inner.read().await;
+    if inner_guard.destroyed {
+        if let Err(error) = shared
+            .store
+            .destroy(inner_guard.old_id.as_deref().unwrap_or(&inner_guard.id))
+            .await
+        {
+            crate::idempotency::keep_deferred_session_commit_locked(&mut response);
+            return session_store_unavailable_response(&error);
+        }
+        if let Ok(val) = HeaderValue::from_str(&build_expire_cookie(&shared.config)) {
+            response.headers_mut().append(SET_COOKIE, val);
+        }
+        // No lock here: a destroyed session saves nothing.
+        crate::idempotency::add_deferred_session_replay_key(
+            &response,
+            None,
+            inner_guard.cookie_backed,
+            None,
+        );
+    } else if inner_guard.dirty {
+        let data = inner_guard.data.clone();
+        let sid = inner_guard.id.clone();
+        let primary_replay_after_guard_denial =
+            inner_guard.cookie_backed && inner_guard.old_id.is_some();
+        // A session with no stored row has nothing keyed to its old id.
+        let rotation = inner_guard
+            .old_id
+            .clone()
+            .filter(|_| inner_guard.cookie_backed)
+            .map(|old_id| SessionRotation {
+                old_id,
+                new_id: sid.clone(),
+                earlier_ids: inner_guard.prior_ids.clone(),
+            });
+        // The tenant `[tenancy] source = "session"` will resolve for a
+        // retry presenting this finalized session — read live from the
+        // data just written rather than reusing the tenant captured
+        // before the handler ran, which a handler like an org switch
+        // may have just changed.
+        let finalized_tenant = shared
+            .tenancy_session_key
+            .as_deref()
+            .and_then(|key| data.get(key).cloned());
+        // Lock the alias before the session is saved. A request with the
+        // saved session then finds its key in flight. If a later step
+        // fails, the lock stays until its TTL ends.
+        if let Some(reserve) = crate::idempotency::reserve_deferred_session_replay_key(
+            &response,
+            Some(&sid),
+            primary_replay_after_guard_denial,
+            finalized_tenant.as_deref(),
+        ) && let Err(error) = reserve.await
+        {
+            drop(inner_guard);
+            tracing::error!("session alias idempotency lock failed: {error}");
+            crate::idempotency::keep_deferred_session_commit_locked(&mut response);
+            return crate::idempotency::persistence_failed_response();
+        }
+        if let Some(ref old_id) = inner_guard.old_id
+            && let Err(error) = shared.store.destroy(old_id).await
+        {
+            drop(inner_guard);
+            crate::idempotency::keep_deferred_session_commit_locked(&mut response);
+            return session_store_unavailable_response(&error);
+        }
+        drop(inner_guard);
+        if let Err(error) = shared.store.save(&sid, data).await {
+            crate::idempotency::keep_deferred_session_commit_locked(&mut response);
+            return session_store_unavailable_response(&error);
+        }
+        if let (Some(hooks), Some(rotation)) = (&shared.rotation_hooks, &rotation) {
+            hooks.run(rotation).await;
+        }
+        // Sign the session ID when signing keys are active
+        let cookie_value = shared.signing_keys.as_ref().map_or_else(
+            || sid.clone(),
+            |keys| format!("{sid}.{}", keys.sign(sid.as_bytes())),
+        );
+        if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&shared.config, &cookie_value)) {
+            response.headers_mut().append(SET_COOKIE, val);
+        }
+    }
+
+    if let Some(finalize) = crate::idempotency::finalize_deferred_session_commit(&mut response)
+        && finalize.await.is_err()
+    {
+        return crate::idempotency::persistence_failed_response();
+    }
+
+    response
+}
+
 impl<St, Inner> Service<Request> for SessionService<St, Inner>
 where
     St: SessionStore + Clone,
@@ -1007,159 +1207,85 @@ where
 {
     type Response = Response;
     type Error = Inner::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = SessionFuture<St, Inner::Future, Inner::Error>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn call(&mut self, mut req: Request) -> Self::Future {
-        let store = Arc::clone(&self.store);
-        let config = Arc::clone(&self.config);
-        let signing_keys = self.signing_keys.clone();
-        let entropy = self.entropy.clone();
-        let tenancy_session_key = self.tenancy_session_key.clone();
-        let rotation_hooks = self.rotation_hooks.clone();
+        let shared = Arc::clone(&self.shared);
+        // Verify the HMAC of the cookie if signing is active.
+        let Some(existing_id) = session_id_from_headers(
+            req.headers(),
+            &shared.config.cookie_name,
+            shared.signing_keys.as_deref(),
+        ) else {
+            // No cookie: a new session, and nothing to load. Call the inner
+            // service at once.
+            let session = Session::for_request(
+                shared.entropy.uuid_v4().to_string(),
+                HashMap::new(),
+                false,
+                shared.entropy.clone(),
+            );
+            // No idempotency scope: with no cookie, the scope has no session
+            // id, and idempotency reads the same from the new session.
+            req.extensions_mut().insert(session.clone());
+            return SessionFuture {
+                state: SessionState::Serving {
+                    inner: self.inner.call(req),
+                    pending: Some((shared, session)),
+                },
+            };
+        };
+
+        // The load is async, so the inner service moves into the future. Swap
+        // to keep the poll_ready semantics.
         let mut inner = self.inner.clone();
-        // Swap to ensure correct poll_ready semantics
         std::mem::swap(&mut self.inner, &mut inner);
 
-        Box::pin(async move {
-            // 1. Extract or create session ID (verify HMAC if signing is active)
-            let existing_id = session_id_from_headers(
-                req.headers(),
-                &config.cookie_name,
-                signing_keys.as_deref(),
-            );
+        SessionFuture {
+            state: SessionState::Loading {
+                fut: Box::pin(async move {
+                    // 1. Load the session of the cookie.
+                    let mut stale_cookie_session_id = None;
+                    let (session_id, data, cookie_backed) =
+                        match shared.store.load(&existing_id).await {
+                            Ok(Some(data)) => (existing_id, data, true),
+                            Ok(None) => {
+                                stale_cookie_session_id = Some(existing_id);
+                                (shared.entropy.uuid_v4().to_string(), HashMap::new(), false)
+                            }
+                            Err(error) => return Ok(session_store_unavailable_response(&error)),
+                        };
 
-            let mut stale_cookie_session_id = None;
-            let (session_id, data) = if let Some(ref id) = existing_id {
-                match store.load(id).await {
-                    Ok(Some(data)) => (id.clone(), data),
-                    Ok(None) => {
-                        stale_cookie_session_id = Some(id.clone());
-                        (entropy.uuid_v4().to_string(), HashMap::new())
+                    // 2. Create session handle and insert into extensions
+                    let current_session_scope = cookie_backed.then(|| session_id.clone());
+                    let session = Session::for_request(
+                        session_id,
+                        data,
+                        cookie_backed,
+                        shared.entropy.clone(),
+                    );
+                    req.extensions_mut()
+                        .insert(crate::idempotency::IdempotencySessionScope::new(
+                            current_session_scope,
+                            stale_cookie_session_id,
+                        ));
+                    req.extensions_mut().insert(session.clone());
+
+                    // 3. Call inner service
+                    let response = inner.call(req).await?;
+
+                    // 4. Save or destroy the session.
+                    if response_was_deadline_cancelled(&response) {
+                        return Ok(response);
                     }
-                    Err(error) => return Ok(session_store_unavailable_response(&error)),
-                }
-            } else {
-                (entropy.uuid_v4().to_string(), HashMap::new())
-            };
-
-            // 2. Create session handle and insert into extensions
-            let cookie_backed = existing_id.as_ref().is_some_and(|id| id == &session_id);
-            let session = if cookie_backed {
-                Session::new_cookie_backed(session_id.clone(), data)
-            } else {
-                Session::new(session_id.clone(), data)
-            }
-            .with_entropy(entropy.clone());
-            let current_session_scope = cookie_backed.then(|| session_id.clone());
-            req.extensions_mut()
-                .insert(crate::idempotency::IdempotencySessionScope::new(
-                    current_session_scope,
-                    stale_cookie_session_id,
-                ));
-            req.extensions_mut().insert(session.clone());
-
-            // 3. Call inner service
-            let mut response = inner.call(req).await?;
-
-            // 4. Save or destroy session — but skip persistence when the deadline
-            // cancelled the handler, so a partial mutation isn't committed.
-            if response_was_deadline_cancelled(&response) {
-                return Ok(response);
-            }
-
-            let inner_guard = session.inner.read().await;
-            if inner_guard.destroyed {
-                if let Err(error) = store.destroy(&session_id).await {
-                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
-                    return Ok(session_store_unavailable_response(&error));
-                }
-                if let Ok(val) = HeaderValue::from_str(&build_expire_cookie(&config)) {
-                    response.headers_mut().append(SET_COOKIE, val);
-                }
-                // No lock here: a destroyed session saves nothing.
-                crate::idempotency::add_deferred_session_replay_key(
-                    &response,
-                    None,
-                    inner_guard.cookie_backed,
-                    None,
-                );
-            } else if inner_guard.dirty {
-                let data = inner_guard.data.clone();
-                let sid = inner_guard.id.clone();
-                let primary_replay_after_guard_denial =
-                    inner_guard.cookie_backed && inner_guard.old_id.is_some();
-                // A session with no stored row has nothing keyed to its old id.
-                let rotation = inner_guard
-                    .old_id
-                    .clone()
-                    .filter(|_| inner_guard.cookie_backed)
-                    .map(|old_id| SessionRotation {
-                        old_id,
-                        new_id: sid.clone(),
-                        earlier_ids: inner_guard.prior_ids.clone(),
-                    });
-                // The tenant `[tenancy] source = "session"` will resolve for a
-                // retry presenting this finalized session — read live from the
-                // data just written rather than reusing the tenant captured
-                // before the handler ran, which a handler like an org switch
-                // may have just changed.
-                let finalized_tenant = tenancy_session_key
-                    .as_deref()
-                    .and_then(|key| data.get(key).cloned());
-                // Lock the alias before the session is saved. A request with the
-                // saved session then finds its key in flight. If a later step
-                // fails, the lock stays until its TTL ends.
-                if let Some(reserve) = crate::idempotency::reserve_deferred_session_replay_key(
-                    &response,
-                    Some(&sid),
-                    primary_replay_after_guard_denial,
-                    finalized_tenant.as_deref(),
-                ) && let Err(error) = reserve.await
-                {
-                    drop(inner_guard);
-                    tracing::error!("session alias idempotency lock failed: {error}");
-                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
-                    return Ok(crate::idempotency::persistence_failed_response());
-                }
-                if let Some(ref old_id) = inner_guard.old_id
-                    && let Err(error) = store.destroy(old_id).await
-                {
-                    drop(inner_guard);
-                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
-                    return Ok(session_store_unavailable_response(&error));
-                }
-                drop(inner_guard);
-                if let Err(error) = store.save(&sid, data).await {
-                    crate::idempotency::keep_deferred_session_commit_locked(&mut response);
-                    return Ok(session_store_unavailable_response(&error));
-                }
-                if let (Some(hooks), Some(rotation)) = (&rotation_hooks, &rotation) {
-                    hooks.run(rotation).await;
-                }
-                // Sign the session ID when signing keys are active
-                let cookie_value = signing_keys.as_ref().map_or_else(
-                    || sid.clone(),
-                    |keys| format!("{sid}.{}", keys.sign(sid.as_bytes())),
-                );
-                if let Ok(val) = HeaderValue::from_str(&build_set_cookie(&config, &cookie_value)) {
-                    response.headers_mut().append(SET_COOKIE, val);
-                }
-            }
-
-            if let Some(finalize) =
-                crate::idempotency::finalize_deferred_session_commit(&mut response)
-                && finalize.await.is_err()
-            {
-                return Ok(crate::idempotency::persistence_failed_response());
-            }
-
-            Ok(response)
-        })
+                    Ok(save_session(shared, session, response).await)
+                }),
+            },
+        }
     }
 }
 
@@ -1183,8 +1309,8 @@ fn session_store_unavailable_response(error: &SessionStoreError) -> Response {
 /// # What that costs, and why it is worth it
 ///
 /// The `Arc<dyn BoxedSessionStore>` bridge adds one `Box::pin` per store
-/// operation — 1-2 per request (a `load`, plus a `save` or `destroy` only when
-/// the session is dirty). In exchange it removes one whole `Router::layer`
+/// operation: a `load` only when the request has a session cookie, and a
+/// `save`, a `destroy`, or both (a rotation) only when the session changed. In exchange it removes one whole `Router::layer`
 /// nesting level, and a nesting level is not a one-off cost: `Route::call`
 /// deep-clones everything below it on *every* request, so each level is
 /// re-cloned by every level above it. One boxed future per store call is
@@ -1925,6 +2051,215 @@ mod tests {
             .expect("session still present");
         assert!(!saved.contains_key("user"), "no partial session save");
         assert!(response.headers().get(SET_COOKIE).is_none());
+    }
+
+    // ── Requests without a cookie (issue #2830) ───────────────────────────
+    //
+    // These requests do not load a session, so the layer can call the inner
+    // service at once. These tests make sure that the persistence rules stay
+    // the same on that path.
+
+    #[tokio::test]
+    async fn no_cookie_clean_session_sets_no_cookie_and_saves_nothing() {
+        let store = MemoryStore::new();
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(SessionLayer::new(store.clone(), SessionConfig::default()));
+
+        let response = app
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get(SET_COOKIE).is_none());
+        assert!(store.sessions.read().await.is_empty(), "nothing saved");
+    }
+
+    #[tokio::test]
+    async fn no_cookie_dirty_session_is_saved_with_a_cookie() {
+        let store = MemoryStore::new();
+        let app = Router::new()
+            .route(
+                "/",
+                get(|session: Session| async move {
+                    session.insert("user", "alice").await;
+                    session.id().await
+                }),
+            )
+            .layer(SessionLayer::new(store.clone(), SessionConfig::default()));
+
+        let response = app
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .expect("a dirty session sets a cookie")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let id = String::from_utf8(body.to_vec()).unwrap();
+        assert!(cookie.starts_with(&format!("autumn.sid={id};")));
+        let saved = store.load(&id).await.unwrap().expect("session saved");
+        assert_eq!(saved.get("user").map(String::as_str), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn no_cookie_rotated_session_sets_the_rotated_id() {
+        let store = MemoryStore::new();
+        let app = Router::new()
+            .route(
+                "/",
+                get(|session: Session| async move {
+                    let before = session.id().await;
+                    session.rotate_id().await;
+                    session.insert("user", "alice").await;
+                    format!("{before} {}", session.id().await)
+                }),
+            )
+            .layer(SessionLayer::new(store.clone(), SessionConfig::default()));
+
+        let response = app
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let (before, after) = body.split_once(' ').unwrap();
+        assert_ne!(before, after);
+        assert!(cookie.starts_with(&format!("autumn.sid={after};")));
+        assert!(store.load(after).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn no_cookie_destroyed_session_expires_the_cookie() {
+        let store = MemoryStore::new();
+        let app = Router::new()
+            .route(
+                "/",
+                get(|session: Session| async move {
+                    session.insert("user", "alice").await;
+                    session.destroy().await;
+                    "ok"
+                }),
+            )
+            .layer(SessionLayer::new(store.clone(), SessionConfig::default()));
+
+        let response = app
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let cookie = response
+            .headers()
+            .get(SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("Max-Age=0"), "cookie should be expired");
+        assert!(store.sessions.read().await.is_empty(), "nothing saved");
+    }
+
+    #[tokio::test]
+    async fn no_cookie_deadline_cancelled_response_skips_the_save() {
+        let store = MemoryStore::new();
+        let app = Router::new()
+            .route(
+                "/",
+                get(|session: Session| async move {
+                    session.insert("user", "alice").await;
+                    let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+                    response
+                        .extensions_mut()
+                        .insert(crate::router::RequestDeadlineCancelled);
+                    response
+                }),
+            )
+            .layer(SessionLayer::new(store.clone(), SessionConfig::default()));
+
+        let response = app
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get(SET_COOKIE).is_none());
+        assert!(store.sessions.read().await.is_empty(), "nothing saved");
+    }
+
+    /// A task that still holds the session lock must not make the layer
+    /// treat the session as clean. The layer waits for the lock, then saves.
+    #[tokio::test]
+    async fn no_cookie_session_locked_by_a_task_is_saved_after_the_lock() {
+        let store = MemoryStore::new();
+        let app = Router::new()
+            .route(
+                "/",
+                get(|session: Session| async move {
+                    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+                    tokio::spawn(async move {
+                        let mut guard = session.inner.write().await;
+                        locked_tx.send(()).unwrap();
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        guard.data.insert("user".to_owned(), "alice".to_owned());
+                        guard.dirty = true;
+                    });
+                    locked_rx.await.unwrap();
+                    "ok"
+                }),
+            )
+            .layer(SessionLayer::new(store.clone(), SessionConfig::default()));
+
+        let response = app
+            .oneshot(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert!(
+            response.headers().get(SET_COOKIE).is_some(),
+            "the change made under the lock is saved"
+        );
+        let saved: Vec<_> = store.sessions.read().await.values().cloned().collect();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].get("user").map(String::as_str), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn no_cookie_inner_error_passes_through_without_a_save() {
+        let store = MemoryStore::new();
+        let mut svc = SessionLayer::new(store.clone(), SessionConfig::default()).layer(
+            tower::service_fn(|req: Request| async move {
+                let session = req.extensions().get::<Session>().unwrap().clone();
+                session.insert("user", "alice").await;
+                Err::<Response, &'static str>("inner failed")
+            }),
+        );
+
+        let result = svc
+            .ready()
+            .await
+            .unwrap()
+            .call(HttpRequest::builder().uri("/").body(Body::empty()).unwrap())
+            .await;
+
+        assert_eq!(result.err(), Some("inner failed"));
+        assert!(store.sessions.read().await.is_empty(), "nothing saved");
     }
 
     // ── Signed session cookies (RED phase) ─────────────────────────────────

@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/metrics_record
+# unit: whole process (criterion --profile-time: the iteration count is wall-clock bound; read the shares)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+     461,973,836   29.1%  <core::hash::sip::Hasher as core::hash::Hasher>::write
+     211,681,050   13.3%  <autumn_web::metrics::Counter>::increment
+     185,015,808   11.7%  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one
+     101,776,977    6.4%  <autumn_web::metrics::Instrument>::series_for
+      78,916,427    5.0%  __memcmp_avx2_movbe
+      74,711,796    4.7%  autumn_web::metrics::instrument
+      73,400,051    4.6%  autumn_web::metrics::insert_label
+      63,750,980    4.0%  _int_free
+      50,563,473    3.2%  malloc
+      48,824,050    3.1%  autumn_web::actuator::is_valid_label_name
+      44,438,750    2.8%  <criterion::bencher::Bencher>::iter
+      36,591,005    2.3%  free
+      27,540,435    1.7%  core::ptr::drop_glue
+      25,231,030    1.6%  <autumn_web::metrics::Counter>::with_label
+      17,301,438    1.1%  <autumn_web::metrics::Series>::observe
+      16,883,115    1.1%  __memcpy_avx_unaligned_erms
+      11,796,435    0.7%  <autumn_web::metrics::Histogram>::record
+      10,623,717    0.7%  __rustc::__rdl_alloc
+      10,501,455    0.7%  <alloc::raw_vec::RawVecInner>::finish_grow
+       9,371,635    0.6%  autumn_web::metrics::counter
+       7,667,595    0.5%  <autumn_web::metrics::Timer>::record
+       6,297,291    0.4%  <alloc::raw_vec::RawVec>::grow_one
+       3,145,716    0.2%  autumn_web::metrics::limits
+       2,883,573    0.2%  <autumn_web::metrics::Instrument>::capped_key
+       1,180,413    0.1%  __rustc::__rust_alloc
+       1,180,413    0.1%  __rustc::__rust_no_alloc_shim_is_unstable_v2
+       1,180,348    0.1%  __rustc::__rdl_dealloc
+       1,180,348    0.1%  __rustc::__rust_dealloc
+         851,955    0.1%  autumn_web::metrics::timer
+         216,724    0.0%  _dl_relocate_object
+
+   1,587,479,810  100.0%  TOTAL
