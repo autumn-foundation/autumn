@@ -823,6 +823,18 @@ mod tests {
     /// Gzip budget. Browsers download this size.
     const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 11 * 1024;
 
+    /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
+    /// CRLF checkout changes the bytes, the content hash and the size.
+    #[test]
+    fn shipped_assets_have_lf_line_ends() {
+        for (name, bytes) in [
+            ("autumn-widgets.js", AUTUMN_WIDGETS_JS),
+            ("widgets.css", crate::ui::WIDGETS_CSS.as_bytes()),
+        ] {
+            assert!(!bytes.contains(&b'\r'), "{name} has a CR byte");
+        }
+    }
+
     #[test]
     fn widgets_js_stays_inside_its_size_budget() {
         use std::io::Write as _;
