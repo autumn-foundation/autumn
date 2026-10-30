@@ -16,6 +16,7 @@ pr_description.md
 # were already tracked, which is exactly why the trap went unnoticed.
 !scripts/*.sh
 !scripts/*.py
+!scripts/perf/*.py
 !scripts/lib/*.sh
 !scripts/self-hosted-runner/*.sh
 !.claude/skills/**/*.sh

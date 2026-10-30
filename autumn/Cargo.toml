@@ -207,6 +207,13 @@ sim-testing = ["dep:proptest"]
 # Ledger profiling harnesses (`docs/perf/`). Off by default and not part of any
 # CI feature set, so the harness module is only compiled when asked for.
 ledger-profile = ["db"]
+# Ledger capture (`autumn/src/ledger_capture.rs`): records every statement the
+# framework issues, with its call site and generic plan, when
+# `AUTUMN_LEDGER_CAPTURE_DIR` is set. CI's Docker sweep enables it, and
+# `scripts/check-perf-profiles.py ledger` gates the capture against
+# `docs/perf/ledger/queries/`. It plans through diesel's Postgres connection,
+# so it needs the `postgres` backend, not only `db`.
+ledger-capture = ["postgres", "dep:backtrace"]
 # `dep:rustls` is not optional flavouring: `redis`'s `tokio-rustls-comp`
 # feature makes `rediss://` URLs reachable, and those panic inside
 # `rustls::ClientConfig::builder()` unless a process-level
@@ -511,6 +518,7 @@ secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.18.0"
 hmac = "0.12"
 sha2 = "0.10"
+backtrace = { version = "0.3", optional = true }
 infer = { version = "0.22", optional = true }
 sha1 = { version = "0.11", optional = true }
 rsa = { version = "0.9", default-features = false, features = ["std", "pem"], optional = true }

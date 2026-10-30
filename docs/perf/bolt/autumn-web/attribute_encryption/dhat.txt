@@ -1,0 +1,22 @@
+# Bolt profile: autumn-web/attribute_encryption
+# unit: whole process
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 4,376,259
+blocks allocated: 85,531
+peak live bytes (whole run): 1,880,636
+
+         bytes      blocks  site
+
+     1,600,000      30,000  <autumn_web::encryption::KeyRing>::encrypt
+     1,431,024      25,006  attribute_encryption::main
+     1,342,528      30,512  <autumn_web::encryption::KeyRing>::decrypt
+         1,024           1  _IO_file_doallocate
+           548           2  main
+           472           1  __fopen_internal
+           360           2  getdelim
+           152           1  __pthread_attr_extension
+            56           3  autumn_web::encryption::decode_master_hex
+            32           1  pthread_getattr_np@@GLIBC_2.32
+            32           1  pthread_attr_setaffinity_np@@GLIBC_2.32
+            31           1  autumn_web::encryption::derive_data_key

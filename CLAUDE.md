@@ -18,6 +18,22 @@ dhat passes have taken it to the floor, and the remainder is allocator cost
 driven by the tower layer-clone cascade (tracked in #2830). Pick another
 `autumn/benches/*` target instead, and skip building that bench.
 
+## Performance profiles (Bolt and Ledger)
+
+Every workload and every query has a committed profile, and CI fails a new one
+that has none. See `docs/perf/README.md`.
+
+- **A new `[[bench]]`** needs a `[[workload]]` entry in
+  `docs/perf/bolt/workloads.toml` and a profile from
+  `scripts/bolt-profile.sh <package>/<bench>` (callgrind + dhat). The `lint`
+  job runs `scripts/check-perf-profiles.py bolt`.
+- **A new SQL statement** needs `docs/perf/ledger/queries/<fingerprint>.toml`.
+  The Docker sweep builds with `ledger-capture` and records every statement
+  the framework issues. The step after it runs
+  `scripts/check-perf-profiles.py ledger`. Write the missing profiles with
+  `scripts/ledger-profile.sh`, or run `scripts/perf/ledger_catalog.py update`
+  on the `ledger-capture` artifact of the failed run.
+
 ## Changelog
 
 **Never edit `CHANGELOG.md` in a feature PR**, and never create a new
@@ -176,7 +192,8 @@ house-pattern testcontainer DB test — `#[ignore = "requires Docker (testcontai
 **no workflow edit**. Do not add a per-test allowlist line.
 
 This sweep compiles the consolidated binary with `--features
-"test-support,offline-sync,ws,mail,redis,i18n,collab"` (db + maud are already defaults), so
+"test-support,offline-sync,ws,mail,redis,i18n,collab,ledger-capture"` (db + maud are already defaults;
+`ledger-capture` feeds the Ledger profile gate), so
 a new Postgres/DB testcontainer test — and now also the previously-unreachable
 `ws`/`mail`/`redis` testcontainer Docker tests — runs automatically. As of
 #1945 the feature set folds in the `ws` `live_broadcast` OOB-fragment suite, the

@@ -1,0 +1,17 @@
+# Ledger profile: autumn-web/repository_crud
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: pg_stat_statements, reset before each run; buffers = shared hit + read
+# command: "$BIN" --iterations 200  # and again with {n}=0, subtracted
+
+statements per iteration: 7.00
+rows per iteration: 26.00
+shared buffers per iteration: 115.19
+temp blocks written per iteration: 0.00
+
+   calls     rows   buffers  statement
+
+    1.00     1.00    104.80  SELECT COUNT(*) FROM "bolt_bench_products"
+    1.00     1.00      4.04  INSERT INTO "bolt_bench_products" ("name", "description", "price_cents", "in_stock") VALUES ($1, $2, $3, $4) RETURNING "bolt_bench_products"."id", "bolt_bench_products"."name", "bolt_bench_products"."
+    1.00    20.00      3.35  SELECT "bolt_bench_products"."id", "bolt_bench_products"."name", "bolt_bench_products"."description", "bolt_bench_products"."price_cents", "bolt_bench_products"."in_stock", "bolt_bench_products"."crea
+    1.00     1.00      3.00  SELECT "bolt_bench_products"."id", "bolt_bench_products"."name", "bolt_bench_products"."description", "bolt_bench_products"."price_cents", "bolt_bench_products"."in_stock", "bolt_bench_products"."crea
+    3.00     3.00      0.00  SELECT $1

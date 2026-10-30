@@ -1,0 +1,12 @@
+# Bolt profile: autumn-web/feed_render
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 61,004
+blocks allocated: 196
+peak live bytes (whole run): 38,323
+
+         bytes      blocks  site
+
+        44,259          71  <autumn_web::feed::Feed>::render
+        16,745         125  feed_render::sample_feed

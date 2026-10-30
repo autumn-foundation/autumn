@@ -1,0 +1,21 @@
+# Bolt profile: autumn-web/markdown_render
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 51,872
+blocks allocated: 295
+peak live bytes (whole run): 27,424
+
+         bytes      blocks  site
+
+        25,564         173  autumn_web::markdown::user_content::sanitize_user_html
+        18,831           7  autumn_web::markdown::user_content::render_user_content_html
+         3,672          27  <ammonia::rcdom::RcDom as markup5ever::interface::tree_builder::TreeSink>::append
+         1,952          44  ammonia::rcdom::append
+           680           5  <ammonia::rcdom::RcDom as markup5ever::interface::tree_builder::TreeSink>::create_element
+           384           4  <html5ever::tree_builder::TreeBuilder>::step
+           277          25  <autumn_web::markdown::user_content::build_sanitizer::{closure#0} as ammonia::AttributeFilter>::filter
+           208           4  <autumn_web::markdown::user_content::SafeEvents as core::iter::traits::iterator::Iterator>::next
+           192           1  <html5ever::tree_builder::TreeBuilder>::create_formatting_element_for
+            80           2  ammonia::rcdom::append_to_existing_text
+            32           3  autumn_web::markdown::user_content::url_scheme_allowed
