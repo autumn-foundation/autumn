@@ -211,8 +211,9 @@ ledger-profile = ["db"]
 # framework issues, with its call site and generic plan, when
 # `AUTUMN_LEDGER_CAPTURE_DIR` is set. CI's Docker sweep enables it, and
 # `scripts/check-perf-profiles.py ledger` gates the capture against
-# `docs/perf/ledger/queries/`.
-ledger-capture = ["db", "dep:backtrace"]
+# `docs/perf/ledger/queries/`. It plans through diesel's Postgres connection,
+# so it needs the `postgres` backend, not only `db`.
+ledger-capture = ["postgres", "dep:backtrace"]
 # `dep:rustls` is not optional flavouring: `redis`'s `tokio-rustls-comp`
 # feature makes `rediss://` URLs reachable, and those panic inside
 # `rustls::ClientConfig::builder()` unless a process-level
