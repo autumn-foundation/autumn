@@ -1075,8 +1075,8 @@ impl<'a> Renderer<'a> {
 /// Render a Markdown node through the sanitizing user-content path — the same
 /// allowlist Autumn's user-submitted rich text goes through.
 ///
-/// The intermediate HTML is bounded by `max_html`, so a small source cannot
-/// build a large string before the output meter sees it.
+/// `max_html` bounds the intermediate HTML. A small source cannot build a
+/// large string before the output meter sees it.
 #[cfg(feature = "markdown")]
 fn render_markdown(source: &str, max_html: usize, path: &str) -> Result<String, ConstelaError> {
     crate::markdown::render_user_content_html_bounded(source, max_html).map_err(|err| {

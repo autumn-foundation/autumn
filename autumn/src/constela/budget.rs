@@ -192,7 +192,7 @@ impl Output {
     }
 
     /// The bytes that can still be written.
-    pub fn remaining(&self) -> usize {
+    pub const fn remaining(&self) -> usize {
         self.limit.saturating_sub(self.written.get())
     }
 

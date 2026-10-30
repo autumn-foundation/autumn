@@ -37,6 +37,14 @@ controls**:
 Either control alone blocks the canonical payloads. Both are applied so that a
 bypass of one is not a bypass of the feature.
 
+### Size limits
+
+- Block nesting deeper than 100 levels is flattened.
+- The parser reads at most 1,048,576 events. Later content is dropped.
+- `render_user_content_html_bounded(source, max_html_bytes)` returns
+  `HtmlTooLarge` when the HTML before sanitizing exceeds `max_html_bytes`. Use
+  it when you have your own size budget.
+
 ```rust
 use autumn_web::markdown::render_user_content;
 

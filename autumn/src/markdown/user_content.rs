@@ -94,6 +94,10 @@ const ALLOWED_TEXT_ALIGN: &[&str] = &["left", "right", "center"];
 ///
 /// See the [`markdown` module documentation](crate::markdown) for the exact
 /// guarantee and allowlist.
+///
+/// The render reads at most 1,048,576 parser events. Later content is dropped.
+/// For a size limit that returns an error, use
+/// [`render_user_content_html_bounded`].
 /// Prefer `render_user_content` (the `maud` feature) when you are emitting into
 /// a Maud template.
 ///
@@ -113,10 +117,14 @@ pub fn render_user_content_html(source: &str) -> String {
 }
 
 /// Like [`render_user_content_html`], but fails when the intermediate HTML
-/// (before sanitizing) goes over `max_html_bytes`.
+/// (before sanitizing) exceeds `max_html_bytes`.
 ///
-/// The check runs while the HTML is written, so a large document stops early.
-/// Use it where the caller has its own size budget.
+/// The check runs while the HTML is written, so the render stops at the limit.
+/// Use it where the caller has its own size budget. The limit does not apply
+/// to the sanitized output, which can be smaller or larger.
+///
+/// Parser events past a fixed cap (1,048,576) are dropped, as in
+/// [`render_user_content_html`]. The result is then cut, not an error.
 ///
 /// # Errors
 ///
@@ -153,27 +161,20 @@ pub fn render_user_content_html_bounded(
     Ok(sanitize_user_html(&writer.buf))
 }
 
-/// The intermediate HTML of a render went over the caller's limit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The intermediate HTML of a render exceeded the caller's limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("rendered HTML exceeds the {limit}-byte limit")]
 pub struct HtmlTooLarge {
     limit: usize,
 }
 
 impl HtmlTooLarge {
-    /// The limit, in bytes, that the HTML went over.
+    /// The limit, in bytes, that the HTML exceeded.
     #[must_use]
     pub const fn limit(&self) -> usize {
         self.limit
     }
 }
-
-impl std::fmt::Display for HtmlTooLarge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "rendered HTML goes over the {}-byte limit", self.limit)
-    }
-}
-
-impl std::error::Error for HtmlTooLarge {}
 
 /// A `String` writer that fails once it would hold more than `limit` bytes.
 struct BoundedWriter {
@@ -315,9 +316,12 @@ fn build_sanitizer() -> ammonia::Builder<'static> {
 /// of nesting; documents below the cap render byte-identically.
 const MAX_BLOCK_NESTING_DEPTH: usize = 100;
 
-/// The most pulldown-cmark events one render may consume. Later events are
-/// dropped, so one request cannot make the render work without bound.
+/// The most pulldown-cmark events one render reads. Later events are dropped.
+/// Small in tests, so the cap is quick to reach.
+#[cfg(not(test))]
 const MAX_EVENTS: usize = 1 << 20;
+#[cfg(test)]
+const MAX_EVENTS: usize = 1 << 12;
 
 /// Streaming adapter over pulldown-cmark events that removes every avenue for
 /// attacker-controlled markup *before* the HTML writer runs:
@@ -578,20 +582,35 @@ mod tests {
     }
 
     #[test]
-    fn bounded_render_stops_before_the_sanitizer_runs() {
-        // 400k `<em>` pairs: the intermediate HTML is megabytes. The limit
-        // must trip early, so the call stays fast and allocates little.
-        let source = "*a* ".repeat(400_000);
-        let err = render_user_content_html_bounded(&source, 64 * 1024).unwrap_err();
-        assert_eq!(err.limit(), 64 * 1024);
+    fn bounded_render_rejects_large_output_from_small_source() {
+        // 4 bytes of source give 11 bytes of HTML per repeat.
+        let source = "*a* ".repeat(MAX_EVENTS / 8);
+        let err = render_user_content_html_bounded(&source, 64).unwrap_err();
+        assert_eq!(err.limit(), 64);
+    }
+
+    #[test]
+    fn bounded_writer_stops_at_the_limit() {
+        use std::fmt::Write;
+        let mut writer = BoundedWriter {
+            buf: String::new(),
+            limit: 5,
+        };
+        assert!(writer.write_str("abc").is_ok());
+        assert!(writer.write_str("defg").is_err());
+        // A refused write leaves the buffer as it was.
+        assert_eq!(writer.buf, "abc");
+        assert!(writer.write_str("de").is_ok());
+        assert_eq!(writer.buf, "abcde");
     }
 
     #[test]
     fn event_count_is_capped() {
-        // One event per source byte, so this source has more events than the cap.
-        let source = "*a* ".repeat(MAX_EVENTS / 2);
+        // Each repeat of `*a* ` gives four events, so this has twice the cap.
+        let repeats = MAX_EVENTS / 2;
+        let source = "*a* ".repeat(repeats);
         let html = render_user_content_html(&source);
-        let full = "<em>a</em> ".len() * (MAX_EVENTS / 2);
+        let full = "<em>a</em> ".len() * repeats;
         assert!(html.len() < full * 3 / 4, "{} >= {}", html.len(), full);
         assert!(html.contains("<em>a</em>"));
     }

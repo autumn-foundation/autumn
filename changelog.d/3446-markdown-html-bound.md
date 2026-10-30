@@ -1,7 +1,7 @@
 ### Added
 
 - **markdown:** `render_user_content_html_bounded` fails when the HTML
-  before sanitizing goes over a byte limit (issue #3446). The Constela
+  before sanitizing exceeds a byte limit (issue #3446). The Constela
   `markdown` node uses it with the remaining output budget.
 
 ### Fixed

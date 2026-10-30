@@ -702,8 +702,9 @@ fn a_markdown_node_renders_through_the_user_content_sanitizer() {
     assert!(rendered.contains("<strong>bold</strong>"), "{rendered}");
 }
 
-/// The source fits the output limit, but its HTML does not. The render must
-/// fail with a limit diagnostic, and must stop while it writes the HTML.
+/// The source fits the output limit, but its HTML does not. The render fails
+/// with a limit diagnostic. The early stop itself is tested in
+/// `markdown::user_content`.
 #[cfg(feature = "markdown")]
 #[test]
 fn a_markdown_node_whose_html_is_over_the_output_limit_is_refused() {
