@@ -499,7 +499,7 @@ async fn keyboard_nav_bar() {
         press(&page, "Enter").await;
         wait_for(
             &page,
-            &format!("document.querySelector('{MENU}').offsetParent !== null"),
+            &format!("document.querySelector('{MENU}').matches(':popover-open')"),
         )
         .await;
     })
