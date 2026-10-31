@@ -709,19 +709,29 @@ applied at runtime and are not resolved here.
 
 An item, statement, match arm or field under `#[cfg(…)]` is used only when the
 predicate is true for the enabled features. A `#[cfg_attr(…, cfg(…))]` counts
-when its condition holds. Thus a gated handler is not a
+when its condition holds. A `#![cfg(…)]` that is off takes out its file,
+module or function. Thus a gated handler is not a
 route, a gated helper is not a target, and a gated call is not followed. The
-scan reads `[features] default` from the nearest `Cargo.toml`. `--features a,b`
-adds features in every crate of the scan, `--all-features` turns on every
+scan parses each file with `syn`, so a gated node ends where the Rust grammar
+ends it. A macro body is read the same way when it parses as Rust.
+
+The features are solved as `cargo build --workspace` solves them. The scan
+reads `[features] default` from the nearest `Cargo.toml`. `--features a,b`
+turns on each name in each crate that declares it (`views/a` names one
+crate), `--all-features` turns on every
 feature (as Cargo does, an optional dependency that a `dep:` entry names is
 not a feature), and `--no-default-features` turns the default
-set off. A predicate the scan cannot decide (`target_os = "linux"`), or a file
-with no package manifest, keeps the item. A finding inside a gated item or
+set off. A crate of the scan also turns on what it asks for in a path
+dependency that is in the scan: the `features` list, the default features,
+and the `views/a` entries of its enabled features. A predicate the scan
+cannot decide (`target_os = "linux"`), or a file with no package manifest,
+keeps the item. A finding inside a gated item or
 statement that is off has no route. The features change only the route
 attribution. They do not change the findings or the exit code. A `--features`
-name that no crate declares gets a warning on stderr. The scan cannot read a
-gated statement inside a custom macro, or a feature that a dependent crate
-turns on. It keeps those.
+name that no crate declares gets a warning on stderr. A file that `syn` cannot
+parse, or a macro body that is not Rust, is read token by token, which finds
+the end of a gated node by heuristics. A dependent outside the scan root
+turns on no features.
 
 Attribution is therefore a lower bound. `status: "pass"` means no finding was
 attributed to that route, not that the page is proven clean — read it alongside

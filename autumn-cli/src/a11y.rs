@@ -68,19 +68,26 @@
 //! the exit code is computed from severities alone, so attribution reports and
 //! never gates.
 //!
-//! # Known heuristic limits
+//! # How the `cfg` reader works
 //!
-//! The `cfg` reader finds the end of a gated item by reading tokens. It has
-//! these limits (issue #3458). Each one can lose or keep an attribution. None
-//! changes a finding or the exit code:
+//! `syn` parses each file. Each `#[cfg]` or `#[cfg_attr]` then gates the AST
+//! node that it is on: an item, a statement, a match arm or a field. A macro
+//! body is read as Rust when it parses as Rust. A `#![cfg(…)]` takes out its
+//! file, module or function. The features are solved as
+//! `cargo build --workspace` solves them (issue #3458):
 //!
-//! - A gated statement inside a custom macro (not `html!`) is scanned as live
-//!   code.
-//! - `--features` applies to every crate in a workspace scan. Cargo applies it
-//!   per package. A name that no crate declares gets a warning.
-//! - Features that a crate gets from its dependents are not seen.
+//! - A `--features` name is on in each crate that declares it.
+//! - A crate of the scan turns on the features that it asks for in a path
+//!   dependency that is also in the scan.
 //!
-//! A full fix parses bodies with `syn::visit`.
+//! Known limits. Each one can lose or keep an attribution. None changes a
+//! finding or the exit code:
+//!
+//! - A file that `syn` cannot parse, and a macro body that is not Rust, are
+//!   read token by token. That reader finds the end of a gated node by
+//!   heuristics.
+//! - A dependent outside the scan root, and a dev or a build dependency, turn
+//!   on no features.
 //!
 //! Like `autumn i18n check`, the scanner reads tokens rather than a
 //! type-resolved AST, and deliberately errs toward *not* flagging anything it
@@ -100,7 +107,7 @@
 //!   a body as maud would misread `<button></button>` as an empty `button` and
 //!   fire a false `button-name`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
 
@@ -394,8 +401,8 @@ pub fn scan_project(root: &Path) -> std::io::Result<Scan> {
 /// 0). Nested subdir read errors *during recursion* remain best-effort
 /// (swallowed by [`collect_rs_files`]), mirroring `autumn i18n check`.
 ///
-/// `cfg(feature = "…")` reads the default features of each crate plus
-/// `features`.
+/// `cfg(feature = "…")` reads the features of each crate as
+/// [`CrateFeatures`] solves them.
 pub fn scan_project_with(root: &Path, features: &CargoFeatures) -> std::io::Result<Scan> {
     std::fs::read_dir(root)?;
     let mut crates = CrateFeatures::new(features);
@@ -403,6 +410,7 @@ pub fn scan_project_with(root: &Path, features: &CargoFeatures) -> std::io::Resu
     let mut files = Vec::new();
     collect_rs_files(root, &mut files);
     files.sort();
+    crates.resolve(&files);
     for path in files {
         let Ok(src) = std::fs::read_to_string(&path) else {
             continue;
@@ -457,12 +465,18 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 ///
 /// A call edge or an item under a `cfg` that is false for these features is
 /// dropped (issue #2666). A predicate the scan cannot decide keeps it.
+///
+/// The features are solved as `cargo build --workspace` solves them (issue
+/// #3458). A `--features` name is on in each crate that declares it. A crate
+/// of the scan also turns on the features that it asks for in a path
+/// dependency that is in the scan.
 struct CrateFeatures<'a> {
     selection: &'a CargoFeatures,
     /// The nearest `Cargo.toml` of each directory.
-    manifest_of: std::collections::HashMap<PathBuf, Option<PathBuf>>,
-    /// The enabled features of each manifest.
-    by_manifest: std::collections::HashMap<PathBuf, Option<BTreeSet<String>>>,
+    manifest_of: HashMap<PathBuf, Option<PathBuf>>,
+    /// The enabled features of each manifest. `None` for a manifest with no
+    /// package.
+    by_manifest: HashMap<PathBuf, Option<BTreeSet<String>>>,
     /// The features that the scanned crates declare. `None` when no scanned
     /// crate has a package.
     declared: Option<BTreeSet<String>>,
@@ -472,8 +486,8 @@ impl<'a> CrateFeatures<'a> {
     fn new(selection: &'a CargoFeatures) -> Self {
         Self {
             selection,
-            manifest_of: std::collections::HashMap::new(),
-            by_manifest: std::collections::HashMap::new(),
+            manifest_of: HashMap::new(),
+            by_manifest: HashMap::new(),
             declared: None,
         }
     }
@@ -492,36 +506,239 @@ impl<'a> CrateFeatures<'a> {
             .collect()
     }
 
-    /// The enabled features of the crate that holds `file`: the crate of the
-    /// nearest `Cargo.toml`, as Cargo finds it. `None` when there is no such
-    /// manifest, or it has no package: the scan then decides no feature
-    /// predicate.
-    fn for_file(&mut self, file: &Path) -> Option<&BTreeSet<String>> {
+    /// The nearest `Cargo.toml` of `file`, as Cargo finds it.
+    fn manifest_for(&mut self, file: &Path) -> Option<PathBuf> {
         let dir = std::path::absolute(file).ok()?.parent()?.to_path_buf();
-        let manifest = self
-            .manifest_of
+        self.manifest_of
             .entry(dir)
             .or_insert_with_key(|dir| {
                 dir.ancestors()
                     .map(|dir| dir.join("Cargo.toml"))
                     .find(|path| path.is_file())
             })
-            .clone()?;
-        let selection = self.selection;
-        let declared = &mut self.declared;
-        self.by_manifest
-            .entry(manifest)
-            .or_insert_with_key(|path| {
-                let text = std::fs::read_to_string(path).ok()?;
-                let enabled = enabled_features(&text, selection)?;
-                if let Ok(table) = toml::from_str::<toml::Table>(&text) {
-                    declared
+            .clone()
+    }
+
+    /// Read the manifest of each file, and solve the features of each crate.
+    fn resolve(&mut self, files: &[PathBuf]) {
+        let manifests: BTreeSet<PathBuf> = files
+            .iter()
+            .filter_map(|file| self.manifest_for(file))
+            .collect();
+        let mut packages = Vec::new();
+        for manifest in manifests {
+            match Package::read(&manifest) {
+                Some(package) => {
+                    self.declared
                         .get_or_insert_with(BTreeSet::new)
-                        .extend(declared_features(&table));
+                        .extend(package.declared.iter().cloned());
+                    packages.push(package);
                 }
-                Some(enabled)
+                None => {
+                    self.by_manifest.insert(manifest, None);
+                }
+            }
+        }
+        let enabled = solve_features(&packages, self.selection);
+        for (package, enabled) in packages.into_iter().zip(enabled) {
+            self.by_manifest.insert(package.manifest, Some(enabled));
+        }
+    }
+
+    /// The enabled features of the crate that holds `file`. `None` when there
+    /// is no manifest, or it has no package: the scan then decides no feature
+    /// predicate.
+    fn for_file(&mut self, file: &Path) -> Option<&BTreeSet<String>> {
+        let manifest = self.manifest_for(file)?;
+        self.by_manifest.get(&manifest)?.as_ref()
+    }
+}
+
+/// A crate of the scan.
+struct Package {
+    manifest: PathBuf,
+    /// The canonical directory of the manifest.
+    dir: PathBuf,
+    text: String,
+    table: toml::Table,
+    /// The features that the crate declares.
+    declared: BTreeSet<String>,
+    /// The root directory and the `[workspace.dependencies]` table of the
+    /// workspace of the crate.
+    workspace: Option<(PathBuf, toml::Table)>,
+}
+
+/// A path dependency: its canonical directory, the features it asks for,
+/// and whether it asks for the default features.
+type DepRequest = (PathBuf, Vec<String>, bool);
+
+impl Package {
+    /// Read the manifest at `manifest`. `None` when it has no `[package]`.
+    fn read(manifest: &Path) -> Option<Self> {
+        let text = std::fs::read_to_string(manifest).ok()?;
+        let table = toml::from_str::<toml::Table>(&text).ok()?;
+        table.get("package")?;
+        let dir = std::fs::canonicalize(manifest.parent()?).ok()?;
+        let workspace = dir.ancestors().find_map(|root| {
+            let text = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+            let table = toml::from_str::<toml::Table>(&text).ok()?;
+            let workspace = table.get("workspace")?;
+            let deps = workspace
+                .get("dependencies")
+                .and_then(toml::Value::as_table)
+                .cloned()
+                .unwrap_or_default();
+            Some((root.to_path_buf(), deps))
+        });
+        Some(Self {
+            manifest: manifest.to_path_buf(),
+            dir,
+            declared: declared_features(&table),
+            text,
+            table,
+            workspace,
+        })
+    }
+
+    /// The normal dependencies of the crate, of every target. A dev or a
+    /// build dependency is not in the same build, so it is not read.
+    fn dependencies(&self) -> impl Iterator<Item = (&String, &toml::Value)> {
+        let targets = self
+            .table
+            .get("target")
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flat_map(|targets| targets.values());
+        std::iter::once(self.table.get("dependencies"))
+            .chain(targets.map(|target| target.get("dependencies")))
+            .filter_map(|deps| deps.and_then(toml::Value::as_table))
+            .flat_map(|deps| deps.iter())
+    }
+
+    /// The path dependency that `spec` names. `None` for a registry or a git
+    /// dependency: it is not a crate of the scan.
+    fn path_dependency(&self, key: &str, spec: &toml::Value) -> Option<DepRequest> {
+        let spec = spec.as_table()?;
+        let default_of = |table: &toml::Table| {
+            table
+                .get("default-features")
+                .or_else(|| table.get("default_features"))
+                .and_then(toml::Value::as_bool)
+        };
+        let own_default = default_of(spec);
+        let mut features = string_list(spec.get("features"));
+        if spec.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+            let (root, deps) = self.workspace.as_ref()?;
+            let entry = deps.get(key)?.as_table()?;
+            let dir = std::fs::canonicalize(root.join(entry.get("path")?.as_str()?)).ok()?;
+            features.extend(string_list(entry.get("features")));
+            // A member cannot turn off defaults that the workspace turns on.
+            let default = default_of(entry).unwrap_or(true) || own_default.unwrap_or(false);
+            return Some((dir, features, default));
+        }
+        let dir = std::fs::canonicalize(self.dir.join(spec.get("path")?.as_str()?)).ok()?;
+        Some((dir, features, own_default.unwrap_or(true)))
+    }
+
+    /// The features that the crate asks for in each path dependency that is
+    /// on, for its `enabled` features and its `requested` names.
+    fn dependency_requests(
+        &self,
+        enabled: &BTreeSet<String>,
+        requested: &[String],
+    ) -> Vec<DepRequest> {
+        let features = self.table.get("features").and_then(toml::Value::as_table);
+        // The entries of each enabled feature, and the requested names.
+        let entries: Vec<String> = enabled
+            .iter()
+            .filter_map(|name| features.and_then(|features| features.get(name)))
+            .flat_map(|list| string_list(Some(list)))
+            .chain(requested.iter().cloned())
+            .collect();
+        let mut out = Vec::new();
+        for (key, spec) in self.dependencies() {
+            let Some((dir, mut asked, default)) = self.path_dependency(key, spec) else {
+                continue;
+            };
+            let optional = spec.get("optional").and_then(toml::Value::as_bool) == Some(true);
+            let dep_entry = format!("dep:{key}");
+            // An optional dependency is on when a `dep:` or a strong `key/…`
+            // entry names it, or when its implicit feature is on.
+            let on = !optional
+                || entries.iter().any(|entry| {
+                    *entry == dep_entry || entry.split_once('/').is_some_and(|(pkg, _)| pkg == key)
+                })
+                || (enabled.contains(key)
+                    && !features.is_some_and(|features| features.contains_key(key)));
+            if !on {
+                continue;
+            }
+            asked.extend(entries.iter().filter_map(|entry| {
+                let (pkg, feature) = entry.split_once('/')?;
+                (pkg.trim_end_matches('?') == key).then(|| feature.to_owned())
+            }));
+            out.push((dir, asked, default));
+        }
+        out
+    }
+}
+
+/// The strings of a TOML array. Empty for any other value.
+fn string_list(value: Option<&toml::Value>) -> Vec<String> {
+    value
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The enabled features of each package, in order.
+///
+/// Each crate starts from its own `--features` names. Then each crate turns
+/// on what it asks for in its path dependencies, until nothing changes. The
+/// sets only grow, and the names are finite, so the loop ends.
+fn solve_features(packages: &[Package], selection: &CargoFeatures) -> Vec<BTreeSet<String>> {
+    let by_dir: HashMap<&Path, usize> = packages
+        .iter()
+        .enumerate()
+        .map(|(index, package)| (package.dir.as_path(), index))
+        .collect();
+    let mut extra: Vec<BTreeSet<String>> = vec![BTreeSet::new(); packages.len()];
+    loop {
+        let enabled: Vec<BTreeSet<String>> = packages
+            .iter()
+            .zip(&extra)
+            .map(|(package, extra)| {
+                enabled_features(&package.text, selection, extra).unwrap_or_default()
             })
-            .as_ref()
+            .collect();
+        let mut changed = false;
+        for (index, package) in packages.iter().enumerate() {
+            let requested: Vec<String> = own_requests(&package.table, selection)
+                .into_iter()
+                .chain(extra[index].iter().cloned())
+                .collect();
+            for (dir, asked, default) in package.dependency_requests(&enabled[index], &requested) {
+                let Some(&target) = by_dir.get(dir.as_path()) else {
+                    continue;
+                };
+                let names = asked
+                    .into_iter()
+                    .chain(default.then(|| "default".to_owned()));
+                for name in names {
+                    // As Cargo does, a name the crate does not declare is
+                    // not a feature of it.
+                    if packages[target].declared.contains(&name) {
+                        changed |= extra[target].insert(name);
+                    }
+                }
+            }
+        }
+        if !changed {
+            return enabled;
+        }
     }
 }
 
@@ -564,18 +781,33 @@ fn declared_features(table: &toml::Table) -> BTreeSet<String> {
     declared
 }
 
-/// The features that `selection` turns on for the package in `manifest`.
-/// `None` for a manifest with no `[package]` (a virtual workspace).
-///
-/// `--features` names apply to every crate of the scan.
-fn enabled_features(manifest: &str, selection: &CargoFeatures) -> Option<BTreeSet<String>> {
+/// The names that `selection` asks for in the package of `table`. As Cargo
+/// does, a plain name counts only in a package that declares it. A
+/// `pkg/feature` name is kept for [`enabled_features`] to resolve.
+fn own_requests(table: &toml::Table, selection: &CargoFeatures) -> Vec<String> {
+    let declared = declared_features(table);
+    let mut names: Vec<String> = requested_names(selection)
+        .into_iter()
+        .filter(|name| name.contains('/') || declared.contains(name))
+        .collect();
+    if selection.all {
+        names.extend(declared);
+    }
+    names
+}
+
+/// The features that `selection`, plus the `extra` names that dependents
+/// ask for, turn on for the package in `manifest`. `None` for a manifest with
+/// no `[package]` (a virtual workspace).
+fn enabled_features(
+    manifest: &str,
+    selection: &CargoFeatures,
+    extra: &BTreeSet<String>,
+) -> Option<BTreeSet<String>> {
     let table = toml::from_str::<toml::Table>(manifest).ok()?;
     table.get("package")?;
-    let mut requested = requested_names(selection);
-    if selection.all {
-        requested.extend(declared_features(&table));
-    }
-    let requested: Vec<&str> = requested.iter().map(String::as_str).collect();
+    let requested = own_requests(&table, selection);
+    let requested: Vec<&str> = requested.iter().chain(extra).map(String::as_str).collect();
     // `true`: an optional dependency of any target table counts. With `false`,
     // the edge scan keeps only the edge capsule's targets.
     Some(crate::edge_scan::enabled_features_with_defaults(
@@ -600,8 +832,9 @@ fn scan_source_with(src: &str, file: &str, features: Option<&BTreeSet<String>>, 
         return;
     };
     find_html_blocks(&stream, file, scan);
+    let gates = gate_ends(&stream);
     let trees: Vec<TokenTree> = stream.into_iter().collect();
-    collect_fns(&trees, file, features, &mut scan.fns);
+    collect_fns(&trees, file, features, &gates, &mut scan.fns);
 }
 
 /// Recursively walk a token stream, analyzing each `html! { … }` macro body and
@@ -849,11 +1082,13 @@ fn collect_fns(
     trees: &[TokenTree],
     file: &str,
     features: Option<&BTreeSet<String>>,
+    gates: &Gates,
     out: &mut Vec<FnDecl>,
 ) {
     let level = Level {
         file,
         features,
+        gates,
         callable: true,
         owner: None,
         top: None,
@@ -866,6 +1101,8 @@ fn collect_fns(
 struct Level<'a> {
     file: &'a str,
     features: Option<&'a BTreeSet<String>>,
+    /// Where each gated node ends.
+    gates: &'a Gates,
     /// Whether items at this level are reachable by a bare name. Free items in
     /// a module are; items inside a function body or an `impl`/`trait` block
     /// are not.
@@ -881,17 +1118,22 @@ fn collect_fns_in(trees: &[TokenTree], level: &Level<'_>, out: &mut Vec<FnDecl>)
     let Level {
         file,
         features,
+        gates,
         callable,
-        owner,
-        top,
+        ..
     } = *level;
+    // A `#![cfg(…)]` that is off takes out the file or the module.
+    if inner_cfg_is_off(trees, features) {
+        out.push(FnDecl::excluded(file, span_of(trees, 0, trees.len())));
+        return;
+    }
     let mut pending: Vec<RouteDecl> = Vec::new();
     // Set when an `impl`/`trait` head is seen, so its block is descended as
     // associated items.
     let mut assoc_block = false;
     let mut i = 0;
     while i < trees.len() {
-        if let Some(next) = skip_unindexed_item(trees, i, features) {
+        if let Some(next) = skip_unindexed_item(trees, i, features, gates) {
             out.push(FnDecl::excluded(file, span_of(trees, i, next)));
             i = next;
             pending.clear();
@@ -904,38 +1146,11 @@ fn collect_fns_in(trees: &[TokenTree], level: &Level<'_>, out: &mut Vec<FnDecl>)
         }
         if let TokenTree::Ident(ident) = &trees[i] {
             if *ident == "fn"
-                && let Some(TokenTree::Ident(name)) = trees.get(i + 1)
+                && matches!(trees.get(i + 1), Some(TokenTree::Ident(_)))
                 && let Some(body_at) = find_fn_body(trees, i + 2)
-                && let TokenTree::Group(body) = &trees[body_at]
+                && matches!(&trees[body_at], TokenTree::Group(_))
             {
-                let inner: Vec<TokenTree> = body.stream().into_iter().collect();
-                let (calls, excluded) = fn_calls(&trees[i + 2..body_at], &inner, features);
-                let start = trees[i].span().start();
-                let end = body.span().end();
-                out.push(FnDecl {
-                    name: name.to_string(),
-                    file: file.to_owned(),
-                    start: (start.line, start.column),
-                    end: (end.line, end.column),
-                    calls,
-                    routes: std::mem::take(&mut pending),
-                    callable,
-                    owner,
-                    top,
-                });
-                let index = out.len() - 1;
-                out.extend(
-                    excluded
-                        .into_iter()
-                        .map(|span| FnDecl::excluded(file, span)),
-                );
-                let body = Level {
-                    callable: false,
-                    owner: Some(index),
-                    top: top.or(Some(index)),
-                    ..*level
-                };
-                collect_fns_in(&inner, &body, out);
+                index_fn(trees, i, body_at, level, std::mem::take(&mut pending), out);
                 i = body_at + 1;
                 continue;
             }
@@ -979,6 +1194,58 @@ fn collect_fns_in(trees: &[TokenTree], level: &Level<'_>, out: &mut Vec<FnDecl>)
     }
 }
 
+/// Index the function `fn NAME … { … }` at `trees[at]`, with its body at
+/// `trees[body_at]`, and the functions in its body. `routes` are its route
+/// attributes.
+fn index_fn(
+    trees: &[TokenTree],
+    at: usize,
+    body_at: usize,
+    level: &Level<'_>,
+    routes: Vec<RouteDecl>,
+    out: &mut Vec<FnDecl>,
+) {
+    let (TokenTree::Ident(name), TokenTree::Group(body)) = (&trees[at + 1], &trees[body_at]) else {
+        return;
+    };
+    let inner: Vec<TokenTree> = body.stream().into_iter().collect();
+    // A `#![cfg(…)]` in the body that is off takes out the function.
+    if inner_cfg_is_off(&inner, level.features) {
+        out.push(FnDecl::excluded(
+            level.file,
+            span_of(trees, at, body_at + 1),
+        ));
+        return;
+    }
+    let (calls, excluded) = fn_calls(&trees[at + 2..body_at], &inner, level.features, level.gates);
+    let start = trees[at].span().start();
+    let end = body.span().end();
+    out.push(FnDecl {
+        name: name.to_string(),
+        file: level.file.to_owned(),
+        start: (start.line, start.column),
+        end: (end.line, end.column),
+        calls,
+        routes,
+        callable: level.callable,
+        owner: level.owner,
+        top: level.top,
+    });
+    let index = out.len() - 1;
+    out.extend(
+        excluded
+            .into_iter()
+            .map(|span| FnDecl::excluded(level.file, span)),
+    );
+    let body = Level {
+        callable: false,
+        owner: Some(index),
+        top: level.top.or(Some(index)),
+        ..*level
+    };
+    collect_fns_in(&inner, &body, out);
+}
+
 /// The call edges of a function, and the ranges of its body that a `cfg`
 /// takes out of the build. `head` is the tokens between the name and the
 /// body; `body` is the body.
@@ -986,10 +1253,11 @@ fn fn_calls(
     head: &[TokenTree],
     body: &[TokenTree],
     features: Option<&BTreeSet<String>>,
+    gates: &Gates,
 ) -> (BTreeSet<String>, Vec<Span>) {
     let mut calls = BTreeSet::new();
     let mut excluded = Vec::new();
-    collect_calls(body, features, &mut calls, &mut excluded);
+    collect_calls(body, features, gates, &mut calls, &mut excluded);
     // A name bound in this function — a parameter, a local, a closure
     // argument — shadows any free function that shares it, so calling it does
     // not reach that function.
@@ -1007,6 +1275,28 @@ fn fn_calls(
     (calls, excluded)
 }
 
+/// Whether the inner attributes (`#![…]`) at the start of `trees` hold a
+/// `cfg` or `cfg_attr` that is off for `features`.
+fn inner_cfg_is_off(trees: &[TokenTree], features: Option<&BTreeSet<String>>) -> bool {
+    let mut i = 0;
+    while let (
+        Some(TokenTree::Punct(pound)),
+        Some(TokenTree::Punct(bang)),
+        Some(TokenTree::Group(attr)),
+    ) = (trees.get(i), trees.get(i + 1), trees.get(i + 2))
+    {
+        if pound.as_char() != '#' || bang.as_char() != '!' || attr.delimiter() != Delimiter::Bracket
+        {
+            return false;
+        }
+        if cfg_is_off(attr, features) {
+            return true;
+        }
+        i += 3;
+    }
+    false
+}
+
 /// The index past an item at `trees[i]` that [`collect_fns_in`] does not
 /// index, or `None` when the item is indexed.
 ///
@@ -1020,6 +1310,7 @@ fn skip_unindexed_item(
     trees: &[TokenTree],
     i: usize,
     features: Option<&BTreeSet<String>>,
+    gates: &Gates,
 ) -> Option<usize> {
     // A gated item can be a match arm or a field inside a body, so it ends
     // where `skip_gated` says, not at the next brace group.
@@ -1031,7 +1322,7 @@ fn skip_unindexed_item(
                 && !is_cfg_test_attr(trees, i)
                 && cfg_is_off(attr, features)
     ) {
-        return Some(skip_gated(trees, i + 2));
+        return Some(gated_end(trees, i, gates));
     }
     let off = is_cfg_test_attr(trees, i)
         || (matches!(&trees[i], TokenTree::Ident(ident) if *ident == "macro_rules")
@@ -1140,6 +1431,7 @@ fn find_fn_body(trees: &[TokenTree], start: usize) -> Option<usize> {
 fn collect_calls(
     trees: &[TokenTree],
     features: Option<&BTreeSet<String>>,
+    gates: &Gates,
     out: &mut BTreeSet<String>,
     excluded: &mut Vec<Span>,
 ) {
@@ -1160,7 +1452,7 @@ fn collect_calls(
             && attr.delimiter() == Delimiter::Bracket
         {
             i = if cfg_is_off(attr, features) {
-                let end = skip_gated(trees, i + 2);
+                let end = gated_end(trees, i, gates);
                 excluded.push(span_of(trees, i, end));
                 end
             } else {
@@ -1193,7 +1485,7 @@ fn collect_calls(
         }
         if let TokenTree::Group(group) = &trees[i] {
             let inner: Vec<TokenTree> = group.stream().into_iter().collect();
-            collect_calls(&inner, features, out, excluded);
+            collect_calls(&inner, features, gates, out, excluded);
         }
         i += 1;
     }
@@ -1291,6 +1583,211 @@ fn cfg_is_off(attr: &proc_macro2::Group, features: Option<&BTreeSet<String>>) ->
     matches!(attr.stream().into_iter().next(), Some(TokenTree::Ident(id)) if id == "cfg" || id == "cfg_attr")
         && syn::parse2::<syn::Meta>(attr.stream())
             .is_ok_and(|meta| crate::edge_scan::meta_cfg_excludes(&meta, features))
+}
+
+/// A `(line, column)` source position.
+type Pos = (usize, usize);
+
+/// The end of the node that each outer `cfg` or `cfg_attr` attribute gates,
+/// keyed by the position of its `#`.
+type Gates = HashMap<Pos, Pos>;
+
+/// Read the gated nodes of a file from its `syn` AST.
+///
+/// The map is empty when `syn` cannot parse the file. Then the token reader
+/// ([`skip_gated`]) finds each end. A macro body is read as statements or
+/// as a list of expressions when it parses as one. Otherwise the token reader
+/// reads it.
+fn gate_ends(stream: &TokenStream) -> Gates {
+    let mut visitor = GateVisitor::default();
+    if let Ok(file) = syn::parse2::<syn::File>(stream.clone()) {
+        syn::visit::Visit::visit_file(&mut visitor, &file);
+    }
+    visitor.ends
+}
+
+/// The position of a span's start.
+fn start_of(span: proc_macro2::Span) -> Pos {
+    let at = span.start();
+    (at.line, at.column)
+}
+
+/// The end of the last token of `node`.
+fn end_of(node: &impl quote::ToTokens) -> Option<Pos> {
+    let at = node.to_token_stream().into_iter().last()?.span().end();
+    Some((at.line, at.column))
+}
+
+/// Collects [`Gates`] from a `syn` AST.
+#[derive(Default)]
+struct GateVisitor {
+    ends: Gates,
+}
+
+impl GateVisitor {
+    /// Record the end of `node` for each `cfg` or `cfg_attr` in `attrs`. The
+    /// visit goes outside in, so the largest node that starts at an
+    /// attribute keeps it.
+    fn gate(&mut self, attrs: &[syn::Attribute], node: &impl quote::ToTokens) {
+        let mut end = None;
+        for attr in attrs {
+            let is_cfg = attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr");
+            if !is_cfg || !matches!(attr.style, syn::AttrStyle::Outer) {
+                continue;
+            }
+            let Some(node_end) = end.or_else(|| end_of(node)) else {
+                return;
+            };
+            end = Some(node_end);
+            self.ends
+                .entry(start_of(attr.pound_token.spans[0]))
+                .or_insert(node_end);
+        }
+    }
+}
+
+/// The outer attributes of a node with one of `variants`.
+macro_rules! attrs_of {
+    ($node:expr, $ty:ident, [$($variant:ident),* $(,)?]) => {
+        match $node {
+            $(syn::$ty::$variant(inner) => inner.attrs.as_slice(),)*
+            _ => &[],
+        }
+    };
+}
+
+const fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    attrs_of!(
+        expr,
+        Expr,
+        [
+            Array, Assign, Async, Await, Binary, Block, Break, Call, Cast, Closure, Const,
+            Continue, Field, ForLoop, Group, If, Index, Infer, Let, Lit, Loop, Macro, Match,
+            MethodCall, Paren, Path, Range, RawAddr, Reference, Repeat, Return, Struct, Try,
+            TryBlock, Tuple, Unary, Unsafe, While, Yield,
+        ]
+    )
+}
+
+const fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    attrs_of!(
+        item,
+        Item,
+        [
+            Const,
+            Enum,
+            ExternCrate,
+            Fn,
+            ForeignMod,
+            Impl,
+            Macro,
+            Mod,
+            Static,
+            Struct,
+            Trait,
+            TraitAlias,
+            Type,
+            Union,
+            Use,
+        ]
+    )
+}
+
+impl<'ast> syn::visit::Visit<'ast> for GateVisitor {
+    fn visit_stmt(&mut self, stmt: &'ast syn::Stmt) {
+        // The statement holds its `;`, so it is the larger node.
+        let attrs = match stmt {
+            syn::Stmt::Local(local) => local.attrs.as_slice(),
+            syn::Stmt::Item(item) => item_attrs(item),
+            syn::Stmt::Expr(expr, _) => expr_attrs(expr),
+            syn::Stmt::Macro(mac) => mac.attrs.as_slice(),
+        };
+        self.gate(attrs, stmt);
+        syn::visit::visit_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        self.gate(expr_attrs(expr), expr);
+        syn::visit::visit_expr(self, expr);
+    }
+
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        self.gate(item_attrs(item), item);
+        syn::visit::visit_item(self, item);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        self.gate(attrs_of!(item, ImplItem, [Const, Fn, Type, Macro]), item);
+        syn::visit::visit_impl_item(self, item);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        self.gate(attrs_of!(item, TraitItem, [Const, Fn, Type, Macro]), item);
+        syn::visit::visit_trait_item(self, item);
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast syn::ForeignItem) {
+        self.gate(
+            attrs_of!(item, ForeignItem, [Fn, Static, Type, Macro]),
+            item,
+        );
+        syn::visit::visit_foreign_item(self, item);
+    }
+
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        self.gate(&arm.attrs, arm);
+        syn::visit::visit_arm(self, arm);
+    }
+
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        self.gate(&field.attrs, field);
+        syn::visit::visit_field_value(self, field);
+    }
+
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        self.gate(&field.attrs, field);
+        syn::visit::visit_field(self, field);
+    }
+
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        self.gate(&variant.attrs, variant);
+        syn::visit::visit_variant(self, variant);
+    }
+
+    /// Read a macro body as Rust when it parses as Rust. An `html!` body is
+    /// markup, and a `macro_rules!` body holds templates, so neither is read.
+    fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        use syn::parse::Parser as _;
+        let name = mac.path.segments.last().map(|seg| seg.ident.to_string());
+        if matches!(name.as_deref(), Some("html" | "macro_rules")) {
+            return;
+        }
+        if let Ok(stmts) = syn::Block::parse_within.parse2(mac.tokens.clone()) {
+            for stmt in &stmts {
+                self.visit_stmt(stmt);
+            }
+        } else if let Ok(exprs) =
+            syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+                .parse2(mac.tokens.clone())
+        {
+            for expr in &exprs {
+                self.visit_expr(expr);
+            }
+        }
+    }
+}
+
+/// The index past the node that the attribute at `trees[i]` gates. `gates`
+/// gives its end. Without an entry, [`skip_gated`] finds it.
+fn gated_end(trees: &[TokenTree], i: usize, gates: &Gates) -> usize {
+    let Some(&end) = gates.get(&start_of(trees[i].span())) else {
+        return skip_gated(trees, i + 2);
+    };
+    let from = (i + 2).min(trees.len());
+    trees[from..]
+        .iter()
+        .position(|tree| start_of(tree.span()) >= end)
+        .map_or(trees.len(), |at| from + at)
 }
 
 /// Skip the statement, match arm, field or item after an attribute, from
@@ -1673,8 +2170,7 @@ struct RouteGraph<'a> {
 impl<'a> RouteGraph<'a> {
     fn build(fns: &'a [FnDecl]) -> Self {
         // A name defined more than once is unresolvable, so it is not indexed.
-        let mut by_name: std::collections::HashMap<&str, Option<usize>> =
-            std::collections::HashMap::new();
+        let mut by_name: HashMap<&str, Option<usize>> = HashMap::new();
         for (index, decl) in fns.iter().enumerate().filter(|(_, d)| d.callable) {
             by_name
                 .entry(decl.name.as_str())
@@ -1682,8 +2178,7 @@ impl<'a> RouteGraph<'a> {
                 .or_insert(Some(index));
         }
         // The same per body: the helpers a function declares at its top level.
-        let mut local: std::collections::HashMap<(usize, &str), Option<usize>> =
-            std::collections::HashMap::new();
+        let mut local: HashMap<(usize, &str), Option<usize>> = HashMap::new();
         for (index, decl) in fns.iter().enumerate() {
             if let Some(owner) = decl.owner {
                 local
@@ -5176,7 +5671,7 @@ mod tests {
             features: vec!["admin, billing".to_owned()],
             ..CargoFeatures::default()
         };
-        let on = enabled_features(MANIFEST, &selection).expect("a package");
+        let on = enabled_features(MANIFEST, &selection, &BTreeSet::new()).expect("a package");
         assert!(
             on.contains("db") && on.contains("admin") && on.contains("billing"),
             "{on:?}"
@@ -5190,7 +5685,7 @@ mod tests {
             all: true,
             ..CargoFeatures::default()
         };
-        let on = enabled_features(MANIFEST, &selection).expect("a package");
+        let on = enabled_features(MANIFEST, &selection, &BTreeSet::new()).expect("a package");
         for name in ["db", "admin", "billing", "redis"] {
             assert!(on.contains(name), "{name} is off: {on:?}");
         }
@@ -5199,7 +5694,7 @@ mod tests {
     #[test]
     fn a_virtual_workspace_manifest_decides_no_feature() {
         let manifest = "[workspace]\nmembers = [\"app\"]\n";
-        assert!(enabled_features(manifest, &CargoFeatures::default()).is_none());
+        assert!(enabled_features(manifest, &CargoFeatures::default(), &BTreeSet::new()).is_none());
     }
 
     #[test]
@@ -5331,7 +5826,7 @@ mod tests {
             all: false,
             no_default: true,
         };
-        let on = enabled_features(MANIFEST, &selection).expect("a package");
+        let on = enabled_features(MANIFEST, &selection, &BTreeSet::new()).expect("a package");
         assert!(on.contains("admin") && !on.contains("db"), "{on:?}");
     }
 
@@ -5344,7 +5839,7 @@ mod tests {
             all: false,
             no_default: true,
         };
-        let on = enabled_features(MANIFEST, &selection).expect("a package");
+        let on = enabled_features(MANIFEST, &selection, &BTreeSet::new()).expect("a package");
         assert!(on.contains("default") && on.contains("db"), "{on:?}");
     }
 
@@ -5355,7 +5850,7 @@ mod tests {
             all: true,
             no_default: true,
         };
-        let on = enabled_features(MANIFEST, &selection).expect("a package");
+        let on = enabled_features(MANIFEST, &selection, &BTreeSet::new()).expect("a package");
         assert!(on.contains("default") && on.contains("db"), "{on:?}");
     }
 
@@ -5370,7 +5865,7 @@ mod tests {
             all: true,
             ..CargoFeatures::default()
         };
-        let on = enabled_features(manifest, &selection).expect("a package");
+        let on = enabled_features(manifest, &selection, &BTreeSet::new()).expect("a package");
         assert!(on.contains("admin") && !on.contains("redis"), "{on:?}");
     }
 
@@ -5382,7 +5877,7 @@ mod tests {
             all: true,
             ..CargoFeatures::default()
         };
-        let on = enabled_features(manifest, &selection).expect("a package");
+        let on = enabled_features(manifest, &selection, &BTreeSet::new()).expect("a package");
         assert!(on.contains("nix"), "{on:?}");
     }
 
@@ -6308,5 +6803,356 @@ mod tests {
             ..CargoFeatures::default()
         };
         assert_eq!(run_in_with(dir.path(), opts(), &typo), plain);
+    }
+
+    // ── AST gate map (issue #3458) ─────────────────────────────────────────
+
+    #[test]
+    fn a_block_after_for_in_does_not_end_a_gated_statement() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                #[cfg(feature = "admin")]
+                for x in { xs() } { let _y = html! { img src="/x.png"; }; }
+                html! { span { "a" } }
+            }
+        "#;
+        assert!(routes_with_features(src, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_struct_pattern_in_a_gated_if_let_does_not_end_it() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                #[cfg(feature = "admin")]
+                if let Row { id } = { row() } { let _y = html! { img src="/x.png"; }; }
+                html! { span { "a" } }
+            }
+        "#;
+        assert!(routes_with_features(src, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_gated_statement_in_a_custom_macro_is_dropped() {
+        for body in [
+            r#"my_macro! { #[cfg(feature = "admin")] let _x = admin(); }"#,
+            r#"let _v = my_vec![#[cfg(feature = "admin")] admin(), clean()];"#,
+            r#"my_macro!(#[cfg(feature = "admin")] for x in { xs() } { admin(); });"#,
+            // Not Rust: the token reader reads it.
+            r#"tokio::select! { #[cfg(feature = "admin")] _ = tick() => admin(), _ = b() => clean(), }"#,
+        ] {
+            let src = format!(
+                r#"
+                #[get("/a")]
+                async fn a() -> Markup {{
+                    {body}
+                    html! {{ span {{ "a" }} }}
+                }}
+
+                fn admin() -> Markup {{ html! {{ img src="/x.png"; }} }}
+                "#
+            );
+            assert!(routes_with_features(&src, &[]).is_empty(), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_gated_macro_statement_does_not_hide_the_next_statement() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                #[cfg(feature = "admin")]
+                my_macro! { a() }
+                html! { img src="/x.png"; }
+            }
+        "#;
+        assert_eq!(routes_with_features(src, &[]), vec!["GET /a".to_owned()]);
+    }
+
+    #[test]
+    fn a_file_that_syn_cannot_parse_falls_back_to_the_token_reader() {
+        // `@` at the top level is not Rust, so syn rejects the file.
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                #[cfg(feature = "admin")]
+                let _x = admin();
+                html! { span { "a" } }
+            }
+
+            fn admin() -> Markup { html! { img src="/x.png"; } }
+            @
+        "#;
+        assert!(routes_with_features(src, &[]).is_empty());
+    }
+
+    #[test]
+    fn gate_ends_map_each_cfg_to_the_end_of_its_node() {
+        let src = "fn a() {\n    #[cfg(x)] let v = 1;\n    b();\n}\n";
+        let stream = TokenStream::from_str(src).unwrap();
+        let gates = gate_ends(&stream);
+        // The `#` is at line 2, column 4. The `;` ends at column 24.
+        assert_eq!(gates.get(&(2, 4)), Some(&(2, 24)));
+        assert_eq!(gates.len(), 1);
+    }
+
+    // ── Inner `#![cfg(…)]` (issue #3458) ───────────────────────────────────
+
+    #[test]
+    fn an_inner_cfg_that_is_off_drops_the_file() {
+        let src = r#"
+            #![cfg(feature = "admin")]
+
+            #[get("/admin")]
+            async fn admin() -> Markup { html! { img src="/x.png"; } }
+        "#;
+        let off = report_with_features(&[("admin.rs", src)], &[]);
+        assert!(off.routes.is_empty(), "{:?}", off.routes);
+        assert!(off.findings[0].routes.is_empty());
+        let on = report_with_features(&[("admin.rs", src)], &["admin"]);
+        assert_eq!(on.findings[0].routes, vec!["GET /admin".to_owned()]);
+    }
+
+    #[test]
+    fn an_inner_cfg_that_is_off_drops_a_module() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup { html! { (admin::panel()) } }
+
+            mod admin {
+                #![cfg_attr(feature = "db", cfg(feature = "admin"))]
+                pub fn panel() -> Markup { html! { img src="/x.png"; } }
+            }
+        "#;
+        assert!(routes_with_features(src, &["db"]).is_empty());
+        assert_eq!(routes_with_features(src, &[]), vec!["GET /a".to_owned()]);
+    }
+
+    #[test]
+    fn an_inner_cfg_that_is_off_drops_a_function() {
+        let src = r#"
+            #[get("/a")]
+            async fn a() -> Markup {
+                #![cfg(feature = "admin")]
+                html! { img src="/x.png"; }
+            }
+        "#;
+        let report = report_with_features(&[("views.rs", src)], &[]);
+        assert!(report.routes.is_empty(), "{:?}", report.routes);
+        assert!(report.findings[0].routes.is_empty());
+    }
+
+    // ── Workspace features (issue #3458) ───────────────────────────────────
+
+    /// The `views` crate: a handler with one call gated on `feature`.
+    fn views_src(feature: &str) -> String {
+        format!(
+            r#"
+            #[get("/a")]
+            async fn a() -> Markup {{
+                #[cfg(feature = "{feature}")]
+                let _y = gated();
+                html! {{ span {{ "a" }} }}
+            }}
+
+            fn gated() -> Markup {{ html! {{ img src="/y.png"; }} }}
+            "#
+        )
+    }
+
+    /// A workspace in a temp dir with `views/src/lib.rs` from [`views_src`]
+    /// and an empty `app/src/lib.rs`. `files` are `(path, text)` pairs.
+    fn workspace(feature: &str, files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("app/src")).unwrap();
+        std::fs::create_dir_all(root.join("views/src")).unwrap();
+        std::fs::write(root.join("app/src/lib.rs"), "").unwrap();
+        std::fs::write(root.join("views/src/lib.rs"), views_src(feature)).unwrap();
+        for (path, text) in files {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        dir
+    }
+
+    const WS_ROOT: &str = "[workspace]\nmembers = [\"app\", \"views\"]\n";
+    const VIEWS_EXTRA: &str = "[package]\nname = \"views\"\nversion = \"0.1.0\"\n\n\
+        [features]\nextra = []\n";
+
+    /// The `app` manifest, with `rest` after its `[package]` table.
+    fn app_manifest(rest: &str) -> String {
+        format!("[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n{rest}")
+    }
+
+    /// Whether the call that `views` gates is kept, for `selection`.
+    fn views_gate_on(dir: &tempfile::TempDir, selection: &CargoFeatures) -> bool {
+        !routes_in(dir.path(), selection).is_empty()
+    }
+
+    fn with_features(features: &[&str]) -> CargoFeatures {
+        CargoFeatures {
+            features: features.iter().map(|f| (*f).to_owned()).collect(),
+            ..CargoFeatures::default()
+        }
+    }
+
+    #[test]
+    fn a_feature_reaches_only_the_crates_that_declare_it() {
+        // As Cargo does: `--features admin` turns `admin` on in `app` only.
+        let app = app_manifest("[features]\nadmin = []\n");
+        let dir = workspace(
+            "admin",
+            &[
+                ("Cargo.toml", WS_ROOT),
+                ("app/Cargo.toml", &app),
+                ("views/Cargo.toml", VIEWS_EXTRA),
+            ],
+        );
+        assert!(!views_gate_on(&dir, &with_features(&["admin"])));
+        // A crate that declares the name gets it.
+        assert!(extra_on("", &with_features(&["extra"])));
+        // A name for one package reaches that package only.
+        assert!(extra_on("", &with_features(&["views/extra"])));
+        assert!(!extra_on(
+            "[features]\nextra = []\n",
+            &with_features(&["app/extra"])
+        ));
+    }
+
+    /// [`views_gate_on`] for `extra`, with `app` built from `rest`.
+    fn extra_on(rest: &str, selection: &CargoFeatures) -> bool {
+        let app = app_manifest(rest);
+        let dir = workspace(
+            "extra",
+            &[
+                ("Cargo.toml", WS_ROOT),
+                ("app/Cargo.toml", &app),
+                ("views/Cargo.toml", VIEWS_EXTRA),
+            ],
+        );
+        views_gate_on(&dir, selection)
+    }
+
+    #[test]
+    fn a_feature_that_a_dependent_turns_on_is_on() {
+        let none = CargoFeatures::default();
+        assert!(!extra_on("", &none));
+        assert!(extra_on(
+            "[dependencies]\nviews = { path = \"../views\", features = [\"extra\"] }\n",
+            &none
+        ));
+        // A renamed dependency.
+        assert!(extra_on(
+            "[dependencies]\nv = { package = \"views\", path = \"../views\", features = [\"extra\"] }\n",
+            &none
+        ));
+        // A target table counts.
+        assert!(extra_on(
+            "[target.'cfg(unix)'.dependencies]\nviews = { path = \"../views\", features = [\"extra\"] }\n",
+            &none
+        ));
+        // A dev or build dependency is not in the build of `views`.
+        assert!(!extra_on(
+            "[dev-dependencies]\nviews = { path = \"../views\", features = [\"extra\"] }\n",
+            &none
+        ));
+        assert!(!extra_on(
+            "[build-dependencies]\nviews = { path = \"../views\", features = [\"extra\"] }\n",
+            &none
+        ));
+    }
+
+    #[test]
+    fn a_dependency_feature_entry_turns_the_feature_on() {
+        let deps = "[dependencies]\nviews = { path = \"../views\" }\n";
+        let rest = format!("[features]\nadmin = [\"views/extra\"]\n\n{deps}");
+        assert!(!extra_on(&rest, &CargoFeatures::default()));
+        assert!(extra_on(&rest, &with_features(&["admin"])));
+        let weak = format!("[features]\nadmin = [\"views?/extra\"]\n\n{deps}");
+        assert!(extra_on(&weak, &with_features(&["admin"])));
+        let default = format!("[features]\ndefault = [\"views/extra\"]\n\n{deps}");
+        assert!(extra_on(&default, &CargoFeatures::default()));
+    }
+
+    #[test]
+    fn an_optional_dependency_passes_features_only_when_it_is_on() {
+        let deps = "[dependencies]\nviews = { path = \"../views\", optional = true, features = [\"extra\"] }\n";
+        let rest = format!("[features]\nui = [\"dep:views\"]\nweak = [\"views?/extra\"]\n\n{deps}");
+        assert!(!extra_on(&rest, &CargoFeatures::default()));
+        // A weak entry does not turn the dependency on.
+        assert!(!extra_on(&rest, &with_features(&["weak"])));
+        assert!(extra_on(&rest, &with_features(&["ui"])));
+        // The implicit feature of the dependency turns it on.
+        assert!(extra_on(deps, &with_features(&["views"])));
+        let strong = "[features]\nadmin = [\"views/extra\"]\n\n\
+            [dependencies]\nviews = { path = \"../views\", optional = true }\n";
+        assert!(extra_on(strong, &with_features(&["admin"])));
+    }
+
+    #[test]
+    fn a_dependent_turns_on_the_default_features() {
+        let views = "[package]\nname = \"views\"\nversion = \"0.1.0\"\n\n\
+            [features]\ndefault = [\"extra\"]\nextra = []\n";
+        let check = |deps: &str| {
+            let app = app_manifest(deps);
+            let dir = workspace(
+                "extra",
+                &[
+                    ("Cargo.toml", WS_ROOT),
+                    ("app/Cargo.toml", &app),
+                    ("views/Cargo.toml", views),
+                ],
+            );
+            let selection = CargoFeatures {
+                no_default: true,
+                ..CargoFeatures::default()
+            };
+            views_gate_on(&dir, &selection)
+        };
+        assert!(check("[dependencies]\nviews = { path = \"../views\" }\n"));
+        assert!(!check(
+            "[dependencies]\nviews = { path = \"../views\", default-features = false }\n"
+        ));
+        assert!(!check(""));
+    }
+
+    #[test]
+    fn a_workspace_dependency_passes_its_features() {
+        let root = "[workspace]\nmembers = [\"app\", \"views\"]\n\n\
+            [workspace.dependencies]\nviews = { path = \"views\", features = [\"extra\"] }\n";
+        let app = app_manifest("[dependencies]\nviews = { workspace = true }\n");
+        let dir = workspace(
+            "extra",
+            &[
+                ("Cargo.toml", root),
+                ("app/Cargo.toml", &app),
+                ("views/Cargo.toml", VIEWS_EXTRA),
+            ],
+        );
+        assert!(views_gate_on(&dir, &CargoFeatures::default()));
+    }
+
+    #[test]
+    fn features_pass_along_a_chain_of_dependents() {
+        // `app` turns on `mid/more`, and `more` turns on `views/extra`.
+        let root = "[workspace]\nmembers = [\"app\", \"mid\", \"views\"]\n";
+        let app =
+            app_manifest("[dependencies]\nmid = { path = \"../mid\", features = [\"more\"] }\n");
+        let mid = "[package]\nname = \"mid\"\nversion = \"0.1.0\"\n\n\
+            [features]\nmore = [\"views/extra\"]\n\n\
+            [dependencies]\nviews = { path = \"../views\" }\n";
+        let dir = workspace(
+            "extra",
+            &[
+                ("Cargo.toml", root),
+                ("app/Cargo.toml", &app),
+                ("views/Cargo.toml", VIEWS_EXTRA),
+            ],
+        );
+        std::fs::create_dir_all(dir.path().join("mid/src")).unwrap();
+        std::fs::write(dir.path().join("mid/src/lib.rs"), "").unwrap();
+        std::fs::write(dir.path().join("mid/Cargo.toml"), mid).unwrap();
+        assert!(views_gate_on(&dir, &CargoFeatures::default()));
     }
 }
