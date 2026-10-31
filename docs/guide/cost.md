@@ -348,6 +348,22 @@ worker saw the window.
 For a `JobInfo` or `TaskInfo` that you make by hand, call
 `autumn_web::cost::mark_deferrable(WorkKind::Job, "name")`.
 
+### Durable workflows (autumn-harvest)
+
+The same signal can hold activities of Autumn Harvest workflows. Name the
+activity types on the plugin:
+
+```rust,ignore
+HarvestPlugin::new()
+    .activities(activities![rebuild_search_index, charge_card])
+    .cost_deferrable_activities(["rebuild_search_index"]);
+```
+
+While the signal is high, Harvest workers claim no task of a named type. The
+task stays `PENDING` and uses no attempt. Workflow tasks and other activity
+types run. The `harvest_cost_hold` gauge is `1` while a worker holds work.
+See `docs/cost-deferral.md` in the autumn-harvest repository for the limits.
+
 ### Limits
 
 - A durable worker reads the signal before each claim. A job that a worker
