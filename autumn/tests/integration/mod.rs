@@ -602,6 +602,8 @@ mod widget_css_coverage;
 #[cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
 mod widget_pack_browser;
 #[cfg(feature = "maud")]
+mod widgets_accordion;
+#[cfg(feature = "maud")]
 mod widgets_alert;
 #[cfg(feature = "maud")]
 mod widgets_avatar;

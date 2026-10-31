@@ -236,6 +236,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "field",
     // `autumn_web::a11y` primitives (#3398).
     "accessible-primitives",
+    "accordion",
     "hero",
     "infinite-feed",
     "locale-switcher",
@@ -448,6 +449,7 @@ const INTERACTIVE_MARKERS: &[&str] = &[
 /// `active-search` has no marker. It is here because typing drives it.
 const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "accessible-primitives",
+    "accordion",
     "active-search",
     "autocomplete",
     "confirm-action",

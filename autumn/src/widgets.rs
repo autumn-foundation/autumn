@@ -17,6 +17,7 @@
 //! | `nav_link` | Navigation anchor, auto-marked active + `aria-current` |
 //! | `nav_bar` | Top-bar/sidebar `<nav>` landmark: brand, links, dropdowns, responsive toggle |
 //! | `tabs` | No-JS `tablist`/`tab`/`tabpanel` switcher with `:target` deep-linking |
+//! | `accordion` / `collapsible` | No-JS `<details>` disclosure. `accordion` is exclusive or multi-open |
 //! | `infinite_feed` | htmx infinite-scroll / "Load more" feed from a `CursorPage` |
 //! | `reaction_controls` | No-JS vote/like toggle buttons + live aggregate for `#[votable]` |
 //! | `comment_thread` | No-JS/htmx nested comment list with an inline reply form per node, for `#[commentable]` |
@@ -4537,6 +4538,242 @@ pub fn tabs(
             }
         }
     }
+}
+
+// ── accordion / collapsible (#3401) ─────────────────────────────────────────
+
+/// Settings for an [`accordion`].
+///
+/// `name` is the root `id` and, in exclusive mode, the shared `name` of the
+/// items. Use a different name for each accordion on a page. A
+/// [`CollapsibleConfig::attrs`] `name` must differ from it too: items with one
+/// `name` close each other.
+///
+/// ```rust
+/// use autumn_web::widgets::{AccordionConfig, HeadingLevel};
+///
+/// let config = AccordionConfig::new("faq").multiple().open(0).level(HeadingLevel::H2);
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct AccordionConfig<'a> {
+    name: &'a str,
+    multiple: bool,
+    open: Vec<usize>,
+    level: HeadingLevel,
+    class: Option<&'a str>,
+    attrs: &'a [(&'a str, &'a str)],
+}
+
+#[cfg(feature = "maud")]
+impl<'a> AccordionConfig<'a> {
+    /// An exclusive accordion called `name`, with every item closed and
+    /// `<h3>` titles. `name` must not be empty or hold spaces. Set
+    /// [`AccordionConfig::level`] one level below the heading that holds
+    /// the accordion.
+    #[must_use]
+    pub const fn new(name: &'a str) -> Self {
+        Self {
+            name,
+            multiple: false,
+            open: Vec::new(),
+            level: HeadingLevel::H3,
+            class: None,
+            attrs: &[],
+        }
+    }
+
+    /// Let many items be open at once. The default is exclusive: one open item.
+    #[must_use]
+    pub const fn multiple(mut self) -> Self {
+        self.multiple = true;
+        self
+    }
+
+    /// Open the item at `index` at render. Call it again for more items. An
+    /// exclusive accordion opens only the first open item in page order. An
+    /// index out of range does nothing.
+    #[must_use]
+    pub fn open(mut self, index: usize) -> Self {
+        self.open.push(index);
+        self
+    }
+
+    /// Set the heading level of each title (default [`HeadingLevel::H3`]).
+    #[must_use]
+    pub const fn level(mut self, level: HeadingLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Add class(es) to the root element.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+
+    /// Add attributes to the root element. `on*` and `hx-on*` handlers and
+    /// `style` are dropped. The widget sets `id` and `class` first, so a
+    /// second `id` or `class` is dropped.
+    #[must_use]
+    pub const fn attrs(mut self, attrs: &'a [(&'a str, &'a str)]) -> Self {
+        self.attrs = attrs;
+        self
+    }
+}
+
+/// Render a no-JS accordion of native `<details>` items.
+///
+/// Each `(title, body)` is one item. The title is escaped. It sits in a
+/// heading inside `<summary>`. Enter and Space toggle it natively. Give each
+/// item a non-empty title: an empty title leaves an unnamed toggle.
+///
+/// An exclusive accordion (the default) gives each `<details>` the same
+/// `name`, so the browser keeps one open. [`AccordionConfig::multiple`]
+/// omits the `name`.
+///
+/// ```rust
+/// use autumn_web::widgets::{AccordionConfig, accordion};
+/// use maud::html;
+///
+/// let items = [("Shipping", html! { p { "2 days." } })];
+/// let html = accordion(&items, &AccordionConfig::new("faq").open(0)).into_string();
+/// assert!(html.contains(r#"name="faq" open"#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn accordion(items: &[(&str, maud::Markup)], config: &AccordionConfig<'_>) -> maud::Markup {
+    // An exclusive accordion opens one item: the first in page order.
+    let exclusive_open = config
+        .open
+        .iter()
+        .copied()
+        .filter(|&i| i < items.len())
+        .min();
+    let is_open = |i: usize| {
+        if config.multiple {
+            config.open.contains(&i)
+        } else {
+            exclusive_open == Some(i)
+        }
+    };
+    let group = (!config.multiple).then_some(config.name);
+    let root_class = merge_class("autumn-accordion", config.class);
+    let mut attrs: Vec<(&str, &str)> = vec![("id", config.name), ("class", &root_class)];
+    attrs.extend_from_slice(config.attrs);
+    let body = maud::html! {
+        @for (i, (title, body)) in items.iter().enumerate() {
+            details class="autumn-accordion__item" name=[group] open[is_open(i)] {
+                summary class="autumn-accordion__summary" {
+                    (heading(
+                        config.level,
+                        None,
+                        "autumn-accordion__heading",
+                        &maud::html! { (title) },
+                    ))
+                }
+                div class="autumn-accordion__body" { (body) }
+            }
+        }
+    };
+    crate::form::widget_element("div", &attrs, &crate::form::FieldOptions::new(), body)
+}
+
+/// Settings for a [`collapsible_with`].
+///
+/// ```rust
+/// use autumn_web::widgets::CollapsibleConfig;
+///
+/// let config = CollapsibleConfig::new().open(true).class("card");
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy)]
+pub struct CollapsibleConfig<'a> {
+    open: bool,
+    class: Option<&'a str>,
+    attrs: &'a [(&'a str, &'a str)],
+}
+
+#[cfg(feature = "maud")]
+impl Default for CollapsibleConfig<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "maud")]
+impl<'a> CollapsibleConfig<'a> {
+    /// A closed collapsible with no extra class or attributes.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            open: false,
+            class: None,
+            attrs: &[],
+        }
+    }
+
+    /// Render it open (default `false`).
+    #[must_use]
+    pub const fn open(mut self, open: bool) -> Self {
+        self.open = open;
+        self
+    }
+
+    /// Add class(es) to the `<details>` element.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+
+    /// Add attributes to the `<details>` element, for example a `name` to
+    /// group collapsibles. `on*` and `hx-on*` handlers, `style`, `class` and
+    /// `open` are dropped: use [`CollapsibleConfig::open`] for the open state.
+    #[must_use]
+    pub const fn attrs(mut self, attrs: &'a [(&'a str, &'a str)]) -> Self {
+        self.attrs = attrs;
+        self
+    }
+}
+
+/// Render one closed disclosure: a native `<details>` with `summary` as its
+/// toggle. The summary is escaped.
+///
+/// ```rust
+/// use autumn_web::widgets::collapsible;
+/// use maud::html;
+///
+/// let html = collapsible("More", &html! { p { "Body" } }).into_string();
+/// assert!(html.starts_with(r#"<details class="autumn-collapsible">"#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn collapsible(summary: &str, body: &maud::Markup) -> maud::Markup {
+    collapsible_with(summary, body, &CollapsibleConfig::new())
+}
+
+/// Like [`collapsible`], with [`CollapsibleConfig`] settings.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn collapsible_with(
+    summary: &str,
+    body: &maud::Markup,
+    config: &CollapsibleConfig<'_>,
+) -> maud::Markup {
+    let root_class = merge_class("autumn-collapsible", config.class);
+    let mut attrs: Vec<(&str, &str)> = vec![("class", &root_class)];
+    if config.open {
+        attrs.push(("open", ""));
+    }
+    // `open` belongs to the config, so `open(false)` always means closed.
+    attrs.extend(config.attrs.iter().filter(|(name, _)| *name != "open"));
+    let inner = maud::html! {
+        summary class="autumn-collapsible__summary" { (summary) }
+        div class="autumn-collapsible__body" { (body) }
+    };
+    crate::form::widget_element("details", &attrs, &crate::form::FieldOptions::new(), inner)
 }
 
 // ── Deterministic hashing (badge/avatar colors) ────────────────────────────

@@ -868,6 +868,92 @@
     border-color: var(--danger-hover);
 }
 
+/* ── Accordion and collapsible (autumn-accordion, autumn-collapsible) ──────── */
+
+.autumn-accordion {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    overflow: hidden;
+}
+
+.autumn-accordion__item + .autumn-accordion__item {
+    border-top: 1px solid var(--border);
+}
+
+.autumn-collapsible {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    overflow: hidden;
+}
+
+.autumn-accordion__summary,
+.autumn-collapsible__summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    color: var(--text);
+    font-weight: var(--font-weight-medium);
+    cursor: pointer;
+    list-style: none;
+}
+
+.autumn-accordion__summary::-webkit-details-marker,
+.autumn-collapsible__summary::-webkit-details-marker {
+    display: none;
+}
+
+/* The chevron is a border, so it needs no icon font and follows the text color. */
+.autumn-accordion__summary::after,
+.autumn-collapsible__summary::after {
+    content: "";
+    flex: none;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-right: 2px solid var(--text-muted);
+    border-bottom: 2px solid var(--text-muted);
+    transform: rotate(45deg);
+}
+
+:is(.autumn-accordion__item, .autumn-collapsible)[open] > :is(.autumn-accordion__summary, .autumn-collapsible__summary)::after {
+    transform: rotate(-135deg);
+}
+
+.autumn-accordion__summary:hover,
+.autumn-collapsible__summary:hover {
+    background: var(--surface-muted);
+}
+
+.autumn-accordion__summary:focus-visible,
+.autumn-collapsible__summary:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+}
+
+.autumn-accordion__heading {
+    margin: 0;
+    font: inherit;
+}
+
+.autumn-accordion__body,
+.autumn-collapsible__body {
+    padding: var(--space-3) var(--space-4) var(--space-4);
+    color: var(--text);
+}
+
+/* Motion is opt-in: reduced motion is the default. */
+@media (prefers-reduced-motion: no-preference) {
+    .autumn-accordion__summary::after,
+    .autumn-collapsible__summary::after {
+        transition: transform 0.15s ease;
+    }
+}
+
 /* ── Tabs (autumn-tabs) ────────────────────────────────────────────────────── */
 
 .autumn-tabs__list {
