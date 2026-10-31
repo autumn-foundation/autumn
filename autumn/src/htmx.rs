@@ -829,10 +829,10 @@ mod tests {
     /// `docs/guide/keyboard.md`. Raise it only with a reason in the PR.
     /// Issue #3399 added the toast runtime. It increased the budgets from
     /// 32 KiB and 10 KiB. Issue #3402 added the popover menu runtime. It
-    /// increased the raw budget from 36 KiB.
+    /// increased the raw budget from 36 KiB and the gzip budget from 11 KiB.
     const WIDGETS_JS_BUDGET_BYTES: usize = 38 * 1024;
     /// Gzip budget. Browsers download this size.
-    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 11 * 1024;
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 12 * 1024;
 
     /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
     /// CRLF checkout changes the bytes, the content hash and the size.

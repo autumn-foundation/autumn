@@ -4439,7 +4439,7 @@ fn render_menu_entry(entry: &MenuEntry) -> maud::Markup {
 ///
 /// Items are links or `button_to` forms, so they work without JavaScript.
 /// With `autumn-widgets.js`, the menu has the APG keys: Enter, Space,
-/// ArrowDown or ArrowUp opens it on the first or last item; the arrow keys
+/// `ArrowDown` or `ArrowUp` opens it on the first or last item; the arrow keys
 /// wrap; Home/End and typeahead move; Escape and Tab close it, and focus
 /// goes back to the trigger. Without JavaScript the popover still opens and
 /// closes; only the arrow keys need JavaScript.
@@ -9870,7 +9870,7 @@ mod popover_tests {
     use super::*;
     use http::Method;
 
-    fn cfg() -> PopoverConfig<'static> {
+    const fn cfg() -> PopoverConfig<'static> {
         PopoverConfig::new("more")
     }
 

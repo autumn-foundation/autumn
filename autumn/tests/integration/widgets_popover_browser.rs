@@ -224,6 +224,7 @@ async fn attr(page: &Page, selector: &str, name: &str) -> String {
 }
 
 async fn is_open(page: &Page, selector: &str) -> bool {
+    settle().await;
     eval_bool(
         page,
         &format!("document.querySelector({selector:?}).matches(':popover-open')"),
