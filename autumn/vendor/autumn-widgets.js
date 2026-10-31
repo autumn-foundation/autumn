@@ -590,17 +590,16 @@
   });
 
   // ── non-modal drawer (#3403) ──────────────────────────────────────────────
-  // Invoker commands cannot `show()`, so a non-modal drawer trigger has
-  // data-drawer-open and toggles. Escape is the fallback for browsers
-  // without closedby="closerequest".
+  // Invoker commands cannot show() a dialog: a non-modal drawer trigger has
+  // data-drawer-open and toggles. Escape is the closedby fallback.
   document.addEventListener('click', function (e) {
     var o = e.target.closest && e.target.closest('[data-drawer-open]');
     var d = o && document.getElementById(o.getAttribute('data-drawer-open'));
     if (d && d.show) d.open ? d.close() : d.show();
   });
   document.addEventListener('keydown', function (e) {
-    var d = e.key === 'Escape' && e.target.closest &&
-      e.target.closest('.autumn-drawer[open]:not(:modal)');
+    var d = e.key === 'Escape' && !e.defaultPrevented && e.target.closest &&
+      e.target.closest('.autumn-drawer[closedby][open]:not(:modal)');
     if (d) d.close();
   });
 

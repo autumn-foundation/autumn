@@ -88,6 +88,24 @@ async fn index() -> Markup {
     content(true)
 }
 
+/// Two open non-modal drawers: one ignores Escape, one closes on it.
+#[get("/escape")]
+async fn escape() -> Markup {
+    let body = html! { input type="text" aria-label="Inside"; };
+    let pinned = DrawerConfig::new()
+        .modal(false)
+        .open(true)
+        .light_dismiss(false);
+    let closable = DrawerConfig::new().modal(false).open(true);
+    layout(
+        true,
+        &html! {
+            (drawer("pinned", "Pinned", &body, &pinned))
+            (drawer("closable", "Closable", &body, &closable))
+        },
+    )
+}
+
 /// The same page with no `autumn-widgets.js`.
 #[get("/no-js")]
 async fn no_js() -> Markup {
@@ -95,9 +113,13 @@ async fn no_js() -> Markup {
 }
 
 async fn runner() -> SystemTestRunner {
-    Box::pin(SystemTest::new().routes(routes![index, no_js]).build())
-        .await
-        .expect("start runner")
+    Box::pin(
+        SystemTest::new()
+            .routes(routes![index, no_js, escape])
+            .build(),
+    )
+    .await
+    .expect("start runner")
 }
 
 async fn eval_bool(page: &Page, js: &str) -> bool {
@@ -516,4 +538,54 @@ async fn modal_drawer_works_without_js() {
     wait_for(&page, &is_open("right")).await;
     activate(&page, "#right .autumn-drawer__close").await;
     wait_for(&page, &format!("!{}", is_open("right"))).await;
+}
+
+/// Send a synthetic Escape keydown from the input in drawer `id`. A synthetic
+/// event never reaches the browser's close watcher, so this isolates the
+/// `autumn-widgets.js` fallback.
+fn escape_from(id: &str) -> String {
+    format!(
+        "(document.querySelector('#{id} input').dispatchEvent(new KeyboardEvent('keydown', \
+         {{ key: 'Escape', bubbles: true, cancelable: true }})), true)"
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn escape_fallback_follows_the_dismissal_policy() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/escape").await;
+    assert!(eval_bool(&page, &is_open("pinned")).await);
+    assert!(eval_bool(&page, &is_open("closable")).await);
+
+    // `light_dismiss(false)`: Escape does not close it.
+    assert!(eval_bool(&page, &escape_from("pinned")).await);
+    assert!(
+        eval_bool(&page, &is_open("pinned")).await,
+        "pinned stays open"
+    );
+
+    // An inner widget already used the Escape: the drawer stays open.
+    assert!(
+        eval_bool(
+            &page,
+            "(document.querySelector('#closable input').addEventListener('keydown', \
+             e => e.preventDefault()), true)"
+        )
+        .await
+    );
+    assert!(eval_bool(&page, &escape_from("closable")).await);
+    assert!(
+        eval_bool(&page, &is_open("closable")).await,
+        "consumed Escape"
+    );
+
+    // Control: with no inner handler, the fallback closes it.
+    assert!(eval_bool(&page, "(document.getElementById('closable').close(), document.getElementById('closable').show(), true)").await);
+    let fresh = "(() => { const i = document.querySelector('#closable input'); \
+                 const c = i.cloneNode(true); i.replaceWith(c); return true; })()";
+    assert!(eval_bool(&page, fresh).await);
+    assert!(eval_bool(&page, &escape_from("closable")).await);
+    wait_for(&page, &format!("!{}", is_open("closable"))).await;
 }
