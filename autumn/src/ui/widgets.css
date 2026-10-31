@@ -1048,6 +1048,8 @@
     .autumn-drawer--right[open] { animation: autumn-drawer-in-x 0.2s ease-out; }
     .autumn-drawer--top[open] { --autumn-drawer-from: -100%; animation: autumn-drawer-in-y 0.2s ease-out; }
     .autumn-drawer--bottom[open] { animation: autumn-drawer-in-y 0.2s ease-out; }
+}
+
 /* ── Accordion and collapsible (autumn-accordion, autumn-collapsible) ──────── */
 
 .autumn-accordion {
