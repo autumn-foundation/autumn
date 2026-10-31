@@ -24,6 +24,12 @@ use http::Method;
 use maud::{DOCTYPE, Markup, html};
 
 fn layout(dir: &str, body: &Markup) -> Markup {
+    page(dir, body, true)
+}
+
+/// `runtime` off is the no-JS case. `Page::click` and `Page::press` wait on
+/// a script, so a test cannot turn JavaScript off and still send input.
+fn page(dir: &str, body: &Markup, runtime: bool) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" dir=(dir) {
@@ -31,7 +37,7 @@ fn layout(dir: &str, body: &Markup) -> Markup {
                 meta charset="utf-8";
                 title { "Popover" }
                 link rel="stylesheet" href="/static/css/autumn-widgets.css";
-                script src="/static/js/autumn-widgets.js" defer {}
+                @if runtime { script src="/static/js/autumn-widgets.js" defer {} }
             }
             body { (body) }
         }
@@ -51,21 +57,28 @@ fn actions() -> Markup {
     )
 }
 
+fn index_body() -> Markup {
+    html! {
+        h1 id="title" { "Popover" }
+        (popover(
+            "Help",
+            &html! { p { "Help text" } button id="inner" type="button" { "Inner" } },
+            &PopoverConfig::new("help"),
+        ))
+        (actions())
+        button id="after" type="button" { "After" }
+    }
+}
+
 #[get("/")]
 async fn index() -> Markup {
-    layout(
-        "ltr",
-        &html! {
-            h1 id="title" { "Popover" }
-            (popover(
-                "Help",
-                &html! { p { "Help text" } button id="inner" type="button" { "Inner" } },
-                &PopoverConfig::new("help"),
-            ))
-            (actions())
-            button id="after" type="button" { "After" }
-        },
-    )
+    layout("ltr", &index_body())
+}
+
+/// The same page with no `autumn-widgets.js`.
+#[get("/bare")]
+async fn bare() -> Markup {
+    page("ltr", &index_body(), false)
 }
 
 /// One popover per side and align, in the middle of the page.
@@ -134,7 +147,7 @@ async fn echo() -> &'static str {
 async fn runner() -> SystemTestRunner {
     Box::pin(
         SystemTest::new()
-            .routes(routes![index, pos, flip, rtl, echo])
+            .routes(routes![index, bare, pos, flip, rtl, echo])
             .build(),
     )
     .await
@@ -517,12 +530,14 @@ async fn menu_button_closes_on_tab_and_activates_a_link_with_enter() {
 
     focus(&page, "#actions-trigger").await;
     press(&page, "Enter").await;
+    settle().await;
     press(&page, "Tab").await;
     assert!(!is_open(&page, "#actions").await, "Tab closes the menu");
     assert_eq!(active_id(&page).await, "after", "focus moves on");
 
     focus(&page, "#actions-trigger").await;
     press(&page, "Enter").await;
+    settle().await;
     press(&page, "ArrowDown").await;
     press(&page, "Enter").await;
     assert!(
@@ -541,11 +556,10 @@ async fn attr_url(page: &Page) -> String {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
-async fn popover_and_menu_open_and_close_with_javascript_off() {
+async fn popover_and_menu_work_without_the_runtime() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");
-    page.set_javascript_enabled(false).await.expect("js off");
-    page.visit("/").await.expect("visit");
+    page.visit("/bare").await.expect("visit");
     wait_for(&page, "document.readyState === 'complete'").await;
     assert!(
         eval_bool(&page, "window.__autumnWidgets === undefined").await,
