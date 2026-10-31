@@ -52,7 +52,7 @@ commands (Baseline Dec 2025).
 | Entry | Markup |
 |---|---|
 | `MenuEntry::link(label, href)` | `<a role="menuitem">` |
-| `MenuEntry::action(label, action, method, csrf)` | A `button_to` form with the CSRF token. The button has `role="menuitem"`. It works with JavaScript off. |
+| `MenuEntry::action(label, action, method, csrf)` | A `button_to` form with the CSRF token. The button has `role="menuitem"`. It works with JavaScript off. Chain `.csrf_field(name)` when `security.csrf.form_field` is not `_csrf`. |
 | `MenuEntry::separator()` | `<hr role="separator">` |
 | `MenuEntry::group(label, entries)` | `role="group"` with a visible label |
 | `.destructive()` | Adds `autumn-menu__item--destructive` to a link or form item |

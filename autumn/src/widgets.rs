@@ -4268,6 +4268,7 @@ enum MenuKind {
         action: String,
         method: http::Method,
         csrf: String,
+        csrf_field: Option<String>,
     },
     Separator,
     Group {
@@ -4290,6 +4291,7 @@ impl std::fmt::Debug for MenuKind {
                 label,
                 action,
                 method,
+                csrf_field,
                 ..
             } => f
                 .debug_struct("Action")
@@ -4297,6 +4299,7 @@ impl std::fmt::Debug for MenuKind {
                 .field("action", action)
                 .field("method", method)
                 .field("csrf", &"<redacted>")
+                .field("csrf_field", csrf_field)
                 .finish(),
             Self::Separator => f.write_str("Separator"),
             Self::Group { label, entries } => f
@@ -4367,7 +4370,19 @@ impl MenuEntry {
             action: action.into(),
             method,
             csrf: csrf_token.into(),
+            csrf_field: None,
         })
+    }
+
+    /// Set the name of the hidden CSRF input of an [`action`](Self::action)
+    /// item. Use it when `security.csrf.form_field` is not `_csrf`. Other
+    /// entries stay as they are.
+    #[must_use]
+    pub fn csrf_field(mut self, name: impl Into<String>) -> Self {
+        if let MenuKind::Action { csrf_field, .. } = &mut self.kind {
+            *csrf_field = Some(name.into());
+        }
+        self
     }
 
     /// A line between groups of items.
@@ -4409,6 +4424,7 @@ fn render_menu_entry(entry: &MenuEntry) -> maud::Markup {
             action,
             method,
             csrf,
+            csrf_field,
         } => maud::html! {
             // The form is generic. `role="none"` keeps the menu's children valid.
             div role="none" class="autumn-menu__form" {
@@ -4419,6 +4435,7 @@ fn render_menu_entry(entry: &MenuEntry) -> maud::Markup {
                     csrf,
                     &crate::links::ButtonToOptions::new()
                         .class(item_class)
+                        .csrf_field(csrf_field.as_deref().unwrap_or("_csrf"))
                         .attrs(&[("role", "menuitem")]),
                 ))
             }
@@ -10097,6 +10114,22 @@ mod popover_tests {
         assert!(shown.contains("<redacted>"), "{shown}");
         let group = MenuEntry::group("G", vec![entry]);
         assert!(!format!("{group:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn menu_action_uses_the_configured_csrf_field_name() {
+        let html = dropdown_menu(
+            "A",
+            &[MenuEntry::action("Delete", "/del", Method::DELETE, "tok")
+                .csrf_field("authenticity")],
+            &cfg(),
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"name="authenticity" value="tok""#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
     }
 
     #[test]
