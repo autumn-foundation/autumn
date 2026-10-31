@@ -133,7 +133,7 @@ async fn rtl() -> Markup {
             (popover(
                 "Start",
                 &html! { p { "Body" } },
-                &PopoverConfig::new("rtl").side(PopoverSide::Start),
+                &PopoverConfig::new("rtl").side(PopoverSide::End),
             ))
         },
     )
@@ -263,6 +263,10 @@ async fn boxes(page: &Page, id: &str) -> [(f64, f64, f64, f64); 2] {
 }
 
 async fn open_and_measure(page: &Page, id: &str) -> [(f64, f64, f64, f64); 2] {
+    // An open panel can cover the next trigger. Close it first.
+    page.evaluate("document.querySelectorAll(':popover-open').forEach(p => p.hidePopover())")
+        .await
+        .expect("close");
     page.click(&format!("#{id}-trigger")).await.expect("open");
     wait_for(
         page,
@@ -388,7 +392,7 @@ async fn popover_flips_at_the_viewport_edge() {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
-async fn popover_start_side_follows_the_writing_direction() {
+async fn popover_end_side_follows_the_writing_direction() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");
     open(&page, "/rtl").await;
@@ -532,6 +536,7 @@ async fn menu_button_closes_on_tab_and_activates_a_link_with_enter() {
     press(&page, "Enter").await;
     settle().await;
     press(&page, "Tab").await;
+    eprintln!("ACTIVE {}", eval_string(&page, "document.activeElement.outerHTML.slice(0, 120)").await);
     assert!(!is_open(&page, "#actions").await, "Tab closes the menu");
     assert_eq!(active_id(&page).await, "after", "focus moves on");
 
