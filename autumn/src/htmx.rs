@@ -893,6 +893,8 @@ mod tests {
             "'hint'",
             // A disabled button gets no interest. It keeps the CSS mode.
             "button:not(:disabled)",
+            // `:popover-open` throws where popovers are missing.
+            "selector(:popover-open)",
         ] {
             assert!(js.contains(name), "missing `{name}`");
         }

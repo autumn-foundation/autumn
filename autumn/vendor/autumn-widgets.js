@@ -807,6 +807,8 @@
   // the next hover or focus, hides a hover-only tooltip on Escape, and adds
   // the Chromium enhancement.
   var TIP = '[data-autumn-tooltip]';
+  // A browser without popovers throws on the `:popover-open` selector.
+  var HINTS = !!window.CSS && CSS.supports('selector(:popover-open)');
 
   function tipIn(wrap) {
     return wrap.querySelector(':scope > [role="tooltip"]');
@@ -856,7 +858,7 @@
   // CSS tooltip whose trigger has focus.
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
-    document.querySelectorAll(TIP + ' > [popover]:popover-open').forEach(function (tip) {
+    if (HINTS) document.querySelectorAll(TIP + ' > [popover]:popover-open').forEach(function (tip) {
       e.preventDefault();
       tip.hidePopover();
     });
