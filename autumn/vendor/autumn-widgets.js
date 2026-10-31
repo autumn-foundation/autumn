@@ -589,7 +589,8 @@
         if (all.length) focusItem(menu, e.key === 'ArrowUp' ? all[all.length - 1] : all[0]);
       } else {
         try {
-          menu.showPopover();
+          // `source` makes the button the implicit anchor, as `commandfor` does.
+          menu.showPopover({ source: triggerOf(menu) });
         } catch (_) {
           menuAt = null;
         }
@@ -630,7 +631,7 @@
       var pop = e.target.closest('[data-popover-toggle]');
       var panel = pop && document.getElementById(pop.getAttribute('data-popover-toggle'));
       if (panel && panel.togglePopover) {
-        panel.togglePopover();
+        panel.togglePopover({ source: pop });
         return;
       }
       var opener = e.target.closest('[data-modal-open]');

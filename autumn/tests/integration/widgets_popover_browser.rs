@@ -555,6 +555,23 @@ async fn attr_url(page: &Page) -> String {
     eval_string(page, "location.hash").await
 }
 
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn menu_opened_with_an_arrow_key_is_anchored_to_the_trigger() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+
+    focus(&page, "#actions-trigger").await;
+    press(&page, "ArrowDown").await;
+    assert!(is_open(&page, "#actions").await);
+    let [t, p] = boxes(&page, "actions").await;
+    assert!(
+        p.1 >= t.3 - EPS && (p.0 - t.0).abs() <= EPS,
+        "below the trigger, start edges meet: {t:?} {p:?}"
+    );
+}
+
 // ── no JavaScript ───────────────────────────────────────────────────────
 
 #[tokio::test]
