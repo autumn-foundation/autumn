@@ -523,12 +523,12 @@
     align-items: center;
 }
 
-.autumn-nav__item a {
+.autumn-nav__item a:not(.autumn-menu__item) {
     color: var(--text);
     text-decoration: none;
 }
 
-.autumn-nav__item a:hover {
+.autumn-nav__item a:not(.autumn-menu__item):hover {
     color: var(--primary);
 }
 
@@ -781,7 +781,6 @@
    `position-area` needs no anchor name. `position-try-fallbacks` flips the
    panel when it does not fit. Without anchor positioning, the UA centers it. */
 .autumn-popover__panel {
-    margin: 0;
     padding: var(--space-3);
     border: 1px solid var(--border);
     border-radius: var(--radius);
@@ -794,6 +793,7 @@
 @supports (position-area: bottom) {
     .autumn-popover__panel {
         inset: auto;
+        margin: 0;
         position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
         position-visibility: anchors-visible;
     }
@@ -856,6 +856,13 @@
 
 .autumn-menu__item--destructive {
     color: var(--danger);
+}
+
+@media (forced-colors: active) {
+    .autumn-menu__item:hover {
+        outline: 1px solid Highlight;
+        outline-offset: -1px;
+    }
 }
 
 .autumn-menu__separator {

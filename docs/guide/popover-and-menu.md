@@ -43,7 +43,9 @@ The `id` in `PopoverConfig::new` is the id of the panel. The trigger id is
 
 An old browser without anchor positioning shows the panel in the middle of
 the page. An old browser without invoker commands uses the
-`data-popover-toggle` fallback in `autumn-widgets.js`.
+`data-popover-toggle` fallback in `autumn-widgets.js`. With JavaScript off,
+such a browser cannot open the panel. The floor is a browser with invoker
+commands (Baseline Dec 2025).
 
 ## Menu items
 

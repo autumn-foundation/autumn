@@ -517,7 +517,14 @@
     return m && m.matches(MENU) ? m : null;
   }
 
-  function isOpen(el) { return el.matches(':popover-open'); }
+  // Older browsers throw on `:popover-open`. They have no open popover.
+  function isOpen(el) {
+    try { return el.matches(':popover-open'); } catch (_) { return false; }
+  }
+
+  // A popover (`data-autumn-popover`) and a menu both need aria-expanded.
+  // Only a menu moves focus.
+  var POPOVER = MENU + ',[data-autumn-popover]';
 
   function initMenu(menu) {
     var trigger = triggerOf(menu);
@@ -526,13 +533,15 @@
 
   document.addEventListener('toggle', function (e) {
     var menu = e.target;
-    if (!menu.matches || !menu.matches(MENU)) return;
+    if (!menu.matches || !menu.matches(POPOVER)) return;
     var open = e.newState === 'open';
     var trigger = triggerOf(menu);
     if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    // Another menu's closing event must not drop this menu's request.
     var req = menuAt;
+    if (!req || req.menu !== menu) return;
     menuAt = null;
-    var all = open && req && req.menu === menu ? listItems(menu) : [];
+    var all = open ? listItems(menu) : [];
     if (all.length) focusItem(menu, req.at === 'last' ? all[all.length - 1] : all[0]);
   }, true);
 
@@ -547,7 +556,24 @@
     }
     var item = e.target.closest(MENU + ' [role="menuitem"]');
     var owner = item && item.closest(MENU);
-    if (owner && isOpen(owner)) owner.hidePopover();
+    if (!owner || e.defaultPrevented || item.getAttribute('aria-disabled') === 'true') return;
+    // Close after the item acts (a submit, a link, a command). Some browsers
+    // do not focus a clicked button, so focus the trigger here.
+    setTimeout(function () {
+      if (!isOpen(owner)) return;
+      var opener = triggerOf(owner);
+      if (opener) opener.focus();
+      owner.hidePopover();
+    }, 0);
+  });
+
+  // Focus that leaves a menu and its trigger closes the menu.
+  document.addEventListener('focusout', function (e) {
+    var to = e.relatedTarget;
+    var menu = e.target.closest && (e.target.closest(MENU) || menuOfButton(e.target.closest(MENU_BUTTON)));
+    if (!to || !menu || !isOpen(menu)) return;
+    var trigger = triggerOf(menu);
+    if (!menu.contains(to) && !(trigger && trigger.contains(to))) menu.hidePopover();
   });
 
   document.addEventListener('keydown', function (e) {
@@ -562,13 +588,22 @@
         menuAt = null;
         if (all.length) focusItem(menu, e.key === 'ArrowUp' ? all[all.length - 1] : all[0]);
       } else {
-        menu.showPopover();
+        try {
+          menu.showPopover();
+        } catch (_) {
+          menuAt = null;
+        }
       }
       return;
     }
     var inside = t.closest(MENU);
     if (!inside) return;
-    // Tab leaves the menu: close it, then focus moves on from the button.
+    // Escape and Tab: focus the trigger first, so focus does not depend on
+    // the browser restoring it. Tab then moves on from the button.
+    if (e.key === 'Escape' && isOpen(inside)) {
+      var back = triggerOf(inside);
+      if (back) back.focus();
+    }
     if (e.key === 'Tab' && isOpen(inside)) {
       var opener = triggerOf(inside);
       if (opener) opener.focus();
@@ -577,7 +612,7 @@
     // Space activates a link item, as Enter does.
     if (e.key === ' ' && t.matches('a[role="menuitem"]')) {
       e.preventDefault();
-      t.click();
+      if (!e.repeat) t.click();
     }
   });
 
@@ -824,7 +859,7 @@
     each(root, '[data-autumn-tabs]', initTabs);
     each(root, '[data-ac-value-id]', initAutocomplete);
     each(root, '[data-autumn-nav]', initNav);
-    each(root, MENU, initMenu);
+    each(root, POPOVER, initMenu);
     root.dispatchEvent(new CustomEvent('autumn:init', { bubbles: true }));
     each(root, '[data-autumn-roving]', initRoving);
     each(root, REGION, initRegion);

@@ -520,6 +520,7 @@ const BROWSER_GATE_PATHS: &[&str] = &[
     "autumn/src/htmx.rs",
     "autumn/vendor/htmx.min.js",
     "autumn/tests/integration/widgets_toast_browser.rs",
+    "autumn/tests/integration/widgets_popover_browser.rs",
     "autumn/src/widget_pack.rs",
     "autumn/src/plugin_conformance/**",
     "autumn-plugin-reference/src/**",
@@ -555,6 +556,11 @@ fn widget_browser_workflow_runs_on_widget_changes() {
             "widgets-browser.yml does not run the `{suite}` browser suite"
         );
     }
+    let publish = read_crate_file("../.github/workflows/publish-gate.yml");
+    assert!(
+        publish.contains("widgets_popover_browser -- --include-ignored"),
+        "publish-gate.yml does not run the popover browser suite (#3402)"
+    );
     // A filter that matches nothing exits 0. Each suite needs a count check.
     assert!(
         workflow.contains("the_swatch_pack_passes_widget_browser_conformance -- --include-ignored"),

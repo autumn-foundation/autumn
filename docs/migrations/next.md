@@ -249,6 +249,49 @@ A test that calls `.assert_selector(".wizard-progress")` must use
 **Automation:** `manual` — the selectors are in the app's own stylesheets,
 scripts and tests. A codemod cannot find them reliably.
 
+### Widgets: `NavMenu` is a popover menu
+
+**Why:** `NavMenu` now uses the same primitive as `dropdown_menu`: a native
+`popover` opened by `command="toggle-popover"` and `commandfor` (issue
+#3402). The browser handles open, close, light dismiss, Escape and the top
+layer.
+
+**You are affected only if your own CSS, JS or tests target the old markup.**
+
+- With JavaScript off, a menu starts closed. Before, it was an open list.
+  The trigger opens it with no JavaScript in a browser with invoker
+  commands (Baseline Dec 2025).
+- The trigger has no `data-nav-menu-toggle`. Use `aria-haspopup="menu"`.
+- The menu has no `hidden` attribute. It is closed when it is not
+  `:popover-open`. A rule on `.autumn-nav__menu[hidden]` does nothing.
+- The server now sends `role="menu"`, `role="menuitem"` and
+  `aria-haspopup="menu"`. The runtime sets `aria-expanded`.
+- The menu is in the top layer, so `z-index` on `.autumn-nav__menu` does
+  nothing.
+
+**Before (`{X.Y}`):**
+
+```css
+.autumn-nav__menu[hidden] { display: none; }
+```
+
+```rust
+page.assert_selector("[data-nav-menu-toggle]");
+```
+
+**After (`{(X+1).0}`):**
+
+```css
+.autumn-nav__menu:not(:popover-open) { display: none; }
+```
+
+```rust
+page.assert_selector("[aria-haspopup=menu]");
+```
+
+**Automation:** `manual` — the selectors are in the app's own stylesheets
+and tests.
+
 ### Jobs: `JobTrackingStore` has a required `update_record` method
 
 **Why:** Each built-in store had the same code for `mark_running`,

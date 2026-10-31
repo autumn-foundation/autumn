@@ -8,6 +8,13 @@
   destructive variant. `autumn-widgets.js` adds the arrow keys, typeahead
   and focus return. See `docs/guide/popover-and-menu.md`.
 
+### Breaking Changes
+
+- **Breaking:** **widgets:** a `NavMenu` is a popover menu (issue #3402).
+  With JS off, the menu starts closed, not open. The trigger has no
+  `data-nav-menu-toggle`, and `.autumn-nav__menu[hidden]` is gone
+  ([migration guide](docs/migrations/next.md)).
+
 ### Changed
 
 - **widgets:** a `NavMenu` is a popover menu. The server now sends

@@ -2,7 +2,8 @@
 //!
 //! The tests check opening and closing with the mouse and the keyboard,
 //! the APG menu-button keys, focus return to the trigger, anchor
-//! positioning (side, align, flip, right-to-left) and the no-JS fallback.
+//! positioning (side, align, flip, right-to-left) and the page without the
+//! runtime script.
 //!
 //! Run:
 //!
@@ -397,10 +398,7 @@ async fn popover_end_side_follows_the_writing_direction() {
     let page = runner.page().await.expect("page");
     open(&page, "/rtl").await;
     let [t, p] = open_and_measure(&page, "rtl").await;
-    assert!(
-        p.2 <= t.0 + EPS,
-        "end is the left side in rtl: {t:?} {p:?}"
-    );
+    assert!(p.2 <= t.0 + EPS, "end is the left side in rtl: {t:?} {p:?}");
 }
 
 // ── dropdown menu: mouse ────────────────────────────────────────────────

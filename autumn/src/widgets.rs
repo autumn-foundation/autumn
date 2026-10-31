@@ -4155,9 +4155,11 @@ pub struct PopoverConfig<'a> {
 
 #[cfg(feature = "maud")]
 impl<'a> PopoverConfig<'a> {
-    /// Start a config. `id` must be unique on the page.
+    /// Start a config. `id` must be unique on the page. An empty `id`
+    /// panics in a debug build.
     #[must_use]
     pub const fn new(id: &'a str) -> Self {
+        debug_assert!(!id.is_empty(), "PopoverConfig::new needs a non-empty id");
         Self {
             id,
             side: PopoverSide::Bottom,
@@ -4246,7 +4248,8 @@ pub fn popover(trigger: &str, content: &maud::Markup, config: &PopoverConfig<'_>
             (popover_trigger(trigger, config, false))
             div id=(config.id) class="autumn-popover__panel" popover role="group"
                 aria-labelledby=(format!("{}-trigger", config.id))
-                data-side=(config.side.as_str()) data-align=(config.align.as_str()) {
+                data-side=(config.side.as_str()) data-align=(config.align.as_str())
+                data-autumn-popover {
                 (content)
             }
         }
@@ -4254,7 +4257,7 @@ pub fn popover(trigger: &str, content: &maud::Markup, config: &PopoverConfig<'_>
 }
 
 #[cfg(feature = "maud")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum MenuKind {
     Link {
         label: String,
@@ -4271,6 +4274,38 @@ enum MenuKind {
         label: String,
         entries: Vec<MenuEntry>,
     },
+}
+
+// `Debug` hides the CSRF token, so a log line never carries it.
+#[cfg(feature = "maud")]
+impl std::fmt::Debug for MenuKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Link { label, href } => f
+                .debug_struct("Link")
+                .field("label", label)
+                .field("href", href)
+                .finish(),
+            Self::Action {
+                label,
+                action,
+                method,
+                ..
+            } => f
+                .debug_struct("Action")
+                .field("label", label)
+                .field("action", action)
+                .field("method", method)
+                .field("csrf", &"<redacted>")
+                .finish(),
+            Self::Separator => f.write_str("Separator"),
+            Self::Group { label, entries } => f
+                .debug_struct("Group")
+                .field("label", label)
+                .field("entries", entries)
+                .finish(),
+        }
+    }
 }
 
 /// One entry of a [`dropdown_menu`].
@@ -4303,8 +4338,12 @@ impl MenuEntry {
 
     /// A form item. It works without JavaScript and carries the CSRF token.
     ///
-    /// Same rules as [`button_to`](crate::links::button_to): `method` must
-    /// be `GET`, `POST`, `PUT`, `PATCH` or `DELETE`, or the render panics.
+    /// Same rules as [`button_to`](crate::links::button_to).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `method` is not `GET`, `POST`, `PUT`, `PATCH` or
+    /// `DELETE`. A `<form>` cannot send any other method.
     #[must_use]
     pub fn action(
         label: impl Into<String>,
@@ -4312,6 +4351,17 @@ impl MenuEntry {
         method: http::Method,
         csrf_token: impl Into<String>,
     ) -> Self {
+        assert!(
+            [
+                http::Method::GET,
+                http::Method::POST,
+                http::Method::PUT,
+                http::Method::PATCH,
+                http::Method::DELETE,
+            ]
+            .contains(&method),
+            "MenuEntry::action only supports GET, POST, PUT, PATCH, or DELETE (got {method})"
+        );
         Self::of(MenuKind::Action {
             label: label.into(),
             action: action.into(),
@@ -10032,6 +10082,36 @@ mod popover_tests {
     fn menu_without_items_still_renders_a_menu() {
         let html = dropdown_menu("A", &[], &cfg()).into_string();
         assert!(html.contains(r#"role="menu""#), "{html}");
+    }
+
+    #[test]
+    fn popover_panel_is_marked_for_the_runtime() {
+        assert!(pop().contains("data-autumn-popover"));
+    }
+
+    #[test]
+    fn menu_entry_debug_hides_the_csrf_token() {
+        let entry = MenuEntry::action("Delete", "/del", Method::DELETE, "secret-token");
+        let shown = format!("{entry:?}");
+        assert!(!shown.contains("secret-token"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        let group = MenuEntry::group("G", vec![entry]);
+        assert!(!format!("{group:?}").contains("secret-token"));
+    }
+
+    #[test]
+    #[should_panic(expected = "MenuEntry::action only supports")]
+    fn menu_action_rejects_an_unsupported_method_at_build_time() {
+        let _ = MenuEntry::action("Peek", "/x", Method::HEAD, "t");
+    }
+
+    #[test]
+    fn nav_bars_with_distinct_ids_get_distinct_menu_ids() {
+        let menu = || NavItem::menu(NavMenu::new("A").link("/a", "A"));
+        let one = nav_bar("/", &NavBarConfig::new().item(menu()).id("one")).into_string();
+        let two = nav_bar("/", &NavBarConfig::new().item(menu()).id("two")).into_string();
+        assert!(one.contains(r#"commandfor="one-menu-1""#), "{one}");
+        assert!(two.contains(r#"commandfor="two-menu-1""#), "{two}");
     }
 
     #[test]

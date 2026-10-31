@@ -43,4 +43,9 @@ Option 2.
 - Apps with CSS on `.autumn-nav__menu[hidden]` or on `data-nav-menu-toggle`
   must update it.
 - A browser without anchor positioning shows the panel in the middle of the
-  page. A browser without invoker commands uses `data-popover-toggle`.
+  page. A browser without invoker commands uses `data-popover-toggle`,
+  which needs JS. With JS off, that browser cannot open a menu. The floor is
+  Baseline Dec 2025.
+- A closing menu moves focus to the trigger itself (Escape, Tab, a click on
+  an item). Some browsers do not focus a clicked button, so the native
+  focus restore is not enough.
