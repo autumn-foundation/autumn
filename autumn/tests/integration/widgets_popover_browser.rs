@@ -595,6 +595,27 @@ async fn menu_closes_after_an_item_whose_click_is_handled_by_script() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn menu_items_fit_inside_the_panel_without_a_global_border_box_reset() {
+    // The page loads only the widget stylesheet: no `* { box-sizing }` reset.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    page.click("#actions-trigger").await.expect("open");
+    assert!(is_open(&page, "#actions").await);
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { const m = document.getElementById('actions'); \
+             return [...m.querySelectorAll('.autumn-menu__item')] \
+               .every(i => i.offsetWidth <= m.clientWidth); })()",
+        )
+        .await,
+        "every item is no wider than the panel content box"
+    );
+}
+
 // ── no JavaScript ───────────────────────────────────────────────────────
 
 #[tokio::test]
