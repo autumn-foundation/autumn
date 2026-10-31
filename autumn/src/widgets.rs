@@ -22,13 +22,13 @@
 //! | `comment_thread` | No-JS/htmx nested comment list with an inline reply form per node, for `#[commentable]` |
 //! | `locale_switcher` | Path-preserving language switcher for locale-prefixed routing (issue #1251) |
 //! | `theme_toggle` | No-JS System / Light / Dark switch that stores the `autumn.theme` cookie (issue #3396) |
-//! | `tooltip` / `tooltip_with` | Text that shows on hover and focus, linked by `aria-describedby` (issue #3404) |
 //!
 //! # Feedback widgets
 //!
 //! | Widget | Use |
 //! |--------|-----|
 //! | `toast` / `toast_with` / `toast_region` | htmx action feedback, appended out-of-band. Pauses on hover or focus. Has a close button |
+//! | `tooltip` / `tooltip_with` | Text that shows on hover and focus, linked by `aria-describedby` (issue #3404) |
 //!
 //! # Interactive / search widgets
 //!
@@ -4807,23 +4807,28 @@ impl<'a> TooltipConfig<'a> {
 /// Then the text is the accessible name. The id goes in the server HTML, so
 /// the link works without JS. A leading `#` in `id` is removed.
 ///
+/// If the trigger does not use the id, the text has no link to it. Then
+/// screen readers do not read it, and Escape does not hide it.
+///
 /// A tooltip holds text only (`text: &str`). For links or buttons, use a
-/// popover. Do not use `title` for a tooltip: keyboard and touch users
-/// cannot see it.
+/// popover. Do not use `title` for a tooltip: keyboard users cannot see
+/// it. A tooltip is not for touch: a touch screen has no hover. Do not put
+/// the only label of a control in it on a touch layout.
 ///
 /// **Behaviour (WCAG 1.4.13):**
 ///
 /// - CSS shows the text on hover and on keyboard focus (`:focus-visible`).
 ///   A mouse click does not keep it open.
 /// - A transparent bridge covers the gap. The pointer can move onto the text.
-/// - The text has no timer. It stays until hover and focus go, or Escape.
+/// - The text has no timer. It stays until hover and focus go. Escape also
+///   hides it.
 /// - Escape hides it. `autumn-widgets.js` does this with the keyboard core
 ///   (`data-autumn-dismiss="escape"`). The next hover or focus shows it again.
 ///   Without JS, Escape does nothing.
 /// - CSS anchor positioning places the text and flips it at the viewport
 ///   edge. Older browsers place it with `position: absolute`.
 /// - On Chromium, the runtime adds `popover="hint"` to the text and
-///   `interestfor` to a `<button>` or `<a>` trigger. The browser then shows,
+///   `interestfor` to a `<button>` or `<a href>` trigger. The browser then shows,
 ///   hides and dismisses it in the top layer. The server never sends these
 ///   attributes, so other browsers keep the CSS baseline.
 ///
@@ -4878,6 +4883,8 @@ pub fn tooltip_with(
     trigger: impl FnOnce(&str) -> maud::Markup,
 ) -> maud::Markup {
     let id = selector_to_id(id);
+    // A text of spaces only is empty: CSS `:empty` then hides it.
+    let text = text.trim();
     let root = merge_class(
         &format!("autumn-tooltip {}", config.placement.class()),
         config.class,

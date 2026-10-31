@@ -891,6 +891,8 @@ mod tests {
             "interestForElement",
             "interestfor",
             "'hint'",
+            // A disabled button gets no interest. It keeps the CSS mode.
+            "button:not(:disabled)",
         ] {
             assert!(js.contains(name), "missing `{name}`");
         }

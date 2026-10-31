@@ -135,5 +135,6 @@ fn the_prelude_exports_the_tooltip() {
     let config = C::new().placement(P::Bottom);
     let a = t("x", "y", |_| html! {}).into_string();
     let b = w("x", "y", &config, |_| html! {}).into_string();
-    assert_ne!(a, b);
+    assert!(a.contains("autumn-tooltip--top"), "{a}");
+    assert!(b.contains("autumn-tooltip--bottom"), "{b}");
 }

@@ -110,6 +110,25 @@ fn body() -> Markup {
             button id="load" type="button" hx-get="/fragment" hx-target="#slot"
                 hx-swap="innerHTML" { "Load" }
             div id="slot" {}
+            // An htmx swap replaces the trigger.
+            (tooltip("swap-tip", "Copies the link", swap_button))
+            // A disabled trigger.
+            (tooltip("off-tip", "Sign in to edit", |tip| {
+                html! { button id="off" type="button" disabled aria-describedby=(tip) { "Edit" } }
+            }))
+            // A plugin toggletip: `role="tooltip"` with an `aria-controls`
+            // trigger and no tooltip root.
+            button id="tt-btn" type="button" aria-controls="tt" aria-expanded="true" { "Info" }
+            div id="tt" role="tooltip" data-autumn-dismiss { span { "More info" } }
+            // A tooltip in an open keyboard-core layer.
+            button id="menu-btn" type="button" aria-controls="menu" aria-expanded="true" {
+                "Menu"
+            }
+            div id="menu" data-autumn-dismiss {
+                (tooltip("menu-tip", "In a layer", |tip| {
+                    html! { button id="menu-item" type="button" aria-describedby=(tip) { "Item" } }
+                }))
+            }
         }
     }
 }
@@ -152,6 +171,21 @@ async fn no_runtime_page() -> Markup {
     layout(false, false)
 }
 
+/// The trigger that `/swap` replaces with `hx-swap="outerHTML"`.
+fn swap_button(tip: &str) -> Markup {
+    html! {
+        button id="swap" type="button" aria-describedby=(tip) hx-get="/swap"
+            hx-swap="outerHTML" { "Copy" }
+    }
+}
+
+#[get("/swap")]
+async fn swap() -> Markup {
+    html! {
+        button id="swapped" type="button" aria-describedby="swap-tip" { "Copied" }
+    }
+}
+
 #[get("/fragment")]
 async fn fragment() -> Markup {
     tooltip("late-tip", "Swapped in", |tip| {
@@ -162,7 +196,13 @@ async fn fragment() -> Markup {
 async fn runner() -> SystemTestRunner {
     Box::pin(
         SystemTest::new()
-            .routes(routes![css_page, interest_page, no_runtime_page, fragment])
+            .routes(routes![
+                css_page,
+                interest_page,
+                no_runtime_page,
+                fragment,
+                swap
+            ])
             .plugin_assets(&FIXTURE)
             .build(),
     )
@@ -258,8 +298,21 @@ async fn open_path(page: &Page, path: &str) {
             "the runtime did not start"
         );
     }
-    // Move the mouse to a corner with no tooltip.
+    move_away(page).await;
+}
+
+/// Move the mouse to the left margin, away from each tooltip.
+async fn move_away(page: &Page) {
     page.move_mouse(1.0, 400.0).await.expect("move mouse");
+    assert!(
+        eval_bool(
+            page,
+            "(() => { const e = document.elementFromPoint(1, 400); \
+             return !e || !e.closest('[data-autumn-tooltip]'); })()"
+        )
+        .await,
+        "the point (1, 400) is on a tooltip"
+    );
 }
 
 /// Focus `before_id` by script, then press Tab: a keyboard focus.
@@ -300,26 +353,25 @@ async fn rect(page: &Page, id: &str) -> [f64; 4] {
     [r[0], r[1], r[2], r[3]]
 }
 
-/// Move the mouse from the trigger to the text in small steps, through the
-/// gap. Return the number of steps where the text did not show.
-async fn walk_to_bubble(page: &Page, trigger: &str, bubble: &str) -> usize {
+/// Move the mouse from the trigger into the middle of the gap above it.
+/// Stay there for 1 s: longer than the CSS hide transition and the Chromium
+/// interest end delay. Return `true` when the text still shows.
+async fn hold_in_gap(page: &Page, trigger: &str, bubble: &str) -> bool {
     let [tx, ty, tw, _] = rect(page, trigger).await;
-    let [bx, by, bw, bh] = rect(page, bubble).await;
-    let (x0, y0) = (tx + tw / 2.0, ty + 2.0);
-    let (x1, y1) = (bx + bw / 2.0, by + bh / 2.0);
-    let mut misses = 0;
-    for step in 0..=10 {
-        let f = f64::from(step) / 10.0;
-        page.move_mouse(x0 + (x1 - x0) * f, y0 + (y1 - y0) * f)
-            .await
-            .expect("move mouse");
-        tokio::time::sleep(Duration::from_millis(30)).await;
-        if !eval_bool(page, &visible_js(bubble)).await {
-            misses += 1;
-        }
-    }
-    misses
+    let [_, by, _, bh] = rect(page, bubble).await;
+    let x = tx + tw / 2.0;
+    page.move_mouse(x, ty + 2.0).await.expect("move mouse");
+    page.move_mouse(x, (by + bh + ty) / 2.0)
+        .await
+        .expect("move mouse");
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    eval_bool(page, &visible_js(bubble)).await
 }
+
+/// Turn off the hover bridge, for the canary.
+const NO_BRIDGE: &str = "(() => { const s = new CSSStyleSheet(); \
+    s.replaceSync('.autumn-tooltip__bubble::before { display: none; }'); \
+    document.adoptedStyleSheets = [...document.adoptedStyleSheets, s]; return true; })()";
 
 fn axe_source() -> &'static str {
     static SOURCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -399,7 +451,7 @@ async fn escape_hides_a_hovered_tooltip() {
         page.press("Escape").await.expect("Escape");
         expect_hidden(&page, "copy-tip", &format!("{mode:?}: Escape")).await;
         expect_stays_hidden(&page, "copy-tip", &format!("{mode:?}: pointer stays")).await;
-        page.move_mouse(1.0, 400.0).await.expect("move away");
+        move_away(&page).await;
         page.hover("#copy").await.expect("hover again");
         expect_shown(&page, "copy-tip", &format!("{mode:?}: hover again")).await;
     }
@@ -418,25 +470,47 @@ async fn the_hover_bridge_keeps_the_tooltip_open() {
         page.hover("#copy").await.expect("hover");
         expect_shown(&page, "copy-tip", &format!("{mode:?}: on hover")).await;
         let [_, ty, _, _] = rect(&page, "copy").await;
-        let [_, by, _, bh] = rect(&page, "copy-tip").await;
+        let [bx, by, bw, bh] = rect(&page, "copy-tip").await;
         assert!(by + bh < ty, "{mode:?}: the text is above the trigger");
         assert!(ty - (by + bh) >= 4.0, "{mode:?}: there is a gap to bridge");
-        let misses = walk_to_bubble(&page, "copy", "copy-tip").await;
-        assert_eq!(misses, 0, "{mode:?}: the text hid on the way to it");
+        assert!(
+            hold_in_gap(&page, "copy", "copy-tip").await,
+            "{mode:?}: the text hid while the pointer was in the gap"
+        );
+        page.move_mouse(bx + bw / 2.0, by + bh / 2.0)
+            .await
+            .expect("move onto the text");
         // Stay on the text: it does not time out (WCAG 1.4.13, persistent).
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(
             eval_bool(&page, &visible_js("copy-tip")).await,
-            "{mode:?}: persistent"
+            "{mode:?}: the text stays while the pointer is on it"
         );
-        page.move_mouse(1.0, 400.0).await.expect("move away");
+        move_away(&page).await;
         expect_hidden(&page, "copy-tip", &format!("{mode:?}: pointer left")).await;
     }
     page.expect_no_console_errors().await.expect("no errors");
 }
 
-/// A mouse click focuses the trigger without `:focus-visible`. The text does
-/// not stay after the pointer leaves.
+/// The canary for the test above: without the bridge, the text hides while
+/// the pointer is in the gap.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn without_the_bridge_the_text_hides_in_the_gap() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    for mode in MODES {
+        open(&page, mode).await;
+        assert!(eval_bool(&page, NO_BRIDGE).await, "turn off the bridge");
+        page.hover("#copy").await.expect("hover");
+        expect_shown(&page, "copy-tip", &format!("{mode:?}: on hover")).await;
+        assert!(
+            !hold_in_gap(&page, "copy", "copy-tip").await,
+            "{mode:?}: the text must hide in the gap without the bridge (canary)"
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires Chromium"]
 async fn a_mouse_click_does_not_pin_the_tooltip() {
@@ -446,7 +520,7 @@ async fn a_mouse_click_does_not_pin_the_tooltip() {
         open(&page, mode).await;
         page.click("#copy").await.expect("click");
         assert_eq!(active_id(&page).await, "copy");
-        page.move_mouse(1.0, 400.0).await.expect("move away");
+        move_away(&page).await;
         expect_hidden(&page, "copy-tip", &format!("{mode:?}: after a click")).await;
     }
     page.expect_no_console_errors().await.expect("no errors");
@@ -467,16 +541,18 @@ async fn escape_closes_the_tooltip_before_the_modal() {
             poll(&page, "document.getElementById('dlg').open").await,
             "the modal opens"
         );
-        assert!(
-            eval_bool(
-                &page,
-                "(() => { const b = document.getElementById('modal-btn'); b.focus(); \
-                 return document.activeElement === b; })()"
-            )
-            .await,
-            "focus the trigger in the modal"
+        // Tab to the trigger in the modal: a keyboard focus.
+        for _ in 0..6 {
+            if active_id(&page).await == "modal-btn" {
+                break;
+            }
+            page.press("Tab").await.expect("Tab");
+        }
+        assert_eq!(
+            active_id(&page).await,
+            "modal-btn",
+            "Tab reaches the trigger"
         );
-        // A script focus after a key press is a keyboard focus.
         expect_shown(&page, "modal-tip", &format!("{mode:?}: in the modal")).await;
         page.press("Escape").await.expect("Escape");
         expect_hidden(&page, "modal-tip", &format!("{mode:?}: first Escape")).await;
@@ -488,6 +564,38 @@ async fn escape_closes_the_tooltip_before_the_modal() {
         assert!(
             poll(&page, "!document.getElementById('dlg').open").await,
             "{mode:?}: the second Escape closes the modal"
+        );
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// In an open keyboard-core layer, the first Escape hides the tooltip. The
+/// second closes the layer.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn escape_closes_the_tooltip_before_its_layer() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    for mode in MODES {
+        open(&page, mode).await;
+        tab_from(&page, "menu-btn").await;
+        assert_eq!(active_id(&page).await, "menu-item");
+        expect_shown(&page, "menu-tip", &format!("{mode:?}: in the layer")).await;
+        page.press("Escape").await.expect("Escape");
+        expect_hidden(&page, "menu-tip", &format!("{mode:?}: first Escape")).await;
+        assert!(
+            eval_bool(&page, "!document.getElementById('menu').hidden").await,
+            "{mode:?}: the first Escape must not close the layer"
+        );
+        page.press("Escape").await.expect("Escape");
+        assert!(
+            poll(&page, "document.getElementById('menu').hidden").await,
+            "{mode:?}: the second Escape closes the layer"
+        );
+        assert_eq!(
+            active_id(&page).await,
+            "menu-btn",
+            "focus goes to the trigger"
         );
     }
     page.expect_no_console_errors().await.expect("no errors");
@@ -573,6 +681,106 @@ async fn the_runtime_enhances_only_where_interestfor_works() {
     page.expect_no_console_errors().await.expect("no errors");
 }
 
+/// An htmx `outerHTML` swap of the trigger keeps the tooltip: the new
+/// trigger gets the same mode, and its text shows on focus.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_swapped_trigger_keeps_its_tooltip() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    for mode in MODES {
+        open(&page, mode).await;
+        page.click("#swap").await.expect("click");
+        assert!(
+            poll(&page, "!!document.getElementById('swapped')").await,
+            "the swap runs"
+        );
+        move_away(&page).await;
+        expect_hidden(&page, "swap-tip", &format!("{mode:?}: after the swap")).await;
+        assert_eq!(
+            eval_bool(
+                &page,
+                "document.getElementById('swapped').getAttribute('interestfor') === 'swap-tip'"
+            )
+            .await,
+            matches!(mode, Mode::Interest),
+            "{mode:?}: the new trigger gets the mode"
+        );
+        tab_from(&page, "load").await;
+        // Skip to the new trigger.
+        for _ in 0..4 {
+            if active_id(&page).await == "swapped" {
+                break;
+            }
+            page.press("Tab").await.expect("Tab");
+        }
+        assert_eq!(active_id(&page).await, "swapped");
+        expect_shown(&page, "swap-tip", &format!("{mode:?}: new trigger")).await;
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// A disabled button gets no interest in Chromium. It keeps the CSS mode,
+/// so hover still shows the text.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_disabled_trigger_keeps_the_css_mode() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    for mode in MODES {
+        open(&page, mode).await;
+        assert!(
+            eval_bool(
+                &page,
+                "!document.getElementById('off-tip').hasAttribute('popover')"
+            )
+            .await,
+            "{mode:?}: no popover on a disabled trigger"
+        );
+        page.hover("#off").await.expect("hover");
+        expect_shown(&page, "off-tip", &format!("{mode:?}: hover")).await;
+        page.press("Escape").await.expect("Escape");
+        expect_hidden(&page, "off-tip", &format!("{mode:?}: Escape")).await;
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// A `role="tooltip"` layer with an `aria-controls` trigger (a plugin
+/// toggletip) keeps its trigger: Escape closes it, sets `aria-expanded`,
+/// and moves focus back.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_toggletip_with_aria_controls_keeps_its_trigger() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    for mode in MODES {
+        open(&page, mode).await;
+        assert!(
+            eval_bool(
+                &page,
+                "(() => { const b = document.getElementById('tt-btn'); b.focus(); \
+                 return document.activeElement === b; })()"
+            )
+            .await
+        );
+        page.press("Escape").await.expect("Escape");
+        assert!(
+            poll(&page, "document.getElementById('tt').hidden").await,
+            "{mode:?}: Escape closes the toggletip"
+        );
+        assert_eq!(
+            eval_string(
+                &page,
+                "document.getElementById('tt-btn').getAttribute('aria-expanded')"
+            )
+            .await,
+            "false",
+            "{mode:?}: aria-expanded follows"
+        );
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
 /// An icon-only trigger takes its accessible name from the text.
 #[tokio::test]
 #[ignore = "requires Chromium"]
@@ -601,7 +809,7 @@ async fn without_the_runtime_css_shows_the_text_but_escape_does_nothing() {
     open_path(&page, "/no-runtime").await;
     page.hover("#copy").await.expect("hover");
     expect_shown(&page, "copy-tip", "hover, no runtime").await;
-    page.move_mouse(1.0, 400.0).await.expect("move away");
+    move_away(&page).await;
     expect_hidden(&page, "copy-tip", "pointer left, no runtime").await;
     tab_from(&page, "before").await;
     expect_shown(&page, "copy-tip", "focus, no runtime").await;
@@ -614,6 +822,7 @@ async fn without_the_runtime_css_shows_the_text_but_escape_does_nothing() {
 }
 
 /// axe passes with each tooltip shown, in both modes and both schemes.
+/// Each tooltip shows on its own: Tab from the element before its trigger.
 #[tokio::test]
 #[ignore = "requires Chromium"]
 async fn axe_passes_with_the_tooltip_shown() {
@@ -634,12 +843,18 @@ async fn axe_passes_with_the_tooltip_shown() {
                 .await,
                 "select the {scheme} scheme"
             );
-            tab_from(&page, "before").await;
-            expect_shown(&page, "copy-tip", "for axe").await;
-            // axe must not read a color in the middle of a transition.
-            assert!(poll(&page, "document.getAnimations().length === 0").await);
-            for violation in page.axe_violations(axe_source()).await.expect("axe") {
-                failures.push(format!("{mode:?} [{scheme}] {violation}"));
+            for (before, tip) in [
+                ("before", "copy-tip"),
+                ("copy", "docs-tip"),
+                ("docs", "del-tip"),
+            ] {
+                tab_from(&page, before).await;
+                expect_shown(&page, tip, "for axe").await;
+                // axe must not read a color in the middle of a transition.
+                assert!(poll(&page, "document.getAnimations().length === 0").await);
+                for violation in page.axe_violations(axe_source()).await.expect("axe") {
+                    failures.push(format!("{mode:?} [{scheme}] #{tip}: {violation}"));
+                }
             }
         }
     }

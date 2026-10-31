@@ -1480,18 +1480,22 @@
 /* ── Tooltip (autumn-tooltip, #3404) ───────────────────────────────────────── */
 
 /* The root is the anchor. `anchor-scope` keeps each tooltip on its own
-   trigger. The fallback places the text with `position: absolute`. */
+   trigger. `display: inline` keeps a long link trigger in the text flow.
+   The fallback places the text with `position: absolute`. */
 .autumn-tooltip {
     --autumn-tooltip-gap: var(--space-2);
     position: relative;
-    display: inline-block;
+    display: inline;
     anchor-name: --autumn-tooltip;
     anchor-scope: --autumn-tooltip;
 }
 
-/* Hidden, but in the layout: `aria-describedby` still reads the text.
-   `pointer-events: auto` lets the pointer move onto it (WCAG 1.4.13). */
+/* Hidden: `display: none`, so a hidden text adds no scroll overflow.
+   `aria-describedby` still reads it. `pointer-events: auto` lets the
+   pointer move onto it (WCAG 1.4.13). The transparent border shows in
+   forced colors. */
 .autumn-tooltip__bubble {
+    display: none;
     position: absolute;
     z-index: var(--z-tooltip);
     box-sizing: border-box;
@@ -1499,7 +1503,7 @@
     max-width: min(20rem, calc(100vw - 2 * var(--space-2)));
     margin: 0;
     padding: var(--space-1) var(--space-2);
-    border: 0;
+    border: 1px solid transparent;
     border-radius: var(--radius-sm);
     background: var(--text);
     color: var(--surface);
@@ -1511,9 +1515,8 @@
     white-space: normal;
     overflow-wrap: break-word;
     pointer-events: auto;
-    visibility: hidden;
-    opacity: 0;
-    transition: opacity 120ms ease-out, visibility 0s linear 120ms;
+    opacity: 1;
+    transition: opacity 120ms ease-out;
 }
 
 /* The hover bridge: a transparent box that covers the gap on each side. */
@@ -1523,26 +1526,32 @@
     inset: calc(-1 * var(--autumn-tooltip-gap));
 }
 
-.autumn-tooltip:hover > .autumn-tooltip__bubble,
-.autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble {
-    visibility: visible;
-    opacity: 1;
-    transition: opacity 120ms ease-out;
+/* A popover shows only when open: the browser shows it. */
+.autumn-tooltip:hover > .autumn-tooltip__bubble:not([popover]),
+.autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble:not([popover]),
+.autumn-tooltip > .autumn-tooltip__bubble[popover]:popover-open {
+    display: block;
 }
 
 /* Without `:has()`, any focus shows the text. */
 @supports not selector(:has(a)) {
-    .autumn-tooltip:focus-within > .autumn-tooltip__bubble {
-        visibility: visible;
-        opacity: 1;
-        transition: opacity 120ms ease-out;
+    .autumn-tooltip:focus-within > .autumn-tooltip__bubble:not([popover]) {
+        display: block;
     }
 }
 
-/* Escape sets `hidden`. An empty text never shows. */
+/* Fade in from transparent. */
+@starting-style {
+    .autumn-tooltip__bubble {
+        opacity: 0;
+    }
+}
+
+/* Escape sets `hidden`. An empty text never shows. `!important` wins over
+   each show rule above. */
 .autumn-tooltip__bubble[hidden],
 .autumn-tooltip__bubble:empty {
-    display: none;
+    display: none !important;
 }
 
 /* Fallback placement, without anchor positioning. */
@@ -1575,7 +1584,9 @@
 }
 
 /* Anchor positioning. `position: fixed` escapes an `overflow` clip. The
-   text flips to the other side when it has no room. */
+   text tries the other side, then above and below. `self-*` areas follow
+   the direction of the tooltip, not of the page. `unsafe` alignment keeps
+   the text off its trigger when no block area fits. */
 @supports (anchor-scope: all) {
     .autumn-tooltip > .autumn-tooltip__bubble {
         position: fixed;
@@ -1586,28 +1597,44 @@
     }
 
     .autumn-tooltip--top > .autumn-tooltip__bubble {
-        position-area: top;
-        margin-bottom: var(--autumn-tooltip-gap);
+        position-area: block-start;
+        align-self: unsafe end;
+        margin-block-end: var(--autumn-tooltip-gap);
         position-try-fallbacks: flip-block;
     }
 
     .autumn-tooltip--bottom > .autumn-tooltip__bubble {
-        position-area: bottom;
-        margin-top: var(--autumn-tooltip-gap);
+        position-area: block-end;
+        align-self: unsafe start;
+        margin-block-start: var(--autumn-tooltip-gap);
         position-try-fallbacks: flip-block;
     }
 
     .autumn-tooltip--start > .autumn-tooltip__bubble {
-        position-area: inline-start;
+        position-area: self-inline-start;
         margin-inline-end: var(--autumn-tooltip-gap);
-        position-try-fallbacks: flip-inline;
+        position-try-fallbacks: flip-inline, --autumn-tooltip-above, --autumn-tooltip-below;
     }
 
     .autumn-tooltip--end > .autumn-tooltip__bubble {
-        position-area: inline-end;
+        position-area: self-inline-end;
         margin-inline-start: var(--autumn-tooltip-gap);
-        position-try-fallbacks: flip-inline;
+        position-try-fallbacks: flip-inline, --autumn-tooltip-above, --autumn-tooltip-below;
     }
+}
+
+@position-try --autumn-tooltip-above {
+    position-area: block-start;
+    align-self: unsafe end;
+    justify-self: anchor-center;
+    margin: 0 0 var(--autumn-tooltip-gap);
+}
+
+@position-try --autumn-tooltip-below {
+    position-area: block-end;
+    align-self: unsafe start;
+    justify-self: anchor-center;
+    margin: var(--autumn-tooltip-gap) 0 0;
 }
 
 /* Chromium: the runtime makes the text a `popover="hint"`. The browser
@@ -1619,15 +1646,10 @@
     inset: auto;
     translate: none;
     overflow: visible;
-    visibility: visible;
-    opacity: 1;
-    transition: none;
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .autumn-tooltip__bubble,
-    .autumn-tooltip:hover > .autumn-tooltip__bubble,
-    .autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble {
+    .autumn-tooltip__bubble {
         transition: none;
     }
 }

@@ -5,7 +5,11 @@ text describes the trigger. Hover and keyboard focus show it. Escape hides
 it. It needs no JavaScript to show.
 
 Use a tooltip for text only. For links, buttons or forms, use a popover.
-Do not use `title`: keyboard and touch users cannot see it.
+Do not use `title`: keyboard users cannot see it.
+
+A tooltip is not for touch. A touch screen has no hover, and a tap does not
+always focus the trigger. Do not put the only label of a control in a
+tooltip on a touch layout. Show a visible label there.
 
 ## Add a tooltip
 
@@ -58,7 +62,7 @@ let docs = tooltip_with("docs-tip", "Opens the guide", &config, |tip| html! {
 |---|---|---|
 | Show | `:hover`, `:focus-visible` | `interestfor` |
 | Place | anchor positioning, flips at the edge | top layer, implicit anchor |
-| Hide on Escape | keyboard core (`data-autumn-dismiss="escape"`) | `popover="hint"` |
+| Hide on Escape | keyboard core (`data-autumn-dismiss="escape"`) | the runtime (`hidePopover()`) |
 | Needs `autumn-widgets.js` | for Escape only | yes |
 
 The rules (WCAG 1.4.13):
@@ -75,7 +79,17 @@ not on each focus. A browser without `:has()` shows it on any focus.
 
 The runtime adds `interestfor` and `popover="hint"` only on Chromium, and
 only for a `<button>` or `<a href>` trigger. The server never sends them.
-Thus Firefox and Safari keep the CSS baseline.
+Firefox and Safari keep the CSS baseline. A disabled button also keeps the
+CSS baseline: Chromium gives it no interest. If an htmx swap replaces the
+trigger, the runtime links the new trigger.
+
+Anchor positioning keeps the text on the screen:
+
+- `Top` and `Bottom` flip to the other side.
+- `Start` and `End` flip to the other side, then go above or below.
+- `Start` and `End` follow the direction of the tooltip (`dir="rtl"`).
+
+A hidden text is `display: none`. It adds no scroll overflow.
 
 Without JavaScript, CSS shows and places the text. Escape does nothing.
 

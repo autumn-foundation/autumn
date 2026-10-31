@@ -140,13 +140,18 @@
     return layer.getAttribute('data-autumn-dismiss') === 'escape';
   }
 
-  // An id list attribute, so match one word of it.
+  // An id list attribute, so match one word of it. A tooltip's trigger can
+  // also use aria-controls (a plugin toggletip).
   function triggerOf(layer) {
     if (!layer.id) return null;
     var id = '~="' + CSS.escape(layer.id) + '"]';
-    return document.querySelector(isTip(layer)
-      ? '[aria-describedby' + id + ',[aria-labelledby' + id
-      : '[aria-controls' + id);
+    return (isTip(layer) && document.querySelector('[aria-describedby' + id + ',[aria-labelledby' + id)) ||
+      document.querySelector('[aria-controls' + id);
+  }
+
+  // True when `trigger` names `layer` in aria-controls.
+  function controls(trigger, layer) {
+    return (trigger.getAttribute('aria-controls') || '').split(/\s+/).indexOf(layer.id) >= 0;
   }
 
   // The data-autumn-activedescendant list that `el` controls, if any.
@@ -163,7 +168,7 @@
   function setOpen(layer, open) {
     var trigger = triggerOf(layer);
     layer.hidden = !open;
-    if (!trigger || isTip(layer)) return;
+    if (!trigger || !controls(trigger, layer)) return;
     trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
     if (!open && layer.hasAttribute('data-autumn-activedescendant')) setActive(trigger, layer, null);
   }
@@ -175,12 +180,14 @@
     emit(layer, 'autumn:dismiss', null);
   }
 
-  // A layer is open when it is not hidden, has content and shows. A
+  // A layer is open when it is not hidden, has content and shows (CSS can
+  // hide a tooltip). A
   // tooltip's content can be text only.
   function isOpen(layer) {
     if (layer.hidden) return false;
     if (!layer.childElementCount && !(isTip(layer) && layer.textContent.trim())) return false;
-    return getComputedStyle(layer).visibility !== 'hidden';
+    var style = getComputedStyle(layer);
+    return style.display !== 'none' && style.visibility !== 'hidden';
   }
 
   // Calls `fn(layer, inside)` for each open layer. `inside` tells if `node`
@@ -808,11 +815,15 @@
   // Chromium: `interestfor` on a button or link, `popover="hint"` on the
   // text. The browser then shows, hides and dismisses it in the top layer.
   // The server never sends these attributes, so other browsers keep CSS.
+  // A disabled button gets no interest, so it keeps CSS. A new trigger from
+  // an htmx swap gets `interestfor` again. A hint that is open for the old
+  // trigger closes.
   function initTooltip(wrap) {
     var tip = tipIn(wrap);
     var trigger = tip && triggerOf(tip);
-    if (!trigger || !wrap.contains(trigger) || !trigger.matches('button, a[href]') ||
+    if (!trigger || !wrap.contains(trigger) || !trigger.matches('button:not(:disabled), a[href]') ||
       !('interestForElement' in trigger)) return;
+    if (tip.matches('[popover]:popover-open') && !trigger.hasAttribute('interestfor')) tip.hidePopover();
     tip.removeAttribute('data-autumn-dismiss');
     tip.hidden = false;
     tip.setAttribute('popover', 'hint');
@@ -829,20 +840,25 @@
   document.addEventListener('mouseover', rearm);
   document.addEventListener('focusin', rearm);
 
-  // WCAG 1.4.13: Escape also hides a tooltip that shows for hover only. The
-  // core hides one whose trigger has focus, and then cancels the key. The
-  // browser closes an open hint popover, but in a modal it closes the modal
-  // too. So close the popover here, and cancel the key.
+  // Escape closes an open hint popover first, and cancels the key. Without
+  // this, the browser also closes a modal around it, and the core closes a
+  // layer around it. The capture phase runs before the core.
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
-    document.querySelectorAll(TIP + ' > [role="tooltip"]').forEach(function (tip) {
-      if (tip.matches('[popover]:popover-open')) {
-        e.preventDefault();
-        tip.hidePopover();
-      } else if (escapeOnly(tip) && tip.parentNode.matches(':hover') && isOpen(tip)) {
-        e.preventDefault();
-        dismiss(tip, false);
-      }
+    document.querySelectorAll(TIP + ' > [popover]:popover-open').forEach(function (tip) {
+      e.preventDefault();
+      tip.hidePopover();
+    });
+  }, true);
+
+  // WCAG 1.4.13: Escape also hides a tooltip that shows for hover only. The
+  // core hides one whose trigger has focus, and then cancels the key.
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+    document.querySelectorAll(TIP + ':hover > [role="tooltip"]').forEach(function (tip) {
+      if (!isOpen(tip) || !escapeOnly(tip)) return;
+      e.preventDefault();
+      dismiss(tip, false);
     });
   });
 
@@ -862,6 +878,9 @@
     each(root, REGION, initRegion);
     each(root, TOAST, initToast);
     each(root, TIP, initTooltip);
+    // A swap inside a tooltip (a new trigger).
+    var outer = root.parentElement && root.parentElement.closest(TIP);
+    if (outer) initTooltip(outer);
     // The theme is page state, so only a whole-page init syncs it.
     if (root === document) syncTheme();
   }

@@ -49,12 +49,13 @@ Rules:
   The element whose `aria-controls` names the list is the controller. The
   element whose `aria-controls` names the layer is the trigger. For a
   `role="tooltip"` layer, the trigger is the element whose
-  `aria-describedby` or `aria-labelledby` names it. The core does not set
-  `aria-expanded` on it.
-- **Open and close.** A layer is open when it has no `hidden` attribute, is
-  not `visibility: hidden`, and has at least one child element (a tooltip
-  can have text only). To close it, the core sets `hidden` and
-  the trigger's `aria-expanded="false"`. When focus is in the layer, Escape
+  `aria-describedby` or `aria-labelledby` names it. If there is none, the
+  core uses `aria-controls`.
+- **Open and close.** A layer is open when it has no `hidden` attribute,
+  and CSS shows it (not `display: none`, not `visibility: hidden`). It must
+  also have a child element. A tooltip needs text only. To close it, the
+  core sets `hidden`. It sets `aria-expanded="false"` on an `aria-controls`
+  trigger only. When focus is in the layer, Escape
   moves focus to the trigger.
 - **Who opens a layer.** The core opens a layer only for ArrowDown or
   ArrowUp in an active-descendant list. In other cases your code opens it:

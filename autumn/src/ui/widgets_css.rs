@@ -465,30 +465,37 @@ mod tests {
 
     // ── tooltip (#3404) ──────────────────────────────────────────────
 
-    /// The text is hidden until hover or focus. It keeps its layout box, so
-    /// `aria-describedby` still reads it.
+    /// The block that starts at `head`, up to its closing brace.
+    fn css_block(head: &str) -> String {
+        let css = lf_css();
+        let at = css.find(head).unwrap_or_else(|| panic!("missing `{head}`"));
+        let end = css[at..].find("\n}\n").expect("block end");
+        css[at..at + end].to_owned()
+    }
+
+    /// The text is `display: none` until hover or keyboard focus, so a
+    /// hidden text adds no scroll overflow. `aria-describedby` still reads
+    /// it. A popover shows only when the browser opens it.
     #[test]
     fn tooltip_is_hidden_until_hover_or_keyboard_focus() {
         let body = rule_body(".autumn-tooltip__bubble");
-        assert!(body.contains("visibility: hidden;"), "{body}");
+        assert!(body.contains("display: none;"), "{body}");
         assert!(body.contains("pointer-events: auto;"), "{body}");
-        let css = lf_css();
         assert!(
-            css.contains(
-                ".autumn-tooltip:hover > .autumn-tooltip__bubble,\n\
-                 .autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble {"
+            lf_css().contains(
+                ".autumn-tooltip:hover > .autumn-tooltip__bubble:not([popover]),\n\
+                 .autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble:not([popover]),\n\
+                 .autumn-tooltip > .autumn-tooltip__bubble[popover]:popover-open {\n    \
+                 display: block;"
             ),
             "missing the show selectors"
         );
-        assert!(
-            rule_body(".autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble")
-                .contains("visibility: visible;")
-        );
         // Browsers without `:has()` show on any focus.
-        let at = css
-            .find("@supports not selector(:has(a)) {\n    .autumn-tooltip:focus-within")
-            .expect("the :focus-within fallback");
-        assert!(css[at..at + 200].contains("visibility: visible;"));
+        let block =
+            css_block("@supports not selector(:has(a)) {\n    .autumn-tooltip:focus-within");
+        assert!(block.contains("display: block;"), "{block}");
+        // A long link trigger stays in the text flow.
+        assert!(rule_body(".autumn-tooltip").contains("display: inline;"));
     }
 
     /// WCAG 1.4.13 (hoverable): a transparent bridge covers the gap between
@@ -504,12 +511,14 @@ mod tests {
         );
     }
 
-    /// The dismiss helper sets `hidden`. An empty text never shows.
+    /// The dismiss helper sets `hidden`. An empty text never shows. Both win
+    /// over each show rule.
     #[test]
     fn a_dismissed_or_empty_tooltip_does_not_show() {
         assert!(
             lf_css().contains(
-                ".autumn-tooltip__bubble[hidden],\n.autumn-tooltip__bubble:empty {\n    display: none;"
+                ".autumn-tooltip__bubble[hidden],\n.autumn-tooltip__bubble:empty {\n    \
+                 display: none !important;"
             ),
             "missing the [hidden] / :empty rule"
         );
@@ -522,25 +531,35 @@ mod tests {
         let root = rule_body(".autumn-tooltip");
         assert!(root.contains("anchor-name: --autumn-tooltip;"), "{root}");
         assert!(root.contains("anchor-scope: --autumn-tooltip;"), "{root}");
-        let css = lf_css();
-        let at = css
-            .find("@supports (anchor-scope: all) {")
-            .expect("the anchor block");
-        let block = &css[at..at + 1200];
+        let block = css_block("@supports (anchor-scope: all) {");
         for declaration in [
             "position: fixed;",
             "position-anchor: --autumn-tooltip;",
             "position-try-fallbacks: flip-block;",
-            "position-try-fallbacks: flip-inline;",
+            // Start and end try the other side, then above and below, so
+            // the text never covers its trigger in a narrow viewport.
+            "position-try-fallbacks: flip-inline, --autumn-tooltip-above, --autumn-tooltip-below;",
+            // `self-*` follows the tooltip's direction in an RTL subtree.
+            "position-area: self-inline-start;",
+            "position-area: self-inline-end;",
+            // The text stays off its trigger when no block area fits.
+            "align-self: unsafe end;",
+            "align-self: unsafe start;",
         ] {
             assert!(
                 block.contains(declaration),
                 "missing `{declaration}`:{block}"
             );
         }
+        for name in ["--autumn-tooltip-above", "--autumn-tooltip-below"] {
+            assert!(
+                lf_css().contains(&format!("@position-try {name} {{")),
+                "missing @position-try {name}"
+            );
+        }
         for placement in ["top", "bottom", "start", "end"] {
             assert!(
-                css.contains(&format!(
+                lf_css().contains(&format!(
                     ".autumn-tooltip--{placement} > .autumn-tooltip__bubble"
                 )),
                 "no rule for the {placement} placement"
@@ -558,20 +577,22 @@ mod tests {
             "position-anchor: auto;",
             "inset: auto;",
             "overflow: visible;",
-            "visibility: visible;",
         ] {
             assert!(body.contains(declaration), "missing `{declaration}`:{body}");
         }
     }
 
+    /// Forced colors paint a transparent border, so the text keeps an edge.
+    #[test]
+    fn tooltip_keeps_an_edge_in_forced_colors() {
+        assert!(rule_body(".autumn-tooltip__bubble").contains("border: 1px solid transparent;"));
+    }
+
     #[test]
     fn tooltip_sits_above_toasts_and_has_no_motion_when_reduced() {
         assert!(rule_body(".autumn-tooltip__bubble").contains("z-index: var(--z-tooltip);"));
-        let css = lf_css();
-        let at = css
-            .find("@media (prefers-reduced-motion: reduce) {\n    .autumn-tooltip__bubble")
-            .expect("reduced-motion tooltip block");
-        let block = &css[at..at + css[at..].find("\n}\n").expect("block end")];
+        let block =
+            css_block("@media (prefers-reduced-motion: reduce) {\n    .autumn-tooltip__bubble");
         assert!(block.contains("transition: none;"), "{block}");
     }
 
