@@ -737,6 +737,45 @@ async fn keyboard_accessible_primitives() {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
+async fn keyboard_accordion() {
+    const ITEM: &str = "#demo-faq > details:nth-child";
+    const MULTI: &str = "#demo-faq-multi > details:nth-child";
+    let is_open = |sel: String| format!("document.querySelector({sel:?}).open");
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/accordion").await;
+
+    assert!(eval_bool(&page, &is_open(format!("{ITEM}(1)"))).await);
+    focus(&page, &format!("{ITEM}(2) > summary")).await;
+    press(&page, "Enter").await;
+    assert!(
+        eval_bool(&page, &is_open(format!("{ITEM}(2)"))).await,
+        "Enter opens"
+    );
+    assert!(
+        !eval_bool(&page, &is_open(format!("{ITEM}(1)"))).await,
+        "an exclusive accordion closes the other item"
+    );
+    press(&page, " ").await;
+    assert!(
+        !eval_bool(&page, &is_open(format!("{ITEM}(2)"))).await,
+        "Space closes"
+    );
+
+    // Multi mode: items 1 and 2 stay open when item 3 opens.
+    focus(&page, &format!("{MULTI}(3) > summary")).await;
+    press(&page, "Enter").await;
+    for n in 1..=3 {
+        assert!(
+            eval_bool(&page, &is_open(format!("{MULTI}({n})"))).await,
+            "multi item {n} is open"
+        );
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
 async fn keyboard_toast() {
     const CLOSE: &str = ".autumn-toast--persistent [data-autumn-toast-close]";
     const LEFT: &str = "String(document.querySelectorAll('.autumn-toast--persistent').length)";

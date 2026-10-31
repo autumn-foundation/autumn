@@ -2254,6 +2254,7 @@ for the common cases:
 | `card(&body, &CardConfig::new().title("..."))` / `stat_card(label, value, link)` | Titled panels and metric tiles (`autumn_web::widgets`, prelude re-export) |
 | `sparkline(&points)` / `bar_chart(&series)` / `line_chart(&series)` (+ `_with(&ChartConfig)`) | Server-rendered, accessible, zero-JS **SVG charts** from `&[(&str, f64)]` (`/_stories` gallery). `bar_chart` anchors bars at zero; `ChartConfig::new().title(...).min(...).max(...)` sets an axis override / accessible name (#1231) |
 | `tabs(id, Some(active) \| None, &[(id, label, markup)])` | Tab switcher: `:target` CSS with JS off; APG arrow keys with `autumn-widgets.js` (`docs/guide/tabs.md`, `docs/guide/keyboard.md`) |
+| `accordion(&[(title, markup)], &AccordionConfig::new(name))` / `collapsible(summary, &markup)` / `collapsible_with(.., &CollapsibleConfig)` | No-JS disclosure on native `<details>` (#3401). Exclusive by default (shared `name`); `.multiple()` lets items open on their own; `.open(i)`, `.level(HeadingLevel)`, `.class()`, `.attrs()`. Titles are escaped; Enter/Space on `<summary>` are native (`docs/guide/accordion.md`) |
 | `modal(id, title, &body, &ModalConfig)` / `confirm_action(...)` | Native `<dialog>` confirm for destructive actions — replaces `hx-confirm`/`window.confirm()` |
 | `drawer(id, title, &body, &DrawerConfig)` / `drawer_trigger(...)` | Edge `<dialog>` (left/right/top/bottom), modal or not; `DialogSize` and `close_button(label)` also on `ModalConfig` (`docs/guide/drawer.md`) |
 | `badge(label, BadgeVariant::for_label(status))` / `status_tag(label)` | Semantic status pill; `BadgeVariant` = `Neutral`/`Info`/`Success`/`Warning`/`Danger`, `for_label` picks a deterministic color; `badge_with`/`BadgeConfig` set `title`/`aria-label`. Composes inside a `data_table` cell |
@@ -4575,6 +4576,7 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/widget-styling.md`
 - `docs/guide/tabs.md`
 - `docs/guide/drawer.md`
+- `docs/guide/accordion.md`
 - `docs/guide/maintenance-mode.md`
 - `docs/guide/deployment.md`
 - `docs/guide/fleet-deploys.md`

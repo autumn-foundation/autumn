@@ -150,6 +150,8 @@ fn widgets_css_path_and_selectors_are_stable() {
         ".autumn-alert",
         ".autumn-badge",
         ".autumn-theme-toggle",
+        ".autumn-accordion",
+        ".autumn-collapsible",
     ] {
         assert!(
             autumn_web::ui::WIDGETS_COMPONENT_CSS.contains(selector),

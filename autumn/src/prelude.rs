@@ -238,18 +238,18 @@ pub use crate::widgets::localized_path;
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
-    ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig, AvatarConfig, AvatarSize,
-    BadgeConfig, BadgeVariant, CardConfig, Column, CommentThread, CommentView, ConfirmActionConfig,
-    Crumb, Cta, CtaStyle, DEFAULT_TOAST_DURATION, DEFAULT_TOAST_REGION_ID, DataTableConfig,
-    DialogSize, DrawerConfig, DrawerSide, FeedConfig, FeedMode, HeadingLevel, HeroConfig,
-    ModalConfig, NavBarConfig, NavBarLayout, NavItem, NavLinkMatch, NavMenu, ReactionControls,
-    SearchMethod, ToastConfig, active_search, active_search_empty_state, active_search_input,
-    active_search_results, alert, alert_with, autocomplete_empty_state, autocomplete_input,
-    autocomplete_option, avatar, badge, badge_with, breadcrumb, card, comment_thread,
-    confirm_action, data_table, drawer, drawer_trigger, error_summary, feed_page, hero,
-    infinite_feed, locale_switcher, modal, modal_close_button, modal_trigger, nav_bar, nav_link,
-    nav_link_matched, property_list, reaction_controls, stat_card, status_tag, tabs, toast,
-    toast_in, toast_region, toast_with,
+    AccordionConfig, ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig,
+    AvatarConfig, AvatarSize, BadgeConfig, BadgeVariant, CardConfig, CollapsibleConfig, Column,
+    CommentThread, CommentView, ConfirmActionConfig, Crumb, Cta, CtaStyle, DEFAULT_TOAST_DURATION,
+    DEFAULT_TOAST_REGION_ID, DataTableConfig, DialogSize, DrawerConfig, DrawerSide, FeedConfig,
+    FeedMode, HeadingLevel, HeroConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem,
+    NavLinkMatch, NavMenu, ReactionControls, SearchMethod, ToastConfig, accordion, active_search,
+    active_search_empty_state, active_search_input, active_search_results, alert, alert_with,
+    autocomplete_empty_state, autocomplete_input, autocomplete_option, avatar, badge, badge_with,
+    breadcrumb, card, collapsible, collapsible_with, comment_thread, confirm_action, data_table,
+    drawer, drawer_trigger, error_summary, feed_page, hero, infinite_feed, locale_switcher, modal,
+    modal_close_button, modal_trigger, nav_bar, nav_link, nav_link_matched, property_list,
+    reaction_controls, stat_card, status_tag, tabs, toast, toast_in, toast_region, toast_with,
 };
 
 // ── Widget stories ───────────────────────────────────────────────

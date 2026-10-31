@@ -1028,6 +1028,10 @@ Per-primitive setters (in addition to the shared set):
   `#field`; the root has `id="error-summary" tabindex="-1" autofocus`, so
   focus moves to it on a failed submit — one per page). All prelude
   re-exported.
+- `autumn_web::widgets::{accordion, collapsible, collapsible_with}` +
+  `AccordionConfig::new(name)` / `CollapsibleConfig` — no-JS disclosure on
+  native `<details>`. Exclusive by default; `.multiple()`, `.open(i)`,
+  `.level()`, `.class()`, `.attrs()`. See `docs/guide/accordion.md`.
 - `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
   `toast_in(region_id, message, AlertVariant)` /
   `toast_with(message, AlertVariant, &ToastConfig)` / `toast_region(id)` +

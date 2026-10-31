@@ -64,10 +64,14 @@ const SQLITE_FEATURE_MSG: &str = "`autumn migrate` detected a SQLite database UR
 /// build a detected `SQLite` URL still routes here and then hits the
 /// [`SQLITE_FEATURE_MSG`] seam.
 fn is_sqlite_target(database_url: &str) -> bool {
-    matches!(
-        autumn_web::config::DatabaseBackend::detect(database_url),
-        Some(autumn_web::config::DatabaseBackend::Sqlite)
-    )
+    target_backend(database_url) == autumn_web::config::DatabaseBackend::Sqlite
+}
+
+/// The backend of `database_url`. An unknown URL is Postgres, as in
+/// [`is_sqlite_target`].
+fn target_backend(database_url: &str) -> autumn_web::config::DatabaseBackend {
+    autumn_web::config::DatabaseBackend::detect(database_url)
+        .unwrap_or(autumn_web::config::DatabaseBackend::Postgres)
 }
 
 /// Reject a `database_url` this CLI build's embedded `FRAMEWORK_MIGRATIONS`
@@ -2487,11 +2491,15 @@ fn is_production_profile(explicit: Option<&str>) -> bool {
 /// Whether an applied user migration has a usable `down.sql` on disk.
 ///
 /// Returns `false` when the migration is not present locally (`dir` is `None`)
-/// or its `down.sql` is missing/empty/comment-only.
-fn has_revertable_down_sql(m: &AppliedUserMigration) -> bool {
+/// or its `down.sql` is missing/empty/comment-only. The comment rules are
+/// those of `backend`.
+fn has_revertable_down_sql(
+    m: &AppliedUserMigration,
+    backend: autumn_web::config::DatabaseBackend,
+) -> bool {
     m.dir.as_ref().is_some_and(|d| {
         std::fs::read_to_string(d.join("down.sql"))
-            .is_ok_and(|sql| safety::has_executable_sql(&sql))
+            .is_ok_and(|sql| safety::has_executable_sql(backend, &sql))
     })
 }
 
@@ -2655,12 +2663,16 @@ fn run_down(
 /// an executable `down.sql`, and a `CONCURRENTLY` index revert must opt out of
 /// the per-migration transaction. Prints the offending migrations and exits the
 /// process on failure (before any schema is mutated).
-fn check_rollback_plan_revertable(applied: &[AppliedUserMigration], plan: &[String]) {
+fn check_rollback_plan_revertable(
+    applied: &[AppliedUserMigration],
+    plan: &[String],
+    backend: autumn_web::config::DatabaseBackend,
+) {
     let missing: Vec<&str> = plan
         .iter()
         .filter_map(|version| {
             let m = applied.iter().find(|m| &m.version == version)?;
-            (!has_revertable_down_sql(m)).then_some(m.name.as_str())
+            (!has_revertable_down_sql(m, backend)).then_some(m.name.as_str())
         })
         .collect();
     if !missing.is_empty() {
@@ -2713,7 +2725,7 @@ fn preflight_rollback_target(
         std::process::exit(1);
     });
     let plan = build_rollback_plan(args, &applied);
-    check_rollback_plan_revertable(&applied, &plan);
+    check_rollback_plan_revertable(&applied, &plan, target_backend(database_url));
     plan
 }
 
@@ -2823,7 +2835,7 @@ fn run_down_target(
 
         // Re-validate under the lock (defense-in-depth against the plan
         // going stale between the up-front preflight and here).
-        check_rollback_plan_revertable(applied, &plan);
+        check_rollback_plan_revertable(applied, &plan, target_backend(database_url));
 
         // Preflight passed: enable maintenance mode (if requested and not
         // already enabled for an earlier target) before we mutate schema,
@@ -2957,7 +2969,7 @@ fn show_rollback_availability(database_url: &str, migrations_dir: &str) {
                 "  \u{2717} {}  (applied but missing locally — not revertable)",
                 m.name
             );
-        } else if !has_revertable_down_sql(m) {
+        } else if !has_revertable_down_sql(m, target_backend(database_url)) {
             eprintln!(
                 "  \u{2717} {}  (no executable down.sql — not revertable)",
                 m.name
@@ -3876,7 +3888,10 @@ mod tests {
             name: "20260101000000".to_string(),
             dir: None,
         };
-        assert!(!has_revertable_down_sql(&m));
+        assert!(!has_revertable_down_sql(
+            &m,
+            autumn_web::config::DatabaseBackend::Postgres
+        ));
     }
 
     #[test]
@@ -3890,7 +3905,10 @@ mod tests {
             name: "20260101000000_create_posts".to_string(),
             dir: Some(dir),
         };
-        assert!(has_revertable_down_sql(&m));
+        assert!(has_revertable_down_sql(
+            &m,
+            autumn_web::config::DatabaseBackend::Postgres
+        ));
     }
 
     #[test]
@@ -3904,7 +3922,10 @@ mod tests {
             name: "20260101000000_create_posts".to_string(),
             dir: Some(dir),
         };
-        assert!(!has_revertable_down_sql(&m));
+        assert!(!has_revertable_down_sql(
+            &m,
+            autumn_web::config::DatabaseBackend::Postgres
+        ));
     }
 
     /// Build an `AppliedUserMigration` backed by a temp dir containing the given
