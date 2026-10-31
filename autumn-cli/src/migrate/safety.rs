@@ -267,20 +267,30 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 /// Split a normalized `ALTER TABLE` statement into individual subcommand strings.
 ///
 /// Strips the `alter table <name>` prefix and splits the remaining text on
-/// commas outside parentheses, trimming each segment. With `quote_aware`, a
-/// comma in quoted text does not split. Only `SQLite` input sets it. The
-/// scanner does not know Postgres dollar quotes or `E'..\'` escapes, and a
-/// wrong guess there could merge a `DROP COLUMN` into its neighbour.
+/// commas outside parentheses, trimming each segment. With `quote_aware`
+/// (`SQLite`), a comma in any quoted text does not split. Without it
+/// (Postgres), `'..'`, `E'..'`, `"name"` and dollar-quoted text are skipped.
+/// Backticks and brackets are not Postgres quotes.
 fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
     let after_prefix = normalized.strip_prefix("alter table ").unwrap_or("");
-    let subcommands_start = after_prefix.find(' ').map_or(after_prefix.len(), |i| i + 1);
+    // SQLite quotes names with backticks and brackets, so a `"` may be plain text.
+    let name_len = if quote_aware {
+        after_prefix.find(' ').unwrap_or(after_prefix.len())
+    } else {
+        table_name_len(after_prefix)
+    };
+    let subcommands_start = name_len.saturating_add(1).min(after_prefix.len());
     let subcommands = &after_prefix[subcommands_start..];
 
     let mut result = Vec::new();
     let mut depth: i32 = 0;
     let mut quote: Option<char> = None;
     let mut start = 0;
+    let mut skip_to = 0;
     for (i, c) in subcommands.char_indices() {
+        if i < skip_to {
+            continue;
+        }
         // In quoted text, only the closing quote counts. A doubled quote
         // closes and reopens the text.
         if let Some(q) = quote {
@@ -288,6 +298,12 @@ fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
                 quote = None;
             }
             continue;
+        }
+        if !quote_aware {
+            skip_to = i + pg_literal_len(subcommands, i);
+            if skip_to > i {
+                continue;
+            }
         }
         match c {
             '\'' | '"' | '`' if quote_aware => quote = Some(c),
@@ -306,6 +322,78 @@ fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
         result.push(last);
     }
     result
+}
+
+/// Byte length of the table name at the start of `text`: up to the first
+/// space outside `"name"` quotes.
+fn table_name_len(text: &str) -> usize {
+    let mut i = 0;
+    while let Some(c) = text[i..].chars().next() {
+        match c {
+            ' ' => break,
+            '"' => i += quoted_name_len(&text[i..]),
+            _ => i += c.len_utf8(),
+        }
+    }
+    i
+}
+
+/// Byte length of the Postgres literal that starts at byte `i` of `text`, or 0.
+///
+/// A literal is `'..'` (`''` escapes), `E'..'` (`\'` escapes), `"name"`
+/// (`""` escapes) or a dollar quote. A name that ends in `e` or `$` does not
+/// start one.
+fn pg_literal_len(text: &str, i: usize) -> usize {
+    let rest = &text[i..];
+    let at_boundary = |end: usize| {
+        !text[..end]
+            .chars()
+            .next_back()
+            .is_some_and(|p| p.is_alphanumeric() || p == '_' || p == '$')
+    };
+    match rest.as_bytes()[0] {
+        b'\'' => quote_len(rest),
+        b'"' => quoted_name_len(rest),
+        b'e' | b'E' if rest.as_bytes().get(1) == Some(&b'\'') && at_boundary(i) => {
+            1 + escaped_quote_len(&rest[1..])
+        }
+        b'$' if at_boundary(i) => dollar_quote_len(rest).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Byte length of the `"name"` at the start of `rest`. `""` is a quote. An
+/// unclosed name runs to the end.
+fn quoted_name_len(rest: &str) -> usize {
+    let mut j = 1;
+    while let Some(rel) = rest[j..].find('"') {
+        let abs = j + rel;
+        if rest[abs + 1..].starts_with('"') {
+            j = abs + 2;
+        } else {
+            return abs + 1;
+        }
+    }
+    rest.len()
+}
+
+/// Byte length of the `E'..'` body at the start of `rest` (`rest` starts with
+/// `'`). `\` escapes the next char and `''` is a quote. Unclosed runs to the end.
+fn escaped_quote_len(rest: &str) -> usize {
+    let mut chars = rest.char_indices().skip(1);
+    while let Some((j, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\'' if rest[j + 1..].starts_with('\'') => {
+                chars.next();
+            }
+            '\'' => return j + 1,
+            _ => {}
+        }
+    }
+    rest.len()
 }
 
 /// True iff `subcommand` is an ALTER TABLE subcommand that Autumn fully classifies.
@@ -772,7 +860,11 @@ fn quote_len(rest: &str) -> usize {
 fn dollar_quote_len(rest: &str) -> Option<usize> {
     let after = rest.strip_prefix('$')?;
     let tag_body = &after[..after.find('$')?];
-    if !tag_body.chars().all(|c| c.is_alphanumeric() || c == '_') {
+    let mut tag_chars = tag_body.chars();
+    let starts_ok = tag_chars
+        .next()
+        .is_none_or(|c| c.is_alphabetic() || c == '_');
+    if !starts_ok || !tag_body.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
     let tag_len = tag_body.len() + 2;
@@ -848,12 +940,78 @@ fn strip_line_comments(sql: &str) -> String {
 }
 
 /// Strip comments, collapse whitespace, and lowercase a single statement.
+///
+/// A `$tag$` token keeps its case: Postgres matches dollar-quote tags
+/// case-sensitively, and the literal scanners must see the same text.
 pub fn normalize_statement(stmt: &str) -> String {
-    strip_line_comments(&strip_block_comments(stmt))
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+    lowercase_except_dollar_tags(
+        &strip_line_comments(&strip_block_comments(stmt))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+/// Lowercase `text`, but keep the case a dollar-quote tag needs.
+///
+/// The literal scanner decides what is a literal, as it does for splitting.
+/// In a dollar-quoted span, the two delimiters and any body text that equals
+/// the tag in a different case keep their case. Postgres compares tags
+/// case-sensitively, so the scanners must see the same text.
+fn lowercase_except_dollar_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(c) = text[i..].chars().next() {
+        let n = pg_literal_len(text, i);
+        if n == 0 {
+            out.extend(c.to_lowercase());
+            i += c.len_utf8();
+            continue;
+        }
+        let span = &text[i..i + n];
+        if span.starts_with('$') {
+            push_dollar_span(&mut out, span);
+        } else {
+            out.extend(span.chars().flat_map(char::to_lowercase));
+        }
+        i += n;
+    }
+    out
+}
+
+/// Append the dollar-quoted `span`, lowercased except for its tag text.
+fn push_dollar_span(out: &mut String, span: &str) {
+    let tag_len = span[1..].find('$').map_or(span.len(), |p| p + 2);
+    let tag = &span[..tag_len];
+    let closed = span.len() >= 2 * tag_len && span.ends_with(tag);
+    let body_end = if closed {
+        span.len() - tag_len
+    } else {
+        span.len()
+    };
+    let body = &span[tag_len..body_end];
+    // Mark every body byte inside a case-variant of the tag, overlaps included.
+    let tag_lower = tag.to_lowercase();
+    let mut keep = vec![false; body.len()];
+    for (j, _) in body.char_indices() {
+        let hit = body
+            .get(j..j + tag_len)
+            .is_some_and(|w| w.to_lowercase() == tag_lower);
+        if hit {
+            keep[j..j + tag_len].fill(true);
+        }
+    }
+    out.push_str(tag);
+    for (j, c) in body.char_indices() {
+        if keep[j] {
+            out.push(c);
+        } else {
+            out.extend(c.to_lowercase());
+        }
+    }
+    if closed {
+        out.push_str(tag);
+    }
 }
 
 /// Returns `true` when `sql` contains an executable concurrent index operation
@@ -3234,6 +3392,219 @@ mod tests {
             true,
         );
         assert_eq!(subs, ["add column a text default 'it''s,x'"]);
+    }
+
+    fn pg_subs(sql: &str) -> Vec<&str> {
+        alter_table_subcommands(sql, false)
+    }
+
+    #[test]
+    fn pg_split_ignores_a_paren_in_a_string_literal() {
+        for lit in ["'('", "')'", "'/* ( */'", "'it''s ('"] {
+            let sql = format!("alter table t add column a text default {lit}, add column b int");
+            assert_eq!(pg_subs(&sql).len(), 2, "{lit}");
+        }
+    }
+
+    #[test]
+    fn pg_split_ignores_a_paren_in_a_dollar_quote() {
+        for lit in ["$$($$", "$tag$($tag$", "$$ ( ' $$"] {
+            let sql = format!("alter table t add column a text default {lit}, add column b int");
+            assert_eq!(pg_subs(&sql).len(), 2, "{lit}");
+        }
+    }
+
+    #[test]
+    fn pg_split_honours_backslash_escapes_in_e_strings() {
+        let subs = pg_subs("alter table t add column a text default e'it\\'s', add column b int");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        let subs = pg_subs("alter table t add column a text default e'\\'(', add column b int");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_ignores_a_quote_inside_a_quoted_name() {
+        for name in [r#""a'b""#, r#""$$""#, r#""e'""#, r#""a""'b""#, r#""a(b""#] {
+            let sql = format!("alter table t add column {name} int, drop column c");
+            let subs = pg_subs(&sql);
+            assert_eq!(subs.len(), 2, "{name}: {subs:?}");
+        }
+    }
+
+    #[test]
+    fn quote_in_a_quoted_name_does_not_hide_a_drop_column() {
+        let sql = r#"ALTER TABLE t ADD COLUMN "a'b" int, DROP COLUMN c;"#;
+        let f = classify_sql_for(DatabaseBackend::Postgres, sql);
+        assert!(
+            f.iter().any(|f| f.operation.starts_with("DROP COLUMN")),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn dollar_tag_cannot_start_with_a_digit() {
+        assert_eq!(dollar_quote_len("$1$ x $1$"), None);
+        assert_eq!(dollar_quote_len("$a1$ x $a1$"), Some(11));
+        let subs =
+            pg_subs("alter table t add column a int default $1$, add column b int, drop column c$");
+        assert_eq!(subs.len(), 3, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_reads_a_quoted_table_name_with_spaces() {
+        for table in [r#""my table""#, r#""x add column y""#, r#"s."my table""#] {
+            let sql = format!(
+                "alter table {table} add column a text default 'ok', add column b int not null"
+            );
+            let subs = pg_subs(&sql);
+            assert_eq!(
+                subs,
+                [
+                    "add column a text default 'ok'",
+                    "add column b int not null"
+                ],
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_table_name_with_spaces_keeps_the_not_null_finding() {
+        let sql =
+            r#"ALTER TABLE "my table" ADD COLUMN a text DEFAULT 'ok', ADD COLUMN b int NOT NULL;"#;
+        let f = classify_sql_for(DatabaseBackend::Postgres, sql);
+        assert!(
+            f.iter()
+                .any(|f| f.operation == "ADD COLUMN NOT NULL (no default)"),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn dollar_tag_case_does_not_close_a_literal_early() {
+        for lit in [
+            "$tag$ $TAG$ $tag$",
+            "$tag$ x$TAG$y $tag$",
+            "$Tag$ $tag$ $Tag$",
+        ] {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a text DEFAULT {lit}, ADD COLUMN b int NOT NULL;"
+            );
+            let f = classify_sql_for(DatabaseBackend::Postgres, &sql);
+            assert!(
+                f.iter()
+                    .any(|f| f.operation == "ADD COLUMN NOT NULL (no default)"),
+                "{lit}: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dollar_tag_overlapping_an_inner_token_keeps_its_closing_tag() {
+        for lit in ["$Tag$ $X$Tag$", "$a$ $A$A$ $a$", "'$A$', $B$ $b$ $B$"] {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a text DEFAULT {lit}, ADD COLUMN b int NOT NULL;"
+            );
+            let f = classify_sql_for(DatabaseBackend::Postgres, &sql);
+            assert!(
+                f.iter()
+                    .any(|f| f.operation == "ADD COLUMN NOT NULL (no default)"),
+                "{lit}: {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_handles_unclosed_and_escaped_literals() {
+        assert_eq!(normalize_statement("SELECT $Tag$ ABC"), "select $Tag$ abc");
+        assert_eq!(normalize_statement("SELECT $Tag$"), "select $Tag$");
+        assert_eq!(normalize_statement("SELECT E'A''B'"), "select e'a''b'");
+        assert_eq!(
+            normalize_statement("SELECT E'A\\'B' X"),
+            "select e'a\\'b' x"
+        );
+        assert_eq!(normalize_statement("SELECT E'AB"), "select e'ab");
+    }
+
+    #[test]
+    fn pg_split_handles_unclosed_and_escaped_names_and_e_strings() {
+        assert_eq!(
+            pg_subs(r#"alter table t drop column "a, drop column b"#).len(),
+            1
+        );
+        assert!(pg_subs(r#"alter table "t, add column a int"#).is_empty());
+        let subs = pg_subs("alter table t add column a text default e'x''(', drop column b");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        assert_eq!(
+            pg_subs("alter table t add column a text default e'x(, y").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_the_case_of_dollar_tags_only() {
+        assert_eq!(
+            normalize_statement("SELECT $Tag$ ABC $tag$ $$ X $$"),
+            "select $Tag$ abc $tag$ $$ x $$"
+        );
+    }
+
+    #[test]
+    fn sqlite_table_name_with_a_double_quote_inside_backticks() {
+        let sql = "ALTER TABLE `a\"b` ADD COLUMN c INT NOT NULL;";
+        let f = classify_sql_for(DatabaseBackend::Sqlite, sql);
+        assert!(!f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn pg_split_keeps_a_comma_inside_a_literal_together() {
+        let subs = pg_subs("alter table t add column a text default 'x,y', drop column b");
+        assert_eq!(subs, ["add column a text default 'x,y'", "drop column b"]);
+    }
+
+    #[test]
+    fn pg_split_does_not_treat_a_name_ending_in_e_or_dollar_as_a_quote() {
+        let subs = pg_subs("alter table t add column name text default ('a'), drop column b");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        let subs = pg_subs("alter table t add column a$b$ int, drop column b");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_survives_an_unclosed_literal() {
+        assert_eq!(
+            pg_subs("alter table t add column a text default '(, x").len(),
+            1
+        );
+        assert_eq!(
+            pg_subs("alter table t add column a text default $$(, x").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn paren_in_a_literal_does_not_hide_a_not_null_finding() {
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT '(', ADD COLUMN b int NOT NULL;";
+        let f = classify_sql_for(DatabaseBackend::Postgres, sql);
+        assert!(
+            f.iter()
+                .any(|f| f.operation == "ADD COLUMN NOT NULL (no default)"),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn paren_in_a_literal_does_not_hide_a_manual_review_finding() {
+        for lit in ["'('", "')'", "$$($$", "'/* ( */'"] {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a text DEFAULT {lit}, DROP CONSTRAINT important_check;"
+            );
+            let f = classify_sql_for(DatabaseBackend::Postgres, &sql);
+            assert!(
+                f.iter().any(|f| f.risk == RiskLevel::ManualReview),
+                "{lit}: {f:?}"
+            );
+        }
     }
 
     #[test]
