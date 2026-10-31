@@ -236,6 +236,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "field",
     // `autumn_web::a11y` primitives (#3398).
     "accessible-primitives",
+    "accordion",
     "hero",
     "infinite-feed",
     "locale-switcher",
