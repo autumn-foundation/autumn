@@ -4545,7 +4545,9 @@ pub fn tabs(
 /// Settings for an [`accordion`].
 ///
 /// `name` is the root `id` and, in exclusive mode, the shared `name` of the
-/// items. Use a different name for each accordion on a page.
+/// items. Use a different name for each accordion on a page. A
+/// [`CollapsibleConfig::attrs`] `name` must differ from it too: items with one
+/// `name` close each other.
 ///
 /// ```rust
 /// use autumn_web::widgets::{AccordionConfig, HeadingLevel};
@@ -4566,9 +4568,11 @@ pub struct AccordionConfig<'a> {
 #[cfg(feature = "maud")]
 impl<'a> AccordionConfig<'a> {
     /// An exclusive accordion called `name`, with every item closed and
-    /// `<h3>` titles.
+    /// `<h3>` titles. `name` must not be empty or hold spaces. Set
+    /// [`AccordionConfig::level`] one level below the heading that holds
+    /// the accordion.
     #[must_use]
-    pub fn new(name: &'a str) -> Self {
+    pub const fn new(name: &'a str) -> Self {
         Self {
             name,
             multiple: false,
@@ -4579,7 +4583,7 @@ impl<'a> AccordionConfig<'a> {
         }
     }
 
-    /// Let items open on their own. The default is exclusive: one open item.
+    /// Let many items be open at once. The default is exclusive: one open item.
     #[must_use]
     pub const fn multiple(mut self) -> Self {
         self.multiple = true;
@@ -4587,7 +4591,7 @@ impl<'a> AccordionConfig<'a> {
     }
 
     /// Open the item at `index` at render. Call it again for more items. An
-    /// exclusive accordion opens only the first of them in page order. An
+    /// exclusive accordion opens only the first open item in page order. An
     /// index out of range does nothing.
     #[must_use]
     pub fn open(mut self, index: usize) -> Self {
@@ -4609,8 +4613,9 @@ impl<'a> AccordionConfig<'a> {
         self
     }
 
-    /// Add attributes to the root element. `on*` and `hx-on*` handlers,
-    /// `style`, `id` and `class` are dropped.
+    /// Add attributes to the root element. `on*` and `hx-on*` handlers and
+    /// `style` are dropped. The widget sets `id` and `class` first, so a
+    /// second `id` or `class` is dropped.
     #[must_use]
     pub const fn attrs(mut self, attrs: &'a [(&'a str, &'a str)]) -> Self {
         self.attrs = attrs;
@@ -4621,7 +4626,8 @@ impl<'a> AccordionConfig<'a> {
 /// Render a no-JS accordion of native `<details>` items.
 ///
 /// Each `(title, body)` is one item. The title is escaped. It sits in a
-/// heading inside `<summary>`. Enter and Space toggle it natively.
+/// heading inside `<summary>`. Enter and Space toggle it natively. Give each
+/// item a non-empty title: an empty title leaves an unnamed toggle.
 ///
 /// An exclusive accordion (the default) gives each `<details>` the same
 /// `name`, so the browser keeps one open. [`AccordionConfig::multiple`]
@@ -4723,8 +4729,8 @@ impl<'a> CollapsibleConfig<'a> {
     }
 
     /// Add attributes to the `<details>` element, for example a `name` to
-    /// group collapsibles. `on*` and `hx-on*` handlers, `style` and `class`
-    /// are dropped.
+    /// group collapsibles. `on*` and `hx-on*` handlers, `style`, `class` and
+    /// `open` are dropped: use [`CollapsibleConfig::open`] for the open state.
     #[must_use]
     pub const fn attrs(mut self, attrs: &'a [(&'a str, &'a str)]) -> Self {
         self.attrs = attrs;
@@ -4761,7 +4767,8 @@ pub fn collapsible_with(
     if config.open {
         attrs.push(("open", ""));
     }
-    attrs.extend_from_slice(config.attrs);
+    // `open` belongs to the config, so `open(false)` always means closed.
+    attrs.extend(config.attrs.iter().filter(|(name, _)| *name != "open"));
     let inner = maud::html! {
         summary class="autumn-collapsible__summary" { (summary) }
         div class="autumn-collapsible__body" { (body) }

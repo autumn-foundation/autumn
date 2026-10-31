@@ -280,7 +280,8 @@ fn builtin_stories() -> Vec<Story> {
             "Accordion",
             {
                 use autumn_web::widgets::{
-                    AccordionConfig, CollapsibleConfig, accordion, collapsible, collapsible_with,
+                    AccordionConfig, CollapsibleConfig, HeadingLevel, accordion, collapsible,
+                    collapsible_with,
                 };
 
                 let items = [
@@ -289,8 +290,8 @@ fn builtin_stories() -> Vec<Story> {
                     ("Support", maud::html! { p { "Mail us any time." } }),
                 ];
                 maud::html! {
-                    (accordion(&items, &AccordionConfig::new("demo-faq").open(0)))
-                    (accordion(&items, &AccordionConfig::new("demo-faq-multi").multiple().open(0).open(1)))
+                    (accordion(&items, &AccordionConfig::new("demo-faq").level(HeadingLevel::H2).open(0)))
+                    (accordion(&items, &AccordionConfig::new("demo-faq-multi").level(HeadingLevel::H2).multiple().open(0).open(1)))
                     (collapsible("Advanced options", &maud::html! { p { "Hidden until opened." } }))
                     (collapsible_with(
                         "Open by default",

@@ -24,17 +24,19 @@ accordion on a page.
 
 | Option | Effect |
 |--------|--------|
-| `multiple()` | Items open on their own. The default is exclusive: one item open at a time. |
+| `multiple()` | Let many items be open at once. The default is exclusive: one item open at a time. |
 | `open(index)` | Open an item at render. In exclusive mode, only the first open item in page order applies. An index out of range does nothing. |
 | `level(HeadingLevel)` | Heading level of each title. Default `H3`. |
 | `class(str)` | Extra class on the root. |
 | `attrs(&[(name, value)])` | Extra attributes on the root. |
 
 Exclusive mode uses `<details name>`. All major browsers support it. An old
-browser opens items on their own: the page still works.
+browser lets many items be open. The page still works.
 
 Each title is a heading inside `<summary>`. Screen reader users can jump
-between titles by heading.
+between titles by heading. Set `level` one below the heading that holds the
+accordion. Give each item a non-empty title. The name must not be empty or
+hold spaces.
 
 ## Collapsible
 
@@ -51,15 +53,18 @@ let open = collapsible_with(
 ```
 
 A collapsible is one `<details>`. `attrs` go on the `<details>`. To group
-collapsibles, pass `("name", "group")` in `attrs`.
+collapsibles, pass `("name", "group")` in `attrs`. Items with one `name`
+close each other, so do not reuse an accordion name.
 
 ## Attributes
 
-`attrs` removes `on*` and `hx-on*` handlers, `style`, and names the widget
-owns (`id`, `class`). `data-*` and `hx-*` pass through. Titles are escaped.
+`attrs` removes `on*` and `hx-on*` handlers and `style`. The widget sets
+`class` first (and `id` on an accordion), so a second one is dropped. A
+collapsible also drops `open`: use `CollapsibleConfig::open`. `data-*` and
+`hx-*` pass through. Titles are escaped.
 A body is `Markup`: escape user text in it.
 
 ## Style
 
 Classes use the `autumn-` prefix. The stylesheet uses tokens only. The
-chevron turns only when `prefers-reduced-motion: no-preference`.
+chevron turns with a transition only when `prefers-reduced-motion: no-preference`.

@@ -75,7 +75,11 @@ fn each_item_has_summary_and_body() {
 fn empty_items_render_an_empty_root() {
     let html = accordion(&[], &AccordionConfig::new("faq")).into_string();
     assert!(details_tags(&html).is_empty(), "{html}");
-    assert!(html.contains("autumn-accordion"), "{html}");
+    assert!(html.ends_with("></div>"), "{html}");
+    assert!(
+        html.starts_with(r#"<div id="faq" class="autumn-accordion""#),
+        "{html}"
+    );
 }
 
 // ── default open ────────────────────────────────────────────────────────
@@ -100,6 +104,18 @@ fn exclusive_keeps_only_the_first_open_item() {
     let html = accordion(&items(), &config).into_string();
     let open: Vec<bool> = details_tags(&html).iter().map(|t| is_open(t)).collect();
     assert_eq!(open, [true, false, false], "{html}");
+}
+
+#[test]
+fn exclusive_open_is_the_first_in_page_order() {
+    let open = |config: AccordionConfig<'_>| -> Vec<bool> {
+        let html = accordion(&items(), &config).into_string();
+        details_tags(&html).iter().map(|t| is_open(t)).collect()
+    };
+    let faq = || AccordionConfig::new("faq");
+    assert_eq!(open(faq().open(2).open(1)), [false, true, false]);
+    assert_eq!(open(faq().open(9).open(1)), [false, true, false]);
+    assert_eq!(open(faq().open(1).open(1)), [false, true, false]);
 }
 
 #[test]
@@ -182,6 +198,10 @@ fn attrs_drop_handlers_style_and_owned_names() {
     assert!(!html.contains("hx-on"), "{html}");
     assert!(!html.contains("style="), "{html}");
     assert!(!html.contains("evil"), "{html}");
+    assert!(
+        html.starts_with(r#"<div id="faq" class="autumn-accordion""#),
+        "{html}"
+    );
 }
 
 #[test]
@@ -236,6 +256,23 @@ fn collapsible_attrs_are_cleaned() {
     );
     // A collapsible is a single disclosure: the app may group it itself.
     assert!(html.contains(r#"name="grp""#), "{html}");
+}
+
+#[test]
+fn collapsible_open_belongs_to_the_config() {
+    let attrs = [("open", "")];
+    let closed = CollapsibleConfig::new().attrs(&attrs);
+    let html = collapsible_with("More", &html! { "x" }, &closed).into_string();
+    assert!(!is_open(details_tags(&html)[0]), "open(false) wins: {html}");
+
+    let open = CollapsibleConfig::new().open(true).attrs(&attrs);
+    let html = collapsible_with("More", &html! { "x" }, &open).into_string();
+    assert_eq!(
+        html.matches("open").count(),
+        1,
+        "one open attribute: {html}"
+    );
+    assert!(is_open(details_tags(&html)[0]), "{html}");
 }
 
 // ── stylesheet ──────────────────────────────────────────────────────────
@@ -294,5 +331,28 @@ fn stylesheet_respects_reduced_motion() {
 
 #[test]
 fn stylesheet_has_a_visible_focus_ring() {
-    assert!(accordion_css().contains(":focus-visible"));
+    let css = accordion_css();
+    for class in [".autumn-accordion__summary", ".autumn-collapsible__summary"] {
+        // The selector may sit in a list: the rule body follows the next `{`.
+        let at = css
+            .find(&format!("{class}:focus-visible"))
+            .unwrap_or_else(|| panic!("no rule for {class}"));
+        let start = at + css[at..].find('{').expect("rule start");
+        let block = &css[start..start + css[start..].find('}').expect("rule end")];
+        assert!(
+            block.contains("outline: 2px solid var(--primary)"),
+            "{block}"
+        );
+    }
+}
+
+#[test]
+fn every_transition_sits_in_the_motion_guard() {
+    let css = accordion_css();
+    let guard = css
+        .find("@media (prefers-reduced-motion: no-preference)")
+        .expect("guard");
+    for (at, _) in css.match_indices("transition") {
+        assert!(at > guard, "a transition sits before the guard");
+    }
 }

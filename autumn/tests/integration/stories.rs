@@ -449,6 +449,7 @@ const INTERACTIVE_MARKERS: &[&str] = &[
 /// `active-search` has no marker. It is here because typing drives it.
 const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "accessible-primitives",
+    "accordion",
     "active-search",
     "autocomplete",
     "confirm-action",
