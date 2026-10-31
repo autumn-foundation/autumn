@@ -2268,6 +2268,7 @@ for the common cases:
 | `autocomplete_input(id, label, &AutocompleteConfig)` / `autocomplete_option(value, label)` / `autocomplete_empty_state(msg)` | Typeahead/autocomplete picker for choosing a related record and storing its ID — the companion to `active_search` when the user must pick one row rather than browse matches. Selection and input sync need the shipped `autumn-widgets.js` runtime (`<script src="/static/js/autumn-widgets.js" defer>`, no inline JS, CSP-compatible) on top of htmx; include it once in the layout or the picker will not select. Its `<noscript>` fallback is a bare `<select>`, NOT a form like `active_search`'s — it has to sit inside the surrounding application form to submit (`docs/guide/active-search-and-autocomplete.md`) |
 | `local_datetime(dt, tz)` (`autumn_web::time_zone`) | Render a `DateTime<Utc>` in a user's IANA zone. Pair with the `TimeZone` extractor (resolves the requesting user's zone) and `set_time_zone_in_session` / `parse_iana`; take "now" from the `Clock` extractor rather than `Utc::now()` so rendering stays test-injectable (`docs/guide/time-zones.md`) |
 | `wizard_progress(&ctx, step).await` / `wizard_progress_from_steps(&[WizardProgressStep])` (`autumn_web::wizard`) | Accessible step-progress `<nav>` (`aria-current="step"`, "Step N of M"). `wizard_progress` reads step states from the session; `wizard_progress_from_steps` is the sync form for steps you already have (#3398). The `/_stories` gallery shows it with pagination, flash and the `a11y` primitives |
+| `WidgetPack::new("pack").extend(stories).assets(&ASSETS)` + `app.widget_pack(pack)` (`autumn_web::widget_pack`) | Ship widgets as a plugin crate (#3400). Contract: `Render`, `&FieldOptions` passthrough, public tokens only (no raw colors, no setting `--primary`), `autumn-<pack>-*` classes, keyboard core `data-*` + `autumn:init` (no own arrow-key JS), CSP-safe, one story per widget with slug `<pack>-…`. `with_story_gallery` now ADDS (plugin galleries start from `StoryGallery::new()`). Non-input widgets write their root with `widget_pack::element(tag, attrs, &FieldOptions, body)`. Form inputs: `impl FieldRenderer` + `FieldContext::control` (radios: `grouped()` + `group_item`), then `custom_input_with(&cs, …)` or `form_for(..).override_field(f, FieldControl::custom(R))`. Check with `plugin_conformance::widgets::run_widget_conformance` and (feature `system-tests`) `browser::run_widget_browser_conformance(&pack, &axe_src)` (`docs/guide/widget-packs.md`) |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
 | `theme_toggle(&ThemeToggleConfig::new(theme).csrf(token, "_csrf"))` + `ui::theme::{Theme, Density, router}` | Dark mode (#3396). Tokens are `light-dark()`: the OS selects the scheme, `data-theme="light\|dark"` overrides it, `data-density="compact\|comfortable\|spacious"` scales `--space-*`. `Theme` is an extractor for the `autumn.theme` cookie — render `html data-theme=[theme.data_theme()]` in the layout. `.merge(ui::theme::router())` mounts the no-JS `POST /_autumn/theme`; `autumn-widgets.js` applies it in place. Classes are `autumn-alert--<v>`, `autumn-badge--<v>`, `autumn-wizard-*` (no unprefixed `alert`/`badge`/`wizard-*`). Text on a `--primary`/`--danger` fill uses `--on-primary`/`--on-danger`, never white (`docs/guide/widget-styling.md`) |
 
@@ -3018,6 +3019,17 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `restore_missing = true` serves a missing database from its replica on a
   fresh volume. A replicated fleet root is served by one process (one
   replicator per database).
+- Delete with replication (issue #3235): `delete` also purges the replica.
+  It writes a tombstone row (`_autumn_fleet_tombstones`) on the control
+  database first; no row, no delete (`503`). A failed purge keeps the row,
+  and the maintenance task retries it (`purge_deleted_replicas`).
+  `restore_missing` does not restore a tombstoned key; `restore` does, and
+  drops the tombstone. `replica_retention_after_delete = "30d"` keeps the
+  replica for undo; during it, a create on demand answers `410` and
+  `provision` purges the old replica and ends it. `restore_check_sample` (default `1`) restores random databases every
+  `[replication] verify_interval_secs`; a failure turns `replication:fleet`
+  `Down`. Do not write an `on_delete` hook to delete replicas. Guide:
+  "Deleting a database's replica" in `docs/guide/sqlite-fleet.md`.
 - Failover: turn on `[database.fleet.ownership]` (`owner` unique per volume,
   `slots = ["0-8191"]`, `lease_secs = 30`) with `restore_missing`. A host
   serves only the slot ranges it claims; an unowned slot is `421`

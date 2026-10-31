@@ -14,6 +14,8 @@ function run(initialCookie, action, hasToggle, initialTheme) {
     readyState: 'complete', documentElement: root,
     get cookie() { return cookie; }, set cookie(v) { cookie = v.split(';')[0]; },
     addEventListener: (t, f) => { (listeners[t] = listeners[t] || []).push(f); },
+    // The runtime fires `autumn:init` on the document (#3400).
+    dispatchEvent: () => true,
     querySelectorAll: s => s.includes('theme-toggle') && hasToggle ? buttons : [],
     querySelector: s => hasToggle && s.includes('theme-toggle')
       && (!s.includes('[action=') || s.includes('"' + action + '"')) ? form : null,

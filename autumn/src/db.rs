@@ -116,6 +116,9 @@ pub mod fleet_replication;
 /// Background work on fleet databases nobody asks for (issue 3234).
 #[cfg(feature = "sqlite")]
 pub mod fleet_sweeper;
+/// Replica tombstones of a fleet (issue #3235).
+#[cfg(feature = "sqlite")]
+pub mod fleet_tombstones;
 pub mod pooler;
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]

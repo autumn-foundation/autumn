@@ -109,6 +109,7 @@ mod imp {
     use autumn_web::config::{AutumnConfig, DatabaseFleetConfig};
     use autumn_web::db::fleet::{DatabaseFleet, FleetError};
     use autumn_web::db::fleet_replication::{FleetReplication, replica_root};
+    use autumn_web::db::fleet_tombstones::FleetTombstones;
     use autumn_web::fleet_layout::FleetDbKey;
     use autumn_web::replication::ReplicationSettings;
 
@@ -637,40 +638,59 @@ mod imp {
                 target.profile
             ));
         }
-        let deleted = runtime()?
-            .block_on(fleet.delete(&key))
-            .map_err(|e| e.to_string())?;
+        // With replication on, the replica goes too (issue #3235).
+        let replication = if target.replicated() {
+            let purge = |error: String| {
+                format!(
+                    "Delete stopped: with [replication] on, a delete also removes the replica, \
+                     and it cannot reach it.\n  {error}"
+                )
+            };
+            let loaded = validated_replication(target).map_err(purge)?;
+            let replication = replication_for(target, &loaded).map_err(purge)?;
+            fleet
+                .install_replication(Arc::clone(&replication))
+                .map_err(|_| "the fleet already replicates".to_owned())?;
+            Some(replication)
+        } else {
+            None
+        };
+        let rt = runtime()?;
+        let deleted = rt.block_on(fleet.delete(&key)).map_err(|e| e.to_string())?;
         if !deleted {
             return Err(format!("{key} does not exist at {}.", path.display()));
         }
         eprintln!("\u{2713} Deleted {key} ({}).", path.display());
-        if target.config.replication.is_some() {
-            eprintln!("  \u{2139} Its replica stays at the replica destination.");
-            if target.fleet.restore_missing {
-                eprintln!(
-                    "  \u{26A0} restore_missing is on: the app restores {key} from its \
-                     replica on the next request for it."
-                );
-            }
+        let Some(tombstones) = replication.as_ref().and_then(|r| r.tombstones()) else {
+            return Ok(());
+        };
+        let kept = |row: &autumn_web::db::fleet_tombstones::Tombstone| {
+            row.confirmed && row.attempts == 0 && row.purge_after > tombstones.now()
+        };
+        match rt.block_on(tombstones.get(&key.name())) {
+            Ok(None) => eprintln!("  \u{2713} Its replica is purged."),
+            Ok(Some(row)) if kept(&row) => eprintln!(
+                "  \u{2139} Its replica is kept until {} \
+                 (database.fleet.replica_retention_after_delete). Until that time, `autumn \
+                 fleet restore {key} --force` brings it back. After that time, the app \
+                 purges it.",
+                row.purge_after.to_rfc3339()
+            ),
+            Ok(Some(row)) => eprintln!(
+                "  \u{26A0} Its replica is not purged yet: {}.\n    A tombstone records it: \
+                 restore_missing does not bring it back, and the app tries the purge again.",
+                row.last_error
+                    .as_deref()
+                    .unwrap_or("the purge did not finish")
+            ),
+            Err(error) => eprintln!("  \u{26A0} Could not read the replica tombstone: {error}."),
         }
         Ok(())
     }
 
-    fn restore(
-        target: &Target,
-        key: &str,
-        timestamp: Option<&str>,
-        force: bool,
-    ) -> Result<(), String> {
-        // Every check that can refuse runs before the fleet is built.
-        if !force {
-            return Err(format!(
-                "Restore stopped: this replaces the database file of {key} with its replica \
-                 ({} profile).\n  Run again with --force.",
-                target.profile
-            ));
-        }
-        let at = replica::parse_timestamp(timestamp).map_err(|e| e.to_string())?;
+    /// `[replication]` as `delete` and `restore` read it. It must name
+    /// exactly one destination, whether replication is on or not.
+    fn validated_replication(target: &Target) -> Result<replica::Loaded, String> {
         let loaded = replica::Loaded::new(target.profile.clone(), target.config.clone())
             .map_err(|e| e.to_string())?;
         // The check boot makes, and one more: a restore must not guess
@@ -695,18 +715,20 @@ mod imp {
                 errors.join("; ")
             ));
         }
-        let fleet = target.build(None)?;
-        let key = parse_key(&fleet, key)?;
-        let destination = loaded.destination().map_err(|e| e.to_string())?;
-        let root = loaded.root();
-        let prefix = replica_root(&root, &key);
-        eprintln!("  \u{2139} source: {}", destination.describe());
-        eprintln!("  \u{2139} prefix: {prefix}");
+        Ok(loaded)
+    }
 
-        // A restore uses only `root`. This process does not upload WAL frames.
+    /// The fleet replication of `delete` and `restore`: the `[replication]`
+    /// destination, and the tombstones on the control database (issue
+    /// #3235). This process does not upload WAL frames.
+    fn replication_for(
+        target: &Target,
+        loaded: &replica::Loaded,
+    ) -> Result<Arc<FleetReplication>, String> {
+        let destination = loaded.destination().map_err(|e| e.to_string())?;
         let settings = ReplicationSettings {
             database_path: PathBuf::new(),
-            root,
+            root: loaded.root(),
             sync_interval: loaded.replication.sync_interval(),
             snapshot_interval: Duration::from_secs(
                 loaded.replication.snapshot_interval_secs.max(1),
@@ -721,13 +743,49 @@ mod imp {
             ),
             verify_interval: None,
         };
-        let replication = Arc::new(FleetReplication::new(
-            destination,
-            settings,
-            loaded.replication.rpo(),
-            false,
-            Arc::new(autumn_web::time::SystemClock),
-        ));
+        let clock: Arc<dyn autumn_web::time::ClockSource> = Arc::new(autumn_web::time::SystemClock);
+        let control = autumn_web::db::create_pool(&target.config.database)
+            .map_err(|e| format!("could not open the control database: {e}"))?
+            .ok_or_else(|| "no control database is configured ([database] url)".to_owned())?;
+        Ok(Arc::new(
+            FleetReplication::new(
+                destination,
+                settings,
+                loaded.replication.rpo(),
+                false,
+                Arc::clone(&clock),
+            )
+            .with_tombstones(Arc::new(FleetTombstones::new(control, clock)))
+            .with_retention_after_delete(target.fleet.replica_retention_after_delete),
+        ))
+    }
+
+    fn restore(
+        target: &Target,
+        key: &str,
+        timestamp: Option<&str>,
+        force: bool,
+    ) -> Result<(), String> {
+        // Every check that can refuse runs before the fleet is built.
+        if !force {
+            return Err(format!(
+                "Restore stopped: this replaces the database file of {key} with its replica \
+                 ({} profile).\n  Run again with --force.",
+                target.profile
+            ));
+        }
+        let at = replica::parse_timestamp(timestamp).map_err(|e| e.to_string())?;
+        let loaded = validated_replication(target)?;
+        let fleet = target.build(None)?;
+        let key = parse_key(&fleet, key)?;
+        let prefix = replica_root(&loaded.root(), &key);
+        // The restore also drops the tombstone of a deleted database.
+        let replication = replication_for(target, &loaded)?;
+        eprintln!(
+            "  \u{2139} source: {}",
+            loaded.destination().map_err(|e| e.to_string())?.describe()
+        );
+        eprintln!("  \u{2139} prefix: {prefix}");
         fleet
             .install_replication(replication)
             .map_err(|_| "the fleet already replicates".to_owned())?;
@@ -774,6 +832,8 @@ mod imp {
                 idle_close_secs: 0,
                 restore_missing: false,
                 ownership: None,
+                replica_retention_after_delete: std::time::Duration::ZERO,
+                restore_check_sample: 0,
             })
             .build()
             .unwrap();

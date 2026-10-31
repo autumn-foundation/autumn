@@ -823,6 +823,18 @@ mod tests {
     /// Gzip budget. Browsers download this size.
     const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 11 * 1024;
 
+    /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
+    /// CRLF checkout changes the bytes, the content hash and the size.
+    #[test]
+    fn shipped_assets_have_lf_line_ends() {
+        for (name, bytes) in [
+            ("autumn-widgets.js", AUTUMN_WIDGETS_JS),
+            ("widgets.css", crate::ui::WIDGETS_CSS.as_bytes()),
+        ] {
+            assert!(!bytes.contains(&b'\r'), "{name} has a CR byte");
+        }
+    }
+
     #[test]
     fn widgets_js_stays_inside_its_size_budget() {
         use std::io::Write as _;
@@ -855,12 +867,41 @@ mod tests {
             "data-autumn-dismiss",
             "autumn:navigate",
             "autumn:dismiss",
+            "autumn:init",
             "aria-activedescendant",
             "Home",
             "End",
         ] {
             assert!(js.contains(name), "missing `{name}`");
         }
+    }
+
+    /// Plugin JS hooks `autumn:init` (issue #3400).
+    ///
+    /// The runtime fires it on
+    /// each new root after core widget init and before roving init, so a
+    /// plugin can set roles that roving reads. The first init waits for
+    /// `DOMContentLoaded`, so a deferred plugin script that loads after the
+    /// runtime still gets the page-load event.
+    #[test]
+    fn widgets_js_fires_autumn_init_for_plugins() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        let init_all = js
+            .find("function initAll(root)")
+            .expect("initAll must exist");
+        let body = &js[init_all..];
+        let fire = body
+            .find("'autumn:init'")
+            .expect("initAll must fire autumn:init");
+        let roving = body
+            .find("initRoving)")
+            .expect("initAll must init roving lists");
+        assert!(fire < roving, "autumn:init must fire before roving init");
+        assert!(
+            js.contains("document.addEventListener('DOMContentLoaded', boot)"),
+            "the first init must wait for DOMContentLoaded"
+        );
     }
 
     #[test]

@@ -3719,6 +3719,183 @@ mod tests {
         assert_eq!(subs, ["add column a text default 'it''s,x'"]);
     }
 
+    // ── #3527 (issue #3521): Postgres ALTER TABLE split ──────────────────────
+
+    fn pg_subs(sql: &str) -> Vec<&str> {
+        alter_table_subcommands(DatabaseBackend::Postgres, sql)
+    }
+
+    #[test]
+    fn pg_split_ignores_a_paren_in_a_string_literal() {
+        for lit in ["'('", "')'", "'/* ( */'", "'it''s ('"] {
+            let sql = format!("alter table t add column a text default {lit}, add column b int");
+            assert_eq!(pg_subs(&sql).len(), 2, "{lit}");
+        }
+    }
+
+    #[test]
+    fn pg_split_ignores_a_paren_in_a_dollar_quote() {
+        for lit in ["$$($$", "$tag$($tag$", "$$ ( ' $$"] {
+            let sql = format!("alter table t add column a text default {lit}, add column b int");
+            assert_eq!(pg_subs(&sql).len(), 2, "{lit}");
+        }
+    }
+
+    #[test]
+    fn pg_split_honours_backslash_escapes_in_e_strings() {
+        let subs = pg_subs("alter table t add column a text default e'it\\'s', add column b int");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        let subs = pg_subs("alter table t add column a text default e'\\'(', add column b int");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_ignores_a_quote_inside_a_quoted_name() {
+        for name in [r#""a'b""#, r#""$$""#, r#""e'""#, r#""a""'b""#, r#""a(b""#] {
+            let sql = format!("alter table t add column {name} int, drop column c");
+            let subs = pg_subs(&sql);
+            assert_eq!(subs.len(), 2, "{name}: {subs:?}");
+        }
+    }
+
+    #[test]
+    fn quote_in_a_quoted_name_does_not_hide_a_drop_column() {
+        let sql = r#"ALTER TABLE t ADD COLUMN "a'b" int, DROP COLUMN c;"#;
+        assert_eq!(ops(DatabaseBackend::Postgres, sql), ["DROP COLUMN"]);
+    }
+
+    #[test]
+    fn dollar_tag_cannot_start_with_a_digit() {
+        assert_eq!(dollar_quote_len("$1$ x $1$"), None);
+        assert_eq!(dollar_quote_len("$a1$ x $a1$"), Some(11));
+        let subs =
+            pg_subs("alter table t add column a int default $1$, add column b int, drop column c$");
+        assert_eq!(subs.len(), 3, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_reads_a_quoted_table_name_with_spaces() {
+        for table in [r#""my table""#, r#""x add column y""#, r#"s."my table""#] {
+            let sql = format!(
+                "alter table {table} add column a text default 'ok', add column b int not null"
+            );
+            assert_eq!(
+                pg_subs(&sql),
+                [
+                    "add column a text default 'ok'",
+                    "add column b int not null"
+                ],
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn dollar_tag_case_does_not_close_a_literal_early() {
+        for lit in [
+            "$tag$ $TAG$ $tag$",
+            "$tag$ x$TAG$y $tag$",
+            "$Tag$ $tag$ $Tag$",
+            "$Tag$ $X$Tag$",
+            "$a$ $A$A$ $a$",
+            "'$A$', $B$ $b$ $B$",
+        ] {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a text DEFAULT {lit}, ADD COLUMN b int NOT NULL;"
+            );
+            assert!(
+                ops(DatabaseBackend::Postgres, &sql)
+                    .contains(&"ADD COLUMN NOT NULL (no default)".to_owned()),
+                "{lit}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_quoted_spans_verbatim() {
+        let pg = DatabaseBackend::Postgres;
+        for (sql, want) in [
+            ("SELECT $Tag$ ABC", "select $Tag$ ABC"),
+            ("SELECT $Tag$", "select $Tag$"),
+            ("SELECT E'A''B'", "select E'A''B'"),
+            ("SELECT E'A\\'B' X", "select E'A\\'B' x"),
+            ("SELECT E'AB", "select E'AB"),
+            (
+                "SELECT $Tag$ ABC $Tag$ $$ X $$",
+                "select $Tag$ ABC $Tag$ $$ X $$",
+            ),
+        ] {
+            assert_eq!(normalize_statement(pg, sql), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn pg_split_handles_unclosed_and_escaped_names_and_e_strings() {
+        assert_eq!(
+            pg_subs(r#"alter table t drop column "a, drop column b"#).len(),
+            1
+        );
+        assert!(pg_subs(r#"alter table "t, add column a int"#).is_empty());
+        let subs = pg_subs("alter table t add column a text default e'x''(', drop column b");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        assert_eq!(
+            pg_subs("alter table t add column a text default e'x(, y").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn sqlite_table_name_with_a_double_quote_inside_backticks() {
+        let sql = "ALTER TABLE `a\"b` ADD COLUMN c INT NOT NULL;";
+        assert_eq!(
+            ops(DatabaseBackend::Sqlite, sql),
+            ["ADD COLUMN NOT NULL (no default)"]
+        );
+    }
+
+    #[test]
+    fn pg_split_keeps_a_comma_inside_a_literal_together() {
+        let subs = pg_subs("alter table t add column a text default 'x,y', drop column b");
+        assert_eq!(subs, ["add column a text default 'x,y'", "drop column b"]);
+    }
+
+    #[test]
+    fn pg_split_does_not_treat_a_name_ending_in_e_or_dollar_as_a_quote() {
+        let subs = pg_subs("alter table t add column name text default ('a'), drop column b");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        let subs = pg_subs("alter table t add column a$b$ int, drop column b");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_survives_an_unclosed_literal() {
+        for sql in [
+            "alter table t add column a text default '(, x",
+            "alter table t add column a text default $$(, x",
+        ] {
+            assert_eq!(pg_subs(sql).len(), 1, "{sql}");
+        }
+    }
+
+    #[test]
+    fn paren_in_a_literal_does_not_hide_a_finding() {
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT '(', ADD COLUMN b int NOT NULL;";
+        assert_eq!(
+            ops(DatabaseBackend::Postgres, sql),
+            ["ADD COLUMN NOT NULL (no default)"]
+        );
+        for lit in ["'('", "')'", "$$($$", "'/* ( */'"] {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a text DEFAULT {lit}, DROP CONSTRAINT important_check;"
+            );
+            let f = classify_sql_for(DatabaseBackend::Postgres, &sql);
+            assert!(
+                f.iter().any(|f| f.risk == RiskLevel::ManualReview),
+                "{lit}: {f:?}"
+            );
+        }
+    }
+
     #[test]
     fn alter_table_subcommands_ignores_a_comma_in_backtick_and_bracket_names() {
         for sql in [

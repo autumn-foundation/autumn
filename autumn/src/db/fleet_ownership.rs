@@ -2171,6 +2171,8 @@ mod tests {
                 idle_close_secs: 0,
                 restore_missing: true,
                 ownership: None,
+                replica_retention_after_delete: std::time::Duration::ZERO,
+                restore_check_sample: 0,
             })
             .build()
             .unwrap();

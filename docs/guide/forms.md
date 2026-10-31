@@ -207,6 +207,26 @@ the browser never fills a password field again on an edit form.
 This is what the scaffold generator emits. Reach for the individual helpers when
 the form's layout matters; reach for `form_for` when it does not.
 
+### Controls from a widget pack
+
+A widget pack (for example a date picker) gives a `FieldRenderer`. Bind it
+to one field in two ways:
+
+```rust,ignore
+use autumn_web::form::{FieldControl, FieldOptions, custom_input_with};
+
+// With a changeset:
+custom_input_with(&changeset, "due", "Due", &DatePicker, &FieldOptions::new())
+
+// With form_for:
+form_for(&changeset, "/tasks", "post")
+    .override_field("due", FieldControl::custom(DatePicker))
+    .render()
+```
+
+The control gets the same wrapper, label, hint, errors and passthrough as a
+core control. See [Widget Packs](widget-packs.md#bind-a-form-input).
+
 ---
 
 ## Two validation paths, and how to choose

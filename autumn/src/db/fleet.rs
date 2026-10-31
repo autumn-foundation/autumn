@@ -86,6 +86,19 @@ pub const DEFAULT_FLEET_CONCURRENCY: usize = 8;
 /// How often the idle sweeper looks for databases to close, at most.
 const MAX_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often the replica lifecycle task retries the purge of deleted
+/// databases' replicas (issue #3235).
+const PURGE_PASS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Tombstone rows one purge pass reads.
+const PURGE_BATCH: usize = 256;
+
+/// Where the restore check writes its scratch files, under the root.
+const RESTORE_CHECK_DIR: &str = "restore-check";
+
+/// A scratch file older than this is from a check that did not end.
+const SCRATCH_STALE: Duration = Duration::from_secs(24 * 3600);
+
 /// How long a database stays open after its last use before LRU may close it.
 ///
 /// A request resolves its database, then checks a connection out a moment
@@ -1530,6 +1543,7 @@ impl DatabaseFleet {
         if path.exists() {
             return Ok(());
         }
+        self.purge_before_create(key, true).await?;
         // The publish result decides: of two concurrent provisions (in this
         // process or another) only the one whose link created the file
         // records a creation, and its caller alone runs the signup work.
@@ -1821,6 +1835,7 @@ impl DatabaseFleet {
             if !create {
                 return Err(FleetError::NotFound { name });
             }
+            self.purge_before_create(&key, false).await?;
             let fleet = self.clone();
             let (create_path, create_name) = (path.clone(), name.clone());
             crate::time::spawn_blocking(move || {
@@ -2025,6 +2040,20 @@ impl DatabaseFleet {
         let hooks = self.hooks();
         if hooks.is_empty() {
             return Ok(false);
+        }
+        // A deleted database is not restored by an open (issue #3235).
+        if let Some(tombstones) = self.replication().and_then(|r| r.tombstones()) {
+            let row = tombstones
+                .get(&key.name())
+                .await
+                .map_err(|error| FleetError::Restore {
+                    name: key.name(),
+                    detail: error.to_string(),
+                })?;
+            if row.is_some() {
+                tracing::info!(database = %key, "fleet database was deleted: its replica is not restored");
+                return Ok(false);
+            }
         }
         let (hook_key, hook_path) = (key.clone(), path.to_path_buf());
         let root = self.inner.root.clone();
@@ -2343,6 +2372,8 @@ impl DatabaseFleet {
     pub fn spawn_maintenance(&self, shutdown: CancellationToken) -> tokio::task::JoinHandle<()> {
         let fleet = self.clone();
         let interval = self.sweep_interval();
+        // Ends on its own at shutdown; nothing waits for a purge in flight.
+        drop(self.spawn_replica_lifecycle(shutdown.clone()));
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -2399,8 +2430,13 @@ impl DatabaseFleet {
     /// so afterwards keeps its files: this call touches nothing after the
     /// unlink.
     ///
-    /// The database's replica, if any, is not deleted here: a lifecycle hook
-    /// (`on_delete`) decides.
+    /// With replication installed, the replica goes too (issue #3235). A
+    /// tombstone row is written first: when it cannot be written, the delete
+    /// is refused and no file is removed. After the files are gone, the
+    /// replica is purged at once, or kept for
+    /// `replica_retention_after_delete`. A failed purge does not fail the
+    /// delete: the tombstone stays and
+    /// [`purge_deleted_replicas`](Self::purge_deleted_replicas) retries it.
     ///
     /// Cancellation-safe: the work runs in an owned task, so a dropped caller
     /// only stops waiting.
@@ -2449,6 +2485,26 @@ impl DatabaseFleet {
         let path = self.path_of(&key);
         let root = self.inner.root.clone();
         let name = key.name();
+        // Before any file goes: a crash after the removal must not leave
+        // the replica with nothing that blocks its restore.
+        let tombstones = self.replication().and_then(|r| r.tombstones()).cloned();
+        // Names this delete's pending row: a refusal drops only its own.
+        let owner = self
+            .replication()
+            .map(|r| format!("{:016x}", r.entropy().next_u64()))
+            .unwrap_or_default();
+        if let Some(tombstones) = &tombstones {
+            let retention = self
+                .replication()
+                .map_or(Duration::ZERO, |r| r.retention_after_delete());
+            tombstones
+                .record(&name, retention, path.is_file(), &owner)
+                .await
+                .map_err(|error| FleetError::Unavailable {
+                    name: name.clone(),
+                    detail: format!("could not record the replica tombstone: {error}"),
+                })?;
+        }
         let removed = self
             .with_provision_turn(&key, async {
                 let removed = crate::time::spawn_blocking(move || {
@@ -2478,13 +2534,470 @@ impl DatabaseFleet {
             .await;
         if matches!(removed, Ok(true)) {
             self.inner.counters.deleted.fetch_add(1, Ordering::Relaxed);
+            self.purge_after_delete(&key).await;
             // Only now: a refused delete (another process has the file open)
             // or a missing file must not trigger, say, replica cleanup.
             for hook in self.hooks() {
                 hook.on_delete(&key);
             }
+        } else if let Some(tombstones) = &tombstones
+            && let Err(error) = tombstones.remove_pending(&key.name(), Some(&owner)).await
+        {
+            // The retry task drops it later: the file is still there.
+            tracing::warn!(database = %key, %error, "fleet delete: could not drop the pending tombstone");
         }
         removed
+    }
+
+    /// After a delete removed the files: confirm the tombstone, write the
+    /// marker, and purge the replica unless the retention keeps it. Never
+    /// fails the delete.
+    async fn purge_after_delete(&self, key: &FleetDbKey) {
+        let Some(replication) = self.replication().cloned() else {
+            return;
+        };
+        let name = key.name();
+        // A tick still in flight on a released replica could ship after the
+        // cutoff is taken.
+        {
+            let (replication, key) = (Arc::clone(&replication), key.clone());
+            let _ = crate::time::spawn_blocking(move || replication.quiesce_released(&key)).await;
+        }
+        let retention = replication.retention_after_delete();
+        let tombstones = replication.tombstones().cloned();
+        let floor = match (newest_generation(&replication, key).await, &tombstones) {
+            (Ok(floor), _) => floor,
+            (Err(error), Some(_)) => {
+                // The retry task confirms the pending row once the lookup works.
+                tracing::warn!(database = %key, %error, "fleet delete: could not read the replica's generations; the tombstone stays pending and the retry task purges the replica");
+                return;
+            }
+            (Err(_), None) => None,
+        };
+        let confirmed = match &tombstones {
+            Some(tombstones) => match tombstones.confirm(&name, retention, floor).await {
+                Ok(Some(row)) => Some(row),
+                Ok(None) => {
+                    // Another process re-created or restored the key after
+                    // the removal. Its new database is not this purge's.
+                    tracing::info!(database = %key, "fleet delete: the key was made again; nothing to purge");
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(database = %key, %error, "fleet delete: could not confirm the replica tombstone");
+                    None
+                }
+            },
+            None => None,
+        };
+        let row = confirmed.clone().unwrap_or_else(|| {
+            super::fleet_tombstones::Tombstone::new(&name, replication.now(), retention, true)
+        });
+        let _turn = replication.purge_turn().lock().await;
+        // The pending row stays when the confirm failed: the retry task
+        // confirms it later, and its cutoff cannot cover a re-create.
+        let purge_now = retention.is_zero() && (confirmed.is_some() || tombstones.is_none());
+        let (marked, result) = {
+            let (replication, key, row) = (Arc::clone(&replication), key.clone(), row.clone());
+            crate::time::spawn_blocking(move || {
+                // Before the purge: a purge that stops part way leaves the
+                // marker, so another host does not restore the rest.
+                let marked = replication
+                    .write_marker(&key, &row)
+                    .inspect_err(|error| {
+                        tracing::warn!(database = %key, %error, "fleet delete: could not write the tombstone marker; the retry task writes it");
+                    })
+                    .is_ok();
+                let purged = if purge_now {
+                    replication.purge_replica(&key, row.deleted_at).map(Some)
+                } else {
+                    Ok(None)
+                };
+                (marked, purged)
+            })
+            .await
+            .unwrap_or_else(|error| (false, Err(error.to_string())))
+        };
+        if marked
+            && confirmed.is_some()
+            && let Some(tombstones) = &tombstones
+            && let Err(error) = tombstones.set_marked(&name).await
+        {
+            tracing::warn!(database = %key, %error, "fleet delete: could not record the marker");
+        }
+        match (result, &tombstones) {
+            (Ok(Some(objects)), _) => {
+                tracing::info!(database = %key, objects, "fleet delete: replica purged");
+                if let Some(tombstones) = &tombstones
+                    && let Err(error) = tombstones.remove(&name).await
+                {
+                    tracing::warn!(database = %key, %error, "fleet delete: could not drop the tombstone; the retry task drops it");
+                }
+            }
+            (Ok(None), _) if confirmed.is_some() => {
+                tracing::info!(database = %key, purge_after = %row.purge_after, "fleet delete: replica kept until its retention ends");
+            }
+            (Ok(None), _) => {
+                tracing::warn!(database = %key, "fleet delete: the pending tombstone stays; the retry task purges the replica");
+            }
+            (Err(error), Some(tombstones)) if confirmed.is_some() => {
+                tracing::warn!(database = %key, %error, "fleet delete: could not purge the replica; the retry task tries again");
+                if let Err(error) = tombstones.record_failure(row, &error).await {
+                    tracing::warn!(database = %key, %error, "fleet delete: could not record the failed purge");
+                }
+            }
+            (Err(error), Some(_)) => {
+                tracing::warn!(database = %key, %error, "fleet delete: could not purge the replica; the pending tombstone stays and the retry task purges it");
+            }
+            (Err(error), None) => {
+                tracing::error!(database = %key, %error, "fleet delete: could not purge the replica, and no tombstone records it; the replica stays");
+            }
+        }
+    }
+
+    /// Before a new database is made for `key`: purge the replica of a
+    /// deleted database with the same key, and drop its tombstone. The new
+    /// database must not share a prefix with old data that a later purge
+    /// deletes. An `explicit` create (`provision`) ends a retention early.
+    /// A create on demand does not: it gets `410` until the retention ends.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Deleting`] for a create on demand during a retention.
+    /// [`FleetError::Unavailable`] when the tombstone cannot be read or the
+    /// old replica cannot be purged. Retry later.
+    async fn purge_before_create(
+        &self,
+        key: &FleetDbKey,
+        explicit: bool,
+    ) -> Result<(), FleetError> {
+        let Some(replication) = self.replication().cloned() else {
+            return Ok(());
+        };
+        let Some(tombstones) = replication.tombstones().cloned() else {
+            return Ok(());
+        };
+        let name = key.name();
+        let unavailable = |detail: String| FleetError::Unavailable {
+            name: name.clone(),
+            detail,
+        };
+        let read = |row: Result<_, super::fleet_tombstones::TombstoneError>| {
+            row.map_err(|error| unavailable(error.to_string()))
+        };
+        if read(tombstones.get(&name).await)?.is_none() {
+            return self
+                .check_remote_retention(&replication, key, explicit)
+                .await;
+        }
+        let _turn = replication.purge_turn().lock().await;
+        let Some(row) = read(tombstones.get(&name).await)? else {
+            return Ok(());
+        };
+        if !explicit && row.confirmed && tombstones.now() < row.purge_after {
+            // A stale client must not end the undo window.
+            return Err(FleetError::Deleting { name });
+        }
+        let cutoff = if row.confirmed {
+            row.deleted_at
+        } else {
+            replication.now()
+        };
+        let (purger, purge_key) = (Arc::clone(&replication), key.clone());
+        crate::time::spawn_blocking(move || purger.purge_replica(&purge_key, cutoff))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+            .map_err(|error| {
+                unavailable(format!(
+                    "the replica of the deleted database is not purged yet ({error}); retry"
+                ))
+            })?;
+        tombstones
+            .remove(&name)
+            .await
+            .map_err(|error| unavailable(error.to_string()))?;
+        tracing::info!(database = %key, "fleet database made again: the old replica is purged");
+        Ok(())
+    }
+
+    /// A create on demand with no local tombstone: another host may have
+    /// deleted the key and keep its replica for undo. Its marker says until
+    /// when. Only with `restore_missing`, which reads the replicas already.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Deleting`] during that retention.
+    /// [`FleetError::Unavailable`] when the marker cannot be read.
+    async fn check_remote_retention(
+        &self,
+        replication: &Arc<super::fleet_replication::FleetReplication>,
+        key: &FleetDbKey,
+        explicit: bool,
+    ) -> Result<(), FleetError> {
+        if explicit || !replication.restores_missing() {
+            return Ok(());
+        }
+        let (reader, marker_key) = (Arc::clone(replication), key.clone());
+        let marker = crate::time::spawn_blocking(move || reader.marker(&marker_key))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result)
+            .map_err(|detail| FleetError::Unavailable {
+                name: key.name(),
+                detail: format!("could not read the tombstone marker: {detail}"),
+            })?;
+        if marker.is_some_and(|marker| replication.now() < marker.purge_after()) {
+            return Err(FleetError::Deleting { name: key.name() });
+        }
+        Ok(())
+    }
+
+    /// Purge the replica of each deleted database that is due (issue
+    /// #3235): its retention ended, and its backoff after a failed purge
+    /// too. The replica lifecycle task calls this every minute. A key whose
+    /// file is on disk, or whose slot this host does not own, waits.
+    pub async fn purge_deleted_replicas(&self) -> super::fleet_tombstones::PurgeReport {
+        let mut report = super::fleet_tombstones::PurgeReport::default();
+        let Some(replication) = self.replication().cloned() else {
+            return report;
+        };
+        let Some(tombstones) = replication.tombstones().cloned() else {
+            return report;
+        };
+        // Every row, page by page: rows that wait must not hide later ones.
+        let mut after: Option<String> = None;
+        loop {
+            let page = match tombstones.list_after(after.as_deref(), PURGE_BATCH).await {
+                Ok(page) => page,
+                Err(error) => {
+                    report.last_error = Some(error.to_string());
+                    break;
+                }
+            };
+            let Some(last) = page.last().map(|row| row.key.clone()) else {
+                break;
+            };
+            for listed in page {
+                self.purge_one(&replication, &tombstones, &listed.key, &mut report)
+                    .await;
+            }
+            after = Some(last);
+        }
+        replication.record_purge_report(report.clone());
+        report
+    }
+
+    /// One row of [`purge_deleted_replicas`](Self::purge_deleted_replicas).
+    async fn purge_one(
+        &self,
+        replication: &Arc<super::fleet_replication::FleetReplication>,
+        tombstones: &super::fleet_tombstones::FleetTombstones,
+        name: &str,
+        report: &mut super::fleet_tombstones::PurgeReport,
+    ) {
+        let fail = |report: &mut super::fleet_tombstones::PurgeReport, error: String| {
+            report.failed += 1;
+            report.last_error = Some(error);
+        };
+        let Ok(key) = self.key_for_name(name) else {
+            // Another mode's name: not this fleet's to purge.
+            report.waiting += 1;
+            return;
+        };
+        let _turn = replication.purge_turn().lock().await;
+        // Again under the turn: a re-create may have handled it.
+        let row = match tombstones.get(name).await {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(error) => return fail(report, error.to_string()),
+        };
+        let now = tombstones.now();
+        if row.attempts > 0 {
+            report.failing += 1;
+            if report.last_error.is_none() {
+                report.last_error.clone_from(&row.last_error);
+            }
+        }
+        let stale = chrono::Duration::from_std(super::fleet_tombstones::STALE_PENDING)
+            .is_ok_and(|stale| now.signed_duration_since(row.deleted_at) > stale);
+        if self.exists(&key) {
+            // A confirmed row next to a live file is stale: a restore or a
+            // re-create drops the row before it publishes. A pending row is
+            // a delete that runs now, or one that stopped long ago.
+            if row.confirmed {
+                let _ = tombstones.remove(name).await;
+            } else if stale {
+                let _ = tombstones.remove_pending(name, None).await;
+            } else {
+                report.waiting += 1;
+            }
+            return;
+        }
+        // A young pending row: its delete may still find no file and drop it.
+        if !self.owns(&key) || (!row.confirmed && !stale) {
+            report.waiting += 1;
+            return;
+        }
+        let row = if row.confirmed {
+            row
+        } else {
+            // The delete stopped after the removal.
+            let floor = match newest_generation(replication, &key).await {
+                Ok(floor) => floor,
+                Err(error) => return fail(report, error),
+            };
+            match tombstones
+                .confirm(name, replication.retention_after_delete(), floor)
+                .await
+            {
+                Ok(Some(row)) => row,
+                Ok(None) => return,
+                Err(error) => return fail(report, error.to_string()),
+            }
+        };
+        if !row.marked {
+            // Other hosts read the marker during the retention too.
+            let (writer, marker_key, marker_row) =
+                (Arc::clone(replication), key.clone(), row.clone());
+            let written =
+                crate::time::spawn_blocking(move || writer.write_marker(&marker_key, &marker_row))
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+            match written {
+                Ok(()) => {
+                    if let Err(error) = tombstones.set_marked(name).await {
+                        fail(report, error.to_string());
+                    }
+                }
+                Err(error) => fail(report, error),
+            }
+        }
+        if !row.is_due(now) {
+            report.waiting += 1;
+            return;
+        }
+        let (purger, purge_key, cutoff) = (Arc::clone(replication), key.clone(), row.deleted_at);
+        let outcome = crate::time::spawn_blocking(move || purger.purge_replica(&purge_key, cutoff))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+        match outcome {
+            Ok(objects) => match tombstones.remove(name).await {
+                Ok(()) => {
+                    tracing::info!(database = %key, objects, "fleet: replica of a deleted database purged");
+                    report.purged += 1;
+                }
+                Err(error) => fail(report, error.to_string()),
+            },
+            Err(error) => {
+                tracing::warn!(database = %key, %error, attempts = row.attempts + 1, "fleet: could not purge the replica of a deleted database");
+                if let Err(store) = tombstones.record_failure(row, &error).await {
+                    fail(report, store.to_string());
+                } else {
+                    fail(report, error);
+                }
+            }
+        }
+    }
+
+    /// Restore `sample` random databases of this fleet into scratch files,
+    /// and check each one (issue #3235): `PRAGMA integrity_check` and the
+    /// identity row. The result goes to the `replication:fleet` health
+    /// indicator, which turns `Down` when a check failed. Blocking work runs
+    /// on the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::NotReplicated`] without replication, or a
+    /// [`list`](Self::list) error.
+    pub async fn check_replica_sample(
+        &self,
+        sample: usize,
+    ) -> Result<super::fleet_replication::RestoreCheckReport, FleetError> {
+        let replication = self
+            .replication()
+            .cloned()
+            .ok_or_else(|| FleetError::NotReplicated {
+                name: self.root().display().to_string(),
+            })?;
+        let mut keys = self.list().await?;
+        // A partial Fisher-Yates shuffle: the first `take` keys are the sample.
+        let take = sample.min(keys.len());
+        for i in 0..take {
+            let span = u64::try_from(keys.len() - i).unwrap_or(u64::MAX);
+            let pick = usize::try_from(replication.entropy().next_u64() % span).unwrap_or(0);
+            keys.swap(i, i + pick);
+        }
+        keys.truncate(take);
+        let scratch = self
+            .root()
+            .join(crate::fleet_layout::RESERVED_DIR)
+            .join(RESTORE_CHECK_DIR);
+        let checker = Arc::clone(&replication);
+        let now = replication.now();
+        let mut report = crate::time::spawn_blocking(move || {
+            // A process that died during a check leaves its files.
+            sweep_scratch(&scratch, now);
+            let mut report = super::fleet_replication::RestoreCheckReport::default();
+            for key in keys {
+                match checker.check_restore(&key, &scratch) {
+                    super::fleet_replication::RestoreCheck::Passed => {
+                        report.passed.push(key.name());
+                    }
+                    super::fleet_replication::RestoreCheck::NoReplica => {
+                        report.unreplicated.push(key.name());
+                    }
+                    super::fleet_replication::RestoreCheck::Failed(error) => {
+                        tracing::error!(database = %key, %error, "fleet restore check failed");
+                        report.failed.push((key.name(), error));
+                    }
+                }
+            }
+            report
+        })
+        .await
+        .map_err(|error| FleetError::Io {
+            op: "restore check",
+            detail: error.to_string(),
+        })?;
+        report.checked_at = Some(replication.now());
+        replication.record_restore_check(report.clone());
+        Ok(report)
+    }
+
+    /// Start the replica lifecycle task (issue #3235): a purge pass every
+    /// minute, and the restore check at its interval. `None` without
+    /// replication. It stops when `shutdown` is cancelled.
+    fn spawn_replica_lifecycle(
+        &self,
+        shutdown: CancellationToken,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let replication = self.replication().cloned()?;
+        let fleet = self.clone();
+        Some(tokio::spawn(async move {
+            let mut purge = tokio::time::interval(PURGE_PASS_INTERVAL);
+            purge.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let (every, sample) = replication.restore_check().unwrap_or((Duration::MAX, 0));
+            let mut check =
+                tokio::time::interval(every.min(Duration::from_secs(u64::from(u32::MAX))));
+            check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The first tick is at once. Boot is busy: the first check waits
+            // one interval.
+            check.tick().await;
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    _ = purge.tick() => {
+                        let _ = fleet.purge_deleted_replicas().await;
+                    }
+                    _ = check.tick(), if sample > 0 => {
+                        let _ = fleet.check_replica_sample(sample).await;
+                    }
+                }
+            }
+        }))
     }
 
     /// Wait until no open of `key` is in progress. An open is never
@@ -2636,11 +3149,16 @@ impl DatabaseFleet {
                 let path = self.path_of(&key);
                 let root = self.inner.root.clone();
                 let restore_key = key.clone();
+                // Take the tombstone first, under the purge turn: the retry
+                // task then cannot purge the replica this restore reads.
+                let _turn = replication.purge_turn().lock().await;
+                let claimed = self.claim_tombstone(&replication, &key).await?;
+                let restore_from = Arc::clone(&replication);
                 // The guard finishes the drain whatever fails: an error that
                 // skipped it would strand every later opener of this key.
                 let restored = crate::time::spawn_blocking(move || {
                     check_contained(&root, &path)?;
-                    restore_in_place(&root, &replication, &restore_key, target, &path)
+                    restore_in_place(&root, &restore_from, &restore_key, target, &path)
                 })
                 .await
                 .map_err(|error| FleetError::Restore {
@@ -2648,12 +3166,67 @@ impl DatabaseFleet {
                     detail: error.to_string(),
                 })
                 .and_then(|r| r);
+                match (&restored, claimed) {
+                    (Ok(_), _) => self.forget_marker(&replication, &key).await,
+                    // Nothing came back: the tombstone stays.
+                    (Err(_), Some(row)) => {
+                        if let Some(tombstones) = replication.tombstones()
+                            && let Err(error) = tombstones.put(&row).await
+                        {
+                            tracing::error!(database = %key, %error, "fleet restore failed and its tombstone could not be put back");
+                        }
+                    }
+                    (Err(_), None) => {}
+                }
                 return restored;
             }
             let pending = self.lock_state().draining.get(key).cloned();
             if let Some(pending) = pending {
                 pending.wait().await;
             }
+        }
+    }
+
+    /// An explicit restore of `key` starts: take its tombstone row, so the
+    /// retry task does not purge the replica meanwhile. The caller puts it
+    /// back if the restore fails.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Restore`] when the row cannot be read or dropped. The
+    /// restore does not start: a row left next to the restored file would
+    /// block its later restore.
+    async fn claim_tombstone(
+        &self,
+        replication: &super::fleet_replication::FleetReplication,
+        key: &FleetDbKey,
+    ) -> Result<Option<super::fleet_tombstones::Tombstone>, FleetError> {
+        let Some(tombstones) = replication.tombstones() else {
+            return Ok(None);
+        };
+        let name = key.name();
+        let failed = |error: super::fleet_tombstones::TombstoneError| FleetError::Restore {
+            name: name.clone(),
+            detail: format!("could not take the tombstone: {error}"),
+        };
+        let row = tombstones.get(&name).await.map_err(failed)?;
+        if row.is_some() {
+            tombstones.remove(&name).await.map_err(failed)?;
+        }
+        Ok(row)
+    }
+
+    /// An explicit restore brought `key` back: remove its marker, so other
+    /// hosts restore it again.
+    async fn forget_marker(
+        &self,
+        replication: &Arc<super::fleet_replication::FleetReplication>,
+        key: &FleetDbKey,
+    ) {
+        let (worker, marker_key) = (Arc::clone(replication), key.clone());
+        let removed = crate::time::spawn_blocking(move || worker.delete_marker(&marker_key)).await;
+        if let Ok(Err(error)) = removed {
+            tracing::warn!(database = %key, %error, "fleet restore: could not remove the tombstone marker");
         }
     }
 
@@ -3156,6 +3729,58 @@ fn migrate_existing_blocking(fleet: &DatabaseFleet, key: &FleetDbKey) -> Result<
         Err(_) if !path.exists() => Ok(0),
         Err(error) => Err(error),
     }
+}
+
+/// Remove the scratch files and staging directories under `dir` that were
+/// last changed more than [`SCRATCH_STALE`] before `now`. Blocking.
+fn sweep_scratch(dir: &Path, now: chrono::DateTime<chrono::Utc>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let changed = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(chrono::DateTime::<chrono::Utc>::from);
+        let old = changed.is_ok_and(|changed| {
+            now.signed_duration_since(changed)
+                .to_std()
+                .is_ok_and(|age| age > SCRATCH_STALE)
+        });
+        if !old {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
+/// The newest generation in the replica of `key`, read on the blocking
+/// pool. `Ok(None)` when there is none.
+///
+/// # Errors
+///
+/// The destination failed. Then no cutoff can be set: a generation of a
+/// host clock that is ahead could be newer than the app clock.
+async fn newest_generation(
+    replication: &Arc<super::fleet_replication::FleetReplication>,
+    key: &FleetDbKey,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let (reader, key) = (Arc::clone(replication), key.clone());
+    crate::time::spawn_blocking(move || reader.newest_generation(&key))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result)
+}
+
+/// The identity row of the database file at `path`, read on a query-only
+/// connection. For the restore check of a scratch file.
+pub(crate) fn read_identity(path: &Path, name: &str) -> Result<Option<String>, FleetError> {
+    inspect_blocking(path, name).map(|info| info.identity)
 }
 
 /// [`DatabaseFleet::inspect`] on a blocking, query-only connection.
@@ -3961,6 +4586,8 @@ mod tests {
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
         }
     }
 

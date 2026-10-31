@@ -112,6 +112,19 @@
     margin-bottom: var(--space-4);
 }
 
+/* A grouped custom control (#3400): a <fieldset> with a <legend>. */
+.autumn-field--group {
+    min-inline-size: 0;
+    padding: 0;
+    border: 0;
+}
+
+/* A legend is not a flex item, so it takes the label gap as a margin. */
+.autumn-field--group > legend {
+    padding: 0;
+    margin-bottom: var(--space-1);
+}
+
 .autumn-field__label {
     font-size: var(--font-size-sm);
     font-weight: var(--font-weight-medium);

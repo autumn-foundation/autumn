@@ -10,6 +10,16 @@ version, folding the changelog fragments in, dating the changelog section,
 updating install instructions) is a separate, deliberate step the user asks for
 by name.
 
+## Security defaults, not security blocks
+
+Autumn is a framework. Make the safe path the default. Do not block the app
+from a choice it makes on purpose.
+
+- Filter and check what the framework or a plugin writes itself.
+- Pass through what the app gives explicitly (for example `FieldOptions`
+  `hx-on`). The app owns its CSP.
+- An unsafe path is an explicit opt-in with a clear name. It is never removed.
+
 ## Performance agents (Bolt)
 
 **Do not profile or optimize the `request_pipeline` workload**
@@ -91,7 +101,7 @@ so it is usually automatic:
 | `test-features` | Linux | one job per non-default feature set (markdown, i18n, tls, …) |
 | `test-docker` | Linux | the `#[ignore]`d Docker/testcontainer sweep |
 | `test-docker-deploy` | Linux | `deploy_e2e` alone, on a fresh disk (#2547) |
-| `widgets-browser` (own workflow) | Linux | Chromium: axe + keyboard over `/_stories`, the #3397 keyboard suite (#3398), and the #3399 toast suite. Runs only when widget paths change. |
+| `widgets-browser` (own workflow) | Linux | Chromium: axe + keyboard over `/_stories`, the #3397 keyboard suite (#3398), the #3399 toast suite, and widget pack conformance (#3400). Runs only when widget paths change. |
 
 `widgets-browser` is not in `ci.yml`. It is
 `.github/workflows/widgets-browser.yml`, with a `paths:` filter. Its tests are
