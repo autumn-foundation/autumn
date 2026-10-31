@@ -250,6 +250,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "tabs",
     "theme-toggle",
     "toast",
+    "tooltip",
     "transition-controls",
     "translated-transition-controls",
 ];
@@ -457,6 +458,7 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "tabs",
     "theme-toggle",
     "toast",
+    "tooltip",
 ];
 
 /// The browser test fn name for `slug`.
@@ -516,6 +518,7 @@ const BROWSER_GATE_PATHS: &[&str] = &[
     "autumn/src/htmx.rs",
     "autumn/vendor/htmx.min.js",
     "autumn/tests/integration/widgets_toast_browser.rs",
+    "autumn/tests/integration/widgets_tooltip_browser.rs",
     "autumn/src/widget_pack.rs",
     "autumn/src/plugin_conformance/**",
     "autumn-plugin-reference/src/**",
@@ -541,6 +544,7 @@ fn widget_browser_workflow_runs_on_widget_changes() {
         "stories_browser",
         "widgets_keyboard_browser",
         "widgets_toast_browser",
+        "widgets_tooltip_browser",
         "widget_pack_browser",
     ] {
         assert!(
@@ -556,7 +560,7 @@ fn widget_browser_workflow_runs_on_widget_changes() {
         "widgets-browser.yml does not run the reference widget pack (#3400)"
     );
     assert!(
-        workflow.matches("passed' ").count() >= 5,
+        workflow.matches("passed' ").count() >= 6,
         "widgets-browser.yml must check a non-zero pass count for each suite"
     );
 }

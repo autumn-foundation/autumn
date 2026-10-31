@@ -1043,7 +1043,12 @@ Per-primitive setters (in addition to the shared set):
   — htmx infinite-scroll / "Load more" feed from a `CursorPage`: one cursored
   `hx-get` sentinel appends the next page in place (no reload, no duplicate
   rows), progressive `<a href>` fallback; `feed_page` is the per-page append
-  fragment. All prelude re-exported.
+  fragment. `tooltip(id, text, |tip| trigger)` /
+  `tooltip_with(id, text, &TooltipConfig, |tip| trigger)` with
+  `TooltipPlacement::{Top,Bottom,Start,End}` — accessible tooltip: the
+  closure gets the `role="tooltip"` id for `aria-describedby` (or
+  `aria-labelledby`); hover/focus show it, Escape hides it, `interestfor` on
+  Chromium (`docs/guide/tooltip.md`). All prelude re-exported.
 - `autumn_web::flash::{flash_messages, flash_messages_with,
   FlashMessagesConfig}` — accessible flash-banner renderer (per-severity
   `role`/`aria-live`, `autumn-flash--<level>` classes, empty renders nothing,
@@ -1555,7 +1560,7 @@ middleware (tenant scoping, an auth shim, request enrichment) — mapping the
 layer onto individual handlers instead tests a stack the real app never
 serves.
 
-`Page`: `visit`, `fill`, `click`, `press`, `hover`, `set_javascript_enabled`, `expect_text`, `expect_url`,
+`Page`: `visit`, `fill`, `click`, `press`, `hover`, `move_mouse(x, y)`, `set_javascript_enabled`, `expect_text`, `expect_url`,
 `expect_attribute`, `expect_on_top`, `expect_hx_settle`, `expect_sse_event`,
 `expect_no_console_errors`, `console_errors`, `snapshot`, `evaluate`. The
 `expect_*` assertions poll to a deadline and ignore the transient CDP errors a
