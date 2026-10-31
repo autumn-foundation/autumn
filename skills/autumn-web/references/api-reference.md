@@ -1654,6 +1654,7 @@ Limits are two independent sets. `Limits { max_bytes: 512 KiB, max_depth: 64,
 max_nodes: 20_000 }` bounds the **document** and is applied before and around
 deserialization. `RenderLimits { max_depth: 128, max_nodes: 50_000, max_each_items: 5_000,
 max_output_bytes: 4 MiB }` bounds the **expansion** against runtime state.
+Work is bounded too: 320 fuel units per allowed node, spent on nodes, expressions and bytes scanned.
 `max_output_bytes` spans the body and every portal together and also caps what
 one expression may *build* (`concat`/`array`/`obj`/`+` assemble a value inside
 the evaluator before any of it is emitted); `max_depth` caps the shape of state
