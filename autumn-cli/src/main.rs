@@ -642,11 +642,12 @@ pub enum A11ySubcommands {
         /// fails, consistent with `autumn i18n check --strict`.
         #[arg(long)]
         strict: bool,
-        /// Cargo features to turn on in every crate of the scan, in addition
-        /// to the default features. Repeat the flag or give a comma-separated
-        /// list. An item or a call under a `#[cfg(feature = "…")]` that is off
-        /// does not attribute a route. Features change only the route
-        /// attribution, not the findings or the exit code.
+        /// Cargo features to turn on, in addition to the default features. A
+        /// name is on in each crate that declares it. `pkg/feat` names one
+        /// crate. Repeat the flag or give a comma-separated list. An item or a
+        /// call under a `#[cfg(feature = "…")]` that is off does not attribute
+        /// a route. Features change only the route attribution, not the
+        /// findings or the exit code.
         #[arg(long, value_name = "FEATURES")]
         features: Vec<String>,
         /// Turn on every feature that the manifest declares, and the implicit
