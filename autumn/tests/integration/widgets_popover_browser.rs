@@ -398,8 +398,8 @@ async fn popover_end_side_follows_the_writing_direction() {
     open(&page, "/rtl").await;
     let [t, p] = open_and_measure(&page, "rtl").await;
     assert!(
-        p.0 >= t.2 - EPS,
-        "start is the right side in rtl: {t:?} {p:?}"
+        p.2 <= t.0 + EPS,
+        "end is the left side in rtl: {t:?} {p:?}"
     );
 }
 
@@ -536,7 +536,6 @@ async fn menu_button_closes_on_tab_and_activates_a_link_with_enter() {
     press(&page, "Enter").await;
     settle().await;
     press(&page, "Tab").await;
-    eprintln!("ACTIVE {}", eval_string(&page, "document.activeElement.outerHTML.slice(0, 120)").await);
     assert!(!is_open(&page, "#actions").await, "Tab closes the menu");
     assert_eq!(active_id(&page).await, "after", "focus moves on");
 

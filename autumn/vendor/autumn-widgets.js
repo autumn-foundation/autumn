@@ -569,7 +569,11 @@
     var inside = t.closest(MENU);
     if (!inside) return;
     // Tab leaves the menu: close it, then focus moves on from the button.
-    if (e.key === 'Tab' && isOpen(inside)) inside.hidePopover();
+    if (e.key === 'Tab' && isOpen(inside)) {
+      var opener = triggerOf(inside);
+      if (opener) opener.focus();
+      inside.hidePopover();
+    }
     // Space activates a link item, as Enter does.
     if (e.key === ' ' && t.matches('a[role="menuitem"]')) {
       e.preventDefault();
