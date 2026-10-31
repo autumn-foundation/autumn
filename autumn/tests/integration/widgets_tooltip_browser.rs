@@ -128,6 +128,8 @@ fn body() -> Markup {
                 (tooltip("menu-tip", "In a layer", |tip| {
                     html! { button id="menu-item" type="button" aria-describedby=(tip) { "Item" } }
                 }))
+                " "
+                button id="menu-other" type="button" { "Other" }
             }
         }
     }
@@ -596,6 +598,34 @@ async fn escape_closes_the_tooltip_before_its_layer() {
             active_id(&page).await,
             "menu-btn",
             "focus goes to the trigger"
+        );
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// In an open layer, focus is on another control and the pointer is on a
+/// tooltip. The first Escape hides the tooltip. The second closes the layer.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn escape_closes_a_hovered_tooltip_before_its_layer() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    for mode in MODES {
+        open(&page, mode).await;
+        tab_from(&page, "menu-item").await;
+        assert_eq!(active_id(&page).await, "menu-other");
+        page.hover("#menu-item").await.expect("hover");
+        expect_shown(&page, "menu-tip", &format!("{mode:?}: hover in the layer")).await;
+        page.press("Escape").await.expect("Escape");
+        expect_hidden(&page, "menu-tip", &format!("{mode:?}: first Escape")).await;
+        assert!(
+            eval_bool(&page, "!document.getElementById('menu').hidden").await,
+            "{mode:?}: the first Escape must not close the layer"
+        );
+        page.press("Escape").await.expect("Escape");
+        assert!(
+            poll(&page, "document.getElementById('menu').hidden").await,
+            "{mode:?}: the second Escape closes the layer"
         );
     }
     page.expect_no_console_errors().await.expect("no errors");

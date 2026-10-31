@@ -840,27 +840,23 @@
   document.addEventListener('mouseover', rearm);
   document.addEventListener('focusin', rearm);
 
-  // Escape closes an open hint popover first, and cancels the key. Without
-  // this, the browser also closes a modal around it, and the core closes a
-  // layer around it. The capture phase runs before the core.
+  // Escape closes a shown tooltip first, and cancels the key: an open hint
+  // popover, or a CSS tooltip that shows for hover (WCAG 1.4.13). Without
+  // this, the core closes a layer around it, and the browser closes a modal
+  // around it. The capture phase runs before the core. The core closes a
+  // CSS tooltip whose trigger has focus.
   document.addEventListener('keydown', function (e) {
     if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
     document.querySelectorAll(TIP + ' > [popover]:popover-open').forEach(function (tip) {
       e.preventDefault();
       tip.hidePopover();
     });
-  }, true);
-
-  // WCAG 1.4.13: Escape also hides a tooltip that shows for hover only. The
-  // core hides one whose trigger has focus, and then cancels the key.
-  document.addEventListener('keydown', function (e) {
-    if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
     document.querySelectorAll(TIP + ':hover > [role="tooltip"]').forEach(function (tip) {
       if (!isOpen(tip) || !escapeOnly(tip)) return;
       e.preventDefault();
       dismiss(tip, false);
     });
-  });
+  }, true);
 
   // Run `fn` on `root` (when it matches) and on each match inside it.
   function each(root, selector, fn) {
