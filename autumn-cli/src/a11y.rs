@@ -962,9 +962,10 @@ fn declared_features(table: &toml::Table) -> BTreeSet<String> {
     declared
 }
 
-/// The names that `selection` asks for in the package of `table`. As Cargo
-/// does, a plain name counts only in a package that declares it. A
-/// `pkg/feature` name is kept for [`enabled_features`] to resolve.
+/// The names that `selection` asks for in a package with the `declared`
+/// features. As Cargo does, a plain name counts only in a package that
+/// declares it. A
+/// `pkg/feature` name is kept for [`enabled_from`] to resolve.
 fn own_requests(declared: &BTreeSet<String>, selection: &CargoFeatures) -> Vec<String> {
     let mut names: Vec<String> = requested_names(selection)
         .into_iter()
