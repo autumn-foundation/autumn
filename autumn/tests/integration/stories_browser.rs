@@ -777,3 +777,43 @@ async fn keyboard_toast() {
     );
     page.expect_no_console_errors().await.expect("no errors");
 }
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_tooltip() {
+    const TRIGGER: &str = "[data-autumn-tooltip] button[aria-describedby]";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/tooltip").await;
+
+    let tip = attr(&page, TRIGGER, "aria-describedby").await;
+    let bubble = format!("#{tip}");
+    let visible = format!(
+        "(() => {{ const s = getComputedStyle(document.getElementById({tip:?})); \
+         return s.display !== 'none' && s.visibility === 'visible'; }})()"
+    );
+    assert_eq!(attr(&page, &bubble, "role").await, "tooltip");
+    assert!(!eval_bool(&page, &visible).await, "hidden at rest");
+    focus(&page, TRIGGER).await;
+    wait_for(&page, &visible).await;
+    press(&page, "Escape").await;
+    wait_for(&page, &format!("!{visible}")).await;
+    assert!(
+        eval_bool(
+            &page,
+            &format!("document.activeElement.matches({TRIGGER:?})")
+        )
+        .await,
+        "focus stays on the trigger"
+    );
+
+    // A new focus shows the text again. axe checks it in both schemes.
+    axe_in_both_schemes(&page, "shown tooltip", || async {
+        eval_bool(&page, "(document.activeElement.blur(), true)").await;
+        focus(&page, TRIGGER).await;
+        wait_for(&page, &visible).await;
+        wait_for(&page, "document.getAnimations().length === 0").await;
+    })
+    .await;
+    page.expect_no_console_errors().await.expect("no errors");
+}

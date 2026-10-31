@@ -20,9 +20,12 @@
   //   data-autumn-wrap="false"         stop at the first and last item
   //   data-autumn-typeahead            type a letter to move (roving only)
   //   data-autumn-dismiss              Escape, outside click or focus-out closes
+  //   data-autumn-dismiss="escape"     only Escape closes (a tooltip)
   //
   // The controller (or trigger) is the element whose aria-controls names the
-  // list (or layer). Events: `autumn:navigate` (detail.item), `autumn:dismiss`.
+  // list (or layer). A role="tooltip" layer's trigger names it in
+  // aria-describedby or aria-labelledby. Events: `autumn:navigate`
+  // (detail.item), `autumn:dismiss`.
   // `autumn:init` fires on each new root (the page, an htmx swap) before
   // roving init, so plugin JS can set roles that roving reads (#3400).
 
@@ -129,9 +132,21 @@
     emit(list, 'autumn:navigate', item);
   }
 
-  // aria-controls is a list of ids, so match one word of it.
+  function isTip(layer) {
+    return layer.getAttribute('role') === 'tooltip';
+  }
+
+  function escapeOnly(layer) {
+    return layer.getAttribute('data-autumn-dismiss') === 'escape';
+  }
+
+  // An id list attribute, so match one word of it.
   function triggerOf(layer) {
-    return layer.id ? document.querySelector('[aria-controls~="' + CSS.escape(layer.id) + '"]') : null;
+    if (!layer.id) return null;
+    var id = '~="' + CSS.escape(layer.id) + '"]';
+    return document.querySelector(isTip(layer)
+      ? '[aria-describedby' + id + ',[aria-labelledby' + id
+      : '[aria-controls' + id);
   }
 
   // The data-autumn-activedescendant list that `el` controls, if any.
@@ -148,7 +163,7 @@
   function setOpen(layer, open) {
     var trigger = triggerOf(layer);
     layer.hidden = !open;
-    if (!trigger) return;
+    if (!trigger || isTip(layer)) return;
     trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
     if (!open && layer.hasAttribute('data-autumn-activedescendant')) setActive(trigger, layer, null);
   }
@@ -160,13 +175,20 @@
     emit(layer, 'autumn:dismiss', null);
   }
 
+  // A layer is open when it is not hidden, has content and shows. A
+  // tooltip's content can be text only.
+  function isOpen(layer) {
+    if (layer.hidden) return false;
+    if (!layer.childElementCount && !(isTip(layer) && layer.textContent.trim())) return false;
+    return getComputedStyle(layer).visibility !== 'hidden';
+  }
+
   // Calls `fn(layer, inside)` for each open layer. `inside` tells if `node`
-  // is in the layer or its trigger. Inner layers come first. An empty layer
-  // is not open.
+  // is in the layer or its trigger. Inner layers come first.
   function eachOpenLayer(node, fn) {
     var layers = document.querySelectorAll('[data-autumn-dismiss]:not([hidden])');
     for (var i = layers.length - 1; i >= 0; i--) {
-      if (!layers[i].childElementCount) continue;
+      if (!isOpen(layers[i])) continue;
       var trigger = triggerOf(layers[i]);
       var inside = !!node && (layers[i].contains(node) || (!!trigger && trigger.contains(node)));
       if (fn(layers[i], inside) === false) return;
@@ -238,7 +260,7 @@
   // A click outside a layer and its trigger closes the layer.
   document.addEventListener('click', function (e) {
     eachOpenLayer(e.target, function (layer, inside) {
-      if (!inside) dismiss(layer, false);
+      if (!inside && !escapeOnly(layer)) dismiss(layer, false);
     });
   });
 
@@ -249,7 +271,7 @@
     var to = e.relatedTarget;
     if (!to) return;
     eachOpenLayer(e.target, function (layer, inside) {
-      if (!inside) return;
+      if (!inside || escapeOnly(layer)) return;
       var trigger = triggerOf(layer);
       if (!layer.contains(to) && !(trigger && trigger.contains(to))) dismiss(layer, false);
     });
@@ -772,6 +794,58 @@
     queueMicrotask(function () { toasts.forEach(initToast); });
   });
 
+  // ── tooltip (#3404) ───────────────────────────────────────────────────────
+  // CSS shows the text on hover and keyboard focus. The keyboard core hides
+  // it on Escape (data-autumn-dismiss="escape"). This code shows it again on
+  // the next hover or focus, hides a hover-only tooltip on Escape, and adds
+  // the Chromium enhancement.
+  var TIP = '[data-autumn-tooltip]';
+
+  function tipIn(wrap) {
+    return wrap.querySelector(':scope > [role="tooltip"]');
+  }
+
+  // Chromium: `interestfor` on a button or link, `popover="hint"` on the
+  // text. The browser then shows, hides and dismisses it in the top layer.
+  // The server never sends these attributes, so other browsers keep CSS.
+  function initTooltip(wrap) {
+    var tip = tipIn(wrap);
+    var trigger = tip && triggerOf(tip);
+    if (!trigger || !wrap.contains(trigger) || !trigger.matches('button, a[href]') ||
+      !('interestForElement' in trigger)) return;
+    tip.removeAttribute('data-autumn-dismiss');
+    tip.hidden = false;
+    tip.setAttribute('popover', 'hint');
+    trigger.setAttribute('interestfor', tip.id);
+  }
+
+  // A dismissed tooltip shows again when hover or focus comes from outside.
+  function rearm(e) {
+    var wrap = e.target.closest && e.target.closest(TIP);
+    if (!wrap || (e.relatedTarget && wrap.contains(e.relatedTarget))) return;
+    var tip = tipIn(wrap);
+    if (tip && tip.hidden) tip.hidden = false;
+  }
+  document.addEventListener('mouseover', rearm);
+  document.addEventListener('focusin', rearm);
+
+  // WCAG 1.4.13: Escape also hides a tooltip that shows for hover only. The
+  // core hides one whose trigger has focus, and then cancels the key. The
+  // browser closes an open hint popover, but in a modal it closes the modal
+  // too. So close the popover here, and cancel the key.
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+    document.querySelectorAll(TIP + ' > [role="tooltip"]').forEach(function (tip) {
+      if (tip.matches('[popover]:popover-open')) {
+        e.preventDefault();
+        tip.hidePopover();
+      } else if (escapeOnly(tip) && tip.parentNode.matches(':hover') && isOpen(tip)) {
+        e.preventDefault();
+        dismiss(tip, false);
+      }
+    });
+  });
+
   // Run `fn` on `root` (when it matches) and on each match inside it.
   function each(root, selector, fn) {
     if (root.matches && root.matches(selector)) fn(root);
@@ -787,6 +861,7 @@
     each(root, '[data-autumn-roving]', initRoving);
     each(root, REGION, initRegion);
     each(root, TOAST, initToast);
+    each(root, TIP, initTooltip);
     // The theme is page state, so only a whole-page init syncs it.
     if (root === document) syncTheme();
   }

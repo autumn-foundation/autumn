@@ -463,6 +463,129 @@ mod tests {
         );
     }
 
+    // ── tooltip (#3404) ──────────────────────────────────────────────
+
+    /// The text is hidden until hover or focus. It keeps its layout box, so
+    /// `aria-describedby` still reads it.
+    #[test]
+    fn tooltip_is_hidden_until_hover_or_keyboard_focus() {
+        let body = rule_body(".autumn-tooltip__bubble");
+        assert!(body.contains("visibility: hidden;"), "{body}");
+        assert!(body.contains("pointer-events: auto;"), "{body}");
+        let css = lf_css();
+        assert!(
+            css.contains(
+                ".autumn-tooltip:hover > .autumn-tooltip__bubble,\n\
+                 .autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble {"
+            ),
+            "missing the show selectors"
+        );
+        assert!(
+            rule_body(".autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble")
+                .contains("visibility: visible;")
+        );
+        // Browsers without `:has()` show on any focus.
+        let at = css
+            .find("@supports not selector(:has(a)) {\n    .autumn-tooltip:focus-within")
+            .expect("the :focus-within fallback");
+        assert!(css[at..at + 200].contains("visibility: visible;"));
+    }
+
+    /// WCAG 1.4.13 (hoverable): a transparent bridge covers the gap between
+    /// the trigger and the text, so the pointer can move onto the text.
+    #[test]
+    fn tooltip_has_a_hover_bridge_over_the_gap() {
+        let body = rule_body(".autumn-tooltip__bubble::before");
+        assert!(body.contains("content: \"\";"), "{body}");
+        assert!(body.contains("position: absolute;"), "{body}");
+        assert!(
+            body.contains("inset: calc(-1 * var(--autumn-tooltip-gap));"),
+            "{body}"
+        );
+    }
+
+    /// The dismiss helper sets `hidden`. An empty text never shows.
+    #[test]
+    fn a_dismissed_or_empty_tooltip_does_not_show() {
+        assert!(
+            lf_css().contains(
+                ".autumn-tooltip__bubble[hidden],\n.autumn-tooltip__bubble:empty {\n    display: none;"
+            ),
+            "missing the [hidden] / :empty rule"
+        );
+    }
+
+    /// Anchor positioning applies only with `anchor-scope`. Without it, all
+    /// tooltips on a page share one anchor name.
+    #[test]
+    fn tooltip_anchor_positioning_needs_anchor_scope() {
+        let root = rule_body(".autumn-tooltip");
+        assert!(root.contains("anchor-name: --autumn-tooltip;"), "{root}");
+        assert!(root.contains("anchor-scope: --autumn-tooltip;"), "{root}");
+        let css = lf_css();
+        let at = css
+            .find("@supports (anchor-scope: all) {")
+            .expect("the anchor block");
+        let block = &css[at..at + 1200];
+        for declaration in [
+            "position: fixed;",
+            "position-anchor: --autumn-tooltip;",
+            "position-try-fallbacks: flip-block;",
+            "position-try-fallbacks: flip-inline;",
+        ] {
+            assert!(
+                block.contains(declaration),
+                "missing `{declaration}`:{block}"
+            );
+        }
+        for placement in ["top", "bottom", "start", "end"] {
+            assert!(
+                css.contains(&format!(
+                    ".autumn-tooltip--{placement} > .autumn-tooltip__bubble"
+                )),
+                "no rule for the {placement} placement"
+            );
+        }
+    }
+
+    /// On Chromium the runtime makes the text a `popover="hint"`. The CSS
+    /// resets the UA popover box and places it at the implicit anchor.
+    #[test]
+    fn tooltip_popover_resets_the_ua_box() {
+        let body = rule_body(".autumn-tooltip__bubble[popover]");
+        for declaration in [
+            "position: fixed;",
+            "position-anchor: auto;",
+            "inset: auto;",
+            "overflow: visible;",
+            "visibility: visible;",
+        ] {
+            assert!(body.contains(declaration), "missing `{declaration}`:{body}");
+        }
+    }
+
+    #[test]
+    fn tooltip_sits_above_toasts_and_has_no_motion_when_reduced() {
+        assert!(rule_body(".autumn-tooltip__bubble").contains("z-index: var(--z-tooltip);"));
+        let css = lf_css();
+        let at = css
+            .find("@media (prefers-reduced-motion: reduce) {\n    .autumn-tooltip__bubble")
+            .expect("reduced-motion tooltip block");
+        let block = &css[at..at + css[at..].find("\n}\n").expect("block end")];
+        assert!(block.contains("transition: none;"), "{block}");
+    }
+
+    #[test]
+    fn tooltip_text_meets_aa_contrast_in_both_schemes() {
+        for scheme in Scheme::BOTH {
+            let ratio = contrast(
+                &declared(".autumn-tooltip__bubble", "color", scheme),
+                &declared(".autumn-tooltip__bubble", "background", scheme),
+            );
+            assert!(ratio >= 4.5, "{scheme:?}: {ratio:.2}:1");
+        }
+    }
+
     /// WCAG 1.4.11: a text input's border is its only visible boundary, so
     /// it uses `--control-border` (3:1), not the decorative `--border`.
     #[test]

@@ -22,6 +22,7 @@
 //! | `comment_thread` | No-JS/htmx nested comment list with an inline reply form per node, for `#[commentable]` |
 //! | `locale_switcher` | Path-preserving language switcher for locale-prefixed routing (issue #1251) |
 //! | `theme_toggle` | No-JS System / Light / Dark switch that stores the `autumn.theme` cookie (issue #3396) |
+//! | `tooltip` / `tooltip_with` | Text that shows on hover and focus, linked by `aria-describedby` (issue #3404) |
 //!
 //! # Feedback widgets
 //!
@@ -4644,7 +4645,10 @@ impl<'a> BadgeConfig<'a> {
         Self::default()
     }
 
-    /// Set a `title` (tooltip) — useful when the visible label is abbreviated.
+    /// Set a `title` — useful when the visible label is abbreviated.
+    ///
+    /// Keyboard and touch users cannot see a `title`. For an accessible
+    /// tooltip on a focusable element, use [`tooltip`].
     #[must_use]
     pub const fn title(mut self, title: &'a str) -> Self {
         self.title = Some(title);
@@ -4730,6 +4734,161 @@ pub fn badge_with(label: &str, variant: BadgeVariant, config: &BadgeConfig<'_>) 
 #[must_use]
 pub fn status_tag(label: &str) -> maud::Markup {
     badge(label, BadgeVariant::Neutral)
+}
+
+// ── tooltip (#3404) ─────────────────────────────────────────────────────────
+
+/// Where a [`tooltip`] shows, next to its trigger.
+///
+/// With CSS anchor positioning, the text flips to the opposite side when it
+/// has no room. `Start` and `End` follow the writing direction.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TooltipPlacement {
+    /// Above the trigger. The default.
+    #[default]
+    Top,
+    /// Below the trigger.
+    Bottom,
+    /// Before the trigger: left in a left-to-right page.
+    Start,
+    /// After the trigger: right in a left-to-right page.
+    End,
+}
+
+#[cfg(feature = "maud")]
+impl TooltipPlacement {
+    /// The root modifier class, for example `autumn-tooltip--top`.
+    const fn class(self) -> &'static str {
+        match self {
+            Self::Top => "autumn-tooltip--top",
+            Self::Bottom => "autumn-tooltip--bottom",
+            Self::Start => "autumn-tooltip--start",
+            Self::End => "autumn-tooltip--end",
+        }
+    }
+}
+
+/// Options for [`tooltip_with`]. The default is the [`tooltip`] output.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct TooltipConfig<'a> {
+    placement: TooltipPlacement,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> TooltipConfig<'a> {
+    /// A default config: [`TooltipPlacement::Top`], no extra class.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the side where the text shows.
+    #[must_use]
+    pub const fn placement(mut self, placement: TooltipPlacement) -> Self {
+        self.placement = placement;
+        self
+    }
+
+    /// Add a class to the root `<span>`.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render an accessible tooltip: a short text that describes a trigger.
+///
+/// `trigger` gets the id of the text. Put it in `aria-describedby` on the
+/// focusable element. For an icon-only trigger, put it in `aria-labelledby`.
+/// Then the text is the accessible name. The id goes in the server HTML, so
+/// the link works without JS. A leading `#` in `id` is removed.
+///
+/// A tooltip holds text only (`text: &str`). For links or buttons, use a
+/// popover. Do not use `title` for a tooltip: keyboard and touch users
+/// cannot see it.
+///
+/// **Behaviour (WCAG 1.4.13):**
+///
+/// - CSS shows the text on hover and on keyboard focus (`:focus-visible`).
+///   A mouse click does not keep it open.
+/// - A transparent bridge covers the gap. The pointer can move onto the text.
+/// - The text has no timer. It stays until hover and focus go, or Escape.
+/// - Escape hides it. `autumn-widgets.js` does this with the keyboard core
+///   (`data-autumn-dismiss="escape"`). The next hover or focus shows it again.
+///   Without JS, Escape does nothing.
+/// - CSS anchor positioning places the text and flips it at the viewport
+///   edge. Older browsers place it with `position: absolute`.
+/// - On Chromium, the runtime adds `popover="hint"` to the text and
+///   `interestfor` to a `<button>` or `<a>` trigger. The browser then shows,
+///   hides and dismisses it in the top layer. The server never sends these
+///   attributes, so other browsers keep the CSS baseline.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-tooltip` | Root `<span>`, the anchor |
+/// | `.autumn-tooltip--<placement>` | `top`, `bottom`, `start` or `end` |
+/// | `.autumn-tooltip__bubble` | The `role="tooltip"` text |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::tooltip;
+/// use maud::html;
+///
+/// let out = tooltip("copy-tip", "Copy the link", |tip| html! {
+///     button type="button" aria-describedby=(tip) { "Copy" }
+/// })
+/// .into_string();
+/// assert!(out.contains(r#"aria-describedby="copy-tip""#));
+/// assert!(out.contains(r#"role="tooltip""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn tooltip(id: &str, text: &str, trigger: impl FnOnce(&str) -> maud::Markup) -> maud::Markup {
+    tooltip_with(id, text, &TooltipConfig::new(), trigger)
+}
+
+/// Like [`tooltip`], with a [`TooltipConfig`]: placement and an extra class.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{TooltipConfig, TooltipPlacement, tooltip_with};
+/// use maud::html;
+///
+/// let config = TooltipConfig::new().placement(TooltipPlacement::Bottom);
+/// let out = tooltip_with("del-tip", "Delete", &config, |tip| html! {
+///     button type="button" aria-labelledby=(tip) { span aria-hidden="true" { "×" } }
+/// })
+/// .into_string();
+/// assert!(out.contains("autumn-tooltip--bottom"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn tooltip_with(
+    id: &str,
+    text: &str,
+    config: &TooltipConfig<'_>,
+    trigger: impl FnOnce(&str) -> maud::Markup,
+) -> maud::Markup {
+    let id = selector_to_id(id);
+    let root = merge_class(
+        &format!("autumn-tooltip {}", config.placement.class()),
+        config.class,
+    );
+    maud::html! {
+        span class=(root) data-autumn-tooltip {
+            (trigger(id))
+            span id=(id) class="autumn-tooltip__bubble" role="tooltip"
+                data-autumn-dismiss="escape" { (text) }
+        }
+    }
 }
 
 // ── avatar (#1263) ──────────────────────────────────────────────────────────

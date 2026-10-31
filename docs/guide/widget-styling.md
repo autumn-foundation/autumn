@@ -39,7 +39,7 @@ same tokens.
 | Space | `--space-1` … `--space-8` (0.25rem … 2rem, scaled by density) |
 | Type | `--font-size-xs` … `--font-size-2xl`, `--font-weight-*`, `--line-height-*`, `--font-family`, `--font-mono` |
 | Radius | `--radius-sm`, `--radius-md`, `--radius-lg`, `--radius-full`, `--radius` |
-| Z-index | `--z-dropdown`, `--z-sticky`, `--z-banner`, `--z-toast` (only without JS: the runtime puts the toast region in the top layer) |
+| Z-index | `--z-dropdown`, `--z-sticky`, `--z-banner`, `--z-toast` (only without JS: the runtime puts the toast region in the top layer), `--z-tooltip` (only without the Chromium top layer) |
 | Breakpoints | `--breakpoint-sm` … `--breakpoint-xl` |
 
 `--on-primary` and `--on-danger` are the text colors on a `--primary` or a

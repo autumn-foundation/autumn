@@ -420,6 +420,43 @@ fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Overlays",
+            "Tooltip",
+            {
+                use autumn_web::widgets::{TooltipConfig, TooltipPlacement, tooltip, tooltip_with};
+
+                maud::html! {
+                    p {
+                        // The closure gets the text's id. Hover or keyboard
+                        // focus shows the text. Escape hides it.
+                        (tooltip("copy-tip", "Copy the link to the clipboard", |tip| maud::html! {
+                            button type="button" aria-describedby=(tip) { "Copy link" }
+                        }))
+                        " "
+                        // A link trigger, with the text below it.
+                        (tooltip_with(
+                            "docs-tip",
+                            "Opens the tooltip guide",
+                            &TooltipConfig::new().placement(TooltipPlacement::Bottom),
+                            |tip| maud::html! { a href="#docs" aria-describedby=(tip) { "Docs" } },
+                        ))
+                        " "
+                        // An icon-only trigger: the text is its name.
+                        (tooltip_with(
+                            "delete-tip",
+                            "Delete",
+                            &TooltipConfig::new().placement(TooltipPlacement::End),
+                            |tip| maud::html! {
+                                button type="button" aria-labelledby=(tip) {
+                                    span aria-hidden="true" { "×" }
+                                }
+                            },
+                        ))
+                    }
+                }
+            }
+        },
+        story! {
             "Display",
             "Badge",
             {

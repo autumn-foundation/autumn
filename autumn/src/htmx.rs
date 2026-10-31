@@ -818,10 +818,11 @@ mod tests {
     /// Byte budget for `autumn-widgets.js` (issue #3397). See
     /// `docs/guide/keyboard.md`. Raise it only with a reason in the PR.
     /// Issue #3399 added the toast runtime. It increased the budgets from
-    /// 32 KiB and 10 KiB.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 36 * 1024;
+    /// 32 KiB and 10 KiB. Issue #3404 added the tooltip runtime. It
+    /// increased them from 36 KiB and 11 KiB.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 40 * 1024;
     /// Gzip budget. Browsers download this size.
-    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 11 * 1024;
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 12 * 1024;
 
     /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
     /// CRLF checkout changes the bytes, the content hash and the size.
@@ -874,6 +875,30 @@ mod tests {
         ] {
             assert!(js.contains(name), "missing `{name}`");
         }
+    }
+
+    /// The tooltip runtime (issue #3404): the Escape-only dismiss mode, the
+    /// `aria-describedby` trigger lookup, and the Chromium enhancement.
+    #[test]
+    fn widgets_js_has_the_tooltip_contract() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        for name in [
+            "[data-autumn-tooltip]",
+            "'escape'",
+            "aria-describedby",
+            "aria-labelledby",
+            "interestForElement",
+            "interestfor",
+            "'hint'",
+        ] {
+            assert!(js.contains(name), "missing `{name}`");
+        }
+        let init_all = &js[js.find("function initAll(root)").expect("initAll")..];
+        assert!(
+            init_all[..init_all.find("\n  }").expect("end")].contains("initTooltip"),
+            "initAll must init tooltips, so an htmx swap enhances them"
+        );
     }
 
     /// Plugin JS hooks `autumn:init` (issue #3400).

@@ -1477,6 +1477,161 @@
     }
 }
 
+/* ── Tooltip (autumn-tooltip, #3404) ───────────────────────────────────────── */
+
+/* The root is the anchor. `anchor-scope` keeps each tooltip on its own
+   trigger. The fallback places the text with `position: absolute`. */
+.autumn-tooltip {
+    --autumn-tooltip-gap: var(--space-2);
+    position: relative;
+    display: inline-block;
+    anchor-name: --autumn-tooltip;
+    anchor-scope: --autumn-tooltip;
+}
+
+/* Hidden, but in the layout: `aria-describedby` still reads the text.
+   `pointer-events: auto` lets the pointer move onto it (WCAG 1.4.13). */
+.autumn-tooltip__bubble {
+    position: absolute;
+    z-index: var(--z-tooltip);
+    box-sizing: border-box;
+    width: max-content;
+    max-width: min(20rem, calc(100vw - 2 * var(--space-2)));
+    margin: 0;
+    padding: var(--space-1) var(--space-2);
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: var(--text);
+    color: var(--surface);
+    box-shadow: var(--shadow);
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-normal);
+    line-height: var(--line-height-normal);
+    text-align: start;
+    white-space: normal;
+    overflow-wrap: break-word;
+    pointer-events: auto;
+    visibility: hidden;
+    opacity: 0;
+    transition: opacity 120ms ease-out, visibility 0s linear 120ms;
+}
+
+/* The hover bridge: a transparent box that covers the gap on each side. */
+.autumn-tooltip__bubble::before {
+    content: "";
+    position: absolute;
+    inset: calc(-1 * var(--autumn-tooltip-gap));
+}
+
+.autumn-tooltip:hover > .autumn-tooltip__bubble,
+.autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble {
+    visibility: visible;
+    opacity: 1;
+    transition: opacity 120ms ease-out;
+}
+
+/* Without `:has()`, any focus shows the text. */
+@supports not selector(:has(a)) {
+    .autumn-tooltip:focus-within > .autumn-tooltip__bubble {
+        visibility: visible;
+        opacity: 1;
+        transition: opacity 120ms ease-out;
+    }
+}
+
+/* Escape sets `hidden`. An empty text never shows. */
+.autumn-tooltip__bubble[hidden],
+.autumn-tooltip__bubble:empty {
+    display: none;
+}
+
+/* Fallback placement, without anchor positioning. */
+.autumn-tooltip--top > .autumn-tooltip__bubble {
+    bottom: 100%;
+    left: 50%;
+    translate: -50% 0;
+    margin-bottom: var(--autumn-tooltip-gap);
+}
+
+.autumn-tooltip--bottom > .autumn-tooltip__bubble {
+    top: 100%;
+    left: 50%;
+    translate: -50% 0;
+    margin-top: var(--autumn-tooltip-gap);
+}
+
+.autumn-tooltip--start > .autumn-tooltip__bubble {
+    top: 50%;
+    inset-inline-end: 100%;
+    translate: 0 -50%;
+    margin-inline-end: var(--autumn-tooltip-gap);
+}
+
+.autumn-tooltip--end > .autumn-tooltip__bubble {
+    top: 50%;
+    inset-inline-start: 100%;
+    translate: 0 -50%;
+    margin-inline-start: var(--autumn-tooltip-gap);
+}
+
+/* Anchor positioning. `position: fixed` escapes an `overflow` clip. The
+   text flips to the other side when it has no room. */
+@supports (anchor-scope: all) {
+    .autumn-tooltip > .autumn-tooltip__bubble {
+        position: fixed;
+        position-anchor: --autumn-tooltip;
+        inset: auto;
+        translate: none;
+        margin: 0;
+    }
+
+    .autumn-tooltip--top > .autumn-tooltip__bubble {
+        position-area: top;
+        margin-bottom: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-block;
+    }
+
+    .autumn-tooltip--bottom > .autumn-tooltip__bubble {
+        position-area: bottom;
+        margin-top: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-block;
+    }
+
+    .autumn-tooltip--start > .autumn-tooltip__bubble {
+        position-area: inline-start;
+        margin-inline-end: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-inline;
+    }
+
+    .autumn-tooltip--end > .autumn-tooltip__bubble {
+        position-area: inline-end;
+        margin-inline-start: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-inline;
+    }
+}
+
+/* Chromium: the runtime makes the text a `popover="hint"`. The browser
+   shows it in the top layer. Reset the UA popover box, and place the text
+   at the implicit anchor (the `interestfor` trigger). */
+.autumn-tooltip__bubble[popover] {
+    position: fixed;
+    position-anchor: auto;
+    inset: auto;
+    translate: none;
+    overflow: visible;
+    visibility: visible;
+    opacity: 1;
+    transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .autumn-tooltip__bubble,
+    .autumn-tooltip:hover > .autumn-tooltip__bubble,
+    .autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble {
+        transition: none;
+    }
+}
+
 /* ── Infinite feed (autumn-feed) ───────────────────────────────────────────── */
 
 .autumn-feed {

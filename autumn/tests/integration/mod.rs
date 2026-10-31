@@ -623,6 +623,10 @@ mod widgets_theme_toggle;
 mod widgets_toast;
 #[cfg(all(feature = "system-tests", feature = "maud"))]
 mod widgets_toast_browser;
+#[cfg(feature = "maud")]
+mod widgets_tooltip;
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_tooltip_browser;
 #[cfg(feature = "ws")]
 mod ws_integration;
 #[cfg(feature = "ws")]
