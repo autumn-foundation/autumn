@@ -364,7 +364,7 @@ async fn hold_in_gap(page: &Page, trigger: &str, bubble: &str) -> bool {
     page.move_mouse(x, (by + bh + ty) / 2.0)
         .await
         .expect("move mouse");
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     eval_bool(page, &visible_js(bubble)).await
 }
 
