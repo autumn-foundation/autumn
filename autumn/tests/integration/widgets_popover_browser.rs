@@ -569,6 +569,32 @@ async fn menu_opened_with_an_arrow_key_is_anchored_to_the_trigger() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn menu_closes_after_an_item_whose_click_is_handled_by_script() {
+    // htmx cancels the click of a boosted link and swaps the page itself.
+    // The menu must still close.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    page.evaluate(
+        "document.querySelector('#actions a[href=\"#duplicate\"]')\
+         .addEventListener('click', e => e.preventDefault())",
+    )
+    .await
+    .expect("handle the click");
+
+    page.click("#actions-trigger").await.expect("open");
+    assert!(is_open(&page, "#actions").await);
+    page.click("#actions a[href='#duplicate']")
+        .await
+        .expect("choose the item");
+    assert!(
+        !is_open(&page, "#actions").await,
+        "a handled click still closes the menu"
+    );
+}
+
 // ── no JavaScript ───────────────────────────────────────────────────────
 
 #[tokio::test]

@@ -553,7 +553,8 @@
     }
     var item = e.target.closest(MENU + ' [role="menuitem"]');
     var owner = item && item.closest(MENU);
-    if (!owner || e.defaultPrevented || item.getAttribute('aria-disabled') === 'true') return;
+    // A script may cancel the click (htmx does for a boosted link). Still close.
+    if (!owner || item.getAttribute('aria-disabled') === 'true') return;
     // Close after the item acts. Focus the trigger: some browsers do not
     // focus a clicked button.
     setTimeout(function () {
