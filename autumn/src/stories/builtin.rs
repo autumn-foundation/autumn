@@ -378,6 +378,58 @@ fn builtin_stories() -> Vec<Story> {
         },
         story! {
             "Overlays",
+            "Popover",
+            {
+                use autumn_web::widgets::{PopoverAlign, PopoverConfig, PopoverSide, popover};
+
+                // `command`/`commandfor` open the panel with no JavaScript.
+                // The browser gives light dismiss and Escape.
+                maud::html! {
+                    (popover(
+                        "Help",
+                        &maud::html! { p { "Press ? to see the keyboard shortcuts." } },
+                        &PopoverConfig::new("help-popover"),
+                    ))
+                    (popover(
+                        "Above, centered",
+                        &maud::html! { p { "Opens above the trigger." } },
+                        &PopoverConfig::new("tip-popover")
+                            .side(PopoverSide::Top)
+                            .align(PopoverAlign::Center),
+                    ))
+                }
+            }
+        },
+        story! {
+            "Overlays",
+            "Dropdown menu",
+            {
+                use autumn_web::widgets::{MenuEntry, PopoverConfig, dropdown_menu};
+                use http::Method;
+
+                // An APG menu button. Items are links or CSRF forms, so they
+                // work with JavaScript off. Only the arrow keys need it.
+                dropdown_menu(
+                    "Actions",
+                    &[
+                        MenuEntry::link("Edit", "/posts/1/edit"),
+                        MenuEntry::group(
+                            "Share",
+                            vec![
+                                MenuEntry::link("Copy link", "/posts/1/link"),
+                                MenuEntry::link("Email", "/posts/1/email"),
+                            ],
+                        ),
+                        MenuEntry::separator(),
+                        MenuEntry::action("Delete", "/posts/1", Method::DELETE, "demo-token")
+                            .destructive(),
+                    ],
+                    &PopoverConfig::new("post-actions"),
+                )
+            }
+        },
+        story! {
+            "Overlays",
             "Modal",
             {
                 use autumn_web::widgets::{

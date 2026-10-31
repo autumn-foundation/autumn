@@ -478,22 +478,14 @@
 
   // ── nav_bar widget ──────────────────────────────────────────────────────
   // Progressive enhancement for autumn_web::widgets::nav_bar: before this
-  // runs, the hamburger toggle is hidden and every dropdown is rendered open
-  // so all links stay visible with JS off. Once it runs, the hamburger is
-  // revealed and each dropdown becomes an APG menu button. The keyboard core
-  // gives the menu its arrow keys, typeahead, Escape and click-outside.
+  // runs, the hamburger toggle is hidden. Once it runs, the hamburger is
+  // revealed. Dropdowns are popover menus (see below).
 
-  function openNavMenu(toggle, menu, focusAt) {
-    setOpen(menu, true);
-    var all = listItems(menu);
-    if (focusAt && all.length) focusItem(menu, focusAt === 'last' ? all[all.length - 1] : all[0]);
-  }
-
-  // initNav is guarded per-CONTROL (toggle / menu toggle), not once per nav
-  // element: when htmx swaps a <nav data-autumn-nav>'s innerHTML (the nav
-  // itself stays in the DOM, only its children are replaced), the swapped-in
-  // hamburger/dropdown buttons are brand-new nodes, so they need wiring again
-  // even though the nav was already initialized once.
+  // initNav is guarded per-CONTROL (the toggle), not once per nav element:
+  // when htmx swaps a <nav data-autumn-nav>'s innerHTML (the nav itself stays
+  // in the DOM, only its children are replaced), the swapped-in hamburger is
+  // a brand-new node, so it needs wiring again even though the nav was
+  // already initialized once.
   function initNav(nav) {
     nav.classList.add('autumn-nav--enhanced');
 
@@ -507,44 +499,83 @@
         collapse.classList.toggle('autumn-nav__collapse--open', !open);
       });
     }
-
-    nav.querySelectorAll('[data-nav-menu-toggle]').forEach(function (menuToggle) {
-      var menu = document.getElementById(menuToggle.getAttribute('aria-controls'));
-      if (!menu || !once(menuToggle)) return;
-      // These roles promise arrow keys, so only the runtime adds them.
-      menuToggle.setAttribute('aria-haspopup', 'menu');
-      menu.setAttribute('role', 'menu');
-      if (menuToggle.id) menu.setAttribute('aria-labelledby', menuToggle.id);
-      menu.querySelectorAll('li').forEach(function (li) { li.setAttribute('role', 'none'); });
-      menu.querySelectorAll('a').forEach(function (a) {
-        a.setAttribute('role', 'menuitem');
-        a.tabIndex = -1;
-      });
-      // Collapse the server-rendered "open" default.
-      setOpen(menu, false);
-
-      function closeOthers() {
-        nav.querySelectorAll('[data-nav-menu-toggle]').forEach(function (other) {
-          var m = document.getElementById(other.getAttribute('aria-controls'));
-          if (m && other !== menuToggle) setOpen(m, false);
-        });
-      }
-
-      // A keyboard click (Enter or Space) has detail 0 and focuses the
-      // first item. A mouse click keeps focus on the button.
-      menuToggle.addEventListener('click', function (e) {
-        closeOthers();
-        if (menu.hidden) openNavMenu(menuToggle, menu, e.detail === 0 ? 'first' : null);
-        else setOpen(menu, false);
-      });
-      menuToggle.addEventListener('keydown', function (e) {
-        if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
-        e.preventDefault();
-        closeOthers();
-        openNavMenu(menuToggle, menu, e.key === 'ArrowUp' ? 'last' : 'first');
-      });
-    });
   }
+
+  // ── popover menu (issue #3402) ────────────────────────────────────────────
+  // dropdown_menu and NavMenu are native popovers. The browser opens them from
+  // command/commandfor and gives light dismiss, Escape and focus return. This
+  // adds the rest of the APG menu button: aria-expanded, focus on open,
+  // ArrowDown/ArrowUp on the button, Space on a link, and Tab or a click on an
+  // item to close. The keyboard core gives the arrows, Home/End and typeahead.
+
+  var MENU = '[data-autumn-menu]';
+  var MENU_BUTTON = '[aria-haspopup="menu"][commandfor]';
+  var menuAt = null; // { menu, at }: where focus goes when that menu opens
+
+  function menuOfButton(btn) {
+    var m = btn && document.getElementById(btn.getAttribute('commandfor'));
+    return m && m.matches(MENU) ? m : null;
+  }
+
+  function isOpen(el) { return el.matches(':popover-open'); }
+
+  function initMenu(menu) {
+    var trigger = triggerOf(menu);
+    if (trigger) trigger.setAttribute('aria-expanded', isOpen(menu) ? 'true' : 'false');
+  }
+
+  document.addEventListener('toggle', function (e) {
+    var menu = e.target;
+    if (!menu.matches || !menu.matches(MENU)) return;
+    var open = e.newState === 'open';
+    var trigger = triggerOf(menu);
+    if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    var req = menuAt;
+    menuAt = null;
+    var all = open && req && req.menu === menu ? listItems(menu) : [];
+    if (all.length) focusItem(menu, req.at === 'last' ? all[all.length - 1] : all[0]);
+  }, true);
+
+  document.addEventListener('click', function (e) {
+    if (!e.target.closest) return;
+    var button = e.target.closest(MENU_BUTTON);
+    if (button) {
+      // A keyboard click (Enter or Space) has detail 0 and focuses the first item.
+      var menu = menuOfButton(button);
+      menuAt = menu && e.detail === 0 ? { menu: menu, at: 'first' } : null;
+      return;
+    }
+    var item = e.target.closest(MENU + ' [role="menuitem"]');
+    var owner = item && item.closest(MENU);
+    if (owner && isOpen(owner)) owner.hidePopover();
+  });
+
+  document.addEventListener('keydown', function (e) {
+    var t = e.target;
+    if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || !t || !t.closest) return;
+    var menu = menuOfButton(t.closest(MENU_BUTTON));
+    if (menu && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+      e.preventDefault();
+      menuAt = { menu: menu, at: e.key === 'ArrowUp' ? 'last' : 'first' };
+      if (isOpen(menu)) {
+        var all = listItems(menu);
+        menuAt = null;
+        if (all.length) focusItem(menu, e.key === 'ArrowUp' ? all[all.length - 1] : all[0]);
+      } else {
+        menu.showPopover();
+      }
+      return;
+    }
+    var inside = t.closest(MENU);
+    if (!inside) return;
+    // Tab leaves the menu: close it, then focus moves on from the button.
+    if (e.key === 'Tab' && isOpen(inside)) inside.hidePopover();
+    // Space activates a link item, as Enter does.
+    if (e.key === ' ' && t.matches('a[role="menuitem"]')) {
+      e.preventDefault();
+      t.click();
+    }
+  });
 
   // ── modal / confirm_action ────────────────────────────────────────────────
   // autumn_web::widgets::modal / confirm_action open and close their
@@ -557,6 +588,12 @@
   // free from the browser in both paths.
   if (!('command' in HTMLButtonElement.prototype)) {
     document.addEventListener('click', function (e) {
+      var pop = e.target.closest('[data-popover-toggle]');
+      var panel = pop && document.getElementById(pop.getAttribute('data-popover-toggle'));
+      if (panel && panel.togglePopover) {
+        panel.togglePopover();
+        return;
+      }
       var opener = e.target.closest('[data-modal-open]');
       if (opener) {
         var toOpen = document.getElementById(opener.getAttribute('data-modal-open'));
@@ -783,6 +820,7 @@
     each(root, '[data-autumn-tabs]', initTabs);
     each(root, '[data-ac-value-id]', initAutocomplete);
     each(root, '[data-autumn-nav]', initNav);
+    each(root, MENU, initMenu);
     root.dispatchEvent(new CustomEvent('autumn:init', { bubbles: true }));
     each(root, '[data-autumn-roving]', initRoving);
     each(root, REGION, initRegion);

@@ -500,6 +500,81 @@ async fn keyboard_nav_bar() {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
+async fn keyboard_popover() {
+    const TRIGGER: &str = "#help-popover-trigger";
+    const PANEL: &str = "#help-popover";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/popover").await;
+
+    focus(&page, TRIGGER).await;
+    assert!(!shown(&page, PANEL).await, "closed at first");
+    press(&page, "Enter").await;
+    assert!(shown(&page, PANEL).await, "Enter opens the popover");
+    press(&page, "Escape").await;
+    assert!(!shown(&page, PANEL).await, "Escape closes the popover");
+    assert_eq!(
+        active_id(&page).await,
+        "help-popover-trigger",
+        "Escape returns focus to the trigger"
+    );
+
+    axe_in_both_schemes(&page, "open popover", || async {
+        focus(&page, TRIGGER).await;
+        press(&page, "Enter").await;
+        wait_for(
+            &page,
+            &format!("document.querySelector('{PANEL}').matches(':popover-open')"),
+        )
+        .await;
+    })
+    .await;
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_dropdown_menu() {
+    const TRIGGER: &str = "#post-actions-trigger";
+    const MENU: &str = "#post-actions";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/dropdown-menu").await;
+
+    focus(&page, TRIGGER).await;
+    assert_eq!(attr(&page, TRIGGER, "aria-expanded").await, "false");
+    press(&page, "Enter").await;
+    assert_eq!(attr(&page, TRIGGER, "aria-expanded").await, "true");
+    assert_eq!(
+        active_text(&page).await,
+        "Edit",
+        "Enter focuses the first item"
+    );
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_text(&page).await, "Copy link");
+    press(&page, "End").await;
+    assert_eq!(active_text(&page).await, "Delete");
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_text(&page).await, "Edit", "ArrowDown wraps");
+    press(&page, "Escape").await;
+    assert!(!shown(&page, MENU).await, "Escape closes the menu");
+    assert_eq!(active_id(&page).await, "post-actions-trigger");
+
+    axe_in_both_schemes(&page, "open dropdown menu", || async {
+        focus(&page, TRIGGER).await;
+        press(&page, "Enter").await;
+        wait_for(
+            &page,
+            &format!("document.querySelector('{MENU}').matches(':popover-open')"),
+        )
+        .await;
+    })
+    .await;
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
 async fn keyboard_autocomplete() {
     const INPUT: &str = "#tag-picker-query";
     let runner = runner().await;

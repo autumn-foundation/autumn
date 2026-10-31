@@ -748,7 +748,7 @@ const MENU: &str = "autumn-nav-menu-1";
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
-async fn the_runtime_adds_menu_button_roles() {
+async fn the_menu_button_has_roles_and_one_tab_stop() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");
     open(&page, "/").await;
@@ -878,14 +878,13 @@ async fn every_fallback_works_with_javascript_disabled() {
         .await
     );
 
-    // Nav: every dropdown link is visible.
-    assert!(shown(&page, MENU).await);
-    assert_eq!(attr(&page, TOGGLE, "aria-expanded").await, "true");
-    assert_eq!(
-        attr(&page, MENU, "role").await,
-        "",
-        "no role=menu without JS"
-    );
+    // Nav: the dropdown is a popover. `commandfor` opens it with JS off.
+    assert!(!shown(&page, MENU).await, "closed at first");
+    assert_eq!(attr(&page, MENU, "role").await, "menu");
+    page.click(&format!("#{TOGGLE}")).await.expect("open");
+    assert!(shown(&page, MENU).await, "commandfor opens the popover");
+    page.click("#title").await.expect("click outside");
+    assert!(!shown(&page, MENU).await, "light dismiss closes it");
 
     // Autocomplete: the `<noscript>` select is live and inside the form.
     assert!(

@@ -97,7 +97,7 @@ the changelog when a release is cut. See
 `autumn/src/ui/`, `autumn/vendor/autumn-widgets.js`, `autumn/src/stories/`
 and the other paths in its `paths:` filter. It also runs each week.
 
-The job runs five suites:
+The job runs six suites:
 
 - `stories_browser` loads each `/_stories/{slug}` page. It injects axe-core
   and fails on a `serious` or `critical` violation. It checks each page in
@@ -108,6 +108,9 @@ The job runs five suites:
 - `widgets_toast_browser` checks the #3399 toast: hover and focus pause the
   timer, the close button removes the toast and moves focus, and toasts
   show above a modal.
+- `widgets_popover_browser` checks the #3402 popover and dropdown menu: mouse
+  and keyboard, the APG menu-button keys, focus return, anchor positioning
+  and the no-JS fallback.
 - `widget_pack_browser` checks widget pack conformance (#3400): a good
   pack passes, three canary packs fail (axe, keyboard trap, console), and
   pack JS gets `autumn:init`.
@@ -127,6 +130,8 @@ cargo test -p autumn-web --features system-tests \
   --test integration_tests widgets_keyboard_browser -- --include-ignored
 cargo test -p autumn-web --features system-tests \
   --test integration_tests widgets_toast_browser -- --include-ignored
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests widgets_popover_browser -- --include-ignored
 cargo test -p autumn-web --features system-tests \
   --test integration_tests widget_pack_browser -- --include-ignored
 cargo test -p autumn-plugin-reference --features system-tests --lib \
