@@ -502,11 +502,9 @@
   }
 
   // ── popover menu (issue #3402) ────────────────────────────────────────────
-  // dropdown_menu and NavMenu are native popovers. The browser opens them from
-  // command/commandfor and gives light dismiss, Escape and focus return. This
-  // adds the rest of the APG menu button: aria-expanded, focus on open,
-  // ArrowDown/ArrowUp on the button, Space on a link, and Tab or a click on an
-  // item to close. The keyboard core gives the arrows, Home/End and typeahead.
+  // dropdown_menu and NavMenu are native popovers: the browser opens them from
+  // command/commandfor and gives light dismiss and Escape. This adds the rest
+  // of the APG menu button. The keyboard core gives arrows, Home/End, typeahead.
 
   var MENU = '[data-autumn-menu]';
   var MENU_BUTTON = '[aria-haspopup="menu"][commandfor]';
@@ -517,13 +515,12 @@
     return m && m.matches(MENU) ? m : null;
   }
 
-  // Older browsers throw on `:popover-open`. They have no open popover.
+  // Old browsers throw on `:popover-open`: they have no open popover.
   function isOpen(el) {
     try { return el.matches(':popover-open'); } catch (_) { return false; }
   }
 
-  // A popover (`data-autumn-popover`) and a menu both need aria-expanded.
-  // Only a menu moves focus.
+  // A popover and a menu both get aria-expanded. Only a menu moves focus.
   var POPOVER = MENU + ',[data-autumn-popover]';
 
   function initMenu(menu) {
@@ -537,7 +534,7 @@
     var open = e.newState === 'open';
     var trigger = triggerOf(menu);
     if (trigger) trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
-    // Another menu's closing event must not drop this menu's request.
+    // Only this menu's own event may use its request.
     var req = menuAt;
     if (!req || req.menu !== menu) return;
     menuAt = null;
@@ -557,8 +554,8 @@
     var item = e.target.closest(MENU + ' [role="menuitem"]');
     var owner = item && item.closest(MENU);
     if (!owner || e.defaultPrevented || item.getAttribute('aria-disabled') === 'true') return;
-    // Close after the item acts (a submit, a link, a command). Some browsers
-    // do not focus a clicked button, so focus the trigger here.
+    // Close after the item acts. Focus the trigger: some browsers do not
+    // focus a clicked button.
     setTimeout(function () {
       if (!isOpen(owner)) return;
       var opener = triggerOf(owner);
@@ -589,7 +586,7 @@
         if (all.length) focusItem(menu, e.key === 'ArrowUp' ? all[all.length - 1] : all[0]);
       } else {
         try {
-          // `source` makes the button the implicit anchor, as `commandfor` does.
+          // `source` anchors the panel to the button, as `commandfor` does.
           menu.showPopover({ source: triggerOf(menu) });
         } catch (_) {
           menuAt = null;
@@ -599,8 +596,7 @@
     }
     var inside = t.closest(MENU);
     if (!inside) return;
-    // Escape and Tab: focus the trigger first, so focus does not depend on
-    // the browser restoring it. Tab then moves on from the button.
+    // Escape and Tab: focus the trigger first. Tab then moves on from it.
     if (e.key === 'Escape' && isOpen(inside)) {
       var back = triggerOf(inside);
       if (back) back.focus();

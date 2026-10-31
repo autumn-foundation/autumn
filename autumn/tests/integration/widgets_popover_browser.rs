@@ -258,10 +258,7 @@ async fn boxes(page: &Page, id: &str) -> [(f64, f64, f64, f64); 2] {
          f(document.getElementById('{id}').getBoundingClientRect())]); }})()"
     );
     let v: Vec<[f64; 4]> = serde_json::from_str(&eval_string(page, &js).await).expect("rects");
-    [
-        (v[0][0], v[0][1], v[0][2], v[0][3]),
-        (v[1][0], v[1][1], v[1][2], v[1][3]),
-    ]
+    [v[0].into(), v[1].into()]
 }
 
 async fn open_and_measure(page: &Page, id: &str) -> [(f64, f64, f64, f64); 2] {
