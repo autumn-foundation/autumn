@@ -576,7 +576,7 @@ struct Package {
     text: String,
     /// The parsed form of `text`.
     table: toml::Table,
-    /// The features that the crate declares.
+    /// The features that the crate declares, on any host.
     declared: BTreeSet<String>,
     /// The root of the build of the crate: its workspace root, or its own
     /// directory when no workspace has it as a member. Each build is solved
@@ -797,7 +797,7 @@ fn solve_features(packages: &[Package], selection: &CargoFeatures) -> Vec<BTreeS
         .collect();
     let own: Vec<Vec<String>> = packages
         .iter()
-        .map(|package| own_requests(&package.table, selection))
+        .map(|package| own_requests(&package.declared, selection))
         .collect();
     let mut extra: Vec<BTreeSet<String>> = vec![BTreeSet::new(); packages.len()];
     loop {
@@ -958,14 +958,13 @@ fn declared_features(table: &toml::Table) -> BTreeSet<String> {
 /// The names that `selection` asks for in the package of `table`. As Cargo
 /// does, a plain name counts only in a package that declares it. A
 /// `pkg/feature` name is kept for [`enabled_features`] to resolve.
-fn own_requests(table: &toml::Table, selection: &CargoFeatures) -> Vec<String> {
-    let declared = declared_features(table);
+fn own_requests(declared: &BTreeSet<String>, selection: &CargoFeatures) -> Vec<String> {
     let mut names: Vec<String> = requested_names(selection)
         .into_iter()
         .filter(|name| name.contains('/') || declared.contains(name))
         .collect();
     if selection.all {
-        names.extend(declared);
+        names.extend(declared.iter().cloned());
     }
     names
 }
@@ -981,7 +980,7 @@ fn enabled_features(
 ) -> Option<BTreeSet<String>> {
     let table = toml::from_str::<toml::Table>(manifest).ok()?;
     table.get("package")?;
-    let own = own_requests(&table, selection);
+    let own = own_requests(&declared_features(&table), selection);
     Some(enabled_from(manifest, &own, extra, selection.no_default))
 }
 
@@ -1034,13 +1033,14 @@ fn scan_off_source(src: &str, file: &str, scan: &mut Scan) {
 
 /// The module files that a `cfg` that is off takes out of the build.
 ///
-/// A file is out when its `#![cfg(…)]` is off, when the `mod name;` that
-/// declares it is under a `cfg` that is off, or when its parent file is out.
+/// A file is out when its `#![cfg(…)]` is off. It is also out when each
+/// `mod name;` that declares it is under a `cfg` that is off, or is in a file
+/// that is out.
 /// A `mod` with a `#[path]` attribute is not followed.
 fn off_module_files(files: &[PathBuf], crates: &mut CrateFeatures<'_>) -> BTreeSet<PathBuf> {
     let mut self_off = BTreeSet::new();
-    // Each child module file: its parent file, and whether its `mod` is off.
-    let mut parent_of: HashMap<PathBuf, (PathBuf, bool)> = HashMap::new();
+    // Each child module file: each parent file, and whether its `mod` is off.
+    let mut parents_of: HashMap<PathBuf, Vec<(PathBuf, bool)>> = HashMap::new();
     for file in files {
         let Ok(src) = std::fs::read_to_string(file) else {
             continue;
@@ -1059,28 +1059,45 @@ fn off_module_files(files: &[PathBuf], crates: &mut CrateFeatures<'_>) -> BTreeS
                 dir.join(format!("{name}.rs")),
                 dir.join(&name).join("mod.rs"),
             ] {
-                parent_of.insert(child, (file.clone(), off));
+                parents_of
+                    .entry(child)
+                    .or_default()
+                    .push((file.clone(), off));
             }
         }
     }
-    let is_off = |file: &PathBuf| {
-        let mut current = file;
-        let mut seen = BTreeSet::new();
-        loop {
-            if self_off.contains(current) {
-                return true;
-            }
-            let Some((parent, off)) = parent_of.get(current) else {
-                return false;
-            };
-            // A module cycle is not valid Rust. Stop on it.
-            if *off || !seen.insert(current) {
-                return *off;
-            }
-            current = parent;
-        }
-    };
-    files.iter().filter(|file| is_off(file)).cloned().collect()
+    let mut memo = HashMap::new();
+    files
+        .iter()
+        .filter(|file| module_is_off(file, &self_off, &parents_of, &mut memo))
+        .cloned()
+        .collect()
+}
+
+/// Whether the module file `file` is out of the build. It is out when its own
+/// `#![cfg(…)]` is off, or when it has declarations and each one is off or
+/// sits in a file that is out.
+fn module_is_off(
+    file: &PathBuf,
+    self_off: &BTreeSet<PathBuf>,
+    parents_of: &HashMap<PathBuf, Vec<(PathBuf, bool)>>,
+    memo: &mut HashMap<PathBuf, bool>,
+) -> bool {
+    if self_off.contains(file) {
+        return true;
+    }
+    if let Some(&off) = memo.get(file) {
+        return off;
+    }
+    // A module cycle is not valid Rust. Read the file as live while it is open.
+    memo.insert(file.clone(), false);
+    let off = parents_of.get(file).is_some_and(|parents| {
+        parents
+            .iter()
+            .all(|(parent, gated)| *gated || module_is_off(parent, self_off, parents_of, memo))
+    });
+    memo.insert(file.clone(), off);
+    off
 }
 
 /// The directory that holds the files of the modules that `file` declares.
@@ -7419,6 +7436,24 @@ mod tests {
     }
 
     #[test]
+    fn a_module_file_with_one_live_declaration_is_kept() {
+        // `lib.rs` declares it. A gated `main.rs` declaration does not take
+        // it out.
+        let dir = module_crate(&[
+            ("lib.rs", "pub mod admin;\n"),
+            (
+                "main.rs",
+                "#[cfg(feature = \"admin\")]\nmod admin;\nfn main() {}\n",
+            ),
+            ("admin.rs", ADMIN_PAGE),
+        ]);
+        assert_eq!(
+            routes_in(dir.path(), &CargoFeatures::default()),
+            vec!["GET /admin".to_owned()]
+        );
+    }
+
+    #[test]
     fn a_module_file_under_an_off_parent_is_dropped() {
         let dir = module_crate(&[
             ("lib.rs", "mod admin;\n"),
@@ -7855,6 +7890,29 @@ mod tests {
             "{WS_ROOT}\n[patch.crates-io]\nviews = {{ path = \"views\" }}\n"
         )));
         assert!(!check(WS_ROOT));
+    }
+
+    #[test]
+    fn an_optional_dependency_of_another_host_is_still_a_feature() {
+        // Cargo turns on `feature = "extra"` on any host, but does not build
+        // the dependency.
+        let views = "[package]\nname = \"views\"\nversion = \"0.1.0\"\n\n\
+            [target.'cfg(any())'.dependencies]\nextra = { path = \"../extra\", optional = true }\n";
+        let dir = workspace(
+            "extra",
+            &[
+                ("Cargo.toml", WS_ROOT),
+                ("app/Cargo.toml", &app_manifest("")),
+                ("views/Cargo.toml", views),
+            ],
+        );
+        assert!(views_gate_on(&dir, &with_features(&["extra"])));
+        let all = CargoFeatures {
+            all: true,
+            ..CargoFeatures::default()
+        };
+        assert!(views_gate_on(&dir, &all));
+        assert!(!views_gate_on(&dir, &CargoFeatures::default()));
     }
 
     #[test]
