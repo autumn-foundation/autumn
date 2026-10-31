@@ -1065,6 +1065,20 @@ impl Page {
         Ok(self)
     }
 
+    /// Click the viewport point `(x, y)` with a real mouse event.
+    ///
+    /// Use it to hit what has no element, such as a dialog backdrop.
+    ///
+    /// # Errors
+    /// CDP errors.
+    pub async fn click_at(&self, x: f64, y: f64) -> Result<&Self, SystemTestError> {
+        self.inner
+            .click(chromiumoxide::layout::Point::new(x, y))
+            .await?;
+        self.wait_for_hx_settle().await?;
+        Ok(self)
+    }
+
     /// Press one key on the focused element, as a user does.
     ///
     /// Sends real CDP `keyDown`/`keyUp` events, so the browser runs its

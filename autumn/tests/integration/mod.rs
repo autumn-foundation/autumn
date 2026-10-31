@@ -610,6 +610,10 @@ mod widgets_badge;
 #[cfg(feature = "maud")]
 mod widgets_charts;
 #[cfg(feature = "maud")]
+mod widgets_drawer;
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_drawer_browser;
+#[cfg(feature = "maud")]
 mod widgets_infinite_feed;
 #[cfg(all(feature = "system-tests", feature = "maud"))]
 mod widgets_keyboard_browser;

@@ -137,6 +137,7 @@ fn widgets_css_path_and_selectors_are_stable() {
         ".autumn-autocomplete",
         ".autumn-nav",
         ".autumn-modal",
+        ".autumn-drawer",
         ".autumn-tabs",
         ".autumn-pager",
         ".autumn-breadcrumb",

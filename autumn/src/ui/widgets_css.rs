@@ -346,6 +346,35 @@ mod tests {
         }
     }
 
+    /// The drawer paints the token surface and has a rule for each edge,
+    /// size and close button.
+    #[test]
+    fn drawer_uses_tokens_and_styles_every_variant() {
+        let body = rule_body(".autumn-drawer");
+        for declaration in ["background: var(--surface);", "color: var(--text);"] {
+            assert!(body.contains(declaration), "missing `{declaration}`:{body}");
+        }
+        for selector in [
+            ".autumn-drawer--left",
+            ".autumn-drawer--right",
+            ".autumn-drawer--top",
+            ".autumn-drawer--bottom",
+            ".autumn-drawer--sm",
+            ".autumn-drawer--lg",
+            ".autumn-drawer--full",
+            ".autumn-modal--sm",
+            ".autumn-modal--lg",
+            ".autumn-modal--full",
+            ".autumn-modal__close",
+            ".autumn-drawer__close",
+        ] {
+            assert!(
+                WIDGETS_COMPONENT_CSS.contains(selector),
+                "no rule: {selector}"
+            );
+        }
+    }
+
     /// The exit animation cancels the region gap, which density scales.
     #[test]
     fn toast_exit_follows_the_density_gap() {
