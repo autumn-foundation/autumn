@@ -481,15 +481,19 @@ mod tests {
         let body = rule_body(".autumn-tooltip__bubble");
         assert!(body.contains("display: none;"), "{body}");
         assert!(body.contains("pointer-events: auto;"), "{body}");
-        assert!(
-            lf_css().contains(
-                ".autumn-tooltip:hover > .autumn-tooltip__bubble:not([popover]),\n\
-                 .autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble:not([popover]),\n\
-                 .autumn-tooltip > .autumn-tooltip__bubble[popover]:popover-open {\n    \
-                 display: block;"
-            ),
-            "missing the show selectors"
-        );
+        // One rule for each selector. A browser without `:has()` or
+        // `:popover-open` drops a whole selector list, so a list would lose
+        // the hover baseline too.
+        for selector in [
+            ".autumn-tooltip:hover > .autumn-tooltip__bubble:not([popover])",
+            ".autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble:not([popover])",
+            ".autumn-tooltip > .autumn-tooltip__bubble[popover]:popover-open",
+        ] {
+            assert!(
+                lf_css().contains(&format!("\n{selector} {{\n    display: block;\n}}")),
+                "`{selector}` must be a rule of its own"
+            );
+        }
         // Browsers without `:has()` show on any focus.
         let block =
             css_block("@supports not selector(:has(a)) {\n    .autumn-tooltip:focus-within");

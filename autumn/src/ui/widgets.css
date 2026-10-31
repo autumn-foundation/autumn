@@ -1526,9 +1526,16 @@
     inset: calc(-1 * var(--autumn-tooltip-gap));
 }
 
-/* A popover shows only when open: the browser shows it. */
-.autumn-tooltip:hover > .autumn-tooltip__bubble:not([popover]),
-.autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble:not([popover]),
+/* One rule for each selector: a browser drops a whole list when it does
+   not know one pseudo-class in it. A popover shows only when open. */
+.autumn-tooltip:hover > .autumn-tooltip__bubble:not([popover]) {
+    display: block;
+}
+
+.autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble:not([popover]) {
+    display: block;
+}
+
 .autumn-tooltip > .autumn-tooltip__bubble[popover]:popover-open {
     display: block;
 }

@@ -820,9 +820,18 @@
   // trigger closes.
   function initTooltip(wrap) {
     var tip = tipIn(wrap);
-    var trigger = tip && triggerOf(tip);
+    if (!tip) return;
+    var trigger = triggerOf(tip);
     if (!trigger || !wrap.contains(trigger) || !trigger.matches('button:not(:disabled), a[href]') ||
-      !('interestForElement' in trigger)) return;
+      !('interestForElement' in trigger)) {
+      // A new trigger that gets no interest: go back to the CSS mode.
+      if (tip.hasAttribute('popover')) {
+        if (tip.matches(':popover-open')) tip.hidePopover();
+        tip.removeAttribute('popover');
+        tip.setAttribute('data-autumn-dismiss', 'escape');
+      }
+      return;
+    }
     if (tip.matches('[popover]:popover-open') && !trigger.hasAttribute('interestfor')) tip.hidePopover();
     tip.removeAttribute('data-autumn-dismiss');
     tip.hidden = false;

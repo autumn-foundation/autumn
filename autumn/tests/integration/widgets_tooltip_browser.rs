@@ -112,6 +112,13 @@ fn body() -> Markup {
             div id="slot" {}
             // An htmx swap replaces the trigger.
             (tooltip("swap-tip", "Copies the link", swap_button))
+            // An htmx swap replaces the trigger with a disabled one.
+            (tooltip("swapoff-tip", "Sends the form", |tip| {
+                html! {
+                    button id="swapoff" type="button" aria-describedby=(tip) hx-get="/swap-off"
+                        hx-swap="outerHTML" { "Send" }
+                }
+            }))
             // A disabled trigger.
             (tooltip("off-tip", "Sign in to edit", |tip| {
                 html! { button id="off" type="button" disabled aria-describedby=(tip) { "Edit" } }
@@ -188,6 +195,13 @@ async fn swap() -> Markup {
     }
 }
 
+#[get("/swap-off")]
+async fn swap_off() -> Markup {
+    html! {
+        button id="swappedoff" type="button" disabled aria-describedby="swapoff-tip" { "Sent" }
+    }
+}
+
 #[get("/fragment")]
 async fn fragment() -> Markup {
     tooltip("late-tip", "Swapped in", |tip| {
@@ -203,7 +217,8 @@ async fn runner() -> SystemTestRunner {
                 interest_page,
                 no_runtime_page,
                 fragment,
-                swap
+                swap,
+                swap_off
             ])
             .plugin_assets(&FIXTURE)
             .build(),
@@ -746,6 +761,38 @@ async fn a_swapped_trigger_keeps_its_tooltip() {
         }
         assert_eq!(active_id(&page).await, "swapped");
         expect_shown(&page, "swap-tip", &format!("{mode:?}: new trigger")).await;
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// An htmx swap to a disabled trigger goes back to the CSS mode: hover
+/// shows the text, and Escape hides it.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_swap_to_a_disabled_trigger_goes_back_to_the_css_mode() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    for mode in MODES {
+        open(&page, mode).await;
+        page.click("#swapoff").await.expect("click");
+        assert!(
+            poll(&page, "!!document.getElementById('swappedoff')").await,
+            "the swap runs"
+        );
+        assert!(
+            poll(
+                &page,
+                "(() => { const t = document.getElementById('swapoff-tip'); \
+                 return !t.hasAttribute('popover') && t.getAttribute('data-autumn-dismiss') === 'escape'; })()"
+            )
+            .await,
+            "{mode:?}: the text is back in the CSS mode"
+        );
+        move_away(&page).await;
+        page.hover("#swappedoff").await.expect("hover");
+        expect_shown(&page, "swapoff-tip", &format!("{mode:?}: hover")).await;
+        page.press("Escape").await.expect("Escape");
+        expect_hidden(&page, "swapoff-tip", &format!("{mode:?}: Escape")).await;
     }
     page.expect_no_console_errors().await.expect("no errors");
 }
