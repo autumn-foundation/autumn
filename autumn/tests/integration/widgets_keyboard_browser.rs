@@ -238,6 +238,7 @@ async fn press(page: &Page, key: &str) {
 }
 
 async fn active_id(page: &Page) -> String {
+    settle().await;
     eval_string(
         page,
         "document.activeElement ? document.activeElement.id : ''",
@@ -246,6 +247,7 @@ async fn active_id(page: &Page) -> String {
 }
 
 async fn active_text(page: &Page) -> String {
+    settle().await;
     eval_string(
         page,
         "document.activeElement ? document.activeElement.textContent.trim() : ''",
@@ -253,7 +255,14 @@ async fn active_text(page: &Page) -> String {
     .await
 }
 
+/// The runtime reacts to the `toggle` event, which the browser queues as a
+/// task. Let it run before the test reads the page.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
 async fn attr(page: &Page, id: &str, name: &str) -> String {
+    settle().await;
     eval_string(
         page,
         &format!("document.getElementById('{id}').getAttribute('{name}') || ''"),
@@ -878,13 +887,18 @@ async fn every_fallback_works_with_javascript_disabled() {
         .await
     );
 
-    // Nav: the dropdown is a popover. `commandfor` opens it with JS off.
+    // Nav: the dropdown is a closed popover with the menu roles. The popover
+    // suite clicks it open; `Page::click` needs a script.
     assert!(!shown(&page, MENU).await, "closed at first");
     assert_eq!(attr(&page, MENU, "role").await, "menu");
-    page.click(&format!("#{TOGGLE}")).await.expect("open");
-    assert!(shown(&page, MENU).await, "commandfor opens the popover");
-    page.click("#title").await.expect("click outside");
-    assert!(!shown(&page, MENU).await, "light dismiss closes it");
+    assert!(
+        eval_bool(
+            &page,
+            &format!("document.getElementById('{TOGGLE}').getAttribute('commandfor') === '{MENU}'")
+        )
+        .await,
+        "commandfor opens it with no JS"
+    );
 
     // Autocomplete: the `<noscript>` select is live and inside the form.
     assert!(

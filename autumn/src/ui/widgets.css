@@ -812,8 +812,13 @@
     .autumn-popover__panel[data-side="start"][data-align="end"] { position-area: inline-start span-block-start; }
 }
 
-.autumn-menu {
+/* `display` only while open: a `display` on the closed popover would beat the
+   UA rule that hides it. */
+.autumn-menu:popover-open {
     display: flex;
+}
+
+.autumn-menu {
     flex-direction: column;
     min-width: 10rem;
     padding: var(--space-1);

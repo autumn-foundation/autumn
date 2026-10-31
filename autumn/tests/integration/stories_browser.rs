@@ -173,7 +173,14 @@ async fn focus(page: &Page, selector: &str) {
     );
 }
 
+/// The runtime reacts to the `toggle` event, which the browser queues as a
+/// task. Let it run before the test reads the page.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
 async fn attr(page: &Page, selector: &str, name: &str) -> String {
+    settle().await;
     eval_string(
         page,
         &format!(
@@ -185,6 +192,7 @@ async fn attr(page: &Page, selector: &str, name: &str) -> String {
 }
 
 async fn active_id(page: &Page) -> String {
+    settle().await;
     eval_string(
         page,
         "document.activeElement ? document.activeElement.id : ''",
@@ -193,6 +201,7 @@ async fn active_id(page: &Page) -> String {
 }
 
 async fn active_text(page: &Page) -> String {
+    settle().await;
     eval_string(
         page,
         "document.activeElement ? document.activeElement.textContent.trim() : ''",
