@@ -590,20 +590,18 @@
   });
 
   // ── non-modal drawer (#3403) ──────────────────────────────────────────────
-  // The invoker commands have no non-modal `show`, so drawer_trigger emits
-  // data-drawer-open for a drawer that is not modal. A non-modal <dialog>
-  // gets no Escape from the browser; closedby="any" does it where supported.
-  // Elsewhere, close it on Escape when focus is inside it.
+  // Invoker commands cannot `show()`, so a non-modal drawer trigger has
+  // data-drawer-open and toggles. Escape is the fallback for browsers
+  // without closedby="closerequest".
   document.addEventListener('click', function (e) {
-    var opener = e.target.closest && e.target.closest('[data-drawer-open]');
-    if (!opener) return;
-    var d = document.getElementById(opener.getAttribute('data-drawer-open'));
-    if (d && d.show && !d.open) d.show();
+    var o = e.target.closest && e.target.closest('[data-drawer-open]');
+    var d = o && document.getElementById(o.getAttribute('data-drawer-open'));
+    if (d && d.show) d.open ? d.close() : d.show();
   });
   document.addEventListener('keydown', function (e) {
-    if (e.key !== 'Escape' || e.defaultPrevented) return;
-    var d = e.target.closest && e.target.closest('dialog[closedby="any"][open]');
-    if (d && !d.matches(':modal')) d.close();
+    var d = e.key === 'Escape' && e.target.closest &&
+      e.target.closest('.autumn-drawer[open]:not(:modal)');
+    if (d) d.close();
   });
 
   // ── theme_toggle (#3396) ──────────────────────────────────────────────────

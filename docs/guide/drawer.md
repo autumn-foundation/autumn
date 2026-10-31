@@ -43,9 +43,13 @@ commands have no non-modal `show`, so `drawer_trigger` emits
 
 ## Dismissal
 
-`light_dismiss` emits `closedby="any"`. Escape and a click on the backdrop
-close the drawer. `autumn-widgets.js` fills in browsers without
-`closedby`. Escape always closes a modal drawer.
+A modal drawer closes on Escape. With `light_dismiss`, it also closes on a
+click on the backdrop (`closedby="any"`). `autumn-widgets.js` adds the same
+behavior in browsers that lack `closedby`.
+
+A non-modal drawer ignores clicks on the page. With `light_dismiss`, Escape
+closes it (`closedby="closerequest"`). The trigger toggles it. Pass the same
+`DrawerConfig` to `drawer` and `drawer_trigger`.
 
 ## CSS hooks
 

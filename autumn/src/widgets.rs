@@ -4257,18 +4257,22 @@ impl DrawerConfig {
         self
     }
 
-    /// `true` (default): opens with `showModal()`. Focus is trapped and the
-    /// page behind is inert. `false`: opens with `show()`. The page stays
-    /// usable. Open it with [`drawer_trigger`] (needs `autumn-widgets.js`)
-    /// or [`DrawerConfig::open`].
+    /// `true` (default): opens with `showModal()`. The browser traps focus
+    /// and makes the page inert.
+    ///
+    /// `false`: opens with `show()`. The page stays usable. Open it with
+    /// [`drawer_trigger`] (needs `autumn-widgets.js`) or [`DrawerConfig::open`].
+    /// Pass the same config to [`drawer`] and [`drawer_trigger`].
     #[must_use]
     pub const fn modal(mut self, modal: bool) -> Self {
         self.modal = modal;
         self
     }
 
-    /// `true` (default): emits `closedby="any"`. Escape and an outside click
-    /// close the drawer. See [`ModalConfig::light_dismiss`] for support notes.
+    /// `true` (default): Escape closes the drawer. A modal drawer also closes
+    /// on a click on the backdrop (`closedby="any"`; see
+    /// [`ModalConfig::light_dismiss`]). A non-modal drawer ignores page clicks
+    /// (`closedby="closerequest"`).
     #[must_use]
     pub const fn light_dismiss(mut self, light_dismiss: bool) -> Self {
         self.light_dismiss = light_dismiss;
@@ -4326,15 +4330,19 @@ impl DrawerConfig {
 #[must_use]
 pub fn drawer(id: &str, title: &str, body: &maud::Markup, config: &DrawerConfig) -> maud::Markup {
     let size_class = config.size.modifier("autumn-drawer");
-    let root_class = merge_class(
-        &merge_class(
-            &merge_class("autumn-drawer", Some(config.side.class())),
-            size_class.as_deref(),
-        ),
-        config.class.as_deref(),
-    );
+    let classes = [
+        Some("autumn-drawer"),
+        Some(config.side.class()),
+        size_class.as_deref(),
+        config.class.as_deref().filter(|c| !c.is_empty()),
+    ];
+    let root_class = classes.into_iter().flatten().collect::<Vec<_>>().join(" ");
     let title_id = format!("{id}-title");
-    let closedby = config.light_dismiss.then_some("any");
+    let closedby = match (config.light_dismiss, config.modal) {
+        (false, _) => None,
+        (true, true) => Some("any"),
+        (true, false) => Some("closerequest"),
+    };
     let aria_modal = config.modal.then_some("true");
     let open = config.open && !config.modal;
     maud::html! {

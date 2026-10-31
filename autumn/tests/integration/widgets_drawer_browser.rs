@@ -50,6 +50,7 @@ fn content(scripts: bool) -> Markup {
         .side(DrawerSide::Left)
         .size(DialogSize::Sm);
     let bottom = DrawerConfig::new().side(DrawerSide::Bottom);
+    let top = DrawerConfig::new().side(DrawerSide::Top);
     let panel = DrawerConfig::new().modal(false).close_button("Close panel");
     let sticky = DrawerConfig::new().light_dismiss(false);
     let wide = ModalConfig::new()
@@ -64,6 +65,7 @@ fn content(scripts: bool) -> Markup {
             div id="open-right" { (modal_trigger("Open right", "right", None)) }
             (modal_trigger("Open left", "left", None))
             (modal_trigger("Open bottom", "bottom", None))
+            (modal_trigger("Open top", "top", None))
             (modal_trigger("Open sticky", "sticky", None))
             (modal_trigger("Open wide", "wide", None))
             (modal_trigger("Open small", "small", None))
@@ -72,6 +74,7 @@ fn content(scripts: bool) -> Markup {
             (drawer("right", "Right", &body, &right))
             (drawer("left", "Left", &body, &left))
             (drawer("bottom", "Bottom", &body, &bottom))
+            (drawer("top", "Top", &body, &top))
             (drawer("sticky", "Sticky", &body, &sticky))
             (drawer("panel", "Panel", &body, &panel))
             (modal("wide", "Wide", &body, &wide))
@@ -197,6 +200,23 @@ async fn modal_drawer_traps_focus_and_returns_it_on_escape() {
         "focus moves in"
     );
 
+    // Tab reaches the close button and the input.
+    let mut seen = String::new();
+    for _ in 0..6 {
+        page.press("Tab").await.expect("tab");
+        let id = page
+            .evaluate("document.activeElement.id + '|' + document.activeElement.className")
+            .await
+            .ok()
+            .and_then(|r| r.into_value::<String>().ok())
+            .unwrap_or_default();
+        seen.push_str(&id);
+    }
+    assert!(
+        seen.contains("autumn-drawer__close"),
+        "close button: {seen}"
+    );
+    assert!(seen.contains("inside"), "input: {seen}");
     // Tab may leave for the browser UI (`body`). It never reaches the page behind.
     for _ in 0..6 {
         page.press("Tab").await.expect("tab");
@@ -230,7 +250,12 @@ async fn backdrop_click_dismisses_each_edge() {
     let page = runner.page().await.expect("page");
     open(&page, "/").await;
 
-    for (id, side) in [("right", "right"), ("left", "left"), ("bottom", "bottom")] {
+    for (id, side) in [
+        ("right", "right"),
+        ("left", "left"),
+        ("bottom", "bottom"),
+        ("top", "top"),
+    ] {
         activate(&page, &trigger(id)).await;
         wait_for(&page, &is_open(id)).await;
         click_backdrop(&page, id, side).await;
@@ -276,6 +301,11 @@ async fn without_light_dismiss_a_backdrop_click_keeps_the_drawer_open() {
     click_backdrop(&page, "sticky", "right").await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(eval_bool(&page, &is_open("sticky")).await);
+    assert!(eval_bool(&page, "document.getElementById('sticky').matches(':modal')").await);
+    assert!(
+        eval_bool(&page, &focus_inside("sticky")).await,
+        "focus stays in"
+    );
     page.press("Escape").await.expect("escape");
     wait_for(&page, &format!("!{}", is_open("sticky"))).await;
 }
@@ -369,6 +399,7 @@ async fn modal_sizes_apply_and_the_close_button_works() {
 
     activate(&page, &trigger("small")).await;
     wait_for(&page, &is_open("small")).await;
+    settle(&page).await;
     let small = eval_f64(
         &page,
         "document.getElementById('small').getBoundingClientRect().width",
@@ -378,6 +409,7 @@ async fn modal_sizes_apply_and_the_close_button_works() {
 
     activate(&page, &trigger("wide")).await;
     wait_for(&page, &is_open("wide")).await;
+    settle(&page).await;
     let wide = eval_f64(
         &page,
         "document.getElementById('wide').getBoundingClientRect().width",
@@ -408,6 +440,20 @@ async fn non_modal_drawer_leaves_the_page_usable() {
     activate(&page, "#after").await;
     assert!(eval_bool(&page, "document.activeElement.id === 'after'").await);
     assert!(eval_bool(&page, &is_open("panel")).await, "it stays open");
+
+    // A click on the page does not close it.
+    page.click("#title").await.expect("click page");
+    assert!(
+        eval_bool(&page, &is_open("panel")).await,
+        "page click keeps it open"
+    );
+    // The trigger toggles it.
+    activate(&page, "[data-drawer-open='panel']").await;
+    wait_for(&page, &format!("!{}", is_open("panel"))).await;
+    page.click("[data-drawer-open='panel']")
+        .await
+        .expect("reopen");
+    wait_for(&page, &is_open("panel")).await;
 
     // Escape inside the drawer closes it.
     assert!(
@@ -459,6 +505,12 @@ async fn modal_drawer_works_without_js() {
         .await,
         "focus returns to the trigger"
     );
+
+    // The native `closedby` attribute closes it on a backdrop click.
+    activate(&page, &trigger("right")).await;
+    wait_for(&page, &is_open("right")).await;
+    click_backdrop(&page, "right", "right").await;
+    wait_for(&page, &format!("!{}", is_open("right"))).await;
 
     activate(&page, &trigger("right")).await;
     wait_for(&page, &is_open("right")).await;

@@ -103,9 +103,18 @@ fn drawer_is_modal_and_light_dismissible_by_default() {
 }
 
 #[test]
+fn non_modal_drawer_closes_on_escape_not_on_outside_click() {
+    let out = render(&DrawerConfig::new().modal(false));
+    assert!(out.contains(r#"closedby="closerequest""#), "{out}");
+    assert!(!out.contains(r#"closedby="any""#), "{out}");
+}
+
+#[test]
 fn drawer_light_dismiss_can_be_turned_off() {
-    let out = render(&DrawerConfig::new().light_dismiss(false));
-    assert!(!out.contains("closedby"), "{out}");
+    for modal in [true, false] {
+        let out = render(&DrawerConfig::new().modal(modal).light_dismiss(false));
+        assert!(!out.contains("closedby"), "{out}");
+    }
 }
 
 #[test]
