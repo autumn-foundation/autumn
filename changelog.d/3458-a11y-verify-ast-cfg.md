@@ -12,4 +12,4 @@
   solves them (issue #3458). A `--features` name is on only in the crates
   that declare it. A crate turns on the features that it asks for in a path
   dependency of the same workspace. A target table counts only when its `cfg`
-  is true on the host. Only the route attribution changes. [no-plugin]
+  or its triple matches the host. Only the route attribution changes. [no-plugin]

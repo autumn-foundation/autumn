@@ -737,8 +737,9 @@ workspace:
 - the `views/a` and `views?/a` entries of its enabled features.
 
 A `[workspace.dependencies]` entry and a `[patch]` entry with a path count
-too. A target table counts when its `cfg` is true on the host. Each workspace
-is solved alone. Resolver 1 also counts dev and build dependencies.
+too. A target table counts when its `cfg` or its triple matches the host. A
+target `cfg` that the scan cannot decide does not count. Each workspace is
+solved alone. Resolver 1 also counts dev and build dependencies.
 
 A predicate that the scan cannot decide (`target_env = "gnu"`) keeps the item.
 A file with no package manifest also keeps it. A finding inside a gated item

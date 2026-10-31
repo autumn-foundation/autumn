@@ -84,7 +84,7 @@
 //! - A `--features` name is on in each crate that declares it.
 //! - A crate turns on the features that it asks for in a path dependency of
 //!   the same workspace.
-//! - A target table counts when its `cfg` is true on the host.
+//! - A target table counts when its `cfg` or its triple matches the host.
 //! - Resolver 1 also counts dev and build dependencies.
 //!
 //! Known limits. Each one can lose or keep an attribution. None changes a
@@ -838,9 +838,14 @@ fn solve_features(packages: &[Package], selection: &CargoFeatures) -> Vec<BTreeS
     }
 }
 
-/// Whether a `[target.'…']` key holds on the host that runs the scan.
-/// `None` when the scan cannot decide it, as for a target triple.
+/// Whether a `[target.'…']` key holds on the host that runs the scan: a
+/// `cfg(…)` predicate, or a target triple. `None` when the scan cannot decide
+/// it.
 fn host_cfg(key: &str) -> Option<bool> {
+    if !key.trim_start().starts_with("cfg") {
+        let host = env!("AUTUMN_HOST_TARGET");
+        return (!host.is_empty()).then(|| key.trim() == host);
+    }
     let meta = syn::parse_str::<syn::Meta>(key).ok()?;
     let syn::Meta::List(list) = &meta else {
         return None;
@@ -877,6 +882,8 @@ fn host_cfg_meta(meta: &syn::Meta) -> Option<bool> {
                 "target_family" => std::env::consts::FAMILY.to_owned(),
                 "target_arch" => std::env::consts::ARCH.to_owned(),
                 "target_pointer_width" => usize::BITS.to_string(),
+                "target_env" => env!("AUTUMN_TARGET_ENV").to_owned(),
+                "target_vendor" => env!("AUTUMN_TARGET_VENDOR").to_owned(),
                 "target_endian" => if cfg!(target_endian = "little") {
                     "little"
                 } else {
@@ -7714,6 +7721,11 @@ mod tests {
             "[target.'cfg(any())'.dependencies]\nviews = { path = \"../views\", features = [\"extra\"] }\n",
             &none
         ));
+        let triple = format!(
+            "[target.{}.dependencies]\nviews = {{ path = \"../views\", features = [\"extra\"] }}\n",
+            env!("AUTUMN_HOST_TARGET")
+        );
+        assert!(extra_on(&triple, &none));
 
         // A dev or build dependency is not in the build of `views`.
         assert!(!extra_on(
@@ -7861,13 +7873,14 @@ mod tests {
             host_cfg("cfg(any(unix, windows, target_os = \"wasi\"))"),
             Some(true)
         );
-        // The scan cannot decide these.
-        assert_eq!(host_cfg("cfg(target_env = \"gnu\")"), None);
-        assert_eq!(host_cfg("x86_64-unknown-linux-gnu"), None);
-        assert_eq!(
-            host_cfg("cfg(all(target_env = \"gnu\", any()))"),
-            Some(false)
-        );
+        // A target triple, and `target_env`, read the build target.
+        assert_eq!(host_cfg(env!("AUTUMN_HOST_TARGET")), Some(true));
+        assert_eq!(host_cfg("riscv64gc-unknown-plan9"), Some(false));
+        let target_env = format!("cfg(target_env = \"{}\")", env!("AUTUMN_TARGET_ENV"));
+        assert_eq!(host_cfg(&target_env), Some(true));
+        // The scan cannot decide this one.
+        assert_eq!(host_cfg("cfg(panic = \"unwind\")"), None);
+        assert_eq!(host_cfg("cfg(all(panic = \"unwind\", any()))"), Some(false));
     }
 
     #[test]
