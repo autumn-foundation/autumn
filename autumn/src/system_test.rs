@@ -152,6 +152,14 @@ use crate::browser_detect::{browser_candidates, find_chromium};
 
 // ── SystemTestError ────────────────────────────────────────────────────────
 
+/// Run axe-core and return the serious and critical violations as a JSON
+/// array of strings. See [`Page::axe_violations`].
+const AXE_RUN_JS: &str = "axe.run(document, { resultTypes: ['violations'] }).then(r => JSON.stringify(\
+    r.violations\
+      .filter(v => v.impact === 'serious' || v.impact === 'critical')\
+      .map(v => `${v.id} (${v.impact}): ${v.help} -> ` \
+        + v.nodes.slice(0, 5).map(n => n.target.join(' ')).join(', '))))";
+
 /// Errors produced by the system-test harness.
 #[derive(Debug, thiserror::Error)]
 pub enum SystemTestError {
@@ -342,6 +350,8 @@ pub struct SystemTest {
     /// App-wide Tower layers registered via [`SystemTest::layer`], applied in
     /// the same router position as [`crate::app::AppBuilder::layer`].
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    /// Asset bundles from [`SystemTest::plugin_assets`].
+    plugin_assets: Vec<&'static crate::assets::PluginAssets>,
     /// `WebMCP` settings from [`SystemTest::mount_webmcp`].
     #[cfg(feature = "webmcp")]
     webmcp: Option<crate::webmcp::WebMcpRuntime>,
@@ -372,6 +382,7 @@ impl SystemTest {
             hx_settle_timeout: DEFAULT_HX_SETTLE_TIMEOUT,
             state_override: None,
             custom_layers: Vec::new(),
+            plugin_assets: Vec::new(),
             #[cfg(feature = "webmcp")]
             webmcp: None,
         }
@@ -464,6 +475,22 @@ impl SystemTest {
                 type_name: std::any::type_name::<L>(),
                 layer: layer.erase(),
             });
+        self
+    }
+
+    /// Serve a [`PluginAssets`](crate::assets::PluginAssets) bundle.
+    ///
+    /// It works as
+    /// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets)
+    /// does. A widget pack test uses it for the pack CSS and JS.
+    pub fn plugin_assets(mut self, assets: &'static crate::assets::PluginAssets) -> Self {
+        if !self
+            .plugin_assets
+            .iter()
+            .any(|installed| std::ptr::eq(*installed, assets))
+        {
+            self.plugin_assets.push(assets);
+        }
         self
     }
 
@@ -577,8 +604,18 @@ impl SystemTest {
                 .collect();
             crate::webmcp::install(&state, &docs, runtime, None, &config);
         }
-        crate::router::try_build_router_with_layers(self.routes, &config, state, self.custom_layers)
-            .unwrap_or_else(|error| panic!("invalid router configuration: {error}"))
+        let mut router = crate::router::try_build_router_with_layers(
+            self.routes,
+            &config,
+            state,
+            self.custom_layers,
+        )
+        .unwrap_or_else(|error| panic!("invalid router configuration: {error}"));
+        for assets in self.plugin_assets {
+            crate::assets::plugin::register(assets);
+            router = router.merge(assets.router());
+        }
+        router
     }
 
     /// Launch a managed headless Chromium and attach it to an **already
@@ -1375,6 +1412,44 @@ impl Page {
         let js_str: String = js.into();
         let res = self.inner.evaluate(js_str).await?;
         Ok(res)
+    }
+
+    /// Run axe-core on the page and return the serious and critical
+    /// violations, one line each: `rule (impact): help -> targets`.
+    ///
+    /// `axe_source` is the axe-core 4.x script. Autumn does not ship it: a
+    /// test reads its own vendored copy. The script goes in through CDP, so
+    /// the page CSP does not block it. The core `/_stories` gate and
+    /// [`plugin_conformance::widgets`](crate::plugin_conformance::widgets)
+    /// both use this method (issue #3400), so the two gates stay the same.
+    ///
+    /// # Errors
+    /// [`SystemTestError::AssertionFailed`] when axe-core does not load or
+    /// its report does not parse, or CDP errors.
+    pub async fn axe_violations(&self, axe_source: &str) -> Result<Vec<String>, SystemTestError> {
+        self.inner.evaluate(axe_source.to_owned()).await?;
+        let loaded = self
+            .evaluate_bool(
+                "typeof axe === 'object' && /^4\\./.test(axe.version)".to_owned(),
+                false,
+            )
+            .await?;
+        if !loaded {
+            return Err(SystemTestError::AssertionFailed {
+                message: "axe-core 4.x did not load".into(),
+                artifact_path: None,
+            });
+        }
+        let report = self
+            .inner
+            .evaluate(AXE_RUN_JS)
+            .await?
+            .into_value::<String>()
+            .unwrap_or_default();
+        serde_json::from_str(&report).map_err(|err| SystemTestError::AssertionFailed {
+            message: format!("axe report {report:?}: {err}"),
+            artifact_path: None,
+        })
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────

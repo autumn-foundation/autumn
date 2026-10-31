@@ -39,6 +39,13 @@ use autumn_web::prelude::*;
 #[cfg(feature = "db")]
 use autumn_web::reexports::diesel_migrations;
 
+// surface: widget_pack
+// surface: form::FieldRenderer
+//
+// The `swatch` widget pack: a `WidgetPack` with stories and assets, and a
+// `FieldRenderer` that binds to `Changeset<T>` and `form_for`.
+pub mod swatch;
+
 /// The URL prefix every route this plugin mounts lives under.
 pub const PREFIX: &str = "/reference";
 
@@ -146,6 +153,17 @@ impl Plugin for ReferencePlugin {
 
         // surface: AppBuilder::merge
         let app = app.merge(autumn_web::reexports::axum::Router::new());
+
+        // surface: AppBuilder::widget_pack
+        //
+        // Serves the pack assets and adds its stories to the gallery.
+        let app = app.widget_pack(swatch::pack());
+
+        // surface: AppBuilder::with_story_gallery
+        //
+        // Each call adds to the gallery. A plugin starts from `new`, not
+        // `builtin`.
+        let app = app.with_story_gallery(autumn_web::stories::StoryGallery::new());
 
         // surface: AppBuilder::error_pages
         let app = app.error_pages(ReferenceErrorPages);
@@ -461,6 +479,91 @@ mod tests {
             "the reference plugin must model what it documents:\n{}",
             report.to_text_report()
         );
+    }
+
+    #[test]
+    fn the_swatch_pack_passes_widget_conformance() {
+        let report =
+            autumn_web::plugin_conformance::widgets::run_widget_conformance(&swatch::pack());
+        assert!(report.passed(), "{}", report.to_text_report());
+    }
+
+    #[test]
+    fn the_swatch_picker_binds_to_form_for() {
+        use autumn_web::form::{Changeset, FieldControl, FormField, FormModel, form_for};
+
+        #[derive(serde::Serialize)]
+        struct Theme {
+            accent: String,
+        }
+        impl FormModel for Theme {
+            fn form_fields() -> Vec<FormField> {
+                vec![FormField::new("accent", "Accent", FieldControl::Text, true)]
+            }
+        }
+        let changeset = Changeset::new(Theme {
+            accent: "danger".into(),
+        });
+        let html = form_for(&changeset, "/theme", "post")
+            .override_field("accent", FieldControl::custom(swatch::SwatchPicker))
+            .render()
+            .into_string();
+        assert!(
+            html.contains(
+                r#"<fieldset id="accent-field" class="autumn-field autumn-field--group">"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"<input type="radio" id="accent-danger" name="accent" required class="autumn-swatch-radio" value="danger" checked="">"#
+            ),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn mounting_the_reference_plugin_serves_the_swatch_pack() {
+        let builder = autumn_web::app()
+            .with_story_gallery(autumn_web::stories::StoryGallery::builtin())
+            .plugin(ReferencePlugin::new());
+        let routes = builder.plugin_route_infos().expect("routes");
+        for file in ["swatch.css", "swatch.js"] {
+            assert!(
+                routes
+                    .iter()
+                    .any(|r| r.path == format!("/static/_plugins/swatch/{file}")),
+                "{file} is not served: {routes:?}"
+            );
+        }
+        let pack = swatch::pack();
+        let slugs: Vec<&str> = pack
+            .stories()
+            .iter()
+            .map(autumn_web::stories::Story::slug)
+            .collect();
+        assert_eq!(slugs, ["swatch-picker", "swatch-toolbar"]);
+    }
+
+    /// The swatch pack in Chromium: the same axe gate as core, plus the
+    /// keyboard and console checks.
+    #[cfg(feature = "system-tests")]
+    #[tokio::test]
+    #[ignore = "requires Chromium"]
+    async fn the_swatch_pack_passes_widget_browser_conformance() {
+        let axe = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../autumn/tests/fixtures/axe-core/axe.min.js"
+        ))
+        .expect("read the vendored axe-core");
+        let report =
+            autumn_web::plugin_conformance::widgets::browser::run_widget_browser_conformance(
+                &swatch::pack(),
+                &axe,
+            )
+            .await
+            .expect("browser conformance runs");
+        assert!(report.passed(), "{}", report.to_text_report());
     }
 
     #[test]

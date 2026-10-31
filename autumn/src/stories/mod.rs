@@ -182,6 +182,10 @@ pub enum StoryRenderError {
 #[derive(Debug, Clone, Default)]
 pub struct StoryRegistry {
     stories: Arc<Vec<Story>>,
+    /// Extra stylesheet URLs each gallery page links (#3400).
+    stylesheets: Arc<Vec<String>>,
+    /// Extra script URLs each gallery page loads with `defer` (#3400).
+    scripts: Arc<Vec<String>>,
 }
 
 impl StoryRegistry {
@@ -209,6 +213,8 @@ impl StoryRegistry {
         }
         Self {
             stories: Arc::new(stories),
+            stylesheets: Arc::default(),
+            scripts: Arc::default(),
         }
     }
 
@@ -216,6 +222,20 @@ impl StoryRegistry {
     #[must_use]
     pub fn stories(&self) -> &[Story] {
         &self.stories
+    }
+
+    /// Extra stylesheet URLs that each gallery page links, after the core
+    /// widget stylesheet.
+    #[must_use]
+    pub fn stylesheets(&self) -> &[String] {
+        &self.stylesheets
+    }
+
+    /// Extra script URLs that each gallery page loads with `defer`, after
+    /// the widget runtime.
+    #[must_use]
+    pub fn scripts(&self) -> &[String] {
+        &self.scripts
     }
 
     /// Look a story up by its URL slug.
@@ -258,6 +278,8 @@ pub fn builtin() -> StoryRegistry {
 #[derive(Debug, Clone, Default)]
 pub struct StoryGallery {
     stories: Vec<Story>,
+    stylesheets: Vec<String>,
+    scripts: Vec<String>,
 }
 
 impl StoryGallery {
@@ -272,6 +294,7 @@ impl StoryGallery {
     pub fn builtin() -> Self {
         Self {
             stories: builtin::all_stories(),
+            ..Self::default()
         }
     }
 
@@ -283,10 +306,56 @@ impl StoryGallery {
         self
     }
 
+    /// Link the stylesheet at `href` on each gallery page.
+    ///
+    /// The link comes after the core widget stylesheet. A widget pack uses this for its own CSS. A second
+    /// call with the same `href` does nothing.
+    #[must_use]
+    pub fn stylesheet(mut self, href: impl Into<String>) -> Self {
+        push_unique(&mut self.stylesheets, href.into());
+        self
+    }
+
+    /// Load the script at `src` with `defer` on each gallery page.
+    ///
+    /// The script comes after the widget runtime. A widget pack uses this for its own JS. A second call
+    /// with the same `src` does nothing.
+    #[must_use]
+    pub fn script(mut self, src: impl Into<String>) -> Self {
+        push_unique(&mut self.scripts, src.into());
+        self
+    }
+
+    /// Add the stories and the asset links of `other` after the ones in
+    /// `self`. Duplicate story slugs panic later, when the registry is built.
+    #[must_use]
+    pub fn merge(mut self, other: Self) -> Self {
+        self.stories.extend(other.stories);
+        for href in other.stylesheets {
+            push_unique(&mut self.stylesheets, href);
+        }
+        for src in other.scripts {
+            push_unique(&mut self.scripts, src);
+        }
+        self
+    }
+
     /// Stories collected so far, in registration order.
     #[must_use]
     pub fn stories(&self) -> &[Story] {
         &self.stories
+    }
+
+    /// Extra stylesheet URLs, in registration order.
+    #[must_use]
+    pub fn stylesheets(&self) -> &[String] {
+        &self.stylesheets
+    }
+
+    /// Extra script URLs, in registration order.
+    #[must_use]
+    pub fn scripts(&self) -> &[String] {
+        &self.scripts
     }
 
     /// The gallery's axum sub-router (`GET /_stories`, `GET /_stories/{slug}`).
@@ -310,7 +379,18 @@ impl StoryGallery {
     ///
     /// Panics on duplicate slugs — see [`StoryRegistry::new`].
     pub(crate) fn into_registry(self) -> StoryRegistry {
-        StoryRegistry::new(self.stories)
+        StoryRegistry {
+            stylesheets: Arc::new(self.stylesheets),
+            scripts: Arc::new(self.scripts),
+            ..StoryRegistry::new(self.stories)
+        }
+    }
+}
+
+/// Push `value` when `list` does not hold it yet.
+fn push_unique(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
     }
 }
 
@@ -498,6 +578,7 @@ fn story_detail_response(
     let registry = registry_from_state(state);
     let Some(story) = registry.find(slug) else {
         let page = story_page(
+            &registry,
             "Story not found",
             &maud::html! {
                 main class="story-content" {
@@ -514,11 +595,11 @@ fn story_detail_response(
     };
 
     match story.render() {
-        Ok(rendered) => {
-            Html(render_story_detail(story, &rendered, nonce).into_string()).into_response()
-        }
+        Ok(rendered) => Html(render_story_detail(&registry, story, &rendered, nonce).into_string())
+            .into_response(),
         Err(error) => {
             let page = story_page(
+                &registry,
                 "Story failed to render",
                 &maud::html! {
                     main class="story-content" {
@@ -633,7 +714,8 @@ fn density_switch() -> maud::Markup {
 }
 
 /// Full HTML document shell: framework widget stylesheet + htmx + widget
-/// runtime script + gallery chrome.
+/// runtime script + gallery chrome, then the widget pack stylesheets and
+/// scripts from `registry` (#3400).
 ///
 /// Loads two same-origin scripts (both always mounted under the `htmx`
 /// feature), in this order so `defer` preserves it regardless of download
@@ -671,6 +753,7 @@ fn density_switch() -> maud::Markup {
 /// the request's nonce so browsers don't block it; without the layer no
 /// `nonce` attribute is emitted.
 fn story_page(
+    registry: &StoryRegistry,
     title: &str,
     body: &maud::Markup,
     nonce: Option<&crate::security::CspNonce>,
@@ -698,10 +781,18 @@ fn story_page(
                 @for href in stylesheets {
                     link rel="stylesheet" href=(href);
                 }
+                // Widget pack stylesheets (#3400), after the core one.
+                @for href in registry.stylesheets() {
+                    link rel="stylesheet" href=(href);
+                }
                 @if let Some(n) = nonce {
                     meta name="htmx-config" content=(format!(r#"{{"inlineStyleNonce":"{}"}}"#, n.value()));
                 }
                 @for src in scripts {
+                    script src=(src) defer {}
+                }
+                // Widget pack scripts (#3400), after the widget runtime.
+                @for src in registry.scripts() {
                     script src=(src) defer {}
                 }
                 style nonce=[nonce.map(crate::security::CspNonce::value)] {
@@ -725,6 +816,7 @@ fn render_story_index(
     nonce: Option<&crate::security::CspNonce>,
 ) -> maud::Markup {
     story_page(
+        registry,
         "Widget stories",
         &maud::html! {
             div class="story-layout" {
@@ -776,12 +868,14 @@ fn render_story_index(
 /// (which also owns the render-failure response), so the preview and the
 /// Rendered HTML tab always show the same output.
 fn render_story_detail(
+    registry: &StoryRegistry,
     story: &Story,
     rendered: &maud::Markup,
     nonce: Option<&crate::security::CspNonce>,
 ) -> maud::Markup {
     let rendered_html = rendered.clone().into_string();
     story_page(
+        registry,
         story.name(),
         &maud::html! {
             main class="story-content" {
@@ -1014,7 +1108,8 @@ mod tests {
             }
         };
         let rendered = story.render().expect("proof story renders");
-        let page = render_story_detail(&story, &rendered, None).into_string();
+        let page =
+            render_story_detail(&StoryRegistry::default(), &story, &rendered, None).into_string();
         let dom = crate::test_html::parse(&page);
 
         let preview = crate::test_html::SelectorList::parse(".story-preview .proof-marker")
@@ -1066,6 +1161,64 @@ mod tests {
             page.contains("&lt;p"),
             "Rendered HTML tab must show the escaped markup: {page}"
         );
+    }
+
+    // #3400: `merge` appends stories and keeps one copy of each asset link.
+    #[test]
+    fn gallery_merge_appends_stories_and_dedupes_asset_links() {
+        let first = StoryGallery::new()
+            .extend([demo_story("Display", "Card")])
+            .stylesheet("/a.css")
+            .script("/a.js");
+        let second = StoryGallery::new()
+            .extend([demo_story("Pack", "Swatch picker")])
+            .stylesheet("/a.css")
+            .stylesheet("/b.css")
+            .script("/b.js");
+        let merged = first.merge(second);
+        let slugs: Vec<&str> = merged.stories().iter().map(Story::slug).collect();
+        assert_eq!(slugs, ["card", "swatch-picker"]);
+        assert_eq!(merged.stylesheets(), ["/a.css", "/b.css"]);
+        assert_eq!(merged.scripts(), ["/a.js", "/b.js"]);
+
+        let registry = merged.into_registry();
+        assert_eq!(registry.stylesheets(), ["/a.css", "/b.css"]);
+        assert_eq!(registry.scripts(), ["/a.js", "/b.js"]);
+    }
+
+    // #3400: a pack story needs the pack CSS and JS. Each gallery page links
+    // them after the core stylesheet and the widget runtime.
+    #[test]
+    fn gallery_pages_link_pack_assets_after_core_assets() {
+        let registry = StoryGallery::new()
+            .extend([demo_story("Pack", "Swatch picker")])
+            .stylesheet("/static/_plugins/swatch/swatch.css")
+            .script("/static/_plugins/swatch/swatch.js")
+            .into_registry();
+        let story = &registry.stories()[0];
+        let rendered = story.render().expect("demo story renders");
+        for page in [
+            render_story_index(&registry, None).into_string(),
+            render_story_detail(&registry, story, &rendered, None).into_string(),
+        ] {
+            let core_css = page
+                .find(crate::ui::WIDGETS_CSS_PATH)
+                .expect("core stylesheet");
+            let pack_css = page
+                .find(r#"<link rel="stylesheet" href="/static/_plugins/swatch/swatch.css">"#)
+                .unwrap_or_else(|| panic!("pack stylesheet missing: {page}"));
+            assert!(core_css < pack_css, "pack CSS must follow core CSS: {page}");
+            let pack_js = page
+                .find(r#"<script src="/static/_plugins/swatch/swatch.js" defer></script>"#)
+                .unwrap_or_else(|| panic!("pack script missing: {page}"));
+            #[cfg(feature = "htmx")]
+            assert!(
+                page.find(crate::htmx::AUTUMN_WIDGETS_JS_PATH)
+                    .is_some_and(|core_js| core_js < pack_js),
+                "pack JS must follow the widget runtime: {page}"
+            );
+            let _ = pack_js;
+        }
     }
 
     // U8 (AC4/AC5, R12): enabled-but-unregistered renders a helpful empty
@@ -1224,7 +1377,7 @@ mod tests {
                 .render()
                 .unwrap_or_else(|err| panic!("builtin story `{}` failed: {err}", story.slug()));
             assert_balanced_html(
-                &render_story_detail(story, &rendered, None).into_string(),
+                &render_story_detail(&registry, story, &rendered, None).into_string(),
                 &format!("detail page for `{}`", story.slug()),
             );
         }
@@ -1247,7 +1400,7 @@ mod tests {
 
         let story = &registry.stories()[0];
         let rendered = story.render().expect("demo story renders");
-        let detail = render_story_detail(story, &rendered, Some(&nonce)).into_string();
+        let detail = render_story_detail(&registry, story, &rendered, Some(&nonce)).into_string();
         assert!(
             detail.contains(r#"<style nonce="test-nonce-value">"#),
             "detail inline style must carry the CSP nonce: {detail}"

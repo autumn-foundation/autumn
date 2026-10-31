@@ -224,24 +224,12 @@ fn axe_source() -> &'static str {
     })
 }
 
-/// Inject axe-core and return the serious and critical violations, one
-/// line each: `rule (impact): help -> targets`.
+/// The serious and critical axe violations. `Page::axe_violations` is the
+/// same check that widget pack conformance runs (#3400).
 async fn axe_violations(page: &Page) -> Vec<String> {
-    page.evaluate(axe_source()).await.expect("inject axe-core");
-    assert!(
-        eval_bool(page, "typeof axe === 'object' && /^4\\./.test(axe.version)").await,
-        "axe-core did not load"
-    );
-    let report = eval_string(
-        page,
-        "axe.run(document, { resultTypes: ['violations'] }).then(r => JSON.stringify(\
-           r.violations\
-             .filter(v => v.impact === 'serious' || v.impact === 'critical')\
-             .map(v => `${v.id} (${v.impact}): ${v.help} -> ` \
-               + v.nodes.slice(0, 5).map(n => n.target.join(' ')).join(', '))))",
-    )
-    .await;
-    serde_json::from_str(&report).unwrap_or_else(|err| panic!("axe report {report:?}: {err}"))
+    page.axe_violations(axe_source())
+        .await
+        .expect("run axe-core")
 }
 
 /// Select a gallery color scheme (`light` or `dark`). Check that the page

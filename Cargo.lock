@@ -829,6 +829,8 @@ version = "0.9.0"
 dependencies = [
  "autumn-web",
  "maud",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

@@ -1085,6 +1085,25 @@ Per-primitive setters (in addition to the shared set):
 `TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` — are documented
 in **Typed accessible primitives** above.)
 
+## Widget packs (`autumn_web::widget_pack`, feature `maud`, #3400)
+
+| API | Notes |
+|---|---|
+| `WidgetPack::new(name)` | `name` is `[a-z0-9]` words joined by `-`; panics otherwise. Classes are `autumn-<name>-*`. |
+| `.extend(stories)` / `.assets(&'static PluginAssets)` | Stories (slug must start `<name>-`) and the CSS/JS bundle. |
+| `.head()` / `.gallery()` / `.stylesheet_urls()` / `.script_urls()` | Layout tags with SRI; a `StoryGallery` with the asset links. |
+| `AppBuilder::widget_pack(pack)` | Serves the bundle and merges the stories into `/_stories`. Second install of a name is a no-op. |
+| `AppBuilder::with_story_gallery(g)` | Adds (merges); duplicate slugs panic at startup. |
+| `StoryGallery::stylesheet(href)` / `.script(src)` / `.merge(other)` | Extra assets each gallery page links. |
+| `form::FieldRenderer` (`name`, `render`, `multipart`, `grouped`) | Plugin form control. `FieldControl::custom(r)`, `custom_input_with(&cs, field, label, &r, &opts)`. |
+| `form::FieldContext::control(tag, attrs, body)` | Writes the control with `id`/`name`/`value`/`required`/`aria-*` + passthrough; drops owned names, `on*`/`hx-on*`, `style`; never pre-fills password/file/checkbox/radio. |
+| `form::FieldContext::group_item(tag, suffix, attrs, body)` | One input of a grouped (`<fieldset>`) control: `id="{field}-{suffix}"`, `name`, `required`, `aria-invalid`, passthrough. |
+| `widget_pack::element(tag, attrs, &FieldOptions, body)` | Root of a non-input widget with the app `data-*`/`hx-*` passthrough. |
+| `plugin_conformance::widgets::run_widget_conformance(&pack)` | Static: `widget-pack-name`, `widget-stories`, `widget-class-names`, `widget-markup-csp`, `widget-tokens`, `widget-scripts`. |
+| `plugin_conformance::widgets::browser::run_widget_browser_conformance(&pack, axe_src).await` | Feature `system-tests`: `widget-axe` (light + dark), `widget-console`, `widget-keyboard`. |
+| `Page::axe_violations(axe_src)` / `SystemTest::plugin_assets(&ASSETS)` | Shared axe check; serve a bundle in a system test. |
+| `autumn:init` event | Fires on `document` at `DOMContentLoaded` and on each htmx-swapped root, before roving init. |
+
 ## Cache read-through (0.6.0)
 
 `autumn_web::cache::{get_or_compute, get_or_compute_with,
