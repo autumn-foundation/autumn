@@ -3215,25 +3215,22 @@ impl NavBarConfig {
 /// becomes active, for links to unrelated tools that shouldn't claim
 /// "you are here" (e.g. an external or admin-actuator link).
 ///
-/// [`NavItem::menu`] renders a `<button>` trigger plus a `<ul>` of sub-links.
-/// Before JavaScript enhances the page, the hamburger toggle is hidden (a
-/// horizontal bar with no toggle has nothing to hide) and every dropdown is
-/// rendered open (`aria-expanded="true"`, no `hidden` attribute) so **all
-/// links stay visible with JavaScript off** — the framework's
-/// `/static/js/autumn-widgets.js` runtime (same-origin, CSP-safe under the
-/// default `script-src 'self'`) then reveals the hamburger and wires the
-/// toggle/dropdown behavior. No app-authored JavaScript, and
-/// no inline `<script>` or `style=` attributes, are ever required.
+/// [`NavItem::menu`] renders a menu button plus a `role="menu"` popover of
+/// sub-links. It is the same primitive as [`dropdown_menu`]. The trigger uses
+/// `command`/`commandfor`, so the menu opens and closes with JavaScript off.
+/// The hamburger toggle stays hidden until the runtime shows it. The
+/// framework's `/static/js/autumn-widgets.js` runtime (same-origin, CSP-safe
+/// under the default `script-src 'self'`) wires the hamburger and the arrow
+/// keys. No app-authored JavaScript, and no inline `<script>` or `style=`
+/// attributes, are ever required.
 ///
 /// # Keyboard (with `autumn-widgets.js`)
 ///
-/// Each dropdown becomes an APG menu button. The runtime adds
-/// `aria-haspopup="menu"`, `role="menu"` and `role="menuitem"`. The server
-/// does not send these roles, because they promise arrow keys that need JS.
-/// `Enter`, `Space` or `ArrowDown` opens the menu on the first item; `ArrowUp`
-/// opens it on the last. In the menu: `ArrowDown`/`ArrowUp` (wrapping),
-/// `Home`/`End`, a letter (typeahead), `Escape` (close, focus returns to the
-/// button) and `Tab` (close). The toggle id is `{menu-id}-toggle`.
+/// Each dropdown is an APG menu button. `Enter`, `Space` or `ArrowDown` opens
+/// the menu on the first item; `ArrowUp` opens it on the last. In the menu:
+/// `ArrowDown`/`ArrowUp` (wrapping), `Home`/`End`, a letter (typeahead),
+/// `Escape` (close, focus returns to the button) and `Tab` (close). The
+/// browser handles light dismiss. The toggle id is `{menu-id}-toggle`.
 ///
 /// # CSS hooks
 ///
@@ -3252,7 +3249,7 @@ impl NavBarConfig {
 /// | `.autumn-nav__item--menu` | `<li>` wrapping a dropdown menu |
 /// | `.autumn-nav__section` | Non-interactive group-label `<li>` |
 /// | `.autumn-nav__menu-toggle` | Dropdown trigger `<button>` |
-/// | `.autumn-nav__menu` | Dropdown sub-item `<ul>` |
+/// | `.autumn-nav__menu` | Dropdown sub-item `<ul>` (a popover) |
 ///
 /// # Example
 ///
@@ -3354,6 +3351,8 @@ fn render_nav_link_item(current_path: &str, link: &NavLinkItem) -> maud::Markup 
 
 /// Render a dropdown menu `<li>`: a trigger `<button>` plus its `<ul>` of
 /// sub-links, using and incrementing `menu_counter` to derive a unique id.
+///
+/// The menu is the same popover menu as [`dropdown_menu`].
 #[cfg(feature = "maud")]
 fn render_nav_menu(
     current_path: &str,
@@ -3363,19 +3362,38 @@ fn render_nav_menu(
 ) -> maud::Markup {
     *menu_counter += 1;
     let menu_id = format!("{id}-menu-{menu_counter}");
+    let toggle_id = format!("{menu_id}-toggle");
     maud::html! {
         li class="autumn-nav__item autumn-nav__item--menu" {
-            button type="button" id=(format!("{menu_id}-toggle")) class="autumn-nav__menu-toggle"
-                aria-expanded="true" aria-controls=(menu_id) data-nav-menu-toggle {
+            button type="button" id=(toggle_id) class="autumn-nav__menu-toggle"
+                command="toggle-popover" commandfor=(menu_id) aria-controls=(menu_id)
+                aria-haspopup="menu" data-popover-toggle=(menu_id) {
                 (menu.label)
             }
-            ul id=(menu_id) class="autumn-nav__menu" data-autumn-roving
-                data-autumn-orientation="vertical" data-autumn-typeahead data-autumn-dismiss {
+            ul id=(menu_id) class="autumn-popover__panel autumn-menu autumn-nav__menu" popover
+                role="menu" aria-labelledby=(toggle_id) data-side="bottom" data-align="start"
+                data-autumn-menu data-autumn-roving data-autumn-orientation="vertical"
+                data-autumn-typeahead {
                 @for link in &menu.links {
-                    li class="autumn-nav__item" { (render_nav_link_item(current_path, link)) }
+                    li role="none" class="autumn-nav__item" {
+                        (render_nav_menu_item(current_path, link))
+                    }
                 }
             }
         }
+    }
+}
+
+/// Render a nav link as a `menuitem`. It marks the active page like [`nav_link_matched`].
+#[cfg(feature = "maud")]
+fn render_nav_menu_item(current_path: &str, link: &NavLinkItem) -> maud::Markup {
+    let active = link
+        .match_mode
+        .is_some_and(|mode| nav_link_is_active(current_path, &link.href, mode));
+    maud::html! {
+        a href=(link.href) role="menuitem"
+            class=(if active { "autumn-menu__item autumn-active" } else { "autumn-menu__item" })
+            aria-current=[active.then_some("page")] { (link.label) }
     }
 }
 
@@ -4062,6 +4080,424 @@ pub fn modal_close_button(label: &str, dialog_id: &str, class: Option<&str>) -> 
         button type="button" class=[class]
             command="close" commandfor=(dialog_id) data-modal-close=(dialog_id) {
             (label)
+        }
+    }
+}
+
+// ── popover + dropdown menu (issue #3402) ────────────────────────────────────
+
+/// Which side of the trigger a [`popover`] opens on.
+///
+/// `Start` and `End` are logical: they follow the writing direction, so
+/// `Start` is the left side in a left-to-right page.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PopoverSide {
+    /// Above the trigger.
+    Top,
+    /// Below the trigger (default).
+    #[default]
+    Bottom,
+    /// Before the trigger, in the writing direction.
+    Start,
+    /// After the trigger, in the writing direction.
+    End,
+}
+
+#[cfg(feature = "maud")]
+impl PopoverSide {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Bottom => "bottom",
+            Self::Start => "start",
+            Self::End => "end",
+        }
+    }
+}
+
+/// How a [`popover`] lines up with the trigger along the other axis.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PopoverAlign {
+    /// Edges meet at the start (default).
+    #[default]
+    Start,
+    /// Centered on the trigger.
+    Center,
+    /// Edges meet at the end.
+    End,
+}
+
+#[cfg(feature = "maud")]
+impl PopoverAlign {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Center => "center",
+            Self::End => "end",
+        }
+    }
+}
+
+/// Settings for [`popover`] and [`dropdown_menu`].
+///
+/// `id` is the id of the popover panel. The trigger gets `{id}-trigger`.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy)]
+pub struct PopoverConfig<'a> {
+    id: &'a str,
+    side: PopoverSide,
+    align: PopoverAlign,
+    class: Option<&'a str>,
+    trigger_class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> PopoverConfig<'a> {
+    /// Start a config. `id` must be unique on the page. An empty `id`
+    /// panics in a debug build.
+    #[must_use]
+    pub const fn new(id: &'a str) -> Self {
+        debug_assert!(!id.is_empty(), "PopoverConfig::new needs a non-empty id");
+        Self {
+            id,
+            side: PopoverSide::Bottom,
+            align: PopoverAlign::Start,
+            class: None,
+            trigger_class: None,
+        }
+    }
+
+    /// Set the side. The browser flips it when the panel does not fit.
+    #[must_use]
+    pub const fn side(mut self, side: PopoverSide) -> Self {
+        self.side = side;
+        self
+    }
+
+    /// Set the alignment.
+    #[must_use]
+    pub const fn align(mut self, align: PopoverAlign) -> Self {
+        self.align = align;
+        self
+    }
+
+    /// Add a class to the root element.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+
+    /// Add a class to the trigger button.
+    #[must_use]
+    pub const fn trigger_class(mut self, class: &'a str) -> Self {
+        self.trigger_class = Some(class);
+        self
+    }
+}
+
+/// The trigger button of a popover or a menu.
+///
+/// `command`/`commandfor` open the panel with no JavaScript.
+/// `data-popover-toggle` is the hook for browsers without invoker commands.
+/// The server sends no `aria-expanded`: it cannot know the state. The
+/// runtime adds it.
+#[cfg(feature = "maud")]
+fn popover_trigger(label: &str, config: &PopoverConfig<'_>, menu: bool) -> maud::Markup {
+    maud::html! {
+        button type="button" id=(format!("{}-trigger", config.id))
+            class=(merge_class("autumn-popover__trigger", config.trigger_class))
+            command="toggle-popover" commandfor=(config.id) aria-controls=(config.id)
+            aria-haspopup=[menu.then_some("menu")] data-popover-toggle=(config.id) {
+            (label)
+        }
+    }
+}
+
+/// Render a trigger button and a native `popover` panel.
+///
+/// The trigger uses `command="toggle-popover"` and `commandfor`. The
+/// browser opens and closes the panel, and handles light dismiss and
+/// Escape. CSS anchor positioning places the panel by
+/// [`PopoverConfig::side`] and [`PopoverConfig::align`], and flips it at
+/// the viewport edge. No JavaScript is needed.
+///
+/// The panel has `role="group"` and is named by the trigger.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{PopoverConfig, popover};
+///
+/// let html = popover(
+///     "Help",
+///     &maud::html! { p { "Press ? for shortcuts." } },
+///     &PopoverConfig::new("help"),
+/// )
+/// .into_string();
+/// assert!(html.contains(r#"commandfor="help""#));
+/// assert!(html.contains("popover"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn popover(trigger: &str, content: &maud::Markup, config: &PopoverConfig<'_>) -> maud::Markup {
+    maud::html! {
+        div class=(merge_class("autumn-popover", config.class)) {
+            (popover_trigger(trigger, config, false))
+            div id=(config.id) class="autumn-popover__panel" popover role="group"
+                aria-labelledby=(format!("{}-trigger", config.id))
+                data-side=(config.side.as_str()) data-align=(config.align.as_str())
+                data-autumn-popover {
+                (content)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "maud")]
+#[derive(Clone)]
+enum MenuKind {
+    Link {
+        label: String,
+        href: String,
+    },
+    Action {
+        label: String,
+        action: String,
+        method: http::Method,
+        csrf: String,
+        csrf_field: Option<String>,
+    },
+    Separator,
+    Group {
+        label: String,
+        entries: Vec<MenuEntry>,
+    },
+}
+
+// `Debug` hides the CSRF token, so a log line never carries it.
+#[cfg(feature = "maud")]
+impl std::fmt::Debug for MenuKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Link { label, href } => f
+                .debug_struct("Link")
+                .field("label", label)
+                .field("href", href)
+                .finish(),
+            Self::Action {
+                label,
+                action,
+                method,
+                csrf_field,
+                ..
+            } => f
+                .debug_struct("Action")
+                .field("label", label)
+                .field("action", action)
+                .field("method", method)
+                .field("csrf", &"<redacted>")
+                .field("csrf_field", csrf_field)
+                .finish(),
+            Self::Separator => f.write_str("Separator"),
+            Self::Group { label, entries } => f
+                .debug_struct("Group")
+                .field("label", label)
+                .field("entries", entries)
+                .finish(),
+        }
+    }
+}
+
+/// One entry of a [`dropdown_menu`].
+///
+/// A link, a `button_to` form, a separator or a labelled group.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct MenuEntry {
+    kind: MenuKind,
+    destructive: bool,
+}
+
+#[cfg(feature = "maud")]
+impl MenuEntry {
+    const fn of(kind: MenuKind) -> Self {
+        Self {
+            kind,
+            destructive: false,
+        }
+    }
+
+    /// A link item (`<a role="menuitem">`).
+    #[must_use]
+    pub fn link(label: impl Into<String>, href: impl Into<String>) -> Self {
+        Self::of(MenuKind::Link {
+            label: label.into(),
+            href: href.into(),
+        })
+    }
+
+    /// A form item. It works without JavaScript and carries the CSRF token.
+    ///
+    /// Same rules as [`button_to`](crate::links::button_to).
+    ///
+    /// # Panics
+    ///
+    /// Panics when `method` is not `GET`, `POST`, `PUT`, `PATCH` or
+    /// `DELETE`. A `<form>` cannot send any other method.
+    #[must_use]
+    pub fn action(
+        label: impl Into<String>,
+        action: impl Into<String>,
+        method: http::Method,
+        csrf_token: impl Into<String>,
+    ) -> Self {
+        assert!(
+            [
+                http::Method::GET,
+                http::Method::POST,
+                http::Method::PUT,
+                http::Method::PATCH,
+                http::Method::DELETE,
+            ]
+            .contains(&method),
+            "MenuEntry::action only supports GET, POST, PUT, PATCH, or DELETE (got {method})"
+        );
+        Self::of(MenuKind::Action {
+            label: label.into(),
+            action: action.into(),
+            method,
+            csrf: csrf_token.into(),
+            csrf_field: None,
+        })
+    }
+
+    /// Set the name of the hidden CSRF input of an [`action`](Self::action)
+    /// item. Use it when `security.csrf.form_field` is not `_csrf`. Other
+    /// entries stay as they are.
+    #[must_use]
+    pub fn csrf_field(mut self, name: impl Into<String>) -> Self {
+        if let MenuKind::Action { csrf_field, .. } = &mut self.kind {
+            *csrf_field = Some(name.into());
+        }
+        self
+    }
+
+    /// A line between groups of items.
+    #[must_use]
+    pub const fn separator() -> Self {
+        Self::of(MenuKind::Separator)
+    }
+
+    /// A labelled group of items.
+    #[must_use]
+    pub fn group(label: impl Into<String>, entries: Vec<Self>) -> Self {
+        Self::of(MenuKind::Group {
+            label: label.into(),
+            entries,
+        })
+    }
+
+    /// Mark a link or form item as destructive. Other entries stay as they are.
+    #[must_use]
+    pub const fn destructive(mut self) -> Self {
+        self.destructive = true;
+        self
+    }
+}
+
+#[cfg(feature = "maud")]
+fn render_menu_entry(entry: &MenuEntry) -> maud::Markup {
+    let item_class = if entry.destructive {
+        "autumn-menu__item autumn-menu__item--destructive"
+    } else {
+        "autumn-menu__item"
+    };
+    match &entry.kind {
+        MenuKind::Link { label, href } => maud::html! {
+            a href=(href) role="menuitem" class=(item_class) { (label) }
+        },
+        MenuKind::Action {
+            label,
+            action,
+            method,
+            csrf,
+            csrf_field,
+        } => maud::html! {
+            // The form is generic. `role="none"` keeps the menu's children valid.
+            div role="none" class="autumn-menu__form" {
+                (crate::links::button_to_with(
+                    label,
+                    action,
+                    method.clone(),
+                    csrf,
+                    &crate::links::ButtonToOptions::new()
+                        .class(item_class)
+                        .csrf_field(csrf_field.as_deref().unwrap_or("_csrf"))
+                        .attrs(&[("role", "menuitem")]),
+                ))
+            }
+        },
+        MenuKind::Separator => maud::html! {
+            hr role="separator" class="autumn-menu__separator";
+        },
+        MenuKind::Group { label, entries } => maud::html! {
+            div role="group" aria-label=(label) class="autumn-menu__group" {
+                div class="autumn-menu__label" aria-hidden="true" { (label) }
+                @for e in entries { (render_menu_entry(e)) }
+            }
+        },
+    }
+}
+
+/// Render an APG menu button: a trigger and a `role="menu"` popover.
+///
+/// Items are links or `button_to` forms, so they work without JavaScript.
+/// With `autumn-widgets.js`, the menu has the APG keys: Enter, Space,
+/// `ArrowDown` or `ArrowUp` opens it on the first or last item; the arrow keys
+/// wrap; Home/End and typeahead move; Escape and Tab close it, and focus
+/// goes back to the trigger. Without JavaScript the popover still opens and
+/// closes; only the arrow keys need JavaScript.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{MenuEntry, PopoverConfig, dropdown_menu};
+/// use http::Method;
+///
+/// let html = dropdown_menu(
+///     "Actions",
+///     &[
+///         MenuEntry::link("Edit", "/posts/1/edit"),
+///         MenuEntry::separator(),
+///         MenuEntry::action("Delete", "/posts/1", Method::DELETE, "csrf-token")
+///             .destructive(),
+///     ],
+///     &PopoverConfig::new("post-actions"),
+/// )
+/// .into_string();
+/// assert!(html.contains(r#"role="menu""#));
+/// assert!(html.contains(r#"role="menuitem""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn dropdown_menu(
+    trigger: &str,
+    items: &[MenuEntry],
+    config: &PopoverConfig<'_>,
+) -> maud::Markup {
+    maud::html! {
+        div class=(merge_class("autumn-popover", config.class)) {
+            (popover_trigger(trigger, config, true))
+            div id=(config.id) class="autumn-popover__panel autumn-menu" popover role="menu"
+                aria-labelledby=(format!("{}-trigger", config.id))
+                data-side=(config.side.as_str()) data-align=(config.align.as_str())
+                data-autumn-menu data-autumn-roving data-autumn-orientation="vertical"
+                data-autumn-typeahead {
+                @for e in items { (render_menu_entry(e)) }
+            }
         }
     }
 }
@@ -8132,14 +8568,12 @@ mod tests {
         ));
         let html = nav_bar("/", &config).into_string();
         assert!(html.contains(r#"type="button""#), "{html}");
-        assert!(html.contains("data-nav-menu-toggle"), "{html}");
-        assert!(html.contains(r#"aria-expanded="true""#), "{html}");
         assert!(
             html.contains(r#"aria-controls="autumn-nav-menu-1""#),
             "{html}"
         );
         assert!(
-            html.contains(r#"<ul id="autumn-nav-menu-1" class="autumn-nav__menu""#),
+            html.contains(r#"<ul id="autumn-nav-menu-1" class="autumn-popover__panel autumn-menu autumn-nav__menu" popover"#),
             "{html}"
         );
     }
@@ -8161,23 +8595,12 @@ mod tests {
             "{html}"
         );
         assert!(menu.contains("data-autumn-typeahead"), "{html}");
-        assert!(menu.contains("data-autumn-dismiss"), "{html}");
         // `aria-labelledby` on the menu needs a toggle id.
         assert!(html.contains(r#"id="autumn-nav-menu-1-toggle""#), "{html}");
-    }
-
-    #[test]
-    fn nav_bar_menu_roles_need_js() {
-        // With JS off, `role="menu"` promises arrow keys that do not work.
-        // The runtime adds the menu roles. The server markup stays a
-        // disclosure.
-        let config = NavBarConfig::new().item(NavItem::menu(
-            NavMenu::new("Products").link("/widgets", "Widgets"),
-        ));
-        let html = nav_bar("/", &config).into_string();
-        assert!(!html.contains(r#"role="menu""#), "{html}");
-        assert!(!html.contains(r#"role="menuitem""#), "{html}");
-        assert!(!html.contains("aria-haspopup"), "{html}");
+        assert!(
+            html.contains(r#"aria-labelledby="autumn-nav-menu-1-toggle""#),
+            "{html}"
+        );
     }
 
     #[test]
@@ -9456,5 +9879,289 @@ mod tests {
         assert_eq!(fmt_coord(0.0), "0");
         assert_eq!(fmt_coord(-0.0), "0");
         assert_eq!(fmt_coord(1.2345), "1.234");
+    }
+}
+
+#[cfg(all(test, feature = "maud"))]
+mod popover_tests {
+    use super::*;
+    use http::Method;
+
+    const fn cfg() -> PopoverConfig<'static> {
+        PopoverConfig::new("more")
+    }
+
+    fn pop() -> String {
+        popover("Details", &maud::html! { p { "Body" } }, &cfg()).into_string()
+    }
+
+    fn menu() -> String {
+        dropdown_menu(
+            "Actions",
+            &[
+                MenuEntry::link("Edit", "/edit"),
+                MenuEntry::separator(),
+                MenuEntry::action("Delete", "/del", Method::DELETE, "tok").destructive(),
+            ],
+            &cfg(),
+        )
+        .into_string()
+    }
+
+    #[test]
+    fn popover_trigger_uses_invoker_commands() {
+        let html = pop();
+        assert!(html.contains(r#"command="toggle-popover""#), "{html}");
+        assert!(html.contains(r#"commandfor="more""#), "{html}");
+        assert!(html.contains(r#"type="button""#), "{html}");
+        assert!(html.contains(r#"id="more-trigger""#), "{html}");
+        assert!(html.contains(">Details</button>"), "{html}");
+    }
+
+    #[test]
+    fn popover_panel_is_a_native_popover() {
+        let html = pop();
+        assert!(html.contains(r#"id="more""#), "{html}");
+        assert!(html.contains(" popover"), "{html}");
+        assert!(!html.contains(r#"popover="manual""#), "{html}");
+        assert!(html.contains(r#"role="group""#), "{html}");
+        assert!(html.contains(r#"aria-labelledby="more-trigger""#), "{html}");
+        assert!(html.contains("<p>Body</p>"), "{html}");
+    }
+
+    #[test]
+    fn popover_has_no_inline_style_or_handler() {
+        let html = pop();
+        assert!(!html.contains("style="), "{html}");
+        assert!(!html.contains("onclick"), "{html}");
+        // The server cannot know the state. The runtime sets aria-expanded.
+        assert!(!html.contains("aria-expanded"), "{html}");
+    }
+
+    #[test]
+    fn popover_side_and_align_default_to_bottom_start() {
+        let html = pop();
+        assert!(html.contains(r#"data-side="bottom""#), "{html}");
+        assert!(html.contains(r#"data-align="start""#), "{html}");
+    }
+
+    #[test]
+    fn popover_side_and_align_are_configurable() {
+        let c = PopoverConfig::new("p")
+            .side(PopoverSide::Top)
+            .align(PopoverAlign::End);
+        let html = popover("T", &maud::html! {}, &c).into_string();
+        assert!(html.contains(r#"data-side="top""#), "{html}");
+        assert!(html.contains(r#"data-align="end""#), "{html}");
+        for (side, want) in [
+            (PopoverSide::Bottom, "bottom"),
+            (PopoverSide::Start, "start"),
+            (PopoverSide::End, "end"),
+        ] {
+            let c = PopoverConfig::new("p").side(side);
+            let html = popover("T", &maud::html! {}, &c).into_string();
+            assert!(html.contains(&format!(r#"data-side="{want}""#)), "{html}");
+        }
+        let c = PopoverConfig::new("p").align(PopoverAlign::Center);
+        let html = popover("T", &maud::html! {}, &c).into_string();
+        assert!(html.contains(r#"data-align="center""#), "{html}");
+    }
+
+    #[test]
+    fn popover_classes_are_merged() {
+        let c = PopoverConfig::new("p").class("mine").trigger_class("btn");
+        let html = popover("T", &maud::html! {}, &c).into_string();
+        assert!(html.contains(r#"class="autumn-popover mine""#), "{html}");
+        assert!(
+            html.contains(r#"class="autumn-popover__trigger btn""#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn popover_escapes_label_and_id() {
+        let c = PopoverConfig::new(r#"a"b"#);
+        let html = popover("<b>x</b>", &maud::html! {}, &c).into_string();
+        assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"), "{html}");
+        assert!(html.contains("a&quot;b"), "{html}");
+        assert!(!html.contains(r#"id="a"b""#), "{html}");
+    }
+
+    #[test]
+    fn menu_trigger_is_an_apg_menu_button() {
+        let html = menu();
+        assert!(html.contains(r#"aria-haspopup="menu""#), "{html}");
+        assert!(html.contains(r#"aria-controls="more""#), "{html}");
+        assert!(html.contains(r#"command="toggle-popover""#), "{html}");
+        assert!(html.contains(r#"commandfor="more""#), "{html}");
+        assert!(!html.contains("aria-expanded"), "{html}");
+    }
+
+    #[test]
+    fn menu_container_has_role_menu_and_keyboard_core() {
+        let html = menu();
+        assert!(html.contains(r#"role="menu""#), "{html}");
+        assert!(html.contains(r#"aria-labelledby="more-trigger""#), "{html}");
+        assert!(html.contains(" popover"), "{html}");
+        assert!(html.contains("data-autumn-menu"), "{html}");
+        assert!(html.contains("data-autumn-roving"), "{html}");
+        assert!(
+            html.contains(r#"data-autumn-orientation="vertical""#),
+            "{html}"
+        );
+        assert!(html.contains("data-autumn-typeahead"), "{html}");
+        // The browser owns Escape and light dismiss for a popover.
+        assert!(!html.contains("data-autumn-dismiss"), "{html}");
+    }
+
+    #[test]
+    fn menu_link_item_is_a_menuitem_anchor() {
+        let html = menu();
+        assert!(
+            html.contains(r#"<a href="/edit" role="menuitem" class="autumn-menu__item">Edit</a>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn menu_action_item_is_a_csrf_form_button() {
+        let html = menu();
+        assert!(html.contains(r#"action="/del""#), "{html}");
+        assert!(html.contains(r#"method="post""#), "{html}");
+        assert!(html.contains(r#"name="_method" value="DELETE""#), "{html}");
+        assert!(html.contains(r#"name="_csrf" value="tok""#), "{html}");
+        assert!(html.contains(r#"<div role="none""#), "{html}");
+        assert!(
+            html.contains(r#"role="menuitem""#) && html.contains(">Delete</button>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn menu_destructive_item_has_a_variant_class() {
+        let html = menu();
+        assert!(
+            html.contains("autumn-menu__item autumn-menu__item--destructive"),
+            "{html}"
+        );
+        let link = dropdown_menu(
+            "A",
+            &[MenuEntry::link("Remove", "/rm").destructive()],
+            &cfg(),
+        )
+        .into_string();
+        assert!(link.contains("autumn-menu__item--destructive"), "{link}");
+        assert_eq!(
+            html.matches("autumn-menu__item--destructive").count(),
+            1,
+            "only the marked item: {html}"
+        );
+    }
+
+    #[test]
+    fn menu_separator_has_role_separator() {
+        let html = menu();
+        assert!(html.contains(r#"role="separator""#), "{html}");
+    }
+
+    #[test]
+    fn menu_group_is_labelled() {
+        let html = dropdown_menu(
+            "A",
+            &[MenuEntry::group(
+                "Account",
+                vec![MenuEntry::link("Profile", "/me")],
+            )],
+            &cfg(),
+        )
+        .into_string();
+        assert!(html.contains(r#"role="group""#), "{html}");
+        assert!(html.contains(r#"aria-label="Account""#), "{html}");
+        assert!(html.contains(r#"aria-hidden="true""#), "{html}");
+        assert!(html.contains(">Account<"), "{html}");
+        assert!(html.contains(">Profile</a>"), "{html}");
+    }
+
+    #[test]
+    fn menu_escapes_labels_and_hrefs() {
+        let html = dropdown_menu(
+            "<i>t</i>",
+            &[MenuEntry::link("<b>x</b>", r#"/a"b"#)],
+            &cfg(),
+        )
+        .into_string();
+        assert!(html.contains("&lt;i&gt;t&lt;/i&gt;"), "{html}");
+        assert!(html.contains("&lt;b&gt;x&lt;/b&gt;"), "{html}");
+        assert!(html.contains("/a&quot;b"), "{html}");
+    }
+
+    #[test]
+    fn menu_without_items_still_renders_a_menu() {
+        let html = dropdown_menu("A", &[], &cfg()).into_string();
+        assert!(html.contains(r#"role="menu""#), "{html}");
+    }
+
+    #[test]
+    fn popover_panel_is_marked_for_the_runtime() {
+        assert!(pop().contains("data-autumn-popover"));
+    }
+
+    #[test]
+    fn menu_entry_debug_hides_the_csrf_token() {
+        let entry = MenuEntry::action("Delete", "/del", Method::DELETE, "secret-token");
+        let shown = format!("{entry:?}");
+        assert!(!shown.contains("secret-token"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        let group = MenuEntry::group("G", vec![entry]);
+        assert!(!format!("{group:?}").contains("secret-token"));
+    }
+
+    #[test]
+    fn menu_action_uses_the_configured_csrf_field_name() {
+        let html = dropdown_menu(
+            "A",
+            &[MenuEntry::action("Delete", "/del", Method::DELETE, "tok")
+                .csrf_field("authenticity")],
+            &cfg(),
+        )
+        .into_string();
+        assert!(
+            html.contains(r#"name="authenticity" value="tok""#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"name="_csrf""#), "{html}");
+    }
+
+    #[test]
+    #[should_panic(expected = "MenuEntry::action only supports")]
+    fn menu_action_rejects_an_unsupported_method_at_build_time() {
+        let _ = MenuEntry::action("Peek", "/x", Method::HEAD, "t");
+    }
+
+    #[test]
+    fn nav_bars_with_distinct_ids_get_distinct_menu_ids() {
+        let menu = || NavItem::menu(NavMenu::new("A").link("/a", "A"));
+        let one = nav_bar("/", &NavBarConfig::new().item(menu()).id("one")).into_string();
+        let two = nav_bar("/", &NavBarConfig::new().item(menu()).id("two")).into_string();
+        assert!(one.contains(r#"commandfor="one-menu-1""#), "{one}");
+        assert!(two.contains(r#"commandfor="two-menu-1""#), "{two}");
+    }
+
+    #[test]
+    fn nav_menu_is_a_popover_menu() {
+        let config = NavBarConfig::new().item(NavItem::menu(
+            NavMenu::new("Products").link("/widgets", "Widgets"),
+        ));
+        let html = nav_bar("/widgets", &config).into_string();
+        assert!(html.contains(r#"command="toggle-popover""#), "{html}");
+        assert!(html.contains(r#"commandfor="autumn-nav-menu-1""#), "{html}");
+        assert!(html.contains(r#"aria-haspopup="menu""#), "{html}");
+        assert!(html.contains(r#"role="menu""#), "{html}");
+        assert!(html.contains(r#"<li role="none""#), "{html}");
+        assert!(html.contains(r#"role="menuitem""#), "{html}");
+        assert!(html.contains(r#"aria-current="page""#), "{html}");
+        assert!(html.contains("data-autumn-menu"), "{html}");
+        assert!(!html.contains("data-nav-menu-toggle"), "{html}");
+        assert!(!html.contains("data-autumn-dismiss"), "{html}");
     }
 }

@@ -14,7 +14,7 @@ The shipped widgets use the core:
 |---|---|---|
 | `tabs` | Tabs, automatic activation | ArrowLeft/ArrowRight, Home/End, Tab to the panel |
 | `autocomplete_input` | Combobox with listbox popup | ArrowDown/ArrowUp, Enter, Escape |
-| `NavMenu` in `nav_bar` | Menu button | Enter, Space, ArrowDown or ArrowUp opens; ArrowDown/ArrowUp, Home/End, a letter, Escape, Tab |
+| `NavMenu` in `nav_bar`, `dropdown_menu` | Menu button | Enter, Space, ArrowDown or ArrowUp opens; ArrowDown/ArrowUp, Home/End, a letter, Escape, Tab. See [Popover and Dropdown Menu](popover-and-menu.md). |
 
 Load the runtime once in your layout:
 
@@ -144,9 +144,9 @@ Each widget works with JavaScript off:
   The runtime adds `autumn-tabs--enhanced`. Then the CSS uses `[hidden]`,
   not `:target`, and `aria-selected` follows the shown tab.
 - **Autocomplete** shows its `<noscript>` `<select>`.
-- **`NavMenu`** renders open, as a disclosure. The runtime adds
-  `role="menu"`, `role="menuitem"` and `aria-haspopup`. These roles promise
-  arrow keys, so the server does not send them.
+- **`NavMenu` and `dropdown_menu`** are native popovers. The trigger opens
+  and closes them with `commandfor`. The server sends the menu roles. Only
+  the arrow keys need JavaScript.
 - **Toast** fades out on its CSS timer. Hover pauses the timer. The close
   button stays hidden. A persistent toast stays until the page changes.
 
@@ -159,13 +159,14 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 36 KiB |
-| `autumn-widgets.js`, gzip level 9 | 11 KiB |
+| `autumn-widgets.js`, raw | 38 KiB |
+| `autumn-widgets.js`, gzip level 9 | 12 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
 above the budget. Raise the budget only with a reason in the PR. Issue
 #3399 added the toast runtime. It increased the budgets from 32 KiB and
-10 KiB.
+10 KiB. Issue #3402 added the popover menu runtime. It increased the raw
+budget from 36 KiB and the gzip budget from 11 KiB.
 
 ## Tests
 

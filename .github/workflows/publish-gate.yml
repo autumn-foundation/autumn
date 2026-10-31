@@ -271,6 +271,18 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-toast-browser.log" \
             || { echo "::error::no toast browser tests ran"; exit 1; }
 
+      # Popover and dropdown menu in a real browser (#3402).
+      - name: Run the popover browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_popover_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-popover-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-popover-browser.log" \
+            || { echo "::error::no popover browser tests ran"; exit 1; }
+
   # ---------------------------------------------------------------------------
   # 1. Crate metadata
   # ---------------------------------------------------------------------------

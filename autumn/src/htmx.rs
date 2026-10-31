@@ -791,9 +791,19 @@ mod tests {
             .expect("autumn-widgets.js should be valid UTF-8");
         assert!(js.contains("data-autumn-nav"), "{js}");
         assert!(js.contains("data-nav-toggle"), "{js}");
-        assert!(js.contains("data-nav-menu-toggle"), "{js}");
         assert!(js.contains("aria-expanded"), "{js}");
         assert!(js.contains("Escape"), "{js}");
+    }
+
+    #[test]
+    fn widgets_js_wires_popover_menu() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        assert!(js.contains("data-autumn-menu"), "{js}");
+        assert!(js.contains("showPopover"), "{js}");
+        assert!(js.contains("hidePopover"), "{js}");
+        assert!(js.contains("data-popover-toggle"), "{js}");
+        assert!(!js.contains("data-nav-menu-toggle"), "{js}");
     }
 
     #[test]
@@ -818,10 +828,11 @@ mod tests {
     /// Byte budget for `autumn-widgets.js` (issue #3397). See
     /// `docs/guide/keyboard.md`. Raise it only with a reason in the PR.
     /// Issue #3399 added the toast runtime. It increased the budgets from
-    /// 32 KiB and 10 KiB.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 36 * 1024;
+    /// 32 KiB and 10 KiB. Issue #3402 added the popover menu runtime. It
+    /// increased the raw budget from 36 KiB and the gzip budget from 11 KiB.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 38 * 1024;
     /// Gzip budget. Browsers download this size.
-    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 11 * 1024;
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 12 * 1024;
 
     /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
     /// CRLF checkout changes the bytes, the content hash and the size.

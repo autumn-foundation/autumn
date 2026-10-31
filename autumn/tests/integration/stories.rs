@@ -232,6 +232,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "comment-thread",
     "confirm-action",
     "data-table",
+    "dropdown-menu",
     // Form field wrapper (`autumn_web::form`, #3395), not a `widgets.rs` fn.
     "field",
     // `autumn_web::a11y` primitives (#3398).
@@ -244,6 +245,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "nav-link",
     // `ui::pagination` (#3398).
     "pagination",
+    "popover",
     "property-list",
     "reaction-controls",
     "stat-card",
@@ -440,7 +442,7 @@ fn every_a11y_primitive_is_exercised_by_a_story() {
 const INTERACTIVE_MARKERS: &[&str] = &[
     "data-autumn-",
     "data-modal-open",
-    "data-nav-menu-toggle",
+    "data-popover-toggle",
     "autumn-flash__dismiss-toggle",
 ];
 
@@ -451,9 +453,11 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "active-search",
     "autocomplete",
     "confirm-action",
+    "dropdown-menu",
     "flash",
     "modal",
     "nav-bar",
+    "popover",
     "tabs",
     "theme-toggle",
     "toast",
@@ -516,6 +520,7 @@ const BROWSER_GATE_PATHS: &[&str] = &[
     "autumn/src/htmx.rs",
     "autumn/vendor/htmx.min.js",
     "autumn/tests/integration/widgets_toast_browser.rs",
+    "autumn/tests/integration/widgets_popover_browser.rs",
     "autumn/src/widget_pack.rs",
     "autumn/src/plugin_conformance/**",
     "autumn-plugin-reference/src/**",
@@ -541,6 +546,7 @@ fn widget_browser_workflow_runs_on_widget_changes() {
         "stories_browser",
         "widgets_keyboard_browser",
         "widgets_toast_browser",
+        "widgets_popover_browser",
         "widget_pack_browser",
     ] {
         assert!(
@@ -550,13 +556,18 @@ fn widget_browser_workflow_runs_on_widget_changes() {
             "widgets-browser.yml does not run the `{suite}` browser suite"
         );
     }
+    let publish = read_crate_file("../.github/workflows/publish-gate.yml");
+    assert!(
+        publish.contains("widgets_popover_browser -- --include-ignored"),
+        "publish-gate.yml does not run the popover browser suite (#3402)"
+    );
     // A filter that matches nothing exits 0. Each suite needs a count check.
     assert!(
         workflow.contains("the_swatch_pack_passes_widget_browser_conformance -- --include-ignored"),
         "widgets-browser.yml does not run the reference widget pack (#3400)"
     );
     assert!(
-        workflow.matches("passed' ").count() >= 5,
+        workflow.matches("passed' ").count() >= 6,
         "widgets-browser.yml must check a non-zero pass count for each suite"
     );
 }
