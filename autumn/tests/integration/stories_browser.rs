@@ -634,6 +634,12 @@ async fn keyboard_modal() {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
+async fn keyboard_drawer() {
+    check_dialog_keyboard("/_stories/drawer", "filters").await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
 async fn keyboard_confirm_action() {
     check_dialog_keyboard("/_stories/confirm-action", "delete-post").await;
 }

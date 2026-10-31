@@ -51,6 +51,7 @@
 //! | Situation | Use |
 //! |-----------|-----|
 //! | Custom dialog content | `modal` |
+//! | Panel from an edge (filters, menus, details) | `drawer` |
 //! | Confirm a destructive action (delete, etc.) without `window.confirm()` | `confirm_action` |
 //!
 //! # Integration with the repository full-text search feature
@@ -3911,6 +3912,10 @@ pub struct ModalConfig {
     /// pressing Escape dismisses the dialog. Off by default so a
     /// destructive confirm isn't accidentally dismissed by a stray click.
     light_dismiss: bool,
+    /// Size of the dialog (default [`DialogSize::Md`]).
+    size: DialogSize,
+    /// Accessible name of the built-in close button. `None` omits it.
+    close_label: Option<String>,
 }
 
 #[cfg(feature = "maud")]
@@ -3924,7 +3929,24 @@ impl ModalConfig {
             level: HeadingLevel::H2,
             class: None,
             light_dismiss: false,
+            size: DialogSize::Md,
+            close_label: None,
         }
+    }
+
+    /// Set the dialog size (default [`DialogSize::Md`]).
+    #[must_use]
+    pub const fn size(mut self, size: DialogSize) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Add a built-in × button. `label` is its accessible name, for example
+    /// `"Close dialog"`. The button is off by default.
+    #[must_use]
+    pub fn close_button(mut self, label: impl Into<String>) -> Self {
+        self.close_label = Some(label.into());
+        self
     }
 
     /// Set the footer content (e.g. action buttons) rendered in
@@ -3979,6 +4001,8 @@ impl ModalConfig {
 /// | `.autumn-modal` | Root `<dialog>` |
 /// | `.autumn-modal__content` | Inner content wrapper |
 /// | `.autumn-modal__title` | Title heading |
+/// | `.autumn-modal__close` | × button (only with [`ModalConfig::close_button`]) |
+/// | `.autumn-modal--sm`, `--lg`, `--full` | Size modifiers on the root |
 /// | `.autumn-modal__body` | Body wrapper |
 /// | `.autumn-modal__footer` | Footer wrapper (only present when configured) |
 ///
@@ -3998,13 +4022,20 @@ impl ModalConfig {
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn modal(id: &str, title: &str, body: &maud::Markup, config: &ModalConfig) -> maud::Markup {
-    let root_class = merge_class("autumn-modal", config.class.as_deref());
+    let size_class = config.size.modifier("autumn-modal");
+    let root_class = merge_class(
+        &merge_class("autumn-modal", size_class.as_deref()),
+        config.class.as_deref(),
+    );
     let title_id = format!("{id}-title");
     let closedby = config.light_dismiss.then_some("any");
     maud::html! {
         dialog id=(id) class=(root_class) role="dialog" aria-modal="true"
             aria-labelledby=(title_id) closedby=[closedby] {
             div class="autumn-modal__content" {
+                @if let Some(label) = &config.close_label {
+                    (dialog_close_x("autumn-modal__close", id, label))
+                }
                 (heading(config.level, Some(title_id.as_str()), "autumn-modal__title", &maud::html! { (title) }))
                 div class="autumn-modal__body" { (body) }
                 @if let Some(footer) = &config.footer {
@@ -4061,6 +4092,296 @@ pub fn modal_close_button(label: &str, dialog_id: &str, class: Option<&str>) -> 
     maud::html! {
         button type="button" class=[class]
             command="close" commandfor=(dialog_id) data-modal-close=(dialog_id) {
+            (label)
+        }
+    }
+}
+
+/// Size of a [`modal`] or [`drawer`].
+///
+/// `Md` is the default and adds no modifier class.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DialogSize {
+    /// Small.
+    Sm,
+    /// Medium (default).
+    #[default]
+    Md,
+    /// Large.
+    Lg,
+    /// The whole viewport.
+    Full,
+}
+
+#[cfg(feature = "maud")]
+impl DialogSize {
+    /// The modifier class for `base`, or `None` for `Md`.
+    fn modifier(self, base: &str) -> Option<String> {
+        let suffix = match self {
+            Self::Sm => "sm",
+            Self::Md => return None,
+            Self::Lg => "lg",
+            Self::Full => "full",
+        };
+        Some(format!("{base}--{suffix}"))
+    }
+}
+
+/// A × button that closes the dialog `dialog_id`. `label` is its accessible name.
+#[cfg(feature = "maud")]
+fn dialog_close_x(class: &str, dialog_id: &str, label: &str) -> maud::Markup {
+    maud::html! {
+        button type="button" class=(class) aria-label=(label)
+            command="close" commandfor=(dialog_id) data-modal-close=(dialog_id) {
+            span aria-hidden="true" { "×" }
+        }
+    }
+}
+
+/// The edge a [`drawer`] slides from.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DrawerSide {
+    /// Left edge.
+    Left,
+    /// Right edge (default).
+    #[default]
+    Right,
+    /// Top edge.
+    Top,
+    /// Bottom edge.
+    Bottom,
+}
+
+#[cfg(feature = "maud")]
+impl DrawerSide {
+    const fn class(self) -> &'static str {
+        match self {
+            Self::Left => "autumn-drawer--left",
+            Self::Right => "autumn-drawer--right",
+            Self::Top => "autumn-drawer--top",
+            Self::Bottom => "autumn-drawer--bottom",
+        }
+    }
+}
+
+/// Configuration for a [`drawer`].
+///
+/// Build with [`DrawerConfig::new`] and chain builder methods.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{DialogSize, DrawerConfig, DrawerSide, drawer};
+/// use maud::html;
+///
+/// let config = DrawerConfig::new()
+///     .side(DrawerSide::Left)
+///     .size(DialogSize::Lg)
+///     .close_button("Close filters");
+/// let html = drawer("filters", "Filters", &html! { p { "…" } }, &config);
+/// ```
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone)]
+pub struct DrawerConfig {
+    footer: Option<maud::Markup>,
+    level: HeadingLevel,
+    class: Option<String>,
+    side: DrawerSide,
+    size: DialogSize,
+    modal: bool,
+    light_dismiss: bool,
+    open: bool,
+    close_label: Option<String>,
+}
+
+#[cfg(feature = "maud")]
+impl Default for DrawerConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "maud")]
+impl DrawerConfig {
+    /// A modal drawer on the right edge, medium size, with light dismiss on
+    /// and no close button.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            footer: None,
+            level: HeadingLevel::H2,
+            class: None,
+            side: DrawerSide::Right,
+            size: DialogSize::Md,
+            modal: true,
+            light_dismiss: true,
+            open: false,
+            close_label: None,
+        }
+    }
+
+    /// Set the footer content, rendered in `<div class="autumn-drawer__footer">`.
+    #[must_use]
+    pub fn footer(mut self, footer: maud::Markup) -> Self {
+        self.footer = Some(footer);
+        self
+    }
+
+    /// Set the title heading level (default [`HeadingLevel::H2`]).
+    #[must_use]
+    pub const fn level(mut self, level: HeadingLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Add extra CSS class(es) to the root element.
+    #[must_use]
+    pub fn class(mut self, class: impl Into<String>) -> Self {
+        self.class = Some(class.into());
+        self
+    }
+
+    /// Set the edge (default [`DrawerSide::Right`]).
+    #[must_use]
+    pub const fn side(mut self, side: DrawerSide) -> Self {
+        self.side = side;
+        self
+    }
+
+    /// Set the size (default [`DialogSize::Md`]).
+    #[must_use]
+    pub const fn size(mut self, size: DialogSize) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// `true` (default): opens with `showModal()`. Focus is trapped and the
+    /// page behind is inert. `false`: opens with `show()`. The page stays
+    /// usable. Open it with [`drawer_trigger`] (needs `autumn-widgets.js`)
+    /// or [`DrawerConfig::open`].
+    #[must_use]
+    pub const fn modal(mut self, modal: bool) -> Self {
+        self.modal = modal;
+        self
+    }
+
+    /// `true` (default): emits `closedby="any"`. Escape and an outside click
+    /// close the drawer. See [`ModalConfig::light_dismiss`] for support notes.
+    #[must_use]
+    pub const fn light_dismiss(mut self, light_dismiss: bool) -> Self {
+        self.light_dismiss = light_dismiss;
+        self
+    }
+
+    /// Render a non-modal drawer already open. A modal drawer ignores this:
+    /// a modal dialog opens only through `showModal()`.
+    #[must_use]
+    pub const fn open(mut self, open: bool) -> Self {
+        self.open = open;
+        self
+    }
+
+    /// Add a built-in × button. `label` is its accessible name.
+    #[must_use]
+    pub fn close_button(mut self, label: impl Into<String>) -> Self {
+        self.close_label = Some(label.into());
+        self
+    }
+}
+
+/// Render a native `<dialog>` drawer that slides in from an edge.
+///
+/// It reuses the [`modal`] machinery: invoker commands, `closedby` light
+/// dismiss and the `autumn-widgets.js` fallbacks. Open a modal drawer with
+/// [`modal_trigger`] or [`drawer_trigger`]. It needs no app JavaScript.
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-drawer` | Root `<dialog>` |
+/// | `.autumn-drawer--left`, `--right`, `--top`, `--bottom` | Edge |
+/// | `.autumn-drawer--sm`, `--lg`, `--full` | Size |
+/// | `.autumn-drawer__content` | Content wrapper |
+/// | `.autumn-drawer__title` | Title heading |
+/// | `.autumn-drawer__close` | × button (only with [`DrawerConfig::close_button`]) |
+/// | `.autumn-drawer__body` | Body wrapper |
+/// | `.autumn-drawer__footer` | Footer (only when set) |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{DrawerConfig, drawer, drawer_trigger};
+/// use maud::html;
+///
+/// let config = DrawerConfig::new();
+/// let trigger = drawer_trigger("Filters", "filters", &config, None);
+/// let html = drawer("filters", "Filters", &html! { p { "…" } }, &config).into_string();
+/// assert!(html.contains("autumn-drawer--right"));
+/// assert!(trigger.into_string().contains(r#"commandfor="filters""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn drawer(id: &str, title: &str, body: &maud::Markup, config: &DrawerConfig) -> maud::Markup {
+    let size_class = config.size.modifier("autumn-drawer");
+    let root_class = merge_class(
+        &merge_class(
+            &merge_class("autumn-drawer", Some(config.side.class())),
+            size_class.as_deref(),
+        ),
+        config.class.as_deref(),
+    );
+    let title_id = format!("{id}-title");
+    let closedby = config.light_dismiss.then_some("any");
+    let aria_modal = config.modal.then_some("true");
+    let open = config.open && !config.modal;
+    maud::html! {
+        dialog id=(id) class=(root_class) role="dialog" aria-modal=[aria_modal]
+            aria-labelledby=(title_id) closedby=[closedby] open[open] {
+            div class="autumn-drawer__content" {
+                @if let Some(label) = &config.close_label {
+                    (dialog_close_x("autumn-drawer__close", id, label))
+                }
+                (heading(config.level, Some(title_id.as_str()), "autumn-drawer__title", &maud::html! { (title) }))
+                div class="autumn-drawer__body" { (body) }
+                @if let Some(footer) = &config.footer {
+                    div class="autumn-drawer__footer" { (footer) }
+                }
+            }
+        }
+    }
+}
+
+/// Render a `<button>` that opens the [`drawer`] `dialog_id`.
+///
+/// A modal drawer gets the same invoker command as [`modal_trigger`]. A
+/// non-modal drawer gets `data-drawer-open`, which `autumn-widgets.js` wires
+/// to `show()`: the invoker commands have no non-modal `show`.
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{DrawerConfig, drawer_trigger};
+///
+/// let html = drawer_trigger("Menu", "menu", &DrawerConfig::new().modal(false), None)
+///     .into_string();
+/// assert!(html.contains(r#"data-drawer-open="menu""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn drawer_trigger(
+    label: &str,
+    dialog_id: &str,
+    config: &DrawerConfig,
+    class: Option<&str>,
+) -> maud::Markup {
+    if config.modal {
+        return modal_trigger(label, dialog_id, class);
+    }
+    maud::html! {
+        button type="button" class=[class] aria-controls=(dialog_id) data-drawer-open=(dialog_id) {
             (label)
         }
     }

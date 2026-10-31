@@ -589,6 +589,23 @@
     if (t.matches && t.matches('dialog[closedby="any"][open]')) t.close();
   });
 
+  // ── non-modal drawer (#3403) ──────────────────────────────────────────────
+  // The invoker commands have no non-modal `show`, so drawer_trigger emits
+  // data-drawer-open for a drawer that is not modal. A non-modal <dialog>
+  // gets no Escape from the browser; closedby="any" does it where supported.
+  // Elsewhere, close it on Escape when focus is inside it.
+  document.addEventListener('click', function (e) {
+    var opener = e.target.closest && e.target.closest('[data-drawer-open]');
+    if (!opener) return;
+    var d = document.getElementById(opener.getAttribute('data-drawer-open'));
+    if (d && d.show && !d.open) d.show();
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape' || e.defaultPrevented) return;
+    var d = e.target.closest && e.target.closest('dialog[closedby="any"][open]');
+    if (d && !d.matches(':modal')) d.close();
+  });
+
   // ── theme_toggle (#3396) ──────────────────────────────────────────────────
   // autumn_web::widgets::theme_toggle is a no-JS POST form. This code applies
   // the choice in place: data-theme on <html> and aria-pressed on each toggle.
