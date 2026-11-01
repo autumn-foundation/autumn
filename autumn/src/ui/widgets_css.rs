@@ -346,6 +346,61 @@ mod tests {
         }
     }
 
+    /// An unclosed block turns every later rule into part of it, for example
+    /// an `@media` query. Braces must balance, and never go below zero.
+    #[test]
+    fn component_css_braces_balance() {
+        let mut css = String::new();
+        let mut rest = WIDGETS_COMPONENT_CSS;
+        while let Some(start) = rest.find("/*") {
+            css.push_str(&rest[..start]);
+            let end = rest[start..]
+                .find("*/")
+                .map_or(rest.len(), |e| start + e + 2);
+            rest = &rest[end..];
+        }
+        css.push_str(rest);
+        let mut depth = 0_i32;
+        for c in css.chars() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            assert!(depth >= 0, "a `}}` has no matching `{{`");
+        }
+        assert_eq!(depth, 0, "{depth} unclosed `{{` in widgets.css");
+    }
+
+    /// The drawer paints the token surface and has a rule for each edge,
+    /// size and close button.
+    #[test]
+    fn drawer_uses_tokens_and_styles_every_variant() {
+        let body = rule_body(".autumn-drawer");
+        for declaration in ["background: var(--surface);", "color: var(--text);"] {
+            assert!(body.contains(declaration), "missing `{declaration}`:{body}");
+        }
+        for selector in [
+            ".autumn-drawer--left",
+            ".autumn-drawer--right",
+            ".autumn-drawer--top",
+            ".autumn-drawer--bottom",
+            ".autumn-drawer--sm",
+            ".autumn-drawer--lg",
+            ".autumn-drawer--full",
+            ".autumn-modal--sm",
+            ".autumn-modal--lg",
+            ".autumn-modal--full",
+            ".autumn-modal__close",
+            ".autumn-drawer__close",
+        ] {
+            assert!(
+                WIDGETS_COMPONENT_CSS.contains(selector),
+                "no rule: {selector}"
+            );
+        }
+    }
+
     /// The exit animation cancels the region gap, which density scales.
     #[test]
     fn toast_exit_follows_the_density_gap() {

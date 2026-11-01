@@ -823,6 +823,64 @@
     margin-top: var(--space-1);
 }
 
+.autumn-modal--sm {
+    max-width: 20rem;
+}
+
+.autumn-modal--lg {
+    max-width: 48rem;
+}
+
+.autumn-modal--full {
+    max-width: none;
+    width: 100%;
+    max-height: none;
+    height: 100%;
+    margin: 0;
+    border-radius: 0;
+}
+
+.autumn-modal__content,
+.autumn-drawer__content {
+    position: relative;
+}
+
+.autumn-modal__close,
+.autumn-drawer__close {
+    position: absolute;
+    top: var(--space-3);
+    right: var(--space-3);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    background: transparent;
+    color: var(--text);
+    border: 0;
+    border-radius: var(--radius);
+    font-size: var(--font-size-lg);
+    line-height: 1;
+    cursor: pointer;
+}
+
+.autumn-modal__close:hover,
+.autumn-drawer__close:hover {
+    background-color: var(--bg);
+}
+
+.autumn-modal__close:focus-visible,
+.autumn-drawer__close:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-modal__close ~ .autumn-modal__title,
+.autumn-drawer__close ~ .autumn-drawer__title {
+    padding-right: var(--space-8);
+}
+
 .autumn-modal__confirm-form {
     display: inline;
 }
@@ -866,6 +924,130 @@
 .autumn-modal__confirm--danger:hover {
     background-color: var(--danger-hover);
     border-color: var(--danger-hover);
+}
+
+/* ── Drawer / sheet (autumn-drawer) ────────────────────────────────────────── */
+
+.autumn-drawer {
+    --autumn-drawer-size: 24rem;
+    box-sizing: border-box;
+    position: fixed;
+    z-index: var(--z-banner);
+    margin: 0;
+    padding: 0;
+    max-width: none;
+    max-height: none;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+}
+
+.autumn-drawer[open] {
+    display: flex;
+    flex-direction: column;
+}
+
+.autumn-drawer::backdrop {
+    background-color: rgba(17, 24, 39, 0.5);
+}
+
+.autumn-drawer--sm {
+    --autumn-drawer-size: 16rem;
+}
+
+.autumn-drawer--lg {
+    --autumn-drawer-size: 40rem;
+}
+
+.autumn-drawer--full {
+    --autumn-drawer-size: 100%;
+}
+
+.autumn-drawer--left,
+.autumn-drawer--right {
+    top: 0;
+    bottom: 0;
+    width: var(--autumn-drawer-size);
+    max-width: 100%;
+    height: 100%;
+}
+
+.autumn-drawer--left {
+    left: 0;
+    right: auto;
+    border-width: 0 1px 0 0;
+}
+
+.autumn-drawer--right {
+    right: 0;
+    left: auto;
+    border-width: 0 0 0 1px;
+}
+
+.autumn-drawer--top,
+.autumn-drawer--bottom {
+    left: 0;
+    right: 0;
+    height: var(--autumn-drawer-size);
+    max-height: 100%;
+    width: 100%;
+}
+
+.autumn-drawer--top {
+    top: 0;
+    bottom: auto;
+    border-width: 0 0 1px;
+}
+
+.autumn-drawer--bottom {
+    bottom: 0;
+    top: auto;
+    border-width: 1px 0 0;
+}
+
+.autumn-drawer__content {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    gap: var(--space-3);
+    padding: var(--space-6);
+    overflow: auto;
+}
+
+.autumn-drawer__title {
+    margin: 0;
+    font-size: var(--font-size-lg);
+    font-weight: var(--font-weight-semibold);
+    color: var(--text);
+}
+
+.autumn-drawer__body {
+    flex: 1;
+    color: var(--text);
+    font-size: 0.9375rem;
+}
+
+.autumn-drawer__footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+}
+
+@keyframes autumn-drawer-in-x {
+    from { translate: var(--autumn-drawer-from, 100%) 0; }
+}
+
+@keyframes autumn-drawer-in-y {
+    from { translate: 0 var(--autumn-drawer-from, 100%); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .autumn-drawer--left[open] { --autumn-drawer-from: -100%; animation: autumn-drawer-in-x 0.2s ease-out; }
+    .autumn-drawer--right[open] { animation: autumn-drawer-in-x 0.2s ease-out; }
+    .autumn-drawer--top[open] { --autumn-drawer-from: -100%; animation: autumn-drawer-in-y 0.2s ease-out; }
+    .autumn-drawer--bottom[open] { animation: autumn-drawer-in-y 0.2s ease-out; }
 }
 
 /* ── Accordion and collapsible (autumn-accordion, autumn-collapsible) ──────── */

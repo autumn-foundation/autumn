@@ -51,6 +51,7 @@ Looking for the API reference instead? That is
 - [View Formatting Helpers](format-helpers.md) — `number_to_currency`, `pluralize`, `truncate`, `time_ago_in_words` and friends
 - [Maud Fragment Caching](fragment-caching.md) — caching part of a rendered page
 - [Tabs](tabs.md) — tabbed panels without writing JavaScript
+- [Drawer and modal sizes](drawer.md) — edge panels, modal sizes and a built-in close button
 - [Accordion and collapsible](accordion.md) — native `<details>` disclosure, no JavaScript
 - [Widget Packs](widget-packs.md) — ship widgets as a plugin: the widget contract, stories, form binding, conformance
 - [Widget Keyboard Core](keyboard.md) — APG arrow keys, typeahead and dismiss for widgets, bound by `data-*`

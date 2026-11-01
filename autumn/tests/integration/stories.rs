@@ -232,6 +232,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "comment-thread",
     "confirm-action",
     "data-table",
+    "drawer",
     // Form field wrapper (`autumn_web::form`, #3395), not a `widgets.rs` fn.
     "field",
     // `autumn_web::a11y` primitives (#3398).
@@ -441,6 +442,7 @@ fn every_a11y_primitive_is_exercised_by_a_story() {
 const INTERACTIVE_MARKERS: &[&str] = &[
     "data-autumn-",
     "data-modal-open",
+    "data-drawer-open",
     "data-nav-menu-toggle",
     "autumn-flash__dismiss-toggle",
 ];
@@ -453,6 +455,7 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "active-search",
     "autocomplete",
     "confirm-action",
+    "drawer",
     "flash",
     "modal",
     "nav-bar",
@@ -518,6 +521,7 @@ const BROWSER_GATE_PATHS: &[&str] = &[
     "autumn/src/htmx.rs",
     "autumn/vendor/htmx.min.js",
     "autumn/tests/integration/widgets_toast_browser.rs",
+    "autumn/tests/integration/widgets_drawer_browser.rs",
     "autumn/src/widget_pack.rs",
     "autumn/src/plugin_conformance/**",
     "autumn-plugin-reference/src/**",
@@ -543,6 +547,7 @@ fn widget_browser_workflow_runs_on_widget_changes() {
         "stories_browser",
         "widgets_keyboard_browser",
         "widgets_toast_browser",
+        "widgets_drawer_browser",
         "widget_pack_browser",
     ] {
         assert!(

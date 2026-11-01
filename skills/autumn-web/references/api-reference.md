@@ -917,7 +917,9 @@ Per-primitive setters (in addition to the shared set):
 - `autumn_web::widgets`: `card(&body, &CardConfig)`,
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
   `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
-  `modal_close_button`, `confirm_action(...)`.
+  `modal_close_button`, `confirm_action(...)`,
+  `drawer(id, title, &body, &DrawerConfig)`, `drawer_trigger` (#3403);
+  `DialogSize` sizes both, `close_button(label)` adds a ×.
 - `autumn_web::widgets::transition_controls(action, field, current,
   transitions, can, csrf, csrf_field)` (#1917) — renders one CSRF-protected,
   no-JS `POST` form + submit button per field-level `#[state_machine]`

@@ -407,7 +407,7 @@ fn builtin_stories() -> Vec<Story> {
             "Modal",
             {
                 use autumn_web::widgets::{
-                    ModalConfig, modal, modal_close_button, modal_trigger,
+                    DialogSize, ModalConfig, modal, modal_close_button, modal_trigger,
                 };
 
                 let body = maud::html! { p { "This action cannot be undone." } };
@@ -415,10 +415,53 @@ fn builtin_stories() -> Vec<Story> {
                     .footer(maud::html! {
                         (modal_close_button("Cancel", "delete-confirm", None))
                     })
+                    .close_button("Close dialog")
                     .light_dismiss(true);
+                let large = ModalConfig::new()
+                    .size(DialogSize::Lg)
+                    .close_button("Close dialog")
+                    .light_dismiss(true);
+                let large_body = maud::html! { p { "A large dialog has room for a form." } };
                 maud::html! {
                     (modal_trigger("Delete post", "delete-confirm", None))
                     (modal("delete-confirm", "Delete this post?", &body, &config))
+                    (modal_trigger("Large modal", "large-modal", None))
+                    (modal("large-modal", "Large modal", &large_body, &large))
+                }
+            }
+        },
+        story! {
+            "Overlays",
+            "Drawer",
+            {
+                use autumn_web::widgets::{
+                    DialogSize, DrawerConfig, DrawerSide, drawer, drawer_trigger,
+                    modal_close_button,
+                };
+
+                let body = maud::html! { p { "Filters and details sit at the edge." } };
+                let right = DrawerConfig::new()
+                    .close_button("Close filters")
+                    .footer(maud::html! { (modal_close_button("Done", "filters", None)) });
+                let left = DrawerConfig::new()
+                    .side(DrawerSide::Left)
+                    .size(DialogSize::Sm)
+                    .close_button("Close menu");
+                let bottom = DrawerConfig::new()
+                    .side(DrawerSide::Bottom)
+                    .close_button("Close sheet");
+                let panel = DrawerConfig::new()
+                    .modal(false)
+                    .close_button("Close panel");
+                maud::html! {
+                    (drawer_trigger("Filters", "filters", &right, None))
+                    (drawer("filters", "Filters", &body, &right))
+                    (drawer_trigger("Menu", "menu-drawer", &left, None))
+                    (drawer("menu-drawer", "Menu", &body, &left))
+                    (drawer_trigger("Bottom sheet", "bottom-sheet", &bottom, None))
+                    (drawer("bottom-sheet", "Bottom sheet", &body, &bottom))
+                    (drawer_trigger("Side panel", "side-panel", &panel, None))
+                    (drawer("side-panel", "Side panel", &body, &panel))
                 }
             }
         },
