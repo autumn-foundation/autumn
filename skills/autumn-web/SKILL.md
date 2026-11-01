@@ -214,6 +214,15 @@ my-app/
 > changed action on an existing foreign key. If the database already has the
 > action, declare it on the model. See `docs/guide/declarative-schema.md`.
 
+> **Keep every table at 32 columns or fewer.** A 33rd column forces diesel's
+> `64-column-tables` feature, and Cargo turns it on for the whole build: every
+> crate that uses diesel then compiles slower and needs more memory (one crate
+> measured 1.16 GB / 1m18s at 32, 2.92 GB / 2m04s at 64 and 9.95 GB / 8m16s at
+> 128). Move rarely-read columns to a 1:1 side table or a JSONB column instead.
+> `autumn build` warns about a wide table but does not fail. `autumn schema
+> width` lists the wide tables and exits non-zero. See
+> `docs/guide/table-width.md`.
+
 ## Cargo.toml
 
 ```toml

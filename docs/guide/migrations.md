@@ -6,6 +6,11 @@ covers the advisory-lock serialisation that prevents schema divergence during
 rolling deploys, how to monitor contention, and what to expect on non-Postgres
 backends.
 
+Keep each table at 32 columns or fewer. A wider table forces diesel's
+`64-column-tables` feature, which makes every crate that uses diesel slower to
+compile. `autumn build` warns when a migration crosses that line. See
+[Table width](./table-width.md).
+
 ---
 
 ## Advisory lock serialisation

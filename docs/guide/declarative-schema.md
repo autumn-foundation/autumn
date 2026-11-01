@@ -554,6 +554,20 @@ checks are:
 
 ---
 
+## `autumn schema width`
+
+Reports every table wider than Diesel's default 32-column tuple cap, read from
+the replayed migrations, the `diesel::table!` blocks and the `#[model]`
+structs. It exits non-zero on a finding. `autumn build` prints the same
+findings as a warning. See [Table width](./table-width.md) for why 32 is the
+line.
+
+```sh
+autumn schema width
+autumn schema width --all
+autumn schema width --max 64
+```
+
 ## A typical loop
 
 ```sh
