@@ -521,6 +521,12 @@ impl Replay {
                     if let Some((to, _)) = read_name(action, 2)
                         && let Some(state) = self.tables.remove(&table)
                     {
+                        // `RENAME TO` names no schema: the table stays in its
+                        // own, so `a.t RENAME TO u` is `a.u`.
+                        let to = match table.rsplit_once('.') {
+                            Some((schema, _)) if !to.contains('.') => format!("{schema}.{to}"),
+                            _ => to,
+                        };
                         self.tables.insert(to.clone(), state);
                         table = to;
                     }
@@ -646,35 +652,67 @@ pub fn rust_source_widths(path: &Path, src: &str) -> Vec<TableWidth> {
             path: path.to_path_buf(),
         }));
     }
-    if mentions_model && let Ok(parsed) = super::parse::parse_model_source(src, Backend::Postgres) {
-        for table in parsed.tables {
-            // The parser adds a conventional `created_at` the macro never reads.
-            let implicit = parsed
-                .implicit_columns
-                .iter()
-                .filter(|(t, _)| *t == table.name)
-                .count();
-            // A field whose SQL type the parser cannot rebuild (a custom enum)
-            // is skipped from `columns` with a diagnostic, but it is still a
-            // column the macro's Diesel derives carry. Width needs no type.
-            let mut skipped: Vec<&str> = parsed
-                .diagnostics
-                .iter()
-                .filter(|d| d.table == table.name)
-                .map(|d| d.field.as_str())
-                .filter(|f| !table.columns.iter().any(|c| c.name == *f))
-                .collect();
-            skipped.sort_unstable();
-            skipped.dedup();
-            out.push(TableWidth {
-                columns: table.columns.len().saturating_sub(implicit) + skipped.len(),
-                table: table.name,
-                source: WidthSource::Model,
-                path: path.to_path_buf(),
-            });
+    if mentions_model {
+        out.extend(model_widths(path, src));
+        // `parse_model_source` reads top-level items only; a `#[model]` inside
+        // an inline `mod x { … }` is re-read from that module's tokens.
+        if let Ok(file) = syn::parse_file(src) {
+            let mut modules = Vec::new();
+            collect_inline_modules(&file.items, &mut modules);
+            for items in modules {
+                let tokens = quote::quote! { #(#items)* }.to_string();
+                out.extend(model_widths(path, &tokens));
+            }
         }
     }
     out
+}
+
+/// The `#[model]` widths among the top-level items of `src`.
+fn model_widths(path: &Path, src: &str) -> Vec<TableWidth> {
+    let mut out = Vec::new();
+    let Ok(parsed) = super::parse::parse_model_source(src, Backend::Postgres) else {
+        return out;
+    };
+    for table in parsed.tables {
+        // The parser adds a conventional `created_at` the macro never reads.
+        let implicit = parsed
+            .implicit_columns
+            .iter()
+            .filter(|(t, _)| *t == table.name)
+            .count();
+        // A field whose SQL type the parser cannot rebuild (a custom enum)
+        // is skipped from `columns` with a diagnostic, but it is still a
+        // column the macro's Diesel derives carry. Width needs no type.
+        let mut skipped: Vec<&str> = parsed
+            .diagnostics
+            .iter()
+            .filter(|d| d.table == table.name)
+            .map(|d| d.field.as_str())
+            .filter(|f| !table.columns.iter().any(|c| c.name == *f))
+            .collect();
+        skipped.sort_unstable();
+        skipped.dedup();
+        out.push(TableWidth {
+            columns: table.columns.len().saturating_sub(implicit) + skipped.len(),
+            table: table.name,
+            source: WidthSource::Model,
+            path: path.to_path_buf(),
+        });
+    }
+    out
+}
+
+/// Every inline module's item list, at any depth.
+fn collect_inline_modules<'a>(items: &'a [syn::Item], out: &mut Vec<&'a [syn::Item]>) {
+    for item in items {
+        if let syn::Item::Mod(module) = item
+            && let Some((_, nested)) = &module.content
+        {
+            out.push(nested);
+            collect_inline_modules(nested, out);
+        }
+    }
 }
 
 // ── Discovery ──────────────────────────────────────────────────────────────
@@ -1079,6 +1117,34 @@ mod tests {
             .expect("model width");
         // id + 31 + the enum field the parser cannot type.
         assert_eq!(model.columns, 33);
+    }
+
+    #[test]
+    fn rename_keeps_the_schema() {
+        let cols: Vec<String> = (0..32).map(|i| format!("c{i} TEXT")).collect();
+        let w = widths(&[
+            format!("CREATE TABLE a.t ({});", cols.join(", ")).as_str(),
+            "ALTER TABLE a.t RENAME TO u;",
+            "ALTER TABLE a.u ADD COLUMN one_more TEXT;",
+        ]);
+        assert_eq!(w.get("a.t"), None);
+        assert_eq!(w.get("u"), None);
+        assert_eq!(w.get("a.u"), Some(&33));
+    }
+
+    #[test]
+    fn models_in_inline_modules_count() {
+        let fields: Vec<String> = (0..33).map(|i| format!("pub f{i}: String,")).collect();
+        let src = format!(
+            "mod models {{ mod deeper {{ #[model]\npub struct Wide {{\n#[id]\npub id: i64,\n{}\n}} }} }}",
+            fields.join("\n")
+        );
+        let found = rust_source_widths(Path::new("lib.rs"), &src);
+        let model = found
+            .iter()
+            .find(|t| t.source == WidthSource::Model)
+            .expect("nested model width");
+        assert_eq!(model.columns, 34);
     }
 
     #[test]
