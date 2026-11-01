@@ -609,14 +609,7 @@ impl AdminModel for FeatureFlagAdminModel {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|r| crate::AdminHistoryEntry {
-                id: r.id,
-                actor: r.actor.unwrap_or_else(|| "cli".to_owned()),
-                op: r.op,
-                request_id: None,
-                changes: vec![],
-                recorded_at: r.changed_at.and_utc(),
-            })
+            .map(history_row_to_entry)
             .collect();
 
             Ok(crate::AdminHistoryPage {
@@ -704,6 +697,19 @@ impl FlagRow {
     }
 }
 
+// Echo clone class (autumn-admin-plugin::history_row_shape): `HistoryRow` and
+// `history_row_to_entry` below are structurally identical to their namesakes
+// in `experiments.rs` — same columns, same `actor` default. They have
+// co-changed twice (commit 3d318b55: `changed_at` Timestamptz→Timestamp +
+// `.and_utc()`; commit 10e9538e: pool type), but the surrounding query is not
+// a clone: this model's `get_history` walks a rename-ancestry recursive CTE
+// (`ancestor_cte` below) that `experiments.rs` has no equivalent for, so the
+// two `get_history` bodies are a real, documented divergence, not an
+// oversight. Two instances with no missed-fix defect is below Echo's merge
+// bar (rule of three), so this is linked, not merged — keep the "cli"
+// default and the column set in sync by hand;
+// `history_row_to_entry_defaults_actor_to_cli` below pins the one invariant
+// that matters.
 #[derive(diesel::QueryableByName)]
 struct HistoryRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -716,6 +722,17 @@ struct HistoryRow {
     changed_at: chrono::NaiveDateTime,
 }
 
+fn history_row_to_entry(r: HistoryRow) -> crate::AdminHistoryEntry {
+    crate::AdminHistoryEntry {
+        id: r.id,
+        actor: r.actor.unwrap_or_else(|| "cli".to_owned()),
+        op: r.op,
+        request_id: None,
+        changes: vec![],
+        recorded_at: r.changed_at.and_utc(),
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -726,6 +743,23 @@ mod tests {
     fn feature_flag_admin_model_slug_is_feature_flags() {
         let model = FeatureFlagAdminModel;
         assert_eq!(model.slug(), "feature-flags");
+    }
+
+    // Pins the one invariant `history_row_to_entry` shares with its
+    // `experiments.rs` namesake (see the clone-class comment on `HistoryRow`
+    // above): a NULL `actor` column reads as "cli" in the admin history tab.
+    // If this drifts from `experiments.rs`'s copy, the two models' history
+    // tabs would show different authorship for the same kind of
+    // unattributed mutation.
+    #[test]
+    fn history_row_to_entry_defaults_actor_to_cli() {
+        let row = HistoryRow {
+            id: 1,
+            op: "update".to_owned(),
+            actor: None,
+            changed_at: chrono::Utc::now().naive_utc(),
+        };
+        assert_eq!(history_row_to_entry(row).actor, "cli");
     }
 
     #[test]
