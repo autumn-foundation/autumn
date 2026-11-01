@@ -163,8 +163,12 @@ movement. Each fleet database ships its WAL to object storage under
 `fleet/<name>/`, through the same engine and the same `[replication]`
 destination as the control database:
 
-- the fleet replicator ticks one `Replicator` per **open** database on one
-  thread;
+- the fleet replicator ticks one `Replicator` per **open** database. One
+  thread starts a pass every sync interval. `replication_workers` threads
+  (default 4) ship the databases of a pass at the same time, the database
+  that shipped longest ago first. One thread for all databases did not keep
+  the RPO: with 150 to 230 busy databases per host, a pass took several
+  seconds (Murmuration, 2026-10);
 - a database it replicates runs with `wal_autocheckpoint = 0`, and only its
   replicator checkpoints. Fleet pools never inherit the process latch that
   disables auto-checkpointing for the control database, so a fleet that does

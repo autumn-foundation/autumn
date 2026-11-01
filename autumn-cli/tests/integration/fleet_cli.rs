@@ -122,6 +122,7 @@ mod sqlite {
                 ownership: None,
                 replica_retention_after_delete: std::time::Duration::ZERO,
                 restore_check_sample: 0,
+                replication_workers: 4,
             }
         }
 

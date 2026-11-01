@@ -175,6 +175,7 @@ fn fleet(dir: &FsPath, mode: FleetMode, create_on_demand: bool) -> DatabaseFleet
         ownership: None,
         replica_retention_after_delete: std::time::Duration::ZERO,
         restore_check_sample: 0,
+        replication_workers: 4,
     })
     .migrations("app", MIGRATIONS)
     .migrations(
