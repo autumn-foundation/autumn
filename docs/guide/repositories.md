@@ -4,6 +4,19 @@ Repositories in `autumn-web` provide a clean, type-safe, and highly optimized OR
 
 In version `0.5.0`, Autumn introduces high-performance **Bulk CRUD operations** to minimize database round trips and execute massive writes transaction-safely and hook-compliantly.
 
+### Names and imports
+
+`#[repository] trait NoteRepository` generates the struct `PgNoteRepository`.
+A SQLite build (`sqlite` feature) also names it `SqliteNoteRepository`. The two
+names are one type.
+
+In a module with `#[model]` or `#[repository]`, import
+`autumn_web::db::prelude::*`, not `diesel::prelude::*`. Diesel's prelude also
+brings in the blocking `RunQueryDsl`, and the generated code then fails with
+E0034 ("multiple applicable items in scope"). `autumn_web::db::prelude` has
+all of Diesel's prelude, with the `diesel_async` `RunQueryDsl` and
+`SaveChangesDsl`.
+
 ---
 
 ## Generated Bulk CRUD Methods

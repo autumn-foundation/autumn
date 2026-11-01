@@ -123,6 +123,7 @@ mod sqlite {
                 replica_retention_after_delete: std::time::Duration::ZERO,
                 restore_check_sample: 0,
                 replication_workers: 4,
+                min_residency: std::time::Duration::from_secs(2),
             }
         }
 
@@ -615,6 +616,38 @@ mod sqlite {
 
         let stderr = run_err(&app.dir, &["fleet", "delete", "tenant:acme", "--force"]);
         assert!(stderr.contains("does not exist"), "{stderr}");
+    }
+
+    #[test]
+    fn fleet_import_puts_a_backup_back() {
+        let app = App::new("");
+        app.provision(&app.fleet(), &["acme"], 2);
+        let backup = app.dir.join("acme-backup.db");
+        run_ok(
+            &app.dir,
+            &["fleet", "backup", "tenant:acme", backup.to_str().unwrap()],
+        );
+
+        let stderr = run_err(
+            &app.dir,
+            &["fleet", "import", "tenant:acme", backup.to_str().unwrap()],
+        );
+        assert!(stderr.contains("already has a database"), "{stderr}");
+
+        run_ok(&app.dir, &["fleet", "delete", "tenant:acme", "--force"]);
+        run_ok(
+            &app.dir,
+            &["fleet", "import", "tenant/acme", backup.to_str().unwrap()],
+        );
+        assert_eq!(count_notes(&app.path("acme")), 2);
+        assert!(backup.is_file(), "the source stays");
+
+        let stderr = run_err(
+            &app.dir,
+            &["fleet", "import", "tenant:globex", backup.to_str().unwrap()],
+        );
+        assert!(stderr.contains("tenant:acme"), "{stderr}");
+        assert!(!app.path("globex").exists(), "nothing is published");
     }
 
     #[test]

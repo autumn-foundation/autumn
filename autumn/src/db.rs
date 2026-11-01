@@ -120,6 +120,26 @@ pub mod fleet_sweeper;
 #[cfg(feature = "sqlite")]
 pub mod fleet_tombstones;
 pub mod pooler;
+
+/// Diesel's prelude for async code. Use it in place of `diesel::prelude::*`.
+///
+/// `diesel::prelude::*` also brings in the blocking `RunQueryDsl` and
+/// `SaveChangesDsl`. In a module with `#[model]` or `#[repository]`, the
+/// generated code then fails with E0034 ("multiple applicable items in
+/// scope"). This prelude has all of Diesel's prelude, but those two names
+/// are the `diesel_async` traits.
+///
+/// ```rust,ignore
+/// use autumn_web::db::prelude::*;
+///
+/// let n: i64 = notes::table.count().get_result(&mut *db).await?;
+/// ```
+pub mod prelude {
+    pub use diesel::prelude::*;
+    // A named import hides the glob import of the same name.
+    pub use diesel_async::{AsyncConnection, RunQueryDsl, SaveChangesDsl};
+}
+
 /// `TEXT`-backed newtypes for foreign model-field types on `SQLite` (#1924).
 #[cfg(feature = "sqlite")]
 pub mod sqlite_types;

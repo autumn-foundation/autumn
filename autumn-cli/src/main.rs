@@ -1627,7 +1627,8 @@ enum Commands {
     },
     /// Shard operations (e.g. moving a tenant's data between shards)
     Shard(ShardCommands),
-    /// Operate a `SQLite` database fleet: list, migrate, back up, delete, restore.
+    /// Operate a `SQLite` database fleet: list, migrate, back up, import, delete,
+    /// restore.
     ///
     /// Reads `[database.fleet]` from the app config. `restore` also reads
     /// `[replication]`. Run it from the app directory: the fleet root must
@@ -1639,6 +1640,7 @@ enum Commands {
     ///   autumn fleet list --open
     ///   autumn fleet migrate --concurrency 4
     ///   autumn fleet backup tenant:acme /backups/acme.db
+    ///   autumn fleet import tenant:acme /backups/acme.db
     ///   autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
     #[command(subcommand, verbatim_doc_comment)]
     Fleet(FleetCommands),
@@ -3521,6 +3523,22 @@ enum FleetCommands {
         #[arg(value_name = "DEST")]
         dest: std::path::PathBuf,
     },
+    /// Put a database file back under KEY, for example a backup.
+    ///
+    /// Copies SOURCE with `VACUUM INTO`, checks its integrity and identity row,
+    /// applies `migrations/` and the framework tables, then publishes it.
+    /// Refused when KEY already has a file. SOURCE does not change.
+    Import {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// The database: `tenant:<id>` or `slot:<nnnnn>`.
+        #[arg(value_name = "KEY")]
+        key: String,
+        /// The file to copy in.
+        #[arg(value_name = "SOURCE")]
+        source: std::path::PathBuf,
+    },
     /// Remove one database file and its sidecars.
     ///
     /// With `[replication]` on, also remove its replica, or keep it for
@@ -3583,6 +3601,15 @@ impl FleetCommands {
             Self::Backup { profile, key, dest } => {
                 fleet::FleetCommand::Backup { profile, key, dest }
             }
+            Self::Import {
+                profile,
+                key,
+                source,
+            } => fleet::FleetCommand::Import {
+                profile,
+                key,
+                source,
+            },
             Self::Delete {
                 profile,
                 key,

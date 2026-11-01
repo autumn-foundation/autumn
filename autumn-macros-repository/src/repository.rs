@@ -3335,6 +3335,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let table_ident = format_ident!("{table_name}");
     let trait_name = &trait_def.ident;
     let pg_name = format_ident!("Pg{trait_name}");
+    let sqlite_name = format_ident!("Sqlite{trait_name}");
     let history_flush_method = history_flush_method_ts(&config);
     let new_name = format_ident!("New{model_name}");
     let update_name = format_ident!("Update{model_name}");
@@ -6585,10 +6586,13 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // traits (see `M2mConnSource`).
         #m2m_conn_source_impl
 
-        /// Postgres implementation of the repository.
+        /// The generated repository. A `SQLite` build also names it
+        /// `Sqlite<Trait>`.
         #vis struct #pg_name {
             #struct_fields
         }
+
+        ::autumn_web::__sqlite_repository_alias!(#vis #sqlite_name = #pg_name);
 
         #from_request_parts_impl
 

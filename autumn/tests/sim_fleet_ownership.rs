@@ -122,6 +122,7 @@ async fn host(dir: &std::path::Path, name: &str) -> Host {
         replica_retention_after_delete: std::time::Duration::ZERO,
         restore_check_sample: 0,
         replication_workers: 4,
+        min_residency: std::time::Duration::from_secs(2),
     })
     .build()
     .unwrap();

@@ -1002,6 +1002,7 @@ mod tests {
                 replica_retention_after_delete: setup.retention,
                 restore_check_sample: 0,
                 replication_workers: 4,
+                min_residency: std::time::Duration::from_secs(2),
             })
             .build()
             .unwrap();
@@ -1832,6 +1833,7 @@ mod tests {
                 replica_retention_after_delete: Duration::ZERO,
                 restore_check_sample: 1,
                 replication_workers: 4,
+                min_residency: std::time::Duration::from_secs(2),
             })
             .build()
             .unwrap();
@@ -1897,6 +1899,7 @@ mod tests {
                 replica_retention_after_delete: Duration::ZERO,
                 restore_check_sample: 0,
                 replication_workers: 4,
+                min_residency: std::time::Duration::from_secs(2),
             })
             .build()
             .unwrap();

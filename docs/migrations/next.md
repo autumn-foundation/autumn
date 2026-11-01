@@ -338,16 +338,17 @@ To name the type, use `<S as Service<Request>>::Future`.
 **Automation:** `manual` — the code to change is in the app's own middleware.
 A codemod cannot find it reliably.
 
-### Database: `DatabaseFleetConfig` has three new fields
+### Database: `DatabaseFleetConfig` has four new fields
 
 **Why:** a deleted fleet database's replica now goes with it (issue #3235).
 `replica_retention_after_delete` keeps it for an undo window.
 `restore_check_sample` sets the restore check. `replication_workers` sets the
-number of threads that ship fleet databases.
+number of threads that ship fleet databases. `min_residency` sets how long
+the `max_open` sweep keeps a database that was just used.
 
 **You are affected only if your code builds a `DatabaseFleetConfig` with a
 struct literal** (tests and tools often do). TOML and `AUTUMN_*` config need
-no change: all three keys have defaults.
+no change: all four keys have defaults.
 
 **Before (`{X.Y}`):**
 
@@ -381,6 +382,7 @@ DatabaseFleetConfig {
     replica_retention_after_delete: std::time::Duration::ZERO,
     restore_check_sample: 1,
     replication_workers: 4,
+    min_residency: std::time::Duration::from_secs(2),
 }
 ```
 
@@ -509,6 +511,19 @@ If nothing changed, delete this section.
   before. Update a CSS rule, a test or a `getElementById` call that uses an
   old id.
 
+- **The dev profile sets `session.secure = false`.** The dev server serves
+  plain http on localhost, and most clients do not send a `Secure` cookie
+  back over http. Session sign-in then failed under `cargo run`. Other
+  profiles keep `true`. To keep `true` in dev, set `[session] secure = true`.
+- **A required `CsrfToken` works with CSRF off.** Before, a handler that took
+  `CsrfToken`, `CsrfFormField` or `CsrfTokenHeader` answered `500` when
+  `security.csrf.enabled = false` (the dev default). Now `CsrfToken` is empty
+  and the names are the defaults. Nothing checks them. To know whether CSRF
+  is on, take `Option<CsrfToken>`.
+- **A SQLite build adds `Sqlite<Trait>` names.** `#[repository] trait
+  NoteRepository` now also defines `type SqliteNoteRepository =
+  PgNoteRepository` in a SQLite build. A type of your own with that name in
+  the same module now conflicts: rename it.
 - **A fleet delete removes the replica (#3235).** With `[replication]` on,
   `DatabaseFleet::delete` and `autumn fleet delete` now delete the
   database's objects in object storage too. Before, they stayed. To keep

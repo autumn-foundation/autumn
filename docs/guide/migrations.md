@@ -8,6 +8,26 @@ backends.
 
 ---
 
+## Scope: control only, or shards only
+
+`AppBuilder::migrations` sends a set to the control database and to every
+shard (`[[database.shards]]`, or each `[database.fleet]` file). Use
+`migrations_for` to keep a set on one side:
+
+```rust
+use autumn_web::migrate::MigrationScope;
+
+autumn_web::app()
+    .migrations_for(MigrationScope::Control, CONTROL_MIGRATIONS)
+    .migrations_for(MigrationScope::Shards, TENANT_MIGRATIONS)
+```
+
+Boot and `AUTUMN_MIGRATE=1` obey the scope. The `autumn migrate` and
+`autumn fleet migrate` commands read `migrations/` and do not know a scope.
+See [SQLite fleet: migrations](sqlite-fleet.md#control-only-and-tenant-only-sets).
+
+---
+
 ## Advisory lock serialisation
 
 When several replicas boot at the same time or when `autumn migrate` is

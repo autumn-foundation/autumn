@@ -89,6 +89,7 @@
 //! | `AUTUMN_DATABASE__FLEET__ROOT` | `database.fleet.root` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__PATH` | `database.fleet.path` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__MAX_OPEN` | `database.fleet.max_open` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__MIN_RESIDENCY` | `database.fleet.min_residency` | duration; empty is `2s` |
 //! | `AUTUMN_DATABASE__FLEET__POOL_SIZE` | `database.fleet.pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND` | `database.fleet.create_on_demand` | `Option<bool>` |
 //! | `AUTUMN_DATABASE__FLEET__IDLE_CLOSE_SECS` | `database.fleet.idle_close_secs` | `u64` |
@@ -617,6 +618,11 @@ allowed_origins = ["*"]
 # `allow_local_in_production = true`) or `s3`.
 [storage]
 backend = "local"
+
+# Dev: plain http on localhost. Most clients do not send a `Secure`
+# cookie back over http, so session sign-in would fail.
+[session]
+secure = false
 
 [security.trusted_proxies]
 # Dev: trust X-Forwarded-* from loopback only so local reverse
@@ -6860,6 +6866,7 @@ impl AutumnConfig {
                 root,
                 path: None,
                 max_open: default_fleet_max_open(),
+                min_residency: default_fleet_min_residency(),
                 pool_size: default_fleet_pool_size(),
                 create_on_demand: None,
                 idle_close_secs: default_fleet_idle_close_secs(),
@@ -6877,6 +6884,9 @@ impl AutumnConfig {
         parse_env(env, "AUTUMN_DATABASE__FLEET__ROOT", &mut fleet.root);
         parse_env_option_string(env, "AUTUMN_DATABASE__FLEET__PATH", &mut fleet.path);
         parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_OPEN", &mut fleet.max_open);
+        let mut residency = Some(fleet.min_residency);
+        parse_env_option_duration(env, "AUTUMN_DATABASE__FLEET__MIN_RESIDENCY", &mut residency);
+        fleet.min_residency = residency.unwrap_or_else(default_fleet_min_residency);
         parse_env(
             env,
             "AUTUMN_DATABASE__FLEET__POOL_SIZE",
@@ -10432,12 +10442,34 @@ pub struct DatabaseFleetConfig {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Most databases kept open at once. The least recently used idle one is
-    /// closed past this. Default: `256`. Each open database holds up to
-    /// [`pool_size`](Self::pool_size) connections and three file descriptors
-    /// per connection (database, `-wal`, `-shm`).
+    /// Databases kept open at once, as a soft limit. Default: `256`.
+    ///
+    /// Past this, the sweeper closes the least recently used idle database.
+    /// It does not close a database that is in use or that was used within
+    /// [`min_residency`](Self::min_residency), and an open never waits for
+    /// room. Thus a burst across many keys can open more databases than this
+    /// value. The count goes back down when the burst stops.
+    ///
+    /// Each open database holds up to [`pool_size`](Self::pool_size)
+    /// connections, and about `2 × pool_size + 1` file descriptors (the
+    /// database and `-wal` per connection, one `-shm`). Set the open-file
+    /// limit (`ulimit -n`) for the peak count, not for this value.
     #[serde(default = "default_fleet_max_open")]
     pub max_open: usize,
+
+    /// How long a database stays open after its last use before the
+    /// [`max_open`](Self::max_open) sweep can close it. Default: `"2s"`.
+    ///
+    /// The grace covers a request between the time it gets its database and
+    /// the time it gets a connection. A lower value keeps the open count
+    /// nearer to `max_open` during a burst, but a request can then reopen a
+    /// database that it used a moment before. Use a duration string
+    /// (`"500ms"`, `"2s"`). A bare number is milliseconds.
+    #[serde(
+        default = "default_fleet_min_residency",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub min_residency: std::time::Duration,
 
     /// Connections per open database. Default: `2`. `SQLite` has one writer
     /// per database, so a large pool only adds lock contention.
@@ -10669,6 +10701,10 @@ impl DatabaseFleetConfig {
 
 const fn default_fleet_max_open() -> usize {
     256
+}
+
+const fn default_fleet_min_residency() -> std::time::Duration {
+    std::time::Duration::from_secs(2)
 }
 
 const fn default_fleet_pool_size() -> usize {
@@ -20489,6 +20525,7 @@ path = "/healthz"
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
             replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
         }
     }
 
@@ -20745,6 +20782,39 @@ path = "/healthz"
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.database.fleet.unwrap().replication_workers, 2);
+    }
+
+    #[test]
+    fn fleet_min_residency_default_parse_and_env() {
+        let parse = |extra: &str| {
+            toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\n\n\
+                 [database.fleet]\nmode = \"tenant\"\nroot = \"/var/lib/app/fleet\"\n{extra}"
+            ))
+            .unwrap()
+            .database
+            .fleet
+            .unwrap()
+        };
+        assert_eq!(parse("").min_residency, std::time::Duration::from_secs(2));
+        assert_eq!(
+            parse("min_residency = \"500ms\"").min_residency,
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse("min_residency = \"0s\"").min_residency,
+            std::time::Duration::ZERO
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "tenant")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MIN_RESIDENCY", "250ms");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.database.fleet.unwrap().min_residency,
+            std::time::Duration::from_millis(250)
+        );
     }
 
     #[test]
@@ -21078,6 +21148,30 @@ path = "/healthz"
             !config.security.headers.strict_transport_security,
             "dev profile must not force HSTS on (local http development)"
         );
+    }
+
+    #[test]
+    fn dev_profile_sends_the_session_cookie_over_plain_http() {
+        let parse = |profile: &str| -> AutumnConfig {
+            toml::from_str(&toml::to_string(&profile_defaults_as_toml(profile)).unwrap()).unwrap()
+        };
+        assert!(
+            !parse("dev").session.secure,
+            "dev serves plain http on localhost; a Secure cookie is not sent back"
+        );
+        assert!(parse("prod").session.secure);
+        assert!(
+            parse("staging").session.secure,
+            "no profile default: secure"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("autumn.toml"), "[session]\nsecure = true\n").unwrap();
+        let env = MockEnv::new()
+            .with("AUTUMN_PROFILE", "dev")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert!(config.session.secure, "the app's own setting wins");
     }
 
     #[test]

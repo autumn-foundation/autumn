@@ -1884,6 +1884,7 @@ fn validate_enum_field_collisions(
             format!("{pascal_name}Factory"),
             format!("{pascal_name}Repository"),
             format!("Pg{pascal_name}Repository"),
+            format!("Sqlite{pascal_name}Repository"),
             "DecodedForm".to_owned(),
         ];
         if reserved.contains(&enum_ty) {

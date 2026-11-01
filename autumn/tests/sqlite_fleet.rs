@@ -98,7 +98,7 @@ async fn repo_write(
 }
 
 #[get("/notes")]
-async fn repo_read(repo: PgFleetNoteRepository) -> AutumnResult<Json<Vec<String>>> {
+async fn repo_read(repo: SqliteFleetNoteRepository) -> AutumnResult<Json<Vec<String>>> {
     let mut notes: Vec<String> = repo.find_all().await?.into_iter().map(|n| n.body).collect();
     notes.sort();
     Ok(Json(notes))
@@ -176,6 +176,7 @@ fn fleet(dir: &FsPath, mode: FleetMode, create_on_demand: bool) -> DatabaseFleet
         replica_retention_after_delete: std::time::Duration::ZERO,
         restore_check_sample: 0,
         replication_workers: 4,
+        min_residency: std::time::Duration::from_secs(2),
     })
     .migrations("app", MIGRATIONS)
     .migrations(
@@ -214,6 +215,16 @@ fn app(dir: &FsPath, fleet: DatabaseFleet) -> autumn_web::test::TestClient {
         .with_db(control_pool(dir))
         .with_fleet(fleet)
         .build()
+}
+
+/// A `SQLite` build names the generated repository `Sqlite<Trait>` too.
+#[test]
+fn the_sqlite_name_is_the_generated_repository() {
+    use std::any::TypeId;
+    assert_eq!(
+        TypeId::of::<SqliteFleetNoteRepository>(),
+        TypeId::of::<PgFleetNoteRepository>()
+    );
 }
 
 #[tokio::test]
@@ -430,4 +441,53 @@ async fn the_fleet_health_indicator_reports_the_counters() {
     assert_eq!(fleet["details"]["mode"], "tenant");
     assert_eq!(fleet["details"]["open"], 1);
     assert_eq!(fleet["details"]["created_total"], 1);
+}
+
+/// `autumn_web::db::prelude::*` sits next to `#[model]` and `#[repository]`.
+/// `diesel::prelude::*` there gives E0034: it brings in the blocking
+/// `RunQueryDsl` too.
+mod db_prelude_next_to_the_macros {
+    use autumn_web::db::prelude::*;
+
+    mod schema {
+        autumn_web::reexports::diesel::table! {
+            prelude_notes (id) {
+                id -> Int8,
+                body -> Text,
+            }
+        }
+    }
+
+    use schema::prelude_notes;
+
+    #[autumn_web::model]
+    pub struct PreludeNote {
+        #[id]
+        pub id: i64,
+        pub body: String,
+    }
+
+    #[autumn_web::repository(PreludeNote)]
+    pub trait PreludeNoteRepository {}
+
+    pub async fn count(conn: &mut autumn_web::db::RuntimeConnection) -> QueryResult<i64> {
+        prelude_notes::table.count().get_result(conn).await
+    }
+}
+
+#[tokio::test]
+async fn the_db_prelude_runs_async_queries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = control_pool(tmp.path());
+    let mut conn = pool.get().await.unwrap();
+    diesel::sql_query("CREATE TABLE prelude_notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    assert_eq!(
+        db_prelude_next_to_the_macros::count(&mut conn)
+            .await
+            .unwrap(),
+        0
+    );
 }

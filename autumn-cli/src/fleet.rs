@@ -41,6 +41,15 @@ pub enum FleetCommand {
         /// The path of the new file.
         dest: PathBuf,
     },
+    /// Put a database file back under a key, for example a backup.
+    Import {
+        /// Profile overlay for the config.
+        profile: Option<String>,
+        /// The database name.
+        key: String,
+        /// The file to copy in.
+        source: PathBuf,
+    },
     /// Remove one database.
     Delete {
         /// Profile overlay for the config.
@@ -138,6 +147,11 @@ mod imp {
             FleetCommand::Backup { profile, key, dest } => {
                 backup(&Target::load(profile.as_deref())?, key, dest)
             }
+            FleetCommand::Import {
+                profile,
+                key,
+                source,
+            } => import(&Target::load(profile.as_deref())?, key, source),
             FleetCommand::Delete {
                 profile,
                 key,
@@ -626,6 +640,71 @@ mod imp {
         Ok(canonical)
     }
 
+    fn import(target: &Target, key: &str, source: &Path) -> Result<(), String> {
+        target.require_root()?;
+        let dir = Path::new(MIGRATIONS_DIR);
+        if !dir.is_dir() {
+            return Err(format!(
+                "Migrations directory not found: {MIGRATIONS_DIR}/\n  Run this command from \
+                 the app directory."
+            ));
+        }
+        let migrations = diesel_migrations::FileBasedMigrations::from_path(dir)
+            .map_err(|e| format!("could not read {MIGRATIONS_DIR}/: {e}"))?;
+        let fleet = target.build(Some(migrations))?;
+        let remapped = fleet.remapped_migrations();
+        if !remapped.is_empty() {
+            return Err(format!(
+                "These migrations share a version with another migration: {}.\n  \
+                 `autumn fleet import` cannot record them as boot does. Use \
+                 `DatabaseFleet::import` in the app instead.",
+                remapped.join(", ")
+            ));
+        }
+        let key = parse_key(&fleet, key)?;
+        let path = fleet.path_of(&key);
+        // With replication on, the import purges a deleted key's tombstone
+        // and old replica first, so the retry task cannot purge the new one.
+        if target.replicated() {
+            let purge = |error: String| {
+                format!(
+                    "Import stopped: with [replication] on, an import first purges the \
+                     replica of a deleted database, and it cannot reach it.\n  {error}"
+                )
+            };
+            let loaded = validated_replication(target).map_err(purge)?;
+            let replication = replication_for(target, &loaded).map_err(purge)?;
+            fleet
+                .install_replication(replication)
+                .map_err(|_| "the fleet already replicates".to_owned())?;
+        }
+        let rt = runtime()?;
+        let imported = rt.block_on(async {
+            let result = fleet.import(&key, source).await.map(drop);
+            fleet.close_all().await;
+            result
+        });
+        imported.map_err(|e| match e {
+            FleetError::AlreadyExists { .. } => format!(
+                "{key} already has a database at {}.\n  An import never replaces a file. \
+                 Run `autumn fleet delete {key} --force` first.",
+                path.display()
+            ),
+            FleetError::NotFound { .. } => format!("{} is not a file.", source.display()),
+            FleetError::Misplaced { found, .. } => format!(
+                "{} is a copy of {found}, not of {key}. Nothing was imported.",
+                source.display()
+            ),
+            other => other.to_string(),
+        })?;
+        eprintln!(
+            "\u{2713} Imported {} as {key} ({}).",
+            source.display(),
+            path.display()
+        );
+        Ok(())
+    }
+
     fn delete(target: &Target, key: &str, force: bool) -> Result<(), String> {
         let fleet = target.build(None)?;
         let key = parse_key(&fleet, key)?;
@@ -835,6 +914,7 @@ mod imp {
                 replica_retention_after_delete: std::time::Duration::ZERO,
                 restore_check_sample: 0,
                 replication_workers: 4,
+                min_residency: std::time::Duration::from_secs(2),
             })
             .build()
             .unwrap();

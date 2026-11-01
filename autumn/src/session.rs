@@ -49,7 +49,7 @@
 //! backend = "memory"
 //! cookie_name = "autumn.sid"
 //! max_age_secs = 86400       # 24 hours
-//! secure = true               # true by default
+//! secure = true               # default: false in the dev profile, else true
 //! same_site = "Lax"
 //!
 //! [session.redis]
@@ -578,7 +578,9 @@ pub struct SessionConfig {
     #[serde(default = "default_max_age_secs")]
     pub max_age_secs: u64,
 
-    /// Whether the cookie should only be sent over HTTPS.
+    /// Whether the cookie should only be sent over HTTPS. Default: `true`.
+    /// The `dev` profile sets `false`, because it serves plain http on
+    /// localhost.
     #[serde(default = "default_true")]
     pub secure: bool,
 

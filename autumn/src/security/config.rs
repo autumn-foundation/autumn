@@ -1565,11 +1565,11 @@ pub fn default_content_security_policy() -> String {
         .to_owned()
 }
 
-fn default_csrf_header() -> String {
+pub(super) fn default_csrf_header() -> String {
     "X-CSRF-Token".to_owned()
 }
 
-fn default_csrf_field() -> String {
+pub(super) fn default_csrf_field() -> String {
     "_csrf".to_owned()
 }
 
