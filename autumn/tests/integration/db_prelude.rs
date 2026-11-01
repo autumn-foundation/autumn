@@ -1,6 +1,6 @@
 //! `autumn_web::db::prelude::*` sits next to `#[model]` and `#[repository]`
 //! in the default (Postgres) build. `diesel::prelude::*` here gives E0034: it
-//! also imports the blocking `RunQueryDsl`. The SQLite build has the same
+//! also imports the blocking `RunQueryDsl`. The `SQLite` build has the same
 //! check in `tests/sqlite_fleet.rs`.
 
 #![cfg(all(feature = "db", not(feature = "sqlite")))]
@@ -21,7 +21,7 @@ pub struct PreludeNote {
     pub body: String,
 }
 
-#[autumn_web::repository(PreludeNote)]
+#[autumn_web::repository(PreludeNote, table = "db_prelude_notes")]
 pub trait PreludeNoteRepository {}
 
 /// An async query with the prelude's `RunQueryDsl`.
