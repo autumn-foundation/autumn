@@ -319,6 +319,12 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
   by serving it. Turn on [slot ownership](#failover-slot-ownership) with it:
   without ownership, nothing stops the previous owner, and the two copies
   diverge. Boot logs a warning for `restore_missing` without ownership.
+  The restored database holds what the previous owner shipped, and no more.
+  A write it committed after its last sync is not in the replica, even if the
+  request already returned success. So a takeover after a crash loses up to
+  `rpo_secs` of committed writes
+  ([the RPO contract](sqlite-in-production.md#the-rpo-contract)). Replication
+  bounds that loss. It does not prevent it.
 
 **Processes can share a replicated fleet root.** Only one process replicates a
 database. It holds the lock file `<db>.replicator.lock`. The other processes
@@ -467,6 +473,12 @@ the first request.
    Start the new host with the same `slots`. The new host claims the ranges
    when the old lease ends: after at most `lease_secs`, plus one renew
    interval and the clock skew. Then it serves at a new epoch.
+   The new host serves what the old host shipped to the replica. Writes that
+   the old host committed in its last `rpo_secs` can be missing, including
+   writes it answered with success. They stay in the old host's files, but a
+   fail-back (step 5) replaces those files with the replica, so they do not
+   come back. A planned move (step 2) loses nothing: the old host ships
+   everything before it releases the ranges.
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
    fails. It claims the range again only when the new owner lets it go, at a

@@ -3019,8 +3019,10 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
 - With `[replication]` on, each open database ships its WAL under
   `fleet/tenant/<id>` / `fleet/slot/<n>` (health `replication:fleet`);
   `restore_missing = true` serves a missing database from its replica on a
-  fresh volume. A replicated fleet root is served by one process (one
-  replicator per database).
+  fresh volume. It holds what the old owner shipped: after a crash, up to
+  `rpo_secs` of committed writes that already returned success are missing.
+  A replicated fleet root is served by one process (one replicator per
+  database).
 - Delete with replication (issue #3235): `delete` also purges the replica.
   It writes a tombstone row (`_autumn_fleet_tombstones`) on the control
   database first; no row, no delete (`503`). A failed purge keeps the row,

@@ -10462,6 +10462,10 @@ pub struct DatabaseFleetConfig {
     /// tenant: the first request restores the database from object storage.
     /// Turn on [`ownership`](Self::ownership) too, so the old owner is fenced
     /// first (ADR 0019 §7).
+    ///
+    /// The restored database holds what the old owner shipped. After a crash,
+    /// up to `[replication] rpo_secs` of its committed writes are missing,
+    /// including writes whose requests already returned success.
     #[serde(default)]
     pub restore_missing: bool,
 
