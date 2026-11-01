@@ -319,6 +319,12 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
   by serving it. Turn on [slot ownership](#failover-slot-ownership) with it:
   without ownership, nothing stops the previous owner, and the two copies
   diverge. Boot logs a warning for `restore_missing` without ownership.
+  The restored database holds what the previous owner shipped, and no more.
+  A write it committed after its last sync is not in the replica, even if the
+  request already returned success. So a takeover after a crash loses the
+  writes since the last sync: up to `rpo_secs` while replication keeps up
+  ([the RPO contract](sqlite-in-production.md#the-rpo-contract), and the
+  lag note below). Replication bounds that loss. It does not prevent it.
 
 **Processes can share a replicated fleet root.** Only one process replicates a
 database. It holds the lock file `<db>.replicator.lock`. The other processes
@@ -330,6 +336,14 @@ file systems.
 `/actuator/health` reports `replication:fleet` with the number of databases
 replicating, the number this process does not own (`unowned`), the worst lag
 and which database has it.
+
+**Watch the lag on a busy fleet.** One thread per process ships the fleet's
+databases, one after another, and then waits `sync_interval_secs`. A database
+ships once per pass, and a pass takes longer the more open databases have new
+writes. When a pass takes longer than `rpo_secs`, a crash can lose more than
+`rpo_secs` of writes. `worst_lag_seconds` in `replication:fleet` shows it, and
+the indicator is `Down` once the lag passes three times `rpo_secs`. Keep fewer
+busy databases open per process (`max_open`), or run more processes.
 
 ### Deleting a database's replica
 
@@ -467,6 +481,12 @@ the first request.
    Start the new host with the same `slots`. The new host claims the ranges
    when the old lease ends: after at most `lease_secs`, plus one renew
    interval and the clock skew. Then it serves at a new epoch.
+   The new host serves what the old host shipped to the replica. Writes that
+   the old host committed in its last `rpo_secs` can be missing, including
+   writes it answered with success. They stay in the old host's files, but a
+   fail-back (step 5) replaces those files with the replica, so they do not
+   come back. A planned move (step 2) loses nothing: the old host ships
+   everything before it releases the ranges.
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
    fails. It claims the range again only when the new owner lets it go, at a

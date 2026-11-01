@@ -574,6 +574,14 @@ replicator ships one final time and shutdown waits for that flush inside the sam
 `server.shutdown_timeout_secs` budget as the other shutdown phases. If the budget
 runs out first the process still exits, and says so in the log.
 
+The same bound applies when another machine restores from the replica after a
+crash, as a [fleet failover](sqlite-fleet.md#the-failover-procedure) with
+`restore_missing` does, even if the old machine and its disk survive. A request
+returns when its transaction commits on the local disk. Its write is offsite
+only after the next sync, so the new machine can be missing up to `rpo_secs` of
+writes that already returned success. On a busy fleet the lag can pass
+`rpo_secs`; see [the fleet's replication](sqlite-fleet.md#replication-object-storage-between-volumes).
+
 Two surfaces report it, from two vantage points. `autumn db replica status`
 (add `--json` for monitoring) reads the **destination** and reports the current
 generation, how many segments it holds, the instant a restore would land on, and
