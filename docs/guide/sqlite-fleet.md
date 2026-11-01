@@ -321,10 +321,10 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
   diverge. Boot logs a warning for `restore_missing` without ownership.
   The restored database holds what the previous owner shipped, and no more.
   A write it committed after its last sync is not in the replica, even if the
-  request already returned success. So a takeover after a crash loses up to
-  `rpo_secs` of committed writes
-  ([the RPO contract](sqlite-in-production.md#the-rpo-contract)). Replication
-  bounds that loss. It does not prevent it.
+  request already returned success. So a takeover after a crash loses the
+  writes since the last sync: up to `rpo_secs` while replication keeps up
+  ([the RPO contract](sqlite-in-production.md#the-rpo-contract), and the
+  lag note below). Replication bounds that loss. It does not prevent it.
 
 **Processes can share a replicated fleet root.** Only one process replicates a
 database. It holds the lock file `<db>.replicator.lock`. The other processes
@@ -336,6 +336,14 @@ file systems.
 `/actuator/health` reports `replication:fleet` with the number of databases
 replicating, the number this process does not own (`unowned`), the worst lag
 and which database has it.
+
+**Watch the lag on a busy fleet.** One thread per process ships the fleet's
+databases, one after another, and then waits `sync_interval_secs`. A database
+ships once per pass, and a pass takes longer the more open databases have new
+writes. When a pass takes longer than `rpo_secs`, a crash can lose more than
+`rpo_secs` of writes. `worst_lag_seconds` in `replication:fleet` shows it, and
+the indicator is `Down` once the lag passes three times `rpo_secs`. Keep fewer
+busy databases open per process (`max_open`), or run more processes.
 
 ### Deleting a database's replica
 
