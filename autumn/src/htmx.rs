@@ -818,11 +818,11 @@ mod tests {
     /// Byte budget for `autumn-widgets.js` (issue #3397). See
     /// `docs/guide/keyboard.md`. Raise it only with a reason in the PR.
     /// Issue #3399 added the toast runtime. It increased the budgets from
-    /// 32 KiB and 10 KiB. Issue #3404 added the tooltip runtime. It
-    /// increased them from 36 KiB and 11 KiB.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 40 * 1024;
+    /// 32 KiB and 10 KiB. Issue #3404 added the tooltip runtime, next to the
+    /// #3403 drawer. Together they increased them from 36 KiB and 11 KiB.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 44 * 1024;
     /// Gzip budget. Browsers download this size.
-    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 12 * 1024;
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 13 * 1024;
 
     /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
     /// CRLF checkout changes the bytes, the content hash and the size.

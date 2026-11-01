@@ -45,6 +45,7 @@ on:
       - "autumn/tests/integration/widgets_keyboard_browser.rs"
       - "autumn/tests/integration/widgets_toast_browser.rs"
       - "autumn/tests/integration/widgets_tooltip_browser.rs"
+      - "autumn/tests/integration/widgets_drawer_browser.rs"
       - "autumn/tests/fixtures/axe-core/**"
       - "autumn/src/widget_pack.rs"
       - "autumn/src/plugin_conformance.rs"
@@ -75,6 +76,7 @@ on:
       - "autumn/tests/integration/widgets_keyboard_browser.rs"
       - "autumn/tests/integration/widgets_toast_browser.rs"
       - "autumn/tests/integration/widgets_tooltip_browser.rs"
+      - "autumn/tests/integration/widgets_drawer_browser.rs"
       - "autumn/tests/fixtures/axe-core/**"
       - "autumn/src/widget_pack.rs"
       - "autumn/src/plugin_conformance.rs"
@@ -177,6 +179,17 @@ jobs:
             | tee "${RUNNER_TEMP}/widgets-tooltip-browser.log"
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-tooltip-browser.log" \
             || { echo "::error::no tooltip browser tests ran"; exit 1; }
+
+      - name: Run the drawer and modal suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_drawer_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-drawer-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-drawer-browser.log" \
+            || { echo "::error::no drawer browser tests ran"; exit 1; }
 
       # Widget pack conformance (#3400): canaries, `autumn:init`, and the
       # reference `swatch` pack through the same axe gate.

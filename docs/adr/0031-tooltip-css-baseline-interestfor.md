@@ -48,6 +48,6 @@ second tab stop.
 
 - Without JavaScript, Escape does not hide the text.
 - A tooltip is not for touch. The guide says so.
-- The `autumn-widgets.js` budget goes from 36 KiB to 40 KiB raw and from
-  11 KiB to 12 KiB gzip.
+- The `autumn-widgets.js` budget goes from 36 KiB to 44 KiB raw and from
+  11 KiB to 13 KiB gzip, for the tooltip and the #3403 drawer together.
 - Plugins can use `data-autumn-dismiss="escape"`.

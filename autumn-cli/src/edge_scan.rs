@@ -1338,7 +1338,8 @@ impl TargetCfgPredicate {
 /// every other heuristic in this module, resolving path globs and
 /// `exclude` is out of scope for a textual scan; the (rare) cost of that is
 /// treating an unrelated ancestor's `[workspace]` as this project's own.
-fn resolver_v1_is_in_effect(project_root: &Path, table: Option<&toml::Table>) -> bool {
+#[must_use]
+pub fn resolver_v1_is_in_effect(project_root: &Path, table: Option<&toml::Table>) -> bool {
     if let Some(t) = table
         && t.contains_key("workspace")
     {
@@ -1454,6 +1455,13 @@ fn root_package_edition_implies_resolver_v1(
 /// accepted "best-effort, not a build system" trade-off as everywhere else
 /// in this module.
 fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> {
+    find_governing_workspace(project_root).map(|(_, table)| table)
+}
+
+/// [`find_ancestor_workspace_manifest`], with the root directory of the
+/// workspace.
+#[must_use]
+pub fn find_governing_workspace(project_root: &Path) -> Option<(PathBuf, toml::Table)> {
     let mut dir = project_root.parent();
     while let Some(candidate) = dir {
         if let Ok(content) = std::fs::read_to_string(candidate.join("Cargo.toml"))
@@ -1490,7 +1498,7 @@ fn find_ancestor_workspace_manifest(project_root: &Path) -> Option<toml::Table> 
                 !any_glob_matches(&exclude_patterns, &rel, true)
             });
             if governed {
-                return Some(table);
+                return Some((candidate.to_path_buf(), table));
             }
         }
         dir = candidate.parent();

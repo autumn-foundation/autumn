@@ -917,7 +917,9 @@ Per-primitive setters (in addition to the shared set):
 - `autumn_web::widgets`: `card(&body, &CardConfig)`,
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
   `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
-  `modal_close_button`, `confirm_action(...)`.
+  `modal_close_button`, `confirm_action(...)`,
+  `drawer(id, title, &body, &DrawerConfig)`, `drawer_trigger` (#3403);
+  `DialogSize` sizes both, `close_button(label)` adds a ×.
 - `autumn_web::widgets::transition_controls(action, field, current,
   transitions, can, csrf, csrf_field)` (#1917) — renders one CSRF-protected,
   no-JS `POST` form + submit button per field-level `#[state_machine]`
@@ -1026,6 +1028,10 @@ Per-primitive setters (in addition to the shared set):
   `#field`; the root has `id="error-summary" tabindex="-1" autofocus`, so
   focus moves to it on a failed submit — one per page). All prelude
   re-exported.
+- `autumn_web::widgets::{accordion, collapsible, collapsible_with}` +
+  `AccordionConfig::new(name)` / `CollapsibleConfig` — no-JS disclosure on
+  native `<details>`. Exclusive by default; `.multiple()`, `.open(i)`,
+  `.level()`, `.class()`, `.attrs()`. See `docs/guide/accordion.md`.
 - `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
   `toast_in(region_id, message, AlertVariant)` /
   `toast_with(message, AlertVariant, &ToastConfig)` / `toast_region(id)` +
@@ -1655,6 +1661,7 @@ Limits are two independent sets. `Limits { max_bytes: 512 KiB, max_depth: 64,
 max_nodes: 20_000 }` bounds the **document** and is applied before and around
 deserialization. `RenderLimits { max_depth: 128, max_nodes: 50_000, max_each_items: 5_000,
 max_output_bytes: 4 MiB }` bounds the **expansion** against runtime state.
+Work is bounded too: 320 fuel units per allowed node, spent on nodes, expressions and bytes scanned.
 `max_output_bytes` spans the body and every portal together and also caps what
 one expression may *build* (`concat`/`array`/`obj`/`+` assemble a value inside
 the evaluator before any of it is emitted); `max_depth` caps the shape of state

@@ -602,6 +602,8 @@ mod widget_css_coverage;
 #[cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
 mod widget_pack_browser;
 #[cfg(feature = "maud")]
+mod widgets_accordion;
+#[cfg(feature = "maud")]
 mod widgets_alert;
 #[cfg(feature = "maud")]
 mod widgets_avatar;
@@ -609,6 +611,10 @@ mod widgets_avatar;
 mod widgets_badge;
 #[cfg(feature = "maud")]
 mod widgets_charts;
+#[cfg(feature = "maud")]
+mod widgets_drawer;
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_drawer_browser;
 #[cfg(feature = "maud")]
 mod widgets_infinite_feed;
 #[cfg(all(feature = "system-tests", feature = "maud"))]
