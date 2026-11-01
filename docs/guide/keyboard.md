@@ -15,6 +15,7 @@ The shipped widgets use the core:
 | `tabs` | Tabs, automatic activation | ArrowLeft/ArrowRight, Home/End, Tab to the panel |
 | `autocomplete_input` | Combobox with listbox popup | ArrowDown/ArrowUp, Enter, Escape |
 | `NavMenu` in `nav_bar`, `dropdown_menu` | Menu button | Enter, Space, ArrowDown or ArrowUp opens; ArrowDown/ArrowUp, Home/End, a letter, Escape, Tab. See [Popover and Dropdown Menu](popover-and-menu.md). |
+| `tooltip` | Tooltip | Escape hides the text. See [Tooltip](tooltip.md) |
 
 Load the runtime once in your layout:
 
@@ -35,6 +36,7 @@ same attributes.
 | `data-autumn-wrap="false"` | Stop at the first and the last item. The default is to wrap. |
 | `data-autumn-typeahead` | Type a letter to move to the next item that starts with it. Roving lists only. |
 | `data-autumn-dismiss` | Escape, a click outside, or focus that goes outside closes the layer. |
+| `data-autumn-dismiss="escape"` | Only Escape closes the layer. A tooltip uses this. |
 
 Rules:
 
@@ -45,10 +47,15 @@ Rules:
   of a nested list.
 - **Controller and trigger.** The core finds them through `aria-controls`.
   The element whose `aria-controls` names the list is the controller. The
-  element whose `aria-controls` names the layer is the trigger.
-- **Open and close.** A layer is open when it has no `hidden` attribute and
-  has at least one child element. To close it, the core sets `hidden` and
-  the trigger's `aria-expanded="false"`. When focus is in the layer, Escape
+  element whose `aria-controls` names the layer is the trigger. For a
+  `role="tooltip"` layer, the trigger is the element whose
+  `aria-describedby` or `aria-labelledby` names it. If there is none, the
+  core uses `aria-controls`.
+- **Open and close.** A layer is open when it has no `hidden` attribute,
+  and CSS shows it (not `display: none`, not `visibility: hidden`). It must
+  also have a child element. A tooltip needs text only. To close it, the
+  core sets `hidden`. It sets `aria-expanded="false"` on an `aria-controls`
+  trigger only. When focus is in the layer, Escape
   moves focus to the trigger.
 - **Who opens a layer.** The core opens a layer only for ArrowDown or
   ArrowUp in an active-descendant list. In other cases your code opens it:
@@ -149,6 +156,8 @@ Each widget works with JavaScript off:
   the arrow keys need JavaScript.
 - **Toast** fades out on its CSS timer. Hover pauses the timer. The close
   button stays hidden. A persistent toast stays until the page changes.
+- **Tooltip** shows on hover and keyboard focus with CSS. Escape does
+  nothing.
 
 ## Content Security Policy
 
@@ -159,14 +168,15 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 38 KiB |
-| `autumn-widgets.js`, gzip level 9 | 12 KiB |
+| `autumn-widgets.js`, raw | 44 KiB |
+| `autumn-widgets.js`, gzip level 9 | 13 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
 above the budget. Raise the budget only with a reason in the PR. Issue
 #3399 added the toast runtime. It increased the budgets from 32 KiB and
-10 KiB. Issue #3402 added the popover menu runtime. It increased the raw
-budget from 36 KiB and the gzip budget from 11 KiB.
+10 KiB. Issue #3404 added the tooltip runtime, next to the #3403 drawer.
+Issue #3402 added the popover menu runtime. Together they increased them from
+36 KiB and 11 KiB.
 
 ## Tests
 

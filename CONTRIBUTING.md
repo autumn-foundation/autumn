@@ -97,7 +97,7 @@ the changelog when a release is cut. See
 `autumn/src/ui/`, `autumn/vendor/autumn-widgets.js`, `autumn/src/stories/`
 and the other paths in its `paths:` filter. It also runs each week.
 
-The job runs six suites:
+The job runs eight suites:
 
 - `stories_browser` loads each `/_stories/{slug}` page. It injects axe-core
   and fails on a `serious` or `critical` violation. It checks each page in
@@ -111,6 +111,12 @@ The job runs six suites:
 - `widgets_popover_browser` checks the #3402 popover and dropdown menu: mouse
   and keyboard, the APG menu-button keys, focus return, anchor positioning
   and the no-JS fallback.
+- `widgets_tooltip_browser` checks the #3404 tooltip in the CSS mode and the
+  Chromium `interestfor` mode: focus shows it, Escape hides it, the hover
+  bridge keeps it open, and axe passes.
+- `widgets_drawer_browser` checks the #3403 drawer and modal: focus trap and
+  focus return, Escape and backdrop dismissal, the close button, edges and
+  sizes, the non-modal drawer, and the no-JS path.
 - `widget_pack_browser` checks widget pack conformance (#3400): a good
   pack passes, three canary packs fail (axe, keyboard trap, console), and
   pack JS gets `autumn:init`.
@@ -132,6 +138,8 @@ cargo test -p autumn-web --features system-tests \
   --test integration_tests widgets_toast_browser -- --include-ignored
 cargo test -p autumn-web --features system-tests \
   --test integration_tests widgets_popover_browser -- --include-ignored
+cargo test -p autumn-web --features system-tests \
+  --test integration_tests widgets_drawer_browser -- --include-ignored
 cargo test -p autumn-web --features system-tests \
   --test integration_tests widget_pack_browser -- --include-ignored
 cargo test -p autumn-plugin-reference --features system-tests --lib \

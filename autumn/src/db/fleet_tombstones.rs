@@ -1001,6 +1001,7 @@ mod tests {
                 ownership: None,
                 replica_retention_after_delete: setup.retention,
                 restore_check_sample: 0,
+                replication_workers: 4,
             })
             .build()
             .unwrap();
@@ -1830,6 +1831,7 @@ mod tests {
                 ownership: None,
                 replica_retention_after_delete: Duration::ZERO,
                 restore_check_sample: 1,
+                replication_workers: 4,
             })
             .build()
             .unwrap();
@@ -1894,6 +1896,7 @@ mod tests {
                 ownership: None,
                 replica_retention_after_delete: Duration::ZERO,
                 restore_check_sample: 0,
+                replication_workers: 4,
             })
             .build()
             .unwrap();

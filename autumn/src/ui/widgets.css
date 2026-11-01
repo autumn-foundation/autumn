@@ -933,6 +933,64 @@
     margin-top: var(--space-1);
 }
 
+.autumn-modal--sm {
+    max-width: 20rem;
+}
+
+.autumn-modal--lg {
+    max-width: 48rem;
+}
+
+.autumn-modal--full {
+    max-width: none;
+    width: 100%;
+    max-height: none;
+    height: 100%;
+    margin: 0;
+    border-radius: 0;
+}
+
+.autumn-modal__content,
+.autumn-drawer__content {
+    position: relative;
+}
+
+.autumn-modal__close,
+.autumn-drawer__close {
+    position: absolute;
+    top: var(--space-3);
+    right: var(--space-3);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    background: transparent;
+    color: var(--text);
+    border: 0;
+    border-radius: var(--radius);
+    font-size: var(--font-size-lg);
+    line-height: 1;
+    cursor: pointer;
+}
+
+.autumn-modal__close:hover,
+.autumn-drawer__close:hover {
+    background-color: var(--bg);
+}
+
+.autumn-modal__close:focus-visible,
+.autumn-drawer__close:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-modal__close ~ .autumn-modal__title,
+.autumn-drawer__close ~ .autumn-drawer__title {
+    padding-right: var(--space-8);
+}
+
 .autumn-modal__confirm-form {
     display: inline;
 }
@@ -976,6 +1034,216 @@
 .autumn-modal__confirm--danger:hover {
     background-color: var(--danger-hover);
     border-color: var(--danger-hover);
+}
+
+/* ── Drawer / sheet (autumn-drawer) ────────────────────────────────────────── */
+
+.autumn-drawer {
+    --autumn-drawer-size: 24rem;
+    box-sizing: border-box;
+    position: fixed;
+    z-index: var(--z-banner);
+    margin: 0;
+    padding: 0;
+    max-width: none;
+    max-height: none;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+}
+
+.autumn-drawer[open] {
+    display: flex;
+    flex-direction: column;
+}
+
+.autumn-drawer::backdrop {
+    background-color: rgba(17, 24, 39, 0.5);
+}
+
+.autumn-drawer--sm {
+    --autumn-drawer-size: 16rem;
+}
+
+.autumn-drawer--lg {
+    --autumn-drawer-size: 40rem;
+}
+
+.autumn-drawer--full {
+    --autumn-drawer-size: 100%;
+}
+
+.autumn-drawer--left,
+.autumn-drawer--right {
+    top: 0;
+    bottom: 0;
+    width: var(--autumn-drawer-size);
+    max-width: 100%;
+    height: 100%;
+}
+
+.autumn-drawer--left {
+    left: 0;
+    right: auto;
+    border-width: 0 1px 0 0;
+}
+
+.autumn-drawer--right {
+    right: 0;
+    left: auto;
+    border-width: 0 0 0 1px;
+}
+
+.autumn-drawer--top,
+.autumn-drawer--bottom {
+    left: 0;
+    right: 0;
+    height: var(--autumn-drawer-size);
+    max-height: 100%;
+    width: 100%;
+}
+
+.autumn-drawer--top {
+    top: 0;
+    bottom: auto;
+    border-width: 0 0 1px;
+}
+
+.autumn-drawer--bottom {
+    bottom: 0;
+    top: auto;
+    border-width: 1px 0 0;
+}
+
+.autumn-drawer__content {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    gap: var(--space-3);
+    padding: var(--space-6);
+    overflow: auto;
+}
+
+.autumn-drawer__title {
+    margin: 0;
+    font-size: var(--font-size-lg);
+    font-weight: var(--font-weight-semibold);
+    color: var(--text);
+}
+
+.autumn-drawer__body {
+    flex: 1;
+    color: var(--text);
+    font-size: 0.9375rem;
+}
+
+.autumn-drawer__footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+}
+
+@keyframes autumn-drawer-in-x {
+    from { translate: var(--autumn-drawer-from, 100%) 0; }
+}
+
+@keyframes autumn-drawer-in-y {
+    from { translate: 0 var(--autumn-drawer-from, 100%); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .autumn-drawer--left[open] { --autumn-drawer-from: -100%; animation: autumn-drawer-in-x 0.2s ease-out; }
+    .autumn-drawer--right[open] { animation: autumn-drawer-in-x 0.2s ease-out; }
+    .autumn-drawer--top[open] { --autumn-drawer-from: -100%; animation: autumn-drawer-in-y 0.2s ease-out; }
+    .autumn-drawer--bottom[open] { animation: autumn-drawer-in-y 0.2s ease-out; }
+}
+
+/* ── Accordion and collapsible (autumn-accordion, autumn-collapsible) ──────── */
+
+.autumn-accordion {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    overflow: hidden;
+}
+
+.autumn-accordion__item + .autumn-accordion__item {
+    border-top: 1px solid var(--border);
+}
+
+.autumn-collapsible {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    overflow: hidden;
+}
+
+.autumn-accordion__summary,
+.autumn-collapsible__summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    color: var(--text);
+    font-weight: var(--font-weight-medium);
+    cursor: pointer;
+    list-style: none;
+}
+
+.autumn-accordion__summary::-webkit-details-marker,
+.autumn-collapsible__summary::-webkit-details-marker {
+    display: none;
+}
+
+/* The chevron is a border, so it needs no icon font and follows the text color. */
+.autumn-accordion__summary::after,
+.autumn-collapsible__summary::after {
+    content: "";
+    flex: none;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-right: 2px solid var(--text-muted);
+    border-bottom: 2px solid var(--text-muted);
+    transform: rotate(45deg);
+}
+
+:is(.autumn-accordion__item, .autumn-collapsible)[open] > :is(.autumn-accordion__summary, .autumn-collapsible__summary)::after {
+    transform: rotate(-135deg);
+}
+
+.autumn-accordion__summary:hover,
+.autumn-collapsible__summary:hover {
+    background: var(--surface-muted);
+}
+
+.autumn-accordion__summary:focus-visible,
+.autumn-collapsible__summary:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+}
+
+.autumn-accordion__heading {
+    margin: 0;
+    font: inherit;
+}
+
+.autumn-accordion__body,
+.autumn-collapsible__body {
+    padding: var(--space-3) var(--space-4) var(--space-4);
+    color: var(--text);
+}
+
+/* Motion is opt-in: reduced motion is the default. */
+@media (prefers-reduced-motion: no-preference) {
+    .autumn-accordion__summary::after,
+    .autumn-collapsible__summary::after {
+        transition: transform 0.15s ease;
+    }
 }
 
 /* ── Tabs (autumn-tabs) ────────────────────────────────────────────────────── */
@@ -1584,6 +1852,190 @@
 
     .autumn-toast--persistent {
         animation: none;
+    }
+}
+
+/* ── Tooltip (autumn-tooltip, #3404) ───────────────────────────────────────── */
+
+/* The root is the anchor. `anchor-scope` keeps each tooltip on its own
+   trigger. `display: inline` keeps a long link trigger in the text flow.
+   The fallback places the text with `position: absolute`. */
+.autumn-tooltip {
+    --autumn-tooltip-gap: var(--space-2);
+    position: relative;
+    display: inline;
+    anchor-name: --autumn-tooltip;
+    anchor-scope: --autumn-tooltip;
+}
+
+/* Hidden: `display: none`, so a hidden text adds no scroll overflow.
+   `aria-describedby` still reads it. `pointer-events: auto` lets the
+   pointer move onto it (WCAG 1.4.13). The transparent border shows in
+   forced colors. */
+.autumn-tooltip__bubble {
+    display: none;
+    position: absolute;
+    z-index: var(--z-tooltip);
+    box-sizing: border-box;
+    width: max-content;
+    max-width: min(20rem, calc(100vw - 2 * var(--space-2)));
+    margin: 0;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: var(--text);
+    color: var(--surface);
+    box-shadow: var(--shadow);
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-normal);
+    line-height: var(--line-height-normal);
+    text-align: start;
+    white-space: normal;
+    overflow-wrap: break-word;
+    pointer-events: auto;
+    opacity: 1;
+    transition: opacity 120ms ease-out;
+}
+
+/* The hover bridge: a transparent box that covers the gap on each side. */
+.autumn-tooltip__bubble::before {
+    content: "";
+    position: absolute;
+    inset: calc(-1 * var(--autumn-tooltip-gap));
+}
+
+/* One rule for each selector: a browser drops a whole list when it does
+   not know one pseudo-class in it. A popover shows only when open. */
+.autumn-tooltip:hover > .autumn-tooltip__bubble:not([popover]) {
+    display: block;
+}
+
+.autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble:not([popover]) {
+    display: block;
+}
+
+.autumn-tooltip > .autumn-tooltip__bubble[popover]:popover-open {
+    display: block;
+}
+
+/* Without `:has()`, any focus shows the text. */
+@supports not selector(:has(a)) {
+    .autumn-tooltip:focus-within > .autumn-tooltip__bubble:not([popover]) {
+        display: block;
+    }
+}
+
+/* Fade in from transparent. */
+@starting-style {
+    .autumn-tooltip__bubble {
+        opacity: 0;
+    }
+}
+
+/* Escape sets `hidden`. An empty text never shows. `!important` wins over
+   each show rule above. */
+.autumn-tooltip__bubble[hidden],
+.autumn-tooltip__bubble:empty {
+    display: none !important;
+}
+
+/* Fallback placement, without anchor positioning. */
+.autumn-tooltip--top > .autumn-tooltip__bubble {
+    bottom: 100%;
+    left: 50%;
+    translate: -50% 0;
+    margin-bottom: var(--autumn-tooltip-gap);
+}
+
+.autumn-tooltip--bottom > .autumn-tooltip__bubble {
+    top: 100%;
+    left: 50%;
+    translate: -50% 0;
+    margin-top: var(--autumn-tooltip-gap);
+}
+
+.autumn-tooltip--start > .autumn-tooltip__bubble {
+    top: 50%;
+    inset-inline-end: 100%;
+    translate: 0 -50%;
+    margin-inline-end: var(--autumn-tooltip-gap);
+}
+
+.autumn-tooltip--end > .autumn-tooltip__bubble {
+    top: 50%;
+    inset-inline-start: 100%;
+    translate: 0 -50%;
+    margin-inline-start: var(--autumn-tooltip-gap);
+}
+
+/* Anchor positioning. `position: fixed` escapes an `overflow` clip. The
+   text tries the other side, then above and below. `self-*` areas follow
+   the direction of the tooltip, not of the page. `unsafe` alignment keeps
+   the text off its trigger when no block area fits. */
+@supports (anchor-scope: all) {
+    .autumn-tooltip > .autumn-tooltip__bubble {
+        position: fixed;
+        position-anchor: --autumn-tooltip;
+        inset: auto;
+        translate: none;
+        margin: 0;
+    }
+
+    .autumn-tooltip--top > .autumn-tooltip__bubble {
+        position-area: block-start;
+        align-self: unsafe end;
+        margin-block-end: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-block;
+    }
+
+    .autumn-tooltip--bottom > .autumn-tooltip__bubble {
+        position-area: block-end;
+        align-self: unsafe start;
+        margin-block-start: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-block;
+    }
+
+    .autumn-tooltip--start > .autumn-tooltip__bubble {
+        position-area: self-inline-start;
+        margin-inline-end: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-inline, --autumn-tooltip-above, --autumn-tooltip-below;
+    }
+
+    .autumn-tooltip--end > .autumn-tooltip__bubble {
+        position-area: self-inline-end;
+        margin-inline-start: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-inline, --autumn-tooltip-above, --autumn-tooltip-below;
+    }
+}
+
+@position-try --autumn-tooltip-above {
+    position-area: block-start;
+    align-self: unsafe end;
+    justify-self: anchor-center;
+    margin: 0 0 var(--autumn-tooltip-gap);
+}
+
+@position-try --autumn-tooltip-below {
+    position-area: block-end;
+    align-self: unsafe start;
+    justify-self: anchor-center;
+    margin: var(--autumn-tooltip-gap) 0 0;
+}
+
+/* Chromium: the runtime makes the text a `popover="hint"`. The browser
+   shows it in the top layer. Reset the UA popover box, and place the text
+   at the implicit anchor (the `interestfor` trigger). */
+.autumn-tooltip__bubble[popover] {
+    position: fixed;
+    position-anchor: auto;
+    inset: auto;
+    translate: none;
+    overflow: visible;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .autumn-tooltip__bubble {
+        transition: none;
     }
 }
 

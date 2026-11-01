@@ -232,11 +232,13 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "comment-thread",
     "confirm-action",
     "data-table",
+    "drawer",
     "dropdown-menu",
     // Form field wrapper (`autumn_web::form`, #3395), not a `widgets.rs` fn.
     "field",
     // `autumn_web::a11y` primitives (#3398).
     "accessible-primitives",
+    "accordion",
     "hero",
     "infinite-feed",
     "locale-switcher",
@@ -252,6 +254,7 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "tabs",
     "theme-toggle",
     "toast",
+    "tooltip",
     "transition-controls",
     "translated-transition-controls",
 ];
@@ -442,6 +445,7 @@ fn every_a11y_primitive_is_exercised_by_a_story() {
 const INTERACTIVE_MARKERS: &[&str] = &[
     "data-autumn-",
     "data-modal-open",
+    "data-drawer-open",
     "data-popover-toggle",
     "autumn-flash__dismiss-toggle",
 ];
@@ -450,9 +454,11 @@ const INTERACTIVE_MARKERS: &[&str] = &[
 /// `active-search` has no marker. It is here because typing drives it.
 const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "accessible-primitives",
+    "accordion",
     "active-search",
     "autocomplete",
     "confirm-action",
+    "drawer",
     "dropdown-menu",
     "flash",
     "modal",
@@ -461,6 +467,7 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "tabs",
     "theme-toggle",
     "toast",
+    "tooltip",
 ];
 
 /// The browser test fn name for `slug`.
@@ -521,6 +528,8 @@ const BROWSER_GATE_PATHS: &[&str] = &[
     "autumn/vendor/htmx.min.js",
     "autumn/tests/integration/widgets_toast_browser.rs",
     "autumn/tests/integration/widgets_popover_browser.rs",
+    "autumn/tests/integration/widgets_tooltip_browser.rs",
+    "autumn/tests/integration/widgets_drawer_browser.rs",
     "autumn/src/widget_pack.rs",
     "autumn/src/plugin_conformance/**",
     "autumn-plugin-reference/src/**",
@@ -547,6 +556,8 @@ fn widget_browser_workflow_runs_on_widget_changes() {
         "widgets_keyboard_browser",
         "widgets_toast_browser",
         "widgets_popover_browser",
+        "widgets_tooltip_browser",
+        "widgets_drawer_browser",
         "widget_pack_browser",
     ] {
         assert!(
@@ -567,7 +578,7 @@ fn widget_browser_workflow_runs_on_widget_changes() {
         "widgets-browser.yml does not run the reference widget pack (#3400)"
     );
     assert!(
-        workflow.matches("passed' ").count() >= 6,
+        workflow.matches("passed' ").count() >= 8,
         "widgets-browser.yml must check a non-zero pass count for each suite"
     );
 }

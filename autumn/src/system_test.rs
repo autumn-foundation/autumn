@@ -1065,6 +1065,33 @@ impl Page {
         Ok(self)
     }
 
+    /// Move the mouse to the point (`x`, `y`), in CSS pixels from the top
+    /// left of the viewport. CSS `:hover` then applies at that point. Use it
+    /// to move the pointer through a gap, as a user does.
+    ///
+    /// # Errors
+    /// CDP errors.
+    pub async fn move_mouse(&self, x: f64, y: f64) -> Result<&Self, SystemTestError> {
+        self.inner
+            .move_mouse(chromiumoxide::layout::Point::new(x, y))
+            .await?;
+        Ok(self)
+    }
+
+    /// Click the viewport point `(x, y)` with a real mouse event.
+    ///
+    /// Use it to hit what has no element, such as a dialog backdrop.
+    ///
+    /// # Errors
+    /// CDP errors.
+    pub async fn click_at(&self, x: f64, y: f64) -> Result<&Self, SystemTestError> {
+        self.inner
+            .click(chromiumoxide::layout::Point::new(x, y))
+            .await?;
+        self.wait_for_hx_settle().await?;
+        Ok(self)
+    }
+
     /// Press one key on the focused element, as a user does.
     ///
     /// Sends real CDP `keyDown`/`keyUp` events, so the browser runs its

@@ -213,6 +213,29 @@ impl fmt::Display for ReplicationError {
 
 impl std::error::Error for ReplicationError {}
 
+impl ReplicationError {
+    /// Whether the next tick is likely to succeed with no help. Only a
+    /// blocked checkpoint is.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        matches!(self, Self::CheckpointBlocked { .. })
+    }
+}
+
+/// The log level of a failed tick. A transient failure logs at `DEBUG` the
+/// first time and at `WARN` when it happens again. All other failures log at
+/// `WARN`. `consecutive` counts this failure.
+pub(crate) const fn tick_failure_level(
+    error: &ReplicationError,
+    consecutive: u32,
+) -> tracing::Level {
+    if error.is_transient() && consecutive <= 1 {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    }
+}
+
 impl From<WalError> for ReplicationError {
     fn from(e: WalError) -> Self {
         Self::Wal(e)
@@ -520,7 +543,14 @@ impl Replicator {
             }
             // `tick` has already folded the failure into the shared status, so
             // lag keeps growing; this arm only surfaces it in the log.
-            Err(e) => tracing::warn!(error = %e, "SQLite replication tick failed"),
+            Err(e) => {
+                let failures = self.status.snapshot().consecutive_failures;
+                if tick_failure_level(&e, failures) == tracing::Level::WARN {
+                    tracing::warn!(error = %e, "SQLite replication tick failed");
+                } else {
+                    tracing::debug!(error = %e, "SQLite replication tick failed");
+                }
+            }
         }
     }
 
@@ -1424,6 +1454,20 @@ fn sleep_or_cancelled(shutdown: &tokio_util::sync::CancellationToken, total: Dur
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_blocked_checkpoint_warns_only_when_it_happens_again() {
+        let blocked = ReplicationError::CheckpointBlocked { wal_bytes: 1 };
+        assert!(blocked.is_transient());
+        assert_eq!(tick_failure_level(&blocked, 1), tracing::Level::DEBUG);
+        assert_eq!(tick_failure_level(&blocked, 2), tracing::Level::WARN);
+        let io = ReplicationError::Io {
+            op: "read",
+            detail: "gone".to_owned(),
+        };
+        assert!(!io.is_transient());
+        assert_eq!(tick_failure_level(&io, 1), tracing::Level::WARN);
+    }
 
     fn keys(id: &str, epoch: Option<u64>, complete: bool) -> Vec<String> {
         let mut keys = vec![segment::snapshot_key("r", id)];

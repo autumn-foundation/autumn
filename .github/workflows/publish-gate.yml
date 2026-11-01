@@ -283,6 +283,18 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-popover-browser.log" \
             || { echo "::error::no popover browser tests ran"; exit 1; }
 
+      # Drawer and modal in a real browser (#3403).
+      - name: Run the drawer browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_drawer_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-drawer-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-drawer-browser.log" \
+            || { echo "::error::no drawer browser tests ran"; exit 1; }
+
   # ---------------------------------------------------------------------------
   # 1. Crate metadata
   # ---------------------------------------------------------------------------

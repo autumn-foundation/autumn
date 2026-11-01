@@ -95,6 +95,7 @@
 //! | `AUTUMN_DATABASE__FLEET__RESTORE_MISSING` | `database.fleet.restore_missing` | `bool` |
 //! | `AUTUMN_DATABASE__FLEET__REPLICA_RETENTION_AFTER_DELETE` | `database.fleet.replica_retention_after_delete` | duration; empty is `0` |
 //! | `AUTUMN_DATABASE__FLEET__RESTORE_CHECK_SAMPLE` | `database.fleet.restore_check_sample` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__REPLICATION_WORKERS` | `database.fleet.replication_workers` | `usize` |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER` | `database.fleet.ownership.owner` | `String` (creates the section) |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS` | `database.fleet.ownership.slots` | comma-separated `N` / `A-B` |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS` | `database.fleet.ownership.lease_secs` | `u64` |
@@ -6866,6 +6867,7 @@ impl AutumnConfig {
                 ownership: None,
                 replica_retention_after_delete: std::time::Duration::ZERO,
                 restore_check_sample: default_fleet_restore_check_sample(),
+                replication_workers: default_fleet_replication_workers(),
             });
         }
         let Some(fleet) = self.database.fleet.as_mut() else {
@@ -10487,6 +10489,14 @@ pub struct DatabaseFleetConfig {
     /// Default: `1`. `0`, or `verify_interval_secs = 0`, turns the check off.
     #[serde(default = "default_fleet_restore_check_sample")]
     pub restore_check_sample: usize,
+
+    /// With `[replication]` on, the number of threads that ship the fleet
+    /// databases. Default: `4`. Range: `1` to `64`. The RPO holds while one
+    /// pass over the open databases fits in `sync_interval_secs`. Increase
+    /// this value when `last_pass_ms` in `replication:fleet` is near that
+    /// interval.
+    #[serde(default = "default_fleet_replication_workers")]
+    pub replication_workers: usize,
 }
 
 /// `[database.fleet.ownership]`: the slot ranges this host claims on the
@@ -10637,6 +10647,11 @@ impl DatabaseFleetConfig {
                 "database.fleet.pool_size must be at least 1".to_owned(),
             ));
         }
+        if !(1..=64).contains(&self.replication_workers) {
+            return Err(ConfigError::Validation(
+                "database.fleet.replication_workers must be 1 to 64".to_owned(),
+            ));
+        }
         if let Some(ownership) = &self.ownership {
             ownership.validate()?;
         }
@@ -10666,6 +10681,37 @@ const fn default_fleet_idle_close_secs() -> u64 {
 
 const fn default_fleet_restore_check_sample() -> usize {
     1
+}
+
+const fn default_fleet_replication_workers() -> usize {
+    4
+}
+
+/// The boot warning for a high connection count, or `None` below the
+/// threshold. `sqlite` selects the advice for a `SQLite` app.
+pub(crate) fn total_connections_warning(
+    total: usize,
+    threshold: usize,
+    sqlite: bool,
+) -> Option<String> {
+    if !should_warn_total_connections(total, threshold) {
+        return None;
+    }
+    let advice = if sqlite {
+        "Each SQLite connection keeps files open. Set the open-file limit of \
+         the process (ulimit -n) higher than this count, or decrease \
+         database.fleet.max_open, database.fleet.pool_size or database.pool_size."
+    } else {
+        "Ensure each Postgres server's max_connections (plus headroom for \
+         migrations and psql) exceeds the pools that target it, or lower \
+         database.pool_size."
+    };
+    Some(format!(
+        "Aggregate database connection count is high: the control topology and \
+         all shard pools together may open {total} connections (warn threshold \
+         {threshold}). {advice} Set database.max_connections_warn_threshold = 0 \
+         to silence."
+    ))
 }
 
 /// Decide whether the aggregate connection count warrants a startup warning.
@@ -12082,6 +12128,11 @@ fn apply_fleet_replica_env_overrides(fleet: &mut DatabaseFleetConfig, env: &dyn 
         env,
         "AUTUMN_DATABASE__FLEET__RESTORE_CHECK_SAMPLE",
         &mut fleet.restore_check_sample,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DATABASE__FLEET__REPLICATION_WORKERS",
+        &mut fleet.replication_workers,
     );
 }
 
@@ -14457,6 +14508,20 @@ mod tests {
         // A zero threshold silences the warning regardless of the total.
         assert!(!should_warn_total_connections(0, 0));
         assert!(!should_warn_total_connections(10_000, 0));
+    }
+
+    #[test]
+    fn the_connection_warning_speaks_sqlite_to_a_sqlite_app() {
+        // Murmuration FINDINGS 6: a SQLite fleet was told about Postgres.
+        let sqlite = total_connections_warning(266, 100, true).expect("warns");
+        assert!(!sqlite.contains("Postgres"), "{sqlite}");
+        assert!(sqlite.contains("266"), "{sqlite}");
+        assert!(sqlite.contains("database.fleet.max_open"), "{sqlite}");
+        assert!(sqlite.contains("max_connections_warn_threshold = 0"));
+        let postgres = total_connections_warning(266, 100, false).expect("warns");
+        assert!(postgres.contains("Postgres"), "{postgres}");
+        assert!(total_connections_warning(99, 100, true).is_none());
+        assert!(total_connections_warning(10_000, 0, false).is_none());
     }
 
     #[test]
@@ -20423,6 +20488,7 @@ path = "/healthz"
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
         }
     }
 
@@ -20647,6 +20713,38 @@ path = "/healthz"
             std::time::Duration::from_secs(30 * 86_400)
         );
         assert_eq!(fleet.restore_check_sample, 0);
+    }
+
+    #[test]
+    fn fleet_replication_workers_default_parse_and_validate() {
+        let parse = |extra: &str| {
+            toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\n\n\
+                 [database.fleet]\nmode = \"tenant\"\nroot = \"/var/lib/app/fleet\"\n{extra}"
+            ))
+            .unwrap()
+            .database
+            .fleet
+            .unwrap()
+        };
+        let fleet = parse("");
+        assert_eq!(fleet.replication_workers, 4);
+        assert!(fleet.validate().is_ok());
+        assert_eq!(parse("replication_workers = 8").replication_workers, 8);
+        for bad in [0, 65] {
+            let error = parse(&format!("replication_workers = {bad}"))
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("replication_workers"), "{error}");
+        }
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "tenant")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__REPLICATION_WORKERS", "2");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.fleet.unwrap().replication_workers, 2);
     }
 
     #[test]

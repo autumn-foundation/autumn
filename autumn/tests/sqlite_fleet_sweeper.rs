@@ -183,6 +183,7 @@ fn fleet_with(dir: &FsPath, max_open: usize, migrations: EmbeddedMigrations) -> 
         ownership: None,
         replica_retention_after_delete: std::time::Duration::ZERO,
         restore_check_sample: 0,
+        replication_workers: 4,
     })
     .min_residency(Duration::ZERO)
     .migrations("app", migrations)
