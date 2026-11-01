@@ -6586,8 +6586,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // traits (see `M2mConnSource`).
         #m2m_conn_source_impl
 
-        /// The generated repository. A `SQLite` build also names it
-        /// `Sqlite<Trait>`.
+        /// The generated repository.
         #vis struct #pg_name {
             #struct_fields
         }
@@ -30346,7 +30345,10 @@ mod tests {
             // `crate_version` field, an `option_env!` match of about 170
             // bytes. Understood and intended.
             ("plain", quote! { Post }, 82_000),
-            ("soft_delete", quote! { Post, soft_delete }, 89_000),
+            // Raised from 89_000: each repository emits one
+            // `__sqlite_repository_alias!` call (the `Sqlite<Trait>` name),
+            // about 90 bytes. Understood and intended.
+            ("soft_delete", quote! { Post, soft_delete }, 90_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
             // Raised from 95_000 (#2451): each repository publishes its
             // cascade consts. Understood and intended.
