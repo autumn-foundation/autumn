@@ -822,3 +822,69 @@ async fn keyboard_toast() {
     );
     page.expect_no_console_errors().await.expect("no errors");
 }
+
+/// Focus the tab stop before `selector`, then press Tab: a keyboard focus.
+async fn tab_to(page: &Page, selector: &str) {
+    assert!(
+        eval_bool(
+            page,
+            &format!(
+                "(() => {{ const t = document.querySelector({selector:?}); \
+                 const all = [...document.querySelectorAll('a[href],button,input,select,textarea,[tabindex]')] \
+                   .filter(e => e.tabIndex >= 0 && !e.disabled && e.getClientRects().length); \
+                 const i = all.indexOf(t); if (i < 1) return false; \
+                 all[i - 1].focus(); return true; }})()"
+            ),
+        )
+        .await,
+        "no tab stop before {selector}"
+    );
+    press(page, "Tab").await;
+    assert!(
+        eval_bool(
+            page,
+            &format!("document.activeElement.matches({selector:?})")
+        )
+        .await,
+        "Tab does not reach {selector}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_tooltip() {
+    const TRIGGER: &str = "[data-autumn-tooltip] button[aria-describedby]";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/tooltip").await;
+
+    let tip = attr(&page, TRIGGER, "aria-describedby").await;
+    let bubble = format!("#{tip}");
+    let visible = format!(
+        "(() => {{ const s = getComputedStyle(document.getElementById({tip:?})); \
+         return s.display !== 'none' && s.visibility === 'visible'; }})()"
+    );
+    assert_eq!(attr(&page, &bubble, "role").await, "tooltip");
+    assert!(!eval_bool(&page, &visible).await, "hidden at rest");
+    tab_to(&page, TRIGGER).await;
+    wait_for(&page, &visible).await;
+    press(&page, "Escape").await;
+    wait_for(&page, &format!("!{visible}")).await;
+    assert!(
+        eval_bool(
+            &page,
+            &format!("document.activeElement.matches({TRIGGER:?})")
+        )
+        .await,
+        "focus stays on the trigger"
+    );
+
+    // A new focus shows the text again. axe checks it in both schemes.
+    axe_in_both_schemes(&page, "shown tooltip", || async {
+        tab_to(&page, TRIGGER).await;
+        wait_for(&page, &visible).await;
+        wait_for(&page, "document.getAnimations().length === 0").await;
+    })
+    .await;
+    page.expect_no_console_errors().await.expect("no errors");
+}

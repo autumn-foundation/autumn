@@ -1125,8 +1125,13 @@ jobs:
         # `#[cfg(feature = ...)]`-gated, so the set that exists depends on the
         # GLOBALLY unified feature resolution of a workspace build. Narrowing
         # the package selection here would quietly compile fewer of them out and
-        # still report green. Every other test in the workspace is filtered out
-        # by the shard's own filter, so the extra targets only cost their link.
+        # still report green.
+        #
+        # `--test integration_tests` keeps that workspace feature set, but builds
+        # only the target that holds `compile_fail::`. The other ~100 test
+        # binaries filled the runner disk before the fixtures finished: the
+        # runner then lost its own log, and `pass_b` failed with no output
+        # (#3534).
         #
         # `assert_ran` for the reason the TLS/ACME lanes give: `cargo test` exits
         # 0 when a filter matches NOTHING, so a rename in `compile_fail.rs` would
@@ -1143,7 +1148,8 @@ jobs:
                       --skip compile_fail::compile_pass_tests_a
                       --skip compile_fail::compile_pass_tests_b) ;;
           esac
-          cargo test --workspace -- "${filter[@]}" | tee "${RUNNER_TEMP}/trybuild.log"
+          cargo test --workspace --test integration_tests -- "${filter[@]}" \
+            | tee "${RUNNER_TEMP}/trybuild.log"
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/trybuild.log" \
             || { echo "::error::trybuild shard ${{ matrix.shard }} ran no tests — the filter no longer matches anything in compile_fail.rs"; exit 1; }
       - name: Drop the trybuild scratch tree
