@@ -5799,7 +5799,10 @@ mod tests {
             .unwrap();
         let mut wal = source.as_os_str().to_owned();
         wal.push("-wal");
-        assert!(std::fs::metadata(&wal).unwrap().len() > 0, "the rows are in the -wal");
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "the rows are in the -wal"
+        );
 
         drop(fleet.import(&key, &source).await.unwrap());
         assert_eq!(

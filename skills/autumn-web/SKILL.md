@@ -3011,8 +3011,21 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   tenants: call `shards.fleet().unwrap().provision(&fleet.key_for(id)?)` on
   signup (`404` until then, `409` if it exists).
 - `DatabaseFleet` (`autumn_web::db::fleet`): `open_for`, `provision`,
-  `delete` (`410` meanwhile), `backup` (`VACUUM INTO`), `restore`, `list`,
-  `each`, `migrate_all`, `stats`. Health: `db:fleet`.
+  `delete` (`410` meanwhile), `backup` (`VACUUM INTO`), `import` (put a
+  backup back: check, migrate, publish; `409` when the key has a file),
+  `restore`, `list`, `each`, `migrate_all`, `stats`. Health: `db:fleet`.
+  Use `import`, not a `FleetLifecycle::restore_missing` hook, for a local
+  backup.
+- `max_open` is a soft limit: a database in use or used within
+  `min_residency` (default `"2s"`) is not closed, and an open never waits.
+  A burst can open far more files than `max_open`. Size `ulimit -n` for the
+  peak (about `2 × pool_size + 1` fds per open database).
+- Control-only or tenant-only tables: `.migrations_for(MigrationScope::Control,
+  SET)` / `.migrations_for(MigrationScope::Shards, SET)`
+  (`autumn_web::migrate::MigrationScope`), not one set for both.
+- A SQLite build names the generated repository `Sqlite<Trait>` too (alias
+  of `Pg<Trait>`). In a module with `#[model]`/`#[repository]`, import
+  `autumn_web::db::prelude::*`, never `diesel::prelude::*` (E0034).
 - A slot fleet shares files between tenants: keep `tenant_scoped` on its
   repositories. `CrossShard` / `each_shard` open every database on disk —
   admin paths only.
@@ -3060,7 +3073,7 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   before the first request, then `sweep_once()` to run a pass.
 - Out of band (stopped or live app), with the `sqlite` CLI build:
   `autumn fleet list --open`, `migrate [--key K]`, `backup <key> <dest>`,
-  `delete <key> --force`, `restore <key> [--timestamp T] --force`. Keys are
+  `import <key> <src>`, `delete <key> --force`, `restore <key> [--timestamp T] --force`. Keys are
   `tenant:<id>` / `slot:<nnnnn>`. A file another process has open is refused
   ("open in another process"). `migrate` reads `migrations/` only: plugin
   sets need `AUTUMN_MIGRATE=1`. Run it from the app directory.
@@ -3563,7 +3576,7 @@ autumn db backup --keep 7        # dump control DB + shards to ./backups/<profil
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
 autumn db replica restore --force        # SQLite tier: rebuild from the continuous replica; --timestamp <RFC3339> for PITR, --overwrite to replace an existing file  # (0.7.0)
 autumn db replica status --json          # replica generation, segments, and current replication lag; db replica verify proves it restorable  # (0.7.0)
-autumn fleet list --open                 # SQLite fleet (sqlite CLI build): every tenant/slot database; migrate | backup <key> <dest> | delete <key> --force | restore <key> [--timestamp T] --force
+autumn fleet list --open                 # SQLite fleet (sqlite CLI build): every tenant/slot database; migrate | backup <key> <dest> | import <key> <src> | delete <key> --force | restore <key> [--timestamp T] --force
 autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
 autumn db scrub --sample users=1% --seed 42            # scrub AND subset in one pass: 1% of users plus every row they relate to, reproducibly
 autumn db retention --dry-run    # per-dataset retention window, its source, and rows eligible for purge; --purge to enforce now (needs --force outside dev/test), --dataset X, --json  # (0.7.0)
