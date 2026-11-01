@@ -128,8 +128,25 @@ impl WidthReport {
     /// Whether anything is over `max` or a wide diesel feature is on.
     #[must_use]
     pub fn has_findings(&self, max: usize) -> bool {
-        !self.over(max).is_empty() || !self.wide_diesel_features.is_empty()
+        !self.over(max).is_empty() || !self.features_over(max).is_empty()
     }
+
+    /// The resolved wide diesel features whose cap is above `max`. At the
+    /// default 32 both are findings; under `--max 64` only `128-column-tables`
+    /// is, so an app that chose the 64 cap on purpose can still gate on it.
+    #[must_use]
+    pub fn features_over(&self, max: usize) -> Vec<&str> {
+        self.wide_diesel_features
+            .iter()
+            .map(String::as_str)
+            .filter(|f| feature_cap(f).is_none_or(|cap| cap > max))
+            .collect()
+    }
+}
+
+/// The tuple cap a diesel `<N>-column-tables` feature sets.
+fn feature_cap(feature: &str) -> Option<usize> {
+    feature.strip_suffix("-column-tables")?.parse().ok()
 }
 
 // ── SQL ────────────────────────────────────────────────────────────────────
@@ -311,8 +328,9 @@ fn split_top_level(toks: &[Tok], sep: char) -> Vec<&[Tok]> {
     let mut start = 0;
     for (i, t) in toks.iter().enumerate() {
         match t {
-            Tok::Punct('(') => depth += 1,
-            Tok::Punct(')') => depth = depth.saturating_sub(1),
+            // `[` nests too: `DEFAULT ARRAY[1, 2]` is one column, not two.
+            Tok::Punct('(' | '[') => depth += 1,
+            Tok::Punct(')' | ']') => depth = depth.saturating_sub(1),
             Tok::Punct(c) if *c == sep && depth == 0 => {
                 parts.push(&toks[start..i]);
                 start = i + 1;
@@ -802,7 +820,7 @@ fn format_findings(report: &WidthReport, max: usize, out: &mut String) {
             t.path.display()
         );
     }
-    for feature in &report.wide_diesel_features {
+    for feature in report.features_over(max) {
         let _ = writeln!(
             out,
             "  diesel is built with `{feature}`: every crate that depends on diesel compiles \
@@ -961,6 +979,40 @@ mod tests {
         assert_eq!(w.get("fake"), None);
         assert_eq!(w.get("fake2"), None);
         assert_eq!(w.get("real"), Some(&1));
+    }
+
+    #[test]
+    fn array_literals_do_not_split_a_column() {
+        let w = widths(&["CREATE TABLE t (
+            a INT[] DEFAULT ARRAY[1, 2, 3],
+            b INT[][] DEFAULT '{{1,2},{3,4}}',
+            c TEXT
+        );
+        ALTER TABLE t ADD COLUMN d INT[] DEFAULT ARRAY[4, 5], ADD COLUMN e INT;"]);
+        assert_eq!(w.get("t"), Some(&5));
+    }
+
+    #[test]
+    fn max_flag_accepts_the_feature_the_app_chose() {
+        let report = |features: &[&str]| WidthReport {
+            tables: replay_migration_set(&[(PathBuf::from("01/up.sql"), wide_create("t", 40))]),
+            wide_diesel_features: features.iter().map(|f| (*f).to_owned()).collect(),
+        };
+        // At the default cap, both wide features are findings.
+        assert_eq!(
+            report(&["128-column-tables", "64-column-tables"]).features_over(32),
+            vec!["128-column-tables", "64-column-tables"]
+        );
+        // An app that chose 64 on purpose passes `--max 64`.
+        assert!(!report(&["64-column-tables"]).has_findings(64));
+        // ...but not if something pulls in 128.
+        assert_eq!(
+            report(&["128-column-tables", "64-column-tables"]).features_over(64),
+            vec!["128-column-tables"]
+        );
+        assert!(report(&["128-column-tables"]).has_findings(64));
+        // The build warning always measures against 32.
+        assert!(format_build_warning(&report(&["64-column-tables"])).is_some());
     }
 
     #[test]
