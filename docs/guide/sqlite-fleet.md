@@ -39,6 +39,7 @@ idle_close_secs = 300           # close a database idle this long
 # restore_missing = false       # see "Replication" below
 # replica_retention_after_delete = "0s"  # see "Deleting a database's replica"
 # restore_check_sample = 1      # see "Restore check"
+# replication_workers = 4       # see "Replication lag"
 
 # [database.fleet.ownership]    # see "Failover: slot ownership" below
 # owner = "host-a"
@@ -331,6 +332,31 @@ file systems.
 replicating, the number this process does not own (`unowned`), the worst lag
 and which database has it.
 
+### Replication lag
+
+The `[replication] rpo_secs` bound holds while one pass over the open
+databases fits in `sync_interval_secs`. A pass ticks each open database once.
+It starts one interval after the last pass started, or at once if the last
+pass took longer. `replication_workers` threads (default `4`, `1` to `64`)
+ship databases at the same time. The database that shipped longest ago goes
+first.
+
+Many busy databases in one process make a pass long. Monitor these values in
+`replication:fleet`:
+
+- `worst_lag_seconds`: the longest time since a database was last caught
+  up. A takeover can lose this much of that database. The indicator is
+  `DOWN` above three times `rpo_secs`.
+- `last_pass_ms`: the time of the last pass. If it is near
+  `sync_interval_secs × 1000`, increase `replication_workers`, or put fewer
+  busy databases on each host.
+- `ship_workers`: the threads that ship.
+
+`unowned` counts open databases that this process does not replicate.
+Usually another process on the same root holds their lock. A database that
+closes and opens again during a pass can show as `unowned` for some
+milliseconds. The next pass claims it.
+
 ### Deleting a database's replica
 
 `fleet.delete(&key)` and `autumn fleet delete` remove the replica too:
@@ -467,6 +493,13 @@ the first request.
    Start the new host with the same `slots`. The new host claims the ranges
    when the old lease ends: after at most `lease_secs`, plus one renew
    interval and the clock skew. Then it serves at a new epoch.
+   The first request to each database restores it from the replica, so the
+   first requests after a takeover are slow. A host that claims many
+   databases at once can use all its CPU for restores. Limit the number of
+   requests that open databases at the same time. Or open the claimed
+   databases in the background before traffic arrives.
+   A takeover loses the commits that the old host did not ship: up to
+   `worst_lag_seconds` of each database.
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
    fails. It claims the range again only when the new owner lets it go, at a

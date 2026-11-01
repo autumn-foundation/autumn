@@ -4465,21 +4465,15 @@ impl AppBuilder {
                 "Database topology configured"
             );
             // Pool sizes multiply across shards; warn before the aggregate
-            // silently exhausts Postgres's server-side `max_connections`.
+            // exhausts Postgres's `max_connections` or, on SQLite, the
+            // open-file limit of the process.
             let warn_threshold = config.database.max_connections_warn_threshold;
-            if crate::config::should_warn_total_connections(total_max_connections, warn_threshold) {
-                tracing::warn!(
-                    total_max_connections,
-                    warn_threshold,
-                    "Aggregate database connection count is high: the control \
-                     topology and all shard pools together may open \
-                     {total_max_connections} connections (warn threshold \
-                     {warn_threshold}). Ensure each Postgres server's \
-                     max_connections (plus headroom for migrations and \
-                     psql) exceeds the pools that target it, or lower \
-                     database.pool_size. Set \
-                     database.max_connections_warn_threshold = 0 to silence."
-                );
+            if let Some(message) = crate::config::total_connections_warning(
+                total_max_connections,
+                warn_threshold,
+                cfg!(feature = "sqlite"),
+            ) {
+                tracing::warn!(total_max_connections, warn_threshold, "{message}");
             }
             // A transaction-mode pooler breaks session state (issue #3065).
             for warning in crate::db::pooler::pooler_warnings(&config.database) {
@@ -14156,7 +14150,12 @@ fn start_fleet_replication(
             0
         },
     )
-    .with_entropy(state.entropy_arc());
+    .with_entropy(state.entropy_arc())
+    .with_ship_workers(
+        fleet_config.map_or(crate::db::fleet_replication::DEFAULT_SHIP_WORKERS, |f| {
+            f.replication_workers
+        }),
+    );
     if let Some(control) = state.pool() {
         replication = replication.with_tombstones(Arc::new(
             crate::db::fleet_tombstones::FleetTombstones::new(control.clone(), state.clock_arc()),
@@ -15861,6 +15860,7 @@ mod fleet_boot_tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
         });
         config
             .database
@@ -15907,6 +15907,7 @@ mod fleet_boot_tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
         });
         let resolved = format!("sqlite://{}", root.join("control.db").display());
         let Err(err) = crate::db::fleet::build_for_app(
@@ -15970,6 +15971,7 @@ mod fleet_boot_tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
         });
         let all = Arc::new(vec![
             ("framework", crate::migrate::FRAMEWORK_MIGRATIONS),
@@ -16020,6 +16022,7 @@ mod fleet_boot_tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
         });
         let all = Arc::new(vec![("framework", crate::migrate::FRAMEWORK_MIGRATIONS)]);
         let fleet = crate::db::fleet::build_for_app(&config, None, &all, |set| {

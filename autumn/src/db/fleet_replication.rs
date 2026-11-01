@@ -85,6 +85,51 @@ const CLAIM_POLL: Duration = Duration::from_millis(25);
 /// Pause between flush passes at shutdown.
 const FLUSH_RETRY: Duration = Duration::from_millis(100);
 
+/// The default number of threads that ship the databases of one pass.
+pub const DEFAULT_SHIP_WORKERS: usize = 4;
+
+/// The pause after a pass that took `took`, so that a pass starts once per
+/// `interval`. Zero when the pass took longer than `interval`.
+const fn pause_after(interval: Duration, took: Duration) -> Duration {
+    interval.saturating_sub(took)
+}
+
+/// The keys, the oldest time first. A pass ships in this order, so the
+/// database with the most lag ships first.
+fn oldest_first(mut entries: Vec<(FleetDbKey, DateTime<Utc>)>) -> Vec<FleetDbKey> {
+    entries.sort_by_key(|entry| entry.1);
+    entries.into_iter().map(|(key, _)| key).collect()
+}
+
+/// Run `work` once for each key, on at most `workers` threads. The calling
+/// thread is one of them. Blocking: it returns when all keys are done.
+fn for_each_on(workers: usize, keys: &[FleetDbKey], work: impl Fn(&FleetDbKey) + Sync) {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let drain = || {
+        while let Some(key) = keys.get(next.fetch_add(1, Ordering::Relaxed)) {
+            work(key);
+        }
+    };
+    let helpers = workers.min(keys.len()).saturating_sub(1);
+    std::thread::scope(|scope| {
+        for _ in 0..helpers {
+            // If a thread does not start, the other threads do its keys.
+            let _ = std::thread::Builder::new()
+                .name("autumn-fleet-ship".to_owned())
+                .spawn_scoped(scope, drain);
+        }
+        drain();
+    });
+}
+
+/// Real time since `started`, in milliseconds.
+fn millis_since(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// No pass has run yet.
+const NO_PASS: u64 = u64::MAX;
+
 /// The destination key prefix of one fleet database, under the control
 /// database's replication root.
 #[must_use]
@@ -247,6 +292,11 @@ pub struct FleetReplication {
     last_purge: Mutex<Option<PurgeReport>>,
     /// The last restore check, for health.
     last_restore_check: Mutex<Option<RestoreCheckReport>>,
+    /// The threads that ship the databases of one pass.
+    ship_workers: usize,
+    /// The time of the last loop pass in milliseconds, [`NO_PASS`] before
+    /// it. A shutdown flush does not change it.
+    last_pass_ms: AtomicU64,
 }
 
 /// The result of one restore check (issue #3235). See
@@ -311,7 +361,23 @@ impl FleetReplication {
             released: Mutex::new(HashMap::new()),
             last_purge: Mutex::new(None),
             last_restore_check: Mutex::new(None),
+            ship_workers: DEFAULT_SHIP_WORKERS,
+            last_pass_ms: AtomicU64::new(NO_PASS),
         }
+    }
+
+    /// Ship the databases of a pass on `workers` threads. The default is
+    /// [`DEFAULT_SHIP_WORKERS`]. `0` means `1`.
+    #[must_use]
+    pub const fn with_ship_workers(mut self, workers: usize) -> Self {
+        self.ship_workers = if workers == 0 { 1 } else { workers };
+        self
+    }
+
+    /// The threads that ship the databases of a pass.
+    #[must_use]
+    pub const fn ship_workers(&self) -> usize {
+        self.ship_workers
     }
 
     /// Keep a tombstone row on the control database for each deleted
@@ -749,7 +815,9 @@ impl FleetReplication {
         replicas
     }
 
-    /// Open databases that another process replicates.
+    /// Open databases whose replicator lock this process does not hold.
+    /// Usually another process on the same root holds it. A pass claims
+    /// the lock again when that process lets it go.
     #[must_use]
     pub fn unowned(&self) -> usize {
         self.active().values().filter(|r| !r.owned()).count()
@@ -768,86 +836,132 @@ impl FleetReplication {
     /// After the shutdown cutoff (see
     /// [`set_shutdown_cutoff`](Self::set_shutdown_cutoff)), it starts no work.
     pub fn tick_all(&self) {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "real time: the pass time measures blocking I/O"
+        )]
+        let started = std::time::Instant::now();
         self.tick_pass(&|| self.shutdown_cutoff());
+        self.last_pass_ms
+            .store(millis_since(started), Ordering::Release);
     }
 
     /// One tick pass. `cutoff` is read again for each replica, each lock
     /// attempt and each ship step, so a cutoff installed mid-pass takes
     /// effect. After it, no replica starts, and a replica that another thread
     /// holds is given up on.
-    fn tick_pass(&self, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
-        let active: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
+    ///
+    /// [`ship_workers`](Self::ship_workers) threads tick the replicas, the
+    /// one that shipped longest ago first. A pass looks up each replica when
+    /// it gets to it. It does not keep a closed database's replica, so that
+    /// replica's lock is free when the database opens again.
+    fn tick_pass(&self, cutoff: &(dyn Fn() -> Option<std::time::Instant> + Sync)) {
+        let active = self.ship_order();
+        for_each_on(self.ship_workers, &active, |key| {
+            self.tick_active(key, cutoff);
+        });
+        let parked: Vec<FleetDbKey> = self.parked().keys().cloned().collect();
+        for_each_on(self.ship_workers, &parked, |key| {
+            self.tick_parked(key, cutoff);
+        });
+    }
+
+    /// The open databases, the oldest last ship first. A database that never
+    /// shipped counts from its registration, as its lag does.
+    fn ship_order(&self) -> Vec<FleetDbKey> {
+        let entries = self
             .active()
             .iter()
-            .map(|(key, replica)| (key.clone(), Arc::clone(replica)))
+            .map(|(key, replica)| {
+                let shipped = replica.status.snapshot().last_success_at;
+                (key.clone(), shipped.unwrap_or(replica.registered_at))
+            })
             .collect();
-        for (key, replica) in active {
-            let now_cutoff = cutoff();
-            if expired(now_cutoff) {
-                return;
-            }
-            // A database that another process replicates is retried each tick.
-            if replica.fenced.load(Ordering::Acquire) || !replica.claim(&key) {
-                continue;
-            }
-            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
-                continue;
-            };
-            // Closed since this pass began: its close shipped the last
-            // frames, or it is parked. A reopen puts it back in `active`.
-            let current = self
-                .active()
-                .get(&key)
-                .is_some_and(|current| Arc::ptr_eq(current, &replica));
-            if !current {
-                continue;
-            }
-            if let Err(error) = replicator.tick() {
-                tracing::warn!(database = %key, error = %error, "fleet replication tick failed");
-            }
-            // Under the replicator lock: an `on_open` that reuses this
-            // replica then sees the flag.
-            if let Some(newest) = replicator.fenced_by() {
-                self.fence(&key, &replica, newest);
-            }
-            drop(replicator);
+        oldest_first(entries)
+    }
+
+    /// Tick the open database `key` once.
+    fn tick_active(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
+        if expired(cutoff()) {
+            return;
         }
-        let parked: Vec<(FleetDbKey, Arc<ActiveReplica>)> = self
-            .parked()
-            .iter()
-            .map(|(key, replica)| (key.clone(), Arc::clone(replica)))
-            .collect();
-        for (key, replica) in parked {
-            let now_cutoff = cutoff();
-            if expired(now_cutoff) {
-                return;
+        let Some(replica) = self.active().get(key).cloned() else {
+            return;
+        };
+        // A database that another process replicates is retried each tick.
+        if replica.fenced.load(Ordering::Acquire) || !replica.claim(key) {
+            return;
+        }
+        let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
+            return;
+        };
+        // Closed since the lookup: its close shipped the last frames, or it
+        // is parked. A reopen puts a replica back in `active`.
+        let current = self
+            .active()
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, &replica));
+        if !current {
+            return;
+        }
+        if let Err(error) = replicator.tick() {
+            let failures = replica.status.snapshot().consecutive_failures;
+            if crate::replication::engine::tick_failure_level(&error, failures)
+                == tracing::Level::WARN
+            {
+                tracing::warn!(database = %key, error = %error, "fleet replication tick failed");
+            } else {
+                tracing::debug!(database = %key, error = %error, "fleet replication tick failed");
             }
-            let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
-                continue;
-            };
-            // A delete or a restore let it go: its files are being removed.
-            if replica.released.load(Ordering::Acquire) {
-                continue;
-            }
-            let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
-            let fenced_by = replicator.fenced_by();
-            if let Some(newest) = fenced_by {
-                self.fence(&key, &replica, newest);
-            }
-            drop(replicator);
-            if fenced_by.is_some() {
-                // Nothing more ships: let the file go.
-                self.retire_parked(&key, &replica);
-                continue;
-            }
-            if caught_up && self.retire_parked(&key, &replica) {
-                tracing::info!(database = %key, "fleet replication: closed database caught up");
-            }
+        }
+        // Under the replicator lock: an `on_open` that reuses this replica
+        // then sees the flag.
+        if let Some(newest) = replicator.fenced_by() {
+            self.fence(key, &replica, newest);
         }
     }
 
-    /// Run the loop on a dedicated thread until [`stop`](Self::stop). The
-    /// final ship of each database happens when it closes, not here.
+    /// Ship the backlog of the closed database `key`, and retire its
+    /// replicator when it caught up.
+    fn tick_parked(&self, key: &FleetDbKey, cutoff: &dyn Fn() -> Option<std::time::Instant>) {
+        if expired(cutoff()) {
+            return;
+        }
+        let Some(replica) = self.parked().get(key).cloned() else {
+            return;
+        };
+        let Some(mut replicator) = lock_replicator(&replica, cutoff) else {
+            return;
+        };
+        // A delete or a restore let it go: its files are being removed. Or
+        // another pass retired it, or a reopen took it back.
+        let parked = self
+            .parked()
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, &replica));
+        if replica.released.load(Ordering::Acquire) || !parked {
+            return;
+        }
+        let caught_up = ship_until_caught_up(&mut replicator, cutoff).is_ok();
+        let fenced_by = replicator.fenced_by();
+        if let Some(newest) = fenced_by {
+            self.fence(key, &replica, newest);
+        }
+        drop(replicator);
+        if fenced_by.is_some() {
+            // Nothing more ships: let the file go.
+            self.retire_parked(key, &replica);
+            return;
+        }
+        if caught_up && self.retire_parked(key, &replica) {
+            tracing::info!(database = %key, "fleet replication: closed database caught up");
+        }
+    }
+
+    /// Run the loop on a dedicated thread until [`stop`](Self::stop). A pass
+    /// starts every `sync_interval`, or at once when the last pass took
+    /// longer. The final ship of each database happens when it closes, not
+    /// here.
     ///
     /// # Errors
     ///
@@ -858,12 +972,18 @@ impl FleetReplication {
             .name("autumn-fleet-replication".to_owned())
             .spawn(move || {
                 while !this.stopped.load(Ordering::Acquire) {
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "real time: the loop paces blocking I/O"
+                    )]
+                    let started = std::time::Instant::now();
                     this.tick_all();
+                    // A pass starts once per interval. A long pass does not
+                    // add a full interval to the lag.
+                    let pause = pause_after(this.settings.sync_interval, started.elapsed());
                     let mut slept = Duration::ZERO;
-                    while slept < this.settings.sync_interval
-                        && !this.stopped.load(Ordering::Acquire)
-                    {
-                        let step = STOP_POLL.min(this.settings.sync_interval.saturating_sub(slept));
+                    while slept < pause && !this.stopped.load(Ordering::Acquire) {
+                        let step = STOP_POLL.min(pause.saturating_sub(slept));
                         std::thread::sleep(step);
                         slept += step;
                     }
@@ -964,6 +1084,11 @@ impl FleetReplication {
             self.lag_alert_after.as_secs().into(),
         );
         details.insert("destination".to_owned(), self.destination.describe().into());
+        details.insert("ship_workers".to_owned(), self.ship_workers.into());
+        let last_pass_ms = self.last_pass_ms.load(Ordering::Acquire);
+        if last_pass_ms != NO_PASS {
+            details.insert("last_pass_ms".to_owned(), last_pass_ms.into());
+        }
         let lag_ok = if let Some((lag, name)) = worst {
             details.insert("worst_lag_seconds".to_owned(), lag.as_secs().into());
             details.insert("worst_database".to_owned(), name.into());
@@ -1360,6 +1485,7 @@ mod tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
         })
         .build()
         .unwrap();
@@ -1511,6 +1637,7 @@ mod tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
         })
         .build()
         .unwrap();
@@ -1824,6 +1951,7 @@ mod tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
         })
         .build()
         .unwrap();
@@ -2081,6 +2209,7 @@ mod tests {
             ownership: None,
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
+            replication_workers: 4,
         })
         .build()
         .unwrap();
@@ -2487,5 +2616,379 @@ mod tests {
         );
         holder.join().unwrap();
         assert_eq!(replication.closing(), 1, "parked, not shipped");
+    }
+
+    // --- Many busy databases per process (Murmuration FINDINGS 1 and 6) ---
+
+    /// A destination that counts the writes that run at once. Each write
+    /// takes `delay`. With `meet`, the first write waits (up to
+    /// [`NOT_STUCK`]) until a second write starts, so two workers always
+    /// overlap.
+    struct Slow {
+        inner: FileDestination,
+        delay: Duration,
+        meet: bool,
+        in_flight: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Slow {
+        fn new(dir: &Path, delay: Duration, meet: bool) -> Self {
+            Self {
+                inner: FileDestination::new(dir).unwrap(),
+                delay,
+                meet,
+                in_flight: std::sync::atomic::AtomicUsize::new(0),
+                most: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn write<T>(&self, op: impl FnOnce() -> T) -> T {
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(now, Ordering::SeqCst);
+            let began = std::time::Instant::now();
+            while self.meet && self.most.load(Ordering::SeqCst) < 2 && began.elapsed() < NOT_STUCK {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(self.delay);
+            let out = op();
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            out
+        }
+    }
+
+    impl ReplicaDestination for Slow {
+        fn describe(&self) -> String {
+            "slow".to_owned()
+        }
+        fn put(&self, key: &str, body: &[u8]) -> Result<(), crate::replication::DestinationError> {
+            self.write(|| self.inner.put(key, body))
+        }
+        fn put_file(
+            &self,
+            key: &str,
+            path: &Path,
+        ) -> Result<(), crate::replication::DestinationError> {
+            self.write(|| self.inner.put_file(key, path))
+        }
+        fn get(&self, key: &str) -> Result<Vec<u8>, crate::replication::DestinationError> {
+            self.inner.get(key)
+        }
+        fn get_to_file(
+            &self,
+            key: &str,
+            path: &Path,
+        ) -> Result<(), crate::replication::DestinationError> {
+            self.inner.get_to_file(key, path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, crate::replication::DestinationError> {
+            self.inner.list(prefix)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::replication::DestinationError> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// A destination that stops the first write after `arm` until the
+    /// returned sender drops. It sends the key of that write.
+    struct Gate {
+        inner: FileDestination,
+        armed: AtomicBool,
+        reached: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl Gate {
+        fn new(dir: &Path) -> Self {
+            Self {
+                inner: FileDestination::new(dir).unwrap(),
+                armed: AtomicBool::new(false),
+                reached: Mutex::new(None),
+                release: Mutex::new(None),
+            }
+        }
+
+        fn arm(
+            &self,
+        ) -> (
+            std::sync::mpsc::Receiver<String>,
+            std::sync::mpsc::Sender<()>,
+        ) {
+            let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *self.reached.lock().unwrap() = Some(reached_tx);
+            *self.release.lock().unwrap() = Some(release_rx);
+            self.armed.store(true, Ordering::SeqCst);
+            (reached_rx, release_tx)
+        }
+
+        fn stop(&self, key: &str) {
+            if !self.armed.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let reached = self.reached.lock().unwrap().take();
+            if let Some(reached) = reached {
+                let _ = reached.send(key.to_owned());
+            }
+            let release = self.release.lock().unwrap().take();
+            if let Some(release) = release {
+                let _ = release.recv();
+            }
+        }
+    }
+
+    impl ReplicaDestination for Gate {
+        fn describe(&self) -> String {
+            "gate".to_owned()
+        }
+        fn put(&self, key: &str, body: &[u8]) -> Result<(), crate::replication::DestinationError> {
+            self.stop(key);
+            self.inner.put(key, body)
+        }
+        fn put_file(
+            &self,
+            key: &str,
+            path: &Path,
+        ) -> Result<(), crate::replication::DestinationError> {
+            self.stop(key);
+            self.inner.put_file(key, path)
+        }
+        fn get(&self, key: &str) -> Result<Vec<u8>, crate::replication::DestinationError> {
+            self.inner.get(key)
+        }
+        fn get_to_file(
+            &self,
+            key: &str,
+            path: &Path,
+        ) -> Result<(), crate::replication::DestinationError> {
+            self.inner.get_to_file(key, path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>, crate::replication::DestinationError> {
+            self.inner.list(prefix)
+        }
+        fn delete(&self, key: &str) -> Result<(), crate::replication::DestinationError> {
+            self.inner.delete(key)
+        }
+    }
+
+    /// A fleet that ships to `destination` with `workers` ship workers.
+    fn fleet_with(
+        tmp: &Path,
+        destination: Arc<dyn ReplicaDestination>,
+        workers: usize,
+    ) -> (DatabaseFleet, Arc<FleetReplication>) {
+        let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
+            mode: FleetMode::Tenant,
+            root: tmp.join("a").display().to_string(),
+            path: None,
+            max_open: 16,
+            pool_size: 1,
+            create_on_demand: Some(true),
+            idle_close_secs: 0,
+            restore_missing: false,
+            ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+        })
+        .build()
+        .unwrap();
+        let replication = Arc::new(
+            FleetReplication::new(
+                destination,
+                settings(),
+                Duration::from_secs(30),
+                false,
+                Arc::new(crate::time::SystemClock),
+            )
+            .with_ship_workers(workers),
+        );
+        assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
+        (fleet, replication)
+    }
+
+    const TENANTS: [&str; 8] = ["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"];
+
+    /// Open each tenant and run `sql` on it.
+    async fn write_each(fleet: &DatabaseFleet, tenants: &[&str], sql: &str) {
+        for tenant in tenants {
+            let db = fleet.open_for(tenant).await.unwrap();
+            exec(&db, sql).await;
+        }
+    }
+
+    #[test]
+    fn a_fleet_ships_with_a_small_pool_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replication = FleetReplication::new(
+            Arc::new(FileDestination::new(tmp.path()).unwrap()),
+            settings(),
+            Duration::from_secs(30),
+            false,
+            Arc::new(crate::time::SystemClock),
+        );
+        assert_eq!(replication.ship_workers(), DEFAULT_SHIP_WORKERS);
+        assert_eq!(replication.with_ship_workers(0).ship_workers(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_ships_databases_in_parallel() {
+        for (workers, parallel) in [(1, false), (4, true)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let slow = Arc::new(Slow::new(
+                &tmp.path().join("replicas"),
+                Duration::from_millis(5),
+                parallel,
+            ));
+            let (fleet, replication) = fleet_with(
+                tmp.path(),
+                Arc::clone(&slow) as Arc<dyn ReplicaDestination>,
+                workers,
+            );
+            write_each(&fleet, &TENANTS, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+            tick(&replication).await;
+            let most = slow.most.load(Ordering::SeqCst);
+            if parallel {
+                assert!(most >= 2, "{workers} workers shipped one at a time");
+            } else {
+                assert_eq!(most, 1, "one worker ships one database at a time");
+            }
+            fleet.close_all().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_database_reopened_during_a_pass_is_replicated_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Gate::new(&tmp.path().join("replicas")));
+        let (fleet, replication) = fleet_with(
+            tmp.path(),
+            Arc::clone(&gate) as Arc<dyn ReplicaDestination>,
+            1,
+        );
+        let tenants = &TENANTS[..3];
+        write_each(&fleet, tenants, "CREATE TABLE notes (body TEXT NOT NULL)").await;
+        tick(&replication).await;
+        write_each(&fleet, tenants, "INSERT INTO notes VALUES ('next')").await;
+
+        // The pass stops in the first database it ships. The others wait.
+        let (reached, release) = gate.arm();
+        let pass = crate::time::spawn_blocking({
+            let replication = Arc::clone(&replication);
+            move || replication.tick_all()
+        });
+        let stopped = crate::time::spawn_blocking(move || reached.recv_timeout(NOT_STUCK))
+            .await
+            .unwrap()
+            .expect("the pass ships");
+        let waiting = tenants
+            .iter()
+            .find(|tenant| !stopped.contains(&format!("/tenant/{tenant}/")))
+            .unwrap();
+
+        // Close and reopen a database that the pass did not reach yet.
+        let key = fleet.key_for(waiting).unwrap();
+        fleet.close(&key).await;
+        let _db = fleet.open(&key).await.unwrap();
+        assert_eq!(
+            (replication.unowned(), replication.replicating()),
+            (0, 3),
+            "no other process has this volume: this process owns every database"
+        );
+
+        drop(release);
+        pass.await.unwrap();
+        fleet.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_pass_time_and_the_ship_workers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, replication) =
+            replicated_fleet(&tmp.path().join("a"), &tmp.path().join("replicas"), false);
+        fleet.open_for("acme").await.unwrap();
+        tick(&replication).await;
+        let output = replication.indicator().check().await;
+        assert_eq!(output.details["ship_workers"], DEFAULT_SHIP_WORKERS);
+        assert!(
+            output.details["last_pass_ms"].is_u64(),
+            "{:?}",
+            output.details
+        );
+        fleet.close_all().await;
+    }
+
+    #[test]
+    fn the_loop_starts_a_pass_once_per_interval() {
+        let interval = Duration::from_secs(1);
+        assert_eq!(pause_after(interval, Duration::ZERO), interval);
+        assert_eq!(
+            pause_after(interval, Duration::from_millis(300)),
+            Duration::from_millis(700)
+        );
+        // A pass that overran starts the next one at once.
+        assert_eq!(
+            pause_after(interval, Duration::from_secs(3)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn a_pass_takes_the_most_lagging_database_first() {
+        let at = |secs| DateTime::from_timestamp(secs, 0).unwrap();
+        let order = oldest_first(vec![
+            (FleetDbKey::Slot(1), at(30)),
+            (FleetDbKey::Slot(2), at(10)),
+            (FleetDbKey::Slot(3), at(20)),
+        ]);
+        assert_eq!(
+            order,
+            vec![
+                FleetDbKey::Slot(2),
+                FleetDbKey::Slot(3),
+                FleetDbKey::Slot(1)
+            ]
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn a_pass_order_is_every_database_once_oldest_first(
+            times in proptest::collection::vec(0_i64..1_000, 0..64)
+        ) {
+            let at = |secs| DateTime::from_timestamp(secs, 0).unwrap();
+            let entries: Vec<(FleetDbKey, DateTime<Utc>)> = times
+                .iter()
+                .enumerate()
+                .map(|(slot, secs)| (FleetDbKey::Slot(u16::try_from(slot).unwrap()), at(*secs)))
+                .collect();
+            let order = oldest_first(entries.clone());
+            let mut sorted = order.clone();
+            sorted.sort();
+            let mut keys: Vec<FleetDbKey> = entries.iter().map(|(key, _)| key.clone()).collect();
+            keys.sort();
+            proptest::prop_assert_eq!(sorted, keys, "every key once");
+            let when: HashMap<FleetDbKey, DateTime<Utc>> = entries.into_iter().collect();
+            for pair in order.windows(2) {
+                proptest::prop_assert!(when[&pair[0]] <= when[&pair[1]]);
+            }
+        }
+
+        #[test]
+        fn every_worker_count_visits_each_key_once(
+            keys in 0_usize..40,
+            workers in 1_usize..9,
+        ) {
+            let keys: Vec<FleetDbKey> = (0..keys)
+                .map(|slot| FleetDbKey::Slot(u16::try_from(slot).unwrap()))
+                .collect();
+            let seen = Mutex::new(Vec::new());
+            for_each_on(workers, &keys, |key| seen.lock().unwrap().push(key.clone()));
+            let mut seen = seen.into_inner().unwrap();
+            seen.sort();
+            let mut expected = keys;
+            expected.sort();
+            proptest::prop_assert_eq!(seen, expected);
+        }
     }
 }

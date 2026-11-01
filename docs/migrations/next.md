@@ -338,15 +338,16 @@ To name the type, use `<S as Service<Request>>::Future`.
 **Automation:** `manual` — the code to change is in the app's own middleware.
 A codemod cannot find it reliably.
 
-### Database: `DatabaseFleetConfig` has two new fields
+### Database: `DatabaseFleetConfig` has three new fields
 
 **Why:** a deleted fleet database's replica now goes with it (issue #3235).
 `replica_retention_after_delete` keeps it for an undo window.
-`restore_check_sample` sets the restore check.
+`restore_check_sample` sets the restore check. `replication_workers` sets the
+number of threads that ship fleet databases.
 
 **You are affected only if your code builds a `DatabaseFleetConfig` with a
 struct literal** (tests and tools often do). TOML and `AUTUMN_*` config need
-no change: both keys have defaults.
+no change: all three keys have defaults.
 
 **Before (`{X.Y}`):**
 
@@ -379,6 +380,7 @@ DatabaseFleetConfig {
     ownership: None,
     replica_retention_after_delete: std::time::Duration::ZERO,
     restore_check_sample: 1,
+    replication_workers: 4,
 }
 ```
 

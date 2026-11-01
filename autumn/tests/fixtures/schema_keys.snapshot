@@ -187,6 +187,7 @@ database.fleet.ownership.slots
 database.fleet.path
 database.fleet.pool_size
 database.fleet.replica_retention_after_delete
+database.fleet.replication_workers
 database.fleet.restore_check_sample
 database.fleet.restore_missing
 database.fleet.root
