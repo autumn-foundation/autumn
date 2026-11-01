@@ -296,16 +296,23 @@ fn tokenize(sql: &str) -> Vec<Tok> {
     toks
 }
 
-/// Read a possibly schema-qualified name at `i`. Returns the last segment and
+/// Read a possibly schema-qualified name at `i`. Returns the replay key and
 /// the index after the name.
+///
+/// The key keeps the schema, so `a.t` and `b.t` are two tables, and drops a
+/// leading `public.`, so `public.t` and `t` stay one (the default
+/// `search_path`).
 fn read_name(toks: &[Tok], mut i: usize) -> Option<(String, usize)> {
-    let mut name = toks.get(i)?.ident()?;
+    let mut segments = vec![toks.get(i)?.ident()?];
     i += 1;
     while toks.get(i).is_some_and(|t| t.is_punct('.')) {
-        name = toks.get(i + 1)?.ident()?;
+        segments.push(toks.get(i + 1)?.ident()?);
         i += 2;
     }
-    Some((name.to_owned(), i))
+    if segments.len() > 1 && segments[0] == "public" {
+        segments.remove(0);
+    }
+    Some((segments.join("."), i))
 }
 
 /// Skip the keyword sequence `kws` at `i` if every keyword is there.
@@ -449,10 +456,16 @@ impl Replay {
         if !stmt.get(i).is_some_and(|t| t.is_kw("table")) {
             return;
         }
-        i = skip_kws(stmt, i + 1, &["if", "not", "exists"]);
+        let if_not_exists = skip_kws(stmt, i + 1, &["if", "not", "exists"]);
+        let guarded = if_not_exists != i + 1;
+        i = if_not_exists;
         let Some((name, after)) = read_name(stmt, i) else {
             return;
         };
+        // The database leaves an existing table alone, so the replay does too.
+        if guarded && self.tables.contains_key(&name) {
+            return;
+        }
         // `CREATE TABLE x AS …` / `PARTITION OF …` carry no column list.
         if !stmt.get(after).is_some_and(|t| t.is_punct('(')) {
             return;
@@ -641,8 +654,20 @@ pub fn rust_source_widths(path: &Path, src: &str) -> Vec<TableWidth> {
                 .iter()
                 .filter(|(t, _)| *t == table.name)
                 .count();
+            // A field whose SQL type the parser cannot rebuild (a custom enum)
+            // is skipped from `columns` with a diagnostic, but it is still a
+            // column the macro's Diesel derives carry. Width needs no type.
+            let mut skipped: Vec<&str> = parsed
+                .diagnostics
+                .iter()
+                .filter(|d| d.table == table.name)
+                .map(|d| d.field.as_str())
+                .filter(|f| !table.columns.iter().any(|c| c.name == *f))
+                .collect();
+            skipped.sort_unstable();
+            skipped.dedup();
             out.push(TableWidth {
-                columns: table.columns.len().saturating_sub(implicit),
+                columns: table.columns.len().saturating_sub(implicit) + skipped.len(),
                 table: table.name,
                 source: WidthSource::Model,
                 path: path.to_path_buf(),
@@ -1013,6 +1038,47 @@ mod tests {
         assert!(report(&["128-column-tables"]).has_findings(64));
         // The build warning always measures against 32.
         assert!(format_build_warning(&report(&["64-column-tables"])).is_some());
+    }
+
+    #[test]
+    fn create_if_not_exists_keeps_the_existing_table() {
+        let w = widths(&[
+            wide_create("t", 33).as_str(),
+            "CREATE TABLE IF NOT EXISTS t (id INT);",
+            "CREATE TABLE IF NOT EXISTS fresh (id INT, name TEXT);",
+        ]);
+        assert_eq!(w.get("t"), Some(&33));
+        assert_eq!(w.get("fresh"), Some(&2));
+    }
+
+    #[test]
+    fn schemas_keep_same_named_tables_apart() {
+        let cols: Vec<String> = (0..33).map(|i| format!("c{i} TEXT")).collect();
+        let w = widths(&[
+            format!("CREATE TABLE a.t ({});", cols.join(", ")).as_str(),
+            "CREATE TABLE b.t (id INT);",
+            "ALTER TABLE b.t ADD COLUMN x INT;",
+            "CREATE TABLE public.p (id INT); ALTER TABLE p ADD COLUMN y INT;",
+        ]);
+        assert_eq!(w.get("a.t"), Some(&33));
+        assert_eq!(w.get("b.t"), Some(&2));
+        assert_eq!(w.get("p"), Some(&2));
+    }
+
+    #[test]
+    fn model_fields_with_unresolved_types_still_count() {
+        let fields: Vec<String> = (0..31).map(|i| format!("pub f{i}: String,")).collect();
+        let src = format!(
+            "#[model]\npub struct Wide {{\n#[id]\npub id: i64,\n{}\npub status: MyEnum,\n}}",
+            fields.join("\n")
+        );
+        let found = rust_source_widths(Path::new("models.rs"), &src);
+        let model = found
+            .iter()
+            .find(|t| t.source == WidthSource::Model)
+            .expect("model width");
+        // id + 31 + the enum field the parser cannot type.
+        assert_eq!(model.columns, 33);
     }
 
     #[test]
