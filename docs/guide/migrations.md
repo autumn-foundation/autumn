@@ -24,6 +24,8 @@ autumn_web::app()
 
 Boot and `AUTUMN_MIGRATE=1` obey the scope. The `autumn migrate` and
 `autumn fleet migrate` commands read `migrations/` and do not know a scope.
+Do not run `autumn migrate` on an app with a scoped set: use
+`AUTUMN_MIGRATE=1`.
 See [SQLite fleet: migrations](sqlite-fleet.md#control-only-and-tenant-only-sets).
 
 ---

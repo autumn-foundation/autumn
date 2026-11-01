@@ -137,7 +137,8 @@ pub enum FleetError {
         /// The database name.
         name: String,
     },
-    /// [`DatabaseFleet::provision`] was asked for a database that exists (`409`).
+    /// [`DatabaseFleet::provision`] or [`DatabaseFleet::import`] was asked
+    /// for a database that exists (`409`).
     #[error("fleet database {name} already exists")]
     AlreadyExists {
         /// The database name.
@@ -221,6 +222,18 @@ pub enum FleetError {
         /// The routing slot.
         slot: u16,
     },
+    /// [`DatabaseFleet::import`] refused its source file (`422`): it is
+    /// missing, is not a database, fails the integrity check, or does not
+    /// record the key in its identity row. Nothing was changed.
+    #[error("cannot import {path} as fleet database {name}: {detail}")]
+    InvalidSource {
+        /// The database name.
+        name: String,
+        /// The source path.
+        path: String,
+        /// Why the source was refused.
+        detail: String,
+    },
     /// A file operation failed (`500`).
     #[error("fleet {op}: {detail}")]
     Io {
@@ -240,6 +253,7 @@ impl FleetError {
         use http::StatusCode;
         match self {
             Self::InvalidKey(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidSource { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::AlreadyExists { .. } | Self::InUseElsewhere { .. } => StatusCode::CONFLICT,
             Self::Deleting { .. } => StatusCode::GONE,
@@ -423,7 +437,7 @@ pub trait FleetLifecycle: Send + Sync + 'static {
     /// `[database.fleet] restore_missing` says (that setting controls only
     /// the restore from the replica). A background open does not ask. With
     /// replication, an open of a deleted database does not ask either. To
-    /// put back a local backup, use [`DatabaseFleet::import`].
+    /// restore a local backup, use [`DatabaseFleet::import`].
     ///
     /// # Errors
     ///
@@ -1578,39 +1592,61 @@ impl DatabaseFleet {
         Ok(())
     }
 
-    /// Put a database file back under `key`, for example a backup that
-    /// [`backup`](Self::backup) wrote. The fleet copies `source` with
-    /// `VACUUM INTO` into a private staging file, checks it, applies the
-    /// pending migrations, and then publishes it in one step. `source` does
-    /// not change.
-    ///
-    /// The checks: `PRAGMA integrity_check` must pass, and the identity row
-    /// must name `key` (a file with no identity row gets one). With
-    /// ownership, the file gets this host's epoch, so the open does not
-    /// replace it from the replica. As with [`provision`](Self::provision),
-    /// a deleted database's tombstone and old replica are purged first.
-    ///
-    /// Cancellation-safe: the publish runs in an owned task.
+    /// Copy a database file into the fleet as `key`, for example a backup
+    /// that [`backup`](Self::backup) wrote, then open it. See
+    /// [`import_file`](Self::import_file) for the steps and the errors.
     ///
     /// # Errors
     ///
-    /// [`FleetError::AlreadyExists`] when the key has a file.
-    /// [`FleetError::Misplaced`] when `source` records another key.
-    /// [`FleetError::NotFound`] when `source` is not a file.
-    /// [`FleetError::Unavailable`] or [`FleetError::Migration`] when the
-    /// copy, the check or a migration fails. Nothing is published then.
-    /// Or an [`open`](Self::open) error.
+    /// An [`import_file`](Self::import_file) error, or an
+    /// [`open`](Self::open) error. An open error comes after the publish:
+    /// the file is in place, and a second import answers
+    /// [`FleetError::AlreadyExists`].
     pub async fn import(
         &self,
         key: &FleetDbKey,
         source: &Path,
     ) -> Result<FleetDatabase, FleetError> {
-        self.check_key(key)?;
-        let epoch = self.owned_epoch(key)?;
         // Held to the end, so `close_all` also sees the open that follows.
         let _open_counted = self.admit_mutation(key)?;
+        self.import_file(key, source).await?;
+        self.open_with(key, false).await
+    }
+
+    /// Copy a database file into the fleet as `key`, and do not open it.
+    /// `source` does not change.
+    ///
+    /// 1. The fleet copies `source` with `VACUUM INTO` into a private
+    ///    staging file, so rows still in a `-wal` come too.
+    /// 2. The copy must pass `PRAGMA integrity_check`, and its identity row
+    ///    must record `key`.
+    /// 3. The fleet applies the pending migrations to the copy. With
+    ///    ownership, it sets the copy's epoch to this host's epoch. Without
+    ///    ownership, it removes the copy's epoch.
+    /// 4. With replication, the fleet purges the tombstone and the old
+    ///    replica of a deleted key, as [`provision`](Self::provision) does.
+    ///    It does this only after the checks pass, so a refused source keeps
+    ///    the replica.
+    /// 5. The fleet publishes the copy in one step under the path lock. It
+    ///    never replaces a file.
+    ///
+    /// Use it for files you trust: the fleet keeps the source's schema, its
+    /// triggers and its migration records. Cancellation-safe: the work runs
+    /// in an owned task.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::AlreadyExists`] when the key has a file.
+    /// [`FleetError::InvalidSource`] when the source is missing, is not a
+    /// database, fails the integrity check, or records no identity or
+    /// another key. [`FleetError::NotOwner`] when this host loses the slot.
+    /// [`FleetError::Migration`] or [`FleetError::Unavailable`] when a
+    /// migration or the purge fails. Nothing is published on an error.
+    pub async fn import_file(&self, key: &FleetDbKey, source: &Path) -> Result<(), FleetError> {
+        self.check_key(key)?;
+        let epoch = self.owned_epoch(key)?;
         let (fleet, task_key, source) = (self.clone(), key.clone(), source.to_path_buf());
-        let counted = MutationGuard::new(self);
+        let counted = self.admit_mutation(key)?;
         tokio::spawn(async move {
             let _counted = counted;
             fleet
@@ -1621,8 +1657,7 @@ impl DatabaseFleet {
         .map_err(|e| FleetError::Unavailable {
             name: key.name(),
             detail: format!("import task failed: {e}"),
-        })??;
-        self.open_with(key, false).await
+        })?
     }
 
     async fn import_owned(
@@ -1635,13 +1670,18 @@ impl DatabaseFleet {
         if path.exists() {
             return Err(FleetError::AlreadyExists { name: key.name() });
         }
-        self.purge_before_create(key, true).await?;
-        let (fleet, source, name) = (self.clone(), source.to_path_buf(), key.name());
-        let applied = crate::time::spawn_blocking(move || {
-            check_contained(fleet.root(), &path)?;
-            import_database_file(
-                fleet.root(),
-                &path,
+        let task_failed = |e: tokio::task::JoinError| FleetError::Unavailable {
+            name: key.name(),
+            detail: format!("import task failed: {e}"),
+        };
+        // Check and migrate the copy first: a refused source must not end
+        // the retention of a deleted key's replica.
+        let (fleet, staged_path, source, name) =
+            (self.clone(), path.clone(), source.to_path_buf(), key.name());
+        let (staging, applied) = crate::time::spawn_blocking(move || {
+            check_contained(fleet.root(), &staged_path)?;
+            stage_import_file(
+                &staged_path,
                 &name,
                 &source,
                 &fleet.inner.migrations,
@@ -1649,10 +1689,10 @@ impl DatabaseFleet {
             )
         })
         .await
-        .map_err(|e| FleetError::Unavailable {
-            name: key.name(),
-            detail: format!("import task failed: {e}"),
-        })??;
+        .map_err(task_failed)??;
+        let published = self.publish_import(key, &path, &staging, epoch).await;
+        discard_staging(&staging);
+        published?;
         let counters = &self.inner.counters;
         counters.created.fetch_add(1, Ordering::Relaxed);
         counters
@@ -1660,6 +1700,45 @@ impl DatabaseFleet {
             .fetch_add(applied as u64, Ordering::Relaxed);
         tracing::info!(database = %key, "fleet database imported");
         Ok(())
+    }
+
+    /// Purge a deleted key's old replica, then link the checked staging file.
+    async fn publish_import(
+        &self,
+        key: &FleetDbKey,
+        path: &Path,
+        staging: &Path,
+        epoch: Option<crate::lock::FencingToken>,
+    ) -> Result<(), FleetError> {
+        // The copy carries the epoch read at the start. A slot lost since
+        // then must not get a file stamped for it.
+        if epoch.is_some() && self.owned_epoch(key)? != epoch {
+            return Err(FleetError::NotOwner {
+                name: key.name(),
+                slot: key.routing_slot(),
+            });
+        }
+        self.purge_before_create(key, true).await?;
+        let (root, path, staging, name) = (
+            self.inner.root.clone(),
+            path.to_path_buf(),
+            staging.to_path_buf(),
+            key.name(),
+        );
+        crate::time::spawn_blocking(
+            move || match publish_staged(&root, &path, &name, &staging)? {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(FleetError::AlreadyExists { name })
+                }
+                Err(e) => Err(io_error("publish database")(e)),
+            },
+        )
+        .await
+        .map_err(|e| FleetError::Unavailable {
+            name: key.name(),
+            detail: format!("import task failed: {e}"),
+        })?
     }
 
     /// Whether the database's file exists.
@@ -4337,35 +4416,31 @@ fn publish_staged(
     })
 }
 
-/// [`DatabaseFleet::import`] on a blocking thread. Returns the number of
-/// migrations applied.
-fn import_database_file(
-    root: &Path,
+/// Copy `source` into a new staging file beside `path`, check it and
+/// migrate it. Returns the staging file and the number of migrations
+/// applied. Removes the staging file on an error.
+fn stage_import_file(
     path: &Path,
     name: &str,
     source: &Path,
     migrations: &FleetMigrations,
     epoch: Option<u64>,
-) -> Result<usize, FleetError> {
+) -> Result<(PathBuf, usize), FleetError> {
+    let invalid = |detail: String| FleetError::InvalidSource {
+        name: name.to_owned(),
+        path: source.display().to_string(),
+        detail,
+    };
     if !source.is_file() {
-        return Err(FleetError::NotFound {
-            name: source.display().to_string(),
-        });
+        return Err(invalid("no such file".to_owned()));
     }
     let staging = staging_path(path, "importing")?;
-    let applied = stage_import(source, &staging, name, migrations, epoch);
-    if applied.is_err() {
-        discard_staging(&staging);
-        return applied;
-    }
-    let published = publish_staged(root, path, name, &staging);
-    discard_staging(&staging);
-    match published? {
-        Ok(()) => applied,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(FleetError::AlreadyExists {
-            name: name.to_owned(),
-        }),
-        Err(e) => Err(io_error("publish database")(e)),
+    match stage_import(source, &staging, name, migrations, epoch, invalid) {
+        Ok(applied) => Ok((staging, applied)),
+        Err(error) => {
+            discard_staging(&staging);
+            Err(error)
+        }
     }
 }
 
@@ -4376,8 +4451,16 @@ fn stage_import(
     name: &str,
     migrations: &FleetMigrations,
     epoch: Option<u64>,
+    invalid: impl Fn(String) -> FleetError,
 ) -> Result<usize, FleetError> {
     use diesel::RunQueryDsl as _;
+    use diesel::connection::SimpleConnection as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct Kind {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        kind: String,
+    }
 
     let unavailable = |detail: String| FleetError::Unavailable {
         name: name.to_owned(),
@@ -4387,26 +4470,63 @@ fn stage_import(
         .to_str()
         .ok_or_else(|| unavailable("staging path is not UTF-8".to_owned()))?;
     {
-        let Some(_pin) = pin_existing(source).map_err(|e| unavailable(e.to_string()))? else {
-            return Err(FleetError::NotFound {
-                name: source.display().to_string(),
-            });
+        let Some(_pin) = pin_existing(source).map_err(|e| invalid(e.to_string()))? else {
+            return Err(invalid("no such file".to_owned()));
         };
         let mut conn = crate::db::establish_sqlite_migration_connection(&read_only_url(source))
-            .map_err(|e| unavailable(format!("cannot open the source: {e}")))?;
+            .map_err(|e| invalid(format!("cannot open it: {e}")))?;
+        // Do not run functions from the source's views or triggers.
+        conn.batch_execute("PRAGMA trusted_schema = OFF;")
+            .map_err(|e| unavailable(e.to_string()))?;
         diesel::sql_query("VACUUM INTO ?")
             .bind::<diesel::sql_types::Text, _>(dest)
             .execute(&mut conn)
-            .map_err(|e| unavailable(format!("cannot copy the source: {e}")))?;
+            .map_err(|e| invalid(format!("cannot copy it: {e}")))?;
     }
     let url = DatabaseFleet::url_of(staging);
     {
         let mut conn = crate::db::establish_sqlite_migration_connection(&url)
             .map_err(|e| unavailable(e.to_string()))?;
+        conn.batch_execute("PRAGMA trusted_schema = OFF;")
+            .map_err(|e| unavailable(e.to_string()))?;
         crate::replication::sqlite::integrity_check(&mut conn)
-            .map_err(|e| unavailable(format!("the source fails the integrity check: {e}")))?;
+            .map_err(|e| invalid(e.to_string()))?;
+        // The identity and epoch must be plain tables: a view with a trigger
+        // could answer any name.
+        let kinds: Vec<Kind> = diesel::sql_query(format!(
+            "SELECT name || ':' || type AS kind FROM sqlite_master \
+             WHERE name IN ('{IDENTITY_TABLE}', '{EPOCH_TABLE}')"
+        ))
+        .load(&mut conn)
+        .map_err(|e| unavailable(e.to_string()))?;
+        if kinds.iter().any(|row| !row.kind.ends_with(":table")) {
+            return Err(invalid(
+                "its identity or epoch is not a plain table".to_owned(),
+            ));
+        }
+        if !kinds
+            .iter()
+            .any(|row| row.kind == format!("{IDENTITY_TABLE}:table"))
+        {
+            return Err(invalid(
+                "it records no identity row; only a file that a fleet made can be imported"
+                    .to_owned(),
+            ));
+        }
+        // The copy has no history in this fleet: set its epoch, never keep
+        // the source's.
+        conn.batch_execute(&format!("DROP TABLE IF EXISTS {EPOCH_TABLE};"))
+            .map_err(|e| unavailable(e.to_string()))?;
     }
-    check_identity_blocking(&url, name)?;
+    match read_identity(staging, name)? {
+        Some(found) if found == name => {}
+        Some(found) => {
+            return Err(invalid(format!("it is a copy of {found}")));
+        }
+        None => {
+            return Err(invalid("its identity table is empty".to_owned()));
+        }
+    }
     let applied = migrations.apply(&url, name)?;
     if let Some(epoch) = epoch {
         write_epoch_stamp(staging, name, epoch)?;
@@ -5751,10 +5871,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let (fleet, _, backup) = backed_up_tenant(tmp.path()).await;
         let other = fleet.key_for("globex").unwrap();
-        assert!(matches!(
-            fleet.import(&other, &backup).await,
-            Err(FleetError::Misplaced { .. })
-        ));
+        let refused = fleet.import(&other, &backup).await.unwrap_err();
+        assert!(
+            matches!(&refused, FleetError::InvalidSource { detail, .. } if detail.contains("tenant:acme")),
+            "{refused}"
+        );
+        assert_eq!(
+            refused.http_status(),
+            http::StatusCode::UNPROCESSABLE_ENTITY
+        );
         assert!(!fleet.exists(&other));
         assert!(no_staging_files(fleet.root()));
         fleet.close_all().await;
@@ -5787,7 +5912,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let fleet = fleet(&tmp.path().join("fleet"), FleetMode::Tenant, |_| {});
         let key = fleet.key_for("acme").unwrap();
+        drop(fleet.provision(&key).await.unwrap());
         let source = tmp.path().join("live.db");
+        fleet.backup(&key, &source).await.unwrap();
+        assert!(fleet.delete(&key).await.unwrap());
         let mut writer =
             diesel::SqliteConnection::establish(&source.display().to_string()).unwrap();
         writer
@@ -5813,6 +5941,33 @@ mod tests {
         fleet.close_all().await;
     }
 
+    /// The copy keeps no epoch of the source: a high stamp there would skip
+    /// the check against a newer replica later.
+    #[tokio::test]
+    async fn import_drops_the_source_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, key, backup) = backed_up_tenant(tmp.path()).await;
+        assert!(fleet.delete(&key).await.unwrap());
+        write_epoch_stamp(&backup, &key.name(), 99).unwrap();
+
+        drop(fleet.import(&key, &backup).await.unwrap());
+        fleet.close_all().await;
+        assert_eq!(
+            read_epoch_stamp(&fleet.path_of(&key), &key.name()).unwrap(),
+            0
+        );
+        assert_eq!(read_epoch_stamp(&backup, &key.name()).unwrap(), 99);
+    }
+
+    fn sqlite_exec(path: &Path, sql: &str) {
+        use diesel::Connection as _;
+        use diesel::connection::SimpleConnection as _;
+        diesel::SqliteConnection::establish(&path.display().to_string())
+            .unwrap()
+            .batch_execute(sql)
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn import_refuses_a_file_that_is_not_a_database() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5820,13 +5975,23 @@ mod tests {
         let key = fleet.key_for("acme").unwrap();
         let junk = tmp.path().join("junk.db");
         std::fs::write(&junk, b"not a database, not at all, no").unwrap();
-        assert!(fleet.import(&key, &junk).await.is_err());
-        assert!(
-            fleet
-                .import(&key, &tmp.path().join("absent.db"))
-                .await
-                .is_err()
+        // A plain SQLite file: no fleet made it, so it records no identity.
+        let plain = tmp.path().join("plain.db");
+        sqlite_exec(&plain, "CREATE TABLE notes (body TEXT NOT NULL);");
+        // An identity "table" that is a view answers any name: refused.
+        let forged = tmp.path().join("forged.db");
+        sqlite_exec(
+            &forged,
+            &format!("CREATE VIEW {IDENTITY_TABLE} AS SELECT 1 AS id, 'tenant:acme' AS name;"),
         );
+        for source in [junk, plain, forged, tmp.path().join("absent.db")] {
+            let refused = fleet.import(&key, &source).await.unwrap_err();
+            assert!(
+                matches!(refused, FleetError::InvalidSource { .. }),
+                "{}: {refused}",
+                source.display()
+            );
+        }
         assert!(!fleet.exists(&key));
         assert!(no_staging_files(fleet.root()));
     }

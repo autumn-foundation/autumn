@@ -444,8 +444,8 @@ async fn the_fleet_health_indicator_reports_the_counters() {
 }
 
 /// `autumn_web::db::prelude::*` sits next to `#[model]` and `#[repository]`.
-/// `diesel::prelude::*` there gives E0034: it brings in the blocking
-/// `RunQueryDsl` too.
+/// `diesel::prelude::*` there gives E0034: it also imports the blocking
+/// `RunQueryDsl`.
 mod db_prelude_next_to_the_macros {
     use autumn_web::db::prelude::*;
 

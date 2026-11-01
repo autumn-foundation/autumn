@@ -123,7 +123,7 @@ pub mod pooler;
 
 /// Diesel's prelude for async code. Use it in place of `diesel::prelude::*`.
 ///
-/// `diesel::prelude::*` also brings in the blocking `RunQueryDsl` and
+/// `diesel::prelude::*` also imports the blocking `RunQueryDsl` and
 /// `SaveChangesDsl`. In a module with `#[model]` or `#[repository]`, the
 /// generated code then fails with E0034 ("multiple applicable items in
 /// scope"). This prelude has all of Diesel's prelude, but those two names

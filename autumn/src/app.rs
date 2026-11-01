@@ -3709,8 +3709,10 @@ impl AppBuilder {
     ///
     /// The set runs at the same points as [`Self::migrations`], with the
     /// same auto-apply policy. `autumn migrate` and `autumn fleet migrate`
-    /// read the `migrations/` directory and do not know a scope: keep a
-    /// scoped set in its own directory, and apply it with `AUTUMN_MIGRATE=1`.
+    /// read the `migrations/` directory and do not know a scope. Keep the
+    /// control set out of `migrations/`. Do not run `autumn migrate` on the
+    /// app: it applies `migrations/` to the control database. Use
+    /// `AUTUMN_MIGRATE=1`.
     ///
     /// # Examples
     ///
@@ -7955,9 +7957,20 @@ impl AppBuilder {
         // folds in the two standalone shard control sets too, matching
         // `run_startup_migrations`, so both paths reach the same decision
         // regardless of which runs first.
-        let disambiguation_sets =
-            migration_sets_for_disambiguation(&migrations, config.database.has_shards());
+        // One map per side: a control-only set and a shard-only set never
+        // share a database, so they never rename each other's versions.
+        let disambiguation_sets = migration_sets_for_disambiguation(
+            &migrations,
+            config.database.has_shards(),
+            crate::migrate::MigrationScope::reaches_control,
+        );
         let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
+        let shard_disambiguated =
+            crate::migrate::compute_migration_disambiguation(&migration_sets_for_disambiguation(
+                &migrations,
+                config.database.has_shards(),
+                crate::migrate::MigrationScope::reaches_shards,
+            ));
         #[cfg(feature = "sqlite")]
         let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
 
@@ -8020,7 +8033,7 @@ impl AppBuilder {
                 for mig in shard_sets(&migrations) {
                     total += apply_pending_or_exit(
                         url,
-                        crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                        crate::migrate::DisambiguatedMigrations::new(mig, &shard_disambiguated),
                         label,
                         lock_policy,
                     );
@@ -13413,6 +13426,9 @@ async fn setup_database(
     // (or warn about a pending directory migration) for a table it won't use.
     let use_directory_router = shard_router.is_none()
         && (directory_shard_router || config.database.directory_shard_router);
+    if let Some(warning) = unreachable_shard_sets_warning(config, &migrations) {
+        tracing::warn!("{warning}");
+    }
     // A fleet routes by its mode and path template, never by a router.
     #[cfg(feature = "sqlite")]
     if config.database.fleet.is_some() && shard_router.is_some() {
@@ -14593,12 +14609,20 @@ mod sqlite_sharding_unsupported_guard_tests {
 /// avoid. The residual narrow case (a sharded app using an explicit custom
 /// router) may see a harmless, unnecessary disambiguation entry for a shard
 /// version it will never apply; that is safe, just imprecise.
+///
+/// `keep` selects one side by [`MigrationScope`](crate::migrate::MigrationScope):
+/// the control map and the shard map each read only the sets of their side.
+/// With no scoped set, both maps equal the map over every set.
 #[cfg(feature = "db")]
 fn migration_sets_for_disambiguation(
     migrations: &[crate::migrate::RegisteredMigrations],
     shards_configured: bool,
+    keep: impl Fn(crate::migrate::MigrationScope) -> bool,
 ) -> Vec<(&str, &crate::migrate::EmbeddedMigrations)> {
-    let owned = migrations.iter().map(|(name, set, _)| (*name, set));
+    let owned = migrations
+        .iter()
+        .filter(move |(_, _, scope)| keep(*scope))
+        .map(|(name, set, _)| (*name, set));
     if shards_configured {
         owned
             .chain([
@@ -14659,9 +14683,20 @@ async fn run_startup_migrations(
     // two registered sources is resolved automatically rather than causing
     // one migration to be silently skipped — see
     // `compute_migration_disambiguation` and `migration_sets_for_disambiguation`.
-    let disambiguation_sets =
-        migration_sets_for_disambiguation(&migrations, config.database.has_shards());
+    // One map per side: a control-only set and a shard-only set never share
+    // a database, so they never rename each other's versions.
+    let disambiguation_sets = migration_sets_for_disambiguation(
+        &migrations,
+        config.database.has_shards(),
+        crate::migrate::MigrationScope::reaches_control,
+    );
     let disambiguated = crate::migrate::compute_migration_disambiguation(&disambiguation_sets);
+    let shard_disambiguated =
+        crate::migrate::compute_migration_disambiguation(&migration_sets_for_disambiguation(
+            &migrations,
+            config.database.has_shards(),
+            crate::migrate::MigrationScope::reaches_shards,
+        ));
     #[cfg(feature = "sqlite")]
     let sqlite_history_sets = crate::migrate::sqlite_collision_pairs(&disambiguation_sets);
     let migration_result = crate::time::spawn_blocking(move || {
@@ -14772,7 +14807,7 @@ async fn run_startup_migrations(
                     profile.as_deref(),
                     auto_migrate,
                     auto_in_prod,
-                    crate::migrate::DisambiguatedMigrations::new(mig, &disambiguated),
+                    crate::migrate::DisambiguatedMigrations::new(mig, &shard_disambiguated),
                     target,
                     lock_policy,
                 );
@@ -15118,6 +15153,22 @@ fn shard_applied_sets_include(
                 .iter()
                 .any(|migration| migration.name().to_string() == migration_name)
         })
+}
+
+/// The boot warning for a shard-only set when no database takes it: no
+/// `[[database.shards]]` and no `[database.fleet]`.
+#[cfg(feature = "db")]
+fn unreachable_shard_sets_warning(
+    config: &AutumnConfig,
+    migrations: &[crate::migrate::RegisteredMigrations],
+) -> Option<&'static str> {
+    let shard_only = migrations
+        .iter()
+        .any(|(_, _, scope)| *scope == crate::migrate::MigrationScope::Shards);
+    (shard_only && !config.database.has_shards() && config.database.fleet.is_none()).then_some(
+        "A migration set has MigrationScope::Shards, but this profile has no \
+         [[database.shards]] and no [database.fleet]: no database gets it.",
+    )
 }
 
 /// The registered sets that go to the control database.
@@ -20184,6 +20235,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "db")]
     fn migration_names(migrations: &[crate::migrate::RegisteredMigrations]) -> Vec<String> {
         use diesel::migration::{Migration, MigrationSource as _};
         use diesel::pg::Pg;
@@ -20334,6 +20386,57 @@ mod tests {
         for names in [&control, &shards] {
             assert!(names.contains(&"20260101000000_create_gizmos".to_owned()));
         }
+    }
+
+    /// A control-only set and a shard-only set that share a version never
+    /// share a database: neither side renames the other's migration.
+    #[cfg(feature = "db")]
+    #[test]
+    fn scoped_sets_get_one_collision_map_per_side() {
+        use crate::migrate::{MigrationScope, compute_migration_disambiguation};
+        const CONTROL: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_control_collide_migrations");
+        const SHARDS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_shard_migrations");
+
+        let scoped = vec![
+            ("app", CONTROL, MigrationScope::Control),
+            ("app", SHARDS, MigrationScope::Shards),
+        ];
+        for side in [
+            MigrationScope::reaches_control,
+            MigrationScope::reaches_shards,
+        ] {
+            let sets = migration_sets_for_disambiguation(&scoped, false, side);
+            assert_eq!(sets.len(), 1);
+            assert!(compute_migration_disambiguation(&sets).is_empty());
+        }
+        let control: Vec<_> = control_sets(&scoped).collect();
+        let shards: Vec<_> = shard_sets(&scoped).collect();
+        assert!(std::ptr::eq(control[0], std::ptr::from_ref(&scoped[0].1)) && control.len() == 1);
+        assert!(std::ptr::eq(shards[0], std::ptr::from_ref(&scoped[1].1)) && shards.len() == 1);
+
+        // The same two sets for every database collide, as before.
+        let everywhere = vec![
+            ("app", CONTROL, MigrationScope::Everywhere),
+            ("app", SHARDS, MigrationScope::Everywhere),
+        ];
+        let sets =
+            migration_sets_for_disambiguation(&everywhere, false, MigrationScope::reaches_control);
+        assert_eq!(compute_migration_disambiguation(&sets).len(), 1);
+    }
+
+    #[cfg(feature = "db")]
+    #[test]
+    fn a_shard_only_set_with_no_shard_warns() {
+        use crate::migrate::MigrationScope;
+        const SHARDS: crate::migrate::EmbeddedMigrations =
+            diesel_migrations::embed_migrations!("tests/fixtures/scope_shard_migrations");
+        let config = AutumnConfig::default();
+        let only = vec![("app", SHARDS, MigrationScope::Shards)];
+        assert!(unreachable_shard_sets_warning(&config, &only).is_some());
+        let everywhere = vec![("app", SHARDS, MigrationScope::Everywhere)];
+        assert!(unreachable_shard_sets_warning(&config, &everywhere).is_none());
     }
 
     #[cfg(feature = "db")]

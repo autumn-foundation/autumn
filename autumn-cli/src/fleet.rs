@@ -41,7 +41,7 @@ pub enum FleetCommand {
         /// The path of the new file.
         dest: PathBuf,
     },
-    /// Put a database file back under a key, for example a backup.
+    /// Copy a database file into the fleet as a key, for example a backup.
     Import {
         /// Profile overlay for the config.
         profile: Option<String>,
@@ -641,6 +641,19 @@ mod imp {
     }
 
     fn import(target: &Target, key: &str, source: &Path) -> Result<(), String> {
+        // The copy must carry the epoch of the host that owns the slot. This
+        // process holds no lease, so the app's next open could replace the
+        // copy from the replica.
+        if target.fleet.ownership.is_some() {
+            return Err(
+                "Import stopped: [database.fleet.ownership] is on, and this command holds no \
+                 slot lease.\n  Call `DatabaseFleet::import` in the app that owns the slot."
+                    .to_owned(),
+            );
+        }
+        if !source.is_file() {
+            return Err(format!("{} is not a file.", source.display()));
+        }
         target.require_root()?;
         let dir = Path::new(MIGRATIONS_DIR);
         if !dir.is_dir() {
@@ -678,9 +691,10 @@ mod imp {
                 .install_replication(replication)
                 .map_err(|_| "the fleet already replicates".to_owned())?;
         }
+        // Publish only: an open would start a replicator in this process.
         let rt = runtime()?;
         let imported = rt.block_on(async {
-            let result = fleet.import(&key, source).await.map(drop);
+            let result = fleet.import_file(&key, source).await;
             fleet.close_all().await;
             result
         });
@@ -690,12 +704,11 @@ mod imp {
                  Run `autumn fleet delete {key} --force` first.",
                 path.display()
             ),
-            FleetError::NotFound { .. } => format!("{} is not a file.", source.display()),
-            FleetError::Misplaced { found, .. } => format!(
-                "{} is a copy of {found}, not of {key}. Nothing was imported.",
-                source.display()
+            FleetError::Migration { .. } => format!(
+                "{e}\n  If the copy records a plugin migration, call \
+                 `DatabaseFleet::import` in the app instead."
             ),
-            other => other.to_string(),
+            other => format!("{other}\n  Nothing was imported."),
         })?;
         eprintln!(
             "\u{2713} Imported {} as {key} ({}).",

@@ -106,11 +106,12 @@ async fn list(repo: SqliteNoteRepository) -> AutumnResult<Json<Vec<Note>>> {
 ```
 
 `#[repository]` generates `PgNoteRepository`. A SQLite build also names it
-`SqliteNoteRepository`. The two names are one type.
+`SqliteNoteRepository`. The two names are one type. The generators still
+write the `Pg` name.
 
 In a module with `#[model]` or `#[repository]`, use
 `autumn_web::db::prelude::*`, not `diesel::prelude::*`. Diesel's prelude also
-brings in the blocking `RunQueryDsl`, and the generated code then fails with
+imports the blocking `RunQueryDsl`, and the generated code then fails with
 E0034 ("multiple applicable items in scope").
 
 The routing key is the tenant id, resolved exactly as for `ShardedDb`
@@ -143,7 +144,7 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 | `fleet.open(&key)` | open (`404` when missing and not created on demand) |
 | `fleet.delete(&key)` | close, then remove the file, its sidecars and the emptied bucket; requests get `410` meanwhile; `409` when another process still has it open. With replication, the replica goes too: see [Deleting a database's replica](#deleting-a-databases-replica) |
 | `fleet.backup(&key, &dest)` | consistent copy with `VACUUM INTO`; writers keep running |
-| `fleet.import(&key, &src)` | put a copy back: check, migrate, publish (`409` when the key has a file). See [Import a backup](#import-a-backup) |
+| `fleet.import(&key, &src)` | copy a file into the fleet as `key`: check, migrate, publish (`409` when the key has a file, `422` for a bad file). See [Import a backup](#import-a-backup) |
 | `fleet.list()` | every database on disk |
 | `fleet.each(n, f)` | run `f` on every database, `n` at a time |
 | `fleet.migrate_all(n)` | migrate every database, report failures per database |
@@ -152,32 +153,42 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 
 ### Import a backup
 
-`fleet.import(&key, &src)` puts a copy back, for example one that
-`fleet.backup` wrote before a delete:
+`fleet.import(&key, &src)` copies a database file into the fleet as `key`,
+for example a file that `fleet.backup` wrote before a delete:
 
 ```rust
 fleet.backup(&key, &archive).await?;
 fleet.delete(&key).await?;
-// Later: undo.
+// Later: undo the delete.
 fleet.import(&key, &archive).await?;
 ```
 
 The import does not change `src`. It copies `src` with `VACUUM INTO` into a
-private staging file, then:
+private staging file. Then it does these steps:
 
-1. Runs `PRAGMA integrity_check`.
-2. Checks the identity row. A copy of another key is refused (`500`, with
-   nothing published). A file with no identity row gets one.
-3. Applies the pending migrations.
-4. Publishes the file in one step. When the key already has a file, it
-   answers `409` and publishes nothing.
+1. It runs `PRAGMA integrity_check`.
+2. It reads the identity row. The row must record `key`. A file with no
+   identity row (a file that no fleet made) is refused.
+3. It applies the pending migrations. With ownership, it sets the epoch of
+   the copy to this host's epoch. Without ownership, it removes the epoch.
+4. With replication, it purges the tombstone and the old replica of a
+   deleted key, as `provision` does. It does this only after steps 1 to 3
+   pass. Thus a refused file keeps the replica.
+5. It publishes the file in one step. It never replaces a file.
 
-With replication, a deleted key's tombstone and old replica are purged
-first, as for `provision`. With ownership, the copy gets this host's epoch.
+A refused source answers `422` (`FleetError::InvalidSource`), and a key that
+has a file answers `409`. Nothing is published then. `fleet.import_file` does
+the same steps, but does not open the database.
 
-`FleetLifecycle::restore_missing` is a lower-level hook. Each open of a
-missing file asks it, under the path lock, whatever
-`[database.fleet] restore_missing` says. Use `import` for a local backup.
+Import only files that you trust: the copy keeps the schema, the triggers and
+the migration records of `src`. On Windows, the import opens `src` read-write,
+so SQLite can apply a `-wal` or a hot journal to it.
+
+`FleetLifecycle::restore_missing` is a lower-level hook. Each request-path
+open of a missing file asks it, under the path lock, whatever
+`[database.fleet] restore_missing` says. A background open does not ask. With
+replication, an open of a deleted key does not ask. Use `import` for a local
+backup.
 
 ## Operating the fleet
 
@@ -198,7 +209,7 @@ cargo install autumn-cli --no-default-features --features sqlite
 | `autumn fleet list [--open] [--json]` | name, size and path of each database; `--open` adds the identity row, the latest applied app migration and the number of pending app migrations |
 | `autumn fleet migrate [--concurrency N] [--key K]` | apply `migrations/` and the framework tables to every database, or to one |
 | `autumn fleet backup <key> <dest>` | copy one database with `VACUUM INTO`; `dest` must not exist |
-| `autumn fleet import <key> <src>` | put a copy back under `key`; the key must have no file |
+| `autumn fleet import <key> <src>` | copy `src` into the fleet as `key`; the key must have no file |
 | `autumn fleet delete <key> --force` | remove one database and its sidecars; with replication, its replica too |
 | `autumn fleet restore <key> [--timestamp T] --force` | rebuild one database from its replica; `--timestamp` sets a point in time |
 
@@ -221,8 +232,9 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
 - `import` applies `migrations/` and the framework tables to the copy before
   it publishes it. Like `migrate`, it stops when the copy records a migration
   that is not in these sets. With `[replication]` on, it needs the replica
-  destination and the control database, to purge a deleted database's old
-  replica first.
+  destination and the control database, to purge the old replica of a deleted
+  database. With `[database.fleet.ownership]` on, it stops: this command holds
+  no slot lease. Call `DatabaseFleet::import` in the app that owns the slot.
 - Like boot, each command validates `[database]` first and stops when the
   control database resolves inside the fleet root.
 - `list --open` reads each file and changes no data. It exits non-zero when
@@ -301,11 +313,11 @@ autumn_web::app()
 ```
 
 Boot and `AUTUMN_MIGRATE=1` obey the scope. `autumn migrate` and
-`autumn fleet migrate` read `migrations/` and do not know a scope:
-`fleet migrate` applies `migrations/` to each fleet database, and
-`autumn migrate` applies it to the control database. Keep the tenant set in
-`migrations/` and the control set in its own directory, and apply the control
-set with `AUTUMN_MIGRATE=1`.
+`autumn fleet migrate` read `migrations/` and do not know a scope. Keep the
+tenant set in `migrations/` and the control set in its own directory. Then
+`autumn fleet migrate` is correct for the fleet. Do not run `autumn migrate`
+on this app: it applies `migrations/` to the control database. Use
+`AUTUMN_MIGRATE=1`.
 
 ## Opening and closing
 
@@ -314,13 +326,13 @@ set with `AUTUMN_MIGRATE=1`.
 - A file that records another key's name (it was copied or renamed by hand)
   is refused with `500` rather than served.
 - `max_open` is a soft limit. Past it, the least recently used idle database
-  closes. A database with a connection checked out, used within
-  `min_residency` (default `2s`), or held by a request (a `ShardedDb`, a
-  sharded repository) is never closed, and an open never waits for room. So
-  a burst across many keys opens more databases than `max_open`. In one
-  measurement, 1,000 tenants at about 1,300 requests per second gave 594 open
-  databases with `max_open = 16`. The count went back to 16 in about 12
-  seconds after the burst.
+  closes. The sweep does not close a database that has a connection checked
+  out, that a request holds (a `ShardedDb`, a sharded repository), or that
+  was used within `min_residency` (default `2s`). An open never waits for
+  room. Thus a burst across many keys opens more databases than `max_open`.
+  In one measurement, 1,000 tenants at about 1,300 requests per second gave
+  594 open databases with `max_open = 16`. The count decreased to 16 about
+  12 seconds after the burst.
 - A lower `min_residency` keeps the count nearer to `max_open` during a burst.
   A request can then reopen a database that it used a moment before.
 - A new database is built and migrated in a private staging file, then

@@ -619,8 +619,8 @@ allowed_origins = ["*"]
 [storage]
 backend = "local"
 
-# Dev: plain http on localhost. Most clients do not send a `Secure`
-# cookie back over http, so session sign-in would fail.
+# Dev: plain http on localhost. Most clients do not return a `Secure`
+# cookie over http, so session sign-in would fail.
 [session]
 secure = false
 
@@ -10448,7 +10448,7 @@ pub struct DatabaseFleetConfig {
     /// It does not close a database that is in use or that was used within
     /// [`min_residency`](Self::min_residency), and an open never waits for
     /// room. Thus a burst across many keys can open more databases than this
-    /// value. The count goes back down when the burst stops.
+    /// value. The count decreases when the burst stops.
     ///
     /// Each open database holds up to [`pool_size`](Self::pool_size)
     /// connections, and about `2 × pool_size + 1` file descriptors (the
@@ -20805,6 +20805,11 @@ path = "/healthz"
             parse("min_residency = \"0s\"").min_residency,
             std::time::Duration::ZERO
         );
+        assert_eq!(
+            parse("min_residency = 500").min_residency,
+            std::time::Duration::from_millis(500),
+            "a bare number is milliseconds"
+        );
         let env = MockEnv::new()
             .with("AUTUMN_DATABASE__FLEET__MODE", "tenant")
             .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
@@ -20814,6 +20819,13 @@ path = "/healthz"
         assert_eq!(
             config.database.fleet.unwrap().min_residency,
             std::time::Duration::from_millis(250)
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env.with("AUTUMN_DATABASE__FLEET__MIN_RESIDENCY", ""));
+        assert_eq!(
+            config.database.fleet.unwrap().min_residency,
+            std::time::Duration::from_secs(2),
+            "an empty value is the default"
         );
     }
 

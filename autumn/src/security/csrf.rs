@@ -1154,8 +1154,14 @@ mod tests {
     /// the token is empty and the names are the defaults. Nothing checks them.
     #[tokio::test]
     async fn csrf_extractors_work_when_csrf_is_off() {
-        async fn handler(csrf: CsrfToken, field: CsrfFormField, header: CsrfTokenHeader) -> String {
-            format!("[{}] {} {}", csrf.token(), field.0, header.0)
+        async fn handler(
+            csrf: CsrfToken,
+            field: CsrfFormField,
+            header: CsrfTokenHeader,
+            maybe: Option<CsrfToken>,
+        ) -> String {
+            let off = if maybe.is_none() { "off" } else { "on" };
+            format!("[{}] {} {} {off}", csrf.token(), field.0, header.0)
         }
 
         let app = Router::new().route("/", get(handler));
@@ -1168,7 +1174,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
-        assert_eq!(&body[..], b"[] _csrf X-CSRF-Token");
+        assert_eq!(&body[..], b"[] _csrf X-CSRF-Token off");
     }
 
     /// A safe request that already carries the CSRF cookie hands that exact

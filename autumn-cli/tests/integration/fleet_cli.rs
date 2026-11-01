@@ -648,6 +648,26 @@ mod sqlite {
         );
         assert!(stderr.contains("tenant:acme"), "{stderr}");
         assert!(!app.path("globex").exists(), "nothing is published");
+
+        let stderr = run_err(&app.dir, &["fleet", "import", "tenant:globex", "absent.db"]);
+        assert!(stderr.contains("is not a file"), "{stderr}");
+    }
+
+    #[test]
+    fn fleet_import_refuses_a_fleet_with_ownership() {
+        let app = App::new("[database.fleet.ownership]\nowner = \"host-a\"\n");
+        app.provision(&app.fleet(), &["acme"], 1);
+        let backup = app.dir.join("acme-backup.db");
+        run_ok(
+            &app.dir,
+            &["fleet", "backup", "tenant:acme", backup.to_str().unwrap()],
+        );
+        let stderr = run_err(
+            &app.dir,
+            &["fleet", "import", "tenant:globex", backup.to_str().unwrap()],
+        );
+        assert!(stderr.contains("DatabaseFleet::import"), "{stderr}");
+        assert!(!app.path("globex").exists());
     }
 
     #[test]

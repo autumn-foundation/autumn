@@ -384,6 +384,27 @@ pub async fn dependent_delete_all<M: 'static>(
 ///   still rests on the optimistic `lock_version` check plus the pool's
 ///   `busy_timeout`; see [`crate::db::RuntimeConnection`] and issue #1996 for
 ///   the residual single-writer concurrency caveat.
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[macro_export]
+macro_rules! maybe_for_update {
+    ($query:expr $(,)?) => {
+        $crate::reexports::diesel::query_dsl::QueryDsl::for_update($query)
+    };
+}
+
+/// `SQLite` arm of [`maybe_for_update!`] — the identity.
+///
+/// See the Postgres
+/// definition for the full contract; `SQLite` has no `SELECT … FOR UPDATE`, so a
+/// pessimistic-lock read degrades to a plain read.
+#[cfg(all(feature = "db", feature = "sqlite"))]
+#[macro_export]
+macro_rules! maybe_for_update {
+    ($query:expr $(,)?) => {
+        $query
+    };
+}
+
 /// The `SQLite` name of a generated repository. `#[repository]` emits this
 /// macro after the `Pg<Trait>` struct.
 ///
@@ -406,27 +427,6 @@ macro_rules! __sqlite_repository_alias {
 #[macro_export]
 macro_rules! __sqlite_repository_alias {
     ($vis:vis $alias:ident = $target:ident) => {};
-}
-
-#[cfg(all(feature = "db", not(feature = "sqlite")))]
-#[macro_export]
-macro_rules! maybe_for_update {
-    ($query:expr $(,)?) => {
-        $crate::reexports::diesel::query_dsl::QueryDsl::for_update($query)
-    };
-}
-
-/// `SQLite` arm of [`maybe_for_update!`] — the identity.
-///
-/// See the Postgres
-/// definition for the full contract; `SQLite` has no `SELECT … FOR UPDATE`, so a
-/// pessimistic-lock read degrades to a plain read.
-#[cfg(all(feature = "db", feature = "sqlite"))]
-#[macro_export]
-macro_rules! maybe_for_update {
-    ($query:expr $(,)?) => {
-        $query
-    };
 }
 
 /// Compile-time backend block selector for generated `#[repository]`/`#[model]` CRUD.

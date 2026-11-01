@@ -1630,8 +1630,8 @@ enum Commands {
     /// Operate a `SQLite` database fleet: list, migrate, back up, import, delete,
     /// restore.
     ///
-    /// Reads `[database.fleet]` from the app config. `restore` also reads
-    /// `[replication]`. Run it from the app directory: the fleet root must
+    /// Reads `[database.fleet]` from the app config. `delete`, `import` and
+    /// `restore` also read `[replication]`. Run it from the app directory: the fleet root must
     /// exist. Works when the app is stopped and when it runs. Needs the
     /// `sqlite` build of the CLI.
     ///
@@ -3523,11 +3523,12 @@ enum FleetCommands {
         #[arg(value_name = "DEST")]
         dest: std::path::PathBuf,
     },
-    /// Put a database file back under KEY, for example a backup.
+    /// Copy a database file into the fleet as KEY, for example a backup.
     ///
     /// Copies SOURCE with `VACUUM INTO`, checks its integrity and identity row,
     /// applies `migrations/` and the framework tables, then publishes it.
-    /// Refused when KEY already has a file. SOURCE does not change.
+    /// Refused when KEY already has a file, and with
+    /// `[database.fleet.ownership]` on. SOURCE does not change.
     Import {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]

@@ -409,6 +409,8 @@ mod ledger_postgres;
 // read path: profiles the unbounded full-chain read against a deep,
 // production-shaped chain and (after the fix) the bounded replacement.
 #[cfg(feature = "db")]
+mod db_prelude;
+#[cfg(feature = "db")]
 mod ledger_as_of_deep_chain_profile;
 #[cfg(feature = "db")]
 mod repository_audit_actor;

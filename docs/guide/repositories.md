@@ -8,11 +8,11 @@ In version `0.5.0`, Autumn introduces high-performance **Bulk CRUD operations** 
 
 `#[repository] trait NoteRepository` generates the struct `PgNoteRepository`.
 A SQLite build (`sqlite` feature) also names it `SqliteNoteRepository`. The two
-names are one type.
+names are one type. The generators still write the `Pg` name.
 
 In a module with `#[model]` or `#[repository]`, import
 `autumn_web::db::prelude::*`, not `diesel::prelude::*`. Diesel's prelude also
-brings in the blocking `RunQueryDsl`, and the generated code then fails with
+imports the blocking `RunQueryDsl`, and the generated code then fails with
 E0034 ("multiple applicable items in scope"). `autumn_web::db::prelude` has
 all of Diesel's prelude, with the `diesel_async` `RunQueryDsl` and
 `SaveChangesDsl`.
