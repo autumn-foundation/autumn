@@ -545,7 +545,7 @@
   }
 
   // Old browsers throw on `:popover-open`: they have no open popover.
-  function isOpen(el) {
+  function popoverOpen(el) {
     try { return el.matches(':popover-open'); } catch (_) { return false; }
   }
 
@@ -554,7 +554,7 @@
 
   function initMenu(menu) {
     var trigger = triggerOf(menu);
-    if (trigger) trigger.setAttribute('aria-expanded', isOpen(menu) ? 'true' : 'false');
+    if (trigger) trigger.setAttribute('aria-expanded', popoverOpen(menu) ? 'true' : 'false');
   }
 
   document.addEventListener('toggle', function (e) {
@@ -587,7 +587,7 @@
     // Close after the item acts. Focus the trigger: some browsers do not
     // focus a clicked button.
     setTimeout(function () {
-      if (!isOpen(owner)) return;
+      if (!popoverOpen(owner)) return;
       var opener = triggerOf(owner);
       if (opener) opener.focus();
       owner.hidePopover();
@@ -598,7 +598,7 @@
   document.addEventListener('focusout', function (e) {
     var to = e.relatedTarget;
     var menu = e.target.closest && (e.target.closest(MENU) || menuOfButton(e.target.closest(MENU_BUTTON)));
-    if (!to || !menu || !isOpen(menu)) return;
+    if (!to || !menu || !popoverOpen(menu)) return;
     var trigger = triggerOf(menu);
     if (!menu.contains(to) && !(trigger && trigger.contains(to))) menu.hidePopover();
   });
@@ -610,7 +610,7 @@
     if (menu && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
       e.preventDefault();
       menuAt = { menu: menu, at: e.key === 'ArrowUp' ? 'last' : 'first' };
-      if (isOpen(menu)) {
+      if (popoverOpen(menu)) {
         var all = listItems(menu);
         menuAt = null;
         if (all.length) focusItem(menu, e.key === 'ArrowUp' ? all[all.length - 1] : all[0]);
@@ -627,11 +627,11 @@
     var inside = t.closest(MENU);
     if (!inside) return;
     // Escape and Tab: focus the trigger first. Tab then moves on from it.
-    if (e.key === 'Escape' && isOpen(inside)) {
+    if (e.key === 'Escape' && popoverOpen(inside)) {
       var back = triggerOf(inside);
       if (back) back.focus();
     }
-    if (e.key === 'Tab' && isOpen(inside)) {
+    if (e.key === 'Tab' && popoverOpen(inside)) {
       var opener = triggerOf(inside);
       if (opener) opener.focus();
       inside.hidePopover();
