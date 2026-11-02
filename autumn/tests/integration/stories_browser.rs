@@ -993,11 +993,14 @@ async fn keyboard_button() {
     page.expect_no_console_errors().await.expect("no errors");
 }
 
-/// Press Enter on `#button`. While the request runs, check it in one read,
-/// so the 800 ms window cannot pass between checks: the button and the
-/// swap target have `aria-busy="true"`, the spinner shows, and the label is
-/// transparent but keeps its text. After the response, `aria-busy` goes and
-/// focus stays on the button.
+/// Press Enter on `#button` and check the busy state while the request
+/// runs: the button and the swap target have `aria-busy="true"`, the
+/// spinner shows, and the label is transparent but keeps its text. After
+/// the response, `aria-busy` goes and focus stays on the button.
+///
+/// `Page::press` waits for htmx to settle, so the test cannot read the page
+/// during the request. A `MutationObserver` in the page records the busy
+/// state when it happens.
 async fn check_busy_button(page: &Page, button: &str, status: &str) {
     let state = |busy: bool| {
         format!(
@@ -1016,27 +1019,32 @@ async fn check_busy_button(page: &Page, button: &str, status: &str) {
         eval_bool(page, &state(false)).await,
         "#{button} is busy at rest"
     );
-    focus(page, &format!("#{button}")).await;
-    press(page, "Enter").await;
-    if !poll(page, &state(true)).await {
-        let dump = eval_string(
+    assert!(
+        eval_bool(
             page,
             &format!(
-                "(() => {{ const b = document.getElementById({button:?}); \
-                 const s = document.getElementById({status:?}); \
-                 return JSON.stringify({{ button: b.outerHTML, status: s.outerHTML, \
-                   spinner: getComputedStyle(b.querySelector('.autumn-button__spinner')).display, \
-                   htmx: typeof htmx, widgets: window.__autumnWidgets }}); }})()"
+                "(() => {{ window.__busySeen = false; \
+                 const check = () => {{ if ({}) window.__busySeen = true; }}; \
+                 new MutationObserver(check).observe(document.body, \
+                   {{ attributes: true, subtree: true, attributeFilter: ['aria-busy', 'class'] }}); \
+                 return true; }})()",
+                state(true)
             ),
         )
-        .await;
-        panic!("#{button} never showed the busy state: {dump}");
-    }
+        .await,
+        "could not watch #{button}"
+    );
+    focus(page, &format!("#{button}")).await;
+    press(page, "Enter").await;
     wait_for(
         page,
         &format!("document.getElementById({status:?}).textContent.includes('Saved.')"),
     )
     .await;
+    assert!(
+        eval_bool(page, "window.__busySeen === true").await,
+        "#{button} never showed the busy state during the request"
+    );
     wait_for(page, &state(false)).await;
     assert_eq!(active_id(page).await, button, "focus left #{button}");
 }
