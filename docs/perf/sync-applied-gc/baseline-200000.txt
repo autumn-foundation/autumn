@@ -1,0 +1,53 @@
+=== variant baseline rows 200000
+ heap  | heap_blocks |             index_blocks             
+-------+-------------+--------------------------------------
+ 16 MB |        2059 | autumn_sync_applied_pkey=1571 blocks
+(1 row)
+
+ to_delete | survivors | at_boundary 
+-----------+-----------+-------------
+      6449 |    193551 |           0
+(1 row)
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) of gc_applied
+                                                             QUERY PLAN                                                             
+------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_sync_applied  (cost=0.00..4559.00 rows=0 width=0) (actual time=13.098..13.099 rows=0 loops=1)
+   Buffers: shared hit=8508
+   ->  Seq Scan on public.autumn_sync_applied  (cost=0.00..4559.00 rows=6704 width=6) (actual time=0.007..11.288 rows=6449 loops=1)
+         Output: ctid
+         Filter: (autumn_sync_applied.applied_at < '2026-10-02 00:00:00+00'::timestamp with time zone)
+         Rows Removed by Filter: 193551
+         Buffers: shared hit=2059
+ Query Identifier: 3279679669149874998
+ Planning Time: 0.038 ms
+ Execution Time: 13.143 ms
+(10 rows)
+
+=== pg_stat_statements for the sweep
+ calls | rows | total_buffers | shared_blks_hit | shared_blks_read | temp_blks_written | wal_bytes |                            query                             
+-------+------+---------------+-----------------+------------------+-------------------+-----------+--------------------------------------------------------------
+     1 | 6449 |          8508 |            8508 |                0 |                 0 |    348246 | PREPARE gc(timestamptz) AS DELETE FROM autumn_sync_applied W
+(1 row)
+
+gc_wal_bytes 724480
+ rows_after |          survivors_md5           
+------------+----------------------------------
+     193551 | 8930178c3c37b3e705cb9524ce700e63
+(1 row)
+
+ seq_scan | seq_tup_read | idx_scan | idx_tup_fetch 
+----------+--------------+----------+---------------
+        2 |        60636 |        0 |             0
+(1 row)
+
+       indexrelname       | idx_scan 
+--------------------------+----------
+ autumn_sync_applied_pkey |        0
+(1 row)
+
+ ingest_wal_bytes_50k | ingest_buffers_50k 
+----------------------+--------------------
+             11176224 |             203616
+(1 row)
+
