@@ -1206,7 +1206,9 @@ mod tests {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
-        reason = "a channel is rounded and in 0..=255"
+        clippy::many_single_char_names,
+        clippy::suboptimal_flops,
+        reason = "the CSS Color 4 HSL formula, with its own names; a channel is rounded and in 0..=255"
     )]
     fn hsl_to_hex(hsl: &str) -> String {
         let inner = hsl
