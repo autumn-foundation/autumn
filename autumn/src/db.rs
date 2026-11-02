@@ -2260,25 +2260,29 @@ fn sqlite_connection_setup(
     // read-only main targets — so the failure is a clear diagnostic naming FTS5
     // and the fix, rather than a bare "no such module: fts5" from a migration.
     // There is no silent fallback to LIKE: full-text search requires FTS5.
-    if let Err(e) = conn.batch_execute(
+    conn.batch_execute(
         "CREATE VIRTUAL TABLE temp.__autumn_fts5_probe USING fts5(x); \
          DROP TABLE temp.__autumn_fts5_probe;",
-    ) {
-        return Err(diesel::ConnectionError::CouldntSetupConfiguration(
-            diesel::result::Error::QueryBuilderError(
-                format!(
-                    "SQLite FTS5 is not available in the linked SQLite library, but \
-                     autumn-web full-text search (searchable repositories / the \
-                     `--search` scaffold, issue #1910) requires it. Build with the \
-                     bundled, FTS5-enabled SQLite by enabling autumn-web's `sqlite` \
-                     feature (it turns on `libsqlite3-sys/bundled`, whose amalgamation \
-                     defines SQLITE_ENABLE_FTS5). Underlying probe error: {e}"
-                )
-                .into(),
-            ),
-        ));
-    }
+    )
+    .map_err(|e| sqlite_fts5_missing(&e))?;
     Ok(conn)
+}
+
+/// The setup error when the linked `SQLite` library has no FTS5. `probe` is the
+/// error of the FTS5 probe.
+#[cfg(feature = "sqlite")]
+fn sqlite_fts5_missing(probe: &diesel::result::Error) -> diesel::ConnectionError {
+    diesel::ConnectionError::CouldntSetupConfiguration(diesel::result::Error::QueryBuilderError(
+        format!(
+            "SQLite FTS5 is not available in the linked SQLite library, but \
+             autumn-web full-text search (searchable repositories / the \
+             `--search` scaffold, issue #1910) requires it. Build with the \
+             bundled, FTS5-enabled SQLite by enabling autumn-web's `sqlite` \
+             feature (it turns on `libsqlite3-sys/bundled`, whose amalgamation \
+             defines SQLITE_ENABLE_FTS5). Underlying probe error: {probe}"
+        )
+        .into(),
+    ))
 }
 
 /// Apply the per-connection pragmas, retrying while the database is locked.
@@ -5997,6 +6001,31 @@ mod tests {
         let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch)
             .expect("the pool builds");
         drop(pool.get().await.expect("a real limit opens the file"));
+    }
+
+    // The bundled SQLite has FTS5, so the probe never fails here. The error
+    // must still name FTS5, the issue and the fix.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_fts5_missing_error_names_the_module_and_the_fix() {
+        let probe = diesel::result::Error::QueryBuilderError("no such module: fts5".into());
+        let message = sqlite_fts5_missing(&probe).to_string();
+        for needle in [
+            "FTS5",
+            "#1910",
+            "`sqlite`",
+            "libsqlite3-sys/bundled",
+            "no such module: fts5",
+        ] {
+            assert!(
+                message.contains(needle),
+                "{needle} is missing from: {message}"
+            );
+        }
+        assert!(matches!(
+            sqlite_fts5_missing(&probe),
+            diesel::ConnectionError::CouldntSetupConfiguration(_)
+        ));
     }
 
     // TestApp runs a plugin startup hook so: a helper thread calls
