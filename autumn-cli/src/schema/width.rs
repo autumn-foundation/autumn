@@ -106,6 +106,11 @@ pub struct TableWidth {
     /// has one, else its name. Two declarations can share one physical table,
     /// and that is how a wide table stays under the cap.
     pub physical: String,
+    /// The Cargo package that owns the file (the nearest directory with a
+    /// `Cargo.toml`, relative to the scan root). A declaration maps only the
+    /// migrations of its own package, so two apps in one tree that both have
+    /// a `users` table never vouch for each other. Empty outside a scan.
+    pub package: PathBuf,
     /// How many columns the table has.
     pub columns: usize,
     /// Where the count came from.
@@ -141,7 +146,10 @@ impl WidthReport {
             .tables
             .iter()
             .filter(|t| t.columns > max)
-            .filter(|t| t.source != WidthSource::Migration || !declared.contains(&t.physical))
+            .filter(|t| {
+                t.source != WidthSource::Migration
+                    || !declared.contains(&(t.package.clone(), t.physical.clone()))
+            })
             .collect();
         over.sort_by(|a, b| {
             b.columns
@@ -155,20 +163,21 @@ impl WidthReport {
 
     /// The physical tables some `table!` or `#[model]` declares. A model names
     /// a Diesel table, so it maps through that `table!`'s `sql_name`.
-    fn declared_physical(&self) -> std::collections::BTreeSet<String> {
-        let macros: BTreeMap<&str, &str> = self
+    fn declared_physical(&self) -> std::collections::BTreeSet<(PathBuf, String)> {
+        let macros: BTreeMap<(&Path, &str), &str> = self
             .tables
             .iter()
             .filter(|t| t.source == WidthSource::TableMacro)
-            .map(|t| (t.table.as_str(), t.physical.as_str()))
+            .map(|t| ((t.package.as_path(), t.table.as_str()), t.physical.as_str()))
             .collect();
         self.tables
             .iter()
             .filter(|t| t.source != WidthSource::Migration)
             .map(|t| {
-                macros
-                    .get(t.table.as_str())
-                    .map_or_else(|| t.physical.clone(), |p| (*p).to_owned())
+                let physical = macros
+                    .get(&(t.package.as_path(), t.table.as_str()))
+                    .map_or_else(|| t.physical.clone(), |p| (*p).to_owned());
+                (t.package.clone(), physical)
             })
             .collect()
     }
@@ -177,7 +186,10 @@ impl WidthReport {
     /// its width is then the declarations' business, not its own.
     #[must_use]
     pub fn is_declared_migration(&self, t: &TableWidth) -> bool {
-        t.source == WidthSource::Migration && self.declared_physical().contains(&t.physical)
+        t.source == WidthSource::Migration
+            && self
+                .declared_physical()
+                .contains(&(t.package.clone(), t.physical.clone()))
     }
 
     /// The widest table that counts toward the cap, if any: every `table!` and
@@ -187,7 +199,10 @@ impl WidthReport {
         let declared = self.declared_physical();
         self.tables
             .iter()
-            .filter(|t| t.source != WidthSource::Migration || !declared.contains(&t.physical))
+            .filter(|t| {
+                t.source != WidthSource::Migration
+                    || !declared.contains(&(t.package.clone(), t.physical.clone()))
+            })
             .max_by_key(|t| t.columns)
     }
 
@@ -624,6 +639,7 @@ pub fn replay_migration_set(steps: &[(PathBuf, String)]) -> Vec<TableWidth> {
         .into_iter()
         .map(|(table, (columns, path))| TableWidth {
             physical: table.rsplit('.').next().unwrap_or(&table).to_owned(),
+            package: PathBuf::new(),
             table,
             columns: columns.len(),
             source: WidthSource::Migration,
@@ -750,6 +766,7 @@ pub fn rust_source_widths(path: &Path, src: &str) -> Vec<TableWidth> {
         out.extend(tables.into_iter().map(|t| TableWidth {
             table: t.name,
             physical: t.physical,
+            package: PathBuf::new(),
             columns: t.columns,
             source: WidthSource::TableMacro,
             path: path.to_path_buf(),
@@ -772,7 +789,27 @@ pub fn rust_source_widths(path: &Path, src: &str) -> Vec<TableWidth> {
 }
 
 /// The `#[model]` widths among the top-level items of `src`.
+///
+/// Each model is parsed on its own: the parser's implicit-column and
+/// diagnostic records are keyed by table, so two models of one table in one
+/// file would otherwise count each other's.
 fn model_widths(path: &Path, src: &str) -> Vec<TableWidth> {
+    let Ok(file) = syn::parse_file(src) else {
+        return Vec::new();
+    };
+    file.items
+        .iter()
+        .filter(|item| {
+            matches!(item, syn::Item::Struct(st) if st.attrs.iter().any(|a| {
+                a.path().segments.last().is_some_and(|seg| seg.ident == "model")
+            }))
+        })
+        .flat_map(|item| single_model_width(path, &quote::quote! { #item }.to_string()))
+        .collect()
+}
+
+/// The width of the one `#[model]` in `src`.
+fn single_model_width(path: &Path, src: &str) -> Vec<TableWidth> {
     let mut out = Vec::new();
     let Ok(parsed) = super::parse::parse_model_source(src, Backend::Postgres) else {
         return out;
@@ -799,6 +836,7 @@ fn model_widths(path: &Path, src: &str) -> Vec<TableWidth> {
         out.push(TableWidth {
             columns: table.columns.len().saturating_sub(implicit) + skipped.len(),
             physical: table.name.clone(),
+            package: PathBuf::new(),
             table: table.name,
             source: WidthSource::Model,
             path: path.to_path_buf(),
@@ -900,7 +938,28 @@ pub fn scan_tables(root: &Path) -> Vec<TableWidth> {
             tables.extend(rust_source_widths(&relative(&path), &src));
         }
     }
+    let mut packages: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    for t in &mut tables {
+        let dir = t.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        packages
+            .entry(dir.clone())
+            .or_insert_with(|| owning_package(root, &dir))
+            .clone_into(&mut t.package);
+    }
     tables
+}
+
+/// The nearest directory at or above `dir` (relative to `root`) that holds a
+/// `Cargo.toml`, relative to `root`; empty (the root) when none does.
+fn owning_package(root: &Path, dir: &Path) -> PathBuf {
+    let mut current = Some(dir);
+    while let Some(d) = current {
+        if root.join(d).join("Cargo.toml").is_file() {
+            return d.to_path_buf();
+        }
+        current = d.parent();
+    }
+    PathBuf::new()
 }
 
 // ── Cargo ──────────────────────────────────────────────────────────────────
@@ -1386,6 +1445,71 @@ mod tests {
     }
 
     #[test]
+    fn two_models_of_one_table_count_independently() {
+        let wide: Vec<String> = (0..32).map(|i| format!("pub f{i}: String,")).collect();
+        let src = format!(
+            "#[model(table = \"t\")]\npub struct Wide {{\n#[id]\npub id: i64,\n{}\n}}\n\
+             #[model(table = \"t\")]\npub struct Narrow {{\n#[id]\npub id: i64,\npub status: MyEnum,\n}}",
+            wide.join("\n")
+        );
+        let mut widths: Vec<usize> = rust_source_widths(Path::new("models.rs"), &src)
+            .iter()
+            .filter(|t| t.source == WidthSource::Model)
+            .map(|t| t.columns)
+            .collect();
+        widths.sort_unstable();
+        // `Narrow`'s enum diagnostic and both implicit `created_at`s stay
+        // with their own model.
+        assert_eq!(widths, vec![2, 33]);
+    }
+
+    #[test]
+    fn a_declaration_vouches_only_for_its_own_package() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let write = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            std::fs::write(p, body).expect("write");
+        };
+        write("app_a/Cargo.toml", "[package]\nname = \"a\"\n");
+        write(
+            "app_a/migrations/2026_users/up.sql",
+            &wide_create("users", 33),
+        );
+        write("app_b/Cargo.toml", "[package]\nname = \"b\"\n");
+        write(
+            "app_b/src/schema.rs",
+            "diesel::table! { users (id) { id -> Int8, } }",
+        );
+        let report = WidthReport {
+            tables: scan_tables(root),
+            wide_diesel_features: Vec::new(),
+        };
+        let over = report.over(DIESEL_DEFAULT_COLUMN_LIMIT);
+        assert_eq!(over.len(), 1, "{report:?}");
+        assert_eq!(over[0].package, PathBuf::from("app_a"));
+
+        // App A declaring its own table (split) clears it.
+        write(
+            "app_a/src/schema.rs",
+            &format!(
+                "{}\n{}",
+                decl("users", None, 0..20),
+                decl("users_ext", Some("users"), 20..33)
+            ),
+        );
+        let report = WidthReport {
+            tables: scan_tables(root),
+            wide_diesel_features: Vec::new(),
+        };
+        assert!(
+            report.over(DIESEL_DEFAULT_COLUMN_LIMIT).is_empty(),
+            "{report:?}"
+        );
+    }
+
+    #[test]
     fn create_table_as_select_changes_no_width() {
         let w = widths(&["CREATE TABLE copy AS SELECT * FROM real;"]);
         assert!(w.is_empty());
@@ -1505,6 +1629,7 @@ mod tests {
             tables: vec![TableWidth {
                 table: "accounts".to_owned(),
                 physical: "accounts".to_owned(),
+                package: PathBuf::new(),
                 columns: 40,
                 source: WidthSource::Migration,
                 path: PathBuf::from("migrations/2026_wide/up.sql"),

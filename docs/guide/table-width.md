@@ -126,7 +126,8 @@ autumn schema width
 - **Migrations.** Each directory of `<version>_<name>/up.sql` steps is replayed
   in version order. It follows `CREATE TABLE`, `ALTER TABLE … ADD COLUMN`,
   `DROP COLUMN`, `RENAME COLUMN`, `RENAME TO` and `DROP TABLE`. A table over
-  32 columns counts only when **no** `table!` or `#[model]` maps to it. In that
+  32 columns counts only when **no** `table!` or `#[model]` in the same Cargo
+  package maps to it. In that
   case, a generated `src/schema.rs` would declare all of its columns in one
   `table!`. Once your Rust code declares the table, the declarations are what
   count.
