@@ -81,6 +81,10 @@ set.
 | `token:Uuid`      | `uuid::Uuid`                    | `Uuid`             | `UUID`              |
 | `at:NaiveDateTime`| `chrono::NaiveDateTime`         | `Timestamp`        | `TIMESTAMP`         |
 | `at:DateTime`     | `chrono::DateTime<chrono::Utc>` | `Timestamptz`      | `TIMESTAMPTZ`       |
+| `opens:time` *(or `NaiveTime`)* | `chrono::NaiveTime` | `Time`         | `TIME`              |
+| `mobile:phone` *(or `tel`)* | `String`              | `Text`             | `TEXT`              |
+| `accent:color`    | `String` (`#rrggbb`)            | `Text`             | `TEXT`              |
+| `price:money`     | `rust_decimal::Decimal`         | `Numeric`          | `NUMERIC(12,2)`     |
 | `data:Bytea` *(or `Vec<u8>`)* | `Vec<u8>`           | `Bytea`            | `BYTEA`             |
 | `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
 | `slug:slug{from:title}` | `String`                  | `Text`              | `TEXT`              |
@@ -91,6 +95,24 @@ set.
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
 emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
+
+### `time`, `phone`, `color` and `money` — native form controls
+
+These kinds pick a native form control (issue #3405):
+
+| Kind | Form control | Notes |
+|---|---|---|
+| `time` | `<input type="time">` (`FieldControl::Time`) | The browser posts `HH:MM`. On `SQLite` the column is `TEXT`. |
+| `phone` (alias `tel`) | `<input type="tel">` (`FieldControl::Tel`) | A `String` column. The browser does not check the format. |
+| `color` | `<input type="color">` (`FieldControl::Color`) | A `String` column. The browser posts a lowercase `#rrggbb`. A color input always posts a value, so `Option<color>` is an error: use `Option<String>`. |
+| `money` | `<input type="number" step="0.01">` | The same column as a bare `decimal`: `NUMERIC(12,2)`. |
+
+`phone` and `color` take no `{…}` modifier. Use `String{…}` for a constrained
+text column, and `decimal{p,s}` for another precision or scale.
+
+```bash
+autumn generate scaffold Shop name:String opens:time mobile:phone accent:color price:money
+```
 
 ### `json`/`jsonb` — flexible structured data
 

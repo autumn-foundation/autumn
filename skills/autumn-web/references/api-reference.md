@@ -813,7 +813,23 @@ Free functions rendering changeset-aware, accessible inputs:
   `FieldControl` variants (`#[non_exhaustive]`): `Text`, `Textarea`,
   `Password`, `Number { step: Option<String> }`, `Checkbox`, `Date`,
   `DateTime`, `Select { options: Vec<(String, String)> }`, `File` (any
-  `File` field ⇒ `enctype="multipart/form-data"`).
+  `File` field ⇒ `enctype="multipart/form-data"`), and **(#3405)**
+  `Switch`, `Range { step }`, `Radio { options }`, `CheckboxGroup { options }`,
+  `Segmented { options }`, `Email`, `Tel`, `Url`, `Time` (derived for a
+  `NaiveTime` column), `Month`, `Color`, `Hidden`.
+- **(#3405)** native input helpers, each with `*_with(.., &FieldOptions)`:
+  `switch_input` (`role="switch"` checkbox, `#[serde(default)] bool`),
+  `range_input(.., step)`, `radio_group(.., &[(value, label)])`,
+  `checkbox_group(..)` (bind `#[serde(default)] Vec<String>`; prefilled from
+  `Changeset::field_values`), `segmented_control(..)`, `email_input`,
+  `tel_input`, `url_input`, `time_input` (`HH:MM`, reads into `NaiveTime`),
+  `month_input` (`YYYY-MM` `String`), `color_input` (lowercase `#rrggbb`),
+  `hidden_input(&cs, field)` (no label, no wrapper). `required_*` exists for
+  switch, radio group, segmented, email, tel, url, time, month. Range, color
+  and hidden drop `required`; a required checkbox group shows the marker
+  only (validate "one or more" on the server). A group is a `<fieldset>` +
+  `<legend>`; the first input has `id="{field}"` so `error_summary` links
+  land on it, the rest `id="{field}-{index}"`.
   Decode-side contracts handled by the `#[model]`-generated `NewX`:
   non-nullable `bool` columns are `#[serde(default)]` (unchecked checkbox ⇒
   `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`

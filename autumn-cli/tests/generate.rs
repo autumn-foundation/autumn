@@ -259,7 +259,8 @@ fn generate_model_force_overwrites() {
 fn generate_model_invalid_field_lists_supported_set() {
     let (_tmp, project) = fresh_project("badtype-app");
     let (_, stderr, code) =
-        run_autumn_failing(&project, &["generate", "model", "Post", "price:Money"]);
+        // `money` is a kind since #3405, so the example is `Currency`.
+        run_autumn_failing(&project, &["generate", "model", "Post", "price:Currency"]);
     assert_eq!(code, Some(1));
     assert!(stderr.contains("unsupported type"));
     assert!(stderr.contains("Supported:"));
