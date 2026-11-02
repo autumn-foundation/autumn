@@ -4451,6 +4451,7 @@ macro_rules! native_input_helpers {
     )*};
 }
 
+#[cfg(feature = "maud")]
 native_input_helpers! {
     Email, "email", email_input, required_email_input, email_input_with,
         "The browser checks the address shape. Check it on the server too";
