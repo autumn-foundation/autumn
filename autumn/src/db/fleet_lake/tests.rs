@@ -22,9 +22,14 @@ struct Host {
     scratch: PathBuf,
 }
 
+/// Connect timeout of the test pools. The lake tests restore and load in
+/// parallel; on a busy Windows runner the default 5 s is too short.
+const CONNECT_TIMEOUT_SECS: u64 = 60;
+
 fn control(dir: &Path) -> crate::db::Pool<crate::db::RuntimeConnection> {
     crate::db::create_pool(&crate::config::DatabaseConfig {
         url: Some(format!("sqlite://{}", dir.join("control.db").display())),
+        connect_timeout_secs: CONNECT_TIMEOUT_SECS,
         ..Default::default()
     })
     .unwrap()
@@ -57,6 +62,7 @@ fn host(retention: Duration) -> Host {
     let scratch = tmp.path().join("scratch");
     std::fs::create_dir_all(&scratch).unwrap();
     let fleet = DatabaseFleet::builder(fleet_config(&root, retention))
+        .connect_timeout_secs(CONNECT_TIMEOUT_SECS)
         .build()
         .unwrap();
     let destination: Arc<dyn ReplicaDestination> =

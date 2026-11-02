@@ -1752,6 +1752,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (stuck, a, clock) = two_ranges_one_stuck(dir.path()).await;
         assert_eq!(a.refresh().await.claimed.len(), 2);
+        // The two ranges claim at the same time, so either one can get epoch 1.
+        let live = a.epoch_for(15).expect("10-19 is held");
         stuck.stuck.lock().unwrap().push(range(0, 9));
 
         // Three cycles: more than one local lease.
@@ -1765,7 +1767,7 @@ mod tests {
         }
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, range(0, 9));
-        assert_eq!(a.epoch_for(15), Some(token(2)), "the live range serves");
+        assert_eq!(a.epoch_for(15), Some(live), "the live range serves");
         assert_eq!(a.epoch_for(3), None, "the stuck range lapsed");
         assert!(a.unsettled(), "a timed out call may still land");
 
