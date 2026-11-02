@@ -54,6 +54,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Check formatting
         run: cargo fmt --all -- --check
+      # The Rust tests only search the runtime for strings, so a syntax
+      # error there passes them (#3406). Node parses the file.
+      - name: Check the widget runtime parses
+        run: node --check autumn/vendor/autumn-widgets.js
       - name: Clippy
         # `-j 2` caps codegen parallelism. This step checks the whole workspace
         # with `--all-targets`, and at cargo's default (one job per core, 4 on

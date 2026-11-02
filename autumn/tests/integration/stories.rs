@@ -261,6 +261,17 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "tooltip",
     "transition-controls",
     "translated-transition-controls",
+    // The small display set (#3406).
+    "avatar-group",
+    "button",
+    "button-group",
+    "empty-state",
+    "kbd",
+    "meter",
+    "progress",
+    "separator",
+    "skeleton",
+    "spinner",
 ];
 
 /// Slugs of stories for feature-gated modules (#3398).
@@ -461,6 +472,8 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "accordion",
     "active-search",
     "autocomplete",
+    // `data-autumn-busy` (#3406).
+    "button",
     "choice-controls",
     "confirm-action",
     "drawer",
