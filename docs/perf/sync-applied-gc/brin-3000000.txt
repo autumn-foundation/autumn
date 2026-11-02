@@ -1,3 +1,4 @@
+psql:docs/perf/sync-applied-gc/measure.sql:2: NOTICE:  extension "pg_stat_statements" already exists, skipping
 === variant brin rows 3000000
   heap  | heap_blocks |                                    index_blocks                                    
 --------+-------------+------------------------------------------------------------------------------------
@@ -10,24 +11,24 @@
 (1 row)
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) of gc_applied
-                                                                        QUERY PLAN                                                                         
------------------------------------------------------------------------------------------------------------------------------------------------------------
- Delete on public.autumn_sync_applied  (cost=38.34..32307.99 rows=0 width=0) (actual time=63.634..63.636 rows=0 loops=1)
-   Buffers: shared hit=97763 read=1024 dirtied=1003 written=826
-   ->  Bitmap Heap Scan on public.autumn_sync_applied  (cost=38.34..32307.99 rows=104195 width=6) (actual time=0.069..19.413 rows=96755 loops=1)
+                                                                        QUERY PLAN                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_sync_applied  (cost=35.45..32150.13 rows=0 width=0) (actual time=48.510..48.511 rows=0 loops=1)
+   Buffers: shared hit=97763 read=1024 dirtied=1003 written=848
+   ->  Bitmap Heap Scan on public.autumn_sync_applied  (cost=35.45..32150.13 rows=92782 width=6) (actual time=0.061..16.842 rows=96755 loops=1)
          Output: ctid
          Recheck Cond: (autumn_sync_applied.applied_at < '2026-10-02 00:00:00+00'::timestamp with time zone)
          Rows Removed by Index Recheck: 2760
          Heap Blocks: lossy=1024
-         Buffers: shared hit=5 read=1024 written=826
-         ->  Bitmap Index Scan on autumn_sync_applied_applied_at_idx  (cost=0.00..12.29 rows=111572 width=0) (actual time=0.057..0.057 rows=10240 loops=1)
+         Buffers: shared hit=5 read=1024 written=848
+         ->  Bitmap Index Scan on autumn_sync_applied_applied_at_idx  (cost=0.00..12.26 rows=99174 width=0) (actual time=0.048..0.049 rows=10240 loops=1)
                Index Cond: (autumn_sync_applied.applied_at < '2026-10-02 00:00:00+00'::timestamp with time zone)
                Buffers: shared hit=5
- Query Identifier: 4087628366608014937
+ Query Identifier: 8007686937903151434
  Planning:
    Buffers: shared hit=4
- Planning Time: 0.080 ms
- Execution Time: 63.713 ms
+ Planning Time: 0.072 ms
+ Execution Time: 48.578 ms
 (16 rows)
 
 === pg_stat_statements for the sweep
@@ -36,7 +37,7 @@
      1 | 96755 |         97781 |           97781 |                0 |                 0 |   5224770 | PREPARE gc(timestamptz) AS DELETE FROM autumn_sync_applied W
 (1 row)
 
-gc_wal_bytes 9627552
+gc_wal_bytes 9628384
  rows_after |          survivors_md5           
 ------------+----------------------------------
     2903245 | 71a502ab531c539f61fc004973368e94
@@ -44,7 +45,7 @@ gc_wal_bytes 9627552
 
  seq_scan | seq_tup_read | idx_scan | idx_tup_fetch 
 ----------+--------------+----------+---------------
-        4 |      4948004 |        0 |             0
+        4 |      4825056 |        0 |             0
 (1 row)
 
             indexrelname            | idx_scan 
@@ -53,8 +54,8 @@ gc_wal_bytes 9627552
  autumn_sync_applied_applied_at_idx |        0
 (2 rows)
 
- ingest_wal_bytes_50k | ingest_buffers_50k 
-----------------------+--------------------
-             10985328 |             314191
+ ingest_wal_bytes_50k | ingest_buffers_50k | ingest_statements 
+----------------------+--------------------+-------------------
+             11572120 |             314790 |               200
 (1 row)
 

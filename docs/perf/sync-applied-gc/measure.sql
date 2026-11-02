@@ -30,11 +30,16 @@ SELECT count(*) AS rows_after, md5(string_agg(change_id, ',' ORDER BY scope, dev
 FROM autumn_sync_applied;
 SELECT seq_scan, seq_tup_read, idx_scan, idx_tup_fetch FROM pg_stat_user_tables WHERE relname='autumn_sync_applied';
 SELECT indexrelname, idx_scan FROM pg_stat_user_indexes WHERE relname='autumn_sync_applied';
--- Write-side cost: a 50k-row dedup ingest (one day of pushes), WAL + buffers.
+-- Write-side cost: one day of pushes = 200 pushes x 250 dedup rows (50k rows).
+-- Shaped like pg_insert_applied: one INSERT per push, one scope/device, and
+-- applied_at left to its now() default, so every row of a push shares one
+-- timestamp (pinned here per push, 432 s apart across the day).
 SELECT pg_stat_statements_reset() IS NOT NULL AS reset \gset
 SELECT pg_current_wal_lsn() AS lsn1 \gset
-INSERT INTO autumn_sync_applied (scope, device_id, change_id, version, applied_at)
-SELECT 'tenant-' || (i % 200), 'dev-' || (i % 5000), 'new-' || i, i, timestamptz '2026-11-01 00:00:00+00' + i * interval '1 second'
-FROM generate_series(1, 50000) i;
+SELECT format($f$INSERT INTO autumn_sync_applied (scope, device_id, change_id, version, applied_at)
+  SELECT 'tenant-%1$s', 'dev-%2$s', 'new-%3$s-' || g, g, timestamptz '2026-11-01 00:00:00+00' + %3$s * interval '432 seconds'
+  FROM generate_series(1, 250) g$f$, p % 200, p % 5000, p)
+FROM generate_series(1, 200) p \gexec
 SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), :'lsn1') AS ingest_wal_bytes_50k,
-       (SELECT shared_blks_hit + shared_blks_read FROM pg_stat_statements WHERE query LIKE 'INSERT INTO autumn_sync_applied%') AS ingest_buffers_50k;
+       (SELECT sum(shared_blks_hit + shared_blks_read) FROM pg_stat_statements WHERE query LIKE 'INSERT INTO autumn_sync_applied%') AS ingest_buffers_50k,
+       (SELECT sum(calls) FROM pg_stat_statements WHERE query LIKE 'INSERT INTO autumn_sync_applied%') AS ingest_statements;

@@ -11,7 +11,7 @@ indexes = []
 findings = [
   "full-scan: autumn_sync_applied (no index serves it, even with enable_seqscan = off)",
 ]
-notes = "Full scan accepted: btree and BRIN on applied_at both lose at workload level, see docs/perf/sync-applied-gc"
+notes = "Full scan accepted: btree and BRIN on applied_at both lose at workload level (buffers), see docs/perf/sync-applied-gc"
 
 [[site]]
 file = "autumn/src/sync/server.rs"

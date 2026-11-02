@@ -1,3 +1,4 @@
+psql:docs/perf/sync-applied-gc/measure.sql:2: NOTICE:  extension "pg_stat_statements" already exists, skipping
 === variant baseline rows 3000000
   heap  | heap_blocks |             index_blocks              
 --------+-------------+---------------------------------------
@@ -10,18 +11,18 @@
 (1 row)
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) of gc_applied
-                                                               QUERY PLAN                                                                
------------------------------------------------------------------------------------------------------------------------------------------
- Delete on public.autumn_sync_applied  (cost=0.00..68374.79 rows=0 width=0) (actual time=294.718..294.719 rows=0 loops=1)
-   Buffers: shared hit=98592 read=30041 dirtied=1003 written=935
-   ->  Seq Scan on public.autumn_sync_applied  (cost=0.00..68374.79 rows=100182 width=6) (actual time=0.011..252.503 rows=96755 loops=1)
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_sync_applied  (cost=0.00..68375.08 rows=0 width=0) (actual time=241.118..241.120 rows=0 loops=1)
+   Buffers: shared hit=98592 read=30041 dirtied=1003 written=936
+   ->  Seq Scan on public.autumn_sync_applied  (cost=0.00..68375.08 rows=97343 width=6) (actual time=0.012..209.040 rows=96755 loops=1)
          Output: ctid
          Filter: (autumn_sync_applied.applied_at < '2026-10-02 00:00:00+00'::timestamp with time zone)
          Rows Removed by Filter: 2903245
-         Buffers: shared hit=834 read=30041 written=935
- Query Identifier: -8554756381832333848
- Planning Time: 0.048 ms
- Execution Time: 294.785 ms
+         Buffers: shared hit=834 read=30041 written=936
+ Query Identifier: -1214127714484208048
+ Planning Time: 0.046 ms
+ Execution Time: 241.184 ms
 (10 rows)
 
 === pg_stat_statements for the sweep
@@ -30,7 +31,7 @@
      1 | 96755 |        127630 |           98624 |            29006 |                 0 |   5224770 | PREPARE gc(timestamptz) AS DELETE FROM autumn_sync_applied W
 (1 row)
 
-gc_wal_bytes 5434592
+gc_wal_bytes 7464424
  rows_after |          survivors_md5           
 ------------+----------------------------------
     2903245 | 71a502ab531c539f61fc004973368e94
@@ -46,8 +47,8 @@ gc_wal_bytes 5434592
  autumn_sync_applied_pkey |        1
 (1 row)
 
- ingest_wal_bytes_50k | ingest_buffers_50k 
-----------------------+--------------------
-             10228608 |             203226
+ ingest_wal_bytes_50k | ingest_buffers_50k | ingest_statements 
+----------------------+--------------------+-------------------
+             11562040 |             203114 |               200
 (1 row)
 
