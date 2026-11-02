@@ -2075,13 +2075,20 @@ mod tests {
         let shared = Arc::new(store(dir.path(), &clock).await);
         let a =
             FleetOwnership::new(shared, owner("a"), vec![range(0, 9), range(10, 19)], TTL).unwrap();
-        assert_eq!(a.refresh().await.claimed.len(), 2);
+        let claimed = a.refresh().await.claimed;
+        assert_eq!(claimed.len(), 2);
+        // The two claims run at the same time, so either can get epoch 1.
+        let held = claimed
+            .iter()
+            .find(|(claimed, _)| *claimed == range(10, 19))
+            .map(|(_, epoch)| *epoch);
+        assert!(held.is_some());
         assert!(a.lose(3, token(9)));
         let report = a.refresh().await;
         assert_eq!(report.renewed, vec![range(10, 19)]);
         assert!(report.lost.is_empty());
         assert_eq!(report.claimed, vec![(range(0, 9), token(10))]);
-        assert_eq!(a.epoch_for(15), Some(token(2)));
+        assert_eq!(a.epoch_for(15), held, "the other range keeps its epoch");
     }
 
     #[tokio::test]
