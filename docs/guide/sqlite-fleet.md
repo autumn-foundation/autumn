@@ -411,6 +411,15 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
   by serving it. Turn on [slot ownership](#failover-slot-ownership) with it:
   without ownership, nothing stops the previous owner, and the two copies
   diverge. Boot logs a warning for `restore_missing` without ownership.
+  This setting is only for a missing file. A stale file (one that is older
+  than the replica) is a different case: with ownership on, the host
+  restores it without `restore_missing` (step 5 of
+  [the failover procedure](#the-failover-procedure)).
+
+**Replication is asynchronous.** A host acknowledges a write when the write
+is on its own volume. The next pass ships it to the replica. So a failover
+to another volume can lose an acknowledged write. See
+[What a failover costs](#what-a-failover-costs).
 
 **Processes can share a replicated fleet root.** Only one process replicates a
 database. It holds the lock file `<db>.replicator.lock`. The other processes
@@ -544,6 +553,9 @@ slots = ["0-8191"]   # default: every slot, as one range
 lease_secs = 30      # default; 3 to 3600
 ```
 
+The lease is also the takeover time after a crash. See
+[What a failover costs](#what-a-failover-costs) before you change it.
+
 The overrides are `AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER`, `..._SLOTS`
 (comma-separated) and `..._LEASE_SECS`. The processes on one volume (a `web`
 and a `worker` role) use the same `owner` and the same `slots`. A tenant fleet
@@ -599,9 +611,10 @@ the first request.
    older than the replica. Each file records the epoch it was last opened
    under. On the first open at the newer epoch, the host compares that epoch
    with the newest epoch at the replica. If the replica's is newer, the host
-   restores the file from the replica before it serves it. Without
-   `[replication]` there is nothing to compare with: give the old host an
-   empty volume.
+   restores the file from the replica before it serves it. This works
+   without `restore_missing`: that setting is only for a missing file.
+   Without `[replication]` there is nothing to compare with: give the old
+   host an empty volume.
 6. **Move part of a range.** Change `slots` on the owner, for example from
    `"0-8191"` to `"0-4095"`, and restart it. A clean shutdown releases the
    old range, so the owner claims `"0-4095"` at once at a new epoch. Another
@@ -613,6 +626,27 @@ the `held` ranges with their epoch and whether the host serves them now, and
 the ranges that are `waiting`, `lost` or `failed`. The status is `Down` when
 the last claim or renew could not reach the table, or when a held range
 stopped serving because a renew did not come back in time.
+
+### What a failover costs
+
+Replication is asynchronous. A host acknowledges a write when the write is
+on its own volume. The next pass ships it to the replica. A failover costs
+data and time:
+
+| Cost | Bound | Default |
+| --- | --- | --- |
+| Data | The writes that the old owner did not ship. While each pass fits in `sync_interval_secs`, at most `rpo_secs`. At worst, `worst_lag_seconds` in `replication:fleet`. | 10 s |
+| Time, old owner crashed | At most `lease_secs + lease_secs / 3` after the last renew of the old owner, plus the clock skew and the first restore. The lease ends, then the waiting host claims on its next try (every `lease_secs / 3`). | 40 s |
+| Time, lease already ended | At most `lease_secs / 3`: the next try of the waiting host. | 10 s |
+
+- A long lease gives a long outage after a crash. A short lease allows less
+  clock skew (see [Clocks](#clocks)).
+- A paused host (`SIGSTOP`, a frozen VM) is the same as a crashed host. It
+  loses the writes that it did not ship.
+- The old volume does not keep these writes. When the old owner gets the
+  range back, it restores the replica over its stale file (step 5 above).
+- A fenced old owner answers `421` for each write. `fleet:ownership` shows
+  the range as `lost`, then as `waiting` while the new owner holds it.
 
 ### Clocks
 

@@ -3057,7 +3057,12 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   (`FleetError::NotOwner`), and `restore_missing` runs only for an owned key.
   Each claim gets an epoch: a restore selects the newest epoch, and an old
   owner's replicator stops. A host that gets a range back restores files
-  older than the replica before it serves them. Health: `fleet:ownership`. The built-in table is
+  older than the replica before it serves them, with or without
+  `restore_missing`. Replication is asynchronous: a takeover loses the
+  unshipped writes (`rpo_secs` steady state, `worst_lag_seconds` worst), and a
+  fail back does not bring them back. A crash costs up to
+  `lease_secs + lease_secs / 3` of outage. Guide: "What a failover costs".
+  Health: `fleet:ownership`. The built-in table is
   on the control database, so it fences the processes of one host only;
   hosts on different machines implement `SlotOwnershipStore`
   (`autumn_web::db::fleet_ownership`). Guide: "Failover: slot ownership" in
