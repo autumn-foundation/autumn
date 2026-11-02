@@ -63,6 +63,16 @@ fn the_replication_section_says_an_acknowledged_write_can_be_lost() {
     );
 }
 
+/// The last cell of the table row whose first cell is `label`.
+fn row_default(text: &str, label: &str) -> String {
+    let row = text
+        .lines()
+        .find(|line| line.starts_with(&format!("| {label} |")))
+        .unwrap_or_else(|| panic!("the cost table has no `{label}` row"));
+    let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+    cells[cells.len() - 2].to_owned()
+}
+
 /// Findings 1, 2 and 6: the data and the time that a failover costs.
 #[test]
 fn the_guide_gives_the_cost_of_a_failover() {
@@ -78,16 +88,23 @@ fn the_guide_gives_the_cost_of_a_failover() {
             "`lease_secs + lease_secs / 3`",
             "outage",
             "SIGSTOP",
+            "opened during the pause",
+            "keeps its own file",
         ],
     );
     let lease = default_lease_secs();
-    let takeover = lease + lease / 3;
     let rpo = ReplicationConfig::default().rpo_secs;
-    assert_says(
-        &text,
-        heading,
-        &[&format!("{takeover} s"), &format!("{rpo} s")],
-    );
+    for (label, secs) in [
+        ("Data", rpo),
+        ("Time, old host crashed", lease + lease / 3),
+        ("Time, old lease already ended", lease / 3),
+    ] {
+        let default = row_default(&text, label);
+        assert!(
+            default.starts_with(&format!("{secs} s")),
+            "the `{label}` row must give the default {secs} s, not `{default}`"
+        );
+    }
 }
 
 /// Finding 2: the ownership config states the default lease, next to the
@@ -98,14 +115,16 @@ fn the_ownership_example_shows_the_default_lease() {
     let text = section(heading);
     let lease = default_lease_secs();
     assert!(
-        text.contains(&format!("lease_secs = {lease}      # default")),
+        text.lines().any(|line| {
+            line.starts_with(&format!("lease_secs = {lease} ")) && line.contains("# default")
+        }),
         "`{heading}` must show the default `lease_secs = {lease}`"
     );
     assert_says(&text, heading, &["takeover time"]);
 }
 
 /// Finding 4: `restore_missing` reads as "only when the file is absent".
-/// A fail back restores a stale file without it.
+/// A fail-back restores a stale file without it.
 #[test]
 fn the_guide_says_a_stale_file_is_restored_without_restore_missing() {
     let heading = "## Replication: object storage between volumes";

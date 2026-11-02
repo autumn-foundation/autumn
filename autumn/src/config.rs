@@ -1166,8 +1166,9 @@ pub struct ReplicationConfig {
     /// how much recently committed data a total loss of the machine costs.
     /// Defaults to 10 (AC #2).
     ///
-    /// Replication is asynchronous. A write is acknowledged before it ships,
-    /// so a failover to another volume can lose an acknowledged write.
+    /// Replication is asynchronous. The host acknowledges a write before the
+    /// replicator ships it. So a failover to another volume can lose an
+    /// acknowledged write.
     #[serde(default = "default_rpo_secs")]
     pub rpo_secs: u64,
 
@@ -10500,8 +10501,9 @@ pub struct DatabaseFleetConfig {
     /// Turn on [`ownership`](Self::ownership) too, so the old owner is fenced
     /// first (ADR 0019 §7).
     ///
-    /// This setting is only for a missing file. With ownership on, a file
-    /// that is older than the replica (a fail back) is restored without it.
+    /// This setting is only for a missing file. With ownership and
+    /// `[replication]` on, a host that gets a range back restores a stale
+    /// file without this setting.
     #[serde(default)]
     pub restore_missing: bool,
 
@@ -10562,7 +10564,7 @@ pub struct FleetOwnershipConfig {
     /// `30`. From `3` to `3600`. Clock skew plus the longest request must be
     /// less than a third of it.
     ///
-    /// The lease is also the takeover time. After a crash, another host
+    /// The lease also sets the takeover time. After a crash, another host
     /// serves the range at most `lease_secs + lease_secs / 3` after the last
     /// renew. A long lease gives a long outage.
     #[serde(default = "default_fleet_lease_secs")]

@@ -2646,8 +2646,9 @@ mod tests {
         }
 
         /// Replication is asynchronous. A takeover loses the writes that the
-        /// old owner did not ship. A fail back loses them too, though they
-        /// are on the old owner's volume (a frozen host, Baton findings 1, 6).
+        /// old owner did not ship. The new owner opened the database during
+        /// the pause, so a fail-back does not recover them, though they are
+        /// on the old owner's volume (Baton findings 1, 6).
         #[tokio::test]
         async fn a_takeover_and_a_fail_back_lose_the_unshipped_writes() {
             let dir = tempfile::tempdir().unwrap();
@@ -2698,7 +2699,45 @@ mod tests {
             a.fleet.close_all().await;
         }
 
-        /// `restore_missing` is for a missing file only. A fail back restores
+        /// A paused host ships its unshipped writes when it continues. If the
+        /// new owner did not open the database meanwhile, they are not lost.
+        #[tokio::test]
+        async fn a_paused_host_ships_the_tail_of_a_database_the_new_owner_did_not_open() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            exec(&db_a, "INSERT INTO notes VALUES ('shipped')")
+                .await
+                .unwrap();
+            tick(&a.replication).await;
+            // Acknowledged. A pauses before the next pass ships it.
+            exec(&db_a, "INSERT INTO notes VALUES ('not shipped')")
+                .await
+                .unwrap();
+            drop(db_a);
+
+            // B claims the range but does not open the database yet.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+
+            // A continues, finds the range lost and closes the database. The
+            // close ships the tail.
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            assert_eq!(a.fleet.fence_unowned(), 1);
+            a.fleet.close(&key).await;
+
+            let db_b = b.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_b).await, vec!["shipped", "not shipped"]);
+            drop(db_b);
+            b.fleet.close_all().await;
+        }
+
+        /// `restore_missing` is for a missing file only. A fail-back restores
         /// a stale file without it (Baton finding 4).
         #[tokio::test]
         async fn a_fail_back_restores_a_stale_file_without_restore_missing() {
