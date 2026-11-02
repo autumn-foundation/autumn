@@ -164,22 +164,41 @@ impl WidthReport {
     /// The physical tables some `table!` or `#[model]` declares. A model names
     /// a Diesel table, so it maps through that `table!`'s `sql_name`.
     fn declared_physical(&self) -> std::collections::BTreeSet<(PathBuf, String)> {
-        let macros: BTreeMap<(&Path, &str), &str> = self
+        // A `table!` keeps its own physical table: two `users` declarations in
+        // different schemas map two tables. Only a `#[model]` resolves through
+        // the `table!` it names, and if that name is declared more than once
+        // in the package, through each of them.
+        let mut macros: BTreeMap<(&Path, &str), Vec<&str>> = BTreeMap::new();
+        for t in self
             .tables
             .iter()
             .filter(|t| t.source == WidthSource::TableMacro)
-            .map(|t| ((t.package.as_path(), t.table.as_str()), t.physical.as_str()))
-            .collect();
-        self.tables
-            .iter()
-            .filter(|t| t.source != WidthSource::Migration)
-            .map(|t| {
-                let physical = macros
-                    .get(&(t.package.as_path(), t.table.as_str()))
-                    .map_or_else(|| t.physical.clone(), |p| (*p).to_owned());
-                (t.package.clone(), physical)
-            })
-            .collect()
+        {
+            macros
+                .entry((t.package.as_path(), t.table.as_str()))
+                .or_default()
+                .push(t.physical.as_str());
+        }
+        let mut declared = std::collections::BTreeSet::new();
+        for t in &self.tables {
+            match t.source {
+                WidthSource::Migration => {}
+                WidthSource::TableMacro => {
+                    declared.insert((t.package.clone(), t.physical.clone()));
+                }
+                WidthSource::Model => match macros.get(&(t.package.as_path(), t.table.as_str())) {
+                    Some(physicals) => declared.extend(
+                        physicals
+                            .iter()
+                            .map(|p| (t.package.clone(), (*p).to_owned())),
+                    ),
+                    None => {
+                        declared.insert((t.package.clone(), t.physical.clone()));
+                    }
+                },
+            }
+        }
+        declared
     }
 
     /// Whether `t` is a migration whose table some Rust declaration maps:
@@ -1559,6 +1578,24 @@ mod tests {
         assert!(
             public.over(DIESEL_DEFAULT_COLUMN_LIMIT).is_empty(),
             "{public:?}"
+        );
+    }
+
+    #[test]
+    fn same_named_declarations_in_two_schemas_keep_their_own_tables() {
+        let cols: Vec<String> = (0..33).map(|i| format!("c{i} TEXT")).collect();
+        let sql = format!(
+            "CREATE TABLE a.users ({}); CREATE TABLE b.users (id INT);",
+            cols.join(", ")
+        );
+        // `a.users` is declared in one module and `b.users` in another, both
+        // as `users`: the last one must not overwrite the first's mapping.
+        let schema = "mod a { diesel::table! { a.users (c0) { c0 -> Text, } } } \
+                      mod b { diesel::table! { b.users (id) { id -> Int4, } } }";
+        let report = report_of(&sql, &[("schema.rs", schema)]);
+        assert!(
+            report.over(DIESEL_DEFAULT_COLUMN_LIMIT).is_empty(),
+            "{report:?}"
         );
     }
 
