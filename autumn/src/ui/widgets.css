@@ -2756,8 +2756,9 @@
     text-overflow: ellipsis;
 }
 
-/* The spinner sits on top of the label, so the width does not change. */
-.autumn-button__spinner {
+/* The spinner sits on top of the label, so the width does not change.
+   Two classes: this rule must beat the `.autumn-spinner__icon` display. */
+.autumn-button > .autumn-button__spinner {
     display: none;
     position: absolute;
     inset: 0;
@@ -2766,16 +2767,18 @@
 
 /* Busy: a static `aria-busy`, or an htmx request on the button or on an
    element around it (the button sends it, its form sends it, or
-   `hx-indicator` names it). */
-.autumn-button[aria-busy="true"] .autumn-button__spinner,
-.htmx-request .autumn-button__spinner {
+   `hx-indicator` names it). Three classes: these beat the rule above. */
+.autumn-button[aria-busy="true"] > .autumn-button__spinner,
+.autumn-button.htmx-request > .autumn-button__spinner,
+.htmx-request .autumn-button > .autumn-button__spinner {
     display: block;
 }
 
 /* Hide the icon and the label with opacity only. They stay in the
    accessibility tree, so the button keeps its name. */
-.autumn-button[aria-busy="true"] .autumn-button__spinner ~ *,
-.htmx-request .autumn-button__spinner ~ * {
+.autumn-button[aria-busy="true"] > .autumn-button__spinner ~ *,
+.autumn-button.htmx-request > .autumn-button__spinner ~ *,
+.htmx-request .autumn-button > .autumn-button__spinner ~ * {
     opacity: 0;
 }
 

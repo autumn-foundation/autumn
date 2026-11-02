@@ -1857,6 +1857,10 @@ fn concat_suffix(base: &str, suffix: &str) -> String {
 /// ```
 #[cfg(feature = "maud")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent HTML attribute or class"
+)]
 pub struct FieldOptions<'a> {
     hint: Option<Cow<'a, str>>,
     required: bool,

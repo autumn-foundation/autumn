@@ -1002,15 +1002,56 @@ mod tests {
             }
         }
         assert_eq!(hides, 1, "one rule hides the content of a busy button");
-        let shows = rules()
-            .into_iter()
+    }
+
+    /// Class-level specificity: classes, attributes and pseudo-classes.
+    /// The selectors it reads have no ids and no `:not()`.
+    fn class_specificity(selector: &str) -> usize {
+        selector.matches('.').count()
+            + selector.matches('[').count()
+            + selector.matches(':').count()
+            - 2 * selector.matches("::").count()
+    }
+
+    /// Codex review (#3406): `.autumn-spinner__icon` comes later in the
+    /// file and sets `display`. The rule that hides the button spinner must
+    /// beat it, and each busy rule must beat the hide rule. Then the order
+    /// of the rules does not matter.
+    #[test]
+    fn button_spinner_is_hidden_unless_the_button_is_busy() {
+        const HIDE: &str = ".autumn-button > .autumn-button__spinner";
+        let rules = rules();
+        let sets_display = |r: &&Rule| r.declarations().iter().any(|(p, _)| *p == "display");
+        let hide = rules
+            .iter()
+            .find(|r| r.selector == HIDE)
+            .expect("the hide rule");
+        assert!(hide.body.contains("display: none;"), "{}", hide.body);
+        let floor = class_specificity(HIDE);
+        let icon = rules
+            .iter()
+            .filter(sets_display)
+            .filter(|r| r.selector == ".autumn-spinner__icon")
+            .count();
+        assert!(icon > 0, "no `.autumn-spinner__icon` display rule");
+        assert!(class_specificity(".autumn-spinner__icon") < floor);
+        let show = rules
+            .iter()
+            .filter(sets_display)
             .find(|r| {
                 r.selector
-                    .contains(r#".autumn-button[aria-busy="true"] .autumn-button__spinner"#)
-                    && r.selector.contains(".htmx-request .autumn-button__spinner")
+                    .contains(r#".autumn-button[aria-busy="true"] > .autumn-button__spinner"#)
             })
-            .expect("a rule that shows the spinner");
-        assert!(shows.body.contains("display: block;"), "{}", shows.body);
+            .expect("the busy rule");
+        assert!(show.body.contains("display: block;"), "{}", show.body);
+        let selectors: Vec<&str> = show.selector.split(',').map(str::trim).collect();
+        assert_eq!(selectors.len(), 3, "{selectors:?}");
+        for selector in selectors {
+            assert!(
+                class_specificity(selector) > floor,
+                "{selector} does not beat {HIDE}"
+            );
+        }
     }
 
     /// An indicator is hidden until htmx marks it, or an element around

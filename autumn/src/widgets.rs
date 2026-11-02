@@ -7680,6 +7680,19 @@ impl ButtonSize {
     }
 }
 
+/// When a [`button`] is busy.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ButtonBusy {
+    /// Never.
+    #[default]
+    No,
+    /// Now: the server renders `aria-busy="true"`.
+    Now,
+    /// During an htmx request: `data-autumn-busy`.
+    OnRequest,
+}
+
 /// Options for [`button`]. The default is a medium primary
 /// `type="button"`.
 #[cfg(feature = "maud")]
@@ -7690,8 +7703,7 @@ pub struct ButtonConfig<'a> {
     kind: crate::a11y::ButtonType,
     icon: Option<maud::Markup>,
     icon_only: bool,
-    loading: bool,
-    loading_on_request: bool,
+    busy: ButtonBusy,
     disabled: bool,
     id: Option<&'a str>,
     class: Option<&'a str>,
@@ -7751,9 +7763,10 @@ impl<'a> ButtonConfig<'a> {
 
     /// Render the button busy: `aria-busy="true"`, `disabled` and a
     /// spinner. Use it when the server knows that work is in progress.
+    /// It replaces [`loading_on_request`](Self::loading_on_request).
     #[must_use]
     pub const fn loading(mut self) -> Self {
-        self.loading = true;
+        self.busy = ButtonBusy::Now;
         self
     }
 
@@ -7764,10 +7777,10 @@ impl<'a> ButtonConfig<'a> {
     /// the htmx `htmx-request` class. That is the case when the button
     /// sends the request, when its form sends it, or when `hx-indicator`
     /// names the button. `autumn-widgets.js` sets `aria-busy="true"` for
-    /// the same time.
+    /// the same time. It replaces [`loading`](Self::loading).
     #[must_use]
     pub const fn loading_on_request(mut self) -> Self {
-        self.loading_on_request = true;
+        self.busy = ButtonBusy::OnRequest;
         self
     }
 
@@ -7855,14 +7868,13 @@ pub fn button(label: &str, config: &ButtonConfig<'_>) -> maud::Markup {
     if let Some(id) = config.id {
         attrs.push(("id", id));
     }
-    if config.disabled || config.loading {
+    match config.busy {
+        ButtonBusy::Now => attrs.extend([("disabled", ""), ("aria-busy", "true")]),
+        ButtonBusy::OnRequest => attrs.push(("data-autumn-busy", "")),
+        ButtonBusy::No => {}
+    }
+    if config.disabled && config.busy != ButtonBusy::Now {
         attrs.push(("disabled", ""));
-    }
-    if config.loading {
-        attrs.push(("aria-busy", "true"));
-    }
-    if config.loading_on_request {
-        attrs.push(("data-autumn-busy", ""));
     }
     attrs.extend_from_slice(config.attrs);
     let label_class = if config.icon_only {
@@ -7872,7 +7884,7 @@ pub fn button(label: &str, config: &ButtonConfig<'_>) -> maud::Markup {
     };
     // The spinner is first. CSS hides the elements after it while busy.
     let body = maud::html! {
-        @if config.loading || config.loading_on_request {
+        @if config.busy != ButtonBusy::No {
             span class="autumn-button__spinner autumn-spinner__icon" aria-hidden="true" {}
         }
         @if let Some(icon) = &config.icon {
@@ -8928,9 +8940,7 @@ const fn avatar_group_split(len: usize, total: Option<usize>, max: usize) -> (us
         _ => len,
     };
     let max = if max == 0 { 1 } else { max };
-    let shown = if count <= max {
-        len
-    } else if len < max - 1 {
+    let shown = if count <= max || len < max - 1 {
         len
     } else {
         max - 1
@@ -12330,6 +12340,19 @@ mod display_set_tests {
         // The runtime sets aria-busy. The server does not.
         assert!(!html.contains("aria-busy"), "{html}");
         assert!(!html.contains("disabled"), "{html}");
+    }
+
+    #[test]
+    fn the_last_loading_call_wins() {
+        let html = btn(&ButtonConfig::new().loading_on_request().loading());
+        assert!(html.contains(r#"aria-busy="true""#), "{html}");
+        assert!(!html.contains("data-autumn-busy"), "{html}");
+        let html = btn(&ButtonConfig::new().loading().loading_on_request());
+        assert!(html.contains("data-autumn-busy"), "{html}");
+        assert!(!html.contains("aria-busy"), "{html}");
+        // `disabled` with a static loading state is one attribute.
+        let html = btn(&ButtonConfig::new().disabled().loading());
+        assert_eq!(html.matches("disabled").count(), 1, "{html}");
     }
 
     #[test]
