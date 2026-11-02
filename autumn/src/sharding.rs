@@ -3586,7 +3586,7 @@ mod tests {
     // A fleet opens `max_open` databases, not one per shard.
     #[cfg(feature = "sqlite")]
     #[test]
-    fn a_fleet_counts_max_open_databases() {
+    fn sqlite_fleet_counts_max_open_databases() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let fleet = crate::db::fleet::DatabaseFleet::builder(crate::config::DatabaseFleetConfig {
             mode: crate::fleet_layout::FleetMode::Slot,
