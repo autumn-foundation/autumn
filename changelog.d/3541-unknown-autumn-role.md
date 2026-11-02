@@ -9,10 +9,13 @@
 ### Changed
 
 - **config:** `role` in `autumn.toml` and `AUTUMN_ROLE` use one parser, so
-  they give the same result. `role` is now case-insensitive, as
-  `AUTUMN_ROLE` was. New API: `FromStr` for `ProcessRole`,
+  they give the same result. `role` now ignores case and leading or trailing
+  spaces, as `AUTUMN_ROLE` did. New API: `FromStr` for `ProcessRole`,
   `ProcessRole::ACCEPTED_VALUES`, `ProcessRole::parse_env_override` and
-  `config::UnknownProcessRole`.
+  `config::ParseProcessRoleError`.
+- **config:** `AutumnConfig::apply_env_overrides` and
+  `apply_env_overrides_with_env` do not print a warning for an unknown
+  `AUTUMN_ROLE`. They leave `role` as it is. The loaders reject the value.
 - **doctor:** `autumn doctor` fails the `process_role_backend` row on an
   unknown `AUTUMN_ROLE` or `role`, with the boot error text. It reads
   `AUTUMN_ROLE` and `AUTUMN_JOBS__BACKEND` from `.env` too, as the app does.

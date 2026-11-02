@@ -3478,6 +3478,17 @@ const PROCESS_ROLE_SPELLINGS: [(&str, ProcessRole); 10] = [
     ("worker_only", ProcessRole::Worker),
 ];
 
+/// The spellings of [`PROCESS_ROLE_SPELLINGS`], in the same order.
+const PROCESS_ROLE_NAMES: [&str; PROCESS_ROLE_SPELLINGS.len()] = {
+    let mut names = [""; PROCESS_ROLE_SPELLINGS.len()];
+    let mut i = 0;
+    while i < PROCESS_ROLE_SPELLINGS.len() {
+        names[i] = PROCESS_ROLE_SPELLINGS[i].0;
+        i += 1;
+    }
+    names
+};
+
 /// A `role` or `AUTUMN_ROLE` value that names no [`ProcessRole`].
 ///
 /// The message names the value and lists the accepted spellings.
@@ -3486,11 +3497,11 @@ const PROCESS_ROLE_SPELLINGS: [(&str, ProcessRole); 10] = [
     "unknown process role {value:?} (accepted: {})",
     ProcessRole::ACCEPTED_VALUES.join(", ")
 )]
-pub struct UnknownProcessRole {
+pub struct ParseProcessRoleError {
     value: String,
 }
 
-impl UnknownProcessRole {
+impl ParseProcessRoleError {
     /// The value as given, before trim.
     #[must_use]
     pub fn value(&self) -> &str {
@@ -3499,14 +3510,14 @@ impl UnknownProcessRole {
 }
 
 impl std::str::FromStr for ProcessRole {
-    type Err = UnknownProcessRole;
+    type Err = ParseProcessRoleError;
 
     /// Parse a role. Case-insensitive. Leading and trailing spaces are
     /// ignored.
     ///
     /// # Errors
     ///
-    /// Returns [`UnknownProcessRole`] when the value is not in
+    /// Returns [`ParseProcessRoleError`] when the value is not in
     /// [`ProcessRole::ACCEPTED_VALUES`]. A blank value is an error.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let wanted = value.trim().to_ascii_lowercase();
@@ -3514,7 +3525,7 @@ impl std::str::FromStr for ProcessRole {
             .iter()
             .find(|(spelling, _)| *spelling == wanted)
             .map(|(_, role)| *role)
-            .ok_or_else(|| UnknownProcessRole {
+            .ok_or_else(|| ParseProcessRoleError {
                 value: value.to_owned(),
             })
     }
@@ -3560,15 +3571,7 @@ impl<'de> Deserialize<'de> for ProcessRole {
 
 impl ProcessRole {
     /// Every spelling [`FromStr`](std::str::FromStr) accepts, in error order.
-    pub const ACCEPTED_VALUES: [&'static str; 10] = {
-        let mut names = [""; 10];
-        let mut i = 0;
-        while i < PROCESS_ROLE_SPELLINGS.len() {
-            names[i] = PROCESS_ROLE_SPELLINGS[i].0;
-            i += 1;
-        }
-        names
-    };
+    pub const ACCEPTED_VALUES: &'static [&'static str] = &PROCESS_ROLE_NAMES;
 
     /// Parse a role value. Returns `None` for an unknown or blank value.
     ///
@@ -3585,8 +3588,8 @@ impl ProcessRole {
     ///
     /// # Errors
     ///
-    /// Returns [`UnknownProcessRole`] for a value that names no role.
-    pub fn parse_env_override(value: &str) -> Result<Option<Self>, UnknownProcessRole> {
+    /// Returns [`ParseProcessRoleError`] for a value that names no role.
+    pub fn parse_env_override(value: &str) -> Result<Option<Self>, ParseProcessRoleError> {
         if value.trim().is_empty() {
             return Ok(None);
         }
@@ -23734,7 +23737,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         for spelling in ROLE_SPELLINGS_3541 {
             assert!(spelling.parse::<ProcessRole>().is_ok(), "{spelling}");
         }
-        assert_eq!(ProcessRole::ACCEPTED_VALUES, ROLE_SPELLINGS_3541);
+        assert_eq!(ProcessRole::ACCEPTED_VALUES, ROLE_SPELLINGS_3541.as_slice());
     }
 
     #[test]
@@ -23804,8 +23807,23 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert!(toml_err.contains(&expected), "toml: {toml_err}");
 
         // The same good value also gives the same role on both paths.
-        let parsed: AutumnConfig = toml::from_str("role = \"JOBS\"\n").expect("JOBS");
-        assert_eq!(parsed.role, ProcessRole::Worker);
+        let from_toml: AutumnConfig = toml::from_str("role = \" JOBS \"\n").expect("JOBS");
+        let env = role_env_3541(env_dir.path(), &[("AUTUMN_ROLE", " JOBS ")]);
+        let from_env = AutumnConfig::load_with_env(&env).expect("JOBS");
+        assert_eq!(from_toml.role, ProcessRole::Worker);
+        assert_eq!(from_env.role, from_toml.role);
+    }
+
+    /// The bug in #3541: a valid TOML role and a typo in the env. The load
+    /// must fail. It must not keep the TOML role or fall back to `combined`.
+    #[test]
+    fn autumn_role_env_typo_over_valid_toml_role_fails_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("autumn.toml"), "role = \"worker\"\n")
+            .expect("write autumn.toml");
+        let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", "workers")]);
+        let err = AutumnConfig::load_with_env(&env).expect_err("typo must fail");
+        assert!(err.to_string().contains("\"workers\""), "{err}");
     }
 
     #[test]

@@ -6375,8 +6375,9 @@ where
 
 /// Resolve the role as the runtime loader does (#3541).
 ///
-/// A non-blank `AUTUMN_ROLE` wins. A blank one is unset. An unknown value on
-/// either source is an error with the boot error text. It does not fall back.
+/// The loader parses the TOML `role` first, so a bad one is an error even
+/// when `AUTUMN_ROLE` is valid. Then a non-blank `AUTUMN_ROLE` wins. A blank
+/// one is unset. An unknown value is an error with the boot error text.
 fn resolve_process_role_from_sources<F>(
     env_var: &F,
     table: Option<&toml::Table>,
@@ -6384,23 +6385,24 @@ fn resolve_process_role_from_sources<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    if let Some(value) = env_var("AUTUMN_ROLE") {
-        if let Some(role) =
-            ProcessRole::parse_env_override(&value).map_err(|err| format!("AUTUMN_ROLE: {err}"))?
-        {
-            return Ok(role);
-        }
-    }
-    match table.and_then(|t| t.get("role")) {
-        None => Ok(ProcessRole::Combined),
+    let configured = match table.and_then(|t| t.get("role")) {
+        None => ProcessRole::Combined,
         Some(toml::Value::String(value)) => value
             .parse::<ProcessRole>()
-            .map_err(|err| format!("role: {err}")),
-        Some(other) => Err(format!(
-            "role: expected a string, found {}",
-            other.type_str()
-        )),
-    }
+            .map_err(|err| format!("role: {err}"))?,
+        Some(other) => {
+            return Err(format!(
+                "role: expected a string, found {}",
+                other.type_str()
+            ));
+        }
+    };
+    let from_env = env_var("AUTUMN_ROLE")
+        .map(|value| ProcessRole::parse_env_override(&value))
+        .transpose()
+        .map_err(|err| format!("AUTUMN_ROLE: {err}"))?
+        .flatten();
+    Ok(from_env.unwrap_or(configured))
 }
 
 /// Resolve the configured queue names and the effective `jobs.pin` for the
@@ -20637,6 +20639,35 @@ foo = "bar"
                 "{source}"
             );
         }
+    }
+
+    /// #3541: boot parses the TOML `role` first. A bad one fails even when
+    /// `AUTUMN_ROLE` is valid.
+    #[test]
+    fn resolve_process_role_rejects_bad_toml_role_under_valid_env() {
+        let table: toml::Table = toml::from_str("role = \"wrker\"\n").expect("parse toml");
+        let (role, _) = resolve_process_role_and_backend_from_sources(
+            |key| (key == "AUTUMN_ROLE").then(|| "worker".to_owned()),
+            Some(&table),
+        );
+        let message = role.expect_err("bad TOML role must fail");
+        assert!(message.contains("\"wrker\""), "{message}");
+    }
+
+    /// #3541: doctor reads `AUTUMN_ROLE` from the env it is given. `run()`
+    /// gives it the `.env` overlay, as the app loader uses.
+    #[test]
+    fn resolve_process_role_reads_the_given_env() {
+        let env = autumn_web::config::MockEnv::new()
+            .with("AUTUMN_ROLE", "workers")
+            .with("AUTUMN_JOBS__BACKEND", "postgres");
+        let (role, backend) = resolve_process_role_and_backend(None, &env);
+        assert!(role.expect_err("unknown").contains("\"workers\""));
+        assert_eq!(backend, "postgres");
+
+        let env = autumn_web::config::MockEnv::new().with("AUTUMN_ROLE", "server");
+        let (role, _) = resolve_process_role_and_backend(None, &env);
+        assert_eq!(role, Ok(ProcessRole::Web));
     }
 
     /// #3541: a blank `AUTUMN_ROLE=` is unset. The TOML role applies.
