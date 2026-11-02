@@ -245,6 +245,7 @@
     margin: 0;
     border: 1px solid var(--control-border);
     border-radius: var(--radius-full);
+    color: var(--text);
     background-color: var(--surface-muted);
     cursor: pointer;
 }
