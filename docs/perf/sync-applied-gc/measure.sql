@@ -1,4 +1,5 @@
 \pset pager off
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 \echo === variant :variant rows :n
 SELECT pg_size_pretty(pg_relation_size('autumn_sync_applied')) AS heap,
        pg_relation_size('autumn_sync_applied')/8192 AS heap_blocks,
