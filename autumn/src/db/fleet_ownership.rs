@@ -735,8 +735,6 @@ struct PendingCall {
 /// The answer of a claim that outlived its time limit.
 struct LateClaim {
     answer: tokio::sync::oneshot::Receiver<Result<Grant, OwnershipError>>,
-    /// Local lease end: send time + lease - renew interval.
-    valid_until: tokio::time::Instant,
 }
 
 impl PendingCall {
@@ -978,10 +976,7 @@ impl FleetOwnership {
                         .unwrap_or_else(PoisonError::into_inner)
                         .as_mut()
                 {
-                    call.late = Some(LateClaim {
-                        answer: answered,
-                        valid_until,
-                    });
+                    call.late = Some(LateClaim { answer: answered });
                 }
                 return Outcome::TimedOut;
             }
@@ -1024,9 +1019,9 @@ impl FleetOwnership {
         }
     }
 
-    /// Read the answer of a claim that ended late, and hold the grant. The
-    /// lease end counts from the send time, so it is never later than the
-    /// store's. `release_all` releases the grant. This also clears the slot.
+    /// Read the answer of a claim that ended late, and hold the grant with a
+    /// lease that is already over: the range is not served until a renew.
+    /// `release_all` releases the grant. This also clears the slot.
     fn settle_late(
         &self,
         range: SlotRange,
@@ -1044,7 +1039,7 @@ impl FleetOwnership {
         // A late error or a closed channel is a failed claim: nothing to keep.
         if let Ok(Ok(grant)) = late.answer.try_recv() {
             tracing::info!(range = %range, epoch = %grant.epoch, "fleet slot claim ended late; kept");
-            self.accept(range, grant, floor, late.valid_until, false);
+            self.accept(range, grant, floor, tokio::time::Instant::now(), false);
         }
     }
 
@@ -1978,18 +1973,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_late_grant_is_served_only_until_its_lease_end() {
+    async fn a_late_grant_is_not_served_before_a_renew() {
         let dir = tempfile::tempdir().unwrap();
         let (stuck, a, late) = late_claim(dir.path()).await;
-        // Stuck again. The lease end counts from the send time, so it passes
-        // while the renew hangs.
+        // The renew hangs. The grant was settled inside the old lease.
         stuck.stuck.lock().unwrap().push(late);
-        let _ = a.refresh().await;
-        assert_eq!(a.epoch_for(3), None, "the lease end passed");
+        let running = Arc::clone(&a);
+        let refresh = tokio::spawn(async move { running.refresh().await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(a.epoch_for(3), None, "not served before a renew");
         assert!(
             a.held().iter().any(|(r, _)| *r == late),
             "but the grant is known"
         );
+        refresh.abort();
     }
 
     #[tokio::test(start_paused = true)]
