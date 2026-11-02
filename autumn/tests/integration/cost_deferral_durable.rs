@@ -134,9 +134,11 @@ mod postgres {
     }
 
     #[derive(diesel::QueryableByName)]
-    struct ValueRow {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        value: i64,
+    struct JobRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        status: String,
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        attempt: i32,
     }
 
     #[tokio::test]
@@ -176,16 +178,32 @@ mod postgres {
         )
         .await;
 
+        // The worker meters a run when its handler returns, then acks the row
+        // (`status = 'completed'`) in a separate write. The scenario returns
+        // once both runs are metered, so the ack may still be in flight: wait
+        // for the row to settle before reading its attempt.
         let mut conn = pool.get().await.expect("conn");
-        let first_attempt = diesel::sql_query(
-            "SELECT COUNT(*) AS value FROM autumn_jobs \
-             WHERE name = 'pg_cost_deferred_job' AND status = 'completed' AND attempt = 1",
-        )
-        .get_result::<ValueRow>(&mut conn)
-        .await
-        .expect("query")
-        .value;
-        assert_eq!(first_attempt, 1, "the deferred job used no attempt");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let row = loop {
+            let row = diesel::sql_query(
+                "SELECT status, attempt FROM autumn_jobs \
+                 WHERE name = 'pg_cost_deferred_job'",
+            )
+            .get_result::<JobRow>(&mut conn)
+            .await
+            .expect("query");
+            if row.status == "completed" {
+                break row;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deferred job never settled: status {:?}, attempt {}",
+                row.status,
+                row.attempt
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        assert_eq!(row.attempt, 1, "the deferred job used no attempt");
     }
 }
 

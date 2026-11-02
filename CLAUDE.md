@@ -44,6 +44,28 @@ that has none. See `docs/perf/README.md`.
   `scripts/ledger-profile.sh`, or run `scripts/perf/ledger_catalog.py update`
   on the `ledger-capture` artifact of the failed run.
 
+## Diesel table width: 32 columns or fewer
+
+**No framework Diesel declaration (`table!` or `#[model]`) goes over 32
+columns**, and no Autumn crate turns on diesel's `64-column-tables` or
+`128-column-tables`. Diesel compiles its tuple impls up to that cap, and Cargo
+unifies the feature, so one wide declaration makes every crate that uses
+diesel compile the larger set. Every app built on Autumn pays for it. Measured
+on one crate: 1.16 GB / 1m18s at 32, 2.92 GB / 2m04s at 64, 9.95 GB / 8m16s at
+128.
+
+- The cap is per **declaration**, not per database table. A table past 32
+  columns is declared in halves: a second `table!` with
+  `#[sql_name = "<table>"]` maps the same rows. Each `#[model(table = …)]`
+  sits on one half. Every `NOT NULL` column without a default goes in the half
+  you insert through.
+- The `lint` job runs `autumn schema width .`. It reads every `table!` and
+  `#[model]`, replays every migration set, and fails on a declaration over 32
+  columns, a migration table over 32 that no declaration maps, or a wide
+  diesel feature.
+- Apps are not blocked. `autumn build` prints the same findings as a warning
+  and keeps building. See `docs/guide/table-width.md`.
+
 ## Changelog
 
 **Never edit `CHANGELOG.md` in a feature PR**, and never create a new

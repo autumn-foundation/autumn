@@ -67,6 +67,7 @@ Looking for the API reference instead? That is
 ## Database, models and queries
 
 - [Declarative Schema](declarative-schema.md) — describing tables on the model and letting Autumn derive the DDL
+- [Table Width](table-width.md) — why tables stay at 32 columns or fewer, and the `autumn build` warning
 - [Migrations](migrations.md) — writing, running, and rolling back schema changes
 - [Database Seeding](seeding.md) — populating a fresh database with development data
 - [Repositories and Bulk Operations](repositories.md) — querying, inserting and updating records

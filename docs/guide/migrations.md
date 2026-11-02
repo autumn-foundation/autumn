@@ -6,6 +6,12 @@ covers the advisory-lock serialisation that prevents schema divergence during
 rolling deploys, how to monitor contention, and what to expect on non-Postgres
 backends.
 
+Keep each Diesel `table!` at 32 columns or fewer. A wider declaration forces
+diesel's `64-column-tables` feature, which makes every crate that uses diesel
+slower to compile. A wide table is fine when Rust declares it in halves with
+`#[sql_name]`. `autumn build` warns when a migration widens a table past 32
+columns and no declaration splits it. See [Table width](./table-width.md).
+
 ---
 
 ## Advisory lock serialisation

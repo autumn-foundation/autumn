@@ -554,6 +554,21 @@ checks are:
 
 ---
 
+## `autumn schema width`
+
+Reports every `diesel::table!` and `#[model]` wider than Diesel's default
+32-column tuple cap, and every replayed migration table over 32 columns that
+no declaration maps (a `#[sql_name]` split counts as a mapping). It exits
+non-zero on a finding. `autumn build` prints the same
+findings as a warning. See [Table width](./table-width.md) for why 32 is the
+line.
+
+```sh
+autumn schema width
+autumn schema width --all
+autumn schema width --max 64
+```
+
 ## A typical loop
 
 ```sh
