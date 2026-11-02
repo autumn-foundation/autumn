@@ -452,8 +452,9 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
   The plugin-check CLI uses the same rules. Nothing else changed.
 - **New stable surface (no-route plugins):** `ConformanceConfig::no_routes()`
   and the `ConformanceConfig::no_routes` field. A plugin that mounts no routes
-  now passes `run_conformance` in `cargo test`, the same as
-  `autumn plugin-check --no-routes`. Code that does not call it sees no
+  now passes `run_conformance` in `cargo test`, like
+  `autumn plugin-check --no-routes`. Pass the plugin's contract with it, so a
+  route under the `registered_as` name is found. Code that does not call it sees no
   change. `ConformanceConfig` is `#[non_exhaustive]`, so the new field breaks
   no struct literal.
 - **New stable surface (widget packs, #3400):** `widget_pack` (the widget

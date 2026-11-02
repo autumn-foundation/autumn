@@ -54,9 +54,9 @@ pub struct ConformanceConfig {
     /// one. Drives the `experimental-surface` check; without it that check is
     /// skipped rather than assumed clean.
     pub contract: Option<PluginContract>,
-    /// The plugin mounts no routes, like `autumn plugin-check --no-routes`.
-    /// Then no attributed route skips `route-attribution`, and an attributed
-    /// route fails it.
+    /// The plugin mounts no routes. Then no route under a name of the plugin
+    /// skips `route-attribution`, and such a route fails it. The names are
+    /// `plugin_name` and, with a contract, its `plugin` and `registered_as`.
     pub no_routes: bool,
 }
 
@@ -74,9 +74,14 @@ impl ConformanceConfig {
     }
 
     /// Declare that the plugin mounts no routes (a cache, a background
-    /// runtime). This is the library form of `autumn plugin-check --no-routes`.
+    /// runtime). It is the library counterpart of
+    /// `autumn plugin-check --no-routes`, and it is stricter: it does not need
+    /// a contract dump to skip.
     ///
-    /// Without it, a report with no attributed route fails `route-attribution`.
+    /// Pass the plugin's contract too, so that a route under its
+    /// `registered_as` name (the type path by default) is also found.
+    /// Without `no_routes`, a report with no attributed route fails
+    /// `route-attribution`.
     #[must_use]
     pub const fn no_routes(mut self) -> Self {
         self.no_routes = true;
@@ -341,13 +346,23 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
 }
 
 /// `route-attribution` for a plugin that declares
-/// [`no_routes`](ConformanceConfig::no_routes), the same rule as
-/// `autumn plugin-check --no-routes`: no attributed route skips, and an
-/// attributed route fails, because it contradicts the declaration.
-fn check_no_routes(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
+/// [`no_routes`](ConformanceConfig::no_routes). No route under any name of
+/// the plugin skips the check. A route under one of them fails it, because it
+/// contradicts the declaration.
+///
+/// The names are `plugin_name`, the contract's crate name and the contract's
+/// `registered_as`: routes carry `Plugin::name()`, which defaults to the type
+/// path, not the crate name.
+fn check_no_routes(config: &ConformanceConfig, routes: &[RouteInfo]) -> CheckResult {
+    let plugin_name = config.plugin_name.as_str();
+    let contract = config.contract.as_ref();
+    let names: Vec<&str> = std::iter::once(plugin_name)
+        .chain(contract.map(|c| c.plugin.as_str()))
+        .chain(contract.and_then(|c| c.registered_as.as_deref()))
+        .collect();
     let attributed = routes
         .iter()
-        .filter(|r| matches!(&r.source, RouteSource::Plugin(n) if n == plugin_name))
+        .filter(|r| matches!(&r.source, RouteSource::Plugin(n) if names.contains(&n.as_str())))
         .count();
 
     if attributed == 0 {
@@ -363,7 +378,8 @@ fn check_no_routes(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
             status: CheckStatus::Fail,
             message: format!(
                 "no_routes was declared, but {attributed} route(s) are attributed to \
-                 plugin:{plugin_name}"
+                 {plugin_name} (names checked: {})",
+                names.join(", ")
             ),
             diagnostics: vec![],
         }
@@ -783,7 +799,7 @@ pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> Conf
     let mut checks = Vec::new();
 
     if config.no_routes {
-        checks.push(check_no_routes(&config.plugin_name, routes));
+        checks.push(check_no_routes(config, routes));
     } else {
         checks.push(check_route_attribution(&config.plugin_name, routes));
     }
@@ -1381,6 +1397,28 @@ mod tests {
             attribution.message
         );
         assert!(!report.passed());
+    }
+
+    #[test]
+    fn run_conformance_no_routes_counts_every_name_of_the_plugin() {
+        // `Plugin::name()` defaults to the type path, so routes carry it, not
+        // the crate name the config uses.
+        let routes = vec![make_route(
+            "GET",
+            "/cache/stats",
+            plugin("my_cache::CachePlugin"),
+        )];
+        let mut contract = PluginContract::new("my-cache");
+        contract.registered_as = Some("my_cache::CachePlugin".to_owned());
+        let config = ConformanceConfig::new("my-cache")
+            .contract(contract)
+            .no_routes();
+        let report = run_conformance(&config, &routes);
+        assert!(
+            !report.passed(),
+            "a route under the registered name contradicts no_routes:\n{}",
+            report.to_text_report()
+        );
     }
 
     #[test]
