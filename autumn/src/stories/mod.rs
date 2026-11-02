@@ -45,6 +45,13 @@ const STORY_DETAIL_PATH: &str = "/_stories/{slug}";
 /// Demo backend for the "Active search" story. See [`demo_search`].
 const STORIES_DEMO_SEARCH_PATH: &str = "/_stories/demo/search";
 
+/// Demo backend for the busy states in the "Button", "Spinner" and
+/// "Skeleton" stories (#3406). See [`demo_save`].
+const STORIES_DEMO_SAVE_PATH: &str = "/_stories/demo/save";
+
+/// How long [`demo_save`] waits, so the busy state is visible.
+const STORIES_DEMO_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+
 /// Demo backend for the "Autocomplete" story. See [`demo_tag_search`].
 const STORIES_DEMO_TAG_SEARCH_PATH: &str = "/_stories/demo/tags/search";
 
@@ -462,6 +469,16 @@ where
             STORIES_DEMO_FEED_PATH,
             axum::routing::get(demo_infinite_feed),
         )
+        .route(STORIES_DEMO_SAVE_PATH, axum::routing::get(demo_save))
+}
+
+/// The backend of the busy-state demos (#3406): it waits, then answers
+/// "Saved.". The wait lets a visitor see `aria-busy`, the button spinner
+/// and the `hx-indicator` skeleton. It is a GET, so it needs no CSRF token
+/// and changes nothing.
+async fn demo_save() -> Html<&'static str> {
+    tokio::time::sleep(STORIES_DEMO_SAVE_DELAY).await;
+    Html("Saved.")
 }
 
 /// Query params `demo_search` and `demo_tag_search` both accept — the `q`

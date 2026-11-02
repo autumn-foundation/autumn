@@ -1560,13 +1560,14 @@
 }
 
 /* Deterministic per-name background palette (selected by avatar_palette_class).
-   Class-based so no inline `style` attribute is emitted. */
+   Class-based so no inline `style` attribute is emitted. Each color gives
+   white initials 4.5:1 (WCAG 1.4.3); a test in widgets_css.rs checks it. */
 .autumn-avatar--c0 { background: hsl(0, 60%, 42%); }
 .autumn-avatar--c1 { background: hsl(30, 60%, 40%); }
-.autumn-avatar--c2 { background: hsl(60, 55%, 36%); }
-.autumn-avatar--c3 { background: hsl(90, 55%, 34%); }
+.autumn-avatar--c2 { background: hsl(60, 55%, 30%); }
+.autumn-avatar--c3 { background: hsl(90, 55%, 32%); }
 .autumn-avatar--c4 { background: hsl(120, 50%, 34%); }
-.autumn-avatar--c5 { background: hsl(150, 55%, 34%); }
+.autumn-avatar--c5 { background: hsl(150, 55%, 33%); }
 .autumn-avatar--c6 { background: hsl(180, 55%, 32%); }
 .autumn-avatar--c7 { background: hsl(210, 60%, 42%); }
 .autumn-avatar--c8 { background: hsl(240, 55%, 50%); }
@@ -2624,4 +2625,588 @@
 .autumn-active {
     font-weight: var(--font-weight-semibold);
     color: var(--primary);
+}
+
+/* ── Button (autumn-button, #3406) ────────────────────────────────────────── */
+
+.autumn-button {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    padding: 0 var(--space-4);
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    font-family: inherit;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    line-height: var(--line-height-tight);
+    text-decoration: none;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.autumn-button:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-button:disabled,
+.autumn-button[aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* A busy button is disabled too. It keeps full opacity: the spinner shows. */
+.autumn-button[aria-busy="true"] {
+    opacity: 1;
+    cursor: progress;
+}
+
+/* Sizes come before the variants, so the link variant can drop the padding. */
+.autumn-button--sm {
+    min-block-size: var(--space-8);
+    padding-inline: var(--space-3);
+}
+
+.autumn-button--md {
+    min-block-size: calc(var(--space-8) + var(--space-2));
+    padding-inline: var(--space-4);
+}
+
+.autumn-button--lg {
+    min-block-size: calc(var(--space-8) + var(--space-4));
+    padding-inline: var(--space-6);
+    font-size: var(--font-size-md);
+}
+
+/* An icon-only button is square. */
+.autumn-button--icon {
+    padding-inline: 0;
+    min-inline-size: calc(var(--space-8) + var(--space-2));
+}
+
+.autumn-button--icon.autumn-button--sm {
+    min-inline-size: var(--space-8);
+}
+
+.autumn-button--icon.autumn-button--lg {
+    min-inline-size: calc(var(--space-8) + var(--space-4));
+}
+
+.autumn-button--primary {
+    background-color: var(--primary);
+    color: var(--on-primary);
+}
+
+.autumn-button--primary:hover {
+    background-color: var(--primary-hover);
+}
+
+.autumn-button--secondary {
+    background-color: var(--surface);
+    color: var(--text);
+    border-color: var(--control-border);
+}
+
+.autumn-button--secondary:hover {
+    background-color: var(--surface-muted);
+}
+
+.autumn-button--ghost {
+    background-color: transparent;
+    color: var(--text);
+}
+
+.autumn-button--ghost:hover {
+    background-color: var(--surface-muted);
+}
+
+.autumn-button--destructive {
+    background-color: var(--danger);
+    color: var(--on-danger);
+}
+
+.autumn-button--destructive:hover {
+    background-color: var(--danger-hover);
+}
+
+/* A link button keeps a 24px target (WCAG 2.5.8). A fixed size, not a
+   space token: the minimum must not scale down with density. */
+.autumn-button--link {
+    min-block-size: 1.5rem;
+    padding: 0;
+    background-color: transparent;
+    color: var(--primary);
+    text-decoration: underline;
+    text-underline-offset: 0.15em;
+}
+
+.autumn-button--link:hover {
+    color: var(--primary-hover);
+}
+
+.autumn-button__icon {
+    display: inline-flex;
+    flex: none;
+}
+
+.autumn-button__label {
+    min-inline-size: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* The spinner sits on top of the label, so the width does not change.
+   Two classes: this rule must beat the `.autumn-spinner__icon` display. */
+.autumn-button > .autumn-button__spinner {
+    display: none;
+    position: absolute;
+    inset: 0;
+    margin: auto;
+}
+
+/* Busy: `aria-busy` (from the server, or from the runtime for the
+   submitter of a form), or htmx marks the button itself (it sends the
+   request, or `hx-indicator` names it). Three classes: these beat the
+   rule above. */
+.autumn-button[aria-busy="true"] > .autumn-button__spinner,
+.autumn-button.htmx-request > .autumn-button__spinner {
+    display: block;
+}
+
+/* Hide the icon and the label with opacity only. They stay in the
+   accessibility tree, so the button keeps its name. */
+.autumn-button[aria-busy="true"] > .autumn-button__spinner ~ *,
+.autumn-button.htmx-request > .autumn-button__spinner ~ * {
+    opacity: 0;
+}
+
+/* ── Button group (autumn-button-group, #3406) ────────────────────────────── */
+
+.autumn-button-group {
+    display: inline-flex;
+    isolation: isolate;
+}
+
+.autumn-button-group--vertical {
+    flex-direction: column;
+}
+
+/* The focus ring shows above the next button. */
+.autumn-button-group > :focus-visible {
+    z-index: 1;
+}
+
+/* The buttons touch. -1px puts two borders on one line. */
+.autumn-button-group:not(.autumn-button-group--vertical) > :not(:first-child) {
+    margin-inline-start: -1px;
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
+}
+
+.autumn-button-group:not(.autumn-button-group--vertical) > :not(:last-child) {
+    border-start-end-radius: 0;
+    border-end-end-radius: 0;
+}
+
+.autumn-button-group--vertical > :not(:first-child) {
+    margin-block-start: -1px;
+    border-start-start-radius: 0;
+    border-start-end-radius: 0;
+}
+
+.autumn-button-group--vertical > :not(:last-child) {
+    border-end-start-radius: 0;
+    border-end-end-radius: 0;
+}
+
+/* ── Spinner (autumn-spinner, #3406) ──────────────────────────────────────── */
+
+.autumn-spinner {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    color: var(--primary);
+}
+
+.autumn-spinner--sm {
+    font-size: var(--font-size-md);
+}
+
+.autumn-spinner--md {
+    font-size: var(--font-size-2xl);
+}
+
+.autumn-spinner--lg {
+    font-size: calc(2 * var(--font-size-md));
+}
+
+/* A ring with one colored arc. The busy button uses it too. Without
+   color-mix(), the track is transparent and the arc still shows. */
+.autumn-spinner__icon {
+    display: inline-block;
+    flex: none;
+    inline-size: 1em;
+    block-size: 1em;
+    box-sizing: border-box;
+    border: 0.15em solid transparent;
+    border-color: color-mix(in srgb, currentColor 25%, transparent);
+    border-block-start-color: currentColor;
+    border-radius: var(--radius-full);
+}
+
+@keyframes autumn-spin {
+    to { transform: rotate(1turn); }
+}
+
+/* Opacity only: no motion. */
+@keyframes autumn-pulse {
+    50% { opacity: 0.4; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .autumn-spinner__icon {
+        animation: autumn-spin 0.8s linear infinite;
+    }
+}
+
+/* Reduced motion: the ring does not turn. It fades slowly. */
+@media (prefers-reduced-motion: reduce) {
+    .autumn-spinner__icon {
+        animation: autumn-pulse 2s ease-in-out infinite;
+    }
+}
+
+/* Forced colors makes every border one color, and the arc goes. */
+@media (forced-colors: active) {
+    .autumn-spinner__icon {
+        forced-color-adjust: none;
+        border-color: GrayText;
+        border-block-start-color: CanvasText;
+    }
+}
+
+/* An htmx indicator is hidden until htmx gives it, or an element around
+   it, the `htmx-request` class. A spinner keeps its `role="status"` root
+   in the tree and hides only its content, so a screen reader reads the
+   label when it shows. */
+.autumn-indicator:not(.autumn-spinner):not(.htmx-request, .htmx-request *),
+.autumn-spinner.autumn-indicator:not(.htmx-request, .htmx-request *) > * {
+    display: none;
+}
+
+/* ── Skeleton (autumn-skeleton, #3406) ────────────────────────────────────── */
+
+.autumn-skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.autumn-skeleton--circle {
+    flex-direction: row;
+}
+
+/* Forced colors removes the background. The transparent border keeps an
+   edge, because forced colors paints it. */
+.autumn-skeleton__item {
+    display: block;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background-color: var(--border);
+}
+
+.autumn-skeleton--line .autumn-skeleton__item {
+    inline-size: 100%;
+    block-size: 1em;
+}
+
+.autumn-skeleton--line .autumn-skeleton__item:last-child:not(:only-child) {
+    inline-size: 60%;
+}
+
+.autumn-skeleton--block .autumn-skeleton__item {
+    block-size: calc(3 * var(--space-8));
+    border-radius: var(--radius);
+}
+
+.autumn-skeleton--circle .autumn-skeleton__item {
+    flex: none;
+    inline-size: calc(var(--space-8) + var(--space-2));
+    block-size: calc(var(--space-8) + var(--space-2));
+    border-radius: var(--radius-full);
+}
+
+/* The skeleton pulses. Reduced motion: it does not. */
+@media (prefers-reduced-motion: no-preference) {
+    .autumn-skeleton__item {
+        animation: autumn-pulse 1.5s ease-in-out infinite;
+    }
+}
+
+/* ── Progress and meter (autumn-progress, autumn-meter, #3406) ────────────── */
+
+.autumn-progress {
+    display: block;
+    inline-size: 100%;
+    block-size: var(--space-2);
+    accent-color: var(--primary);
+}
+
+/* The browser colors a meter good, average or bad. These rules use the
+   tokens. Keep each engine's pseudo-element in its own rule: one unknown
+   selector drops the whole rule. Use the `background` shorthand: the UA
+   paints a gradient image over a `background-color`. */
+.autumn-meter {
+    display: block;
+    inline-size: 100%;
+    block-size: var(--space-2);
+    appearance: none;
+    border: 0;
+    border-radius: var(--radius-full);
+    background: var(--surface-muted);
+    color: var(--text);
+}
+
+.autumn-meter::-webkit-meter-bar {
+    block-size: var(--space-2);
+    border: 0;
+    border-radius: var(--radius-full);
+    background: var(--surface-muted);
+}
+
+.autumn-meter::-webkit-meter-optimum-value {
+    border-radius: var(--radius-full);
+    background: var(--success);
+}
+
+.autumn-meter::-webkit-meter-suboptimum-value {
+    border-radius: var(--radius-full);
+    background: var(--warning-text);
+}
+
+.autumn-meter::-webkit-meter-even-less-good-value {
+    border-radius: var(--radius-full);
+    background: var(--danger);
+}
+
+.autumn-meter::-moz-meter-bar {
+    border-radius: var(--radius-full);
+    background: var(--success);
+}
+
+.autumn-meter:-moz-meter-optimum::-moz-meter-bar {
+    background: var(--success);
+}
+
+.autumn-meter:-moz-meter-sub-optimum::-moz-meter-bar {
+    background: var(--warning-text);
+}
+
+.autumn-meter:-moz-meter-sub-sub-optimum::-moz-meter-bar {
+    background: var(--danger);
+}
+
+/* Forced colors removes the backgrounds, and the bar goes. Use system
+   colors: a Canvas track with an edge and a Highlight fill. */
+@media (forced-colors: active) {
+    .autumn-meter {
+        forced-color-adjust: none;
+        border: 1px solid CanvasText;
+        background: Canvas;
+    }
+
+    .autumn-meter::-webkit-meter-bar {
+        background: Canvas;
+    }
+
+    .autumn-meter::-webkit-meter-optimum-value {
+        background: Highlight;
+    }
+
+    .autumn-meter::-webkit-meter-suboptimum-value {
+        background: Highlight;
+    }
+
+    .autumn-meter::-webkit-meter-even-less-good-value {
+        background: Highlight;
+    }
+
+    .autumn-meter::-moz-meter-bar {
+        background: Highlight;
+    }
+
+    .autumn-meter:-moz-meter-optimum::-moz-meter-bar {
+        background: Highlight;
+    }
+
+    .autumn-meter:-moz-meter-sub-optimum::-moz-meter-bar {
+        background: Highlight;
+    }
+
+    .autumn-meter:-moz-meter-sub-sub-optimum::-moz-meter-bar {
+        background: Highlight;
+    }
+}
+
+.autumn-progress-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.autumn-progress-field__header {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-2);
+    font-size: var(--font-size-sm);
+}
+
+.autumn-progress-field__label {
+    font-weight: var(--font-weight-medium);
+    color: var(--text);
+}
+
+.autumn-progress-field__value {
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ── Separator (autumn-separator, #3406) ──────────────────────────────────── */
+
+.autumn-separator {
+    block-size: 0;
+    margin: var(--space-4) 0;
+    border: 0;
+    border-block-start: 1px solid var(--border);
+}
+
+.autumn-separator--vertical {
+    display: inline-block;
+    align-self: stretch;
+    inline-size: 0;
+    block-size: auto;
+    min-block-size: 1em;
+    margin: 0 var(--space-2);
+    border-block-start: 0;
+    border-inline-start: 1px solid var(--border);
+    vertical-align: middle;
+}
+
+/* ── Kbd (autumn-kbd, #3406) ──────────────────────────────────────────────── */
+
+.autumn-kbd {
+    display: inline-block;
+    min-inline-size: 1.5em;
+    padding: 0 var(--space-1);
+    border: 1px solid var(--border);
+    border-block-end-width: 2px;
+    border-radius: var(--radius-sm);
+    background-color: var(--surface-muted);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    line-height: var(--line-height-normal);
+    text-align: center;
+    white-space: nowrap;
+}
+
+.autumn-kbd-combo {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* ── Empty state (autumn-empty-state, #3406) ──────────────────────────────── */
+
+.autumn-empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-8) var(--space-4);
+    text-align: center;
+}
+
+.autumn-empty-state__icon {
+    display: inline-flex;
+    color: var(--text-muted);
+    font-size: var(--font-size-2xl);
+}
+
+.autumn-empty-state__title {
+    margin: 0;
+    color: var(--text);
+    font-size: var(--font-size-lg);
+    font-weight: var(--font-weight-semibold);
+}
+
+.autumn-empty-state__body {
+    max-inline-size: 40ch;
+    margin: 0;
+    color: var(--text-muted);
+}
+
+.autumn-empty-state__action {
+    margin-block-start: var(--space-2);
+}
+
+/* ── Avatar group (autumn-avatar-group, #3406) ────────────────────────────── */
+
+.autumn-avatar-group {
+    display: inline-flex;
+    align-items: center;
+}
+
+/* A ring in the surface color shows where two avatars overlap. */
+.autumn-avatar-group > .autumn-avatar {
+    box-shadow: 0 0 0 2px var(--surface);
+}
+
+.autumn-avatar-group > .autumn-avatar + .autumn-avatar {
+    margin-inline-start: calc(-1 * var(--space-2));
+}
+
+/* The +N item is a pill: a long count or large text does not clip
+   (WCAG 1.4.4). Its minimum sizes match the .autumn-avatar--* sizes. */
+.autumn-avatar-group__more {
+    width: auto;
+    height: auto;
+    padding: 0 var(--space-1);
+    background-color: var(--surface-muted);
+    color: var(--text);
+    font-weight: var(--font-weight-semibold);
+}
+
+.autumn-avatar-group__more.autumn-avatar--sm {
+    min-width: 24px;
+    min-height: 24px;
+}
+
+.autumn-avatar-group__more.autumn-avatar--md {
+    min-width: 40px;
+    min-height: 40px;
+}
+
+.autumn-avatar-group__more.autumn-avatar--lg {
+    min-width: 64px;
+    min-height: 64px;
+}
+
+/* ── Auto-grow textarea (autumn-auto-grow, #3406) ─────────────────────────── */
+
+/* The textarea grows with its text. A browser with no `field-sizing` keeps
+   the `rows` height. `field-sizing` also sizes the width to the text, so
+   the width is set. */
+.autumn-auto-grow {
+    inline-size: 100%;
+    field-sizing: content;
+    min-block-size: 3lh;
+    max-block-size: 50vh;
 }

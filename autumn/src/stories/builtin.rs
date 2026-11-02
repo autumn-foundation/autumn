@@ -114,7 +114,7 @@ fn builtin_stories() -> Vec<Story> {
             {
                 use autumn_web::form::{
                     Changeset, FieldOptions, checkbox_input_with, required_password_input,
-                    select_input_with, text_input_with,
+                    select_input_with, text_input_with, textarea_input_with,
                 };
 
                 // Field wrapper v2 (#3395): hint, required marker, typed
@@ -128,6 +128,7 @@ fn builtin_stories() -> Vec<Story> {
                         "password": "",
                         "plan": "pro",
                         "terms": false,
+                        "about": "Type more lines. The box grows.",
                     }),
                     errors,
                 );
@@ -152,6 +153,10 @@ fn builtin_stories() -> Vec<Story> {
                         &FieldOptions::new().disabled().hint("Change your plan in billing."),
                     ))
                     (checkbox_input_with(&changeset, "terms", "I accept the terms", &FieldOptions::new().required()))
+                    // `field-sizing: content` grows the textarea (#3406).
+                    (textarea_input_with(&changeset, "about", "About you", &FieldOptions::new()
+                        .auto_grow()
+                        .hint("The box grows with the text.")))
                 }
             }
         },
@@ -619,6 +624,308 @@ fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Display",
+            "Avatar group",
+            {
+                use autumn_web::widgets::{
+                    AvatarConfig, AvatarGroupConfig, AvatarSize, avatar, avatar_group,
+                    avatar_group_with,
+                };
+
+                let names = [
+                    "Ada Lovelace",
+                    "Grace Hopper",
+                    "Linus Torvalds",
+                    "Margaret Hamilton",
+                    "Barbara Liskov",
+                    "Edsger Dijkstra",
+                ];
+                let members: Vec<maud::Markup> =
+                    names.iter().map(|n| avatar(n, &AvatarConfig::new())).collect();
+                let small = AvatarConfig::new().size(AvatarSize::Small);
+                let likes: Vec<maud::Markup> =
+                    names.iter().take(3).map(|n| avatar(n, &small)).collect();
+                maud::html! {
+                    // Six avatars: four show, and "+2" names the rest.
+                    div { (avatar_group("Project members", &members)) }
+                    // 120 people, 3 avatars: the total sets the count.
+                    div {
+                        (avatar_group_with("Liked by", &likes, &AvatarGroupConfig::new()
+                            .size(AvatarSize::Small)
+                            .max(3)
+                            .total(120)))
+                    }
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Separator",
+            {
+                use autumn_web::widgets::{SeparatorConfig, separator, separator_with};
+
+                maud::html! {
+                    p { "Account settings" }
+                    (separator())
+                    p { "Billing settings" }
+                    // Vertical separators in a row of links.
+                    div {
+                        a href="#docs" { "Docs" }
+                        (separator_with(&SeparatorConfig::new().vertical()))
+                        a href="#api" { "API" }
+                        // For looks only: screen readers skip it.
+                        (separator_with(&SeparatorConfig::new().vertical().decorative()))
+                        a href="#blog" { "Blog" }
+                    }
+                }
+            }
+        },
+        story! {
+            "Display",
+            "Kbd",
+            {
+                use autumn_web::widgets::{kbd, kbd_combo};
+
+                maud::html! {
+                    p { "Press " (kbd("Esc")) " to close the dialog." }
+                    p { "Press " (kbd_combo(&["Ctrl", "K"])) " to search." }
+                }
+            }
+        },
+        story! {
+            "Actions",
+            "Button",
+            {
+                use autumn_web::links::{LinkToOptions, link_to_with};
+                use autumn_web::widgets::{ButtonConfig, ButtonSize, ButtonVariant, button};
+
+                let pencil = maud::html! {
+                    svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor" {
+                        path d="M11.5 1.5a1.4 1.4 0 0 1 2 2L5 12l-3 1 1-3z" {}
+                    }
+                };
+                let secondary = ButtonConfig::new().variant(ButtonVariant::Secondary);
+                maud::html! {
+                    p {
+                        (button("Primary", &ButtonConfig::new())) " "
+                        (button("Secondary", &secondary)) " "
+                        (button("Ghost", &ButtonConfig::new().variant(ButtonVariant::Ghost))) " "
+                        (button("Delete", &ButtonConfig::new().variant(ButtonVariant::Destructive))) " "
+                        (button("Link", &ButtonConfig::new().variant(ButtonVariant::Link)))
+                    }
+                    p {
+                        (button("Small", &ButtonConfig::new().size(ButtonSize::Small))) " "
+                        (button("Medium", &ButtonConfig::new())) " "
+                        (button("Large", &ButtonConfig::new().size(ButtonSize::Large)))
+                    }
+                    p {
+                        // An icon before the label.
+                        (button("Edit", &secondary.clone().icon(pencil.clone()))) " "
+                        // Icon only: the label is the hidden name.
+                        (button("Edit post", &ButtonConfig::new()
+                            .variant(ButtonVariant::Ghost)
+                            .icon(pencil)
+                            .icon_only())) " "
+                        (button("Disabled", &ButtonConfig::new().disabled())) " "
+                        // The server knows that work is in progress.
+                        (button("Exporting", &ButtonConfig::new().loading()))
+                    }
+                    p {
+                        // Live: the demo answers after a short wait. The
+                        // button is busy while the request runs.
+                        (button("Save", &ButtonConfig::new()
+                            .id("story-save")
+                            .loading_on_request()
+                            .attrs(&[
+                                ("hx-get", "/_stories/demo/save"),
+                                ("hx-target", "#story-save-status"),
+                            ])))
+                        " "
+                        span id="story-save-status" role="status" {}
+                    }
+                    // The submit button of an htmx form is busy too.
+                    form hx-get="/_stories/demo/save" hx-target="#story-publish-status" {
+                        (button("Publish", &ButtonConfig::new()
+                            .submit()
+                            .id("story-publish")
+                            .loading_on_request()))
+                        " "
+                        span id="story-publish-status" role="status" {}
+                    }
+                    // The classes also style a link.
+                    p {
+                        (link_to_with("Read the docs", "#docs", &LinkToOptions::new()
+                            .class("autumn-button autumn-button--secondary autumn-button--md")))
+                    }
+                }
+            }
+        },
+        story! {
+            "Actions",
+            "Button group",
+            {
+                use autumn_web::widgets::{
+                    ButtonConfig, ButtonGroupConfig, ButtonVariant, button, button_group,
+                    button_group_with,
+                };
+
+                let secondary = ButtonConfig::new().variant(ButtonVariant::Secondary);
+                maud::html! {
+                    div {
+                        (button_group("Text alignment", &[
+                            button("Left", &secondary),
+                            button("Center", &secondary),
+                            button("Right", &secondary),
+                        ]))
+                    }
+                    div {
+                        (button_group_with(
+                            "Zoom",
+                            &[button("Zoom in", &secondary), button("Zoom out", &secondary)],
+                            &ButtonGroupConfig::new().vertical(),
+                        ))
+                    }
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Spinner",
+            {
+                use autumn_web::widgets::{
+                    ButtonConfig, ButtonVariant, SpinnerConfig, SpinnerSize, button, spinner,
+                    spinner_with,
+                };
+
+                maud::html! {
+                    p {
+                        (spinner_with("Loading", &SpinnerConfig::new().size(SpinnerSize::Small))) " "
+                        (spinner("Loading")) " "
+                        (spinner_with("Loading", &SpinnerConfig::new().size(SpinnerSize::Large)))
+                    }
+                    p {
+                        // An htmx indicator: hidden until the request runs.
+                        (button("Load", &ButtonConfig::new()
+                            .variant(ButtonVariant::Secondary)
+                            .attrs(&[
+                                ("hx-get", "/_stories/demo/save"),
+                                ("hx-target", "#story-spinner-status"),
+                                ("hx-indicator", "#story-spinner"),
+                            ])))
+                        " "
+                        (spinner_with("Loading", &SpinnerConfig::new()
+                            .size(SpinnerSize::Small)
+                            .indicator("story-spinner")))
+                        " "
+                        span id="story-spinner-status" {}
+                    }
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Skeleton",
+            {
+                use autumn_web::widgets::{
+                    ButtonConfig, ButtonVariant, SkeletonConfig, SkeletonShape, button, skeleton,
+                    skeleton_with,
+                };
+
+                maud::html! {
+                    // Three lines. The last one is shorter.
+                    div { (skeleton_with(SkeletonShape::Line, &SkeletonConfig::new().count(3))) }
+                    p {}
+                    div { (skeleton(SkeletonShape::Block)) }
+                    p {}
+                    div { (skeleton_with(SkeletonShape::Circle, &SkeletonConfig::new().count(3))) }
+                    p {}
+                    // An htmx indicator: hidden until the request runs.
+                    div {
+                        (button("Reload", &ButtonConfig::new()
+                            .variant(ButtonVariant::Secondary)
+                            .attrs(&[
+                                ("hx-get", "/_stories/demo/save"),
+                                ("hx-target", "#story-skeleton-result"),
+                                ("hx-indicator", "#story-skeleton"),
+                            ])))
+                        (skeleton_with(SkeletonShape::Line, &SkeletonConfig::new()
+                            .count(2)
+                            .indicator("story-skeleton")))
+                        div id="story-skeleton-result" {}
+                    }
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Progress",
+            {
+                use autumn_web::widgets::{ProgressConfig, progress, progress_with};
+
+                maud::html! {
+                    p { (progress("Upload", Some(40.0), 100.0)) }
+                    (progress_with("Upload report.pdf", Some(0.65), 1.0, &ProgressConfig::new()
+                        .visible_label()))
+                    p {}
+                    (progress_with("Import", Some(3.0), 8.0, &ProgressConfig::new()
+                        .visible_label()
+                        .value_text("3 of 8 files")))
+                    // No known end: an indeterminate bar.
+                    p { (progress("Loading", None, 1.0)) }
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Meter",
+            {
+                use autumn_web::widgets::{MeterConfig, meter, meter_with};
+
+                maud::html! {
+                    p { (meter("Disk use", 0.4, 0.0..=1.0)) }
+                    // 7 is above `low` and below `high`: an average value.
+                    (meter_with("Disk use", 7.0, 0.0..=10.0, &MeterConfig::new()
+                        .low(5.0)
+                        .high(8.0)
+                        .optimum(0.0)
+                        .visible_label()
+                        .value_text("7 GB of 10 GB")))
+                    p {}
+                    // 15 is below `low`, and the best is high: a bad value.
+                    (meter_with("Battery", 15.0, 0.0..=100.0, &MeterConfig::new()
+                        .low(20.0)
+                        .high(80.0)
+                        .optimum(100.0)
+                        .visible_label()))
+                }
+            }
+        },
+        story! {
+            "Feedback",
+            "Empty state",
+            {
+                use autumn_web::links::{LinkToOptions, link_to_with};
+                use autumn_web::widgets::{EmptyStateConfig, HeadingLevel, empty_state, empty_state_with};
+
+                let new_post = link_to_with("New post", "#new-post", &LinkToOptions::new()
+                    .class("autumn-button autumn-button--primary autumn-button--md"));
+                let icon = maud::html! {
+                    svg viewBox="0 0 16 16" width="32" height="32" fill="currentColor" {
+                        path d="M2 3h12v10H2zM3 4v8h10V4z" {}
+                    }
+                };
+                maud::html! {
+                    (empty_state("No posts yet", "Write your first post. It shows here.", Some(&new_post)))
+                    (empty_state_with(
+                        "No results",
+                        "Try a different search.",
+                        None,
+                        &EmptyStateConfig::new().icon(icon).level(HeadingLevel::H3),
+                    ))
+                }
+            }
+        },
+        story! {
             "Feedback",
             "Alert",
             {
@@ -1020,7 +1327,8 @@ fn builtin_stories() -> Vec<Story> {
                         li role="none" { (MenuItem::new("View").href("/posts/1")) }
                     }
                     (TextField::new("email").input_type("email").label("Email address").required())
-                    (TextArea::new("bio").label("Bio").rows(3))
+                    // The text area grows with its text (#3406).
+                    (TextArea::new("bio").label("Bio").rows(3).auto_grow())
                     (Select::new("plan").label("Plan")
                         .options([SelectOption::new("free", "Free"), SelectOption::new("pro", "Pro")])
                         .selected_value("pro"))
