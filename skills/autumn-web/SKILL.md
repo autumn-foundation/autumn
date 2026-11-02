@@ -2535,6 +2535,10 @@ app-code change) via `role = "web"|"worker"|"combined"` in config or the
 | `worker` | no (probe-only router) | yes |
 
 - Run a specific tier: `autumn serve --role web|worker|combined`.
+- An unknown value stops the boot; it does not fall back to `combined`
+  (#3541). `role` and `AUTUMN_ROLE` accept the same values (case-insensitive;
+  aliases in `ProcessRole::ACCEPTED_VALUES`). An empty `AUTUMN_ROLE=` is unset.
+  `autumn doctor` shows the same error on its `process_role_backend` row.
 - A split (non-`combined`) role **requires a `postgres`/`redis`/`sqlite` jobs
   backend** — an in-memory queue can't cross processes. `sqlite` qualifies only
   within one host, since its queue is a table in one file (#1907).
