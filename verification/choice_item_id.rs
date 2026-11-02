@@ -126,8 +126,8 @@ proof fn split_at_the_last_dash(a: Seq<u8>, x: Seq<u8>, b: Seq<u8>, y: Seq<u8>)
     assert(a.len() == b.len());
     assert(a =~= s.subrange(0, a.len() as int));
     assert(b =~= t.subrange(0, b.len() as int));
-    assert(x =~= s.subrange(a.len() + 1, s.len() as int));
-    assert(y =~= t.subrange(b.len() + 1, t.len() as int));
+    assert(x =~= s.subrange(a.len() as int + 1, s.len() as int));
+    assert(y =~= t.subrange(b.len() as int + 1, t.len() as int));
 }
 
 /// Two items never share an id.
