@@ -633,6 +633,14 @@ fn symbol_index(
             .entry(repo.repository.to_owned())
             .or_default()
             .insert(id.clone());
+        // A SQLite build also names the struct `Sqlite<Trait>`.
+        #[cfg(feature = "sqlite")]
+        if let Some(rest) = repo.implementation.strip_prefix("Pg") {
+            index
+                .entry(format!("Sqlite{rest}"))
+                .or_default()
+                .insert(id.clone());
+        }
         index
             .entry(repo.implementation.to_owned())
             .or_default()
@@ -1508,6 +1516,37 @@ mod tests {
             .expect("a repository extractor must link the route to the repository");
         assert_eq!(edge.provenance, Provenance::Signature);
         assert_eq!(edge.symbol, "PgPostRepository");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn the_sqlite_repository_name_links_the_route_to_the_repository() {
+        let graph = build(
+            &[],
+            0,
+            &[route(
+                "show",
+                "GET",
+                "/posts/{id}",
+                &["SqlitePostRepository"],
+                &[],
+            )],
+            &[model("Post", "app::models::Post", "posts")],
+            &[repository(
+                "PostRepository",
+                "PgPostRepository",
+                "Post",
+                "posts",
+            )],
+            &[],
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|e| e.from.starts_with("route:") && e.to.starts_with("repository:")),
+            "the Sqlite<Trait> name must link the route to the repository"
+        );
     }
 
     #[test]
