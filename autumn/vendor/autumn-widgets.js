@@ -1008,16 +1008,16 @@
   // A history restore (hx-boost, Back) brings back nodes without listeners.
   document.addEventListener('htmx:historyRestore', function () { initAll(document); });
 
-  // Busy state (#3406): htmx 2 sets no aria-busy. Mark the requester, the
-  // submitter and the named indicators that have [data-autumn-busy], and
-  // the target. The XHR loadend event clears the state after each request.
-  // Remove only an aria-busy that this code set, after its last request.
-  var busyCount = new WeakMap();
+  // Busy state (#3406). Mark this request's [data-autumn-busy] requester,
+  // submitter and indicators (marked since beforeRequest), and its target.
+  var busyCount = new WeakMap(), busyBefore = [];
+  function marked() { return Array.from(document.querySelectorAll('[data-autumn-busy].htmx-request')); }
+  document.addEventListener('htmx:beforeRequest', function () { busyBefore = marked(); });
   document.addEventListener('htmx:beforeSend', function (e) {
     var d = e.detail, ev = (d.requestConfig || {}).triggeringEvent;
-    var els = [e.target, ev && ev.submitter]
-      .concat(Array.from(document.querySelectorAll('.htmx-request')))
-      .filter(function (el) { return el && el.matches && el.matches('[data-autumn-busy]'); });
+    var els = [e.target, ev && ev.submitter].filter(function (el) {
+      return el && el.matches && el.matches('[data-autumn-busy]');
+    }).concat(marked().filter(function (el) { return busyBefore.indexOf(el) < 0; }));
     if (els.length && d.target) els.push(d.target);
     els = els.filter(function (el, i) {
       return els.indexOf(el) === i && (busyCount.has(el) || !el.hasAttribute('aria-busy'));

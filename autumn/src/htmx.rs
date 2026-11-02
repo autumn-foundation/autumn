@@ -879,7 +879,11 @@ mod tests {
             "'htmx:beforeSend'",
             "matches('[data-autumn-busy]')",
             "ev && ev.submitter",
-            "querySelectorAll('.htmx-request')",
+            // This request's indicators only: the ones htmx marks between
+            // beforeRequest and beforeSend (Codex review).
+            "'htmx:beforeRequest'",
+            "querySelectorAll('[data-autumn-busy].htmx-request')",
+            "busyBefore.indexOf(el) < 0",
             "d.target",
             "busyCount",
             "setAttribute('aria-busy', 'true')",
