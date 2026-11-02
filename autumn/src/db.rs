@@ -2196,7 +2196,12 @@ pub(crate) fn build_sqlite_pool_with(
     config.custom_setup = Box::new(move |url: &str| {
         use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
         let url = url.to_owned();
-        async move {
+        // The setup runs in its own task. At `create_timeout`, deadpool drops
+        // only the `JoinHandle`, and the setup finishes in its task. If deadpool
+        // dropped the setup itself, the diesel-async `CancelWrapper` of the query
+        // in flight would call `block_in_place` in its `Drop`. That panics on a
+        // current-thread runtime, so the caller got a panic, not a timeout.
+        let setup = async move {
             let mut conn = RuntimeConnection::establish(&url).await?;
             let pragmas = sqlite_connection_pragmas(
                 sqlite_target_is_read_only(&url),
@@ -2235,6 +2240,13 @@ pub(crate) fn build_sqlite_pool_with(
                 ));
             }
             Ok(conn)
+        };
+        async move {
+            tokio::spawn(setup).await.map_err(|e| {
+                diesel::ConnectionError::BadConnection(format!(
+                    "SQLite connection setup task failed: {e}"
+                ))
+            })?
         }
         .boxed()
     });
@@ -5921,6 +5933,38 @@ mod tests {
                 "message must name the offending target and the accepted scheme, got: {msg}"
             );
         }
+    }
+
+    // A connection setup that passes `create_timeout` must give an error, not a
+    // panic. deadpool drops the setup future at the limit. Each query in it is
+    // a diesel-async `CancelWrapper`, whose `Drop` calls `block_in_place` for
+    // a task in flight. That panics on a current-thread runtime, the runtime
+    // `#[tokio::test]` uses. The `SQLite fleet (windows-latest)` job hit it
+    // when a loaded runner took more than the 5 s limit to open a file.
+    // A zero limit is deterministic: tokio's `timeout` polls the setup once,
+    // the blocking `establish` starts, and then the limit has passed.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_setup_timeout_is_an_error_on_a_current_thread_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("slow.db").display());
+        let pool = build_sqlite_pool_with(&url, 1, 0, SqliteCheckpointOwner::ProcessLatch)
+            .expect("the pool builds");
+        let Err(err) = pool.get().await else {
+            panic!("a zero create limit must time out");
+        };
+        assert!(
+            matches!(
+                err,
+                deadpool::managed::PoolError::Timeout(deadpool::managed::TimeoutType::Create)
+            ),
+            "expected a create timeout, got: {err:?}"
+        );
+        // The setup still finishes in its own task. The next connection,
+        // with a real limit, opens the same file.
+        let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch)
+            .expect("the pool builds");
+        pool.get().await.expect("a real limit opens the file");
     }
 
     // …but the two scheme-less spellings `normalize_sqlite_target` explicitly
