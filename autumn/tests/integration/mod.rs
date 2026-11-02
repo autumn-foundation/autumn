@@ -167,6 +167,7 @@ mod feed;
 #[cfg(feature = "maud")]
 mod form_field_options;
 mod form_for_derive;
+mod form_native_inputs;
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;

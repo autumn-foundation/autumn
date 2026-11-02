@@ -1813,11 +1813,12 @@ fn concat_suffix(base: &str, suffix: &str) -> String {
 ///
 /// | Option | Controls |
 /// |---|---|
-/// | `placeholder`, `inputmode` | text, password, textarea, number |
-/// | `pattern` | text, password |
-/// | `min`, `max` | number, date, datetime |
-/// | `readonly` | all except checkbox, select, file |
-/// | `autocomplete` | all except checkbox, file |
+/// | `placeholder`, `inputmode` | text, password, textarea, number, email, tel, url |
+/// | `pattern` | text, password, email, tel, url |
+/// | `min`, `max` | number, date, datetime, time, month, range |
+/// | `readonly` | all except checkbox, switch, select, file, range, color, hidden and the groups |
+/// | `autocomplete` | all except checkbox, switch, file, hidden and the groups |
+/// | `required` | all except range, color and hidden (a checkbox group shows the marker only) |
 /// | `disabled` | all |
 ///
 /// - [`data`](Self::data) and [`hx`](Self::hx) add `data-*` and `hx-*`
@@ -2062,6 +2063,17 @@ pub(crate) enum FieldKind {
     DateTime,
     Select,
     File,
+    // Native inputs (issue #3405).
+    Email,
+    Tel,
+    Url,
+    Time,
+    Month,
+    Color,
+    Range,
+    /// A checkbox with `role="switch"`.
+    Switch,
+    Hidden,
 }
 
 #[cfg(feature = "maud")]
@@ -2070,11 +2082,19 @@ impl FieldKind {
         match self {
             Self::Text => Some("text"),
             Self::Password => Some("password"),
-            Self::Checkbox => Some("checkbox"),
+            Self::Checkbox | Self::Switch => Some("checkbox"),
             Self::Number => Some("number"),
             Self::Date => Some("date"),
             Self::DateTime => Some("datetime-local"),
             Self::File => Some("file"),
+            Self::Email => Some("email"),
+            Self::Tel => Some("tel"),
+            Self::Url => Some("url"),
+            Self::Time => Some("time"),
+            Self::Month => Some("month"),
+            Self::Color => Some("color"),
+            Self::Range => Some("range"),
+            Self::Hidden => Some("hidden"),
             Self::Textarea | Self::Select => None,
         }
     }
@@ -2083,24 +2103,70 @@ impl FieldKind {
     const fn takes_text_entry(self) -> bool {
         matches!(
             self,
-            Self::Text | Self::Password | Self::Textarea | Self::Number
+            Self::Text
+                | Self::Password
+                | Self::Textarea
+                | Self::Number
+                | Self::Email
+                | Self::Tel
+                | Self::Url
         )
     }
 
     const fn takes_pattern(self) -> bool {
-        matches!(self, Self::Text | Self::Password)
+        matches!(
+            self,
+            Self::Text | Self::Password | Self::Email | Self::Tel | Self::Url
+        )
     }
 
     const fn takes_range(self) -> bool {
-        matches!(self, Self::Number | Self::Date | Self::DateTime)
+        matches!(
+            self,
+            Self::Number | Self::Date | Self::DateTime | Self::Time | Self::Month | Self::Range
+        )
     }
 
     const fn takes_readonly(self) -> bool {
-        !matches!(self, Self::Checkbox | Self::Select | Self::File)
+        !matches!(
+            self,
+            Self::Checkbox
+                | Self::Switch
+                | Self::Select
+                | Self::File
+                | Self::Range
+                | Self::Color
+                | Self::Hidden
+        )
     }
 
     const fn takes_autocomplete(self) -> bool {
-        !matches!(self, Self::Checkbox | Self::File)
+        !matches!(
+            self,
+            Self::Checkbox | Self::Switch | Self::File | Self::Hidden
+        )
+    }
+
+    /// HTML applies `required` to no `range`, `color` or `hidden` input:
+    /// they always have a value.
+    const fn takes_required(self) -> bool {
+        !matches!(self, Self::Range | Self::Color | Self::Hidden)
+    }
+
+    /// A box shows first, then the label. It posts `value="true"`.
+    const fn is_box(self) -> bool {
+        matches!(self, Self::Checkbox | Self::Switch)
+    }
+
+    /// The `class` of the wrapper `<div>`.
+    const fn wrapper_class(self) -> &'static str {
+        match self {
+            Self::Checkbox => "autumn-field autumn-field--checkbox",
+            Self::Switch => "autumn-field autumn-field--checkbox autumn-field--switch",
+            Self::Range => "autumn-field autumn-field--range",
+            Self::Color => "autumn-field autumn-field--color",
+            _ => "autumn-field",
+        }
     }
 }
 
@@ -2302,6 +2368,7 @@ pub(crate) fn render_field(
 ) -> maud::Markup {
     let kind = spec.kind;
     let has_errors = !errors.is_empty();
+    let required = opts.required && kind.takes_required();
     let hint = opts.hint.as_deref();
     let field_html = fast_escape(spec.field);
     let field_html = field_html.as_ref();
@@ -2320,11 +2387,7 @@ pub(crate) fn render_field(
     out.push_str(r#"<div id=""#);
     out.push_str(field_html);
     out.push_str(r#"-field" class=""#);
-    out.push_str(if kind == FieldKind::Checkbox {
-        "autumn-field autumn-field--checkbox"
-    } else {
-        "autumn-field"
-    });
+    out.push_str(kind.wrapper_class());
     out.push('"');
     if spec.htmx.is_some() {
         out.push_str(r#" data-autumn-field-wrapper=""#);
@@ -2335,8 +2398,8 @@ pub(crate) fn render_field(
 
     // A checkbox shows its box first, then the label. Other controls show
     // the label and the hint first, so the user reads the hint before typing.
-    if kind != FieldKind::Checkbox {
-        push_label(&mut out, field_html, spec.label, opts.required);
+    if !kind.is_box() {
+        push_label(&mut out, field_html, spec.label, required);
         if let Some(hint) = hint {
             push_hint(&mut out, field_html, hint);
         }
@@ -2362,8 +2425,11 @@ pub(crate) fn render_field(
         out.push_str(field_html);
         out.push('"');
     }
-    if kind == FieldKind::Checkbox {
+    if kind.is_box() {
         out.push_str(r#" value="true""#);
+        if kind == FieldKind::Switch {
+            out.push_str(r#" role="switch""#);
+        }
         if spec.checked {
             out.push_str(" checked");
         }
@@ -2375,7 +2441,7 @@ pub(crate) fn render_field(
     if let Some(step) = spec.step {
         push_attr(&mut out, "step", step);
     }
-    if opts.required {
+    if required {
         out.push_str(r#" required aria-required="true""#);
     }
     out.push_str(if has_errors {
@@ -2436,8 +2502,8 @@ pub(crate) fn render_field(
         _ => {}
     }
 
-    if kind == FieldKind::Checkbox {
-        push_label(&mut out, field_html, spec.label, opts.required);
+    if kind.is_box() {
+        push_label(&mut out, field_html, spec.label, required);
         if let Some(hint) = hint {
             push_hint(&mut out, field_html, hint);
         }
@@ -4086,6 +4152,699 @@ pub fn required_select_input<T: Serialize>(
     )
 }
 
+// ── Native input helpers (issue #3405) ──────────────────────────────
+
+/// Render one single-value input of `kind` from `changeset[field]`.
+#[cfg(feature = "maud")]
+fn native_input<T: Serialize>(
+    kind: FieldKind,
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = changeset.field_value(field).unwrap_or_default();
+    let spec = FieldSpec {
+        value: Some(&value),
+        ..FieldSpec::new(kind, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
+}
+
+/// Render a switch: `<input type="checkbox" role="switch">` tied to a `bool`
+/// field.
+///
+/// The binding is the same as [`checkbox_input`]. An unchecked switch posts
+/// no key, so mark the field `#[serde(default)]`. A screen reader says "on"
+/// or "off", not "checked".
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn switch_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    switch_input_with(changeset, field, label, &FieldOptions::new())
+}
+
+/// [`switch_input`] for a switch the user must turn on.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_switch_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    switch_input_with(changeset, field, label, &FieldOptions::new().required())
+}
+
+/// [`switch_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn switch_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let spec = FieldSpec {
+        checked: changeset.field_value(field).as_deref() == Some("true"),
+        ..FieldSpec::new(FieldKind::Switch, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
+}
+
+/// Render a single-thumb slider: `<input type="range">`.
+///
+/// `step` sets the HTML `step` attribute (`None` keeps the browser default
+/// of `1`). Set the bounds with [`FieldOptions::min`] and
+/// [`FieldOptions::max`] (default `0` and `100`). A slider always has a
+/// value, so it takes no `required` state.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn range_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    step: Option<&str>,
+) -> maud::Markup {
+    range_input_with(changeset, field, label, step, &FieldOptions::new())
+}
+
+/// [`range_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn range_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    step: Option<&str>,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = changeset.field_value(field).unwrap_or_default();
+    let spec = FieldSpec {
+        value: Some(&value),
+        step,
+        ..FieldSpec::new(FieldKind::Range, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
+}
+
+/// Render a radio group: a `<fieldset>` with a `<legend>` and one
+/// `<input type="radio">` for each `(value, label)` choice.
+///
+/// The radio whose value is the changeset value is `checked`. Each radio has
+/// `id="{field}-{index}"`. The hint and error links go on the `<fieldset>`.
+/// The native arrow keys move the selection.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn radio_group<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+) -> maud::Markup {
+    radio_group_with(changeset, field, label, choices, &FieldOptions::new())
+}
+
+/// [`radio_group`] for a field that needs a choice. Each radio gets
+/// `required`, and the legend gets the marker.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_radio_group<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+) -> maud::Markup {
+    radio_group_with(
+        changeset,
+        field,
+        label,
+        choices,
+        &FieldOptions::new().required(),
+    )
+}
+
+/// [`radio_group`] with a hint and typed attributes. See [`FieldOptions`].
+/// The passthrough goes on each radio.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn radio_group_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    render_choice_group(
+        ChoiceStyle::Radio,
+        changeset,
+        field,
+        label,
+        SelectChoices::Borrowed(choices),
+        options,
+    )
+}
+
+/// Render a checkbox group: a `<fieldset>` with a `<legend>` and one
+/// `<input type="checkbox" name="{field}">` for each choice.
+///
+/// Bind it to a `Vec<T>` or `HashSet<T>` field with `#[serde(default)]`.
+/// Each checked box posts one `{field}={value}` pair, and an empty group
+/// posts no key. The boxes of [`Changeset::field_values`] are `checked`.
+///
+/// [`FieldOptions::required`] shows the marker only. `required` on a box
+/// means "check this box", so no box gets it. Check for one or more values
+/// on the server, for example with `#[validate(length(min = 1))]`.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn checkbox_group<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+) -> maud::Markup {
+    checkbox_group_with(changeset, field, label, choices, &FieldOptions::new())
+}
+
+/// [`checkbox_group`] with a hint and typed attributes. See
+/// [`FieldOptions`]. The passthrough goes on each box.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn checkbox_group_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    render_choice_group(
+        ChoiceStyle::Checkbox,
+        changeset,
+        field,
+        label,
+        SelectChoices::Borrowed(choices),
+        options,
+    )
+}
+
+/// Render a segmented control: a [`radio_group`] that looks like a row of
+/// buttons.
+///
+/// Each radio is visually hidden but stays in the tab order, so the native
+/// arrow keys move the selection. The `<label>` next to it is the visible
+/// segment.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn segmented_control<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+) -> maud::Markup {
+    segmented_control_with(changeset, field, label, choices, &FieldOptions::new())
+}
+
+/// [`segmented_control`] for a field that needs a choice. See
+/// [`required_radio_group`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_segmented_control<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+) -> maud::Markup {
+    segmented_control_with(
+        changeset,
+        field,
+        label,
+        choices,
+        &FieldOptions::new().required(),
+    )
+}
+
+/// [`segmented_control`] with a hint and typed attributes. See
+/// [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn segmented_control_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    render_choice_group(
+        ChoiceStyle::Segmented,
+        changeset,
+        field,
+        label,
+        SelectChoices::Borrowed(choices),
+        options,
+    )
+}
+
+/// Write the single-value input helpers: the plain helper, the `required_`
+/// helper and the `_with` helper for one input type.
+#[cfg(feature = "maud")]
+macro_rules! native_input_helpers {
+    ($(
+        $kind:ident, $html:literal, $plain:ident, $required:ident, $with:ident, $what:literal;
+    )*) => {$(
+        #[doc = concat!("Render a labeled `<input type=\"", $html, "\">` tied to a changeset ", $what, ".")]
+        ///
+        /// The wrapper, label, hint and errors are the same as [`text_input`].
+        #[cfg(feature = "maud")]
+        #[must_use]
+        pub fn $plain<T: Serialize>(
+            changeset: &Changeset<T>,
+            field: &str,
+            label: &str,
+        ) -> maud::Markup {
+            $with(changeset, field, label, &FieldOptions::new())
+        }
+
+        #[doc = concat!("[`", stringify!($plain), "`] for a required field. See [`required_text_input`].")]
+        #[cfg(feature = "maud")]
+        #[must_use]
+        pub fn $required<T: Serialize>(
+            changeset: &Changeset<T>,
+            field: &str,
+            label: &str,
+        ) -> maud::Markup {
+            $with(changeset, field, label, &FieldOptions::new().required())
+        }
+
+        #[doc = concat!("[`", stringify!($plain), "`] with a hint and typed attributes. See [`FieldOptions`].")]
+        #[cfg(feature = "maud")]
+        #[must_use]
+        pub fn $with<T: Serialize>(
+            changeset: &Changeset<T>,
+            field: &str,
+            label: &str,
+            options: &FieldOptions<'_>,
+        ) -> maud::Markup {
+            native_input(FieldKind::$kind, changeset, field, label, options)
+        }
+    )*};
+}
+
+native_input_helpers! {
+    Email, "email", email_input, required_email_input, email_input_with,
+        "field. The browser checks the address shape. Check it on the server too";
+    Tel, "tel", tel_input, required_tel_input, tel_input_with,
+        "phone number. The browser does not check the format";
+    Url, "url", url_input, required_url_input, url_input_with,
+        "absolute URL field. The browser checks the URL shape";
+}
+
+/// Render a labeled `<input type="time">` tied to a changeset field.
+///
+/// The value is normalized for the browser: `HH:MM`, or `HH:MM:SS` when the
+/// seconds are not zero, or `HH:MM:SS.sss` when there is a fraction. With
+/// seconds the input gets `step="1"`, and with a fraction `step="0.001"`, so
+/// the browser accepts the value. The browser posts `HH:MM` (or `HH:MM:SS`
+/// when the input shows seconds). A `chrono::NaiveTime` field reads both.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn time_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    time_input_with(changeset, field, label, &FieldOptions::new())
+}
+
+/// [`time_input`] for a required field. See [`required_text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_time_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    time_input_with(changeset, field, label, &FieldOptions::new().required())
+}
+
+/// [`time_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn time_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let raw = changeset.field_value(field).unwrap_or_default();
+    let (value, step) = normalize_time_value(&raw);
+    let spec = FieldSpec {
+        value: Some(&value),
+        step,
+        ..FieldSpec::new(FieldKind::Time, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
+}
+
+/// Render a labeled `<input type="month">` tied to a changeset field.
+///
+/// The value is normalized to `YYYY-MM`, also from a date or a datetime. The
+/// browser posts `YYYY-MM`, so bind the control to a `String` field.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn month_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    month_input_with(changeset, field, label, &FieldOptions::new())
+}
+
+/// [`month_input`] for a required field. See [`required_text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_month_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    month_input_with(changeset, field, label, &FieldOptions::new().required())
+}
+
+/// [`month_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn month_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = normalize_month_value(&changeset.field_value(field).unwrap_or_default());
+    let spec = FieldSpec {
+        value: Some(&value),
+        ..FieldSpec::new(FieldKind::Month, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
+}
+
+/// Render a labeled `<input type="color">` tied to a `String` field.
+///
+/// The browser posts a lowercase `#rrggbb`. A `#rrggbb` or `#rgb` value is
+/// shown in that form. Any other value (also `None`) is not rendered, so the
+/// browser shows and posts `#000000`. A color input always has a value, so it
+/// takes no `required` state, and it cannot post "no color": use a text input
+/// for an optional color.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn color_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    color_input_with(changeset, field, label, &FieldOptions::new())
+}
+
+/// [`color_input`] with a hint and typed attributes. See [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn color_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = changeset
+        .field_value(field)
+        .and_then(|raw| normalize_color_value(&raw));
+    let spec = FieldSpec {
+        value: value.as_deref(),
+        ..FieldSpec::new(FieldKind::Color, field, label)
+    };
+    render_field(&spec, changeset.errors_for(field), options)
+}
+
+/// Render `<input type="hidden">` tied to a changeset field.
+///
+/// It has no label, no wrapper and no error block. Show the errors of a
+/// hidden field with [`crate::widgets::error_summary`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn hidden_input<T: Serialize>(changeset: &Changeset<T>, field: &str) -> maud::Markup {
+    hidden_input_with(changeset, field, &FieldOptions::new())
+}
+
+/// [`hidden_input`] with the `data-*` and `hx-*` passthrough and
+/// `disabled`. It ignores the hint, `required` and the other typed options.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn hidden_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let value = changeset.field_value(field).unwrap_or_default();
+    render_hidden(field, &value, options)
+}
+
+/// Write `<input type="hidden" id name value>` and the passthrough.
+#[cfg(feature = "maud")]
+fn render_hidden(field: &str, value: &str, options: &FieldOptions<'_>) -> maud::Markup {
+    let field_html = fast_escape(field);
+    let mut out = String::with_capacity(
+        60usize
+            .saturating_add(field_html.len().saturating_mul(2))
+            .saturating_add(value.len()),
+    );
+    out.push_str(r#"<input type="hidden" id=""#);
+    out.push_str(&field_html);
+    out.push_str(r#"" name=""#);
+    out.push_str(&field_html);
+    out.push('"');
+    push_attr(&mut out, "value", value);
+    push_option_attrs(&mut out, Some(FieldKind::Hidden), options, &[]);
+    out.push('>');
+    maud::PreEscaped(out)
+}
+
+/// How a choice group looks.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChoiceStyle {
+    Radio,
+    Checkbox,
+    Segmented,
+}
+
+/// Render a radio group, a checkbox group or a segmented control in the
+/// grouped wrapper (`<fieldset>`, `<legend>`, hint, errors).
+#[cfg(feature = "maud")]
+fn render_choice_group<T: Serialize>(
+    style: ChoiceStyle,
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: SelectChoices<'_>,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    // A missing value is `""`, as in `select_input`, so a `("", "None")`
+    // choice is checked.
+    let selected: Vec<String> = if style == ChoiceStyle::Checkbox {
+        changeset.field_values(field)
+    } else {
+        vec![changeset.field_value(field).unwrap_or_default()]
+    };
+    let context = FieldContext {
+        field,
+        label,
+        value: None,
+        values: &selected,
+        errors: changeset.errors_for(field),
+        options,
+        grouped: true,
+    };
+    let mut items = String::new();
+    push_choice_items(&mut items, style, &context, choices);
+    render_custom_field(&context, &maud::PreEscaped(items))
+}
+
+/// Append the inputs of a choice group.
+///
+/// The first item gets `id="{field}"`, so an error summary link `#{field}`
+/// moves focus to the group. Item `index` 1 and up gets
+/// `id="{field}-{index}"` (see `verification/choice_item_id.rs`). The proof
+/// takes a `field` with no `-`, as a Rust field name is.
+#[cfg(feature = "maud")]
+fn push_choice_items(
+    out: &mut String,
+    style: ChoiceStyle,
+    context: &FieldContext<'_>,
+    choices: SelectChoices<'_>,
+) {
+    let field_html = fast_escape(context.field);
+    let (container, item_open, item_close, input_class, label_class) = match style {
+        ChoiceStyle::Radio | ChoiceStyle::Checkbox => (
+            "autumn-choices",
+            r#"<div class="autumn-choice">"#,
+            "</div>",
+            "autumn-choice__input",
+            "autumn-choice__label",
+        ),
+        ChoiceStyle::Segmented => (
+            "autumn-segmented",
+            "",
+            "",
+            "autumn-segmented__input",
+            "autumn-segmented__option",
+        ),
+    };
+    let input_type = if style == ChoiceStyle::Checkbox {
+        "checkbox"
+    } else {
+        "radio"
+    };
+    // `required` on a box means "check this box", so a checkbox group never
+    // writes it. A radio group writes it on each radio.
+    let required = context.is_required() && style != ChoiceStyle::Checkbox;
+    out.push_str(r#"<div class=""#);
+    out.push_str(container);
+    out.push_str(r#"">"#);
+    let mut push_item = |index: usize, value: &str, label: &str| {
+        let mut id = String::with_capacity(field_html.len().saturating_add(4));
+        id.push_str(&field_html);
+        if index > 0 {
+            id.push('-');
+            id.push_str(&index.to_string());
+        }
+        out.push_str(item_open);
+        out.push_str(r#"<input type=""#);
+        out.push_str(input_type);
+        out.push_str(r#"" id=""#);
+        out.push_str(&id);
+        out.push_str(r#"" name=""#);
+        out.push_str(&field_html);
+        out.push('"');
+        push_attr(out, "value", value);
+        if context.values.iter().any(|v| v == value) {
+            out.push_str(" checked");
+        }
+        if required {
+            out.push_str(" required");
+        }
+        out.push_str(r#" class=""#);
+        out.push_str(input_class);
+        out.push('"');
+        if context.is_invalid() {
+            out.push_str(r#" aria-invalid="true""#);
+        }
+        push_option_attrs(out, Some(FieldKind::Checkbox), context.options, &[]);
+        out.push_str(r#"><label for=""#);
+        out.push_str(&id);
+        out.push_str(r#"" class=""#);
+        out.push_str(label_class);
+        out.push_str(r#"">"#);
+        write_escaped(label, out);
+        out.push_str("</label>");
+        out.push_str(item_close);
+    };
+    match choices {
+        SelectChoices::None => {}
+        SelectChoices::Borrowed(choices) => {
+            for (index, (value, label)) in choices.iter().enumerate() {
+                push_item(index, value, label);
+            }
+        }
+        SelectChoices::Owned(choices) => {
+            for (index, (value, label)) in choices.iter().enumerate() {
+                push_item(index, value, label);
+            }
+        }
+    }
+    out.push_str("</div>");
+}
+
+/// Normalize a stored time for `<input type="time">`.
+///
+/// `HH:MM:00` becomes `HH:MM`. Other seconds stay, with `step="1"`. A
+/// fraction keeps at most 3 digits (the HTML limit), with `step="0.001"`.
+/// Any other shape stays as it is.
+#[cfg(feature = "maud")]
+fn normalize_time_value(raw: &str) -> (String, Option<&'static str>) {
+    let digits = |range: std::ops::Range<usize>| {
+        raw.get(range)
+            .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let colon = |at: usize| raw.as_bytes().get(at) == Some(&b':');
+    let (Some(hh_mm), true, true, true) = (raw.get(0..5), digits(0..2), colon(2), digits(3..5))
+    else {
+        return (raw.to_owned(), None);
+    };
+    let rest = raw.get(5..).unwrap_or_default();
+    if rest.is_empty() {
+        return (raw.to_owned(), None);
+    }
+    let (Some(seconds), true, true) = (raw.get(6..8), colon(5), digits(6..8)) else {
+        return (raw.to_owned(), None);
+    };
+    let tail = raw.get(8..).unwrap_or_default();
+    let fraction = match tail.strip_prefix('.') {
+        None if tail.is_empty() => "",
+        Some(f) if !f.is_empty() && f.bytes().all(|b| b.is_ascii_digit()) => {
+            f.get(..3).unwrap_or(f).trim_end_matches('0')
+        }
+        _ => return (raw.to_owned(), None),
+    };
+    if fraction.is_empty() {
+        if seconds == "00" {
+            (hh_mm.to_owned(), None)
+        } else {
+            (format!("{hh_mm}:{seconds}"), Some("1"))
+        }
+    } else {
+        (format!("{hh_mm}:{seconds}.{fraction}"), Some("0.001"))
+    }
+}
+
+/// Normalize a stored value to `YYYY-MM` for `<input type="month">`. A date
+/// or a datetime keeps its year and month. Any other shape stays as it is.
+#[cfg(feature = "maud")]
+fn normalize_month_value(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let is_digit = |at: usize| bytes.get(at).is_some_and(u8::is_ascii_digit);
+    let shape = (0..4).all(is_digit)
+        && bytes.get(4) == Some(&b'-')
+        && is_digit(5)
+        && is_digit(6)
+        && matches!(bytes.get(7), None | Some(b'-'));
+    match raw.get(..7) {
+        Some(month) if shape => month.to_owned(),
+        _ => raw.to_owned(),
+    }
+}
+
+/// A valid `#rrggbb` (or `#rgb`, expanded) in lowercase, or `None`.
+#[cfg(feature = "maud")]
+fn normalize_color_value(raw: &str) -> Option<String> {
+    let hex = raw.strip_prefix('#')?;
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    match hex.len() {
+        6 => Some(raw.to_ascii_lowercase()),
+        3 => {
+            let mut out = String::with_capacity(7);
+            out.push('#');
+            for c in hex.chars().map(|c| c.to_ascii_lowercase()) {
+                out.push(c);
+                out.push(c);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
 /// Render an ARIA live region for htmx swap announcements.
 ///
 /// Emits `<div id="…" role="status" aria-live="polite" aria-atomic="true">`.
@@ -4178,6 +4937,43 @@ pub enum FieldControl {
     /// `<input type="file">`. The presence of any `File` field makes
     /// [`FormFor::render`] emit `enctype="multipart/form-data"`.
     File,
+    /// `<input type="checkbox" role="switch">` for a `bool` (issue #3405).
+    Switch,
+    /// `<input type="range">`, a single-thumb slider.
+    Range {
+        /// The HTML `step` attribute, or `None` for the browser default.
+        step: Option<String>,
+    },
+    /// A radio group in a `<fieldset>` with a `<legend>`.
+    Radio {
+        /// The `(value, label)` pairs, one radio each.
+        options: Vec<(String, String)>,
+    },
+    /// A checkbox group in a `<fieldset>`, for a `Vec<T>` field.
+    CheckboxGroup {
+        /// The `(value, label)` pairs, one box each.
+        options: Vec<(String, String)>,
+    },
+    /// A segmented control: radios that look like a row of buttons.
+    Segmented {
+        /// The `(value, label)` pairs, one segment each.
+        options: Vec<(String, String)>,
+    },
+    /// `<input type="email">`.
+    Email,
+    /// `<input type="tel">`.
+    Tel,
+    /// `<input type="url">`.
+    Url,
+    /// `<input type="time">`. The `#[model]` derive gives it to a
+    /// `NaiveTime` column.
+    Time,
+    /// `<input type="month">`, for a `YYYY-MM` `String`.
+    Month,
+    /// `<input type="color">`, for a `#rrggbb` `String`.
+    Color,
+    /// `<input type="hidden">`, with no label and no wrapper.
+    Hidden,
     /// A control from a widget pack (issue #3400).
     ///
     /// The [`FieldRenderer`]
@@ -4705,10 +5501,18 @@ fn render_form_control<T: Serialize>(
     // A non-null `bool` is not a "must be checked" box. A password is never
     // pre-filled, so a required one blocks every edit form. These two controls
     // use only `FieldOptions::required`.
+    // A switch, a slider, a color, a hidden input and a checkbox group
+    // always have a value, or have no "must be set" meaning in HTML.
     let required_by_model = field.required
         && !matches!(
             field.control,
-            FieldControl::Checkbox | FieldControl::Password
+            FieldControl::Checkbox
+                | FieldControl::Password
+                | FieldControl::Switch
+                | FieldControl::Range { .. }
+                | FieldControl::Color
+                | FieldControl::Hidden
+                | FieldControl::CheckboxGroup { .. }
         );
     let merged;
     let options = if required_by_model && !options.required {
@@ -4744,6 +5548,41 @@ fn render_form_control<T: Serialize>(
             let spec = FieldSpec::new(FieldKind::File, name, label);
             render_field(&spec, changeset.errors_for(name), options)
         }
+        FieldControl::Switch => switch_input_with(changeset, name, label, options),
+        FieldControl::Range { step } => {
+            range_input_with(changeset, name, label, step.as_deref(), options)
+        }
+        FieldControl::Radio { options: choices } => render_choice_group(
+            ChoiceStyle::Radio,
+            changeset,
+            name,
+            label,
+            SelectChoices::Owned(choices),
+            options,
+        ),
+        FieldControl::CheckboxGroup { options: choices } => render_choice_group(
+            ChoiceStyle::Checkbox,
+            changeset,
+            name,
+            label,
+            SelectChoices::Owned(choices),
+            options,
+        ),
+        FieldControl::Segmented { options: choices } => render_choice_group(
+            ChoiceStyle::Segmented,
+            changeset,
+            name,
+            label,
+            SelectChoices::Owned(choices),
+            options,
+        ),
+        FieldControl::Email => email_input_with(changeset, name, label, options),
+        FieldControl::Tel => tel_input_with(changeset, name, label, options),
+        FieldControl::Url => url_input_with(changeset, name, label, options),
+        FieldControl::Time => time_input_with(changeset, name, label, options),
+        FieldControl::Month => month_input_with(changeset, name, label, options),
+        FieldControl::Color => color_input_with(changeset, name, label, options),
+        FieldControl::Hidden => hidden_input_with(changeset, name, options),
         FieldControl::Custom(control) => {
             custom_input_with(changeset, name, label, control.renderer(), options)
         }

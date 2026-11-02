@@ -46,6 +46,21 @@ It proves that tokens are unique and strictly increasing per lock name, and
 that a stale write is rejected. It does not prove that holders never overlap;
 the fencing token makes overlap safe.
 
+## Choice item ids
+
+`choice_item_id.rs` models the ids of a radio group, a checkbox group and a
+segmented control (`push_choice_items` in `autumn/src/form.rs`, issue #3405).
+Verify it with:
+
+```sh
+verus verification/choice_item_id.rs
+```
+
+The first item has the field id. Item 1 and up has `{field}-{index}`. It
+proves that two items never share an id, and that an item id is never a
+hint, error, wrapper, label or nested-subfield id, or a plain field id. The
+proptest `choice_item_ids_never_collide` checks the rendered markup.
+
 ## Fleet slot ownership
 
 `fleet_slot_ownership.rs` models the slot-ownership table of a SQLite fleet

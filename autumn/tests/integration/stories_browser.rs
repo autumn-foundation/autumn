@@ -858,6 +858,75 @@ async fn keyboard_accordion() {
     page.expect_no_console_errors().await.expect("no errors");
 }
 
+/// Native choice controls (#3405): no script, only the browser keys.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_choice_controls() {
+    let checked = |sel: &str| format!("document.querySelector({sel:?}).checked");
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/choice-controls").await;
+
+    // Space toggles the switch.
+    assert!(
+        eval_bool(&page, &checked("#alerts")).await,
+        "the switch starts on"
+    );
+    focus(&page, "#alerts").await;
+    press(&page, " ").await;
+    settle().await;
+    assert!(
+        !eval_bool(&page, &checked("#alerts")).await,
+        "Space turns the switch off"
+    );
+
+    // The arrow keys move the radio selection.
+    focus(&page, "#plan-1").await;
+    press(&page, "ArrowDown").await;
+    assert_eq!(active_id(&page).await, "plan-2");
+    assert!(
+        eval_bool(&page, &checked("#plan-2")).await,
+        "ArrowDown selects the next radio"
+    );
+
+    // A segment radio is visually hidden, but it takes focus and the arrow
+    // keys. Its label shows the focus ring.
+    focus(&page, "#view-1").await;
+    press(&page, "ArrowRight").await;
+    assert_eq!(active_id(&page).await, "view-2");
+    assert!(
+        eval_bool(&page, &checked("#view-2")).await,
+        "ArrowRight selects the next segment"
+    );
+    assert!(
+        eval_bool(
+            &page,
+            "document.querySelector('#view-2').matches(':focus-visible')"
+        )
+        .await,
+        "a keyboard move makes the segment radio :focus-visible"
+    );
+    assert_eq!(
+        eval_string(
+            &page,
+            "getComputedStyle(document.querySelector('label[for=view-2]')).outlineStyle",
+        )
+        .await,
+        "solid",
+        "the focused segment shows a focus ring"
+    );
+
+    // Space checks a box of the checkbox group.
+    focus(&page, "#topics-1").await;
+    press(&page, " ").await;
+    settle().await;
+    assert!(
+        eval_bool(&page, &checked("#topics-1")).await,
+        "Space checks a box"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
 #[tokio::test]
 #[ignore = "requires Chromium"]
 async fn keyboard_toast() {

@@ -232,6 +232,221 @@
     color: var(--text-muted);
 }
 
+/* ── Native inputs — issue #3405 ──────────────────────────────────────────── */
+
+/* A switch is a native checkbox, drawn as a track and a thumb. */
+.autumn-field--switch .autumn-field__input {
+    appearance: none;
+    position: relative;
+    flex-shrink: 0;
+    width: 2.25rem;
+    height: 1.25rem;
+    padding: 0;
+    margin: 0;
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius-full);
+    background-color: var(--surface-muted);
+    cursor: pointer;
+}
+
+/* Logical offsets, so the thumb moves the other way in a right-to-left page. */
+.autumn-field--switch .autumn-field__input::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    inset-inline-start: 0.125rem;
+    width: 0.875rem;
+    height: 0.875rem;
+    border-radius: var(--radius-full);
+    background-color: var(--text-muted);
+    transform: translateY(-50%);
+    transition: inset-inline-start 0.15s ease, background-color 0.15s ease;
+}
+
+.autumn-field--switch .autumn-field__input:checked {
+    border-color: var(--primary);
+    background-color: var(--primary);
+}
+
+.autumn-field--switch .autumn-field__input:checked::before {
+    inset-inline-start: calc(100% - 1rem);
+    background-color: var(--on-primary);
+}
+
+/* The switch rule above is more specific than the shared invalid and
+   disabled rules, so state them again. */
+.autumn-field--switch .autumn-field__input--invalid,
+.autumn-field--switch .autumn-field__input:user-invalid {
+    border-color: var(--danger);
+}
+
+.autumn-field--switch .autumn-field__input:disabled {
+    cursor: not-allowed;
+}
+
+.autumn-field--switch .autumn-field__input:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+/* A slider has no box. The browser draws the track and the thumb. */
+.autumn-field--range .autumn-field__input {
+    padding: 0;
+    border: 0;
+    background-color: transparent;
+    accent-color: var(--primary);
+}
+
+.autumn-field--range .autumn-field__input:focus {
+    box-shadow: none;
+}
+
+.autumn-field--range .autumn-field__input:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-field--color .autumn-field__input {
+    width: 3rem;
+    height: 2.5rem;
+    padding: var(--space-1);
+    cursor: pointer;
+}
+
+/* A radio group and a checkbox group: one choice for each line. */
+.autumn-choices {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.autumn-choice {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.autumn-choice__input {
+    margin: 0;
+    accent-color: var(--primary);
+}
+
+.autumn-choice__input:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-choice__label {
+    font-size: var(--font-size-sm);
+    color: var(--text);
+    cursor: pointer;
+}
+
+/* A segmented control: radios with a visible label for each segment. The
+   radio stays in the tab order (clip pattern, not display:none), so the
+   native arrow keys move the selection. */
+.autumn-segmented {
+    position: relative;
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-self: flex-start;
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius);
+}
+
+.autumn-segmented__input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+}
+
+.autumn-segmented__option {
+    padding: var(--space-2) var(--space-3);
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    color: var(--text);
+    background-color: var(--surface);
+    cursor: pointer;
+}
+
+.autumn-segmented__option:first-of-type {
+    border-start-start-radius: var(--radius);
+    border-end-start-radius: var(--radius);
+}
+
+.autumn-segmented__option:last-of-type {
+    border-start-end-radius: var(--radius);
+    border-end-end-radius: var(--radius);
+}
+
+.autumn-segmented__option ~ .autumn-segmented__option {
+    border-inline-start: 1px solid var(--control-border);
+}
+
+.autumn-segmented__input:checked + .autumn-segmented__option {
+    color: var(--on-primary);
+    background-color: var(--primary);
+}
+
+.autumn-segmented__input:focus-visible + .autumn-segmented__option {
+    position: relative;
+    z-index: 1;
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-segmented__input:disabled + .autumn-segmented__option {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.autumn-field--group[aria-invalid="true"] .autumn-segmented {
+    border-color: var(--danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .autumn-field--switch .autumn-field__input::before {
+        transition: none;
+    }
+}
+
+/* Forced colors (Windows High Contrast): the page colors go away, so draw
+   the switch and the selected segment with system colors. */
+@media (forced-colors: active) {
+    .autumn-field--switch .autumn-field__input {
+        border-color: CanvasText;
+    }
+
+    .autumn-field--switch .autumn-field__input::before {
+        background-color: CanvasText;
+    }
+
+    .autumn-field--switch .autumn-field__input:checked {
+        border-color: Highlight;
+        background-color: Highlight;
+    }
+
+    .autumn-field--switch .autumn-field__input:checked::before {
+        background-color: HighlightText;
+    }
+
+    .autumn-segmented__input:checked + .autumn-segmented__option {
+        forced-color-adjust: none;
+        color: HighlightText;
+        background-color: Highlight;
+    }
+
+    .autumn-segmented__input:focus-visible + .autumn-segmented__option {
+        outline-color: CanvasText;
+    }
+}
+
 /* ── Rich text (autumn-rich-text) — issue #1255 ───────────────────────────── */
 
 .autumn-rich-text {

@@ -156,6 +156,103 @@ fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Forms",
+            "Native inputs",
+            {
+                use autumn_web::form::{
+                    Changeset, FieldOptions, color_input, email_input_with, hidden_input,
+                    month_input, range_input_with, required_time_input, tel_input_with, url_input,
+                };
+
+                // Native inputs (#3405). Each helper reads its value from the
+                // changeset and has the field wrapper: hint, marker, errors.
+                let mut errors = std::collections::HashMap::new();
+                errors.insert("site".to_string(), vec!["Start the address with https://".to_string()]);
+                let changeset = Changeset::from_errors(
+                    serde_json::json!({
+                        "email": "ada@example.com",
+                        "phone": "",
+                        "site": "example.com",
+                        "opens": "09:30:00",
+                        "period": "2026-03-15",
+                        "accent": "#7C3AED",
+                        "volume": 40,
+                        "token": "abc123",
+                    }),
+                    errors,
+                );
+
+                maud::html! {
+                    (email_input_with(&changeset, "email", "Email", &FieldOptions::new()
+                        .autocomplete("email")))
+                    (tel_input_with(&changeset, "phone", "Phone", &FieldOptions::new()
+                        .autocomplete("tel")
+                        .hint("Include the country code.")))
+                    (url_input(&changeset, "site", "Website"))
+                    // `09:30:00` renders as `09:30`.
+                    (required_time_input(&changeset, "opens", "Opens at"))
+                    // A date renders as its month: `2026-03`.
+                    (month_input(&changeset, "period", "Billing month"))
+                    // The browser posts a lowercase `#rrggbb`.
+                    (color_input(&changeset, "accent", "Accent color"))
+                    (range_input_with(&changeset, "volume", "Volume", Some("10"), &FieldOptions::new()
+                        .min("0")
+                        .max("100")))
+                    // A hidden input has no label and is not visible.
+                    (hidden_input(&changeset, "token"))
+                }
+            }
+        },
+        story! {
+            "Forms",
+            "Choice controls",
+            {
+                use autumn_web::form::{
+                    Changeset, FieldOptions, checkbox_group_with, radio_group,
+                    required_segmented_control, switch_input_with,
+                };
+
+                // Choice controls (#3405). A group is a <fieldset> with a
+                // <legend>. All of them work with JavaScript off: the native
+                // radio arrow keys move a selection, Space toggles a box.
+                let mut errors = std::collections::HashMap::new();
+                errors.insert("topics".to_string(), vec!["Choose one or more topics.".to_string()]);
+                let changeset = Changeset::from_errors(
+                    serde_json::json!({
+                        "alerts": true,
+                        "plan": "pro",
+                        "topics": ["rust"],
+                        "view": "grid",
+                    }),
+                    errors,
+                );
+
+                maud::html! {
+                    // A checkbox with role="switch". A screen reader says "on".
+                    (switch_input_with(&changeset, "alerts", "Email alerts", &FieldOptions::new()
+                        .hint("At most one email a day.")))
+                    (radio_group(&changeset, "plan", "Plan", &[
+                        ("free", "Free"),
+                        ("pro", "Pro"),
+                        ("team", "Team"),
+                    ]))
+                    // Bind to a `#[serde(default)] Vec<String>`. `required` shows
+                    // the marker only: validate "one or more" on the server.
+                    (checkbox_group_with(&changeset, "topics", "Topics", &[
+                        ("rust", "Rust"),
+                        ("web", "Web"),
+                        ("db", "Databases"),
+                    ], &FieldOptions::new().required()))
+                    // Radios that look like a row of buttons.
+                    (required_segmented_control(&changeset, "view", "View", &[
+                        ("list", "List"),
+                        ("grid", "Grid"),
+                        ("board", "Board"),
+                    ]))
+                }
+            }
+        },
+        story! {
             "Display",
             "Property list",
             {

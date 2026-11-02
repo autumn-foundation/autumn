@@ -495,3 +495,54 @@ fn form_for_override_promotes_field_to_select() {
     // Excluded field is gone.
     assert!(!html.contains(r#"name="rating""#));
 }
+
+diesel::table! {
+    alarms (id) {
+        id -> Integer,
+        label -> Text,
+        rings_at -> Time,
+        snooze_until -> Nullable<Time>,
+    }
+}
+
+#[autumn_web::model(table = "alarms")]
+pub struct Alarm {
+    pub id: i32,
+    pub label: String,
+    pub rings_at: chrono::NaiveTime,
+    pub snooze_until: Option<chrono::NaiveTime>,
+}
+
+#[test]
+fn derived_naive_time_renders_a_time_input_that_round_trips() {
+    // Issue #3405: a `NaiveTime` column renders `<input type="time">`.
+    let fields = Alarm::form_fields();
+    assert!(matches!(fields[1].control, FieldControl::Time));
+    assert!(fields[1].required);
+    assert!(matches!(fields[2].control, FieldControl::Time));
+    assert!(!fields[2].required);
+
+    let changeset = Changeset::new(Alarm {
+        id: 1,
+        label: "Wake".into(),
+        rings_at: chrono::NaiveTime::from_hms_opt(7, 15, 0).unwrap(),
+        snooze_until: None,
+    });
+    let html = form_for(&changeset, "/alarms", "post")
+        .render()
+        .into_string();
+    assert!(
+        html.contains(r#"<input type="time" id="rings_at" name="rings_at" value="07:15" required"#),
+        "{html}"
+    );
+
+    // The browser posts `HH:MM`, and a blank optional time. The
+    // `ChangesetForm` decoder reads both into the insert struct.
+    let new_alarm: NewAlarm =
+        autumn_web::form::from_urlencoded(b"label=Wake&rings_at=07%3A15&snooze_until=").unwrap();
+    assert_eq!(
+        new_alarm.rings_at,
+        chrono::NaiveTime::from_hms_opt(7, 15, 0).unwrap()
+    );
+    assert_eq!(new_alarm.snooze_until, None);
+}

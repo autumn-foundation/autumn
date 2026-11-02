@@ -229,6 +229,8 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "bulk-actions",
     "card",
     "charts",
+    // Native choice inputs (`autumn_web::form`, #3405).
+    "choice-controls",
     "comment-thread",
     "confirm-action",
     "data-table",
@@ -243,6 +245,8 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "infinite-feed",
     "locale-switcher",
     "modal",
+    // Native inputs (`autumn_web::form`, #3405).
+    "native-inputs",
     "nav-bar",
     "nav-link",
     // `ui::pagination` (#3398).
@@ -457,6 +461,7 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "accordion",
     "active-search",
     "autocomplete",
+    "choice-controls",
     "confirm-action",
     "drawer",
     "dropdown-menu",

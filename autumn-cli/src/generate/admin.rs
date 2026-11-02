@@ -629,6 +629,9 @@ const fn admin_field_kind(field: &Field) -> &'static str {
         FieldKind::Bool => "AdminFieldKind::Boolean",
         FieldKind::F32 | FieldKind::F64 => "AdminFieldKind::Float",
         FieldKind::NaiveDateTime | FieldKind::DateTime => "AdminFieldKind::DateTime",
+        // The admin panel has no time kind. A `NaiveTime` reads `HH:MM` and
+        // `HH:MM:SS` from text (issue #3405).
+        FieldKind::Time => "AdminFieldKind::Text",
         // Bytea and Attachment both render as hidden in the admin panel —
         // binary blobs and file metadata aren't suitable for direct inline
         // editing. `position` (issue #1358) is hidden for a different
