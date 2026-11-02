@@ -469,6 +469,36 @@ DatabaseFleetConfig {
 **Automation:** `manual` — a struct literal needs the values the app wants.
 A codemod cannot choose them.
 
+### Config: an unknown `AUTUMN_ROLE` stops the boot
+
+**Why:** a typo such as `AUTUMN_ROLE=workers` booted the app as `combined`
+(issue #3541). A worker pod then served user routes and ran the cron
+scheduler. The warning went to stderr before logging started, so it was easy
+to miss. A bad `role` in `autumn.toml` already stopped the boot.
+
+**You are affected only if a deployment sets `AUTUMN_ROLE` to a value that
+is not a role.** Run `autumn doctor` with the deployment env. The
+`process_role_backend` row fails on such a value.
+
+**Before (`{X.Y}`):**
+
+```text
+Warning: AUTUMN_ROLE="workers" is not valid (expected combined, web, or worker), ignoring
+```
+
+The app booted as `combined`.
+
+**After (`{(X+1).0}`):**
+
+```text
+configuration error: AUTUMN_ROLE: unknown process role "workers" (accepted: combined, all, web_and_worker, server_and_worker, web, server, http, worker, jobs, worker_only)
+```
+
+The app does not boot. Set a valid value, or remove the variable to get
+`combined`. An empty `AUTUMN_ROLE=` is still unset.
+
+**Automation:** `manual` — the fix is in the deployment env, not in code.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**

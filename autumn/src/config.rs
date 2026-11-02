@@ -3449,41 +3449,148 @@ impl SchedulerBackend {
 ///   does **not** serve user routes, but still binds the HTTP listener to serve
 ///   only the liveness/readiness probes and the actuator (so orchestrators can
 ///   supervise it and `/actuator/jobs` works).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+///
+/// `role` in TOML and `AUTUMN_ROLE` use one parser, [`FromStr`]. An unknown
+/// value is an error on both paths (#3541).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessRole {
     /// Serve HTTP and run background workers + scheduler (default; unchanged
     /// single-process behavior).
-    #[serde(
-        alias = "all",
-        alias = "combined",
-        alias = "web_and_worker",
-        alias = "server_and_worker"
-    )]
     #[default]
     Combined,
     /// Serve HTTP (and enqueue jobs) only — no worker loops, no scheduler.
-    #[serde(alias = "server", alias = "http")]
     Web,
     /// Run workers + scheduler only — probe/actuator HTTP only, no user routes.
-    #[serde(alias = "jobs", alias = "worker_only")]
     Worker,
 }
 
-impl ProcessRole {
-    /// Parse an environment variable / flag value for process-role selection.
+/// Each accepted spelling and its role. The order is the error order.
+const PROCESS_ROLE_SPELLINGS: [(&str, ProcessRole); 10] = [
+    ("combined", ProcessRole::Combined),
+    ("all", ProcessRole::Combined),
+    ("web_and_worker", ProcessRole::Combined),
+    ("server_and_worker", ProcessRole::Combined),
+    ("web", ProcessRole::Web),
+    ("server", ProcessRole::Web),
+    ("http", ProcessRole::Web),
+    ("worker", ProcessRole::Worker),
+    ("jobs", ProcessRole::Worker),
+    ("worker_only", ProcessRole::Worker),
+];
+
+/// A `role` or `AUTUMN_ROLE` value that names no [`ProcessRole`].
+///
+/// The message names the value and lists the accepted spellings.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "unknown process role {value:?} (accepted: {})",
+    ProcessRole::ACCEPTED_VALUES.join(", ")
+)]
+pub struct UnknownProcessRole {
+    value: String,
+}
+
+impl UnknownProcessRole {
+    /// The value as given, before trim.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl std::str::FromStr for ProcessRole {
+    type Err = UnknownProcessRole;
+
+    /// Parse a role. Case-insensitive. Leading and trailing spaces are
+    /// ignored.
     ///
-    /// Accepts (case-insensitive, trimmed): `combined`/`all`, `web`/`server`/
-    /// `http`, `worker`/`jobs`. Returns `None` for anything else so callers can
-    /// warn and keep the default.
+    /// # Errors
+    ///
+    /// Returns [`UnknownProcessRole`] when the value is not in
+    /// [`ProcessRole::ACCEPTED_VALUES`]. A blank value is an error.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let wanted = value.trim().to_ascii_lowercase();
+        PROCESS_ROLE_SPELLINGS
+            .iter()
+            .find(|(spelling, _)| *spelling == wanted)
+            .map(|(_, role)| *role)
+            .ok_or_else(|| UnknownProcessRole {
+                value: value.to_owned(),
+            })
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Canonical names. The schema walker probes with the first one.
+        const VARIANTS: &[&str] = &["combined", "web", "worker"];
+
+        struct RoleVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RoleVisitor {
+            type Value = ProcessRole;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a process role string")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<ProcessRole, E> {
+                value.parse().map_err(E::custom)
+            }
+
+            fn visit_enum<A>(self, data: A) -> Result<ProcessRole, A::Error>
+            where
+                A: serde::de::EnumAccess<'de>,
+            {
+                use serde::de::{Error as _, VariantAccess as _};
+                let (name, variant): (String, _) = data.variant()?;
+                variant.unit_variant()?;
+                name.parse().map_err(A::Error::custom)
+            }
+        }
+
+        // `deserialize_enum`, not `deserialize_str`: the strict-config schema
+        // walker gives a real variant name only through this path.
+        deserializer.deserialize_enum("ProcessRole", VARIANTS, RoleVisitor)
+    }
+}
+
+impl ProcessRole {
+    /// Every spelling [`FromStr`](std::str::FromStr) accepts, in error order.
+    pub const ACCEPTED_VALUES: [&'static str; 10] = {
+        let mut names = [""; 10];
+        let mut i = 0;
+        while i < PROCESS_ROLE_SPELLINGS.len() {
+            names[i] = PROCESS_ROLE_SPELLINGS[i].0;
+            i += 1;
+        }
+        names
+    };
+
+    /// Parse a role value. Returns `None` for an unknown or blank value.
+    ///
+    /// Use [`FromStr`](std::str::FromStr) to get the error, or
+    /// [`parse_env_override`](Self::parse_env_override) for `AUTUMN_ROLE`.
     #[must_use]
     pub fn from_env_value(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "combined" | "all" | "web_and_worker" | "server_and_worker" => Some(Self::Combined),
-            "web" | "server" | "http" => Some(Self::Web),
-            "worker" | "jobs" | "worker_only" => Some(Self::Worker),
-            _ => None,
+        value.parse().ok()
+    }
+
+    /// Parse an `AUTUMN_ROLE` value.
+    ///
+    /// A blank value is unset: `Ok(None)`, and the configured role stays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownProcessRole`] for a value that names no role.
+    pub fn parse_env_override(value: &str) -> Result<Option<Self>, UnknownProcessRole> {
+        if value.trim().is_empty() {
+            return Ok(None);
         }
+        value.parse().map(Some)
     }
 
     /// Stable lowercase identifier for the role (round-trips `from_env_value`).
@@ -5438,6 +5545,9 @@ impl AutumnConfig {
 
         // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
+        // An unknown `AUTUMN_ROLE` fails the load, as a bad TOML `role` does
+        // (#3541). It must not boot as `combined`.
+        Self::role_env_override(env)?;
 
         // Env overrides already applied `AUTUMN_SERVER__STRICT_CONFIG`.
         if config.server.strict_config {
@@ -6066,6 +6176,9 @@ impl AutumnConfig {
     }
 
     /// Apply environment overrides using the provided env abstraction.
+    ///
+    /// This does not validate. An unknown `AUTUMN_ROLE` leaves `role` as it
+    /// is. The loaders, such as [`load_with_env`](Self::load_with_env), reject it.
     pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
         self.apply_server_env_overrides_with_env(env);
         self.apply_deploy_env_overrides_with_env(env);
@@ -7393,16 +7506,21 @@ impl AutumnConfig {
         );
     }
 
+    /// Set `role` from `AUTUMN_ROLE`. A blank or unknown value leaves it.
+    /// [`role_env_override`](Self::role_env_override) rejects the unknown value
+    /// at load.
     fn apply_role_env_overrides_with_env(&mut self, env: &dyn Env) {
-        if let Ok(val) = env.var("AUTUMN_ROLE") {
-            match ProcessRole::from_env_value(&val) {
-                Some(role) => self.role = role,
-                None => eprintln!(
-                    "Warning: AUTUMN_ROLE={val:?} is not valid \
-                     (expected combined, web, or worker), ignoring"
-                ),
-            }
+        if let Ok(Some(role)) = Self::role_env_override(env) {
+            self.role = role;
         }
+    }
+
+    /// Read `AUTUMN_ROLE` (#3541). `Ok(None)` when it is absent or blank.
+    fn role_env_override(env: &dyn Env) -> Result<Option<ProcessRole>, ConfigError> {
+        env.var("AUTUMN_ROLE").map_or(Ok(None), |value| {
+            ProcessRole::parse_env_override(&value)
+                .map_err(|err| ConfigError::Validation(format!("AUTUMN_ROLE: {err}")))
+        })
     }
 
     /// `AUTUMN_RETENTION__*` overrides for the unified retention policy
@@ -23563,11 +23681,11 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert_eq!(config.role, ProcessRole::Web);
     }
 
+    /// `apply_env_overrides_with_env` does not validate. An unknown value
+    /// leaves `role` as it is. The loaders reject it (#3541).
     #[test]
-    fn autumn_role_env_override_ignores_invalid_value_keeping_default() {
+    fn apply_env_overrides_leaves_role_on_unknown_value() {
         let env = MockEnv::new().with("AUTUMN_ROLE", "nonsense");
-        // Start from a non-default to prove invalid values do not reset it and
-        // do not force it either — they leave the current value untouched.
         let mut config = AutumnConfig {
             role: ProcessRole::Worker,
             ..Default::default()
@@ -23575,9 +23693,165 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.role, ProcessRole::Worker);
 
-        // And from the default, an invalid value keeps Combined.
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.role, ProcessRole::Combined);
+    }
+
+    // ── Unknown AUTUMN_ROLE fails the load (#3541) ──────────────────────────
+
+    /// The accepted spellings, in the order the error lists them.
+    const ROLE_SPELLINGS_3541: [&str; 10] = [
+        "combined",
+        "all",
+        "web_and_worker",
+        "server_and_worker",
+        "web",
+        "server",
+        "http",
+        "worker",
+        "jobs",
+        "worker_only",
+    ];
+
+    /// An env with no config file and the given extra variables.
+    fn role_env_3541(dir: &std::path::Path, vars: &[(&str, &str)]) -> MockEnv {
+        let mut env = MockEnv::new()
+            .with("AUTUMN_ENV", "test")
+            .with("AUTUMN_MANIFEST_DIR", dir.to_str().expect("utf-8 temp dir"));
+        for (key, value) in vars {
+            env = env.with(key, value);
+        }
+        env
+    }
+
+    #[test]
+    fn process_role_from_str_accepts_aliases() {
+        assert_eq!("jobs".parse::<ProcessRole>(), Ok(ProcessRole::Worker));
+        assert_eq!("server".parse::<ProcessRole>(), Ok(ProcessRole::Web));
+        assert_eq!("all".parse::<ProcessRole>(), Ok(ProcessRole::Combined));
+        assert_eq!(" WEB ".parse::<ProcessRole>(), Ok(ProcessRole::Web));
+        for spelling in ROLE_SPELLINGS_3541 {
+            assert!(spelling.parse::<ProcessRole>().is_ok(), "{spelling}");
+        }
+        assert_eq!(ProcessRole::ACCEPTED_VALUES, ROLE_SPELLINGS_3541);
+    }
+
+    #[test]
+    fn process_role_from_str_error_names_value_and_accepted_spellings() {
+        let err = "workers"
+            .parse::<ProcessRole>()
+            .expect_err("workers is unknown");
+        assert_eq!(err.value(), "workers");
+        let message = err.to_string();
+        assert!(message.contains("\"workers\""), "{message}");
+        for spelling in ROLE_SPELLINGS_3541 {
+            assert!(message.contains(spelling), "{spelling} missing: {message}");
+        }
+        // A blank string is not a role.
+        assert!("".parse::<ProcessRole>().is_err());
+    }
+
+    #[test]
+    fn process_role_parse_env_override_treats_blank_as_unset() {
+        assert_eq!(ProcessRole::parse_env_override(""), Ok(None));
+        assert_eq!(ProcessRole::parse_env_override("  "), Ok(None));
+        assert_eq!(
+            ProcessRole::parse_env_override("jobs"),
+            Ok(Some(ProcessRole::Worker))
+        );
+        let err = ProcessRole::parse_env_override("workers").expect_err("unknown");
+        assert_eq!(err.value(), "workers");
+    }
+
+    #[test]
+    fn autumn_role_env_unknown_value_fails_config_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", "workers")]);
+
+        let err = AutumnConfig::load_with_env(&env).expect_err("unknown role must fail");
+        assert!(matches!(err, ConfigError::Validation(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("AUTUMN_ROLE"), "{message}");
+        assert!(message.contains("\"workers\""), "{message}");
+
+        // The deploy CLI loader agrees.
+        assert!(AutumnConfig::load_with_env_lenient_unknown_roots(&env).is_err());
+    }
+
+    #[test]
+    fn autumn_role_env_and_toml_reject_the_same_bad_value_alike() {
+        let expected = "workers"
+            .parse::<ProcessRole>()
+            .expect_err("unknown")
+            .to_string();
+
+        let env_dir = tempfile::tempdir().expect("temp dir");
+        let env = role_env_3541(env_dir.path(), &[("AUTUMN_ROLE", "workers")]);
+        let env_err = AutumnConfig::load_with_env(&env)
+            .expect_err("env must fail")
+            .to_string();
+
+        let toml_dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(toml_dir.path().join("autumn.toml"), "role = \"workers\"\n")
+            .expect("write autumn.toml");
+        let env = role_env_3541(toml_dir.path(), &[]);
+        let toml_err = AutumnConfig::load_with_env(&env)
+            .expect_err("toml must fail")
+            .to_string();
+
+        assert!(env_err.contains(&expected), "env: {env_err}");
+        assert!(toml_err.contains(&expected), "toml: {toml_err}");
+
+        // The same good value also gives the same role on both paths.
+        let parsed: AutumnConfig = toml::from_str("role = \"JOBS\"\n").expect("JOBS");
+        assert_eq!(parsed.role, ProcessRole::Worker);
+    }
+
+    #[test]
+    fn autumn_role_env_aliases_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (value, role) in [
+            ("jobs", ProcessRole::Worker),
+            ("server", ProcessRole::Web),
+            ("all", ProcessRole::Combined),
+        ] {
+            let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", value)]);
+            let config = AutumnConfig::load_with_env(&env).expect(value);
+            assert_eq!(config.role, role, "{value}");
+        }
+    }
+
+    /// An empty `AUTUMN_ROLE=` is unset: the configured role stays.
+    #[test]
+    fn autumn_role_env_blank_keeps_configured_role() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for value in ["", "   "] {
+            let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", value)]);
+            let config = AutumnConfig::load_with_env(&env).expect("blank is unset");
+            assert_eq!(config.role, ProcessRole::Combined, "{value:?}");
+        }
+
+        std::fs::write(dir.path().join("autumn.toml"), "role = \"web\"\n")
+            .expect("write autumn.toml");
+        let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", "")]);
+        let config = AutumnConfig::load_with_env(&env).expect("blank is unset");
+        assert_eq!(config.role, ProcessRole::Web);
+    }
+
+    /// A TOML `role = ""` stays an error, as before.
+    #[test]
+    fn toml_blank_role_is_an_error() {
+        assert!(toml::from_str::<AutumnConfig>("role = \"\"\n").is_err());
+    }
+
+    /// The custom `role` parser must not stop the strict-config schema walk.
+    #[test]
+    fn schema_walk_reaches_fields_after_role() {
+        let schema = AutumnConfig::get_schema_keys();
+        let root = schema.get("").expect("root keys");
+        for key in ["role", "auth", "security"] {
+            assert!(root.contains(key), "{key} missing from schema root");
+        }
     }
 }

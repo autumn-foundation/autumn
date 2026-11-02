@@ -4971,6 +4971,24 @@ fn check_database_topology_contract(
     }
 }
 
+/// The `process_role_backend` row. An unknown role fails here, as it fails
+/// the boot (#3541). A valid role goes to [`check_split_topology_on_local`].
+fn check_process_role(
+    role: &Result<ProcessRole, String>,
+    jobs_backend: &str,
+    database_url: Option<&str>,
+) -> CheckResult {
+    match role {
+        Ok(role) => check_split_topology_on_local(*role, jobs_backend, database_url),
+        Err(message) => CheckResult {
+            name: "process_role_backend",
+            status: CheckStatus::Fail,
+            detail: Some(format!("{message}; the app does not boot")),
+            hint: Some("Set AUTUMN_ROLE (or role in autumn.toml) to combined, web or worker"),
+        },
+    }
+}
+
 /// Verify the selected process role is compatible with the jobs backend.
 ///
 /// A split web/worker role runs the HTTP tier and the job/scheduler tier in
@@ -6324,9 +6342,14 @@ where
 /// runtime reads: the `AUTUMN_ROLE` / `AUTUMN_JOBS__BACKEND` env vars take
 /// precedence over the top-level `role` / `[jobs] backend` keys in the config
 /// table. Defaults to [`ProcessRole::Combined`] and the `"local"` backend.
-fn resolve_process_role_and_backend(table: Option<&toml::Table>) -> (ProcessRole, String) {
+///
+/// The role is an `Err` with the boot error text when it names no role.
+fn resolve_process_role_and_backend(
+    table: Option<&toml::Table>,
+    env: &dyn autumn_web::config::Env,
+) -> (Result<ProcessRole, String>, String) {
     resolve_process_role_and_backend_from_sources(
-        |key| std::env::var(key).ok().filter(|value| !value.is_empty()),
+        |key| env.var(key).ok().filter(|value| !value.is_empty()),
         table,
     )
 }
@@ -6334,22 +6357,11 @@ fn resolve_process_role_and_backend(table: Option<&toml::Table>) -> (ProcessRole
 fn resolve_process_role_and_backend_from_sources<F>(
     env_var: F,
     table: Option<&toml::Table>,
-) -> (ProcessRole, String)
+) -> (Result<ProcessRole, String>, String)
 where
     F: Fn(&str) -> Option<String>,
 {
-    // Mirror the runtime (`apply_role_env_overrides_with_env`): an invalid
-    // `AUTUMN_ROLE` env value is ignored and we fall through to the configured
-    // TOML `role`, rather than short-circuiting straight to `Combined`.
-    let role = first_env(&env_var, &["AUTUMN_ROLE"])
-        .as_deref()
-        .and_then(ProcessRole::from_env_value)
-        .or_else(|| {
-            first_toml_string(table, &["role"])
-                .as_deref()
-                .and_then(ProcessRole::from_env_value)
-        })
-        .unwrap_or(ProcessRole::Combined);
+    let role = resolve_process_role_from_sources(&env_var, table);
 
     let jobs = table
         .and_then(|t| t.get("jobs"))
@@ -6359,6 +6371,36 @@ where
         .unwrap_or_else(|| "local".to_owned());
 
     (role, backend)
+}
+
+/// Resolve the role as the runtime loader does (#3541).
+///
+/// A non-blank `AUTUMN_ROLE` wins. A blank one is unset. An unknown value on
+/// either source is an error with the boot error text. It does not fall back.
+fn resolve_process_role_from_sources<F>(
+    env_var: &F,
+    table: Option<&toml::Table>,
+) -> Result<ProcessRole, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(value) = env_var("AUTUMN_ROLE") {
+        if let Some(role) =
+            ProcessRole::parse_env_override(&value).map_err(|err| format!("AUTUMN_ROLE: {err}"))?
+        {
+            return Ok(role);
+        }
+    }
+    match table.and_then(|t| t.get("role")) {
+        None => Ok(ProcessRole::Combined),
+        Some(toml::Value::String(value)) => value
+            .parse::<ProcessRole>()
+            .map_err(|err| format!("role: {err}")),
+        Some(other) => Err(format!(
+            "role: expected a string, found {}",
+            other.type_str()
+        )),
+    }
 }
 
 /// Resolve the configured queue names and the effective `jobs.pin` for the
@@ -9617,7 +9659,8 @@ pub fn run(opts: DoctorOptions) {
         |key| db_denv.var(key).ok().filter(|value| !value.is_empty()),
         Some(&merged_db_toml),
     );
-    let (process_role, jobs_backend) = resolve_process_role_and_backend(Some(&merged_db_toml));
+    let (process_role, jobs_backend) =
+        resolve_process_role_and_backend(Some(&merged_db_toml), db_denv.as_ref());
     let port = resolve_server_port();
     let tailwind = tailwind_enabled();
     let signing_secret = resolve_optional_signing_secret();
@@ -9676,13 +9719,14 @@ pub fn run(opts: DoctorOptions) {
         check_database_topology_contract(&topology_for_check, is_production)
     }));
 
-    // 4b. Process role vs. jobs backend: a split web/worker role can't share the
-    // in-process `local` job queue across separate processes — nor an in-memory
-    // SQLite database, which is private to each of them.
+    // 4b. Process role vs. jobs backend: an unknown role fails (#3541). A split
+    // web/worker role can't share the in-process `local` job queue across
+    // separate processes — nor an in-memory SQLite database, which is private to
+    // each of them.
     let split_topology_db_url = db_topology.primary_url.clone();
     tasks.push(Box::new(move || {
-        check_split_topology_on_local(
-            process_role,
+        check_process_role(
+            &process_role,
             &jobs_backend,
             split_topology_db_url.as_deref(),
         )
@@ -9706,7 +9750,11 @@ pub fn run(opts: DoctorOptions) {
     // and `doctor --strict` could wrongly warn or fail on queue coverage for a process
     // that runs no job workers. Precedence mirrors the runtime exactly (`AUTUMN_ROLE`
     // env > merged-table `role` > `Combined`), reusing the shared resolver.
-    let (queue_coverage_role, _) = resolve_process_role_and_backend(Some(&merged_jobs_toml));
+    // An unknown role already fails the `process_role_backend` row. Use the
+    // default here so this row still reports.
+    let (queue_coverage_role, _) =
+        resolve_process_role_and_backend(Some(&merged_jobs_toml), db_denv.as_ref());
+    let queue_coverage_role = queue_coverage_role.unwrap_or_default();
     // Topology/registry inputs (#1756) that let the coverage check restore a
     // SOUND `--strict` hard-fail: the declared fleet topology (all worker tiers'
     // pins) and the compiled `#[job(queue)]` set (from a jobs manifest or an
@@ -19345,6 +19393,7 @@ foo = "bar"
             |key| (key == "AUTUMN_ROLE").then(|| "worker".to_owned()),
             Some(&table),
         );
+        let role = role.expect("valid role");
         assert_eq!(role, ProcessRole::Worker);
         assert_eq!(backend, "local");
     }
@@ -19352,6 +19401,7 @@ foo = "bar"
     #[test]
     fn resolve_process_role_defaults_to_combined_and_local() {
         let (role, backend) = resolve_process_role_and_backend_from_sources(|_| None, None);
+        let role = role.expect("valid role");
         assert_eq!(role, ProcessRole::Combined);
         assert_eq!(backend, "local");
     }
@@ -19584,6 +19634,7 @@ foo = "bar"
         // that matches no known queue Warns → `--strict` fails. This is exactly
         // the false failure the fix eliminates.
         let (raw_role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&base));
+        let raw_role = raw_role.expect("valid role");
         assert_eq!(raw_role, ProcessRole::Combined);
         let (raw_queues, raw_pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&base));
         let raw_result = check_queue_coverage(raw_role, &raw_queues, &raw_pin);
@@ -19609,6 +19660,7 @@ foo = "bar"
         }
         let (merged_role, _) =
             resolve_process_role_and_backend_from_sources(|_| None, Some(&merged));
+        let merged_role = merged_role.expect("valid role");
         assert_eq!(
             merged_role,
             ProcessRole::Web,
@@ -19645,6 +19697,7 @@ foo = "bar"
             |key| (key == "AUTUMN_ROLE").then(|| "worker".to_owned()),
             Some(&merged),
         );
+        let env_role = env_role.expect("valid role");
         assert_eq!(env_role, ProcessRole::Worker);
         assert_eq!(
             check_queue_coverage(env_role, &queues, &pin).status,
@@ -19661,6 +19714,7 @@ foo = "bar"
             toml::from_str("role = \"web\"\n[jobs]\npin = [\"ghost\"]\nqueues = [\"critical\"]\n")
                 .expect("parse toml");
         let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+        let role = role.expect("valid role");
         assert_eq!(role, ProcessRole::Web);
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
         let result = check_queue_coverage(role, &queues, &pin);
@@ -19697,6 +19751,7 @@ foo = "bar"
             }
         }
         let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&merged));
+        let role = role.expect("valid role");
         assert_eq!(role, ProcessRole::Worker);
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&merged));
         let result = check_queue_coverage(role, &queues, &pin);
@@ -20544,28 +20599,84 @@ foo = "bar"
             |key| (key == "AUTUMN_JOBS__BACKEND").then(|| "postgres".to_owned()),
             Some(&table),
         );
+        let role = role.expect("valid role");
         assert_eq!(role, ProcessRole::Web);
         assert_eq!(backend, "postgres");
     }
 
+    /// #3541: an unknown `AUTUMN_ROLE` is an error, as at boot. It does not
+    /// fall back to the TOML role.
     #[test]
-    fn resolve_process_role_falls_back_to_toml_when_env_role_invalid() {
-        // An invalid AUTUMN_ROLE must be ignored in favor of the configured
-        // TOML role, exactly like the runtime's apply_role_env_overrides_with_env.
+    fn resolve_process_role_rejects_unknown_env_value() {
         let table: toml::Table =
             toml::from_str("role = \"worker\"\n[jobs]\nbackend = \"local\"\n").expect("parse toml");
         let (role, backend) = resolve_process_role_and_backend_from_sources(
-            |key| (key == "AUTUMN_ROLE").then(|| "garbage".to_owned()),
+            |key| (key == "AUTUMN_ROLE").then(|| "workers".to_owned()),
             Some(&table),
         );
-        assert_eq!(role, ProcessRole::Worker);
+        let expected = "workers"
+            .parse::<ProcessRole>()
+            .expect_err("unknown")
+            .to_string();
+        let message = role.expect_err("unknown env role must fail");
+        assert!(message.contains("AUTUMN_ROLE"), "{message}");
+        assert!(message.contains(&expected), "{message}");
         assert_eq!(backend, "local");
+    }
 
-        // ...and doctor therefore flags the split-on-local misconfiguration the
-        // runtime rejects at startup, instead of wrongly passing.
-        let result = check_split_topology_on_local(role, &backend, None);
+    /// #3541: a bad TOML `role` fails the same way the loader does.
+    #[test]
+    fn resolve_process_role_rejects_unknown_toml_value() {
+        for source in ["role = \"wrker\"\n", "role = \"\"\n", "role = 5\n"] {
+            let table: toml::Table = toml::from_str(source).expect("parse toml");
+            let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+            let message = role.expect_err(source);
+            assert!(message.starts_with("role: "), "{source}: {message}");
+            assert!(
+                toml::from_str::<autumn_web::config::AutumnConfig>(source).is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    /// #3541: a blank `AUTUMN_ROLE=` is unset. The TOML role applies.
+    #[test]
+    fn resolve_process_role_treats_blank_env_as_unset() {
+        let table: toml::Table = toml::from_str("role = \"web\"\n").expect("parse toml");
+        for value in ["", "  "] {
+            let (role, _) = resolve_process_role_and_backend_from_sources(
+                |key| (key == "AUTUMN_ROLE").then(|| value.to_owned()),
+                Some(&table),
+            );
+            assert_eq!(role, Ok(ProcessRole::Web), "{value:?}");
+        }
+        let (role, _) = resolve_process_role_and_backend_from_sources(
+            |key| (key == "AUTUMN_ROLE").then(|| "jobs".to_owned()),
+            Some(&table),
+        );
+        assert_eq!(role, Ok(ProcessRole::Worker));
+    }
+
+    /// #3541: the `process_role_backend` row fails on an unknown role.
+    #[test]
+    fn process_role_check_fails_on_unknown_role() {
+        let (role, backend) = resolve_process_role_and_backend_from_sources(
+            |key| (key == "AUTUMN_ROLE").then(|| "workers".to_owned()),
+            None,
+        );
+        let result = check_process_role(&role, &backend, None);
+        assert_eq!(result.name, "process_role_backend");
+        assert_eq!(result.status, CheckStatus::Fail);
+        let detail = result.detail.unwrap_or_default();
+        assert!(detail.contains("\"workers\""), "{detail}");
+        assert!(result.hint.is_some());
+
+        // A valid role still runs the split-topology check.
+        let result = check_process_role(&Ok(ProcessRole::Worker), "local", None);
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.detail.unwrap_or_default().contains("worker"));
+        let result = check_process_role(&Ok(ProcessRole::Combined), "local", None);
+        assert_eq!(result.status, CheckStatus::Pass);
     }
 
     #[test]

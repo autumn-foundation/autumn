@@ -221,6 +221,20 @@ role = "worker"     # or: web | combined
 autumn serve --role worker   # or: --role web
 ```
 
+The env var and the TOML key accept the same values. Case is not important.
+The aliases are `all`, `web_and_worker` and `server_and_worker` (combined),
+`server` and `http` (web), and `jobs` and `worker_only` (worker).
+
+An unknown value stops the boot. It does not fall back to `combined`. The
+error names the value and lists the accepted values:
+
+```text
+configuration error: AUTUMN_ROLE: unknown process role "workers" (accepted: combined, all, web_and_worker, server_and_worker, web, server, http, worker, jobs, worker_only)
+```
+
+An empty `AUTUMN_ROLE=` is unset: the `role` key applies, or `combined`.
+`autumn doctor` shows the same error on its `process_role_backend` row.
+
 ### Self-gating app-owned background work
 
 The framework already uses the resolved role to gate the `#[job]` runtime, the
