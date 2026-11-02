@@ -208,7 +208,8 @@ use autumn_web::form::{FieldOptions, checkbox_group_with, radio_group, switch_in
 ```
 
 - A group is a `<fieldset>` with a `<legend>`. The hint and error links go on
-  the `<fieldset>`. Each input has `id="{field}-{index}"`.
+  the `<fieldset>`. The first input has `id="{field}"`, so an error summary
+  link moves focus to the group. The other inputs have `id="{field}-{index}"`.
 - A checkbox group posts one `topics=…` pair for each checked box, and no key
   when no box is checked. `Changeset::field_values` checks the boxes again
   after a 422.

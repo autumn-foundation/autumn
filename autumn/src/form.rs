@@ -4413,9 +4413,9 @@ macro_rules! native_input_helpers {
     ($(
         $kind:ident, $html:literal, $plain:ident, $required:ident, $with:ident, $what:literal;
     )*) => {$(
-        #[doc = concat!("Render a labeled `<input type=\"", $html, "\">` tied to a changeset ", $what, ".")]
+        #[doc = concat!("Render a labeled `<input type=\"", $html, "\">` tied to a changeset field.")]
         ///
-        /// The wrapper, label, hint and errors are the same as [`text_input`].
+        #[doc = concat!($what, ". The wrapper, label, hint and errors are the same as [`text_input`].")]
         #[cfg(feature = "maud")]
         #[must_use]
         pub fn $plain<T: Serialize>(
@@ -4453,11 +4453,11 @@ macro_rules! native_input_helpers {
 
 native_input_helpers! {
     Email, "email", email_input, required_email_input, email_input_with,
-        "field. The browser checks the address shape. Check it on the server too";
+        "The browser checks the address shape. Check it on the server too";
     Tel, "tel", tel_input, required_tel_input, tel_input_with,
-        "phone number. The browser does not check the format";
+        "For a phone number. The browser does not check the format";
     Url, "url", url_input, required_url_input, url_input_with,
-        "absolute URL field. The browser checks the URL shape";
+        "For an absolute URL. The browser checks the URL shape";
 }
 
 /// Render a labeled `<input type="time">` tied to a changeset field.

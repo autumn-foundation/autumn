@@ -19,8 +19,10 @@ passthrough). Map new scaffold DSL kinds onto them.
 3. A group (radio, checkbox, segmented) uses the `<fieldset>` and `<legend>`
    wrapper that a grouped custom control (#3400) already has. The `aria-*`
    links go on the `<fieldset>`.
-4. Each group item has `id="{field}-{index}"`. The index, not the value,
-   goes in the id, so a value with spaces or quotes cannot break the id.
+4. The first group item has `id="{field}"`, so the error summary link
+   `#{field}` finds the group. Item 1 and up has `id="{field}-{index}"`. The
+   index, not the value, goes in the id, so a value with spaces or quotes
+   cannot break the id.
 5. A checkbox group reads `Changeset::field_values` (#3394), so the boxes
    stay checked after a 422.
 6. A segmented control is radios with other classes. The radio is
@@ -54,6 +56,8 @@ Question: "How can these helpers break a form?" Each answer gives a guard.
 | A switch is not visible in forced-colors mode. | A `forced-colors` rule draws the thumb with system colors. |
 | The model `required` flag makes a switch, range, color or checkbox group "must be set". | `form_for` ignores the model flag for them, as it does for a checkbox. |
 | A new class has no CSS rule. | `widget_css_coverage` fails. Add the rules. |
+| An error summary link `#{field}` finds no element in a group. | The first item has the field id. A test follows the link. |
+| A nullable color column can never stay NULL (a color input always posts a value). | The DSL rejects `Option<color>`. |
 | A scaffold sample literal is wrong for a `TIME` column. | Exhaustive matches. Add a literal and a test for each new kind. |
 
 ## Six thinking hats
