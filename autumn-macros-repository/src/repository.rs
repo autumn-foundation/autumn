@@ -3335,6 +3335,7 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
     let table_ident = format_ident!("{table_name}");
     let trait_name = &trait_def.ident;
     let pg_name = format_ident!("Pg{trait_name}");
+    let sqlite_name = format_ident!("Sqlite{trait_name}");
     let history_flush_method = history_flush_method_ts(&config);
     let new_name = format_ident!("New{model_name}");
     let update_name = format_ident!("Update{model_name}");
@@ -6585,10 +6586,12 @@ pub fn repository_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
         // traits (see `M2mConnSource`).
         #m2m_conn_source_impl
 
-        /// Postgres implementation of the repository.
+        /// The generated repository.
         #vis struct #pg_name {
             #struct_fields
         }
+
+        ::autumn_web::__sqlite_repository_alias!(#vis #sqlite_name = #pg_name);
 
         #from_request_parts_impl
 
@@ -30342,7 +30345,10 @@ mod tests {
             // `crate_version` field, an `option_env!` match of about 170
             // bytes. Understood and intended.
             ("plain", quote! { Post }, 82_000),
-            ("soft_delete", quote! { Post, soft_delete }, 89_000),
+            // Raised from 89_000: each repository emits one
+            // `__sqlite_repository_alias!` call (the `Sqlite<Trait>` name),
+            // about 90 bytes. Understood and intended.
+            ("soft_delete", quote! { Post, soft_delete }, 90_000),
             ("tenant_scoped", quote! { Post, tenant_scoped }, 103_000),
             // Raised from 95_000 (#2451): each repository publishes its
             // cascade consts. Understood and intended.

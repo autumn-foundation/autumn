@@ -32,7 +32,8 @@ url = "sqlite:///var/lib/app/control.db"
 mode = "tenant"                 # or "slot"
 root = "/var/lib/app/fleet"     # on the host's local volume
 # path = "{bucket}/{tenant}.db" # default for mode = "tenant"
-max_open = 256                  # open databases at most (LRU past this)
+max_open = 256                  # soft limit on open databases (LRU past this)
+# min_residency = "2s"          # LRU does not close a database used this recently
 pool_size = 2                   # connections per open database
 idle_close_secs = 300           # close a database idle this long
 # create_on_demand = false      # default: false for tenants, true for slots
@@ -99,10 +100,19 @@ async fn create(mut db: ShardedDb, Path(body): Path<String>) -> AutumnResult<Str
 pub trait NoteRepository {}
 
 #[get("/notes")]
-async fn list(repo: PgNoteRepository) -> AutumnResult<Json<Vec<Note>>> {
+async fn list(repo: SqliteNoteRepository) -> AutumnResult<Json<Vec<Note>>> {
     Ok(Json(repo.find_all().await?))
 }
 ```
+
+`#[repository]` generates `PgNoteRepository`. A SQLite build also names it
+`SqliteNoteRepository`. The two names are one type. The generators still
+write the `Pg` name.
+
+In a module with `#[model]` or `#[repository]`, use
+`autumn_web::db::prelude::*`, not `diesel::prelude::*`. Diesel's prelude also
+imports the blocking `RunQueryDsl`, and the generated code then fails with
+E0034 ("multiple applicable items in scope").
 
 The routing key is the tenant id, resolved exactly as for `ShardedDb`
 (`ShardKeyOverride`, then the tenancy middleware, then `[tenancy]`
@@ -134,11 +144,51 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 | `fleet.open(&key)` | open (`404` when missing and not created on demand) |
 | `fleet.delete(&key)` | close, then remove the file, its sidecars and the emptied bucket; requests get `410` meanwhile; `409` when another process still has it open. With replication, the replica goes too: see [Deleting a database's replica](#deleting-a-databases-replica) |
 | `fleet.backup(&key, &dest)` | consistent copy with `VACUUM INTO`; writers keep running |
+| `fleet.import(&key, &src)` | copy a file into the fleet as `key`: check, migrate, publish (`409` when the key has a file, `422` for a bad file). See [Import a backup](#import-a-backup) |
 | `fleet.list()` | every database on disk |
 | `fleet.each(n, f)` | run `f` on every database, `n` at a time |
 | `fleet.migrate_all(n)` | migrate every database, report failures per database |
 | `fleet.restore(&key, at)` | rebuild from the replica (needs replication); `409` when another process still has it open |
 | `fleet.stats()` | counters (also on `/actuator/health` as `db:fleet`) |
+
+### Import a backup
+
+`fleet.import(&key, &src)` copies a database file into the fleet as `key`,
+for example a file that `fleet.backup` wrote before a delete:
+
+```rust
+fleet.backup(&key, &archive).await?;
+fleet.delete(&key).await?;
+// Later: undo the delete.
+fleet.import(&key, &archive).await?;
+```
+
+The import does not change `src`. It copies `src` with `VACUUM INTO` into a
+private staging file. Then it does these steps:
+
+1. It runs `PRAGMA integrity_check`.
+2. It reads the identity row. The row must record `key`. A file with no
+   identity row (a file that no fleet made) is refused.
+3. It applies the pending migrations. With ownership, it sets the epoch of
+   the copy to this host's epoch. Without ownership, it removes the epoch.
+4. With replication, it purges the tombstone and the old replica of a
+   deleted key, as `provision` does. It does this only after steps 1 to 3
+   pass. Thus a refused file keeps the replica.
+5. It publishes the file in one step. It never replaces a file.
+
+A refused source answers `422` (`FleetError::InvalidSource`), and a key that
+has a file answers `409`. Nothing is published then. `fleet.import_file` does
+the same steps, but does not open the database.
+
+Import only files that you trust: the copy keeps the schema, the triggers and
+the migration records of `src`. On Windows, the import opens `src` read-write,
+so SQLite can apply a `-wal` or a hot journal to it.
+
+`FleetLifecycle::restore_missing` is a lower-level hook. Each request-path
+open of a missing file asks it, under the path lock, whatever
+`[database.fleet] restore_missing` says. A background open does not ask. With
+replication, an open of a deleted key does not ask. Use `import` for a local
+backup.
 
 ## Operating the fleet
 
@@ -159,6 +209,7 @@ cargo install autumn-cli --no-default-features --features sqlite
 | `autumn fleet list [--open] [--json]` | name, size and path of each database; `--open` adds the identity row, the latest applied app migration and the number of pending app migrations |
 | `autumn fleet migrate [--concurrency N] [--key K]` | apply `migrations/` and the framework tables to every database, or to one |
 | `autumn fleet backup <key> <dest>` | copy one database with `VACUUM INTO`; `dest` must not exist |
+| `autumn fleet import <key> <src>` | copy `src` into the fleet as `key`; the key must have no file |
 | `autumn fleet delete <key> --force` | remove one database and its sidecars; with replication, its replica too |
 | `autumn fleet restore <key> [--timestamp T] --force` | rebuild one database from its replica; `--timestamp` sets a point in time |
 
@@ -166,6 +217,7 @@ cargo install autumn-cli --no-default-features --features sqlite
 autumn fleet list --open
 autumn fleet migrate --concurrency 4
 autumn fleet backup tenant:acme /backups/acme.db
+autumn fleet import tenant:acme /backups/acme.db
 autumn fleet delete tenant:acme --force
 autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
 ```
@@ -175,7 +227,14 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
 - No command creates the fleet root. Each command stops when
   `database.fleet.root` does not exist, so a wrong directory does not give an
   empty fleet. For a new volume, create the root directory first.
-- Only `restore` creates a database file. The other commands do not.
+- Only `restore` and `import` create a database file. The other commands do
+  not.
+- `import` applies `migrations/` and the framework tables to the copy before
+  it publishes it. Like `migrate`, it stops when the copy records a migration
+  that is not in these sets. With `[replication]` on, it needs the replica
+  destination and the control database, to purge the old replica of a deleted
+  database. With `[database.fleet.ownership]` on, it stops: this command holds
+  no slot lease. Call `DatabaseFleet::import` in the app that owns the slot.
 - Like boot, each command validates `[database]` first and stops when the
   control database resolves inside the fleet root.
 - `list --open` reads each file and changes no data. It exits non-zero when
@@ -237,21 +296,53 @@ Each database's run is one `BEGIN IMMEDIATE` transaction: atomic, and safe
 when two processes race. During a rollout the fleet is mixed, so write
 migrations expand-then-contract.
 
+### Control-only and tenant-only sets
+
+`AppBuilder::migrations` sends a set to the control database and to every
+fleet database. To keep a set on one side, use `migrations_for`:
+
+```rust
+use autumn_web::migrate::{EmbeddedMigrations, MigrationScope, embed_migrations};
+
+const CONTROL: EmbeddedMigrations = embed_migrations!("migrations-control");
+const TENANT: EmbeddedMigrations = embed_migrations!("migrations");
+
+autumn_web::app()
+    .migrations_for(MigrationScope::Control, CONTROL) // control database only
+    .migrations_for(MigrationScope::Shards, TENANT)   // each fleet database only
+```
+
+Boot and `AUTUMN_MIGRATE=1` obey the scope. `autumn migrate` and
+`autumn fleet migrate` read `migrations/` and do not know a scope. Keep the
+tenant set in `migrations/` and the control set in its own directory. Then
+`autumn fleet migrate` is correct for the fleet. Do not run `autumn migrate`
+on this app: it applies `migrations/` to the control database. Use
+`AUTUMN_MIGRATE=1`.
+
 ## Opening and closing
 
 - The first request for a database opens it (about half a millisecond for a
   small schema). Concurrent first requests share that one open.
 - A file that records another key's name (it was copied or renamed by hand)
   is refused with `500` rather than served.
-- Past `max_open`, the least recently used idle database closes. A database
-  with a connection checked out, used in the last two seconds, or held by a
-  request (a `ShardedDb`, a sharded repository) is never closed, so the cap is
-  soft under load.
+- `max_open` is a soft limit. Past it, the least recently used idle database
+  closes. The sweep does not close a database that has a connection checked
+  out, that a request holds (a `ShardedDb`, a sharded repository), or that
+  was used within `min_residency` (default `2s`). An open never waits for
+  room. Thus a burst across many keys opens more databases than `max_open`.
+  In one measurement, 1,000 tenants at about 1,300 requests per second gave
+  594 open databases with `max_open = 16`. The count decreased to 16 about
+  12 seconds after the burst.
+- A lower `min_residency` keeps the count nearer to `max_open` during a burst.
+  A request can then reopen a database that it used a moment before.
 - A new database is built and migrated in a private staging file, then
   published in one step: it is absent or complete, never half made. When two
   processes on one volume create the same database, both end up on one file.
-- Budget: `max_open × pool_size` connections and roughly
-  `max_open × (2 × pool_size + 1)` file descriptors.
+- Budget: `pool_size` connections and about `2 × pool_size + 1` file
+  descriptors (database and `-wal` per connection, one `-shm`) per open
+  database. Size the open-file limit (`ulimit -n`) for the peak open count
+  under a burst, not for `max_open`. The default limit on macOS is 256: 594
+  open databases go past it.
 - Metrics label every fleet database `shard=fleet`; the database name goes on
   spans and logs only, so a tenant fleet cannot explode metric cardinality.
 
@@ -559,6 +650,12 @@ above the epoch that the replicator found.
   remove files. If another process opens the database in that gap, `delete`
   answers `409`. `restore` also answers `409` if that process creates the
   file before `restore` publishes.
+
+## With `autumn-harvest-sqlite`
+
+`autumn-harvest-sqlite` and the `sqlite` feature of `autumn-web` use the same
+`libsqlite3-sys`, so the two link one SQLite. `SqliteRuntime` and its drive
+future are `Send`: one tokio task can own the runtime.
 
 ## See also
 

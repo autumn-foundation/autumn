@@ -111,7 +111,6 @@ pub struct PresignPutResult {
 /// #[secured]  // enforces session authentication
 /// async fn complete_upload(
 ///     State(state): State<AppState>,
-///     CsrfFormField(_): CsrfFormField,  // enforces CSRF
 ///     Form(form): Form<CompleteForm>,
 /// ) -> AutumnResult<Markup> {
 ///     let blobs = state.extension::<BlobStoreState>().unwrap();

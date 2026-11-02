@@ -381,16 +381,54 @@ To name the type, use `<S as Service<Request>>::Future`.
 **Automation:** `manual` — the code to change is in the app's own middleware.
 A codemod cannot find it reliably.
 
-### Database: `DatabaseFleetConfig` has three new fields
+### Security: the CSRF extractors cannot reject
+
+**Why:** a required `CsrfToken` answered `500` when CSRF was off (the dev
+default), so one handler did not work in every profile.
+
+**You are affected only if your code names the rejection type** of
+`CsrfToken`, `CsrfFormField` or `CsrfTokenHeader`, for example in a custom
+extractor. It is now `std::convert::Infallible`.
+
+**Before (`{X.Y}`):**
+
+```rust
+let token = CsrfToken::from_request_parts(parts, state).await.ok();
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+// `None` when CSRF is off, as `.ok()` gave before.
+let token = parts.extensions.get::<CsrfToken>().cloned();
+```
+
+**Automation:** `manual` — the replacement depends on what the code wants
+when CSRF is off.
+
+### Repositories: a SQLite build defines `Sqlite<Trait>`
+
+**Why:** the generated repository was named only `Pg<Trait>`, also on
+SQLite.
+
+**You are affected only if a SQLite app defines its own type named
+`Sqlite<Trait>`** (for example `SqliteNoteRepository`) in the module of a
+`#[repository] trait NoteRepository`. Rename your type, or use the new
+alias.
+
+**Automation:** `manual` — a codemod cannot choose the new name.
+
+### Database: `DatabaseFleetConfig` has four new fields
 
 **Why:** a deleted fleet database's replica now goes with it (issue #3235).
 `replica_retention_after_delete` keeps it for an undo window.
 `restore_check_sample` sets the restore check. `replication_workers` sets the
-number of threads that ship fleet databases.
+number of threads that ship fleet databases. `min_residency` sets how long
+the `max_open` sweep keeps a database that was just used.
 
 **You are affected only if your code builds a `DatabaseFleetConfig` with a
 struct literal** (tests and tools often do). TOML and `AUTUMN_*` config need
-no change: all three keys have defaults.
+no change: all four keys have defaults.
 
 **Before (`{X.Y}`):**
 
@@ -424,6 +462,7 @@ DatabaseFleetConfig {
     replica_retention_after_delete: std::time::Duration::ZERO,
     restore_check_sample: 1,
     replication_workers: 4,
+    min_residency: std::time::Duration::from_secs(2),
 }
 ```
 
@@ -551,6 +590,17 @@ If nothing changed, delete this section.
   second of two equal values now ends in `--n1`. It ended in `-<index>`
   before. Update a CSS rule, a test or a `getElementById` call that uses an
   old id.
+
+- **The dev profile sets `session.secure = false`.** The dev server serves
+  plain http on localhost, and most clients do not return a `Secure` cookie
+  over http. Session sign-in then failed under `cargo run`. Other profiles
+  keep `true`. To keep `true` in dev, set `[session] secure = true`.
+
+- **A required `CsrfToken` works with CSRF off.** Before, a handler that took
+  `CsrfToken`, `CsrfFormField` or `CsrfTokenHeader` answered `500` when
+  `security.csrf.enabled = false` (the dev default). Now `CsrfToken` is empty
+  and the names are the defaults. Nothing checks them. To know whether CSRF
+  is on, take `Option<CsrfToken>`.
 
 - **A fleet delete removes the replica (#3235).** With `[replication]` on,
   `DatabaseFleet::delete` and `autumn fleet delete` now delete the

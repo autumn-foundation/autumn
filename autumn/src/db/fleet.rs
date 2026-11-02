@@ -99,7 +99,8 @@ const RESTORE_CHECK_DIR: &str = "restore-check";
 /// A scratch file older than this is from a check that did not end.
 const SCRATCH_STALE: Duration = Duration::from_secs(24 * 3600);
 
-/// How long a database stays open after its last use before LRU may close it.
+/// How long a database stays open after its last use before LRU may close it,
+/// when `database.fleet.min_residency` is not set.
 ///
 /// A request resolves its database, then checks a connection out a moment
 /// later (a generated repository even later, lazily); without this grace a
@@ -136,7 +137,8 @@ pub enum FleetError {
         /// The database name.
         name: String,
     },
-    /// [`DatabaseFleet::provision`] was asked for a database that exists (`409`).
+    /// [`DatabaseFleet::provision`] or [`DatabaseFleet::import`] was asked
+    /// for a database that exists (`409`).
     #[error("fleet database {name} already exists")]
     AlreadyExists {
         /// The database name.
@@ -220,6 +222,18 @@ pub enum FleetError {
         /// The routing slot.
         slot: u16,
     },
+    /// [`DatabaseFleet::import`] refused its source file (`422`): it is
+    /// missing, is not a database, fails the integrity check, or does not
+    /// record the key in its identity row. Nothing was changed.
+    #[error("cannot import {path} as fleet database {name}: {detail}")]
+    InvalidSource {
+        /// The database name.
+        name: String,
+        /// The source path.
+        path: String,
+        /// Why the source was refused.
+        detail: String,
+    },
     /// A file operation failed (`500`).
     #[error("fleet {op}: {detail}")]
     Io {
@@ -239,6 +253,7 @@ impl FleetError {
         use http::StatusCode;
         match self {
             Self::InvalidKey(_) => StatusCode::BAD_REQUEST,
+            Self::InvalidSource { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::AlreadyExists { .. } | Self::InUseElsewhere { .. } => StatusCode::CONFLICT,
             Self::Deleting { .. } => StatusCode::GONE,
@@ -418,6 +433,12 @@ pub trait FleetLifecycle: Send + Sync + 'static {
     /// stray sidecars of the absent database first. Other keys that share the
     /// lock file wait, so do the slow work (a download) only as needed.
     ///
+    /// Each request-path open of a missing file asks this hook, whatever
+    /// `[database.fleet] restore_missing` says (that setting controls only
+    /// the restore from the replica). A background open does not ask. With
+    /// replication, an open of a deleted database does not ask either. To
+    /// restore a local backup, use [`DatabaseFleet::import`].
+    ///
     /// # Errors
     ///
     /// A message that becomes [`FleetError::Restore`].
@@ -522,7 +543,7 @@ impl diesel::migration::MigrationSource<diesel::sqlite::Sqlite> for FleetSet {
 
 /// One embedded set of the app's shared list.
 struct SharedEmbedded {
-    all: Arc<Vec<(&'static str, EmbeddedMigrations)>>,
+    all: Arc<Vec<crate::migrate::RegisteredMigrations>>,
     idx: usize,
 }
 
@@ -551,17 +572,17 @@ pub(crate) struct FleetMigrations {
 }
 
 impl FleetMigrations {
-    /// The sets of `all` that `keep` accepts. The app passes a filter that
-    /// drops the control-plane framework set.
+    /// The sets of `all` that reach the shards and that `keep` accepts. The
+    /// app passes a filter that drops the control-plane framework set.
     pub(crate) fn new(
-        all: &Arc<Vec<(&'static str, EmbeddedMigrations)>>,
+        all: &Arc<Vec<crate::migrate::RegisteredMigrations>>,
         keep: impl Fn(&EmbeddedMigrations) -> bool,
         apply_on_open: bool,
     ) -> Self {
         let sets = all
             .iter()
             .enumerate()
-            .filter(|(_, (_, set))| keep(set))
+            .filter(|(_, (_, set, scope))| scope.reaches_shards() && keep(set))
             .map(|(idx, _)| {
                 FleetSet(Arc::new(SharedEmbedded {
                     all: Arc::clone(all),
@@ -872,7 +893,6 @@ impl fmt::Debug for DatabaseFleet {
 /// Builder for a [`DatabaseFleet`] outside app boot (tests, tools).
 pub struct DatabaseFleetBuilder {
     config: DatabaseFleetConfig,
-    min_residency: Duration,
     connect_timeout_secs: u64,
     migrations: Vec<FleetSet>,
     apply_on_open: bool,
@@ -932,10 +952,10 @@ impl DatabaseFleetBuilder {
     }
 
     /// How long a database stays open after its last use before LRU may
-    /// close it. Default: [`DEFAULT_MIN_RESIDENCY`].
+    /// close it. Replaces [`DatabaseFleetConfig::min_residency`].
     #[must_use]
     pub const fn min_residency(mut self, residency: Duration) -> Self {
-        self.min_residency = residency;
+        self.config.min_residency = residency;
         self
     }
 
@@ -955,12 +975,7 @@ impl DatabaseFleetBuilder {
     pub fn build(self) -> Result<DatabaseFleet, FleetError> {
         let mut migrations = FleetMigrations::from_sets(self.migrations, self.apply_on_open);
         migrations.refuse_unknown = self.refuse_unknown;
-        DatabaseFleet::from_parts(
-            &self.config,
-            self.connect_timeout_secs,
-            migrations,
-            self.min_residency,
-        )
+        DatabaseFleet::from_parts(&self.config, self.connect_timeout_secs, migrations)
     }
 }
 
@@ -970,7 +985,6 @@ impl DatabaseFleet {
     pub const fn builder(config: DatabaseFleetConfig) -> DatabaseFleetBuilder {
         DatabaseFleetBuilder {
             config,
-            min_residency: DEFAULT_MIN_RESIDENCY,
             connect_timeout_secs: 5,
             migrations: Vec::new(),
             apply_on_open: true,
@@ -982,7 +996,6 @@ impl DatabaseFleet {
         config: &DatabaseFleetConfig,
         connect_timeout_secs: u64,
         migrations: FleetMigrations,
-        min_residency: Duration,
     ) -> Result<Self, FleetError> {
         let template = FleetPathTemplate::parse(config.path_template(), config.mode)?;
         std::fs::create_dir_all(&config.root).map_err(io_error("create root directory"))?;
@@ -998,7 +1011,7 @@ impl DatabaseFleet {
                 create_on_demand: config.effective_create_on_demand(),
                 idle_close: (config.idle_close_secs > 0)
                     .then(|| Duration::from_secs(config.idle_close_secs)),
-                min_residency,
+                min_residency: config.min_residency,
                 connect_timeout_secs,
                 migrations,
                 replicating: AtomicBool::new(false),
@@ -1027,10 +1040,18 @@ impl DatabaseFleet {
         &self.inner.root
     }
 
-    /// The configured cap on open databases.
+    /// The configured soft cap on open databases. See
+    /// [`DatabaseFleetConfig::max_open`].
     #[must_use]
     pub fn max_open(&self) -> usize {
         self.inner.max_open
+    }
+
+    /// How long a database stays open after its last use before LRU may
+    /// close it.
+    #[must_use]
+    pub fn min_residency(&self) -> Duration {
+        self.inner.min_residency
     }
 
     /// Connections per open database.
@@ -1569,6 +1590,155 @@ impl DatabaseFleet {
             self.lock_state().unacknowledged.insert(key.clone());
         }
         Ok(())
+    }
+
+    /// Copy a database file into the fleet as `key`, for example a backup
+    /// that [`backup`](Self::backup) wrote, then open it. See
+    /// [`import_file`](Self::import_file) for the steps and the errors.
+    ///
+    /// # Errors
+    ///
+    /// An [`import_file`](Self::import_file) error, or an
+    /// [`open`](Self::open) error. An open error comes after the publish:
+    /// the file is in place, and a second import answers
+    /// [`FleetError::AlreadyExists`].
+    pub async fn import(
+        &self,
+        key: &FleetDbKey,
+        source: &Path,
+    ) -> Result<FleetDatabase, FleetError> {
+        // Held to the end, so `close_all` also sees the open that follows.
+        let _open_counted = self.admit_mutation(key)?;
+        self.import_file(key, source).await?;
+        self.open_with(key, false).await
+    }
+
+    /// Copy a database file into the fleet as `key`, and do not open it.
+    /// `source` does not change.
+    ///
+    /// 1. The fleet copies `source` with `VACUUM INTO` into a private
+    ///    staging file, so rows still in a `-wal` come too.
+    /// 2. The copy must pass `PRAGMA integrity_check`, and its identity row
+    ///    must record `key`.
+    /// 3. The fleet applies the pending migrations to the copy. With
+    ///    ownership, it sets the copy's epoch to this host's epoch. Without
+    ///    ownership, it removes the copy's epoch.
+    /// 4. With replication, the fleet purges the tombstone and the old
+    ///    replica of a deleted key, as [`provision`](Self::provision) does.
+    ///    It does this only after the checks pass, so a refused source keeps
+    ///    the replica.
+    /// 5. The fleet publishes the copy in one step under the path lock. It
+    ///    never replaces a file.
+    ///
+    /// Use it for files you trust: the fleet keeps the source's schema, its
+    /// triggers and its migration records. Cancellation-safe: the work runs
+    /// in an owned task.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::AlreadyExists`] when the key has a file.
+    /// [`FleetError::InvalidSource`] when the source is missing, is not a
+    /// database, fails the integrity check, or records no identity or
+    /// another key. [`FleetError::NotOwner`] when this host loses the slot.
+    /// [`FleetError::Migration`] or [`FleetError::Unavailable`] when a
+    /// migration or the purge fails. Nothing is published on an error.
+    pub async fn import_file(&self, key: &FleetDbKey, source: &Path) -> Result<(), FleetError> {
+        self.check_key(key)?;
+        let epoch = self.owned_epoch(key)?;
+        let (fleet, task_key, source) = (self.clone(), key.clone(), source.to_path_buf());
+        let counted = self.admit_mutation(key)?;
+        tokio::spawn(async move {
+            let _counted = counted;
+            fleet
+                .with_provision_turn(&task_key, fleet.import_owned(&task_key, &source, epoch))
+                .await
+        })
+        .await
+        .map_err(|e| FleetError::Unavailable {
+            name: key.name(),
+            detail: format!("import task failed: {e}"),
+        })?
+    }
+
+    async fn import_owned(
+        &self,
+        key: &FleetDbKey,
+        source: &Path,
+        epoch: Option<crate::lock::FencingToken>,
+    ) -> Result<(), FleetError> {
+        let path = self.path_of(key);
+        if path.exists() {
+            return Err(FleetError::AlreadyExists { name: key.name() });
+        }
+        let task_failed = |e: tokio::task::JoinError| FleetError::Unavailable {
+            name: key.name(),
+            detail: format!("import task failed: {e}"),
+        };
+        // Check and migrate the copy first: a refused source must not end
+        // the retention of a deleted key's replica.
+        let (fleet, staged_path, source, name) =
+            (self.clone(), path.clone(), source.to_path_buf(), key.name());
+        let (staging, applied) = crate::time::spawn_blocking(move || {
+            check_contained(fleet.root(), &staged_path)?;
+            stage_import_file(
+                &staged_path,
+                &name,
+                &source,
+                &fleet.inner.migrations,
+                epoch.map(crate::lock::FencingToken::get),
+            )
+        })
+        .await
+        .map_err(task_failed)??;
+        let published = self.publish_import(key, &path, &staging, epoch).await;
+        discard_staging(&staging);
+        published?;
+        let counters = &self.inner.counters;
+        counters.created.fetch_add(1, Ordering::Relaxed);
+        counters
+            .migrations_applied
+            .fetch_add(applied as u64, Ordering::Relaxed);
+        tracing::info!(database = %key, "fleet database imported");
+        Ok(())
+    }
+
+    /// Purge a deleted key's old replica, then link the checked staging file.
+    async fn publish_import(
+        &self,
+        key: &FleetDbKey,
+        path: &Path,
+        staging: &Path,
+        epoch: Option<crate::lock::FencingToken>,
+    ) -> Result<(), FleetError> {
+        // The copy carries the epoch read at the start. A slot lost since
+        // then must not get a file stamped for it.
+        if epoch.is_some() && self.owned_epoch(key)? != epoch {
+            return Err(FleetError::NotOwner {
+                name: key.name(),
+                slot: key.routing_slot(),
+            });
+        }
+        self.purge_before_create(key, true).await?;
+        let (root, path, staging, name) = (
+            self.inner.root.clone(),
+            path.to_path_buf(),
+            staging.to_path_buf(),
+            key.name(),
+        );
+        crate::time::spawn_blocking(
+            move || match publish_staged(&root, &path, &name, &staging)? {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(FleetError::AlreadyExists { name })
+                }
+                Err(e) => Err(io_error("publish database")(e)),
+            },
+        )
+        .await
+        .map_err(|e| FleetError::Unavailable {
+            name: key.name(),
+            detail: format!("import task failed: {e}"),
+        })?
     }
 
     /// Whether the database's file exists.
@@ -3861,6 +4031,20 @@ fn existing_only_url(path: &Path) -> String {
     }
 }
 
+/// A connection string that opens `path` read-only, if the file exists. On
+/// Unix a `file:` URI with `mode=ro`. Elsewhere the plain path: hold
+/// [`pin_existing`] while it is open.
+fn read_only_url(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        existing_only_url(path).replace("?mode=rw", "?mode=ro")
+    }
+    #[cfg(not(unix))]
+    {
+        DatabaseFleet::url_of(path)
+    }
+}
+
 /// Keep `path` from being removed or replaced while the caller opens it, on
 /// Windows, where [`existing_only_url`] cannot refuse to create the file.
 /// The handle shares read and write but not delete, so a removal or rename
@@ -4202,8 +4386,25 @@ fn create_database_file(
         discard(&staging);
         return Err(error);
     }
-    // The path lock is held only for the publish, not for the build above.
-    let published = with_path_lock(root, name, || {
+    let published = publish_staged(root, path, name, &staging);
+    discard(&staging);
+    match published? {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(io_error("publish database")(e)),
+    }
+}
+
+/// Link a complete staging file to `path` under the path lock. The inner
+/// result is the link: `AlreadyExists` when another file is there.
+fn publish_staged(
+    root: &Path,
+    path: &Path,
+    name: &str,
+    staging: &Path,
+) -> Result<std::io::Result<()>, FleetError> {
+    // The path lock is held only for the publish, not for the build.
+    with_path_lock(root, name, || {
         // Under the lock nobody else can publish here. A path with no main
         // file holds no live database, so its stray sidecars are stale.
         if !path.exists() {
@@ -4211,15 +4412,126 @@ fn create_database_file(
                 std::fs::remove_file(file)
             })?;
         }
-        Ok(std::fs::hard_link(&staging, path))
-    });
-    discard(&staging);
-    let published = published?;
-    match published {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) => Err(io_error("publish database")(e)),
+        Ok(std::fs::hard_link(staging, path))
+    })
+}
+
+/// Copy `source` into a new staging file beside `path`, check it and
+/// migrate it. Returns the staging file and the number of migrations
+/// applied. Removes the staging file on an error.
+fn stage_import_file(
+    path: &Path,
+    name: &str,
+    source: &Path,
+    migrations: &FleetMigrations,
+    epoch: Option<u64>,
+) -> Result<(PathBuf, usize), FleetError> {
+    let invalid = |detail: String| FleetError::InvalidSource {
+        name: name.to_owned(),
+        path: source.display().to_string(),
+        detail,
+    };
+    if !source.is_file() {
+        return Err(invalid("no such file".to_owned()));
     }
+    let staging = staging_path(path, "importing")?;
+    match stage_import(source, &staging, name, migrations, epoch, invalid) {
+        Ok(applied) => Ok((staging, applied)),
+        Err(error) => {
+            discard_staging(&staging);
+            Err(error)
+        }
+    }
+}
+
+/// Copy `source` to `staging`, check the copy, and migrate it.
+fn stage_import(
+    source: &Path,
+    staging: &Path,
+    name: &str,
+    migrations: &FleetMigrations,
+    epoch: Option<u64>,
+    invalid: impl Fn(String) -> FleetError,
+) -> Result<usize, FleetError> {
+    use diesel::RunQueryDsl as _;
+    use diesel::connection::SimpleConnection as _;
+
+    #[derive(diesel::QueryableByName)]
+    struct Kind {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        kind: String,
+    }
+
+    let unavailable = |detail: String| FleetError::Unavailable {
+        name: name.to_owned(),
+        detail,
+    };
+    let dest = staging
+        .to_str()
+        .ok_or_else(|| unavailable("staging path is not UTF-8".to_owned()))?;
+    {
+        let Some(_pin) = pin_existing(source).map_err(|e| invalid(e.to_string()))? else {
+            return Err(invalid("no such file".to_owned()));
+        };
+        let mut conn = crate::db::establish_sqlite_migration_connection(&read_only_url(source))
+            .map_err(|e| invalid(format!("cannot open it: {e}")))?;
+        // Do not run functions from the source's views or triggers.
+        conn.batch_execute("PRAGMA trusted_schema = OFF;")
+            .map_err(|e| unavailable(e.to_string()))?;
+        diesel::sql_query("VACUUM INTO ?")
+            .bind::<diesel::sql_types::Text, _>(dest)
+            .execute(&mut conn)
+            .map_err(|e| invalid(format!("cannot copy it: {e}")))?;
+    }
+    let url = DatabaseFleet::url_of(staging);
+    {
+        let mut conn = crate::db::establish_sqlite_migration_connection(&url)
+            .map_err(|e| unavailable(e.to_string()))?;
+        conn.batch_execute("PRAGMA trusted_schema = OFF;")
+            .map_err(|e| unavailable(e.to_string()))?;
+        crate::replication::sqlite::integrity_check(&mut conn)
+            .map_err(|e| invalid(e.to_string()))?;
+        // The identity and epoch must be plain tables: a view with a trigger
+        // could answer any name.
+        let kinds: Vec<Kind> = diesel::sql_query(format!(
+            "SELECT name || ':' || type AS kind FROM sqlite_master \
+             WHERE name IN ('{IDENTITY_TABLE}', '{EPOCH_TABLE}')"
+        ))
+        .load(&mut conn)
+        .map_err(|e| unavailable(e.to_string()))?;
+        if kinds.iter().any(|row| !row.kind.ends_with(":table")) {
+            return Err(invalid(
+                "its identity or epoch is not a plain table".to_owned(),
+            ));
+        }
+        if !kinds
+            .iter()
+            .any(|row| row.kind == format!("{IDENTITY_TABLE}:table"))
+        {
+            return Err(invalid(
+                "it records no identity row; only a file that a fleet made can be imported"
+                    .to_owned(),
+            ));
+        }
+        // The copy has no history in this fleet: set its epoch, never keep
+        // the source's.
+        conn.batch_execute(&format!("DROP TABLE IF EXISTS {EPOCH_TABLE};"))
+            .map_err(|e| unavailable(e.to_string()))?;
+    }
+    match read_identity(staging, name)? {
+        Some(found) if found == name => {}
+        Some(found) => {
+            return Err(invalid(format!("it is a copy of {found}")));
+        }
+        None => {
+            return Err(invalid("its identity table is empty".to_owned()));
+        }
+    }
+    let applied = migrations.apply(&url, name)?;
+    if let Some(epoch) = epoch {
+        write_epoch_stamp(staging, name, epoch)?;
+    }
+    Ok(applied)
 }
 
 /// Identity row and migrations on a staging file, closed before it returns.
@@ -4513,7 +4825,7 @@ impl crate::actuator::HealthIndicator for FleetHealthIndicator {
 pub(crate) fn build_for_app(
     config: &crate::config::AutumnConfig,
     resolved_control_url: Option<&str>,
-    all: &Arc<Vec<(&'static str, EmbeddedMigrations)>>,
+    all: &Arc<Vec<crate::migrate::RegisteredMigrations>>,
     keep: impl Fn(&EmbeddedMigrations) -> bool,
 ) -> Result<Option<DatabaseFleet>, String> {
     let Some(fleet_config) = config.database.fleet.as_ref() else {
@@ -4528,7 +4840,6 @@ pub(crate) fn build_for_app(
         fleet_config,
         config.database.connect_timeout_secs,
         FleetMigrations::new(all, keep, apply_on_open),
-        DEFAULT_MIN_RESIDENCY,
     )
     .map_err(|e| format!("Failed to set up database.fleet: {e}"))?;
     // The configured control database, and the one a custom pool provider
@@ -4589,6 +4900,7 @@ mod tests {
             replica_retention_after_delete: std::time::Duration::ZERO,
             restore_check_sample: 0,
             replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
         }
     }
 
@@ -4738,6 +5050,33 @@ mod tests {
         fleet.open(&FleetDbKey::Slot(2)).await.unwrap();
         settle(&fleet).await;
         assert_eq!(fleet.stats().open, 2);
+    }
+
+    #[tokio::test]
+    async fn the_configured_min_residency_sets_the_lru_grace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
+            max_open: 1,
+            min_residency: Duration::ZERO,
+            ..config(tmp.path(), FleetMode::Slot)
+        })
+        .build()
+        .unwrap();
+        assert_eq!(fleet.min_residency(), Duration::ZERO);
+        fleet.open(&FleetDbKey::Slot(1)).await.unwrap();
+        fleet.open(&FleetDbKey::Slot(2)).await.unwrap();
+        settle(&fleet).await;
+        assert_eq!(fleet.open_keys(), vec![FleetDbKey::Slot(2)]);
+
+        let default = DatabaseFleet::builder(config(tmp.path(), FleetMode::Slot))
+            .build()
+            .unwrap();
+        assert_eq!(default.min_residency(), DEFAULT_MIN_RESIDENCY);
+        let tuned = DatabaseFleet::builder(config(tmp.path(), FleetMode::Slot))
+            .min_residency(Duration::from_millis(5))
+            .build()
+            .unwrap();
+        assert_eq!(tuned.min_residency(), Duration::from_millis(5));
     }
 
     #[tokio::test]
@@ -5457,6 +5796,206 @@ mod tests {
         assert_eq!(rows, vec!["kept".to_owned()]);
     }
 
+    /// A tenant fleet with one note in `acme`, a backup of it, and the key.
+    async fn backed_up_tenant(tmp: &Path) -> (DatabaseFleet, FleetDbKey, PathBuf) {
+        use diesel_async::RunQueryDsl as _;
+        let fleet = fleet(&tmp.join("fleet"), FleetMode::Tenant, |_| {});
+        let key = fleet.key_for("acme").unwrap();
+        let db = fleet.provision(&key).await.unwrap();
+        {
+            let mut conn = db.pool().get().await.unwrap();
+            diesel::sql_query("CREATE TABLE notes (body TEXT NOT NULL)")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            diesel::sql_query("INSERT INTO notes (body) VALUES ('kept')")
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+        }
+        drop(db);
+        let backup = tmp.join("acme-backup.db");
+        fleet.backup(&key, &backup).await.unwrap();
+        (fleet, key, backup)
+    }
+
+    /// No staging file or directory is left under the root.
+    fn no_staging_files(root: &Path) -> bool {
+        walk_paths(root).iter().all(|path| {
+            let text = path.to_string_lossy();
+            !text.contains(".importing-") && !text.contains(".creating-")
+        })
+    }
+
+    fn walk_paths(dir: &Path) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                paths.extend(walk_paths(&path));
+            }
+            paths.push(path);
+        }
+        paths
+    }
+
+    #[tokio::test]
+    async fn import_puts_a_backup_back_under_its_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, key, backup) = backed_up_tenant(tmp.path()).await;
+        assert!(fleet.delete(&key).await.unwrap());
+        assert!(!fleet.exists(&key));
+
+        let db = fleet.import(&key, &backup).await.unwrap();
+        assert_eq!(db.key(), &key);
+        assert_eq!(read_bodies(&fleet.path_of(&key)), vec!["kept".to_owned()]);
+        assert!(backup.is_file(), "the source stays in place");
+        assert!(no_staging_files(fleet.root()));
+        fleet.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn import_refuses_a_key_whose_database_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, key, backup) = backed_up_tenant(tmp.path()).await;
+        assert!(matches!(
+            fleet.import(&key, &backup).await,
+            Err(FleetError::AlreadyExists { .. })
+        ));
+        assert_eq!(read_bodies(&fleet.path_of(&key)), vec!["kept".to_owned()]);
+        fleet.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn import_refuses_a_backup_of_another_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, _, backup) = backed_up_tenant(tmp.path()).await;
+        let other = fleet.key_for("globex").unwrap();
+        let refused = fleet.import(&other, &backup).await.unwrap_err();
+        assert!(
+            matches!(&refused, FleetError::InvalidSource { detail, .. } if detail.contains("tenant:acme")),
+            "{refused}"
+        );
+        assert_eq!(
+            refused.http_status(),
+            http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert!(!fleet.exists(&other));
+        assert!(no_staging_files(fleet.root()));
+        fleet.close_all().await;
+    }
+
+    #[tokio::test]
+    async fn import_migrates_a_backup_before_it_publishes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = DatabaseFleet::builder(config(&tmp.path().join("bare"), FleetMode::Tenant))
+            .build()
+            .unwrap();
+        let key = bare.key_for("acme").unwrap();
+        drop(bare.provision(&key).await.unwrap());
+        let backup = tmp.path().join("bare-backup.db");
+        bare.backup(&key, &backup).await.unwrap();
+        bare.close_all().await;
+
+        let fleet = fleet(&tmp.path().join("fleet"), FleetMode::Tenant, |_| {});
+        let db = fleet.import(&key, &backup).await.unwrap();
+        assert!(table_exists(&db, "_autumn_version_history").await);
+        drop(db);
+        fleet.close_all().await;
+    }
+
+    /// The source's newest rows can still be in its `-wal`: the copy has them.
+    #[tokio::test]
+    async fn import_reads_the_rows_in_the_source_wal() {
+        use diesel::Connection as _;
+        use diesel::connection::SimpleConnection as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(&tmp.path().join("fleet"), FleetMode::Tenant, |_| {});
+        let key = fleet.key_for("acme").unwrap();
+        drop(fleet.provision(&key).await.unwrap());
+        let source = tmp.path().join("live.db");
+        fleet.backup(&key, &source).await.unwrap();
+        assert!(fleet.delete(&key).await.unwrap());
+        let mut writer =
+            diesel::SqliteConnection::establish(&source.display().to_string()).unwrap();
+        writer
+            .batch_execute(
+                "PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0; \
+                 CREATE TABLE notes (body TEXT NOT NULL); \
+                 INSERT INTO notes (body) VALUES ('in the wal');",
+            )
+            .unwrap();
+        let mut wal = source.as_os_str().to_owned();
+        wal.push("-wal");
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "the rows are in the -wal"
+        );
+
+        drop(fleet.import(&key, &source).await.unwrap());
+        assert_eq!(
+            read_bodies(&fleet.path_of(&key)),
+            vec!["in the wal".to_owned()]
+        );
+        drop(writer);
+        fleet.close_all().await;
+    }
+
+    /// The copy keeps no epoch of the source: a high stamp there would skip
+    /// the check against a newer replica later.
+    #[tokio::test]
+    async fn import_drops_the_source_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (fleet, key, backup) = backed_up_tenant(tmp.path()).await;
+        assert!(fleet.delete(&key).await.unwrap());
+        write_epoch_stamp(&backup, &key.name(), 99).unwrap();
+
+        drop(fleet.import(&key, &backup).await.unwrap());
+        fleet.close_all().await;
+        assert_eq!(
+            read_epoch_stamp(&fleet.path_of(&key), &key.name()).unwrap(),
+            0
+        );
+        assert_eq!(read_epoch_stamp(&backup, &key.name()).unwrap(), 99);
+    }
+
+    fn sqlite_exec(path: &Path, sql: &str) {
+        use diesel::Connection as _;
+        use diesel::connection::SimpleConnection as _;
+        diesel::SqliteConnection::establish(&path.display().to_string())
+            .unwrap()
+            .batch_execute(sql)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn import_refuses_a_file_that_is_not_a_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fleet = fleet(&tmp.path().join("fleet"), FleetMode::Tenant, |_| {});
+        let key = fleet.key_for("acme").unwrap();
+        let junk = tmp.path().join("junk.db");
+        std::fs::write(&junk, b"not a database, not at all, no").unwrap();
+        // A plain SQLite file: no fleet made it, so it records no identity.
+        let plain = tmp.path().join("plain.db");
+        sqlite_exec(&plain, "CREATE TABLE notes (body TEXT NOT NULL);");
+        // An identity "table" that is a view answers any name: refused.
+        let forged = tmp.path().join("forged.db");
+        sqlite_exec(
+            &forged,
+            &format!("CREATE VIEW {IDENTITY_TABLE} AS SELECT 1 AS id, 'tenant:acme' AS name;"),
+        );
+        for source in [junk, plain, forged, tmp.path().join("absent.db")] {
+            let refused = fleet.import(&key, &source).await.unwrap_err();
+            assert!(
+                matches!(refused, FleetError::InvalidSource { .. }),
+                "{}: {refused}",
+                source.display()
+            );
+        }
+        assert!(!fleet.exists(&key));
+        assert!(no_staging_files(fleet.root()));
+    }
+
     fn read_bodies(path: &Path) -> Vec<String> {
         use diesel::RunQueryDsl as _;
         #[derive(diesel::QueryableByName)]
@@ -5585,18 +6124,26 @@ mod tests {
             (
                 "repository-commit-hooks",
                 crate::repository_commit_hooks::REPOSITORY_COMMIT_HOOK_MIGRATIONS,
+                crate::migrate::MigrationScope::Everywhere,
             ),
             (
                 "version-history",
                 crate::version_history::VERSION_HISTORY_MIGRATIONS,
+                crate::migrate::MigrationScope::Everywhere,
             ),
-            ("derivations", crate::derivation::DERIVATION_MIGRATIONS),
+            (
+                "derivations",
+                crate::derivation::DERIVATION_MIGRATIONS,
+                crate::migrate::MigrationScope::Everywhere,
+            ),
         ]);
         let boot = DatabaseFleet::from_parts(
-            &config(&root, FleetMode::Slot),
+            &DatabaseFleetConfig {
+                min_residency: Duration::ZERO,
+                ..config(&root, FleetMode::Slot)
+            },
             5,
             FleetMigrations::new(&all, |_| true, false),
-            Duration::ZERO,
         )
         .unwrap();
         boot.open(&FleetDbKey::Slot(1)).await.unwrap();

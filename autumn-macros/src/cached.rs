@@ -204,7 +204,10 @@ const MODEL_READ_VERBS: &[&str] = &["find_all", "find_by_id", "exists_by_id"];
 /// resolves the model rather than this heuristic guessing it.
 fn model_from_repository_ident(ident: &str) -> Option<String> {
     let base = ident.strip_suffix("Repository")?;
-    let base = base.strip_prefix("Pg").unwrap_or(base);
+    let base = base
+        .strip_prefix("Pg")
+        .or_else(|| base.strip_prefix("Sqlite"))
+        .unwrap_or(base);
     let mut chars = base.chars();
     if !chars.next()?.is_ascii_uppercase() {
         return None;
@@ -218,7 +221,8 @@ fn model_from_repository_ident(ident: &str) -> Option<String> {
 /// The trait of the same family (`PostRepository`) does not carry the constant,
 /// so a read bounded on the trait cannot have its model resolved here.
 fn is_concrete_repository_ident(ident: &str) -> bool {
-    ident.starts_with("Pg") && model_from_repository_ident(ident).is_some()
+    (ident.starts_with("Pg") || ident.starts_with("Sqlite"))
+        && model_from_repository_ident(ident).is_some()
 }
 
 /// Whether an ident looks like a model type: `Post`, `LineItem`.
@@ -1250,6 +1254,17 @@ mod tests {
         // the model comes from the repository's own `__AUTUMN_MODEL_NAME`.
         assert_eq!(derived_repositories(&f), vec!["PgPostRepository"]);
         assert_eq!(derived_models(&f), [] as [String; 0]);
+        assert!(!derive_dependencies(&f).unresolved_repository);
+    }
+
+    #[test]
+    fn derives_dependencies_from_the_sqlite_repository_name() {
+        let f: ItemFn = syn::parse_quote! {
+            async fn recent_posts(repo: &SqlitePostRepository) -> Vec<String> {
+                repo.find_all().await.unwrap_or_default()
+            }
+        };
+        assert_eq!(derived_repositories(&f), vec!["SqlitePostRepository"]);
         assert!(!derive_dependencies(&f).unresolved_repository);
     }
 

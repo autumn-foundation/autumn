@@ -352,7 +352,6 @@ policy allows `PUT` from your app's origin if you call from browser JavaScript
 
 ```rust,ignore
 use std::time::Duration;
-use autumn_web::security::CsrfToken;
 use autumn_web::storage::{BlobStoreState, PresignPutResult, complete_direct_upload};
 use autumn_web::{AutumnResult, Json, secured, State, post};
 use serde::{Deserialize, Serialize};
@@ -375,7 +374,6 @@ struct PresignResponse {
 #[secured]
 #[post("/uploads/presign")]
 async fn presign(
-    _csrf: CsrfToken,                   // ensures caller has a valid session
     State(blobs): State<BlobStoreState>,
     Json(req): Json<PresignRequest>,
 ) -> AutumnResult<Json<PresignResponse>> {
@@ -398,7 +396,6 @@ struct CompleteRequest { key: String }
 #[secured]
 #[post("/uploads/complete")]
 async fn complete(
-    _csrf: CsrfToken,
     State(blobs): State<BlobStoreState>,
     mut db: Db,
     Json(req): Json<CompleteRequest>,

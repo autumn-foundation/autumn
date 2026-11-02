@@ -601,18 +601,14 @@ impl FromRequestParts<AppState> for Csrf {
 
     async fn from_request_parts(
         parts: &mut Parts,
-        state: &AppState,
+        _state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Both underlying extractors reject when `CsrfLayer` is not mounted,
-        // which is exactly what `security.csrf.enabled = false` produces — a
-        // supported configuration, and the default in `TestApp`. Failing here
-        // would make every page in the application 500 under that setting,
-        // which is a far worse outcome than rendering forms without a token
-        // that nothing is going to check. So the absence is represented, not
-        // treated as an error.
+        // `CsrfLayer` puts both values in the extensions. Without it
+        // (`security.csrf.enabled = false`, the default in `TestApp`) they are
+        // absent, and forms render no token field.
         Ok(Self {
-            token: CsrfToken::from_request_parts(parts, state).await.ok(),
-            field: CsrfFormField::from_request_parts(parts, state).await.ok(),
+            token: parts.extensions.get::<CsrfToken>().cloned(),
+            field: parts.extensions.get::<CsrfFormField>().cloned(),
         })
     }
 }

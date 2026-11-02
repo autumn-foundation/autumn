@@ -1002,6 +1002,7 @@ mod tests {
                 replica_retention_after_delete: setup.retention,
                 restore_check_sample: 0,
                 replication_workers: 4,
+                min_residency: std::time::Duration::from_secs(2),
             })
             .build()
             .unwrap();
@@ -1538,6 +1539,43 @@ mod tests {
             assert_eq!(destination.keys(&key), Vec::<String>::new());
         }
 
+        /// A rejected import keeps the retained replica. Only a copy that
+        /// passes every check ends the retention.
+        #[tokio::test]
+        async fn a_rejected_import_keeps_the_retained_replica() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let host = host(&Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: true,
+                retention: Duration::from_secs(3600),
+            });
+            let key = shipped(&host, "acme").await;
+            let backup = tmp.path().join("acme-backup.db");
+            host.fleet.backup(&key, &backup).await.unwrap();
+            host.fleet.close(&key).await;
+            clock.advance(Duration::from_secs(1));
+            assert!(host.fleet.delete(&key).await.unwrap());
+
+            let junk = tmp.path().join("junk.db");
+            std::fs::write(&junk, b"not a database, not at all, no").unwrap();
+            for source in [tmp.path().join("absent.db"), junk] {
+                assert!(host.fleet.import(&key, &source).await.is_err());
+                assert!(
+                    host.tombstones.get(&key.name()).await.unwrap().is_some(),
+                    "a rejected import keeps the tombstone"
+                );
+                assert!(!destination.keys(&key).is_empty(), "and the replica");
+            }
+
+            drop(host.fleet.import(&key, &backup).await.unwrap());
+            assert!(host.tombstones.get(&key.name()).await.unwrap().is_none());
+            host.fleet.close_all().await;
+        }
+
         #[tokio::test]
         async fn a_marker_that_failed_during_the_retention_is_written_again() {
             let tmp = tempfile::tempdir().unwrap();
@@ -1832,6 +1870,7 @@ mod tests {
                 replica_retention_after_delete: Duration::ZERO,
                 restore_check_sample: 1,
                 replication_workers: 4,
+                min_residency: std::time::Duration::from_secs(2),
             })
             .build()
             .unwrap();
@@ -1897,6 +1936,7 @@ mod tests {
                 replica_retention_after_delete: Duration::ZERO,
                 restore_check_sample: 0,
                 replication_workers: 4,
+                min_residency: std::time::Duration::from_secs(2),
             })
             .build()
             .unwrap();

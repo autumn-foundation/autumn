@@ -209,7 +209,7 @@ status code you chose in the extractor.
 | `Auth<T>`     | Request extensions       | 401 if not authenticated |
 | `Session`     | Session store            | 500 if session backend fails |
 | `Valid<Json<T>>` | Request body + validation | 422 with field-level errors |
-| `CsrfToken`   | Session                  | 500 if session unavailable |
+| `CsrfToken`   | `CsrfLayer`              | never; empty with CSRF off |
 | `Path<T>`     | URL path segments        | 400 if parse fails   |
 | `Query<T>`    | URL query string         | 400 if parse fails   |
 | `Json<T>`     | Request body             | 400/422 if parse fails |

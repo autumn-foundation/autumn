@@ -422,7 +422,9 @@ proofs are in `verification/fleet_replica_tombstones.rs`.
 - Existing sharded app code runs unchanged; a Postgres-sharded app and a
   SQLite-fleet app share handlers and repositories.
 - Bounded resources: `max_open × pool_size` connections, about
-  `max_open × (2 × pool_size + 1)` file descriptors.
+  `max_open × (2 × pool_size + 1)` file descriptors, when the fleet is not
+  busy. A burst can open more than `max_open` databases: the limit is soft
+  (see `database.fleet.min_residency` and ADR 0031).
 - Metrics stay bounded: a fleet database's metric and route label is
   `shard=fleet`; its name goes on spans and logs only.
 

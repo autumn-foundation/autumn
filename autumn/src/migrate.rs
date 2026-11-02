@@ -50,6 +50,39 @@ pub use diesel_migrations::EmbeddedMigrations;
 /// Re-export the `embed_migrations!` macro.
 pub use diesel_migrations::embed_migrations;
 
+/// The databases that a registered migration set goes to. Set it with
+/// [`AppBuilder::migrations_for`](crate::app::AppBuilder::migrations_for).
+///
+/// A shard is a `[[database.shards]]` database or a `[database.fleet]` file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum MigrationScope {
+    /// The control database and every shard. The default.
+    #[default]
+    Everywhere,
+    /// The control database only.
+    Control,
+    /// Every shard only. Not the control database.
+    Shards,
+}
+
+impl MigrationScope {
+    /// Whether the set goes to the control database.
+    #[must_use]
+    pub const fn reaches_control(self) -> bool {
+        matches!(self, Self::Everywhere | Self::Control)
+    }
+
+    /// Whether the set goes to each shard.
+    #[must_use]
+    pub const fn reaches_shards(self) -> bool {
+        matches!(self, Self::Everywhere | Self::Shards)
+    }
+}
+
+/// One registered migration set: its label, the set, and its scope.
+pub(crate) type RegisteredMigrations = (&'static str, EmbeddedMigrations, MigrationScope);
+
 /// Embedded Autumn framework migrations.
 ///
 /// These are applied by `autumn migrate` and are also registered

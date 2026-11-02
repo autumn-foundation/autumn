@@ -405,6 +405,30 @@ macro_rules! maybe_for_update {
     };
 }
 
+/// The `SQLite` name of a generated repository. `#[repository]` emits this
+/// macro after the `Pg<Trait>` struct.
+///
+/// - **`SQLite`**: `type Sqlite<Trait> = Pg<Trait>;`, so a `SQLite` app can use
+///   the name of its backend.
+/// - **Postgres**: nothing.
+#[doc(hidden)]
+#[cfg(all(feature = "db", feature = "sqlite"))]
+#[macro_export]
+macro_rules! __sqlite_repository_alias {
+    ($vis:vis $alias:ident = $target:ident) => {
+        #[doc = ::core::concat!("The `SQLite` name of [`", ::core::stringify!($target), "`].")]
+        $vis type $alias = $target;
+    };
+}
+
+/// Postgres arm of [`__sqlite_repository_alias!`]: no alias.
+#[doc(hidden)]
+#[cfg(all(feature = "db", not(feature = "sqlite")))]
+#[macro_export]
+macro_rules! __sqlite_repository_alias {
+    ($vis:vis $alias:ident = $target:ident) => {};
+}
+
 /// Compile-time backend block selector for generated `#[repository]`/`#[model]` CRUD.
 ///
 /// Used where the two backends need *structurally different* code (not just a
