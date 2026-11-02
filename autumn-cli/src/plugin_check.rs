@@ -348,12 +348,22 @@ pub fn build_report(opts: &PluginCheckOptions<'_>, routes: &[RouteInfo]) -> Conf
     );
 
     if let Some(prefix) = opts.expected_prefix {
-        checks.push(check_route_prefix(
-            route_key,
-            prefix,
-            opts.intentional_root_routes,
-            routes,
-        ));
+        checks.push(if opts.no_routes {
+            // The same rule as `autumn_web::plugin_conformance`'s
+            // `ConformanceConfig::no_routes` (issue #2828): `--no-routes`
+            // together with `--prefix` is a contradiction, not a
+            // combination that skips on finding nothing to check.
+            CheckResult {
+                name: "route-prefix".to_owned(),
+                status: CheckStatus::Fail,
+                message: format!(
+                    "--no-routes and the prefix {prefix} contradict each other; set one of them"
+                ),
+                diagnostics: vec![],
+            }
+        } else {
+            check_route_prefix(route_key, prefix, opts.intentional_root_routes, routes)
+        });
     }
 
     checks.push(check_collisions(routes));
@@ -1955,6 +1965,24 @@ mod contract_tests {
         let report = build_report(&o, &[]);
         assert_eq!(find(&report, "route-attribution").status, CheckStatus::Skip);
         assert!(report.passed(), "{}", report.to_text_report());
+    }
+
+    /// `--no-routes` together with `--prefix` is a contradiction, not a
+    /// combination that passes on nothing: the same rule
+    /// `autumn_web::plugin_conformance::run_conformance` enforces for
+    /// `ConformanceConfig::no_routes` (issue #2828's drift class — this is
+    /// the library's own special case, mirrored here, not a new rule).
+    #[test]
+    fn no_routes_with_a_prefix_fails_route_prefix_instead_of_skipping() {
+        let dump = present(vec![demo_contract()]);
+        let mut o = opts(&dump);
+        o.no_routes = true;
+        o.expected_prefix = Some("/demo");
+        let report = build_report(&o, &[]);
+        let prefix = find(&report, "route-prefix");
+        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
+        assert!(prefix.message.contains("no_routes") || prefix.message.contains("--no-routes"));
+        assert!(!report.passed());
     }
 
     /// No routes skips only on an explicit `--no-routes`: an unannotated
