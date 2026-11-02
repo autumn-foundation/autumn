@@ -5170,11 +5170,11 @@ mod tests {
     #[test]
     fn an_exemption_binds_a_route_over_the_state_cap() {
         let route = |pairs: usize| {
-            "/x".to_owned()
-                + &(0..pairs)
-                    .map(|i| format!("/{{c{i}}}/l{i}"))
-                    .collect::<String>()
-                + "/zzz"
+            let mut path = String::from("/x");
+            for i in 0..pairs {
+                let _ = write!(path, "/{{c{i}}}/l{i}");
+            }
+            path + "/zzz"
         };
         assert!(!binds(&route(2), "/api"), "a short route stays unbound");
         assert!(binds(&route(14), "/api"), "a route over the cap binds");
