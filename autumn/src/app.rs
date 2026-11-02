@@ -4502,6 +4502,19 @@ impl AppBuilder {
                     + topology.replica().map_or(0, |p| p.status().max_size)
             });
             let total_max_connections = control_max_connections + shard_max_connections;
+            let backend = if cfg!(feature = "sqlite") {
+                let control_databases = pool
+                    .as_ref()
+                    .map_or(0, |topology| 1 + usize::from(topology.replica().is_some()));
+                let shard_databases = shards
+                    .as_ref()
+                    .map_or(0, crate::sharding::ShardSet::total_databases);
+                crate::config::ConnectionBackend::Sqlite {
+                    databases: control_databases + shard_databases,
+                }
+            } else {
+                crate::config::ConnectionBackend::Postgres
+            };
             tracing::info!(
                 primary_max_connections = config.database.effective_primary_pool_size(),
                 replica_configured = config.database.replica_url.is_some(),
@@ -4517,7 +4530,7 @@ impl AppBuilder {
             if let Some(message) = crate::config::total_connections_warning(
                 total_max_connections,
                 warn_threshold,
-                cfg!(feature = "sqlite"),
+                backend,
             ) {
                 tracing::warn!(total_max_connections, warn_threshold, "{message}");
             }

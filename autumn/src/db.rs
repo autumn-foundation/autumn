@@ -4044,7 +4044,7 @@ impl Db {
     /// This is the single code path behind the [`Db`] extractor and all
     /// shard-routed checkouts: span creation, checkout interceptors,
     /// `SET statement_timeout`, and the metrics captured for the
-    /// slow-query warning on `Drop`.
+    /// long-hold warning on `Drop`.
     #[allow(
         clippy::too_many_lines,
         reason = "one checkout sequence; the deadline wait (#3058) is one more step"
@@ -4498,13 +4498,16 @@ impl Drop for Db {
             // `run_instrumented`. The accumulator must reflect genuine
             // instrumented queries only.
 
-            // Log slow query if it exceeds the threshold
+            // A long hold is not one query (Pigeonhole FINDINGS 1): it covers
+            // all work while the handler held the connection, for example a
+            // fan-out. So it gets its own message and no `sql` field. Inside
+            // the span, so the log shows the pool and the shard.
             if elapsed >= self.slow_query_threshold {
+                let _entered = self.span.enter();
                 tracing::warn!(
                     route = %route_key,
-                    sql = "SELECT ?",
-                    duration_ms = elapsed_ms,
-                    "slow database query"
+                    held_ms = elapsed_ms,
+                    "database connection held past slow_query_threshold"
                 );
             }
         }
@@ -4663,6 +4666,84 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 
 #[cfg(test)]
 mod tests {
+    /// The logs of one `Db` that `route` holds for `held` on a ticking clock,
+    /// with a `500ms` slow-query threshold.
+    #[cfg(feature = "sqlite")]
+    async fn logs_after_a_hold(
+        route: &str,
+        held: std::time::Duration,
+    ) -> Vec<crate::log::capture::CapturedLogEntry> {
+        use crate::log::capture::{LogBuffer, LogCaptureLayer};
+        use crate::log::filter::ParameterFilter;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let pool = super::create_pool(&crate::config::DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        })
+        .expect("sqlite pool builds")
+        .expect("url configured");
+        let clock = crate::time::TickingClock::starting_at(chrono::DateTime::UNIX_EPOCH);
+        let logs = LogBuffer::new(16, ParameterFilter::default());
+        let subscriber = tracing_subscriber::registry().with(LogCaptureLayer::new(logs.clone()));
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let db = super::Db::checkout(super::DbCheckoutParams {
+            pool: &pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            route_key: Some(super::RouteKey::Composed(route.to_owned())),
+            metrics: Some(crate::middleware::MetricsCollector::new()),
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+            clock: std::sync::Arc::new(clock.clone()),
+        })
+        .await
+        .expect("checkout");
+        clock.advance(held);
+        drop(db);
+        logs.snapshot(None, None)
+    }
+
+    /// Pigeonhole FINDINGS 1: a handler held `Db` across a 6.6 s fan-out. The
+    /// log charged that time to `sql: "SELECT ?"`, a statement not in the
+    /// code. A long hold is not one query: it gets its own event.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_long_connection_hold_is_not_logged_as_a_query() {
+        let entries =
+            logs_after_a_hold("POST /census", std::time::Duration::from_millis(6653)).await;
+        assert!(
+            entries.iter().all(|e| e.message != "slow database query"),
+            "a hold is not a query: {entries:?}"
+        );
+        let held: Vec<_> = entries
+            .iter()
+            .filter(|e| e.message.contains("connection held"))
+            .collect();
+        assert_eq!(held.len(), 1, "{entries:?}");
+        let event = held[0];
+        assert_eq!(event.level, "WARN");
+        assert_eq!(event.fields["route"], "POST /census");
+        assert_eq!(event.fields["held_ms"], 6653);
+        assert!(!event.fields.contains_key("sql"), "{event:?}");
+    }
+
+    /// A hold under the threshold logs nothing.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn a_short_connection_hold_logs_nothing() {
+        let entries = logs_after_a_hold("GET /fast", std::time::Duration::from_millis(499)).await;
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.message.contains("connection held")),
+            "{entries:?}"
+        );
+    }
+
     /// An unset statement timeout keeps the session's `0` from checkout; an
     /// unset idle timeout keeps the session value through `DEFAULT`.
     #[test]

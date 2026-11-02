@@ -10364,6 +10364,11 @@ pub struct DatabaseConfig {
     pub migration_lock_retries: u32,
 
     /// Slow query threshold. Default: `500ms`.
+    ///
+    /// Two warnings use it. `slow database query`: one instrumented
+    /// statement took this long. `database connection held past
+    /// slow_query_threshold`: a handler held a `Db` this long. A hold covers
+    /// all work in that time, not one statement.
     #[serde(
         deserialize_with = "deserialize_duration",
         default = "default_slow_query_threshold"
@@ -10735,24 +10740,48 @@ const fn default_fleet_replication_workers() -> usize {
     4
 }
 
+/// The database backend that the boot connection warning gives advice for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionBackend {
+    /// Postgres: the budget is each server's `max_connections`.
+    Postgres,
+    /// `SQLite`: the budget is the open-file limit of the process.
+    Sqlite {
+        /// The database files that the pools open: one per pool, and
+        /// `max_open` for a fleet.
+        databases: usize,
+    },
+}
+
+/// The files that `SQLite` keeps open: the database and its `-wal` for each
+/// connection, and one `-shm` for each database.
+pub(crate) const fn sqlite_open_files(connections: usize, databases: usize) -> usize {
+    connections.saturating_mul(2).saturating_add(databases)
+}
+
 /// The boot warning for a high connection count, or `None` below the
-/// threshold. `sqlite` selects the advice for a `SQLite` app.
+/// threshold.
 pub(crate) fn total_connections_warning(
     total: usize,
     threshold: usize,
-    sqlite: bool,
+    backend: ConnectionBackend,
 ) -> Option<String> {
     if !should_warn_total_connections(total, threshold) {
         return None;
     }
-    let advice = if sqlite {
-        "Each SQLite connection keeps files open. Set the open-file limit of \
-         the process (ulimit -n) higher than this count, or decrease \
-         database.fleet.max_open, database.fleet.pool_size or database.pool_size."
-    } else {
-        "Ensure each Postgres server's max_connections (plus headroom for \
-         migrations and psql) exceeds the pools that target it, or lower \
-         database.pool_size."
+    let advice = match backend {
+        ConnectionBackend::Sqlite { databases } => format!(
+            "On SQLite they keep about {files} open files (the database and its \
+             -wal for each connection, one -shm for each database). \
+             database.fleet.max_open is a soft limit: a burst opens more. Set the \
+             open-file limit of the process (ulimit -n) above the peak, or decrease \
+             database.fleet.max_open, database.fleet.pool_size or database.pool_size.",
+            files = sqlite_open_files(total, databases),
+        ),
+        ConnectionBackend::Postgres => "Ensure each Postgres server's max_connections \
+             (plus headroom for migrations and psql) exceeds the pools that target \
+             it, or lower database.pool_size."
+            .to_owned(),
     };
     Some(format!(
         "Aggregate database connection count is high: the control topology and \
@@ -14561,15 +14590,43 @@ mod tests {
     #[test]
     fn the_connection_warning_speaks_sqlite_to_a_sqlite_app() {
         // Murmuration FINDINGS 6: a SQLite fleet was told about Postgres.
-        let sqlite = total_connections_warning(266, 100, true).expect("warns");
+        let sqlite_backend = ConnectionBackend::Sqlite { databases: 65 };
+        let sqlite = total_connections_warning(266, 100, sqlite_backend).expect("warns");
         assert!(!sqlite.contains("Postgres"), "{sqlite}");
         assert!(sqlite.contains("266"), "{sqlite}");
         assert!(sqlite.contains("database.fleet.max_open"), "{sqlite}");
         assert!(sqlite.contains("max_connections_warn_threshold = 0"));
-        let postgres = total_connections_warning(266, 100, false).expect("warns");
+        let postgres =
+            total_connections_warning(266, 100, ConnectionBackend::Postgres).expect("warns");
         assert!(postgres.contains("Postgres"), "{postgres}");
-        assert!(total_connections_warning(99, 100, true).is_none());
-        assert!(total_connections_warning(10_000, 0, false).is_none());
+        assert!(total_connections_warning(99, 100, sqlite_backend).is_none());
+        assert!(total_connections_warning(10_000, 0, ConnectionBackend::Postgres).is_none());
+    }
+
+    #[test]
+    fn the_sqlite_warning_gives_the_open_file_count() {
+        // Pigeonhole FINDINGS 2: the budget is files, not connections.
+        // 64 fleet files x 2 connections, plus a control file with 10.
+        let backend = ConnectionBackend::Sqlite { databases: 65 };
+        let message = total_connections_warning(138, 100, backend).expect("warns");
+        // 2 x 138 (database and -wal) + 65 (-shm).
+        assert!(message.contains("about 341 open files"), "{message}");
+        assert!(message.contains("-wal"), "{message}");
+        assert!(message.contains("soft limit"), "{message}");
+        assert!(message.contains("ulimit -n"), "{message}");
+        assert!(!message.contains("Postgres"), "{message}");
+    }
+
+    #[test]
+    fn sqlite_open_files_counts_two_per_connection_and_one_per_database() {
+        assert_eq!(sqlite_open_files(0, 0), 0);
+        assert_eq!(
+            sqlite_open_files(2, 1),
+            5,
+            "the fleet guide's 2 x pool_size + 1"
+        );
+        assert_eq!(sqlite_open_files(128, 64), 64 * 5);
+        assert_eq!(sqlite_open_files(usize::MAX, 1), usize::MAX, "saturates");
     }
 
     #[test]

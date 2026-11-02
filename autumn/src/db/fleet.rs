@@ -1364,6 +1364,9 @@ impl DatabaseFleet {
 
     /// The database key for a routing key (a tenant id), per the fleet mode.
     ///
+    /// A slot fleet takes any routing key, because the key never names a
+    /// file. It does not check the id: the app does that.
+    ///
     /// # Errors
     ///
     /// [`FleetError::InvalidKey`] when a tenant fleet is given an id that
@@ -5017,6 +5020,24 @@ mod tests {
         .build()
         .unwrap();
         on_demand.open_for("globex").await.unwrap();
+    }
+
+    /// Pigeonhole FINDINGS 3: a slot key never names a file, so a slot fleet
+    /// takes any routing key. A tenant fleet refuses the same keys. The app
+    /// checks its own ids in slot mode.
+    #[test]
+    fn a_slot_fleet_takes_keys_that_a_tenant_fleet_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let slot = fleet(tmp.path(), FleetMode::Slot, |_| {});
+        let tenant = fleet(tmp.path(), FleetMode::Tenant, |_| {});
+        for key in ["Acme", "../etc/passwd", "", "con", "a b"] {
+            assert!(
+                matches!(tenant.key_for(key), Err(FleetError::InvalidKey(_))),
+                "tenant mode refuses {key:?}"
+            );
+            let expected = crate::sharding::slot_for_key(key.into()).0;
+            assert_eq!(slot.key_for(key).unwrap(), FleetDbKey::Slot(expected));
+        }
     }
 
     #[tokio::test]
