@@ -2207,8 +2207,13 @@ pub(crate) fn build_sqlite_pool_with(
         //   `TestApp` does) and the runtime thread waits for it, it never runs.
         //
         // A blocking thread needs neither the scheduler nor a tokio timer.
-        let setup =
-            crate::time::spawn_blocking(move || sqlite_connection_setup(&url, checkpoint_owner));
+        //
+        // Not gated: on a sim runtime whose thread waits for a startup hook,
+        // the gate never opens, so each new connection waited 2 s and counted
+        // a give-up. The setup touches no sim state.
+        let setup = crate::time::spawn_blocking_ungated(move || {
+            sqlite_connection_setup(&url, checkpoint_owner)
+        });
         async move {
             let conn = setup.await.map_err(|e| {
                 diesel::ConnectionError::BadConnection(format!(
@@ -6019,6 +6024,40 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("the setup hung: it needs the blocked runtime thread");
         got.expect("the connection opens");
+    }
+
+    // The same blocked runtime thread on a sim runtime, with a sim alive. The
+    // runtime thread cannot park, so gated blocking work waits for the 2 s
+    // give-up and counts a give-up, and the run is then not sure to replay.
+    // The connection setup touches no sim state, so it must not be gated.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sim_sqlite_setup_is_not_gated_while_the_runtime_thread_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("sim.db").display());
+        let rt = crate::sim::gate::runtime().unwrap();
+        let seat = crate::sim::gate::SimSeat::default();
+        seat.take();
+        let before = crate::sim::gate::give_ups();
+        rt.block_on(async {
+            let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch)
+                .expect("the pool builds");
+            let handle = tokio::runtime::Handle::current();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let got = handle
+                    .block_on(pool.get())
+                    .map(drop)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(got);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the setup hung")
+                .expect("the connection opens");
+        });
+        let after = crate::sim::gate::give_ups();
+        seat.leave();
+        assert_eq!(after, before, "the connection setup waited for the gate");
     }
 
     // …but the two scheme-less spellings `normalize_sqlite_target` explicitly
