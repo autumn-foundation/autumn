@@ -539,12 +539,14 @@ doesn't. It inherits every boundary of
   The acknowledgment binds only to routes that serve a URL under the prefix.
   A route is left out when a more specific route wins every URL it would serve.
   The CSRF middleware cleans the request path first. A capture or a catch-all
-  can hold `..`, `.` or `%2e`, so a request to `/other/../api` reaches
-  `POST /other/{id}/api` and is cleaned to `/api`. The acknowledgment binds to
-  such a route too. Two limits remain:
-  - A `%2f` inside a capture is not modeled. It can also hide `..`.
-  - A route that is bound this way is not ranked by router precedence. The
-    gate can bind a route that no request reaches. It does not miss one.
+  can hold `..`, `.` or `%2e`. For example, a request to `/other/../api`
+  reaches `POST /other/{id}/api`. The middleware cleans that path to `/api`.
+  The acknowledgment binds to such a route too. Three limits remain:
+  - A `%2f` inside a capture is not modeled. A `%2f` can also hide `..`.
+  - The gate does not rank these routes by router precedence. It can bind a
+    route that no request reaches.
+  - A route with many captures can have too many cleaned shapes to track. The
+    gate then binds the route.
 - **A build you do not audit.** The gate audits the build in
   `POSTURE_AUDIT_FLAGS`. A route that exists only in another build is not in
   the manifest. Keep the flags the same as your image build. The `build`
