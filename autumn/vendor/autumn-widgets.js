@@ -1016,12 +1016,16 @@
     var host = elt.closest('[hx-indicator],[data-hx-indicator]');
     if (!host) return [elt];
     var sel = host.getAttribute('hx-indicator') || host.getAttribute('data-hx-indicator');
-    return sel.split(',').reduce(function (all, s) {
-      s = s.trim();
-      var one = s === 'this' ? host : s.indexOf('closest ') === 0 ? elt.closest(s.slice(8))
-        : s.indexOf('find ') === 0 ? elt.querySelector(s.slice(5)) : null;
-      return all.concat(one ? [one] : /^(closest|find) /.test(s) ? [] : Array.from(document.querySelectorAll(s)));
-    }, []);
+    try {
+      // A plain CSS list stays whole: a comma can sit inside :is() or [a="b, c"].
+      if (!/(^|,)\s*(this|closest |find )/.test(sel)) return Array.from(document.querySelectorAll(sel));
+      return sel.split(',').reduce(function (all, s) {
+        s = s.trim();
+        var one = s === 'this' ? host : s.indexOf('closest ') === 0 ? elt.closest(s.slice(8))
+          : s.indexOf('find ') === 0 ? elt.querySelector(s.slice(5)) : null;
+        return all.concat(one ? [one] : /^(closest|find) /.test(s) ? [] : Array.from(document.querySelectorAll(s)));
+      }, []);
+    } catch (err) { return []; }
   }
   document.addEventListener('htmx:beforeSend', function (e) {
     var d = e.detail, ev = (d.requestConfig || {}).triggeringEvent;

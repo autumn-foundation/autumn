@@ -168,7 +168,7 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 45 KiB |
+| `autumn-widgets.js`, raw | 46 KiB |
 | `autumn-widgets.js`, gzip level 9 | 14 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails

@@ -833,7 +833,7 @@ mod tests {
     /// increased them from 36 KiB and 11 KiB. Issue #3406 added the busy
     /// state for htmx requests (`data-autumn-busy`), with its own
     /// `hx-indicator` resolver. It increased them from 44 KiB and 13 KiB.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 45 * 1024;
+    const WIDGETS_JS_BUDGET_BYTES: usize = 46 * 1024;
     /// Gzip budget. Browsers download this size.
     const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 14 * 1024;
 
