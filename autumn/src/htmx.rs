@@ -831,11 +831,11 @@ mod tests {
     /// 32 KiB and 10 KiB. Issue #3404 added the tooltip runtime, next to the
     /// #3403 drawer. Issue #3402 added the popover menu runtime. Together they
     /// increased them from 36 KiB and 11 KiB. Issue #3406 added the busy
-    /// state for htmx requests (`data-autumn-busy`). It increased the raw
-    /// budget from 44 KiB. The gzip budget did not change.
+    /// state for htmx requests (`data-autumn-busy`), with its own
+    /// `hx-indicator` resolver. It increased them from 44 KiB and 13 KiB.
     const WIDGETS_JS_BUDGET_BYTES: usize = 45 * 1024;
     /// Gzip budget. Browsers download this size.
-    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 13 * 1024;
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 14 * 1024;
 
     /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
     /// CRLF checkout changes the bytes, the content hash and the size.
@@ -879,11 +879,12 @@ mod tests {
             "'htmx:beforeSend'",
             "matches('[data-autumn-busy]')",
             "ev && ev.submitter",
-            // This request's indicators only: the ones htmx marks between
-            // beforeRequest and beforeSend (Codex review).
-            "'htmx:beforeRequest'",
-            "querySelectorAll('[data-autumn-busy].htmx-request')",
-            "busyBefore.indexOf(el) < 0",
+            // This request's own indicators, shared ones too: resolve the
+            // inherited `hx-indicator` as htmx does (Codex review).
+            "function indicatorsOf(elt)",
+            "closest('[hx-indicator],[data-hx-indicator]')",
+            "s === 'this' ? host",
+            "indicatorsOf(e.target)",
             "d.target",
             "busyCount",
             "setAttribute('aria-busy', 'true')",

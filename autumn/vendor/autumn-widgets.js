@@ -1009,15 +1009,25 @@
   document.addEventListener('htmx:historyRestore', function () { initAll(document); });
 
   // Busy state (#3406). Mark this request's [data-autumn-busy] requester,
-  // submitter and indicators (marked since beforeRequest), and its target.
-  var busyCount = new WeakMap(), busyBefore = [];
-  function marked() { return Array.from(document.querySelectorAll('[data-autumn-busy].htmx-request')); }
-  document.addEventListener('htmx:beforeRequest', function () { busyBefore = marked(); });
+  // submitter and indicators, and its target. Indicators resolve as htmx
+  // does: the inherited hx-indicator, else the requester.
+  var busyCount = new WeakMap();
+  function indicatorsOf(elt) {
+    var host = elt.closest('[hx-indicator],[data-hx-indicator]');
+    if (!host) return [elt];
+    var sel = host.getAttribute('hx-indicator') || host.getAttribute('data-hx-indicator');
+    return sel.split(',').reduce(function (all, s) {
+      s = s.trim();
+      var one = s === 'this' ? host : s.indexOf('closest ') === 0 ? elt.closest(s.slice(8))
+        : s.indexOf('find ') === 0 ? elt.querySelector(s.slice(5)) : null;
+      return all.concat(one ? [one] : /^(closest|find) /.test(s) ? [] : Array.from(document.querySelectorAll(s)));
+    }, []);
+  }
   document.addEventListener('htmx:beforeSend', function (e) {
     var d = e.detail, ev = (d.requestConfig || {}).triggeringEvent;
     var els = [e.target, ev && ev.submitter].filter(function (el) {
       return el && el.matches && el.matches('[data-autumn-busy]');
-    }).concat(marked().filter(function (el) { return busyBefore.indexOf(el) < 0; }));
+    }).concat(indicatorsOf(e.target).filter(function (el) { return el.matches('[data-autumn-busy]'); }));
     if (els.length && d.target) els.push(d.target);
     els = els.filter(function (el, i) {
       return els.indexOf(el) === i && (busyCount.has(el) || !el.hasAttribute('aria-busy'));
