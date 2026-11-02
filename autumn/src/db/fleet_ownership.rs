@@ -1963,6 +1963,19 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_late_claim_below_the_fence_floor_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, late) = late_claim(dir.path()).await;
+        // A replicator saw a newer epoch for this range.
+        a.lose(3, token(9));
+        a.release_all().await;
+        assert!(a.held().iter().all(|(r, _)| *r != late), "not kept");
+        // Nothing released it, so the store lease stays until its end.
+        let b = FleetOwnership::new(stuck.clone(), owner("b"), vec![late], TTL).unwrap();
+        assert_eq!(b.refresh().await.waiting, vec![late]);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_claim_that_ends_late_is_renewed_not_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
         let (_stuck, a, late) = late_claim(dir.path()).await;
