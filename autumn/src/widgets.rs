@@ -23,6 +23,10 @@
 //! | `comment_thread` | No-JS/htmx nested comment list with an inline reply form per node, for `#[commentable]` |
 //! | `locale_switcher` | Path-preserving language switcher for locale-prefixed routing (issue #1251) |
 //! | `theme_toggle` | No-JS System / Light / Dark switch that stores the `autumn.theme` cookie (issue #3396) |
+//! | `button` / `button_group` | Button with a variant, a size, an icon and a loading state. A `role="group"` of buttons (issue #3406) |
+//! | `separator` / `kbd` / `kbd_combo` | `<hr>` or a vertical `role="separator"`. Keyboard keys (issue #3406) |
+//! | `avatar_group` | Avatars that overlap, with a `+N` item (issue #3406) |
+//! | `progress` / `meter` | Native `<progress>` and `<meter>`, with a name and an optional visible label (issue #3406) |
 //!
 //! # Feedback widgets
 //!
@@ -30,6 +34,8 @@
 //! |--------|-----|
 //! | `toast` / `toast_with` / `toast_region` | htmx action feedback, appended out-of-band. Pauses on hover or focus. Has a close button |
 //! | `tooltip` / `tooltip_with` | Text that shows on hover and focus, linked by `aria-describedby` (issue #3404) |
+//! | `spinner` / `skeleton` | A `role="status"` spinner and a placeholder shape. Each can be an htmx `hx-indicator` (issue #3406) |
+//! | `empty_state` | Title, text and action for a list with no data (issue #3406) |
 //!
 //! # Interactive / search widgets
 //!
@@ -7616,6 +7622,1322 @@ pub fn line_chart_with(series: &[(&str, f64)], config: &ChartConfig<'_>) -> maud
     chart_root("line", "0 0 100 40", series, config, &body)
 }
 
+// ── button / button_group (#3406) ───────────────────────────────────────────
+
+/// The look of a [`button`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ButtonVariant {
+    /// The main action. A filled button. The default.
+    #[default]
+    Primary,
+    /// A second action. An outlined button.
+    Secondary,
+    /// A quiet action. It has no fill and no border.
+    Ghost,
+    /// An action that deletes data or that you cannot undo. A red button.
+    Destructive,
+    /// A button that looks like a link.
+    Link,
+}
+
+#[cfg(feature = "maud")]
+impl ButtonVariant {
+    /// The variant class, for example `autumn-button--primary`.
+    const fn class(self) -> &'static str {
+        match self {
+            Self::Primary => "autumn-button--primary",
+            Self::Secondary => "autumn-button--secondary",
+            Self::Ghost => "autumn-button--ghost",
+            Self::Destructive => "autumn-button--destructive",
+            Self::Link => "autumn-button--link",
+        }
+    }
+}
+
+/// The size of a [`button`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ButtonSize {
+    /// A small button, for dense rows and tables.
+    Small,
+    /// The default size.
+    #[default]
+    Medium,
+    /// A large button, for a main call to action.
+    Large,
+}
+
+#[cfg(feature = "maud")]
+impl ButtonSize {
+    /// The size class, for example `autumn-button--md`.
+    const fn class(self) -> &'static str {
+        match self {
+            Self::Small => "autumn-button--sm",
+            Self::Medium => "autumn-button--md",
+            Self::Large => "autumn-button--lg",
+        }
+    }
+}
+
+/// Options for [`button`]. The default is a medium primary
+/// `type="button"`.
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct ButtonConfig<'a> {
+    variant: ButtonVariant,
+    size: ButtonSize,
+    kind: crate::a11y::ButtonType,
+    icon: Option<maud::Markup>,
+    icon_only: bool,
+    loading: bool,
+    loading_on_request: bool,
+    disabled: bool,
+    id: Option<&'a str>,
+    class: Option<&'a str>,
+    attrs: &'a [(&'a str, &'a str)],
+}
+
+#[cfg(feature = "maud")]
+impl<'a> ButtonConfig<'a> {
+    /// A medium [`ButtonVariant::Primary`] button with `type="button"`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the look.
+    #[must_use]
+    pub const fn variant(mut self, variant: ButtonVariant) -> Self {
+        self.variant = variant;
+        self
+    }
+
+    /// Set the size.
+    #[must_use]
+    pub const fn size(mut self, size: ButtonSize) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Set the `type`. The default is `type="button"`.
+    #[must_use]
+    pub const fn kind(mut self, kind: crate::a11y::ButtonType) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Set `type="submit"`.
+    #[must_use]
+    pub const fn submit(mut self) -> Self {
+        self.kind = crate::a11y::ButtonType::Submit;
+        self
+    }
+
+    /// Show `icon` before the label. The icon is `aria-hidden`.
+    #[must_use]
+    pub fn icon(mut self, icon: maud::Markup) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// Show only the icon. The label stays in the button as visually
+    /// hidden text, so it is still the accessible name.
+    #[must_use]
+    pub const fn icon_only(mut self) -> Self {
+        self.icon_only = true;
+        self
+    }
+
+    /// Render the button busy: `aria-busy="true"`, `disabled` and a
+    /// spinner. Use it when the server knows that work is in progress.
+    #[must_use]
+    pub const fn loading(mut self) -> Self {
+        self.loading = true;
+        self
+    }
+
+    /// Show the busy state during an htmx request. The button gets
+    /// `data-autumn-busy` and a hidden spinner.
+    ///
+    /// The spinner shows while the button, or an element around it, has
+    /// the htmx `htmx-request` class. That is the case when the button
+    /// sends the request, when its form sends it, or when `hx-indicator`
+    /// names the button. `autumn-widgets.js` sets `aria-busy="true"` for
+    /// the same time.
+    #[must_use]
+    pub const fn loading_on_request(mut self) -> Self {
+        self.loading_on_request = true;
+        self
+    }
+
+    /// Add `disabled`.
+    #[must_use]
+    pub const fn disabled(mut self) -> Self {
+        self.disabled = true;
+        self
+    }
+
+    /// Set the `id`, for example for `hx-indicator="#save"`.
+    #[must_use]
+    pub const fn id(mut self, id: &'a str) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// Add a class to the `<button>`.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+
+    /// Add attributes to the `<button>`, for example `hx-post`. `on*` and
+    /// `hx-on*` handlers and `style` are dropped. The widget sets `type`,
+    /// `class`, `id`, `disabled`, `aria-busy` and `data-autumn-busy` first,
+    /// so a second copy of one of them is dropped.
+    #[must_use]
+    pub const fn attrs(mut self, attrs: &'a [(&'a str, &'a str)]) -> Self {
+        self.attrs = attrs;
+        self
+    }
+}
+
+/// Render a `<button>` with a variant, a size, an optional icon and a
+/// loading state.
+///
+/// `label` is the visible text and the accessible name. Do not give an
+/// empty label: a debug build panics.
+///
+/// The `autumn-button` classes also style an `<a href>`. Use them with
+/// [`crate::links::link_to_with`] or [`crate::links::button_to_with`].
+///
+/// # CSS hooks
+///
+/// | Selector | Element |
+/// |---|---|
+/// | `.autumn-button` | The `<button>` |
+/// | `.autumn-button--<variant>` | `primary`, `secondary`, `ghost`, `destructive` or `link` |
+/// | `.autumn-button--<size>` | `sm`, `md` or `lg` |
+/// | `.autumn-button--icon` | An icon-only button |
+/// | `.autumn-button__icon` | The icon |
+/// | `.autumn-button__label` | The label |
+/// | `.autumn-button__spinner` | The busy spinner |
+///
+/// # Example
+///
+/// ```rust
+/// use autumn_web::widgets::{ButtonConfig, ButtonVariant, button};
+///
+/// let config = ButtonConfig::new()
+///     .variant(ButtonVariant::Destructive)
+///     .loading_on_request()
+///     .attrs(&[("hx-delete", "/posts/7")]);
+/// let html = button("Delete", &config).into_string();
+/// assert!(html.contains("autumn-button--destructive"));
+/// assert!(html.contains("data-autumn-busy"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn button(label: &str, config: &ButtonConfig<'_>) -> maud::Markup {
+    assert_named("button", label);
+    let mut root = format!(
+        "autumn-button {} {}",
+        config.variant.class(),
+        config.size.class()
+    );
+    if config.icon_only {
+        root.push_str(" autumn-button--icon");
+    }
+    let root = merge_class(&root, config.class);
+    let mut attrs: Vec<(&str, &str)> = vec![("type", config.kind.as_str()), ("class", &root)];
+    if let Some(id) = config.id {
+        attrs.push(("id", id));
+    }
+    if config.disabled || config.loading {
+        attrs.push(("disabled", ""));
+    }
+    if config.loading {
+        attrs.push(("aria-busy", "true"));
+    }
+    if config.loading_on_request {
+        attrs.push(("data-autumn-busy", ""));
+    }
+    attrs.extend_from_slice(config.attrs);
+    let label_class = if config.icon_only {
+        "autumn-button__label autumn-visually-hidden"
+    } else {
+        "autumn-button__label"
+    };
+    // The spinner is first. CSS hides the elements after it while busy.
+    let body = maud::html! {
+        @if config.loading || config.loading_on_request {
+            span class="autumn-button__spinner autumn-spinner__icon" aria-hidden="true" {}
+        }
+        @if let Some(icon) = &config.icon {
+            span class="autumn-button__icon" aria-hidden="true" { (icon) }
+        }
+        span class=(label_class) { (label) }
+    };
+    crate::form::widget_element("button", &attrs, &crate::form::FieldOptions::new(), body)
+}
+
+/// Panic in a debug build when `label` gives no accessible name.
+#[cfg(feature = "maud")]
+#[track_caller]
+fn assert_named(widget: &str, label: &str) {
+    debug_assert!(
+        !crate::a11y::is_blank(label),
+        "{widget}: the label is empty or blank, so the element has no accessible name"
+    );
+}
+
+/// Options for [`button_group_with`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ButtonGroupConfig<'a> {
+    vertical: bool,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> ButtonGroupConfig<'a> {
+    /// A horizontal group with no extra class.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            vertical: false,
+            class: None,
+        }
+    }
+
+    /// Put the buttons in a column.
+    #[must_use]
+    pub const fn vertical(mut self) -> Self {
+        self.vertical = true;
+        self
+    }
+
+    /// Add a class to the group.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render related buttons as one group: `role="group"` with
+/// `aria-label`.
+///
+/// `label` names the group, for example "Text alignment". The buttons
+/// touch, and the outer corners are round.
+///
+/// ```rust
+/// use autumn_web::widgets::{ButtonConfig, ButtonVariant, button, button_group};
+///
+/// let secondary = ButtonConfig::new().variant(ButtonVariant::Secondary);
+/// let html = button_group(
+///     "Text alignment",
+///     &[button("Left", &secondary), button("Right", &secondary)],
+/// )
+/// .into_string();
+/// assert!(html.contains(r#"role="group""#));
+/// assert!(html.contains(r#"aria-label="Text alignment""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn button_group(label: &str, buttons: &[maud::Markup]) -> maud::Markup {
+    button_group_with(label, buttons, &ButtonGroupConfig::new())
+}
+
+/// Like [`button_group`], with a [`ButtonGroupConfig`].
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn button_group_with(
+    label: &str,
+    buttons: &[maud::Markup],
+    config: &ButtonGroupConfig<'_>,
+) -> maud::Markup {
+    assert_named("button_group", label);
+    let base = if config.vertical {
+        "autumn-button-group autumn-button-group--vertical"
+    } else {
+        "autumn-button-group"
+    };
+    let root = merge_class(base, config.class);
+    maud::html! {
+        div class=(root) role="group" aria-label=(label) {
+            @for button in buttons { (button) }
+        }
+    }
+}
+
+// ── spinner / skeleton (#3406) ──────────────────────────────────────────────
+
+/// The size of a [`spinner`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpinnerSize {
+    /// 1 rem: inline with text.
+    Small,
+    /// 1.5 rem. The default.
+    #[default]
+    Medium,
+    /// 2 rem: a page or a panel that loads.
+    Large,
+}
+
+#[cfg(feature = "maud")]
+impl SpinnerSize {
+    /// The size class, for example `autumn-spinner--md`.
+    const fn class(self) -> &'static str {
+        match self {
+            Self::Small => "autumn-spinner--sm",
+            Self::Medium => "autumn-spinner--md",
+            Self::Large => "autumn-spinner--lg",
+        }
+    }
+}
+
+/// Options for [`spinner_with`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpinnerConfig<'a> {
+    size: SpinnerSize,
+    indicator: Option<&'a str>,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> SpinnerConfig<'a> {
+    /// A medium spinner that always shows.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            size: SpinnerSize::Medium,
+            indicator: None,
+            class: None,
+        }
+    }
+
+    /// Set the size.
+    #[must_use]
+    pub const fn size(mut self, size: SpinnerSize) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Make the spinner an htmx indicator with this `id`. A leading `#` is
+    /// removed. The spinner is hidden until htmx gives it, or an element
+    /// around it, the `htmx-request` class. Name it in `hx-indicator`.
+    #[must_use]
+    pub const fn indicator(mut self, id: &'a str) -> Self {
+        self.indicator = Some(id);
+        self
+    }
+
+    /// Add a class to the root.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render a loading spinner: `role="status"` with a visually hidden
+/// label.
+///
+/// `label` is the text that a screen reader reads, for example
+/// "Loading results". The ring is `aria-hidden`. With
+/// `prefers-reduced-motion: reduce`, the ring does not turn. It fades in
+/// and out slowly.
+///
+/// For a busy button, use [`ButtonConfig::loading_on_request`]. Do not
+/// put a spinner in a button.
+///
+/// ```rust
+/// use autumn_web::widgets::spinner;
+///
+/// let html = spinner("Loading results").into_string();
+/// assert!(html.contains(r#"role="status""#));
+/// assert!(html.contains("Loading results"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn spinner(label: &str) -> maud::Markup {
+    spinner_with(label, &SpinnerConfig::new())
+}
+
+/// Like [`spinner`], with a [`SpinnerConfig`]: size, htmx indicator and
+/// class.
+///
+/// ```rust
+/// use autumn_web::widgets::{SpinnerConfig, spinner_with};
+///
+/// let config = SpinnerConfig::new().indicator("search-busy");
+/// let html = spinner_with("Searching", &config).into_string();
+/// assert!(html.contains(r#"id="search-busy""#));
+/// assert!(html.contains("autumn-indicator"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn spinner_with(label: &str, config: &SpinnerConfig<'_>) -> maud::Markup {
+    assert_named("spinner", label);
+    let mut root = format!("autumn-spinner {}", config.size.class());
+    if config.indicator.is_some() {
+        root.push_str(" autumn-indicator");
+    }
+    let root = merge_class(&root, config.class);
+    maud::html! {
+        span id=[config.indicator.map(selector_to_id)] class=(root) role="status" {
+            span class="autumn-spinner__icon" aria-hidden="true" {}
+            span class="autumn-visually-hidden" { (label) }
+        }
+    }
+}
+
+/// The shape of a [`skeleton`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkeletonShape {
+    /// A line of text. The default.
+    #[default]
+    Line,
+    /// A block, for an image or a card.
+    Block,
+    /// A circle, for an avatar.
+    Circle,
+}
+
+#[cfg(feature = "maud")]
+impl SkeletonShape {
+    /// The shape class, for example `autumn-skeleton--line`.
+    const fn class(self) -> &'static str {
+        match self {
+            Self::Line => "autumn-skeleton--line",
+            Self::Block => "autumn-skeleton--block",
+            Self::Circle => "autumn-skeleton--circle",
+        }
+    }
+}
+
+/// Options for [`skeleton_with`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy)]
+pub struct SkeletonConfig<'a> {
+    count: usize,
+    indicator: Option<&'a str>,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl Default for SkeletonConfig<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "maud")]
+impl<'a> SkeletonConfig<'a> {
+    /// One shape that always shows.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            count: 1,
+            indicator: None,
+            class: None,
+        }
+    }
+
+    /// Render `count` shapes. The default is 1, and 0 also gives 1. Lines
+    /// go in a column, and the last line is shorter. Circles go in a row.
+    #[must_use]
+    pub const fn count(mut self, count: usize) -> Self {
+        self.count = count;
+        self
+    }
+
+    /// Make the skeleton an htmx indicator with this `id`. A leading `#`
+    /// is removed. The skeleton is hidden until htmx gives it, or an
+    /// element around it, the `htmx-request` class. Name it in
+    /// `hx-indicator`.
+    #[must_use]
+    pub const fn indicator(mut self, id: &'a str) -> Self {
+        self.indicator = Some(id);
+        self
+    }
+
+    /// Add a class to the root.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render a skeleton: a grey placeholder shape for content that loads.
+///
+/// The skeleton is `aria-hidden`. Tell screen readers that the content
+/// loads in a different way, for example with `aria-busy` on the region
+/// or with a [`spinner`]. With `prefers-reduced-motion: reduce`, the
+/// skeleton does not pulse.
+///
+/// ```rust
+/// use autumn_web::widgets::{SkeletonShape, skeleton};
+///
+/// let html = skeleton(SkeletonShape::Circle).into_string();
+/// assert!(html.contains("autumn-skeleton--circle"));
+/// assert!(html.contains(r#"aria-hidden="true""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn skeleton(shape: SkeletonShape) -> maud::Markup {
+    skeleton_with(shape, &SkeletonConfig::new())
+}
+
+/// Like [`skeleton`], with a [`SkeletonConfig`]: count, htmx indicator
+/// and class.
+///
+/// ```rust
+/// use autumn_web::widgets::{SkeletonConfig, SkeletonShape, skeleton_with};
+///
+/// let config = SkeletonConfig::new().count(3).indicator("posts-loading");
+/// let html = skeleton_with(SkeletonShape::Line, &config).into_string();
+/// assert_eq!(html.matches("autumn-skeleton__item").count(), 3);
+/// assert!(html.contains(r#"id="posts-loading""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn skeleton_with(shape: SkeletonShape, config: &SkeletonConfig<'_>) -> maud::Markup {
+    let mut root = format!("autumn-skeleton {}", shape.class());
+    if config.indicator.is_some() {
+        root.push_str(" autumn-indicator");
+    }
+    let root = merge_class(&root, config.class);
+    maud::html! {
+        span id=[config.indicator.map(selector_to_id)] class=(root) aria-hidden="true" {
+            @for _ in 0..config.count.max(1) {
+                span class="autumn-skeleton__item" {}
+            }
+        }
+    }
+}
+
+// ── progress / meter (#3406) ────────────────────────────────────────────────
+
+/// Options for [`progress_with`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProgressConfig<'a> {
+    visible_label: bool,
+    value_text: Option<&'a str>,
+    id: Option<&'a str>,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> ProgressConfig<'a> {
+    /// A bar with no visible label.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            visible_label: false,
+            value_text: None,
+            id: None,
+            class: None,
+        }
+    }
+
+    /// Show the label and the value above the bar.
+    #[must_use]
+    pub const fn visible_label(mut self) -> Self {
+        self.visible_label = true;
+        self
+    }
+
+    /// Show `text` as the value, for example "3 of 8 files", in place of
+    /// the percent. It is also the `aria-valuetext`.
+    #[must_use]
+    pub const fn value_text(mut self, text: &'a str) -> Self {
+        self.value_text = Some(text);
+        self
+    }
+
+    /// Set the `id` of the root.
+    #[must_use]
+    pub const fn id(mut self, id: &'a str) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// Add a class to the root.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render a native `<progress>` bar for a task that completes.
+///
+/// `label` is the accessible name. `value` goes from 0 to `max`. `None`
+/// gives an indeterminate bar, for work with no known end. The widget
+/// clamps `value` to `0..=max`. A `NaN` or infinite `value` is `None`. A
+/// `max` that is not a finite number above 0 is 1.
+///
+/// For a measurement in a range, for example disk use, use [`meter`].
+///
+/// ```rust
+/// use autumn_web::widgets::progress;
+///
+/// let html = progress("Upload", Some(40.0), 100.0).into_string();
+/// assert!(html.contains(r#"aria-label="Upload""#));
+/// assert!(html.contains(r#"value="40""#));
+/// assert!(html.contains(r#"max="100""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn progress(label: &str, value: Option<f64>, max: f64) -> maud::Markup {
+    progress_with(label, value, max, &ProgressConfig::new())
+}
+
+/// Like [`progress`], with a [`ProgressConfig`]: visible label, value
+/// text, id and class.
+///
+/// ```rust
+/// use autumn_web::widgets::{ProgressConfig, progress_with};
+///
+/// let config = ProgressConfig::new().visible_label();
+/// let html = progress_with("Upload", Some(0.5), 1.0, &config).into_string();
+/// assert!(html.contains("autumn-progress-field__label"));
+/// assert!(html.contains("50%"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn progress_with(
+    label: &str,
+    value: Option<f64>,
+    max: f64,
+    config: &ProgressConfig<'_>,
+) -> maud::Markup {
+    assert_named("progress", label);
+    let max = if max.is_finite() && max > 0.0 {
+        max
+    } else {
+        1.0
+    };
+    let value = value.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, max));
+    let shown = value.map(|v| {
+        config
+            .value_text
+            .map_or_else(|| percent(v, 0.0, max), str::to_owned)
+    });
+    let value_text = config.value_text.filter(|_| value.is_some());
+    let field = config.visible_label;
+    let bar_class = if field {
+        "autumn-progress".to_owned()
+    } else {
+        merge_class("autumn-progress", config.class)
+    };
+    let bar = maud::html! {
+        progress class=(bar_class) id=[config.id.filter(|_| !field)] aria-label=(label)
+            aria-valuetext=[value_text] value=[value.map(fmt_number)] max=(fmt_number(max)) {
+            @if let Some(text) = &shown { (text) }
+        }
+    };
+    if field {
+        range_field(label, shown.as_deref(), config.id, config.class, &bar)
+    } else {
+        bar
+    }
+}
+
+/// The visible label and value above a progress bar or a meter. The text
+/// is `aria-hidden`: the bar has the same name and value.
+#[cfg(feature = "maud")]
+fn range_field(
+    label: &str,
+    value: Option<&str>,
+    id: Option<&str>,
+    class: Option<&str>,
+    bar: &maud::Markup,
+) -> maud::Markup {
+    maud::html! {
+        div class=(merge_class("autumn-progress-field", class)) id=[id] {
+            div class="autumn-progress-field__header" aria-hidden="true" {
+                span class="autumn-progress-field__label" { (label) }
+                @if let Some(value) = value {
+                    span class="autumn-progress-field__value" { (value) }
+                }
+            }
+            (bar)
+        }
+    }
+}
+
+/// `value` as a whole percent of `min..=max`, for example `"40%"`.
+#[cfg(feature = "maud")]
+fn percent(value: f64, min: f64, max: f64) -> String {
+    let span = max - min;
+    let ratio = if span > 0.0 {
+        (value - min) / span
+    } else {
+        1.0
+    };
+    format!("{}%", fmt_number((ratio * 100.0).round()))
+}
+
+/// A finite number as an attribute value: `40` not `40.0`, `0` not `-0`.
+#[cfg(feature = "maud")]
+fn fmt_number(value: f64) -> String {
+    // Adding 0.0 turns -0.0 into 0.0.
+    format!("{}", value + 0.0)
+}
+
+/// Options for [`meter_with`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MeterConfig<'a> {
+    low: Option<f64>,
+    high: Option<f64>,
+    optimum: Option<f64>,
+    visible_label: bool,
+    value_text: Option<&'a str>,
+    id: Option<&'a str>,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> MeterConfig<'a> {
+    /// A meter with no `low`, `high` or `optimum` and no visible label.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            low: None,
+            high: None,
+            optimum: None,
+            visible_label: false,
+            value_text: None,
+            id: None,
+            class: None,
+        }
+    }
+
+    /// Set `low`: the top of the low part of the range.
+    #[must_use]
+    pub const fn low(mut self, low: f64) -> Self {
+        self.low = Some(low);
+        self
+    }
+
+    /// Set `high`: the bottom of the high part of the range.
+    #[must_use]
+    pub const fn high(mut self, high: f64) -> Self {
+        self.high = Some(high);
+        self
+    }
+
+    /// Set `optimum`: the best value. With `low` and `high`, the browser
+    /// colors the bar good, average or bad.
+    #[must_use]
+    pub const fn optimum(mut self, optimum: f64) -> Self {
+        self.optimum = Some(optimum);
+        self
+    }
+
+    /// Show the label and the value above the bar.
+    #[must_use]
+    pub const fn visible_label(mut self) -> Self {
+        self.visible_label = true;
+        self
+    }
+
+    /// Show `text` as the value, for example "7 GB of 10 GB", in place of
+    /// the percent. It is also the `aria-valuetext`.
+    #[must_use]
+    pub const fn value_text(mut self, text: &'a str) -> Self {
+        self.value_text = Some(text);
+        self
+    }
+
+    /// Set the `id` of the root.
+    #[must_use]
+    pub const fn id(mut self, id: &'a str) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    /// Add a class to the root.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render a native `<meter>`: a measurement in a known range, for example
+/// disk use or a score.
+///
+/// `label` is the accessible name. The widget clamps `value`, `low`,
+/// `high` and `optimum` to `range`. A range with the start above the end
+/// is turned around. A `NaN` or infinite bound is 0 (start) or 1 (end). A
+/// `NaN` or infinite `value` is the start.
+///
+/// For a task that completes, use [`progress`].
+///
+/// ```rust
+/// use autumn_web::widgets::meter;
+///
+/// let html = meter("Disk use", 70.0, 0.0..=100.0).into_string();
+/// assert!(html.contains(r#"aria-label="Disk use""#));
+/// assert!(html.contains(r#"value="70""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn meter(label: &str, value: f64, range: std::ops::RangeInclusive<f64>) -> maud::Markup {
+    meter_with(label, value, range, &MeterConfig::new())
+}
+
+/// Like [`meter`], with a [`MeterConfig`]: `low`, `high`, `optimum`,
+/// visible label, value text, id and class.
+///
+/// ```rust
+/// use autumn_web::widgets::{MeterConfig, meter_with};
+///
+/// let config = MeterConfig::new().low(25.0).high(75.0).optimum(10.0);
+/// let html = meter_with("Disk use", 90.0, 0.0..=100.0, &config).into_string();
+/// assert!(html.contains(r#"high="75""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn meter_with(
+    label: &str,
+    value: f64,
+    range: std::ops::RangeInclusive<f64>,
+    config: &MeterConfig<'_>,
+) -> maud::Markup {
+    assert_named("meter", label);
+    let (start, end) = range.into_inner();
+    let start = if start.is_finite() { start } else { 0.0 };
+    let end = if end.is_finite() { end } else { 1.0 };
+    let (min, max) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    let value = if value.is_finite() {
+        value.clamp(min, max)
+    } else {
+        min
+    };
+    let clamp = |x: Option<f64>| {
+        x.filter(|x| x.is_finite())
+            .map(|x| fmt_number(x.clamp(min, max)))
+    };
+    let shown = config
+        .value_text
+        .map_or_else(|| percent(value, min, max), str::to_owned);
+    let field = config.visible_label;
+    let bar_class = if field {
+        "autumn-meter".to_owned()
+    } else {
+        merge_class("autumn-meter", config.class)
+    };
+    let bar = maud::html! {
+        meter class=(bar_class) id=[config.id.filter(|_| !field)] aria-label=(label)
+            aria-valuetext=[config.value_text] value=(fmt_number(value))
+            min=(fmt_number(min)) max=(fmt_number(max))
+            low=[clamp(config.low)] high=[clamp(config.high)] optimum=[clamp(config.optimum)] {
+            (shown)
+        }
+    };
+    if field {
+        range_field(label, Some(&shown), config.id, config.class, &bar)
+    } else {
+        bar
+    }
+}
+
+// ── separator / kbd (#3406) ─────────────────────────────────────────────────
+
+/// Options for [`separator_with`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SeparatorConfig<'a> {
+    vertical: bool,
+    decorative: bool,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> SeparatorConfig<'a> {
+    /// A horizontal `<hr>`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            vertical: false,
+            decorative: false,
+            class: None,
+        }
+    }
+
+    /// A vertical line, for a row of items: `role="separator"` with
+    /// `aria-orientation="vertical"`.
+    #[must_use]
+    pub const fn vertical(mut self) -> Self {
+        self.vertical = true;
+        self
+    }
+
+    /// A line for looks only: `role="none"`. Screen readers do not read it.
+    #[must_use]
+    pub const fn decorative(mut self) -> Self {
+        self.decorative = true;
+        self
+    }
+
+    /// Add a class.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render a horizontal separator: `<hr class="autumn-separator">`.
+///
+/// ```rust
+/// use autumn_web::widgets::separator;
+///
+/// assert_eq!(separator().into_string(), r#"<hr class="autumn-separator">"#);
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn separator() -> maud::Markup {
+    separator_with(&SeparatorConfig::new())
+}
+
+/// Like [`separator`], with a [`SeparatorConfig`]: vertical, decorative
+/// and class.
+///
+/// ```rust
+/// use autumn_web::widgets::{SeparatorConfig, separator_with};
+///
+/// let html = separator_with(&SeparatorConfig::new().vertical()).into_string();
+/// assert!(html.contains(r#"role="separator""#));
+/// assert!(html.contains(r#"aria-orientation="vertical""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn separator_with(config: &SeparatorConfig<'_>) -> maud::Markup {
+    let decorative = config.decorative.then_some("none");
+    if config.vertical {
+        let root = merge_class("autumn-separator autumn-separator--vertical", config.class);
+        maud::html! {
+            div class=(root) role=(decorative.unwrap_or("separator"))
+                aria-orientation=[(!config.decorative).then_some("vertical")] {}
+        }
+    } else {
+        let root = merge_class("autumn-separator", config.class);
+        maud::html! { hr class=(root) role=[decorative]; }
+    }
+}
+
+/// Render a keyboard key: `<kbd class="autumn-kbd">`.
+///
+/// ```rust
+/// use autumn_web::widgets::kbd;
+///
+/// assert_eq!(kbd("Esc").into_string(), r#"<kbd class="autumn-kbd">Esc</kbd>"#);
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn kbd(key: &str) -> maud::Markup {
+    maud::html! { kbd class="autumn-kbd" { (key) } }
+}
+
+/// Render a key combination: one `<kbd>` for each key, with `+` between,
+/// in an outer `<kbd>`. This is the HTML pattern for keys that you press
+/// together. An empty `keys` gives no markup.
+///
+/// ```rust
+/// use autumn_web::widgets::kbd_combo;
+///
+/// let html = kbd_combo(&["Ctrl", "K"]).into_string();
+/// assert!(html.starts_with(r#"<kbd class="autumn-kbd-combo">"#));
+/// assert_eq!(html.matches(r#"<kbd class="autumn-kbd">"#).count(), 2);
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn kbd_combo(keys: &[&str]) -> maud::Markup {
+    if keys.is_empty() {
+        return maud::html! {};
+    }
+    maud::html! {
+        kbd class="autumn-kbd-combo" {
+            @for (i, key) in keys.iter().enumerate() {
+                @if i > 0 { "+" }
+                (kbd(key))
+            }
+        }
+    }
+}
+
+// ── empty_state (#3406) ─────────────────────────────────────────────────────
+
+/// Options for [`empty_state_with`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Default)]
+pub struct EmptyStateConfig<'a> {
+    icon: Option<maud::Markup>,
+    level: HeadingLevel,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl<'a> EmptyStateConfig<'a> {
+    /// An `<h2>` title, with no icon.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Show `icon` above the title. The icon is `aria-hidden`.
+    #[must_use]
+    pub fn icon(mut self, icon: maud::Markup) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    /// Set the heading level of the title (default [`HeadingLevel::H2`]).
+    /// Use one level below the heading that holds the empty state.
+    #[must_use]
+    pub const fn level(mut self, level: HeadingLevel) -> Self {
+        self.level = level;
+        self
+    }
+
+    /// Add a class to the root.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render an empty state: a title, a short text and an optional action,
+/// for a list or a page with no data yet.
+///
+/// The title is a heading. An empty `body` gives no paragraph. Give an
+/// action that lets the user fix the empty state, for example a link to
+/// create the first item.
+///
+/// ```rust
+/// use autumn_web::links::link_to;
+/// use autumn_web::widgets::empty_state;
+///
+/// let action = link_to("New post", "/posts/new");
+/// let html = empty_state("No posts yet", "Write your first post.", Some(&action))
+///     .into_string();
+/// assert!(html.contains(r#"<h2 class="autumn-empty-state__title">No posts yet</h2>"#));
+/// assert!(html.contains("autumn-empty-state__action"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn empty_state(title: &str, body: &str, action: Option<&maud::Markup>) -> maud::Markup {
+    empty_state_with(title, body, action, &EmptyStateConfig::new())
+}
+
+/// Like [`empty_state`], with an [`EmptyStateConfig`]: icon, heading level
+/// and class.
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn empty_state_with(
+    title: &str,
+    body: &str,
+    action: Option<&maud::Markup>,
+    config: &EmptyStateConfig<'_>,
+) -> maud::Markup {
+    let root = merge_class("autumn-empty-state", config.class);
+    maud::html! {
+        div class=(root) {
+            @if let Some(icon) = &config.icon {
+                div class="autumn-empty-state__icon" aria-hidden="true" { (icon) }
+            }
+            (heading(config.level, None, "autumn-empty-state__title", &maud::html! { (title) }))
+            @if !body.trim().is_empty() {
+                p class="autumn-empty-state__body" { (body) }
+            }
+            @if let Some(action) = action {
+                div class="autumn-empty-state__action" { (action) }
+            }
+        }
+    }
+}
+
+// ── avatar_group (#3406) ────────────────────────────────────────────────────
+
+/// The default [`AvatarGroupConfig::max`]: five items, the `+N` item
+/// included.
+#[cfg(feature = "maud")]
+pub const DEFAULT_AVATAR_GROUP_MAX: usize = 5;
+
+/// Options for [`avatar_group_with`].
+#[cfg(feature = "maud")]
+#[derive(Debug, Clone, Copy)]
+pub struct AvatarGroupConfig<'a> {
+    max: usize,
+    total: Option<usize>,
+    size: AvatarSize,
+    more_label: &'a str,
+    class: Option<&'a str>,
+}
+
+#[cfg(feature = "maud")]
+impl Default for AvatarGroupConfig<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "maud")]
+impl<'a> AvatarGroupConfig<'a> {
+    /// At most [`DEFAULT_AVATAR_GROUP_MAX`] items, medium size, the label
+    /// `"{count} more"`.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            max: DEFAULT_AVATAR_GROUP_MAX,
+            total: None,
+            size: AvatarSize::Medium,
+            more_label: "{count} more",
+            class: None,
+        }
+    }
+
+    /// Show at most `max` items, the `+N` item included. With more
+    /// avatars, the group shows `max - 1` avatars and `+N`. 0 is 1.
+    #[must_use]
+    pub const fn max(mut self, max: usize) -> Self {
+        self.max = max;
+        self
+    }
+
+    /// Set the number of people when it is more than the avatars you
+    /// give, for example 120 likes with 3 avatars. A `total` below the
+    /// number of avatars does nothing.
+    #[must_use]
+    pub const fn total(mut self, total: usize) -> Self {
+        self.total = Some(total);
+        self
+    }
+
+    /// Set the size of the `+N` item. Give the avatars the same size.
+    #[must_use]
+    pub const fn size(mut self, size: AvatarSize) -> Self {
+        self.size = size;
+        self
+    }
+
+    /// Set the accessible name of the `+N` item. `{count}` becomes the
+    /// number. The default is `"{count} more"`. Translate it here.
+    #[must_use]
+    pub const fn more_label(mut self, label: &'a str) -> Self {
+        self.more_label = label;
+        self
+    }
+
+    /// Add a class to the root.
+    #[must_use]
+    pub const fn class(mut self, class: &'a str) -> Self {
+        self.class = Some(class);
+        self
+    }
+}
+
+/// Render avatars as one group that overlaps, with a `+N` item for the
+/// rest.
+///
+/// `label` names the group (`role="group"`), for example "Project
+/// members". Make each avatar with [`avatar`]. With more than
+/// [`DEFAULT_AVATAR_GROUP_MAX`] avatars, the group shows four and `+N`.
+///
+/// ```rust
+/// use autumn_web::widgets::{AvatarConfig, avatar, avatar_group};
+///
+/// let names = ["Ada", "Grace", "Linus", "Margaret", "Barbara", "Edsger"];
+/// let avatars: Vec<_> = names.iter().map(|n| avatar(n, &AvatarConfig::new())).collect();
+/// let html = avatar_group("Project members", &avatars).into_string();
+/// assert!(html.contains(r#"aria-label="2 more""#));
+/// assert!(html.contains("+2"));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn avatar_group(label: &str, avatars: &[maud::Markup]) -> maud::Markup {
+    avatar_group_with(label, avatars, &AvatarGroupConfig::new())
+}
+
+/// Like [`avatar_group`], with an [`AvatarGroupConfig`]: max, total, size,
+/// `+N` label and class.
+#[cfg(feature = "maud")]
+#[must_use]
+#[track_caller]
+pub fn avatar_group_with(
+    label: &str,
+    avatars: &[maud::Markup],
+    config: &AvatarGroupConfig<'_>,
+) -> maud::Markup {
+    assert_named("avatar_group", label);
+    let (shown, extra) = avatar_group_split(avatars.len(), config.total, config.max);
+    let root = merge_class("autumn-avatar-group", config.class);
+    let more = format!(
+        "autumn-avatar {} autumn-avatar-group__more",
+        config.size.class()
+    );
+    let more_label = config.more_label.replace("{count}", &extra.to_string());
+    maud::html! {
+        div class=(root) role="group" aria-label=(label) {
+            @for avatar in &avatars[..shown] { (avatar) }
+            @if extra > 0 {
+                span class=(more) role="img" aria-label=(more_label) {
+                    span aria-hidden="true" { "+" (extra) }
+                }
+            }
+        }
+    }
+}
+
+/// How many avatars show, and the `+N` count: `(shown, extra)`.
+///
+/// `max` counts the `+N` item. Thus `shown + extra` is the people count,
+/// and `shown`, plus 1 for a `+N` item, is never above `max`.
+#[cfg(feature = "maud")]
+const fn avatar_group_split(len: usize, total: Option<usize>, max: usize) -> (usize, usize) {
+    let count = match total {
+        Some(total) if total > len => total,
+        _ => len,
+    };
+    let max = if max == 0 { 1 } else { max };
+    let shown = if count <= max {
+        len
+    } else if len < max - 1 {
+        len
+    } else {
+        max - 1
+    };
+    (shown, count - shown)
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(all(test, feature = "maud"))]
@@ -10895,5 +12217,628 @@ mod popover_tests {
         assert!(html.contains("data-autumn-menu"), "{html}");
         assert!(!html.contains("data-nav-menu-toggle"), "{html}");
         assert!(!html.contains("data-autumn-dismiss"), "{html}");
+    }
+}
+
+/// Issue #3406: the small display set.
+#[cfg(all(test, feature = "maud"))]
+mod display_set_tests {
+    use super::*;
+    use maud::html;
+    use proptest::prelude::*;
+
+    fn btn(config: &ButtonConfig<'_>) -> String {
+        button("Save", config).into_string()
+    }
+
+    // ── button ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn button_default_is_a_medium_primary_type_button() {
+        let html = btn(&ButtonConfig::new());
+        assert!(html.starts_with("<button"), "{html}");
+        assert!(html.contains(r#"type="button""#), "{html}");
+        assert!(
+            html.contains(r#"class="autumn-button autumn-button--primary autumn-button--md""#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<span class="autumn-button__label">Save</span>"#),
+            "{html}"
+        );
+        assert!(!html.contains("disabled"), "{html}");
+        assert!(!html.contains("aria-busy"), "{html}");
+        assert!(!html.contains("autumn-button__spinner"), "{html}");
+    }
+
+    #[test]
+    fn button_variant_and_size_set_their_classes() {
+        for (variant, class) in [
+            (ButtonVariant::Primary, "autumn-button--primary"),
+            (ButtonVariant::Secondary, "autumn-button--secondary"),
+            (ButtonVariant::Ghost, "autumn-button--ghost"),
+            (ButtonVariant::Destructive, "autumn-button--destructive"),
+            (ButtonVariant::Link, "autumn-button--link"),
+        ] {
+            let html = btn(&ButtonConfig::new().variant(variant));
+            assert!(html.contains(class), "{variant:?}: {html}");
+        }
+        for (size, class) in [
+            (ButtonSize::Small, "autumn-button--sm"),
+            (ButtonSize::Medium, "autumn-button--md"),
+            (ButtonSize::Large, "autumn-button--lg"),
+        ] {
+            let html = btn(&ButtonConfig::new().size(size));
+            assert!(html.contains(class), "{size:?}: {html}");
+        }
+    }
+
+    #[test]
+    fn button_kind_sets_the_type() {
+        assert!(btn(&ButtonConfig::new().submit()).contains(r#"type="submit""#));
+        let reset = ButtonConfig::new().kind(crate::a11y::ButtonType::Reset);
+        assert!(btn(&reset).contains(r#"type="reset""#));
+    }
+
+    #[test]
+    fn button_icon_is_hidden_and_before_the_label() {
+        let icon = html! { svg viewBox="0 0 1 1" {} };
+        let html = btn(&ButtonConfig::new().icon(icon));
+        let at_icon = html
+            .find(r#"<span class="autumn-button__icon" aria-hidden="true"><svg"#)
+            .unwrap_or_else(|| panic!("no icon: {html}"));
+        let at_label = html.find("autumn-button__label").unwrap();
+        assert!(at_icon < at_label, "{html}");
+    }
+
+    #[test]
+    fn icon_only_button_keeps_the_label_as_hidden_text() {
+        let icon = html! { "×" };
+        let html = btn(&ButtonConfig::new().icon(icon).icon_only());
+        assert!(html.contains("autumn-button--icon"), "{html}");
+        assert!(
+            html.contains(
+                r#"<span class="autumn-button__label autumn-visually-hidden">Save</span>"#
+            ),
+            "{html}"
+        );
+        assert!(!html.contains("aria-label"), "{html}");
+    }
+
+    #[test]
+    fn loading_button_is_busy_disabled_and_has_a_spinner() {
+        let html = btn(&ButtonConfig::new().loading());
+        assert!(html.contains(r#"aria-busy="true""#), "{html}");
+        assert!(html.contains("disabled"), "{html}");
+        assert!(
+            html.contains(
+                r#"<span class="autumn-button__spinner autumn-spinner__icon" aria-hidden="true"></span>"#
+            ),
+            "{html}"
+        );
+        // The spinner is first, so CSS can hide the icon and the label after it.
+        let at_spinner = html.find("autumn-button__spinner").unwrap();
+        assert!(at_spinner < html.find("autumn-button__label").unwrap());
+        assert!(!html.contains("data-autumn-busy"), "{html}");
+    }
+
+    #[test]
+    fn loading_on_request_marks_the_button_for_the_runtime() {
+        let html = btn(&ButtonConfig::new().loading_on_request());
+        assert!(html.contains("data-autumn-busy"), "{html}");
+        assert!(html.contains("autumn-button__spinner"), "{html}");
+        // The runtime sets aria-busy. The server does not.
+        assert!(!html.contains("aria-busy"), "{html}");
+        assert!(!html.contains("disabled"), "{html}");
+    }
+
+    #[test]
+    fn button_id_class_and_disabled() {
+        let html = btn(&ButtonConfig::new().id("save").class("wide").disabled());
+        assert!(html.contains(r#"id="save""#), "{html}");
+        assert!(html.contains("autumn-button--md wide"), "{html}");
+        assert!(html.contains("disabled"), "{html}");
+    }
+
+    #[test]
+    fn button_attrs_pass_through_but_cannot_replace_owned_ones() {
+        let attrs = [
+            ("hx-post", "/save?a=1&b=2"),
+            ("hx-indicator", "this"),
+            ("type", "submit"),
+            ("class", "evil"),
+            ("onclick", "alert(1)"),
+            ("hx-on:click", "alert(1)"),
+            ("style", "color:red"),
+            ("Bad Name", "x"),
+        ];
+        let html = btn(&ButtonConfig::new().attrs(&attrs));
+        assert!(html.contains(r#"hx-post="/save?a=1&amp;b=2""#), "{html}");
+        assert!(html.contains(r#"hx-indicator="this""#), "{html}");
+        assert_eq!(html.matches("type=").count(), 1, "{html}");
+        assert!(html.contains(r#"type="button""#), "{html}");
+        assert!(!html.contains("evil"), "{html}");
+        assert!(!html.contains("onclick"), "{html}");
+        assert!(!html.contains("hx-on"), "{html}");
+        assert!(!html.contains("style="), "{html}");
+        assert!(!html.contains("Bad Name"), "{html}");
+    }
+
+    #[test]
+    fn button_label_is_escaped() {
+        let html = button("<script>x</script>", &ButtonConfig::new()).into_string();
+        assert!(html.contains("&lt;script&gt;x&lt;/script&gt;"), "{html}");
+        assert!(!html.contains("<script>"), "{html}");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "accessible name")]
+    fn button_with_a_blank_label_panics_in_debug() {
+        let _ = button("  ", &ButtonConfig::new());
+    }
+
+    // ── button_group ────────────────────────────────────────────────────
+
+    #[test]
+    fn button_group_is_a_named_group() {
+        let a = button("Left", &ButtonConfig::new());
+        let b = button("Right", &ButtonConfig::new());
+        let html = button_group("Text alignment", &[a, b]).into_string();
+        assert!(
+            html.starts_with(
+                r#"<div class="autumn-button-group" role="group" aria-label="Text alignment">"#
+            ),
+            "{html}"
+        );
+        assert!(
+            html.contains(">Left<") && html.contains(">Right<"),
+            "{html}"
+        );
+        assert!(html.ends_with("</div>"), "{html}");
+    }
+
+    #[test]
+    fn button_group_vertical_and_class() {
+        let config = ButtonGroupConfig::new().vertical().class("tools");
+        let html = button_group_with("Tools", &[], &config).into_string();
+        assert!(
+            html.contains(r#"class="autumn-button-group autumn-button-group--vertical tools""#),
+            "{html}"
+        );
+    }
+
+    // ── spinner ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn spinner_is_a_status_with_hidden_text() {
+        let html = spinner("Loading results").into_string();
+        assert_eq!(
+            html,
+            concat!(
+                r#"<span class="autumn-spinner autumn-spinner--md" role="status">"#,
+                r#"<span class="autumn-spinner__icon" aria-hidden="true"></span>"#,
+                r#"<span class="autumn-visually-hidden">Loading results</span></span>"#,
+            )
+        );
+    }
+
+    #[test]
+    fn spinner_size_indicator_and_class() {
+        for (size, class) in [
+            (SpinnerSize::Small, "autumn-spinner--sm"),
+            (SpinnerSize::Large, "autumn-spinner--lg"),
+        ] {
+            let html = spinner_with("Wait", &SpinnerConfig::new().size(size)).into_string();
+            assert!(html.contains(class), "{html}");
+        }
+        let config = SpinnerConfig::new().indicator("#busy").class("inline");
+        let html = spinner_with("Wait", &config).into_string();
+        assert!(html.contains(r#"id="busy""#), "{html}");
+        assert!(
+            html.contains(r#"class="autumn-spinner autumn-spinner--md autumn-indicator inline""#),
+            "{html}"
+        );
+        assert!(!spinner("Wait").into_string().contains("autumn-indicator"));
+    }
+
+    // ── skeleton ────────────────────────────────────────────────────────
+
+    #[test]
+    fn skeleton_is_hidden_from_screen_readers() {
+        let html = skeleton(SkeletonShape::Line).into_string();
+        assert_eq!(
+            html,
+            concat!(
+                r#"<span class="autumn-skeleton autumn-skeleton--line" aria-hidden="true">"#,
+                r#"<span class="autumn-skeleton__item"></span></span>"#,
+            )
+        );
+    }
+
+    #[test]
+    fn skeleton_shapes_count_and_indicator() {
+        for (shape, class) in [
+            (SkeletonShape::Block, "autumn-skeleton--block"),
+            (SkeletonShape::Circle, "autumn-skeleton--circle"),
+        ] {
+            assert!(skeleton(shape).into_string().contains(class));
+        }
+        let three = SkeletonConfig::new().count(3);
+        let html = skeleton_with(SkeletonShape::Line, &three).into_string();
+        assert_eq!(html.matches("autumn-skeleton__item").count(), 3, "{html}");
+        let zero = SkeletonConfig::new().count(0);
+        let html = skeleton_with(SkeletonShape::Line, &zero).into_string();
+        assert_eq!(html.matches("autumn-skeleton__item").count(), 1, "{html}");
+
+        let config = SkeletonConfig::new()
+            .indicator("#feed-loading")
+            .class("wide");
+        let html = skeleton_with(SkeletonShape::Block, &config).into_string();
+        assert!(html.contains(r#"id="feed-loading""#), "{html}");
+        assert!(
+            html.contains(
+                r#"class="autumn-skeleton autumn-skeleton--block autumn-indicator wide""#
+            ),
+            "{html}"
+        );
+    }
+
+    // ── progress ────────────────────────────────────────────────────────
+
+    #[test]
+    fn progress_is_a_named_native_bar() {
+        let html = progress("Upload", Some(40.0), 100.0).into_string();
+        assert_eq!(
+            html,
+            r#"<progress class="autumn-progress" aria-label="Upload" value="40" max="100">40%</progress>"#
+        );
+    }
+
+    #[test]
+    fn progress_with_no_value_is_indeterminate() {
+        for value in [None, Some(f64::NAN), Some(f64::INFINITY)] {
+            let html = progress("Loading", value, 100.0).into_string();
+            assert!(!html.contains("value="), "{value:?}: {html}");
+            assert!(html.contains(r#"max="100""#), "{html}");
+            assert!(html.ends_with("></progress>"), "{html}");
+        }
+    }
+
+    #[test]
+    fn progress_clamps_the_value_and_fixes_a_bad_max() {
+        let html = progress("Upload", Some(150.0), 100.0).into_string();
+        assert!(html.contains(r#"value="100""#), "{html}");
+        let html = progress("Upload", Some(-3.0), 100.0).into_string();
+        assert!(html.contains(r#"value="0""#), "{html}");
+        assert!(!html.contains("-0"), "{html}");
+        for max in [0.0, -5.0, f64::NAN, f64::INFINITY] {
+            let html = progress("Upload", Some(0.5), max).into_string();
+            assert!(html.contains(r#"max="1""#), "{max}: {html}");
+            assert!(html.contains(r#"value="0.5""#), "{max}: {html}");
+        }
+    }
+
+    #[test]
+    fn progress_visible_label_shows_label_and_value() {
+        let config = ProgressConfig::new().visible_label().id("up").class("big");
+        let html = progress_with("Upload", Some(1.0), 4.0, &config).into_string();
+        assert!(
+            html.starts_with(r#"<div class="autumn-progress-field big" id="up">"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(concat!(
+                r#"<div class="autumn-progress-field__header" aria-hidden="true">"#,
+                r#"<span class="autumn-progress-field__label">Upload</span>"#,
+                r#"<span class="autumn-progress-field__value">25%</span></div>"#,
+            )),
+            "{html}"
+        );
+        // The bar keeps its own name: the header is aria-hidden.
+        assert!(html.contains(r#"aria-label="Upload""#), "{html}");
+    }
+
+    #[test]
+    fn progress_value_text_replaces_the_percent() {
+        let config = ProgressConfig::new()
+            .visible_label()
+            .value_text("3 of 8 files");
+        let html = progress_with("Upload", Some(3.0), 8.0, &config).into_string();
+        assert!(html.contains(r#"aria-valuetext="3 of 8 files""#), "{html}");
+        assert!(html.contains(">3 of 8 files</span>"), "{html}");
+        assert!(!html.contains("38%"), "{html}");
+        // An indeterminate bar has no value, so no value text.
+        let html = progress_with("Upload", None, 8.0, &config).into_string();
+        assert!(!html.contains("aria-valuetext"), "{html}");
+    }
+
+    #[test]
+    fn progress_without_visible_label_puts_id_and_class_on_the_bar() {
+        let config = ProgressConfig::new().id("up").class("thin");
+        let html = progress_with("Upload", Some(0.2), 1.0, &config).into_string();
+        assert!(
+            html.starts_with(r#"<progress class="autumn-progress thin" id="up""#),
+            "{html}"
+        );
+    }
+
+    // ── meter ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn meter_is_a_named_native_meter() {
+        let html = meter("Disk use", 70.0, 0.0..=100.0).into_string();
+        assert_eq!(
+            html,
+            r#"<meter class="autumn-meter" aria-label="Disk use" value="70" min="0" max="100">70%</meter>"#
+        );
+    }
+
+    #[test]
+    fn meter_thresholds_are_clamped_to_the_range() {
+        let config = MeterConfig::new().low(-10.0).high(80.0).optimum(500.0);
+        let html = meter_with("Score", 5.0, 0.0..=10.0, &config).into_string();
+        assert!(html.contains(r#"low="0""#), "{html}");
+        assert!(html.contains(r#"high="10""#), "{html}");
+        assert!(html.contains(r#"optimum="10""#), "{html}");
+        let nan = MeterConfig::new().low(f64::NAN);
+        let html = meter_with("Score", 5.0, 0.0..=10.0, &nan).into_string();
+        assert!(!html.contains("low="), "{html}");
+    }
+
+    #[test]
+    fn meter_fixes_a_reversed_or_bad_range_and_value() {
+        #[allow(clippy::reversed_empty_ranges)]
+        let html = meter("Score", 5.0, 10.0..=0.0).into_string();
+        assert!(html.contains(r#"min="0" max="10""#), "{html}");
+        let html = meter("Score", f64::NAN, 2.0..=4.0).into_string();
+        assert!(html.contains(r#"value="2""#), "{html}");
+        let html = meter("Score", 9.0, f64::NAN..=f64::INFINITY).into_string();
+        assert!(html.contains(r#"value="1" min="0" max="1""#), "{html}");
+    }
+
+    #[test]
+    fn meter_visible_label_and_value_text() {
+        let config = MeterConfig::new()
+            .visible_label()
+            .value_text("7 GB of 10 GB")
+            .id("disk");
+        let html = meter_with("Disk use", 7.0, 0.0..=10.0, &config).into_string();
+        assert!(
+            html.starts_with(r#"<div class="autumn-progress-field" id="disk">"#),
+            "{html}"
+        );
+        assert!(html.contains(">7 GB of 10 GB</span>"), "{html}");
+        assert!(html.contains(r#"aria-valuetext="7 GB of 10 GB""#), "{html}");
+    }
+
+    // ── separator ───────────────────────────────────────────────────────
+
+    #[test]
+    fn separator_is_an_hr() {
+        assert_eq!(
+            separator().into_string(),
+            r#"<hr class="autumn-separator">"#
+        );
+        let html = separator_with(&SeparatorConfig::new().decorative().class("x")).into_string();
+        assert_eq!(html, r#"<hr class="autumn-separator x" role="none">"#);
+    }
+
+    #[test]
+    fn vertical_separator_has_role_and_orientation() {
+        let html = separator_with(&SeparatorConfig::new().vertical()).into_string();
+        assert_eq!(
+            html,
+            concat!(
+                r#"<div class="autumn-separator autumn-separator--vertical" "#,
+                r#"role="separator" aria-orientation="vertical"></div>"#,
+            )
+        );
+        let html = separator_with(&SeparatorConfig::new().vertical().decorative()).into_string();
+        assert!(html.contains(r#"role="none""#), "{html}");
+        assert!(!html.contains("aria-orientation"), "{html}");
+    }
+
+    // ── kbd ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn kbd_renders_and_escapes_a_key() {
+        assert_eq!(
+            kbd("Esc").into_string(),
+            r#"<kbd class="autumn-kbd">Esc</kbd>"#
+        );
+        assert_eq!(
+            kbd("<").into_string(),
+            r#"<kbd class="autumn-kbd">&lt;</kbd>"#
+        );
+    }
+
+    #[test]
+    fn kbd_combo_nests_keys_with_plus() {
+        assert_eq!(
+            kbd_combo(&["Ctrl", "Shift", "K"]).into_string(),
+            concat!(
+                r#"<kbd class="autumn-kbd-combo">"#,
+                r#"<kbd class="autumn-kbd">Ctrl</kbd>+"#,
+                r#"<kbd class="autumn-kbd">Shift</kbd>+"#,
+                r#"<kbd class="autumn-kbd">K</kbd></kbd>"#,
+            )
+        );
+        assert_eq!(kbd_combo(&[]).into_string(), "");
+    }
+
+    // ── empty_state ─────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_state_has_title_body_and_action() {
+        let action = html! { a href="/posts/new" { "New post" } };
+        let html =
+            empty_state("No posts yet", "Write your first post.", Some(&action)).into_string();
+        assert_eq!(
+            html,
+            concat!(
+                r#"<div class="autumn-empty-state">"#,
+                r#"<h2 class="autumn-empty-state__title">No posts yet</h2>"#,
+                r#"<p class="autumn-empty-state__body">Write your first post.</p>"#,
+                r#"<div class="autumn-empty-state__action"><a href="/posts/new">New post</a></div>"#,
+                "</div>",
+            )
+        );
+    }
+
+    #[test]
+    fn empty_state_omits_an_empty_body_and_no_action() {
+        let html = empty_state("Nothing here", "  ", None).into_string();
+        assert!(!html.contains("autumn-empty-state__body"), "{html}");
+        assert!(!html.contains("autumn-empty-state__action"), "{html}");
+    }
+
+    #[test]
+    fn empty_state_icon_level_and_class() {
+        let config = EmptyStateConfig::new()
+            .icon(html! { svg {} })
+            .level(HeadingLevel::H3)
+            .class("card");
+        let html = empty_state_with("No <b>data</b>", "x", None, &config).into_string();
+        assert!(
+            html.starts_with(concat!(
+                r#"<div class="autumn-empty-state card">"#,
+                r#"<div class="autumn-empty-state__icon" aria-hidden="true"><svg></svg></div>"#,
+            )),
+            "{html}"
+        );
+        assert!(
+            html.contains(
+                r#"<h3 class="autumn-empty-state__title">No &lt;b&gt;data&lt;/b&gt;</h3>"#
+            ),
+            "{html}"
+        );
+    }
+
+    // ── avatar_group ────────────────────────────────────────────────────
+
+    fn avatars(n: usize) -> Vec<maud::Markup> {
+        (0..n)
+            .map(|i| avatar(&format!("Person {i}"), &AvatarConfig::new()))
+            .collect()
+    }
+
+    #[test]
+    fn avatar_group_is_a_named_group_with_every_avatar_under_max() {
+        let html = avatar_group("Members", &avatars(3)).into_string();
+        assert!(
+            html.starts_with(
+                r#"<div class="autumn-avatar-group" role="group" aria-label="Members">"#
+            ),
+            "{html}"
+        );
+        assert_eq!(html.matches("autumn-avatar--initials").count(), 3, "{html}");
+        assert!(!html.contains("autumn-avatar-group__more"), "{html}");
+    }
+
+    #[test]
+    fn avatar_group_over_max_shows_max_minus_one_and_more() {
+        let html = avatar_group("Members", &avatars(8)).into_string();
+        assert_eq!(html.matches("autumn-avatar--initials").count(), 4, "{html}");
+        assert!(
+            html.contains(concat!(
+                r#"<span class="autumn-avatar autumn-avatar--md autumn-avatar-group__more" "#,
+                r#"role="img" aria-label="4 more"><span aria-hidden="true">+4</span></span>"#,
+            )),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn avatar_group_total_size_label_and_class() {
+        let config = AvatarGroupConfig::new()
+            .max(3)
+            .total(120)
+            .size(AvatarSize::Small)
+            .more_label("{count} weitere")
+            .class("likes");
+        let html = avatar_group_with("Likes", &avatars(3), &config).into_string();
+        assert!(
+            html.contains(r#"class="autumn-avatar-group likes""#),
+            "{html}"
+        );
+        assert_eq!(html.matches("autumn-avatar--initials").count(), 2, "{html}");
+        assert!(
+            html.contains("autumn-avatar--sm autumn-avatar-group__more"),
+            "{html}"
+        );
+        assert!(html.contains(r#"aria-label="118 weitere""#), "{html}");
+        assert!(html.contains(">+118<"), "{html}");
+    }
+
+    #[test]
+    fn avatar_group_split_examples() {
+        assert_eq!(avatar_group_split(3, None, 5), (3, 0));
+        assert_eq!(avatar_group_split(5, None, 5), (5, 0));
+        assert_eq!(avatar_group_split(6, None, 5), (4, 2));
+        assert_eq!(avatar_group_split(2, Some(3), 5), (2, 1));
+        assert_eq!(avatar_group_split(3, Some(1), 5), (3, 0));
+        assert_eq!(avatar_group_split(3, None, 1), (0, 3));
+        assert_eq!(avatar_group_split(3, None, 0), (0, 3));
+        assert_eq!(avatar_group_split(0, None, 5), (0, 0));
+    }
+
+    proptest! {
+        /// The split never loses a person and never shows more than `max`
+        /// items.
+        #[test]
+        fn avatar_group_split_keeps_count_and_max(
+            len in 0usize..50,
+            total in proptest::option::of(0usize..500),
+            max in 0usize..20,
+        ) {
+            let (shown, extra) = avatar_group_split(len, total, max);
+            let count = total.map_or(len, |t| t.max(len));
+            prop_assert_eq!(shown + extra, count);
+            prop_assert!(shown <= len);
+            prop_assert!(shown + usize::from(extra > 0) <= max.max(1));
+        }
+
+        /// A progress value is always in `0..=max`, and `max` is above 0.
+        #[test]
+        fn progress_value_is_always_in_range(
+            value in proptest::option::of(proptest::num::f64::ANY),
+            max in proptest::num::f64::ANY,
+        ) {
+            let html = progress("P", value, max).into_string();
+            let attr = |name: &str| -> Option<f64> {
+                let key = format!(r#" {name}=""#);
+                let at = html.find(&key)? + key.len();
+                html[at..at + html[at..].find('"')?].parse().ok()
+            };
+            let max = attr("max").expect("max");
+            prop_assert!(max.is_finite() && max > 0.0);
+            if let Some(v) = attr("value") {
+                prop_assert!((0.0..=max).contains(&v), "{} not in 0..={}", v, max);
+            }
+        }
+
+        /// A meter value and its thresholds are always in `min..=max`.
+        #[test]
+        fn meter_values_are_always_in_range(
+            value in proptest::num::f64::ANY,
+            a in proptest::num::f64::ANY,
+            b in proptest::num::f64::ANY,
+            low in proptest::num::f64::ANY,
+        ) {
+            let html = meter_with("M", value, a..=b, &MeterConfig::new().low(low)).into_string();
+            let attr = |name: &str| -> Option<f64> {
+                let key = format!(r#" {name}=""#);
+                let at = html.find(&key)? + key.len();
+                html[at..at + html[at..].find('"')?].parse().ok()
+            };
+            let (min, max) = (attr("min").expect("min"), attr("max").expect("max"));
+            prop_assert!(min.is_finite() && max.is_finite() && min <= max);
+            let v = attr("value").expect("value");
+            prop_assert!((min..=max).contains(&v));
+            if let Some(l) = attr("low") {
+                prop_assert!((min..=max).contains(&l));
+            }
+        }
     }
 }

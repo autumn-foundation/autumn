@@ -1008,6 +1008,19 @@
   // A history restore (hx-boost, Back) brings back nodes without listeners.
   document.addEventListener('htmx:historyRestore', function () { initAll(document); });
 
+  // Busy state (#3406). htmx 2 sets no aria-busy. A [data-autumn-busy]
+  // element is busy while it, or an element around it, has .htmx-request.
+  // afterSettle also runs when a swap removed the requester.
+  function syncBusy() {
+    document.querySelectorAll('[data-autumn-busy]').forEach(function (el) {
+      if (el.closest('.htmx-request')) el.setAttribute('aria-busy', 'true');
+      else el.removeAttribute('aria-busy');
+    });
+  }
+  ['htmx:beforeSend', 'htmx:afterRequest', 'htmx:afterSettle'].forEach(function (name) {
+    document.addEventListener(name, syncBusy);
+  });
+
   // htmx puts the response's `class` back after afterSwap (its settle step).
   // That can drop the enhanced classes and move the tab highlight. Apply
   // them again from state that settle keeps: the init guard and aria-selected.

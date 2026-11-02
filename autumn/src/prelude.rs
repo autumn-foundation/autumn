@@ -233,25 +233,33 @@ pub use crate::form::{Changeset, ChangesetForm, IntoChangeset};
 /// renders `maud::Markup`.
 pub use crate::widgets::localized_path;
 /// Card, stat tile, hero, active search, autocomplete, data table, property
-/// list, and breadcrumb configuration types and rendering helpers.
+/// list, breadcrumb, button, spinner, skeleton, progress, meter, separator,
+/// kbd, empty state and avatar group configuration types and rendering
+/// helpers.
 ///
 /// See [`crate::widgets`] for the full API.
 #[cfg(feature = "maud")]
 pub use crate::widgets::{
     AccordionConfig, ActiveSearchConfig, AlertConfig, AlertVariant, AutocompleteConfig,
-    AvatarConfig, AvatarSize, BadgeConfig, BadgeVariant, CardConfig, CollapsibleConfig, Column,
-    CommentThread, CommentView, ConfirmActionConfig, Crumb, Cta, CtaStyle, DEFAULT_TOAST_DURATION,
-    DEFAULT_TOAST_REGION_ID, DataTableConfig, DialogSize, DrawerConfig, DrawerSide, FeedConfig,
-    FeedMode, HeadingLevel, HeroConfig, MenuEntry, ModalConfig, NavBarConfig, NavBarLayout,
-    NavItem, NavLinkMatch, NavMenu, PopoverAlign, PopoverConfig, PopoverSide, ReactionControls,
-    SearchMethod, ToastConfig, TooltipConfig, TooltipPlacement, accordion, active_search,
+    AvatarConfig, AvatarGroupConfig, AvatarSize, BadgeConfig, BadgeVariant, ButtonConfig,
+    ButtonGroupConfig, ButtonSize, ButtonVariant, CardConfig, CollapsibleConfig, Column,
+    CommentThread, CommentView, ConfirmActionConfig, Crumb, Cta, CtaStyle,
+    DEFAULT_AVATAR_GROUP_MAX, DEFAULT_TOAST_DURATION, DEFAULT_TOAST_REGION_ID, DataTableConfig,
+    DialogSize, DrawerConfig, DrawerSide, EmptyStateConfig, FeedConfig, FeedMode, HeadingLevel,
+    HeroConfig, MenuEntry, MeterConfig, ModalConfig, NavBarConfig, NavBarLayout, NavItem,
+    NavLinkMatch, NavMenu, PopoverAlign, PopoverConfig, PopoverSide, ProgressConfig,
+    ReactionControls, SearchMethod, SeparatorConfig, SkeletonConfig, SkeletonShape, SpinnerConfig,
+    SpinnerSize, ToastConfig, TooltipConfig, TooltipPlacement, accordion, active_search,
     active_search_empty_state, active_search_input, active_search_results, alert, alert_with,
-    autocomplete_empty_state, autocomplete_input, autocomplete_option, avatar, badge, badge_with,
-    breadcrumb, card, collapsible, collapsible_with, comment_thread, confirm_action, data_table,
-    drawer, drawer_trigger, dropdown_menu, error_summary, feed_page, hero, infinite_feed,
-    locale_switcher, modal, modal_close_button, modal_trigger, nav_bar, nav_link, nav_link_matched,
-    popover, property_list, reaction_controls, stat_card, status_tag, tabs, toast, toast_in,
-    toast_region, toast_with, tooltip, tooltip_with,
+    autocomplete_empty_state, autocomplete_input, autocomplete_option, avatar, avatar_group,
+    avatar_group_with, badge, badge_with, breadcrumb, button, button_group, button_group_with,
+    card, collapsible, collapsible_with, comment_thread, confirm_action, data_table, drawer,
+    drawer_trigger, dropdown_menu, empty_state, empty_state_with, error_summary, feed_page, hero,
+    infinite_feed, kbd, kbd_combo, locale_switcher, meter, meter_with, modal, modal_close_button,
+    modal_trigger, nav_bar, nav_link, nav_link_matched, popover, progress, progress_with,
+    property_list, reaction_controls, separator, separator_with, skeleton, skeleton_with, spinner,
+    spinner_with, stat_card, status_tag, tabs, toast, toast_in, toast_region, toast_with, tooltip,
+    tooltip_with,
 };
 
 // ── Widget stories ───────────────────────────────────────────────

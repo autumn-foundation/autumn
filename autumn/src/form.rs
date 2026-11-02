@@ -1868,6 +1868,7 @@ pub struct FieldOptions<'a> {
     pattern: Option<Cow<'a, str>>,
     min: Option<Cow<'a, str>>,
     max: Option<Cow<'a, str>>,
+    auto_grow: bool,
     /// `(prefix, name, value)`. The setters check `name`.
     extra: Vec<(&'static str, Cow<'a, str>, Cow<'a, str>)>,
 }
@@ -1888,6 +1889,7 @@ impl<'a> FieldOptions<'a> {
             pattern: None,
             min: None,
             max: None,
+            auto_grow: false,
             extra: Vec::new(),
         }
     }
@@ -1964,6 +1966,15 @@ impl<'a> FieldOptions<'a> {
         self
     }
 
+    /// Let a `<textarea>` grow with its text (`field-sizing: content`). The
+    /// textarea gets the `autumn-auto-grow` class. Other controls ignore
+    /// it. A browser with no `field-sizing` keeps the fixed height.
+    #[must_use]
+    pub const fn auto_grow(mut self) -> Self {
+        self.auto_grow = true;
+        self
+    }
+
     /// Add `data-{name}="{value}"`. The setter drops `name` if it is not
     /// `[a-z0-9-]+` or if it starts with `autumn-`.
     #[must_use]
@@ -2002,6 +2013,12 @@ impl<'a> FieldOptions<'a> {
     #[must_use]
     pub const fn is_readonly(&self) -> bool {
         self.readonly
+    }
+
+    /// Whether [`auto_grow`](Self::auto_grow) is set.
+    #[must_use]
+    pub const fn is_auto_grow(&self) -> bool {
+        self.auto_grow
     }
 
     /// The hint text, if set.
@@ -2378,10 +2395,17 @@ pub(crate) fn render_field(
     if opts.required {
         out.push_str(r#" required aria-required="true""#);
     }
+    out.push_str(r#" class="autumn-field__input"#);
+    if has_errors {
+        out.push_str(" autumn-field__input--invalid");
+    }
+    if kind == FieldKind::Textarea && opts.auto_grow {
+        out.push_str(" autumn-auto-grow");
+    }
     out.push_str(if has_errors {
-        r#" class="autumn-field__input autumn-field__input--invalid" aria-invalid="true""#
+        r#"" aria-invalid="true""#
     } else {
-        r#" class="autumn-field__input" aria-invalid="false""#
+        r#"" aria-invalid="false""#
     });
     if let Some(ids) = &describedby {
         out.push_str(r#" aria-describedby=""#);
@@ -3315,10 +3339,17 @@ fn rich_text_area_inner<T: Serialize>(
     push_attr(&mut editor, "id", field);
     push_attr(&mut editor, "name", field);
     editor.push_str(r#" rows="12""#);
+    editor.push_str(r#" class="autumn-field__input autumn-rich-text__editor"#);
+    if has_errors {
+        editor.push_str(" autumn-field__input--invalid");
+    }
+    if options.auto_grow {
+        editor.push_str(" autumn-auto-grow");
+    }
     editor.push_str(if has_errors {
-        r#" class="autumn-field__input autumn-rich-text__editor autumn-field__input--invalid" aria-invalid="true""#
+        r#"" aria-invalid="true""#
     } else {
-        r#" class="autumn-field__input autumn-rich-text__editor" aria-invalid="false""#
+        r#"" aria-invalid="false""#
     });
     push_attr(&mut editor, "aria-describedby", &described_by);
     if required {
@@ -6410,6 +6441,81 @@ mod tests {
         assert!(html.contains(r#"id="bio""#), "{html}");
         assert!(html.contains("Bio"), "{html}");
         assert!(html.contains("Hello world"), "{html}");
+    }
+
+    /// Issue #3406: `auto_grow` adds the class to a textarea only.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn auto_grow_marks_a_textarea_and_no_other_control() {
+        #[derive(serde::Serialize)]
+        struct F {
+            bio: String,
+            name: String,
+        }
+        let cs = Changeset::new(F {
+            bio: "Hi".into(),
+            name: "Ada".into(),
+        });
+        let grow = FieldOptions::new().auto_grow();
+        assert!(grow.is_auto_grow());
+        assert!(!FieldOptions::new().is_auto_grow());
+
+        let html = textarea_input_with(&cs, "bio", "Bio", &grow).into_string();
+        assert!(
+            html.contains(r#"class="autumn-field__input autumn-auto-grow" aria-invalid="false""#),
+            "{html}"
+        );
+        let plain = textarea_input(&cs, "bio", "Bio").into_string();
+        assert!(!plain.contains("autumn-auto-grow"), "{plain}");
+        let text = text_input_with(&cs, "name", "Name", &grow).into_string();
+        assert!(!text.contains("autumn-auto-grow"), "{text}");
+    }
+
+    /// Issue #3406: an invalid auto-grow textarea keeps both classes.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn auto_grow_keeps_the_invalid_class() {
+        #[derive(serde::Serialize)]
+        struct F {
+            bio: String,
+        }
+        let mut cs = Changeset::new(F { bio: String::new() });
+        cs.add_error("bio", "Too short");
+        let html =
+            textarea_input_with(&cs, "bio", "Bio", &FieldOptions::new().auto_grow()).into_string();
+        assert!(
+            html.contains(
+                r#"class="autumn-field__input autumn-field__input--invalid autumn-auto-grow" aria-invalid="true""#
+            ),
+            "{html}"
+        );
+    }
+
+    /// Issue #3406: the rich-text editor is a textarea too.
+    #[cfg(feature = "maud")]
+    #[test]
+    fn auto_grow_reaches_the_rich_text_editor() {
+        #[derive(serde::Serialize)]
+        struct F {
+            body: String,
+        }
+        let cs = Changeset::new(F {
+            body: "# Hi".into(),
+        });
+        let html = rich_text_area_with(
+            &cs,
+            "body",
+            "Body",
+            &RichTextLabels::new(),
+            &FieldOptions::new().auto_grow(),
+        )
+        .into_string();
+        assert!(
+            html.contains(
+                r#"class="autumn-field__input autumn-rich-text__editor autumn-auto-grow""#
+            ),
+            "{html}"
+        );
     }
 
     #[cfg(feature = "maud")]

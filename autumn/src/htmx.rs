@@ -864,6 +864,27 @@ mod tests {
         );
     }
 
+    /// Issue #3406: `data-autumn-busy` gets `aria-busy` while an htmx
+    /// request runs on it or on an element around it. htmx 2 sets no
+    /// `aria-busy`. The sync runs before the send and after the request
+    /// and the settle, so a swap that removes the requester leaves no
+    /// stale `aria-busy`.
+    #[test]
+    fn widgets_js_syncs_aria_busy_with_htmx_requests() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS).expect("utf8");
+        for needle in [
+            "[data-autumn-busy]",
+            "closest('.htmx-request')",
+            "setAttribute('aria-busy', 'true')",
+            "removeAttribute('aria-busy')",
+            "'htmx:beforeSend'",
+            "'htmx:afterRequest'",
+            "'htmx:afterSettle'",
+        ] {
+            assert!(js.contains(needle), "autumn-widgets.js has no `{needle}`");
+        }
+    }
+
     #[test]
     fn widgets_js_has_the_keyboard_core_contract() {
         // The documented `data-*` contract (issue #3397). Plugins bind to

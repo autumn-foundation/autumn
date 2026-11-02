@@ -1028,6 +1028,31 @@ Per-primitive setters (in addition to the shared set):
   `#field`; the root has `id="error-summary" tabindex="-1" autofocus`, so
   focus moves to it on a failed submit — one per page). All prelude
   re-exported.
+- `autumn_web::widgets` small display set (#3406,
+  `docs/guide/display-widgets.md`): `button(label, &ButtonConfig)` with
+  `ButtonVariant::{Primary,Secondary,Ghost,Destructive,Link}`,
+  `ButtonSize::{Small,Medium,Large}`, `.kind/.submit/.icon/.icon_only/
+  .disabled/.id/.class/.attrs`, `.loading()` (static `aria-busy="true"` +
+  `disabled`) and `.loading_on_request()` (`data-autumn-busy`; the spinner
+  shows while the button or an ancestor has `.htmx-request`, and
+  `autumn-widgets.js` sets `aria-busy`); `button_group(label, &[Markup])` /
+  `button_group_with(.., &ButtonGroupConfig::new().vertical())`;
+  `spinner(label)` / `spinner_with(.., &SpinnerConfig)` (`SpinnerSize`,
+  `.indicator(id)`); `skeleton(SkeletonShape::{Line,Block,Circle})` /
+  `skeleton_with(.., &SkeletonConfig::new().count(n).indicator(id))` — an
+  indicator has `autumn-indicator`, hidden until `.htmx-request`;
+  `progress(label, Option<f64>, max)` / `progress_with(.., &ProgressConfig)`
+  and `meter(label, value, min..=max)` / `meter_with(.., &MeterConfig)`
+  (`low/high/optimum/visible_label/value_text`, values clamped);
+  `separator()` / `separator_with(&SeparatorConfig::new().vertical()
+  .decorative())`; `kbd(key)` / `kbd_combo(&[keys])`;
+  `empty_state(title, body, Option<&Markup>)` / `empty_state_with(..,
+  &EmptyStateConfig)`; `avatar_group(label, &[Markup])` /
+  `avatar_group_with(.., &AvatarGroupConfig)` (`max` counts the `+N` item,
+  default `DEFAULT_AVATAR_GROUP_MAX` = 5; `.total`, `.size`,
+  `.more_label("{count} more")`). `FieldOptions::auto_grow()` and
+  `a11y::TextArea::auto_grow()` add `autumn-auto-grow`
+  (`field-sizing: content`). All prelude re-exported.
 - `autumn_web::widgets::{accordion, collapsible, collapsible_with}` +
   `AccordionConfig::new(name)` / `CollapsibleConfig` — no-JS disclosure on
   native `<details>`. Exclusive by default; `.multiple()`, `.open(i)`,

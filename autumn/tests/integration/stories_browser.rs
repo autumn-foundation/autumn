@@ -972,3 +972,118 @@ async fn keyboard_tooltip() {
     .await;
     page.expect_no_console_errors().await.expect("no errors");
 }
+
+/// The busy state (#3406). Enter sends the htmx request. While it runs, the
+/// button has `aria-busy="true"` and shows its spinner. The label is
+/// transparent, not removed, so it stays the name. After the response,
+/// `aria-busy` goes and focus stays on the button.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_button() {
+    const SAVE: &str = "#story-save";
+    const SPINNER: &str = "#story-save .autumn-button__spinner";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/button").await;
+
+    assert!(!shown(&page, SPINNER).await, "the spinner shows at rest");
+    assert_eq!(attr(&page, SAVE, "aria-busy").await, "");
+    focus(&page, SAVE).await;
+    press(&page, "Enter").await;
+    wait_for(
+        &page,
+        "document.querySelector('#story-save').getAttribute('aria-busy') === 'true'",
+    )
+    .await;
+    assert!(shown(&page, SPINNER).await, "no spinner while busy");
+    assert_eq!(
+        eval_string(
+            &page,
+            "getComputedStyle(document.querySelector('#story-save .autumn-button__label')).opacity",
+        )
+        .await,
+        "0"
+    );
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.querySelector('#story-save .autumn-button__label').textContent",
+        )
+        .await,
+        "Save"
+    );
+    wait_for(
+        &page,
+        "document.querySelector('#story-save-status').textContent.includes('Saved.')",
+    )
+    .await;
+    wait_for(
+        &page,
+        "!document.querySelector('#story-save').hasAttribute('aria-busy')",
+    )
+    .await;
+    assert!(
+        !shown(&page, SPINNER).await,
+        "the spinner shows after the request"
+    );
+    assert_eq!(
+        active_id(&page).await,
+        "story-save",
+        "focus left the button"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// An `hx-indicator` skeleton or spinner (#3406) is hidden at rest, shows
+/// while the request runs, and hides again after the response.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn display_set_indicators_show_only_during_a_request() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    for (path, trigger, indicator, result) in [
+        (
+            "/_stories/skeleton",
+            "Reload",
+            "#story-skeleton",
+            "#story-skeleton-result",
+        ),
+        (
+            "/_stories/spinner",
+            "Load",
+            "#story-spinner",
+            "#story-spinner-status",
+        ),
+    ] {
+        open(&page, path).await;
+        assert!(!shown(&page, indicator).await, "{indicator} shows at rest");
+        assert!(
+            eval_bool(
+                &page,
+                &format!(
+                    "(() => {{ const b = Array.from(document.querySelectorAll('.autumn-button')) \
+                     .find(b => b.textContent.trim() === {trigger:?}); \
+                     if (!b) return false; b.click(); return true; }})()"
+                ),
+            )
+            .await,
+            "no {trigger} button on {path}"
+        );
+        wait_for(
+            &page,
+            &format!("getComputedStyle(document.querySelector({indicator:?})).display !== 'none'"),
+        )
+        .await;
+        wait_for(
+            &page,
+            &format!("document.querySelector({result:?}).textContent.includes('Saved.')"),
+        )
+        .await;
+        wait_for(
+            &page,
+            &format!("getComputedStyle(document.querySelector({indicator:?})).display === 'none'"),
+        )
+        .await;
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}

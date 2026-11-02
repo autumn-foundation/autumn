@@ -54,6 +54,7 @@ Looking for the API reference instead? That is
 - [Tooltip](tooltip.md) — accessible hover and focus text, with `interestfor` on Chromium
 - [Drawer and modal sizes](drawer.md) — edge panels, modal sizes and a built-in close button
 - [Accordion and collapsible](accordion.md) — native `<details>` disclosure, no JavaScript
+- [Buttons, loading states and small display widgets](display-widgets.md) — button variants and busy state, button group, spinner, skeleton, progress, meter, separator, kbd, empty state, avatar group, auto-grow textarea
 - [Widget Packs](widget-packs.md) — ship widgets as a plugin: the widget contract, stories, form binding, conformance
 - [Widget Keyboard Core](keyboard.md) — APG arrow keys, typeahead and dismiss for widgets, bound by `data-*`
 - [Popover and Dropdown Menu](popover-and-menu.md) — native popover and APG menu button: anchor positioning, items, keys
