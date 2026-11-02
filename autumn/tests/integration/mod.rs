@@ -164,6 +164,7 @@ mod fake_generators;
 mod fault_injection;
 mod feature_flags_integration;
 mod feed;
+mod fleet_failover_guide;
 #[cfg(feature = "maud")]
 mod form_field_options;
 mod form_for_derive;

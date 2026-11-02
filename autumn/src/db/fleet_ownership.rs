@@ -2140,7 +2140,19 @@ mod tests {
             store_clock: &crate::time::TickingClock,
             ranges: Vec<SlotRange>,
         ) -> Host {
-            let (fleet, replication, clock) = plain(dir, volume);
+            host_with(dir, volume, name, store_clock, ranges, true).await
+        }
+
+        /// As `host_on`, with `restore_missing` as given.
+        async fn host_with(
+            dir: &std::path::Path,
+            volume: &str,
+            name: &str,
+            store_clock: &crate::time::TickingClock,
+            ranges: Vec<SlotRange>,
+            restore_missing: bool,
+        ) -> Host {
+            let (fleet, replication, clock) = plain_with(dir, volume, restore_missing);
             let store = Arc::new(store(dir, store_clock).await);
             let ownership = Arc::new(FleetOwnership::new(store, owner(name), ranges, TTL).unwrap());
             fleet.start_ownership(Arc::clone(&ownership)).await.unwrap();
@@ -2161,6 +2173,19 @@ mod tests {
             Arc<FleetReplication>,
             crate::time::TickingClock,
         ) {
+            plain_with(dir, volume, true)
+        }
+
+        /// As `plain`, with `restore_missing` as given.
+        fn plain_with(
+            dir: &std::path::Path,
+            volume: &str,
+            restore_missing: bool,
+        ) -> (
+            DatabaseFleet,
+            Arc<FleetReplication>,
+            crate::time::TickingClock,
+        ) {
             let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
                 mode: FleetMode::Tenant,
                 root: dir.join(volume).display().to_string(),
@@ -2169,7 +2194,7 @@ mod tests {
                 pool_size: 2,
                 create_on_demand: Some(true),
                 idle_close_secs: 0,
-                restore_missing: true,
+                restore_missing,
                 ownership: None,
                 replica_retention_after_delete: std::time::Duration::ZERO,
                 restore_check_sample: 0,
@@ -2193,7 +2218,7 @@ mod tests {
                     verify_interval: None,
                 },
                 Duration::from_secs(30),
-                true,
+                restore_missing,
                 Arc::new(clock.clone()),
             ));
             assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
@@ -2616,6 +2641,140 @@ mod tests {
             // Under the same epoch, its own file is current.
             let db_a = a.fleet.open(&key).await.unwrap();
             assert_eq!(bodies(&db_a).await, vec!["a1", "b1", "a3"]);
+            drop(db_a);
+            a.fleet.close_all().await;
+        }
+
+        /// Replication is asynchronous. A takeover loses the writes that the
+        /// old owner did not ship. The new owner opened the database during
+        /// the pause, so a fail-back does not recover them, though they are
+        /// on the old owner's volume (Baton findings 1, 6).
+        #[tokio::test]
+        async fn a_takeover_and_a_fail_back_lose_the_unshipped_writes() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            exec(&db_a, "INSERT INTO notes VALUES ('shipped')")
+                .await
+                .unwrap();
+            tick(&a.replication).await;
+            // Acknowledged. A freezes before the next pass ships it.
+            exec(&db_a, "INSERT INTO notes VALUES ('not shipped')")
+                .await
+                .unwrap();
+            drop(db_a);
+
+            // The lease ends. B takes over from the replica, without the tail.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+            let db_b = b.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_b).await, vec!["shipped"]);
+            exec(&db_b, "INSERT INTO notes VALUES ('b1')")
+                .await
+                .unwrap();
+            tick(&b.replication).await;
+            drop(db_b);
+
+            // A thaws, finds the range lost and closes its database.
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            assert_eq!(a.fleet.fence_unowned(), 1);
+            a.fleet.close(&key).await;
+            b.fleet.close_all().await;
+            assert!(b.fleet.release_ownership().await);
+
+            // A gets the range back. The replica replaces its file, so the
+            // unshipped write on A's own volume is gone.
+            assert_eq!(
+                a.ownership.refresh().await.claimed,
+                vec![(SlotRange::ALL, token(3))]
+            );
+            let db_a = a.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_a).await, vec!["shipped", "b1"]);
+            drop(db_a);
+            a.fleet.close_all().await;
+        }
+
+        /// A paused host ships its unshipped writes when it continues. If the
+        /// new owner did not open the database meanwhile, they are not lost.
+        #[tokio::test]
+        async fn a_paused_host_ships_the_tail_of_a_database_the_new_owner_did_not_open() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            exec(&db_a, "INSERT INTO notes VALUES ('shipped')")
+                .await
+                .unwrap();
+            tick(&a.replication).await;
+            // Acknowledged. A pauses before the next pass ships it.
+            exec(&db_a, "INSERT INTO notes VALUES ('not shipped')")
+                .await
+                .unwrap();
+            drop(db_a);
+
+            // B claims the range but does not open the database yet.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+
+            // A continues, finds the range lost and closes the database. The
+            // close ships the tail.
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            assert_eq!(a.fleet.fence_unowned(), 1);
+            a.fleet.close(&key).await;
+
+            let db_b = b.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_b).await, vec!["shipped", "not shipped"]);
+            drop(db_b);
+            b.fleet.close_all().await;
+        }
+
+        /// `restore_missing` is for a missing file only. A fail-back restores
+        /// a stale file without it (Baton finding 4).
+        #[tokio::test]
+        async fn a_fail_back_restores_a_stale_file_without_restore_missing() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host_with(dir.path(), "a", "a", &clock, vec![SlotRange::ALL], false).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            exec(&db_a, "INSERT INTO notes VALUES ('a1')")
+                .await
+                .unwrap();
+            tick(&a.replication).await;
+            drop(db_a);
+            a.fleet.close(&key).await;
+
+            // B, on an empty volume, needs `restore_missing` to take over.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            let db_b = b.fleet.open(&key).await.unwrap();
+            exec(&db_b, "INSERT INTO notes VALUES ('b1')")
+                .await
+                .unwrap();
+            tick(&b.replication).await;
+            drop(db_b);
+            b.fleet.close_all().await;
+            assert!(b.fleet.release_ownership().await);
+
+            assert_eq!(
+                a.ownership.refresh().await.claimed,
+                vec![(SlotRange::ALL, token(3))]
+            );
+            let db_a = a.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_a).await, vec!["a1", "b1"]);
             drop(db_a);
             a.fleet.close_all().await;
         }
