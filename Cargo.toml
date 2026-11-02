@@ -149,7 +149,7 @@ ammonia = "4.2.4"
 # Interactive console prompt (issue #2148). Pulled in only by autumn-web's
 # `repl` feature; see `autumn/src/repl.rs`.
 rhai = { version = "1", default-features = false, features = ["std", "serde"] }
-rustyline = { version = "17", default-features = false, features = ["with-file-history"] }
+rustyline = { version = "19", default-features = false, features = ["with-file-history"] }
 chromiumoxide = { version = "0.9", default-features = false }
 # Pure-Rust PDF writer (issue #1317). `default-features = false` excludes the
 # `html` feature (azul CSS layout + rust-fontconfig system-font scanning) —
