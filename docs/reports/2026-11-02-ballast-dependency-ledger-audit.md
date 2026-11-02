@@ -326,10 +326,20 @@ curl -sS https://index.crates.io/as/yn/async-trait   # version/syn-req history
    doesn't fix the underlying token-scoping issue.
 4. **`fuzz/` and `examples/island-flock/` scheduled-batch ownership**: eighth
    pass, still unaddressed.
-5. **GitHub-native Dependabot alert count**: not checked this pass (no tool
-   available beyond the RustSec-backed `cargo-deny` count, which stayed
-   consistent with #3471's work); still the standing tooling gap noted five
-   passes running.
+5. **GitHub-native Dependabot alert count moved 18 → 23** (4/11/3 → 5/13/5,
+   high/moderate/low), surfaced only as a side-effect message on this pass's
+   own `git push` — still no tool in this session lists individual alerts by
+   id, the sixth pass flagging that gap. A rise the same week the Dependabot
+   *PR* queue went to zero is counterintuitive enough to be worth next pass's
+   first look: either GitHub's scanner opened alerts for advisories that
+   never got a corresponding PR (a GHSA-only finding, as `css-inline`'s
+   GHSA-jh54-c7gc-mvcc was two passes ago), or something in #3471's own
+   version moves (e.g. `css-inline` landing on 0.23.1, past what any
+   Dependabot PR targeted) introduced new exposure that the RustSec-backed
+   `cargo-deny` count (87 unwaived-advisories-ok, unchanged) doesn't
+   independently corroborate. Not investigated further this pass — no
+   breakdown-by-id tool available — but the direction of the delta is new
+   information, not noise, and shouldn't wait six more passes.
 6. `cargo-bloat` / binary-size attribution and an unused-feature audit: cost
    attribution via `--timings` is now done (item 6 from last pass); size and
    unused-feature analysis are the next layer of the same oldest-open-item,
