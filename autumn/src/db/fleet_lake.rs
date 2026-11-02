@@ -1372,12 +1372,11 @@ fn for_each_row(
         })
         .collect::<Vec<_>>()
         .join(" || char(9) || ");
-    // MATERIALIZED: each value is computed once, so its type and its bytes
-    // agree even for `random()`.
-    let statement = format!(
-        "WITH _autumn_lake_rows AS MATERIALIZED (SELECT * FROM temp.{RESULT_VIEW}) \
-         SELECT {arrays} AS row FROM _autumn_lake_rows"
-    );
+    // An OFFSET stops SQLite from flattening the subquery into this one. It
+    // runs as a co-routine: each value is computed once per row (its type
+    // and its bytes agree, even for `random()`), and rows still stream.
+    let statement =
+        format!("SELECT {arrays} AS row FROM (SELECT * FROM temp.{RESULT_VIEW} LIMIT -1 OFFSET 0)");
     let rows = diesel::sql_query(statement)
         .load_iter::<Encoded, diesel::connection::DefaultLoadingMode>(&mut conn)
         .map_err(|error| query(error.to_string()))?;

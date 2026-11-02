@@ -1076,6 +1076,26 @@ async fn a_random_value_is_encoded_from_one_evaluation() {
     }
 }
 
+/// Rows stream: a stop after the first row ends even an endless query.
+#[tokio::test]
+async fn an_endless_query_stops_at_the_first_break() {
+    let host = host(Duration::ZERO);
+    ship(&host, "acme", &[NOTES]).await;
+    let snapshot = lake(&host).materialize().await.unwrap();
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let given = snapshot.for_each_row(
+            "WITH RECURSIVE n(x) AS (VALUES (1) UNION ALL SELECT x + 1 FROM n) SELECT x FROM n",
+            |_, _| ControlFlow::Break(()),
+        );
+        let _ = sent.send(given);
+    });
+    let given = received
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the first row comes before the whole result");
+    assert_eq!(given.unwrap(), 1);
+}
+
 #[tokio::test]
 async fn for_each_row_streams_and_stops_early() {
     let host = host(Duration::ZERO);
