@@ -243,12 +243,15 @@ jobs:
     # budget (per recent run history), and these new steps average ~2 min
     # each, so the old budget would have started failing on timeout rather
     # than on a real regression.
-    # 150 -> 210: by 2026-11 the 1.88.0 leg had 58 steps (median 2.35 min,
-    # 146.7 min of steps). On trunk-dev it ran 1h55m-2h23m, and on #3560 it
-    # was cancelled at 150 min once, then passed in 2h26m on a re-run. 210
-    # gives ~40% headroom over the slowest observed run; a wedged app still
-    # fails long before GitHub's 360-minute default.
-    timeout-minutes: 210
+    # 150 -> 90 (#3572): by 2026-11 the 1.88.0 leg had 58 steps (median 2.35
+    # min) and ran 1h55m-2h26m, cancelled at 150 min once on #3560. Every
+    # step compiled the generated app's dependency tree from cold. With one
+    # shared CARGO_TARGET_DIR for the generated apps (the step after
+    # rust-cache below) the 1.88.0 leg ran in 34.5 min and stable in 27 min.
+    # 90 is ~2.6x the slower leg, which leaves room for a cold rust-cache, and
+    # still stops a wedged app quickly. If this leg nears 90 again, split it
+    # into shards rather than raise the limit.
+    timeout-minutes: 90
     env:
       # The generated projects build with line tables only, not full debug
       # info. With full debug info, the `cargo test` link of an attachment
