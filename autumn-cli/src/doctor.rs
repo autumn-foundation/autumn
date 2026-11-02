@@ -12383,7 +12383,7 @@ mod tests {
         edge_scan_of("#[edge]\nfn greet() {}\nfn wire() { edge_routes![greet]; }")
     }
 
-    /// #1621 review finding 12. Both hints are `hint` fields on `CheckResult`, so
+    /// #1621. Both hints are `hint` fields on `CheckResult`, so
     /// they are serialized verbatim into `autumn doctor --json`; a dropped `\`
     /// line continuation bakes the source indentation into the message as a long
     /// run of spaces mid-sentence. Pin the exact text.

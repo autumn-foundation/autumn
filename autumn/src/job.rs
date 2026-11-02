@@ -26960,8 +26960,8 @@ default = 1
         assert!(!lim.reserved.contains_key("default"));
     }
 
-    /// Concurrency stress for the atomic reserve-then-claim primitive (#1623,
-    /// Finding 1). Many tasks flood `bulk`/`default` through
+    /// Concurrency stress for the atomic reserve-then-claim primitive (#1623).
+    /// Many tasks flood `bulk`/`default` through
     /// [`QueueSlots::try_reserve`] while a guardian repeatedly reserves
     /// `critical`. Because the claimability check and the running-count
     /// increment happen under one lock, the invariants below must hold under

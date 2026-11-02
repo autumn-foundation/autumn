@@ -10,6 +10,14 @@ version, folding the changelog fragments in, dating the changelog section,
 updating install instructions) is a separate, deliberate step the user asks for
 by name.
 
+## Comments stand alone
+
+A comment says what the code does or why. It never cites a source that a
+later reader does not have: no findings documents (`FINDINGS 2`, `Finding 3`),
+no lab or app names (`Pigeonhole`, `Murmuration`, `Baton`), no review rounds or
+labels (`Codex review round 22, P2`, `F2`). Put that history in the commit
+message or the PR. An issue number (`#1234`) is fine.
+
 ## Security defaults, not security blocks
 
 Autumn is a framework. Make the safe path the default. Do not block the app

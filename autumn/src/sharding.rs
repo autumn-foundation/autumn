@@ -3583,7 +3583,7 @@ mod tests {
         assert_eq!(set.total_databases(), 2);
     }
 
-    // Pigeonhole FINDINGS 2: a fleet opens `max_open` databases, not one per shard.
+    // A fleet opens `max_open` databases, not one per shard.
     #[cfg(feature = "sqlite")]
     #[test]
     fn a_fleet_counts_max_open_databases() {

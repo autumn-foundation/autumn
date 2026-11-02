@@ -2627,7 +2627,7 @@ mod tests {
         );
     }
 
-    /// Findings 2 & 3 (#2036): the schema-command backend derives from the
+    /// #2036: the schema-command backend derives from the
     /// profile-resolved URL when one is configured (its scheme is authoritative),
     /// and only falls back to the project default when no URL is present — so
     /// `--profile <name>` picks the apply path / provider-lock of the database it

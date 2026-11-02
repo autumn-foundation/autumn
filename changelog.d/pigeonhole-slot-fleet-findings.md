@@ -9,6 +9,11 @@
   `2 × connections + databases` (database and `-wal` per connection, one
   `-shm` per database). A fleet counts `max_open` databases. The warning
   also says that `database.fleet.max_open` is a soft limit.
+- **db:** on Unix, a SQLite app also warns at boot when its open files at
+  `max_open` reach 80 % of the process open-file limit (`ulimit -n`), at any
+  connection count. Before, 99 connections (about 297 files) passed a limit
+  of 256 with no warning. `database.max_connections_warn_threshold = 0`
+  silences it.
 - **db:** on a SQLite build, the `db.connection` and `db.transaction` spans
   set `db.system = "sqlite"`, not `"postgresql"`. The `db.connection` span
   also records `db.pool`.

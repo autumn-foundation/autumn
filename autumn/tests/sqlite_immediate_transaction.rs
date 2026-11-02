@@ -21,10 +21,10 @@
 //!    same connection SUCCEEDS on `SQLite` — parity with Postgres — because the
 //!    `BEGIN IMMEDIATE` is begun through diesel's transaction manager, so the
 //!    nested op emits a `SAVEPOINT` instead of failing "cannot start a
-//!    transaction within a transaction" (issue #1996 Finding 1);
+//!    transaction within a transaction" (issue #1996);
 //! 6. a COMMIT-time failure (a deferred foreign-key violation) leaves the pool
 //!    yielding a clean, reusable connection — the failed-commit connection is
-//!    never handed back mid-transaction (issue #1996 Finding 3).
+//!    never handed back mid-transaction (issue #1996).
 //!
 //! 7. `Db::tx_immediate` (issue #2885): the explicit user-facing immediate
 //!    transaction — commits a write, rolls back on `Err`, rolls back on panic
@@ -274,7 +274,7 @@ async fn errored_rmw_rolls_back_the_immediate_transaction() {
     assert_eq!(after.lock_version, 1, "no lock_version bump on rollback");
 }
 
-// Finding 1 (Codex P2): a `with_lock` callback receives the transaction
+// A `with_lock` callback receives the transaction
 // connection and may legitimately open a NESTED transaction/savepoint. On
 // Postgres the outer `BEGIN` sets the transaction-manager depth to 1, so the
 // nested op emits a `SAVEPOINT` and succeeds. Before the fix the SQLite arm
@@ -355,7 +355,7 @@ async fn with_lock_callback_can_open_nested_transactions_on_sqlite() {
     );
 }
 
-// Finding 3 (Codex P2): a COMMIT-time failure in the SQLite immediate arm must
+// A COMMIT-time failure in the SQLite immediate arm must
 // not leave the POOL handing back a connection with an open write transaction. A
 // deferred foreign-key violation is accepted mid-transaction and only checked at
 // COMMIT, so it deterministically forces a COMMIT-time failure. Because commit

@@ -1096,7 +1096,7 @@ mod tests {
         assert!(finish(&checks).is_ok());
     }
 
-    /// Finding 3 (#2036): the SELECTED profile's backend must flow into the
+    /// #2036: the SELECTED profile's backend must flow into the
     /// checks. When `gather_local_facts` resolves the requested profile's backend
     /// to Sqlite (from its database URL), a Sqlite-tagged snapshot must NOT trip a
     /// false `provider-lock` ERROR — even though the ambient project default is
@@ -1183,7 +1183,7 @@ mod tests {
         assert_eq!(snap.status, Status::Error, "{snap:?}");
     }
 
-    /// Finding 1 (connectivity false-positive): a MISSING migrations dir must not
+    /// Connectivity false-positive: a MISSING migrations dir must not
     /// short-circuit `probe_pending` to `Reachable(empty)` — with a configured URL
     /// the probe must still attempt a connection, so an offline/misconfigured
     /// database surfaces as `Unreachable` (a WARN) rather than a false "database is

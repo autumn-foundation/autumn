@@ -531,7 +531,7 @@ mod blob {
         }
     }
 
-    /// AC #5 (Finding 1): a blob `Range` request must fetch **only** the
+    /// AC #5: a blob `Range` request must fetch **only** the
     /// requested slice via `get_range` and must **never** open the whole-object
     /// stream (`get_stream`) — otherwise a seek buffers the entire object.
     #[tokio::test]

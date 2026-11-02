@@ -12408,7 +12408,7 @@ enabled = true
             .expect("opaque nest routers must not fail the duplicate preflight");
     }
 
-    /// Finding 1 (issue #1012 review): two handlers that differ ONLY by capture
+    /// Issue #1012: two handlers that differ ONLY by capture
     /// name — `/users/{id}` vs `/users/{slug}` — key by literal template so they
     /// look distinct to a naive preflight, but axum's matcher (verified against
     /// axum 0.8.9: matchit reports a "conflict") rejects the second route shape
@@ -12445,7 +12445,7 @@ enabled = true
         );
     }
 
-    /// Finding 1, scoped-group variant: the capture-name normalization must run
+    /// Scoped-group variant of the test above: the capture-name normalization must run
     /// AFTER `join_nested_path` prefix resolution, so a scoped `/users/{slug}`
     /// under `/api` collides with a top-level `/api/users/{id}`.
     #[tokio::test]
@@ -12479,7 +12479,7 @@ enabled = true
         );
     }
 
-    /// Finding 1 NEGATIVE guard: normalization must not over-flag. Two genuinely
+    /// NEGATIVE guard: normalization must not over-flag. Two genuinely
     /// different shapes that axum's matcher accepts (verified: `/users/{id}` and
     /// `/users/{id}/posts` do NOT conflict) must still build cleanly.
     #[tokio::test]
@@ -12492,7 +12492,7 @@ enabled = true
                 .expect("distinct route shapes must not be flagged as duplicates");
     }
 
-    /// Finding 2 (issue #1012 review): `#[ws]` records the synthetic `WS` method
+    /// Issue #1012: `#[ws]` records the synthetic `WS` method
     /// but `group_and_mount_routes` mounts its handler via `axum::routing::get`,
     /// so `#[get("/live")]` + `#[ws("/live")]` produce two overlapping `GET`
     /// `MethodRouter`s that panic on merge. Normalizing `WS` to its effective

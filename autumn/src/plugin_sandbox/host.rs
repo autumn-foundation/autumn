@@ -8188,7 +8188,7 @@ hosts = ["api.example.com"]
 
     #[test]
     fn the_fuel_edge_for_a_write_includes_the_guest_s_read() {
-        // #2523 finding 7. Fuel to price the reply is not fuel to read it. A
+        // #2523. Fuel to price the reply is not fuel to read it. A
         // POST that commits and then runs out of fuel in the guest fails, and a
         // retry sends it again.
         let need = priced(&post()) + post().reply_reserve() as u64 * GUEST_READ_FUEL_PER_BYTE;

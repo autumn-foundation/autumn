@@ -4502,6 +4502,7 @@ impl AppBuilder {
                     + topology.replica().map_or(0, |p| p.status().max_size)
             });
             let total_max_connections = control_max_connections + shard_max_connections;
+            let warn_threshold = config.database.max_connections_warn_threshold;
             let backend = if cfg!(feature = "sqlite") {
                 let control_databases = pool
                     .as_ref()
@@ -4526,13 +4527,23 @@ impl AppBuilder {
             // Pool sizes multiply across shards; warn before the aggregate
             // exhausts Postgres's `max_connections` or, on SQLite, the
             // open-file limit of the process.
-            let warn_threshold = config.database.max_connections_warn_threshold;
             if let Some(message) = crate::config::total_connections_warning(
                 total_max_connections,
                 warn_threshold,
                 backend,
             ) {
                 tracing::warn!(total_max_connections, warn_threshold, "{message}");
+            }
+            // On SQLite the open files can pass the process limit at any
+            // connection count.
+            if let crate::config::ConnectionBackend::Sqlite { databases } = backend {
+                let files = crate::config::sqlite_open_files(total_max_connections, databases);
+                let limit = crate::config::open_file_limit();
+                if let Some(message) =
+                    crate::config::open_files_warning(files, limit, warn_threshold)
+                {
+                    tracing::warn!(files, limit, "{message}");
+                }
             }
             // A transaction-mode pooler breaks session state (issue #3065).
             for warning in crate::db::pooler::pooler_warnings(&config.database) {
@@ -18558,22 +18569,23 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    // Finding 2 (Codex P2), corrected: the fail-closed `statement_timeout` guard
-    // must fire once a custom provider has actually established a pool. A custom
-    // provider can build its own SQLite pool without the built-in
-    // `create_topology`/`create_pool` factories — the default `create_topology`
-    // only delegates to `create_pool`, and both are overridable — so
-    // `setup_database` enforces the guard at dispatch. It must run only for an
-    // established pool (`Some(..)`), not before the provider returns: a provider
-    // returning `Ok(None)` opts into the supported no-database mode and must still
-    // boot even with a nonzero `statement_timeout`, matching the built-in path.
+    // The fail-closed `statement_timeout` guard must fire once a custom
+    // provider has actually established a pool. A custom provider can build
+    // its own SQLite pool without the built-in `create_topology`/`create_pool`
+    // factories — the default `create_topology` only delegates to
+    // `create_pool`, and both are overridable — so `setup_database` enforces
+    // the guard at dispatch. It must run only for an established pool
+    // (`Some(..)`), not before the provider returns: a provider returning
+    // `Ok(None)` opts into the supported no-database mode and must still boot
+    // even with a nonzero `statement_timeout`, matching the built-in path.
     // CI's sqlite job runs the named integration targets, not `--lib`, and
-    // `setup_database` and the shared guard are crate-private, so this boundary is
-    // reachable only from a unit test.
+    // `setup_database` and the shared guard are crate-private, so this
+    // boundary is reachable only from a unit test.
     //
-    // Case (a): a custom provider that establishes a real in-memory SQLite pool
-    // (`Ok(Some(..))`) under a nonzero `statement_timeout` must fail closed with
-    // the actionable error, keeping the original F2 bypass closed.
+    // Case (a): a custom provider that establishes a real in-memory SQLite
+    // pool (`Ok(Some(..))`) under a nonzero `statement_timeout` must fail
+    // closed with the actionable error. A custom provider must not bypass the
+    // guard.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn custom_pool_provider_with_established_sqlite_pool_fails_closed_on_statement_timeout() {

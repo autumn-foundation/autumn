@@ -5022,9 +5022,8 @@ mod tests {
         on_demand.open_for("globex").await.unwrap();
     }
 
-    /// Pigeonhole FINDINGS 3: a slot key never names a file, so a slot fleet
-    /// takes any routing key. A tenant fleet refuses the same keys. The app
-    /// checks its own ids in slot mode.
+    /// A slot key never names a file, so a slot fleet takes any routing key. A
+    /// tenant fleet refuses the same keys. In slot mode the app checks its ids.
     #[test]
     fn a_slot_fleet_takes_keys_that_a_tenant_fleet_refuses() {
         let tmp = tempfile::tempdir().unwrap();

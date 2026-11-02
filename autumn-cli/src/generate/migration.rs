@@ -908,7 +908,7 @@ pub struct Post {
     /// A `SQLite` `Add…To…` migration that adds a nullable `references` field
     /// creates an index in `up.sql`, and its `down.sql` must `DROP INDEX` before
     /// `DROP COLUMN` — `SQLite` refuses to drop a column still used by an index
-    /// (issue #1614 finding 5).
+    /// (issue #1614).
     #[test]
     fn add_columns_migration_on_sqlite_drops_index_before_column_on_rollback() {
         with_no_db_env(|| {

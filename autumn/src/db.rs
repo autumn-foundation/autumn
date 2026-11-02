@@ -4506,7 +4506,7 @@ impl Drop for Db {
             // `run_instrumented`. The accumulator must reflect genuine
             // instrumented queries only.
 
-            // A long hold is not one query (Pigeonhole FINDINGS 1). It covers
+            // A long hold is not one query. It covers
             // all work in the hold, for example a fan-out. So it has its own
             // message and no `sql` field. Enter the span so that the log shows
             // the pool and the shard (`db.pool`, `db.shard`).
@@ -4715,9 +4715,8 @@ mod tests {
         logs.snapshot(None, None)
     }
 
-    /// Pigeonhole FINDINGS 1: a handler held `Db` across a 6.6 s fan-out. The
-    /// log charged that time to `sql: "SELECT ?"`, a statement not in the
-    /// code. A long hold is not one query: it gets its own event.
+    /// A handler that holds `Db` across a long fan-out must not log the hold as
+    /// one query with `sql: "SELECT ?"`. The hold gets its own event.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn a_long_connection_hold_is_not_logged_as_a_query() {

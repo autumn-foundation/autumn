@@ -356,6 +356,9 @@ on this app: it applies `migrations/` to the control database. Use
 - When connections reach `database.max_connections_warn_threshold`
   (default 100), the boot warning gives the open files at `max_open`. The
   formula is `2 × connections + databases`. It counts the control database.
+- On Unix, boot also warns when those files reach 80 % of the open-file limit
+  (`ulimit -n`), at any connection count. The rest is for sockets and logs.
+  `database.max_connections_warn_threshold = 0` silences both warnings.
 - Metrics label every fleet database `shard=fleet`; the database name goes on
   spans and logs only, so a tenant fleet cannot explode metric cardinality.
 
