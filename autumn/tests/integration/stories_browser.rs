@@ -1018,7 +1018,20 @@ async fn check_busy_button(page: &Page, button: &str, status: &str) {
     );
     focus(page, &format!("#{button}")).await;
     press(page, "Enter").await;
-    wait_for(page, &state(true)).await;
+    if !poll(page, &state(true)).await {
+        let dump = eval_string(
+            page,
+            &format!(
+                "(() => {{ const b = document.getElementById({button:?}); \
+                 const s = document.getElementById({status:?}); \
+                 return JSON.stringify({{ button: b.outerHTML, status: s.outerHTML, \
+                   spinner: getComputedStyle(b.querySelector('.autumn-button__spinner')).display, \
+                   htmx: typeof htmx, widgets: window.__autumnWidgets }}); }})()"
+            ),
+        )
+        .await;
+        panic!("#{button} never showed the busy state: {dump}");
+    }
     wait_for(
         page,
         &format!("document.getElementById({status:?}).textContent.includes('Saved.')"),
