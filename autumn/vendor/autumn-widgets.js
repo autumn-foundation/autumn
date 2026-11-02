@@ -1011,19 +1011,27 @@
   // Busy state (#3406): htmx 2 sets no aria-busy. Mark the requester, the
   // submitter and the named indicators that have [data-autumn-busy], and
   // the target. The XHR loadend event clears the state after each request.
-  // Remove only an aria-busy that this code set.
-  var busySet = new WeakSet();
+  // Remove only an aria-busy that this code set, after its last request.
+  var busyCount = new WeakMap();
   document.addEventListener('htmx:beforeSend', function (e) {
     var d = e.detail, ev = (d.requestConfig || {}).triggeringEvent;
     var els = [e.target, ev && ev.submitter]
       .concat(Array.from(document.querySelectorAll('.htmx-request')))
       .filter(function (el) { return el && el.matches && el.matches('[data-autumn-busy]'); });
     if (els.length && d.target) els.push(d.target);
-    els = els.filter(function (el) { return busySet.has(el) || !el.hasAttribute('aria-busy'); });
-    els.forEach(function (el) { busySet.add(el); el.setAttribute('aria-busy', 'true'); });
+    els = els.filter(function (el, i) {
+      return els.indexOf(el) === i && (busyCount.has(el) || !el.hasAttribute('aria-busy'));
+    });
+    els.forEach(function (el) {
+      busyCount.set(el, (busyCount.get(el) || 0) + 1);
+      el.setAttribute('aria-busy', 'true');
+    });
     d.xhr.addEventListener('loadend', function () {
       els.forEach(function (el) {
-        if (!el.classList.contains('htmx-request')) { busySet.delete(el); el.removeAttribute('aria-busy'); }
+        var n = busyCount.get(el) - 1;
+        if (n > 0) return busyCount.set(el, n);
+        busyCount.delete(el);
+        el.removeAttribute('aria-busy');
       });
     });
   });

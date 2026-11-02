@@ -8451,10 +8451,13 @@ fn percent(value: f64, min: f64, max: f64, floor: bool) -> String {
         1.0
     };
     let pct = ratio * 100.0;
-    format!(
-        "{}%",
-        fmt_number(if floor { pct.floor() } else { pct.round() })
-    )
+    // 1e-9 absorbs float error: 29.0 / 100.0 * 100.0 is 28.999…, not 29.
+    let pct = if floor {
+        (pct + 1e-9).floor()
+    } else {
+        pct.round()
+    };
+    format!("{}%", fmt_number(pct))
 }
 
 /// A finite number as an attribute value: `40` not `40.0`, `0` not `-0`.
@@ -12483,6 +12486,11 @@ mod display_set_tests {
         let config = ProgressConfig::new().visible_label();
         let html = progress_with("Upload", Some(99.6), 100.0, &config).into_string();
         assert!(html.contains(">99%</span>"), "{html}");
+        // Codex review: float error must not round a whole percent down.
+        for value in [29.0, 57.0, 58.0] {
+            let html = progress_with("Upload", Some(value), 100.0, &config).into_string();
+            assert!(html.contains(&format!(">{value}%</span>")), "{html}");
+        }
         let config = MeterConfig::new().visible_label();
         let html = meter_with("Huge", 0.0, -f64::MAX..=f64::MAX, &config).into_string();
         assert!(html.contains(">50%</span>"), "{html}");

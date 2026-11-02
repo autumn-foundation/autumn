@@ -881,7 +881,7 @@ mod tests {
             "ev && ev.submitter",
             "querySelectorAll('.htmx-request')",
             "d.target",
-            "busySet",
+            "busyCount",
             "setAttribute('aria-busy', 'true')",
             "addEventListener('loadend'",
             "removeAttribute('aria-busy')",
