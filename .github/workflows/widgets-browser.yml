@@ -9,6 +9,8 @@ name: Widget browser gate
 #   * Each interactive story has a keyboard test.
 #   * The #3397 keyboard suite runs on its own fixture page.
 #   * The #3399 toast suite checks pause, close, focus and the top layer.
+#   * The #3402 popover suite checks the menu button keys, focus return,
+#     anchor positioning and the no-JS fallback.
 #   * The #3404 tooltip suite checks focus, Escape and the hover bridge, in
 #     the CSS mode and the `interestfor` mode.
 #   * Widget pack conformance (#3400): the canary packs, `autumn:init`, and
@@ -44,6 +46,7 @@ on:
       - "autumn/tests/integration/stories_browser.rs"
       - "autumn/tests/integration/widgets_keyboard_browser.rs"
       - "autumn/tests/integration/widgets_toast_browser.rs"
+      - "autumn/tests/integration/widgets_popover_browser.rs"
       - "autumn/tests/integration/widgets_tooltip_browser.rs"
       - "autumn/tests/integration/widgets_drawer_browser.rs"
       - "autumn/tests/fixtures/axe-core/**"
@@ -75,6 +78,7 @@ on:
       - "autumn/tests/integration/stories_browser.rs"
       - "autumn/tests/integration/widgets_keyboard_browser.rs"
       - "autumn/tests/integration/widgets_toast_browser.rs"
+      - "autumn/tests/integration/widgets_popover_browser.rs"
       - "autumn/tests/integration/widgets_tooltip_browser.rs"
       - "autumn/tests/integration/widgets_drawer_browser.rs"
       - "autumn/tests/fixtures/axe-core/**"
@@ -168,6 +172,17 @@ jobs:
             | tee "${RUNNER_TEMP}/widgets-toast-browser.log"
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-toast-browser.log" \
             || { echo "::error::no toast browser tests ran"; exit 1; }
+
+      - name: Run the popover and menu suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_popover_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-popover-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-popover-browser.log" \
+            || { echo "::error::no popover browser tests ran"; exit 1; }
 
       - name: Run the tooltip behaviour suite
         env:

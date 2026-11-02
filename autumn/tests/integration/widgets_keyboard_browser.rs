@@ -238,6 +238,7 @@ async fn press(page: &Page, key: &str) {
 }
 
 async fn active_id(page: &Page) -> String {
+    settle().await;
     eval_string(
         page,
         "document.activeElement ? document.activeElement.id : ''",
@@ -246,6 +247,7 @@ async fn active_id(page: &Page) -> String {
 }
 
 async fn active_text(page: &Page) -> String {
+    settle().await;
     eval_string(
         page,
         "document.activeElement ? document.activeElement.textContent.trim() : ''",
@@ -253,7 +255,14 @@ async fn active_text(page: &Page) -> String {
     .await
 }
 
+/// The runtime reacts to the `toggle` event, which the browser queues as a
+/// task. Let it run before the test reads the page.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
 async fn attr(page: &Page, id: &str, name: &str) -> String {
+    settle().await;
     eval_string(
         page,
         &format!("document.getElementById('{id}').getAttribute('{name}') || ''"),
@@ -748,7 +757,7 @@ const MENU: &str = "autumn-nav-menu-1";
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
-async fn the_runtime_adds_menu_button_roles() {
+async fn the_menu_button_has_roles_and_one_tab_stop() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");
     open(&page, "/").await;
@@ -878,13 +887,17 @@ async fn every_fallback_works_with_javascript_disabled() {
         .await
     );
 
-    // Nav: every dropdown link is visible.
-    assert!(shown(&page, MENU).await);
-    assert_eq!(attr(&page, TOGGLE, "aria-expanded").await, "true");
-    assert_eq!(
-        attr(&page, MENU, "role").await,
-        "",
-        "no role=menu without JS"
+    // Nav: the dropdown is a closed popover with the menu roles. The popover
+    // suite clicks it open; `Page::click` needs a script.
+    assert!(!shown(&page, MENU).await, "closed at first");
+    assert_eq!(attr(&page, MENU, "role").await, "menu");
+    assert!(
+        eval_bool(
+            &page,
+            &format!("document.getElementById('{TOGGLE}').getAttribute('commandfor') === '{MENU}'")
+        )
+        .await,
+        "commandfor opens it with no JS"
     );
 
     // Autocomplete: the `<noscript>` select is live and inside the form.

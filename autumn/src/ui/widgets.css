@@ -523,12 +523,12 @@
     align-items: center;
 }
 
-.autumn-nav__item a {
+.autumn-nav__item a:not(.autumn-menu__item) {
     color: var(--text);
     text-decoration: none;
 }
 
-.autumn-nav__item a:hover {
+.autumn-nav__item a:not(.autumn-menu__item):hover {
     color: var(--primary);
 }
 
@@ -549,16 +549,6 @@
     color: inherit;
     font: inherit;
     cursor: pointer;
-}
-
-.autumn-nav__menu {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-}
-
-.autumn-nav__menu[hidden] {
-    display: none;
 }
 
 @media (max-width: 768px) {
@@ -774,6 +764,126 @@
 .autumn-property-list dd {
     margin: 0;
     color: var(--text);
+}
+
+/* ── Popover + dropdown menu (autumn-popover, autumn-menu) ─────────────────── */
+
+.autumn-popover {
+    display: inline-block;
+}
+
+.autumn-popover__trigger {
+    font: inherit;
+    cursor: pointer;
+}
+
+/* The popover is in the top layer. The trigger is its implicit anchor, so
+   `position-area` needs no anchor name. `position-try-fallbacks` flips the
+   panel when it does not fit. Without anchor positioning, the UA centers it. */
+.autumn-popover__panel {
+    padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+    max-width: min(24rem, calc(100vw - 2rem));
+}
+
+@supports (position-area: bottom) {
+    .autumn-popover__panel {
+        inset: auto;
+        margin: 0;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+        position-visibility: anchors-visible;
+    }
+
+    .autumn-popover__panel[data-side="bottom"] { position-area: block-end span-inline-end; }
+    .autumn-popover__panel[data-side="bottom"][data-align="center"] { position-area: block-end; }
+    .autumn-popover__panel[data-side="bottom"][data-align="end"] { position-area: block-end span-inline-start; }
+    .autumn-popover__panel[data-side="top"] { position-area: block-start span-inline-end; }
+    .autumn-popover__panel[data-side="top"][data-align="center"] { position-area: block-start; }
+    .autumn-popover__panel[data-side="top"][data-align="end"] { position-area: block-start span-inline-start; }
+    .autumn-popover__panel[data-side="end"] { position-area: inline-end span-block-end; }
+    .autumn-popover__panel[data-side="end"][data-align="center"] { position-area: inline-end; }
+    .autumn-popover__panel[data-side="end"][data-align="end"] { position-area: inline-end span-block-start; }
+    .autumn-popover__panel[data-side="start"] { position-area: inline-start span-block-end; }
+    .autumn-popover__panel[data-side="start"][data-align="center"] { position-area: inline-start; }
+    .autumn-popover__panel[data-side="start"][data-align="end"] { position-area: inline-start span-block-start; }
+}
+
+/* `display` only while open: a `display` on the closed popover would beat the
+   UA rule that hides it. */
+.autumn-menu:popover-open {
+    display: flex;
+}
+
+.autumn-menu {
+    flex-direction: column;
+    min-width: 10rem;
+    padding: var(--space-1);
+    list-style: none;
+}
+
+.autumn-menu__form {
+    display: contents;
+}
+
+.autumn-menu__item {
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    padding: var(--space-2) var(--space-3);
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-size: var(--font-size-sm);
+    text-align: start;
+    text-decoration: none;
+    cursor: pointer;
+}
+
+.autumn-menu__item:hover,
+.autumn-menu__item:focus-visible {
+    background-color: var(--surface-muted);
+}
+
+.autumn-menu__item:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+}
+
+.autumn-menu__item--destructive {
+    color: var(--danger);
+}
+
+@media (forced-colors: active) {
+    .autumn-menu__item:hover {
+        outline: 1px solid Highlight;
+        outline-offset: -1px;
+    }
+}
+
+.autumn-menu__separator {
+    height: 1px;
+    margin: var(--space-1) 0;
+    border: 0;
+    background-color: var(--border);
+}
+
+.autumn-menu__group {
+    display: flex;
+    flex-direction: column;
+}
+
+.autumn-menu__label {
+    padding: var(--space-1) var(--space-3);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    font-weight: var(--font-weight-semibold);
+    text-transform: uppercase;
 }
 
 /* ── Modal / confirm dialog (autumn-modal, autumn-confirm) ────────────────── */

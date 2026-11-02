@@ -791,9 +791,19 @@ mod tests {
             .expect("autumn-widgets.js should be valid UTF-8");
         assert!(js.contains("data-autumn-nav"), "{js}");
         assert!(js.contains("data-nav-toggle"), "{js}");
-        assert!(js.contains("data-nav-menu-toggle"), "{js}");
         assert!(js.contains("aria-expanded"), "{js}");
         assert!(js.contains("Escape"), "{js}");
+    }
+
+    #[test]
+    fn widgets_js_wires_popover_menu() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        assert!(js.contains("data-autumn-menu"), "{js}");
+        assert!(js.contains("showPopover"), "{js}");
+        assert!(js.contains("hidePopover"), "{js}");
+        assert!(js.contains("data-popover-toggle"), "{js}");
+        assert!(!js.contains("data-nav-menu-toggle"), "{js}");
     }
 
     #[test]
@@ -819,7 +829,8 @@ mod tests {
     /// `docs/guide/keyboard.md`. Raise it only with a reason in the PR.
     /// Issue #3399 added the toast runtime. It increased the budgets from
     /// 32 KiB and 10 KiB. Issue #3404 added the tooltip runtime, next to the
-    /// #3403 drawer. Together they increased them from 36 KiB and 11 KiB.
+    /// #3403 drawer. Issue #3402 added the popover menu runtime. Together they
+    /// increased them from 36 KiB and 11 KiB.
     const WIDGETS_JS_BUDGET_BYTES: usize = 44 * 1024;
     /// Gzip budget. Browsers download this size.
     const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 13 * 1024;

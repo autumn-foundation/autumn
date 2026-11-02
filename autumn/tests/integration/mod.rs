@@ -620,6 +620,8 @@ mod widgets_infinite_feed;
 #[cfg(all(feature = "system-tests", feature = "maud"))]
 mod widgets_keyboard_browser;
 mod widgets_modal;
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_popover_browser;
 #[cfg(feature = "maud")]
 mod widgets_reaction_controls;
 mod widgets_tabs;

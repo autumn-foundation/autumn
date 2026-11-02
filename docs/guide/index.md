@@ -56,6 +56,7 @@ Looking for the API reference instead? That is
 - [Accordion and collapsible](accordion.md) — native `<details>` disclosure, no JavaScript
 - [Widget Packs](widget-packs.md) — ship widgets as a plugin: the widget contract, stories, form binding, conformance
 - [Widget Keyboard Core](keyboard.md) — APG arrow keys, typeahead and dismiss for widgets, bound by `data-*`
+- [Popover and Dropdown Menu](popover-and-menu.md) — native popover and APG menu button: anchor positioning, items, keys
 - [Widget Styling](widget-styling.md) — restyling the shipped widgets to match your design
 - [Widget Stories](stories.md) — the `/_stories` gallery for previewing widgets in isolation
 - [Rich Text](rich-text.md) — accepting and safely rendering user-authored markup
