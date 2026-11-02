@@ -46,7 +46,6 @@ updates:
       - dependency-name: "matchit"
     labels:
       - dependencies
-      - automated
 
   - package-ecosystem: github-actions
     directory: /
@@ -69,6 +68,3 @@ updates:
       # this action alone. See PR #2615's review comments for the full
       # rehearsal.
       - dependency-name: "dtolnay/rust-toolchain"
-    labels:
-      - ci
-      - automated

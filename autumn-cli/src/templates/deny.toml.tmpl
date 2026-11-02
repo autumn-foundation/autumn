@@ -81,15 +81,16 @@ ignore = [
     # `rsa` reaches every Autumn app through `jsonwebtoken`, an unconditional
     # autumn-web dependency, and no patched `rsa` release exists (the advisory
     # says "no safe upgrade is available"). The vulnerable path is RSA-family
-    # JWT signing/verification; key recovery needs an attacker-timed RSA
-    # private-key operation oracle, which an Autumn app does not expose by
-    # default. Autumn re-triages this every release and drops the waiver when a
+    # JWT verification; key recovery needs an attacker-timed RSA private-key
+    # operation oracle. jsonwebtoken's RSA support in this app is verify-only
+    # (no RSA signing/decryption), so there is no private-key timing oracle to
+    # exploit. Autumn re-triages this every release and drops the waiver when a
     # fixed `rsa` — or a `jsonwebtoken` without the RSA backend — ships, so the
     # review-by below is Autumn's cadence: on a date that has passed, take the
     # newest autumn-web and re-run the audit before assuming it still stands.
-    # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05: still no fixed
-    # rsa release; see docs/reports/2026-10-05-ballast-dependency-ledger-audit.md).
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # Review-by: 2026-12-02 (reconfirmed unchanged 2026-11-02: still no fixed
+    # rsa release; see docs/reports/2026-11-02-ballast-dependency-ledger-audit.md).
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT verify path (no RSA signing/decryption, so no private-key timing oracle); reconfirmed unchanged 2026-11-02; review-by 2026-12-02" },
     # RUSTSEC-2026-0387 — `crypto-bigint` has secret-dependent branches in
     # nominally constant-time operations.
     # https://rustsec.org/advisories/RUSTSEC-2026-0387
@@ -110,8 +111,10 @@ ignore = [
     # instant -> parking_lot -> reqwest-retry -> postgresql_archive ->
     # (build) postgresql_embedded. Unmaintained, not vulnerable — there is no
     # exploit here, and no safe upgrade (the author recommends `web-time`).
-    # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
-    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    # Checked 2026-11-02: latest postgresql_embedded is 0.20.1, needing rustc
+    # 1.94.0 — above this template's 1.88.0 MSRV; the gap widened, not closed.
+    # Review-by: 2026-12-02 (reconfirmed unchanged 2026-11-02).
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; latest postgresql_embedded 0.20.1 needs rustc 1.94.0, MSRV is 1.88.0; reconfirmed unchanged 2026-11-02; review-by 2026-12-02" },
     # <<< autumn:bundled-pg-waiver
 ]
 
