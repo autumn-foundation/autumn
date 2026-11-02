@@ -489,6 +489,14 @@ Everything here is addressed to someone maintaining an `autumn-plugin-*` /
 - **New stable surface:** `plugin_conformance::is_sensitive_path`,
   `normalize_path_for_collision` and `is_plugin_asset_path` are public.
   The plugin-check CLI uses the same rules. Nothing else changed.
+- **New stable surface (no-route plugins):** `ConformanceConfig::no_routes()`
+  and the `ConformanceConfig::no_routes` field. A plugin that mounts no routes
+  now passes `run_conformance` in `cargo test`, like
+  `autumn plugin-check --no-routes`. Pass the contract from
+  `AppBuilder::plugin_contracts()` with it, so a route under the
+  `registered_as` name is found; without one, every plugin route fails. Code that does not call it sees no
+  change. `ConformanceConfig` is `#[non_exhaustive]`, so the new field breaks
+  no struct literal.
 - **New stable surface (widget packs, #3400):** `widget_pack` (the widget
   contract and `WidgetPack`), `AppBuilder::widget_pack`,
   `AppBuilder::with_story_gallery` and `form::FieldRenderer` (with
