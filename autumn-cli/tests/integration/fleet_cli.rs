@@ -955,4 +955,142 @@ mod sqlite {
         assert!(stderr.contains("[replication]"), "{stderr}");
         assert_eq!(count_notes(&app.path("acme")), 1);
     }
+
+    /// Ship `tenants` (id, notes) to `replicas`, then close the fleet.
+    fn ship(app: &App, replicas: &Path, tenants: &[(&str, usize)]) {
+        let (fleet, _) = replicated_fleet(app, replicas);
+        runtime().block_on(async {
+            for (tenant, rows) in tenants {
+                let key = fleet.key_for(tenant).unwrap();
+                let db = fleet.provision(&key).await.unwrap();
+                for n in 0..*rows {
+                    exec(
+                        db.path(),
+                        &format!("INSERT INTO notes VALUES ('{tenant} {n}')"),
+                    );
+                }
+            }
+            fleet.close_all().await;
+        });
+    }
+
+    fn lake_app(replicas: &Path, extra: &str) -> App {
+        App::new(&format!(
+            "{extra}[replication]\nenabled = true\npath = \"{}\"\nprefix = \"app\"\n",
+            replicas.display()
+        ))
+    }
+
+    const PER_TENANT: &str =
+        "SELECT _autumn_tenant AS tenant, COUNT(*) AS n FROM notes GROUP BY 1 ORDER BY 1;\n";
+
+    #[test]
+    fn fleet_lake_runs_sql_over_the_replicas_with_no_volume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let app = lake_app(&replicas, "");
+        ship(
+            &app,
+            &replicas,
+            &[("acme", 2), ("globex", 1), ("initech", 3)],
+        );
+        std::fs::remove_dir_all(app.root()).unwrap();
+        std::fs::write(app.dir.join("q.sql"), PER_TENANT).unwrap();
+
+        // No control database on this host: the operator must accept
+        // marker-only tombstones by name.
+        let stderr = run_err(&app.dir, &["fleet", "lake", "q.sql"]);
+        assert!(stderr.contains("--markers-only"), "{stderr}");
+
+        let (stdout, stderr) = run_ok(&app.dir, &["fleet", "lake", "q.sql", "--markers-only"]);
+        assert_eq!(stdout, "tenant,n\nacme,2\nglobex,1\ninitech,3\n");
+        assert!(stderr.contains("3 tenant(s) loaded"), "{stderr}");
+
+        run_ok(
+            &app.dir,
+            &[
+                "fleet",
+                "lake",
+                "q.sql",
+                "--markers-only",
+                "--out",
+                "out.csv",
+                "--concurrency",
+                "2",
+            ],
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.dir.join("out.csv")).unwrap(),
+            "tenant,n\nacme,2\nglobex,1\ninitech,3\n"
+        );
+        assert!(
+            !app.root().exists(),
+            "the lake made nothing under the fleet root"
+        );
+
+        // Keep the lake for other tools.
+        run_ok(
+            &app.dir,
+            &[
+                "fleet",
+                "lake",
+                "q.sql",
+                "--markers-only",
+                "--keep",
+                "lake.db",
+            ],
+        );
+        let kept = app.dir.join("lake.db");
+        #[derive(QueryableByName)]
+        struct Count {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            n: i64,
+        }
+        let n = diesel::sql_query("SELECT COUNT(*) AS n FROM notes")
+            .get_result::<Count>(&mut connect(&kept))
+            .unwrap()
+            .n;
+        assert_eq!(n, 6);
+    }
+
+    #[test]
+    fn fleet_lake_skips_a_deleted_tenant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let app = lake_app(&replicas, "replica_retention_after_delete = \"1d\"\n\n");
+        ship(&app, &replicas, &[("acme", 2), ("globex", 1)]);
+        run_ok(&app.dir, &["fleet", "delete", "tenant:globex", "--force"]);
+        assert!(
+            replica_objects(&replicas, "globex") > 0,
+            "kept for the retention"
+        );
+        std::fs::write(app.dir.join("q.sql"), PER_TENANT).unwrap();
+
+        // The control database has the tombstone row.
+        let (stdout, stderr) = run_ok(&app.dir, &["fleet", "lake", "q.sql"]);
+        assert_eq!(stdout, "tenant,n\nacme,2\n");
+        assert!(stderr.contains("1 deleted"), "{stderr}");
+    }
+
+    #[test]
+    fn fleet_lake_refuses_a_write_and_needs_replication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let app = lake_app(&replicas, "");
+        ship(&app, &replicas, &[("acme", 1)]);
+        std::fs::write(app.dir.join("q.sql"), "DELETE FROM notes").unwrap();
+        let stderr = run_err(&app.dir, &["fleet", "lake", "q.sql", "--markers-only"]);
+        assert!(stderr.contains("lake query"), "{stderr}");
+
+        let stderr = run_err(
+            &app.dir,
+            &["fleet", "lake", "missing.sql", "--markers-only"],
+        );
+        assert!(stderr.contains("missing.sql"), "{stderr}");
+
+        let app = App::new("");
+        std::fs::write(app.dir.join("q.sql"), PER_TENANT).unwrap();
+        let stderr = run_err(&app.dir, &["fleet", "lake", "q.sql", "--markers-only"]);
+        assert!(stderr.contains("[replication]"), "{stderr}");
+    }
 }

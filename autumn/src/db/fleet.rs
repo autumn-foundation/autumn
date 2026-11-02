@@ -1104,6 +1104,21 @@ impl DatabaseFleet {
         self.inner.replication.get()
     }
 
+    /// A lake over this fleet's replicas (issue #3236). It carries the
+    /// tombstones and refuses a scratch directory under the fleet root.
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::NotReplicated`] when the fleet does not replicate.
+    pub fn lake(&self) -> Result<super::fleet_lake::FleetLake, FleetError> {
+        let replication = self
+            .replication()
+            .ok_or_else(|| FleetError::NotReplicated {
+                name: "lake".to_owned(),
+            })?;
+        Ok(replication.lake().outside_root(self.root()))
+    }
+
     /// Whether databases are opened for an external checkpointer.
     #[must_use]
     pub fn replicating(&self) -> bool {

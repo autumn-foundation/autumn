@@ -114,6 +114,14 @@ async fn admin_notes(
     Ok(Json(notes))
 }
 
+/// `across_tenants()` count over every database on disk.
+#[get("/admin/count")]
+async fn admin_count(
+    CrossShard(repo): CrossShard<PgFleetNoteRepository>,
+) -> AutumnResult<Json<i64>> {
+    Ok(Json(repo.count().await?))
+}
+
 /// `Shards::each_shard` over the fleet: one entry per database file.
 #[get("/admin/counts")]
 async fn admin_counts(shards: Shards) -> AutumnResult<Json<Vec<(String, i64)>>> {
@@ -208,6 +216,7 @@ fn app(dir: &FsPath, fleet: DatabaseFleet) -> autumn_web::test::TestClient {
             repo_write,
             repo_read,
             admin_notes,
+            admin_count,
             admin_counts,
             provision,
             db_by_name
@@ -490,4 +499,134 @@ async fn the_db_prelude_runs_async_queries() {
             .unwrap(),
         0
     );
+}
+
+/// Ship the fleet's databases to a local replica directory.
+fn replicate(
+    fleet: &DatabaseFleet,
+    replicas: &FsPath,
+) -> std::sync::Arc<autumn_web::db::fleet_replication::FleetReplication> {
+    use autumn_web::db::fleet_replication::FleetReplication;
+    use autumn_web::replication::{FileDestination, ReplicaDestination, ReplicationSettings};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let destination: Arc<dyn ReplicaDestination> =
+        Arc::new(FileDestination::new(replicas).unwrap());
+    let replication = Arc::new(FleetReplication::new(
+        destination,
+        ReplicationSettings {
+            database_path: std::path::PathBuf::new(),
+            root: "app/test".to_owned(),
+            sync_interval: Duration::from_secs(1),
+            snapshot_interval: Duration::from_secs(3600),
+            max_wal_bytes: 4 * 1024 * 1024,
+            retention: Duration::from_secs(24 * 3600),
+            verify_interval: None,
+        },
+        Duration::from_secs(30),
+        false,
+        Arc::new(autumn_web::time::SystemClock),
+    ));
+    assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
+    replication
+}
+
+/// The lake over the replicas gives the same answer as `across_tenants()`
+/// over the volume, and it needs no volume (issue #3236).
+#[tokio::test]
+async fn the_lake_matches_across_tenants_with_no_volume() {
+    use autumn_web::db::fleet_lake::{LakeValue, TENANT_COLUMN};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let fleet = fleet(tmp.path(), FleetMode::Tenant, true);
+    let replication = replicate(&fleet, &tmp.path().join("replicas"));
+    let client = app(tmp.path(), fleet.clone());
+    for (tenant, body) in [
+        ("acme", "plan"),
+        ("globex", "launch"),
+        ("acme", "ship"),
+        ("initech", "audit"),
+        ("initech", "bill"),
+        ("initech", "close"),
+    ] {
+        client
+            .post(&format!("/notes/{body}"))
+            .header("x-tenant-id", tenant)
+            .send()
+            .await
+            .assert_status(200);
+    }
+
+    // `across_tenants()` over the volume.
+    let count: i64 = client.get("/admin/count").send().await.json();
+    let bodies: Vec<String> = client.get("/admin/notes").send().await.json();
+    let counts: Vec<(String, i64)> = client.get("/admin/counts").send().await.json();
+    assert_eq!(count, 6);
+
+    // Ship the last frames, then take the volume away.
+    fleet.close_all().await;
+    std::fs::remove_dir_all(tmp.path().join("fleet")).unwrap();
+
+    let scratch = tmp.path().join("scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let snapshot = replication
+        .lake()
+        .markers_only()
+        .with_scratch_dir(&scratch)
+        .materialize()
+        .await
+        .unwrap();
+
+    let total = snapshot
+        .query("SELECT COUNT(*) FROM fleet_notes")
+        .await
+        .unwrap();
+    assert_eq!(total.rows, vec![vec![LakeValue::Integer(count)]]);
+
+    let lake_bodies = snapshot
+        .query("SELECT body FROM fleet_notes ORDER BY body")
+        .await
+        .unwrap();
+    let lake_bodies: Vec<String> = lake_bodies
+        .rows
+        .iter()
+        .map(|row| row[0].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(lake_bodies, bodies);
+
+    let per_tenant = snapshot
+        .query(&format!(
+            "SELECT 'tenant:' || {TENANT_COLUMN}, COUNT(*) FROM fleet_notes GROUP BY 1 ORDER BY 1"
+        ))
+        .await
+        .unwrap();
+    let per_tenant: Vec<(String, i64)> = per_tenant
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_str().unwrap().to_owned(),
+                row[1].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(per_tenant, counts);
+
+    // A grouped sum, which `across_tenants()` refuses across shards.
+    let lengths = snapshot
+        .query(&format!(
+            "SELECT {TENANT_COLUMN}, SUM(length(body)) FROM fleet_notes GROUP BY 1 ORDER BY 1"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        lengths.rows,
+        vec![
+            vec![LakeValue::Text("acme".into()), LakeValue::Integer(8)],
+            vec![LakeValue::Text("globex".into()), LakeValue::Integer(6)],
+            vec![LakeValue::Text("initech".into()), LakeValue::Integer(14)],
+        ]
+    );
+    assert!(!tmp.path().join("fleet").exists());
 }
