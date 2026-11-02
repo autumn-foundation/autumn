@@ -1453,7 +1453,7 @@ fn exempt_servers<'a>(prefix: &str, routes: &[&'a RouteKey]) -> Vec<&'a RouteKey
     } else {
         vec![base.to_owned(), below]
     };
-    subjects
+    let mut served: Vec<&RouteKey> = subjects
         .iter()
         .flat_map(|subject| {
             let overlapping: Vec<&RouteKey> = routes
@@ -1463,7 +1463,83 @@ fn exempt_servers<'a>(prefix: &str, routes: &[&'a RouteKey]) -> Vec<&'a RouteKey
                 .collect();
             undominated(subject, &overlapping)
         })
-        .collect()
+        .collect();
+    // A request can also reach the prefix through dot segments.
+    served.extend(
+        routes
+            .iter()
+            .filter(|(path, _)| reaches_through_dots(path, &subjects))
+            .copied(),
+    );
+    served
+}
+
+/// Most cleaned shapes kept for one route before it is bound unconditionally.
+const MAX_DOT_STATES: usize = 1024;
+
+/// Segment spellings that `clean_path` resolves as `..`.
+const POP_FORMS: [&str; 4] = ["..", "%2e%2e", ".%2e", "%2e."];
+
+/// Segment spellings that `clean_path` resolves as `.`.
+const SKIP_FORMS: [&str; 2] = [".", "%2e"];
+
+/// Whether a request to `route` can clean into one of the `subjects`, by
+/// way of a dot segment.
+///
+/// The router sees the raw path and `CsrfService` the cleaned one. A capture
+/// can hold a whole dot segment, and a catch-all can hold `../` parts. So the
+/// route is walked as a stack of segment patterns: a capture that can be a
+/// dot segment may also push nothing (`.`) or pop one segment (`..`). A
+/// catch-all may pop any number of segments. `..` stops at the root.
+///
+/// Limits, stated in the posture guide: a `%2f` inside a capture is not
+/// modeled, and the result is not ranked by router precedence.
+fn reaches_through_dots(route: &str, subjects: &[String]) -> bool {
+    // Each state is a cleaned prefix and whether a dot was used to get it.
+    let mut states: BTreeSet<(Vec<&str>, bool)> = BTreeSet::from([(Vec::new(), false)]);
+    for segment in route.split('/').filter(|s| !s.is_empty()) {
+        let mut next = BTreeSet::new();
+        for (stack, dotted) in &states {
+            if segment.contains(CATCH_ALL) {
+                for keep in 0..=stack.len() {
+                    let mut cleaned = stack[..keep].to_vec();
+                    cleaned.push(segment);
+                    next.insert((cleaned, *dotted || keep < stack.len()));
+                }
+                continue;
+            }
+            let mut push = stack.clone();
+            push.push(segment);
+            next.insert((push, *dotted));
+            if is_dot_form(segment, &SKIP_FORMS) {
+                next.insert((stack.clone(), true));
+            }
+            if is_dot_form(segment, &POP_FORMS) {
+                let mut popped = stack.clone();
+                popped.pop();
+                next.insert((popped, true));
+            }
+        }
+        if next.len() > MAX_DOT_STATES {
+            return true;
+        }
+        states = next;
+    }
+    states.iter().any(|(stack, dotted)| {
+        let cleaned = format!("/{}", stack.join("/"));
+        *dotted && subjects.iter().any(|s| intersect(&cleaned, s).is_some())
+    })
+}
+
+/// Whether `segment` can be, or hold, one of the dot `forms`.
+fn is_dot_form(segment: &str, forms: &[&str]) -> bool {
+    forms.iter().any(|form| {
+        if segment.contains(CAPTURE) {
+            segments_overlap(segment, form)
+        } else {
+            segment == *form
+        }
+    })
 }
 
 /// Configured exemption prefixes, which the per-route rows cannot show.
@@ -4986,6 +5062,67 @@ mod tests {
         .find(|f| f.kind == "csrf_exemption_added")
         .expect("a new exemption is a widening")
         .canonical()
+    }
+
+    /// Digest of one `POST` route under `prefix`, with `scopes` on the route.
+    /// A change in the digest means the exemption binds to the route.
+    fn binds(route_path: &str, prefix: &str) -> bool {
+        let digest = |scopes: &[&str]| exemption_digest(&[(route_path, "POST", scopes)], &[prefix]);
+        digest(&["mfa"]) != digest(&[])
+    }
+
+    /// `..` in a capture moves the cleaned path out of `/other`, into `/api`.
+    #[test]
+    fn an_exemption_binds_a_route_reached_through_dot_dot() {
+        assert!(binds("/other/{id}/api", "/api"));
+        assert!(binds("/other/{id}/api/{x}", "/api"));
+    }
+
+    /// `.` in a capture leaves the cleaned path one segment shorter.
+    #[test]
+    fn an_exemption_binds_a_route_reached_through_a_single_dot() {
+        assert!(binds("/api/{a}/x/z", "/api/x/z"));
+    }
+
+    /// `%2e` spellings reach the prefix the same way.
+    #[test]
+    fn an_exemption_binds_a_route_reached_through_encoded_dots() {
+        assert!(binds("/other/%2e{a}/api", "/api"));
+        assert!(binds("/other/.{a}/api", "/api"));
+    }
+
+    /// A catch-all holds whole `../` segments.
+    #[test]
+    fn an_exemption_binds_a_catch_all_that_can_climb_out() {
+        assert!(binds("/files/{*path}", "/api"));
+    }
+
+    /// A segment with a fixed edge that is not a dot cannot be a dot segment.
+    #[test]
+    fn an_exemption_ignores_a_segment_that_cannot_be_a_dot_segment() {
+        assert!(!binds("/other/v{id}/api", "/api"));
+        assert!(!binds("/other/{id}x/api", "/api"));
+    }
+
+    /// A literal route never has a dot to resolve.
+    #[test]
+    fn an_exemption_ignores_a_literal_route_outside_the_prefix() {
+        assert!(!binds("/other/api", "/api"));
+        assert!(!binds("/other/x/api", "/api"));
+    }
+
+    /// `..` cannot climb above the root, so one capture cannot reach a prefix
+    /// that sits behind two literal segments it must keep.
+    #[test]
+    fn an_exemption_ignores_a_route_whose_literals_keep_it_outside() {
+        assert!(!binds("/a/b/{id}/c", "/api"));
+    }
+
+    /// A route with many captures binds, and the model stays bounded.
+    #[test]
+    fn an_exemption_survives_a_route_with_many_captures() {
+        let path = "/o/{a}/{b}/{c}/{d}/{e}/{f}/{g}/{h}/{i}/{j}/api";
+        assert!(binds(path, "/api"));
     }
 
     /// A node answers every method, so a static node without `POST` still
