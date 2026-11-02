@@ -1,0 +1,10 @@
+# Bolt profile: autumn-web/metrics_held
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 0
+blocks allocated: 0
+peak live bytes (whole run): 6,197
+
+         bytes      blocks  site
+
