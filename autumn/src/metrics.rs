@@ -2823,6 +2823,48 @@ mod tests {
     }
 
     #[test]
+    fn held_gauge_and_histogram_reuse_their_series_and_stay_correct() {
+        let _limits = LimitsGuard::pinned();
+        let gauge_name = unique_name("facade_held_gauge");
+        let gauge_handle = gauge(&gauge_name).with_label("pool", "a");
+        gauge_handle.set(2.0);
+        gauge_handle.increment(3_u32);
+        gauge_handle.decrement(1_u32);
+        let hist_name = unique_name("facade_held_histogram");
+        let hist_handle = histogram(&hist_name).with_label("route", "/x");
+        hist_handle.record(0.5);
+        hist_handle.record(1.5);
+
+        let g = expect_instrument(&gauge_name);
+        assert_eq!(g.series.len(), 1);
+        assert!(matches!(
+            g.series[0].value,
+            SeriesValue::Gauge { value } if (value - 4.0).abs() < f64::EPSILON
+        ));
+        let h = expect_instrument(&hist_name);
+        assert_eq!(h.series.len(), 1);
+        assert!(matches!(
+            h.series[0].value,
+            SeriesValue::Histogram { count: 2, .. }
+        ));
+    }
+
+    #[test]
+    fn held_handle_over_the_series_cap_keeps_counting_drops() {
+        let _limits = LimitsGuard::pinned();
+        let name = unique_name("facade_held_over_cap");
+        for i in 0..DEFAULT_MAX_SERIES_PER_METRIC {
+            counter(&name)
+                .with_label("shard", i.to_string())
+                .increment(1);
+        }
+        let over = counter(&name).with_label("shard", "over");
+        over.increment(1);
+        over.increment(1);
+        assert_eq!(expect_instrument(&name).dropped_series, 2);
+    }
+
+    #[test]
     fn extending_a_handle_after_recording_resolves_a_new_series() {
         let name = unique_name("facade_held_extended");
         let base = counter(&name).with_label("a", "1");
