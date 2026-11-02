@@ -3582,7 +3582,7 @@ enum FleetCommands {
     ///
     /// Restores each live tenant from `[replication]` into a private scratch
     /// directory, copies its tables into one `SQLite` file with an
-    /// `_autumn_tenant` column, and runs SQL_FILE on it. Writes CSV: NULL is
+    /// `_autumn_tenant` column, and runs `SQL_FILE` on it. Writes CSV: NULL is
     /// empty, a blob is hex. Deleted tenants are skipped: their tombstone rows
     /// come from the control database. It never opens the fleet root, so it
     /// runs on a host with no volume.
