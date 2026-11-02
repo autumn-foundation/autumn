@@ -852,8 +852,11 @@ A plugin that mounts no routes (a cache, a background runtime) calls
 `ConformanceConfig::new(..).contract(..).no_routes()`. It is the library
 counterpart of `autumn plugin-check --no-routes`. No route under a name of the
 plugin skips `route-attribution`, and such a route fails it. The names are the
-config's plugin name and the contract's `plugin` and `registered_as`, so pass
-the contract: routes carry `Plugin::name()`, which defaults to the type path.
+config's plugin name and the contract's `plugin` and `registered_as`. Routes
+carry `Plugin::name()`, which defaults to the type path, and only
+`AppBuilder::plugin` fills `registered_as`. So pass the contract from
+`builder.plugin_contracts()`. With no `registered_as`, every plugin route
+fails the check.
 Unlike the CLI, the library check does not need a contract to skip. Do not set
 a `prefix` with `no_routes`; the two contradict each other, and `route-prefix`
 fails.

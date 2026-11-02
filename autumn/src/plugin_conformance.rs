@@ -78,8 +78,9 @@ impl ConformanceConfig {
     /// `autumn plugin-check --no-routes`, and it is stricter: it does not need
     /// a contract dump to skip.
     ///
-    /// Pass the plugin's contract too, so that a route under its
-    /// `registered_as` name (the type path by default) is also found.
+    /// Pass the contract from `AppBuilder::plugin_contracts()`, which carries
+    /// `registered_as`, the name the plugin's routes carry. With no
+    /// `registered_as`, every plugin route fails the check.
     /// Without `no_routes`, a report with no attributed route fails
     /// `route-attribution`.
     #[must_use]
@@ -352,7 +353,9 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
 ///
 /// The names are `plugin_name`, the contract's crate name and the contract's
 /// `registered_as`: routes carry `Plugin::name()`, which defaults to the type
-/// path, not the crate name.
+/// path, not the crate name. Only `AppBuilder::plugin` fills `registered_as`,
+/// so pass the contract from `AppBuilder::plugin_contracts`. Without it, every
+/// plugin route counts.
 fn check_no_routes(config: &ConformanceConfig, routes: &[RouteInfo]) -> CheckResult {
     let plugin_name = config.plugin_name.as_str();
     let contract = config.contract.as_ref();
@@ -360,9 +363,16 @@ fn check_no_routes(config: &ConformanceConfig, routes: &[RouteInfo]) -> CheckRes
         .chain(contract.map(|c| c.plugin.as_str()))
         .chain(contract.and_then(|c| c.registered_as.as_deref()))
         .collect();
+    // With no `registered_as`, the name the routes carry is unknown (it is
+    // `Plugin::name()`, the type path by default). Then fail closed: any
+    // plugin route contradicts `no_routes`.
+    let name_known = contract.is_some_and(|c| c.registered_as.is_some());
     let attributed = routes
         .iter()
-        .filter(|r| matches!(&r.source, RouteSource::Plugin(n) if names.contains(&n.as_str())))
+        .filter(|r| match &r.source {
+            RouteSource::Plugin(n) => !name_known || names.contains(&n.as_str()),
+            _ => false,
+        })
         .count();
 
     if attributed == 0 {
@@ -1397,6 +1407,58 @@ mod tests {
             attribution.message
         );
         assert!(!report.passed());
+    }
+
+    #[test]
+    fn run_conformance_no_routes_fails_closed_without_the_registered_name() {
+        // The plugin's own `contract()` has no `registered_as`: only
+        // `AppBuilder::plugin` fills it. The real route name is then unknown,
+        // so any plugin route contradicts `no_routes`.
+        let routes = vec![make_route(
+            "GET",
+            "/cache/stats",
+            plugin("my_cache::CachePlugin"),
+        )];
+        let config = ConformanceConfig::new("my-cache")
+            .contract(PluginContract::new("my-cache"))
+            .no_routes();
+        let report = run_conformance(&config, &routes);
+        assert!(
+            !report.passed(),
+            "an unknown registered name must not let a route pass:\n{}",
+            report.to_text_report()
+        );
+        // A user route is not a plugin route.
+        let user = vec![make_route("GET", "/posts", RouteSource::User)];
+        assert!(run_conformance(&config, &user).passed());
+    }
+
+    #[test]
+    fn run_conformance_no_routes_with_the_builder_contract() {
+        // The documented flow: a plugin with the default `Plugin::name()`
+        // (its type path) that mounts a route, and the contract that the
+        // builder enriched.
+        #[crate::get("/cache/stats")]
+        async fn stats() -> &'static str {
+            "stats"
+        }
+        struct CachePlugin;
+        impl crate::plugin::Plugin for CachePlugin {
+            fn contract(&self) -> Option<PluginContract> {
+                Some(PluginContract::new("my-cache").autumn_web("0.9"))
+            }
+            fn build(self, app: crate::app::AppBuilder) -> crate::app::AppBuilder {
+                app.routes(crate::routes![stats])
+            }
+        }
+        let builder = crate::app().plugin(CachePlugin);
+        let routes = builder.plugin_route_infos().expect("routes");
+        let contract = builder.plugin_contracts()[0].clone();
+        assert!(contract.registered_as.is_some());
+        let config = ConformanceConfig::new("my-cache")
+            .contract(contract)
+            .no_routes();
+        assert!(!run_conformance(&config, &routes).passed());
     }
 
     #[test]
