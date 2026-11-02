@@ -1,6 +1,6 @@
-//! Pigeonhole (a slot-fleet lab) findings, as `docs/guide/sqlite-fleet.md`
-//! states them. The behaviour behind each claim has a test in `db::fleet`,
-//! `db` and `config`.
+//! These tests check that `docs/guide/sqlite-fleet.md` states the Pigeonhole
+//! findings. Pigeonhole is a slot-fleet lab. The behaviour behind each claim
+//! has a test in `db`, `db::fleet`, `config` and `sharding`.
 
 const GUIDE: &str = include_str!("../../../docs/guide/sqlite-fleet.md");
 

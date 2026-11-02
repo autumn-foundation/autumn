@@ -1215,9 +1215,9 @@ impl ShardSet {
             .sum()
     }
 
-    /// The database files that this set opens at most: one per configured
-    /// pool, or `max_open` for a fleet (a soft limit). The boot warning
-    /// uses it to count `SQLite` open files.
+    /// The databases that this set opens: one per configured pool, or
+    /// `max_open` for a fleet. A fleet burst opens more. The boot warning
+    /// uses this count for the `SQLite` open-file estimate.
     #[must_use]
     pub fn total_databases(&self) -> usize {
         #[cfg(feature = "sqlite")]
@@ -3583,7 +3583,7 @@ mod tests {
         assert_eq!(set.total_databases(), 2);
     }
 
-    // Pigeonhole FINDINGS 2: a fleet opens `max_open` files, not one per shard.
+    // Pigeonhole FINDINGS 2: a fleet opens `max_open` databases, not one per shard.
     #[cfg(feature = "sqlite")]
     #[test]
     fn a_fleet_counts_max_open_databases() {

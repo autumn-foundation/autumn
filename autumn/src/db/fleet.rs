@@ -1365,7 +1365,7 @@ impl DatabaseFleet {
     /// The database key for a routing key (a tenant id), per the fleet mode.
     ///
     /// A slot fleet takes any routing key, because the key never names a
-    /// file. It does not check the id: the app does that.
+    /// file. This function does not check the id. The app must check it.
     ///
     /// # Errors
     ///

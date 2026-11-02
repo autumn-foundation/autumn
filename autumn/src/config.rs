@@ -10740,7 +10740,7 @@ const fn default_fleet_replication_workers() -> usize {
     4
 }
 
-/// The database backend that the boot connection warning gives advice for.
+/// The backend that selects the advice in the boot connection warning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConnectionBackend {
     /// Postgres: the budget is each server's `max_connections`.
@@ -10771,11 +10771,12 @@ pub(crate) fn total_connections_warning(
     }
     let advice = match backend {
         ConnectionBackend::Sqlite { databases } => format!(
-            "On SQLite they keep about {files} open files (the database and its \
-             -wal for each connection, one -shm for each database). \
-             database.fleet.max_open is a soft limit: a burst opens more. Set the \
-             open-file limit of the process (ulimit -n) above the peak, or decrease \
-             database.fleet.max_open, database.fleet.pool_size or database.pool_size.",
+            "These connections keep about {files} files open on SQLite (the \
+             database and its -wal for each connection, one -shm for each \
+             database). database.fleet.max_open is a soft limit: a burst opens \
+             more. Set the open-file limit of the process (ulimit -n) above the \
+             peak. Or decrease database.fleet.max_open, database.fleet.pool_size or \
+             database.pool_size.",
             files = sqlite_open_files(total, databases),
         ),
         ConnectionBackend::Postgres => "Ensure each Postgres server's max_connections \
@@ -14610,7 +14611,7 @@ mod tests {
         let backend = ConnectionBackend::Sqlite { databases: 65 };
         let message = total_connections_warning(138, 100, backend).expect("warns");
         // 2 x 138 (database and -wal) + 65 (-shm).
-        assert!(message.contains("about 341 open files"), "{message}");
+        assert!(message.contains("about 341 files open"), "{message}");
         assert!(message.contains("-wal"), "{message}");
         assert!(message.contains("soft limit"), "{message}");
         assert!(message.contains("ulimit -n"), "{message}");

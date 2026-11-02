@@ -3712,7 +3712,7 @@ impl Db {
 
         let span = tracing::info_span!(
             "db.transaction",
-            db.system = "postgresql",
+            db.system = DB_SYSTEM,
             db.isolation = opts.isolation.as_str(),
             db.tx.attempts = tracing::field::Empty,
         );
@@ -3949,6 +3949,14 @@ impl std::fmt::Display for RouteKey {
     }
 }
 
+/// The OpenTelemetry `db.system` value of the runtime backend. The `sqlite`
+/// feature makes the whole runtime `SQLite`.
+const DB_SYSTEM: &str = if cfg!(feature = "sqlite") {
+    "sqlite"
+} else {
+    "postgresql"
+};
+
 /// Everything required to check out and instrument a pooled connection.
 ///
 /// Shared by the plain [`Db`] extractor and shard-routed checkouts so that
@@ -4063,13 +4071,13 @@ impl Db {
         // Span covers the full time the connection is held — from
         // checkout through the end of the request — rather than just
         // `pool.get()`. Dropping `Db` closes the span, so span duration
-        // reflects real connection hold time and `db.system=postgresql`
-        // propagates to any query futures handlers instrument with
-        // `db.span()`.
+        // reflects real connection hold time and `db.system` propagates to
+        // any query futures handlers instrument with `db.span()`.
         let span = tracing::info_span!(
             "db.connection",
             otel.kind = "client",
-            db.system = "postgresql",
+            db.system = DB_SYSTEM,
+            db.pool = params.pool_name,
             db.shard = tracing::field::Empty,
         );
         if let Some(shard) = params.shard {
@@ -4498,10 +4506,10 @@ impl Drop for Db {
             // `run_instrumented`. The accumulator must reflect genuine
             // instrumented queries only.
 
-            // A long hold is not one query (Pigeonhole FINDINGS 1): it covers
-            // all work while the handler held the connection, for example a
-            // fan-out. So it gets its own message and no `sql` field. Inside
-            // the span, so the log shows the pool and the shard.
+            // A long hold is not one query (Pigeonhole FINDINGS 1). It covers
+            // all work in the hold, for example a fan-out. So it has its own
+            // message and no `sql` field. Enter the span so that the log shows
+            // the pool and the shard (`db.pool`, `db.shard`).
             if elapsed >= self.slow_query_threshold {
                 let _entered = self.span.enter();
                 tracing::warn!(
@@ -4729,6 +4737,17 @@ mod tests {
         assert_eq!(event.fields["route"], "POST /census");
         assert_eq!(event.fields["held_ms"], 6653);
         assert!(!event.fields.contains_key("sql"), "{event:?}");
+    }
+
+    /// Spans name the backend that runs. A `SQLite` fleet said `postgresql`.
+    #[test]
+    fn db_system_names_the_runtime_backend() {
+        let expected = if cfg!(feature = "sqlite") {
+            "sqlite"
+        } else {
+            "postgresql"
+        };
+        assert_eq!(super::DB_SYSTEM, expected);
     }
 
     /// A hold under the threshold logs nothing.
@@ -6924,7 +6943,7 @@ mod tests {
     }
 
     /// A composed key (a shard-tagged label, an unmatched path) is written
-    /// verbatim into both the metric key and the slow-query `route` field.
+    /// verbatim into both the metric key and the held-connection `route` field.
     #[test]
     fn route_key_composed_writes_verbatim() {
         let key = RouteKey::Composed("GET /notes shard=shard0".to_owned());

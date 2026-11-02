@@ -129,11 +129,10 @@ apart.
 **every database on disk**, opening each. Use them on admin paths, not hot
 paths.
 
-A handler that holds a `Db` past `slow_query_threshold` logs
-`database connection held past slow_query_threshold` with `held_ms`. The
-time covers all work while the handler held the connection, not one
-statement. A fan-out does not need the control connection. Take `LazyDb` and
-check out after the fan-out.
+When a handler holds a `Db` past `database.slow_query_threshold`, Autumn
+logs `database connection held past slow_query_threshold` with `held_ms`.
+The time covers all work in the hold, not one statement. For a fan-out, take
+`LazyDb`. Call `checkout()` after the fan-out.
 
 ## Provisioning, deletion, backup
 
@@ -354,9 +353,9 @@ on this app: it applies `migrations/` to the control database. Use
   database. Size the open-file limit (`ulimit -n`) for the peak open count
   under a burst, not for `max_open`. The default limit on macOS is 256: 594
   open databases go past it.
-- The boot warning (at `max_connections_warn_threshold`, default 100
-  connections) gives the open files at `max_open`:
-  `2 × connections + databases`, the control database included.
+- When connections reach `database.max_connections_warn_threshold`
+  (default 100), the boot warning gives the open files at `max_open`. The
+  formula is `2 × connections + databases`. It counts the control database.
 - Metrics label every fleet database `shard=fleet`; the database name goes on
   spans and logs only, so a tenant fleet cannot explode metric cardinality.
 
