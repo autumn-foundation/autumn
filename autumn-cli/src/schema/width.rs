@@ -638,7 +638,9 @@ pub fn replay_migration_set(steps: &[(PathBuf, String)]) -> Vec<TableWidth> {
         .tables
         .into_iter()
         .map(|(table, (columns, path))| TableWidth {
-            physical: table.rsplit('.').next().unwrap_or(&table).to_owned(),
+            // The replay key: schema kept, `public.` dropped, so `a.users`
+            // and `b.users` stay two tables when matched to declarations.
+            physical: table.clone(),
             package: PathBuf::new(),
             table,
             columns: columns.len(),
@@ -670,11 +672,19 @@ fn table_macro_tables(tokens: proc_macro2::TokenStream) -> Vec<MacroTable> {
     use proc_macro2::{Delimiter, Spacing, TokenTree};
 
     let mut out = Vec::new();
-    let mut last_ident: Option<String> = None;
+    // `b.users` is the path `["b", "users"]`; a bare `users` is one segment.
+    let mut path: Vec<String> = Vec::new();
+    let mut prev_dot = false;
     let mut sql_name: Option<String> = None;
     for tree in tokens {
+        let is_dot = matches!(&tree, TokenTree::Punct(p) if p.as_char() == '.');
         match tree {
-            TokenTree::Ident(ident) => last_ident = Some(ident.to_string()),
+            TokenTree::Ident(ident) => {
+                if !prev_dot {
+                    path.clear();
+                }
+                path.push(ident.to_string().trim_start_matches("r#").to_owned());
+            }
             // `#[sql_name = "wide"]` before the table: the physical name.
             TokenTree::Group(group) if group.delimiter() == Delimiter::Bracket => {
                 let inner: Vec<TokenTree> = group.stream().into_iter().collect();
@@ -703,24 +713,33 @@ fn table_macro_tables(tokens: proc_macro2::TokenStream) -> Vec<MacroTable> {
                         TokenTree::Punct(p) if p.as_char() == '-' && p.spacing() == Spacing::Joint
                     );
                 }
-                if let Some(name) = last_ident.take() {
-                    let name = name.trim_start_matches("r#").to_owned();
+                if let Some((name, schema)) = path.split_last() {
+                    let table = sql_name.take().unwrap_or_else(|| name.clone());
+                    // Same key shape as the migration replay: the schema
+                    // stays, `public` goes.
+                    let physical = match schema {
+                        [] => table,
+                        [s] if s == "public" => table,
+                        _ => format!("{}.{table}", schema.join(".")),
+                    };
                     out.push(MacroTable {
-                        physical: sql_name.take().unwrap_or_else(|| name.clone()),
-                        name,
+                        name: name.clone(),
+                        physical,
                         columns,
                     });
                 }
+                path.clear();
                 sql_name = None;
             }
             // The `(pk)` group leaves the name alone; `;` (after a `use`
             // line) resets it.
             TokenTree::Punct(p) if p.as_char() == ';' => {
-                last_ident = None;
+                path.clear();
                 sql_name = None;
             }
             _ => {}
         }
+        prev_dot = is_dot;
     }
     out
 }
@@ -1506,6 +1525,40 @@ mod tests {
         assert!(
             report.over(DIESEL_DEFAULT_COLUMN_LIMIT).is_empty(),
             "{report:?}"
+        );
+    }
+
+    #[test]
+    fn a_declaration_in_one_schema_does_not_cover_another() {
+        let cols: Vec<String> = (0..33).map(|i| format!("c{i} TEXT")).collect();
+        let sql = format!(
+            "CREATE TABLE a.users ({}); CREATE TABLE b.users (id INT);",
+            cols.join(", ")
+        );
+        let only_b = "diesel::table! { b.users (id) { id -> Int4, } }";
+        let report = report_of(&sql, &[("schema.rs", only_b)]);
+        let over = report.over(DIESEL_DEFAULT_COLUMN_LIMIT);
+        assert_eq!(over.len(), 1, "{report:?}");
+        assert_eq!(over[0].table, "a.users");
+
+        // Declaring `a.users` (and `public.x` / bare `x` agreeing) clears it.
+        let both = format!(
+            "{only_b}\n{}\n{}",
+            "diesel::table! { a.users (c0) { c0 -> Text, } }",
+            "diesel::table! { #[sql_name = \"users\"] a.users_ext (c1) { c1 -> Text, } }"
+        );
+        let report = report_of(&sql, &[("schema.rs", &both)]);
+        assert!(
+            report.over(DIESEL_DEFAULT_COLUMN_LIMIT).is_empty(),
+            "{report:?}"
+        );
+        let public = report_of(
+            &wide_create("public.p", 33),
+            &[("schema.rs", "diesel::table! { p (c0) { c0 -> Text, } }")],
+        );
+        assert!(
+            public.over(DIESEL_DEFAULT_COLUMN_LIMIT).is_empty(),
+            "{public:?}"
         );
     }
 
