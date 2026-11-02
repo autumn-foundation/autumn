@@ -5546,11 +5546,13 @@ impl AutumnConfig {
         let mut config: Self = toml::from_str(&toml_str)?;
         config.profile = Some(profile);
 
+        // An unknown `AUTUMN_ROLE` fails the load, as a bad TOML `role` does
+        // (#3541). It must not boot as `combined`. Check it before the
+        // overrides, so the load error comes without their warning.
+        Self::role_env_override(env)?;
+
         // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
-        // An unknown `AUTUMN_ROLE` fails the load, as a bad TOML `role` does
-        // (#3541). It must not boot as `combined`.
-        Self::role_env_override(env)?;
 
         // Env overrides already applied `AUTUMN_SERVER__STRICT_CONFIG`.
         if config.server.strict_config {
@@ -6180,8 +6182,9 @@ impl AutumnConfig {
 
     /// Apply environment overrides using the provided env abstraction.
     ///
-    /// This does not validate. An unknown `AUTUMN_ROLE` leaves `role` as it
-    /// is. The loaders, such as [`load_with_env`](Self::load_with_env), reject it.
+    /// This does not fail. An unknown `AUTUMN_ROLE` leaves `role` as it is and
+    /// prints a warning. The loaders, such as
+    /// [`load_with_env`](Self::load_with_env), reject it.
     pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
         self.apply_server_env_overrides_with_env(env);
         self.apply_deploy_env_overrides_with_env(env);
@@ -7509,12 +7512,14 @@ impl AutumnConfig {
         );
     }
 
-    /// Set `role` from `AUTUMN_ROLE`. A blank or unknown value leaves it.
-    /// [`role_env_override`](Self::role_env_override) rejects the unknown value
-    /// at load.
+    /// Set `role` from `AUTUMN_ROLE`. A blank value leaves it. An unknown
+    /// value leaves it and prints a warning. The loaders reject that value
+    /// before they get here.
     fn apply_role_env_overrides_with_env(&mut self, env: &dyn Env) {
-        if let Ok(Some(role)) = Self::role_env_override(env) {
-            self.role = role;
+        match Self::role_env_override(env) {
+            Ok(Some(role)) => self.role = role,
+            Ok(None) => {}
+            Err(err) => eprintln!("Warning: {err}; role not changed"),
         }
     }
 

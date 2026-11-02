@@ -14,8 +14,8 @@
   `ProcessRole::ACCEPTED_VALUES`, `ProcessRole::parse_env_override` and
   `config::ParseProcessRoleError`.
 - **config:** `AutumnConfig::apply_env_overrides` and
-  `apply_env_overrides_with_env` do not print a warning for an unknown
-  `AUTUMN_ROLE`. They leave `role` as it is. The loaders reject the value.
+  `apply_env_overrides_with_env` do not fail. For an unknown `AUTUMN_ROLE`
+  they print a warning and leave `role` as it is. The loaders reject it.
 - **doctor:** `autumn doctor` fails the `process_role_backend` row on an
   unknown `AUTUMN_ROLE` or `role`, with the boot error text. It reads
   `AUTUMN_ROLE` and `AUTUMN_JOBS__BACKEND` from `.env` too, as the app does.

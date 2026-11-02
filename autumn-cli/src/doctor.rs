@@ -6390,6 +6390,20 @@ where
         Some(toml::Value::String(value)) => value
             .parse::<ProcessRole>()
             .map_err(|err| format!("role: {err}"))?,
+        // serde's table form of a unit variant, `role = { web = {} }`. The
+        // loader accepts it too.
+        Some(toml::Value::Table(table))
+            if table.len() == 1
+                && table
+                    .values()
+                    .all(|v| v.as_table().is_some_and(toml::Table::is_empty)) =>
+        {
+            table
+                .keys()
+                .next()
+                .map_or(Ok(ProcessRole::Combined), |name| name.parse())
+                .map_err(|err| format!("role: {err}"))?
+        }
         Some(other) => {
             return Err(format!(
                 "role: expected a string, found {}",
@@ -20639,6 +20653,22 @@ foo = "bar"
                 "{source}"
             );
         }
+    }
+
+    /// #3541: doctor accepts the table form of `role`, as the loader does.
+    #[test]
+    fn resolve_process_role_accepts_table_form() {
+        let source = "role = { web = {} }\n";
+        let loaded: autumn_web::config::AutumnConfig =
+            toml::from_str(source).expect("loader accepts the table form");
+        let table: toml::Table = toml::from_str(source).expect("parse toml");
+        let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+        assert_eq!(role, Ok(loaded.role));
+        assert_eq!(role, Ok(ProcessRole::Web));
+
+        let table: toml::Table = toml::from_str("role = { wrker = {} }\n").expect("parse toml");
+        let (role, _) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+        assert!(role.expect_err("unknown").contains("\"wrker\""));
     }
 
     /// #3541: boot parses the TOML `role` first. A bad one fails even when

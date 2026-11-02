@@ -497,6 +497,11 @@ configuration error: AUTUMN_ROLE: unknown process role "workers" (accepted: comb
 The app does not boot. Set a valid value, or remove the variable to get
 `combined`. An empty `AUTUMN_ROLE=` is still unset.
 
+The `autumn` CLI commands that load the config also read `AUTUMN_ROLE`. Some
+of them do not show the load error. For example, `autumn migrate` can then
+report "No database URL found". If a CLI command fails in this way, examine
+`AUTUMN_ROLE` in your shell.
+
 **Automation:** `manual` — the fix is in the deployment env, not in code.
 
 ## Plugin authors

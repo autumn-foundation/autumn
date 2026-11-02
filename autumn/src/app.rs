@@ -9728,8 +9728,9 @@ pub(crate) fn framework_retention_mode_from_env() -> Option<FrameworkRetentionMo
             // Warn and fall through to a normal boot rather than exiting.
             // This var is read on *every* start, so exiting here would let a
             // stray value in a wrapping script or a shared environment take a
-            // production app down at boot. Mirrors `AUTUMN_ROLE`'s handling
-            // of an unrecognized value.
+            // production app down at boot. `AUTUMN_ROLE` is different: an
+            // unknown role stops the boot (#3541), because a wrong role runs
+            // the wrong work.
             eprintln!(
                 "Warning: {FRAMEWORK_RETENTION_ENV}={other:?} is not valid (expected \"report\" \
                  or \"purge\"), ignoring"
