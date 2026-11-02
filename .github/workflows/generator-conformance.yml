@@ -243,7 +243,12 @@ jobs:
     # budget (per recent run history), and these new steps average ~2 min
     # each, so the old budget would have started failing on timeout rather
     # than on a real regression.
-    timeout-minutes: 150
+    # 150 -> 210: by 2026-11 the 1.88.0 leg had 58 steps (median 2.35 min,
+    # 146.7 min of steps). On trunk-dev it ran 1h55m-2h23m, and on #3560 it
+    # was cancelled at 150 min once, then passed in 2h26m on a re-run. 210
+    # gives ~40% headroom over the slowest observed run; a wedged app still
+    # fails long before GitHub's 360-minute default.
+    timeout-minutes: 210
     env:
       # The generated projects build with line tables only, not full debug
       # info. With full debug info, the `cargo test` link of an attachment
