@@ -735,7 +735,7 @@ struct PendingCall {
 /// The answer of a claim that outlived its time limit.
 struct LateClaim {
     answer: tokio::sync::oneshot::Receiver<Result<Grant, OwnershipError>>,
-    /// Same as a claim that ended in time.
+    /// Local lease end: send time + lease - renew interval.
     valid_until: tokio::time::Instant,
 }
 
@@ -889,6 +889,9 @@ impl FleetOwnership {
     /// A range whose store call is slow fails alone: the other ranges still
     /// renew. The report keeps the order of the configured ranges. The order
     /// of the epochs between ranges is not fixed.
+    ///
+    /// A claim that ends late is kept. The next refresh renews it, so the
+    /// report lists it as `renewed`, not `claimed`.
     pub async fn refresh(&self) -> RefreshReport {
         let calls = self
             .ranges
@@ -1021,9 +1024,9 @@ impl FleetOwnership {
         }
     }
 
-    /// Read the answer of a claim that ended after its time limit, and hold
-    /// the grant. Its local lease is already over, so the range is not served
-    /// until a renew. `release_all` can still release it.
+    /// Read the answer of a claim that ended late, and hold the grant. The
+    /// lease end counts from the send time, so it is never later than the
+    /// store's. `release_all` releases the grant. This also clears the slot.
     fn settle_late(
         &self,
         range: SlotRange,
@@ -1038,6 +1041,7 @@ impl FleetOwnership {
             slot.take().and_then(|call| call.late)
         };
         let Some(mut late) = late else { return };
+        // A late error or a closed channel is a failed claim: nothing to keep.
         if let Ok(Ok(grant)) = late.answer.try_recv() {
             tracing::info!(range = %range, epoch = %grant.epoch, "fleet slot claim ended late; kept");
             self.accept(range, grant, floor, late.valid_until, false);
@@ -1119,8 +1123,9 @@ impl FleetOwnership {
         range.is_some()
     }
 
-    /// Release every held range, so another host can claim it at once. Call
-    /// it after the fleet closed its databases.
+    /// Release every held range, so another host can claim it at once. A
+    /// claim that ended late is released too. Call it after the fleet closed
+    /// its databases.
     pub async fn release_all(&self) {
         for ((&range, floor), pending) in self
             .ranges
@@ -1955,14 +1960,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (stuck, a, late) = late_claim(dir.path()).await;
         assert!(!a.unsettled(), "the call ended");
+        let b = FleetOwnership::new(stuck.clone(), owner("b"), vec![late], TTL).unwrap();
+        assert_eq!(b.refresh().await.waiting, vec![late], "the store holds it");
         a.release_all().await;
         assert!(a.held().is_empty());
-        let b = FleetOwnership::new(stuck.clone(), owner("b"), vec![late], TTL).unwrap();
         assert_eq!(b.refresh().await.claimed.len(), 1, "claimable at once");
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_claim_that_ends_late_is_never_served_but_is_renewed() {
+    async fn a_claim_that_ends_late_is_renewed_not_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
         let (_stuck, a, late) = late_claim(dir.path()).await;
         let report = a.refresh().await;
@@ -1972,13 +1978,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_late_grant_does_not_serve_before_a_renew() {
+    async fn a_late_grant_is_served_only_until_its_lease_end() {
         let dir = tempfile::tempdir().unwrap();
         let (stuck, a, late) = late_claim(dir.path()).await;
-        // Stuck again, so no renew can make the lease valid.
+        // Stuck again. The lease end counts from the send time, so it passes
+        // while the renew hangs.
         stuck.stuck.lock().unwrap().push(late);
         let _ = a.refresh().await;
-        assert_eq!(a.epoch_for(3), None, "the local lease had run out");
+        assert_eq!(a.epoch_for(3), None, "the lease end passed");
         assert!(
             a.held().iter().any(|(r, _)| *r == late),
             "but the grant is known"
@@ -1996,6 +2003,7 @@ mod tests {
         assert_eq!(report.failed.len(), 1);
         stuck.stuck.lock().unwrap().clear();
         tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!a.unsettled(), "the call ended");
         assert_eq!(a.held(), before, "a late renew changes nothing here");
         let report = a.refresh().await;
         assert_eq!(report.renewed.len(), 2);
