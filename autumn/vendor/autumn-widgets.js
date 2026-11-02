@@ -1008,6 +1008,44 @@
   // A history restore (hx-boost, Back) brings back nodes without listeners.
   document.addEventListener('htmx:historyRestore', function () { initAll(document); });
 
+  // Busy state (#3406). Mark this request's [data-autumn-busy] requester,
+  // submitter and indicators, and its target. Indicators resolve as htmx
+  // does: the inherited hx-indicator, else the requester.
+  var busyCount = new WeakMap();
+  function indicatorsOf(elt) {
+    var host = elt.closest('[hx-indicator],[data-hx-indicator]');
+    if (!host) return [elt];
+    var sel = host.getAttribute('hx-indicator') || host.getAttribute('data-hx-indicator');
+    return sel.split(',').reduce(function (all, s) {
+      s = s.trim();
+      var one = s === 'this' ? host : s.indexOf('closest ') === 0 ? elt.closest(s.slice(8))
+        : s.indexOf('find ') === 0 ? elt.querySelector(s.slice(5)) : null;
+      return all.concat(one ? [one] : /^(closest|find) /.test(s) ? [] : Array.from(document.querySelectorAll(s)));
+    }, []);
+  }
+  document.addEventListener('htmx:beforeSend', function (e) {
+    var d = e.detail, ev = (d.requestConfig || {}).triggeringEvent;
+    var els = [e.target, ev && ev.submitter].filter(function (el) {
+      return el && el.matches && el.matches('[data-autumn-busy]');
+    }).concat(indicatorsOf(e.target).filter(function (el) { return el.matches('[data-autumn-busy]'); }));
+    if (els.length && d.target) els.push(d.target);
+    els = els.filter(function (el, i) {
+      return els.indexOf(el) === i && (busyCount.has(el) || !el.hasAttribute('aria-busy'));
+    });
+    els.forEach(function (el) {
+      busyCount.set(el, (busyCount.get(el) || 0) + 1);
+      el.setAttribute('aria-busy', 'true');
+    });
+    d.xhr.addEventListener('loadend', function () {
+      els.forEach(function (el) {
+        var n = busyCount.get(el) - 1;
+        if (n > 0) return busyCount.set(el, n);
+        busyCount.delete(el);
+        el.removeAttribute('aria-busy');
+      });
+    });
+  });
+
   // htmx puts the response's `class` back after afterSwap (its settle step).
   // That can drop the enhanced classes and move the tab highlight. Apply
   // them again from state that settle keeps: the init guard and aria-selected.

@@ -168,15 +168,16 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 44 KiB |
-| `autumn-widgets.js`, gzip level 9 | 13 KiB |
+| `autumn-widgets.js`, raw | 45 KiB |
+| `autumn-widgets.js`, gzip level 9 | 14 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
 above the budget. Raise the budget only with a reason in the PR. Issue
 #3399 added the toast runtime. It increased the budgets from 32 KiB and
 10 KiB. Issue #3404 added the tooltip runtime, next to the #3403 drawer.
 Issue #3402 added the popover menu runtime. Together they increased them from
-36 KiB and 11 KiB.
+36 KiB and 11 KiB. Issue #3406 added the busy state for htmx requests. It
+increased them from 44 KiB and 13 KiB.
 
 ## Tests
 

@@ -972,3 +972,139 @@ async fn keyboard_tooltip() {
     .await;
     page.expect_no_console_errors().await.expect("no errors");
 }
+
+/// The busy state (#3406). Enter sends the htmx request. While it runs, the
+/// button has `aria-busy="true"` and shows its spinner. The label is
+/// transparent, not removed, so it stays the name. After the response,
+/// `aria-busy` goes and focus stays on the button.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_button() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/button").await;
+    // The button sends the request, then it submits the form that sends it.
+    for (button, status) in [
+        ("story-save", "story-save-status"),
+        ("story-publish", "story-publish-status"),
+    ] {
+        check_busy_button(&page, button, status).await;
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// Press Enter on `#button` and check the busy state while the request
+/// runs: the button and the swap target have `aria-busy="true"`, the
+/// spinner shows, and the label is transparent but keeps its text. After
+/// the response, `aria-busy` goes and focus stays on the button.
+///
+/// `Page::press` waits for htmx to settle, so the test cannot read the page
+/// during the request. A `MutationObserver` in the page records the busy
+/// state when it happens.
+async fn check_busy_button(page: &Page, button: &str, status: &str) {
+    let state = |busy: bool| {
+        format!(
+            "(() => {{ const b = document.getElementById({button:?}); \
+             const s = document.getElementById({status:?}); \
+             const spin = getComputedStyle(b.querySelector('.autumn-button__spinner')).display; \
+             const label = b.querySelector('.autumn-button__label'); \
+             return {busy} \
+               ? b.getAttribute('aria-busy') === 'true' && s.getAttribute('aria-busy') === 'true' \
+                 && spin === 'block' && getComputedStyle(label).opacity === '0' \
+                 && label.textContent === b.id.replace('story-', '').replace(/^./, c => c.toUpperCase()) \
+               : !b.hasAttribute('aria-busy') && !s.hasAttribute('aria-busy') && spin === 'none'; }})()"
+        )
+    };
+    assert!(
+        eval_bool(page, &state(false)).await,
+        "#{button} is busy at rest"
+    );
+    assert!(
+        eval_bool(
+            page,
+            &format!(
+                "(() => {{ window.__busySeen = false; \
+                 const check = () => {{ if ({}) window.__busySeen = true; }}; \
+                 new MutationObserver(check).observe(document.body, \
+                   {{ attributes: true, subtree: true, attributeFilter: ['aria-busy', 'class'] }}); \
+                 return true; }})()",
+                state(true)
+            ),
+        )
+        .await,
+        "could not watch #{button}"
+    );
+    focus(page, &format!("#{button}")).await;
+    press(page, "Enter").await;
+    wait_for(
+        page,
+        &format!("document.getElementById({status:?}).textContent.includes('Saved.')"),
+    )
+    .await;
+    assert!(
+        eval_bool(page, "window.__busySeen === true").await,
+        "#{button} never showed the busy state during the request"
+    );
+    wait_for(page, &state(false)).await;
+    assert_eq!(active_id(page).await, button, "focus left #{button}");
+}
+
+/// An `hx-indicator` skeleton or spinner (#3406) is hidden at rest, shows
+/// while the request runs, and hides again after the response.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn display_set_indicators_show_only_during_a_request() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    for (path, trigger, indicator, result) in [
+        (
+            "/_stories/skeleton",
+            "Reload",
+            "#story-skeleton",
+            "#story-skeleton-result",
+        ),
+        (
+            "/_stories/spinner",
+            "Load",
+            "#story-spinner",
+            "#story-spinner-status",
+        ),
+    ] {
+        // A spinner indicator keeps its root. Its content shows and hides.
+        let indicator = &if indicator.contains("spinner") {
+            format!("{indicator} > :first-child")
+        } else {
+            indicator.to_owned()
+        };
+        open(&page, path).await;
+        assert!(!shown(&page, indicator).await, "{indicator} shows at rest");
+        assert!(
+            eval_bool(
+                &page,
+                &format!(
+                    "(() => {{ const b = Array.from(document.querySelectorAll('.autumn-button')) \
+                     .find(b => b.textContent.trim() === {trigger:?}); \
+                     if (!b) return false; b.click(); return true; }})()"
+                ),
+            )
+            .await,
+            "no {trigger} button on {path}"
+        );
+        wait_for(
+            &page,
+            &format!("getComputedStyle(document.querySelector({indicator:?})).display !== 'none'"),
+        )
+        .await;
+        wait_for(
+            &page,
+            &format!("document.querySelector({result:?}).textContent.includes('Saved.')"),
+        )
+        .await;
+        wait_for(
+            &page,
+            &format!("getComputedStyle(document.querySelector({indicator:?})).display === 'none'"),
+        )
+        .await;
+    }
+    page.expect_no_console_errors().await.expect("no errors");
+}
