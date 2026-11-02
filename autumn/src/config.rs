@@ -3531,6 +3531,33 @@ impl std::str::FromStr for ProcessRole {
     }
 }
 
+/// The `Deserialize` visitor for [`ProcessRole`]. A string or a unit enum
+/// variant goes through [`FromStr`](std::str::FromStr).
+struct ProcessRoleVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ProcessRoleVisitor {
+    type Value = ProcessRole;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a process role string")
+    }
+
+    /// For a format that gives an enum as a plain string.
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<ProcessRole, E> {
+        value.parse().map_err(E::custom)
+    }
+
+    fn visit_enum<A>(self, data: A) -> Result<ProcessRole, A::Error>
+    where
+        A: serde::de::EnumAccess<'de>,
+    {
+        use serde::de::{Error as _, VariantAccess as _};
+        let (name, variant): (String, _) = data.variant()?;
+        variant.unit_variant()?;
+        name.parse().map_err(A::Error::custom)
+    }
+}
+
 impl<'de> Deserialize<'de> for ProcessRole {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -3539,33 +3566,9 @@ impl<'de> Deserialize<'de> for ProcessRole {
         /// Canonical names. The schema walker probes with the first one.
         const VARIANTS: &[&str] = &["combined", "web", "worker"];
 
-        struct RoleVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for RoleVisitor {
-            type Value = ProcessRole;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a process role string")
-            }
-
-            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<ProcessRole, E> {
-                value.parse().map_err(E::custom)
-            }
-
-            fn visit_enum<A>(self, data: A) -> Result<ProcessRole, A::Error>
-            where
-                A: serde::de::EnumAccess<'de>,
-            {
-                use serde::de::{Error as _, VariantAccess as _};
-                let (name, variant): (String, _) = data.variant()?;
-                variant.unit_variant()?;
-                name.parse().map_err(A::Error::custom)
-            }
-        }
-
         // `deserialize_enum`, not `deserialize_str`: the strict-config schema
         // walker gives a real variant name only through this path.
-        deserializer.deserialize_enum("ProcessRole", VARIANTS, RoleVisitor)
+        deserializer.deserialize_enum("ProcessRole", VARIANTS, ProcessRoleVisitor)
     }
 }
 
@@ -23866,6 +23869,28 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
     #[test]
     fn toml_blank_role_is_an_error() {
         assert!(toml::from_str::<AutumnConfig>("role = \"\"\n").is_err());
+    }
+
+    /// Each path of the `role` visitor: a plain string, a unit variant, and
+    /// the text for a wrong type.
+    #[test]
+    fn process_role_visitor_paths() {
+        use serde::de::Visitor as _;
+        let role = ProcessRoleVisitor
+            .visit_str::<serde::de::value::Error>(" jobs ")
+            .expect("plain string");
+        assert_eq!(role, ProcessRole::Worker);
+        let err = ProcessRoleVisitor
+            .visit_str::<serde::de::value::Error>("workers")
+            .expect_err("unknown");
+        assert!(err.to_string().contains("\"workers\""), "{err}");
+
+        assert_eq!(
+            serde_json::from_str::<ProcessRole>("\"server\"").expect("json string"),
+            ProcessRole::Web
+        );
+        let expected = &ProcessRoleVisitor as &dyn serde::de::Expected;
+        assert_eq!(expected.to_string(), "a process role string");
     }
 
     /// The custom `role` parser must not stop the strict-config schema walk.
