@@ -848,6 +848,12 @@ mod conformance_tests {
 }
 ```
 
+A plugin that mounts no routes (a cache, a background runtime) calls
+`ConformanceConfig::new(..).no_routes()`. This is the library form of
+`autumn plugin-check --no-routes`: no attributed route skips
+`route-attribution`, and an attributed route fails it. Do not set a `prefix`
+with `no_routes`; the two contradict each other, and `route-prefix` fails.
+
 ### 3. Publishing checklist
 
 Work through this list, then publish and submit for listing:

@@ -54,6 +54,10 @@ pub struct ConformanceConfig {
     /// one. Drives the `experimental-surface` check; without it that check is
     /// skipped rather than assumed clean.
     pub contract: Option<PluginContract>,
+    /// The plugin mounts no routes, like `autumn plugin-check --no-routes`.
+    /// Then no attributed route skips `route-attribution`, and an attributed
+    /// route fails it.
+    pub no_routes: bool,
 }
 
 impl ConformanceConfig {
@@ -65,7 +69,18 @@ impl ConformanceConfig {
             intentional_root_routes: Vec::new(),
             sensitive_routes: Vec::new(),
             contract: None,
+            no_routes: false,
         }
+    }
+
+    /// Declare that the plugin mounts no routes (a cache, a background
+    /// runtime). This is the library form of `autumn plugin-check --no-routes`.
+    ///
+    /// Without it, a report with no attributed route fails `route-attribution`.
+    #[must_use]
+    pub const fn no_routes(mut self) -> Self {
+        self.no_routes = true;
+        self
     }
 
     /// Attach the plugin's declared contract so the `experimental-surface`
@@ -322,6 +337,36 @@ pub fn check_route_attribution(plugin_name: &str, routes: &[RouteInfo]) -> Check
             plugin_routes.len()
         ),
         diagnostics: vec![],
+    }
+}
+
+/// `route-attribution` for a plugin that declares
+/// [`no_routes`](ConformanceConfig::no_routes), the same rule as
+/// `autumn plugin-check --no-routes`: no attributed route skips, and an
+/// attributed route fails, because it contradicts the declaration.
+fn check_no_routes(plugin_name: &str, routes: &[RouteInfo]) -> CheckResult {
+    let attributed = routes
+        .iter()
+        .filter(|r| matches!(&r.source, RouteSource::Plugin(n) if n == plugin_name))
+        .count();
+
+    if attributed == 0 {
+        CheckResult {
+            name: "route-attribution".to_owned(),
+            status: CheckStatus::Skip,
+            message: format!("{plugin_name} declares no_routes and contributes no routes"),
+            diagnostics: vec![],
+        }
+    } else {
+        CheckResult {
+            name: "route-attribution".to_owned(),
+            status: CheckStatus::Fail,
+            message: format!(
+                "no_routes was declared, but {attributed} route(s) are attributed to \
+                 plugin:{plugin_name}"
+            ),
+            diagnostics: vec![],
+        }
     }
 }
 
@@ -737,15 +782,32 @@ pub fn check_experimental_surface(contract: Option<&PluginContract>) -> CheckRes
 pub fn run_conformance(config: &ConformanceConfig, routes: &[RouteInfo]) -> ConformanceReport {
     let mut checks = Vec::new();
 
-    checks.push(check_route_attribution(&config.plugin_name, routes));
+    if config.no_routes {
+        checks.push(check_no_routes(&config.plugin_name, routes));
+    } else {
+        checks.push(check_route_attribution(&config.plugin_name, routes));
+    }
 
     if let Some(ref prefix) = config.expected_prefix {
-        checks.push(check_route_prefix(
-            &config.plugin_name,
-            prefix,
-            &config.intentional_root_routes,
-            routes,
-        ));
+        checks.push(if config.no_routes {
+            // The same rule as a plugin index listing: a prefix for no routes
+            // is a contradiction, not a check that passes on nothing.
+            CheckResult {
+                name: "route-prefix".to_owned(),
+                status: CheckStatus::Fail,
+                message: format!(
+                    "no_routes and the prefix {prefix} contradict each other; set one of them"
+                ),
+                diagnostics: vec![],
+            }
+        } else {
+            check_route_prefix(
+                &config.plugin_name,
+                prefix,
+                &config.intentional_root_routes,
+                routes,
+            )
+        });
     }
 
     let (collision_check, _) = check_collisions(routes);
@@ -1277,6 +1339,71 @@ mod tests {
         let config = ConformanceConfig::new("my-plugin");
         let report = run_conformance(&config, &[]);
         assert_eq!(report.plugin_name, "my-plugin");
+    }
+
+    #[test]
+    fn run_conformance_no_routes_skips_attribution_when_none() {
+        let routes = vec![make_route("GET", "/posts", RouteSource::User)];
+        let config = ConformanceConfig::new("cache").no_routes();
+        let report = run_conformance(&config, &routes);
+        let attribution = report
+            .checks
+            .iter()
+            .find(|c| c.name == "route-attribution")
+            .expect("route-attribution check runs");
+        assert_eq!(
+            attribution.status,
+            CheckStatus::Skip,
+            "{}",
+            attribution.message
+        );
+        assert!(
+            report.passed(),
+            "a plugin that declares no routes and mounts none passes:\n{}",
+            report.to_text_report()
+        );
+    }
+
+    #[test]
+    fn run_conformance_no_routes_fails_when_plugin_mounts_routes() {
+        let routes = vec![make_route("GET", "/cache/stats", plugin("cache"))];
+        let config = ConformanceConfig::new("cache").no_routes();
+        let report = run_conformance(&config, &routes);
+        let attribution = report
+            .checks
+            .iter()
+            .find(|c| c.name == "route-attribution")
+            .expect("route-attribution check runs");
+        assert_eq!(attribution.status, CheckStatus::Fail);
+        assert!(
+            attribution.message.contains("no_routes") && attribution.message.contains('1'),
+            "message names the setting and the count: {}",
+            attribution.message
+        );
+        assert!(!report.passed());
+    }
+
+    #[test]
+    fn run_conformance_no_routes_and_prefix_contradict() {
+        let config = ConformanceConfig::new("cache").no_routes().prefix("/cache");
+        let report = run_conformance(&config, &[]);
+        let prefix = report
+            .checks
+            .iter()
+            .find(|c| c.name == "route-prefix")
+            .expect("route-prefix check runs when a prefix is set");
+        assert_eq!(prefix.status, CheckStatus::Fail, "{}", prefix.message);
+        assert!(!report.passed());
+    }
+
+    #[test]
+    fn run_conformance_without_no_routes_still_fails_on_no_routes() {
+        let config = ConformanceConfig::new("cache");
+        let report = run_conformance(&config, &[]);
+        assert!(
+            !report.passed(),
+            "the default stays fail-closed when no route is attributed"
+        );
     }
 
     #[test]
