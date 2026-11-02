@@ -214,6 +214,18 @@ my-app/
 > changed action on an existing foreign key. If the database already has the
 > action, declare it on the model. See `docs/guide/declarative-schema.md`.
 
+> **Keep every Diesel `table!` and `#[model]` at 32 columns or fewer.** A 33rd
+> column in one declaration forces diesel's `64-column-tables` feature, and
+> Cargo turns it on for the whole build: every crate that uses diesel then
+> compiles slower and needs more memory (one crate measured 1.16 GB / 1m18s at
+> 32, 2.92 GB / 2m04s at 64 and 9.95 GB / 8m16s at 128). The cap is per
+> declaration, not per database table: declare a wide table in halves, the
+> second with `#[sql_name = "<table>"]`, and put each `#[model(table = …)]` on
+> one half. Every `NOT NULL` column without a default goes in the half you
+> insert through. `autumn build` warns about a wide declaration but does not
+> fail. `autumn schema width` lists them and exits non-zero. See
+> `docs/guide/table-width.md`.
+
 ## Cargo.toml
 
 ```toml

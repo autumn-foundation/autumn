@@ -19,6 +19,7 @@ pub mod rename;
 pub mod schema_rs;
 pub mod shadow;
 pub mod snapshot;
+pub mod width;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -173,6 +174,28 @@ pub enum SchemaAction {
         #[arg(long)]
         json: bool,
     },
+    /// Report every Diesel declaration wider than Diesel's default 32-column
+    /// tuple cap, and exit non-zero when there is one.
+    ///
+    /// Reads every `diesel::table!` block and every `#[model]` struct under
+    /// PATH, replays the migration sets (each `up.sql` in version order), and
+    /// asks cargo whether diesel resolves with `64-column-tables` or
+    /// `128-column-tables`. The cap is per declaration: a migration table over
+    /// 32 columns counts only when no `table!` (by name or `#[sql_name]`) or
+    /// `#[model]` maps it. A wider cap makes every crate that depends on
+    /// diesel slower and hungrier to compile. `autumn build` prints the same
+    /// findings as a warning; this command is the CI gate.
+    Width {
+        /// Project root to scan (defaults to the current directory).
+        #[arg(value_name = "PATH", default_value = ".")]
+        path: PathBuf,
+        /// The widest table allowed.
+        #[arg(long, default_value_t = width::DIESEL_DEFAULT_COLUMN_LIMIT)]
+        max: usize,
+        /// Print every table and its width, not only the wide ones.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 /// Run an `autumn schema` action. Prints to stdout on success; on error, writes
@@ -212,6 +235,7 @@ pub fn run(action: SchemaAction) {
         } => run_pull(profile.as_deref(), out.as_deref(), backend, dry_run),
         SchemaAction::Migrate { profile } => migrate::run_migrate(profile.as_deref()),
         SchemaAction::Doctor { profile, json } => doctor::run_doctor(profile.as_deref(), json),
+        SchemaAction::Width { path, max, all } => width::run_width(&path, max, all),
     };
     if let Err(message) = result {
         eprintln!("error: {message}");
