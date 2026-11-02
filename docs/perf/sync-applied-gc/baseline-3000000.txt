@@ -10,27 +10,27 @@
 (1 row)
 
 === EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) of gc_applied
-                                                               QUERY PLAN                                                               
-----------------------------------------------------------------------------------------------------------------------------------------
- Delete on public.autumn_sync_applied  (cost=0.00..68375.21 rows=0 width=0) (actual time=264.995..264.996 rows=0 loops=1)
-   Buffers: shared hit=97589 read=30041 dirtied=1003 written=941
-   ->  Seq Scan on public.autumn_sync_applied  (cost=0.00..68375.21 rows=97404 width=6) (actual time=0.012..229.780 rows=96755 loops=1)
+                                                               QUERY PLAN                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_sync_applied  (cost=0.00..68374.79 rows=0 width=0) (actual time=294.718..294.719 rows=0 loops=1)
+   Buffers: shared hit=98592 read=30041 dirtied=1003 written=935
+   ->  Seq Scan on public.autumn_sync_applied  (cost=0.00..68374.79 rows=100182 width=6) (actual time=0.011..252.503 rows=96755 loops=1)
          Output: ctid
          Filter: (autumn_sync_applied.applied_at < '2026-10-02 00:00:00+00'::timestamp with time zone)
          Rows Removed by Filter: 2903245
-         Buffers: shared hit=834 read=30041 written=941
- Query Identifier: -2046800805186434771
- Planning Time: 0.054 ms
- Execution Time: 265.072 ms
+         Buffers: shared hit=834 read=30041 written=935
+ Query Identifier: -8554756381832333848
+ Planning Time: 0.048 ms
+ Execution Time: 294.785 ms
 (10 rows)
 
 === pg_stat_statements for the sweep
  calls | rows  | total_buffers | shared_blks_hit | shared_blks_read | temp_blks_written | wal_bytes |                            query                             
 -------+-------+---------------+-----------------+------------------+-------------------+-----------+--------------------------------------------------------------
-     1 | 96755 |        127630 |           98624 |            29006 |                 0 |  13393509 | PREPARE gc(timestamptz) AS DELETE FROM autumn_sync_applied W
+     1 | 96755 |        127630 |           98624 |            29006 |                 0 |   5224770 | PREPARE gc(timestamptz) AS DELETE FROM autumn_sync_applied W
 (1 row)
 
-gc_wal_bytes 15795120
+gc_wal_bytes 5434592
  rows_after |          survivors_md5           
 ------------+----------------------------------
     2903245 | 71a502ab531c539f61fc004973368e94
@@ -38,7 +38,7 @@ gc_wal_bytes 15795120
 
  seq_scan | seq_tup_read | idx_scan | idx_tup_fetch 
 ----------+--------------+----------+---------------
-        6 |      9000000 |        1 |       2903245
+        6 |      9000000 |        1 |           720
 (1 row)
 
        indexrelname       | idx_scan 
@@ -48,6 +48,6 @@ gc_wal_bytes 15795120
 
  ingest_wal_bytes_50k | ingest_buffers_50k 
 ----------------------+--------------------
-             40795736 |             203323
+             10228608 |             203226
 (1 row)
 

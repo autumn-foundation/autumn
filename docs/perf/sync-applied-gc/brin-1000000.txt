@@ -1,0 +1,60 @@
+=== variant brin rows 1000000
+ heap  | heap_blocks |                                   index_blocks                                    
+-------+-------------+-----------------------------------------------------------------------------------
+ 80 MB |       10292 | autumn_sync_applied_pkey=7896 blocks, autumn_sync_applied_applied_at_idx=3 blocks
+(1 row)
+
+ to_delete | survivors | at_boundary 
+-----------+-----------+-------------
+     32245 |    967755 |           0
+(1 row)
+
+=== EXPLAIN (ANALYZE, BUFFERS, VERBOSE, SETTINGS) of gc_applied
+                                                                       QUERY PLAN                                                                        
+---------------------------------------------------------------------------------------------------------------------------------------------------------
+ Delete on public.autumn_sync_applied  (cost=19.69..10774.66 rows=0 width=0) (actual time=26.459..26.461 rows=0 loops=1)
+   Buffers: shared hit=32584 read=384 dirtied=334 written=366
+   ->  Bitmap Heap Scan on public.autumn_sync_applied  (cost=19.69..10774.66 rows=30388 width=6) (actual time=0.052..10.112 rows=32245 loops=1)
+         Output: ctid
+         Recheck Cond: (autumn_sync_applied.applied_at < '2026-10-02 00:00:00+00'::timestamp with time zone)
+         Rows Removed by Index Recheck: 5082
+         Heap Blocks: lossy=384
+         Buffers: shared hit=5 read=384 written=366
+         ->  Bitmap Index Scan on autumn_sync_applied_applied_at_idx  (cost=0.00..12.10 rows=37037 width=0) (actual time=0.038..0.039 rows=3840 loops=1)
+               Index Cond: (autumn_sync_applied.applied_at < '2026-10-02 00:00:00+00'::timestamp with time zone)
+               Buffers: shared hit=5
+ Query Identifier: 2103197585640702349
+ Planning:
+   Buffers: shared hit=4
+ Planning Time: 0.084 ms
+ Execution Time: 26.540 ms
+(16 rows)
+
+=== pg_stat_statements for the sweep
+ calls | rows  | total_buffers | shared_blks_hit | shared_blks_read | temp_blks_written | wal_bytes |                            query                             
+-------+-------+---------------+-----------------+------------------+-------------------+-----------+--------------------------------------------------------------
+     1 | 32245 |         32631 |           32630 |                1 |                 0 |   1741230 | PREPARE gc(timestamptz) AS DELETE FROM autumn_sync_applied W
+(1 row)
+
+gc_wal_bytes 3622128
+ rows_after |          survivors_md5           
+------------+----------------------------------
+     967755 | cce670564296058b03a960c0e76553c5
+(1 row)
+
+ seq_scan | seq_tup_read | idx_scan | idx_tup_fetch 
+----------+--------------+----------+---------------
+        4 |      1745353 |        0 |             0
+(1 row)
+
+            indexrelname            | idx_scan 
+------------------------------------+----------
+ autumn_sync_applied_pkey           |        0
+ autumn_sync_applied_applied_at_idx |        0
+(2 rows)
+
+ ingest_wal_bytes_50k | ingest_buffers_50k 
+----------------------+--------------------
+             11230504 |             311907
+(1 row)
+

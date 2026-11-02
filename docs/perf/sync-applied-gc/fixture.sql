@@ -14,9 +14,6 @@ CREATE TABLE autumn_sync_applied (
     resolved_row JSONB,
     PRIMARY KEY (scope, device_id, change_id)
 ) WITH (autovacuum_enabled = false);
-\if :{?variant_ddl}
-:variant_ddl
-\endif
 INSERT INTO autumn_sync_applied
 SELECT 'tenant-' || (floor(200 * power(random(), 2.5)))::int,
        'dev-' || (i % 5000),
@@ -28,4 +25,8 @@ SELECT 'tenant-' || (floor(200 * power(random(), 2.5)))::int,
          + (random() - 0.5) * interval '20 minutes',
        CASE WHEN i % 33 = 0 THEN jsonb_build_object('title', 'row ' || i, 'body', repeat('x', 200)) END
 FROM generate_series(1, :n) i;
-ANALYZE autumn_sync_applied;
+\if :{?variant_ddl}
+-- Built after the load (a BRIN built before it has no summaries until vacuum).
+:variant_ddl
+\endif
+VACUUM (ANALYZE) autumn_sync_applied;
