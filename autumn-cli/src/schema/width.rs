@@ -18,9 +18,22 @@
 //! | 72        | 3.55 GB           | 3m 26s     |
 //! | 128       | 9.95 GB           | 8m 16s     |
 //!
-//! So the framework holds every table it ships to [`DIESEL_DEFAULT_COLUMN_LIMIT`]
-//! columns (a hard CI gate: `autumn schema width .` in the `lint` job), and
-//! `autumn build` *warns* an application that crosses it. The warning never
+//! The cap applies to each **`table!` declaration**, not to the physical
+//! table. Two declarations can map one table, so a 40-column table compiles at
+//! the default cap when it is declared in halves:
+//!
+//! ```ignore
+//! diesel::table! { wide (id) { id -> Int4, state -> Text, a -> Int4 } }
+//! diesel::table! {
+//!     #[sql_name = "wide"]
+//!     wide_ext (id) { id -> Int4, paused -> Nullable<Text>, b -> Int4 }
+//! }
+//! ```
+//!
+//! So the framework holds every Diesel declaration it ships to
+//! [`DIESEL_DEFAULT_COLUMN_LIMIT`] columns (a hard CI gate: `autumn schema
+//! width .` in the `lint` job), and `autumn build` *warns* an application that
+//! crosses it. The warning never
 //! stops the build: a wide table is the app's call to make, it just should be
 //! a call it makes knowingly. See `docs/guide/table-width.md`.
 //!
@@ -34,9 +47,12 @@
 //!   through a small DDL reader (`CREATE TABLE`, `ALTER TABLE … ADD/DROP/RENAME
 //!   COLUMN`, `ALTER TABLE … RENAME TO`, `DROP TABLE`), and the final width of
 //!   each table is what counts. Sets replay independently: the Postgres and
-//!   `SQLite` twins of one schema are two sets, not one.
+//!   `SQLite` twins of one schema are two sets, not one. A wide physical table
+//!   is a finding only when no `table!` or `#[model]` maps to it: then
+//!   `diesel print-schema` would write one wide `table!`. Once the Rust side
+//!   declares it, the declarations are what count.
 //! - **`table!` blocks.** Every `diesel::table!` invocation in a `.rs` file; one
-//!   column per `name -> Type` entry.
+//!   column per `name -> Type` entry, mapped to its `#[sql_name]` table.
 //! - **`#[model]` structs.** The columns the declarative-schema parser derives
 //!   from the struct, the same view `autumn schema snapshot` takes.
 //!
@@ -83,8 +99,13 @@ impl WidthSource {
 /// One table's column count, from one source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableWidth {
-    /// The table name (unqualified, unquoted).
+    /// The name Rust code uses: the `table!` identifier, the `#[model]`'s
+    /// Diesel table, or the migration's (schema-qualified) table.
     pub table: String,
+    /// The database table it maps to: a `table!`'s `#[sql_name = "…"]` when it
+    /// has one, else its name. Two declarations can share one physical table,
+    /// and that is how a wide table stays under the cap.
+    pub physical: String,
     /// How many columns the table has.
     pub columns: usize,
     /// Where the count came from.
@@ -106,9 +127,22 @@ pub struct WidthReport {
 
 impl WidthReport {
     /// The tables wider than `max`, widest first.
+    ///
+    /// Diesel's cap applies to each `table!` declaration, not to the physical
+    /// table: a 40-column table declared as `wide` and
+    /// `#[sql_name = "wide"] wide_ext` compiles at the default 32. So a
+    /// `table!` or `#[model]` over `max` is always a finding, and a migration
+    /// over `max` is one only when no Rust declaration maps to that table, which
+    /// means a generated `schema.rs` would emit one wide `table!` for it.
     #[must_use]
     pub fn over(&self, max: usize) -> Vec<&TableWidth> {
-        let mut over: Vec<&TableWidth> = self.tables.iter().filter(|t| t.columns > max).collect();
+        let declared = self.declared_physical();
+        let mut over: Vec<&TableWidth> = self
+            .tables
+            .iter()
+            .filter(|t| t.columns > max)
+            .filter(|t| t.source != WidthSource::Migration || !declared.contains(&t.physical))
+            .collect();
         over.sort_by(|a, b| {
             b.columns
                 .cmp(&a.columns)
@@ -119,10 +153,42 @@ impl WidthReport {
         over
     }
 
-    /// The widest table seen, if any.
+    /// The physical tables some `table!` or `#[model]` declares. A model names
+    /// a Diesel table, so it maps through that `table!`'s `sql_name`.
+    fn declared_physical(&self) -> std::collections::BTreeSet<String> {
+        let macros: BTreeMap<&str, &str> = self
+            .tables
+            .iter()
+            .filter(|t| t.source == WidthSource::TableMacro)
+            .map(|t| (t.table.as_str(), t.physical.as_str()))
+            .collect();
+        self.tables
+            .iter()
+            .filter(|t| t.source != WidthSource::Migration)
+            .map(|t| {
+                macros
+                    .get(t.table.as_str())
+                    .map_or_else(|| t.physical.clone(), |p| (*p).to_owned())
+            })
+            .collect()
+    }
+
+    /// Whether `t` is a migration whose table some Rust declaration maps:
+    /// its width is then the declarations' business, not its own.
+    #[must_use]
+    pub fn is_declared_migration(&self, t: &TableWidth) -> bool {
+        t.source == WidthSource::Migration && self.declared_physical().contains(&t.physical)
+    }
+
+    /// The widest table that counts toward the cap, if any: every `table!` and
+    /// `#[model]`, and each migration table no declaration maps.
     #[must_use]
     pub fn widest(&self) -> Option<&TableWidth> {
-        self.tables.iter().max_by_key(|t| t.columns)
+        let declared = self.declared_physical();
+        self.tables
+            .iter()
+            .filter(|t| t.source != WidthSource::Migration || !declared.contains(&t.physical))
+            .max_by_key(|t| t.columns)
     }
 
     /// Whether anything is over `max` or a wide diesel feature is on.
@@ -557,6 +623,7 @@ pub fn replay_migration_set(steps: &[(PathBuf, String)]) -> Vec<TableWidth> {
         .tables
         .into_iter()
         .map(|(table, (columns, path))| TableWidth {
+            physical: table.rsplit('.').next().unwrap_or(&table).to_owned(),
             table,
             columns: columns.len(),
             source: WidthSource::Migration,
@@ -567,19 +634,45 @@ pub fn replay_migration_set(steps: &[(PathBuf, String)]) -> Vec<TableWidth> {
 
 // ── Rust ───────────────────────────────────────────────────────────────────
 
+/// One table in a `table!` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MacroTable {
+    /// The Rust identifier.
+    name: String,
+    /// The `#[sql_name]`, else the identifier.
+    physical: String,
+    /// One per `name -> Type` entry.
+    columns: usize,
+}
+
 /// Count the columns of every table in one `table!` invocation's tokens.
 ///
 /// A table is `[#[attrs]] [schema.]name [(pk, …)] { col -> Type, … }`; one
 /// invocation can hold several, plus `use` lines. A column is one top-level
 /// `->` inside the brace group.
-fn table_macro_tables(tokens: proc_macro2::TokenStream) -> Vec<(String, usize)> {
+fn table_macro_tables(tokens: proc_macro2::TokenStream) -> Vec<MacroTable> {
     use proc_macro2::{Delimiter, Spacing, TokenTree};
 
     let mut out = Vec::new();
     let mut last_ident: Option<String> = None;
+    let mut sql_name: Option<String> = None;
     for tree in tokens {
         match tree {
             TokenTree::Ident(ident) => last_ident = Some(ident.to_string()),
+            // `#[sql_name = "wide"]` before the table: the physical name.
+            TokenTree::Group(group) if group.delimiter() == Delimiter::Bracket => {
+                let inner: Vec<TokenTree> = group.stream().into_iter().collect();
+                if let [
+                    TokenTree::Ident(key),
+                    TokenTree::Punct(eq),
+                    TokenTree::Literal(lit),
+                ] = inner.as_slice()
+                    && key == "sql_name"
+                    && eq.as_char() == '='
+                {
+                    sql_name = Some(lit.to_string().trim_matches('"').to_owned());
+                }
+            }
             TokenTree::Group(group) if group.delimiter() == Delimiter::Brace => {
                 let mut columns = 0;
                 let mut prev_minus = false;
@@ -595,12 +688,21 @@ fn table_macro_tables(tokens: proc_macro2::TokenStream) -> Vec<(String, usize)> 
                     );
                 }
                 if let Some(name) = last_ident.take() {
-                    out.push((name.trim_start_matches("r#").to_owned(), columns));
+                    let name = name.trim_start_matches("r#").to_owned();
+                    out.push(MacroTable {
+                        physical: sql_name.take().unwrap_or_else(|| name.clone()),
+                        name,
+                        columns,
+                    });
                 }
+                sql_name = None;
             }
-            // `#[sql_name = "…"]` and the `(pk)` group leave the name alone;
-            // `;` (after a `use` line) resets it.
-            TokenTree::Punct(p) if p.as_char() == ';' => last_ident = None,
+            // The `(pk)` group leaves the name alone; `;` (after a `use`
+            // line) resets it.
+            TokenTree::Punct(p) if p.as_char() == ';' => {
+                last_ident = None;
+                sql_name = None;
+            }
             _ => {}
         }
     }
@@ -608,7 +710,7 @@ fn table_macro_tables(tokens: proc_macro2::TokenStream) -> Vec<(String, usize)> 
 }
 
 /// Visit every `table!` macro in a parsed file, nested modules included.
-fn collect_table_macros(items: &[syn::Item], out: &mut Vec<(String, usize)>) {
+fn collect_table_macros(items: &[syn::Item], out: &mut Vec<MacroTable>) {
     for item in items {
         match item {
             syn::Item::Macro(m)
@@ -645,9 +747,10 @@ pub fn rust_source_widths(path: &Path, src: &str) -> Vec<TableWidth> {
     if mentions_table && let Ok(file) = syn::parse_file(src) {
         let mut tables = Vec::new();
         collect_table_macros(&file.items, &mut tables);
-        out.extend(tables.into_iter().map(|(table, columns)| TableWidth {
-            table,
-            columns,
+        out.extend(tables.into_iter().map(|t| TableWidth {
+            table: t.name,
+            physical: t.physical,
+            columns: t.columns,
             source: WidthSource::TableMacro,
             path: path.to_path_buf(),
         }));
@@ -695,6 +798,7 @@ fn model_widths(path: &Path, src: &str) -> Vec<TableWidth> {
         skipped.dedup();
         out.push(TableWidth {
             columns: table.columns.len().saturating_sub(implicit) + skipped.len(),
+            physical: table.name.clone(),
             table: table.name,
             source: WidthSource::Model,
             path: path.to_path_buf(),
@@ -882,6 +986,14 @@ fn format_findings(report: &WidthReport, max: usize, out: &mut String) {
             t.source.label(),
             t.path.display()
         );
+        if t.source == WidthSource::Migration {
+            let _ = writeln!(
+                out,
+                "    no `table!` maps to it, so a generated schema.rs declares all {} columns \
+                 in one `table!`",
+                t.columns
+            );
+        }
     }
     for feature in report.features_over(max) {
         let _ = writeln!(
@@ -902,7 +1014,7 @@ pub fn format_build_warning(report: &WidthReport) -> Option<String> {
     }
     let mut out = format!(
         "warning: Diesel table width over {max} columns\n\
-         \x20 A table wider than {max} columns needs diesel's `64-column-tables` or \
+         \x20 A Diesel `table!` wider than {max} columns needs diesel's `64-column-tables` or \
          `128-column-tables` feature,\n\
          \x20 and that feature makes every crate that uses diesel slower and hungrier to \
          compile\n\
@@ -911,7 +1023,8 @@ pub fn format_build_warning(report: &WidthReport) -> Option<String> {
     format_findings(report, max, &mut out);
     let _ = write!(
         out,
-        "  Split rarely-read columns into a 1:1 side table, or group them in a JSONB column.\n\
+        "  Split the Diesel declaration: a second `table!` with `#[sql_name = \"<table>\"]`\n\
+         \x20 maps the same table, and each declaration stays at {max} or fewer.\n\
          \x20 The build continues. `autumn schema width` re-runs this check.\n\
          \x20 See {GUIDE}"
     );
@@ -938,8 +1051,15 @@ pub fn run_width(root: &Path, max: usize, all: bool) -> Result<(), String> {
                 .then_with(|| a.table.cmp(&b.table))
         });
         for t in tables {
+            // A wide table the Rust side splits is listed, but marked: its
+            // declarations are what Diesel compiles.
+            let note = if report.is_declared_migration(t) {
+                "  (declared in Rust)"
+            } else {
+                ""
+            };
             println!(
-                "{:>4}  {:<40} {:<10} {}",
+                "{:>4}  {:<40} {:<10} {}{note}",
                 t.columns,
                 t.table,
                 t.source.label(),
@@ -1147,6 +1267,124 @@ mod tests {
         assert_eq!(model.columns, 34);
     }
 
+    fn report_of(sql: &str, rust: &[(&str, &str)]) -> WidthReport {
+        let mut tables = replay_migration_set(&[(PathBuf::from("01/up.sql"), sql.to_owned())]);
+        for (path, src) in rust {
+            tables.extend(rust_source_widths(Path::new(path), src));
+        }
+        WidthReport {
+            tables,
+            wide_diesel_features: Vec::new(),
+        }
+    }
+
+    fn decl(name: &str, sql_name: Option<&str>, columns: std::ops::Range<usize>) -> String {
+        let attr = sql_name.map_or_else(String::new, |n| format!("#[sql_name = \"{n}\"]"));
+        let cols: Vec<String> = columns.map(|i| format!("c{i} -> Text,")).collect();
+        format!(
+            "diesel::table! {{ {attr} {name} (c0) {{ {} }} }}",
+            cols.join(" ")
+        )
+    }
+
+    #[test]
+    fn sql_name_maps_a_declaration_to_its_table() {
+        let src = r#"
+            diesel::table! { wide (id) { id -> Int4, state -> Text, a -> Int4 } }
+            diesel::table! {
+                #[sql_name = "wide"]
+                wide_ext (id) { id -> Int4, paused -> Nullable<Text>, b -> Int4 }
+            }
+        "#;
+        let found = rust_source_widths(Path::new("schema.rs"), src);
+        let pairs: Vec<(&str, &str, usize)> = found
+            .iter()
+            .map(|t| (t.table.as_str(), t.physical.as_str(), t.columns))
+            .collect();
+        assert_eq!(pairs, vec![("wide", "wide", 3), ("wide_ext", "wide", 3)]);
+    }
+
+    #[test]
+    fn a_wide_table_split_across_declarations_is_not_a_finding() {
+        let sql = wide_create("wide", 40);
+        let split = format!(
+            "{}\n{}",
+            decl("wide", None, 0..20),
+            decl("wide_ext", Some("wide"), 20..40)
+        );
+        let report = report_of(&sql, &[("schema.rs", &split)]);
+        assert!(
+            report.over(DIESEL_DEFAULT_COLUMN_LIMIT).is_empty(),
+            "{report:?}"
+        );
+        assert!(format_build_warning(&report).is_none());
+    }
+
+    #[test]
+    fn a_wide_table_no_declaration_maps_is_a_finding() {
+        let report = report_of(&wide_create("wide", 40), &[]);
+        let over = report.over(DIESEL_DEFAULT_COLUMN_LIMIT);
+        assert_eq!(over.len(), 1);
+        let warning = format_build_warning(&report).expect("warning");
+        assert!(warning.contains("no `table!` maps to it"), "{warning}");
+        assert!(warning.contains("#[sql_name"), "{warning}");
+    }
+
+    #[test]
+    fn one_wide_declaration_is_a_finding_even_when_split_elsewhere() {
+        // The physical table is split, but one declaration still carries 33.
+        let split = format!(
+            "{}\n{}",
+            decl("wide", None, 0..33),
+            decl("wide_ext", Some("wide"), 33..40)
+        );
+        let report = report_of(&wide_create("wide", 40), &[("schema.rs", &split)]);
+        let over = report.over(DIESEL_DEFAULT_COLUMN_LIMIT);
+        assert_eq!(over.len(), 1);
+        assert_eq!(over[0].source, WidthSource::TableMacro);
+        assert_eq!(over[0].table, "wide");
+    }
+
+    #[test]
+    fn a_model_on_the_split_half_maps_through_its_sql_name() {
+        let fields: Vec<String> = (0..20).map(|i| format!("pub f{i}: String,")).collect();
+        let model = format!(
+            "#[model(table = \"wide_ext\")]\npub struct WideExt {{\n#[id]\npub id: i64,\n{}\n}}",
+            fields.join("\n")
+        );
+        // Only the model's half is declared, via `wide_ext` → `wide`.
+        let report = report_of(
+            &wide_create("wide", 40),
+            &[
+                ("schema.rs", &decl("wide_ext", Some("wide"), 0..21)),
+                ("models.rs", &model),
+            ],
+        );
+        assert!(
+            report.over(DIESEL_DEFAULT_COLUMN_LIMIT).is_empty(),
+            "{report:?}"
+        );
+    }
+
+    #[test]
+    fn widest_skips_a_split_physical_table() {
+        let split = format!(
+            "{}\n{}",
+            decl("wide", None, 0..20),
+            decl("wide_ext", Some("wide"), 20..40)
+        );
+        let report = report_of(&wide_create("wide", 40), &[("schema.rs", &split)]);
+        let widest = report.widest().expect("widest");
+        assert_eq!(widest.columns, 20);
+        assert_eq!(widest.source, WidthSource::TableMacro);
+        let migration = report
+            .tables
+            .iter()
+            .find(|t| t.source == WidthSource::Migration)
+            .expect("migration");
+        assert!(report.is_declared_migration(migration));
+    }
+
     #[test]
     fn create_table_as_select_changes_no_width() {
         let w = widths(&["CREATE TABLE copy AS SELECT * FROM real;"]);
@@ -1266,6 +1504,7 @@ mod tests {
         let report = WidthReport {
             tables: vec![TableWidth {
                 table: "accounts".to_owned(),
+                physical: "accounts".to_owned(),
                 columns: 40,
                 source: WidthSource::Migration,
                 path: PathBuf::from("migrations/2026_wide/up.sql"),

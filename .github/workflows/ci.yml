@@ -179,18 +179,19 @@ jobs:
         # count too. No build, a few seconds. See docs/perf/README.md.
         run: python3 scripts/check-perf-profiles.py bolt
 
-      - name: Diesel table-width gate (no framework table over 32 columns)
+      - name: Diesel table-width gate (no framework declaration over 32 columns)
         # Diesel compiles its column-tuple impls up to a cap set by a feature:
         # `32-column-tables` (default), `64-` or `128-`. Cargo unifies it, so
-        # one table past 32 columns pushes the wider cap onto every crate that
-        # depends on diesel — every app built on Autumn included. Measured on
-        # one crate: 1.16 GB / 1m18s at 32, 2.92 GB / 2m04s at 64, 9.95 GB /
-        # 8m16s at 128. This replays every migration set in the repo (each
-        # `up.sql` in version order), reads every `table!` and `#[model]`, and
-        # asks cargo which diesel features resolve; a table over 32 columns or
-        # a wide feature fails the job. Apps get the same findings as a
-        # warning from `autumn build`, never a failure. See
-        # docs/guide/table-width.md.
+        # one `table!` past 32 columns pushes the wider cap onto every crate
+        # that depends on diesel — every app built on Autumn included.
+        # Measured on one crate: 1.16 GB / 1m18s at 32, 2.92 GB / 2m04s at 64,
+        # 9.95 GB / 8m16s at 128. The cap is per declaration, so a wide table
+        # declared in halves (`#[sql_name = "<table>"]`) is fine. This reads
+        # every `table!` and `#[model]`, replays every migration set (a table
+        # over 32 counts only when no declaration maps it), and asks cargo
+        # which diesel features resolve. Any finding fails the job. Apps get
+        # the same findings as a warning from `autumn build`, never a
+        # failure. See docs/guide/table-width.md.
         run: cargo run -p autumn-cli --bin autumn -- schema width .
 
       - name: Accessibility gate (raw html! escape hatches across the repo)

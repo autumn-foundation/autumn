@@ -174,13 +174,15 @@ pub enum SchemaAction {
         #[arg(long)]
         json: bool,
     },
-    /// Report every Diesel table wider than Diesel's default 32-column tuple
-    /// cap, and exit non-zero when there is one.
+    /// Report every Diesel declaration wider than Diesel's default 32-column
+    /// tuple cap, and exit non-zero when there is one.
     ///
-    /// Reads the migration sets under PATH (each `up.sql` replayed in
-    /// version order), every `diesel::table!` block and every `#[model]`
-    /// struct, and asks cargo whether diesel resolves with `64-column-tables`
-    /// or `128-column-tables`. A wider cap makes every crate that depends on
+    /// Reads every `diesel::table!` block and every `#[model]` struct under
+    /// PATH, replays the migration sets (each `up.sql` in version order), and
+    /// asks cargo whether diesel resolves with `64-column-tables` or
+    /// `128-column-tables`. The cap is per declaration: a migration table over
+    /// 32 columns counts only when no `table!` (by name or `#[sql_name]`) or
+    /// `#[model]` maps it. A wider cap makes every crate that depends on
     /// diesel slower and hungrier to compile. `autumn build` prints the same
     /// findings as a warning; this command is the CI gate.
     Width {
