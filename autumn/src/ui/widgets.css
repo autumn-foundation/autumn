@@ -1560,13 +1560,14 @@
 }
 
 /* Deterministic per-name background palette (selected by avatar_palette_class).
-   Class-based so no inline `style` attribute is emitted. */
+   Class-based so no inline `style` attribute is emitted. Each color gives
+   white initials 4.5:1 (WCAG 1.4.3); a test in widgets_css.rs checks it. */
 .autumn-avatar--c0 { background: hsl(0, 60%, 42%); }
 .autumn-avatar--c1 { background: hsl(30, 60%, 40%); }
-.autumn-avatar--c2 { background: hsl(60, 55%, 36%); }
-.autumn-avatar--c3 { background: hsl(90, 55%, 34%); }
+.autumn-avatar--c2 { background: hsl(60, 55%, 30%); }
+.autumn-avatar--c3 { background: hsl(90, 55%, 32%); }
 .autumn-avatar--c4 { background: hsl(120, 50%, 34%); }
-.autumn-avatar--c5 { background: hsl(150, 55%, 34%); }
+.autumn-avatar--c5 { background: hsl(150, 55%, 33%); }
 .autumn-avatar--c6 { background: hsl(180, 55%, 32%); }
 .autumn-avatar--c7 { background: hsl(210, 60%, 42%); }
 .autumn-avatar--c8 { background: hsl(240, 55%, 50%); }
@@ -2732,8 +2733,10 @@
     background-color: var(--danger-hover);
 }
 
+/* A link button keeps a 24px target (WCAG 2.5.8). A fixed size, not a
+   space token: the minimum must not scale down with density. */
 .autumn-button--link {
-    min-block-size: auto;
+    min-block-size: 1.5rem;
     padding: 0;
     background-color: transparent;
     color: var(--primary);
@@ -2765,20 +2768,19 @@
     margin: auto;
 }
 
-/* Busy: a static `aria-busy`, or an htmx request on the button or on an
-   element around it (the button sends it, its form sends it, or
-   `hx-indicator` names it). Three classes: these beat the rule above. */
+/* Busy: `aria-busy` (from the server, or from the runtime for the
+   submitter of a form), or htmx marks the button itself (it sends the
+   request, or `hx-indicator` names it). Three classes: these beat the
+   rule above. */
 .autumn-button[aria-busy="true"] > .autumn-button__spinner,
-.autumn-button.htmx-request > .autumn-button__spinner,
-.htmx-request .autumn-button > .autumn-button__spinner {
+.autumn-button.htmx-request > .autumn-button__spinner {
     display: block;
 }
 
 /* Hide the icon and the label with opacity only. They stay in the
    accessibility tree, so the button keeps its name. */
 .autumn-button[aria-busy="true"] > .autumn-button__spinner ~ *,
-.autumn-button.htmx-request > .autumn-button__spinner ~ *,
-.htmx-request .autumn-button > .autumn-button__spinner ~ * {
+.autumn-button.htmx-request > .autumn-button__spinner ~ * {
     opacity: 0;
 }
 
@@ -2887,9 +2889,12 @@
     }
 }
 
-/* An htmx indicator (spinner or skeleton) is hidden until htmx gives it,
-   or an element around it, the `htmx-request` class. */
-.autumn-indicator:not(.htmx-request, .htmx-request *) {
+/* An htmx indicator is hidden until htmx gives it, or an element around
+   it, the `htmx-request` class. A spinner keeps its `role="status"` root
+   in the tree and hides only its content, so a screen reader reads the
+   label when it shows. */
+.autumn-indicator:not(.autumn-spinner):not(.htmx-request, .htmx-request *),
+.autumn-spinner.autumn-indicator:not(.htmx-request, .htmx-request *) > * {
     display: none;
 }
 
@@ -2953,7 +2958,8 @@
 
 /* The browser colors a meter good, average or bad. These rules use the
    tokens. Keep each engine's pseudo-element in its own rule: one unknown
-   selector drops the whole rule. */
+   selector drops the whole rule. Use the `background` shorthand: the UA
+   paints a gradient image over a `background-color`. */
 .autumn-meter {
     display: block;
     inline-size: 100%;
@@ -2961,7 +2967,7 @@
     appearance: none;
     border: 0;
     border-radius: var(--radius-full);
-    background-color: var(--surface-muted);
+    background: var(--surface-muted);
     color: var(--text);
 }
 
@@ -2969,39 +2975,81 @@
     block-size: var(--space-2);
     border: 0;
     border-radius: var(--radius-full);
-    background-color: var(--surface-muted);
+    background: var(--surface-muted);
 }
 
 .autumn-meter::-webkit-meter-optimum-value {
     border-radius: var(--radius-full);
-    background-color: var(--success);
+    background: var(--success);
 }
 
 .autumn-meter::-webkit-meter-suboptimum-value {
     border-radius: var(--radius-full);
-    background-color: var(--warning-text);
+    background: var(--warning-text);
 }
 
 .autumn-meter::-webkit-meter-even-less-good-value {
     border-radius: var(--radius-full);
-    background-color: var(--danger);
+    background: var(--danger);
 }
 
 .autumn-meter::-moz-meter-bar {
     border-radius: var(--radius-full);
-    background-color: var(--success);
+    background: var(--success);
 }
 
 .autumn-meter:-moz-meter-optimum::-moz-meter-bar {
-    background-color: var(--success);
+    background: var(--success);
 }
 
 .autumn-meter:-moz-meter-sub-optimum::-moz-meter-bar {
-    background-color: var(--warning-text);
+    background: var(--warning-text);
 }
 
 .autumn-meter:-moz-meter-sub-sub-optimum::-moz-meter-bar {
-    background-color: var(--danger);
+    background: var(--danger);
+}
+
+/* Forced colors removes the backgrounds, and the bar goes. Use system
+   colors: a Canvas track with an edge and a Highlight fill. */
+@media (forced-colors: active) {
+    .autumn-meter {
+        forced-color-adjust: none;
+        border: 1px solid CanvasText;
+        background: Canvas;
+    }
+
+    .autumn-meter::-webkit-meter-bar {
+        background: Canvas;
+    }
+
+    .autumn-meter::-webkit-meter-optimum-value {
+        background: Highlight;
+    }
+
+    .autumn-meter::-webkit-meter-suboptimum-value {
+        background: Highlight;
+    }
+
+    .autumn-meter::-webkit-meter-even-less-good-value {
+        background: Highlight;
+    }
+
+    .autumn-meter::-moz-meter-bar {
+        background: Highlight;
+    }
+
+    .autumn-meter:-moz-meter-optimum::-moz-meter-bar {
+        background: Highlight;
+    }
+
+    .autumn-meter:-moz-meter-sub-optimum::-moz-meter-bar {
+        background: Highlight;
+    }
+
+    .autumn-meter:-moz-meter-sub-sub-optimum::-moz-meter-bar {
+        background: Highlight;
+    }
 }
 
 .autumn-progress-field {
@@ -3125,17 +3173,39 @@
     margin-inline-start: calc(-1 * var(--space-2));
 }
 
+/* The +N item is a pill: a long count or large text does not clip
+   (WCAG 1.4.4). Its minimum sizes match the .autumn-avatar--* sizes. */
 .autumn-avatar-group__more {
+    width: auto;
+    height: auto;
+    padding: 0 var(--space-1);
     background-color: var(--surface-muted);
     color: var(--text);
     font-weight: var(--font-weight-semibold);
 }
 
+.autumn-avatar-group__more.autumn-avatar--sm {
+    min-width: 24px;
+    min-height: 24px;
+}
+
+.autumn-avatar-group__more.autumn-avatar--md {
+    min-width: 40px;
+    min-height: 40px;
+}
+
+.autumn-avatar-group__more.autumn-avatar--lg {
+    min-width: 64px;
+    min-height: 64px;
+}
+
 /* ── Auto-grow textarea (autumn-auto-grow, #3406) ─────────────────────────── */
 
 /* The textarea grows with its text. A browser with no `field-sizing` keeps
-   the `rows` height. */
+   the `rows` height. `field-sizing` also sizes the width to the text, so
+   the width is set. */
 .autumn-auto-grow {
+    inline-size: 100%;
     field-sizing: content;
     min-block-size: 3lh;
     max-block-size: 50vh;

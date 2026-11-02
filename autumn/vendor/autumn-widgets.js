@@ -1008,17 +1008,24 @@
   // A history restore (hx-boost, Back) brings back nodes without listeners.
   document.addEventListener('htmx:historyRestore', function () { initAll(document); });
 
-  // Busy state (#3406). htmx 2 sets no aria-busy. A [data-autumn-busy]
-  // element is busy while it, or an element around it, has .htmx-request.
-  // afterSettle also runs when a swap removed the requester.
-  function syncBusy() {
-    document.querySelectorAll('[data-autumn-busy]').forEach(function (el) {
-      if (el.closest('.htmx-request')) el.setAttribute('aria-busy', 'true');
-      else el.removeAttribute('aria-busy');
+  // Busy state (#3406): htmx 2 sets no aria-busy. Mark the requester, the
+  // submitter and the named indicators that have [data-autumn-busy], and
+  // the target. The XHR loadend event clears the state after each request.
+  // Remove only an aria-busy that this code set.
+  var busySet = new WeakSet();
+  document.addEventListener('htmx:beforeSend', function (e) {
+    var d = e.detail, ev = (d.requestConfig || {}).triggeringEvent;
+    var els = [e.target, ev && ev.submitter]
+      .concat(Array.from(document.querySelectorAll('.htmx-request')))
+      .filter(function (el) { return el && el.matches && el.matches('[data-autumn-busy]'); });
+    if (els.length && d.target) els.push(d.target);
+    els = els.filter(function (el) { return busySet.has(el) || !el.hasAttribute('aria-busy'); });
+    els.forEach(function (el) { busySet.add(el); el.setAttribute('aria-busy', 'true'); });
+    d.xhr.addEventListener('loadend', function () {
+      els.forEach(function (el) {
+        if (!el.classList.contains('htmx-request')) { busySet.delete(el); el.removeAttribute('aria-busy'); }
+      });
     });
-  }
-  ['htmx:beforeSend', 'htmx:afterRequest', 'htmx:afterSettle'].forEach(function (name) {
-    document.addEventListener(name, syncBusy);
   });
 
   // htmx puts the response's `class` back after afterSwap (its settle step).

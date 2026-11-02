@@ -19,5 +19,7 @@
     (`+N` overflow with a translatable name).
 - **forms:** `FieldOptions::auto_grow()` and `a11y::TextArea::auto_grow()`:
   a textarea that grows with its text (`field-sizing: content`).
-- **widgets:** `data-autumn-busy`: `autumn-widgets.js` sets `aria-busy` on
-  the element while an htmx request runs on it or on an element around it.
+- **widgets:** `data-autumn-busy`: during the element's own htmx request,
+  `autumn-widgets.js` sets `aria-busy` on it and on the swap target. The
+  request is its own when the element sends it, submits the form, or
+  `hx-indicator` names it.

@@ -980,58 +980,52 @@ async fn keyboard_tooltip() {
 #[tokio::test]
 #[ignore = "requires Chromium"]
 async fn keyboard_button() {
-    const SAVE: &str = "#story-save";
-    const SPINNER: &str = "#story-save .autumn-button__spinner";
     let runner = runner().await;
     let page = runner.page().await.expect("page");
     open(&page, "/_stories/button").await;
-
-    assert!(!shown(&page, SPINNER).await, "the spinner shows at rest");
-    assert_eq!(attr(&page, SAVE, "aria-busy").await, "");
-    focus(&page, SAVE).await;
-    press(&page, "Enter").await;
-    wait_for(
-        &page,
-        "document.querySelector('#story-save').getAttribute('aria-busy') === 'true'",
-    )
-    .await;
-    assert!(shown(&page, SPINNER).await, "no spinner while busy");
-    assert_eq!(
-        eval_string(
-            &page,
-            "getComputedStyle(document.querySelector('#story-save .autumn-button__label')).opacity",
-        )
-        .await,
-        "0"
-    );
-    assert_eq!(
-        eval_string(
-            &page,
-            "document.querySelector('#story-save .autumn-button__label').textContent",
-        )
-        .await,
-        "Save"
-    );
-    wait_for(
-        &page,
-        "document.querySelector('#story-save-status').textContent.includes('Saved.')",
-    )
-    .await;
-    wait_for(
-        &page,
-        "!document.querySelector('#story-save').hasAttribute('aria-busy')",
-    )
-    .await;
-    assert!(
-        !shown(&page, SPINNER).await,
-        "the spinner shows after the request"
-    );
-    assert_eq!(
-        active_id(&page).await,
-        "story-save",
-        "focus left the button"
-    );
+    // The button sends the request, then it submits the form that sends it.
+    for (button, status) in [
+        ("story-save", "story-save-status"),
+        ("story-publish", "story-publish-status"),
+    ] {
+        check_busy_button(&page, button, status).await;
+    }
     page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// Press Enter on `#button`. While the request runs, check it in one read,
+/// so the 800 ms window cannot pass between checks: the button and the
+/// swap target have `aria-busy="true"`, the spinner shows, and the label is
+/// transparent but keeps its text. After the response, `aria-busy` goes and
+/// focus stays on the button.
+async fn check_busy_button(page: &Page, button: &str, status: &str) {
+    let state = |busy: bool| {
+        format!(
+            "(() => {{ const b = document.getElementById({button:?}); \
+             const s = document.getElementById({status:?}); \
+             const spin = getComputedStyle(b.querySelector('.autumn-button__spinner')).display; \
+             const label = b.querySelector('.autumn-button__label'); \
+             return {busy} \
+               ? b.getAttribute('aria-busy') === 'true' && s.getAttribute('aria-busy') === 'true' \
+                 && spin === 'block' && getComputedStyle(label).opacity === '0' \
+                 && label.textContent === b.id.replace('story-', '').replace(/^./, c => c.toUpperCase()) \
+               : !b.hasAttribute('aria-busy') && !s.hasAttribute('aria-busy') && spin === 'none'; }})()"
+        )
+    };
+    assert!(
+        eval_bool(page, &state(false)).await,
+        "#{button} is busy at rest"
+    );
+    focus(page, &format!("#{button}")).await;
+    press(page, "Enter").await;
+    wait_for(page, &state(true)).await;
+    wait_for(
+        page,
+        &format!("document.getElementById({status:?}).textContent.includes('Saved.')"),
+    )
+    .await;
+    wait_for(page, &state(false)).await;
+    assert_eq!(active_id(page).await, button, "focus left #{button}");
 }
 
 /// An `hx-indicator` skeleton or spinner (#3406) is hidden at rest, shows
@@ -1055,6 +1049,12 @@ async fn display_set_indicators_show_only_during_a_request() {
             "#story-spinner-status",
         ),
     ] {
+        // A spinner indicator keeps its root. Its content shows and hides.
+        let indicator = &if indicator.contains("spinner") {
+            format!("{indicator} > :first-child")
+        } else {
+            indicator.to_owned()
+        };
         open(&page, path).await;
         assert!(!shown(&page, indicator).await, "{indicator} shows at rest");
         assert!(

@@ -1045,7 +1045,7 @@ mod tests {
             .expect("the busy rule");
         assert!(show.body.contains("display: block;"), "{}", show.body);
         let selectors: Vec<&str> = show.selector.split(',').map(str::trim).collect();
-        assert_eq!(selectors.len(), 3, "{selectors:?}");
+        assert_eq!(selectors.len(), 2, "{selectors:?}");
         for selector in selectors {
             assert!(
                 class_specificity(selector) > floor,
@@ -1060,10 +1060,22 @@ mod tests {
     fn indicator_is_hidden_until_an_htmx_request() {
         let rule = rules()
             .into_iter()
-            .find(|r| r.selector == ".autumn-indicator:not(.htmx-request, .htmx-request *)")
+            .find(|r| {
+                r.selector
+                    .contains(".autumn-indicator:not(.autumn-spinner):not(")
+            })
             .expect("indicator rule");
         assert!(rule.at.is_empty(), "{}", rule.at);
         assert!(rule.body.contains("display: none;"), "{}", rule.body);
+        // A spinner hides its content only. Its live region stays in the
+        // tree, so the label that shows is read.
+        assert!(
+            rule.selector.contains(
+                ".autumn-spinner.autumn-indicator:not(.htmx-request, .htmx-request *) > *"
+            ),
+            "{}",
+            rule.selector
+        );
     }
 
     /// `field-sizing: content` grows the textarea. A minimum keeps it from
@@ -1072,6 +1084,7 @@ mod tests {
     fn auto_grow_uses_field_sizing_content() {
         let body = rule_body(".autumn-auto-grow");
         for declaration in [
+            "inline-size: 100%;",
             "field-sizing: content;",
             "min-block-size: 3lh;",
             "max-block-size: 50vh;",
@@ -1080,7 +1093,8 @@ mod tests {
         }
     }
 
-    /// WCAG 1.4.3: button, kbd, chip and empty-state text in both schemes.
+    /// WCAG 1.4.3: button, kbd, `+N` item and empty-state text in both
+    /// schemes.
     /// A transparent background reads the surface.
     #[test]
     fn display_set_text_meets_aa_contrast() {
@@ -1154,11 +1168,7 @@ mod tests {
     fn meter_fills_and_spinner_meet_non_text_contrast() {
         let mut failures = Vec::new();
         for scheme in Scheme::BOTH {
-            let track = declared(
-                ".autumn-meter::-webkit-meter-bar",
-                "background-color",
-                scheme,
-            );
+            let track = declared(".autumn-meter::-webkit-meter-bar", "background", scheme);
             for fill in [
                 ".autumn-meter::-webkit-meter-optimum-value",
                 ".autumn-meter::-webkit-meter-suboptimum-value",
@@ -1167,7 +1177,7 @@ mod tests {
                 ".autumn-meter:-moz-meter-sub-optimum::-moz-meter-bar",
                 ".autumn-meter:-moz-meter-sub-sub-optimum::-moz-meter-bar",
             ] {
-                let ratio = contrast(&declared(fill, "background-color", scheme), &track);
+                let ratio = contrast(&declared(fill, "background", scheme), &track);
                 if ratio < 3.0 {
                     failures.push(format!("{scheme:?} {fill}: {ratio:.2}:1"));
                 }
@@ -1190,5 +1200,78 @@ mod tests {
             "{}",
             rule_body(".autumn-skeleton__item")
         );
+    }
+
+    /// `hsl(h, s%, l%)` as `#rrggbb`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a channel is rounded and in 0..=255"
+    )]
+    fn hsl_to_hex(hsl: &str) -> String {
+        let inner = hsl
+            .trim()
+            .strip_prefix("hsl(")
+            .and_then(|v| v.strip_suffix(')'))
+            .unwrap_or_else(|| panic!("not hsl(): {hsl}"));
+        let parts: Vec<f64> = inner
+            .split(',')
+            .map(|p| p.trim().trim_end_matches('%').parse().expect("number"))
+            .collect();
+        let (h, s, l) = (parts[0] / 360.0, parts[1] / 100.0, parts[2] / 100.0);
+        let q = if l < 0.5 {
+            l * (1.0 + s)
+        } else {
+            l + s - l * s
+        };
+        let p = 2.0 * l - q;
+        let channel = |t: f64| {
+            let t = t.rem_euclid(1.0);
+            let c = if t < 1.0 / 6.0 {
+                p + (q - p) * 6.0 * t
+            } else if t < 0.5 {
+                q
+            } else if t < 2.0 / 3.0 {
+                p + (q - p) * (2.0 / 3.0 - t) * 6.0
+            } else {
+                p
+            };
+            format!("{:02x}", (c * 255.0).round() as u8)
+        };
+        format!(
+            "#{}{}{}",
+            channel(h + 1.0 / 3.0),
+            channel(h),
+            channel(h - 1.0 / 3.0)
+        )
+    }
+
+    /// axe (#3406 avatar group story): white initials on each palette
+    /// color, and on the fallback, meet 4.5:1.
+    #[test]
+    fn avatar_initials_meet_aa_contrast_on_every_palette_color() {
+        assert_eq!(hsl_to_hex("hsl(0, 100%, 50%)"), "#ff0000");
+        let mut failures = Vec::new();
+        for class in (0..12)
+            .map(|i| format!(".autumn-avatar--c{i}"))
+            .chain([".autumn-avatar--initials".to_owned()])
+        {
+            let body = rule_body(&class);
+            let value = body
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix("background:"))
+                .chain(
+                    body.split_once("background:")
+                        .map(|(_, v)| v.split(';').next().unwrap_or("")),
+                )
+                .next()
+                .unwrap_or_else(|| panic!("{class} has no background"));
+            let bg = hsl_to_hex(value.trim().trim_end_matches(';'));
+            let ratio = contrast("#ffffff", &bg);
+            if ratio < 4.5 {
+                failures.push(format!("{class} {bg}: {ratio:.2}:1"));
+            }
+        }
+        assert!(failures.is_empty(), "below 4.5:1 — {failures:?}");
     }
 }

@@ -830,8 +830,10 @@ mod tests {
     /// Issue #3399 added the toast runtime. It increased the budgets from
     /// 32 KiB and 10 KiB. Issue #3404 added the tooltip runtime, next to the
     /// #3403 drawer. Issue #3402 added the popover menu runtime. Together they
-    /// increased them from 36 KiB and 11 KiB.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 44 * 1024;
+    /// increased them from 36 KiB and 11 KiB. Issue #3406 added the busy
+    /// state for htmx requests (`data-autumn-busy`). It increased the raw
+    /// budget from 44 KiB. The gzip budget did not change.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 45 * 1024;
     /// Gzip budget. Browsers download this size.
     const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 13 * 1024;
 
@@ -864,22 +866,25 @@ mod tests {
         );
     }
 
-    /// Issue #3406: `data-autumn-busy` gets `aria-busy` while an htmx
-    /// request runs on it or on an element around it. htmx 2 sets no
-    /// `aria-busy`. The sync runs before the send and after the request
-    /// and the settle, so a swap that removes the requester leaves no
-    /// stale `aria-busy`.
+    /// Issue #3406: a `data-autumn-busy` element gets `aria-busy` during
+    /// its own htmx request: it sends it, it is the form submitter, or
+    /// `hx-indicator` names it. htmx 2 sets no `aria-busy`. The XHR
+    /// `loadend` clears it on every path, also when a swap or an error
+    /// removed the requester. Only an `aria-busy` that the runtime set is
+    /// removed.
     #[test]
-    fn widgets_js_syncs_aria_busy_with_htmx_requests() {
+    fn widgets_js_sets_aria_busy_for_the_request_only() {
         let js = std::str::from_utf8(AUTUMN_WIDGETS_JS).expect("utf8");
         for needle in [
-            "[data-autumn-busy]",
-            "closest('.htmx-request')",
-            "setAttribute('aria-busy', 'true')",
-            "removeAttribute('aria-busy')",
             "'htmx:beforeSend'",
-            "'htmx:afterRequest'",
-            "'htmx:afterSettle'",
+            "matches('[data-autumn-busy]')",
+            "ev && ev.submitter",
+            "querySelectorAll('.htmx-request')",
+            "d.target",
+            "busySet",
+            "setAttribute('aria-busy', 'true')",
+            "addEventListener('loadend'",
+            "removeAttribute('aria-busy')",
         ] {
             assert!(js.contains(needle), "autumn-widgets.js has no `{needle}`");
         }

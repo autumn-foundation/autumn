@@ -1033,9 +1033,10 @@ Per-primitive setters (in addition to the shared set):
   `ButtonVariant::{Primary,Secondary,Ghost,Destructive,Link}`,
   `ButtonSize::{Small,Medium,Large}`, `.kind/.submit/.icon/.icon_only/
   .disabled/.id/.class/.attrs`, `.loading()` (static `aria-busy="true"` +
-  `disabled`) and `.loading_on_request()` (`data-autumn-busy`; the spinner
-  shows while the button or an ancestor has `.htmx-request`, and
-  `autumn-widgets.js` sets `aria-busy`); `button_group(label, &[Markup])` /
+  `disabled`) and `.loading_on_request()` (`data-autumn-busy`: busy during its own
+  request — it sends it, submits the form, or `hx-indicator` names it;
+  `autumn-widgets.js` sets `aria-busy` on it and the swap target);
+  `.attrs` passes app attributes through (widget-owned names win); `button_group(label, &[Markup])` /
   `button_group_with(.., &ButtonGroupConfig::new().vertical())`;
   `spinner(label)` / `spinner_with(.., &SpinnerConfig)` (`SpinnerSize`,
   `.indicator(id)`); `skeleton(SkeletonShape::{Line,Block,Circle})` /

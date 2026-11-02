@@ -2,7 +2,8 @@
 
 `autumn_web::widgets` has a set of small widgets (issue #3406). Each one
 renders native HTML with `autumn-*` classes. The stylesheet uses only the
-design tokens. None of them needs JavaScript, except the htmx busy state.
+design tokens. Only the htmx states need JavaScript: htmx for an
+indicator, and `autumn-widgets.js` for a busy button.
 
 | Widget | Element |
 |---|---|
@@ -45,12 +46,15 @@ let delete = button(
   `aria-hidden`.
 - **Icon only:** `.icon_only()` hides the label visually. The label stays
   in the button, so it is still the accessible name.
-- **Attributes:** `.attrs(&[("hx-post", "/save")])` adds attributes. The
-  widget drops `on*` and `hx-on*` handlers and `style`.
+- **Attributes:** `.attrs(&[("hx-post", "/save")])` adds attributes.
+  They pass through as given, `hx-on*` and `style` too: the app owns its
+  CSP. The widget drops a malformed name and a second copy of a name.
 
-The label is required. A debug build panics on an empty label.
+The label is required. A debug build panics on an empty label. The same
+is true for the labels of the group, spinner, progress, meter and avatar
+group widgets, and for the empty-state title.
 
-The classes also style a link. Use them with `link_to_with` or
+The classes also style a link from `link_to_with` and the button of
 `button_to_with`:
 
 ```rust
@@ -83,25 +87,37 @@ let save = button(
 );
 ```
 
-htmx adds the `htmx-request` class to the element that sends a request,
-or to the elements that `hx-indicator` names. The spinner shows while the
-button, or an element around it, has that class. Thus it shows in these
-cases:
+The button is busy during its own request only:
 
 - The button sends the request.
-- The form of the button sends the request.
+- The button submits the form that sends the request.
 - `hx-indicator` names the button, for example `hx-indicator="#save"`.
   Set the id with `.id("save")`.
 
-`autumn-widgets.js` sets `aria-busy="true"` on each `[data-autumn-busy]`
-element for the same time. htmx 2 does not set `aria-busy`. The runtime
-removes it after the request and after the settle step.
+htmx adds the `htmx-request` class to the element that sends a request,
+or to the elements that `hx-indicator` names. CSS shows the spinner
+while the button has that class. htmx 2 does not set `aria-busy`, so
+`autumn-widgets.js` sets `aria-busy="true"` on the busy button and on the
+swap target. On a form submitter, this `aria-busy` shows the spinner. The
+runtime removes only an `aria-busy` that it set. It removes it when the
+request ends, also after an error or an abort.
+
+`hx-indicator` is inherited. If an element around the button sets it,
+htmx marks that element, not the button. The runtime still sets
+`aria-busy` on the button, so the spinner shows.
 
 The spinner covers the label, so the width does not change. CSS hides the
 icon and the label with `opacity: 0` only. They stay in the accessibility
 tree, so the button keeps its name.
 
-To stop a second click, add `hx-disabled-elt="this"` to the button.
+`aria-busy` does not tell the user that the work is done. Put the result
+in a `role="status"` region that is on the page before the request, for
+example `span id="save-status" role="status" {}`.
+
+To stop a second click, add `hx-sync="this:drop"`. Do not use
+`hx-disabled-elt="this"`: a disabled button loses the keyboard focus. A
+`.loading()` button is `disabled`. Thus a swap that puts one in place of
+the focused button moves the focus.
 
 ## Button group
 
@@ -143,7 +159,7 @@ let text = skeleton_with(SkeletonShape::Line, &SkeletonConfig::new().count(3));
 ```
 
 - `Line` fills the width. With more than one line, the last line is
-  shorter.
+  shorter. `count` is at most `MAX_SKELETON_COUNT` (64).
 - `Block` is for an image or a card.
 - `Circle` is avatar size. Circles go in a row.
 
@@ -176,6 +192,10 @@ let page = html! {
 The `autumn-indicator` class does not use the htmx indicator styles. Those
 styles are an inline `<style>`, which a strict CSP can block.
 
+A spinner indicator keeps its `role="status"` element on the page and
+hides only its content. When the content shows, a screen reader reads the
+label. A skeleton indicator is hidden completely.
+
 ## Progress and meter
 
 Use `progress` for a task that completes. Use `meter` for a measurement in
@@ -206,9 +226,11 @@ let disk = meter_with(
 - `.value_text(text)` shows `text` in place of the percent. It is also the
   `aria-valuetext`.
 - The widget clamps each value to its range. A `NaN` progress value gives
-  an indeterminate bar.
+  an indeterminate bar. The progress percent rounds down, so 99.6% shows
+  "99%".
 - The meter fills use `--success`, `--warning-text` and `--danger`. Each
-  has 3:1 contrast with the track in both schemes.
+  has 3:1 contrast with the track in both schemes. In forced colors mode,
+  the meter uses system colors.
 
 ## Separator
 
@@ -220,8 +242,9 @@ let bar = separator_with(&SeparatorConfig::new().vertical());
 let look = separator_with(&SeparatorConfig::new().decorative());
 ```
 
-A vertical separator is `role="separator"` with
-`aria-orientation="vertical"`. A decorative one is `role="none"`.
+A vertical separator is a `<span>` with `role="separator"` and
+`aria-orientation="vertical"`, so it can go in a paragraph. A decorative
+one is `role="none"`.
 
 ## Kbd
 
@@ -271,7 +294,8 @@ let likes = avatar_group_with(
   is 5. With more avatars, the group shows `max - 1` avatars and `+N`.
 - `total` sets the number of people when you give fewer avatars.
 - The `+N` item is `role="img"`. Its name comes from `more_label`, where
-  `{count}` becomes the number. Translate it there.
+  `{count}` becomes the number. Translate it there. The item is a pill,
+  so a long count does not clip.
 
 ## Auto-grow textarea
 

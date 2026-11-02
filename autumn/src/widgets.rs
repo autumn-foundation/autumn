@@ -7714,8 +7714,19 @@ pub struct ButtonConfig<'a> {
 impl<'a> ButtonConfig<'a> {
     /// A medium [`ButtonVariant::Primary`] button with `type="button"`.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            variant: ButtonVariant::Primary,
+            size: ButtonSize::Medium,
+            kind: crate::a11y::ButtonType::Button,
+            icon: None,
+            icon_only: false,
+            busy: ButtonBusy::No,
+            disabled: false,
+            id: None,
+            class: None,
+            attrs: &[],
+        }
     }
 
     /// Set the look.
@@ -7773,11 +7784,13 @@ impl<'a> ButtonConfig<'a> {
     /// Show the busy state during an htmx request. The button gets
     /// `data-autumn-busy` and a hidden spinner.
     ///
-    /// The spinner shows while the button, or an element around it, has
-    /// the htmx `htmx-request` class. That is the case when the button
-    /// sends the request, when its form sends it, or when `hx-indicator`
-    /// names the button. `autumn-widgets.js` sets `aria-busy="true"` for
-    /// the same time. It replaces [`loading`](Self::loading).
+    /// The button is busy when it sends the request, when it submits the
+    /// form that sends it, or when `hx-indicator` names it. CSS shows the
+    /// spinner while htmx gives the button the `htmx-request` class.
+    /// `autumn-widgets.js` sets `aria-busy="true"` on the button and on
+    /// the swap target. On a form submitter, this `aria-busy` shows the
+    /// spinner.
+    /// It replaces [`loading`](Self::loading).
     #[must_use]
     pub const fn loading_on_request(mut self) -> Self {
         self.busy = ButtonBusy::OnRequest;
@@ -7805,10 +7818,12 @@ impl<'a> ButtonConfig<'a> {
         self
     }
 
-    /// Add attributes to the `<button>`, for example `hx-post`. `on*` and
-    /// `hx-on*` handlers and `style` are dropped. The widget sets `type`,
-    /// `class`, `id`, `disabled`, `aria-busy` and `data-autumn-busy` first,
-    /// so a second copy of one of them is dropped.
+    /// Add attributes to the `<button>`, for example `hx-post`. Values are
+    /// escaped. They pass through as given, `hx-on*` and `style` too: the
+    /// app owns its CSP. A malformed name is dropped. The widget sets
+    /// `type`, `class`, `id`, `disabled`, `aria-busy` and
+    /// `data-autumn-busy` first, so a second copy of one of them, or of an
+    /// earlier attribute, is dropped.
     #[must_use]
     pub const fn attrs(mut self, attrs: &'a [(&'a str, &'a str)]) -> Self {
         self.attrs = attrs;
@@ -7855,6 +7870,10 @@ impl<'a> ButtonConfig<'a> {
 #[track_caller]
 pub fn button(label: &str, config: &ButtonConfig<'_>) -> maud::Markup {
     assert_named("button", label);
+    debug_assert!(
+        !config.icon_only || config.icon.is_some(),
+        "button: icon_only() needs an icon(), or the button shows nothing"
+    );
     let mut root = format!(
         "autumn-button {} {}",
         config.variant.class(),
@@ -7876,7 +7895,6 @@ pub fn button(label: &str, config: &ButtonConfig<'_>) -> maud::Markup {
     if config.disabled && config.busy != ButtonBusy::Now {
         attrs.push(("disabled", ""));
     }
-    attrs.extend_from_slice(config.attrs);
     let label_class = if config.icon_only {
         "autumn-button__label autumn-visually-hidden"
     } else {
@@ -7892,7 +7910,26 @@ pub fn button(label: &str, config: &ButtonConfig<'_>) -> maud::Markup {
         }
         span class=(label_class) { (label) }
     };
-    crate::form::widget_element("button", &attrs, &crate::form::FieldOptions::new(), body)
+    // The app owns its CSP: its attributes pass through, `on*` and `style`
+    // too. Only a malformed name, or a name the widget sets, is dropped.
+    let mut out = String::from("<button");
+    for (name, value) in &attrs {
+        crate::form::push_attr(&mut out, name, value);
+    }
+    for &(name, value) in config.attrs {
+        let well_formed = name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':' | b'.'));
+        if well_formed && !attrs.iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            crate::form::push_attr(&mut out, name, value);
+            attrs.push((name, value));
+        }
+    }
+    out.push('>');
+    out.push_str(&body.into_string());
+    out.push_str("</button>");
+    maud::PreEscaped(out)
 }
 
 /// Panic in a debug build when `label` gives no accessible name.
@@ -8042,9 +8079,10 @@ impl<'a> SpinnerConfig<'a> {
         self
     }
 
-    /// Make the spinner an htmx indicator with this `id`. A leading `#` is
-    /// removed. The spinner is hidden until htmx gives it, or an element
-    /// around it, the `htmx-request` class. Name it in `hx-indicator`.
+    /// Make the spinner an htmx indicator with this `id`. The widget
+    /// removes a leading `#`. The spinner content is hidden until htmx
+    /// gives the spinner, or an element around it, the `htmx-request`
+    /// class. The `role="status"` root stays. Name it in `hx-indicator`.
     #[must_use]
     pub const fn indicator(mut self, id: &'a str) -> Self {
         self.indicator = Some(id);
@@ -8138,6 +8176,12 @@ impl SkeletonShape {
     }
 }
 
+/// The most shapes that one [`skeleton_with`] renders. A larger
+/// [`SkeletonConfig::count`], for example from a query string, renders
+/// this many.
+#[cfg(feature = "maud")]
+pub const MAX_SKELETON_COUNT: usize = 64;
+
 /// Options for [`skeleton_with`].
 #[cfg(feature = "maud")]
 #[derive(Debug, Clone, Copy)]
@@ -8166,17 +8210,18 @@ impl<'a> SkeletonConfig<'a> {
         }
     }
 
-    /// Render `count` shapes. The default is 1, and 0 also gives 1. Lines
-    /// go in a column, and the last line is shorter. Circles go in a row.
+    /// Render `count` shapes. The default is 1, 0 gives 1, and the maximum
+    /// is [`MAX_SKELETON_COUNT`]. Lines go in a column, and the last line
+    /// is shorter. Circles go in a row.
     #[must_use]
     pub const fn count(mut self, count: usize) -> Self {
         self.count = count;
         self
     }
 
-    /// Make the skeleton an htmx indicator with this `id`. A leading `#`
-    /// is removed. The skeleton is hidden until htmx gives it, or an
-    /// element around it, the `htmx-request` class. Name it in
+    /// Make the skeleton an htmx indicator with this `id`. The widget
+    /// removes a leading `#`. The skeleton is hidden until htmx gives it,
+    /// or an element around it, the `htmx-request` class. Name it in
     /// `hx-indicator`.
     #[must_use]
     pub const fn indicator(mut self, id: &'a str) -> Self {
@@ -8233,7 +8278,7 @@ pub fn skeleton_with(shape: SkeletonShape, config: &SkeletonConfig<'_>) -> maud:
     let root = merge_class(&root, config.class);
     maud::html! {
         span id=[config.indicator.map(selector_to_id)] class=(root) aria-hidden="true" {
-            @for _ in 0..config.count.max(1) {
+            @for _ in 0..config.count.clamp(1, MAX_SKELETON_COUNT) {
                 span class="autumn-skeleton__item" {}
             }
         }
@@ -8299,8 +8344,8 @@ impl<'a> ProgressConfig<'a> {
 ///
 /// `label` is the accessible name. `value` goes from 0 to `max`. `None`
 /// gives an indeterminate bar, for work with no known end. The widget
-/// clamps `value` to `0..=max`. A `NaN` or infinite `value` is `None`. A
-/// `max` that is not a finite number above 0 is 1.
+/// clamps `value` to `0..=max`. It uses `None` for a `NaN` or infinite
+/// `value`, and 1 for a `max` that is not a finite number above 0.
 ///
 /// For a measurement in a range, for example disk use, use [`meter`].
 ///
@@ -8349,7 +8394,7 @@ pub fn progress_with(
     let shown = value.map(|v| {
         config
             .value_text
-            .map_or_else(|| percent(v, 0.0, max), str::to_owned)
+            .map_or_else(|| percent(v, 0.0, max, true), str::to_owned)
     });
     let value_text = config.value_text.filter(|_| value.is_some());
     let field = config.visible_label;
@@ -8395,15 +8440,21 @@ fn range_field(
 }
 
 /// `value` as a whole percent of `min..=max`, for example `"40%"`.
+/// `floor` rounds down, so a task at 99.6% does not show "100%".
 #[cfg(feature = "maud")]
-fn percent(value: f64, min: f64, max: f64) -> String {
-    let span = max - min;
+fn percent(value: f64, min: f64, max: f64, floor: bool) -> String {
+    // Halves: `max - min` can overflow to infinity near `f64::MAX`.
+    let span = max / 2.0 - min / 2.0;
     let ratio = if span > 0.0 {
-        (value - min) / span
+        (value / 2.0 - min / 2.0) / span
     } else {
         1.0
     };
-    format!("{}%", fmt_number((ratio * 100.0).round()))
+    let pct = ratio * 100.0;
+    format!(
+        "{}%",
+        fmt_number(if floor { pct.floor() } else { pct.round() })
+    )
 }
 
 /// A finite number as an attribute value: `40` not `40.0`, `0` not `-0`.
@@ -8498,9 +8549,9 @@ impl<'a> MeterConfig<'a> {
 /// disk use or a score.
 ///
 /// `label` is the accessible name. The widget clamps `value`, `low`,
-/// `high` and `optimum` to `range`. A range with the start above the end
-/// is turned around. A `NaN` or infinite bound is 0 (start) or 1 (end). A
-/// `NaN` or infinite `value` is the start.
+/// `high` and `optimum` to `range`. If the start is above the end, the
+/// widget swaps them. A `NaN` or infinite start becomes 0, and a `NaN` or
+/// infinite end becomes 1. A `NaN` or infinite `value` becomes the start.
 ///
 /// For a task that completes, use [`progress`].
 ///
@@ -8557,7 +8608,7 @@ pub fn meter_with(
     };
     let shown = config
         .value_text
-        .map_or_else(|| percent(value, min, max), str::to_owned);
+        .map_or_else(|| percent(value, min, max, false), str::to_owned);
     let field = config.visible_label;
     let bar_class = if field {
         "autumn-meter".to_owned()
@@ -8602,8 +8653,9 @@ impl<'a> SeparatorConfig<'a> {
         }
     }
 
-    /// A vertical line, for a row of items: `role="separator"` with
-    /// `aria-orientation="vertical"`.
+    /// A vertical line, for a row of items: a `<span>` with
+    /// `role="separator"` and `aria-orientation="vertical"`. A `<span>`
+    /// can go in a paragraph.
     #[must_use]
     pub const fn vertical(mut self) -> Self {
         self.vertical = true;
@@ -8655,7 +8707,7 @@ pub fn separator_with(config: &SeparatorConfig<'_>) -> maud::Markup {
     if config.vertical {
         let root = merge_class("autumn-separator autumn-separator--vertical", config.class);
         maud::html! {
-            div class=(root) role=(decorative.unwrap_or("separator"))
+            span class=(root) role=(decorative.unwrap_or("separator"))
                 aria-orientation=[(!config.decorative).then_some("vertical")] {}
         }
     } else {
@@ -8719,8 +8771,12 @@ pub struct EmptyStateConfig<'a> {
 impl<'a> EmptyStateConfig<'a> {
     /// An `<h2>` title, with no icon.
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub const fn new() -> Self {
+        Self {
+            icon: None,
+            level: HeadingLevel::H2,
+            class: None,
+        }
     }
 
     /// Show `icon` above the title. The icon is `aria-hidden`.
@@ -8749,7 +8805,8 @@ impl<'a> EmptyStateConfig<'a> {
 /// Render an empty state: a title, a short text and an optional action,
 /// for a list or a page with no data yet.
 ///
-/// The title is a heading. An empty `body` gives no paragraph. Give an
+/// The title is a heading. Do not give an empty title: a debug build
+/// panics. An empty `body` gives no paragraph. Give an
 /// action that lets the user fix the empty state, for example a link to
 /// create the first item.
 ///
@@ -8765,6 +8822,7 @@ impl<'a> EmptyStateConfig<'a> {
 /// ```
 #[cfg(feature = "maud")]
 #[must_use]
+#[track_caller]
 pub fn empty_state(title: &str, body: &str, action: Option<&maud::Markup>) -> maud::Markup {
     empty_state_with(title, body, action, &EmptyStateConfig::new())
 }
@@ -8773,12 +8831,14 @@ pub fn empty_state(title: &str, body: &str, action: Option<&maud::Markup>) -> ma
 /// and class.
 #[cfg(feature = "maud")]
 #[must_use]
+#[track_caller]
 pub fn empty_state_with(
     title: &str,
     body: &str,
     action: Option<&maud::Markup>,
     config: &EmptyStateConfig<'_>,
 ) -> maud::Markup {
+    assert_named("empty_state", title);
     let root = merge_class("autumn-empty-state", config.class);
     maud::html! {
         div class=(root) {
@@ -8837,7 +8897,8 @@ impl<'a> AvatarGroupConfig<'a> {
     }
 
     /// Show at most `max` items, the `+N` item included. With more
-    /// avatars, the group shows `max - 1` avatars and `+N`. 0 is 1.
+    /// avatars, the group shows `max - 1` avatars and `+N`. A `max` of 0
+    /// counts as 1.
     #[must_use]
     pub const fn max(mut self, max: usize) -> Self {
         self.max = max;
@@ -8861,7 +8922,8 @@ impl<'a> AvatarGroupConfig<'a> {
     }
 
     /// Set the accessible name of the `+N` item. `{count}` becomes the
-    /// number. The default is `"{count} more"`. Translate it here.
+    /// number. The default is `"{count} more"`. Translate it here. Do not
+    /// give an empty label: a debug build panics.
     #[must_use]
     pub const fn more_label(mut self, label: &'a str) -> Self {
         self.more_label = label;
@@ -8910,6 +8972,7 @@ pub fn avatar_group_with(
     config: &AvatarGroupConfig<'_>,
 ) -> maud::Markup {
     assert_named("avatar_group", label);
+    assert_named("avatar_group more_label", config.more_label);
     let (shown, extra) = avatar_group_split(avatars.len(), config.total, config.max);
     let root = merge_class("autumn-avatar-group", config.class);
     let more = format!(
@@ -12365,15 +12428,20 @@ mod display_set_tests {
 
     #[test]
     fn button_attrs_pass_through_but_cannot_replace_owned_ones() {
+        // The app owns its CSP (CLAUDE.md): handlers and `style` pass
+        // through. The widget's own attributes win.
         let attrs = [
             ("hx-post", "/save?a=1&b=2"),
             ("hx-indicator", "this"),
             ("type", "submit"),
-            ("class", "evil"),
-            ("onclick", "alert(1)"),
-            ("hx-on:click", "alert(1)"),
+            ("CLASS", "evil"),
+            ("hx-on::after-request", "this.form.reset()"),
+            ("data-user_id", "7"),
             ("style", "color:red"),
+            ("title", "a\"b"),
+            ("title", "second"),
             ("Bad Name", "x"),
+            ("\"><script>", "x"),
         ];
         let html = btn(&ButtonConfig::new().attrs(&attrs));
         assert!(html.contains(r#"hx-post="/save?a=1&amp;b=2""#), "{html}");
@@ -12381,10 +12449,43 @@ mod display_set_tests {
         assert_eq!(html.matches("type=").count(), 1, "{html}");
         assert!(html.contains(r#"type="button""#), "{html}");
         assert!(!html.contains("evil"), "{html}");
-        assert!(!html.contains("onclick"), "{html}");
-        assert!(!html.contains("hx-on"), "{html}");
-        assert!(!html.contains("style="), "{html}");
+        assert!(
+            html.contains(r#"hx-on::after-request="this.form.reset()""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"data-user_id="7""#), "{html}");
+        assert!(html.contains(r#"style="color:red""#), "{html}");
+        assert!(html.contains(r#"title="a&quot;b""#), "{html}");
+        assert!(!html.contains("second"), "{html}");
         assert!(!html.contains("Bad Name"), "{html}");
+        assert!(!html.contains("<script>"), "{html}");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "icon_only() needs an icon()")]
+    fn icon_only_without_an_icon_panics_in_debug() {
+        let _ = btn(&ButtonConfig::new().icon_only());
+    }
+
+    #[test]
+    fn skeleton_count_is_capped() {
+        let config = SkeletonConfig::new().count(usize::MAX);
+        let html = skeleton_with(SkeletonShape::Line, &config).into_string();
+        assert_eq!(
+            html.matches("autumn-skeleton__item").count(),
+            MAX_SKELETON_COUNT
+        );
+    }
+
+    #[test]
+    fn percent_rounds_progress_down_and_survives_huge_ranges() {
+        let config = ProgressConfig::new().visible_label();
+        let html = progress_with("Upload", Some(99.6), 100.0, &config).into_string();
+        assert!(html.contains(">99%</span>"), "{html}");
+        let config = MeterConfig::new().visible_label();
+        let html = meter_with("Huge", 0.0, -f64::MAX..=f64::MAX, &config).into_string();
+        assert!(html.contains(">50%</span>"), "{html}");
     }
 
     #[test]
@@ -12399,6 +12500,21 @@ mod display_set_tests {
     #[should_panic(expected = "accessible name")]
     fn button_with_a_blank_label_panics_in_debug() {
         let _ = button("  ", &ButtonConfig::new());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "accessible name")]
+    fn empty_state_with_a_blank_title_panics_in_debug() {
+        let _ = empty_state(" ", "body", None);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "accessible name")]
+    fn avatar_group_with_a_blank_more_label_panics_in_debug() {
+        let config = AvatarGroupConfig::new().more_label("");
+        let _ = avatar_group_with("Members", &[], &config);
     }
 
     // ── button_group ────────────────────────────────────────────────────
@@ -12653,8 +12769,8 @@ mod display_set_tests {
         assert_eq!(
             html,
             concat!(
-                r#"<div class="autumn-separator autumn-separator--vertical" "#,
-                r#"role="separator" aria-orientation="vertical"></div>"#,
+                r#"<span class="autumn-separator autumn-separator--vertical" "#,
+                r#"role="separator" aria-orientation="vertical"></span>"#,
             )
         );
         let html = separator_with(&SeparatorConfig::new().vertical().decorative()).into_string();

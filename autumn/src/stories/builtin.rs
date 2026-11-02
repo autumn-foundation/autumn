@@ -741,7 +741,16 @@ fn builtin_stories() -> Vec<Story> {
                                 ("hx-target", "#story-save-status"),
                             ])))
                         " "
-                        span id="story-save-status" {}
+                        span id="story-save-status" role="status" {}
+                    }
+                    // The submit button of an htmx form is busy too.
+                    form hx-get="/_stories/demo/save" hx-target="#story-publish-status" {
+                        (button("Publish", &ButtonConfig::new()
+                            .submit()
+                            .id("story-publish")
+                            .loading_on_request()))
+                        " "
+                        span id="story-publish-status" role="status" {}
                     }
                     // The classes also style a link.
                     p {
