@@ -3450,7 +3450,7 @@ impl SchedulerBackend {
 ///   only the liveness/readiness probes and the actuator (so orchestrators can
 ///   supervise it and `/actuator/jobs` works).
 ///
-/// `role` in TOML and `AUTUMN_ROLE` use one parser, [`FromStr`]. An unknown
+/// `role` in TOML and `AUTUMN_ROLE` use one parser, [`FromStr`](std::str::FromStr). An unknown
 /// value is an error on both paths (#3541).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessRole {
