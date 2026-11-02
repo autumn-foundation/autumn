@@ -637,7 +637,7 @@ async fn a_tenant_that_ships_after_the_listing_is_planned_again() {
             .list(&prefix)
             .unwrap()
             .iter()
-            .any(|key| key.ends_with(".seg")),
+            .any(|key| Path::new(key).extension().is_some_and(|ext| ext == "seg")),
         "the test needs a segment to hide"
     );
     let stale = Arc::new(Stale {
@@ -1000,6 +1000,20 @@ async fn the_query_runs_one_select_only() {
         .await
         .unwrap();
     assert_eq!(rows.rows[0][0], LakeValue::Integer(300));
+    // `;` and `--` inside a literal are not the end of the statement.
+    let rows = snapshot
+        .query("SELECT 'before; --after' /* c; */ ; -- note")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![vec![LakeValue::Text("before; --after".into())]]
+    );
+    let rows = snapshot.query("SELECT 'before; --after';").await.unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![vec![LakeValue::Text("before; --after".into())]]
+    );
     let rows = snapshot.query("VALUES (1, 'a')").await.unwrap();
     assert_eq!(
         rows.rows,
@@ -1038,6 +1052,28 @@ async fn values_round_trip() {
             LakeValue::Text("before\0after".into()),
         ]
     );
+}
+
+/// Each value is computed once: its type and its bytes agree.
+#[tokio::test]
+async fn a_random_value_is_encoded_from_one_evaluation() {
+    let host = host(Duration::ZERO);
+    ship(&host, "acme", &[NOTES]).await;
+    let snapshot = lake(&host).materialize().await.unwrap();
+    let rows = snapshot
+        .query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 500) \
+             SELECT CASE WHEN random() % 2 = 0 THEN 'abc' ELSE x'ff' END FROM n",
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows.len(), 500);
+    for row in &rows.rows {
+        assert!(
+            row[0] == LakeValue::Text("abc".into()) || row[0] == LakeValue::Blob(vec![0xff]),
+            "{row:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1096,6 +1132,22 @@ fn literals_parse() {
 }
 
 #[test]
+fn the_statement_end_skips_literals_and_comments() {
+    assert_eq!(statement("SELECT 1;"), "SELECT 1");
+    assert_eq!(statement("SELECT 1 ; -- a\n/* b; */ ;\n"), "SELECT 1");
+    assert_eq!(statement("SELECT 'a;--b';"), "SELECT 'a;--b'");
+    assert_eq!(statement("SELECT 'it''s';"), "SELECT 'it''s'");
+    assert_eq!(
+        statement("SELECT \"a;b\", [c;d], `e;f`;"),
+        "SELECT \"a;b\", [c;d], `e;f`"
+    );
+    assert_eq!(statement("SELECT 1; SELECT 2;"), "SELECT 1; SELECT 2");
+    assert_eq!(statement("SELECT 'open"), "SELECT 'open");
+    assert_eq!(statement("SELECT 'é';"), "SELECT 'é'");
+    assert_eq!(statement("  ;  "), "");
+}
+
+#[test]
 fn identifiers_are_quoted() {
     assert_eq!(quote_ident("notes"), "\"notes\"");
     assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
@@ -1127,6 +1179,12 @@ async fn scratch_is_private_and_removed_on_drop() {
 
 #[tokio::test]
 async fn persist_writes_a_standalone_copy() {
+    #[derive(diesel::QueryableByName)]
+    struct N {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
     let host = host(Duration::ZERO);
     three_tenants(&host).await;
     let snapshot = lake(&host).materialize().await.unwrap();
@@ -1139,11 +1197,6 @@ async fn persist_writes_a_standalone_copy() {
         use std::os::unix::fs::PermissionsExt as _;
         let mode = std::fs::metadata(&out).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-    }
-    #[derive(diesel::QueryableByName)]
-    struct N {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        n: i64,
     }
     let mut conn =
         crate::db::establish_sqlite_migration_connection(&out.display().to_string()).unwrap();

@@ -76,8 +76,9 @@ Parquet (option 3) is deferred. DuckDB (option 2) is rejected for now.
    name: a column that a tenant does not have is `NULL`.
 6. **Query.** A `mode=ro` connection makes a temporary view of the SQL and
    sets `query_only`. The SQL must be one `SELECT`, `WITH` or `VALUES`
-   statement. Rows stream through `quote()`, which keeps the storage class
-   and round-trips a real. Text goes as hex, because `quote()` stops at a
+   statement. The result is computed once into temporary storage, so each
+   value has one type. Rows then stream through `quote()`, which keeps the
+   storage class and round-trips a real. Text goes as hex, because `quote()` stops at a
    NUL.
 
 `_autumn_lake_tenants` records each loaded tenant: its generation and its

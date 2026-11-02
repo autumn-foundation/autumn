@@ -1285,24 +1285,54 @@ fn columns_of(conn: &mut SqliteConnection, sql: &str) -> Result<Vec<String>, Lak
     .collect())
 }
 
-/// `sql` with no trailing `;`, white space or `--` comment lines.
+/// `sql` with no trailing `;`, white space or comments. It reads quotes
+/// and comments, so a `;` or a `--` in a literal stays.
 fn statement(sql: &str) -> &str {
-    let mut sql = sql.trim_end();
-    loop {
-        let line_start = sql.rfind('\n').map_or(0, |at| at + 1);
-        let after_semicolon = sql
-            .rfind(';')
-            .filter(|at| *at >= line_start && sql[at + 1..].trim_start().starts_with("--"));
-        if sql[line_start..].trim_start().starts_with("--") {
-            sql = sql[..line_start].trim_end();
-        } else if let Some(at) = after_semicolon {
-            sql = sql[..at].trim_end();
-        } else if let Some(rest) = sql.strip_suffix(';') {
-            sql = rest.trim_end();
-        } else {
-            return sql;
+    let bytes = sql.as_bytes();
+    // The end of the last byte that is code, not space, `;` or a comment.
+    let mut end = 0;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            quote @ (b'\'' | b'"' | b'`' | b'[') => {
+                let close = if quote == b'[' { b']' } else { quote };
+                at += 1;
+                while at < bytes.len() {
+                    if bytes[at] == close {
+                        // A doubled quote is one quote in the literal.
+                        if close != b']' && bytes.get(at + 1) == Some(&close) {
+                            at += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    at += 1;
+                }
+                at = (at + 1).min(bytes.len());
+                end = at;
+            }
+            b'-' if bytes.get(at + 1) == Some(&b'-') => {
+                while at < bytes.len() && bytes[at] != b'\n' {
+                    at += 1;
+                }
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                at += 2;
+                while at < bytes.len() && !(bytes[at] == b'*' && bytes.get(at + 1) == Some(&b'/')) {
+                    at += 1;
+                }
+                at = (at + 2).min(bytes.len());
+            }
+            byte if byte == b';' || byte.is_ascii_whitespace() => at += 1,
+            _ => {
+                at += 1;
+                end = at;
+            }
         }
     }
+    // `end` follows an ASCII byte or the end of a literal, so it is a char
+    // boundary.
+    sql.get(..end).unwrap_or(sql)
 }
 
 #[derive(diesel::QueryableByName)]
@@ -1342,7 +1372,12 @@ fn for_each_row(
         })
         .collect::<Vec<_>>()
         .join(" || char(9) || ");
-    let statement = format!("SELECT {arrays} AS row FROM temp.{RESULT_VIEW}");
+    // MATERIALIZED: each value is computed once, so its type and its bytes
+    // agree even for `random()`.
+    let statement = format!(
+        "WITH _autumn_lake_rows AS MATERIALIZED (SELECT * FROM temp.{RESULT_VIEW}) \
+         SELECT {arrays} AS row FROM _autumn_lake_rows"
+    );
     let rows = diesel::sql_query(statement)
         .load_iter::<Encoded, diesel::connection::DefaultLoadingMode>(&mut conn)
         .map_err(|error| query(error.to_string()))?;
