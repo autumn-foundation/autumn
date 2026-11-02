@@ -517,7 +517,7 @@ jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust
 secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.18.0"
 hmac = "0.12"
-sha2 = "0.10"
+sha2 = "0.11"
 backtrace = { version = "0.3", optional = true }
 infer = { version = "0.22", optional = true }
 sha1 = { version = "0.11", optional = true }
