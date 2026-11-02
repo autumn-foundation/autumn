@@ -4494,56 +4494,21 @@ impl AppBuilder {
         if pool.is_some() || shards.is_some() {
             // Pool sizes multiply across shards: surface the total so
             // N-shard deployments notice the aggregate connection count.
-            let shard_max_connections = shards
-                .as_ref()
-                .map_or(0, crate::sharding::ShardSet::total_max_connections);
-            let control_max_connections = pool.as_ref().map_or(0, |topology| {
-                topology.primary().status().max_size
-                    + topology.replica().map_or(0, |p| p.status().max_size)
-            });
-            let total_max_connections = control_max_connections + shard_max_connections;
-            let warn_threshold = config.database.max_connections_warn_threshold;
-            let backend = if cfg!(feature = "sqlite") {
-                let control_databases = pool
-                    .as_ref()
-                    .map_or(0, |topology| 1 + usize::from(topology.replica().is_some()));
-                let shard_databases = shards
-                    .as_ref()
-                    .map_or(0, crate::sharding::ShardSet::total_databases);
-                crate::config::ConnectionBackend::Sqlite {
-                    databases: control_databases + shard_databases,
-                }
-            } else {
-                crate::config::ConnectionBackend::Postgres
-            };
+            let budget = connection_budget(pool.as_ref(), shards.as_ref());
             tracing::info!(
                 primary_max_connections = config.database.effective_primary_pool_size(),
                 replica_configured = config.database.replica_url.is_some(),
                 replica_max_connections = config.database.effective_replica_pool_size(),
                 shard_count = shards.as_ref().map_or(0, crate::sharding::ShardSet::len),
-                total_max_connections,
+                total_max_connections = budget.total,
                 "Database topology configured"
             );
-            // Pool sizes multiply across shards; warn before the aggregate
-            // exhausts Postgres's `max_connections` or, on SQLite, the
-            // open-file limit of the process.
-            if let Some(message) = crate::config::total_connections_warning(
-                total_max_connections,
-                warn_threshold,
-                backend,
+            for warning in connection_budget_warnings(
+                &budget,
+                config.database.max_connections_warn_threshold,
+                crate::config::open_file_limit(),
             ) {
-                tracing::warn!(total_max_connections, warn_threshold, "{message}");
-            }
-            // On SQLite the open files can pass the process limit at any
-            // connection count.
-            if let crate::config::ConnectionBackend::Sqlite { databases } = backend {
-                let files = crate::config::sqlite_open_files(total_max_connections, databases);
-                let limit = crate::config::open_file_limit();
-                if let Some(message) =
-                    crate::config::open_files_warning(files, limit, warn_threshold)
-                {
-                    tracing::warn!(files, limit, "{message}");
-                }
+                tracing::warn!(total_max_connections = budget.total, "{warning}");
             }
             // A transaction-mode pooler breaks session state (issue #3065).
             for warning in crate::db::pooler::pooler_warnings(&config.database) {
@@ -15956,9 +15921,154 @@ mod agent_authority_route_summary_tests {
     }
 }
 
+/// The connections that the control topology and the shard pools may open,
+/// and the backend that selects the boot advice.
+#[cfg(feature = "db")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectionBudget {
+    /// All pools together, at their maximum size.
+    pub total: usize,
+    /// The backend, with the database count on `SQLite`.
+    pub backend: crate::config::ConnectionBackend,
+}
+
+/// The connection budget of the control topology and the shard set.
+#[cfg(feature = "db")]
+pub(crate) fn connection_budget(
+    topology: Option<&crate::db::DatabaseTopology>,
+    shards: Option<&crate::sharding::ShardSet>,
+) -> ConnectionBudget {
+    let control = topology.map_or(0, |topology| {
+        topology.primary().status().max_size
+            + topology.replica().map_or(0, |pool| pool.status().max_size)
+    });
+    let total = control + shards.map_or(0, crate::sharding::ShardSet::total_max_connections);
+    let backend = if cfg!(feature = "sqlite") {
+        let control_databases =
+            topology.map_or(0, |topology| 1 + usize::from(topology.replica().is_some()));
+        let shard_databases = shards.map_or(0, crate::sharding::ShardSet::total_databases);
+        crate::config::ConnectionBackend::Sqlite {
+            databases: control_databases + shard_databases,
+        }
+    } else {
+        crate::config::ConnectionBackend::Postgres
+    };
+    ConnectionBudget { total, backend }
+}
+
+/// The boot warnings for `budget`: a high connection count and, on `SQLite`,
+/// open files near `open_file_limit`. A `threshold` of `0` silences both.
+#[cfg(feature = "db")]
+pub(crate) fn connection_budget_warnings(
+    budget: &ConnectionBudget,
+    threshold: usize,
+    open_file_limit: Option<u64>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    warnings.extend(crate::config::total_connections_warning(
+        budget.total,
+        threshold,
+        budget.backend,
+    ));
+    // On SQLite the open files can pass the process limit at any connection
+    // count.
+    if let crate::config::ConnectionBackend::Sqlite { databases } = budget.backend {
+        let files = crate::config::sqlite_open_files(budget.total, databases);
+        warnings.extend(crate::config::open_files_warning(
+            files,
+            open_file_limit,
+            threshold,
+        ));
+    }
+    warnings
+}
+
+#[cfg(all(test, feature = "db", not(feature = "sqlite")))]
+mod connection_budget_tests {
+    use super::*;
+
+    #[test]
+    fn a_large_postgres_pool_gets_the_postgres_warning() {
+        let topology = crate::db::create_topology(&crate::config::DatabaseConfig {
+            primary_url: Some("postgres://127.0.0.1:1/budget".to_owned()),
+            pool_size: 120,
+            ..Default::default()
+        })
+        .expect("a lazy topology builds")
+        .expect("a URL is set");
+        let budget = connection_budget(Some(&topology), None);
+        assert_eq!(budget.total, 120);
+        assert_eq!(budget.backend, crate::config::ConnectionBackend::Postgres);
+        let warnings = connection_budget_warnings(&budget, 100, Some(256));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("Postgres"), "{warnings:?}");
+        assert!(connection_budget_warnings(&budget, 0, Some(256)).is_empty());
+    }
+}
+
 #[cfg(all(test, feature = "sqlite"))]
 mod fleet_boot_tests {
     use super::*;
+
+    /// A slot fleet at `max_open = 64`, `pool_size = 2`, beside a control
+    /// database with 10 connections: 138 connections, 65 databases.
+    fn sqlite_budget_fixture(tmp: &std::path::Path) -> ConnectionBudget {
+        let fleet = crate::db::fleet::DatabaseFleet::builder(crate::config::DatabaseFleetConfig {
+            mode: crate::fleet_layout::FleetMode::Slot,
+            root: tmp.join("fleet").display().to_string(),
+            path: None,
+            max_open: 64,
+            pool_size: 2,
+            create_on_demand: None,
+            idle_close_secs: 0,
+            restore_missing: false,
+            ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
+        })
+        .build()
+        .expect("fleet builds");
+        let control = crate::config::DatabaseConfig {
+            primary_url: Some(format!("sqlite://{}", tmp.join("control.db").display())),
+            pool_size: 10,
+            ..Default::default()
+        };
+        let topology = crate::db::create_topology(&control)
+            .expect("topology builds")
+            .expect("url configured");
+        let shards = crate::sharding::ShardSet::from_fleet(fleet, topology.primary().clone());
+        connection_budget(Some(&topology), Some(&shards))
+    }
+
+    #[test]
+    fn sqlite_boot_budget_counts_the_fleet_and_the_control_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let budget = sqlite_budget_fixture(tmp.path());
+        let control = budget.total - 128;
+        assert_eq!(
+            budget.backend,
+            crate::config::ConnectionBackend::Sqlite { databases: 65 }
+        );
+        assert!(control >= 1, "the control pool counts: {budget:?}");
+    }
+
+    #[test]
+    fn sqlite_boot_warns_on_connections_and_on_open_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let budget = sqlite_budget_fixture(tmp.path());
+        let warnings = connection_budget_warnings(&budget, 100, Some(256));
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("connections"), "{warnings:?}");
+        assert!(warnings[1].contains("limit of 256"), "{warnings:?}");
+        // A high limit leaves only the connection warning; 0 silences both.
+        assert_eq!(
+            connection_budget_warnings(&budget, 100, Some(100_000)).len(),
+            1
+        );
+        assert!(connection_budget_warnings(&budget, 0, Some(256)).is_empty());
+    }
 
     async fn table_exists(db: &crate::db::fleet::FleetDatabase, table: &str) -> bool {
         use diesel_async::RunQueryDsl as _;

@@ -4719,7 +4719,7 @@ mod tests {
     /// one query with `sql: "SELECT ?"`. The hold gets its own event.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn a_long_connection_hold_is_not_logged_as_a_query() {
+    async fn sqlite_long_connection_hold_is_not_logged_as_a_query() {
         let entries =
             logs_after_a_hold("POST /census", std::time::Duration::from_millis(6653)).await;
         assert!(
@@ -4752,7 +4752,7 @@ mod tests {
     /// A hold under the threshold logs nothing.
     #[cfg(feature = "sqlite")]
     #[tokio::test]
-    async fn a_short_connection_hold_logs_nothing() {
+    async fn sqlite_short_connection_hold_logs_nothing() {
         let entries = logs_after_a_hold("GET /fast", std::time::Duration::from_millis(499)).await;
         assert!(
             entries
