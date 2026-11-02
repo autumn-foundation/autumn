@@ -2194,47 +2194,33 @@ pub(crate) fn build_sqlite_pool_with(
     // and serves reads. In-memory targets are not read-only and keep the full batch.
     let mut config = diesel_async::pooled_connection::ManagerConfig::<RuntimeConnection>::default();
     config.custom_setup = Box::new(move |url: &str| {
-        use diesel_async::{AsyncConnection as _, SimpleAsyncConnection as _};
         let url = url.to_owned();
+        // The whole setup is synchronous and runs on one blocking thread. At
+        // `create_timeout`, deadpool drops only the `JoinHandle`, and the setup
+        // finishes on its thread. Two failures this prevents:
+        //
+        // - An async setup holds a diesel-async `CancelWrapper` for the query in
+        //   flight. When deadpool drops it, its `Drop` calls `block_in_place`,
+        //   which panics on a current-thread runtime.
+        // - A setup in `tokio::spawn` needs the runtime thread to poll it. When
+        //   a startup hook runs under `Handle::block_on` on a helper thread (as
+        //   `TestApp` does) and the runtime thread waits for it, it never runs.
+        //
+        // A blocking thread needs neither the scheduler nor a tokio timer.
+        //
+        // Not gated: on a sim runtime whose thread waits for a startup hook,
+        // the gate never opens, so each new connection waited 2 s and counted
+        // a give-up. The setup touches no sim state.
+        let setup = crate::time::spawn_blocking_ungated(move || {
+            sqlite_connection_setup(&url, checkpoint_owner)
+        });
         async move {
-            let mut conn = RuntimeConnection::establish(&url).await?;
-            let pragmas = sqlite_connection_pragmas(
-                sqlite_target_is_read_only(&url),
-                checkpoint_owner.replicating(),
-            );
-            apply_sqlite_pragmas(&mut conn, pragmas)
-                .await
-                .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
-            // #1910 FTS5 capability probe. Searchable repositories emit FTS5 virtual
-            // tables and `bm25()` ranking, and the `AddSearch` migration's `CREATE
-            // VIRTUAL TABLE ... USING fts5(...)` is the hard stop that fails loudly at
-            // boot if the linked SQLite lacks FTS5. Probe it here — create and drop a
-            // throwaway FTS5 table in the always-writable `temp` database, harmless on
-            // read-only main targets — so the failure is a clear diagnostic naming FTS5
-            // and the fix, rather than a bare "no such module: fts5" from a migration.
-            // There is no silent fallback to LIKE: full-text search requires FTS5.
-            if let Err(e) = conn
-                .batch_execute(
-                    "CREATE VIRTUAL TABLE temp.__autumn_fts5_probe USING fts5(x); \
-                     DROP TABLE temp.__autumn_fts5_probe;",
-                )
-                .await
-            {
-                return Err(diesel::ConnectionError::CouldntSetupConfiguration(
-                    diesel::result::Error::QueryBuilderError(
-                        format!(
-                            "SQLite FTS5 is not available in the linked SQLite library, but \
-                             autumn-web full-text search (searchable repositories / the \
-                             `--search` scaffold, issue #1910) requires it. Build with the \
-                             bundled, FTS5-enabled SQLite by enabling autumn-web's `sqlite` \
-                             feature (it turns on `libsqlite3-sys/bundled`, whose amalgamation \
-                             defines SQLITE_ENABLE_FTS5). Underlying probe error: {e}"
-                        )
-                        .into(),
-                    ),
-                ));
-            }
-            Ok(conn)
+            let conn = setup.await.map_err(|e| {
+                diesel::ConnectionError::BadConnection(format!(
+                    "SQLite connection setup task failed: {e}"
+                ))
+            })??;
+            Ok(RuntimeConnection::new(conn))
         }
         .boxed()
     });
@@ -2248,6 +2234,57 @@ pub(crate) fn build_sqlite_pool_with(
         .build()?)
 }
 
+/// Open one pool connection and set it up. Blocking: it runs on the blocking
+/// thread that `build_sqlite_pool_with` starts for each new connection.
+///
+/// It applies the per-connection pragmas, then probes for FTS5.
+#[cfg(feature = "sqlite")]
+fn sqlite_connection_setup(
+    url: &str,
+    checkpoint_owner: SqliteCheckpointOwner,
+) -> diesel::ConnectionResult<diesel::SqliteConnection> {
+    use diesel::connection::{Connection as _, SimpleConnection as _};
+
+    let mut conn = diesel::SqliteConnection::establish(url)?;
+    let pragmas = sqlite_connection_pragmas(
+        sqlite_target_is_read_only(url),
+        checkpoint_owner.replicating(),
+    );
+    apply_sqlite_pragmas(&mut conn, pragmas)
+        .map_err(diesel::ConnectionError::CouldntSetupConfiguration)?;
+    // #1910 FTS5 capability probe. Searchable repositories emit FTS5 virtual
+    // tables and `bm25()` ranking, and the `AddSearch` migration's `CREATE
+    // VIRTUAL TABLE ... USING fts5(...)` is the hard stop that fails loudly at
+    // boot if the linked SQLite lacks FTS5. Probe it here — create and drop a
+    // throwaway FTS5 table in the always-writable `temp` database, harmless on
+    // read-only main targets — so the failure is a clear diagnostic naming FTS5
+    // and the fix, rather than a bare "no such module: fts5" from a migration.
+    // There is no silent fallback to LIKE: full-text search requires FTS5.
+    conn.batch_execute(
+        "CREATE VIRTUAL TABLE temp.__autumn_fts5_probe USING fts5(x); \
+         DROP TABLE temp.__autumn_fts5_probe;",
+    )
+    .map_err(|e| sqlite_fts5_missing(&e))?;
+    Ok(conn)
+}
+
+/// The setup error when the linked `SQLite` library has no FTS5. `probe` is the
+/// error of the FTS5 probe.
+#[cfg(feature = "sqlite")]
+fn sqlite_fts5_missing(probe: &diesel::result::Error) -> diesel::ConnectionError {
+    diesel::ConnectionError::CouldntSetupConfiguration(diesel::result::Error::QueryBuilderError(
+        format!(
+            "SQLite FTS5 is not available in the linked SQLite library, but \
+             autumn-web full-text search (searchable repositories / the \
+             `--search` scaffold, issue #1910) requires it. Build with the \
+             bundled, FTS5-enabled SQLite by enabling autumn-web's `sqlite` \
+             feature (it turns on `libsqlite3-sys/bundled`, whose amalgamation \
+             defines SQLITE_ENABLE_FTS5). Underlying probe error: {probe}"
+        )
+        .into(),
+    ))
+}
+
 /// Apply the per-connection pragmas, retrying while the database is locked.
 ///
 /// `PRAGMA journal_mode = WAL` takes an exclusive lock, and `SQLite` does not run
@@ -2258,13 +2295,13 @@ pub(crate) fn build_sqlite_pool_with(
 ///
 /// The journal mode is a persistent property of the file, so one winner settles
 /// it and each retry is then a no-op. The whole retry budget is well inside the
-/// pool's `create_timeout`.
+/// pool's `create_timeout`. Blocking: it sleeps on the thread between attempts.
 #[cfg(feature = "sqlite")]
-async fn apply_sqlite_pragmas(
-    conn: &mut RuntimeConnection,
+fn apply_sqlite_pragmas(
+    conn: &mut diesel::SqliteConnection,
     pragmas: &str,
 ) -> Result<(), diesel::result::Error> {
-    use diesel_async::SimpleAsyncConnection as _;
+    use diesel::connection::SimpleConnection as _;
 
     /// Attempts in total, the first one included.
     const ATTEMPTS: u32 = 10;
@@ -2273,11 +2310,11 @@ async fn apply_sqlite_pragmas(
 
     let mut attempt = 1;
     loop {
-        match conn.batch_execute(pragmas).await {
+        match conn.batch_execute(pragmas) {
             Ok(()) => return Ok(()),
             Err(error) if attempt < ATTEMPTS && sqlite_error_is_locked(&error) => {
                 attempt += 1;
-                tokio::time::sleep(RETRY_DELAY).await;
+                std::thread::sleep(RETRY_DELAY);
             }
             Err(error) => return Err(error),
         }
@@ -5921,6 +5958,135 @@ mod tests {
                 "message must name the offending target and the accepted scheme, got: {msg}"
             );
         }
+    }
+
+    // A connection setup that passes `create_timeout` must give an error, not a
+    // panic. deadpool drops the setup future at the limit. Each query in it is
+    // a diesel-async `CancelWrapper`, whose `Drop` calls `block_in_place` for
+    // a task in flight. That panics on a current-thread runtime, the runtime
+    // `#[tokio::test]` uses. The `SQLite fleet (windows-latest)` job hit it
+    // when a loaded runner took more than the 5 s limit to open a file.
+    // A second connection holds an exclusive lock, so `journal_mode = WAL`
+    // retries for about 225 ms. So the setup is still in flight when the zero
+    // limit passes, at the next 1 ms timer tick.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_setup_timeout_is_an_error_on_a_current_thread_runtime() {
+        use diesel::connection::{Connection as _, SimpleConnection as _};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("slow.db");
+        let url = format!("sqlite://{}", path.display());
+        let mut holder = diesel::SqliteConnection::establish(&path.display().to_string())
+            .expect("open the lock holder");
+        holder
+            .batch_execute("BEGIN EXCLUSIVE")
+            .expect("take the exclusive lock");
+        let pool = build_sqlite_pool_with(&url, 1, 0, SqliteCheckpointOwner::ProcessLatch)
+            .expect("the pool builds");
+        let Err(err) = pool.get().await else {
+            panic!("a zero create limit must time out");
+        };
+        assert!(
+            matches!(
+                err,
+                deadpool::managed::PoolError::Timeout(deadpool::managed::TimeoutType::Create)
+            ),
+            "expected a create timeout, got: {err:?}"
+        );
+        // The setup finishes on its own thread. When the lock is gone, the
+        // next connection, with a real limit, opens the same file.
+        holder.batch_execute("COMMIT").expect("release the lock");
+        drop(holder);
+        let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch)
+            .expect("the pool builds");
+        drop(pool.get().await.expect("a real limit opens the file"));
+    }
+
+    // The bundled SQLite has FTS5, so the probe never fails here. The error
+    // must still name FTS5, the issue and the fix.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_fts5_missing_error_names_the_module_and_the_fix() {
+        let probe = diesel::result::Error::QueryBuilderError("no such module: fts5".into());
+        let message = sqlite_fts5_missing(&probe).to_string();
+        for needle in [
+            "FTS5",
+            "#1910",
+            "`sqlite`",
+            "libsqlite3-sys/bundled",
+            "no such module: fts5",
+        ] {
+            assert!(
+                message.contains(needle),
+                "{needle} is missing from: {message}"
+            );
+        }
+        assert!(matches!(
+            sqlite_fts5_missing(&probe),
+            diesel::ConnectionError::CouldntSetupConfiguration(_)
+        ));
+    }
+
+    // TestApp runs a plugin startup hook so: a helper thread calls
+    // `Handle::block_on`, and the runtime thread waits in `join()`. Then
+    // nothing polls a task spawned on this current-thread runtime, and no
+    // tokio timer fires. A connection setup must not need either.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_setup_finishes_while_the_runtime_thread_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("hook.db").display());
+        let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch)
+            .expect("the pool builds");
+        let handle = tokio::runtime::Handle::current();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got = handle
+                .block_on(pool.get())
+                .map(drop)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(got);
+        });
+        // This blocks the runtime thread on purpose, as TestApp does.
+        let got = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the setup hung: it needs the blocked runtime thread");
+        got.expect("the connection opens");
+    }
+
+    // The same blocked runtime thread on a sim runtime, with a sim alive. The
+    // runtime thread cannot park, so gated blocking work waits for the 2 s
+    // give-up and counts a give-up, and the run is then not sure to replay.
+    // The connection setup touches no sim state, so it must not be gated.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sim_sqlite_setup_is_not_gated_while_the_runtime_thread_is_blocked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = format!("sqlite://{}", tmp.path().join("sim.db").display());
+        let rt = crate::sim::gate::runtime().unwrap();
+        let seat = crate::sim::gate::SimSeat::default();
+        seat.take();
+        let before = crate::sim::gate::give_ups();
+        rt.block_on(async {
+            let pool = build_sqlite_pool_with(&url, 1, 5, SqliteCheckpointOwner::ProcessLatch)
+                .expect("the pool builds");
+            let handle = tokio::runtime::Handle::current();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let got = handle
+                    .block_on(pool.get())
+                    .map(drop)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(got);
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the setup hung")
+                .expect("the connection opens");
+        });
+        let after = crate::sim::gate::give_ups();
+        seat.leave();
+        assert_eq!(after, before, "the connection setup waited for the gate");
     }
 
     // …but the two scheme-less spellings `normalize_sqlite_target` explicitly
