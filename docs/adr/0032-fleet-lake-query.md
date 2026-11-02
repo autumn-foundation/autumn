@@ -61,18 +61,24 @@ Parquet (option 3) is deferred. DuckDB (option 2) is rejected for now.
 3. **Plan.** `restore::plan_from_listing` plans from the same listing. The
    restore applies this plan, so the decision and the restore see one
    generation. The lake checks `restore_allowed` again with the planned
-   generation.
+   generation. When the listing is older than the replica (a head past the
+   listed segments, or a listed marker that is gone), the lake lists that
+   tenant again and decides once more.
 4. **Restore.** `workers` threads restore one chunk of tenants into a
    private scratch directory (mode `0700`, named from `Entropy`).
 5. **Ingest.** In tenant order, the lake attaches each file
    (`mode=ro&immutable=1`), checks its identity row, and copies each app
-   table in one transaction. It adds the column `_autumn_tenant`. Lake
-   columns have no declared type, so each value keeps its storage class.
-   Columns union by name: a column that a tenant does not have is `NULL`.
+   table in one transaction. The journal is in memory, so a failed tenant
+   rolls back. It adds the column `_autumn_tenant`. Lake columns have no
+   declared type, so each value keeps its storage class. They also have no
+   affinity and the `BINARY` collation: a `COLLATE NOCASE` comparison or a
+   text-to-number conversion of the source does not apply. Columns union by
+   name: a column that a tenant does not have is `NULL`.
 6. **Query.** A `mode=ro` connection makes a temporary view of the SQL and
    sets `query_only`. The SQL must be one `SELECT`, `WITH` or `VALUES`
    statement. Rows stream through `quote()`, which keeps the storage class
-   and round-trips a real.
+   and round-trips a real. Text goes as hex, because `quote()` stops at a
+   NUL.
 
 `_autumn_lake_tenants` records each loaded tenant: its generation and its
 effective time.
@@ -91,8 +97,8 @@ effective time.
 
 ### Safe defaults and opt-ins
 
-- A lake with no tombstone rows refuses to load. `markers_only()` is the
-  explicit opt-in. Between the row and the marker of a delete, a
+- A lake with no tombstone source (`with_tombstones`) refuses to load.
+  `markers_only()` is the explicit opt-in. Between the row and the marker of a delete, a
   markers-only lake still loads the tenant.
 - A tenant that fails (restore, marker, identity, ingest) fails the load.
   `skip_failed_tenants()` is the explicit opt-in to report it and continue.

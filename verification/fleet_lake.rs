@@ -37,7 +37,8 @@ pub open spec fn restore_allowed(row: bool, marker: Option<int>, newest: int) ->
     }
 }
 
-/// `include`: the lake loads a database only when its name is valid, it
+/// `decide` with the `restore_allowed` check after the plan in
+/// `FleetLake::plan_from`: the lake loads a database only when its name is valid, it
 /// has a replica, and the tombstone rule lets a restore take it.
 pub open spec fn included(c: Candidate) -> bool {
     c.valid_name && c.has_replica && restore_allowed(c.row, c.marker, c.newest)

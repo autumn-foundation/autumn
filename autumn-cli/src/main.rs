@@ -1633,7 +1633,8 @@ enum Commands {
     /// Reads `[database.fleet]` from the app config. `delete`, `import`,
     /// `restore` and `lake` also read `[replication]`. Run it from the app
     /// directory: the fleet root must exist, except for `lake`, which reads
-    /// object storage only. Works when the app is stopped and when it runs.
+    /// object storage and the control database (or the markers only, with
+    /// `--markers-only`). Works when the app is stopped and when it runs.
     /// Needs the `sqlite` build of the CLI.
     ///
     /// # Examples
@@ -3582,8 +3583,9 @@ enum FleetCommands {
     /// Restores each live tenant from `[replication]` into a private scratch
     /// directory, copies its tables into one `SQLite` file with an
     /// `_autumn_tenant` column, and runs SQL_FILE on it. Writes CSV: NULL is
-    /// empty, a blob is hex. Deleted tenants are skipped. It never opens the
-    /// fleet root, so it runs on a host with no volume.
+    /// empty, a blob is hex. Deleted tenants are skipped: their tombstone rows
+    /// come from the control database. It never opens the fleet root, so it
+    /// runs on a host with no volume.
     Lake {
         /// Resolve the config under a profile overlay (see `db create`).
         #[arg(long, value_name = "PROFILE")]
@@ -3620,8 +3622,8 @@ enum FleetCommands {
         #[arg(long)]
         skip_failed: bool,
         /// Read deleted tenants from the tombstone markers in object storage
-        /// only, with no control database. A delete whose marker is not
-        /// written yet is then not seen.
+        /// only, and do not open the control database. A delete whose marker
+        /// is not written yet is then not seen.
         #[arg(long)]
         markers_only: bool,
     },

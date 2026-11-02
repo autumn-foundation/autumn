@@ -562,7 +562,7 @@ On a host with no fleet, build the lake from the destination:
 | Setting | Default | Does |
 | --- | --- | --- |
 | `with_tombstones(t)` | from the fleet | skip tenants with a tombstone row |
-| `markers_only()` | off | load with no tombstone rows; use the markers only |
+| `markers_only()` | off | load with no tombstone source; use the markers only |
 | `as_of(t)` | latest | each tenant at its newest state at or before `t` |
 | `with_tables([..])` | all | load only these tables |
 | `with_workers(n)` | 4 | restore `n` tenants at the same time |
@@ -575,12 +575,14 @@ Rules:
   has no atomic snapshot across tenants. `as_of(t)` does not make one
   common instant either.
 - **Deleted tenants.** A tombstone row, or a marker that covers the newest
-  generation, skips the tenant. A lake with no tombstone rows refuses to
+  generation, skips the tenant. A lake with no tombstone source refuses to
   load unless you call `markers_only()`.
 - **Failures.** A tenant that fails fails the load, so a total is never
   silently short.
 - **Schema drift.** Columns union by name. A column that a tenant does not
-  have is `NULL`. Values keep their storage class.
+  have is `NULL`. Values keep their storage class. Lake columns have no
+  type affinity and use the `BINARY` collation, so write `COLLATE NOCASE`
+  in the query where the source column had it.
 - **Disk.** The lake needs about the size of the loaded tables, plus one
   restored file per worker. Use `with_tables` to load less.
 - **Trust.** The SQL is operator SQL. Do not pass request input to it.

@@ -1114,7 +1114,7 @@ impl DatabaseFleet {
         let replication = self
             .replication()
             .ok_or_else(|| FleetError::NotReplicated {
-                name: "lake".to_owned(),
+                name: self.root().display().to_string(),
             })?;
         Ok(replication.lake().outside_root(self.root()))
     }

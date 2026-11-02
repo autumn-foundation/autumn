@@ -16,6 +16,7 @@ struct Host {
     _tmp: tempfile::TempDir,
     fleet: DatabaseFleet,
     destination: Arc<dyn ReplicaDestination>,
+    replication: Arc<FleetReplication>,
     tombstones: Arc<FleetTombstones>,
     root: PathBuf,
     scratch: PathBuf,
@@ -84,12 +85,13 @@ fn host(retention: Duration) -> Host {
         .with_tombstones(Arc::clone(&tombstones))
         .with_retention_after_delete(retention),
     );
-    assert!(fleet.install_replication(replication).is_ok());
+    assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
     let root = fleet.root().to_path_buf();
     Host {
         _tmp: tmp,
         fleet,
         destination,
+        replication,
         tombstones,
         root,
         scratch,
@@ -567,6 +569,131 @@ async fn discovery_lists_the_destination_once() {
     assert_eq!(AtomicUsize::load(&counting.lists, Ordering::SeqCst), 1);
 }
 
+/// A fleet listing older than the replica: it hides the newest segment,
+/// or it gives a listing taken before.
+struct Stale {
+    inner: Arc<dyn ReplicaDestination>,
+    hide_newest_segment: bool,
+    frozen: Option<Vec<String>>,
+}
+
+impl ReplicaDestination for Stale {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn put(&self, key: &str, body: &[u8]) -> Result<(), DestinationError> {
+        self.inner.put(key, body)
+    }
+    fn put_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
+        self.inner.put_file(key, path)
+    }
+    fn get(&self, key: &str) -> Result<Vec<u8>, DestinationError> {
+        self.inner.get(key)
+    }
+    fn get_to_file(&self, key: &str, path: &Path) -> Result<(), DestinationError> {
+        self.inner.get_to_file(key, path)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>, DestinationError> {
+        if !prefix.ends_with("/fleet/") {
+            return self.inner.list(prefix);
+        }
+        if let Some(frozen) = &self.frozen {
+            return Ok(frozen.clone());
+        }
+        let mut keys = self.inner.list(prefix)?;
+        if self.hide_newest_segment
+            && let Some(at) = keys
+                .iter()
+                .rposition(|key| Path::new(key).extension().is_some_and(|ext| ext == "seg"))
+        {
+            keys.remove(at);
+        }
+        Ok(keys)
+    }
+    fn delete(&self, key: &str) -> Result<(), DestinationError> {
+        self.inner.delete(key)
+    }
+}
+
+#[tokio::test]
+async fn a_tenant_that_ships_after_the_listing_is_planned_again() {
+    let host = host(Duration::ZERO);
+    // Ship segments while the database is open.
+    let key = host.fleet.key_for("acme").unwrap();
+    let db = host.fleet.provision(&key).await.unwrap();
+    for sql in [NOTES, "INSERT INTO notes (body) VALUES ('a1')"] {
+        exec(&db, sql).await;
+        let replication = Arc::clone(&host.replication);
+        crate::time::spawn_blocking(move || replication.tick_all())
+            .await
+            .unwrap();
+    }
+    exec(&db, "INSERT INTO notes (body) VALUES ('a2')").await;
+    drop(db);
+    host.fleet.close(&key).await;
+    let prefix = format!("{BASE}/fleet/tenant/acme/");
+    assert!(
+        host.destination
+            .list(&prefix)
+            .unwrap()
+            .iter()
+            .any(|key| key.ends_with(".seg")),
+        "the test needs a segment to hide"
+    );
+    let stale = Arc::new(Stale {
+        inner: Arc::clone(&host.destination),
+        hide_newest_segment: true,
+        frozen: None,
+    });
+    let snapshot = FleetLake::new(stale, BASE)
+        .with_tombstones(Arc::clone(&host.tombstones))
+        .with_scratch_dir(&host.scratch)
+        .materialize()
+        .await
+        .unwrap();
+    let rows = snapshot.query("SELECT COUNT(*) FROM notes").await.unwrap();
+    assert_eq!(
+        rows.rows[0][0],
+        LakeValue::Integer(2),
+        "the newest segment too"
+    );
+}
+
+#[tokio::test]
+async fn a_purge_that_ends_after_the_listing_skips_the_tenant() {
+    let host = host(Duration::from_secs(3600));
+    three_tenants(&host).await;
+    assert!(
+        host.fleet
+            .delete(&host.fleet.key_for("globex").unwrap())
+            .await
+            .unwrap()
+    );
+    // The listing still has globex's replica and marker; then the purge
+    // removes them all.
+    let frozen = host.destination.list(&format!("{BASE}/fleet/")).unwrap();
+    for key in host
+        .destination
+        .list(&format!("{BASE}/fleet/tenant/globex/"))
+        .unwrap()
+    {
+        host.destination.delete(&key).unwrap();
+    }
+    let stale = Arc::new(Stale {
+        inner: Arc::clone(&host.destination),
+        hide_newest_segment: false,
+        frozen: Some(frozen),
+    });
+    let snapshot = FleetLake::new(stale, BASE)
+        .markers_only()
+        .with_scratch_dir(&host.scratch)
+        .materialize()
+        .await
+        .unwrap();
+    assert_eq!(ids(&snapshot), ["acme", "initech"]);
+    assert_eq!(skip_of(&snapshot, "globex"), Some(SkipReason::Unreplicated));
+}
+
 // ── Failures ────────────────────────────────────────────────────────────────
 
 fn break_snapshot(host: &Host, id: &str) {
@@ -601,6 +728,56 @@ async fn a_broken_replica_fails_the_load_unless_skipped() {
         skip_of(&snapshot, "globex"),
         Some(SkipReason::Failed(_))
     ));
+}
+
+#[tokio::test]
+async fn a_skipped_tenant_rolls_back_cleanly_after_a_large_copy() {
+    let host = host(Duration::ZERO);
+    let table = "CREATE TABLE a_big (body TEXT)";
+    let fill = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 40000) \
+                INSERT INTO a_big SELECT printf('%0200d', i) FROM n";
+    ship(&host, "acme", &[table, fill]).await;
+    // More rows than the page cache holds, then a refused table.
+    ship(
+        &host,
+        "beta",
+        &[
+            table,
+            fill,
+            &format!("CREATE TABLE z_bad ({TENANT_COLUMN} TEXT)"),
+        ],
+    )
+    .await;
+    let snapshot = lake(&host)
+        .skip_failed_tenants()
+        .materialize()
+        .await
+        .unwrap();
+    assert_eq!(ids(&snapshot), ["acme"]);
+    assert!(matches!(
+        skip_of(&snapshot, "beta"),
+        Some(SkipReason::Failed(_))
+    ));
+    let check = snapshot.query("PRAGMA integrity_check").await;
+    assert!(check.is_err(), "a PRAGMA is not a query");
+    let rows = snapshot
+        .query(&format!(
+            "SELECT {TENANT_COLUMN}, COUNT(*) FROM a_big GROUP BY 1"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![vec![
+            LakeValue::Text("acme".into()),
+            LakeValue::Integer(40000)
+        ]]
+    );
+    let ok = snapshot
+        .query("SELECT integrity_check FROM pragma_integrity_check")
+        .await
+        .unwrap();
+    assert_eq!(ok.rows, vec![vec![LakeValue::Text("ok".into())]]);
 }
 
 #[tokio::test]
@@ -814,6 +991,11 @@ async fn the_query_runs_one_select_only() {
     let rows = snapshot.query("SELECT COUNT(*) FROM notes;").await.unwrap();
     assert_eq!(rows.rows[0][0], LakeValue::Integer(6), "nothing changed");
     let rows = snapshot
+        .query("SELECT COUNT(*) FROM notes; -- the total\n-- by tenant\n")
+        .await
+        .unwrap();
+    assert_eq!(rows.rows[0][0], LakeValue::Integer(6));
+    let rows = snapshot
         .query("WITH t AS (SELECT n FROM notes) SELECT MAX(n) FROM t -- comment")
         .await
         .unwrap();
@@ -833,7 +1015,8 @@ async fn values_round_trip() {
     let rows = snapshot
         .query(
             "SELECT NULL, -9223372036854775808, 0.1 + 0.2, 1e308 * 10, -1e308 * 10, \
-             'it''s' || char(10) || 'ok', x'00ff', 1.0, 'x' AS a, 'y' AS a",
+             'it''s' || char(10) || 'ok', x'00ff', 1.0, 'x' AS a, 'y' AS a, \
+             'before' || char(0) || 'after'",
         )
         .await
         .unwrap();
@@ -852,6 +1035,7 @@ async fn values_round_trip() {
             LakeValue::Real(1.0),
             LakeValue::Text("x".into()),
             LakeValue::Text("y".into()),
+            LakeValue::Text("before\0after".into()),
         ]
     );
 }
@@ -901,7 +1085,12 @@ fn literals_parse() {
         LakeValue::Blob(vec![0, 255])
     );
     assert_eq!(parse_literal("X''").unwrap(), LakeValue::Blob(Vec::new()));
-    for bad in ["", "abc", "'open", "X'0'", "X'zz'"] {
+    assert_eq!(
+        parse_literal("T610062").unwrap(),
+        LakeValue::Text("a\0b".into())
+    );
+    assert_eq!(parse_literal("T").unwrap(), LakeValue::Text(String::new()));
+    for bad in ["", "abc", "'open", "X'0'", "X'zz'", "T0", "Tzz"] {
         assert!(parse_literal(bad).is_err(), "{bad}");
     }
 }
@@ -966,6 +1155,23 @@ async fn persist_writes_a_standalone_copy() {
     assert_eq!(n.n, 6);
 }
 
+/// A name that starts with `file:` is a file name, not a URI.
+#[cfg(unix)]
+#[tokio::test]
+async fn persist_writes_the_named_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let host = host(Duration::ZERO);
+    three_tenants(&host).await;
+    let snapshot = lake(&host).materialize().await.unwrap();
+    std::fs::create_dir(host.scratch.join("sub")).unwrap();
+    let out = host.scratch.join("file:sub%2Fkept.db");
+    snapshot.persist(&out).unwrap();
+    assert!(!host.scratch.join("sub/kept.db").exists());
+    assert!(std::fs::metadata(&out).unwrap().len() > 0);
+    let mode = std::fs::metadata(&out).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
 #[tokio::test]
 async fn the_fleet_lake_refuses_a_scratch_dir_under_the_root() {
     let host = host(Duration::ZERO);
@@ -980,10 +1186,7 @@ async fn the_fleet_lake_refuses_a_scratch_dir_under_the_root() {
         .materialize()
         .await
         .unwrap_err();
-    assert!(
-        matches!(error, LakeError::ScratchUnderRoot { .. }),
-        "{error}"
-    );
+    assert!(matches!(error, LakeError::UnderRoot { .. }), "{error}");
 
     #[cfg(unix)]
     {
@@ -997,11 +1200,22 @@ async fn the_fleet_lake_refuses_a_scratch_dir_under_the_root() {
             .materialize()
             .await
             .unwrap_err();
-        assert!(
-            matches!(error, LakeError::ScratchUnderRoot { .. }),
-            "{error}"
-        );
+        assert!(matches!(error, LakeError::UnderRoot { .. }), "{error}");
     }
+
+    // A kept copy under the root is refused too.
+    let snapshot = host
+        .fleet
+        .lake()
+        .unwrap()
+        .with_scratch_dir(&host.scratch)
+        .materialize()
+        .await
+        .unwrap();
+    let error = snapshot.persist(&host.root.join("kept.db")).unwrap_err();
+    assert!(matches!(error, LakeError::UnderRoot { .. }), "{error}");
+    assert!(!host.root.join("kept.db").exists());
+    drop(snapshot);
 
     // The fleet lake carries the fleet's tombstones.
     let snapshot = host

@@ -1093,4 +1093,53 @@ mod sqlite {
         let stderr = run_err(&app.dir, &["fleet", "lake", "q.sql", "--markers-only"]);
         assert!(stderr.contains("[replication]"), "{stderr}");
     }
+
+    #[test]
+    fn fleet_lake_checks_its_outputs_before_the_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let app = lake_app(&replicas, "");
+        ship(&app, &replicas, &[("acme", 1)]);
+        std::fs::write(app.dir.join("q.sql"), PER_TENANT).unwrap();
+        std::fs::write(app.dir.join("taken.db"), b"x").unwrap();
+        let stderr = run_err(
+            &app.dir,
+            &[
+                "fleet",
+                "lake",
+                "q.sql",
+                "--markers-only",
+                "--out",
+                "out.csv",
+                "--keep",
+                "taken.db",
+            ],
+        );
+        assert!(stderr.contains("taken.db"), "{stderr}");
+        assert!(
+            !stderr.contains("tenant(s) loaded"),
+            "no restore ran: {stderr}"
+        );
+        assert!(!app.dir.join("out.csv").exists(), "no CSV is left behind");
+    }
+
+    #[test]
+    fn fleet_lake_markers_only_does_not_open_the_control_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let replicas = tmp.path().join("replicas");
+        let app = lake_app(&replicas, "");
+        ship(&app, &replicas, &[("acme", 1)]);
+        // A control database file that cannot be opened as SQLite.
+        std::fs::write(tmp.path().join("control.db"), b"not a database").unwrap();
+        std::fs::write(app.dir.join("q.sql"), PER_TENANT).unwrap();
+        // Without the flag the lake reads it, and fails.
+        let stderr = run_err(&app.dir, &["fleet", "lake", "q.sql"]);
+        assert!(stderr.contains("tombstone"), "{stderr}");
+        let (stdout, _) = run_ok(&app.dir, &["fleet", "lake", "q.sql", "--markers-only"]);
+        assert_eq!(stdout, "tenant,n\nacme,1\n");
+        assert_eq!(
+            std::fs::read(tmp.path().join("control.db")).unwrap(),
+            b"not a database"
+        );
+    }
 }

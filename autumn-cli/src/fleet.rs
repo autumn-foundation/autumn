@@ -989,25 +989,47 @@ mod imp {
         eprintln!("  \u{2139} source: {}", destination.describe());
         eprintln!("  \u{2139} prefix: {}/fleet/tenant", loaded.root());
 
-        let mut lake = FleetLake::new(destination, loaded.root())
+        // Cheap checks first: a restore of every tenant comes after them.
+        if let Some(keep) = args.keep {
+            refuse_keep(keep, &target.fleet.root)?;
+        }
+        let out = args
+            .out
+            .map(|out| create_private(out).map(|file| (out, file)));
+        let out = out.transpose()?;
+        let result = run_lake(target, args, &sql, at, destination, loaded.root(), out);
+        if result.is_err()
+            && let Some(out) = args.out
+        {
+            let _ = std::fs::remove_file(out);
+        }
+        result
+    }
+
+    /// The rest of [`lake`], after the outputs are checked.
+    fn run_lake(
+        target: &Target,
+        args: &LakeArgs<'_>,
+        sql: &str,
+        at: Option<chrono::DateTime<chrono::Utc>>,
+        destination: Arc<dyn autumn_web::replication::ReplicaDestination>,
+        base: String,
+        out: Option<(&Path, std::fs::File)>,
+    ) -> Result<(), String> {
+        let mut lake = FleetLake::new(destination, base)
             .outside_root(&target.fleet.root)
             .with_workers(args.concurrency);
-        match control_tombstones(target)? {
-            Some(tombstones) => lake = lake.with_tombstones(tombstones),
-            None if args.markers_only => {
-                eprintln!(
-                    "  \u{26a0} no control database: deleted tenants come from the markers only"
-                );
-                lake = lake.markers_only();
-            }
-            None => {
-                return Err(
-                    "This host has no control database, so the lake cannot read the \
-                     tombstone rows of deleted tenants.\n  Run where the control database is, \
-                     or pass --markers-only to use the markers in object storage only."
-                        .to_owned(),
-                );
-            }
+        if args.markers_only {
+            eprintln!("  \u{26a0} --markers-only: deleted tenants come from the markers only");
+            lake = lake.markers_only();
+        } else {
+            let tombstones = control_tombstones(target)?.ok_or_else(|| {
+                "This host has no control database, so the lake cannot read the tombstone \
+                 rows of deleted tenants.\n  Run where the control database is, or pass \
+                 --markers-only to use the markers in object storage only."
+                    .to_owned()
+            })?;
+            lake = lake.with_tombstones(tombstones);
         }
         if args.skip_failed {
             lake = lake.skip_failed_tenants();
@@ -1025,37 +1047,55 @@ mod imp {
         let snapshot = runtime()?
             .block_on(lake.materialize())
             .map_err(|e| e.to_string())?;
-        let rows = match args.out {
-            Some(out) => {
-                let file = create_private(out)?;
+        report_load(&snapshot);
+        if let Some(keep) = args.keep {
+            snapshot.persist(keep).map_err(|e| e.to_string())?;
+            eprintln!("  \u{2139} lake kept at {}", keep.display());
+        }
+        let rows = match out {
+            Some((path, file)) => {
                 let mut writer = std::io::BufWriter::new(file);
-                let rows = write_csv(&snapshot, &sql, &mut writer);
-                let rows = rows.and_then(|rows| {
-                    writer
-                        .flush()
-                        .map(|()| rows)
-                        .map_err(|e| format!("could not write {}: {e}", out.display()))
-                });
-                if rows.is_err() {
-                    let _ = std::fs::remove_file(out);
-                }
-                rows?
+                let rows = write_csv(&snapshot, sql, &mut writer)?;
+                writer
+                    .flush()
+                    .map_err(|e| format!("could not write {}: {e}", path.display()))?;
+                rows
             }
             None => {
                 let stdout = std::io::stdout();
                 let mut writer = std::io::BufWriter::new(stdout.lock());
-                let rows = write_csv(&snapshot, &sql, &mut writer)?;
+                let rows = write_csv(&snapshot, sql, &mut writer)?;
                 writer
                     .flush()
                     .map_err(|e| format!("could not write stdout: {e}"))?;
                 rows
             }
         };
-        if let Some(keep) = args.keep {
-            snapshot.persist(keep).map_err(|e| e.to_string())?;
-            eprintln!("  \u{2139} lake kept at {}", keep.display());
+        eprintln!("\n\u{2713} {rows} row(s).");
+        Ok(())
+    }
+
+    /// Refuse a `--keep` path that exists or is under the fleet root.
+    fn refuse_keep(keep: &Path, root: &str) -> Result<(), String> {
+        if keep.exists() {
+            return Err(format!("--keep {} already exists.", keep.display()));
         }
-        report(&snapshot, rows);
+        let parent = match keep.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let parent = parent
+            .canonicalize()
+            .map_err(|e| format!("--keep {}: {e}", keep.display()))?;
+        if let Ok(root) = Path::new(root).canonicalize()
+            && parent.starts_with(&root)
+        {
+            return Err(format!(
+                "--keep {} is under the fleet root {}.",
+                keep.display(),
+                root.display()
+            ));
+        }
         Ok(())
     }
 
@@ -1159,8 +1199,8 @@ mod imp {
         }
     }
 
-    /// The summary on stderr: what was loaded and what was skipped.
-    fn report(snapshot: &LakeSnapshot, rows: usize) {
+    /// The load summary on stderr: what was loaded and what was skipped.
+    fn report_load(snapshot: &LakeSnapshot) {
         let count = |want: fn(&SkipReason) -> bool| {
             snapshot
                 .skipped()
@@ -1185,8 +1225,8 @@ mod imp {
             );
         }
         eprintln!(
-            "\n\u{2713} {rows} row(s). {} tenant(s) loaded, {} deleted, {} unreplicated, {} \
-             absent at the timestamp, {} failed, {} invalid name(s), {} slot database(s).",
+            "  \u{2139} {} tenant(s) loaded, {} deleted, {} unreplicated, {} absent at the \
+             timestamp, {} failed, {} invalid name(s), {} slot database(s).",
             tenants.len(),
             count(|r| *r == SkipReason::Deleted),
             count(|r| *r == SkipReason::Unreplicated),

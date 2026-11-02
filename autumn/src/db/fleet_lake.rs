@@ -160,23 +160,26 @@ pub struct LakeSkip {
 /// Why a lake could not be made or queried.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LakeError {
-    /// The lake has no tombstone rows and no `markers_only` opt-in.
+    /// The lake has no tombstone source and no `markers_only` opt-in.
     #[error(
         "the lake has no tombstone source: call with_tombstones(..), or markers_only() \
          to accept that a delete with no marker yet is not seen"
     )]
     NoTombstoneSource,
-    /// The scratch directory is under the fleet root.
-    #[error("scratch directory {} is under the fleet root {}", scratch.display(), root.display())]
-    ScratchUnderRoot {
-        /// The scratch directory, canonical.
-        scratch: PathBuf,
+    /// The scratch directory or the kept copy is under the fleet root.
+    #[error("{} is under the fleet root {}", path.display(), root.display())]
+    UnderRoot {
+        /// The path, canonical.
+        path: PathBuf,
         /// The fleet root, canonical.
         root: PathBuf,
     },
     /// The scratch directory cannot be made or removed.
     #[error("lake scratch directory: {0}")]
     Scratch(String),
+    /// The kept copy cannot be written.
+    #[error("keep the lake: {0}")]
+    Persist(String),
     /// The destination cannot be listed or read.
     #[error("replica destination: {0}")]
     Destination(String),
@@ -403,7 +406,7 @@ impl FleetLake {
         let snapshot = self.materialize().await?;
         let sql = sql.to_owned();
         crate::time::spawn_blocking(move || {
-            let rows = collect_rows(&snapshot.db, &sql);
+            let rows = collect_rows(&snapshot.files.db, &sql);
             drop(snapshot);
             rows
         })
@@ -489,8 +492,10 @@ impl FleetLake {
         drop(conn);
         skipped.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(LakeSnapshot {
-            dir: scratch.keep(),
-            db,
+            files: Arc::new(LakeFiles {
+                dir: scratch.keep(),
+                db,
+            }),
             tenants,
             skipped,
             root,
@@ -511,6 +516,8 @@ impl FleetLake {
 
     /// Decide from the listing, then plan the restore. The restore applies
     /// this plan, so the decision and the restore see the same generation.
+    /// A listing older than the replica (a ship or a purge since) is read
+    /// again for this tenant, once.
     fn plan_tenant(
         &self,
         tenant: &TenantDbId,
@@ -523,22 +530,55 @@ impl FleetLake {
         };
         let root = replica_root(&self.base, &key);
         let row = rows.contains(&key.name());
-        let marker = self.marker(tenant, &root, keys)?;
-        match decide(row, marker, newest_generation(&root, keys)) {
-            Decision::Skip(Skip::Deleted) => return Ok(Planned::Skip(SkipReason::Deleted)),
-            Decision::Skip(Skip::Unreplicated) => {
-                return Ok(Planned::Skip(SkipReason::Unreplicated));
+        if let Attempt::Done(planned) = self.plan_from(tenant, &root, keys, row)? {
+            return Ok(planned);
+        }
+        let fresh = self
+            .destination
+            .list(&format!("{root}/"))
+            .map_err(|error| LakeError::Destination(error.to_string()))?;
+        match self.plan_from(tenant, &root, &fresh, row)? {
+            Attempt::Done(planned) => Ok(planned),
+            Attempt::Stale(detail) => Err(LakeError::Restore {
+                tenant: tenant.to_string(),
+                detail,
+            }),
+        }
+    }
+
+    /// One decision and plan from `keys`.
+    fn plan_from(
+        &self,
+        tenant: &TenantDbId,
+        root: &str,
+        keys: &[String],
+        row: bool,
+    ) -> Result<Attempt, LakeError> {
+        let marker = match self.marker(tenant, root, keys)? {
+            MarkerRead::Absent => None,
+            MarkerRead::At(deleted_at) => Some(deleted_at),
+            MarkerRead::Gone => {
+                return Ok(Attempt::Stale(
+                    "the tombstone marker is gone since the listing".to_owned(),
+                ));
             }
+        };
+        let skip = |reason| Ok(Attempt::Done(Planned::Skip(reason)));
+        match decide(row, marker, newest_generation(root, keys)) {
+            Decision::Skip(Skip::Deleted) => return skip(SkipReason::Deleted),
+            Decision::Skip(Skip::Unreplicated) => return skip(SkipReason::Unreplicated),
             Decision::Plan => {}
         }
         let plan =
-            match restore::plan_from_listing(self.destination.as_ref(), &root, keys, self.as_of) {
+            match restore::plan_from_listing(self.destination.as_ref(), root, keys, self.as_of) {
                 Ok(plan) => plan,
-                Err(RestoreError::NoReplica { .. }) => {
-                    return Ok(Planned::Skip(SkipReason::Unreplicated));
-                }
+                Err(RestoreError::NoReplica { .. }) => return skip(SkipReason::Unreplicated),
                 Err(RestoreError::TargetBeforeRetention { .. }) => {
-                    return Ok(Planned::Skip(SkipReason::AbsentAtTarget));
+                    return skip(SkipReason::AbsentAtTarget);
+                }
+                // The head moved on after the listing.
+                Err(error @ RestoreError::TruncatedTail { .. }) => {
+                    return Ok(Attempt::Stale(error.to_string()));
                 }
                 Err(error) => {
                     return Err(LakeError::Restore {
@@ -549,22 +589,21 @@ impl FleetLake {
             };
         // `as_of` can pick an older generation than the newest.
         if !restore_allowed(row, marker, plan.generation_started_at) {
-            return Ok(Planned::Skip(SkipReason::Deleted));
+            return skip(SkipReason::Deleted);
         }
-        Ok(Planned::Restore(Box::new(plan)))
+        Ok(Attempt::Done(Planned::Restore(Box::new(plan))))
     }
 
-    /// The `deleted_at` of the tenant's marker, read only when the listing
-    /// has one.
+    /// The tenant's marker, read only when the listing has one.
     fn marker(
         &self,
         tenant: &TenantDbId,
         root: &str,
         keys: &[String],
-    ) -> Result<Option<DateTime<Utc>>, LakeError> {
+    ) -> Result<MarkerRead, LakeError> {
         let marker_key = format!("{root}/{MARKER_OBJECT}");
         if !keys.contains(&marker_key) {
-            return Ok(None);
+            return Ok(MarkerRead::Absent);
         }
         let unreadable = |detail: String| LakeError::Marker {
             tenant: tenant.to_string(),
@@ -572,12 +611,12 @@ impl FleetLake {
         };
         let body = match self.destination.get(&marker_key) {
             Ok(body) => body,
-            // A purge removes the marker last: the tenant is gone.
-            Err(error) if error.is_not_found() => return Ok(None),
+            // A purge or a restore removed it after the listing.
+            Err(error) if error.is_not_found() => return Ok(MarkerRead::Gone),
             Err(error) => return Err(unreadable(error.to_string())),
         };
         serde_json::from_slice::<Marker>(&body)
-            .map(|marker| Some(marker.deleted_at()))
+            .map(|marker| MarkerRead::At(marker.deleted_at()))
             .map_err(|error| unreadable(error.to_string()))
     }
 
@@ -633,6 +672,23 @@ impl FleetLake {
 enum Planned {
     Restore(Box<RestorePlan>),
     Skip(SkipReason),
+}
+
+/// One try of [`FleetLake::plan_tenant`].
+enum Attempt {
+    Done(Planned),
+    /// The listing is older than the replica. Why.
+    Stale(String),
+}
+
+/// The tombstone marker of a tenant.
+enum MarkerRead {
+    /// The listing has none.
+    Absent,
+    /// The listing has one, and it is gone now.
+    Gone,
+    /// Its `deleted_at`.
+    At(DateTime<Utc>),
 }
 
 /// The databases one listing of `<base>/fleet/` finds.
@@ -702,8 +758,8 @@ fn newest_generation(root: &str, keys: &[String]) -> Option<DateTime<Utc>> {
         .max()
 }
 
-/// The inclusion decision before a restore (`included` in
-/// `verification/fleet_lake.rs`).
+/// The inclusion decision before a restore. With the `restore_allowed`
+/// check after the plan, it is `included` in `verification/fleet_lake.rs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Decision {
     Skip(Skip),
@@ -795,8 +851,8 @@ impl Drop for Scratch {
 /// Refuse `path` (canonical) under `root` (canonical).
 fn refuse_under(path: &Path, root: Option<&Path>) -> Result<(), LakeError> {
     match root {
-        Some(root) if path.starts_with(root) => Err(LakeError::ScratchUnderRoot {
-            scratch: path.to_path_buf(),
+        Some(root) if path.starts_with(root) => Err(LakeError::UnderRoot {
+            path: path.to_path_buf(),
             root: root.to_path_buf(),
         }),
         _ => Ok(()),
@@ -849,8 +905,9 @@ fn open_lake(db: &Path) -> Result<SqliteConnection, LakeError> {
         super::establish_sqlite_migration_connection(&uri(db, "mode=rwc").map_err(scratch)?)
             .map_err(|error| scratch(error.to_string()))?;
     // A scratch file: a crash loses nothing the next load does not make.
+    // The journal stays (in memory): a skipped tenant rolls back.
     conn.batch_execute(&format!(
-        "PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; \
+        "PRAGMA journal_mode = MEMORY; PRAGMA synchronous = OFF; \
          CREATE TABLE {MANIFEST_TABLE} (tenant TEXT PRIMARY KEY, generation TEXT NOT NULL, \
          effective TEXT NOT NULL, effective_ms INTEGER NOT NULL);"
     ))
@@ -1049,11 +1106,25 @@ pub(crate) fn quote_ident(name: &str) -> String {
 
 // ── Snapshot and query ──────────────────────────────────────────────────────
 
-/// A loaded lake. Dropping it removes its scratch directory.
+/// The files of a lake. The last owner removes them, so a query still
+/// running keeps them.
 #[derive(Debug)]
-pub struct LakeSnapshot {
+struct LakeFiles {
     dir: PathBuf,
     db: PathBuf,
+}
+
+impl Drop for LakeFiles {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// A loaded lake. Dropping it removes its scratch directory, after the
+/// last running query.
+#[derive(Debug)]
+pub struct LakeSnapshot {
+    files: Arc<LakeFiles>,
     tenants: Vec<LakeTenant>,
     skipped: Vec<LakeSkip>,
     /// The canonical fleet root, when known.
@@ -1076,7 +1147,7 @@ impl LakeSnapshot {
     /// The lake database file.
     #[must_use]
     pub fn path(&self) -> &Path {
-        &self.db
+        &self.files.db
     }
 
     /// Run one `SELECT`, `WITH` or `VALUES` statement.
@@ -1085,8 +1156,8 @@ impl LakeSnapshot {
     ///
     /// [`LakeError::Query`].
     pub async fn query(&self, sql: &str) -> Result<LakeRows, LakeError> {
-        let (db, sql) = (self.db.clone(), sql.to_owned());
-        crate::time::spawn_blocking(move || collect_rows(&db, &sql))
+        let (files, sql) = (Arc::clone(&self.files), sql.to_owned());
+        crate::time::spawn_blocking(move || collect_rows(&files.db, &sql))
             .await
             .map_err(|error| LakeError::Task(error.to_string()))?
     }
@@ -1097,7 +1168,7 @@ impl LakeSnapshot {
     ///
     /// [`LakeError::Query`].
     pub fn columns(&self, sql: &str) -> Result<Vec<String>, LakeError> {
-        columns_of(&mut read_only(&self.db)?, sql)
+        columns_of(&mut read_only(&self.files.db)?, sql)
     }
 
     /// Run one statement and give each row to `each`. Blocking. Returns
@@ -1111,7 +1182,7 @@ impl LakeSnapshot {
         sql: &str,
         each: impl FnMut(&[String], Vec<LakeValue>) -> ControlFlow<()>,
     ) -> Result<usize, LakeError> {
-        for_each_row(&self.db, sql, each)
+        for_each_row(&self.files.db, sql, each)
     }
 
     /// Write a standalone copy of the lake to `path` (owner-only on unix).
@@ -1120,10 +1191,13 @@ impl LakeSnapshot {
     ///
     /// # Errors
     ///
-    /// [`LakeError::Scratch`] when `path` exists or cannot be written.
-    /// [`LakeError::ScratchUnderRoot`] when `path` is under the fleet root.
+    /// [`LakeError::Persist`] when `path` exists or cannot be written.
+    /// [`LakeError::UnderRoot`] when `path` is under the fleet root.
     pub fn persist(&self, path: &Path) -> Result<(), LakeError> {
-        let failed = |detail: String| LakeError::Scratch(format!("{}: {detail}", path.display()));
+        let failed = |detail: String| LakeError::Persist(format!("{}: {detail}", path.display()));
+        let name = path
+            .file_name()
+            .ok_or_else(|| failed("no file name".to_owned()))?;
         let parent = match path.parent() {
             Some(parent) if !parent.as_os_str().is_empty() => parent,
             _ => Path::new("."),
@@ -1132,6 +1206,10 @@ impl LakeSnapshot {
             .canonicalize()
             .map_err(|error| failed(error.to_string()))?;
         refuse_under(&parent, self.root.as_deref())?;
+        let target = parent.join(name);
+        // A URI, so SQLite writes this file: a name like `file:x` is a name.
+        let target_uri = crate::replication::file_uri(&target)
+            .ok_or_else(|| failed("the path is not valid Unicode".to_owned()))?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1141,26 +1219,20 @@ impl LakeSnapshot {
         }
         drop(
             options
-                .open(path)
+                .open(&target)
                 .map_err(|error| failed(error.to_string()))?,
         );
-        let written = read_only(&self.db).and_then(|mut conn| {
+        let written = read_only(&self.files.db).and_then(|mut conn| {
             diesel::sql_query("VACUUM INTO ?")
-                .bind::<diesel::sql_types::Text, _>(path.to_string_lossy())
+                .bind::<diesel::sql_types::Text, _>(target_uri)
                 .execute(&mut conn)
                 .map(|_| ())
                 .map_err(|error| LakeError::Query(error.to_string()))
         });
         if written.is_err() {
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&target);
         }
         written.map_err(|error| failed(error.to_string()))
-    }
-}
-
-impl Drop for LakeSnapshot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -1189,8 +1261,7 @@ fn collect_rows(db: &Path, sql: &str) -> Result<LakeRows, LakeError> {
 /// one statement: a trailing statement does not run, and it is refused.
 fn columns_of(conn: &mut SqliteConnection, sql: &str) -> Result<Vec<String>, LakeError> {
     let query = |error: diesel::result::Error| LakeError::Query(error.to_string());
-    let sql = sql.trim_end().trim_end_matches(';').trim_end();
-    let body = format!("SELECT * FROM (\n{sql}\n)");
+    let body = format!("SELECT * FROM (\n{}\n)", statement(sql));
     diesel::sql_query(format!("CREATE TEMP VIEW {RESULT_VIEW} AS {body}"))
         .execute(conn)
         .map_err(query)?;
@@ -1214,6 +1285,26 @@ fn columns_of(conn: &mut SqliteConnection, sql: &str) -> Result<Vec<String>, Lak
     .collect())
 }
 
+/// `sql` with no trailing `;`, white space or `--` comment lines.
+fn statement(sql: &str) -> &str {
+    let mut sql = sql.trim_end();
+    loop {
+        let line_start = sql.rfind('\n').map_or(0, |at| at + 1);
+        let after_semicolon = sql
+            .rfind(';')
+            .filter(|at| *at >= line_start && sql[at + 1..].trim_start().starts_with("--"));
+        if sql[line_start..].trim_start().starts_with("--") {
+            sql = sql[..line_start].trim_end();
+        } else if let Some(at) = after_semicolon {
+            sql = sql[..at].trim_end();
+        } else if let Some(rest) = sql.strip_suffix(';') {
+            sql = rest.trim_end();
+        } else {
+            return sql;
+        }
+    }
+}
+
 #[derive(diesel::QueryableByName)]
 struct Encoded {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -1230,14 +1321,21 @@ fn for_each_row(
     let columns = columns_of(&mut conn, sql)?;
     conn.batch_execute("PRAGMA query_only = ON")
         .map_err(|error| query(error.to_string()))?;
-    // `quote()` keeps the storage class and round-trips a real. A tab
-    // joins the arrays: JSON escapes a tab inside a string.
+    // `quote()` keeps the storage class and round-trips a real. Text goes
+    // as `T` and hex: `quote()` stops at a NUL. A tab joins the arrays:
+    // JSON escapes a tab inside a string.
     let arrays = columns
         .chunks(COLUMNS_PER_ARRAY)
         .map(|chunk| {
             let quoted = chunk
                 .iter()
-                .map(|column| format!("quote({})", quote_ident(column)))
+                .map(|column| {
+                    let column = quote_ident(column);
+                    format!(
+                        "CASE typeof({column}) WHEN 'text' THEN 'T' || hex({column}) \
+                         ELSE quote({column}) END"
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("json_array({quoted})")
@@ -1267,11 +1365,17 @@ fn for_each_row(
     Ok(given)
 }
 
-/// Parse one `quote()` literal into a value.
+/// Parse one `quote()` literal, or `T` and the hex of a text, into a value.
 pub(crate) fn parse_literal(literal: &str) -> Result<LakeValue, String> {
     let bad = || format!("unexpected value {literal:?}");
     if literal == "NULL" {
         return Ok(LakeValue::Null);
+    }
+    if let Some(hex) = literal.strip_prefix('T') {
+        let bytes = decode_hex(hex).ok_or_else(bad)?;
+        return Ok(LakeValue::Text(String::from_utf8(bytes).unwrap_or_else(
+            |error| String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        )));
     }
     if let Some(text) = literal.strip_prefix('\'') {
         let text = text.strip_suffix('\'').ok_or_else(bad)?;
@@ -1279,14 +1383,7 @@ pub(crate) fn parse_literal(literal: &str) -> Result<LakeValue, String> {
     }
     if let Some(hex) = literal.strip_prefix("X'") {
         let hex = hex.strip_suffix('\'').ok_or_else(bad)?;
-        if hex.len() % 2 != 0 || !hex.is_ascii() {
-            return Err(bad());
-        }
-        return (0..hex.len())
-            .step_by(2)
-            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).map_err(|_| bad()))
-            .collect::<Result<Vec<u8>, String>>()
-            .map(LakeValue::Blob);
+        return decode_hex(hex).map(LakeValue::Blob).ok_or_else(bad);
     }
     if literal.contains(['.', 'e', 'E']) {
         return literal
@@ -1298,6 +1395,17 @@ pub(crate) fn parse_literal(literal: &str) -> Result<LakeValue, String> {
         .parse::<i64>()
         .map(LakeValue::Integer)
         .map_err(|_| bad())
+}
+
+/// Decode upper- or lowercase hex. `None` for an odd length or a bad digit.
+fn decode_hex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) || !hex.is_ascii() {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).ok())
+        .collect()
 }
 
 #[cfg(test)]
