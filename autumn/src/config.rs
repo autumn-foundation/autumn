@@ -25387,7 +25387,7 @@ workers = 2
         );
 
         // A bad preset is an error, not a silently shorter list.
-        let mut bad = config.roles.clone();
+        let mut bad = config.roles;
         bad.insert("worker".to_owned(), RolePreset::new(ProcessRole::Worker));
         assert!(matches!(
             derive_fleet_tiers(&bad, &[]),
@@ -25422,8 +25422,10 @@ workers = 2
         );
         assert_eq!(resolve("base = \"web\"").guard_base(), ProcessRole::Web);
         for base in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
-            assert_eq!(Role::from(base).guard_base(), base);
-            assert!(base == Role::from(base) && Role::from(base) == base);
+            let role = Role::from(base);
+            assert_eq!(role.guard_base(), base);
+            // `PartialEq` works in both directions.
+            assert!(base == role && role == base);
         }
     }
 

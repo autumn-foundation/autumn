@@ -18770,7 +18770,7 @@ mod tests {
     fn role_job_config_applies_the_preset() {
         let config = named_role_config_3543("critical", "postgres");
         let role = config.resolve_role().expect("critical");
-        let mut jobs = config.jobs.clone();
+        let mut jobs = config.jobs;
         jobs.pin = vec!["bulk".to_owned()];
         assert_eq!(
             role_job_config(&role, &jobs).pin,
