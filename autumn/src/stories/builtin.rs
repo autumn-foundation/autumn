@@ -1511,6 +1511,36 @@ fn gated_stories() -> Vec<Story> {
             }
         }
     });
+    #[cfg(feature = "storage")]
+    stories.push(story! {
+        "Forms",
+        "Direct upload",
+        {
+            use autumn_web::storage::form_helper::{
+                DirectUploadConfig, direct_upload_field, direct_upload_input,
+            };
+
+            maud::html! {
+                // The form needs `multipart/form-data`. Without JS the
+                // file goes with the form. With `autumn-widgets.js`, the
+                // file goes straight to storage and a hidden field holds
+                // its key. Your app handles the presign URL.
+                form method="post" action="/posts" enctype="multipart/form-data" {
+                    (direct_upload_input("cover_image", "/uploads/presign", Some("image/*")))
+                    // Set the label, allow many files, filter by type.
+                    (direct_upload_field(
+                        "attachments",
+                        "/uploads/presign",
+                        &DirectUploadConfig::new()
+                            .label("Attachments")
+                            .accept(".pdf,image/*")
+                            .multiple(true),
+                    ))
+                    button type="submit" { "Save" }
+                }
+            }
+        }
+    });
     #[cfg(feature = "wizard")]
     stories.push(story! {
         "Forms",

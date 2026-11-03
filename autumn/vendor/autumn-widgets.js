@@ -830,6 +830,181 @@
     });
   }, true);
 
+  // ── direct upload (#3411) ─────────────────────────────────────────────────
+  // fetch gets the presigned URL from the app. XHR sends the bytes, because
+  // fetch has no upload progress. The input loses its name, so the file goes
+  // only to storage. A hidden field holds each blob key. See
+  // `storage::form_helper::direct_upload_field`.
+  var UPLOAD = '[data-autumn-direct-upload]';
+
+  function csrfHeaders() {
+    var meta = document.querySelector('meta[name="csrf-token"],meta[name="autumn-csrf-token"]');
+    var h = {};
+    if (meta) h[meta.getAttribute('data-header') || 'x-csrf-token'] = meta.getAttribute('content') || '';
+    return h;
+  }
+
+  // Does `file` match an `accept` list (".pdf", "image/*", "text/plain")?
+  function accepted(file, accept) {
+    if (!accept) return true;
+    var name = file.name.toLowerCase();
+    var type = (file.type || '').toLowerCase();
+    return accept.split(',').some(function (t) {
+      t = t.trim().toLowerCase();
+      if (!t) return false;
+      if (t.charAt(0) === '.') return name.slice(-t.length) === t;
+      if (t.slice(-2) === '/*') return type.indexOf(t.slice(0, -1)) === 0;
+      return type === t;
+    });
+  }
+
+  function presign(root, file, type) {
+    var h = csrfHeaders();
+    h['Content-Type'] = 'application/json';
+    h.Accept = 'application/json';
+    return fetch(root.getAttribute('data-autumn-upload-url'), {
+      method: 'POST', headers: h, credentials: 'same-origin',
+      body: JSON.stringify({ filename: file.name, content_type: type, size: file.size })
+    }).then(function (r) {
+      if (!r.ok) throw new Error('presign ' + r.status);
+      return r.json();
+    }).then(function (env) {
+      if (!env || !env.url || !env.key) throw new Error('presign envelope');
+      return env;
+    });
+  }
+
+  function put(env, file, type, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var headers = env.headers || {};
+      var xhr = new XMLHttpRequest();
+      xhr.open(env.method || 'PUT', env.url);
+      Object.keys(headers).forEach(function (k) { xhr.setRequestHeader(k, headers[k]); });
+      if (!Object.keys(headers).some(function (k) { return k.toLowerCase() === 'content-type'; })) {
+        xhr.setRequestHeader('Content-Type', type);
+      }
+      xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable) onProgress(Math.round(e.loaded * 100 / e.total));
+      };
+      xhr.onload = function () {
+        if (xhr.status >= 200 && xhr.status < 300) resolve(); else reject(new Error('put ' + xhr.status));
+      };
+      xhr.onerror = xhr.onabort = function () { reject(new Error('put failed')); };
+      xhr.send(file);
+    });
+  }
+
+  function initUpload(root) {
+    if (!once(root)) return;
+    var input = root.querySelector('input[type="file"]');
+    var field = root.getAttribute('data-autumn-upload-field');
+    var bar = root.querySelector('[role="progressbar"]');
+    var status = root.querySelector('[role="status"]');
+    var alertEl = root.querySelector('[role="alert"]');
+    var box = root.querySelector('[data-autumn-upload-fields]');
+    var hint = root.querySelector('[data-autumn-upload-hint]');
+    if (!input || !field || !bar || !status || !alertEl || !box) return;
+    var pending = 0;
+
+    // The bytes go to storage. The form sends only the hidden keys.
+    input.removeAttribute('name');
+    if (hint) hint.hidden = false;
+
+    function progress(n) {
+      bar.hidden = false;
+      bar.setAttribute('aria-valuenow', n);
+      // CSSOM, not a style attribute, so the CSP allows it.
+      bar.style.setProperty('--autumn-upload-percent', n + '%');
+    }
+
+    function upload(file) {
+      var type = file.type || 'application/octet-stream';
+      progress(0);
+      return presign(root, file, type).then(function (env) {
+        return put(env, file, type, progress).then(function () { return env.key; });
+      });
+    }
+
+    function addKey(key, file) {
+      if (!input.multiple) box.textContent = '';
+      var hid = document.createElement('input');
+      hid.type = 'hidden';
+      hid.name = field;
+      hid.value = key;
+      box.appendChild(hid);
+      root.dispatchEvent(new CustomEvent('autumn:upload', { bubbles: true, detail: { key: key, file: file } }));
+    }
+
+    function run(list) {
+      var files = Array.prototype.slice.call(list);
+      var accept = input.getAttribute('accept');
+      var errors = [];
+      files = files.filter(function (f) {
+        if (accepted(f, accept)) return true;
+        errors.push(f.name + ' is not an accepted file type.');
+        return false;
+      });
+      if (!input.multiple) files = files.slice(0, 1);
+      alertEl.textContent = errors.join(' ');
+      if (!files.length) return;
+      var done = [];
+      pending++;
+      root.setAttribute('aria-busy', 'true');
+      files.reduce(function (chain, file, i) {
+        return chain.then(function () {
+          status.textContent = 'Uploading ' + file.name + (files.length > 1 ? ' (' + (i + 1) + ' of ' + files.length + ')' : '') + '.';
+          return upload(file).then(function (key) {
+            addKey(key, file);
+            done.push(file.name);
+          }, function () {
+            errors.push(file.name + ' did not upload.');
+            root.dispatchEvent(new CustomEvent('autumn:upload-error', { bubbles: true, detail: { file: file } }));
+          });
+        });
+      }, Promise.resolve()).then(function () {
+        if (!--pending) root.removeAttribute('aria-busy');
+        bar.hidden = true;
+        alertEl.textContent = errors.join(' ');
+        status.textContent = done.length === 1 ? done[0] + ' uploaded.' : done.length ? done.length + ' files uploaded.' : '';
+        input.value = '';
+      });
+    }
+
+    input.addEventListener('change', function () { run(input.files); });
+
+    function hasFiles(e) {
+      var types = e.dataTransfer && e.dataTransfer.types;
+      return !!types && Array.prototype.indexOf.call(types, 'Files') >= 0;
+    }
+    function over(e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      root.setAttribute('data-dragging', '');
+    }
+    root.addEventListener('dragenter', over);
+    root.addEventListener('dragover', over);
+    root.addEventListener('dragleave', function (e) {
+      if (!root.contains(e.relatedTarget)) root.removeAttribute('data-dragging');
+    });
+    root.addEventListener('drop', function (e) {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      root.removeAttribute('data-dragging');
+      run(e.dataTransfer.files);
+    });
+
+    // A key is missing until its upload ends, so hold the form.
+    var form = root.closest('form');
+    if (form) {
+      form.addEventListener('submit', function (e) {
+        if (!pending) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        alertEl.textContent = 'Wait for the upload to finish, then send the form again.';
+      }, true);
+    }
+  }
+
   // Run `fn` on `root` (when it matches) and on each match inside it.
   function each(root, selector, fn) {
     if (root.matches && root.matches(selector)) fn(root);
@@ -846,6 +1021,7 @@
     each(root, REGION, initRegion);
     each(root, TOAST, initToast);
     each(root, TIP, initTooltip);
+    each(root, UPLOAD, initUpload);
     // A swap inside a tooltip (a new trigger).
     var outer = root.parentElement && root.parentElement.closest(TIP);
     if (outer) initTooltip(outer);

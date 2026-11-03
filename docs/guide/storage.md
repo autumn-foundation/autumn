@@ -358,12 +358,15 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct PresignRequest {
+    filename: String,
     content_type: String,
-    key: String,
+    size: u64,
 }
 
 #[derive(Serialize)]
 struct PresignResponse {
+    /// The blob key. `direct_upload_input` puts it in a hidden field.
+    key: String,
     url: String,
     method: String,
     headers: std::collections::HashMap<String, String>,
@@ -378,10 +381,13 @@ async fn presign(
     Json(req): Json<PresignRequest>,
 ) -> AutumnResult<Json<PresignResponse>> {
     let store = blobs.store();
+    // Your app picks the key. Never trust a key from the browser.
+    let key = format!("uploads/{}", uuid::Uuid::new_v4());
     let result: PresignPutResult = store
-        .presign_put(&req.key, &req.content_type, Duration::from_secs(300))
+        .presign_put(&key, &req.content_type, Duration::from_secs(300))
         .await?;
     Ok(Json(PresignResponse {
+        key,
         url: result.url,
         method: result.method,
         headers: result.headers,
@@ -417,23 +423,50 @@ async fn complete(
 
 ### Maud form helper
 
-If your Maud templates use a standard `<input type="file">` with htmx for
-progressive enhancement, the `autumn_web::storage::form_helper` module (feature
-`maud`) provides a pre-wired input:
+`autumn_web::storage::form_helper` (feature `maud`) renders the upload field.
+`autumn-widgets.js` drives it. Include the script once in your layout:
 
 ```rust,ignore
-use autumn_web::storage::form_helper::direct_upload_input;
+use autumn_web::storage::form_helper::{DirectUploadConfig, direct_upload_field};
 
 html! {
-    (direct_upload_input("avatar", &presign_url, Some("image/*")))
+    form method="post" action="/profile" enctype="multipart/form-data" {
+        (direct_upload_field(
+            "avatar",
+            "/uploads/presign",
+            &DirectUploadConfig::new().label("Avatar").accept("image/*"),
+        ))
+        button type="submit" { "Save" }
+    }
 }
 ```
 
-Renders a file input with `data-controller="direct-upload"` for Stimulus-style JS
-enhancement and an accessible progress bar placeholder. When JavaScript is unavailable,
-users see a notice explaining the dependency. To provide a fallback upload path for
-no-JS users, wrap the component in a `<noscript>` block with an alternative
-`enctype="multipart/form-data"` form and handler.
+`direct_upload_input("avatar", "/uploads/presign", Some("image/*"))` is the
+short form. `DirectUploadConfig` sets the label, the `id`, `accept` and
+`multiple`.
+
+With JavaScript, for each file the script:
+
+1. `POST`s JSON `{filename, content_type, size}` to the presign URL. It sends
+   the token from `<meta name="csrf-token">` in `X-CSRF-Token`.
+2. Reads `{url, method, headers, key}` from the response.
+3. Sends the file to `url`. A progress bar shows the progress.
+4. Adds `<input type="hidden" name="avatar" value="{key}">`.
+
+The form then carries only the keys. Your handler calls
+`complete_direct_upload` with each key, then saves the `Blob`. The file input
+loses its `name`, so the bytes are not sent twice. A form that has a running
+upload does not submit.
+
+The user can drop files on the field. The script checks `accept` on a drop.
+Your server must still check the type and the size.
+
+The script fires `autumn:upload` (`detail.key`, `detail.file`) and
+`autumn:upload-error` (`detail.file`) on the field. A screen reader hears the
+status and the errors in live regions.
+
+**Without JavaScript** the input is a plain file field. It sends the file with
+the form, so use `enctype="multipart/form-data"` and a multipart handler.
 
 ### Orphan handling
 

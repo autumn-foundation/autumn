@@ -273,6 +273,9 @@ fn expected_story_slugs() -> Vec<&'static str> {
     slugs.push("flash");
     #[cfg(feature = "wizard")]
     slugs.push("wizard-progress");
+    // `storage::form_helper` (#3411).
+    #[cfg(feature = "storage")]
+    slugs.push("direct-upload");
     // Widget families (#3408).
     #[cfg(feature = "widgets-search")]
     slugs.extend(["active-search", "autocomplete"]);
