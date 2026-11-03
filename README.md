@@ -21,6 +21,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **Configuration and profiles** - defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
 - **Database ergonomics** - async Postgres primary/replica pools, `Db` extractor for the primary/write role, `#[model]`, `#[repository]`, hooks, and embedded migrations
 - **HTML stack** - Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
+- **Widgets** - server-rendered, CSP-safe widgets. Core widgets need `maud`; the search, social, workflow and chart families are default-on features (`widgets-search`, `widgets-social`, `widgets-workflow`, `widgets-charts`), so a lean app compiles only what it uses (see [widget styling](docs/guide/widget-styling.md#widget-families))
 - **Operations** - `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
 - **Background work** - `#[scheduled]` tasks, `#[job]` handlers, one-off `#[task]` scripts via `autumn task`, and runtime task visibility at `/actuator/tasks`
 - **Companion workflows** - [Autumn Harvest](docs/autumn-workflow-architecture.md) is the separate durable workflow engine for multi-step orchestration when `#[scheduled]` or `#[job]` is not enough

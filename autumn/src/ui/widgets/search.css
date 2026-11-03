@@ -1,0 +1,119 @@
+/* Search widgets (`widgets-search`). The server joins this file to
+   autumn-widgets.css only when the feature is on (#3408). */
+
+/* ── Active search input (autumn-search) ──────────────────────────────────── */
+
+.autumn-search {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin-bottom: var(--space-4);
+}
+
+.autumn-search__label {
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    color: var(--text);
+}
+
+.autumn-search__input {
+    width: 100%;
+    padding: var(--space-2) var(--space-3) var(--space-2) 2.25rem;
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius);
+    font-size: var(--font-size-sm);
+    color: var(--text);
+    background-color: var(--surface);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: 0.625rem center;
+    background-size: 1rem 1rem;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.autumn-search__input:focus {
+    outline: 2px solid transparent;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-light);
+}
+
+/* ── Autocomplete (autumn-autocomplete) ───────────────────────────────────── */
+
+.autumn-autocomplete {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    margin-bottom: var(--space-4);
+}
+
+.autumn-autocomplete__label {
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    color: var(--text);
+}
+
+.autumn-autocomplete__input {
+    width: 100%;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius);
+    font-size: var(--font-size-sm);
+    color: var(--text);
+    background-color: var(--surface);
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.autumn-autocomplete__input:focus {
+    outline: 2px solid transparent;
+    border-color: var(--primary);
+    box-shadow: 0 0 0 3px var(--primary-light);
+}
+
+.autumn-autocomplete__options {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: var(--z-dropdown);
+    background-color: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    max-height: 15rem;
+    overflow-y: auto;
+    list-style: none;
+    margin: var(--space-1) 0 0 0;
+    padding: var(--space-1) 0;
+}
+
+/* An empty listbox stays in the accessibility tree (its live region must
+   speak), so it gets no size, not `display: none`. */
+.autumn-autocomplete__options:empty {
+    border-width: 0;
+    padding: 0;
+    box-shadow: none;
+}
+
+.autumn-autocomplete__option {
+    padding: var(--space-2) var(--space-3);
+    font-size: var(--font-size-sm);
+    color: var(--text);
+    cursor: pointer;
+}
+
+.autumn-autocomplete__option:hover,
+.autumn-autocomplete__option[aria-selected="true"] {
+    background-color: var(--primary-light);
+    color: var(--primary);
+}
+
+/* ── Search empty states (#2354) ─────────────────────────────────────────── */
+
+.autumn-search-empty,
+.autumn-autocomplete-empty {
+    margin: 0;
+    padding: var(--space-3) var(--space-4);
+    color: var(--text-muted);
+}

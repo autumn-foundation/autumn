@@ -2260,6 +2260,13 @@ reject_on_content_type_mismatch = true  # declared-vs-sniffed mismatch (or an
 Trunk-dev ships framework view widgets — prefer these over hand-rolled Maud
 for the common cases:
 
+Core widgets need only `maud`. Four families are default-on features
+(#3408): `widgets-search` (active search, autocomplete), `widgets-social`
+(reactions, comment thread, infinite feed, the `#[commentable]` router),
+`widgets-workflow` (transition controls, bulk actions) and `widgets-charts`.
+With `default-features = false`, name each family the app uses. Paths stay
+`autumn_web::widgets::*` (`docs/guide/widget-styling.md`).
+
 | Helper | Purpose |
 |---|---|
 | `link_to(label, href)` / `link_to_with(..., &LinkToOptions)` | Escaped GET anchors; auto `rel="noopener"` on `target="_blank"` |

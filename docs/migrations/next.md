@@ -137,6 +137,44 @@ status route is not mounted. Without `upgrade`, the app ignores `SIGUSR2`.
 **Automation:** `manual` — the right feature depends on which modules the app
 uses, so no codemod can choose it.
 
+### Features: four widget families are now optional
+
+**Why:** An app that used `card` and `nav_bar` compiled every widget, and
+every page got all the widget CSS and JavaScript (issue #3408, ADR 0033). The
+widgets are now in families. The core widgets need only `maud`. Four families
+have a feature. All four are in `default`, so a default build is the same as
+before. Every `autumn_web::widgets::*` path stays the same.
+
+**Who is affected:** An app that sets `default-features = false` and uses a
+widget of one of these families. The compiler reports `unresolved import`. An
+app that keeps the default features needs no change.
+
+| Feature | Widgets |
+|---------|---------|
+| `widgets-search` | `active_search*`, `autocomplete_*`, `ActiveSearchConfig`, `AutocompleteConfig`, `SearchMethod` |
+| `widgets-social` | `reaction_controls`, `comment_thread`, `comment_dom_id`, `feed_page`, `infinite_feed` and their config types; the `#[commentable]` router |
+| `widgets-workflow` | `transition_controls*`, `TransitionLabels`, `bulk_*`, `BulkActionsConfig` |
+| `widgets-charts` | `sparkline*`, `bar_chart*`, `line_chart*`, `ChartConfig` |
+
+Each family feature turns on `maud`.
+
+**Before (`{X.Y}`):**
+
+```toml
+autumn-web = { version = "{X.Y.Z}", default-features = false, features = ["maud", "htmx"] }
+```
+
+**After:**
+
+```toml
+autumn-web = { version = "{X.Z.0}", default-features = false, features = ["maud", "htmx", "widgets-search"] }
+```
+
+Without `widgets-search`, `/static/js/autumn-widgets.js` has no autocomplete
+runtime. Without a family, `/static/css/autumn-widgets.css` has no rules for
+its classes. The gallery at `/_stories` shows only the stories of the enabled
+families.
+
 ### {Area}: {Short description}
 
 **Why:** One or two sentences on the motivation.

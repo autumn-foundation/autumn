@@ -17,14 +17,63 @@ use std::path::Path;
 ///   `autumn-dev-*` classes are self-styled, not part of the shared sheet.
 /// - `src/flash.rs` — uses the `.flash` / `.flash-<level>` convention, not
 ///   `autumn-*`, and is served as its own stylesheet (`FLASH_CSS`).
+/// `src/widgets/` is listed from disk, so it is not named here.
 const WIDGET_SOURCES: &[&str] = &[
     "src/form.rs",
-    "src/widgets.rs",
     "src/wizard.rs",
     "src/ui/pagination.rs",
     "src/storage/form_helper.rs",
     "src/job_tracking.rs",
 ];
+
+/// Opt-in widget families (#3408): the module in `src/widgets/` and the
+/// CSS file in `src/ui/widgets/` have this name.
+const FAMILY_MODULES: &[&str] = &["search", "social", "workflow", "charts"];
+
+/// Every `.rs` file in `src/widgets/`, relative to the crate root.
+fn widget_module_files() -> Vec<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/widgets");
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("dir entry").path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("rs"))
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("file name");
+            format!("src/widgets/{name}")
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// All widget sources: the fixed list plus every `src/widgets/` file.
+fn all_widget_sources() -> Vec<String> {
+    let mut files: Vec<String> = WIDGET_SOURCES.iter().map(|s| (*s).to_owned()).collect();
+    files.extend(widget_module_files());
+    files
+}
+
+fn read_source(path: &str) -> String {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    std::fs::read_to_string(manifest_dir.join(path))
+        .unwrap_or_else(|e| panic!("failed to read {path}: {e}"))
+        .replace("\r\n", "\n")
+}
+
+/// True when `css` has a selector for exactly `.class` (not a longer class
+/// that starts with it).
+fn has_rule(css: &str, class: &str) -> bool {
+    let selector = format!(".{class}");
+    css.match_indices(&selector).any(|(at, _)| {
+        css[at + selector.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    })
+}
 
 /// Class-name prefixes the shared stylesheet backs. Since #3396 every widget
 /// class has the `autumn-` prefix.
@@ -70,12 +119,10 @@ fn emitted_classes(source: &str) -> Vec<String> {
 
 #[test]
 fn every_emitted_autumn_class_has_backing_css() {
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut missing = Vec::new();
 
-    for path in WIDGET_SOURCES {
-        let source = std::fs::read_to_string(manifest_dir.join(path))
-            .unwrap_or_else(|e| panic!("failed to read {path}: {e}"));
+    for path in all_widget_sources() {
+        let source = read_source(&path);
         for class in emitted_classes(&source) {
             let selector = format!(".{class}");
             if !autumn_web::ui::WIDGETS_COMPONENT_CSS.contains(&selector) {
@@ -92,6 +139,53 @@ fn every_emitted_autumn_class_has_backing_css() {
          autumn_web::ui::WIDGETS_COMPONENT_CSS:\n{missing:#?}\n\
          Add a `.{{class}}` rule to autumn/src/ui/widgets.css."
     );
+}
+
+/// A class that only a family emits has its rule in that family's CSS file,
+/// and not in the core file (#3408). So the family's CSS is complete when it
+/// is the only family on, and the core file carries no dead rules.
+#[test]
+fn every_family_class_is_in_its_own_css_file() {
+    let core_css = read_source("src/ui/widgets.css");
+    let family_files: Vec<String> = FAMILY_MODULES
+        .iter()
+        .map(|m| format!("src/widgets/{m}.rs"))
+        .collect();
+    let core_classes: std::collections::BTreeSet<String> = all_widget_sources()
+        .iter()
+        .filter(|path| !family_files.contains(path))
+        .flat_map(|path| emitted_classes(&read_source(path)))
+        .collect();
+
+    let mut problems = Vec::new();
+    for module in FAMILY_MODULES {
+        let family_css = read_source(&format!("src/ui/widgets/{module}.css"));
+        let classes: std::collections::BTreeSet<String> =
+            emitted_classes(&read_source(&format!("src/widgets/{module}.rs")))
+                .into_iter()
+                .collect();
+        assert!(
+            !classes.is_empty(),
+            "src/widgets/{module}.rs emits no class"
+        );
+        for class in classes {
+            if core_classes.contains(&class) {
+                continue;
+            }
+            if !has_rule(&family_css, &class) {
+                problems.push(format!(
+                    "`.{class}` has no rule in src/ui/widgets/{module}.css"
+                ));
+            }
+            if has_rule(&core_css, &class) {
+                problems.push(format!(
+                    "`.{class}` is only emitted by `{module}`, so move its rule from \
+                     src/ui/widgets.css to src/ui/widgets/{module}.css"
+                ));
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
 }
 
 #[test]

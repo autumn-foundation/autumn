@@ -43,6 +43,7 @@ pub const STORIES_PATH: &str = "/_stories";
 const STORY_DETAIL_PATH: &str = "/_stories/{slug}";
 
 /// Demo backend for the "Active search" story. See [`demo_search`].
+#[cfg(feature = "widgets-search")]
 const STORIES_DEMO_SEARCH_PATH: &str = "/_stories/demo/search";
 
 /// Demo backend for the busy states in the "Button", "Spinner" and
@@ -53,10 +54,12 @@ const STORIES_DEMO_SAVE_PATH: &str = "/_stories/demo/save";
 const STORIES_DEMO_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// Demo backend for the "Autocomplete" story. See [`demo_tag_search`].
+#[cfg(feature = "widgets-search")]
 const STORIES_DEMO_TAG_SEARCH_PATH: &str = "/_stories/demo/tags/search";
 
 /// Demo backend for the "Infinite feed" story's sentinel. See
 /// [`demo_infinite_feed`].
+#[cfg(feature = "widgets-social")]
 const STORIES_DEMO_FEED_PATH: &str = "/_stories/demo/posts/feed";
 
 /// Derive a URL slug from a story name: lowercase, alphanumeric runs joined
@@ -424,6 +427,26 @@ pub struct StoriesConfig {
     pub enabled: bool,
 }
 
+/// Path and handler name of each demo backend that [`story_router`] mounts.
+/// The route listing and the router's path reservation read this list, so
+/// they cannot drift from the mounted routes. A family's demo routes exist
+/// only when its feature is on (#3408).
+pub(crate) fn demo_routes() -> Vec<(&'static str, &'static str)> {
+    #[allow(unused_mut, reason = "each family extend has its own #[cfg]")]
+    let mut routes = vec![(STORIES_DEMO_SAVE_PATH, "story_gallery_demo_save")];
+    #[cfg(feature = "widgets-search")]
+    routes.extend([
+        (STORIES_DEMO_SEARCH_PATH, "story_gallery_demo_search"),
+        (
+            STORIES_DEMO_TAG_SEARCH_PATH,
+            "story_gallery_demo_tag_search",
+        ),
+    ]);
+    #[cfg(feature = "widgets-social")]
+    routes.push((STORIES_DEMO_FEED_PATH, "story_gallery_demo_infinite_feed"));
+    routes
+}
+
 /// Build the gallery sub-router. Mounted by `build_router` when
 /// `config.stories.enabled` is true; handlers read the [`StoryRegistry`]
 /// from the `AppState` extension (mail-preview precedent).
@@ -432,7 +455,7 @@ where
     S: Clone + Send + Sync + 'static,
     AppState: axum::extract::FromRef<S>,
 {
-    axum::Router::new()
+    let router = axum::Router::new()
         .route(
             STORIES_PATH,
             axum::routing::get(
@@ -452,24 +475,29 @@ where
                 },
             ),
         )
-        // Demo backends for the two typeahead stories (Active search,
-        // Autocomplete) — see `demo_search`/`demo_tag_search` below for why
-        // these two specifically get real handlers where every other
-        // story's action URL stays a synthetic 404-on-submit (already the
-        // documented pattern for e.g. Confirm action / Avatar). Namespaced
-        // under `/_stories/demo/*`, the same convention `confirm_action`'s
-        // story already uses (`/_stories/demo/delete-post`), so a real app's
-        // own routes can never collide with these.
+        .route(STORIES_DEMO_SAVE_PATH, axum::routing::get(demo_save));
+    // Demo backends for the two typeahead stories (Active search,
+    // Autocomplete) — see `demo_search`/`demo_tag_search` below for why
+    // these two specifically get real handlers where every other
+    // story's action URL stays a synthetic 404-on-submit (already the
+    // documented pattern for e.g. Confirm action / Avatar). Namespaced
+    // under `/_stories/demo/*`, the same convention `confirm_action`'s
+    // story already uses (`/_stories/demo/delete-post`), so a real app's
+    // own routes can never collide with these. A family's demo routes
+    // exist only when its feature is on (#3408).
+    #[cfg(feature = "widgets-search")]
+    let router = router
         .route(STORIES_DEMO_SEARCH_PATH, axum::routing::get(demo_search))
         .route(
             STORIES_DEMO_TAG_SEARCH_PATH,
             axum::routing::get(demo_tag_search),
-        )
-        .route(
-            STORIES_DEMO_FEED_PATH,
-            axum::routing::get(demo_infinite_feed),
-        )
-        .route(STORIES_DEMO_SAVE_PATH, axum::routing::get(demo_save))
+        );
+    #[cfg(feature = "widgets-social")]
+    let router = router.route(
+        STORIES_DEMO_FEED_PATH,
+        axum::routing::get(demo_infinite_feed),
+    );
+    router
 }
 
 /// The backend of the busy-state demos (#3406): it waits, then answers
@@ -486,6 +514,7 @@ async fn demo_save() -> Html<&'static str> {
 /// [`AutocompleteConfig`](crate::widgets::AutocompleteConfig) both default
 /// `param_name`/`query_param` to.
 #[derive(serde::Deserialize)]
+#[cfg(feature = "widgets-search")]
 struct DemoQuery {
     #[serde(default)]
     q: String,
@@ -496,6 +525,7 @@ struct DemoQuery {
 /// case-insensitively by `q`, returning the same
 /// [`active_search_empty_state`](crate::widgets::active_search_empty_state)
 /// the story documents for the no-matches case.
+#[cfg(feature = "widgets-search")]
 async fn demo_search(
     crate::extract::Query(DemoQuery { q }): crate::extract::Query<DemoQuery>,
 ) -> Html<String> {
@@ -531,6 +561,7 @@ async fn demo_search(
 /// the same [`autocomplete_option`](crate::widgets::autocomplete_option) /
 /// [`autocomplete_empty_state`](crate::widgets::autocomplete_empty_state)
 /// the story's source already documents.
+#[cfg(feature = "widgets-search")]
 async fn demo_tag_search(
     crate::extract::Query(DemoQuery { q }): crate::extract::Query<DemoQuery>,
 ) -> Html<String> {
@@ -565,6 +596,7 @@ async fn demo_tag_search(
 /// alone would have 404-swapped it without the visitor doing anything. This
 /// always returns a terminal page (no further cursor), matching what the
 /// story's own `feed_page` snippet already documents as "the last page".
+#[cfg(feature = "widgets-social")]
 async fn demo_infinite_feed() -> Html<String> {
     let markup = crate::widgets::feed_page(
         maud::html! {
@@ -1577,6 +1609,7 @@ mod tests {
     // story's own source — not a reference to the route const, which would
     // show up literally in the public "Source" tab — nothing else catches
     // the two drifting apart. Guard it here instead.
+    #[cfg(feature = "widgets-search")]
     #[test]
     fn typeahead_stories_point_at_their_registered_demo_routes() {
         let registry = builtin();
@@ -1599,7 +1632,12 @@ mod tests {
              ({STORIES_DEMO_TAG_SEARCH_PATH}): {}",
             autocomplete.source()
         );
+    }
 
+    #[cfg(feature = "widgets-social")]
+    #[test]
+    fn feed_story_points_at_its_registered_demo_route() {
+        let registry = builtin();
         let feed = registry
             .find("infinite-feed")
             .expect("infinite-feed story exists");
@@ -1615,6 +1653,7 @@ mod tests {
     // U14 (interactivity follow-up): the demo handlers backing those routes
     // actually filter, case-insensitively, and fall back to the same empty
     // states the stories document.
+    #[cfg(feature = "widgets-search")]
     #[tokio::test]
     async fn demo_search_filters_case_insensitively_with_empty_state_fallback() {
         let hit = demo_search(crate::extract::Query(DemoQuery {
@@ -1637,6 +1676,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "widgets-search")]
     #[tokio::test]
     async fn demo_tag_search_filters_case_insensitively_with_empty_state_fallback() {
         let hit = demo_tag_search(crate::extract::Query(DemoQuery { q: "RU".to_owned() }))
@@ -1658,6 +1698,7 @@ mod tests {
 
     // U15 (interactivity follow-up): the feed demo must terminate (no
     // further sentinel) — otherwise it would just keep auto-firing.
+    #[cfg(feature = "widgets-social")]
     #[tokio::test]
     async fn demo_infinite_feed_returns_a_terminal_page_with_no_further_sentinel() {
         let body = demo_infinite_feed().await.0;

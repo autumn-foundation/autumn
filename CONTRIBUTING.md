@@ -93,8 +93,8 @@ the changelog when a release is cut. See
 ## Widget browser gate
 
 `.github/workflows/widgets-browser.yml` runs the widgets in headless Chromium
-(issue #3398). It runs when a PR changes widget code: `autumn/src/widgets.rs`,
-`autumn/src/ui/`, `autumn/vendor/autumn-widgets.js`, `autumn/src/stories/`
+(issue #3398). It runs when a PR changes widget code: `autumn/src/widgets/`,
+`autumn/src/ui/`, `autumn/vendor/autumn-widgets*.js`, `autumn/src/stories/`
 and the other paths in its `paths:` filter. It also runs each week.
 
 The job runs eight suites:
@@ -149,8 +149,11 @@ cargo test -p autumn-plugin-reference --features system-tests --lib \
 When you add a widget:
 
 1. Add a story in `autumn/src/stories/builtin.rs`. The default `test` lane
-   fails when a public render fn in `widgets.rs`, `ui/pagination.rs`,
+   fails when a public render fn in `widgets/`, `ui/pagination.rs`,
    `flash.rs` or `wizard.rs`, or an `a11y` primitive, has no story.
+   A widget in an opt-in family (`widgets-search`, `widgets-social`,
+   `widgets-workflow`, `widgets-charts`) goes in that family's module, and
+   its story in that family's `*_stories()` fn (#3408).
 2. If the story needs `autumn-widgets.js` or a CSS state, add
    `async fn keyboard_<slug>()` to
    `autumn/tests/integration/stories_browser.rs` and the slug to

@@ -28,9 +28,10 @@ on:
   pull_request:
     branches: [trunk, trunk-dev]
     paths:
-      - "autumn/src/widgets.rs"
+      - "autumn/src/widgets/**"
       - "autumn/src/ui/**"
       - "autumn/vendor/autumn-widgets.js"
+      - "autumn/vendor/autumn-widgets-search.js"
       - "autumn/src/stories/**"
       - "autumn/src/htmx.rs"
       - "autumn/vendor/htmx.min.js"
@@ -60,9 +61,10 @@ on:
   push:
     branches: [trunk, trunk-dev]
     paths:
-      - "autumn/src/widgets.rs"
+      - "autumn/src/widgets/**"
       - "autumn/src/ui/**"
       - "autumn/vendor/autumn-widgets.js"
+      - "autumn/vendor/autumn-widgets-search.js"
       - "autumn/src/stories/**"
       - "autumn/src/htmx.rs"
       - "autumn/vendor/htmx.min.js"

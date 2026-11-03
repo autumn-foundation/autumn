@@ -57,7 +57,9 @@ jobs:
       # The Rust tests only search the runtime for strings, so a syntax
       # error there passes them (#3406). Node parses the file.
       - name: Check the widget runtime parses
-        run: node --check autumn/vendor/autumn-widgets.js
+        run: |
+          node --check autumn/vendor/autumn-widgets.js
+          node --check autumn/vendor/autumn-widgets-search.js
       - name: Clippy
         # `-j 2` caps codegen parallelism. This step checks the whole workspace
         # with `--all-targets`, and at cargo's default (one job per core, 4 on
@@ -1218,6 +1220,7 @@ jobs:
             repl,
             webmcp,
             ledger-capture,
+            widgets,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1259,6 +1262,16 @@ jobs:
             | tee "${RUNNER_TEMP}/ledger-capture-lib.log"
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/ledger-capture-lib.log" \
             || { echo "::error::no ledger_capture unit tests ran"; exit 1; }
+      - name: Check every widget family combination (#3408)
+        if: matrix.lane == 'widgets'
+        # Each widget family (`widgets-search`, `widgets-social`,
+        # `widgets-workflow`, `widgets-charts`) is default-on, so
+        # `cargo test --workspace` never builds a set with one turned off. An
+        # app can turn defaults off and name only the families it uses, so
+        # the script checks all 16 combinations, plus the `#[commentable]`
+        # router with and without `widgets-social`. A warning in widget code
+        # fails it too.
+        run: ./scripts/check-widget-features.sh
       - name: Run markdown-gated tests (user-content sanitizer)
         if: matrix.lane == 'markdown'
         # `markdown` is not a default feature, so the `test` job's `cargo test

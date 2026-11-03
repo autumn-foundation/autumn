@@ -1866,13 +1866,12 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     if config.stories.enabled {
         claimed.insert(crate::stories::STORIES_PATH.to_owned());
         claimed.insert("/_stories/{slug}".to_owned());
-        // The Active search / Autocomplete / Infinite feed stories' live
-        // demo backends (review follow-up — these three were missing from
-        // the preflight, so a colliding OpenAPI/MCP mount here would panic
-        // in `router.merge` instead of surfacing the typed collision error).
-        claimed.insert("/_stories/demo/search".to_owned());
-        claimed.insert("/_stories/demo/tags/search".to_owned());
-        claimed.insert("/_stories/demo/posts/feed".to_owned());
+        // The stories' live demo backends. Without them here, a colliding
+        // OpenAPI/MCP mount would panic in `router.merge` instead of
+        // surfacing the typed collision error.
+        for (path, _) in crate::stories::demo_routes() {
+            claimed.insert(path.to_owned());
+        }
     }
     // The default unsubscribe endpoint merges a GET (+POST) at `UNSUBSCRIBE_PATH`
     // before the late-merged OpenAPI/MCP routers, so reserve it too — otherwise an
@@ -11644,15 +11643,15 @@ enabled = true
     #[cfg(all(feature = "openapi", feature = "maud"))]
     #[tokio::test]
     async fn try_build_router_rejects_openapi_path_on_story_gallery_demo_route() {
-        // Review follow-up: the Active search / Autocomplete / Infinite feed
-        // stories' live demo backends merge GETs the same way the index/detail
-        // routes above do, but were missing from the preflight reservation —
-        // an OpenAPI mount here would panic in `router.merge` instead of
-        // surfacing this typed collision.
+        // The stories' live demo backends merge GETs the same way the
+        // index/detail routes above do. Without the preflight reservation, an
+        // OpenAPI mount here would panic in `router.merge` instead of
+        // surfacing this typed collision. `demo/save` is mounted with no
+        // widget family (#3408).
         let mut config = AutumnConfig::default();
         config.stories.enabled = true;
         let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
-            .openapi_json_path("/_stories/demo/search");
+            .openapi_json_path("/_stories/demo/save");
         let ctx = RouterContext {
             exception_filters: Vec::new(),
             scoped_groups: Vec::new(),
@@ -11669,15 +11668,14 @@ enabled = true
             #[cfg(feature = "webmcp")]
             webmcp: None,
         };
-        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
-            "story gallery demo search path should be reserved while stories are enabled",
-        );
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("story gallery demo path should be reserved while stories are enabled");
         assert!(matches!(
             err,
             RouterBuildError::OpenApiPathCollision {
                 field: "openapi_json_path",
                 ref path,
-            } if path == "/_stories/demo/search"
+            } if path == "/_stories/demo/save"
         ));
     }
 

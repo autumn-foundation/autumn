@@ -29,7 +29,7 @@ aggregate mode; the `#[model]` macro generates the edge table's typed
 recompute that runs **in the same transaction, under a row lock on the target
 row** — so the persisted aggregate always equals ground truth, even across
 different reactors hitting the same target at the same instant. The view half
-is [`reaction_controls`](../../autumn/src/widgets.rs), a no-JS htmx widget that
+is [`reaction_controls`](../../autumn/src/widgets/social.rs), a no-JS htmx widget that
 renders the buttons and the live total.
 
 The attribute must be written **below** `#[model]` — attribute macros are
@@ -513,7 +513,7 @@ the same transaction. Two consequences worth internalising:
 
 ## The widget
 
-[`reaction_controls`](../../autumn/src/widgets.rs) is the view half. It takes
+[`reaction_controls`](../../autumn/src/widgets/social.rs) is the view half. It takes
 pre-extracted data — never a model or a repository — and renders one
 `<form method="post">` per direction (CSRF-protected once you thread the
 token) plus the live aggregate:

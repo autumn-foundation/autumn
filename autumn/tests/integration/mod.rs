@@ -170,6 +170,7 @@ mod fleet_slot_guide;
 mod form_field_options;
 mod form_for_derive;
 mod form_native_inputs;
+#[cfg(feature = "widgets-search")]
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
@@ -604,6 +605,8 @@ mod webmcp_browser;
 mod webmcp_shim;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
+#[cfg(feature = "maud")]
+mod widget_features;
 #[cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
 mod widget_pack_browser;
 #[cfg(feature = "maud")]
@@ -614,20 +617,20 @@ mod widgets_alert;
 mod widgets_avatar;
 #[cfg(feature = "maud")]
 mod widgets_badge;
-#[cfg(feature = "maud")]
+#[cfg(feature = "widgets-charts")]
 mod widgets_charts;
 #[cfg(feature = "maud")]
 mod widgets_drawer;
 #[cfg(all(feature = "system-tests", feature = "maud"))]
 mod widgets_drawer_browser;
-#[cfg(feature = "maud")]
+#[cfg(feature = "widgets-social")]
 mod widgets_infinite_feed;
-#[cfg(all(feature = "system-tests", feature = "maud"))]
+#[cfg(all(feature = "system-tests", feature = "widgets-search"))]
 mod widgets_keyboard_browser;
 mod widgets_modal;
 #[cfg(all(feature = "system-tests", feature = "maud"))]
 mod widgets_popover_browser;
-#[cfg(feature = "maud")]
+#[cfg(feature = "widgets-social")]
 mod widgets_reaction_controls;
 mod widgets_tabs;
 #[cfg(feature = "maud")]
