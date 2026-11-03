@@ -1,4 +1,4 @@
-# ADR 0033: Split Widgets Into Feature-Gated Modules
+# ADR 0034: Split Widgets Into Feature-Gated Modules
 
 - Status: Accepted
 - Date: 2026-11-03

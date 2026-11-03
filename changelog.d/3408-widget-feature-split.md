@@ -1,7 +1,7 @@
 ### Breaking Changes
 
 - **Breaking:** the widgets are in feature-gated families (issue #3408,
-  ADR 0033). `widgets-search` (active search, autocomplete),
+  ADR 0034). `widgets-search` (active search, autocomplete),
   `widgets-social` (reaction controls, comment thread, infinite feed),
   `widgets-workflow` (transition controls, bulk actions) and
   `widgets-charts` (sparkline, bar chart, line chart) are default-on. A

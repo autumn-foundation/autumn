@@ -51,7 +51,7 @@ sla = []
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
-# Widget families (#3408, ADR 0033). Default-on. Each gates one module in
+# Widget families (#3408, ADR 0034). Default-on. Each gates one module in
 # `widgets/`, its CSS and its JS. Each enables `maud`. The core widgets
 # (layout, nav, feedback, data) need only `maud`.
 widgets-search = ["maud"]

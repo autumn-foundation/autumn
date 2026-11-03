@@ -140,7 +140,7 @@ uses, so no codemod can choose it.
 ### Features: four widget families are now optional
 
 **Why:** An app that used `card` and `nav_bar` compiled every widget, and
-every page got all the widget CSS and JavaScript (issue #3408, ADR 0033). The
+every page got all the widget CSS and JavaScript (issue #3408, ADR 0034). The
 widgets are now in families. The core widgets need only `maud`. Four families
 have a feature. All four are in `default`, so a default build is the same as
 before. Every `autumn_web::widgets::*` path stays the same.
