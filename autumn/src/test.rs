@@ -1345,6 +1345,7 @@ impl TestApp {
 
     /// Mirrors
     /// [`crate::app::AppBuilder::with_push_subscription_store`].
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_push_subscription_store<S>(mut self, store: S) -> Self
     where
@@ -1362,6 +1363,7 @@ impl TestApp {
     /// The usual reason is a
     /// [`RecordingPushTransport`](crate::push::RecordingPushTransport), so a
     /// test can assert exactly what would have gone to the push service.
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_web_push(mut self, push: crate::push::WebPush) -> Self {
         self.state_initializers.push(Box::new(move |state| {

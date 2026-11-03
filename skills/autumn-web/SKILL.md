@@ -273,7 +273,9 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `flash` | Flash messages |
 | `multipart` | Multipart uploads |
 | `redis` | Redis sessions, channels, jobs, webhook replay, and integration points |
-| `oauth2` | OAuth2/OIDC helpers and `autumn generate auth --oauth` scaffolding |
+| `oauth2` | OAuth2/OIDC helpers and `autumn generate auth --oauth` scaffolding; implies `jwt` |
+| `jwt` | Default-on. JWT verification (`jsonwebtoken`): the `jwt` tenancy source and the OIDC `id_token` check |
+| `push` | Default-on. Web Push (`autumn_web::push`, `WebPush`, `[push]`) over `p256` |
 | `openapi` | OpenAPI route metadata and spec generation |
 | `mcp` | Project typed JSON endpoints as MCP tools; implies `openapi` |
 | `webmcp` | Routes (`#[api_doc(webmcp)]` + `mount_webmcp()`) and forms (`webmcp::form_tool`) as tools for the agent in the user's browser; implies `mcp` and `htmx`. Guide: `docs/guide/webmcp.md` |

@@ -2978,6 +2978,7 @@ impl AppBuilder {
     /// ```
     ///
     /// [`WebPush`]: crate::push::WebPush
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_push_subscription_store<S>(self, store: S) -> Self
     where
@@ -3018,6 +3019,7 @@ impl AppBuilder {
     ///
     /// [`WebPush`]: crate::push::WebPush
     /// [`PushTransport`]: crate::push::PushTransport
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_web_push(self, push: crate::push::WebPush) -> Self {
         self.state_initializer(move |state| {
@@ -5316,9 +5318,20 @@ impl AppBuilder {
         // mismatched public/private pair — is a hard boot failure rather than a
         // quiet fallback to "push disabled". The failure this guards is an app
         // that starts cleanly, records subscriptions, and silently delivers
-        // nothing (#1392). An app with no `[push]` block is unaffected.
+        // nothing (#1392). An app with no `[push]` block is unaffected. A build
+        // without the `push` feature refuses any `[push]` block here.
         if let Err(e) = config.validate_push() {
             tracing::error!("Invalid [push] configuration: {e}");
+            #[cfg(feature = "managed-pg")]
+            crate::managed_pg::emergency_stop_async().await;
+            std::process::exit(1);
+        }
+
+        // A build without the `jwt` feature cannot verify a tenant token, so
+        // `tenancy.source = "jwt"` stops the boot rather than failing every
+        // request.
+        if let Err(e) = config.validate_tenancy_source() {
+            tracing::error!("Invalid [tenancy] configuration: {e}");
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);

@@ -1592,7 +1592,15 @@ pub struct AutumnConfig {
     /// leaving the app running with push silently dead. See
     /// [`crate::push::PushConfig`] and `docs/guide/web-push.md`.
     #[serde(default)]
+    #[cfg(feature = "push")]
     pub push: crate::push::PushConfig,
+
+    /// The `[push]` table, kept so the file stays valid without the `push`
+    /// feature. An `AUTUMN_PUSH__*` variable also sets it. The boot fails when
+    /// it is set: see [`validate_push`](Self::validate_push).
+    #[serde(default)]
+    #[cfg(not(feature = "push"))]
+    pub push: Option<InertSection>,
 
     /// HTTP idempotency-key middleware settings.
     #[serde(default)]
@@ -5070,6 +5078,74 @@ const MANUAL_SCHEMA_SECTIONS: &[(&str, &[&str])] = &[
     ("time_zone", &["identifier", "sources"]),
 ];
 
+/// A config table kept in a build without the feature that reads it.
+///
+/// It parses, so a config file that is valid with the feature stays valid
+/// without it, but nothing reads it. `Debug` prints only the key names: a
+/// table such as `[push]` holds a private key.
+///
+/// The inner value is a `toml::Value`, as `[alerts]` is without its feature,
+/// so strict config validation treats the table as one opaque leaf.
+#[cfg(not(feature = "push"))]
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct InertSection(toml::Value);
+
+#[cfg(not(feature = "push"))]
+impl Default for InertSection {
+    fn default() -> Self {
+        Self(toml::Value::Table(toml::Table::new()))
+    }
+}
+
+#[cfg(not(feature = "push"))]
+impl InertSection {
+    /// The keys set in the table, from the file or from the environment.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .as_table()
+            .into_iter()
+            .flat_map(|table| table.keys().map(String::as_str))
+    }
+
+    fn insert(&mut self, key: &str, value: toml::Value) {
+        if let toml::Value::Table(table) = &mut self.0 {
+            table.insert(key.to_owned(), value);
+        }
+    }
+}
+
+#[cfg(not(feature = "push"))]
+impl std::fmt::Debug for InertSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InertSection")
+            .field("keys", &self.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The boot error for `[push]` in a build without the `push` feature.
+#[cfg(not(feature = "push"))]
+pub(crate) const PUSH_FEATURE_MISSING: &str = "[push] is configured but this binary was built \
+     without the `push` feature; rebuild with `--features push`, or remove [push] and the \
+     AUTUMN_PUSH__* variables";
+
+/// The `AUTUMN_PUSH__*` variables and the `[push]` keys they set.
+#[cfg(not(feature = "push"))]
+const PUSH_ENV_KEYS: &[(&str, &str)] = &[
+    ("AUTUMN_PUSH__PRIVATE_KEY", "private_key"),
+    ("AUTUMN_PUSH__PUBLIC_KEY", "public_key"),
+    ("AUTUMN_PUSH__SUBJECT", "subject"),
+    ("AUTUMN_PUSH__TTL_SECS", "ttl_secs"),
+];
+
+/// The error for `tenancy.source = "jwt"` in a build without the `jwt`
+/// feature. The boot reports it, and so does tenant resolution on a router
+/// built without `run`.
+#[cfg(not(feature = "jwt"))]
+pub(crate) const JWT_FEATURE_MISSING: &str = "tenancy.source = \"jwt\" but this binary was built \
+     without the `jwt` feature; rebuild with `--features jwt`, or choose another tenancy source";
+
 impl AutumnConfig {
     /// The capability set of this process, resolved from [`role`](Self::role).
     #[must_use]
@@ -5102,8 +5178,52 @@ impl AutumnConfig {
     /// # Errors
     ///
     /// See [`crate::push::PushConfig::load_vapid_key`].
+    #[cfg(feature = "push")]
     pub fn validate_push(&self) -> Result<(), crate::push::PushError> {
         self.push.load_vapid_key().map(|_| ())
+    }
+
+    /// Validate the `[push]` block in a build without the `push` feature, as
+    /// `AppBuilder::run` does before binding.
+    ///
+    /// Push cannot run in this build, so any `[push]` table or
+    /// `AUTUMN_PUSH__*` variable is a hard failure rather than a section that
+    /// is quietly ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] when `[push]` or an `AUTUMN_PUSH__*`
+    /// variable is set.
+    #[cfg(not(feature = "push"))]
+    pub fn validate_push(&self) -> Result<(), ConfigError> {
+        if self.push.is_some() {
+            return Err(ConfigError::Validation(PUSH_FEATURE_MISSING.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Check that this build can resolve the configured tenancy source, as
+    /// `AppBuilder::run` does before binding.
+    ///
+    /// `tenancy.source = "jwt"` verifies a token with `jsonwebtoken`, which is
+    /// behind the `jwt` feature. Without it, every request would fail tenant
+    /// resolution, so the boot fails instead.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] when tenancy is enabled with
+    /// `source = "jwt"` and the `jwt` feature is off.
+    #[allow(
+        clippy::unused_self,
+        clippy::missing_const_for_fn,
+        reason = "reads `self` only when the `jwt` feature is off"
+    )]
+    pub fn validate_tenancy_source(&self) -> Result<(), ConfigError> {
+        #[cfg(not(feature = "jwt"))]
+        if self.tenancy.enabled && self.tenancy.source == "jwt" {
+            return Err(ConfigError::Validation(JWT_FEATURE_MISSING.to_owned()));
+        }
+        Ok(())
     }
 
     /// The load-shedding ceiling the profile supplies when
@@ -6405,6 +6525,7 @@ impl AutumnConfig {
     /// that documented deployment path silently leaves push unconfigured —
     /// every send failing `NotConfigured` and the public-key endpoint serving
     /// `503`, with the operator looking at a variable they did set.
+    #[cfg(feature = "push")]
     fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
         // Not `parse_env_option_secret`. That helper treats a blank value as "clear this
         // setting", which is right where unsetting via env is meaningful but wrong here,
@@ -6420,6 +6541,22 @@ impl AutumnConfig {
         parse_env_option_string(env, "AUTUMN_PUSH__PUBLIC_KEY", &mut self.push.public_key);
         parse_env_option_string(env, "AUTUMN_PUSH__SUBJECT", &mut self.push.subject);
         parse_env_option(env, "AUTUMN_PUSH__TTL_SECS", &mut self.push.ttl_secs);
+    }
+
+    /// Without the `push` feature, record each `AUTUMN_PUSH__*` variable in
+    /// the kept `[push]` table, so [`validate_push`](Self::validate_push)
+    /// refuses the boot. A variable the operator set must not be dropped
+    /// without a word. The value is not kept: the table records only which
+    /// variable set the key, so a private key never reaches the config.
+    #[cfg(not(feature = "push"))]
+    fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
+        for (var, key) in PUSH_ENV_KEYS {
+            if env.var(var).is_ok() {
+                self.push
+                    .get_or_insert_with(InertSection::default)
+                    .insert(key, toml::Value::String((*var).to_owned()));
+            }
+        }
     }
 
     fn apply_shadow_env_overrides_with_env(&mut self, env: &dyn Env) {

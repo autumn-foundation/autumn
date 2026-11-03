@@ -306,6 +306,8 @@ mod openapi;
 mod openapi_direction;
 #[cfg(feature = "openapi")]
 mod openapi_export;
+// The `jwt` and `push` feature-off paths (default-on features).
+mod optional_jwt_and_push;
 #[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 mod outbox_claim_profile;
 #[cfg(feature = "db")]
@@ -344,9 +346,11 @@ mod plugin_sandbox;
 // outbound HTTP, DB, jobs, render hooks, quotas and the audit surface.
 #[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
 mod plugin_sandbox_capabilities;
+#[cfg(feature = "push")]
 mod push_end_to_end;
+#[cfg(feature = "push")]
 mod push_router;
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "push"))]
 mod push_send_many_subscription_lookup_profile;
 mod query_count_asserts;
 mod query_structured;

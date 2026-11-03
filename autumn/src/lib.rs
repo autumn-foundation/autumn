@@ -685,7 +685,9 @@ pub mod wire;
 // and an outer doc comment here would make rustdoc resolve that whole
 // combined block in the CRATE-ROOT scope — where `WebPush`, `PushError` and
 // friends are not in scope, breaking every intra-doc link in the module and
-// failing the `-D rustdoc::broken_intra_doc_links` docs gate.
+// failing the `-D rustdoc::broken_intra_doc_links` docs gate. Behind the
+// `push` feature, which owns `p256`.
+#[cfg(feature = "push")]
 pub mod push;
 /// Compile-time per-route database query budgets (#1667).
 ///

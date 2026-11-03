@@ -227,9 +227,10 @@ fn scaffolded_project_ships_an_advisory_policy() {
     );
 }
 
-/// The one advisory a fresh scaffold cannot avoid: `jsonwebtoken` is a
-/// non-optional autumn-web dependency, so `rsa` (RUSTSEC-2023-0071, no patched
-/// release) is in every generated app's tree. AC2 allows exactly this — an
+/// The one advisory a fresh scaffold cannot avoid: a scaffold keeps
+/// autumn-web's default features, and the default-on `jwt` feature compiles
+/// `jsonwebtoken`, so `rsa` (RUSTSEC-2023-0071, no patched release) is in every
+/// generated app's tree. AC2 allows exactly this — an
 /// explicitly documented waiver — and nothing else.
 #[test]
 fn scaffold_waivers_are_documented_with_a_reason_and_a_review_date() {

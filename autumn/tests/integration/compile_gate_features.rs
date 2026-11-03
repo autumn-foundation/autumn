@@ -25,6 +25,7 @@ const GATES: &[(&str, &str)] = &[
     ("gdpr", "gdpr"),
     ("slo", "slo"),
     ("graph", "graph"),
+    ("push", "push"),
 ];
 
 /// A feature that must switch on another one.
@@ -36,6 +37,7 @@ const IMPLIES: &[(&str, &str)] = &[
     ("db", "money"),
     ("db", "data-retention"),
     ("acme", "custom-domains"),
+    ("oauth2", "jwt"),
 ];
 
 const ALL_FEATURES: &[&str] = &[
@@ -55,6 +57,8 @@ const ALL_FEATURES: &[&str] = &[
     "gdpr",
     "slo",
     "graph",
+    "jwt",
+    "push",
 ];
 
 fn manifest() -> toml::Table {
@@ -130,6 +134,36 @@ fn psl_is_optional_and_owned_by_custom_domains() {
         Some(true)
     );
     assert!(names(&features(&m)["custom-domains"]).contains("dep:psl"));
+}
+
+/// `jsonwebtoken` and `p256` compile only when their feature is on. Between
+/// them they bring in `rsa` 0.9 (RUSTSEC-2023-0071) and `crypto-bigint` 0.5
+/// (RUSTSEC-2026-0387), which an app that uses neither should not compile.
+#[test]
+fn jwt_and_push_crates_are_optional_and_owned_by_their_feature() {
+    let m = manifest();
+    for (dep, feature) in [("jsonwebtoken", "jwt"), ("p256", "push")] {
+        assert_eq!(
+            m["dependencies"][dep]
+                .get("optional")
+                .and_then(toml::Value::as_bool),
+            Some(true),
+            "`{dep}` must be optional"
+        );
+        let owner = format!("dep:{dep}");
+        assert!(
+            names(&features(&m)[feature]).contains(&owner),
+            "`{feature}` must enable `{owner}`"
+        );
+        for (name, list) in features(&m) {
+            if name != feature {
+                assert!(
+                    !names(list).contains(&owner),
+                    "only `{feature}` may enable `{owner}`, not `{name}`"
+                );
+            }
+        }
+    }
 }
 
 #[test]

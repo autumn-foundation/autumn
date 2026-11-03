@@ -314,6 +314,7 @@ pub use crate::notifications::Notifications;
 /// Web Push service/extractor (deliver a notification to a subscribed browser
 /// even when the app's tab is closed). See [`crate::push`] for the full
 /// surface.
+#[cfg(feature = "push")]
 pub use crate::push::{PushMessage, WebPush};
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;

@@ -244,6 +244,7 @@ where
         // ones, so an app calling `push.subscribe(…).await?` from its own
         // handler gets the same status the built-in push router would return
         // rather than a blanket 500.
+        #[cfg(feature = "push")]
         if let Some(push_err) = any_err.downcast_ref::<crate::push::PushError>() {
             status = push_err.status();
         }

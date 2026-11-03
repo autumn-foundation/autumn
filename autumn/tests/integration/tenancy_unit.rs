@@ -1,9 +1,12 @@
 use autumn_web::config::AutumnConfig;
 use autumn_web::tenancy::extract_tenant_from_parts;
 use axum::http::Request;
+#[cfg(feature = "jwt")]
 use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+#[cfg(feature = "jwt")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "jwt")]
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     sub: String,
@@ -15,6 +18,7 @@ struct Claims {
 }
 
 // Helper to generate a signed JWT
+#[cfg(feature = "jwt")]
 fn generate_jwt(tenant: &str, secret: &str, expired: bool, issuer: Option<&str>) -> String {
     let my_claims = Claims {
         sub: "1234567890".to_owned(),
@@ -33,6 +37,7 @@ fn generate_jwt(tenant: &str, secret: &str, expired: bool, issuer: Option<&str>)
 }
 
 // Helper to generate a JWT with an audience claim
+#[cfg(feature = "jwt")]
 fn generate_jwt_with_audience(tenant: &str, secret: &str, audience: Option<&str>) -> String {
     let my_claims = Claims {
         sub: "1234567890".to_owned(),
@@ -51,6 +56,7 @@ fn generate_jwt_with_audience(tenant: &str, secret: &str, audience: Option<&str>
 }
 
 // Test case-insensitive Bearer check
+#[cfg(feature = "jwt")]
 #[tokio::test]
 async fn test_case_insensitive_bearer_and_valid_jwt() {
     let mut config = AutumnConfig::default();
@@ -97,6 +103,7 @@ async fn test_case_insensitive_bearer_and_valid_jwt() {
 }
 
 // Test JWT validation and signature verification
+#[cfg(feature = "jwt")]
 #[tokio::test]
 async fn test_jwt_verification_signature_and_expiration() {
     let mut config = AutumnConfig::default();
@@ -298,6 +305,7 @@ async fn apex_mixed_case_rejected() {
 
 /// When `jwt_audience` is configured and the JWT carries a matching `aud`
 /// claim, extraction should succeed.
+#[cfg(feature = "jwt")]
 #[tokio::test]
 async fn jwt_audience_valid_passes() {
     let mut config = AutumnConfig::default();
@@ -321,6 +329,7 @@ async fn jwt_audience_valid_passes() {
 
 /// When `jwt_audience` is configured and the JWT carries a *different* `aud`
 /// claim, extraction must fail with a 401-style error.
+#[cfg(feature = "jwt")]
 #[tokio::test]
 async fn jwt_audience_mismatch_fails() {
     let mut config = AutumnConfig::default();
@@ -351,6 +360,7 @@ async fn jwt_audience_mismatch_fails() {
 /// (e.g. a legacy token issuer), extraction must fail. This covers the case
 /// where the token simply omits the audience field rather than providing the
 /// wrong value.
+#[cfg(feature = "jwt")]
 #[tokio::test]
 async fn jwt_audience_missing_claim_fails() {
     let mut config = AutumnConfig::default();
@@ -379,6 +389,7 @@ async fn jwt_audience_missing_claim_fails() {
 
 /// Slicing Authorization at index 7 when index 7 is inside a multi-byte UTF-8 char
 /// (like `é`) must not panic, but must return a clean unauthorized error.
+#[cfg(feature = "jwt")]
 #[tokio::test]
 async fn jwt_malformed_bearer_boundary_handling_does_not_panic() {
     let mut config = AutumnConfig::default();
