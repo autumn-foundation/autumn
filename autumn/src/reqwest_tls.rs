@@ -34,18 +34,18 @@ fn root_store() -> rustls::RootCertStore {
 }
 
 /// The rustls client config that framework clients use.
-pub(crate) fn client_config() -> rustls::ClientConfig {
+pub fn client_config() -> rustls::ClientConfig {
     CLIENT_CONFIG.clone()
 }
 
 /// A `reqwest` async client builder with the framework TLS config.
-pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+pub fn client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().tls_backend_preconfigured(client_config())
 }
 
 /// A `reqwest` blocking client builder with the framework TLS config.
 #[cfg(all(feature = "db", feature = "http-client"))]
-pub(crate) fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
+pub fn blocking_client_builder() -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder().tls_backend_preconfigured(client_config())
 }
 
@@ -109,7 +109,10 @@ mod tests {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
-            if !name.ends_with(".rs") || name == "reqwest_tls.rs" || name == "tests.rs" {
+            let is_rust = path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"));
+            if !is_rust || name == "reqwest_tls.rs" || name == "tests.rs" {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read source");

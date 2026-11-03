@@ -149,19 +149,14 @@ fn windows_that_a_dst_gap_moves_together_are_counted_once() {
         .unwrap()
         .with_timezone(&Utc);
     assert_eq!(cal.working_time(start, end, ny), HOUR);
-    let due = cal
-        .deadline(start, Duration::from_secs(20 * 60), ny)
-        .unwrap();
+    let due = cal.deadline(start, Duration::from_mins(20), ny).unwrap();
     assert_eq!(
         due,
         ny.with_ymd_and_hms(2024, 3, 10, 3, 20, 0)
             .unwrap()
             .with_timezone(&Utc)
     );
-    assert_eq!(
-        cal.working_time(start, due, ny),
-        Duration::from_secs(20 * 60)
-    );
+    assert_eq!(cal.working_time(start, due, ny), Duration::from_mins(20));
 }
 
 #[test]
@@ -344,7 +339,7 @@ fn a_window_that_opens_in_a_dst_gap_moves_forward() {
         .unwrap()
         .with_timezone(&Utc);
     // 02:30 moves to 03:30, so the window is 03:30-04:00.
-    assert_eq!(cal.working_time(start, end, ny), Duration::from_secs(1800));
+    assert_eq!(cal.working_time(start, end, ny), Duration::from_mins(30));
 }
 
 #[test]

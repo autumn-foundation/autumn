@@ -287,7 +287,7 @@ pub fn webmcp_exposure(
 /// rule reads as "read-only verbs only" and a `!` there would invite the
 /// fail-closed default to be read backwards.
 #[must_use]
-pub fn method_is_read_only(method: &str) -> bool {
+pub const fn method_is_read_only(method: &str) -> bool {
     !method_is_mutating(method)
 }
 
@@ -1174,7 +1174,7 @@ pub fn parse_manifest_dump(stdout: &str) -> Option<AgentAuthorityManifest> {
 /// never heard of counts as mutating, because the alternative is a tool that
 /// slips past the `--check` gate on a spelling.
 #[must_use]
-pub fn method_is_mutating(method: &str) -> bool {
+pub const fn method_is_mutating(method: &str) -> bool {
     !method.eq_ignore_ascii_case("GET") && !method.eq_ignore_ascii_case("HEAD")
 }
 

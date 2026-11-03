@@ -2160,10 +2160,18 @@ fn build_ses_route(
     }
 
     // One shared client per route for SNS cert fetching.
+    // If it cannot be built, the route fails closed with 503.
     #[cfg(feature = "inbound-ses")]
-    let http_client = crate::reqwest_tls::client_builder()
-        .build()
-        .expect("the framework TLS config builds a reqwest client");
+    let http_client = match crate::reqwest_tls::client_builder().build() {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "inbound_mail.ses: could not build the SNS HTTP client; every request will be rejected"
+            );
+            None
+        }
+    };
 
     let handler = move |_headers: HeaderMap, body: Bytes| {
         let router = Arc::clone(&router);
@@ -2175,6 +2183,10 @@ fn build_ses_route(
             if topic_arn.is_none() {
                 return StatusCode::SERVICE_UNAVAILABLE;
             }
+            #[cfg(feature = "inbound-ses")]
+            let Some(http_client) = http_client else {
+                return StatusCode::SERVICE_UNAVAILABLE;
+            };
 
             // Reject SES notifications when the `inbound-ses` feature is off: the
             // signature verifier is not compiled in, so accepting requests would

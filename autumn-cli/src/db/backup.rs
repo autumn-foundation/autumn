@@ -340,7 +340,7 @@ impl TargetBackend {
 
     /// Read a manifest spelling. An empty or unknown value is Postgres, so a
     /// manifest without the field restores exactly as before.
-    fn from_manifest(raw: &str) -> Self {
+    const fn from_manifest(raw: &str) -> Self {
         if raw.eq_ignore_ascii_case("sqlite") {
             Self::Sqlite
         } else {

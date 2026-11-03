@@ -2630,9 +2630,8 @@ fn table_section_shape(
 fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
     // Binary Wasm only: `\0asm` and version 1. Text or another version would
     // walk as noise and give counts that bound nothing.
-    if wasm.get(..8)? != b"\0asm\x01\0\0\0" {
-        return None;
-    }
+    wasm.get(..8)
+        .filter(|header| *header == b"\0asm\x01\0\0\0")?;
     let mut cursor = 8usize; // magic + version
     let mut sections = 0usize;
     let mut memory_count = 0usize;

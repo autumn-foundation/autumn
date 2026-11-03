@@ -2709,7 +2709,7 @@ fn test_default_store_ttl_trait_impl() {
 
     assert_eq!(
         BareStore.default_ttl(),
-        Duration::from_secs(86_400),
+        Duration::from_hours(24),
         "IdempotencyStore::default_ttl() must return 24 hours"
     );
 }

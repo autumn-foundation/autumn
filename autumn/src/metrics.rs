@@ -995,7 +995,7 @@ fn format_bound(bound: f64) -> String {
 /// terminal cursor, start an ANSI escape, or split one exposition line into
 /// two. Nothing legitimate in a label value or a description is a control
 /// character.
-fn is_forbidden_control(c: char) -> bool {
+const fn is_forbidden_control(c: char) -> bool {
     c.is_control()
 }
 

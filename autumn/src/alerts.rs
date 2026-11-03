@@ -2174,13 +2174,13 @@ mod tests {
 
     #[test]
     fn first_trigger_sends() {
-        let mut d = AlertDeduplicator::new(std::time::Duration::from_secs(900));
+        let mut d = AlertDeduplicator::new(std::time::Duration::from_mins(15));
         assert_eq!(d.on_trigger("k", ts(0)), DedupDecision::Send);
     }
 
     #[test]
     fn repeated_triggers_within_window_are_suppressed() {
-        let mut d = AlertDeduplicator::new(std::time::Duration::from_secs(900));
+        let mut d = AlertDeduplicator::new(std::time::Duration::from_mins(15));
         assert_eq!(d.on_trigger("k", ts(0)), DedupDecision::Send);
         // Many occurrences inside the window -> all suppressed (not one-per).
         for s in 1..100 {
@@ -2194,7 +2194,7 @@ mod tests {
 
     #[test]
     fn trigger_renotifies_once_after_window_elapses() {
-        let mut d = AlertDeduplicator::new(std::time::Duration::from_secs(900));
+        let mut d = AlertDeduplicator::new(std::time::Duration::from_mins(15));
         assert_eq!(d.on_trigger("k", ts(0)), DedupDecision::Send);
         assert_eq!(d.on_trigger("k", ts(500)), DedupDecision::Suppress);
         // Window elapsed: exactly one re-notification.
@@ -2204,7 +2204,7 @@ mod tests {
 
     #[test]
     fn distinct_keys_are_independent() {
-        let mut d = AlertDeduplicator::new(std::time::Duration::from_secs(900));
+        let mut d = AlertDeduplicator::new(std::time::Duration::from_mins(15));
         assert_eq!(d.on_trigger("a", ts(0)), DedupDecision::Send);
         assert_eq!(d.on_trigger("b", ts(0)), DedupDecision::Send);
     }
@@ -2213,7 +2213,7 @@ mod tests {
 
     #[test]
     fn recovery_sends_only_for_active_key() {
-        let mut d = AlertDeduplicator::new(std::time::Duration::from_secs(900));
+        let mut d = AlertDeduplicator::new(std::time::Duration::from_mins(15));
         // Never triggered: no recovery.
         assert_eq!(d.on_resolve("k"), DedupDecision::Suppress);
         // Trigger, then recover once.
@@ -2225,7 +2225,7 @@ mod tests {
 
     #[test]
     fn trigger_after_recovery_alerts_immediately() {
-        let mut d = AlertDeduplicator::new(std::time::Duration::from_secs(900));
+        let mut d = AlertDeduplicator::new(std::time::Duration::from_mins(15));
         assert_eq!(d.on_trigger("k", ts(0)), DedupDecision::Send);
         assert_eq!(d.on_resolve("k"), DedupDecision::Send);
         // Fresh trigger inside the original window still sends because the key
@@ -2299,7 +2299,7 @@ mod tests {
     fn health_tick_for_sequence(statuses: &[HealthStatus], grace: chrono::Duration) -> HealthTick {
         let name = "db";
         let key = format!("health_indicator_down:{name}");
-        let mut dedup = AlertDeduplicator::new(std::time::Duration::from_secs(900));
+        let mut dedup = AlertDeduplicator::new(std::time::Duration::from_mins(15));
         let mut down_since: HashMap<String, DateTime<Utc>> = HashMap::new();
         let mut last = HealthTick::Idle;
         for (i, status) in statuses.iter().enumerate() {
@@ -2611,7 +2611,7 @@ mod tests {
 
     fn settings() -> AlerterSettings {
         AlerterSettings {
-            dedup_window: std::time::Duration::from_secs(900),
+            dedup_window: std::time::Duration::from_mins(15),
             health_grace: std::time::Duration::from_secs(60),
             error_rate_threshold: 0.05,
             error_rate_min_requests: 20,

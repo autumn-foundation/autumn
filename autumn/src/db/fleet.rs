@@ -97,7 +97,7 @@ const PURGE_BATCH: usize = 256;
 const RESTORE_CHECK_DIR: &str = "restore-check";
 
 /// A scratch file older than this is from a check that did not end.
-const SCRATCH_STALE: Duration = Duration::from_secs(24 * 3600);
+const SCRATCH_STALE: Duration = Duration::from_hours(24);
 
 /// How long a database stays open after its last use before LRU may close it,
 /// when `database.fleet.min_residency` is not set.

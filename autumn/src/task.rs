@@ -352,12 +352,12 @@ mod tests {
 
     #[test]
     fn parse_compound() {
-        assert_eq!(parse_duration("1h 30m"), Some(Duration::from_secs(5400)));
+        assert_eq!(parse_duration("1h 30m"), Some(Duration::from_mins(90)));
     }
 
     #[test]
     fn parse_day() {
-        assert_eq!(parse_duration("1d"), Some(Duration::from_secs(86400)));
+        assert_eq!(parse_duration("1d"), Some(Duration::from_hours(24)));
     }
 
     #[test]
@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn multiple_spaces() {
-        assert_eq!(parse_duration("1h   30m"), Some(Duration::from_secs(5400)));
+        assert_eq!(parse_duration("1h   30m"), Some(Duration::from_mins(90)));
     }
 
     #[test]

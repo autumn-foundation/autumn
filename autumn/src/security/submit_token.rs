@@ -2272,7 +2272,7 @@ mod tests {
             .expect("the guard must acquire an in-flight lock");
         assert_eq!(
             lock_ttl,
-            Duration::from_secs(86_400),
+            Duration::from_hours(24),
             "the in-flight lock TTL must come from in_flight_ttl_secs, not ttl_secs"
         );
         // ...while the consumed-record replay window still tracks ttl_secs.
@@ -2323,7 +2323,7 @@ mod tests {
         let key = storage_key(token);
         assert!(
             store
-                .try_lock(&key, "first-attempt", Duration::from_secs(86_400))
+                .try_lock(&key, "first-attempt", Duration::from_hours(24))
                 .await
                 .unwrap()
         );

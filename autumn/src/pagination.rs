@@ -348,7 +348,7 @@ impl SortDir {
     /// typo, or a missing parameter — falls back to [`SortDir::Asc`]**. A list
     /// endpoint must never 400 on a malformed direction.
     #[must_use]
-    pub fn from_param(value: &str) -> Self {
+    pub const fn from_param(value: &str) -> Self {
         if value.eq_ignore_ascii_case("desc") {
             Self::Desc
         } else {

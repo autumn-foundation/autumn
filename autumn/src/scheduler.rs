@@ -412,7 +412,7 @@ const MIN_TICK_RETENTION: Duration = Duration::from_secs(1);
 /// Cap on how long a tick row stays: 100 years. A longer interval is out of
 /// range for Postgres, and every claim would fail.
 #[cfg(feature = "db")]
-const MAX_TICK_HOLD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+const MAX_TICK_HOLD: Duration = Duration::from_hours(100 * 365 * 24);
 
 /// How long a claimed tick stays claimed: the retention plus the period.
 ///

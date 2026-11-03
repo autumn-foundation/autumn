@@ -948,14 +948,14 @@ mod tests {
             async {
                 let store = S3BlobStore::from_config(&cfg).await.expect("build store");
                 let actual = store
-                    .presigned_url("avatars/42.bin", Duration::from_secs(900))
+                    .presigned_url("avatars/42.bin", Duration::from_mins(15))
                     .await
                     .expect("presign URL");
 
                 let amz_date = query_param(&actual, "X-Amz-Date").expect("X-Amz-Date");
                 let expected_presigning = PresigningConfig::builder()
                     .start_time(parse_amz_date(amz_date))
-                    .expires_in(Duration::from_secs(900))
+                    .expires_in(Duration::from_mins(15))
                     .build()
                     .expect("fixed presigning config");
                 let expected = test_client("https://public.example.com")
@@ -1102,7 +1102,7 @@ mod tests {
     async fn presign_put_url_contains_sigv4_parameters() {
         let store = test_store();
         let result = store
-            .presign_put("img/photo.jpg", "image/jpeg", Duration::from_secs(900))
+            .presign_put("img/photo.jpg", "image/jpeg", Duration::from_mins(15))
             .await
             .unwrap();
         assert!(

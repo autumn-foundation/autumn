@@ -192,6 +192,24 @@ fn workspace_test_profile_keeps_ci_artifacts_bounded() {
     );
 }
 
+/// Old release and MSRV text that must not come back to the first-run docs.
+const STALE_FIRST_RUN_TEXT: &[&str] = &[
+    "Rust 1.85",
+    "Rust 1.86",
+    "rustc 1.85",
+    "rustc 1.86",
+    "rust:1.86",
+    "Rust 1.88",
+    "rustc 1.88",
+    "rust:1.88",
+    "rust-1.88",
+    "autumn-web = \"0.1.0\"",
+    "version=\"0.1.0\"",
+    "\"version\": \"0.1.0\"",
+    "v0.1.0",
+    "crates.io publication is not yet available",
+];
+
 #[test]
 fn first_run_docs_match_current_release_line() {
     let root = workspace_root();
@@ -231,22 +249,7 @@ fn first_run_docs_match_current_release_line() {
         format!(r#"{{ "status": "ok", "version": "{published_version}" }}"#);
 
     for (doc, content) in &docs {
-        for stale in [
-            "Rust 1.85",
-            "Rust 1.86",
-            "rustc 1.85",
-            "rustc 1.86",
-            "rust:1.86",
-            "Rust 1.88",
-            "rustc 1.88",
-            "rust:1.88",
-            "rust-1.88",
-            "autumn-web = \"0.1.0\"",
-            "version=\"0.1.0\"",
-            "\"version\": \"0.1.0\"",
-            "v0.1.0",
-            "crates.io publication is not yet available",
-        ] {
+        for stale in STALE_FIRST_RUN_TEXT {
             assert!(
                 !content.contains(stale),
                 "{doc} still references stale first-run release/MSRV text: {stale}"

@@ -11299,8 +11299,7 @@ mod tests {
         let stamp = |deps: &[(&str, &'static str)], name: &str| {
             deps.iter()
                 .find(|(crate_name, _)| *crate_name == name)
-                .map(|(_, spec)| *spec)
-                .unwrap_or_else(|| panic!("{name} must be stamped"))
+                .map_or_else(|| panic!("{name} must be stamped"), |(_, spec)| *spec)
         };
         for (deps, name, version) in [
             (AUTH_EXTRA_DEPS, "sha2", "\"0.11\""),

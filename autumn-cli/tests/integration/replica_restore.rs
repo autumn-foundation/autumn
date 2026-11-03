@@ -144,7 +144,7 @@ fn replicate_two_batches(root_dir: &Path) -> PathBuf {
             sync_interval: Duration::from_secs(1),
             snapshot_interval: Duration::from_secs(3600),
             max_wal_bytes: 16 * 1024 * 1024,
-            retention: Duration::from_secs(7 * 24 * 3600),
+            retention: Duration::from_hours(7 * 24),
             verify_interval: None,
         },
         destination,

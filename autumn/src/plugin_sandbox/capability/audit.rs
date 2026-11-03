@@ -920,7 +920,7 @@ mod tests {
             // Past the coalescing span, so each is its own record.
             clock.advance(Duration::from_secs(2));
         }
-        let summary = log.summary("shop", Duration::from_secs(86_400));
+        let summary = log.summary("shop", Duration::from_hours(24));
         assert_eq!(summary.dropped, records as u64);
     }
 
@@ -960,7 +960,7 @@ mod tests {
         // Window: only the recent records. All 4096 + 1 are in it; the evicted
         // old events are not.
         // The recent window holds every recent record and nothing old.
-        let recent = log.summary("shop", Duration::from_secs(3 * 3600));
+        let recent = log.summary("shop", Duration::from_hours(3));
         assert_eq!(recent.dropped, MAX_LOG_EVENTS as u64 + 1);
         // A wider window adds the old events the ring evicted.
         let wide = log.summary("shop", 24 * hour);
@@ -990,7 +990,7 @@ mod tests {
         // 12,000 drops fit in the hour; one bucket of slack, never hours.
         assert!(hour <= 12_000 + 4, "the last hour reported {hour} drops");
         assert!(hour >= 12_000, "the last hour lost drops: {hour}");
-        let all = log.summary("shop", Duration::from_secs(6 * 3600)).dropped;
+        let all = log.summary("shop", Duration::from_hours(6)).dropped;
         assert_eq!(all, 60_000);
     }
 

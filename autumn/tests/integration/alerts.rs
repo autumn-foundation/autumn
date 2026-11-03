@@ -57,7 +57,7 @@ fn settings_with_prefix_sensitive(prefix: &str, actuator_sensitive: bool) -> Ale
     // `sensitive = false` fallback is covered explicitly by
     // `sensitive_false_alerts_point_at_mounted_endpoint`.
     AlerterSettings {
-        dedup_window: std::time::Duration::from_secs(900),
+        dedup_window: std::time::Duration::from_mins(15),
         health_grace: std::time::Duration::from_secs(60),
         error_rate_threshold: 0.05,
         error_rate_min_requests: 20,
