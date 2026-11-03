@@ -361,7 +361,7 @@ pub fn check(
     if let Some(crates) = crates {
         rules.crates = crate_rule(&resolver, graph, crates, &mut found, &mut warnings)?;
     }
-    unmatched_patterns(&resolver, graph, crates, &mut warnings)?;
+    unmatched_patterns(&resolver, graph, crates, &mut warnings);
     let mut violations: BTreeMap<BaselineEntry, Violation> = BTreeMap::new();
     for v in found.tables.into_values() {
         let v = Violation::Table(v);
@@ -664,7 +664,7 @@ fn unmatched_patterns(
     graph: Option<&ArchitectureGraph>,
     crates: Option<&CrateGraph>,
     warnings: &mut Vec<String>,
-) -> Result<(), BoundaryError> {
+) {
     let mut crate_names: BTreeSet<String> = graph
         .iter()
         .flat_map(|g| &g.nodes)
@@ -720,7 +720,6 @@ fn unmatched_patterns(
             }
         }
     }
-    Ok(())
 }
 
 // ── Baseline and ratchet ─────────────────────────────────────────────
@@ -847,7 +846,7 @@ pub struct Ratchet {
 impl Ratchet {
     /// Whether the check passes.
     #[must_use]
-    pub fn passes(&self) -> bool {
+    pub const fn passes(&self) -> bool {
         self.new.is_empty() && self.fixed.is_empty()
     }
 
@@ -1527,6 +1526,10 @@ schema_crates = ["billing-schema"]
 
     #[test]
     fn the_more_specific_pattern_wins() {
+        const ADS: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            body_symbols: &["contacts"],
+            ..route("ads", "crm_core_ad::routes", "GET", "/ads")
+        }];
         // `crm-core*` and `crm-core-ad*` both match `crm_core_ad`.
         let config = BoundaryConfig::parse(
             r#"
@@ -1539,10 +1542,6 @@ crates = ["crm-core-ad*"]
 "#,
         )
         .expect("valid");
-        const ADS: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
-            body_symbols: &["contacts"],
-            ..route("ads", "crm_core_ad::routes", "GET", "/ads")
-        }];
         let report =
             check(&config, Some(&build(&[], 0, ADS, MODELS, &[], &[])), None).expect("runs");
         let v = table_violation(&report, "ads").expect("ads is in marketing");
@@ -1551,15 +1550,15 @@ crates = ["crm-core-ad*"]
 
     #[test]
     fn an_owns_glob_matches_a_table_without_case() {
+        const READER: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            body_symbols: &["Touch"],
+            ..route("touches", "crm_core::routes", "GET", "/touches")
+        }];
         let config = BoundaryConfig::parse(
             "[boundaries.marketing]\nowns = [\"ATTRIBUTION_*\"]\nmodules = [\"x\"]\n\
              [boundaries.core]\nowns = []\nmodules = [\"crm_core\"]\n",
         )
         .expect("valid");
-        const READER: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
-            body_symbols: &["Touch"],
-            ..route("touches", "crm_core::routes", "GET", "/touches")
-        }];
         let report = check(
             &config,
             Some(&build(&[], 0, READER, MODELS, &[], &[])),
