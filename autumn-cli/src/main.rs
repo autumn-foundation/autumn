@@ -2,6 +2,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+/// The workspace MSRV: `rust-version` in the root `Cargo.toml`. Generated
+/// projects pin this toolchain.
+pub(crate) const MSRV: &str = env!("CARGO_PKG_RUST_VERSION");
+
 mod a11y;
 mod aeo;
 mod agents;

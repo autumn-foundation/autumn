@@ -28,7 +28,8 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes128Gcm, Key, Nonce};
 use hmac::{Hmac, Mac};
-use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::elliptic_curve::Generate as _;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use sha2::Sha256;
 
 use super::PushError;
@@ -81,7 +82,8 @@ pub fn encrypt(
     // not a style choice.
     rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut salt)
         .map_err(|e| PushError::Encryption(format!("could not draw a random salt: {e}")))?;
-    let ephemeral = p256::SecretKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+    let ephemeral = p256::SecretKey::try_generate_from_rng(&mut rand::rngs::SysRng)
+        .map_err(|e| PushError::Encryption(format!("could not draw an ephemeral key: {e}")))?;
     encrypt_with(plaintext, ua_public, auth_secret, salt, &ephemeral)
 }
 
@@ -121,7 +123,7 @@ pub fn encrypt_with(
         )
     })?;
 
-    let as_public_point = ephemeral.public_key().to_encoded_point(false);
+    let as_public_point = ephemeral.public_key().to_sec1_point(false);
     let as_public = as_public_point.as_bytes();
     debug_assert_eq!(as_public.len(), P256_UNCOMPRESSED_LEN);
 
@@ -132,7 +134,7 @@ pub fn encrypt_with(
     // info = "WebPush: info" ‖ 0x00 ‖ ua_public ‖ as_public
     let mut key_info = Vec::with_capacity(14 + P256_UNCOMPRESSED_LEN * 2);
     key_info.extend_from_slice(b"WebPush: info\0");
-    key_info.extend_from_slice(ua_key.to_encoded_point(false).as_bytes());
+    key_info.extend_from_slice(ua_key.to_sec1_point(false).as_bytes());
     key_info.extend_from_slice(as_public);
     let ikm = hkdf_sha256(auth_secret, shared.raw_secret_bytes(), &key_info, 32);
 
@@ -144,10 +146,15 @@ pub fn encrypt_with(
     let mut record = Vec::with_capacity(plaintext.len() + 1);
     record.extend_from_slice(plaintext);
     record.push(LAST_RECORD_DELIMITER);
-    let cipher = Aes128Gcm::new(<&Key<Aes128Gcm>>::from(cek.as_slice()));
+    let key = <&Key<Aes128Gcm>>::try_from(cek.as_slice()).map_err(|_| {
+        PushError::Encryption("HKDF gave a content key of the wrong length".to_owned())
+    })?;
+    let nonce = <&Nonce<_>>::try_from(nonce.as_slice())
+        .map_err(|_| PushError::Encryption("HKDF gave a nonce of the wrong length".to_owned()))?;
+    let cipher = Aes128Gcm::new(key);
     let ciphertext = cipher
         .encrypt(
-            <&Nonce<_>>::from(nonce.as_slice()),
+            nonce,
             Payload {
                 msg: &record,
                 // `aes128gcm` binds the header through the key derivation, not
@@ -180,7 +187,7 @@ pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> 
 
     // Extract: PRK = HMAC(salt, IKM). `new_from_slice` accepts any key length.
     let mut extract =
-        <HmacSha256 as Mac>::new_from_slice(salt).expect("HMAC accepts any key length");
+        <HmacSha256 as KeyInit>::new_from_slice(salt).expect("HMAC accepts any key length");
     extract.update(ikm);
     let prk = extract.finalize().into_bytes();
 
@@ -190,7 +197,7 @@ pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Vec<u8> 
     let mut counter: u8 = 1;
     while okm.len() < len {
         let mut expand =
-            <HmacSha256 as Mac>::new_from_slice(&prk).expect("HMAC accepts any key length");
+            <HmacSha256 as KeyInit>::new_from_slice(&prk).expect("HMAC accepts any key length");
         expand.update(&previous);
         expand.update(info);
         expand.update(&[counter]);

@@ -238,16 +238,16 @@ jobs:
     # Fail fast instead of burning GitHub's 360-minute default if a
     # generated app wedges on boot (these jobs compile AND run one).
     # 90 -> 150 (#1945): 15 more scaffold-and-cargo-check/build/run steps
-    # landed in the "cli_tests per-test triage" block below. The 1.88.0 leg's
+    # landed in the "cli_tests per-test triage" block below. The MSRV leg's
     # existing ~31 steps already ran ~78-81 min against the old 90-minute
     # budget (per recent run history), and these new steps average ~2 min
     # each, so the old budget would have started failing on timeout rather
     # than on a real regression.
-    # 150 -> 90 (#3572): by 2026-11 the 1.88.0 leg had 58 steps (median 2.35
+    # 150 -> 90 (#3572): by 2026-11 the MSRV leg (then 1.88.0) had 58 steps (median 2.35
     # min) and ran 1h55m-2h26m, cancelled at 150 min once on #3560. Every
     # step compiled the generated app's dependency tree from cold. With one
     # shared CARGO_TARGET_DIR for the generated apps (the step after
-    # rust-cache below) the 1.88.0 leg ran in 34.5 min and stable in 27 min.
+    # rust-cache below) the MSRV leg ran in 34.5 min and stable in 27 min.
     # 90 is ~2.6x the slower leg, which leaves room for a cold rust-cache, and
     # still stops a wedged app quickly. If this leg nears 90 again, split it
     # into shards rather than raise the limit.
@@ -262,7 +262,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
       matrix:
-        toolchain: [stable, "1.88.0"]
+        toolchain: [stable, "1.97.0"]
     steps:
       - uses: actions/checkout@v7
 
@@ -1061,7 +1061,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        toolchain: [stable, "1.88.0"]
+        toolchain: [stable, "1.97.0"]
         variant:
           - name: totp
             test: generated_auth_totp_cargo_checks
@@ -1161,7 +1161,7 @@ jobs:
     timeout-minutes: 90
     strategy:
       matrix:
-        toolchain: [stable, "1.88.0"]
+        toolchain: [stable, "1.97.0"]
     steps:
       - uses: actions/checkout@v7
 

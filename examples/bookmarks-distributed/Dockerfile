@@ -1,4 +1,5 @@
-FROM rust:1.86-bookworm AS builder
+# Must satisfy the workspace MSRV (rust-version in the root Cargo.toml).
+FROM rust:1.97-bookworm AS builder
 WORKDIR /workspace
 
 COPY . .

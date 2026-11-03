@@ -810,10 +810,6 @@ impl ObligationStore for FlakyRelease {
         self.inner.claim_escalation(key, generation, due_at, at)
     }
 
-    #[allow(
-        deprecated,
-        reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
-    )]
     fn release_escalation<'a>(
         &'a self,
         key: &'a str,
@@ -823,7 +819,7 @@ impl ObligationStore for FlakyRelease {
         use std::sync::atomic::Ordering;
         let fail = self
             .failures
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
             .is_ok();
         if fail {
             return Box::pin(std::future::ready(Err(SlaError::Store("down".to_owned()))));

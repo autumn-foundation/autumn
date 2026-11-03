@@ -1,4 +1,4 @@
-msrv = "1.88.0"
+msrv = "1.97.0"
 
 # ── Determinism seam gate (issue #1797) ──────────────────────────────────────
 # Bans reading time / minting ids off the framework's injected seams, so a

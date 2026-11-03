@@ -180,10 +180,12 @@ mod manifest_guard {
     }
 
     #[test]
-    fn the_feature_adds_exactly_one_dependency() {
+    fn the_feature_adds_only_the_interpreter() {
+        // `wasmi_core` is part of the interpreter: wasmi 2 does not re-export
+        // the `LimiterError` that a `ResourceLimiter` returns.
         assert_eq!(
             feature_line(),
-            r#"plugin-sandbox = ["dep:wasmi"]"#,
+            r#"plugin-sandbox = ["dep:wasmi", "dep:wasmi_core"]"#,
             "enabling the sandbox must pull in the interpreter and nothing else"
         );
     }

@@ -36,10 +36,14 @@ serde_json = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 # Pure-Rust WASM interpreter for the reference host behind the `host` feature.
 # Not pinned in `[workspace.dependencies]` because nothing else in the workspace
-# links it and the dependency is native-only (never compiled for wasm). MSRV
-# verified: wasmi 0.40 declares `rust-version = "1.86"`, below this workspace's
-# 1.88 floor. Licensed MIT OR Apache-2.0, matching the workspace policy.
-wasmi = { version = "0.40", optional = true }
+# links it and the dependency is native-only (never compiled for wasm).
+# Licensed MIT OR Apache-2.0, matching the workspace policy.
+# `default-features = false`: no `wat` (text must not skip the binary shape
+# walk) and no `memory64` (the walk reads 32-bit limits). `portable-dispatch`:
+# in wasmi 2.0 the default tail-call dispatch grows the native stack on each
+# failed `memory.grow`. A guest can then overflow the host thread and stop the
+# process, also in a release build. Portable dispatch is a loop, as in 0.40.
+wasmi = { version = "2", optional = true, default-features = false, features = ["std", "validate", "portable-dispatch"] }
 # The edge node (feature `node`, native only). The HTTP server and the origin
 # client. Same reqwest line as `autumn-cli`. `http-body` (already in the graph
 # through axum) lets the node send a request body to the origin without a

@@ -1725,7 +1725,7 @@ fn refused_oauth_request(
 
 #[cfg(feature = "oauth2")]
 fn oauth_http_client() -> crate::AutumnResult<HttpClient> {
-    let client = reqwest::Client::builder()
+    let client = crate::reqwest_tls::client_builder()
         .timeout(Duration::from_secs(OAUTH_HTTP_TIMEOUT_SECS))
         .build()
         .map_err(|e| {

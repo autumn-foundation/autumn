@@ -9,7 +9,7 @@ compiles, runs, and responds to HTTP requests at `http://localhost:3000`.
 
 Before you start, make sure you have:
 
-- **Rust 1.88.0+** (edition 2024) — install from <https://rustup.rs> if you haven't already
+- **Rust 1.97.0+** (edition 2024) — install from <https://rustup.rs> if you haven't already
 - **The Autumn CLI** — install the published CLI with
   `cargo install autumn-cli --version 0.9.0`
 - A terminal and a text editor

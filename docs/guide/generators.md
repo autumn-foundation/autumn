@@ -2082,17 +2082,11 @@ The live HTTP test requires Docker access for the Postgres testcontainer and
 the `diesel` CLI on `PATH`, because `autumn migrate` delegates to
 `diesel migration run`.
 
-### WebAuthn native dependency note
+### WebAuthn dependency note
 
 `autumn generate auth --passkeys` enables the `webauthn` feature and adds
-`webauthn-rs`. That dependency currently builds through OpenSSL. On Ubuntu CI
-the system OpenSSL toolchain is already available, but Windows developers need
-to install the OpenSSL libraries through `vcpkg` and set `VCPKG_ROOT` so
-`openssl-sys` can find them.
-
-The release SemVer gate checks `autumn-web` optional public feature APIs, so this
-native dependency must be present on machines that run `scripts/check-semver.sh`
-locally.
+`webauthn-rs`. Since 0.6, `webauthn-rs` uses pure-Rust crypto. It needs no
+OpenSSL and no native libraries on any platform.
 
 ## `autumn generate policy`
 

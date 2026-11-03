@@ -3,7 +3,7 @@
 [![CI](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/autumn-foundation/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/autumn-foundation/autumn)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Rust: 1.88.0+](https://img.shields.io/badge/rust-1.88.0%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust: 1.97.0+](https://img.shields.io/badge/rust-1.97.0%2B-orange.svg)](https://www.rust-lang.org)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/autumn-foundation/autumn)
 
 > Spring Boot-style web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum).
@@ -324,7 +324,7 @@ Until `1.0.0`, Autumn is in its `0.x` series — see the
 
 ## Requirements
 
-- Rust 1.88.0+ (edition 2024)
+- Rust 1.97.0+ (edition 2024)
 - PostgreSQL for database-backed apps
 
 Autumn can still run without a database if you omit the `[database]` section.

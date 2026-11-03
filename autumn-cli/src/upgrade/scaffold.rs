@@ -837,7 +837,7 @@ pub fn current_files(root: &Path, options: GenerateOptions) -> Option<BTreeMap<S
         project_name: &name,
         crate_name: &crate_name,
         autumn_version: env!("CARGO_PKG_VERSION"),
-        rust_version: option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
+        rust_version: crate::MSRV,
     };
     let mut files: BTreeMap<String, String> = framework_owned_files(&vars, options)
         .into_iter()

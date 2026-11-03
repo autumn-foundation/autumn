@@ -43,7 +43,7 @@ showcasing the framework's major features in a single cohesive application.
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - PostgreSQL and Redis (via Docker Compose below)
 
 ## Quick start

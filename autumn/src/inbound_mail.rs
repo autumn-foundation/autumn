@@ -229,24 +229,32 @@ mod sns_verify {
         use rsa::pkcs8::DecodePublicKey as _;
         use sha2::Digest as _;
 
+        // `rsa` 0.9 uses `digest` 0.10, and `sha1`/`sha2` use `digest` 0.11, so
+        // `Pkcs1v15Sign::new::<Sha256>()` does not compile. Use
+        // `new_unprefixed()` and put the DigestInfo DER structure
+        // (RFC 8017 §9.2) in front of the hash.
+        //
         // SHA-1 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha1, NULL }, OCTET STRING }
         const SHA1_DI_PREFIX: &[u8] = &[
             0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
             0x14,
         ];
+        // SHA-256 DigestInfo prefix: SEQUENCE { SEQUENCE { OID sha256, NULL }, OCTET STRING }
+        const SHA256_DI_PREFIX: &[u8] = &[
+            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x01, 0x05, 0x00, 0x04, 0x20,
+        ];
 
         let public_key = rsa::RsaPublicKey::from_public_key_der(spki_der).map_err(|_| ())?;
         if sig_version == "2" {
             let hash = sha2::Sha256::digest(message);
+            let mut digest_info = SHA256_DI_PREFIX.to_vec();
+            digest_info.extend_from_slice(&hash);
             public_key
-                .verify(Pkcs1v15Sign::new::<sha2::Sha256>(), &hash, sig)
+                .verify(Pkcs1v15Sign::new_unprefixed(), &digest_info, sig)
                 .map_err(|_| ())
         } else {
             // SignatureVersion 1 uses SHA-1.
-            // sha1 0.10 uses const-oid 0.10.x while rsa 0.9 uses const-oid 0.9.x,
-            // so Pkcs1v15Sign::new::<sha1::Sha1>() fails to compile.  Work around
-            // the version split by using new_unprefixed() and prepending the
-            // DigestInfo DER structure (RFC 3447 §9.2) manually.
             use sha1::Digest as _;
             let hash = sha1::Sha1::digest(message);
             let mut digest_info = SHA1_DI_PREFIX.to_vec();
@@ -2153,7 +2161,9 @@ fn build_ses_route(
 
     // One shared client per route for SNS cert fetching.
     #[cfg(feature = "inbound-ses")]
-    let http_client = reqwest::Client::new();
+    let http_client = crate::reqwest_tls::client_builder()
+        .build()
+        .expect("the framework TLS config builds a reqwest client");
 
     let handler = move |_headers: HeaderMap, body: Bytes| {
         let router = Arc::clone(&router);
@@ -2278,6 +2288,71 @@ fn build_generic_route(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// These tests check SNS signatures that an independent signer made: the
+    /// `openssl` CLI (`openssl dgst -sha256|-sha1 -sign`) with a throwaway
+    /// 2048-bit test key. The message is `Message\nhello\nType\nNotification\n`.
+    #[cfg(feature = "inbound-ses")]
+    mod sns_rsa_signature {
+        use base64::Engine as _;
+
+        const MESSAGE: &[u8] = b"Message\nhello\nType\nNotification\n";
+        const SPKI_B64: &[&str] = &[
+            "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAySwOLz16+HeZdoULynlbMPYU1Vdl",
+            "Jm15EKrIUNTQ4yrv9pZmr7Do7MdEkO/FRIbeaA/+ON7FF219KZJlE2K+G4F0S8efe9WE29w5",
+            "62cg7mhgQ1xQBXH1a8ZMfogj3nBf5lgjjjWebfW+dcX6ZEmFsT3OINzB4Hk5Vg6jPRpjyeAj",
+            "+i3djwkUI+GoIHNnzN/umh7jzt87PoSWna3ew3MOVWgGlQAmYezqUIK49vZgfe+KFtw8O+Tc",
+            "X+wyleOTv/y0zWd83eml8SpZP2B3IepNR6+AV43x1fjsKSAaDMwTFMYr4deAn6OoHGdsFbCV",
+            "GogetPIHxpZK5xaOw8Xq1mKW4QIDAQAB",
+        ];
+        const SIG_SHA256_B64: &[&str] = &[
+            "rT+uyDM0NQcjJ1T0rHQsPLrWL48/FCHAucxeyVfd5EGpb7ANAkT00omemTO/L6FoOtIA7N+d",
+            "HkHcDoDdJaWEKVbsPMlkGNAdWoYBAt7F0DzHfih7J+RyJ0dWwusmM8VQeY5rlkzBO+qSu6tC",
+            "6S5W1CqDLgo93sscIVa4qpgyizeanjfx6tgikYVEBX93/90u7QuMRnFbL8DF/bOtj6DggSbW",
+            "QTZc3kepV/BvirG13IZLZvHsDbIRY5UuqbQqYDBk6PLw6O4SSTSW1jxHE3pvILfNxcjm1ODO",
+            "jfZTyvPZrZTC/fguCtDwJA/JgpXVtFyMvwQQ/zi7B2JKgO5fXKdk8Q==",
+        ];
+        const SIG_SHA1_B64: &[&str] = &[
+            "yG9S2BYs+jrdGFF6rSRAqA1gylVToO55QmGToQy76ZupD/E5ifLjH2PKGQHE+HmqU+cKue49",
+            "S+KlD+0kJOHU2DxHl+R5drFPoI3go2IVooyYWvGZz48MxKNOi6oiwOAblIJyzLQcR8bXvvJU",
+            "h9SYu+k1nQnFEG/+X9YdUrLRi/IP+a0AZzYv2RXe5xPy/vxr+f+FNi1WDN2GeYcdRctz+f6/",
+            "TCB+tutY8252hCKBwoMGQ8JqCjEofJG8S1He/zKA3d7YRrsjzM+j0TAIsz2kGyVGr54VmNYC",
+            "0k0YwMiZTt5TK93XV6of1Py29n3fS6s+W0EaVhWnYWGElBBMcM9T4Q==",
+        ];
+
+        fn decode(parts: &[&str]) -> Vec<u8> {
+            base64::engine::general_purpose::STANDARD
+                .decode(parts.concat())
+                .expect("test fixture is base64")
+        }
+
+        fn verify(sig: &[u8], message: &[u8], version: &str) -> bool {
+            super::super::sns_verify::verify_rsa_signature(&decode(SPKI_B64), message, sig, version)
+                .is_ok()
+        }
+
+        #[test]
+        fn version_2_accepts_an_openssl_sha256_signature() {
+            assert!(verify(&decode(SIG_SHA256_B64), MESSAGE, "2"));
+        }
+
+        #[test]
+        fn version_1_accepts_an_openssl_sha1_signature() {
+            assert!(verify(&decode(SIG_SHA1_B64), MESSAGE, "1"));
+        }
+
+        #[test]
+        fn a_changed_message_is_rejected() {
+            assert!(!verify(&decode(SIG_SHA256_B64), b"Message\nhellO\n", "2"));
+            assert!(!verify(&decode(SIG_SHA1_B64), b"Message\nhellO\n", "1"));
+        }
+
+        #[test]
+        fn a_signature_for_the_other_hash_is_rejected() {
+            assert!(!verify(&decode(SIG_SHA1_B64), MESSAGE, "2"));
+            assert!(!verify(&decode(SIG_SHA256_B64), MESSAGE, "1"));
+        }
+    }
 
     #[test]
     fn mailgun_signature_is_64_hex_chars() {

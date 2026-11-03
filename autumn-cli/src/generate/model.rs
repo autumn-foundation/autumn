@@ -1738,11 +1738,10 @@ pub(super) fn warn_if_existing_dep_below_version(
     if existing_dep_version_below(existing_cargo_toml, crate_name, min_major, min_minor) {
         plan.warn(format!(
             "Cargo.toml already declares '{crate_name}', but not provably at \
-             version >= {min_major}.{min_minor} — the generated passkeys/2FA \
-             handlers use the '{crate_name}' 0.21+ `Engine`/\
-             `engine::general_purpose` API; make sure '{crate_name}' >= \
-             {min_major}.{min_minor} by hand or the generated code may fail to \
-             compile."
+             version >= {min_major}.{min_minor}. The generated auth code uses \
+             the '{crate_name}' {min_major}.{min_minor} API. Raise \
+             '{crate_name}' to >= {min_major}.{min_minor} by hand, or the \
+             generated code may fail to compile."
         ));
     }
 }

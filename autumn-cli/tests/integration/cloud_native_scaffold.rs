@@ -335,7 +335,7 @@ fn cloud_native_scaffold_dockerfile_is_production_ready() {
     let project_dir = temp_dir.path().join("container-app");
     let dockerfile = fs::read_to_string(project_dir.join("Dockerfile")).unwrap();
     let dockerignore = fs::read_to_string(project_dir.join(".dockerignore")).unwrap();
-    let msrv = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0");
+    let msrv = env!("CARGO_PKG_RUST_VERSION");
 
     assert!(dockerfile.contains(&format!("FROM rust:{msrv}-bookworm AS builder")));
     assert!(!dockerfile.contains("rust:1.86"));
@@ -584,7 +584,7 @@ fn ci_workflow_pins_msrv_toolchain() {
     let temp_dir = scaffold("ci-msrv-app");
     let project_dir = temp_dir.path().join("ci-msrv-app");
     let ci = fs::read_to_string(project_dir.join(".github/workflows/ci.yml")).unwrap();
-    let msrv = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0");
+    let msrv = env!("CARGO_PKG_RUST_VERSION");
 
     assert!(
         ci.contains(&format!("dtolnay/rust-toolchain@{msrv}")),

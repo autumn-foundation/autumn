@@ -7,7 +7,7 @@ system, shortcodes, permalinks, feeds, a sitemap, a REST API, and import/export.
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - PostgreSQL **12 or newer** — the `search_vector` column is a stored generated
   column, which Postgres 11 does not support. A `docker-compose.yml` pinning
   Postgres 16 is included for local development.

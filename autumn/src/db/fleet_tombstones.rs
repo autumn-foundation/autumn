@@ -905,7 +905,7 @@ mod tests {
                 let budget_spent = delete
                     && self
                         .deletes_left
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                         .is_err();
                 if AtomicBool::load(&self.down, Ordering::SeqCst)
                     || budget_spent

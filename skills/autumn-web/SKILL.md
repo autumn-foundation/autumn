@@ -12,7 +12,7 @@ description: >
 
 **Repository**: https://github.com/autumn-foundation/autumn
 **Branch**: `trunk-dev`
-**Latest release**: 0.9.0 | **Edition**: 2024 | **MSRV**: 1.88.0
+**Latest release**: 0.9.0 | **Edition**: 2024 | **MSRV**: 1.97.0
 
 **Version identity trip wire**: the workspace on `trunk-dev` is versioned
 0.9.0, and `v0.9.0` is the current release line — `autumn-web = "0.9"`,
@@ -2717,13 +2717,12 @@ the build.
   `{ id = "RUSTSEC-…", reason = "why this is acceptable here; review-by <date>" }`.
   A waiver lets exactly one id through; the gate stays on and every other
   advisory still fails.
-- A fresh scaffold ships one waiver already — RUSTSEC-2023-0071 (`rsa`, reached
-  through the unconditional `jsonwebtoken` dependency, no patched release
-  exists) — which is why day-one CI is green. Do not remove it without checking
-  whether a fixed `rsa` has shipped. `--bundled-pg` apps get a second waiver
-  (RUSTSEC-2024-0384, `instant`, via the embedded-Postgres build stack); other
-  flavors deliberately do not, so an unused-waiver warning still means one of
-  the app author's own waivers went stale.
+- A fresh scaffold ships two waivers already — RUSTSEC-2023-0071 (`rsa`) and
+  RUSTSEC-2026-0387 (`crypto-bigint` 0.5), both reached through the
+  unconditional `jsonwebtoken` dependency, no patched release exists — which is
+  why day-one CI is green. Do not remove either without checking
+  whether a fixed release has shipped. An unused-waiver warning means one of the
+  app author's own waivers went stale.
 - An app upgraded from a release before this gate existed receives the workflow
   but not `deny.toml` (the policy is the app's, so `autumn upgrade` never
   writes it). The audit step says so and stops; copy the file from a freshly

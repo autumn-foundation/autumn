@@ -109,25 +109,11 @@ impl RetryBudget {
     }
 
     /// Apply `next` to the tokens in one atomic step. `false` when `next`
-    /// returns `None`; then the tokens do not change. A compare-exchange
-    /// loop: `fetch_update` is deprecated on new toolchains, and its
-    /// replacement is newer than the MSRV.
-    fn update(&self, next: impl Fn(u64) -> Option<u64>) -> bool {
-        let mut current = self.milli_tokens.load(Ordering::Acquire);
-        loop {
-            let Some(value) = next(current) else {
-                return false;
-            };
-            match self.milli_tokens.compare_exchange_weak(
-                current,
-                value,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(actual) => current = actual,
-            }
-        }
+    /// returns `None`; then the tokens do not change.
+    fn update(&self, next: impl FnMut(u64) -> Option<u64>) -> bool {
+        self.milli_tokens
+            .try_update(Ordering::AcqRel, Ordering::Acquire, next)
+            .is_ok()
     }
 }
 

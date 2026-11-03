@@ -1349,10 +1349,10 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the underlying TLS backend cannot be initialised (should not
-    /// happen with the default `rustls-tls` feature).
+    /// happen with the framework `ring` config).
     #[must_use]
     pub fn with_timeout(timeout: Duration) -> Self {
-        let inner = reqwest::ClientBuilder::new()
+        let inner = crate::reqwest_tls::client_builder()
             .timeout(timeout)
             .redirect(pooled_redirect_policy())
             .build()
@@ -1385,7 +1385,7 @@ impl Client {
     ///
     /// Panics if the underlying TLS backend cannot be initialised.
     pub(crate) fn build_inner(config: &crate::config::HttpClientConfig) -> reqwest::Client {
-        reqwest::ClientBuilder::new()
+        crate::reqwest_tls::client_builder()
             .timeout(Duration::from_secs(config.timeout_secs))
             .redirect(pooled_redirect_policy())
             .build()
@@ -1453,7 +1453,7 @@ impl Client {
     /// # Panics
     ///
     /// Panics if the underlying TLS backend cannot be initialised (should not
-    /// happen with the default `rustls-tls` feature).
+    /// happen with the framework `ring` config).
     #[must_use]
     pub fn from_config(config: &crate::config::HttpClientConfig) -> Self {
         let mut client = Self::from_config_with_inner(Self::build_inner(config), config);
@@ -3894,7 +3894,7 @@ fn build_oneshot_client(
     policy: reqwest::redirect::Policy,
     timeout: Duration,
 ) -> Result<reqwest::Client, ClientError> {
-    let mut builder = reqwest::ClientBuilder::new()
+    let mut builder = crate::reqwest_tls::client_builder()
         .timeout(timeout)
         .redirect(policy);
     if let Some((host, addrs)) = resolve

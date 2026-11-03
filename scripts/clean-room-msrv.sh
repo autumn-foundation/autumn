@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Clean-room rerun of the README quickstart on the toolchain the README
-# advertises ("Rust 1.88.0+", [workspace.package] rust-version).
+# advertises ("Rust 1.97.0+", [workspace.package] rust-version).
 #
 # This is the same journey `quickstart-gate.yml` runs on its MSRV leg, made
 # reproducible on a laptop: a pristine CARGO_HOME (so no cached registry or

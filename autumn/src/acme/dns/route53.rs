@@ -29,7 +29,7 @@
 use std::sync::{Arc, RwLock};
 
 use futures::future::BoxFuture;
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::{Digest as _, Sha256};
 
 use super::http::{HttpRequest, HttpResponse, HttpTransport};

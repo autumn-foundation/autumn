@@ -445,14 +445,11 @@ one in the same crate — still fails, and the gate itself stays on. The id and
 the rationale are committed to your repository, so the decision is reviewable
 in a pull request rather than living in someone's memory.
 
-Your generated `deny.toml` ships with a waiver already in it:
-`RUSTSEC-2023-0071`. `rsa` reaches every Autumn app through `jsonwebtoken`,
-which `autumn-web` depends on unconditionally, and no patched `rsa` release
-exists. An app generated with `--bundled-pg` gets a second one
-(`RUSTSEC-2024-0384`, `instant`, unmaintained, reachable only through the
-embedded-Postgres build stack). Only that flavor gets it, so cargo-deny's
-"this waiver is unused" warning stays available to tell you when one of *your*
-waivers has gone stale.
+Your generated `deny.toml` has two waivers: `RUSTSEC-2023-0071` (`rsa`) and
+`RUSTSEC-2026-0387` (`crypto-bigint` 0.5). Both reach every Autumn app through
+`jsonwebtoken`, which `autumn-web` depends on unconditionally. No patched
+release exists for either. cargo-deny's "this waiver is unused" warning tells
+you when one of *your* waivers has gone stale.
 
 Those waivers are why a freshly scaffolded app's CI is green on day one instead
 of red on the first push. Autumn's CI generates each app flavor and audits it with
