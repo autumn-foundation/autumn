@@ -52,161 +52,24 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.7.8
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      # The Rust tests only search the runtime for strings, so a syntax
-      # error there passes them (#3406). Node parses the file.
-      - name: Check the widget runtime parses
-        run: node --check autumn/vendor/autumn-widgets.js
-      - name: Clippy
-        # `-j 2` caps codegen parallelism. This step checks the whole workspace
-        # with `--all-targets`, and at cargo's default (one job per core, 4 on
-        # ubuntu-latest) its peak memory exceeds the runner's 16 GB while
-        # `Checking autumn-web` — the largest crate. The runner is then
-        # reclaimed mid-step and the job reports `exit code 143` with
-        # "The runner has received a shutdown signal" and no clippy diagnostic
-        # at all, which reads like infrastructure flake rather than what it is.
+      - name: Lint lane (cargo xtask ci lint)
+        # Every check this job runs is a step of the `lint` lane in
+        # xtask/src/lanes.rs: formatting, the widget-runtime parse, the
+        # toolchain-free repo gates (panic, determinism, sqlite unification,
+        # binary names, Bolt profiles), the four clippy lanes, the diesel
+        # table-width gate and the accessibility gate. The reason for each
+        # lives next to its command there.
         #
-        # It is marginal rather than deterministic — the same command succeeds
-        # on some runs — so it surfaced as an intermittent red that re-running
-        # sometimes cleared, on trunk-dev and on every branch cut from it.
-        # Reproduced locally on a 15 GB box: `--workspace --all-targets` is
-        # OOM-killed at `-j 4` and completes clean at `-j 2`.
-        run: cargo clippy -j 2 --workspace --all-targets -- -D warnings
-      - name: Clippy (autumn-web, gated request-path features — panic gate)
-        # The default-feature Clippy above does not compile the feature-gated
-        # request-path modules (channels→ws, mail→mail, sync/*→offline-sync,
-        # session_redis→redis), so their `#![cfg_attr(not(test), deny(clippy::…))]`
-        # panic-gate lints never fire. Lint them with their features enabled so an
-        # unannotated `.unwrap()` in those production paths fails CI. (`--all-features`
-        # is unusable here: `managed-pg-bundled` pulls in `postgresql_embedded`, whose
-        # build script downloads Postgres binaries; this explicit list covers exactly
-        # the gated modules with no new services.)
+        # The lane runs every step even after one fails and prints a summary,
+        # so one run reports every break. Each step's log is a collapsible
+        # group, a failing step is an error annotation, and the summary table
+        # goes to the job summary. To reproduce one step locally:
+        # `cargo xtask ci lint --only <step>`; `--list` shows the step names.
         #
-        # `tls` is in the list for the determinism seam gate (#1797), not the
-        # panic gate. `autumn/src/tls.rs` owns `fn now_unix` — the one site in
-        # THAT MODULE that reads real wall time on purpose (certificate validity
-        # is a fact about the real world), used from `app.rs`'s bind path and the
-        # `CertReloader` poll loop. That function — and the
-        # `#[allow(clippy::disallowed_methods, reason = "…")]` justifying it — is
-        # only COMPILED when `tls` is on, so without it here the deny never sees
-        # the site and a later off-seam read added next to it would ship unlinted.
-        # This also lints the whole `tls`-gated tree under `-D warnings`.
-        #
-        # `acme` joined the set in #1608, which closes the gap the `tls`-only
-        # version of this comment recorded: `acme/renewal.rs` has its own
-        # `now_unix`, and `--all-targets` lints only what the enabled features
-        # compile, so until `acme` was listed here the entire ACME tree — that
-        # seam included — was never linted at all.
-        #
-        # `inbound-mail`/`inbound-mailgun`/`inbound-ses` gate `inbound_mail`, which
-        # parses untrusted RFC 5322 / MIME bodies straight off an unauthenticated
-        # webhook route, and `storage` gates the upload path — both are request-path
-        # modules carrying the panic gate, so they have to be in this feature list
-        # for their `deny(clippy::…)` block to be compiled at all.
-        #
-        # `constela` is here for the same reason: it parses, validates and renders
-        # a document a language model wrote, so a panic in that tree is a 500 that
-        # whoever shapes the model's prompt can trigger on demand. Its nine modules
-        # carry the panic gate and are configured out without this feature.
-        #
-        # `collab` (#1806) is here because `collab/resolver.rs` is gated on
-        # `collab` AND `offline-sync`. The workspace lane above unifies
-        # `collab` in from examples/collab-notes but never `offline-sync`, and
-        # this lane had `offline-sync` without `collab` -- so the resolver, the
-        # piece that decides whether an offline edit merges or is discarded,
-        # was linted by no lane at all.
-        #
-        # `sla` (#1826): the SLA engine carries the panic and determinism gates
-        # and is configured out without this feature.
-        #
-        # KEEP IN SYNC with the identical list in scripts/pre-push-check.sh --
-        # check-panic-gate.sh verifies every gated module's feature is covered by an
-        # enforcing CI clippy lane, so a feature dropped from here silently disarms
-        # that module's deny block.
-        run: cargo clippy -p autumn-web --features "ws,mail,offline-sync,collab,redis,markdown,constela,inbound-mail,inbound-mailgun,inbound-ses,storage,tls,acme,i18n,presence,sla" --all-targets -- -D warnings
-      - name: Clippy (autumn-web, plugin-sandbox — panic gate)
-        # `plugin-sandbox` (#1609) is not a default feature, so neither Clippy run
-        # above compiles `plugin_sandbox`'s request-path modules and their
-        # `#![cfg_attr(not(test), deny(clippy::…))]` panic gates never fire. This is
-        # the module set where an unannotated panic matters most: `host.rs` runs an
-        # interpreter over an artifact the operator explicitly did not audit, and
-        # the whole promise of the lane is that nothing a hostile guest does can
-        # abort the host process.
-        #
-        # Kept as its own lane rather than folded into the list above so a
-        # `wasmi`-linking build is not forced on every gated-feature Clippy run.
-        run: cargo clippy -p autumn-web --features "plugin-sandbox,test-support" --all-targets -- -D warnings
-      - name: Clippy (autumn-web, repl)
-        # `repl` (#2148) is off by default, so no run above compiles
-        # `repl.rs` or the REPL glue that `#[model]` and `#[repository]` emit.
-        # Its own lane, so the Rhai build stays out of the gated list.
-        run: cargo clippy -p autumn-web --features repl --all-targets -- -D warnings
-      - name: Panic-free request-path gate
-        run: ./scripts/check-panic-gate.sh
-      - name: Determinism seam gate
-        # Companion to the clippy runs above (issue #1797). `clippy.toml` bans
-        # direct `Instant::now` / `Utc::now` / `SystemTime::now` /
-        # `Uuid::new_v4`, and each gated module re-denies
-        # `clippy::disallowed_methods` for its production path — so the clippy
-        # steps do the detection. THIS step keeps them able to see it: manifest
-        # integrity, header shape, config completeness, the absence of a
-        # module-wide `allow` spoof or a crate-local `clippy.toml` that would
-        # shadow the config entirely. No toolchain, ~2 seconds, self-testing.
-        run: ./scripts/check-determinism-gate.sh
-      - name: SQLite feature-unification gate
-        # The `sqlite` backend flip (#1614) is safe only while NO manifest
-        # enables it through a dependency edge — cargo unifies features
-        # globally, so one such edge swaps `db::RuntimeConnection` for every
-        # consumer in the graph. Until this gate, that invariant was prose plus
-        # the `sqlite`-excluding feature lists below, and nothing read the
-        # manifests. ~2 seconds, self-testing. The resolver layer asks
-        # `cargo metadata` what cargo resolves, so it is required here.
-        env:
-          SQLITE_GATE_REQUIRE_RESOLVE: "1"
-        run: ./scripts/check-sqlite-unification.sh
-      - name: Example binary-name collision gate
-        # Two workspace members producing the same binary file name break the
-        # Windows linker intermittently (LNK1104, issue #2639) while staying
-        # invisible on Unix, so CI only catches the reintroduction when two
-        # links happen to overlap. This script enumerates every member's
-        # explicit [[bin]] AND auto-discovered src/bin targets (issues
-        # #2690/#2691) and fails on a duplicate name. No toolchain, ~1
-        # second, self-testing.
-        run: ./scripts/check-example-bin-names.sh
-      - name: Bolt profile gate (every workload has a profile)
-        # Every `[[bench]]` target must have an entry in
-        # docs/perf/bolt/workloads.toml and a committed callgrind + dhat
-        # profile under docs/perf/bolt/<package>/<bench>/. A new bench without
-        # one fails here. `scripts/bolt-profile.sh <package>/<bench>` writes
-        # it. `cargo metadata` lists the targets, so auto-discovered benches
-        # count too. No build, a few seconds. See docs/perf/README.md.
-        run: python3 scripts/check-perf-profiles.py bolt
-
-      - name: Diesel table-width gate (no framework declaration over 32 columns)
-        # Diesel compiles its column-tuple impls up to a cap set by a feature:
-        # `32-column-tables` (default), `64-` or `128-`. Cargo unifies it, so
-        # one `table!` past 32 columns pushes the wider cap onto every crate
-        # that depends on diesel — every app built on Autumn included.
-        # Measured on one crate: 1.16 GB / 1m18s at 32, 2.92 GB / 2m04s at 64,
-        # 9.95 GB / 8m16s at 128. The cap is per declaration, so a wide table
-        # declared in halves (`#[sql_name = "<table>"]`) is fine. This reads
-        # every `table!` and `#[model]`, replays every migration set (a table
-        # over 32 counts only when no declaration maps it), and asks cargo
-        # which diesel features resolve. Any finding fails the job. Apps get
-        # the same findings as a warning from `autumn build`, never a
-        # failure. See docs/guide/table-width.md.
-        run: cargo run -p autumn-cli --bin autumn -- schema width .
-
-      - name: Accessibility gate (raw html! escape hatches across the repo)
-        # `autumn a11y verify` statically audits raw `html!` markup for fields
-        # that bypass the typed a11y primitives and lack an accessible name.
-        # Scoped to the whole repo root now that the framework source, the admin
-        # plugin, and every example are clean (issue #1934). The scanner skips
-        # `target/`, dot-dirs, and `tests/` directories (test scaffolding and the
-        # committed red/green fixtures), so a single invocation over `.` fails the
-        # job on any real product finding.
-        run: cargo run -p autumn-cli --bin autumn -- a11y verify .
+        # `scripts/check-panic-gate.sh` and `scripts/check-determinism-gate.sh`
+        # read the clippy commands in xtask/src/lanes.rs as this job's enforcing
+        # clippy lanes, and only while this line runs the lane.
+        run: cargo xtask ci lint
 
   migration-guides:
     name: Migration guide coverage

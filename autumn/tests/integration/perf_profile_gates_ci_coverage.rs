@@ -13,11 +13,26 @@ fn ci() -> String {
         .replace("\r\n", "\n")
 }
 
+/// The `lint` job runs `cargo xtask ci lint`; the Bolt gate is a step of that
+/// lane in `xtask/src/lanes.rs`.
 #[test]
 fn bolt_gate_runs_in_ci() {
     assert!(
-        ci().contains("run: python3 scripts/check-perf-profiles.py bolt"),
-        "ci.yml must run `scripts/check-perf-profiles.py bolt`"
+        ci().lines()
+            .any(|l| l.trim_start() == "run: cargo xtask ci lint"),
+        "ci.yml's `lint` job must run `cargo xtask ci lint`"
+    );
+    let lanes = std::fs::read_to_string(workspace_root().join("xtask/src/lanes.rs"))
+        .expect("read xtask/src/lanes.rs");
+    let lint = lanes
+        .split("pub fn lint() -> Lane")
+        .nth(1)
+        .and_then(|rest| rest.split("pub fn pre_push() -> Lane").next())
+        .expect("xtask/src/lanes.rs defines the lint lane before the pre-push lane");
+    let lint: String = lint.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        lint.contains("\"check-perf-profiles.py\",&[\"bolt\"]"),
+        "the xtask `lint` lane must run `scripts/check-perf-profiles.py bolt`"
     );
 }
 

@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+description = "Maintainer task runner for the Autumn workspace: `cargo xtask`. Never published."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Keep this list short and keep every entry on default features. xtask is a
+# workspace member, so whatever features it turns on are unified into every
+# `cargo build --workspace`. It must never depend on autumn-web, diesel or sqlx.
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[lints]
+workspace = true
