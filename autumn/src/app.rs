@@ -19184,9 +19184,11 @@ mod tests {
     #[cfg(feature = "data-retention")]
     #[test]
     fn append_retention_tasks_records_each_framework_sweep() {
-        let mut config = crate::config::RetentionConfig::default();
-        config.job_history = Some("90d".to_owned());
-        config.audit_archives = Some("400d".to_owned());
+        let config = crate::config::RetentionConfig {
+            job_history: Some("90d".to_owned()),
+            audit_archives: Some("400d".to_owned()),
+            ..Default::default()
+        };
         let sweeps = crate::data_retention::framework_retention_tasks(&config);
         assert_eq!(sweeps.len(), 2);
 
