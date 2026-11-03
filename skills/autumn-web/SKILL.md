@@ -3083,6 +3083,16 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   hosts on different machines implement `SlotOwnershipStore`
   (`autumn_web::db::fleet_ownership`). Guide: "Failover: slot ownership" in
   `docs/guide/sqlite-fleet.md`.
+- Cross-tenant analytics (issue #3236): query the lake, not the volume.
+  `fleet.lake()?.materialize().await?.query(sql)`
+  (`autumn_web::db::fleet_lake`) restores each live tenant from its replica
+  into a scratch SQLite file. Each table gets `_autumn_tenant`. One
+  `SELECT`/`WITH`/`VALUES` on a read-only connection; grouped `SUM`/`AVG`
+  work across tenants. It never opens the fleet root (`FleetLake::new(dest,
+  base)` on a host with no volume). Deleted tenants are skipped. No
+  tombstone source: `markers_only()`. Each tenant is consistent on its own;
+  no atomic snapshot. CLI: `autumn fleet lake q.sql --out q.csv`. Never
+  pass request input as the SQL. Guide: "Query the lake".
 - The control database lives outside `root` (validation refuses it inside).
 - Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
   databases, also closed ones (issue #3234). Write outbox rows in a

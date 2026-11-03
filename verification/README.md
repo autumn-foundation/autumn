@@ -386,3 +386,26 @@ It proves these properties:
 - Each retry makes the input shorter, so the loop stops.
 
 The unit tests and the proptest in `form.rs` check the runtime index choice.
+
+## Fleet lake
+
+`fleet_lake.rs` models the fleet lake (`autumn/src/db/fleet_lake.rs`, issue
+#3236, ADR 0032). Verify it with:
+
+```sh
+verus verification/fleet_lake.rs
+```
+
+It proves these properties:
+
+- A tombstone row, or a marker that covers the generation, keeps a tenant
+  out of the lake. A tenant with no replica stays out too.
+- When the replicas are caught up, the lake row count equals the row count
+  of the live databases on the volume. This is the AC test.
+- The total does not depend on the order in which tenants are loaded.
+- A file in a fresh scratch directory is never under the fleet root when the
+  scratch parent is not under it.
+
+It does not model the restore, the schema union or the query. Tests cover
+them.
+
