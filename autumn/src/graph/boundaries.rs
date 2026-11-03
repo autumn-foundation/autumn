@@ -192,8 +192,7 @@ impl CrateGraph {
     /// The normalized names of a package key: the package name, without a
     /// version, and the library name.
     fn names(&self, package: &str) -> Vec<String> {
-        let name = package.split_once('@').map_or(package, |(name, _)| name);
-        let mut names = vec![crate_key(name)];
+        let mut names = vec![crate_key(package_name(package))];
         if let Some(lib) = self.libs.get(package) {
             names.push(crate_key(lib));
         }
@@ -276,8 +275,8 @@ impl Violation {
             Self::Crate(v) => BaselineEntry::Crate {
                 boundary: v.boundary.clone(),
                 owner: v.owner.clone(),
-                krate: v.krate.clone(),
-                schema_crate: v.schema_crate.clone(),
+                krate: package_name(&v.krate).to_owned(),
+                schema_crate: package_name(&v.schema_crate).to_owned(),
             },
         }
     }
@@ -1121,6 +1120,12 @@ fn crate_key(name: &str) -> String {
     name.replace('-', "_")
 }
 
+/// A package key without the `@<version>` that a second resolved version
+/// adds.
+fn package_name(key: &str) -> &str {
+    key.split_once('@').map_or(key, |(name, _)| name)
+}
+
 /// A node id without the `@<version>` that a second crate version adds.
 fn base_id(id: &str) -> &str {
     if id.starts_with(AUTO_API_ID_PREFIX) {
@@ -1507,6 +1512,9 @@ schema_crates = ["billing-schema"]
         let found = crate_violations(&report);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].schema_crate, "crm-core@0.2.0");
+        // The key has no version, so an upgrade keeps the baseline entry.
+        let key = Violation::Crate(found[0].clone()).key();
+        assert!(!key.to_string().contains('@'), "{key}");
     }
 
     #[test]
