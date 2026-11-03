@@ -295,7 +295,9 @@
   // The capture listener runs before htmx reads the form.
   var pending = new WeakMap();
   document.addEventListener('submit', function (e) {
-    e.target.querySelectorAll('[data-ac-multiple]').forEach(function (w) {
+    var form = e.target;
+    if (!form || !form.querySelectorAll) return;
+    form.querySelectorAll('[data-ac-multiple]').forEach(function (w) {
       var add = pending.get(w);
       if (add) add();
     });
