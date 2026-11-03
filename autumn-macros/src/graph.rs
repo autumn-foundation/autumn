@@ -1342,7 +1342,10 @@ mod tests {
              LEFT OUTER JOIN deals d ON d.contact_id = ct.id\"",
         );
         for table in ["campaigns", "contacts", "deals"] {
-            assert!(symbols.contains(&table.to_owned()), "{table} missing: {symbols:?}");
+            assert!(
+                symbols.contains(&table.to_owned()),
+                "{table} missing: {symbols:?}"
+            );
         }
     }
 
