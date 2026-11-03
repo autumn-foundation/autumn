@@ -165,14 +165,16 @@ pub enum BoundaryError {
 // ── Inputs ───────────────────────────────────────────────────────────
 
 /// The normal (not dev, not build) dependencies of each crate, by package
-/// name.
+/// key.
 ///
-/// The CLI fills this from `cargo metadata`.
+/// A key is the package name. A package that resolves at two versions has
+/// the key `name@version` for each, so their dependencies stay apart. The
+/// CLI fills this from `cargo metadata`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CrateGraph {
-    /// Package name to the package names it depends on.
+    /// Package key to the package keys it depends on.
     pub deps: BTreeMap<String, BTreeSet<String>>,
-    /// Package name to library name, where the two differ. A module path
+    /// Package key to library name, where the two differ. A module path
     /// starts with the library name.
     pub libs: BTreeMap<String, String>,
 }
@@ -187,9 +189,11 @@ impl CrateGraph {
         self.deps.entry(dep.to_owned()).or_default();
     }
 
-    /// The normalized names of a package: its own and its library's.
+    /// The normalized names of a package key: the package name, without a
+    /// version, and the library name.
     fn names(&self, package: &str) -> Vec<String> {
-        let mut names = vec![crate_key(package)];
+        let name = package.split_once('@').map_or(package, |(name, _)| name);
+        let mut names = vec![crate_key(name)];
         if let Some(lib) = self.libs.get(package) {
             names.push(crate_key(lib));
         }
@@ -436,6 +440,9 @@ fn graph_rule(
         if let Some(model) = &node.model {
             r.owner(&model.table)?;
         }
+        if let Some(repository) = &node.repository {
+            r.owner(&repository.table)?;
+        }
         r.node_boundary(node)?;
     }
     let nodes: BTreeMap<&str, &GraphNode> =
@@ -615,21 +622,23 @@ fn schema_owners<'a>(
     graph: Option<&ArchitectureGraph>,
     crates: &CrateGraph,
 ) -> Result<BTreeMap<String, BTreeSet<&'a str>>, BoundaryError> {
-    // Keyed by normalized crate name: a module path spells `-` as `_`.
-    let mut by_crate: BTreeMap<String, BTreeSet<&'a str>> = BTreeMap::new();
+    let mut owners: BTreeMap<String, BTreeSet<&'a str>> = BTreeMap::new();
     for (name, boundary) in &r.config.boundaries {
         for package in crates.deps.keys() {
             if boundary.schema_crates.iter().any(|p| {
                 let p = crate_key(p);
                 crates.names(package).iter().any(|n| glob(&p, n))
             }) {
-                by_crate
-                    .entry(crate_key(package))
+                owners
+                    .entry(package.clone())
                     .or_default()
                     .insert(name.as_str());
             }
         }
     }
+    // Derived from models, keyed by normalized crate name: a module path
+    // spells `-` as `_`.
+    let mut by_crate: BTreeMap<String, BTreeSet<&'a str>> = BTreeMap::new();
     for node in graph.iter().flat_map(|g| &g.nodes) {
         let Some(model) = &node.model else {
             continue;
@@ -644,7 +653,6 @@ fn schema_owners<'a>(
                 .insert(owner);
         }
     }
-    let mut owners: BTreeMap<String, BTreeSet<&'a str>> = BTreeMap::new();
     for package in crates.deps.keys() {
         for name in crates.names(package) {
             if let Some(set) = by_crate.get(&name) {
@@ -1462,6 +1470,43 @@ schema_crates = ["billing-schema"]
             "{:?}",
             report.violations
         );
+    }
+
+    #[test]
+    fn an_ambiguous_repository_table_is_an_error() {
+        // No model maps `archive_rows`; only the repository names it.
+        const ARCHIVE: &[RepositoryGraphDescriptor] = &[RepositoryGraphDescriptor {
+            repository: "ArchiveRepository",
+            implementation: "PgArchiveRepository",
+            model: "Contact",
+            table: "archive_rows",
+            api: "",
+            module_path: "crm_core::repositories",
+            file: "src/repositories.rs",
+            line: 1,
+            crate_version: "0.1.0",
+        }];
+        let config = BoundaryConfig::parse(
+            "[boundaries.a]\nowns = [\"archive_*\"]\n[boundaries.b]\nowns = [\"*_rows\"]\n",
+        )
+        .expect("valid");
+        let graph = build(&[], 0, &[], MODELS, ARCHIVE, &[]);
+        let err = check(&config, Some(&graph), None).expect_err("ambiguous");
+        assert!(
+            matches!(err, BoundaryError::Ambiguous { what: "table", .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_versioned_package_key_matches_by_its_name() {
+        // The CLI keys a package that resolves at two versions as
+        // `name@version`, so their dependencies stay apart.
+        let deps = crates(&[("crm-marketing", "crm-core@0.2.0")]);
+        let report = check(&config(""), Some(&graph()), Some(&deps)).expect("runs");
+        let found = crate_violations(&report);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].schema_crate, "crm-core@0.2.0");
     }
 
     #[test]

@@ -46,6 +46,15 @@ pub fn parse_cargo_metadata(metadata: &Value) -> Result<CargoFacts, String> {
         .and_then(Value::as_array)
         .ok_or("cargo metadata has no `packages`")?;
     let mut facts = CargoFacts::default();
+    // A package that resolves at two versions gets the key `name@version`,
+    // so the dependencies of one version are not read as the other's.
+    let mut seen: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for name in packages
+        .iter()
+        .filter_map(|p| p.get("name").and_then(Value::as_str))
+    {
+        *seen.entry(name).or_default() += 1;
+    }
     let mut names = std::collections::BTreeMap::new();
     for package in packages {
         let (Some(id), Some(name)) = (
@@ -54,13 +63,19 @@ pub fn parse_cargo_metadata(metadata: &Value) -> Result<CargoFacts, String> {
         ) else {
             continue;
         };
-        names.insert(id.to_owned(), name.to_owned());
-        facts.crates.deps.entry(name.to_owned()).or_default();
+        let key = match package.get("version").and_then(Value::as_str) {
+            Some(version) if seen.get(name).copied().unwrap_or(0) > 1 => {
+                format!("{name}@{version}")
+            }
+            _ => name.to_owned(),
+        };
+        facts.crates.deps.entry(key.clone()).or_default();
         if let Some(lib) = library_name(package)
             && lib != name.replace('-', "_")
         {
-            facts.crates.libs.insert(name.to_owned(), lib);
+            facts.crates.libs.insert(key.clone(), lib);
         }
+        names.insert(id.to_owned(), key);
         let owns = package
             .pointer("/metadata/autumn/boundary/owns")
             .and_then(Value::as_array);
@@ -468,6 +483,32 @@ mod tests {
         let text = result.render();
         assert!(!result.passes(), "{text}");
         assert!(text.contains("app -> admin-plugin"), "{text}");
+    }
+
+    #[test]
+    fn two_versions_of_one_package_keep_their_own_dependencies() {
+        let json = serde_json::json!({
+            "packages": [
+                {"id": "m", "name": "marketing", "version": "0.1.0"},
+                {"id": "h1", "name": "helper", "version": "1.0.0"},
+                {"id": "h2", "name": "helper", "version": "2.0.0"},
+                {"id": "o", "name": "other", "version": "0.1.0"},
+                {"id": "s", "name": "core-schema", "version": "0.1.0"}
+            ],
+            "resolve": {"nodes": [
+                {"id": "m", "deps": [{"pkg": "h1"}]},
+                {"id": "o", "deps": [{"pkg": "h2"}]},
+                {"id": "h2", "deps": [{"pkg": "s"}]}
+            ]}
+        });
+        let facts = parse_cargo_metadata(&json).expect("valid");
+        let deps = &facts.crates.deps;
+        assert_eq!(
+            deps["marketing"].iter().collect::<Vec<_>>(),
+            ["helper@1.0.0"]
+        );
+        assert!(deps["helper@1.0.0"].is_empty());
+        assert!(deps["helper@2.0.0"].contains("core-schema"));
     }
 
     #[test]
