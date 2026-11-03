@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use super::corpus;
 use super::markdown;
@@ -55,6 +55,12 @@ impl Report {
 /// Returns an error when the corpus cannot be listed.
 /// Broken links are not errors; they are the [`Report`]'s defects.
 pub fn check(root: &Path) -> Result<Report> {
+    // Destinations are normalised before they are compared with the root, so
+    // the root must be too: `.` or `/repo/xtask/..` would otherwise match no
+    // destination, and every link would look like it escapes the checkout.
+    let root: &Path = &normalize(
+        &std::path::absolute(root).with_context(|| format!("resolving {}", root.display()))?,
+    );
     let files = corpus::tracked_markdown(root)?;
     let mut texts: HashMap<&str, String> = HashMap::new();
     let mut defects = Vec::new();
@@ -854,6 +860,33 @@ mod tests {
         assert!(out.contains("corpus: 2 tracked markdown files"), "{out}");
         assert!(out.contains("defects: 1"), "{out}");
         assert!(!out.contains("Markdown link gate OK."), "{out}");
+    }
+
+    /// A root spelled with `.` or `..` must resolve like the plain path, or
+    /// every link in a clean checkout reads as escaping it.
+    #[test]
+    fn a_root_with_dot_components_checks_like_the_plain_path() {
+        let c = Corpus::new();
+        c.git(&["add", "-A"]);
+        for root in [
+            c.dir.join("."),
+            c.dir.join("docs/.."),
+            c.dir.join("docs/guide/../.."),
+        ] {
+            let r = check(&root).unwrap();
+            assert_eq!(
+                r,
+                Report {
+                    corpus: 2,
+                    defects: vec![]
+                },
+                "{}",
+                root.display()
+            );
+        }
+        // `cargo test` runs from the package directory, one below the root.
+        let r = check(Path::new("..")).unwrap();
+        assert!(r.passed(), "{:#?}", r.defects);
     }
 
     #[test]
