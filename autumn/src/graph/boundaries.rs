@@ -350,7 +350,7 @@ pub fn check(
     graph: Option<&ArchitectureGraph>,
     crates: Option<&CrateGraph>,
 ) -> Result<Report, BoundaryError> {
-    let resolver = Resolver::new(config, graph);
+    let resolver = Resolver::new(config, graph, crates);
     let mut found = Found::default();
     let mut warnings = Vec::new();
     let mut rules = RulesRun::default();
@@ -927,16 +927,35 @@ struct Resolver<'a> {
     config: &'a BoundaryConfig,
     /// The tables of the models in the graph, lowercase.
     tables: BTreeSet<String>,
+    /// Normalized library name to the normalized names of its packages. A
+    /// module path starts with the library name; the config can name the
+    /// package.
+    aliases: BTreeMap<String, Vec<String>>,
 }
 
 impl<'a> Resolver<'a> {
-    fn new(config: &'a BoundaryConfig, graph: Option<&ArchitectureGraph>) -> Self {
+    fn new(
+        config: &'a BoundaryConfig,
+        graph: Option<&ArchitectureGraph>,
+        crates: Option<&CrateGraph>,
+    ) -> Self {
         let tables = graph
             .iter()
             .flat_map(|g| &g.nodes)
             .filter_map(|n| n.model.as_ref().map(|m| m.table.to_ascii_lowercase()))
             .collect();
-        Self { config, tables }
+        let mut aliases: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (package, lib) in crates.iter().flat_map(|c| &c.libs) {
+            aliases
+                .entry(crate_key(lib))
+                .or_default()
+                .push(crate_key(package));
+        }
+        Self {
+            config,
+            tables,
+            aliases,
+        }
     }
 
     /// The boundary that owns `table`.
@@ -954,12 +973,18 @@ impl<'a> Resolver<'a> {
     }
 
     /// The boundary of a graph node, by its crate or its module path.
+    ///
+    /// The crate is the library name at the start of the module path, or the
+    /// name of a package that builds that library.
     fn node_boundary(&self, node: &GraphNode) -> Result<Option<&'a str>, BoundaryError> {
         let root = crate_key(crate_root(&node.module));
+        let mut names = vec![root.clone()];
+        names.extend(self.aliases.get(&root).into_iter().flatten().cloned());
         let mut candidates = Vec::new();
         for (name, b) in &self.config.boundaries {
             for p in &b.crates {
-                if glob(&crate_key(p), &root) {
+                let p_key = crate_key(p);
+                if names.iter().any(|n| glob(&p_key, n)) {
                     candidates.push((name.as_str(), specificity(p)));
                 }
             }
@@ -1753,6 +1778,27 @@ crates = ["crm-core-ad*"]
         let found = crate_violations(&report);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].schema_crate, "crm-core-pkg");
+    }
+
+    #[test]
+    fn a_node_joins_the_boundary_of_its_package_by_library_name() {
+        // The package `crm-mkt-pkg` builds the library `crm_mkt`. Its module
+        // paths start with `crm_mkt`, but the config names the package.
+        const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            body_symbols: &["contacts"],
+            ..route("lib_report", "crm_mkt::routes", "GET", "/lib-report")
+        }];
+        let config = BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\ncrates = [\"crm-core\"]\n\
+             [boundaries.marketing]\nowns = [\"campaigns\"]\ncrates = [\"crm-mkt-pkg\"]\n",
+        )
+        .expect("valid");
+        let mut deps = crates(&[("crm-mkt-pkg", "crm-core")]);
+        deps.libs.insert("crm-mkt-pkg".into(), "crm_mkt".into());
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let report = check(&config, Some(&graph), Some(&deps)).expect("runs");
+        let v = table_violation(&report, "lib_report").expect("the route is in marketing");
+        assert_eq!(v.boundary, "marketing");
     }
 
     #[test]
