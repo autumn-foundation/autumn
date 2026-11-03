@@ -704,3 +704,26 @@ async fn a_refused_file_can_be_chosen_again() {
         .await
     );
 }
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_slow_older_upload_does_not_replace_the_latest_choice() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_with_script(&page, "/").await;
+    // The first upload is slow. The second one ends first.
+    choose(&page, &[("slow-j.txt", "text/plain", "old")]).await;
+    choose(&page, &[("j-new.txt", "text/plain", "new")]).await;
+    wait_for(
+        &page,
+        &format!("document.querySelector('{ROOT} input[type=hidden]')?.value === 'up-j-new.txt'"),
+    )
+    .await;
+    // Wait until the slow upload has ended too.
+    wait_for(
+        &page,
+        &format!("!document.querySelector('{ROOT}').hasAttribute('aria-busy')"),
+    )
+    .await;
+    assert_eq!(hidden_values(&page).await, "avatar=up-j-new.txt");
+}

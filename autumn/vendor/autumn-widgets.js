@@ -908,6 +908,7 @@
     if (!input || !field || !bar || !status || !alertEl || !box) return;
     var pending = 0;
     var errors = [];
+    var latest = 0;
 
     // A restored htmx snapshot can hold the state of a run that ended.
     root.removeAttribute('aria-busy');
@@ -965,6 +966,7 @@
       if (!input.multiple) files = files.slice(0, 1);
       showErrors();
       if (!files.length) return;
+      var mine = ++latest;
       var done = [];
       pending++;
       root.setAttribute('aria-busy', 'true');
@@ -972,6 +974,8 @@
         return chain.then(function () {
           status.textContent = 'Uploading ' + file.name + (files.length > 1 ? ' (' + (i + 1) + ' of ' + files.length + ')' : '') + '.';
           return upload(file).then(function (key) {
+            // A newer pick replaces this one in a single-file field.
+            if (!input.multiple && mine !== latest) return;
             addKey(key, file);
             done.push(file.name);
           }, function () {
