@@ -901,6 +901,8 @@ fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
 ///   compile-time `env!` paths point nowhere;
 /// - a shard on another checkout path must build locally instead;
 /// - a shard filter that matches nothing must fail;
+/// - a shard must fetch the locked dependencies, because trybuild builds its
+///   fixtures `--offline` and the archive carries no registry;
 /// - the archive must carry `target/debug/.fingerprint`, or trybuild builds
 ///   every fixture with default features only.
 #[test]
@@ -941,6 +943,9 @@ fn trybuild_shards_run_from_the_workspace_nextest_archive() {
         "name: workspace-tests-linux",
         "--workspace-remap . --extract-to . --extract-overwrite",
         "source=(--workspace --test integration_tests)",
+        // trybuild builds its fixtures `--offline`; the archive brings no
+        // registry with it.
+        "run: cargo fetch --locked",
         "--no-tests=fail",
         "binary_id(autumn-web::integration_tests)",
     ] {

@@ -27,6 +27,11 @@ package selection drops fixtures, and the shard still reports green.
   `cargo nextest run --archive-file … --workspace-remap . --extract-to .`
   with a filterset over `binary_id(autumn-web::integration_tests)`.
   `--no-tests=fail` replaces the old `test result: ok. N passed` grep.
+- Each shard runs `cargo fetch --locked` first. trybuild passes `--offline`
+  to every nested `cargo`, and so does the doc-snippet check in `rest`.
+  Compiling the workspace used to fill `~/.cargo/registry` as a side effect.
+  An archive does not, so a fresh runner would have nothing to resolve
+  against.
 - `.config/nextest.toml` adds `target/debug/.fingerprint` to every archive and
   fails the archive when it is missing.
 - `test-build` publishes its checkout path as a job output. A shard checked

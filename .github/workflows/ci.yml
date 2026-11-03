@@ -1095,6 +1095,13 @@ jobs:
         with:
           name: workspace-tests-linux
           path: ${{ runner.temp }}/nextest-archive
+      - name: Fetch the locked dependencies
+        # trybuild runs every nested `cargo` with `--offline`, and so does the
+        # doc-snippet check in the `rest` shard. Compiling the workspace used
+        # to fill `~/.cargo/registry` as a side effect; running from the
+        # archive does not, so a fresh runner has nothing for an offline build
+        # to resolve against. Fetch exactly what `Cargo.lock` pins.
+        run: cargo fetch --locked
       - name: Restore the build cache (local-build fallback)
         if: env.REUSE_ARCHIVE != 'true'
         uses: Swatinem/rust-cache@v2.7.8
