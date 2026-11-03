@@ -8,7 +8,7 @@
 //!   boundary B owns is a violation.
 //! * **Crate rule.** A crate in boundary A that depends on a crate that holds
 //!   B's schema is a violation. The graph cannot follow a call into a helper.
-//!   This rule closes that gap.
+//!   This rule finds that case.
 //!
 //! A [`Baseline`] holds the violations that exist today. A new violation
 //! fails. A fixed violation must leave the baseline, so the baseline only
@@ -24,7 +24,7 @@ use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
-use super::manifest::{ArchitectureGraph, GraphNode};
+use super::manifest::{AUTO_API_ID_PREFIX, ArchitectureGraph, GraphNode};
 use super::{Access, NodeKind, Provenance};
 
 /// The file that declares the boundaries, at the project root.
@@ -99,16 +99,38 @@ impl BoundaryConfig {
 
     /// Add the tables a plugin crate declares that it owns.
     ///
-    /// The plugin gets a boundary of its own name, with its crate in it. When
-    /// the config already has a boundary of that name, the lists are merged.
+    /// The config has the last word. A table that a config boundary already
+    /// owns stays there. When a config boundary lists the crate, the tables
+    /// join that boundary. Else the plugin gets a boundary of its own name.
     pub fn add_plugin(&mut self, krate: &str, owns: &[String]) {
-        let boundary = self.boundaries.entry(krate.to_owned()).or_default();
-        for table in owns {
-            if !boundary.owns.contains(table) {
-                boundary.owns.push(table.clone());
+        let key = crate_key(krate);
+        let tables: Vec<String> = owns
+            .iter()
+            .filter(|t| {
+                let t = t.to_ascii_lowercase();
+                !self
+                    .boundaries
+                    .values()
+                    .flat_map(|b| &b.owns)
+                    .any(|p| glob(&p.to_ascii_lowercase(), &t))
+            })
+            .cloned()
+            .collect();
+        let listed = self
+            .boundaries
+            .iter()
+            .flat_map(|(name, b)| b.crates.iter().map(move |p| (name, p)))
+            .filter(|(_, p)| glob(&crate_key(p), &key))
+            .max_by_key(|(_, p)| specificity(p))
+            .map(|(name, _)| name.clone());
+        let name = listed.clone().unwrap_or_else(|| krate.to_owned());
+        let boundary = self.boundaries.entry(name).or_default();
+        for table in tables {
+            if !boundary.owns.contains(&table) {
+                boundary.owns.push(table);
             }
         }
-        if !boundary.crates.iter().any(|c| c == krate) {
+        if listed.is_none() && !boundary.crates.iter().any(|c| c == krate) {
             boundary.crates.push(krate.to_owned());
         }
     }
@@ -142,13 +164,17 @@ pub enum BoundaryError {
 
 // ── Inputs ───────────────────────────────────────────────────────────
 
-/// The normal (not dev, not build) dependencies of each crate, by name.
+/// The normal (not dev, not build) dependencies of each crate, by package
+/// name.
 ///
 /// The CLI fills this from `cargo metadata`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CrateGraph {
-    /// Crate name to the names of the crates it depends on.
+    /// Package name to the package names it depends on.
     pub deps: BTreeMap<String, BTreeSet<String>>,
+    /// Package name to library name, where the two differ. A module path
+    /// starts with the library name.
+    pub libs: BTreeMap<String, String>,
 }
 
 impl CrateGraph {
@@ -159,6 +185,15 @@ impl CrateGraph {
             .or_default()
             .insert(dep.to_owned());
         self.deps.entry(dep.to_owned()).or_default();
+    }
+
+    /// The normalized names of a package: its own and its library's.
+    fn names(&self, package: &str) -> Vec<String> {
+        let mut names = vec![crate_key(package)];
+        if let Some(lib) = self.libs.get(package) {
+            names.push(crate_key(lib));
+        }
+        names
     }
 }
 
@@ -179,7 +214,7 @@ pub struct TableViolation {
     pub kind: NodeKind,
     /// The table.
     pub table: String,
-    /// The access of the edge.
+    /// The strongest access over all edges from the node to the table.
     pub access: Access,
     /// The evidence of the edge.
     pub provenance: Provenance,
@@ -221,16 +256,18 @@ pub enum Violation {
 impl Violation {
     /// The identity of the violation in a baseline.
     ///
-    /// It has no provenance, symbol or location, so a refactor that keeps the
-    /// violation does not change its key.
+    /// It holds the access, so a new write to a table that the baseline only
+    /// reads is a new violation. It holds no evidence, line or crate version,
+    /// so a refactor that keeps the query keeps the key.
     #[must_use]
     pub fn key(&self) -> BaselineEntry {
         match self {
             Self::Table(v) => BaselineEntry::Table {
                 boundary: v.boundary.clone(),
                 owner: v.owner.clone(),
-                node: v.node.clone(),
+                node: base_id(&v.node).to_owned(),
                 table: v.table.clone(),
+                access: v.access,
             },
             Self::Crate(v) => BaselineEntry::Crate {
                 boundary: v.boundary.clone(),
@@ -276,6 +313,18 @@ impl Violation {
     }
 }
 
+/// Which rules a check ran.
+///
+/// A rule that did not run finds nothing. Its baseline entries are then not
+/// fixed, only unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulesRun {
+    /// The graph rule ran.
+    pub graph: bool,
+    /// The crate rule ran, and it knew every schema crate.
+    pub crates: bool,
+}
+
 /// The result of a check before the baseline is applied.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Report {
@@ -283,6 +332,8 @@ pub struct Report {
     pub violations: Vec<Violation>,
     /// Patterns that match nothing, and other notes that do not fail.
     pub warnings: Vec<String>,
+    /// The rules that ran.
+    pub rules: RulesRun,
 }
 
 /// Check the graph rule and the crate rule.
@@ -299,28 +350,85 @@ pub fn check(
     graph: Option<&ArchitectureGraph>,
     crates: Option<&CrateGraph>,
 ) -> Result<Report, BoundaryError> {
-    let resolver = Resolver { config };
-    let mut found: BTreeMap<BaselineEntry, Violation> = BTreeMap::new();
+    let resolver = Resolver::new(config, graph);
+    let mut found = Found::default();
     let mut warnings = Vec::new();
+    let mut rules = RulesRun::default();
     if let Some(graph) = graph {
         graph_rule(&resolver, graph, &mut found)?;
+        rules.graph = true;
     }
     if let Some(crates) = crates {
-        crate_rule(&resolver, graph, crates, &mut found)?;
+        rules.crates = crate_rule(&resolver, graph, crates, &mut found, &mut warnings)?;
     }
     unmatched_patterns(&resolver, graph, crates, &mut warnings)?;
+    let mut violations: BTreeMap<BaselineEntry, Violation> = BTreeMap::new();
+    for v in found.tables.into_values() {
+        let v = Violation::Table(v);
+        violations.insert(v.key(), v);
+    }
+    for v in found.crates {
+        violations.entry(v.key()).or_insert(v);
+    }
     Ok(Report {
-        violations: found.into_values().collect(),
+        violations: violations.into_values().collect(),
         warnings,
+        rules,
     })
 }
 
+/// Violations while the rules run.
+#[derive(Default)]
+struct Found {
+    /// By (boundary, owner, node, table), before the access is known.
+    tables: BTreeMap<(String, String, String, String), TableViolation>,
+    /// Crate-rule violations.
+    crates: Vec<Violation>,
+}
+
+impl Found {
+    /// Add a table violation. One is kept per node and table: the access is
+    /// the strongest, and a direct edge is the better evidence.
+    fn add_table(&mut self, v: TableViolation) {
+        let key = (
+            v.boundary.clone(),
+            v.owner.clone(),
+            base_id(&v.node).to_owned(),
+            v.table.clone(),
+        );
+        match self.tables.get_mut(&key) {
+            None => {
+                self.tables.insert(key, v);
+            }
+            Some(old) => {
+                let access = stronger(old.access, v.access);
+                if old.via.is_some() && v.via.is_none() {
+                    *old = v;
+                }
+                old.access = access;
+            }
+        }
+    }
+}
+
+/// The stronger of two accesses. A write is stronger than a read.
+const fn stronger(a: Access, b: Access) -> Access {
+    match (a, b) {
+        (Access::ReadWrite, _)
+        | (_, Access::ReadWrite)
+        | (Access::Read, Access::Write)
+        | (Access::Write, Access::Read) => Access::ReadWrite,
+        (Access::Write, Access::Write) => Access::Write,
+        (Access::Read, Access::Read) => Access::Read,
+    }
+}
+
 /// The graph rule: every edge from a node in a boundary to a table another
-/// boundary owns.
+/// boundary owns. A repository also reaches its own table.
 fn graph_rule(
     r: &Resolver<'_>,
     graph: &ArchitectureGraph,
-    found: &mut BTreeMap<BaselineEntry, Violation>,
+    found: &mut Found,
 ) -> Result<(), BoundaryError> {
     // Resolve every table and node first, so a conflict in the config is an
     // error even where no edge crosses it.
@@ -332,6 +440,40 @@ fn graph_rule(
     }
     let nodes: BTreeMap<&str, &GraphNode> =
         graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut report = |from: &GraphNode, boundary: &str, table: String, how: Edge| {
+        let Ok(Some(owner)) = r.owner(&table) else {
+            return;
+        };
+        if owner == boundary || r.allows(boundary, &table, how.access) {
+            return;
+        }
+        found.add_table(TableViolation {
+            boundary: boundary.to_owned(),
+            owner: owner.to_owned(),
+            node: from.id.clone(),
+            label: from.label(),
+            kind: from.kind,
+            table,
+            access: how.access,
+            provenance: how.provenance,
+            symbol: how.symbol,
+            via: how.via,
+        });
+    };
+    for node in &graph.nodes {
+        let (Some(repository), Some(boundary)) = (&node.repository, r.node_boundary(node)?) else {
+            continue;
+        };
+        // A repository that overrides its table queries that table, and the
+        // graph has no edge for it.
+        let how = Edge {
+            access: Access::ReadWrite,
+            provenance: Provenance::Declaration,
+            symbol: String::new(),
+            via: None,
+        };
+        report(node, boundary, repository.table.clone(), how);
+    }
     for edge in &graph.edges {
         let Some(from) = nodes.get(edge.from.as_str()) else {
             continue;
@@ -340,44 +482,30 @@ fn graph_rule(
             continue;
         };
         for (table, via) in reached_tables(graph, &nodes, &edge.to) {
-            let Some(owner) = r.owner(&table)? else {
-                continue;
-            };
-            if owner == boundary || r.allows(boundary, &table, edge.access) {
-                continue;
-            }
-            let direct = via.is_none();
-            let violation = Violation::Table(TableViolation {
-                boundary: boundary.to_owned(),
-                owner: owner.to_owned(),
-                node: from.id.clone(),
-                label: from.label(),
-                kind: from.kind,
-                table,
+            let how = Edge {
                 access: edge.access,
                 provenance: edge.provenance,
                 symbol: edge.symbol.clone(),
                 via,
-            });
-            // One violation per node and table. A direct edge is the better
-            // evidence, so it replaces an edge through a repository.
-            let key = violation.key();
-            let keep_old = matches!(
-                found.get(&key),
-                Some(Violation::Table(old)) if old.via.is_none() || !direct
-            );
-            if !keep_old {
-                found.insert(key, violation);
-            }
+            };
+            report(from, boundary, table, how);
         }
     }
     Ok(())
 }
 
+/// The evidence for one reached table.
+struct Edge {
+    access: Access,
+    provenance: Provenance,
+    symbol: String,
+    via: Option<String>,
+}
+
 /// The tables an edge target stands for, with the repository in between.
 ///
-/// A model is its table. A repository is the tables of the models it has
-/// edges to, which include its declared relations.
+/// A model is its table. A repository is its own table and the tables of
+/// the models it has edges to, which include its declared relations.
 fn reached_tables(
     graph: &ArchitectureGraph,
     nodes: &BTreeMap<&str, &GraphNode>,
@@ -399,9 +527,7 @@ fn reached_tables(
         .filter_map(|e| nodes.get(e.to.as_str()))
         .filter_map(|n| n.model.as_ref().map(|m| m.table.clone()))
         .collect();
-    if tables.is_empty() {
-        tables.insert(repository.table.clone());
-    }
+    tables.insert(repository.table.clone());
     tables
         .into_iter()
         .map(|t| (t, Some(node.id.clone())))
@@ -412,16 +538,32 @@ fn reached_tables(
 /// boundary's schema crate.
 ///
 /// The search goes through crates in no boundary, such as a shared helper
-/// crate. It stops at a crate in a boundary: that crate is checked on its own.
+/// crate. It stops at a crate in a boundary: that crate is checked on its own,
+/// or it is in a `modules` boundary that the graph rule checks.
+///
+/// Returns whether the rule knew every schema crate.
 fn crate_rule(
     r: &Resolver<'_>,
     graph: Option<&ArchitectureGraph>,
     crates: &CrateGraph,
-    found: &mut BTreeMap<BaselineEntry, Violation>,
-) -> Result<(), BoundaryError> {
+    found: &mut Found,
+    warnings: &mut Vec<String>,
+) -> Result<bool, BoundaryError> {
+    let mut complete = true;
+    if graph.is_none() {
+        for (name, b) in &r.config.boundaries {
+            if !b.owns.is_empty() && b.schema_crates.is_empty() {
+                complete = false;
+                warnings.push(format!(
+                    "boundary `{name}`: with no graph, its schema crates are unknown; set \
+                     `schema_crates` or check a graph"
+                ));
+            }
+        }
+    }
     let schema = schema_owners(r, graph, crates)?;
     for start in crates.deps.keys() {
-        let Some(boundary) = r.crate_boundary(start)? else {
+        let Some(boundary) = r.crate_boundary(start, crates)? else {
             continue;
         };
         let mut parent: BTreeMap<&str, &str> = BTreeMap::new();
@@ -432,7 +574,7 @@ fn crate_rule(
                     continue;
                 }
                 parent.insert(dep, current);
-                let dep_boundary = r.crate_boundary(dep)?;
+                let dep_boundary = r.crate_boundary(dep, crates)?;
                 for owner in schema.get(dep.as_str()).into_iter().flatten() {
                     if *owner == boundary
                         || dep_boundary == Some(boundary)
@@ -447,22 +589,21 @@ fn crate_rule(
                         at = prev;
                     }
                     path.reverse();
-                    let violation = Violation::Crate(CrateViolation {
+                    found.crates.push(Violation::Crate(CrateViolation {
                         boundary: boundary.to_owned(),
                         owner: (*owner).to_owned(),
                         krate: start.clone(),
                         schema_crate: dep.clone(),
                         path,
-                    });
-                    found.entry(violation.key()).or_insert(violation);
+                    }));
                 }
-                if dep_boundary.is_none() {
+                if dep_boundary.is_none() && !r.in_modules_boundary(dep, crates) {
                     queue.push_back(dep);
                 }
             }
         }
     }
-    Ok(())
+    Ok(complete)
 }
 
 /// The boundaries whose schema each crate holds.
@@ -478,13 +619,14 @@ fn schema_owners<'a>(
     let mut by_crate: BTreeMap<String, BTreeSet<&'a str>> = BTreeMap::new();
     for (name, boundary) in &r.config.boundaries {
         for package in crates.deps.keys() {
-            let key = crate_key(package);
-            if boundary
-                .schema_crates
-                .iter()
-                .any(|p| glob(&crate_key(p), &key))
-            {
-                by_crate.entry(key).or_default().insert(name.as_str());
+            if boundary.schema_crates.iter().any(|p| {
+                let p = crate_key(p);
+                crates.names(package).iter().any(|n| glob(&p, n))
+            }) {
+                by_crate
+                    .entry(crate_key(package))
+                    .or_default()
+                    .insert(name.as_str());
             }
         }
     }
@@ -502,11 +644,15 @@ fn schema_owners<'a>(
                 .insert(owner);
         }
     }
-    Ok(crates
-        .deps
-        .keys()
-        .filter_map(|p| by_crate.get(&crate_key(p)).map(|o| (p.clone(), o.clone())))
-        .collect())
+    let mut owners: BTreeMap<String, BTreeSet<&'a str>> = BTreeMap::new();
+    for package in crates.deps.keys() {
+        for name in crates.names(package) {
+            if let Some(set) = by_crate.get(&name) {
+                owners.entry(package.clone()).or_default().extend(set);
+            }
+        }
+    }
+    Ok(owners)
 }
 
 /// A warning for each pattern that matches nothing in the inputs.
@@ -519,22 +665,14 @@ fn unmatched_patterns(
     crates: Option<&CrateGraph>,
     warnings: &mut Vec<String>,
 ) -> Result<(), BoundaryError> {
-    let tables: BTreeSet<String> = graph
-        .iter()
-        .flat_map(|g| &g.nodes)
-        .filter_map(|n| n.model.as_ref().map(|m| m.table.to_ascii_lowercase()))
-        .collect();
     let mut crate_names: BTreeSet<String> = graph
         .iter()
         .flat_map(|g| &g.nodes)
         .map(|n| crate_key(crate_root(&n.module)))
         .collect();
-    crate_names.extend(
-        crates
-            .iter()
-            .flat_map(|c| c.deps.keys())
-            .map(|k| crate_key(k)),
-    );
+    for c in crates {
+        crate_names.extend(c.deps.keys().flat_map(|k| c.names(k)));
+    }
     for (name, b) in &r.config.boundaries {
         let mut warn = |list: &str, pattern: &str, what: &str| {
             warnings.push(format!(
@@ -544,7 +682,7 @@ fn unmatched_patterns(
         if let Some(graph) = graph {
             for p in &b.owns {
                 let p_lower = p.to_ascii_lowercase();
-                if !tables.iter().any(|t| glob(&p_lower, t)) {
+                if !r.tables.iter().any(|t| glob(&p_lower, t)) {
                     warn("owns", p, "table of a #[model] in the graph");
                 }
             }
@@ -565,14 +703,18 @@ fn unmatched_patterns(
         if let Some(crates) = crates {
             for p in &b.schema_crates {
                 let key = crate_key(p);
-                if !crates.deps.keys().any(|c| glob(&key, &crate_key(c))) {
+                let hit = crates
+                    .deps
+                    .keys()
+                    .any(|c| crates.names(c).iter().any(|n| glob(&key, n)));
+                if !hit {
                     warn("schema_crates", p, "crate");
                 }
             }
         }
         for (list, entries) in [("may_read", &b.may_read), ("may_write", &b.may_write)] {
             for t in entries {
-                if r.owner(t)?.is_none() {
+                if r.exception_owners(t).is_empty() {
                     warn(list, t, "table that a boundary owns");
                 }
             }
@@ -593,10 +735,12 @@ pub enum BaselineEntry {
         boundary: String,
         /// The boundary that owns the table.
         owner: String,
-        /// The node id.
+        /// The node id, with no crate version.
         node: String,
         /// The table.
         table: String,
+        /// The strongest access of the node to the table.
+        access: Access,
     },
     /// A crate-rule violation.
     Crate {
@@ -620,7 +764,8 @@ impl std::fmt::Display for BaselineEntry {
                 owner,
                 node,
                 table,
-            } => write!(f, "{boundary} -> {owner}.{table} ({node})"),
+                access,
+            } => write!(f, "{boundary} -> {owner}.{table} ({access}, {node})"),
             Self::Crate {
                 boundary,
                 owner,
@@ -749,13 +894,19 @@ impl Ratchet {
 }
 
 /// Compare a report with a baseline. No baseline holds nothing.
+///
+/// A baseline entry of a rule that did not run is not fixed.
 #[must_use]
 pub fn ratchet(report: Report, baseline: Option<&Baseline>) -> Ratchet {
     let accepted: BTreeSet<&BaselineEntry> = baseline.iter().flat_map(|b| &b.violations).collect();
     let current: BTreeSet<BaselineEntry> = report.violations.iter().map(Violation::key).collect();
+    let ran = |entry: &BaselineEntry| match entry {
+        BaselineEntry::Table { .. } => report.rules.graph,
+        BaselineEntry::Crate { .. } => report.rules.crates,
+    };
     let fixed = accepted
         .iter()
-        .filter(|e| !current.contains(**e))
+        .filter(|e| ran(e) && !current.contains(**e))
         .map(|e| (*e).clone())
         .collect();
     let (known, new) = report
@@ -775,9 +926,20 @@ pub fn ratchet(report: Report, baseline: Option<&Baseline>) -> Ratchet {
 /// Finds the boundary of a table, node or crate.
 struct Resolver<'a> {
     config: &'a BoundaryConfig,
+    /// The tables of the models in the graph, lowercase.
+    tables: BTreeSet<String>,
 }
 
 impl<'a> Resolver<'a> {
+    fn new(config: &'a BoundaryConfig, graph: Option<&ArchitectureGraph>) -> Self {
+        let tables = graph
+            .iter()
+            .flat_map(|g| &g.nodes)
+            .filter_map(|n| n.model.as_ref().map(|m| m.table.to_ascii_lowercase()))
+            .collect();
+        Self { config, tables }
+    }
+
     /// The boundary that owns `table`.
     fn owner(&self, table: &str) -> Result<Option<&'a str>, BoundaryError> {
         let table = table.to_ascii_lowercase();
@@ -811,18 +973,33 @@ impl<'a> Resolver<'a> {
         pick("node", &node.id, &candidates)
     }
 
-    /// The boundary of a crate, by its name.
-    fn crate_boundary(&self, krate: &str) -> Result<Option<&'a str>, BoundaryError> {
-        let key = crate_key(krate);
+    /// The boundary of a package, by its name or its library name.
+    fn crate_boundary(
+        &self,
+        package: &str,
+        crates: &CrateGraph,
+    ) -> Result<Option<&'a str>, BoundaryError> {
+        let names = crates.names(package);
         let mut candidates = Vec::new();
         for (name, b) in &self.config.boundaries {
             for p in &b.crates {
-                if glob(&crate_key(p), &key) {
+                let p_key = crate_key(p);
+                if names.iter().any(|n| glob(&p_key, n)) {
                     candidates.push((name.as_str(), specificity(p)));
                 }
             }
         }
-        pick("crate", krate, &candidates)
+        pick("crate", package, &candidates)
+    }
+
+    /// Whether a `modules` pattern of a boundary matches the crate root.
+    fn in_modules_boundary(&self, package: &str, crates: &CrateGraph) -> bool {
+        let names = crates.names(package);
+        self.config
+            .boundaries
+            .values()
+            .flat_map(|b| &b.modules)
+            .any(|p| names.iter().any(|n| module_matches(p, n)))
     }
 
     /// Whether `boundary` lists `table` as an exception for `access`.
@@ -837,6 +1014,21 @@ impl<'a> Resolver<'a> {
         hit(&b.may_write) || (access == Access::Read && hit(&b.may_read))
     }
 
+    /// The boundaries that own a table an exception pattern matches.
+    ///
+    /// The pattern is matched against the tables in the graph, and read as a
+    /// table name too. A tie between two boundaries counts for neither.
+    fn exception_owners(&self, pattern: &str) -> BTreeSet<&'a str> {
+        let lower = pattern.to_ascii_lowercase();
+        self.tables
+            .iter()
+            .filter(|t| glob(&lower, t))
+            .map(String::as_str)
+            .chain(std::iter::once(lower.as_str()))
+            .filter_map(|t| self.owner(t).ok().flatten())
+            .collect()
+    }
+
     /// Whether `boundary` lists a table of `owner` as an exception. That
     /// exception needs a dependency on `owner`'s schema crate.
     fn allows_schema_of(&self, boundary: &str, owner: &str) -> bool {
@@ -846,7 +1038,7 @@ impl<'a> Resolver<'a> {
         b.may_read
             .iter()
             .chain(&b.may_write)
-            .any(|t| matches!(self.owner(t), Ok(Some(o)) if o == owner))
+            .any(|t| self.exception_owners(t).contains(owner))
     }
 }
 
@@ -895,6 +1087,14 @@ fn crate_root(module: &str) -> &str {
 /// A crate name with `-` as `_`, as `module_path!()` spells it.
 fn crate_key(name: &str) -> String {
     name.replace('-', "_")
+}
+
+/// A node id without the `@<version>` that a second crate version adds.
+fn base_id(id: &str) -> &str {
+    if id.starts_with(AUTO_API_ID_PREFIX) {
+        return id;
+    }
+    id.split_once('@').map_or(id, |(base, _)| base)
 }
 
 /// Whether `text` matches `pattern`, where `*` matches any run.
@@ -993,8 +1193,8 @@ mod tests {
         },
         // Marketing joins a core table in raw SQL.
         RouteGraphDescriptor {
-            body_symbols: &["c", "campaigns", "contact_id", "contacts", "ct", "id"],
-            sql_symbols: &["c", "campaigns", "contact_id", "contacts", "ct", "id"],
+            body_symbols: &["CONTACTS", "c", "campaigns", "contact_id", "ct", "id"],
+            sql_symbols: &["CONTACTS", "c", "campaigns", "contact_id", "ct", "id"],
             ..route("joined", "crm_marketing::routes", "GET", "/joined")
         },
         // Marketing writes a core table through the core repository.
@@ -1096,6 +1296,25 @@ schema_crates = ["billing-schema"]
     }
 
     #[test]
+    fn a_plugin_joins_the_boundary_that_lists_its_crate() {
+        let mut config = BoundaryConfig::parse("[boundaries.admin]\ncrates = [\"admin-plugin\"]\n")
+            .expect("valid");
+        config.add_plugin("admin-plugin", &["admin_log".to_owned()]);
+        assert_eq!(config.boundaries.len(), 1);
+        assert_eq!(config.boundaries["admin"].owns, ["admin_log"]);
+    }
+
+    #[test]
+    fn a_plugin_table_the_config_owns_stays_with_the_config() {
+        let mut config =
+            BoundaryConfig::parse("[boundaries.admin]\nowns = [\"admin_*\"]\n").expect("valid");
+        config.add_plugin("admin-plugin", &["admin_log".to_owned()]);
+        let plugin = &config.boundaries["admin-plugin"];
+        assert!(plugin.owns.is_empty(), "{plugin:?}");
+        assert!(check(&config, Some(&graph()), None).is_ok());
+    }
+
+    #[test]
     fn a_plugin_adds_a_boundary_of_its_own() {
         let mut config = config("");
         config.add_plugin("autumn-admin-plugin", &["admin_audit_log".to_owned()]);
@@ -1141,9 +1360,11 @@ schema_crates = ["billing-schema"]
     #[test]
     fn a_raw_sql_join_is_a_violation() {
         let report = check(&config(""), Some(&graph()), None).expect("check runs");
+        // Only the SQL path folds `CONTACTS` to the `contacts` table.
         let v = table_violation(&report, "joined").expect("the JOIN reaches contacts");
         assert_eq!((v.owner.as_str(), v.table.as_str()), ("core", "contacts"));
         assert_eq!(v.provenance, Provenance::Body);
+        assert_eq!(v.symbol, "CONTACTS");
     }
 
     #[test]
@@ -1170,12 +1391,87 @@ schema_crates = ["billing-schema"]
             body_symbols: &["contacts"],
             ..route("both", "crm_marketing::routes", "GET", "/both")
         }];
-        let graph = build(&[], 0, BOTH, MODELS, REPOSITORIES, &[]);
+        let mut graph = build(&[], 0, BOTH, MODELS, REPOSITORIES, &[]);
+        // `build` sorts the model edge first. Reverse the order, so the
+        // repository edge comes first and the direct edge must replace it.
+        graph.edges.reverse();
         let report = check(&config(""), Some(&graph), None).expect("check runs");
         let found = tables(&report);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].via, None);
         assert_eq!(found[0].symbol, "contacts");
+    }
+
+    #[test]
+    fn a_repository_with_an_overridden_table_reaches_that_table() {
+        const ARCHIVE: &[RepositoryGraphDescriptor] = &[RepositoryGraphDescriptor {
+            repository: "ArchiveRepository",
+            implementation: "PgArchiveRepository",
+            model: "Contact",
+            table: "contacts_archive",
+            api: "",
+            module_path: "crm_core::repositories",
+            file: "src/repositories.rs",
+            line: 1,
+            crate_version: "0.1.0",
+        }];
+        const USER: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            signature_symbols: &["PgArchiveRepository"],
+            ..route("archive", "crm_marketing::routes", "GET", "/archive")
+        }];
+        let config = config(
+            "may_write = [\"contacts\"]\n\
+             [boundaries.archive]\nowns = [\"contacts_archive\"]\nmodules = [\"crm_archive\"]\n",
+        );
+        let graph = build(&[], 0, USER, MODELS, ARCHIVE, &[]);
+        let report = check(&config, Some(&graph), None).expect("check runs");
+        let route = table_violation(&report, "archive").expect("the route reaches the archive");
+        assert_eq!(
+            (route.owner.as_str(), route.table.as_str()),
+            ("archive", "contacts_archive")
+        );
+        // The core repository over the archive table is a violation too.
+        assert!(
+            tables(&report)
+                .iter()
+                .any(|v| v.kind == NodeKind::Repository && v.table == "contacts_archive"),
+            "{:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_node_is_an_error() {
+        let config = BoundaryConfig::parse(
+            "[boundaries.a]\nmodules = [\"crm_marketing\"]\n\
+             [boundaries.b]\nmodules = [\"crm_marketing\"]\n",
+        )
+        .expect("valid");
+        let err = check(&config, Some(&graph()), None).expect_err("ambiguous");
+        assert!(
+            matches!(err, BoundaryError::Ambiguous { what: "node", .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_key_holds_the_base_id_and_the_access() {
+        let report = current();
+        let Violation::Table(mut v) = report.violations[0].clone() else {
+            panic!("a table violation");
+        };
+        let read = Violation::Table(v.clone()).key();
+        v.access = Access::Write;
+        assert_ne!(
+            Violation::Table(v.clone()).key(),
+            read,
+            "a new write is a new violation"
+        );
+        v.node.push_str("@0.2.0");
+        let BaselineEntry::Table { node, .. } = Violation::Table(v).key() else {
+            panic!("a table key");
+        };
+        assert!(!node.contains('@'), "{node}");
     }
 
     #[test]
@@ -1375,12 +1671,102 @@ crates = ["crm-core-ad*"]
     }
 
     #[test]
-    fn a_dev_dependency_is_not_in_the_crate_graph() {
-        // The CLI leaves dev and build dependencies out. An empty graph has
-        // nothing to report.
-        let report =
-            check(&config(""), Some(&graph()), Some(&CrateGraph::default())).expect("runs");
+    fn may_write_allows_the_dependency_it_needs() {
+        let deps = crates(&[("crm-marketing", "crm-core")]);
+        let report = check(
+            &config("may_write = [\"contacts\"]\n"),
+            Some(&graph()),
+            Some(&deps),
+        )
+        .expect("runs");
         assert!(crate_violations(&report).is_empty());
+    }
+
+    #[test]
+    fn a_glob_exception_allows_the_dependency_and_does_not_warn() {
+        let deps = crates(&[("crm-marketing", "crm-core")]);
+        let report = check(
+            &config("may_read = [\"contact*\"]\n"),
+            Some(&graph()),
+            Some(&deps),
+        )
+        .expect("runs");
+        assert!(
+            crate_violations(&report).is_empty(),
+            "{:?}",
+            report.violations
+        );
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("contact*")),
+            "{:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn the_search_stops_at_a_crate_in_a_boundary() {
+        // `crm-core-api` is in core (by `crm-core*`) and depends on the core
+        // schema. Marketing depends on the API crate only. That crate is
+        // checked on its own; marketing is not.
+        let mut config = config("");
+        config
+            .boundaries
+            .get_mut("core")
+            .expect("core")
+            .schema_crates = vec!["crm-core-schema".into()];
+        let deps = crates(&[
+            ("crm-marketing", "crm-core-api"),
+            ("crm-core-api", "crm-core-schema"),
+        ]);
+        let report = check(&config, Some(&graph()), Some(&deps)).expect("runs");
+        assert!(
+            crate_violations(&report).is_empty(),
+            "{:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn the_search_stops_at_a_crate_in_a_modules_boundary() {
+        let config = BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\nmodules = [\"crm_core\"]\n\
+             [boundaries.billing]\nowns = [\"campaigns\"]\ncrates = [\"crm-billing\"]\n\
+             schema_crates = [\"crm-billing\"]\n\
+             [boundaries.marketing]\nowns = []\ncrates = [\"crm-marketing\"]\n",
+        )
+        .expect("valid");
+        let deps = crates(&[("crm-marketing", "crm-core"), ("crm-core", "crm-billing")]);
+        let report = check(&config, Some(&graph()), Some(&deps)).expect("runs");
+        assert!(
+            !crate_violations(&report)
+                .iter()
+                .any(|v| v.boundary == "marketing"),
+            "{:?}",
+            report.violations
+        );
+    }
+
+    #[test]
+    fn a_schema_crate_matches_its_library_name() {
+        // The package `crm-core-pkg` builds the library `crm_core`, which is
+        // the name in the module paths of the models.
+        let mut deps = crates(&[("crm-marketing", "crm-core-pkg")]);
+        deps.libs.insert("crm-core-pkg".into(), "crm_core".into());
+        let report = check(&config(""), Some(&graph()), Some(&deps)).expect("runs");
+        let found = crate_violations(&report);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].schema_crate, "crm-core-pkg");
+    }
+
+    #[test]
+    fn without_a_graph_a_derived_schema_crate_is_a_warning() {
+        let deps = crates(&[("crm-marketing", "crm-core")]);
+        let report = check(&config(""), None, Some(&deps)).expect("runs");
+        assert!(
+            report.warnings.iter().any(|w| w.contains("schema_crates")),
+            "{:?}",
+            report.warnings
+        );
     }
 
     // ── Baseline and ratchet ─────────────────────────────────────────
@@ -1437,6 +1823,32 @@ crates = ["crm-core-ad*"]
             "{}",
             result.render()
         );
+    }
+
+    #[test]
+    fn fixing_one_violation_shrinks_the_baseline_by_one() {
+        let report = current();
+        let baseline = Baseline::from_violations(&report.violations);
+        // Allow the reads. Only the write through the repository is left.
+        let fixed =
+            check(&config("may_read = [\"contacts\"]\n"), Some(&graph()), None).expect("runs");
+        let result = ratchet(fixed.clone(), Some(&baseline));
+        assert_eq!(result.fixed.len(), 2, "{:?}", result.fixed);
+        assert_eq!(result.known.len(), 1);
+        let shrunk = Baseline::from_violations(&fixed.violations);
+        assert_eq!(shrunk.violations.len(), 1);
+        assert!(ratchet(fixed, Some(&shrunk)).passes());
+    }
+
+    #[test]
+    fn a_rule_that_did_not_run_fixes_nothing() {
+        let report = current();
+        let baseline = Baseline::from_violations(&report.violations);
+        // No graph: the graph rule did not run, so its entries are not fixed.
+        let without_graph = check(&config(""), None, None).expect("runs");
+        let result = ratchet(without_graph, Some(&baseline));
+        assert!(result.fixed.is_empty(), "{:?}", result.fixed);
+        assert!(result.passes());
     }
 
     #[test]

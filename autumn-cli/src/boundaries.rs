@@ -6,10 +6,9 @@
 //!
 //! See `docs/guide/table-ownership.md`.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use autumn_web::graph::boundaries::{self, Baseline, BoundaryConfig, CrateGraph, Ratchet};
 use autumn_web::graph::manifest::ArchitectureGraph;
@@ -57,6 +56,11 @@ pub fn parse_cargo_metadata(metadata: &Value) -> Result<CargoFacts, String> {
         };
         names.insert(id.to_owned(), name.to_owned());
         facts.crates.deps.entry(name.to_owned()).or_default();
+        if let Some(lib) = library_name(package)
+            && lib != name.replace('-', "_")
+        {
+            facts.crates.libs.insert(name.to_owned(), lib);
+        }
         let owns = package
             .pointer("/metadata/autumn/boundary/owns")
             .and_then(Value::as_array);
@@ -104,6 +108,26 @@ pub fn parse_cargo_metadata(metadata: &Value) -> Result<CargoFacts, String> {
     Ok(facts)
 }
 
+/// The library target name of a package, if it has one.
+fn library_name(package: &Value) -> Option<String> {
+    package
+        .get("targets")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|t| {
+            t.get("kind")
+                .and_then(Value::as_array)
+                .is_some_and(|kinds| {
+                    kinds
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|k| k.ends_with("lib") || k == "proc-macro")
+                })
+        })
+        .and_then(|t| t.get("name").and_then(Value::as_str))
+        .map(|n| n.replace('-', "_"))
+}
+
 /// Whether one `resolve` dependency is a normal one.
 ///
 /// Cargo writes `kind: null` for a normal dependency. An old Cargo writes no
@@ -126,9 +150,10 @@ pub const DOCTOR_BUDGET: Duration = Duration::from_secs(30);
 
 /// Run `cargo metadata` in `dir` and read it.
 ///
+/// `args` are feature flags, so the crate graph matches the built app.
 /// `offline` adds `--offline`, so no index is fetched. With a `budget`, the
-/// child is killed when it runs longer. The child may not install a
-/// toolchain.
+/// child and its children are stopped when it runs longer. The child may not
+/// install a toolchain.
 ///
 /// # Errors
 ///
@@ -136,6 +161,7 @@ pub const DOCTOR_BUDGET: Duration = Duration::from_secs(30);
 /// cannot read.
 pub fn cargo_facts(
     dir: &Path,
+    args: &[String],
     offline: bool,
     budget: Option<Duration>,
 ) -> Result<CargoFacts, String> {
@@ -143,53 +169,28 @@ pub fn cargo_facts(
     let mut command = Command::new(cargo);
     command
         .args(["metadata", "--format-version=1"])
-        .current_dir(dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .args(args)
+        .current_dir(dir);
     if offline {
         command.arg("--offline");
     }
     crate::deps::no_toolchain_installs(&mut command);
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("cannot run cargo metadata: {e}"))?;
-    // Read both pipes on threads, so a full pipe cannot stall the child.
-    let stdout = child.stdout.take().map(read_on_thread);
-    let stderr = child.stderr.take().map(read_on_thread);
-    let deadline = budget.map(|b| Instant::now() + b);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {}
-            Err(e) => return Err(format!("cannot wait for cargo metadata: {e}")),
+    let output = crate::deps::run_bounded(&mut command, budget).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::Interrupted {
+            "cargo metadata did not finish in time".to_owned()
+        } else {
+            format!("cannot run cargo metadata: {e}")
         }
-        if deadline.is_some_and(|d| Instant::now() >= d) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("cargo metadata did not finish in time".to_owned());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
-    if !status.success() {
-        let stderr = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+    })?;
+    if !output.status.success() {
         return Err(format!(
             "cargo metadata failed: {}",
-            String::from_utf8_lossy(&stderr).trim()
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    let json: Value = serde_json::from_slice(&stdout)
+    let json: Value = serde_json::from_slice(&output.stdout)
         .map_err(|e| format!("cargo metadata printed bad JSON: {e}"))?;
     parse_cargo_metadata(&json)
-}
-
-/// Read a pipe to its end on a new thread.
-fn read_on_thread<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        bytes
-    })
 }
 
 /// Read and parse `boundaries.toml`.
@@ -287,6 +288,9 @@ fn fail(message: &str) -> ! {
 }
 
 /// Run `autumn graph check-boundaries`.
+///
+/// It builds the app (or reads `--graph`) and runs `cargo metadata` in the
+/// current directory, as the build does.
 pub fn run(opts: &CheckBoundariesOptions<'_>) {
     eprintln!("\u{1F342} autumn graph check-boundaries\n");
     let config_path = Path::new(opts.config);
@@ -297,30 +301,30 @@ pub fn run(opts: &CheckBoundariesOptions<'_>) {
             .as_deref()
             .map(|p| relative_to_config(config_path, p))
     });
-    let graph = match opts.graph {
-        Some(path) => load_graph(Path::new(path)).unwrap_or_else(|e| fail(&e)),
-        None => crate::graph::dump(&opts.build),
-    };
-    let dir = config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let facts = cargo_facts(dir, false, None).unwrap_or_else(|e| fail(&format!("crate rule: {e}")));
+    if opts.update_baseline && baseline_path.is_none() {
+        fail("--update-baseline needs --baseline PATH or `baseline` in boundaries.toml");
+    }
     let baseline = match (&baseline_path, opts.update_baseline) {
         (Some(path), false) => load_baseline(path).unwrap_or_else(|e| fail(&e)),
         _ => None,
     };
+    let graph = opts.graph.map_or_else(
+        || crate::graph::dump(&opts.build),
+        |path| load_graph(Path::new(path)).unwrap_or_else(|e| fail(&e)),
+    );
+    let facts = cargo_facts(Path::new("."), &opts.build.features.to_args(), false, None)
+        .unwrap_or_else(|e| fail(&format!("crate rule: {e}")));
     let (result, all) = evaluate(config, Some(&graph), Some(&facts), baseline.as_ref())
         .unwrap_or_else(|e| fail(&e));
 
-    if opts.update_baseline {
-        let Some(path) = baseline_path else {
-            fail("--update-baseline needs --baseline PATH or `baseline` in boundaries.toml");
-        };
-        let before = load_baseline(&path).unwrap_or_else(|e| fail(&e));
+    if let (true, Some(path)) = (opts.update_baseline, &baseline_path) {
+        // The old file may hold a merge conflict. It only gives the count.
+        let old = load_baseline(path)
+            .ok()
+            .flatten()
+            .map_or(0, |b| b.violations.len());
         let next = Baseline::from_violations(&all);
-        write_baseline(&path, &next).unwrap_or_else(|e| fail(&e));
-        let old = before.map_or(0, |b| b.violations.len());
+        write_baseline(path, &next).unwrap_or_else(|e| fail(&e));
         eprintln!(
             "\u{2713} Wrote {} violation(s) to {} (was {old}).",
             next.violations.len(),
@@ -430,11 +434,75 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_adds_plugin_boundaries() {
+    fn a_read_of_a_plugin_table_is_a_violation() {
+        use autumn_web::graph::manifest::build;
+        use autumn_web::graph::{ModelGraphDescriptor, RouteGraphDescriptor};
+        const MODELS: &[ModelGraphDescriptor] = &[ModelGraphDescriptor {
+            model: "AdminLog",
+            model_path: "admin_plugin::AdminLog",
+            table: "admin_log",
+            relations: &[],
+            module_path: "admin_plugin::models",
+            file: "src/lib.rs",
+            line: 1,
+            crate_version: "0.1.0",
+        }];
+        const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            handler: "audit",
+            module_path: "app::routes",
+            method: "GET",
+            path: "/audit",
+            static_route: false,
+            file: "src/main.rs",
+            line: 1,
+            crate_version: "0.1.0",
+            signature_symbols: &[],
+            body_symbols: &["admin_log"],
+            sql_symbols: &[],
+        }];
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
         let config =
             BoundaryConfig::parse("[boundaries.app]\nmodules = [\"app\"]\n").expect("valid");
         let facts = parse_cargo_metadata(&metadata()).expect("valid");
-        let (result, _) = evaluate(config, None, Some(&facts), None).expect("runs");
-        assert!(result.passes(), "{}", result.render());
+        let (result, _) = evaluate(config, Some(&graph), Some(&facts), None).expect("runs");
+        let text = result.render();
+        assert!(!result.passes(), "{text}");
+        assert!(text.contains("app -> admin-plugin"), "{text}");
+    }
+
+    #[test]
+    fn a_build_dependency_is_not_in_the_crate_graph() {
+        let json = serde_json::json!({
+            "packages": [
+                {"id": "a", "name": "app"},
+                {"id": "b", "name": "codegen"}
+            ],
+            "resolve": {"nodes": [
+                {"id": "a", "deps": [
+                    {"pkg": "b", "dep_kinds": [{"kind": "build", "target": null}]}
+                ]}
+            ]}
+        });
+        let facts = parse_cargo_metadata(&json).expect("valid");
+        assert!(facts.crates.deps["app"].is_empty());
+    }
+
+    #[test]
+    fn a_library_name_that_differs_is_recorded() {
+        let json = serde_json::json!({
+            "packages": [
+                {"id": "a", "name": "crm-core-pkg",
+                 "targets": [{"kind": ["lib"], "name": "crm_core"}]},
+                {"id": "b", "name": "crm-web",
+                 "targets": [{"kind": ["lib"], "name": "crm_web"}]}
+            ],
+            "resolve": {"nodes": []}
+        });
+        let facts = parse_cargo_metadata(&json).expect("valid");
+        assert_eq!(
+            facts.crates.libs.get("crm-core-pkg").map(String::as_str),
+            Some("crm_core")
+        );
+        assert!(!facts.crates.libs.contains_key("crm-web"));
     }
 }

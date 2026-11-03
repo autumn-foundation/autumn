@@ -507,7 +507,7 @@ pub struct CheckBoundariesArgs {
     #[arg(long, value_name = "PATH")]
     baseline: Option<String>,
     /// Write the current violations to the baseline and exit 0.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "json")]
     update_baseline: bool,
     /// Print the result as JSON.
     #[arg(long)]

@@ -1004,6 +1004,26 @@ fn run_stoppable(
     })
 }
 
+/// Run `command` to completion, or stop it after `budget`.
+///
+/// It uses the same process group, Ctrl+C registry and pipe drain as the
+/// audit. A stop returns an `Interrupted` error.
+pub fn run_bounded(
+    command: &mut Command,
+    budget: Option<Duration>,
+) -> std::io::Result<std::process::Output> {
+    let stop = StopHandle::default();
+    ACTIVE.register(&stop);
+    if let Some(budget) = budget {
+        let timer = stop.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(budget);
+            timer.stop();
+        });
+    }
+    run_stoppable(command, &stop)
+}
+
 /// The directory holding the app's policy file, searching upward from `start`.
 ///
 /// The CI gate runs at the repository root, so the outermost policy wins over

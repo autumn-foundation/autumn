@@ -163,3 +163,13 @@ fn the_baseline_accepts_todays_violations_and_shrinks() {
     assert!(shrunk.violations.is_empty());
     assert!(ratchet(fixed, Some(&shrunk)).passes());
 }
+
+#[test]
+fn the_fixture_routes_mount() {
+    let routes = autumn_web::routes![
+        bnd_core::bnd_list_contacts,
+        bnd_marketing::bnd_report,
+        bnd_marketing::bnd_joined,
+    ];
+    assert_eq!(routes.len(), 3);
+}

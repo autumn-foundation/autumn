@@ -10988,7 +10988,7 @@ fn check_table_boundaries(config_path: &std::path::Path) -> CheckResult {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."));
-    let facts = cargo_facts(dir, true, Some(DOCTOR_BUDGET));
+    let facts = cargo_facts(dir, &[], true, Some(DOCTOR_BUDGET));
     let baseline = config
         .baseline
         .as_deref()
@@ -11050,8 +11050,9 @@ fn check_table_boundaries_impl(
             name: "table_boundaries",
             status: CheckStatus::Pass,
             detail: Some(format!(
-                "no new boundary violations ({} known in the baseline)",
-                result.known.len()
+                "no new boundary violations ({} known in the baseline, {} pattern warning(s))",
+                result.known.len(),
+                result.warnings.len()
             )),
             hint: None,
         };
@@ -23657,20 +23658,21 @@ mod table_boundaries_tests {
         .expect("valid")
     }
 
-    fn facts() -> Result<CargoFacts, String> {
-        Ok(CargoFacts {
+    fn facts() -> CargoFacts {
+        CargoFacts {
             crates: CrateGraph::default(),
             plugins: Vec::new(),
-        })
+        }
     }
 
-    fn graph() -> Option<Result<autumn_web::graph::manifest::ArchitectureGraph, String>> {
-        Some(Ok(build(&[], 0, ROUTES, MODELS, &[], &[])))
+    fn graph() -> autumn_web::graph::manifest::ArchitectureGraph {
+        build(&[], 0, ROUTES, MODELS, &[], &[])
     }
 
     #[test]
     fn a_violation_warns_so_strict_fails() {
-        let result = check_table_boundaries_impl(config(), graph(), facts(), Ok(None));
+        let result =
+            check_table_boundaries_impl(config(), Some(Ok(graph())), Ok(facts()), Ok(None));
         assert_eq!(result.status, CheckStatus::Warn);
         let detail = result.detail.expect("detail");
         assert!(detail.contains("marketing -> core"), "{detail}");
@@ -23679,29 +23681,51 @@ mod table_boundaries_tests {
 
     #[test]
     fn a_baselined_violation_passes() {
-        let report = autumn_web::graph::boundaries::check(
-            &config(),
-            Some(&build(&[], 0, ROUTES, MODELS, &[], &[])),
-            None,
-        )
-        .expect("runs");
+        let report =
+            autumn_web::graph::boundaries::check(&config(), Some(&graph()), None).expect("runs");
         let baseline = Baseline::from_violations(&report.violations);
-        let result = check_table_boundaries_impl(config(), graph(), facts(), Ok(Some(baseline)));
+        let result = check_table_boundaries_impl(
+            config(),
+            Some(Ok(graph())),
+            Ok(facts()),
+            Ok(Some(baseline)),
+        );
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
     }
 
     #[test]
     fn a_rule_that_cannot_run_warns() {
-        let result = check_table_boundaries_impl(config(), None, facts(), Ok(None));
+        let result = check_table_boundaries_impl(config(), None, Ok(facts()), Ok(None));
         assert_eq!(result.status, CheckStatus::Warn);
-        assert!(result.detail.expect("detail").contains("graph rule not run"));
+        assert!(
+            result
+                .detail
+                .expect("detail")
+                .contains("graph rule not run")
+        );
         let result = check_table_boundaries_impl(
             config(),
-            graph(),
+            Some(Ok(graph())),
             Err("no cargo".into()),
             Ok(None),
         );
-        assert!(result.detail.expect("detail").contains("crate rule not run"));
+        assert!(
+            result
+                .detail
+                .expect("detail")
+                .contains("crate rule not run")
+        );
+    }
+
+    #[test]
+    fn a_baseline_without_a_graph_lists_nothing_as_fixed() {
+        let report =
+            autumn_web::graph::boundaries::check(&config(), Some(&graph()), None).expect("runs");
+        let baseline = Baseline::from_violations(&report.violations);
+        let result = check_table_boundaries_impl(config(), None, Ok(facts()), Ok(Some(baseline)));
+        let detail = result.detail.expect("detail");
+        assert!(!detail.contains("no longer occur"), "{detail}");
+        assert!(detail.contains("graph rule not run"), "{detail}");
     }
 
     #[test]
@@ -23710,7 +23734,7 @@ mod table_boundaries_tests {
             "[boundaries.a]\nowns = [\"contacts\"]\n[boundaries.b]\nowns = [\"contacts\"]\n",
         )
         .expect("valid");
-        let result = check_table_boundaries_impl(config, graph(), facts(), Ok(None));
+        let result = check_table_boundaries_impl(config, Some(Ok(graph())), Ok(facts()), Ok(None));
         assert_eq!(result.status, CheckStatus::Fail);
     }
 }

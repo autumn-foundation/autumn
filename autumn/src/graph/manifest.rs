@@ -468,7 +468,7 @@ fn repository_id(module_path: &str, repository: &str) -> String {
 }
 
 /// The id prefix of a route a `#[repository(api = "...")]` generated.
-const AUTO_API_ID_PREFIX: &str = "route:auto-api:";
+pub(crate) const AUTO_API_ID_PREFIX: &str = "route:auto-api:";
 
 /// The id of a job node.
 fn job_id(module_path: &str, handler: &str) -> String {

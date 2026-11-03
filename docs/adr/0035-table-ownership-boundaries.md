@@ -36,11 +36,13 @@ reads one item's own tokens. It cannot follow a call into a helper.
   `may_write` entry for a table of B allows the dependency.
 - **Plugins.** A crate declares its tables in
   `[package.metadata.autumn.boundary] owns`. The check reads it from
-  `cargo metadata`. This works for a plugin with no `#[model]` too.
+  `cargo metadata`. A table that `boundaries.toml` already owns stays there.
+  The graph rule sees a plugin table only when it has a `#[model]`.
   `plugin_migrations` gives no table names at run time, so it is not used.
 - **Ratchet.** A JSON baseline holds the keys of known violations. A key has
-  no evidence and no line number. A new violation fails. A baseline entry
-  that no longer occurs also fails, so the baseline only shrinks.
+  the access, but no evidence, line number or crate version. A new violation
+  fails. A baseline entry that no longer occurs also fails, so a fixed entry
+  cannot stay. An entry of a rule that did not run is not fixed.
 - **Where.** The rules are in `autumn_web::graph::boundaries` with no IO. The
   CLI reads the files. `autumn graph check-boundaries` builds the app.
   `autumn doctor` reads a committed graph and runs `cargo metadata --offline`.
@@ -57,6 +59,6 @@ reads one item's own tokens. It cannot follow a call into a helper.
 ## Alternatives
 
 - **Capture SQL at run time** (the `ledger-capture` path). This sees every
-  statement, but needs a database and a test run. It can be a later slice.
+  statement, but needs a database and a test run. It can be a later change.
 - **Keep the config in `autumn.toml`.** The runtime would carry keys it never
   uses, and the config schema gate would need to know them.
