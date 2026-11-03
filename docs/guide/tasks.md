@@ -101,6 +101,41 @@ struct BackfillArgs {
 A task returning `Err(AutumnError)` exits non-zero and prints the error to
 stderr, so CI and cron can rely on normal process status.
 
+## Run A Task In A Deployed Image
+
+`autumn task` builds the app binary with cargo before it runs it. A release
+image has the binary but no toolchain, so run the binary directly. The CLI
+sets three environment variables, and you can set them yourself:
+
+| Variable | Effect |
+| --- | --- |
+| `AUTUMN_RUN_TASK=<name>` | Run the named task with full app context, then exit. |
+| `AUTUMN_TASK_ARGS_JSON` | The task flags as a JSON array of strings, for example `["--user-id","42","--dry-run"]`. Omit it for a task with no flags. |
+| `AUTUMN_LIST_TASKS=1` | Print the registered tasks as JSON and exit. |
+
+```bash
+AUTUMN_RUN_TASK=backfill-user AUTUMN_TASK_ARGS_JSON='["--user-id","42"]' ./blog
+```
+
+JSON quoting through a remote shell (`fly ssh console -C`, `kubectl exec`) is
+easy to get wrong. Ship a small wrapper script in the image that takes
+`<name> --flag value`, encodes the flags, and sets the variables.
+
+The task runs inside the app binary, so it reads the same config files,
+profile and environment as the server, and gets the same database pool.
+Startup hooks run before the task. A hook that starts a background loop should
+skip it when `AUTUMN_RUN_TASK` is set, because the process exits as soon as
+the task returns.
+
+## A Task, Not A Separate Binary
+
+Write an operational script as a task. Do not add a `src/bin/` program that
+opens its own database connection. A separate binary reads a raw URL and
+skips what the app resolves: the active profile, TLS and pooler settings,
+encryption keys, and the rest of `autumn.toml`. It can work on a laptop and fail
+against a managed database. A task gets all of it from the app, and it ships
+in the image the app already deploys.
+
 ## Generate A Skeleton
 
 ```bash
