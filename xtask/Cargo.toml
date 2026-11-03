@@ -18,7 +18,8 @@ regex = "1"
 # Process and file helpers: `sh` (command builder, `$CARGO`) and `fs`
 # (contextual file errors, temp dirs). Only these two modules: `sh` adds no
 # dependency and `fs` adds `tempfile`, already in the build.
-smop = { version = "0.3", default-features = false, features = ["sh", "fs"] }
+# 0.3.1 for `CommandBuilder::status()`, which passes a script's exit code through.
+smop = { version = "0.3.1", default-features = false, features = ["sh", "fs"] }
 
 [lints]
 workspace = true

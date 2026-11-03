@@ -219,12 +219,15 @@ fn run_lane(
     })
 }
 
-/// A failing script is an error naming its exit code, so `cargo xtask`
-/// exits 1 rather than with the script's own code.
+/// `cargo xtask` exits with the script's own code: a usage error stays 2.
+/// A script killed by a signal has no code and exits 1.
 fn run_script(root: &Path, name: &str, args: &[String]) -> Result<ExitCode> {
     let script = scripts::resolve(root, name)?;
-    scripts::run(root, &script, args)?;
-    Ok(ExitCode::SUCCESS)
+    let status = scripts::run(root, &script, args)?;
+    Ok(status
+        .code()
+        .and_then(|c| u8::try_from(c).ok())
+        .map_or(ExitCode::FAILURE, ExitCode::from))
 }
 
 fn list(root: &Path, out: &mut impl Write) -> Result<()> {
@@ -402,6 +405,24 @@ mod tests {
             }
         }
         assert!(seen >= 1, "no `cargo xtask check` in any workflow");
+    }
+
+    /// A script's exit code is passed through, not folded into 1, so a
+    /// caller can still tell a usage error (2) from a failed check (1).
+    #[test]
+    fn a_script_exit_code_passes_through() {
+        let root = smop::fs::temp_dir().unwrap();
+        let scripts = root.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("exits.sh"),
+            "#!/usr/bin/env bash\n# Exit with the code given.\nexit \"$1\"\n",
+        )
+        .unwrap();
+        for (arg, want) in [("0", 0u8), ("1", 1), ("3", 3)] {
+            let code = run_script(root.path(), "exits", &[arg.to_owned()]).unwrap();
+            assert_eq!(code, ExitCode::from(want), "exit {arg}");
+        }
     }
 
     #[test]
