@@ -6,8 +6,15 @@ Run the pre-push gate, which compiles the **same targets CI compiles** so a
 cross-package break is caught locally instead of on the PR:
 
 ```sh
-./scripts/pre-push-check.sh
+cargo xtask pre-push
 ```
+
+(`./scripts/pre-push-check.sh` runs the same thing.) The steps are the
+`pre-push` lane in `xtask/src/lanes.rs`; `cargo xtask pre-push --list` names
+them, `--from <step>` resumes after a fix, and `--dry-run` prints the commands.
+CI's `lint` job is the `lint` lane of the same file (`cargo xtask ci lint`), and
+the two lanes share their clippy feature lists, so they cannot drift apart.
+`cargo xtask list` shows every lane and every script under `scripts/`.
 
 It mirrors CI's always-on `lint` + `test` jobs (`.github/workflows/ci.yml`) —
 `./scripts/check-panic-gate.sh` (the [#1611][issue-1611] request-path panic
@@ -42,7 +49,7 @@ target it never triggers trybuild.
 The gate does **not** cover the Docker/testcontainer, `sqlite`-backend, or
 Chromium `system-tests` lanes (those run in dedicated CI jobs); `cargo test -p
 <pkg>` remains fine for iterating on a single crate — just run
-`./scripts/pre-push-check.sh` before you push.
+`cargo xtask pre-push` before you push.
 
 In CI that blocking gate is **sharded across runners**, so a red PR points at
 one of several jobs rather than a single `Test (<os>)`: `test` runs the
@@ -446,7 +453,7 @@ Run it locally with `./scripts/check-panic-gate.sh` — the default invocation r
 its own `--self-test` (synthetic fixtures in a temp dir, asserting the checker
 still *fails* on each spoof it claims to catch, including the widened-predicate,
 inner-`expect`, group-allow, and unmarked-submodule bypasses) before checking the
-real tree, and both legs together take a couple of seconds. `./scripts/pre-push-check.sh`
+real tree, and both legs together take a couple of seconds. `cargo xtask pre-push`
 runs it as its first step, alongside the gated-features clippy run.
 
 ### Falsifying the gate (AC1)

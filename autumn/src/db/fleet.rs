@@ -2673,53 +2673,78 @@ impl DatabaseFleet {
         let path = self.path_of(&key);
         let root = self.inner.root.clone();
         let name = key.name();
-        // Before any file goes: a crash after the removal must not leave
-        // the replica with nothing that blocks its restore.
         let tombstones = self.replication().and_then(|r| r.tombstones()).cloned();
         // Names this delete's pending row: a refusal drops only its own.
         let owner = self
             .replication()
             .map(|r| format!("{:016x}", r.entropy().next_u64()))
             .unwrap_or_default();
-        if let Some(tombstones) = &tombstones {
-            let retention = self
-                .replication()
-                .map_or(Duration::ZERO, |r| r.retention_after_delete());
-            tombstones
-                .record(&name, retention, path.is_file(), &owner)
-                .await
-                .map_err(|error| FleetError::Unavailable {
-                    name: name.clone(),
-                    detail: format!("could not record the replica tombstone: {error}"),
-                })?;
-        }
+        let retention = self
+            .replication()
+            .map_or(Duration::ZERO, |r| r.retention_after_delete());
+        let join_error = |e: tokio::task::JoinError| FleetError::Io {
+            op: "delete database",
+            detail: e.to_string(),
+        };
+        let unrecorded = |error: super::fleet_tombstones::TombstoneError| FleetError::Unavailable {
+            name: name.clone(),
+            detail: format!("could not record the replica tombstone: {error}"),
+        };
+        // `Err`: nothing is recorded or removed. `Ok`: the result of the
+        // removal.
         let removed = self
             .with_provision_turn(&key, async {
+                // Before the lock: the lock then waits for one write only.
+                // The connection stays out of the pool while the lock is
+                // busy (at most the lock timeout).
+                let mut control = match &tombstones {
+                    Some(tombstones) => Some(tombstones.checkout().await.map_err(unrecorded)?),
+                    None => None,
+                };
+                // The path lock first: the file check, the row and the
+                // removal then see one state. A delete in another process
+                // that comes after the removal sees no file, and keeps the
+                // row of this delete (issue #3516).
+                let lock = {
+                    let (root, path, name) = (root.clone(), path.clone(), name.clone());
+                    crate::time::spawn_blocking(move || {
+                        check_contained(&root, &path)?;
+                        PathLock::acquire(&root, &name)
+                    })
+                    .await
+                    .map_err(join_error)
+                    .and_then(|r| r)?
+                };
+                // Before any file goes: a crash after the removal must not
+                // leave the replica with nothing that blocks its restore.
+                if let (Some(tombstones), Some(control)) = (&tombstones, &mut control) {
+                    tombstones
+                        .record_on(control, &name, retention, path.is_file(), &owner)
+                        .await
+                        .map_err(unrecorded)?;
+                }
+                drop(control);
+                let (root, path, name) = (root.clone(), path.clone(), name.clone());
                 let removed = crate::time::spawn_blocking(move || {
+                    let _lock = lock;
                     // Another process sharing the root may still serve the file;
                     // unlinking it under that process would split the tenant's data
                     // between the old inode and a new file. The guard refuses then.
                     // On Unix it also blocks new openers while the files go. On
                     // Windows it closes first.
-                    check_contained(&root, &path)?;
-                    with_path_lock(&root, &name, || {
-                        with_exclusive_access(&path, &name, HOLD_GUARD_WHILE_REMOVING, |present| {
-                            remove_database_files(&path, &root, &name, present)
-                        })
+                    with_exclusive_access(&path, &name, HOLD_GUARD_WHILE_REMOVING, |present| {
+                        remove_database_files(&path, &root, &name, present)
                     })
                 })
                 .await
-                .map_err(|e| FleetError::Io {
-                    op: "delete database",
-                    detail: e.to_string(),
-                })
+                .map_err(join_error)
                 .and_then(|r| r);
                 if removed.is_ok() {
                     self.lock_state().unacknowledged.remove(&key);
                 }
-                removed
+                Ok::<_, FleetError>(removed)
             })
-            .await;
+            .await?;
         if matches!(removed, Ok(true)) {
             self.inner.counters.deleted.fetch_add(1, Ordering::Relaxed);
             self.purge_after_delete(&key).await;
@@ -2847,11 +2872,13 @@ impl DatabaseFleet {
     /// deleted database with the same key, and drop its tombstone. The new
     /// database must not share a prefix with old data that a later purge
     /// deletes. An `explicit` create (`provision`) ends a retention early.
-    /// A create on demand does not: it gets `410` until the retention ends.
+    /// A create on demand does not: it gets `410` while the row is pending
+    /// or in its retention.
     ///
     /// # Errors
     ///
-    /// [`FleetError::Deleting`] for a create on demand during a retention.
+    /// [`FleetError::Deleting`] for a create on demand while a row is
+    /// pending or in its retention.
     /// [`FleetError::Unavailable`] when the tombstone cannot be read or the
     /// old replica cannot be purged. Retry later.
     async fn purge_before_create(
@@ -2882,8 +2909,11 @@ impl DatabaseFleet {
         let Some(row) = read(tombstones.get(&name).await)? else {
             return Ok(());
         };
-        if !explicit && row.confirmed && tombstones.now() < row.purge_after {
-            // A stale client must not end the undo window.
+        if !explicit
+            && !super::fleet_tombstones::create_on_demand_allowed(Some(&row), tombstones.now())
+        {
+            // A stale client must not end the undo window. A pending row has
+            // no cutoff yet (issue #3516).
             return Err(FleetError::Deleting { name });
         }
         let cutoff = if row.confirmed {
@@ -4687,11 +4717,21 @@ fn lock_stripe(name: &str) -> u64 {
 ///
 /// The OS drops the lock when a process dies, so a crash leaves no stale lock.
 /// Keep `work` short: other keys on the same lock file wait for it.
-fn with_path_lock<T>(
+pub(crate) fn with_path_lock<T>(
     root: &Path,
     name: &str,
     work: impl FnOnce() -> Result<T, FleetError>,
 ) -> Result<T, FleetError> {
+    let mut lock = path_lock_file(root, name)?;
+    poll_path_lock(&mut lock, name, |guard| {
+        let done = work();
+        drop(guard);
+        done
+    })?
+}
+
+/// The lock file of `name`'s stripe.
+fn path_lock_file(root: &Path, name: &str) -> Result<fd_lock::RwLock<std::fs::File>, FleetError> {
     let dir = root.join(LOCK_DIR);
     std::fs::create_dir_all(&dir).map_err(io_error("create lock directory"))?;
     let file = std::fs::OpenOptions::new()
@@ -4701,11 +4741,20 @@ fn with_path_lock<T>(
         .truncate(false)
         .open(dir.join(format!("{:02x}.lock", lock_stripe(name))))
         .map_err(io_error("open path lock"))?;
-    let mut lock = fd_lock::RwLock::new(file);
+    Ok(fd_lock::RwLock::new(file))
+}
+
+/// Take `lock` and give its guard to `hold`. Blocking: polls for about 60
+/// seconds, then times out.
+fn poll_path_lock<T>(
+    lock: &mut fd_lock::RwLock<std::fs::File>,
+    name: &str,
+    hold: impl FnOnce(fd_lock::RwLockWriteGuard<'_, std::fs::File>) -> T,
+) -> Result<T, FleetError> {
     let mut polls = 0_u32;
-    let guard = loop {
+    loop {
         match lock.try_write() {
-            Ok(guard) => break guard,
+            Ok(guard) => return Ok(hold(guard)),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 polls += 1;
                 if polls >= LOCK_POLLS {
@@ -4718,10 +4767,34 @@ fn with_path_lock<T>(
             }
             Err(e) => return Err(io_error("lock database path")(e)),
         }
-    };
-    let done = work();
-    drop(guard);
-    done
+    }
+}
+
+/// The path lock of [`with_path_lock`], held across an `await`. A delete
+/// holds it while it writes its tombstone row and removes the files.
+///
+/// It owns the open lock file. Drop closes the file, and the OS then frees
+/// the lock, as for [`VolumeLock`]. On Windows the OS can free it a short
+/// time after the close. Another process then polls a little longer.
+pub(crate) struct PathLock {
+    _file: std::fs::File,
+}
+
+impl PathLock {
+    /// Take the lock for `name`'s path. Blocking, like [`with_path_lock`].
+    ///
+    /// # Errors
+    ///
+    /// [`FleetError::Unavailable`] when the lock times out, or
+    /// [`FleetError::Io`] when the lock file cannot be opened.
+    pub(crate) fn acquire(root: &Path, name: &str) -> Result<Self, FleetError> {
+        let mut lock = path_lock_file(root, name)?;
+        // Keep it held: closing the file frees it.
+        poll_path_lock(&mut lock, name, |guard| std::mem::forget(guard))?;
+        Ok(Self {
+            _file: lock.into_inner(),
+        })
+    }
 }
 
 /// Readiness indicator `db:fleet`: the root directory is usable, with the
@@ -4963,14 +5036,17 @@ mod tests {
     /// build plus its migrations takes longer still.
     const NOT_STUCK: Duration = Duration::from_secs(60);
 
+    /// Wait for every drain to end. A stranded drain never ends, so `NOT_STUCK`
+    /// still catches it. A short bound failed on a loaded Windows runner.
     async fn settle(fleet: &DatabaseFleet) {
-        for _ in 0..500 {
-            if fleet.stats().draining == 0 {
-                return;
+        let drained = async {
+            while fleet.stats().draining != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("drains did not settle");
+        };
+        tokio::time::timeout(NOT_STUCK, drained)
+            .await
+            .expect("drains did not settle");
     }
 
     #[tokio::test]
@@ -6803,13 +6879,14 @@ mod tests {
 
     /// Wait until `key` has a file, as a publish that outlived its caller does.
     async fn published(fleet: &DatabaseFleet, key: &FleetDbKey) {
-        for _ in 0..1000 {
-            if fleet.exists(key) {
-                return;
+        let found = async {
+            while !fleet.exists(key) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("the file was never published");
+        };
+        tokio::time::timeout(NOT_STUCK, found)
+            .await
+            .expect("the file was never published");
     }
 
     #[tokio::test]
@@ -6902,12 +6979,14 @@ mod tests {
         // Drop all five callers while the one opener runs its hook.
         let _ = tokio::time::timeout(Duration::from_millis(60), callers).await;
         // The opener fails on its own task; wait for its entry to go.
-        for _ in 0..1000 {
-            if fleet.stats().open_failures_total > 0 && fleet.open_keys().is_empty() {
-                break;
+        let failed = async {
+            while !(fleet.stats().open_failures_total > 0 && fleet.open_keys().is_empty()) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        };
+        tokio::time::timeout(NOT_STUCK, failed)
+            .await
+            .expect("the failed entry never went");
         assert_eq!(hook.0.load(Ordering::SeqCst), 1, "one opener, not five");
         assert_eq!(fleet.stats().open_failures_total, 1);
         assert!(fleet.open_keys().is_empty(), "the failed entry is gone");
@@ -6923,13 +7002,16 @@ mod tests {
         let second = FleetDbKey::Slot(29);
         // The caller leaves; the opener task still fills the entry.
         cancelled_in_hook(&hook, fleet.open(&second)).await;
-        for _ in 0..500 {
-            if fleet.stats().open == 1 && fleet.stats().draining == 0 {
-                return;
+        let closed = async {
+            while !(fleet.stats().open == 1 && fleet.stats().draining == 0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the older database stayed open: {:?}", fleet.open_keys());
+        };
+        assert!(
+            tokio::time::timeout(NOT_STUCK, closed).await.is_ok(),
+            "the older database stayed open: {:?}",
+            fleet.open_keys()
+        );
     }
 
     #[tokio::test]
