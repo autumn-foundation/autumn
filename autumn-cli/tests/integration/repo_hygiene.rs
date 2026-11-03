@@ -9967,7 +9967,6 @@ fn workspace_members_resolve_raised_dependency_majors() {
         ("hmac", (0, 13)),
         ("aes-gcm", (0, 11)),
         ("lru", (0, 19)),
-        ("wasmi", (2, 0)),
         ("rustyline", (19, 0)),
         ("sysinfo", (0, 40)),
         ("serde-saphyr", (2, 0)),

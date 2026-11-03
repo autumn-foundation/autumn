@@ -207,10 +207,6 @@ impl EdgeArtifact {
         // itself does not change what a well-behaved capsule computes.
         let mut config = Config::default();
         config.consume_fuel(true);
-        // Translate every function at load. wasmi 2 translates lazily by
-        // default and charges that work to the first call's fuel, so the same
-        // request would cost more the first time.
-        config.compilation_mode(wasmi::CompilationMode::Eager);
         let engine = Engine::new(&config);
         let module =
             Module::new(&engine, wasm).map_err(|err| EdgeHostError::Load(err.to_string()))?;
@@ -270,7 +266,9 @@ impl EdgeArtifact {
         let mut linker = <Linker<HostState<'_>>>::new(&self.engine);
         define_wasi_shim(&mut linker)?;
 
-        let started = linker.instantiate_and_start(&mut store, &self.module);
+        let started = linker
+            .instantiate(&mut store, &self.module)
+            .and_then(|pre| pre.start(&mut store));
         let instance = match started {
             Ok(instance) => instance,
             Err(err) => {
@@ -292,7 +290,7 @@ impl EdgeArtifact {
         let fuel_exhausted = trap
             .as_ref()
             .and_then(wasmi::Error::as_trap_code)
-            .is_some_and(|code| matches!(code, wasmi::TrapCode::OutOfFuel));
+            .is_some_and(|code| matches!(code, wasmi::core::TrapCode::OutOfFuel));
         let state = store.into_data();
 
         if let Some(outcome) = state.terminal.clone() {
@@ -918,7 +916,7 @@ fn charge_units(caller: &mut Caller<'_, HostState<'_>>, units: u64) -> Result<()
     let left = caller.get_fuel()?;
     let remaining = left
         .checked_sub(units)
-        .ok_or_else(|| wasmi::Error::from(wasmi::TrapCode::OutOfFuel))?;
+        .ok_or_else(|| wasmi::Error::from(wasmi::core::TrapCode::OutOfFuel))?;
     caller.set_fuel(remaining)
 }
 
@@ -1010,8 +1008,8 @@ mod tests {
     }
 
     /// A guest that loops on a failing `memory.grow` runs out of fuel and
-    /// falls through. It must not overflow the host thread: wasmi 2's
-    /// tail-call dispatch did, in a release build too. The thread has the
+    /// falls through. It must not overflow the host thread. (wasmi 2.0's
+    /// tail-call dispatch did, in a release build too.) The thread has the
     /// 2 MiB stack of a tokio worker.
     #[test]
     fn a_failing_memory_grow_loop_exhausts_its_fuel_and_falls_through() {

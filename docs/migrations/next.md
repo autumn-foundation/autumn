@@ -22,7 +22,7 @@
 - **MSRV delta:** `1.88.0` → `1.97.0` (set by the maintainers; dependencies
   need 1.95; see [Toolchain](#toolchain-rust-1970-or-newer))
 - **Carried dependency majors:** `reqwest 0.12 → 0.13`,
-  `webauthn-rs 0.5 → 0.6`, `p256 0.13 → 0.14`, `wasmi 0.40 → 2`
+  `webauthn-rs 0.5 → 0.6`, `p256 0.13 → 0.14`
 
 ## Summary
 
@@ -786,16 +786,6 @@ If no config keys were removed, delete this subsection.
   Then change `cred_id.as_ref()` to `cred_id.as_slice()` in `encode_cred_id`
   (`CredentialID` is now `Vec<u8>`). Stored passkeys keep the same JSON
   format. Test one passkey login after the change.
-- **`wasmi` 2** ([repository](https://github.com/wasmi-labs/wasmi)). Not in the
-  public API, but a plugin or edge capsule can see three changes:
-  - Fuel use per instruction is different. A plugin that ran close to its
-    `fuel` limit can now get a fuel-exhausted answer. Measure it again.
-  - The hosts load binary Wasm only. 64-bit memories are off.
-  - Load error text changed. A missing import is now named `(env,system)`,
-    not `env::system`.
-
-  Autumn turns on `portable-dispatch`: in 2.0, the default tail-call dispatch
-  lets a guest overflow the host stack.
 - **`p256` 0.14** ([RustCrypto](https://github.com/RustCrypto/elliptic-curves)).
   Not in the public API. Its `crypto-bigint` 0.7 fixes RUSTSEC-2026-0387 on
   the Web Push path. The `jsonwebtoken` ES256/ES384 path still has it.

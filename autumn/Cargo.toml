@@ -342,22 +342,18 @@ edge = ["dep:autumn-edge"]
 # the always-on workspace clippy and test lanes cover the module — but it is
 # why "off by default" is a statement about `autumn-web`'s feature set, not
 # about every build in the tree.
-plugin-sandbox = ["dep:wasmi", "dep:wasmi_core"]
+plugin-sandbox = ["dep:wasmi"]
 
 [dependencies]
 autumn-edge = { version = "0.9.0", path = "../autumn-edge", optional = true }
 # Pure-Rust WebAssembly interpreter behind the `plugin-sandbox` feature. Already
 # resolved in `Cargo.lock` via `autumn-edge`'s reference host, so this adds no
 # new crate to the workspace graph. Licensed MIT OR Apache-2.0.
-# `default-features = false`: no `wat` (text must not skip the binary shape
-# walk) and no `memory64` (the walk reads 32-bit limits). `portable-dispatch`:
-# in wasmi 2.0 the default tail-call dispatch grows the native stack on each
-# failed `memory.grow`. A guest can then overflow the host thread and stop the
-# process, also in a release build. Portable dispatch is a loop, as in 0.40.
-wasmi = { version = "2", optional = true, default-features = false, features = ["std", "validate", "portable-dispatch"] }
-# `ResourceLimiter` returns `wasmi_core::LimiterError`, which wasmi 2 does not
-# re-export. Already in the graph through wasmi.
-wasmi_core = { version = "2", optional = true, default-features = false }
+# Held at 0.40: wasmi 2.0.0 crashes on Windows (STATUS_ACCESS_VIOLATION in the
+# host tests) when it and its caller are built at different optimization
+# levels, and its default tail-call dispatch lets a failing `memory.grow` loop
+# overflow the host stack. Raise it when an upstream release fixes both.
+wasmi = { version = "0.40", optional = true }
 # `default-features = false` drops the database-layer macros from the core
 # macro crate; the `db` feature above pulls them back in through the
 # `autumn-macros-model` / `autumn-macros-repository` crates. A no-database app

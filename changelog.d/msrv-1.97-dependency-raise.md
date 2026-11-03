@@ -14,7 +14,7 @@
 
 - **deps:** every dependency that can move is raised: `webauthn-rs` 0.6,
   `p256` 0.14, `sha2` 0.11, `hmac` 0.13, `aes-gcm` 0.11, `lru` 0.19,
-  `wasmi` 2, `rustyline` 19, `sysinfo` 0.40, `serde-saphyr` 2,
+  `rustyline` 19, `sysinfo` 0.40, `serde-saphyr` 2,
   `postgresql_embedded` 0.22 and `aws-sdk-s3` 1.157. `autumn generate auth`
   stamps `sha2` 0.11, `rand` 0.10, `base64` 0.23, `aes-gcm` 0.11 and
   `webauthn-rs` 0.6, and warns when the app pins an older `rand` or
@@ -23,9 +23,8 @@
   (`webpki-roots`), as before. They do not need a process-wide crypto
   provider. `autumn-media-plugin` clients use `aws-lc-rs` and the
   operating-system root store.
-- **plugins, edge:** wasmi 2 meters fuel differently, so a guest can use a
-  different amount of fuel for the same work. The hosts load binary Wasm
-  only, with 64-bit memories off.
+- **plugins:** the sandbox loads binary Wasm only (`\0asm`, version 1). Text
+  is refused before the compiler sees it.
 - **openapi:** `serde-saphyr` 2 no longer quotes a string with an inline `#`,
   so `openapi.yaml` can change by a few bytes.
 
@@ -43,6 +42,3 @@
 - **deps:** the waivers for `instant` (RUSTSEC-2024-0384) and `lru` 0.16
   (RUSTSEC-2026-0253) are gone, because neither is in the dependency graph
   now.
-- **plugins, edge:** a guest that loops on a failing `memory.grow` can no
-  longer overflow the host thread stack. Autumn turns on wasmi's
-  `portable-dispatch`.

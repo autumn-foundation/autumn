@@ -122,8 +122,7 @@ fn invented_namespace_import_is_refused_at_load() {
   (memory (export "memory") 1)
   (func (export "_start")))
 "#),
-        // wasmi 2 names an import as `(module,field)`.
-        "(env,system)",
+        "env::system",
     );
 }
 
