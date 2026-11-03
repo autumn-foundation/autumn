@@ -291,7 +291,8 @@ field.
 - `.group(g)` shows `1234 5678`. `g` is 2 to 5 and less than `n`. The group
   needs the script. It changes `pattern`, shows the separator boxes, and
   removes the spaces from the form data and from an htmx request, so the
-  server gets the digits only. Strip whitespace on the server too.
+  server gets the digits only. Strip whitespace on the server too. A
+  `pattern` option turns the group off, so your pattern checks the code.
 - The value is never rendered: a code is used one time.
 - An `autocomplete`, `inputmode`, `pattern` or `maxlength` option replaces
   the default. `placeholder` and `minlength` pass through.

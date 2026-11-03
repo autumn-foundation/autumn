@@ -902,9 +902,11 @@
     out.textContent = level && Array.isArray(labels) ? String(labels[+level] || '') : '';
   }
 
+  // [length, group]. The group is 0 until `initOtp` turns it on.
   function otpSize(input) {
     return [parseInt(input.getAttribute('data-autumn-otp'), 10) || 6,
-      parseInt(input.getAttribute('data-autumn-otp-group'), 10) || 0];
+      input.hasAttribute('data-autumn-otp-grouped')
+        ? parseInt(input.getAttribute('data-autumn-otp-group'), 10) || 0 : 0];
   }
 
   // Full-width digits (from CJK mail or an IME) become ASCII digits.
@@ -950,11 +952,14 @@
   // The server sends `maxlength` for a page with no JS. Remove it, so the
   // browser does not cut a paste such as `123-456` before this code runs. A
   // grouped code needs JS: the pattern allows the spaces, and the CSS shows
-  // the separator cells.
+  // the separator cells. An app pattern wins: the code stays ungrouped, so
+  // that pattern still checks it.
   function initOtp(input) {
-    var size = otpSize(input), n = size[0], g = size[1];
+    var n = otpSize(input)[0];
+    var g = parseInt(input.getAttribute('data-autumn-otp-group'), 10) || 0;
     if (input.maxLength === n) input.removeAttribute('maxlength');
-    if (g && !input.hasAttribute('data-autumn-otp-grouped')) {
+    if (g && !input.hasAttribute('data-autumn-otp-grouped') &&
+        input.getAttribute('pattern') === '[0-9]{' + n + '}') {
       var parts = [];
       for (var i = 0; i < n; i += g) parts.push('[0-9]{' + Math.min(g, n - i) + '}');
       input.pattern = parts.join(' ');

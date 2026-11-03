@@ -5387,7 +5387,9 @@ impl OtpFormat {
     }
 
     /// Show the digits in groups of `size`. A size that is not 2 to 5, or
-    /// that is not less than the digit count, removes the group.
+    /// that is not less than the digit count, removes the group. A
+    /// [`FieldOptions::pattern`] turns the group off in the browser, so that
+    /// pattern checks the code.
     #[must_use]
     pub const fn group(mut self, size: u8) -> Self {
         self.group = if size >= 2 && size <= 5 && size < self.digits {

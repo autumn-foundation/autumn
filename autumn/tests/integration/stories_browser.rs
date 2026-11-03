@@ -1002,6 +1002,22 @@ async fn keyboard_sign_in_inputs() {
         .await,
         "12345678"
     );
+    // An app pattern wins: the runtime does not group that code.
+    assert_eq!(
+        eval_string(
+            &page,
+            "(() => { const d = document.createElement('div'); \
+             d.innerHTML = '<input id=\"own\" data-autumn-otp=\"6\" data-autumn-otp-group=\"3\" pattern=\"[1-9][0-9]{5}\">'; \
+             document.body.append(d); \
+             d.dispatchEvent(new CustomEvent('htmx:afterSwap', { bubbles: true })); \
+             const i = d.querySelector('input'); i.value = '123456'; \
+             i.dispatchEvent(new InputEvent('input', { bubbles: true })); \
+             const out = i.pattern + '|' + i.value + '|' + i.hasAttribute('data-autumn-otp-grouped'); \
+             d.remove(); return out; })()",
+        )
+        .await,
+        "[1-9][0-9]{5}|123456|false"
+    );
     // Backspace after a group space deletes the digit before the space.
     assert!(
         eval_bool(
