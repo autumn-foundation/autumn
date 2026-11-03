@@ -116,46 +116,69 @@ mod tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read source");
-            // Only production code: stop at an inline unit test module. A
-            // `mod tests;` line declares a file, so the scan goes past it.
-            let production = text
-                .match_indices("\n#[cfg(test)]\nmod ")
-                .find(|(at, needle)| {
-                    text[at + needle.len()..]
-                        .lines()
-                        .next()
-                        .is_some_and(|line| line.trim_end().ends_with('{'))
-                })
-                .map_or(text.as_str(), |(at, _)| &text[..at]);
-            for (index, line) in production.lines().enumerate() {
-                let code = line.trim_start();
-                if code.starts_with("//") {
-                    continue;
-                }
-                let imports_client = code.starts_with("use reqwest::")
-                    && code
-                        .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .any(|token| ["Client", "ClientBuilder", "get"].contains(&token));
-                if imports_client
-                    || [
-                        "reqwest::Client::new()",
-                        "reqwest::Client::builder()",
-                        "reqwest::Client::default()",
-                        "reqwest::ClientBuilder::new()",
-                        "reqwest::ClientBuilder::default()",
-                        "reqwest::get(",
-                        "reqwest::blocking::Client::new()",
-                        "reqwest::blocking::Client::builder()",
-                        "reqwest::blocking::Client::default()",
-                        "reqwest::blocking::ClientBuilder::new()",
-                        "reqwest::blocking::get(",
-                    ]
-                    .iter()
-                    .any(|needle| code.contains(needle))
-                {
-                    offenders.push(format!("{}:{}", path.display(), index + 1));
-                }
+            for line in bare_client_lines(&text) {
+                offenders.push(format!("{}:{line}", path.display()));
             }
         }
+    }
+
+    /// The 1-based lines of production code in `text` that build a bare
+    /// `reqwest` client. An inline unit test module ends the production code.
+    /// A `mod tests;` line declares a file, so the scan goes past it.
+    fn bare_client_lines(text: &str) -> Vec<usize> {
+        // A Windows checkout has CRLF line endings. Change them to LF so the
+        // split below finds the test module. Line numbers do not change.
+        let text = text.replace("\r\n", "\n");
+        let production = text
+            .match_indices("\n#[cfg(test)]\nmod ")
+            .find(|(at, needle)| {
+                text[at + needle.len()..]
+                    .lines()
+                    .next()
+                    .is_some_and(|line| line.trim_end().ends_with('{'))
+            })
+            .map_or(text.as_str(), |(at, _)| &text[..at]);
+        let mut found = Vec::new();
+        for (index, line) in production.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            let imports_client = code.starts_with("use reqwest::")
+                && code
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .any(|token| ["Client", "ClientBuilder", "get"].contains(&token));
+            if imports_client
+                || [
+                    "reqwest::Client::new()",
+                    "reqwest::Client::builder()",
+                    "reqwest::Client::default()",
+                    "reqwest::ClientBuilder::new()",
+                    "reqwest::ClientBuilder::default()",
+                    "reqwest::get(",
+                    "reqwest::blocking::Client::new()",
+                    "reqwest::blocking::Client::builder()",
+                    "reqwest::blocking::Client::default()",
+                    "reqwest::blocking::ClientBuilder::new()",
+                    "reqwest::blocking::get(",
+                ]
+                .iter()
+                .any(|needle| code.contains(needle))
+            {
+                found.push(index + 1);
+            }
+        }
+        found
+    }
+
+    /// The scan stops at the unit test module with LF or CRLF line endings
+    /// (a Windows checkout has CRLF), and still finds production offenders.
+    #[test]
+    fn the_scan_skips_the_test_module_with_either_line_ending() {
+        let lf = "fn prod() {\n    let c = reqwest::Client::new();\n}\n\
+                  #[cfg(test)]\nmod tests {\n    fn t() { reqwest::Client::new(); }\n}\n";
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(bare_client_lines(lf), vec![2]);
+        assert_eq!(bare_client_lines(&crlf), vec![2]);
     }
 }
