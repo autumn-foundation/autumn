@@ -11072,7 +11072,7 @@ fn check_table_boundaries_impl(
 }
 
 /// A `table_boundaries` result with the shared hint.
-fn table_boundaries_result(status: CheckStatus, detail: String) -> CheckResult {
+const fn table_boundaries_result(status: CheckStatus, detail: String) -> CheckResult {
     CheckResult {
         name: "table_boundaries",
         status,
