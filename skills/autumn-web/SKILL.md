@@ -2257,6 +2257,13 @@ reject_on_content_type_mismatch = true  # declared-vs-sniffed mismatch (or an
 
 ## View helpers and widgets (0.6.0)
 
+Core widgets need only `maud`. Four families are default-on features
+(#3408): `widgets-search` (active search, autocomplete), `widgets-social`
+(reactions, comment thread, infinite feed, the `#[commentable]` router),
+`widgets-workflow` (transition controls, bulk actions) and `widgets-charts`.
+With `default-features = false`, name each family the app uses. Paths stay
+`autumn_web::widgets::*` (`docs/guide/widget-styling.md`).
+
 Trunk-dev ships framework view widgets — prefer these over hand-rolled Maud
 for the common cases:
 

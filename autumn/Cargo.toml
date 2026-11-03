@@ -18,7 +18,7 @@ exclude = ["tests/fixtures/axe-core/"]
 # The last 16 names are the compile gates (#2795, ADR 0027). Default-on; the
 # no-DB daemon starter drops them. Keep this on one line: the panic gate
 # (scripts/check-panic-gate.sh) reads it with grep.
-default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph"]
+default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph"]
 # Compile gates (#2795, ADR 0027). Each gates one module. See the default list.
 ledger = ["version-history"]
 experiments = ["feature-flags"]
@@ -51,6 +51,13 @@ sla = []
 flash = []
 cache-moka = ["dep:moka"]
 maud = ["dep:maud"]
+# Widget families (#3408, ADR 0034). Default-on. Each gates one module in
+# `widgets/`, its CSS and its JS. Each enables `maud`. The core widgets
+# (layout, nav, feedback, data) need only `maud`.
+widgets-search = ["maud"]
+widgets-social = ["maud"]
+widgets-workflow = ["maud"]
+widgets-charts = ["maud"]
 htmx = []
 multipart = ["axum/multipart", "dep:infer"]
 tailwind = []
@@ -671,6 +678,8 @@ features = [
   "ledger", "experiments", "feature-flags", "idempotency", "custom-domains",
   "job-tracking", "upgrade", "nested-form", "alerts", "data-retention",
   "version-history", "wizard", "money", "gdpr", "slo", "graph",
+  # The widget families (#3408). Default-on, named for the same reason.
+  "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts",
 ]
 rustdoc-args = ["--cfg", "docsrs"]
 

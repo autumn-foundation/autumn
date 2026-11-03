@@ -284,29 +284,6 @@
     });
   });
 
-  // ── Min-length enforcement ────────────────────────────────────────────────
-  // Cancel htmx requests from active-search or autocomplete inputs when the
-  // typed value is non-empty but shorter than data-ac-min-length.
-  // Empty inputs are NOT cancelled so the server can clear stale results.
-  // When a below-minimum request is cancelled, also clear the results container
-  // so results from a previous valid query don't remain visible.
-  document.addEventListener('htmx:configRequest', function (e) {
-    var elt = e.detail && e.detail.elt;
-    if (!elt || !elt.dataset) return;
-    var minLen = parseInt(elt.dataset.acMinLength || '0', 10);
-    var len = (elt.value || '').length;
-    if (minLen > 0 && len > 0 && len < minLen) {
-      e.preventDefault();
-      // Clear the htmx target so stale results from a previous valid query
-      // don't remain visible while the input is below the minimum length.
-      var targetSel = elt.getAttribute('hx-target');
-      if (targetSel) {
-        var target = document.querySelector(targetSel);
-        if (target) target.innerHTML = '';
-      }
-    }
-  });
-
   // ── Tabs widget ───────────────────────────────────────────────────────────
   // APG tabs with automatic activation. JS adds `autumn-tabs--enhanced`, so
   // the CSS shows panels by `[hidden]`, not by `:target`. With JS off, the
@@ -400,110 +377,6 @@
     var target = shown && document.getElementById(location.hash.slice(1));
     if (target) target.scrollIntoView();
   });
-
-  // ── Autocomplete widget ───────────────────────────────────────────────────
-  // The listbox uses the keyboard core (data-autumn-activedescendant and
-  // data-autumn-dismiss). This code selects options and keeps
-  // aria-expanded true only while the popup shows at least one option.
-
-  function initAutocomplete(wrapper) {
-    if (!once(wrapper)) return;
-
-    var queryInput = wrapper.querySelector('[data-ac-query]');
-    var valueId = wrapper.dataset.acValueId;
-    var valueName = wrapper.dataset.acValueName;
-    var freeText = 'acFreeText' in wrapper.dataset;
-    var listbox = wrapper.querySelector('[role="listbox"]');
-    if (!queryInput || !valueId || !valueName || !listbox) return;
-
-    function getHidden() { return document.getElementById(valueId); }
-
-    // Free-text mode: assign the name immediately so the field is always
-    // included in form submission even if the user never types in the input.
-    // This preserves any default value set on the hidden input in the HTML.
-    if (freeText) {
-      getHidden().name = valueName;
-    } else if (getHidden().value) {
-      // ID mode: a non-empty hidden value at init means a prior selection was
-      // seeded server-side (an edit-form GET, or a 422 re-render preserving a
-      // previous pick) — assign the name now so it round-trips on submit even
-      // if the user never touches this field again. The 'input' listener
-      // below still clears the name the moment the user edits the query,
-      // same as it already does for a live-session selection.
-      getHidden().name = valueName;
-    }
-
-    // A dismissal (Escape, Tab, a click outside) holds until the user types
-    // or presses ArrowDown/ArrowUp. Thus a late response stays closed.
-    var dismissed = false;
-    listbox.addEventListener('autumn:dismiss', function () { dismissed = true; });
-    queryInput.addEventListener('keydown', function (e) {
-      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') dismissed = false;
-    });
-
-    // New content (an htmx swap, or a clear) shows the popup again, unless
-    // the user dismissed it. An empty listbox stays in the accessibility
-    // tree, so its live region still speaks; the CSS gives it no size.
-    function sync() {
-      var options = listbox.querySelectorAll('[role="option"]');
-      options.forEach(function (o) { o.tabIndex = -1; });
-      listbox.hidden = dismissed;
-      queryInput.setAttribute('aria-expanded', !listbox.hidden && options.length ? 'true' : 'false');
-      queryInput.removeAttribute('aria-activedescendant');
-    }
-    // `subtree` also sees a morph swap that keeps the option count.
-    new MutationObserver(sync).observe(listbox, { childList: true, subtree: true });
-    sync();
-
-    function selectOption(opt) {
-      var hidden = getHidden();
-      hidden.name = valueName;
-      hidden.value = opt.dataset.value || '';
-      queryInput.value = opt.textContent.trim();
-      listbox.innerHTML = '';
-      sync();
-      queryInput.focus();
-    }
-
-    // A mouse press on an option must not take focus from the input.
-    listbox.addEventListener('mousedown', function (e) { e.preventDefault(); });
-
-    listbox.addEventListener('click', function (e) {
-      var opt = e.target.closest('[role="option"]');
-      if (opt) selectOption(opt);
-    });
-
-    listbox.addEventListener('keydown', function (e) {
-      var opt = e.target.closest('[role="option"]');
-      if (!opt || (e.key !== 'Enter' && e.key !== ' ')) return;
-      e.preventDefault();
-      selectOption(opt);
-    });
-
-    queryInput.addEventListener('input', function () {
-      var hidden = getHidden();
-      dismissed = false;
-      // The highlight belongs to the old query. Enter must not commit it.
-      setActive(queryInput, listbox, null);
-      var minLen = parseInt(queryInput.dataset.acMinLength || '0', 10);
-      if (freeText) {
-        // Free-text mode: keep the hidden field in sync with the typed query.
-        // Use this for tag-style fields where the submitted value is the text itself.
-        hidden.name = valueName;
-        hidden.value = queryInput.value;
-      } else {
-        // ID mode (default): a stale selection is invalid once the user edits
-        // the query. The hidden field gains its name only when an option is
-        // selected so no-JS forms are not broken by a phantom empty field.
-        hidden.name = '';
-        hidden.value = '';
-      }
-      // Clear stale options when the query drops below the minimum length.
-      if (minLen > 0 && queryInput.value.length < minLen) {
-        listbox.innerHTML = '';
-      }
-    });
-  }
 
   // ── nav_bar widget ──────────────────────────────────────────────────────
   // Progressive enhancement for autumn_web::widgets::nav_bar: before this
@@ -966,7 +839,6 @@
   // Widget init first: it sets the roles and selection that roving reads.
   function initAll(root) {
     each(root, '[data-autumn-tabs]', initTabs);
-    each(root, '[data-ac-value-id]', initAutocomplete);
     each(root, '[data-autumn-nav]', initNav);
     each(root, POPOVER, initMenu);
     root.dispatchEvent(new CustomEvent('autumn:init', { bubbles: true }));

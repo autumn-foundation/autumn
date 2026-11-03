@@ -989,11 +989,10 @@ pub mod ui;
 /// [`widget_pack::WidgetPack`].
 #[cfg(feature = "maud")]
 pub mod widget_pack;
-/// Active search and autocomplete form primitives with htmx integration.
+/// Server-rendered widgets: layout, navigation, feedback and data display,
+/// plus the opt-in search, social, workflow and chart families.
 ///
-/// See [`widgets`] for the full API including [`widgets::active_search`],
-/// [`widgets::autocomplete_input`], [`widgets::data_table`],
-/// [`widgets::property_list`], and their configuration types.
+/// See [`widgets`] for the full API and the feature of each family.
 pub mod widgets;
 /// First-class multi-step form wizards with session-backed state and per-step validation.
 ///

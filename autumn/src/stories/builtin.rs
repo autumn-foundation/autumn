@@ -8,7 +8,7 @@
 //! capture compiles.
 //!
 //! The CI coverage gate (`autumn/tests/integration/stories.rs`) enforces that
-//! every public render fn in `src/widgets.rs`, `src/ui/pagination.rs`,
+//! every public render fn in `src/widgets/`, `src/ui/pagination.rs`,
 //! `src/flash.rs` and `src/wizard.rs`, and every `src/a11y.rs` primitive, is
 //! used by at least one story's source. When you add a widget, add (or extend)
 //! a story here and add the new top-level widget's slug to
@@ -18,7 +18,18 @@ use super::{Story, story};
 
 /// Every built-in story: the ungated set, then the feature-gated set.
 pub(super) fn all_stories() -> Vec<Story> {
-    let mut stories = builtin_stories();
+    #[allow(unused_mut, reason = "each family extend has its own #[cfg]")]
+    let mut stories = Vec::new();
+    // Widget families (#3408). Search comes first, as before the split.
+    #[cfg(feature = "widgets-search")]
+    stories.extend(search_stories());
+    stories.extend(builtin_stories());
+    #[cfg(feature = "widgets-charts")]
+    stories.extend(charts_stories());
+    #[cfg(feature = "widgets-social")]
+    stories.extend(social_stories());
+    #[cfg(feature = "widgets-workflow")]
+    stories.extend(workflow_stories());
     stories.extend(gated_stories());
     stories
 }
@@ -27,87 +38,6 @@ pub(super) fn all_stories() -> Vec<Story> {
 #[allow(clippy::too_many_lines)]
 fn builtin_stories() -> Vec<Story> {
     vec![
-        story! {
-            "Forms",
-            "Active search",
-            {
-                use autumn_web::widgets::{
-                    ActiveSearchConfig, active_search, active_search_empty_state,
-                    active_search_input, active_search_results,
-                };
-
-                // A real, live-wired demo — unlike most story action URLs,
-                // which stay synthetic 404s on purpose (see e.g. the Confirm
-                // action or Bulk actions stories): a search box that visibly
-                // does nothing while typing reads as broken. The gallery
-                // itself serves this path (see `stories::demo_search`).
-                let config = ActiveSearchConfig::new("/_stories/demo/search", "#post-search-results")
-                    .placeholder("Search posts…");
-                maud::html! {
-                    // The claim below only holds when htmx is actually on
-                    // the page — story_page only loads it under the `htmx`
-                    // feature (review follow-up: a maud-only, no-htmx build
-                    // still compiles this story, and its hx-* attributes
-                    // stay inert without htmx there to process them).
-                    @if cfg!(feature = "htmx") {
-                        p { em { "Try it — this box is live, searching a small demo post list." } }
-                    } @else {
-                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
-                    }
-                    (active_search("post-search", "Search posts", &config))
-                    p { em { "For reference — not live — what your handler returns when nothing matches:" } }
-                    (active_search_empty_state("No posts matched your search."))
-                    // Compose the pieces yourself when you need custom layout
-                    // between the input and the results container: this needs
-                    // its own config, targeting its own results container —
-                    // reusing `config` above would target
-                    // "#post-search-results" (the first demo's), leaving this
-                    // one empty on a successful response (review follow-up).
-                    div {
-                        (active_search_input(
-                            "post-search-split",
-                            "Search posts",
-                            &ActiveSearchConfig::new("/_stories/demo/search", "#post-search-split-results")
-                                .placeholder("Search posts…"),
-                        ))
-                        (active_search_results("post-search-split-results"))
-                    }
-                }
-            }
-        },
-        story! {
-            "Forms",
-            "Autocomplete",
-            {
-                use autumn_web::widgets::{
-                    AutocompleteConfig, autocomplete_empty_state, autocomplete_input,
-                    autocomplete_option,
-                };
-
-                // Real, live-wired demo — see the Active search story above
-                // for why (and `stories::demo_tag_search` for the handler).
-                let config = AutocompleteConfig::new("/_stories/demo/tags/search", "tag_id")
-                    .placeholder("Start typing a tag…");
-                maud::html! {
-                    // See the Active search story above for why this is
-                    // conditional (review follow-up).
-                    @if cfg!(feature = "htmx") {
-                        p { em { "Try it — this box is live, matching against a small demo tag list." } }
-                    } @else {
-                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
-                    }
-                    (autocomplete_input("tag-picker", "Tag", &config))
-                    p { em { "For reference — not live — the two shapes your handler returns:" } }
-                    // One matching option, as your handler would render it. An
-                    // option needs a listbox parent; the live box above has one.
-                    div role="listbox" aria-label="Example options" {
-                        (autocomplete_option("42", "rust"))
-                    }
-                    // And the empty state when nothing matches:
-                    (autocomplete_empty_state("No matching tags."))
-                }
-            }
-        },
         story! {
             "Forms",
             "Field",
@@ -321,48 +251,6 @@ fn builtin_stories() -> Vec<Story> {
                     .title("Release notes")
                     .footer(maud::html! { a href="/changelog" { "Read the changelog" } });
                 card(&body, &config)
-            }
-        },
-        story! {
-            "Display",
-            "Charts",
-            {
-                use autumn_web::widgets::{
-                    ChartConfig, bar_chart, bar_chart_with, line_chart, line_chart_with,
-                    sparkline, sparkline_with,
-                };
-
-                // A 30-point trend series, built with a loop (no env capture).
-                let owned: Vec<(String, f64)> = (0..30)
-                    .map(|day| {
-                        let label = format!("Day {}", day + 1);
-                        let swing = (f64::from(day) * 0.4).sin() * 10.0;
-                        let value = 20.0 + swing;
-                        (label, value)
-                    })
-                    .collect();
-                let trend: Vec<(&str, f64)> =
-                    owned.iter().map(|(l, v)| (l.as_str(), *v)).collect();
-
-                let weekly = [
-                    ("Mon", 3.0), ("Tue", 5.0), ("Wed", 4.0),
-                    ("Thu", 7.0), ("Fri", 6.0),
-                ];
-
-                maud::html! {
-                    // Compact inline trend — plain and configured variants:
-                    (sparkline(&weekly))
-                    (sparkline_with(&weekly, &ChartConfig::new().title("Weekly visits")))
-                    // Bars, with a caller axis override + table fallback:
-                    (bar_chart(&weekly))
-                    (bar_chart_with(
-                        &weekly,
-                        &ChartConfig::new().min(0.0).max(10.0).with_table(),
-                    ))
-                    // A 30-point line chart, auto-scaled and configured:
-                    (line_chart(&trend))
-                    (line_chart_with(&trend, &ChartConfig::new().title("30-day trend")))
-                }
             }
         },
         story! {
@@ -1097,6 +985,223 @@ fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Navigation",
+            "Pagination",
+            {
+                use autumn_web::pagination::{CursorPage, CursorRequest, Page, PageRequest};
+                use autumn_web::ui::pagination::{
+                    PagerOptions, cursor_pagination_nav, pagination_nav,
+                };
+
+                // Page 5 of 20. The pager keeps the `q` filter on every link.
+                let page: Page<u32> = Page::new((41..=50).collect(), 200, &PageRequest::new(5, 10));
+                let offset = PagerOptions::new("/posts").query("q=rust");
+
+                // A cursor page has no total: only Previous and Next.
+                let request = CursorRequest::new(None, 20);
+                let feed: CursorPage<u32> =
+                    CursorPage::from_overfetched((1..=21).collect(), &request, |n| *n);
+                let cursor = PagerOptions::new("/feed").aria_label("Feed pages");
+
+                maud::html! {
+                    (pagination_nav(&page, &offset))
+                    (cursor_pagination_nav(&feed, &cursor))
+                }
+            }
+        },
+        story! {
+            "Primitives",
+            "Accessible primitives",
+            {
+                use autumn_web::a11y::{
+                    Button, Checkbox, FileField, Img, Link, MenuItem, RadioGroup, RadioOption,
+                    Select, SelectOption, TextArea, TextField,
+                };
+
+                // Each primitive needs an accessible name before it renders.
+                let icon = maud::html! { span aria-hidden="true" { "✎" } };
+                maud::html! {
+                    (Img::new(
+                        "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3Crect width='1' height='1' fill='%23c2410c'/%3E%3C/svg%3E",
+                        "Orange square",
+                    )
+                    .width(32)
+                    .height(32))
+                    (Img::decorative("data:image/gif;base64,R0lGODlhAQABAAAAACw="))
+                    p {
+                        (Button::new("Save").submit())
+                        " "
+                        (Button::icon(icon.clone(), "Edit post"))
+                    }
+                    p {
+                        (Link::new("/posts", "All posts"))
+                        " "
+                        (Link::icon("/posts/1/edit", icon, "Edit post 1"))
+                    }
+                    // A menu item needs a `role="menu"` parent. The data-autumn-*
+                    // attributes give the menu its arrow keys (autumn-widgets.js).
+                    ul role="menu" aria-label="Post actions" data-autumn-roving
+                        data-autumn-orientation="vertical" data-autumn-typeahead {
+                        li role="none" { (MenuItem::new("Archive")) }
+                        li role="none" { (MenuItem::new("View").href("/posts/1")) }
+                    }
+                    (TextField::new("email").input_type("email").label("Email address").required())
+                    // The text area grows with its text (#3406).
+                    (TextArea::new("bio").label("Bio").rows(3).auto_grow())
+                    (Select::new("plan").label("Plan")
+                        .options([SelectOption::new("free", "Free"), SelectOption::new("pro", "Pro")])
+                        .selected_value("pro"))
+                    (Checkbox::new("terms").label("I accept the terms"))
+                    (FileField::new("avatar").label("Avatar").accept("image/*"))
+                    (RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
+                        .option(RadioOption::new("express", "Express"))
+                        .label("Delivery speed"))
+                }
+            }
+        },
+    ]
+}
+
+/// Stories for the `widgets-search` family (#3408).
+#[cfg(feature = "widgets-search")]
+fn search_stories() -> Vec<Story> {
+    vec![
+        story! {
+            "Forms",
+            "Active search",
+            {
+                use autumn_web::widgets::{
+                    ActiveSearchConfig, active_search, active_search_empty_state,
+                    active_search_input, active_search_results,
+                };
+
+                // A real, live-wired demo — unlike most story action URLs,
+                // which stay synthetic 404s on purpose (see e.g. the Confirm
+                // action or Bulk actions stories): a search box that visibly
+                // does nothing while typing reads as broken. The gallery
+                // itself serves this path (see `stories::demo_search`).
+                let config = ActiveSearchConfig::new("/_stories/demo/search", "#post-search-results")
+                    .placeholder("Search posts…");
+                maud::html! {
+                    // The claim below only holds when htmx is actually on
+                    // the page — story_page only loads it under the `htmx`
+                    // feature. A maud-only, no-htmx build still compiles this
+                    // story, and its hx-* attributes stay inert there.
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it — this box is live, searching a small demo post list." } }
+                    } @else {
+                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
+                    }
+                    (active_search("post-search", "Search posts", &config))
+                    p { em { "For reference — not live — what your handler returns when nothing matches:" } }
+                    (active_search_empty_state("No posts matched your search."))
+                    // Compose the pieces yourself when you need custom layout
+                    // between the input and the results container: this needs
+                    // its own config, targeting its own results container —
+                    // reusing `config` above would target
+                    // "#post-search-results" (the first demo's), leaving this
+                    // one empty on a successful response.
+                    div {
+                        (active_search_input(
+                            "post-search-split",
+                            "Search posts",
+                            &ActiveSearchConfig::new("/_stories/demo/search", "#post-search-split-results")
+                                .placeholder("Search posts…"),
+                        ))
+                        (active_search_results("post-search-split-results"))
+                    }
+                }
+            }
+        },
+        story! {
+            "Forms",
+            "Autocomplete",
+            {
+                use autumn_web::widgets::{
+                    AutocompleteConfig, autocomplete_empty_state, autocomplete_input,
+                    autocomplete_option,
+                };
+
+                // Real, live-wired demo — see the Active search story above
+                // for why (and `stories::demo_tag_search` for the handler).
+                let config = AutocompleteConfig::new("/_stories/demo/tags/search", "tag_id")
+                    .placeholder("Start typing a tag…");
+                maud::html! {
+                    // See the Active search story above for why this is
+                    // conditional.
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it — this box is live, matching against a small demo tag list." } }
+                    } @else {
+                        p { em { "This box would be live with the htmx feature enabled — hx-* attributes need htmx on the page to do anything." } }
+                    }
+                    (autocomplete_input("tag-picker", "Tag", &config))
+                    p { em { "For reference — not live — the two shapes your handler returns:" } }
+                    // One matching option, as your handler would render it. An
+                    // option needs a listbox parent; the live box above has one.
+                    div role="listbox" aria-label="Example options" {
+                        (autocomplete_option("42", "rust"))
+                    }
+                    // And the empty state when nothing matches:
+                    (autocomplete_empty_state("No matching tags."))
+                }
+            }
+        },
+    ]
+}
+
+/// Stories for the `widgets-charts` family (#3408).
+#[cfg(feature = "widgets-charts")]
+fn charts_stories() -> Vec<Story> {
+    vec![story! {
+        "Display",
+        "Charts",
+        {
+            use autumn_web::widgets::{
+                ChartConfig, bar_chart, bar_chart_with, line_chart, line_chart_with,
+                sparkline, sparkline_with,
+            };
+
+            // A 30-point trend series, built with a loop (no env capture).
+            let owned: Vec<(String, f64)> = (0..30)
+                .map(|day| {
+                    let label = format!("Day {}", day + 1);
+                    let swing = (f64::from(day) * 0.4).sin() * 10.0;
+                    let value = 20.0 + swing;
+                    (label, value)
+                })
+                .collect();
+            let trend: Vec<(&str, f64)> =
+                owned.iter().map(|(l, v)| (l.as_str(), *v)).collect();
+
+            let weekly = [
+                ("Mon", 3.0), ("Tue", 5.0), ("Wed", 4.0),
+                ("Thu", 7.0), ("Fri", 6.0),
+            ];
+
+            maud::html! {
+                // Compact inline trend — plain and configured variants:
+                (sparkline(&weekly))
+                (sparkline_with(&weekly, &ChartConfig::new().title("Weekly visits")))
+                // Bars, with a caller axis override + table fallback:
+                (bar_chart(&weekly))
+                (bar_chart_with(
+                    &weekly,
+                    &ChartConfig::new().min(0.0).max(10.0).with_table(),
+                ))
+                // A 30-point line chart, auto-scaled and configured:
+                (line_chart(&trend))
+                (line_chart_with(&trend, &ChartConfig::new().title("30-day trend")))
+            }
+        }
+    }]
+}
+
+/// Stories for the `widgets-social` family (#3408).
+#[cfg(feature = "widgets-social")]
+#[allow(clippy::too_many_lines)]
+fn social_stories() -> Vec<Story> {
+    vec![
+        story! {
             "Feedback",
             "Infinite feed",
             {
@@ -1123,62 +1228,6 @@ fn builtin_stories() -> Vec<Story> {
                     // last page, so no further sentinel is emitted):
                     (feed_page(next, None, &FeedConfig::new("/_stories/demo/posts/feed").button()))
                 }
-            }
-        },
-        story! {
-            "Forms",
-            "Transition controls",
-            {
-                use autumn_web::widgets::transition_controls;
-
-                // A `#[state_machine]` field emits a `(from, to, Option<guard>)`
-                // transitions constant and a `can_transition_<field>_to`
-                // predicate; pass those two straight through. Here they are
-                // inlined so the story is self-contained.
-                let transitions: &[(&str, &str, Option<&str>)] = &[
-                    ("draft", "published", None),
-                    ("published", "archived", None),
-                ];
-                // Only edges leaving `current` ("draft") render, so this shows
-                // the single `draft -> published` action button.
-                transition_controls(
-                    "/orders/1/transitions/status",
-                    "status",
-                    "draft",
-                    transitions,
-                    |_to| true, // |to| order.can_transition_status_to(to)
-                    None,
-                    None,
-                )
-            }
-        },
-        story! {
-            "Forms",
-            "Translated transition controls",
-            {
-                use autumn_web::widgets::{TransitionLabels, transition_controls_with_labels};
-
-                // Same shape as "Transition controls", with the group label and
-                // one button text overridden. A target state left out of
-                // `.buttons(...)` keeps the default "Mark as {state}" text —
-                // here that is the untranslated "archived" edge.
-                let transitions: &[(&str, &str, Option<&str>)] = &[
-                    ("draft", "published", None),
-                    ("published", "archived", None),
-                ];
-                let labels = TransitionLabels::new()
-                    .group("Estado del pedido")
-                    .buttons(&[("published", "Publicar")]);
-                transition_controls_with_labels(
-                    "/orders/1/transitions/status",
-                    "status",
-                    "draft",
-                    transitions,
-                    |_to| true, // |to| order.can_transition_status_to(to)
-                    None,
-                    None,
-                    &labels,
-                )
             }
         },
         story! {
@@ -1288,6 +1337,69 @@ fn builtin_stories() -> Vec<Story> {
                 }
             }
         },
+    ]
+}
+
+/// Stories for the `widgets-workflow` family (#3408).
+#[cfg(feature = "widgets-workflow")]
+fn workflow_stories() -> Vec<Story> {
+    vec![
+        story! {
+            "Forms",
+            "Transition controls",
+            {
+                use autumn_web::widgets::transition_controls;
+
+                // A `#[state_machine]` field emits a `(from, to, Option<guard>)`
+                // transitions constant and a `can_transition_<field>_to`
+                // predicate; pass those two straight through. Here they are
+                // inlined so the story is self-contained.
+                let transitions: &[(&str, &str, Option<&str>)] = &[
+                    ("draft", "published", None),
+                    ("published", "archived", None),
+                ];
+                // Only edges leaving `current` ("draft") render, so this shows
+                // the single `draft -> published` action button.
+                transition_controls(
+                    "/orders/1/transitions/status",
+                    "status",
+                    "draft",
+                    transitions,
+                    |_to| true, // |to| order.can_transition_status_to(to)
+                    None,
+                    None,
+                )
+            }
+        },
+        story! {
+            "Forms",
+            "Translated transition controls",
+            {
+                use autumn_web::widgets::{TransitionLabels, transition_controls_with_labels};
+
+                // Same shape as "Transition controls", with the group label and
+                // one button text overridden. A target state left out of
+                // `.buttons(...)` keeps the default "Mark as {state}" text —
+                // here that is the untranslated "archived" edge.
+                let transitions: &[(&str, &str, Option<&str>)] = &[
+                    ("draft", "published", None),
+                    ("published", "archived", None),
+                ];
+                let labels = TransitionLabels::new()
+                    .group("Estado del pedido")
+                    .buttons(&[("published", "Publicar")]);
+                transition_controls_with_labels(
+                    "/orders/1/transitions/status",
+                    "status",
+                    "draft",
+                    transitions,
+                    |_to| true, // |to| order.can_transition_status_to(to)
+                    None,
+                    None,
+                    &labels,
+                )
+            }
+        },
         story! {
             "Display",
             "Bulk actions",
@@ -1359,81 +1471,6 @@ fn builtin_stories() -> Vec<Story> {
                         }
                         (bulk_actions_toolbar(&archive))
                     }
-                }
-            }
-        },
-        story! {
-            "Navigation",
-            "Pagination",
-            {
-                use autumn_web::pagination::{CursorPage, CursorRequest, Page, PageRequest};
-                use autumn_web::ui::pagination::{
-                    PagerOptions, cursor_pagination_nav, pagination_nav,
-                };
-
-                // Page 5 of 20. The pager keeps the `q` filter on every link.
-                let page: Page<u32> = Page::new((41..=50).collect(), 200, &PageRequest::new(5, 10));
-                let offset = PagerOptions::new("/posts").query("q=rust");
-
-                // A cursor page has no total: only Previous and Next.
-                let request = CursorRequest::new(None, 20);
-                let feed: CursorPage<u32> =
-                    CursorPage::from_overfetched((1..=21).collect(), &request, |n| *n);
-                let cursor = PagerOptions::new("/feed").aria_label("Feed pages");
-
-                maud::html! {
-                    (pagination_nav(&page, &offset))
-                    (cursor_pagination_nav(&feed, &cursor))
-                }
-            }
-        },
-        story! {
-            "Primitives",
-            "Accessible primitives",
-            {
-                use autumn_web::a11y::{
-                    Button, Checkbox, FileField, Img, Link, MenuItem, RadioGroup, RadioOption,
-                    Select, SelectOption, TextArea, TextField,
-                };
-
-                // Each primitive needs an accessible name before it renders.
-                let icon = maud::html! { span aria-hidden="true" { "✎" } };
-                maud::html! {
-                    (Img::new(
-                        "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1 1'%3E%3Crect width='1' height='1' fill='%23c2410c'/%3E%3C/svg%3E",
-                        "Orange square",
-                    )
-                    .width(32)
-                    .height(32))
-                    (Img::decorative("data:image/gif;base64,R0lGODlhAQABAAAAACw="))
-                    p {
-                        (Button::new("Save").submit())
-                        " "
-                        (Button::icon(icon.clone(), "Edit post"))
-                    }
-                    p {
-                        (Link::new("/posts", "All posts"))
-                        " "
-                        (Link::icon("/posts/1/edit", icon, "Edit post 1"))
-                    }
-                    // A menu item needs a `role="menu"` parent. The data-autumn-*
-                    // attributes give the menu its arrow keys (autumn-widgets.js).
-                    ul role="menu" aria-label="Post actions" data-autumn-roving
-                        data-autumn-orientation="vertical" data-autumn-typeahead {
-                        li role="none" { (MenuItem::new("Archive")) }
-                        li role="none" { (MenuItem::new("View").href("/posts/1")) }
-                    }
-                    (TextField::new("email").input_type("email").label("Email address").required())
-                    // The text area grows with its text (#3406).
-                    (TextArea::new("bio").label("Bio").rows(3).auto_grow())
-                    (Select::new("plan").label("Plan")
-                        .options([SelectOption::new("free", "Free"), SelectOption::new("pro", "Pro")])
-                        .selected_value("pro"))
-                    (Checkbox::new("terms").label("I accept the terms"))
-                    (FileField::new("avatar").label("Avatar").accept("image/*"))
-                    (RadioGroup::new("speed", RadioOption::new("standard", "Standard"))
-                        .option(RadioOption::new("express", "Express"))
-                        .label("Delivery speed"))
                 }
             }
         },

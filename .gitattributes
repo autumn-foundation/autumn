@@ -47,4 +47,4 @@ autumn/tests/fixtures/axe-core/axe.min.js -diff linguist-vendored
 # a content-hashed URL. Force LF so a Windows checkout ships the same bytes,
 # hash and size budget as Linux.
 autumn/vendor/*.js text eol=lf
-autumn/src/ui/*.css text eol=lf
+autumn/src/ui/**/*.css text eol=lf

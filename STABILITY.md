@@ -320,6 +320,11 @@ combinations is also checked on every PR:
 | `seed,repl,ledger-profile` + each backend | features that enable `db`, on each backend |
 | `offline-sync,reporting` + each backend | offline sync on each backend |
 
+The widget families (`widgets-search`, `widgets-social`, `widgets-workflow`,
+`widgets-charts`, #3408) have their own gate: the `widgets` lane of the
+`test-features` CI job checks all 16 combinations with `maud,htmx`, the
+`#[commentable]` router with `db,postgres`, and every family without `htmx`.
+
 `db` alone selects no backend, so it stops at a `compile_error!`. The sweep
 skips it and the features that enable `db` but no backend (`seed`, `repl`,
 `offline-sync`, `ledger-profile`). The combinations above build them with a

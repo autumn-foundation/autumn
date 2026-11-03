@@ -894,22 +894,15 @@ pub(crate) fn append_framework_routes_with_env(
     // enables them (same gating condition as the router mount).
     #[cfg(feature = "maud")]
     if config.stories.enabled {
+        // The demo backends come from the gallery's own list, so this
+        // listing matches the mounted routes (#3408).
         for (path, handler) in [
             (crate::stories::STORIES_PATH, "story_gallery_index"),
             ("/_stories/{slug}", "story_gallery_story"),
-            // Live demo backends for the Active search / Autocomplete /
-            // Infinite feed stories (review follow-up — route-dump
-            // consumers couldn't see these three without an entry here).
-            ("/_stories/demo/search", "story_gallery_demo_search"),
-            (
-                "/_stories/demo/tags/search",
-                "story_gallery_demo_tag_search",
-            ),
-            (
-                "/_stories/demo/posts/feed",
-                "story_gallery_demo_infinite_feed",
-            ),
-        ] {
+        ]
+        .into_iter()
+        .chain(crate::stories::demo_routes())
+        {
             infos.push(RouteInfo::framework_get(path.to_owned(), handler));
         }
     }
@@ -2135,11 +2128,7 @@ mod tests {
         // stories' live demo backends must be listed too, or route-dump
         // consumers can't see them and the OpenAPI/MCP collision preflight
         // (`collect_framework_get_paths` in router.rs) can't reserve them.
-        for demo_path in [
-            "/_stories/demo/search",
-            "/_stories/demo/tags/search",
-            "/_stories/demo/posts/feed",
-        ] {
+        for (demo_path, _) in crate::stories::demo_routes() {
             assert!(
                 paths.contains(&demo_path),
                 "enabled stories must list the demo route {demo_path}: {paths:?}"

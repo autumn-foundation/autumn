@@ -1085,6 +1085,7 @@ jobs:
             repl,
             webmcp,
             ledger-capture,
+            widgets,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1126,6 +1127,17 @@ jobs:
             | tee "${RUNNER_TEMP}/ledger-capture-lib.log"
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/ledger-capture-lib.log" \
             || { echo "::error::no ledger_capture unit tests ran"; exit 1; }
+      - name: Check every widget family combination (#3408)
+        if: matrix.lane == 'widgets'
+        # Each widget family (`widgets-search`, `widgets-social`,
+        # `widgets-workflow`, `widgets-charts`) is default-on, so
+        # `cargo test --workspace` never builds a set with one turned off. An
+        # app can turn defaults off and name only the families it uses, so
+        # the script checks all 16 combinations, plus the `#[commentable]`
+        # router with and without `widgets-social`. A warning in widget code
+        # fails it too. Then it runs the widget tests and specs with every
+        # family off, the branch the default `test` job never reaches.
+        run: ./scripts/check-widget-features.sh
       - name: Run markdown-gated tests (user-content sanitizer)
         if: matrix.lane == 'markdown'
         # `markdown` is not a default feature, so the `test` job's `cargo test
@@ -2773,7 +2785,7 @@ jobs:
         # step writes the tree to a file. Then a failed `cargo tree` fails the
         # step.
         env:
-          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile,alerts,experiments,feature-flags,job-tracking,nested-form,slo,upgrade,wizard
+          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile,alerts,experiments,feature-flags,job-tracking,nested-form,slo,upgrade,wizard,widgets-search,widgets-social,widgets-workflow,widgets-charts
         run: |
           cargo clippy -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" --lib -- -D warnings
           tree="${RUNNER_TEMP}/sqlite-only-tree.txt"

@@ -33,6 +33,7 @@
 #![allow(clippy::must_use_candidate, clippy::missing_const_for_fn)]
 
 use autumn_web::commentable::{CommentNode, commentable_spec_for, registered_commentable_types};
+#[cfg(feature = "widgets-social")]
 use autumn_web::reexports::axum;
 use autumn_web::tenancy::CURRENT_TENANT;
 use diesel::sql_types::{BigInt, Text};
@@ -1961,10 +1962,12 @@ async fn a_parent_soft_deleted_after_the_probe_serves_no_thread() {
 /// Minimal state exposing the pool to the `Db` extractor, so the real handlers
 /// run against a real database.
 #[derive(Clone)]
+#[cfg(feature = "widgets-social")]
 struct RouterState {
     pool: Pool<AsyncPgConnection>,
 }
 
+#[cfg(feature = "widgets-social")]
 impl autumn_web::db::DbState for RouterState {
     fn pool(&self) -> Option<&Pool<autumn_web::db::RuntimeConnection>> {
         Some(&self.pool)
@@ -1972,6 +1975,7 @@ impl autumn_web::db::DbState for RouterState {
 }
 
 /// The comment router mounted the way an app mounts it.
+#[cfg(feature = "widgets-social")]
 fn comment_app(
     pool: Pool<AsyncPgConnection>,
     config: autumn_web::commentable::CommentsConfig,
@@ -1982,6 +1986,7 @@ fn comment_app(
 }
 
 /// Drive one request through the router and read back `(status, body)`.
+#[cfg(feature = "widgets-social")]
 async fn call(
     app: axum::Router,
     mut request: axum::http::Request<axum::body::Body>,
@@ -2009,6 +2014,7 @@ async fn call(
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
+#[cfg(feature = "widgets-social")]
 fn get(path: &str) -> axum::http::Request<axum::body::Body> {
     axum::http::Request::builder()
         .uri(path)
@@ -2018,6 +2024,7 @@ fn get(path: &str) -> axum::http::Request<axum::body::Body> {
 
 /// A form `POST`, optionally carrying a session cookie the handler reads the
 /// author id from.
+#[cfg(feature = "widgets-social")]
 fn form_post(path: &str, body: &str) -> axum::http::Request<axum::body::Body> {
     axum::http::Request::builder()
         .method("POST")
@@ -2031,6 +2038,7 @@ fn form_post(path: &str, body: &str) -> axum::http::Request<axum::body::Body> {
 /// the path segment.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_renders_the_thread_for_any_registered_model() {
     let (pool, _container) = setup_pool().await;
     let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
@@ -2064,6 +2072,7 @@ async fn router_renders_the_thread_for_any_registered_model() {
 /// side, which had no router-level coverage before this change.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_serves_a_denormalized_tenant_column_with_no_tenancy_middleware() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2088,6 +2097,7 @@ async fn router_serves_a_denormalized_tenant_column_with_no_tenancy_middleware()
 /// The registry is the whole gate: a type no model claims cannot be reached.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_rejects_an_unregistered_commentable_type() {
     let (pool, _container) = setup_pool().await;
     let app = comment_app(pool, autumn_web::commentable::CommentsConfig::default());
@@ -2109,6 +2119,7 @@ async fn router_rejects_an_unregistered_commentable_type() {
 /// this must succeed with no `CURRENT_TENANT` scope in sight.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_ignores_a_denormalized_tenant_column_with_no_tenant_context() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2128,6 +2139,7 @@ async fn router_ignores_a_denormalized_tenant_column_with_no_tenant_context() {
 /// scoping entirely.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_requires_tenant_context_for_a_tenant_scoped_model() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2147,6 +2159,7 @@ async fn router_requires_tenant_context_for_a_tenant_scoped_model() {
 /// visible with the column set.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_serves_a_parent_whose_deleted_at_is_only_an_audit_trail() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2170,6 +2183,7 @@ async fn router_serves_a_parent_whose_deleted_at_is_only_an_audit_trail() {
 /// the fix must not turn every `deleted_at` blind.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_reports_not_found_for_a_soft_deleted_parent() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2191,6 +2205,7 @@ async fn router_reports_not_found_for_a_soft_deleted_parent() {
 /// soft-deleted parent.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_hides_a_soft_deleted_parent_when_any_repository_soft_deletes() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2219,6 +2234,7 @@ async fn router_hides_a_soft_deleted_parent_when_any_repository_soft_deletes() {
 /// Posting without a session author is `401`, and writes nothing.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_refuses_to_post_without_a_signed_in_author() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2243,6 +2259,7 @@ async fn router_refuses_to_post_without_a_signed_in_author() {
 /// router authorizes the tenant, never the record.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_honours_the_record_level_authorization_hook() {
     let (pool, _container) = setup_pool().await;
     let repo = PgCmtPostRepository::with_pool_untracked(pool.clone());
@@ -2287,6 +2304,7 @@ async fn router_honours_the_record_level_authorization_hook() {
 /// checkout, which is what declaring the extractor ahead of `Db` buys.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_authorizes_before_it_checks_out_a_connection() {
     let (pool, _container) = setup_pool_with_size(1).await;
     let mut conn = pool.get().await.expect("conn");
@@ -2340,6 +2358,7 @@ async fn router_authorizes_before_it_checks_out_a_connection() {
 /// generic one silently *loses* whatever that route did on create.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_reports_each_created_comment_to_the_app() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2399,6 +2418,7 @@ async fn router_reports_each_created_comment_to_the_app() {
 /// takes a connection from it.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn the_creation_hook_runs_after_the_connection_is_released() {
     let (pool, _container) = setup_pool_with_size(1).await;
     let mut conn = pool.get().await.expect("conn");
@@ -2453,6 +2473,7 @@ async fn the_creation_hook_runs_after_the_connection_is_released() {
 /// — not hand arbitrary path strings to application policy code.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn an_unregistered_type_is_refused_before_the_authorization_hook() {
     let (pool, _container) = setup_pool().await;
 
@@ -2603,6 +2624,7 @@ fn a_sharded_repository_registers_its_model_even_without_a_shard_key() {
 /// malformed would 422 every top-level comment posted from the widget.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_reads_an_empty_reply_to_as_a_top_level_comment() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2635,6 +2657,7 @@ async fn router_reads_an_empty_reply_to_as_a_top_level_comment() {
 /// depth and cross-record checks give.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_rejects_a_malformed_reply_to() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2659,6 +2682,7 @@ async fn router_rejects_a_malformed_reply_to() {
 /// as a bare error htmx would refuse to swap.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_re_renders_with_an_inline_error_when_the_body_is_rejected() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2685,6 +2709,7 @@ async fn router_re_renders_with_an_inline_error_when_the_body_is_rejected() {
 /// ignored rather than followed.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[cfg(feature = "widgets-social")]
 async fn router_redirects_a_non_htmx_submit_only_to_a_relative_path() {
     let (pool, _container) = setup_pool().await;
     let mut conn = pool.get().await.expect("conn");
@@ -2723,6 +2748,7 @@ async fn router_redirects_a_non_htmx_submit_only_to_a_relative_path() {
 
 /// Drive a request as a signed-in author by pre-seeding the session the
 /// handler reads `user_id` from.
+#[cfg(feature = "widgets-social")]
 async fn call_with_author(
     app: axum::Router,
     mut request: axum::http::Request<axum::body::Body>,

@@ -45,10 +45,28 @@ pub const HTMX_SSE_JS: &[u8] = include_bytes!("../vendor/sse.js");
 /// Same-origin path where Autumn serves embedded htmx SSE extension.
 pub const HTMX_SSE_JS_PATH: &str = "/static/js/sse.js";
 
+// The search runtime when `widgets-search` is on, else `""` (#3408).
+// `concat!` expands it, so the bundle stays `const`.
+#[cfg(feature = "widgets-search")]
+macro_rules! widgets_search_js {
+    () => {
+        include_str!("../vendor/autumn-widgets-search.js")
+    };
+}
+#[cfg(not(feature = "widgets-search"))]
+macro_rules! widgets_search_js {
+    () => {
+        ""
+    };
+}
+
 /// Autumn widget runtime JavaScript, embedded at compile time.
 ///
-/// Provides CSP-compatible event-listener wiring for built-in widgets
-/// (autocomplete selection, min-length enforcement). Served automatically
+/// Provides CSP-compatible wiring for the built-in widgets: the keyboard
+/// core, tabs, nav bar, popover menu, modal, drawer, theme toggle, toast and
+/// tooltip. With the `widgets-search` feature, the search runtime
+/// (autocomplete selection, min-length enforcement) comes first (#3408).
+/// Served automatically
 /// at [`AUTUMN_WIDGETS_JS_PATH`] and at the content-hashed URL
 /// `asset_url("js/autumn-widgets.js")` returns.
 ///
@@ -57,7 +75,11 @@ pub const HTMX_SSE_JS_PATH: &str = "/static/js/sse.js";
 /// ```html
 /// <script src="/static/js/autumn-widgets.js" defer></script>
 /// ```
-pub const AUTUMN_WIDGETS_JS: &[u8] = include_bytes!("../vendor/autumn-widgets.js");
+pub const AUTUMN_WIDGETS_JS: &[u8] = concat!(
+    widgets_search_js!(),
+    include_str!("../vendor/autumn-widgets.js")
+)
+.as_bytes();
 
 /// Same-origin path where Autumn serves the widget runtime script.
 pub const AUTUMN_WIDGETS_JS_PATH: &str = "/static/js/autumn-widgets.js";

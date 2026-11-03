@@ -1,0 +1,57 @@
+/* Chart widgets (`widgets-charts`). The server joins this file to
+   autumn-widgets.css only when the feature is on (#3408). */
+
+/* ── charts: sparkline / bar / line (#1231) ─────────────────────────────────
+   Pure inline SVG. Colors/strokes come from tokens via these classes — never
+   an inline `style=` — so charts re-theme by overriding `--primary` etc. and
+   survive a strict style-src/nonce CSP. Per-datum geometry lives in SVG
+   presentation attributes (x/y/width/height/points/cx/cy), not CSS. */
+.autumn-chart {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    color: var(--primary);
+}
+
+.autumn-chart__svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    overflow: visible;
+}
+
+.autumn-chart--sparkline .autumn-chart__svg {
+    height: 2rem;
+}
+
+.autumn-chart--bar .autumn-chart__svg,
+.autumn-chart--line .autumn-chart__svg {
+    height: 8rem;
+}
+
+.autumn-chart__line {
+    fill: none;
+    stroke: var(--primary);
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    vector-effect: non-scaling-stroke;
+}
+
+.autumn-chart__point {
+    fill: var(--primary);
+    stroke: none;
+}
+
+.autumn-chart__bar {
+    fill: var(--primary);
+}
+
+/* The (label, value) data table fallback — present for assistive tech and
+   no-CSS clients, hidden from sighted users without leaving the a11y tree. */
+.autumn-chart__table {
+    border-collapse: collapse;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}

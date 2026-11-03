@@ -1866,13 +1866,12 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     if config.stories.enabled {
         claimed.insert(crate::stories::STORIES_PATH.to_owned());
         claimed.insert("/_stories/{slug}".to_owned());
-        // The Active search / Autocomplete / Infinite feed stories' live
-        // demo backends (review follow-up — these three were missing from
-        // the preflight, so a colliding OpenAPI/MCP mount here would panic
-        // in `router.merge` instead of surfacing the typed collision error).
-        claimed.insert("/_stories/demo/search".to_owned());
-        claimed.insert("/_stories/demo/tags/search".to_owned());
-        claimed.insert("/_stories/demo/posts/feed".to_owned());
+        // The stories' live demo backends. Without them here, a colliding
+        // OpenAPI/MCP mount would panic in `router.merge` instead of
+        // surfacing the typed collision error.
+        for (path, _) in crate::stories::demo_routes() {
+            claimed.insert(path.to_owned());
+        }
     }
     // The default unsubscribe endpoint merges a GET (+POST) at `UNSUBSCRIBE_PATH`
     // before the late-merged OpenAPI/MCP routers, so reserve it too — otherwise an
@@ -9398,7 +9397,8 @@ mod tests {
     }
 
     /// #2353: an `hx-*` story page loads htmx, and loads it before the
-    /// widget runtime.
+    /// widget runtime. The core "Button" story uses `hx-get`, so this test
+    /// needs no widget family (#3408).
     #[cfg(all(feature = "maud", feature = "htmx"))]
     #[tokio::test]
     async fn story_detail_route_loads_htmx_for_hx_stories() {
@@ -9408,7 +9408,7 @@ mod tests {
             stories_state_with_builtin(),
         );
 
-        let response = get_with_host(router, "/_stories/active-search").await;
+        let response = get_with_host(router, "/_stories/button").await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_text(response).await;
         assert!(body.contains("hx-get"), "story must use htmx: {body}");
@@ -9419,6 +9419,29 @@ mod tests {
             .find(crate::htmx::AUTUMN_WIDGETS_JS_PATH)
             .unwrap_or_else(|| panic!("page must load autumn-widgets.js: {body}"));
         assert!(htmx_at < widgets_at, "htmx must load first: {body}");
+    }
+
+    /// Each path in `stories::demo_routes()` is mounted. The route listing
+    /// and the path reservation read that list, so a path in it that the
+    /// gallery does not mount would be listed but answer 404 (#3408).
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn every_listed_story_demo_route_is_mounted() {
+        let demos = crate::stories::demo_routes();
+        assert!(!demos.is_empty(), "the demo route list is empty");
+        for (path, handler) in demos {
+            let router = build_router(
+                Vec::new(),
+                &story_gallery_config(),
+                stories_state_with_builtin(),
+            );
+            let response = get_with_host(router, path).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "listed demo route {path} ({handler}) is not mounted"
+            );
+        }
     }
 
     /// T3 (AC4): a mounted gallery 404s unknown slugs while the index stays up.
@@ -11644,15 +11667,15 @@ enabled = true
     #[cfg(all(feature = "openapi", feature = "maud"))]
     #[tokio::test]
     async fn try_build_router_rejects_openapi_path_on_story_gallery_demo_route() {
-        // Review follow-up: the Active search / Autocomplete / Infinite feed
-        // stories' live demo backends merge GETs the same way the index/detail
-        // routes above do, but were missing from the preflight reservation —
-        // an OpenAPI mount here would panic in `router.merge` instead of
-        // surfacing this typed collision.
+        // The stories' live demo backends merge GETs the same way the
+        // index/detail routes above do. Without the preflight reservation, an
+        // OpenAPI mount here would panic in `router.merge` instead of
+        // surfacing this typed collision. `demo/save` is mounted with no
+        // widget family (#3408).
         let mut config = AutumnConfig::default();
         config.stories.enabled = true;
         let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
-            .openapi_json_path("/_stories/demo/search");
+            .openapi_json_path("/_stories/demo/save");
         let ctx = RouterContext {
             exception_filters: Vec::new(),
             scoped_groups: Vec::new(),
@@ -11669,15 +11692,14 @@ enabled = true
             #[cfg(feature = "webmcp")]
             webmcp: None,
         };
-        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
-            "story gallery demo search path should be reserved while stories are enabled",
-        );
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("story gallery demo path should be reserved while stories are enabled");
         assert!(matches!(
             err,
             RouterBuildError::OpenApiPathCollision {
                 field: "openapi_json_path",
                 ref path,
-            } if path == "/_stories/demo/search"
+            } if path == "/_stories/demo/save"
         ));
     }
 

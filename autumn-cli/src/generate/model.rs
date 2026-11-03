@@ -370,7 +370,8 @@ fn plan_model_with_options_impl(
                      `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))\
                      .declare_plugin_routes(autumn_web::commentable::route_infos(\"/comments\"))`, \
                      and render a thread with \
-                     `autumn_web::widgets::comment_thread`.",
+                     `autumn_web::widgets::comment_thread`. Both need autumn-web's \
+                     `widgets-social` feature (on by default).",
                     table = super::commentable::COMMENTS_TABLE,
                 )
             } else {

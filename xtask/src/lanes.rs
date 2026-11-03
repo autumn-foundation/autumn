@@ -175,6 +175,13 @@ pub fn lint() -> Lane {
                 "Check the widget runtime parses",
                 "node --check autumn/vendor/autumn-widgets.js",
             ),
+            // The search family's runtime (#3408) is its own file. The server
+            // joins it to the bundle when `widgets-search` is on.
+            Step::cmd(
+                "widget-search-runtime-parses",
+                "Check the search widget runtime parses",
+                "node --check autumn/vendor/autumn-widgets-search.js",
+            ),
             panic_gate(),
             determinism_gate(),
             // The resolver layer asks `cargo metadata` what cargo resolves, so

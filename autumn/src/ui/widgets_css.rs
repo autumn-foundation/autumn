@@ -19,24 +19,86 @@
 //! `:root` in your own stylesheet (loaded after this one) — not by forking
 //! these rules.
 
+// One macro for each opt-in widget family (#3408). It gives the family's CSS
+// file when its feature is on and `""` when it is off. `concat!` expands
+// these, so the bundles stay `const`.
+#[cfg(feature = "widgets-search")]
+macro_rules! search_css {
+    () => {
+        include_str!("widgets/search.css")
+    };
+}
+#[cfg(not(feature = "widgets-search"))]
+macro_rules! search_css {
+    () => {
+        ""
+    };
+}
+#[cfg(feature = "widgets-social")]
+macro_rules! social_css {
+    () => {
+        include_str!("widgets/social.css")
+    };
+}
+#[cfg(not(feature = "widgets-social"))]
+macro_rules! social_css {
+    () => {
+        ""
+    };
+}
+#[cfg(feature = "widgets-workflow")]
+macro_rules! workflow_css {
+    () => {
+        include_str!("widgets/workflow.css")
+    };
+}
+#[cfg(not(feature = "widgets-workflow"))]
+macro_rules! workflow_css {
+    () => {
+        ""
+    };
+}
+#[cfg(feature = "widgets-charts")]
+macro_rules! charts_css {
+    () => {
+        include_str!("widgets/charts.css")
+    };
+}
+#[cfg(not(feature = "widgets-charts"))]
+macro_rules! charts_css {
+    () => {
+        ""
+    };
+}
+
+/// The core rules, then the CSS of each enabled widget family.
+macro_rules! component_css {
+    () => {
+        concat!(
+            include_str!("widgets.css"),
+            search_css!(),
+            social_css!(),
+            workflow_css!(),
+            charts_css!()
+        )
+    };
+}
+
 /// Component rules only: `.autumn-field`, `.autumn-nav`, `.autumn-modal`, etc.
+/// It holds the rules of each enabled widget family (#3408).
 ///
 /// References the [`crate::ui::tokens`] custom properties (`var(--primary)`,
 /// `var(--border)`, `var(--radius)`, …) rather than hard-coded colors, so an
 /// app re-themes by overriding tokens. Does not itself define those
 /// variables — see [`WIDGETS_CSS`] for the self-contained bundle.
-pub const WIDGETS_COMPONENT_CSS: &str = include_str!("widgets.css");
+pub const WIDGETS_COMPONENT_CSS: &str = component_css!();
 
 /// Self-contained bundle: [`WIDGETS_COMPONENT_CSS`] prefixed with the shared
 /// design tokens ([`crate::ui::tokens::TOKENS_CSS`]).
 ///
 /// A single `<link>` to [`WIDGETS_CSS_PATH`] styles every widget with no
 /// other stylesheet — Tailwind or otherwise — required.
-pub const WIDGETS_CSS: &str = concat!(
-    include_str!("tokens.css"),
-    "\n",
-    include_str!("widgets.css")
-);
+pub const WIDGETS_CSS: &str = concat!(include_str!("tokens.css"), "\n", component_css!());
 
 /// URL of the framework-served widget stylesheet.
 ///
@@ -51,6 +113,25 @@ mod tests {
     use crate::ui::tokens::test_support::{Scheme, color, contrast};
     use std::fmt::Write as _;
 
+    /// The core rules and every widget family file, whatever the features
+    /// (#3408). The rule tests read this, so they cover each family file.
+    const ALL_CSS: &str = concat!(
+        include_str!("widgets.css"),
+        include_str!("widgets/search.css"),
+        include_str!("widgets/social.css"),
+        include_str!("widgets/workflow.css"),
+        include_str!("widgets/charts.css")
+    );
+
+    /// Each CSS file that the server can join into the bundle (#3408).
+    const CSS_FILES: [(&str, &str); 5] = [
+        ("widgets.css", include_str!("widgets.css")),
+        ("widgets/search.css", include_str!("widgets/search.css")),
+        ("widgets/social.css", include_str!("widgets/social.css")),
+        ("widgets/workflow.css", include_str!("widgets/workflow.css")),
+        ("widgets/charts.css", include_str!("widgets/charts.css")),
+    ];
+
     #[test]
     fn widgets_css_bundles_tokens_and_components() {
         assert!(WIDGETS_CSS.contains(crate::ui::tokens::TOKENS_CSS));
@@ -61,8 +142,8 @@ mod tests {
     fn component_css_references_tokens_not_hardcoded_colors() {
         for token_var in ["var(--primary)", "var(--border)", "var(--radius)"] {
             assert!(
-                WIDGETS_COMPONENT_CSS.contains(token_var),
-                "WIDGETS_COMPONENT_CSS should reference {token_var}"
+                ALL_CSS.contains(token_var),
+                "the component CSS should reference {token_var}"
             );
         }
     }
@@ -108,8 +189,8 @@ mod tests {
             "autumn-active",
         ] {
             assert!(
-                has_rule(WIDGETS_COMPONENT_CSS, class),
-                "widget emits .{class} but WIDGETS_COMPONENT_CSS has no rule for it"
+                has_rule(ALL_CSS, class),
+                "widget emits .{class} but the component CSS has no rule for it"
             );
         }
     }
@@ -125,7 +206,7 @@ mod tests {
     #[test]
     fn widget_focus_states_keep_an_outline_and_base_rules_have_none() {
         assert!(
-            !WIDGETS_COMPONENT_CSS.contains("outline: none"),
+            !ALL_CSS.contains("outline: none"),
             "`outline: none` leaves no focus indicator under forced-colors mode"
         );
         for selector in [
@@ -134,19 +215,17 @@ mod tests {
             ".autumn-search__input:focus {",
             ".autumn-autocomplete__input:focus {",
         ] {
-            let start = WIDGETS_COMPONENT_CSS
+            let start = ALL_CSS
                 .find(selector)
                 .unwrap_or_else(|| panic!("missing `{selector}` rule"));
-            let end = WIDGETS_COMPONENT_CSS[start..].find('}').unwrap() + start;
+            let end = ALL_CSS[start..].find('}').unwrap() + start;
             assert!(
-                WIDGETS_COMPONENT_CSS[start..end].contains("outline: 2px solid transparent;"),
+                ALL_CSS[start..end].contains("outline: 2px solid transparent;"),
                 "`{selector}` must declare a transparent outline"
             );
         }
         assert_eq!(
-            WIDGETS_COMPONENT_CSS
-                .matches("outline: 2px solid transparent;")
-                .count(),
+            ALL_CSS.matches("outline: 2px solid transparent;").count(),
             4,
             "the transparent outline belongs on the four :focus rules only"
         );
@@ -186,10 +265,10 @@ mod tests {
     }
 
     fn rule_body(selector: &str) -> &'static str {
-        let at = WIDGETS_COMPONENT_CSS
+        let at = ALL_CSS
             .find(&format!("{selector} {{"))
             .unwrap_or_else(|| panic!("missing `{selector}` rule"));
-        let body = &WIDGETS_COMPONENT_CSS[at..];
+        let body = &ALL_CSS[at..];
         &body[..body.find('}').unwrap()]
     }
 
@@ -279,7 +358,7 @@ mod tests {
     /// text on a token fill must use `--on-primary` / `--on-danger`, not white.
     #[test]
     fn no_white_text_on_a_token_fill() {
-        for rule in WIDGETS_COMPONENT_CSS.split('}') {
+        for rule in ALL_CSS.split('}') {
             let white = ["color: #fff;", "color: #ffffff;", "color: white;"]
                 .iter()
                 .any(|w| rule.contains(w));
@@ -314,7 +393,7 @@ mod tests {
     #[test]
     fn a_token_surface_sets_its_own_text_color() {
         let mut missing = Vec::new();
-        let mut rest = WIDGETS_COMPONENT_CSS;
+        let mut rest = ALL_CSS;
         while let Some(open) = rest.find('{') {
             let selector = rest[..open].rsplit(['}', '/']).next().unwrap_or("").trim();
             let close = open + rest[open..].find('}').unwrap();
@@ -350,26 +429,28 @@ mod tests {
     /// an `@media` query. Braces must balance, and never go below zero.
     #[test]
     fn component_css_braces_balance() {
-        let mut css = String::new();
-        let mut rest = WIDGETS_COMPONENT_CSS;
-        while let Some(start) = rest.find("/*") {
-            css.push_str(&rest[..start]);
-            let end = rest[start..]
-                .find("*/")
-                .map_or(rest.len(), |e| start + e + 2);
-            rest = &rest[end..];
-        }
-        css.push_str(rest);
-        let mut depth = 0_i32;
-        for c in css.chars() {
-            match c {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
+        for (file, text) in CSS_FILES {
+            let mut css = String::new();
+            let mut rest = text;
+            while let Some(start) = rest.find("/*") {
+                css.push_str(&rest[..start]);
+                let end = rest[start..]
+                    .find("*/")
+                    .map_or(rest.len(), |e| start + e + 2);
+                rest = &rest[end..];
             }
-            assert!(depth >= 0, "a `}}` has no matching `{{`");
+            css.push_str(rest);
+            let mut depth = 0_i32;
+            for c in css.chars() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                assert!(depth >= 0, "a `}}` has no matching `{{` in {file}");
+            }
+            assert_eq!(depth, 0, "{depth} unclosed `{{` in {file}");
         }
-        assert_eq!(depth, 0, "{depth} unclosed `{{` in widgets.css");
     }
 
     /// The drawer paints the token surface and has a rule for each edge,
@@ -394,10 +475,7 @@ mod tests {
             ".autumn-modal__close",
             ".autumn-drawer__close",
         ] {
-            assert!(
-                WIDGETS_COMPONENT_CSS.contains(selector),
-                "no rule: {selector}"
-            );
+            assert!(ALL_CSS.contains(selector), "no rule: {selector}");
         }
     }
 
@@ -405,10 +483,8 @@ mod tests {
     #[test]
     fn toast_exit_follows_the_density_gap() {
         assert!(rule_body(".autumn-toast-region").contains("gap: var(--space-2);"));
-        let at = WIDGETS_COMPONENT_CSS
-            .find("@keyframes autumn-toast-out")
-            .unwrap();
-        let frames = &WIDGETS_COMPONENT_CSS[at..at + 400];
+        let at = ALL_CSS.find("@keyframes autumn-toast-out").unwrap();
+        let frames = &ALL_CSS[at..at + 400];
         assert!(
             frames.contains("margin-top: calc(-1 * var(--space-2));"),
             "{frames}"
@@ -450,7 +526,7 @@ mod tests {
 
     /// The stylesheet with LF line ends. A Windows checkout can have CRLF.
     fn lf_css() -> String {
-        WIDGETS_COMPONENT_CSS.replace("\r\n", "\n")
+        ALL_CSS.replace("\r\n", "\n")
     }
 
     /// WCAG 2.2.1: hover or focus on a toast pauses every toast timer.

@@ -356,7 +356,9 @@ for crate in "${CRATES[@]}"; do
     # `db` alone does not compile (#2605): `postgres` holds the Postgres
     # client. The 0.9.0 baseline has `postgres`, so both builds name it in the
     # shared list. Use this for a feature only the current build has.
-    autumn_web_semver_current_only=""
+    # The widget families (#3408) gate items the baseline has under `maud`
+    # alone. Without them here, those items look removed.
+    autumn_web_semver_current_only="widgets-search,widgets-social,widgets-workflow,widgets-charts"
 
     echo "  pass 1/2: Postgres surface (--features $autumn_web_semver_features)"
     pg_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \

@@ -1290,7 +1290,7 @@ JavaScript at all. Autumn's default CSP is `script-src 'self'` with no
 `'unsafe-inline'`, so an inline `onclick="return confirm(..)"` is blocked
 by the browser — the form would submit with no prompt, which is worse
 than not promising one. The framework's server-rendered replacement for
-`window.confirm()`, [`confirm_action`](../../autumn/src/widgets.rs), submits
+`window.confirm()`, [`confirm_action`](../../autumn/src/widgets/feedback.rs), submits
 its own single-action form and so cannot carry a bulk form's checkbox
 selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks
@@ -1723,7 +1723,7 @@ methods were waiting for (issue #1332) — zero lines of user code:
 - Per row: a **Restore** submit posting to
   `POST /<plural>/{id}/restore`, and a **Purge** control posting to
   `POST /<plural>/{id}/purge` behind
-  [`confirm_action`](../../autumn/src/widgets.rs)'s server-rendered dialog
+  [`confirm_action`](../../autumn/src/widgets/feedback.rs)'s server-rendered dialog
   (titled per row, so the person confirming an irreversible delete can see
   which record it is). Both carry the CSRF hidden field.
 - A `Deleted At` column showing each row's `deleted_at` stamp, so the page

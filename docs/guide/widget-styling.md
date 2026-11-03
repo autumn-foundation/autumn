@@ -24,6 +24,34 @@ No Tailwind build step is required to get styled widgets: the stylesheet is
 plain CSS, not `@apply` rules, so linking it is enough even in a non-Tailwind
 app.
 
+## Widget families
+
+The widgets are in families (#3408). The core widgets (layout, navigation,
+feedback and data display) need only the `maud` feature. Four families have
+their own feature. All four are in `default`.
+
+| Feature | Widgets | CSS file |
+| --- | --- | --- |
+| `widgets-search` | `active_search`, `autocomplete_input` | `ui/widgets/search.css` |
+| `widgets-social` | `reaction_controls`, `comment_thread`, `infinite_feed` | `ui/widgets/social.css` |
+| `widgets-workflow` | `transition_controls`, `bulk_actions_form` | `ui/widgets/workflow.css` |
+| `widgets-charts` | `sparkline`, `bar_chart`, `line_chart` | `ui/widgets/charts.css` |
+
+The server joins the core rules (`ui/widgets.css`) and the CSS of each enabled
+family into the one stylesheet. The URL does not change. The script bundle
+(`/static/js/autumn-widgets.js`) works the same way: the search runtime is in
+it only with `widgets-search`.
+
+To compile and ship only the core, turn default features off and name the
+families you use:
+
+```toml
+autumn-web = { version = "0.9", default-features = false, features = ["maud", "htmx", "widgets-search"] }
+```
+
+The `#[commentable]` router renders `comment_thread`, so it needs
+`widgets-social`.
+
 ## Design tokens
 
 The widget stylesheet uses the design tokens in `autumn_web::ui::tokens`
