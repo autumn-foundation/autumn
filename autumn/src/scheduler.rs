@@ -969,7 +969,8 @@ pub fn coordinator_from_config(
     config: &SchedulerConfig,
     state: &AppState,
 ) -> AutumnResult<Arc<dyn SchedulerCoordinator>> {
-    let replica_id = config.resolved_replica_id();
+    // A preset role prefixes the default replica id with its name (#3543).
+    let replica_id = config.resolved_replica_id_for(state.role());
     match config.backend {
         SchedulerBackend::InProcess => Ok(Arc::new(InProcessSchedulerCoordinator::new(replica_id))),
         SchedulerBackend::Sqlite => {

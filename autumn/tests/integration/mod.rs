@@ -278,6 +278,7 @@ mod model_field_attrs;
 mod model_votable;
 #[cfg(feature = "db")]
 mod money_ledger_postgres;
+mod named_roles;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]

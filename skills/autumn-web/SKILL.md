@@ -2595,8 +2595,8 @@ subset of queues — all config-only, no app-code change:
   queue absent from the latest survey resets to `depth` 0. The Redis survey pages
   the whole due-delayed ZSET so scheduled/retry bursts count exactly. The `local`
   backend keeps the in-process mark path. See `docs/guide/jobs.md`.
-- **`ProcessRole` on `AppState`** — `state.role()` returns the resolved
-  `ProcessRole` (exported at `autumn_web::ProcessRole`) with `serves_http()` /
+- **`Role` on `AppState`** — `state.role()` returns the resolved
+  `Role` (exported at `autumn_web::Role`) with `serves_http()` /
   `runs_workers()` predicates, so app-owned background loops in `on_startup`
   self-gate to the right tier instead of re-reading `AUTUMN_ROLE` (issue #1726).
   `state.capabilities()` returns the `RoleCapabilities` resolved at boot: one
@@ -2604,6 +2604,13 @@ subset of queues — all config-only, no app-code change:
   `commit_hooks`, `fleet_relay`, `restore_check`, `retention`, `serves_http`).
   Gate on the field that matches the work. `/actuator/info` shows the set
   (issue #3542). See `docs/guide/jobs.md#role-capabilities`.
+- **Named roles (`[roles.<name>]`, issue #3543)** — declare a tier once as a
+  preset: `base` (`combined`/`web`/`worker`), `pin`, `workers` and capability
+  overrides that can only turn a capability off. Select it with
+  `AUTUMN_ROLE=<name>`. `state.role()` returns `&Role`: `.name()` is the
+  preset name, `.base()` the `ProcessRole`. Guards read the base; an
+  undeclared name stops the boot. `autumn doctor --strict` derives
+  `[jobs.fleet] tiers` from the presets. See `docs/guide/jobs.md#named-roles`.
 
 ## Operator alerts (0.6.0, issue #1610)
 

@@ -369,8 +369,51 @@ if state.capabilities().job_workers {
 boot, one field for each framework subsystem. `/actuator/info` shows the same
 set. See [Role capabilities](jobs.md#role-capabilities) and
 [Self-gating app-owned background work](jobs.md#self-gating-app-owned-background-work).
-Custom/named roles are unsupported today — for finer placement use per-queue
-worker pinning (#1623) plus app-level `state.capabilities()` gating.
+
+### Named tiers
+
+For more than two tiers, declare each tier once as a `[roles.<name>]` preset in
+`autumn.toml`. Each Deployment then sets only `AUTUMN_ROLE=<name>`:
+
+```toml
+[jobs]
+backend = "postgres"
+
+[roles.critical]
+base = "worker"
+pin = ["critical"]
+scheduler = false
+
+[roles.bulk]
+base = "worker"
+pin = ["bulk", "default"]
+scheduler = false
+
+[roles.cron]
+base = "worker"
+pin = []          # no job workers
+scheduler = true
+```
+
+```yaml
+  worker-critical:
+    image: my-app:latest
+    environment:
+      AUTUMN_ROLE: critical
+      AUTUMN_DATABASE__PRIMARY_URL: postgres://app:secret@db:5432/app
+```
+
+- The base (`combined`, `web` or `worker`) is the safety contract. A preset can
+  only turn a capability off. The durable-backend check reads the base.
+- `state.role().name()` is `"critical"`. `state.role().base()` is
+  `ProcessRole::Worker`.
+- `/actuator/info`, `/actuator/jobs`, a `role` metric label and the default
+  scheduler `replica_id` show the name.
+- `autumn doctor --strict` derives the fleet coverage from the presets. You do
+  not declare the tiers a second time in `[jobs.fleet]`.
+- An undeclared name stops the boot.
+
+See [Named roles](jobs.md#named-roles) for every key and rule.
 
 ## Migration Jobs
 

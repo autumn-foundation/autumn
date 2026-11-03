@@ -4331,8 +4331,7 @@ impl AppBuilder {
         // enqueues into an in-memory queue no worker can drain, and a worker
         // replica's queue starts empty. Reject it here, before any boot work,
         // rather than in `validate()`, so the doctor can still load the config.
-        // A combined role is always fine.
-        let role = config.role;
+        // A combined role is always fine. A named role is checked on its base.
         // Both config-only preconditions, through the same helper the no-boot
         // export calls — the split-role/durable-backend rule and the merged
         // scheduled-task-name check. The helper returns the message rather than
@@ -4340,28 +4339,6 @@ impl AppBuilder {
         // and the export has none.
         if let Err(message) = validate_config_preconditions(&config, &tasks) {
             tracing::error!("{message}");
-            #[cfg(feature = "managed-pg")]
-            crate::managed_pg::emergency_stop_async().await;
-            std::process::exit(1);
-        }
-
-        // The sqlite queue backs a split role only because both processes open
-        // the same file. Against an in-memory target each gets its own private
-        // database, so the web replica would enqueue where no worker can ever
-        // look — the same silent stranding, one step further in (issue #1907).
-        if crate::config::split_role_requires_file_backed_sqlite(
-            role,
-            &config.jobs.backend,
-            config.database.effective_primary_url(),
-        ) {
-            tracing::error!(
-                role = role.as_str(),
-                "process role '{}' with jobs.backend = \"sqlite\" requires a FILE-backed \
-                 database: an in-memory SQLite target is private to each process, so the web \
-                 replica would enqueue into a queue no worker process can see. Point \
-                 database.url at a sqlite:// file, or run the combined role.",
-                role.as_str(),
-            );
             #[cfg(feature = "managed-pg")]
             crate::managed_pg::emergency_stop_async().await;
             std::process::exit(1);
@@ -4575,7 +4552,8 @@ impl AppBuilder {
         // Resolved once. Each subsystem below reads its own field (#3542).
         let capabilities = state.capabilities();
         tracing::info!(
-            role = role.as_str(),
+            role = state.role().name(),
+            base = state.role().base().as_str(),
             capabilities = ?capabilities.enabled().map(crate::config::Capability::as_str).collect::<Vec<_>>(),
             "process role resolved"
         );
@@ -5047,7 +5025,8 @@ impl AppBuilder {
             if jobs.is_empty() {
                 unused_redis_subsystems.push("jobs");
             }
-            unused_redis_subsystems.extend(crate::redis_health::unused_for_role(role));
+            unused_redis_subsystems
+                .extend(crate::redis_health::unused_for_role(state.role().base()));
             crate::redis_health::register_redis_health_indicators(
                 &config,
                 &state.health_indicator_registry,
@@ -5617,11 +5596,13 @@ impl AppBuilder {
         }
         let prestop_grace = config.server.prestop_grace_secs;
 
+        // A preset `pin` and `workers` replace `jobs.pin` and `jobs.workers`.
+        let role_jobs = state.role().jobs_config(&config.jobs).into_owned();
         if let Err(error) = initialize_job_runtime(
             jobs,
             &state,
             &server_shutdown,
-            &config.jobs,
+            &role_jobs,
             capabilities.job_workers,
         ) {
             tracing::error!(error = %error, "job runtime initialization failed");
@@ -6002,7 +5983,7 @@ impl AppBuilder {
                         );
                         leadership_degraded = config.scheduler.backend.is_fleet_distributed();
                         std::sync::Arc::new(crate::scheduler::InProcessSchedulerCoordinator::new(
-                            config.scheduler.resolved_replica_id(),
+                            config.scheduler.resolved_replica_id_for(state.role()),
                         ))
                     }
                 };
@@ -7436,7 +7417,7 @@ impl AppBuilder {
                     crate::config::AutumnConfig::default()
                 }
             };
-        if !config.role.serves_http() {
+        if config.resolve_role().is_ok_and(|role| !role.serves_http()) {
             return (graph_worker_mounted_routes(&config), 0);
         }
         let mounted = graph_mounted_routes(
@@ -15446,7 +15427,7 @@ fn export_preflight(ctx: &ExportPreflight<'_>) -> Result<(), String> {
     // The document itself is still exported: it is built from the routes and the
     // `OpenApiConfig`, neither of which depends on the role, so the contract a
     // worker-profile export writes down is the same one the web role serves.
-    if !config.role.serves_http() {
+    if config.resolve_role().is_ok_and(|role| !role.serves_http()) {
         return Ok(());
     }
 
@@ -15571,10 +15552,15 @@ fn merge_framework_scheduled_tasks(
 /// faithfully still approved a spec for an app that refuses to start (issue
 /// #802):
 ///
+/// * a `role` that names no built-in role and no `[roles.<name>]` preset;
 /// * a `web`/`worker` process role on a non-durable jobs backend — the web
 ///   replica would enqueue into an in-memory queue no worker can drain;
+/// * a `web`/`worker` process role on the `sqlite` jobs backend with an
+///   in-memory database, which no other process can open;
 /// * a duplicate `#[scheduled]` task name, which spawns two loops competing for
 ///   one coordination lock.
+///
+/// A named role is checked on its base.
 ///
 /// `tasks` must ALREADY be the fully merged list — hand-declared entries plus
 /// the `#[repository(..., retention(...))]` sweeps plus the framework's
@@ -15592,14 +15578,40 @@ fn validate_config_preconditions(
     config: &AutumnConfig,
     tasks: &[crate::task::TaskInfo],
 ) -> Result<(), String> {
-    if crate::config::split_role_requires_durable_backend(config.role, &config.jobs.backend) {
+    let role = config
+        .resolve_role()
+        .map_err(|err| format!("role: {err}"))?;
+    // The checks read the base of a named role (#3543).
+    let base = role.base();
+    let role_label = if role.is_preset() {
+        format!("{} (base {})", role.name(), base.as_str())
+    } else {
+        base.as_str().to_owned()
+    };
+    if crate::config::split_role_requires_durable_backend(base, &config.jobs.backend) {
         return Err(format!(
-            "process role '{role}' requires a durable jobs backend: backend '{backend}' is not \
-             a recognized durable backend and falls through to the in-process 'local' runtime, \
-             which cannot be shared across a split web/worker topology. Set jobs.backend = \
-             \"postgres\" or \"redis\", or run the combined role.",
-            role = config.role.as_str(),
+            "process role '{role_label}' requires a durable jobs backend: backend '{backend}' is \
+             not a recognized durable backend and falls through to the in-process 'local' \
+             runtime, which cannot be shared across a split web/worker topology. Set \
+             jobs.backend = \"postgres\" or \"redis\", or run the combined role.",
             backend = config.jobs.backend,
+        ));
+    }
+
+    // The sqlite queue backs a split role only because both processes open
+    // the same file. Against an in-memory target each gets its own private
+    // database, so the web replica would enqueue where no worker can ever
+    // look — the same silent stranding, one step further in (issue #1907).
+    if crate::config::split_role_requires_file_backed_sqlite(
+        base,
+        &config.jobs.backend,
+        config.database.effective_primary_url(),
+    ) {
+        return Err(format!(
+            "process role '{role_label}' with jobs.backend = \"sqlite\" requires a FILE-backed \
+             database: an in-memory SQLite target is private to each process, so the web \
+             replica would enqueue into a queue no worker process can see. Point database.url \
+             at a sqlite:// file, or run the combined role."
         ));
     }
 
@@ -17118,8 +17130,12 @@ fn build_state(
         db_capture_gap: database_topology
             .and_then(|topology| topology.capture_gap().map(std::sync::Arc::from)),
         profile: config.profile.as_deref().map(Arc::from),
-        role: config.role,
-        capabilities: config.capabilities(),
+        // The loaders reject an undeclared role. Only a hand-built config gets
+        // here with one, and it must not boot as another role.
+        role: config.resolve_role().unwrap_or_else(|error| {
+            tracing::error!(error = %error, "refusing to start: the process role does not resolve");
+            std::process::exit(1);
+        }),
         started_at: crate::time::monotonic_now(),
         health_detailed: config.health.detailed,
         probes,
@@ -18637,12 +18653,13 @@ mod tests {
             #[cfg(feature = "ws")]
             None,
         );
-        assert_eq!(state.role(), ProcessRole::Combined);
+        assert_eq!(state.role().base(), ProcessRole::Combined);
+        assert_eq!(state.role().name(), "combined");
         assert_eq!(state.capabilities(), ProcessRole::Combined.capabilities());
 
         // A worker-role config flows through the exact same resolution the
         // framework uses to gate the job runtime, reachable via `state.role()`.
-        config.role = ProcessRole::Worker;
+        config.role = ProcessRole::Worker.into();
         let state = build_state(
             &config,
             #[cfg(feature = "db")]
@@ -18652,10 +18669,87 @@ mod tests {
             #[cfg(feature = "ws")]
             None,
         );
-        assert_eq!(state.role(), ProcessRole::Worker);
-        assert_eq!(state.capabilities(), config.capabilities());
+        assert_eq!(state.role().base(), ProcessRole::Worker);
+        assert_eq!(
+            state.capabilities(),
+            config.resolve_role().expect("worker").capabilities()
+        );
         assert!(state.capabilities().job_workers);
         assert!(!state.capabilities().serves_http);
+    }
+
+    /// A config with `[roles.<name>]` presets and the given role and jobs backend.
+    fn named_role_config_3543(role: &str, backend: &str) -> AutumnConfig {
+        let toml = format!(
+            "role = \"{role}\"\n[jobs]\nbackend = \"{backend}\"\n\
+             [roles.critical]\nbase = \"worker\"\npin = [\"critical\"]\nscheduler = false\n\
+             [roles.api]\nbase = \"web\"\n\
+             [roles.marketing]\nbase = \"combined\"\n"
+        );
+        toml::from_str(&toml).expect("named role config")
+    }
+
+    #[test]
+    fn build_state_exposes_named_role() {
+        let config = named_role_config_3543("critical", "postgres");
+        let state = build_state(
+            &config,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "db")]
+            None,
+            #[cfg(feature = "ws")]
+            None,
+        );
+        assert_eq!(state.role().name(), "critical");
+        assert_eq!(state.role().base(), crate::config::ProcessRole::Worker);
+        assert!(state.capabilities().job_workers);
+        assert!(!state.capabilities().scheduler);
+        assert!(!state.capabilities().serves_http);
+    }
+
+    /// The durable-backend guard reads the base of a named role.
+    #[test]
+    fn durable_backend_guard_fires_for_named_split_roles_on_local() {
+        for role in ["critical", "api"] {
+            let config = named_role_config_3543(role, "local");
+            let err = validate_config_preconditions(&config, &[])
+                .expect_err("a named web/worker role on local must not boot");
+            assert!(err.contains(role), "{role}: {err}");
+            assert!(err.contains("durable jobs backend"), "{role}: {err}");
+            for backend in ["postgres", "redis", "sqlite"] {
+                let config = named_role_config_3543(role, backend);
+                validate_config_preconditions(&config, &[])
+                    .unwrap_or_else(|err| panic!("{role} on {backend}: {err}"));
+            }
+        }
+        // A combined base enqueues and drains in one process.
+        let config = named_role_config_3543("marketing", "local");
+        validate_config_preconditions(&config, &[]).expect("combined base on local");
+    }
+
+    /// The file-backed `SQLite` guard reads the base of a named role.
+    #[test]
+    fn file_backed_sqlite_guard_fires_for_named_split_roles() {
+        for role in ["critical", "api"] {
+            let mut config = named_role_config_3543(role, "sqlite");
+            config.database.url = Some("sqlite::memory:".to_owned());
+            let err = validate_config_preconditions(&config, &[])
+                .expect_err("an in-memory SQLite split role must not boot");
+            assert!(err.contains(role), "{role}: {err}");
+            assert!(err.contains("FILE-backed"), "{role}: {err}");
+        }
+        let mut config = named_role_config_3543("marketing", "sqlite");
+        config.database.url = Some("sqlite::memory:".to_owned());
+        validate_config_preconditions(&config, &[]).expect("combined base");
+    }
+
+    /// An undeclared role stops the boot, as an unknown built-in does.
+    #[test]
+    fn undeclared_named_role_fails_preconditions() {
+        let config = named_role_config_3543("critcal", "postgres");
+        let err = validate_config_preconditions(&config, &[]).expect_err("typo");
+        assert!(err.contains("critcal"), "{err}");
     }
 
     // Postgres-only fixture: it configures a distinct `replica_url`, which
@@ -19854,7 +19948,7 @@ mod tests {
     #[test]
     fn graph_worker_census_is_probes_and_actuator_only() {
         let mut config = AutumnConfig::default();
-        config.role = crate::config::ProcessRole::Worker;
+        config.role = crate::config::ProcessRole::Worker.into();
         config.actuator.sensitive = true;
         let mounted = graph_worker_mounted_routes(&config);
         let paths = census_paths(&mounted);
@@ -19917,7 +20011,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut config = AutumnConfig::default();
-        config.role = crate::config::ProcessRole::Worker;
+        config.role = crate::config::ProcessRole::Worker.into();
         config.health.live_path = "/custom-live".to_owned();
         let builder = app().with_config_loader(CensusLoader(Ok(config)));
         let (mounted, opaque) = builder.dump_graph_surface().await;
