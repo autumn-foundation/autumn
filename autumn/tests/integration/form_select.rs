@@ -463,18 +463,14 @@ impl autumn_web::form::FieldRenderer for PackSelect {
     }
 
     fn render(&self, field: &autumn_web::form::FieldContext<'_>) -> maud::Markup {
-        let options: String = TAGS
-            .iter()
-            .map(|(value, label)| {
-                let mark = if field.values().iter().any(|v| v == value) {
-                    " selected"
-                } else {
-                    ""
-                };
-                format!(r#"<option value="{value}"{mark}>{label}</option>"#)
-            })
-            .collect();
-        field.control("select", &[], maud::PreEscaped(options))
+        let options = maud::html! {
+            @for (value, label) in TAGS {
+                option value=(value) selected[field.values().iter().any(|v| v == value)] {
+                    (label)
+                }
+            }
+        };
+        field.control("select", &[], options)
     }
 }
 
@@ -575,9 +571,9 @@ proptest! {
             Changeset::new(serde_json::json!({ "f": current.first() }))
         };
         let shown: Vec<String> = if multiple {
-            current.clone()
+            current
         } else {
-            current.first().cloned().into_iter().collect()
+            current.into_iter().take(1).collect()
         };
         let opts = if multiple { FieldOptions::new().multiple() } else { FieldOptions::new() };
         let html = grouped_select_input_with(&cs, "f", "F", &top_refs, &group_refs, &opts)

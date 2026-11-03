@@ -5029,7 +5029,7 @@ fn push_choice_items(
     let mut index = 0;
     choices.for_each(|value, label| {
         push_item(index, value, label);
-        index += 1;
+        index = index.saturating_add(1);
     });
     out.push_str("</div>");
 }
