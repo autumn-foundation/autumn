@@ -24,7 +24,7 @@ media.
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 
 No database is required. To carry real WebRTC media you would additionally run a
 [MediaMTX](https://github.com/bluenviron/mediamtx) server with a

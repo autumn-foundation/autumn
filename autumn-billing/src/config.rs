@@ -101,9 +101,9 @@ impl DunningPolicy {
         Self {
             enabled: true,
             retry_delays: vec![
-                Duration::from_secs(86_400),
-                Duration::from_secs(3 * 86_400),
-                Duration::from_secs(5 * 86_400),
+                Duration::from_hours(24),
+                Duration::from_hours(72),
+                Duration::from_hours(120),
             ],
             on_exhausted: ExhaustionAction::CancelSubscription,
         }
@@ -214,7 +214,7 @@ impl Default for BillingConfig {
             cancel_url: "/billing/cancel".to_owned(),
             portal_return_url: "/".to_owned(),
             allow_past_due: false,
-            grace_period: Duration::from_secs(72 * 3600),
+            grace_period: Duration::from_hours(72),
             dunning: DunningPolicy::standard(),
             stripe: StripeConfig::default(),
             plans: Vec::new(),
@@ -641,16 +641,16 @@ interval = "year"
         assert_eq!(cfg.cancel_url, "https://app.test/cancel");
         assert_eq!(cfg.portal_return_url, "https://app.test/account");
         assert!(cfg.allow_past_due);
-        assert_eq!(cfg.grace_period, Duration::from_secs(24 * 3600));
+        assert_eq!(cfg.grace_period, Duration::from_hours(24));
         assert!(cfg.allow_memory_store_in_production);
 
         assert!(cfg.dunning.enabled);
         assert_eq!(
             cfg.dunning.retry_delays,
             vec![
-                Duration::from_secs(24 * 3600),
-                Duration::from_secs(72 * 3600),
-                Duration::from_secs(120 * 3600),
+                Duration::from_hours(24),
+                Duration::from_hours(72),
+                Duration::from_hours(120),
             ]
         );
         assert_eq!(cfg.dunning.on_exhausted, ExhaustionAction::MarkUnpaid);
@@ -978,9 +978,9 @@ interval = "year"
         assert_eq!(policy.delay_for(0), None);
         assert_eq!(policy.delay_for(-1), None);
         assert_eq!(policy.delay_for(i64::MIN), None);
-        assert_eq!(policy.delay_for(1), Some(Duration::from_secs(86_400)));
-        assert_eq!(policy.delay_for(2), Some(Duration::from_secs(3 * 86_400)));
-        assert_eq!(policy.delay_for(3), Some(Duration::from_secs(5 * 86_400)));
+        assert_eq!(policy.delay_for(1), Some(Duration::from_hours(24)));
+        assert_eq!(policy.delay_for(2), Some(Duration::from_hours(72)));
+        assert_eq!(policy.delay_for(3), Some(Duration::from_hours(120)));
         assert_eq!(policy.delay_for(4), None);
         assert_eq!(policy.delay_for(i64::MAX), None);
 

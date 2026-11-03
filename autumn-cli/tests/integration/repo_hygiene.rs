@@ -192,6 +192,24 @@ fn workspace_test_profile_keeps_ci_artifacts_bounded() {
     );
 }
 
+/// Old release and MSRV text that must not come back to the first-run docs.
+const STALE_FIRST_RUN_TEXT: &[&str] = &[
+    "Rust 1.85",
+    "Rust 1.86",
+    "rustc 1.85",
+    "rustc 1.86",
+    "rust:1.86",
+    "Rust 1.88",
+    "rustc 1.88",
+    "rust:1.88",
+    "rust-1.88",
+    "autumn-web = \"0.1.0\"",
+    "version=\"0.1.0\"",
+    "\"version\": \"0.1.0\"",
+    "v0.1.0",
+    "crates.io publication is not yet available",
+];
+
 #[test]
 fn first_run_docs_match_current_release_line() {
     let root = workspace_root();
@@ -231,18 +249,7 @@ fn first_run_docs_match_current_release_line() {
         format!(r#"{{ "status": "ok", "version": "{published_version}" }}"#);
 
     for (doc, content) in &docs {
-        for stale in [
-            "Rust 1.85",
-            "Rust 1.86",
-            "rustc 1.85",
-            "rustc 1.86",
-            "rust:1.86",
-            "autumn-web = \"0.1.0\"",
-            "version=\"0.1.0\"",
-            "\"version\": \"0.1.0\"",
-            "v0.1.0",
-            "crates.io publication is not yet available",
-        ] {
+        for stale in STALE_FIRST_RUN_TEXT {
             assert!(
                 !content.contains(stale),
                 "{doc} still references stale first-run release/MSRV text: {stale}"
@@ -561,9 +568,27 @@ fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
     let script = std::fs::read_to_string(&script_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", script_path.display()));
 
+    // Cargo does not build a crate on a toolchain below its `rust-version`.
+    // So the semver toolchain must be at or above the workspace MSRV.
+    let semver_toolchain = script
+        .lines()
+        .find_map(|line| line.strip_prefix(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-"#))
+        .and_then(|rest| rest.strip_suffix(r#"}""#))
+        .unwrap_or_else(|| {
+            panic!(
+                "{} must pin a default semver toolchain",
+                script_path.display()
+            )
+        })
+        .to_owned();
+    let msrv = workspace_package_value(&read_workspace_manifest(&root), "rust-version");
+    let semver_triple = parse_semver_triple(&semver_toolchain)
+        .unwrap_or_else(|| panic!("semver toolchain `{semver_toolchain}` must be x.y.z"));
+    let msrv_triple =
+        parse_semver_triple(&msrv).unwrap_or_else(|| panic!("MSRV `{msrv}` must be x.y.z"));
     assert!(
-        script.contains(r#"semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.94.1}""#),
-        "{} must pin the semver rustdoc toolchain to Rust 1.94.1 by default",
+        semver_triple >= msrv_triple,
+        "{} semver toolchain {semver_toolchain} is below the MSRV {msrv}",
         script_path.display(),
     );
     assert!(
@@ -591,8 +616,8 @@ fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
         .and_then(|job| job.split("\n  # ---").next())
         .unwrap_or_else(|| panic!("{} must define a semver job", workflow_path.display()));
     assert!(
-        semver_job.contains("dtolnay/rust-toolchain@1.94.1"),
-        "{} semver job must install the pinned Rust 1.94.1 toolchain",
+        semver_job.contains(&format!("dtolnay/rust-toolchain@{semver_toolchain}")),
+        "{} semver job must install the script's Rust {semver_toolchain} toolchain",
         workflow_path.display(),
     );
     assert!(
@@ -602,17 +627,18 @@ fn semver_script_checks_optional_features_with_pinned_rustdoc_toolchain() {
     );
 }
 
+/// `webauthn-rs` 0.6 uses pure-Rust crypto. The guide must not send a
+/// developer to install OpenSSL for `--passkeys`.
 #[test]
-fn webauthn_docs_explain_native_openssl_vcpkg_prerequisite() {
+fn webauthn_docs_do_not_require_openssl() {
     let root = workspace_root();
     let guide_path = root.join("docs/guide/generators.md");
     let guide = std::fs::read_to_string(&guide_path)
         .unwrap_or_else(|err| panic!("failed to read {}: {err}", guide_path.display()));
-
-    for required in ["WebAuthn", "OpenSSL", "vcpkg", "VCPKG_ROOT"] {
+    for stale in ["vcpkg", "VCPKG_ROOT", "openssl-sys"] {
         assert!(
-            guide.contains(required),
-            "{} must document the WebAuthn/OpenSSL native dependency prerequisite `{required}`",
+            !guide.contains(stale),
+            "{} must not ask for `{stale}`: webauthn-rs needs no OpenSSL",
             guide_path.display(),
         );
     }
@@ -9869,4 +9895,165 @@ fn posture_script_passes_both_ack_forms_and_never_unprompted() {
         !calls.contains("--ack"),
         "an empty directory variable must not acknowledge anything: {calls}"
     );
+}
+
+/// Resolved `(member, name, version)` triples: one for each dependency of each
+/// workspace member.
+fn workspace_member_dependencies(root: &Path) -> Vec<(String, String, String)> {
+    let lock_path = root.join("Cargo.lock");
+    let lock = std::fs::read_to_string(&lock_path)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", lock_path.display()));
+    let lock: toml::Value = toml::from_str(&lock).expect("Cargo.lock should parse as TOML");
+    let packages = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .expect("Cargo.lock should list packages");
+    let field = |package: &toml::Value, key: &str| {
+        package
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // Cargo writes `name` alone when one version is locked, else `name version`.
+    let only_version = |name: &str| {
+        let versions: Vec<String> = packages
+            .iter()
+            .filter(|package| field(package, "name") == name)
+            .map(|package| field(package, "version"))
+            .collect();
+        assert_eq!(versions.len(), 1, "{name} must have one locked version");
+        versions[0].clone()
+    };
+    let mut resolved = Vec::new();
+    for member in packages
+        .iter()
+        .filter(|package| package.get("source").is_none())
+    {
+        let member_name = field(member, "name");
+        for dependency in member
+            .get("dependencies")
+            .and_then(toml::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(toml::Value::as_str)
+        {
+            let mut parts = dependency.split(' ');
+            let name = parts.next().unwrap_or_default().to_owned();
+            let version = parts
+                .next()
+                .map_or_else(|| only_version(&name), str::to_owned);
+            resolved.push((member_name.clone(), name, version));
+        }
+    }
+    resolved
+}
+
+/// True when `version` is at or above the `major.minor` floor.
+fn version_at_least(version: &str, floor: (u64, u64)) -> bool {
+    let mut parts = version.split(['.', '-', '+']);
+    let major: u64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let minor: u64 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    (major, minor) >= floor
+}
+
+/// Each raised dependency stays at its new major. See
+/// `docs/plans/2026-11-03-msrv-1.97-dependency-raise.md` for the holds.
+#[test]
+fn workspace_members_resolve_raised_dependency_majors() {
+    const FLOORS: &[(&str, (u64, u64))] = &[
+        ("reqwest", (0, 13)),
+        ("sha2", (0, 11)),
+        ("hmac", (0, 13)),
+        ("aes-gcm", (0, 11)),
+        ("lru", (0, 19)),
+        ("rustyline", (19, 0)),
+        ("sysinfo", (0, 40)),
+        ("serde-saphyr", (2, 0)),
+        ("postgresql_embedded", (0, 22)),
+        ("aws-sdk-s3", (1, 157)),
+        ("webauthn-rs", (0, 6)),
+        ("p256", (0, 14)),
+    ];
+    let resolved = workspace_member_dependencies(&workspace_root());
+    let mut stale = Vec::new();
+    for (crate_name, floor) in FLOORS {
+        let mut seen = false;
+        for (member, name, version) in &resolved {
+            if name == crate_name {
+                seen = true;
+                if !version_at_least(version, *floor) {
+                    stale.push(format!("{member} -> {name} {version}"));
+                }
+            }
+        }
+        assert!(seen, "no workspace member depends on {crate_name}");
+    }
+    assert!(stale.is_empty(), "stale dependency majors: {stale:#?}");
+}
+
+/// One `reqwest` major in the lock file. Two majors double the HTTP client
+/// build and split the types that the `oauth2` API exposes.
+#[test]
+fn lockfile_resolves_one_reqwest_major() {
+    let root = workspace_root();
+    let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("read Cargo.lock");
+    let lock: toml::Value = toml::from_str(&lock).expect("Cargo.lock should parse as TOML");
+    let versions: Vec<&str> = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .expect("Cargo.lock should list packages")
+        .iter()
+        .filter(|package| package.get("name").and_then(toml::Value::as_str) == Some("reqwest"))
+        .filter_map(|package| package.get("version").and_then(toml::Value::as_str))
+        .collect();
+    assert_eq!(versions.len(), 1, "Cargo.lock has reqwest {versions:?}");
+}
+
+/// `autumn-storage-s3` and `autumn-media-plugin` resolve one AWS SDK graph.
+/// Their AWS pins must agree. No pin may carry an upper cap. The old caps held
+/// the old MSRV or worked around compile errors that current AWS SDK releases
+/// do not have.
+#[test]
+fn s3_crates_share_uncapped_aws_pins() {
+    let root = workspace_root();
+    let aws_pins = |manifest: &str| {
+        let path = root.join(manifest);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+        let parsed: toml::Value = toml::from_str(&text).expect("manifest should parse");
+        let mut pins: Vec<(String, String)> = parsed
+            .get("dependencies")
+            .and_then(toml::Value::as_table)
+            .expect("manifest should have dependencies")
+            .iter()
+            .filter(|(name, _)| name.starts_with("aws-"))
+            .map(|(name, spec)| {
+                let version = spec
+                    .as_str()
+                    .or_else(|| spec.get("version").and_then(toml::Value::as_str))
+                    .unwrap_or_default()
+                    .to_owned();
+                (name.clone(), version)
+            })
+            .collect();
+        pins.sort();
+        pins
+    };
+    let storage = aws_pins("autumn-storage-s3/Cargo.toml");
+    let media = aws_pins("autumn-media-plugin/Cargo.toml");
+    assert!(
+        !storage.is_empty(),
+        "autumn-storage-s3 must depend on the AWS SDK"
+    );
+    assert_eq!(
+        storage, media,
+        "the two S3 crates must pin the same AWS versions"
+    );
+    for (name, version) in &storage {
+        assert!(
+            !version.contains('<'),
+            "{name} = \"{version}\" must not carry an upper cap"
+        );
+    }
 }

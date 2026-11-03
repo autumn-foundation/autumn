@@ -102,11 +102,11 @@ async fn token_expires_after_30_days_no_sleep() {
     client.get("/token-check").send().await.assert_status(200);
 
     // Advance just under the 30-day window — still valid.
-    client.advance_clock(Duration::from_secs(29 * 24 * 3600));
+    client.advance_clock(Duration::from_hours(29 * 24));
     client.get("/token-check").send().await.assert_status(200);
 
     // Advance past expiry — should get 401.
-    client.advance_clock(Duration::from_secs(2 * 24 * 3600));
+    client.advance_clock(Duration::from_hours(48));
     client.get("/token-check").send().await.assert_status(401);
 }
 
@@ -135,7 +135,7 @@ async fn advance_clock_with_fixed_clock_is_noop() {
         .build();
 
     // advance_clock should not panic even for a FixedClock
-    client.advance_clock(Duration::from_secs(86400));
+    client.advance_clock(Duration::from_hours(24));
 
     // Time is still pinned — FixedClock ignores advance.
     let body = client.get("/now").send().await.assert_ok().text();

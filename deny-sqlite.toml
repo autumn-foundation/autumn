@@ -7,8 +7,9 @@
 #   cargo deny --config deny-sqlite.toml check advisories licenses sources
 #
 # KEEP [advisories].ignore, [licenses].allow, and [sources] IN SYNC with
-# deny.toml — only the [graph] features and the unused-ignored-advisory knob
-# below intentionally differ. See CONTRIBUTING.md and deny.toml's header for how
+# deny.toml. Only the [graph] features differ. (The sqlite graph does not turn on
+# `webauthn`, so the rsa 0.10 text below does not apply to it; it stays to keep
+# the two lists the same.) See CONTRIBUTING.md and deny.toml's header for how
 # to triage a failing check.
 
 [graph]
@@ -29,47 +30,27 @@ features = ["autumn-web/sqlite"]
 # anywhere in the tree can slip past this gate. Yanked crates stay at the
 # default `warn` (currently chacha20 0.10.1, transitive) — tracked but
 # non-blocking.
-# The RUSTSEC-2024-0384 (instant) ignore enters only via managed-pg-bundled,
-# which is not in the sqlite graph, so it is legitimately unused here — don't
-# warn on it (the shared ignore list is kept identical to deny.toml on purpose).
-unused-ignored-advisory = "allow"
 unmaintained = "all"
 unsound = "all"
 yanked = "warn"
 ignore = [
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" timing sidechannel.
     # No patched rsa release exists (advisory: "no safe upgrade available").
-    # Ingress: rsa 0.9.10 -> jsonwebtoken -> autumn-web, i.e. only the RSA-family
-    # JWT sign/verify path. Autumn exposes no network-reachable attacker-timed
-    # RSA private-key decryption oracle, so real exposure is limited. Tracked by
+    # Ingress: rsa 0.9.10 through jsonwebtoken (RSA-family JWT sign and verify)
+    # and autumn-web's SNS check (`inbound-ses`, public key only); rsa 0.10
+    # through webauthn-rs 0.6 and crypto-glue (RS256 passkey checks, public key
+    # only). Autumn exposes no network-reachable attacker-timed RSA private-key
+    # decryption oracle, so real exposure is limited. Tracked by
     # issue #1600. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05; or when a fixed rsa ships).
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA-JWT path only via jsonwebtoken; tracked in #1600; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
-    # RUSTSEC-2024-0384 — instant unmaintained. Build-time, transitive, and only
-    # pulled in by the managed-pg-bundled feature scanned above:
-    # instant -> parking_lot -> reqwest-retry -> postgresql_archive ->
-    # (build) postgresql_embedded -> autumn-web. Not a runtime vulnerability and no
-    # safe upgrade (author recommends web-time). Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
-    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive via postgresql_embedded (managed-pg-bundled feature); no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
-    # RUSTSEC-2026-0253 — `lru`'s `LruCache::pop()` is not panic-safe. Kept
-    # identical to deny.toml on purpose (see the note above the ignore list);
-    # the full rationale lives there. Short version: the workspace's own `lru` is
-    # FIXED at 0.18.2, and this covers only lru 0.16.4 reached through
-    # aws-sdk-s3 1.122, which is MSRV-pinned and has no patched 0.16.x to move
-    # to. Its sole `lru` use is the S3 Express identity cache, whose keys are
-    # `CacheKey(String)` (no panicking `Drop`) and which never calls `pop()`, so
-    # neither precondition for the UB holds. Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
-    { id = "RUSTSEC-2026-0253", reason = "lru 0.16.4 only, via MSRV-pinned aws-sdk-s3 1.122 (no patched 0.16.x exists; workspace's own lru is fixed at 0.18.2); S3 Express cache keys are String and pop() is never called, so neither UB precondition holds; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; jsonwebtoken RSA-JWT path, SNS and webauthn-rs public-key checks only; tracked in #1600; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
     # RUSTSEC-2026-0387 — crypto-bigint secret-dependent branches in nominally
-    # constant-time operations. Fixed only in >=0.7.6; no 0.4.x/0.5.x release
-    # carries it. Two copies: 0.4.9 via aws-sigv4 -> p256 0.11 (SigV4a ECDSA
-    # signing, which Autumn does not use; it signs with HMAC SigV4), and 0.5.5
-    # via elliptic-curve 0.13 <- p256/p384 <- jsonwebtoken (ES256/ES384 JWT) and
-    # aws-sigv4. The jsonwebtoken copy IS on autumn-web's JWT path, so this is a
-    # real if low-practicality exposure (microarchitectural timing on ECDSA
-    # secrets; no network-reachable signing oracle). Remediation needs the
-    # RustCrypto elliptic-curve stack to move to crypto-bigint >=0.7.6.
-    # Review-by: 2026-11-08.
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.4.9/0.5.5 only, via aws-sigv4 (SigV4a ECDSA path, unused by Autumn HMAC SigV4) and jsonwebtoken ES256/ES384 -> p256/p384 -> elliptic-curve 0.13; no patched 0.4.x/0.5.x; review-by 2026-11-08" },
+    # constant-time operations. Fixed only in >=0.7.6; no 0.5.x release carries
+    # it. One copy is left: 0.5.5 via elliptic-curve 0.13 <- p256/p384 0.13 <-
+    # jsonwebtoken (ES256/ES384 JWT). That is a real if low-practicality exposure
+    # (microarchitectural timing on ECDSA secrets; no network-reachable signing
+    # oracle). Autumn's own p256 (Web Push) and aws-sigv4 use 0.7.10. Remove
+    # when jsonwebtoken moves to p256 0.14. Review-by: 2026-11-08.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 only, via jsonwebtoken ES256/ES384 -> p256/p384 0.13 -> elliptic-curve 0.13; no patched 0.5.x; review-by 2026-11-08" },
 ]
 
 [licenses]

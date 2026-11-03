@@ -198,7 +198,8 @@ impl DataKey {
 }
 
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(msg);
     mac.finalize().into_bytes().into()
 }
@@ -415,9 +416,11 @@ impl KeyRing {
         let data_key = self
             .find_key(mode, key_id)
             .ok_or(EncryptionError::UnknownKeyId(key_id))?;
+        let nonce =
+            <&Nonce<_>>::try_from(nonce_bytes).map_err(|_| EncryptionError::DecryptionFailed)?;
         data_key
             .cipher
-            .decrypt(<&Nonce<_>>::from(nonce_bytes), ciphertext)
+            .decrypt(nonce, ciphertext)
             .map_err(|_| EncryptionError::DecryptionFailed)
     }
 }

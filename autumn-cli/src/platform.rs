@@ -164,10 +164,6 @@ pub struct WindowsPrerequisite {
 /// The prerequisites, in the order `autumn doctor` prints them.
 pub const WINDOWS_PREREQUISITES: &[WindowsPrerequisite] = &[
     WindowsPrerequisite {
-        subject: "autumn generate auth --passkeys",
-        requirement: "OpenSSL via vcpkg with VCPKG_ROOT set (see docs/guide/generators.md)",
-    },
-    WindowsPrerequisite {
         subject: "autumn deploy up / scripts/*.sh",
         requirement: "WSL2 (Tier 2)",
     },
@@ -386,16 +382,16 @@ mod tests {
     }
 
     #[test]
-    fn windows_prerequisites_cover_the_documented_openssl_requirement() {
-        // docs/guide/generators.md documents the vcpkg/OpenSSL requirement for
-        // `--passkeys`; doctor must surface it rather than leave a Windows
-        // developer to discover it through a linker error.
-        let passkeys = WINDOWS_PREREQUISITES
-            .iter()
-            .find(|p| p.subject.contains("--passkeys"))
-            .expect("doctor must flag the passkeys OpenSSL prerequisite");
-        assert!(passkeys.requirement.contains("vcpkg"), "{passkeys:?}");
-        assert!(passkeys.requirement.contains("VCPKG_ROOT"), "{passkeys:?}");
+    fn windows_prerequisites_do_not_ask_for_openssl() {
+        // `webauthn-rs` 0.6 uses pure-Rust crypto, so `--passkeys` needs no
+        // OpenSSL and no vcpkg on Windows.
+        for prerequisite in WINDOWS_PREREQUISITES {
+            assert!(
+                !prerequisite.requirement.contains("OpenSSL")
+                    && !prerequisite.requirement.contains("vcpkg"),
+                "{prerequisite:?}"
+            );
+        }
     }
 
     #[test]

@@ -16,9 +16,7 @@
 # Rules for every `dtolnay/rust-toolchain@<ref>` in a workflow:
 #   - `<ref>` is the canonical pin, the MSRV, `nightly`, or `master` (the
 #     matrix form, whose `toolchain:` input is checked below);
-#   - `<ref>` is `stable` only in toolchain-drift.yml;
-#   - the one documented exception: publish-gate.yml pins the toolchain
-#     cargo-semver-checks needs (see the comment there).
+#   - `<ref>` is `stable` only in toolchain-drift.yml.
 # A matrix job that keeps `stable` as its *label* (so the check name, e.g.
 # `Compile-and-serve gates (stable)`, does not change) must map it with
 # `matrix.toolchain == 'stable' && '<pin>' || matrix.toolchain`, and `<pin>`
@@ -26,7 +24,7 @@
 # `toolchain: stable` would float again, so both are rejected.
 # A static `toolchain:` value must be the pin, the MSRV or `nightly`.
 # Quotes and a trailing comment do not count. `stable` is allowed only in
-# toolchain-drift.yml. The documented exception is allowed here too.
+# toolchain-drift.yml.
 # Flow lists, `${{ }}` expressions and flow maps (`with: { toolchain: x }`) are
 # not checked as static values. Write matrix legs as flow lists.
 #
@@ -44,8 +42,6 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 
 # The one place that may float on `stable`.
 DRIFT_WORKFLOW="toolchain-drift.yml"
-# file:ref pairs that are deliberately pinned to something else.
-EXCEPTIONS=("publish-gate.yml:1.94.1")
 
 die() {
   echo "error: $*" >&2
@@ -87,7 +83,7 @@ check_tree() {
   [[ -n "$msrv" ]] || die "could not find [workspace.package].rust-version in Cargo.toml"
 
   local failures=0
-  local wf name line ref lineno exc ok val
+  local wf name line ref lineno ok val
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     name="$(basename "$wf")"
     lineno=0
@@ -103,9 +99,6 @@ check_tree() {
           "$pin" | "$msrv" | nightly | master) ok=1 ;;
           stable) [[ "$name" == "$DRIFT_WORKFLOW" ]] && ok=1 ;;
         esac
-        for exc in "${EXCEPTIONS[@]}"; do
-          [[ "$name:$ref" == "$exc" ]] && ok=1
-        done
         if ((ok == 0)); then
           echo "error: $wf:$lineno uses dtolnay/rust-toolchain@$ref; expected the pin ($pin)," \
             "the MSRV ($msrv), nightly, or master" >&2
@@ -137,9 +130,6 @@ check_tree() {
             "$pin" | "$msrv" | nightly) ok=1 ;;
             stable) [[ "$name" == "$DRIFT_WORKFLOW" ]] && ok=1 ;;
           esac
-          for exc in "${EXCEPTIONS[@]}"; do
-            [[ "$name:$val" == "$exc" ]] && ok=1
-          done
           if ((ok == 0)); then
             echo "error: $wf:$lineno sets toolchain: $val; use the pin ($pin)," \
               "the MSRV ($msrv) or nightly. Only $DRIFT_WORKFLOW may use 'stable'" >&2
@@ -291,13 +281,9 @@ self_test() {
     toolchain: # set below'
   expect_ok "$tmp/static-empty" "an empty static toolchain with a comment"
   expect_ok "$tmp/static-drift" "a quoted static stable in the drift workflow"
-  mk "$tmp/static-exc" 1.99.0 '- uses: dtolnay/rust-toolchain@master
-  with:
-    toolchain: "1.94.1"' publish-gate.yml
-  expect_ok "$tmp/static-exc" "the semver-checks exception as a static input"
-
-  mk "$tmp/exception" 1.99.0 '- uses: dtolnay/rust-toolchain@1.94.1' publish-gate.yml
-  expect_ok "$tmp/exception" "the documented semver-checks exception"
+  # The semver job pins the MSRV, so no file gets a special pin.
+  mk "$tmp/no-exception" 1.99.0 '- uses: dtolnay/rust-toolchain@1.94.1' publish-gate.yml
+  expect_fail "$tmp/no-exception" "a publish-gate pin that is neither the pin nor the MSRV"
 
   mk "$tmp/short" 1.99 '- uses: dtolnay/rust-toolchain@1.99'
   expect_fail "$tmp/short" "a pin that is not MAJOR.MINOR.PATCH"

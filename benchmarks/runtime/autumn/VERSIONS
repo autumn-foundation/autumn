@@ -1,5 +1,5 @@
 framework: autumn-web 0.4.0
-language:  Rust 1.88.0
+language:  Rust 1.97.0
 async-rt:  Tokio 1.x
 http:      Axum 0.8.x
 db:        Diesel 2.x + diesel-async 0.8.x

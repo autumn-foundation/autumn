@@ -20,7 +20,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 const fn autumn_bin() -> &'static str {

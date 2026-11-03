@@ -259,12 +259,8 @@ struct Counters {
 
 /// Saturating increment: a long-lived replica must not wrap a counter back to
 /// zero and report a healthy mirror that has in fact diverged 2^64 times.
-#[allow(
-    deprecated,
-    reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
-)]
 fn bump(counter: &AtomicU64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_add(1))
     });
 }

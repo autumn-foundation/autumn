@@ -12,6 +12,7 @@ use std::fmt;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+use p256::elliptic_curve::Generate as _;
 
 use super::PushError;
 
@@ -54,10 +55,18 @@ pub struct VapidKey {
 
 impl VapidKey {
     /// Mint a fresh random key pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the operating system's random number generator fails.
     #[must_use]
     pub fn generate() -> Self {
         Self {
-            signing: SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng),
+            // The OS RNG fails only on a broken platform. `UnwrapErr` panics
+            // in that case.
+            signing: SigningKey::generate_from_rng(
+                &mut p256::elliptic_curve::rand_core::UnwrapErr(rand::rngs::SysRng),
+            ),
         }
     }
 
@@ -103,7 +112,7 @@ impl VapidKey {
     /// The uncompressed (SEC1, 65-byte) public key.
     #[must_use]
     pub fn public_key_bytes(&self) -> [u8; P256_UNCOMPRESSED_LEN] {
-        let encoded = self.signing.verifying_key().to_encoded_point(false);
+        let encoded = self.signing.verifying_key().to_sec1_point(false);
         let mut out = [0_u8; P256_UNCOMPRESSED_LEN];
         out.copy_from_slice(encoded.as_bytes());
         out

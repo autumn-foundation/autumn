@@ -231,7 +231,7 @@ mod sqlite {
             Box::pin(async move {
                 let n = message.payload["n"].as_str().unwrap_or_default().to_owned();
                 if fail_left
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                         left.checked_sub(1)
                     })
                     .is_ok()

@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v7
       # Decision (issue #2252): track `stable` here on purpose, not a pinned
       # version. A pin would hide new lints instead of catching them close to
-      # when they land. The `msrv` job below pins 1.88.0 — that is the
+      # when they land. The `msrv` job below pins the MSRV — that is the
       # compile floor, a separate concern from lint currency. A stable bump
       # can arm a new lint across many call sites. Add a scoped
       # `[workspace.lints.clippy]` allow with a comment for it (see
@@ -1375,15 +1375,12 @@ jobs:
         # Docker/network) and the general "Run Docker-dependent tests" sweep
         # below (whose feature set excludes `acme`/`tls` — see CLAUDE.md): it
         # needs Docker (`testcontainers`, gated by `test-support`) to run
-        # Pebble itself, plus the `host-port-exposure` tunnel sidecar image.
-        # `host-port-exposure` lives behind its OWN `acme-pebble` feature
-        # (implying `acme` + `test-support`) rather than being turned on for
-        # every `testcontainers` consumer workspace-wide — an ordinary
-        # `cargo test -p autumn-web --features test-support` (or a plain
-        # `--workspace` run) must not pull in the `russh`/crypto dependency
-        # subtree that feature adds (Codex review, #2541). So this step, and
-        # only this step, stays out of the default `cargo test --workspace`
-        # run and out of contributors' non-Docker inner loop. Pebble is
+        # Pebble itself. Pebble reaches the host's HTTP-01 listener through
+        # the Docker `host-gateway` alias, so no SSH tunnel sidecar is
+        # needed. The test lives behind its OWN `acme-pebble` feature
+        # (implying `acme` + `test-support`), so this step, and only this
+        # step, stays out of the default `cargo test --workspace` run and
+        # out of contributors' non-Docker inner loop. Pebble is
         # hermetic (no real Let's Encrypt rate limits at stake), so this runs
         # on every CI invocation of this job rather than being hand-triggered.
         #
@@ -2703,11 +2700,11 @@ jobs:
           fail_ci_if_error: false
 
   msrv:
-    name: MSRV (1.88.0)
+    name: MSRV (1.97.0)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2.7.8
       - name: Check MSRV alignment
         run: ./scripts/check-msrv.sh
@@ -3314,16 +3311,16 @@ jobs:
       - uses: actions/checkout@v7
       # Pinned to the exact MSRV, not `@stable` (2026-09-28 finding, 🚦
       # Semaphore): every scaffolded app's `rust-toolchain.toml` pins
-      # `channel = "1.88.0"` literally (autumn-cli/src/templates/rust-toolchain.toml.tmpl,
+      # `channel = "<MSRV>"` literally (autumn-cli/src/templates/rust-toolchain.toml.tmpl,
       # rendered from Cargo.toml's `rust-version`), a DIFFERENT rustup toolchain
       # name than "stable". When this job only installed `@stable`, the first
       # `cargo`/`autumn` invocation inside the scaffolded `tier1_app` directory
       # (during `autumn setup`, which shells out to `cargo metadata`) made
-      # rustup auto-install the separate "1.88.0-x86_64-pc-windows-msvc"
+      # rustup auto-install the separate "<MSRV>-x86_64-pc-windows-msvc"
       # toolchain on the fly. That on-demand install intermittently left a
       # non-functional `cargo` component behind, failing every later `cargo`
       # invocation in the job with `"the 'cargo.exe' binary, normally provided
-      # by the 'cargo' component, is not applicable to the '1.88.0-x86_64-pc-windows-msvc'
+      # by the 'cargo' component, is not applicable to the '<MSRV>-x86_64-pc-windows-msvc'
       # toolchain"` — a rustup error, not an autumn/CLI defect. Confirmed by
       # log content on 4 organic occurrences (runs 108204416273, 108534929493,
       # 108821476268, 108842089677), all identical, all resolved once the
@@ -3340,7 +3337,7 @@ jobs:
       # `failed to install component: 'rustfmt-preview-...', detected
       # conflict: 'bin\cargo-fmt.exe'`. Installing the components up front
       # leaves rustup nothing to fetch inside the journey.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.7.8
@@ -3417,7 +3414,7 @@ jobs:
           if (-not $check) { throw "doctor did not run the platform_support check" }
           if ($check.detail -notmatch 'Tier 1') { throw "platform_support did not report Tier 1: $($check.detail)" }
           if ($check.detail -notmatch 'Tier 2') { throw "platform_support did not report Tier 2: $($check.detail)" }
-          if ($check.detail -notmatch 'vcpkg') { throw "platform_support did not flag the vcpkg/OpenSSL prerequisite: $($check.detail)" }
+          if ($check.detail -match 'vcpkg') { throw "platform_support still asks for vcpkg/OpenSSL, which webauthn-rs 0.6 does not need: $($check.detail)" }
           # `doctor` is itself a Tier 1 command, and `--strict` must not reject a
           # machine for being a Windows one.
           # `CheckStatus` serializes lowercase (`#[serde(rename_all)]`).

@@ -21187,7 +21187,7 @@ path = "/healthz"
         let fleet = config.database.fleet.expect("env creates the fleet");
         assert_eq!(
             fleet.replica_retention_after_delete,
-            std::time::Duration::from_secs(30 * 86_400)
+            std::time::Duration::from_hours(30 * 24)
         );
         assert_eq!(fleet.restore_check_sample, 0);
     }
@@ -21287,7 +21287,7 @@ path = "/healthz"
         let fleet = config.database.fleet.unwrap();
         assert_eq!(
             fleet.replica_retention_after_delete,
-            std::time::Duration::from_secs(30 * 86_400)
+            std::time::Duration::from_hours(30 * 24)
         );
         assert_eq!(fleet.restore_check_sample, 3);
     }
@@ -22743,7 +22743,7 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         );
         assert_eq!(
             parse_duration_str("30d").unwrap(),
-            std::time::Duration::from_secs(30 * 86_400)
+            std::time::Duration::from_hours(30 * 24)
         );
         assert!(parse_duration_str("1x").is_err());
         assert!(parse_duration_str(&format!("{}d", u64::MAX)).is_err());

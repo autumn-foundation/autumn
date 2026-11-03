@@ -713,7 +713,7 @@ mod tests {
     use aes_gcm::{Aes128Gcm, Key, Nonce};
     use base64::Engine as _;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use p256::elliptic_curve::sec1::ToEncodedPoint;
+    use p256::elliptic_curve::sec1::ToSec1Point;
 
     // The RFC 8291 §5 user agent, whose PRIVATE key lets these tests decrypt
     // what the framework produced — proving the browser would really be able
@@ -749,7 +749,7 @@ mod tests {
         let as_key = p256::PublicKey::from_sec1_bytes(as_public).expect("as public parses");
         let shared = p256::ecdh::diffie_hellman(ua_private.to_nonzero_scalar(), as_key.as_affine());
 
-        let ua_public_bytes = ua_private.public_key().to_encoded_point(false);
+        let ua_public_bytes = ua_private.public_key().to_sec1_point(false);
         let mut key_info = Vec::new();
         key_info.extend_from_slice(b"WebPush: info\0");
         key_info.extend_from_slice(ua_public_bytes.as_bytes());
@@ -760,10 +760,11 @@ mod tests {
         let cek = hkdf_sha256(salt, &ikm, b"Content-Encoding: aes128gcm\0", 16);
         let nonce = hkdf_sha256(salt, &ikm, b"Content-Encoding: nonce\0", 12);
 
-        let cipher = Aes128Gcm::new(<&Key<Aes128Gcm>>::from(cek.as_slice()));
+        let cipher =
+            Aes128Gcm::new(<&Key<Aes128Gcm>>::try_from(cek.as_slice()).expect("16-byte key"));
         let mut plaintext = cipher
             .decrypt(
-                <&Nonce<_>>::from(nonce.as_slice()),
+                <&Nonce<_>>::try_from(nonce.as_slice()).expect("12-byte nonce"),
                 Payload {
                     msg: ciphertext,
                     aad: b"",

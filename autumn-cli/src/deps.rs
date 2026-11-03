@@ -2241,7 +2241,7 @@ mod tests {
 
     #[test]
     fn age_is_whole_days_and_never_negative() {
-        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(90 * 86_400);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(90 * 24);
         let then = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(88 * 86_400 + 100);
         assert_eq!(age_days(then, now), 1);
         // A clock that moved backwards reads as fresh, never as a huge age.

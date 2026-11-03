@@ -1977,7 +1977,7 @@ struct Writer {
 }
 
 impl Writer {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             pages: Vec::new(),
             ops: Vec::new(),

@@ -24537,7 +24537,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::cron_occurrence_window(&daily, &at),
-            std::time::Duration::from_secs(24 * 60 * 60)
+            std::time::Duration::from_hours(24)
         );
         let every_ten = "*/10 * * * * *".parse::<croner::Cron>().expect("parse");
         let at = chrono_tz::UTC
@@ -24565,7 +24565,7 @@ mod tests {
             std::time::Duration::from_secs(300),
             super::CronTick {
                 unix_secs: 1_700_000_000,
-                window: std::time::Duration::from_secs(86_400),
+                window: std::time::Duration::from_hours(24),
             },
             super::CostGate {
                 shutdown: tokio_util::sync::CancellationToken::new(),
@@ -24577,7 +24577,7 @@ mod tests {
 
         assert_eq!(
             *coordinator.period.lock().unwrap(),
-            Some(std::time::Duration::from_secs(86_400))
+            Some(std::time::Duration::from_hours(24))
         );
     }
 

@@ -773,7 +773,7 @@ fn default_processing_mode_is_background() {
 // ── AC3: Generic endpoint signing key ─────────────────────────────────────────
 
 fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     type HmacSha256 = Hmac<Sha256>;
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");

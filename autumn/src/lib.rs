@@ -619,6 +619,10 @@ pub mod etag;
 /// `autumn_web::http` so handler code can write `use autumn_web::http::Client`.
 #[cfg(feature = "http-client")]
 pub mod http_client;
+// TLS config for the framework's own `reqwest` clients: `ring` and the
+// Mozilla roots, with no process-wide provider.
+#[cfg(any(feature = "http-client", feature = "acme"))]
+pub(crate) mod reqwest_tls;
 #[cfg(feature = "http-client")]
 pub use http_client as http;
 // Retry budget for outbound HTTP (issue #3058). Internal: the client uses it.

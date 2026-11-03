@@ -2627,6 +2627,10 @@ fn table_section_shape(
 }
 
 fn module_shape(wasm: &[u8]) -> Option<ModuleShape> {
+    // Binary Wasm only: `\0asm` and version 1. Text or another version would
+    // walk as noise and give counts that bound nothing.
+    wasm.get(..8)
+        .filter(|header| *header == b"\0asm\x01\0\0\0")?;
     let mut cursor = 8usize; // magic + version
     let mut sections = 0usize;
     let mut memory_count = 0usize;
@@ -4536,6 +4540,55 @@ path = "/hello/greet"
 
     fn host(wat: &str) -> SandboxHost {
         try_host(wat).expect("the fixture loads")
+    }
+
+    /// The load-time shape walk reads binary Wasm only. Text must not reach
+    /// the compiler, because the walk cannot bound what it describes.
+    #[test]
+    fn only_binary_wasm_with_the_magic_header_loads() {
+        let text = guests::HELLO.as_bytes();
+        let binary = wat::parse_str(guests::HELLO).expect("the fixture is valid WAT");
+        let mut bad_version = binary.clone();
+        bad_version[4] = 2;
+        for (bytes, what) in [(text, "WAT text"), (&bad_version[..], "an unknown version")] {
+            assert!(
+                matches!(
+                    SandboxHost::from_module(manifest_with(ResourceLimits::default()), bytes),
+                    Err(SandboxLoadError::Wasm(_))
+                ),
+                "from_module must refuse {what}"
+            );
+            assert!(
+                matches!(
+                    SandboxHost::imports_of(bytes),
+                    Err(SandboxLoadError::Wasm(_))
+                ),
+                "imports_of must refuse {what}"
+            );
+        }
+        assert!(
+            SandboxHost::from_module(manifest_with(ResourceLimits::default()), &binary).is_ok()
+        );
+        // Eight bytes of text walk as zero sections. The walk must still
+        // refuse them, so they never reach the compiler.
+        assert!(module_shape(b"(module)").is_none());
+        assert!(
+            matches!(
+                SandboxHost::imports_of(b"(module)"),
+                Err(SandboxLoadError::Wasm(_))
+            ),
+            "imports_of must refuse WAT text that walks as an empty module"
+        );
+        // wasmi 0.40 has no memory64, so it refuses a 64-bit memory at compile.
+        // This fails if a wasmi raise turns memory64 on.
+        let memory64 = wat::parse_str("(module (memory i64 1))").expect("valid WAT");
+        assert!(
+            matches!(
+                SandboxHost::imports_of(&memory64),
+                Err(SandboxLoadError::Wasm(_))
+            ),
+            "imports_of must refuse a memory64 module"
+        );
     }
 
     fn request(method: &str, path: &str) -> SandboxRequest {

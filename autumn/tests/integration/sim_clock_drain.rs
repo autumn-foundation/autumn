@@ -22,7 +22,7 @@ use autumn_web::time::Clock;
 use serde::{Deserialize, Serialize};
 
 /// 24 hours — the retry backoff under test.
-const TWENTY_FOUR_HOURS: Duration = Duration::from_secs(24 * 3600);
+const TWENTY_FOUR_HOURS: Duration = Duration::from_hours(24);
 
 /// Empty payload for the probe job.
 #[derive(Debug, Clone, Serialize, Deserialize)]

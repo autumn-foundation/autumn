@@ -884,13 +884,9 @@ impl Series {
     /// Saturating rather than wrapping: a wrapped total looks to `PromQL`
     /// exactly like a counter reset, so `rate()` would report an enormous
     /// phantom spike. A pinned total is obviously broken instead.
-    #[allow(
-        deprecated,
-        reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
-    )]
     fn add(&self, amount: u64) {
         if let Self::Counter(total) = self {
-            let _ = total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            let _ = total.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(amount))
             });
         }
@@ -953,12 +949,8 @@ impl Series {
 }
 
 /// Add `delta` to the `f64` held as a bit pattern in `cell`, atomically.
-#[allow(
-    deprecated,
-    reason = "`fetch_update` is renamed `try_update` on rustc 1.99, but `try_update` is newer than the 1.88 MSRV"
-)]
 fn add_f64(cell: &AtomicU64, delta: f64) {
-    let _ = cell.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+    let _ = cell.try_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
         // Both operands are finite (deltas and observations are validated,
         // and this clamp keeps the stored value finite), so the sum can
         // overflow to ±Inf but never be NaN. Clamp so a gauge near
@@ -1003,7 +995,7 @@ fn format_bound(bound: f64) -> String {
 /// terminal cursor, start an ANSI escape, or split one exposition line into
 /// two. Nothing legitimate in a label value or a description is a control
 /// character.
-fn is_forbidden_control(c: char) -> bool {
+const fn is_forbidden_control(c: char) -> bool {
     c.is_control()
 }
 

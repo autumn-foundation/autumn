@@ -685,16 +685,15 @@ fn gate_generated_flavors() -> Vec<String> {
         .collect()
 }
 
-/// The `--bundled-pg` flavor's tree carries an advisory the default flavor's
-/// does not, so that flavor's shipped policy has to cover it.
+/// `managed-pg-bundled` no longer pulls `instant` (RUSTSEC-2024-0384), so the
+/// `--bundled-pg` policy carries no waiver for it.
 #[test]
-fn the_scaffold_policy_covers_the_bundled_postgres_flavor() {
+fn the_scaffold_policy_has_no_bundled_postgres_waiver() {
     let (_tmp, project) = scaffold("bundled-pg-policy-app", &["--bundled-pg"]);
     let deny = read_project_file(&project, "deny.toml");
     assert!(
-        deny.contains("RUSTSEC-2024-0384"),
-        "`--bundled-pg` pulls `instant` (RUSTSEC-2024-0384) through \
-         managed-pg-bundled; without a waiver that app's first CI run is red:\n{deny}"
+        !deny.contains("RUSTSEC-2024-0384"),
+        "`--bundled-pg` no longer reaches `instant`, so its waiver is stale:\n{deny}"
     );
 }
 

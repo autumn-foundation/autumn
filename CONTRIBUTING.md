@@ -566,7 +566,7 @@ the compiler's diagnostic text verbatim, are only valid for one compiler.
 - `.github/workflows/toolchain-drift.yml` is the only workflow that floats on
   `stable`. It runs `cargo fmt` and clippy weekly (and on demand), so the next
   release's fallout is a dedicated, non-blocking signal. It is not a PR gate.
-- The MSRV (`rust-version`, currently 1.88.0) is a separate floor and is checked by
+- The MSRV (`rust-version`, currently 1.97.0) is a separate floor and is checked by
   `scripts/check-msrv.sh`. Do not use an API newer than it because the pin has it:
   `cargo +<msrv> check -p autumn-web -p autumn-cli` catches that.
 - `publish-gate.yml` pins its own older toolchain for `cargo-semver-checks`, for

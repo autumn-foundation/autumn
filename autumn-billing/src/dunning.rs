@@ -30,13 +30,13 @@ pub const RETRY_JOB_NAME: &str = "autumn_billing_dunning_retry";
 
 /// A `Running` row not updated for this long was abandoned by a crashed run.
 /// The next job run resets it to `Pending` and claims it again.
-pub const RUNNING_STALE_AFTER: Duration = Duration::from_secs(10 * 60);
+pub const RUNNING_STALE_AFTER: Duration = Duration::from_mins(10);
 
 /// Delay before the same attempt runs again after a provider transport error.
-pub const TRANSPORT_RETRY_DELAY: Duration = Duration::from_secs(15 * 60);
+pub const TRANSPORT_RETRY_DELAY: Duration = Duration::from_mins(15);
 
 /// Applied ledger rows older than this are deleted at startup.
-pub const EVENT_RETENTION: Duration = Duration::from_secs(30 * 86_400);
+pub const EVENT_RETENTION: Duration = Duration::from_hours(30 * 24);
 
 /// How long startup waits for the job runtime before it gives up re-arming.
 const REARM_WAIT: Duration = Duration::from_secs(30);

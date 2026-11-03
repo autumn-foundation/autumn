@@ -1490,7 +1490,7 @@ tauri-build = {{ version = "2", features = [] }}
 tauri = {{ version = "2", features = [] }}
 # Runtime for the in-process server thread (see src/lib.rs).
 tokio = {{ version = "1", features = ["rt-multi-thread"] }}
-getrandom = {{ version = "0.2", features = ["std"] }}
+getrandom = {{ version = "0.4", features = ["std"] }}
 # The autumn app itself — the server runs IN-PROCESS on a background thread
 # (mobile sandboxes forbid sidecar processes), so the shell links the app
 # crate directly instead of bundling a server binary.
@@ -1948,7 +1948,7 @@ fn load_or_generate_signing_secret(
     }}
     let mut bytes = [0u8; 32];
     // Propagate RNG failure — an all-zero secret would be trivially guessable.
-    getrandom::getrandom(&mut bytes)?;
+    getrandom::fill(&mut bytes)?;
     let hex: String = bytes.iter().map(|b| format!("{{b:02x}}")).collect();
     // The app sandbox is private to this app on iOS/Android, but restrict
     // permissions anyway where the platform supports it.

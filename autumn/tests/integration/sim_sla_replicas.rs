@@ -204,7 +204,7 @@ async fn sim_sla_two_replicas_escalate_once() {
 
     // Go three hours past the start: both check jobs come due and race.
     store.armed.store(true, Ordering::SeqCst);
-    let step = Duration::from_secs(3 * 3600);
+    let step = Duration::from_hours(3);
     clock.advance(step);
     tokio::time::advance(step).await;
     settle().await;
@@ -306,7 +306,7 @@ async fn sim_sla_on_time_met_after_the_claim_cancels_the_breach() {
         "escalated_at": claimed,
         "token": Uuid::from_u128(41),
     });
-    clock.advance(Duration::from_secs(3 * 3600));
+    clock.advance(Duration::from_hours(3));
     let client = app.state().extension::<job::JobClient>().unwrap();
     client.enqueue(ESCALATE_JOB, breach).await.unwrap();
     settle().await;
@@ -377,7 +377,7 @@ async fn sim_sla_reconcile_moves_a_check_to_an_earlier_deadline() {
     assert_eq!(sla.reconcile().await.unwrap(), 1);
     settle().await;
 
-    let step = Duration::from_secs(3 * 3600);
+    let step = Duration::from_hours(3);
     clock.advance(step);
     tokio::time::advance(step).await;
     settle().await;
@@ -423,7 +423,7 @@ async fn sim_sla_a_check_that_runs_hours_early_waits_and_escalates() {
     assert!(fired.lock().unwrap().is_empty(), "not before the deadline");
 
     // The app clock reaches the deadline; the waiting check escalates.
-    let step = Duration::from_secs(3 * 3600);
+    let step = Duration::from_hours(3);
     clock.advance(step);
     tokio::time::advance(step).await;
     settle().await;
@@ -486,7 +486,7 @@ async fn sim_sla_an_early_check_never_uses_the_deadline_as_now() {
     );
 
     // The app clock reaches the deadline; the check escalates.
-    clock.advance(Duration::from_secs(3 * 3600));
+    clock.advance(Duration::from_hours(3));
     for _ in 0..18 {
         tokio::time::advance(Duration::from_secs(600)).await;
         settle().await;
@@ -562,7 +562,7 @@ async fn sim_sla_a_stale_calendar_does_not_claim_before_the_stored_deadline() {
         .await
         .unwrap();
 
-    let step = Duration::from_secs(3 * 3600);
+    let step = Duration::from_hours(3);
     clock.advance(step);
     tokio::time::advance(step).await;
     settle().await;
@@ -624,7 +624,7 @@ async fn sim_sla_a_stale_calendar_reads_the_stored_deadline_status() {
         status.resumes_at,
         Some(Utc.with_ymd_and_hms(2020, 1, 2, 9, 0, 0).unwrap())
     );
-    assert_eq!(status.remaining, Duration::from_secs(6 * 3600));
+    assert_eq!(status.remaining, Duration::from_hours(6));
 
     job::clear_global_job_client();
 }
@@ -718,7 +718,7 @@ async fn sim_sla_a_deadline_restored_while_its_check_runs_still_escalates() {
 
     // At 11:00 the old check reads the 15:00 record, then waits.
     store.armed.store(true, Ordering::SeqCst);
-    let step = Duration::from_secs(2 * 3600);
+    let step = Duration::from_hours(2);
     clock.advance(step);
     tokio::time::advance(step).await;
     for _ in 0..16 {
@@ -771,7 +771,7 @@ async fn sim_sla_a_reconcile_retry_is_not_absorbed_by_a_running_check() {
 
     // At 11:00 the old check reads the 15:00 record, then waits.
     store.armed.store(true, Ordering::SeqCst);
-    let step = Duration::from_secs(2 * 3600);
+    let step = Duration::from_hours(2);
     clock.advance(step);
     tokio::time::advance(step).await;
     for _ in 0..16 {
@@ -878,7 +878,7 @@ async fn sim_sla_a_track_reads_a_deadline_that_changed_before_its_met_write() {
 
     // A rival reconcile stores 15:00 just before this call writes a 12:00
     // reply. The stored record is met on time.
-    clock.advance(Duration::from_secs(4 * 3600));
+    clock.advance(Duration::from_hours(4));
     let later = Utc.with_ymd_and_hms(2020, 1, 1, 15, 0, 0).unwrap();
     *store.rival_due.lock().unwrap() = Some(later);
     let met = Utc.with_ymd_and_hms(2020, 1, 1, 12, 0, 0).unwrap();
@@ -987,7 +987,7 @@ async fn sim_sla_reconcile_with_no_deadline_stops_the_old_check() {
     let old = replica(&clock, &store, &fired);
     let check = serde_json::json!({ "key": key, "generation": generation, "due_at": old_due });
     let client = old.state().extension::<job::JobClient>().unwrap();
-    clock.advance(Duration::from_secs(2 * 3600));
+    clock.advance(Duration::from_hours(2));
     client
         .enqueue(autumn_web::sla::CHECK_JOB, check)
         .await
@@ -1048,7 +1048,7 @@ async fn sim_sla_a_second_escalation_after_the_unique_window_does_not_fire() {
 
     // More than a day later the unique key has expired. A second
     // escalation for the same record must not run the handler again.
-    let step = Duration::from_secs(25 * 3600);
+    let step = Duration::from_hours(25);
     clock.advance(step);
     tokio::time::advance(step).await;
     client.enqueue(ESCALATE_JOB, breach(2)).await.unwrap();
@@ -1107,7 +1107,7 @@ async fn sim_sla_a_stale_escalation_does_not_fire_before_the_new_deadline() {
 
     // At 15:00 the check for the stored deadline escalates one time.
     let check = serde_json::json!({ "key": key, "generation": generation, "due_at": new_due });
-    let step = Duration::from_secs(4 * 3600);
+    let step = Duration::from_hours(4);
     clock.advance(step);
     tokio::time::advance(step).await;
     client

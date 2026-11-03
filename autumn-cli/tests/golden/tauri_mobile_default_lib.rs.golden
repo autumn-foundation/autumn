@@ -267,7 +267,7 @@ fn load_or_generate_signing_secret(
     }
     let mut bytes = [0u8; 32];
     // Propagate RNG failure — an all-zero secret would be trivially guessable.
-    getrandom::getrandom(&mut bytes)?;
+    getrandom::fill(&mut bytes)?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     // The app sandbox is private to this app on iOS/Android, but restrict
     // permissions anyway where the platform supports it.

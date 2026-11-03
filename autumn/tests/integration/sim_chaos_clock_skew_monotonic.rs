@@ -28,10 +28,10 @@ use autumn_web::time::Clock;
 
 /// The skew injected by the chaos config under test — large enough that a
 /// leaked skew would be unmistakable in the assertions below.
-const SKEW: Duration = Duration::from_secs(6 * 3600);
+const SKEW: Duration = Duration::from_hours(6);
 
 /// The virtual advance applied mid-test.
-const ADVANCE: Duration = Duration::from_secs(24 * 3600);
+const ADVANCE: Duration = Duration::from_hours(24);
 
 /// Reads the injected (skewed) wall clock.
 #[get("/now")]

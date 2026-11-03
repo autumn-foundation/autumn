@@ -1309,7 +1309,7 @@ impl std::error::Error for FormDecodeError {}
 
 /// `false` for control, bidi and zero-width characters. These can hide or
 /// reorder text in a log line.
-fn is_printable_key_char(c: char) -> bool {
+const fn is_printable_key_char(c: char) -> bool {
     !c.is_control()
         && !matches!(
             c,

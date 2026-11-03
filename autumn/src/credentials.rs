@@ -245,7 +245,10 @@ pub fn decrypt(key: &MasterKey, ciphertext: &[u8]) -> Result<Vec<u8>, Credential
     let data = &ciphertext[1 + NONCE_LEN..];
 
     let cipher = Aes256Gcm::new_from_slice(&key.bytes).expect("key is always 32 bytes");
-    let nonce = <&Nonce<_>>::from(nonce_bytes);
+    let nonce =
+        <&Nonce<_>>::try_from(nonce_bytes).map_err(|_| CredentialsError::DecryptionFailed {
+            key_source: key.source.clone(),
+        })?;
 
     cipher
         .decrypt(nonce, data)

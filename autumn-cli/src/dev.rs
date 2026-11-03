@@ -197,7 +197,7 @@ const COOPERATIVE_STOP_HOOK_HEADROOM: Duration =
         reason = "the non-Unix stop path, compiled and tested everywhere"
     )
 )]
-const COOPERATIVE_STOP_BOOT_CAP: Duration = Duration::from_secs(15 * 60);
+const COOPERATIVE_STOP_BOOT_CAP: Duration = Duration::from_mins(15);
 
 /// The cooperative-stop budget for an app whose configured graceful-drain
 /// budget is `drain_secs` (`prestop_grace_secs + shutdown_timeout_secs`).

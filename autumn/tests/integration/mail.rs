@@ -245,7 +245,7 @@ async fn mailer_is_a_cloneable_handler_extractor() {
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
 #[tokio::test]

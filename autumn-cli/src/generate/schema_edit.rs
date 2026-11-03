@@ -4721,7 +4721,7 @@ pub fn add_search_up_sql_for(
 /// `reserved fts5 column name` error (or a `vtable constructor failed` error
 /// for the self-collision) at `CREATE VIRTUAL TABLE` time.
 #[must_use]
-fn is_fts5_reserved_search_column(column: &str, fts_table: &str) -> bool {
+const fn is_fts5_reserved_search_column(column: &str, fts_table: &str) -> bool {
     column.eq_ignore_ascii_case("rowid")
         || column.eq_ignore_ascii_case("rank")
         || column.eq_ignore_ascii_case(fts_table)

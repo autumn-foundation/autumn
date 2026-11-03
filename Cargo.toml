@@ -43,7 +43,7 @@ autumn-web = { path = "autumn" }
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.88.0"
+rust-version = "1.97.0"
 version = "0.9.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/autumn-foundation/autumn"
@@ -101,6 +101,7 @@ http = "1"
 # `hyper_util::server::conn::auto::Builder` itself. `server-auto` turns on both
 # HTTP/1 and HTTP/2, which the ALPN `h2` advertisement in `tls.rs` needs.
 hyper-util = { version = "0.1.20", default-features = false, features = ["server-auto", "tokio", "service"] }
+# Held at 0.38: 0.39 exists, but diesel 2.3 needs `<0.39`.
 libsqlite3-sys = { version = "0.38", features = ["bundled"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
@@ -134,6 +135,8 @@ indexmap = "2"
 inventory = "0.3"
 moka = { version = "0.12", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
+# Held at 0.27: 0.28 exists, but testcontainers-modules 0.15 (the newest)
+# needs `^0.27`.
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "minio"] }
 # Keep time on the 0.3 release line for the testcontainers/bollard dependency
@@ -149,7 +152,7 @@ ammonia = "4.2.4"
 # Interactive console prompt (issue #2148). Pulled in only by autumn-web's
 # `repl` feature; see `autumn/src/repl.rs`.
 rhai = { version = "1", default-features = false, features = ["std", "serde"] }
-rustyline = { version = "17", default-features = false, features = ["with-file-history"] }
+rustyline = { version = "19", default-features = false, features = ["with-file-history"] }
 chromiumoxide = { version = "0.9", default-features = false }
 # Pure-Rust PDF writer (issue #1317). `default-features = false` excludes the
 # `html` feature (azul CSS layout + rust-fontconfig system-font scanning) —

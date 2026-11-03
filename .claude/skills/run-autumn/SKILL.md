@@ -29,7 +29,7 @@ cargo 1.97.1, Docker 29.7.2.
 
 ## Prerequisites
 
-- Rust toolchain (`cargo 1.97.1` here; workspace needs 1.88+, edition 2024).
+- Rust toolchain (`cargo 1.97.1` here; workspace needs 1.97+, edition 2024).
 - **Docker**, for the Postgres container. `hello` needs no Docker.
 - `jq` and `curl` (both preinstalled on macOS).
 - Google Chrome, for screenshots — only for `driver.sh shot`.

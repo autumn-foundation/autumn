@@ -848,7 +848,7 @@ mod tests {
         let clock = TickingClock::starting_at(start);
         let clone = clock.clone();
 
-        clock.advance(std::time::Duration::from_secs(86400));
+        clock.advance(std::time::Duration::from_hours(24));
         assert_eq!(clone.now(), start + chrono::Duration::days(1));
     }
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use autumn_web::sim::__with_liveness_budget;
 
-const ONE_YEAR: Duration = Duration::from_secs(365 * 24 * 3600);
+const ONE_YEAR: Duration = Duration::from_hours(365 * 24);
 
 /// Run `body` on a fresh paused current-thread runtime, as `#[sim_test]` does.
 fn on_paused_runtime<F: std::future::Future>(body: F) -> F::Output {
@@ -52,7 +52,7 @@ fn a_body_that_waits_on_timers_is_not_a_deadlock() {
     on_paused_runtime(__with_liveness_budget(0, Some(ONE_YEAR), async {
         // A month of virtual sleeps stays far inside the budget.
         for _ in 0..30 {
-            tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+            tokio::time::sleep(Duration::from_hours(24)).await;
         }
     }));
 }

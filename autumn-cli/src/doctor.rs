@@ -3900,10 +3900,10 @@ mod platform_support_tests {
         // AC: doctor "reports the platform's tier status".
         assert!(detail.contains("Tier 1"), "{detail}");
         assert!(detail.contains("Tier 2"), "{detail}");
-        // AC: "flags known Windows-specific prerequisites (e.g. the
-        // vcpkg/OpenSSL requirement for `generate auth --passkeys`)".
-        assert!(detail.contains("vcpkg"), "{detail}");
-        assert!(detail.contains("--passkeys"), "{detail}");
+        // doctor flags the known Windows prerequisites. `--passkeys` needs no
+        // OpenSSL since `webauthn-rs` 0.6.
+        assert!(!detail.contains("vcpkg"), "{detail}");
+        assert!(detail.contains("WSL2"), "{detail}");
         for prerequisite in WINDOWS_PREREQUISITES {
             assert!(
                 detail.contains(prerequisite.subject),
@@ -9650,7 +9650,7 @@ pub fn run(opts: DoctorOptions) {
     }
 
     // ── Phase 1: config reads (serial, cheap) ────────────────────────────────
-    let msrv = read_msrv().unwrap_or_else(|| "1.88.0".to_owned());
+    let msrv = read_msrv().unwrap_or_else(|| crate::MSRV.to_owned());
     let web_ver = read_autumn_web_version();
     let toml_result = std::fs::read_to_string("autumn.toml");
     // Resolve doctor's database topology and process role/jobs backend from the merged

@@ -41,12 +41,12 @@ See each framework's `VERSIONS` file for exact versions:
 
 | Framework | Runtime | File |
 |-----------|---------|------|
-| **Autumn** | Rust 1.88 + Axum 0.8 | [`autumn/VERSIONS`](autumn/VERSIONS) |
+| **Autumn** | Rust 1.97 + Axum 0.8 | [`autumn/VERSIONS`](autumn/VERSIONS) |
 | **Spring Boot** | Java 21 + Tomcat | [`spring-boot/VERSIONS`](spring-boot/VERSIONS) |
 | **Rails** | Ruby 3.3 + Puma 6 | [`rails/VERSIONS`](rails/VERSIONS) |
 | **Django** | Python 3.12 + Gunicorn/Uvicorn | [`django/VERSIONS`](django/VERSIONS) |
 | **Phoenix** | Elixir 1.17 + Bandit | [`phoenix/VERSIONS`](phoenix/VERSIONS) |
-| **Loco** | Rust 1.88 + Axum 0.7 | [`loco/VERSIONS`](loco/VERSIONS) |
+| **Loco** | Rust 1.97 + Axum 0.7 | [`loco/VERSIONS`](loco/VERSIONS) |
 
 OS, CPU, memory, and container limits are recorded in the results report
 generated alongside each benchmark run.
@@ -166,7 +166,7 @@ Each framework app can be built from a clean checkout:
 ### Autumn (Rust)
 ```bash
 cd benchmarks/runtime/autumn
-# Requires: Rust 1.88+, libpq (or pq-sys bundled)
+# Requires: Rust 1.97+, libpq (or pq-sys bundled)
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
   cargo run --release --bin bench-autumn
 ```
@@ -213,7 +213,7 @@ SECRET_KEY_BASE=$(mix phx.gen.secret) \
 ### Loco (Rust)
 ```bash
 cd benchmarks/runtime/loco
-# Requires: Rust 1.88+
+# Requires: Rust 1.97+
 DATABASE_URL=postgres://benchmark:benchmark@localhost:5432/benchmark \
   cargo run --release -- start
 ```

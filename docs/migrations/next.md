@@ -19,9 +19,10 @@
 - **Old version:** `autumn-web {X.Y.Z}`
 - **New version:** `autumn-web {X.Z.0}`
 - **Expected upgrade effort:** {S / M / L — one paragraph of context}
-- **MSRV delta:** `{old MSRV}` → `{new MSRV}` ({reason, or "unchanged"})
-- **Carried dependency majors:** {e.g. `axum 0.8 → 0.9`, `diesel 2 → 3`,
-  or "none"}
+- **MSRV delta:** `1.88.0` → `1.97.0` (set by the maintainers; dependencies
+  need 1.95; see [Toolchain](#toolchain-rust-1970-or-newer))
+- **Carried dependency majors:** `reqwest 0.12 → 0.13`,
+  `webauthn-rs 0.5 → 0.6`, `p256 0.13 → 0.14`, `serde-saphyr 1 → 2`
 
 ## Summary
 
@@ -504,6 +505,91 @@ report "No database URL found". If a CLI command fails in this way, examine
 
 **Automation:** `manual` — the fix is in the deployment env, not in code.
 
+### Toolchain: Rust 1.97.0 or newer
+
+**Why:** The maintainers set the MSRV to 1.97.0. The newest dependency
+releases need at least 1.95 (`sysinfo` 0.40); the AWS SDK needs 1.94.1.
+1.97.0 was released on 2026-07-09. That is less than the 6 months that
+[STABILITY.md](../../STABILITY.md#minimum-supported-rust-version-msrv-policy)
+asks for a minor-release MSRV bump, so this change is breaking.
+
+**Who is affected:** A project that builds with Rust older than 1.97.0. Cargo
+stops with `rustc 1.88.0 is not supported by the following package:
+autumn-web@… requires rustc 1.97.0`.
+
+**Before (`{X.Y}`):**
+
+```toml
+# rust-toolchain.toml
+[toolchain]
+channel = "1.88.0"
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+# rust-toolchain.toml
+[toolchain]
+channel = "1.97.0"
+```
+
+Set `rust-version = "1.97.0"` in `Cargo.toml`. Set `msrv = "1.97.0"` in
+`clippy.toml`. Change the toolchain pin in your CI. Change the `Dockerfile`
+base image to `rust:1.97.0-bookworm`.
+
+**Automation:** `manual` — `autumn upgrade` offers the new
+`rust-toolchain.toml` and `clippy.toml`, but your CI and `Dockerfile` pins
+are yours.
+
+### HTTP client: `reqwest` 0.13
+
+**Why:** `autumn-web` and `autumn-media-plugin` now use `reqwest` 0.13. An app
+that passes `reqwest` types to Autumn must use 0.13 too.
+
+**Who is affected:**
+
+- An app that uses one of these public items with its own `reqwest` types:
+  - `autumn_web::http::ClientError::Request` (a `reqwest::Error`, and its
+    `From<reqwest::Error>` impl). This is in the default `http-client`
+    feature.
+  - `autumn_web::shadow::HttpShadowTransport::new`, which returns a
+    `reqwest::Error`.
+  - The `oauth2` API: `HttpClient::new`, `HttpRequestBuilder::send`,
+    `HttpInterceptor` and `HttpInterceptorFuture`.
+  - `autumn_media_plugin::recording_available`, which takes a
+    `reqwest::Client`.
+
+  With `reqwest` 0.12 in your `Cargo.toml`, the compiler reports
+  `mismatched types` and notes that there are multiple different versions of
+  crate `reqwest` in the dependency graph.
+- An app that builds its own `reqwest` client with no TLS feature. Before,
+  `autumn-web` turned on `rustls-tls` for every `reqwest` 0.12 user. Now
+  `autumn-web` turns on `rustls-no-provider` and gives its own clients a
+  `ring` config. Your `ClientBuilder::build()` (or `Client::new()`) panics at
+  runtime with "No rustls crypto provider is configured". Turn on a TLS
+  feature (for example `rustls`), or install a rustls `CryptoProvider` first.
+  (With `managed-pg`, `postgresql_embedded` installs `ring` as the process
+  provider before its first download. Install your own provider earlier if
+  you need a different one.)
+
+**Before (`{X.Y}`):**
+
+```toml
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+```
+
+**After (`{(X+1).0}`):**
+
+```toml
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+```
+
+`reqwest` 0.13 also moves `.form()` and `.query()` behind the `form` and
+`query` features. See the upstream notes below.
+
+**Automation:** `manual` — the features you need depend on how your code
+uses `reqwest`.
+
 ## Plugin authors
 
 **Required whenever this release changes the declared stable plugin surface**
@@ -688,12 +774,24 @@ If no config keys were removed, delete this subsection.
 
 ## Upstream dependency updates
 
-For each major dependency bump carried with this release:
-
-- Link to that project's upstream migration notes.
-- Call out any of their changes that leak through Autumn's public API.
-
-If no majors were carried, delete this section.
+- **`reqwest` 0.13** ([changelog](https://github.com/seanmonstar/reqwest/blob/master/CHANGELOG.md)).
+  See [HTTP client](#http-client-reqwest-013). `autumn-media-plugin` uses the
+  `rustls` feature. Its clients now use `aws-lc-rs` and the operating-system
+  root store, not `webpki-roots`. An image with no CA bundle cannot reach an
+  https MediaMTX origin. Install `ca-certificates`.
+- **`webauthn-rs` 0.6** ([repository](https://github.com/kanidm/webauthn-rs)).
+  It uses pure-Rust crypto, so a new `--passkeys` app needs no OpenSSL. A
+  passkey app generated before this release pins `webauthn-rs` 0.5, which
+  still needs OpenSSL. To remove OpenSSL, change the requirement to `0.6`.
+  Then change `cred_id.as_ref()` to `cred_id.as_slice()` in `encode_cred_id`
+  (`CredentialID` is now `Vec<u8>`). Stored passkeys keep the same JSON
+  format. Test one passkey login after the change.
+- **`p256` 0.14** ([RustCrypto](https://github.com/RustCrypto/elliptic-curves)).
+  Not in the public API. Its `crypto-bigint` 0.7 fixes RUSTSEC-2026-0387 on
+  the Web Push path. The `jsonwebtoken` ES256/ES384 path still has it.
+- **`serde-saphyr` 2.** `openapi.yaml` can change by a few bytes: a string
+  with an inline `#` is no longer quoted. The document parses to the same
+  values.
 
 ## How to verify
 
