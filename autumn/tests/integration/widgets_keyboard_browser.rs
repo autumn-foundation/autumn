@@ -1160,6 +1160,8 @@ async fn tags_free_text_submit_adds_the_typed_text() {
     let page = runner.page().await.expect("page");
     open(&page, "/").await;
     page.fill("#words-query", "teal").await.expect("fill");
+    // Close the popup: it covers the Save button.
+    press(&page, "Escape").await;
     page.click("#multi-save").await.expect("submit");
     wait_for(&page, "location.pathname === '/submitted-multi'").await;
     assert_eq!(
