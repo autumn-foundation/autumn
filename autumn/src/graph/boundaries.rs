@@ -1492,7 +1492,7 @@ schema_crates = ["billing-schema"]
             crate_version: "0.1.0",
         }];
         let config = BoundaryConfig::parse(
-            "[boundaries.a]\nowns = [\"archive_*\"]\n[boundaries.b]\nowns = [\"*_rows\"]\n",
+            "[boundaries.a]\nowns = [\"archive_*\"]\n[boundaries.b]\nowns = [\"*ive_rows\"]\n",
         )
         .expect("valid");
         let graph = build(&[], 0, &[], MODELS, ARCHIVE, &[]);
