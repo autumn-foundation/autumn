@@ -1,12 +1,11 @@
 //! Run a lane's steps and report the outcome.
 
-use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use smop::sh::{self, CommandBuilder};
 
 use crate::argv;
 use crate::lanes::{Lane, Step, check_ids};
@@ -200,21 +199,19 @@ pub fn run(
 }
 
 fn execute(root: &Path, step: &Step) -> Outcome {
-    let mut command = match command_for(root, &step.argv) {
+    let command = match command_for(root, &step.argv) {
         Ok(c) => c,
         Err(e) => return Outcome::Failed(format!("{e:#}")),
     };
-    command.current_dir(root);
-    for (key, value) in &step.env {
-        command.env(key, value);
-    }
-    match command.status() {
-        Ok(status) if status.success() => Outcome::Passed,
-        Ok(status) => Outcome::Failed(status.code().map_or_else(
-            || "terminated by a signal".to_owned(),
-            |code| format!("exit status {code}"),
-        )),
-        Err(e) => Outcome::Failed(format!("could not start `{}`: {e}", step.argv[0])),
+    let command = step
+        .env
+        .iter()
+        .fold(command.dir(root), |c, (key, value)| c.env(key, value));
+    // The error names the exit code and the command line, or why the
+    // program could not start.
+    match command.run() {
+        Ok(()) => Outcome::Passed,
+        Err(e) => Outcome::Failed(format!("{e:#}")),
     }
 }
 
@@ -230,24 +227,21 @@ fn execute(root: &Path, step: &Step) -> Outcome {
 /// # Errors
 ///
 /// Returns an error for an empty `argv`.
-pub fn command_for(root: &Path, argv: &[String]) -> Result<Command> {
+pub fn command_for(root: &Path, argv: &[String]) -> Result<CommandBuilder> {
     let (program, rest) = argv.split_first().context("empty command")?;
-    let mut command = if program == "cargo" {
-        Command::new(std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo")))
+    let command = if program == "cargo" {
+        sh::cargo()
     } else if let Some(fallback) = interpreter_for(program) {
         let script = root.join(program);
         let first = std::fs::read_to_string(&script)
             .ok()
             .and_then(|text| text.lines().next().map(str::to_owned))
             .unwrap_or_default();
-        let mut c = Command::new(shebang_interpreter(&first).unwrap_or(fallback));
-        c.arg(root.join(program));
-        c
+        sh::cmd(shebang_interpreter(&first).unwrap_or(fallback)).arg(script)
     } else {
-        Command::new(program)
+        sh::cmd(program)
     };
-    command.args(rest);
-    Ok(command)
+    Ok(command.args(rest))
 }
 
 /// The interpreter a `#!` line names, for the interpreters scripts here use.
@@ -433,9 +427,15 @@ mod tests {
         let log = String::from_utf8(log).unwrap();
         assert!(log.contains("::group::bad (bad)"), "{log}");
         assert!(log.contains("::endgroup::"), "{log}");
-        assert!(log.contains("::error title=bad::exit status"), "{log}");
+        assert!(
+            log.contains("::error title=bad::Command failed with exit code"),
+            "{log}"
+        );
         let md = report.markdown("t");
-        assert!(md.contains("| `bad` bad | **failed**: exit status"), "{md}");
+        assert!(
+            md.contains("| `bad` bad | **failed**: Command failed with exit code"),
+            "{md}"
+        );
         assert!(md.contains("| `after` after | passed |"), "{md}");
     }
 
@@ -465,7 +465,7 @@ mod tests {
         )
         .unwrap();
         match &report.results[0].2 {
-            Outcome::Failed(why) => assert!(why.contains("could not start"), "{why}"),
+            Outcome::Failed(why) => assert!(why.contains("Failed to execute command"), "{why}"),
             other => panic!("expected a failure, got {other:?}"),
         }
     }
@@ -532,16 +532,14 @@ mod tests {
     #[test]
     fn a_python_script_named_sh_runs_under_python() {
         let c = command_for(root(), &["scripts/check-example-bin-names.sh".into()]).unwrap();
-        assert_eq!(c.get_program(), python());
+        assert!(c.to_string().starts_with(&format!("{} ", python())), "{c}");
     }
 
     #[test]
     fn scripts_run_from_the_repo_root_under_their_interpreter() {
         let c = command_for(root(), &["scripts/check-msrv.sh".into(), "--x".into()]).unwrap();
-        assert_eq!(c.get_program(), "bash");
-        let args: Vec<_> = c.get_args().collect();
-        assert_eq!(args[0], root().join("scripts/check-msrv.sh").as_os_str());
-        assert_eq!(args[1], "--x");
+        let script = root().join("scripts/check-msrv.sh");
+        assert_eq!(c.to_string(), format!("bash {} --x", script.display()));
     }
 
     #[test]

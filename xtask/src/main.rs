@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::runner::{Selection, Style};
@@ -210,12 +210,7 @@ fn run_lane(
     if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY")
         && !options.dry_run
     {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&summary)
-            .with_context(|| format!("opening {}", Path::new(&summary).display()))?;
-        file.write_all(report.markdown(lane.name).as_bytes())?;
+        smop::fs::append(&summary, report.markdown(lane.name))?;
     }
     Ok(if report.passed() {
         ExitCode::SUCCESS
@@ -224,13 +219,12 @@ fn run_lane(
     })
 }
 
+/// A failing script is an error naming its exit code, so `cargo xtask`
+/// exits 1 rather than with the script's own code.
 fn run_script(root: &Path, name: &str, args: &[String]) -> Result<ExitCode> {
     let script = scripts::resolve(root, name)?;
-    let status = scripts::run(root, &script, args)?;
-    Ok(status
-        .code()
-        .and_then(|c| u8::try_from(c).ok())
-        .map_or(ExitCode::FAILURE, ExitCode::from))
+    scripts::run(root, &script, args)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 fn list(root: &Path, out: &mut impl Write) -> Result<()> {

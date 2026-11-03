@@ -9206,6 +9206,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "smop"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55d26b97412d66e14b15df71d604bf434513b9c7dedb938cac812fa663df2c45"
+dependencies = [
+ "anyhow",
+ "tempfile",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11851,6 +11861,7 @@ dependencies = [
  "anyhow",
  "clap",
  "regex",
+ "smop",
 ]
 
 [[package]]

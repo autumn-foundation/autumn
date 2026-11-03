@@ -250,28 +250,25 @@ mod tests {
     //! over this repository.
 
     use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use smop::fs::TempDir;
+    use smop::sh;
 
     use super::*;
 
     /// A throwaway git repository holding the two-page corpus every case
-    /// starts from. Removed on drop.
+    /// starts from. Removed when dropped.
     struct Corpus {
         dir: PathBuf,
+        _tmp: TempDir,
     }
 
     impl Corpus {
         fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let dir = std::env::temp_dir().join(format!(
-                "xtask-links-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
+            let tmp = smop::fs::temp_dir().unwrap();
+            let dir = tmp.path().to_path_buf();
             std::fs::create_dir_all(dir.join("docs/guide")).unwrap();
-            let corpus = Self { dir };
+            let corpus = Self { dir, _tmp: tmp };
             corpus.git(&["init", "-q"]);
             // `## a — b` slugs to `a--b`: the dash goes, both spaces stay.
             corpus.write(
@@ -286,12 +283,7 @@ mod tests {
         }
 
         fn git(&self, args: &[&str]) {
-            let status = Command::new("git")
-                .args(args)
-                .current_dir(&self.dir)
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?}");
+            sh::cmd("git").args(args).dir(&self.dir).output().unwrap();
         }
 
         fn path(&self, rel: &str) -> PathBuf {
@@ -333,12 +325,6 @@ mod tests {
             let r = self.report();
             assert!(!r.passed(), "expected a failure, got a pass");
             r
-        }
-    }
-
-    impl Drop for Corpus {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 

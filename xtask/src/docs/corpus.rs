@@ -2,9 +2,9 @@
 //! are decoded.
 
 use std::path::Path;
-use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use smop::sh;
 
 /// Every tracked `*.md` file under `root`, as git spells it (`/`-separated,
 /// relative to `root`), in git's order.
@@ -21,19 +21,12 @@ use anyhow::{Context, Result, bail};
 pub fn tracked_markdown(root: &Path) -> Result<Vec<String>> {
     // NUL-delimited, so a path with whitespace stays one record and git does
     // not quote unusual names.
-    let out = Command::new("git")
+    let listed = sh::cmd("git")
         .args(["ls-files", "-z", "*.md"])
-        .current_dir(root)
+        .dir(root)
         .output()
-        .with_context(|| format!("running `git ls-files` in {}", root.display()))?;
-    if !out.status.success() {
-        bail!(
-            "`git ls-files` failed in {}: {}",
-            root.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
+        .with_context(|| format!("listing the markdown corpus in {}", root.display()))?;
+    Ok(listed
         .split('\0')
         .filter(|f| !f.is_empty() && !is_example_content(f))
         .map(str::to_owned)
@@ -121,16 +114,14 @@ mod tests {
 
     #[test]
     fn a_directory_outside_git_is_an_error() {
-        let dir = std::env::temp_dir().join(format!("xtask-not-a-repo-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = smop::fs::temp_dir().unwrap();
         // Only meaningful where the temp dir is not itself inside a checkout.
-        let inside = Command::new("git")
+        let inside = sh::cmd("git")
             .args(["rev-parse", "--git-dir"])
-            .current_dir(&dir)
-            .output()
-            .is_ok_and(|o| o.status.success());
-        let listed = tracked_markdown(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
+            .dir(dir.path())
+            .success()
+            .unwrap_or(false);
+        let listed = tracked_markdown(dir.path());
         if !inside {
             assert!(
                 listed.is_err(),
