@@ -1,8 +1,8 @@
 //! The costs of a fleet failover, as `docs/guide/sqlite-fleet.md` states them.
 //!
-//! Baton (a failover lab) measured these costs on 0.9. The guide must state
-//! each one, and its numbers must agree with the config defaults. The
-//! behaviour behind each claim has a test in `db::fleet_ownership`.
+//! The guide must state each cost, and its numbers must agree with the
+//! config defaults. The behaviour behind each claim has a test in
+//! `db::fleet_ownership`.
 
 use autumn_web::config::{FleetOwnershipConfig, ReplicationConfig};
 
@@ -52,7 +52,8 @@ fn default_lease_secs() -> u64 {
     config.lease_secs
 }
 
-/// Finding 1: "replication" reads as "an acknowledged write survives".
+/// A reader can take "replication" to mean that an acknowledged write
+/// survives. The guide must say that it can be lost.
 #[test]
 fn the_replication_section_says_an_acknowledged_write_can_be_lost() {
     let heading = "## Replication: object storage between volumes";
@@ -73,7 +74,7 @@ fn row_default(text: &str, label: &str) -> String {
     cells[cells.len() - 2].to_owned()
 }
 
-/// Findings 1, 2 and 6: the data and the time that a failover costs.
+/// The data and the time that a failover costs.
 #[test]
 fn the_guide_gives_the_cost_of_a_failover() {
     let heading = "### What a failover costs";
@@ -107,7 +108,7 @@ fn the_guide_gives_the_cost_of_a_failover() {
     }
 }
 
-/// Finding 2: the ownership config states the default lease, next to the
+/// The ownership config states the default lease, next to the
 /// cost of a long one.
 #[test]
 fn the_ownership_example_shows_the_default_lease() {
@@ -123,8 +124,9 @@ fn the_ownership_example_shows_the_default_lease() {
     assert_says(&text, heading, &["takeover time"]);
 }
 
-/// Finding 4: `restore_missing` reads as "only when the file is absent".
-/// A fail-back restores a stale file without it.
+/// A reader can take `restore_missing` to mean "only when the file is
+/// absent". The guide must say that a fail-back restores a stale file
+/// without it.
 #[test]
 fn the_guide_says_a_stale_file_is_restored_without_restore_missing() {
     let heading = "## Replication: object storage between volumes";

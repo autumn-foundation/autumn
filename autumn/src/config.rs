@@ -10493,6 +10493,11 @@ pub struct DatabaseConfig {
     pub migration_lock_retries: u32,
 
     /// Slow query threshold. Default: `500ms`.
+    ///
+    /// Two warnings use it. `slow database query`: one instrumented
+    /// statement took this long. `database connection held past
+    /// slow_query_threshold`: a handler held a `Db` this long. A hold covers
+    /// all work in that time, not one statement.
     #[serde(
         deserialize_with = "deserialize_duration",
         default = "default_slow_query_threshold"
@@ -10864,24 +10869,49 @@ const fn default_fleet_replication_workers() -> usize {
     4
 }
 
+/// The backend that selects the advice in the boot connection warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionBackend {
+    /// Postgres: the budget is each server's `max_connections`.
+    Postgres,
+    /// `SQLite`: the budget is the open-file limit of the process.
+    Sqlite {
+        /// The database files that the pools open: one per pool, and
+        /// `max_open` for a fleet.
+        databases: usize,
+    },
+}
+
+/// The files that `SQLite` keeps open: the database and its `-wal` for each
+/// connection, and one `-shm` for each database.
+pub(crate) const fn sqlite_open_files(connections: usize, databases: usize) -> usize {
+    connections.saturating_mul(2).saturating_add(databases)
+}
+
 /// The boot warning for a high connection count, or `None` below the
-/// threshold. `sqlite` selects the advice for a `SQLite` app.
+/// threshold.
 pub(crate) fn total_connections_warning(
     total: usize,
     threshold: usize,
-    sqlite: bool,
+    backend: ConnectionBackend,
 ) -> Option<String> {
     if !should_warn_total_connections(total, threshold) {
         return None;
     }
-    let advice = if sqlite {
-        "Each SQLite connection keeps files open. Set the open-file limit of \
-         the process (ulimit -n) higher than this count, or decrease \
-         database.fleet.max_open, database.fleet.pool_size or database.pool_size."
-    } else {
-        "Ensure each Postgres server's max_connections (plus headroom for \
-         migrations and psql) exceeds the pools that target it, or lower \
-         database.pool_size."
+    let advice = match backend {
+        ConnectionBackend::Sqlite { databases } => format!(
+            "These connections keep about {files} files open on SQLite (the \
+             database and its -wal for each connection, one -shm for each \
+             database). database.fleet.max_open is a soft limit: a burst opens \
+             more. Set the open-file limit of the process (ulimit -n) above the \
+             peak. Or decrease database.fleet.max_open, database.fleet.pool_size or \
+             database.pool_size.",
+            files = sqlite_open_files(total, databases),
+        ),
+        ConnectionBackend::Postgres => "Ensure each Postgres server's max_connections \
+             (plus headroom for migrations and psql) exceeds the pools that target \
+             it, or lower database.pool_size."
+            .to_owned(),
     };
     Some(format!(
         "Aggregate database connection count is high: the control topology and \
@@ -10889,6 +10919,53 @@ pub(crate) fn total_connections_warning(
          {threshold}). {advice} Set database.max_connections_warn_threshold = 0 \
          to silence."
     ))
+}
+
+/// The boot warning for `SQLite` open files near the process limit, or
+/// `None`. It fires at 80 % of `limit`, because the process also needs files
+/// for sockets and logs. A `threshold` of `0` silences it, as it silences
+/// [`total_connections_warning`].
+pub(crate) fn open_files_warning(
+    files: usize,
+    limit: Option<u64>,
+    threshold: usize,
+) -> Option<String> {
+    let limit = limit?;
+    let files_wide = u128::try_from(files).unwrap_or(u128::MAX);
+    if threshold == 0 || files_wide.saturating_mul(5) < u128::from(limit).saturating_mul(4) {
+        return None;
+    }
+    Some(format!(
+        "SQLite may keep about {files} files open at database.fleet.max_open, near \
+         the open-file limit of {limit} (ulimit -n). The process also needs files \
+         for sockets and logs. database.fleet.max_open is a soft limit: a burst \
+         opens more. Increase ulimit -n. Or decrease database.fleet.max_open, \
+         database.fleet.pool_size or database.pool_size. Set \
+         database.max_connections_warn_threshold = 0 to silence."
+    ))
+}
+
+/// The soft open-file limit of the process (`RLIMIT_NOFILE`), or `None` when
+/// it is unlimited or the platform has no such limit.
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unnecessary_wraps,
+        clippy::missing_const_for_fn,
+        reason = "the unix build reads the limit; other platforms have none"
+    )
+)]
+pub(crate) fn open_file_limit() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit};
+        let (soft, _hard) = getrlimit(Resource::RLIMIT_NOFILE).ok()?;
+        (soft != RLIM_INFINITY).then_some(soft)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// Decide whether the aggregate connection count warrants a startup warning.
@@ -14689,16 +14766,86 @@ mod tests {
 
     #[test]
     fn the_connection_warning_speaks_sqlite_to_a_sqlite_app() {
-        // Murmuration FINDINGS 6: a SQLite fleet was told about Postgres.
-        let sqlite = total_connections_warning(266, 100, true).expect("warns");
+        // A SQLite app gets SQLite advice, not Postgres advice.
+        let sqlite_backend = ConnectionBackend::Sqlite { databases: 65 };
+        let sqlite = total_connections_warning(266, 100, sqlite_backend).expect("warns");
         assert!(!sqlite.contains("Postgres"), "{sqlite}");
         assert!(sqlite.contains("266"), "{sqlite}");
         assert!(sqlite.contains("database.fleet.max_open"), "{sqlite}");
         assert!(sqlite.contains("max_connections_warn_threshold = 0"));
-        let postgres = total_connections_warning(266, 100, false).expect("warns");
+        let postgres =
+            total_connections_warning(266, 100, ConnectionBackend::Postgres).expect("warns");
         assert!(postgres.contains("Postgres"), "{postgres}");
-        assert!(total_connections_warning(99, 100, true).is_none());
-        assert!(total_connections_warning(10_000, 0, false).is_none());
+        assert!(total_connections_warning(99, 100, sqlite_backend).is_none());
+        assert!(total_connections_warning(10_000, 0, ConnectionBackend::Postgres).is_none());
+    }
+
+    #[test]
+    fn the_sqlite_warning_gives_the_open_file_count() {
+        // On SQLite the budget is open files, not connections.
+        // 64 fleet files x 2 connections, plus a control file with 10.
+        let backend = ConnectionBackend::Sqlite { databases: 65 };
+        let message = total_connections_warning(138, 100, backend).expect("warns");
+        // 2 x 138 (database and -wal) + 65 (-shm).
+        assert!(message.contains("about 341 files open"), "{message}");
+        assert!(message.contains("-wal"), "{message}");
+        assert!(message.contains("soft limit"), "{message}");
+        assert!(message.contains("ulimit -n"), "{message}");
+        assert!(!message.contains("Postgres"), "{message}");
+    }
+
+    #[test]
+    fn the_open_file_warning_fires_below_the_connection_threshold() {
+        // 99 connections stay under the connection threshold of 100, but
+        // their 297 files pass a limit of 256 (the macOS default).
+        let files = sqlite_open_files(99, 99);
+        assert!(
+            total_connections_warning(99, 100, ConnectionBackend::Sqlite { databases: 99 })
+                .is_none()
+        );
+        let message = open_files_warning(files, Some(256), 100).expect("warns");
+        assert!(message.contains("about 297 files"), "{message}");
+        assert!(message.contains("limit of 256"), "{message}");
+        assert!(message.contains("ulimit -n"), "{message}");
+        assert!(message.contains("soft limit"), "{message}");
+        assert!(message.contains("max_connections_warn_threshold = 0"));
+    }
+
+    #[test]
+    fn the_open_file_warning_fires_at_eighty_percent_of_the_limit() {
+        // The process also needs files for sockets and logs.
+        assert!(open_files_warning(205, Some(256), 100).is_some());
+        assert!(open_files_warning(204, Some(256), 100).is_none());
+        assert!(open_files_warning(100, Some(1024), 100).is_none());
+    }
+
+    #[test]
+    fn the_open_file_warning_needs_a_limit_and_a_threshold() {
+        assert!(open_files_warning(10_000, None, 100).is_none(), "no limit");
+        assert!(
+            open_files_warning(10_000, Some(256), 0).is_none(),
+            "silenced"
+        );
+        assert!(open_files_warning(usize::MAX, Some(u64::MAX), 100).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_open_file_limit_reads_the_process_limit() {
+        // `None` only for an unlimited process.
+        assert!(open_file_limit().is_none_or(|limit| limit > 0));
+    }
+
+    #[test]
+    fn sqlite_open_files_counts_two_per_connection_and_one_per_database() {
+        assert_eq!(sqlite_open_files(0, 0), 0);
+        assert_eq!(
+            sqlite_open_files(2, 1),
+            5,
+            "the fleet guide's 2 x pool_size + 1"
+        );
+        assert_eq!(sqlite_open_files(128, 64), 64 * 5);
+        assert_eq!(sqlite_open_files(usize::MAX, 1), usize::MAX, "saturates");
     }
 
     #[test]
@@ -18969,14 +19116,14 @@ path = "/healthz"
 
     #[test]
     fn an_empty_deploy_hosts_env_override_behaves_as_unset() {
-        // #1621 review finding 13. `AUTUMN_DEPLOY__HOSTS=` is the shape a CI or
-        // compose env template produces for "fill in for a fleet" — exactly what
-        // the sibling `AUTUMN_DEPLOY__HOST=` harmlessly takes. Splitting it
-        // unconditionally yielded `[""]`, a NON-empty fleet list holding a blank
-        // string, so a project keeping `[deploy] host` in autumn.toml hard-failed
-        // every `autumn deploy` subcommand (and `autumn doctor`) with "`[deploy]
-        // host` and `[deploy] hosts` are mutually exclusive" — naming a key the
-        // operator never set.
+        // `AUTUMN_DEPLOY__HOSTS=` is the shape a CI or compose env template
+        // produces for "fill in for a fleet" — exactly what the sibling
+        // `AUTUMN_DEPLOY__HOST=` harmlessly takes. Splitting it
+        // unconditionally yielded `[""]`, a NON-empty fleet list holding a
+        // blank string, so a project keeping `[deploy] host` in autumn.toml
+        // hard-failed every `autumn deploy` subcommand (and `autumn doctor`)
+        // with "`[deploy] host` and `[deploy] hosts` are mutually exclusive" —
+        // naming a key the operator never set.
         for blank in ["", "   ", ",", " , "] {
             let mut config: AutumnConfig = toml::from_str(
                 r#"
@@ -19004,10 +19151,10 @@ path = "/healthz"
 
     #[test]
     fn a_trailing_comma_in_the_deploy_hosts_env_override_is_tolerated() {
-        // #1621 review finding 13. Generated env lists routinely carry a trailing
-        // (or doubled) comma; the blank segment it produces used to reach the CLI
-        // as a blank fleet entry and refuse the whole command. Blank segments are
-        // dropped, so the list is exactly the addresses the operator wrote.
+        // Generated env lists routinely carry a trailing (or doubled) comma;
+        // the blank segment it produces used to reach the CLI as a blank fleet
+        // entry and refuse the whole command. Blank segments are dropped, so
+        // the list is exactly the addresses the operator wrote.
         for (value, expected) in [
             ("10.0.0.1,10.0.0.2,", vec!["10.0.0.1", "10.0.0.2"]),
             ("10.0.0.1,,10.0.0.2", vec!["10.0.0.1", "10.0.0.2"]),

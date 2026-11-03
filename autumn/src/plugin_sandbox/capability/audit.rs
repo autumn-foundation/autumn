@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn a_request_s_drops_count_while_its_last_drop_is_in_the_window() {
-        // #2523 finding 18. The span of one request's drops is known, not the
+        // #2523. The span of one request's drops is known, not the
         // time of each drop. Key the record at the last drop: never under-report.
         use std::sync::Arc;
 

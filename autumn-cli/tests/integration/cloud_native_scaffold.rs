@@ -63,7 +63,7 @@ fn cloud_native_scaffold_generates_readme_golden_path() {
         readme.contains("autumn.toml"),
         "README.md must reference `autumn.toml` for enabling the database, got:\n{readme}"
     );
-    // Finding 1: the DB-bootstrap step must NOT dead-end on a `release init`
+    // The DB-bootstrap step must NOT dead-end on a `release init`
     // file-exists error. `autumn new` already wrote Dockerfile/.dockerignore, so
     // `autumn release init --target docker-compose` aborts before emitting the
     // compose file unless --force (which would clobber the scaffold's Dockerfile).
@@ -105,7 +105,7 @@ fn cloud_native_scaffold_generates_readme_golden_path() {
         "README.md must still point at `autumn release init --target docker-compose` for \
          deployment assets, got:\n{readme}"
     );
-    // Finding 1: the `libpq` prerequisite must appear BEFORE the
+    // The `libpq` prerequisite must appear BEFORE the
     // `cargo install diesel_cli … --features postgres` command, since that
     // command's `postgres` feature (and the base `cargo build`, which links the
     // `db` feature) needs the libpq client library.
@@ -176,7 +176,7 @@ fn cloud_native_scaffold_readme_is_flag_aware_for_i18n_and_seed() {
 
 #[test]
 fn cloud_native_scaffold_daemon_readme_is_db_free() {
-    // Finding 2: `--daemon` scaffolds a DB-free app (no `db` feature, no
+    // `--daemon` scaffolds a DB-free app (no `db` feature, no
     // migrations) that runs via `autumn serve`. The README must reflect that
     // shape — not the DB-first golden path (install libpq, configure Postgres,
     // `autumn migrate`).
@@ -190,7 +190,7 @@ fn cloud_native_scaffold_daemon_readme_is_db_free() {
         "daemon README must not tell users to run `autumn migrate` (no DB / no migrations), \
          got:\n{readme}"
     );
-    // Finding 2: `generate scaffold` emits Diesel code that needs the `db`
+    // `generate scaffold` emits Diesel code that needs the `db`
     // feature the daemon scaffold disables, so following the daemon README must
     // not advertise it (it would leave the app non-compiling).
     assert!(
@@ -254,7 +254,7 @@ fn cloud_native_scaffold_daemon_readme_is_db_free() {
 
 #[test]
 fn cloud_native_scaffold_bundled_pg_readme_auto_provisions_db() {
-    // Finding 2: `--bundled-pg` embeds and manages its own Postgres, so the
+    // `--bundled-pg` embeds and manages its own Postgres, so the
     // README must not tell users to configure an external `[database]` or run
     // migrations by hand — it runs via `autumn serve --bundled-pg`.
     let temp_dir = scaffold_with_flags("bundled-readme-app", &["--bundled-pg"]);
@@ -293,7 +293,7 @@ fn cloud_native_scaffold_bundled_pg_readme_auto_provisions_db() {
         "bundled-pg README must document that the background daemon binds a Unix socket and \
          is reached via `autumn serve status`, not a bare localhost:3000, got:\n{readme}"
     );
-    // Finding 2 (guard against over-stripping): bundled-pg keeps the `db`
+    // Guard against over-stripping: bundled-pg keeps the `db`
     // feature and auto-applies migrations, so `generate scaffold` is still valid
     // here and must remain in the CLI reference.
     assert!(

@@ -2842,7 +2842,7 @@ mod tests {
 
     #[test]
     fn the_rollout_header_drops_the_skip_clause_for_a_one_host_plan() {
-        // #1621 review finding 4. A `--only`-narrowed repair reaches this renderer
+        // #1621. A `--only`-narrowed repair reaches this renderer
         // with a ONE-host plan (`single` is false whenever the config declares more
         // than one host), so nobody is left to "skip it": `skipped.join(", ")` is
         // empty and the sentence used to render as "…fleet-wide;  skip it)" — a
@@ -2907,7 +2907,7 @@ mod tests {
 
     #[test]
     fn the_completion_line_is_honest_about_a_narrowed_run() {
-        // #1621 review finding 2. `--only` narrows the plan, the outcomes AND the
+        // #1621. `--only` narrows the plan, the outcomes AND the
         // state table, so `total` is the SELECTED count: "all 1 hosts serving R2"
         // on a 3-host config reads as a full-fleet success while web-a/web-c are
         // still on the previous release. The closing line must say it was narrowed

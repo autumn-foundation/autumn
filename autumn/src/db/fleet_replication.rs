@@ -2637,7 +2637,7 @@ mod tests {
         assert_eq!(replication.closing(), 1, "parked, not shipped");
     }
 
-    // --- Many busy databases per process (Murmuration FINDINGS 1 and 6) ---
+    // --- Many busy databases per process ---
 
     /// A destination that counts the writes that run at once. Each write
     /// takes `delay`. With `meet`, the first write waits (up to

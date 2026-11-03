@@ -2065,7 +2065,7 @@ mod tests {
 
     #[test]
     fn default_readme_db_bootstrap_does_not_dead_end_on_release_init() {
-        // Finding 1: the default golden path must bootstrap a local Postgres
+        // The default golden path must bootstrap a local Postgres
         // with `docker run` (which always works), not lead with
         // `release init --target docker-compose` (which file-errors on a fresh
         // scaffold). The AC-required pointer is still present for deployment.

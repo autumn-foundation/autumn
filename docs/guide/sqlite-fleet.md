@@ -82,6 +82,11 @@ nothing. Uppercase is refused rather than folded: on a case-insensitive file
 system `Acme` and `acme` would share a file. If your ids are UUIDs, send them
 lowercase.
 
+A slot fleet takes any routing key: the key never names a file. So an app
+that moves from tenant to slot mode loses this id check. Check ids where they
+enter the app, for example with `TenantDbId::parse`
+(`autumn_web::fleet_layout`).
+
 ## Handlers
 
 Nothing changes. The fleet is the app's shard set:
@@ -123,6 +128,11 @@ apart.
 `CrossShard<R>`, `Shards::each_shard` and `across_tenants()` fan out over
 **every database on disk**, opening each. Use them on admin paths, not hot
 paths. For analytics, [query the lake](#query-the-lake) instead.
+
+When a handler holds a `Db` past `database.slow_query_threshold`, Autumn
+logs `database connection held past slow_query_threshold` with `held_ms`.
+The time covers all work in the hold, not one statement. For a fan-out, take
+`LazyDb`. Call `checkout()` after the fan-out.
 
 ## Provisioning, deletion, backup
 
@@ -344,6 +354,12 @@ on this app: it applies `migrations/` to the control database. Use
   database. Size the open-file limit (`ulimit -n`) for the peak open count
   under a burst, not for `max_open`. The default limit on macOS is 256: 594
   open databases go past it.
+- When connections reach `database.max_connections_warn_threshold`
+  (default 100), the boot warning gives the open files at `max_open`. The
+  formula is `2 × connections + databases`. It counts the control database.
+- On Unix, boot also warns when those files reach 80 % of the open-file limit
+  (`ulimit -n`), at any connection count. The rest is for sockets and logs.
+  `database.max_connections_warn_threshold = 0` silences both warnings.
 - Metrics label every fleet database `shard=fleet`; the database name goes on
   spans and logs only, so a tenant fleet cannot explode metric cardinality.
 

@@ -7468,7 +7468,7 @@ mod tests {
 
     /// `SQLite` refuses to `DROP COLUMN` while an index still references it, so the
     /// down path must `DROP INDEX` before `DROP COLUMN` for a nullable
-    /// `references` field's auto-index (issue #1614 finding 5). The DROP INDEX
+    /// `references` field's auto-index (issue #1614). The DROP INDEX
     /// name must match the CREATE INDEX name the up path generated.
     #[test]
     fn sqlite_add_columns_down_drops_reference_index_before_column() {
@@ -7586,7 +7586,7 @@ mod tests {
         assert_eq!(add_columns_down_sql("posts", &f), down);
     }
 
-    /// Forward `RemoveColumns` path (issue #1614 finding 9): `SQLite` refuses to
+    /// Forward `RemoveColumns` path (issue #1614): `SQLite` refuses to
     /// `DROP COLUMN` while an index still references it, and the generator
     /// auto-indexes a `references` field, so the `SQLite` up.sql must `DROP INDEX`
     /// before `DROP COLUMN`, using the same name the ADD path created.

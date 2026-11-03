@@ -13251,7 +13251,7 @@ mod tests {
 
     #[test]
     fn fleet_maintenance_flag_is_written_0600_and_never_echoes_the_bypass_token() {
-        // #1621 review finding 8. The flag body embeds `--bypass-header NAME:VALUE`
+        // #1621. The flag body embeds `--bypass-header NAME:VALUE`
         // — a credential that lets a request skip the 503 gate for the whole
         // maintenance window — plus the `--allow-ips` list. Both the remote file
         // and the local staging copy inherit the op's mode, so 0644 exposed the
@@ -13964,7 +13964,7 @@ mod tests {
 
     #[test]
     fn operator_facing_fleet_error_text_carries_no_line_continuation_gutter() {
-        // #1621 review finding 12. These messages are `\`-continued multi-line
+        // #1621. These messages are `\`-continued multi-line
         // literals; a missing continuation backslash bakes the source indentation
         // into the message as a long run of spaces mid-sentence. `DriftDetected`
         // has no placeholders, so its Display output is the literal byte-for-byte.

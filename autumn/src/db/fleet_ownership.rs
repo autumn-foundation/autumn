@@ -2657,7 +2657,7 @@ mod tests {
         /// Replication is asynchronous. A takeover loses the writes that the
         /// old owner did not ship. The new owner opened the database during
         /// the pause, so a fail-back does not recover them, though they are
-        /// on the old owner's volume (Baton findings 1, 6).
+        /// on the old owner's volume.
         #[tokio::test]
         async fn a_takeover_and_a_fail_back_lose_the_unshipped_writes() {
             let dir = tempfile::tempdir().unwrap();
@@ -2747,7 +2747,7 @@ mod tests {
         }
 
         /// `restore_missing` is for a missing file only. A fail-back restores
-        /// a stale file without it (Baton finding 4).
+        /// a stale file without it.
         #[tokio::test]
         async fn a_fail_back_restores_a_stale_file_without_restore_missing() {
             let dir = tempfile::tempdir().unwrap();

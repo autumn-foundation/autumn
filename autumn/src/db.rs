@@ -3752,7 +3752,7 @@ impl Db {
 
         let span = tracing::info_span!(
             "db.transaction",
-            db.system = "postgresql",
+            db.system = DB_SYSTEM,
             db.isolation = opts.isolation.as_str(),
             db.tx.attempts = tracing::field::Empty,
         );
@@ -3989,6 +3989,14 @@ impl std::fmt::Display for RouteKey {
     }
 }
 
+/// The OpenTelemetry `db.system` value of the runtime backend. The `sqlite`
+/// feature makes the whole runtime `SQLite`.
+const DB_SYSTEM: &str = if cfg!(feature = "sqlite") {
+    "sqlite"
+} else {
+    "postgresql"
+};
+
 /// Everything required to check out and instrument a pooled connection.
 ///
 /// Shared by the plain [`Db`] extractor and shard-routed checkouts so that
@@ -4084,7 +4092,7 @@ impl Db {
     /// This is the single code path behind the [`Db`] extractor and all
     /// shard-routed checkouts: span creation, checkout interceptors,
     /// `SET statement_timeout`, and the metrics captured for the
-    /// slow-query warning on `Drop`.
+    /// long-hold warning on `Drop`.
     #[allow(
         clippy::too_many_lines,
         reason = "one checkout sequence; the deadline wait (#3058) is one more step"
@@ -4103,13 +4111,13 @@ impl Db {
         // Span covers the full time the connection is held — from
         // checkout through the end of the request — rather than just
         // `pool.get()`. Dropping `Db` closes the span, so span duration
-        // reflects real connection hold time and `db.system=postgresql`
-        // propagates to any query futures handlers instrument with
-        // `db.span()`.
+        // reflects real connection hold time and `db.system` propagates to
+        // any query futures handlers instrument with `db.span()`.
         let span = tracing::info_span!(
             "db.connection",
             otel.kind = "client",
-            db.system = "postgresql",
+            db.system = DB_SYSTEM,
+            db.pool = params.pool_name,
             db.shard = tracing::field::Empty,
         );
         if let Some(shard) = params.shard {
@@ -4538,13 +4546,16 @@ impl Drop for Db {
             // `run_instrumented`. The accumulator must reflect genuine
             // instrumented queries only.
 
-            // Log slow query if it exceeds the threshold
+            // A long hold is not one query. It covers
+            // all work in the hold, for example a fan-out. So it has its own
+            // message and no `sql` field. Enter the span so that the log shows
+            // the pool and the shard (`db.pool`, `db.shard`).
             if elapsed >= self.slow_query_threshold {
+                let _entered = self.span.enter();
                 tracing::warn!(
                     route = %route_key,
-                    sql = "SELECT ?",
-                    duration_ms = elapsed_ms,
-                    "slow database query"
+                    held_ms = elapsed_ms,
+                    "database connection held past slow_query_threshold"
                 );
             }
         }
@@ -4703,6 +4714,94 @@ impl DatabasePoolProvider for DieselDeadpoolPoolProvider {
 
 #[cfg(test)]
 mod tests {
+    /// The logs of one `Db` that `route` holds for `held` on a ticking clock,
+    /// with a `500ms` slow-query threshold.
+    #[cfg(feature = "sqlite")]
+    async fn logs_after_a_hold(
+        route: &str,
+        held: std::time::Duration,
+    ) -> Vec<crate::log::capture::CapturedLogEntry> {
+        use crate::log::capture::{LogBuffer, LogCaptureLayer};
+        use crate::log::filter::ParameterFilter;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let pool = super::create_pool(&crate::config::DatabaseConfig {
+            primary_url: Some("sqlite::memory:".into()),
+            ..Default::default()
+        })
+        .expect("sqlite pool builds")
+        .expect("url configured");
+        let clock = crate::time::TickingClock::starting_at(chrono::DateTime::UNIX_EPOCH);
+        let logs = LogBuffer::new(16, ParameterFilter::default());
+        let subscriber = tracing_subscriber::registry().with(LogCaptureLayer::new(logs.clone()));
+        let _guard = tracing::dispatcher::set_default(&tracing::Dispatch::new(subscriber));
+
+        let db = super::Db::checkout(super::DbCheckoutParams {
+            pool: &pool,
+            pool_name: "primary",
+            shard: None,
+            statement_timeout: None,
+            idle_in_transaction_timeout: None,
+            route_key: Some(super::RouteKey::Composed(route.to_owned())),
+            metrics: Some(crate::middleware::MetricsCollector::new()),
+            slow_query_threshold: std::time::Duration::from_millis(500),
+            interceptors: Vec::new(),
+            clock: std::sync::Arc::new(clock.clone()),
+        })
+        .await
+        .expect("checkout");
+        clock.advance(held);
+        drop(db);
+        logs.snapshot(None, None)
+    }
+
+    /// A handler that holds `Db` across a long fan-out must not log the hold as
+    /// one query with `sql: "SELECT ?"`. The hold gets its own event.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_long_connection_hold_is_not_logged_as_a_query() {
+        let entries =
+            logs_after_a_hold("POST /census", std::time::Duration::from_millis(6653)).await;
+        assert!(
+            entries.iter().all(|e| e.message != "slow database query"),
+            "a hold is not a query: {entries:?}"
+        );
+        let held: Vec<_> = entries
+            .iter()
+            .filter(|e| e.message.contains("connection held"))
+            .collect();
+        assert_eq!(held.len(), 1, "{entries:?}");
+        let event = held[0];
+        assert_eq!(event.level, "WARN");
+        assert_eq!(event.fields["route"], "POST /census");
+        assert_eq!(event.fields["held_ms"], 6653);
+        assert!(!event.fields.contains_key("sql"), "{event:?}");
+    }
+
+    /// Spans name the backend that runs. A `SQLite` fleet said `postgresql`.
+    #[test]
+    fn db_system_names_the_runtime_backend() {
+        let expected = if cfg!(feature = "sqlite") {
+            "sqlite"
+        } else {
+            "postgresql"
+        };
+        assert_eq!(super::DB_SYSTEM, expected);
+    }
+
+    /// A hold under the threshold logs nothing.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_short_connection_hold_logs_nothing() {
+        let entries = logs_after_a_hold("GET /fast", std::time::Duration::from_millis(499)).await;
+        assert!(
+            entries
+                .iter()
+                .all(|e| !e.message.contains("connection held")),
+            "{entries:?}"
+        );
+    }
+
     /// An unset statement timeout keeps the session's `0` from checkout; an
     /// unset idle timeout keeps the session value through `DEFAULT`.
     #[test]
@@ -7012,7 +7111,7 @@ mod tests {
     }
 
     /// A composed key (a shard-tagged label, an unmatched path) is written
-    /// verbatim into both the metric key and the slow-query `route` field.
+    /// verbatim into both the metric key and the held-connection `route` field.
     #[test]
     fn route_key_composed_writes_verbatim() {
         let key = RouteKey::Composed("GET /notes shard=shard0".to_owned());
