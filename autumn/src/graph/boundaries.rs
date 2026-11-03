@@ -670,7 +670,7 @@ fn unmatched_patterns(
         .flat_map(|g| &g.nodes)
         .map(|n| crate_key(crate_root(&n.module)))
         .collect();
-    for c in crates {
+    if let Some(c) = crates {
         crate_names.extend(c.deps.keys().flat_map(|k| c.names(k)));
     }
     for (name, b) in &r.config.boundaries {
@@ -1737,13 +1737,11 @@ crates = ["crm-core-ad*"]
         .expect("valid");
         let deps = crates(&[("crm-marketing", "crm-core"), ("crm-core", "crm-billing")]);
         let report = check(&config, Some(&graph()), Some(&deps)).expect("runs");
-        assert!(
-            !crate_violations(&report)
-                .iter()
-                .any(|v| v.boundary == "marketing"),
-            "{:?}",
-            report.violations
-        );
+        // `crm-core` is in core by `modules`, so the search does not go
+        // through it to the billing schema.
+        let found = crate_violations(&report);
+        assert!(!found.iter().any(|v| v.owner == "billing"), "{found:?}");
+        assert!(found.iter().any(|v| v.owner == "core"), "{found:?}");
     }
 
     #[test]
@@ -1813,6 +1811,7 @@ crates = ["crm-core-ad*"]
             owner: "core".into(),
             node: "route:crm_marketing::routes::removed".into(),
             table: "contacts".into(),
+            access: Access::Read,
         };
         baseline.violations.push(gone.clone());
         let result = ratchet(report, Some(&baseline));
