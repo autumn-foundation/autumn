@@ -141,6 +141,36 @@ fn every_emitted_autumn_class_has_backing_css() {
     );
 }
 
+/// A class that a core source emits has its rule in the core file (#3408).
+/// A family file is absent when its feature is off, so a core widget must
+/// not rely on it.
+#[test]
+fn every_core_class_is_in_the_core_css_file() {
+    let core_css = read_source("src/ui/widgets.css");
+    let family_files: Vec<String> = FAMILY_MODULES
+        .iter()
+        .map(|m| format!("src/widgets/{m}.rs"))
+        .collect();
+    let mut missing = std::collections::BTreeSet::new();
+    for path in all_widget_sources() {
+        if family_files.contains(&path) {
+            continue;
+        }
+        for class in emitted_classes(&read_source(&path)) {
+            // The same prefix match as `every_emitted_autumn_class_has_backing_css`:
+            // a format string such as `autumn-nav__menu-{n}` emits a prefix.
+            if !core_css.contains(&format!(".{class}")) {
+                missing.insert(format!("`.{class}` (emitted by {path})"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "core widgets emit these classes, but src/ui/widgets.css has no rule for them. \
+         Move the rule out of src/ui/widgets/<family>.css: {missing:#?}"
+    );
+}
+
 /// A class that only a family emits has its rule in that family's CSS file,
 /// and not in the core file (#3408). So the family's CSS is complete when it
 /// is the only family on, and the core file carries no dead rules.
