@@ -20,7 +20,7 @@ fn toml_env(content: &str) -> (tempfile::TempDir, MockEnv) {
 fn jwt_tenancy() -> AutumnConfig {
     let mut config = AutumnConfig::default();
     config.tenancy.enabled = true;
-    config.tenancy.source = "jwt".to_owned();
+    "jwt".clone_into(&mut config.tenancy.source);
     config.tenancy.jwt_secret = Some("secret".to_owned().into());
     config
 }
@@ -120,7 +120,7 @@ fn other_tenancy_configs_boot_in_every_build() {
 
     for source in ["header", "subdomain", "session"] {
         let mut config = jwt_tenancy();
-        config.tenancy.source = source.to_owned();
+        source.clone_into(&mut config.tenancy.source);
         assert!(
             config.validate_tenancy_source().is_ok(),
             "source {source:?} needs no feature"
