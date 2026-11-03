@@ -6,8 +6,11 @@
 # `jsonwebtoken` (which compiles `rsa` 0.9 and `crypto-bigint` 0.5) and `p256`.
 #
 # Phase 1: `maud,htmx` with neither feature, with each, and with both must
-# compile, with no warning in the files the gates touch. `cargo tree` then
-# shows that each crate is in the graph only when its feature is on.
+# compile. The both-on build is the baseline: a build without a feature may
+# not warn anywhere in the files the gates touch where the baseline does not.
+# (A no-DB build already warns about dead DB code in some of those files, so
+# the check compares against the baseline, not against zero.) `cargo tree`
+# then shows that each crate is in the graph only when its feature is on.
 #
 # Phase 2: the specs run with both features off. The build keeps the other
 # default features, so the integration test binary compiles. This runs the
@@ -28,7 +31,9 @@ WATCHED='--> autumn/src/(app\.rs|config\.rs|tenancy\.rs|error\.rs|lib\.rs|prelud
 
 LOG=$(mktemp)
 TREE=$(mktemp)
-trap 'rm -f "$LOG" "$TREE"' EXIT
+BASELINE=$(mktemp)
+FOUND=$(mktemp)
+trap 'rm -f "$LOG" "$TREE" "$BASELINE" "$FOUND"' EXIT
 
 # ── Phase 1: each combination compiles, and links only what it asks for ─────
 
@@ -48,7 +53,8 @@ check() {
 }
 
 failures=0
-for combo in "maud,htmx" "maud,htmx,jwt" "maud,htmx,push" "maud,htmx,jwt,push"; do
+# The baseline runs first.
+for combo in "maud,htmx,jwt,push" "maud,htmx" "maud,htmx,jwt" "maud,htmx,push"; do
   echo "==> cargo check -p autumn-web --lib --no-default-features --features $combo"
   if ! cargo check -p autumn-web --lib --no-default-features --features "$combo" >"$LOG" 2>&1; then
     cat "$LOG"
@@ -56,11 +62,15 @@ for combo in "maud,htmx" "maud,htmx,jwt" "maud,htmx,push" "maud,htmx,jwt,push"; 
     failures=$((failures + 1))
     continue
   fi
-  # The build passed, so each diagnostic in the log is a warning. No pipe:
-  # under pipefail, an early `grep -q` exit can fail the grep before it.
-  if grep -qE -- "$WATCHED" "$LOG"; then
+  # The build passed, so each diagnostic in the log is a warning. Each one
+  # is keyed by its `--> file:line:col` location.
+  grep -oE -- "$WATCHED[^ ]*" "$LOG" | sort -u >"$FOUND" || true
+  if [[ "$combo" == "maud,htmx,jwt,push" ]]; then
+    cp "$FOUND" "$BASELINE"
+  elif new=$(comm -23 "$FOUND" "$BASELINE") && [[ -n "$new" ]]; then
     cat "$LOG"
-    echo "::error::a warning in jwt or push gated code with --features $combo (see above)"
+    echo "::error::--features $combo warns where the both-on build does not:"
+    echo "$new"
     failures=$((failures + 1))
   fi
 
