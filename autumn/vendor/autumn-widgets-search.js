@@ -144,7 +144,8 @@
       var chip = btn.closest('[data-ac-chip]');
       if (e.key === 'Delete' || e.key === 'Backspace') {
         e.preventDefault();
-        remove(chip, true);
+        // Focus moves to the next chip, so a held key must not remove it too.
+        if (!e.repeat) remove(chip, true);
       } else if (e.key === key(false) && !chip.nextElementSibling) {
         e.preventDefault();
         queryInput.focus();

@@ -1046,6 +1046,48 @@ async fn tags_arrow_keys_move_between_chips_and_delete_removes_one() {
     page.expect_no_console_errors().await.expect("no errors");
 }
 
+/// Send a repeated `keydown` of `key` to the focused element, as a held
+/// key does. `Page::press` cannot set `repeat`.
+async fn hold(page: &Page, key: &str) {
+    page.evaluate(format!(
+        "document.activeElement.dispatchEvent(new KeyboardEvent('keydown', \
+         {{ key: '{key}', repeat: true, bubbles: true, cancelable: true }}))"
+    ))
+    .await
+    .expect("dispatch a repeated key");
+    settle().await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_a_held_key_removes_no_extra_chips() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    pick(&page, "tags", "g", "Green").await;
+    pick(&page, "tags", "go", "Gold").await;
+    assert_eq!(chip_values(&page, "tags").await, "4,1,3");
+
+    // In the empty input: one press removes one chip. Repeats do nothing.
+    press(&page, "Backspace").await;
+    for _ in 0..3 {
+        hold(&page, "Backspace").await;
+    }
+    assert_eq!(chip_values(&page, "tags").await, "4,1");
+
+    // On a chip: focus moves to the next chip, which a repeat must keep.
+    press(&page, "ArrowLeft").await;
+    press(&page, "Home").await;
+    assert_eq!(focused_label(&page).await, "Remove Blue");
+    press(&page, "Delete").await;
+    assert_eq!(focused_label(&page).await, "Remove Green");
+    for key in ["Delete", "Backspace"] {
+        hold(&page, key).await;
+    }
+    assert_eq!(chip_values(&page, "tags").await, "1");
+    assert_eq!(focused_label(&page).await, "Remove Green");
+}
+
 #[tokio::test]
 #[ignore = "requires Chromium"]
 async fn tags_chip_list_is_one_tab_stop_before_the_input() {
