@@ -1004,6 +1004,8 @@ mod tests {
                 replication_workers: 4,
                 min_residency: std::time::Duration::from_secs(2),
             })
+            // A loaded CI runner can take more than 5 s to open a connection.
+            .connect_timeout_secs(60)
             .build()
             .unwrap();
             let clock: Arc<dyn ClockSource> = Arc::new(setup.clock.clone());
