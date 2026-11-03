@@ -4945,14 +4945,17 @@ mod tests {
     /// build plus its migrations takes longer still.
     const NOT_STUCK: Duration = Duration::from_secs(60);
 
+    /// Wait for every drain to end. A stranded drain never ends, so `NOT_STUCK`
+    /// still catches it. A short bound failed on a loaded Windows runner.
     async fn settle(fleet: &DatabaseFleet) {
-        for _ in 0..500 {
-            if fleet.stats().draining == 0 {
-                return;
+        let drained = async {
+            while fleet.stats().draining != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("drains did not settle");
+        };
+        tokio::time::timeout(NOT_STUCK, drained)
+            .await
+            .expect("drains did not settle");
     }
 
     #[tokio::test]
@@ -6768,13 +6771,14 @@ mod tests {
 
     /// Wait until `key` has a file, as a publish that outlived its caller does.
     async fn published(fleet: &DatabaseFleet, key: &FleetDbKey) {
-        for _ in 0..1000 {
-            if fleet.exists(key) {
-                return;
+        let found = async {
+            while !fleet.exists(key) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("the file was never published");
+        };
+        tokio::time::timeout(NOT_STUCK, found)
+            .await
+            .expect("the file was never published");
     }
 
     #[tokio::test]
@@ -6867,12 +6871,14 @@ mod tests {
         // Drop all five callers while the one opener runs its hook.
         let _ = tokio::time::timeout(Duration::from_millis(60), callers).await;
         // The opener fails on its own task; wait for its entry to go.
-        for _ in 0..1000 {
-            if fleet.stats().open_failures_total > 0 && fleet.open_keys().is_empty() {
-                break;
+        let failed = async {
+            while !(fleet.stats().open_failures_total > 0 && fleet.open_keys().is_empty()) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        };
+        tokio::time::timeout(NOT_STUCK, failed)
+            .await
+            .expect("the failed entry never went");
         assert_eq!(hook.0.load(Ordering::SeqCst), 1, "one opener, not five");
         assert_eq!(fleet.stats().open_failures_total, 1);
         assert!(fleet.open_keys().is_empty(), "the failed entry is gone");
@@ -6888,13 +6894,16 @@ mod tests {
         let second = FleetDbKey::Slot(29);
         // The caller leaves; the opener task still fills the entry.
         cancelled_in_hook(&hook, fleet.open(&second)).await;
-        for _ in 0..500 {
-            if fleet.stats().open == 1 && fleet.stats().draining == 0 {
-                return;
+        let closed = async {
+            while !(fleet.stats().open == 1 && fleet.stats().draining == 0) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the older database stayed open: {:?}", fleet.open_keys());
+        };
+        assert!(
+            tokio::time::timeout(NOT_STUCK, closed).await.is_ok(),
+            "the older database stayed open: {:?}",
+            fleet.open_keys()
+        );
     }
 
     #[tokio::test]
