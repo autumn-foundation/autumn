@@ -4,18 +4,21 @@
 //! database records the delete until the replica is purged:
 //!
 //! ```text
-//! delete  ─► record row (pending; reset when the file is there)
-//!         ─► remove files ─► confirm own row (deleted_at); row gone: stop
-//!            └ refused: no file ──► drop the pending row
+//! delete  ─► under the path lock: record row (pending; reset when the
+//!            file is there), then remove files
+//!         ─► confirm own row (deleted_at); row gone: stop
+//!            └ refused, or no file ──► drop own pending row
 //!         ─► marker <root>/tombstone ─► retention 0: purge now
 //!            purge ok ──► drop row      purge failed ──► backoff, retry task
 //! open    ─► row, or a marker not older than the newest generation:
 //!            restore_missing restores nothing
-//! create  ─► row in its retention: on demand 410, provision purges first
+//! create  ─► row pending or in its retention: on demand 410; provision
+//!            purges first
 //! restore ─► explicit: take the row, restore, drop the marker; failed: put
 //!            the row back
-//! retry   ─► every minute, every row: write a missing marker, purge a due
-//!            row, drop a row next to a live file
+//! retry   ─► every minute, every row: write a missing marker, confirm a
+//!            pending row older than 10 min with no file, purge a due row,
+//!            drop a row next to a live file
 //! ```
 //!
 //! The rules are pure functions here. The model and its proofs are in
@@ -86,7 +89,7 @@ pub struct Tombstone {
     pub deleted_at: DateTime<Utc>,
     /// `false` while the delete still removes the files.
     pub confirmed: bool,
-    /// The earliest purge: the time of the removal plus the retention.
+    /// The earliest purge: the time of the confirm plus the retention.
     pub purge_after: DateTime<Utc>,
     /// Failed purges so far.
     pub attempts: u32,
@@ -153,6 +156,16 @@ pub fn retry_delay(attempts: u32) -> Duration {
 #[must_use]
 pub fn restore_allowed(row: bool, marker: Option<DateTime<Utc>>, newest: DateTime<Utc>) -> bool {
     !row && marker.is_none_or(|deleted_at| newest > deleted_at)
+}
+
+/// `create_on_demand_allowed` in the model.
+///
+/// `row`: the tombstone of the key. A pending row has no cutoff yet, so it
+/// blocks a create on demand too (issue #3516). Only an explicit
+/// `provision` ends the window early.
+#[must_use]
+pub fn create_on_demand_allowed(row: Option<&Tombstone>, now: DateTime<Utc>) -> bool {
+    row.is_none_or(|row| row.confirmed && now >= row.purge_after)
 }
 
 /// `purge_deletes` in the model: whether a purge deletes an object.
@@ -292,6 +305,16 @@ fn from_millis(millis: i64) -> DateTime<Utc> {
 const COLUMNS: &str =
     "key, deleted_at, confirmed, purge_after, attempts, next_attempt, last_error, marked, owner";
 
+/// A connection to the control database. See
+/// [`FleetTombstones::checkout`].
+pub struct ControlConnection(diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>);
+
+impl std::fmt::Debug for ControlConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlConnection").finish_non_exhaustive()
+    }
+}
+
 /// The tombstone rows on the control database.
 pub struct FleetTombstones {
     control: Pool<RuntimeConnection>,
@@ -323,6 +346,16 @@ impl FleetTombstones {
         self.clock.now()
     }
 
+    /// A connection to the control database, with the table made. A delete
+    /// takes it before the path lock, so the lock waits for one write only.
+    ///
+    /// # Errors
+    ///
+    /// No connection, or the table cannot be made.
+    pub async fn checkout(&self) -> Result<ControlConnection, TombstoneError> {
+        self.conn().await.map(ControlConnection)
+    }
+
     async fn conn(
         &self,
     ) -> Result<diesel_async::pooled_connection::deadpool::Object<RuntimeConnection>, TombstoneError>
@@ -345,13 +378,34 @@ impl FleetTombstones {
     /// the model). `present`: the file is on disk. Then an existing row is
     /// stale (a restore or a re-create drops it first), and it is reset.
     /// Else an existing row is an older or a concurrent delete's, and it
-    /// stays. `owner` names this delete (see [`remove_pending`](Self::remove_pending)).
+    /// stays. `owner` names this delete (see
+    /// [`remove_pending`](Self::remove_pending)).
     ///
     /// # Errors
     ///
     /// The control database cannot be written.
     pub async fn record(
         &self,
+        key: &str,
+        retention: Duration,
+        present: bool,
+        owner: &str,
+    ) -> Result<(), TombstoneError> {
+        let mut conn = self.checkout().await?;
+        self.record_on(&mut conn, key, retention, present, owner)
+            .await
+    }
+
+    /// [`record`](Self::record) on a connection from
+    /// [`checkout`](Self::checkout). A delete holds the path lock here, so
+    /// `present` stays correct until its removal (issue #3516).
+    ///
+    /// # Errors
+    ///
+    /// The control database cannot be written.
+    pub async fn record_on(
+        &self,
+        conn: &mut ControlConnection,
         key: &str,
         retention: Duration,
         present: bool,
@@ -365,7 +419,6 @@ impl FleetTombstones {
         } else {
             "DO NOTHING"
         };
-        let mut conn = self.conn().await?;
         diesel::sql_query(format!(
             "INSERT INTO {TOMBSTONE_TABLE} ({COLUMNS}) VALUES (?, ?, 0, ?, 0, 0, NULL, 0, ?) \
              ON CONFLICT (key) {conflict}"
@@ -374,7 +427,7 @@ impl FleetTombstones {
         .bind::<BigInt, _>(row.deleted_at.timestamp_millis())
         .bind::<BigInt, _>(row.purge_after.timestamp_millis())
         .bind::<Text, _>(owner)
-        .execute(&mut *conn)
+        .execute(&mut *conn.0)
         .await
         .map(drop)
         .map_err(store_error("record"))
@@ -636,6 +689,21 @@ mod tests {
     }
 
     #[test]
+    fn a_pending_row_or_a_retention_blocks_a_create_on_demand() {
+        let retention = Duration::from_secs(60);
+        assert!(create_on_demand_allowed(None, at(0)));
+        let pending = Tombstone::new("tenant:acme", at(1_000), retention, false);
+        assert!(!create_on_demand_allowed(Some(&pending), at(1_000)));
+        assert!(
+            !create_on_demand_allowed(Some(&pending), at(i64::from(i32::MAX))),
+            "a pending row blocks after its retention too"
+        );
+        let confirmed = Tombstone::new("tenant:acme", at(1_000), retention, true);
+        assert!(!create_on_demand_allowed(Some(&confirmed), at(60_999)));
+        assert!(create_on_demand_allowed(Some(&confirmed), at(61_000)));
+    }
+
+    #[test]
     fn a_purge_keeps_newer_generations_and_their_shared_objects() {
         assert!(purge_deletes(Some(at(5)), at(5), true));
         assert!(!purge_deletes(Some(at(6)), at(5), true));
@@ -675,7 +743,7 @@ mod tests {
                 prop_assert!(at(now) >= row.purge_after);
             }
             // a_failure_keeps_the_row.
-            let mut failed = row;
+            let mut failed = row.clone();
             failed.attempts = attempts;
             let failed = failed.after_failure(at(now), "e");
             prop_assert!(failed.next_attempt_at > at(now));
@@ -687,6 +755,14 @@ mod tests {
                 restore_allowed(false, Some(at(deleted)), at(newest)),
                 newest > deleted
             );
+            // a_create_on_demand_keeps_the_retention, both ways.
+            prop_assert_eq!(
+                create_on_demand_allowed(Some(&row), at(now)),
+                at(now) >= row.purge_after
+            );
+            // a_pending_row_blocks_a_create_on_demand.
+            let pending = Tombstone::new("k", at(deleted), retention, false);
+            prop_assert!(!create_on_demand_allowed(Some(&pending), at(now)));
             // a_purge_keeps_newer_generations.
             if newest > deleted {
                 prop_assert!(!purge_deletes(Some(at(newest)), at(deleted), true));
@@ -1372,6 +1448,188 @@ mod tests {
             let report = host.fleet.purge_deleted_replicas().await;
             assert_eq!(report.purged, 1, "{report:?}");
             assert_eq!(destination.keys(&key), Vec::<String>::new());
+        }
+
+        /// Issue #3516: a pending row keeps the undo window. The destination
+        /// recovers before the retry task confirms the row.
+        #[tokio::test]
+        async fn a_create_on_demand_does_not_end_the_retention_of_a_pending_row() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let setup = Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::from_secs(3600),
+            };
+            let host = host_with(&setup, true, &clock);
+            let key = shipped(&host, "acme").await;
+            clock.advance(Duration::from_secs(1));
+            destination.lists_fail.store(true, Ordering::SeqCst);
+            assert!(host.fleet.delete(&key).await.unwrap());
+            let row = host.tombstones.get(&key.name()).await.unwrap().unwrap();
+            assert!(!row.confirmed, "no cutoff without the lookup");
+            destination.lists_fail.store(false, Ordering::SeqCst);
+            let kept = destination.keys(&key);
+            assert!(!kept.is_empty());
+
+            assert!(matches!(
+                host.fleet.open(&key).await,
+                Err(FleetError::Deleting { .. })
+            ));
+            assert!(!host.fleet.exists(&key));
+            assert_eq!(destination.keys(&key), kept, "the undo window stays");
+            assert!(host.tombstones.get(&key.name()).await.unwrap().is_some());
+
+            // The retry task confirms the row. The retention still holds.
+            clock.advance(STALE_PENDING + Duration::from_secs(1));
+            let report = host.fleet.purge_deleted_replicas().await;
+            assert_eq!((report.purged, report.waiting), (0, 1), "{report:?}");
+            assert!(matches!(
+                host.fleet.open(&key).await,
+                Err(FleetError::Deleting { .. })
+            ));
+            // The confirm adds the marker. Every kept object stays.
+            let after = destination.keys(&key);
+            assert!(
+                kept.iter().all(|object| after.contains(object)),
+                "{after:?}"
+            );
+
+            // After the retention, the create on demand goes through.
+            clock.advance(Duration::from_secs(3600));
+            host.fleet.open(&key).await.unwrap();
+            assert_eq!(host.tombstones.get(&key.name()).await.unwrap(), None);
+        }
+
+        /// A pending row blocks a create on demand with no retention too. The
+        /// retry task confirms and purges it; then the create goes through.
+        #[tokio::test]
+        async fn a_pending_row_with_no_retention_waits_for_the_retry_task() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let setup = Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::ZERO,
+            };
+            let host = host_with(&setup, true, &clock);
+            let key = shipped(&host, "acme").await;
+            clock.advance(Duration::from_secs(1));
+            destination.lists_fail.store(true, Ordering::SeqCst);
+            assert!(host.fleet.delete(&key).await.unwrap());
+            destination.lists_fail.store(false, Ordering::SeqCst);
+            assert!(matches!(
+                host.fleet.open(&key).await,
+                Err(FleetError::Deleting { .. })
+            ));
+            assert!(!destination.keys(&key).is_empty());
+
+            clock.advance(STALE_PENDING + Duration::from_secs(1));
+            let report = host.fleet.purge_deleted_replicas().await;
+            assert_eq!(report.purged, 1, "{report:?}");
+            assert_eq!(destination.keys(&key), Vec::<String>::new());
+            host.fleet.open(&key).await.unwrap();
+        }
+
+        /// `provision` ends the window of a pending row: it purges the old
+        /// replica and drops the row.
+        #[tokio::test]
+        async fn provision_ends_the_window_of_a_pending_row() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let setup = Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::from_secs(3600),
+            };
+            let host = host_with(&setup, true, &clock);
+            let key = shipped(&host, "acme").await;
+            let old = destination.keys(&key);
+            clock.advance(Duration::from_secs(1));
+            destination.lists_fail.store(true, Ordering::SeqCst);
+            assert!(host.fleet.delete(&key).await.unwrap());
+            destination.lists_fail.store(false, Ordering::SeqCst);
+            let row = host.tombstones.get(&key.name()).await.unwrap().unwrap();
+            assert!(!row.confirmed);
+
+            clock.advance(Duration::from_secs(1));
+            host.fleet.provision(&key).await.unwrap();
+            assert_eq!(host.tombstones.get(&key.name()).await.unwrap(), None);
+            let now = destination.keys(&key);
+            assert!(
+                old.iter().all(|object| !now.contains(object)),
+                "the old replica is purged: {now:?}"
+            );
+        }
+
+        /// Issue #3516: two processes delete the same file at once. Both
+        /// fleets share one root and one control database. The test holds
+        /// the path lock, so both deletes start before either removes the
+        /// file. Exactly one delete removes it, and its tombstone stays.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn two_deletes_of_one_file_keep_its_tombstone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let setup = Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::from_secs(3600),
+            };
+            let (a, b) = (host(&setup), host(&setup));
+            // The lock winner is random, so one round can miss the race.
+            // Eight rounds make a miss rare.
+            for round in 0..8 {
+                let key = shipped(&a, &format!("acme{round}")).await;
+                let name = key.name();
+                let (held_tx, held_rx) = std::sync::mpsc::channel();
+                let (free_tx, free_rx) = std::sync::mpsc::channel::<()>();
+                let (root, lock_name) = (a.fleet.root().to_path_buf(), name.clone());
+                let holder = std::thread::spawn(move || {
+                    crate::db::fleet::with_path_lock(&root, &lock_name, || {
+                        held_tx.send(()).unwrap();
+                        free_rx.recv().unwrap();
+                        Ok(())
+                    })
+                });
+                held_rx.recv().unwrap();
+                let first = tokio::spawn({
+                    let (fleet, key) = (a.fleet.clone(), key.clone());
+                    async move { fleet.delete(&key).await }
+                });
+                let second = tokio::spawn({
+                    let (fleet, key) = (b.fleet.clone(), key.clone());
+                    async move { fleet.delete(&key).await }
+                });
+                // Both deletes reach the lock.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                free_tx.send(()).unwrap();
+                holder.join().unwrap().unwrap();
+                let first = first.await.unwrap().unwrap();
+                let second = second.await.unwrap().unwrap();
+
+                assert!(first ^ second, "round {round}: one delete removes the file");
+                let row = a.tombstones.get(&name).await.unwrap();
+                let row = row.unwrap_or_else(|| panic!("round {round}: the tombstone is lost"));
+                assert!(row.confirmed, "round {round}: {row:?}");
+                let (reader, marker_key) = (Arc::clone(&a.replication), key.clone());
+                let marker = crate::time::spawn_blocking(move || reader.marker(&marker_key))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(marker.is_some(), "round {round}: the marker is written");
+            }
         }
 
         #[tokio::test]

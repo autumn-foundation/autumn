@@ -103,14 +103,17 @@ It proves these properties:
   that is not newer than the delete. A newer generation restores.
 - A failed purge keeps the row, waits before the next try, and the wait is
   capped.
-- Only a purge, a restore that worked, a re-create that purged, a refused
-  delete of its own pending row, or a confirmed row next to a live file
-  (`Stale`) drops the row. A second delete of a missing file keeps the
+- Only a purge, a restore that worked, an allowed re-create that purged, a
+  refused delete of its own pending row, or a confirmed row next to a live
+  file (`Stale`) drops the row. A second delete of a missing file keeps the
   row. A delete of a present file resets a stale row.
 - A confirm never makes a row: after a re-create or a restore took the
   key, no cutoff covers the new database.
 - Two deletes at once: the one that found no file keeps the pending row of
-  the one that removed the file.
+  the one that removed the file. Without the path lock, the second delete
+  can drop that row (issue #3516).
+- A create on demand never drops a pending row, and never runs before the
+  retention ends. Only `provision` ends the window early (issue #3516).
 - A row is never due before the retention ends, and a pending row is never
   due. The cutoff is at or after both the removal and the newest generation.
 - A purge never deletes a generation newer than the cutoff. With no newer
