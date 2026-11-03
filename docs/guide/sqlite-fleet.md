@@ -519,8 +519,14 @@ refused.
 Rules:
 
 - During the retention, a create on demand (`create_on_demand`) of the key
-  answers `410`. With `restore_missing`, this is also true on a host with its
-  own control database: it reads the retention from the marker. `provision` makes a new database: it purges the old replica
+  answers `410`. With `restore_missing`, a host with its own control
+  database also answers `410`: it reads the retention from the marker.
+- A create on demand also answers `410` while the row is pending, with any
+  retention. A pending row has no cutoff yet. The task confirms the row when
+  it is older than 10 minutes, the file is not on disk, this host owns the
+  slot, and the replica can be read. Until then, only `provision` makes the
+  database again.
+- `provision` makes a new database: it purges the old replica
   first and drops the row. This ends the undo window. If the purge fails,
   `provision` fails with `503`: try again.
 - A purge removes each generation that is not newer than the delete. A newer

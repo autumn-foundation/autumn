@@ -25,9 +25,10 @@ pub struct Tombstone {
 }
 
 pub enum Op {
-    /// `delete` starts: the row is written before any file is removed.
-    /// `present`: the file is on disk, so an existing row is stale and is
-    /// reset. Else an existing row stays as it is.
+    /// `delete` starts: the row is written under the path lock, before any
+    /// file is removed. `present`: the file is on disk, so an existing row
+    /// is stale and is reset. Else an existing row stays as it is. The lock
+    /// keeps `present` correct: a delete after a removal sees no file.
     Record { now: int, present: bool, owner: nat },
     /// The file is gone (`delete`, or the retry task after a crash). `now`
     /// is the later of the clock and the newest generation. A row that is
@@ -46,7 +47,9 @@ pub enum Op {
     /// nothing came back (`ok` is false).
     Restore { ok: bool },
     /// A new database with the same key. `purged`: the old replica is gone.
-    Recreate { purged: bool },
+    /// `explicit`: a `provision`. Else a create on demand at `now`, which
+    /// runs only when `create_on_demand_allowed`.
+    Recreate { purged: bool, explicit: bool, now: int },
 }
 
 /// `retry_delay`: `min(cap, base * 2^attempts)`.
@@ -118,6 +121,16 @@ pub open spec fn purge_deletes(generation: Option<int>, cutoff: int, newer_exist
     }
 }
 
+/// `create_on_demand_allowed`: no row, or a confirmed row past its
+/// retention. A pending row has no cutoff yet, so it blocks too. Only an
+/// explicit `provision` ends a window early.
+pub open spec fn create_on_demand_allowed(row: Option<Tombstone>, now: int) -> bool {
+    match row {
+        Some(t) => t.confirmed && now >= t.purge_after,
+        None => true,
+    }
+}
+
 pub open spec fn apply(
     row: Option<Tombstone>,
     op: Op,
@@ -168,7 +181,8 @@ pub open spec fn apply(
         } else {
             row
         },
-        Op::Recreate { purged } => if purged {
+        Op::Recreate { purged, explicit, now } => if purged && (explicit
+            || create_on_demand_allowed(row, now)) {
             None
         } else {
             row
@@ -262,7 +276,8 @@ pub proof fn only_these_ops_drop_the_row(t: Tombstone, op: Op, retention: nat, b
             Op::Restore { ok } => ok,
             Op::Refused { owner } => !t.confirmed && t.owner == owner,
             Op::Stale => t.confirmed,
-            Op::Recreate { purged } => purged,
+            Op::Recreate { purged, explicit, now } => purged && (explicit
+                || create_on_demand_allowed(Some(t), now)),
             _ => false,
         },
 {
@@ -307,6 +322,88 @@ pub proof fn a_refused_delete_keeps_another_pending_row(t: Tombstone, owner: nat
 pub proof fn a_confirm_never_makes_a_row(now: int, floor: int, retention: nat, base: nat, cap: nat)
     ensures
         apply(None, Op::Confirm { now, floor }, retention, base, cap) is None,
+{
+}
+
+/// Two deletes at once, under the path lock: the second one sees no file,
+/// so it keeps the pending row of the first, and then drops nothing.
+pub proof fn a_delete_after_the_removal_keeps_the_pending_row(t: Tombstone, now: int, owner: nat, retention: nat, base: nat, cap: nat)
+    requires
+        !t.confirmed,
+        t.owner != owner,
+    ensures
+        apply(
+            apply(Some(t), Op::Record { now, present: false, owner }, retention, base, cap),
+            Op::Refused { owner },
+            retention,
+            base,
+            cap,
+        ) == Some(t),
+{
+}
+
+/// Issue #3516: a create on demand never runs while a row is pending. The
+/// delete has no cutoff yet, and the retention may still hold.
+pub proof fn a_pending_row_blocks_a_create_on_demand(t: Tombstone, now: int)
+    requires
+        !t.confirmed,
+    ensures
+        !create_on_demand_allowed(Some(t), now),
+{
+}
+
+/// A create on demand never ends the undo window: it runs only after the
+/// removal plus the retention.
+pub proof fn a_create_on_demand_keeps_the_retention(removed: int, floor: int, owner: nat, retention: nat, now: int)
+    requires
+        create_on_demand_allowed(Some(confirmed(removed, floor, retention, owner)), now),
+    ensures
+        now >= removed + retention,
+{
+}
+
+/// A create on demand needs a confirmed row whose retention has ended. A
+/// pending row never allows it.
+pub proof fn a_create_on_demand_needs_a_confirmed_row(t: Tombstone, now: int)
+    requires
+        create_on_demand_allowed(Some(t), now),
+    ensures
+        t.confirmed,
+        now >= t.purge_after,
+{
+}
+
+/// Issue #3516: a create on demand never drops a pending row, so the undo
+/// window stays until the delete confirms it.
+pub proof fn a_create_on_demand_keeps_a_pending_row(t: Tombstone, now: int, retention: nat, base: nat, cap: nat)
+    requires
+        !t.confirmed,
+    ensures
+        apply(
+            Some(t),
+            Op::Recreate { purged: true, explicit: false, now },
+            retention,
+            base,
+            cap,
+        ) == Some(t),
+{
+}
+
+/// Why a delete records its row under the path lock. Without the lock, a
+/// second delete can see the file before the first one removes it. It then
+/// resets the row to its own owner, finds no file, and drops the row.
+pub proof fn without_the_lock_a_second_delete_drops_the_row(t: Tombstone, now: int, owner: nat, retention: nat, base: nat, cap: nat)
+    requires
+        !t.confirmed,
+        t.owner != owner,
+    ensures
+        apply(
+            apply(Some(t), Op::Record { now, present: true, owner }, retention, base, cap),
+            Op::Refused { owner },
+            retention,
+            base,
+            cap,
+        ) is None,
 {
 }
 

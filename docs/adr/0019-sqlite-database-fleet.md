@@ -356,14 +356,17 @@ brings a deleted tenant back on its next open. Litestream has the same gap.
 - **Delete.** With replication installed, `delete` writes a pending
   tombstone row (`_autumn_fleet_tombstones`) on the control database before
   any file goes. If the row cannot be written, the delete fails. Then a crash
-  after the removal cannot leave a replica that nothing blocks. When the file
-  is present, an existing row is stale, and the delete resets it. When the
+  after the removal cannot leave a replica that nothing blocks. The delete
+  checks the file, writes the row and removes the file under the path lock
+  (issue #3516). So a second delete in another process sees no file after
+  the removal, and it cannot reset or drop the row of the first delete. When
+  the file is present, an existing row is stale, and the delete resets it. When the
   file is missing, an existing row is an older or a concurrent delete's,
   and it stays. A delete that removed nothing drops only the pending row
   that it wrote (each pending row names its delete).
 - **Confirm.** After the removal, the delete confirms its own pending row.
   `deleted_at` is the purge cutoff: the later of the app clock and the
-  newest generation in the replica. The retention runs from the removal. If
+  newest generation in the replica. The retention runs from the confirm. If
   the generations cannot be read, the row stays pending, and the retry task
   confirms it later. The confirm never inserts a row: when
   the row is gone, a re-create or a restore took the key, and nothing is
@@ -383,7 +386,9 @@ brings a deleted tenant back on its next open. Litestream has the same gap.
   turn, restores, and drops the marker. If the restore fails, the row goes
   back.
 - **Re-create.** During the retention, a create on demand answers `410`, so
-  a stale client cannot end the undo window. With `restore_missing`, a host
+  a stale client cannot end the undo window. A pending row also gives `410`
+  (issue #3516). Its delete has no cutoff yet, so its retention has not
+  started. Only `provision` ends the window early. With `restore_missing`, a host
   with its own control database reads the retention from the marker. `provision`, and any create
   after the retention, purges the old replica first and drops the row, or
   fails with `503`. So a later purge never removes the new database's data,
