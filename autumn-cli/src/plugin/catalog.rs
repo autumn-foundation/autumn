@@ -331,6 +331,8 @@ mod tests {
         "autumn-schema-core",
         "autumn-edge",
         "autumn-plugin-reference",
+        // The maintainer task runner (`cargo xtask`); `publish = false`.
+        "xtask",
     ];
 
     /// Crates in [`NON_PLUGIN_MEMBERS`] that ARE published, and so are excluded
