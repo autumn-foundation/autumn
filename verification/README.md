@@ -61,6 +61,21 @@ proves that two items never share an id, and that an item id is never a
 hint, error, wrapper, label or nested-subfield id, or a plain field id. The
 proptest `choice_item_ids_never_collide` checks the rendered markup.
 
+## One-time code format
+
+`otp_format.rs` models `OtpFormat` in `autumn/src/form.rs` (issue #3412).
+Verify it with:
+
+```sh
+verus verification/otp_format.rs
+```
+
+It proves that the digit count is 4 to 10, that a kept group splits the
+code, and that the cell count fits and is at most 14. It also proves that the
+grouped `pattern` from `autumn-widgets.js` has one group more than the
+separator cells. The proptests `otp_format_stays_in_bounds` and
+`otp_markup_matches_the_format` check the runtime.
+
 ## Fleet slot ownership
 
 `fleet_slot_ownership.rs` models the slot-ownership table of a SQLite fleet

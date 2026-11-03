@@ -3038,6 +3038,7 @@ use autumn_web::auth::{{
     hash_password, hash_remember_token, parse_remember_cookie_value, verify_password,
 }};
 use autumn_web::extract::Query;
+use autumn_web::form::{{FieldOptions, password_input_with}};
 use autumn_web::prelude::*;
 use axum::extract::Path;
 use axum::response::{{IntoResponse, Response}};
@@ -3061,6 +3062,12 @@ use crate::schema::{table};
 
 fn redirect_to(url: &str) -> Response {{
     axum::response::Redirect::to(url).into_response()
+}}
+
+/// A password field from `autumn_web::form`. The page shows the error
+/// itself, so the changeset is empty.
+fn password_field(field: &str, label: &str, options: FieldOptions<'_>) -> Markup {{
+    password_input_with(&Changeset::new(()), field, label, &options)
 }}
 
 // ── Persistent "remember-me" login (issue #1397) ─────────────────────────────
@@ -3964,11 +3971,8 @@ fn render_signup_form(
                 label for="email" {{ "Email" }}
                 input type="email" id="email" name="email" required autocomplete="email";
             }}
-            div {{
-                label for="password" {{ "Password (" (min_len) "+ characters)" }}
-                input type="password" id="password" name="password" required
-                      autocomplete="new-password" minlength=(min_len);
-            }}
+            (password_field("password", &format!("Password ({{min_len}}+ characters)"),
+                FieldOptions::new().required().new_password().minlength(min_len).strength_hint().reveal()))
             button type="submit" {{ "Sign Up" }}
         }}
         p {{ a href="/login" {{ "Already have an account? Log in" }} }}
@@ -4132,11 +4136,7 @@ pub async fn login_form(flash: Flash, csrf: Option<CsrfToken>, csrf_field: Optio
                 label for="email" {{ "Email" }}
                 input type="email" id="email" name="email" required autocomplete="email";
             }}
-            div {{
-                label for="password" {{ "Password" }}
-                input type="password" id="password" name="password" required
-                      autocomplete="current-password";
-            }}
+            (password_field("password", "Password", FieldOptions::new().required().current_password().reveal()))
             label {{
                 input type="checkbox" name="remember" value="on";
                 " Remember me on this device"
@@ -4673,18 +4673,12 @@ fn render_change_password_form(
         }}
         form action="/account/password" method="post" {{
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
-            div {{
-                label for="current-password" {{ "Current password" }}
-                input type="password" id="current-password" name="current_password" autocomplete="current-password" required;
-            }}
-            div {{
-                label for="new-password" {{ "New password" }}
-                input type="password" id="new-password" name="new_password" autocomplete="new-password" required;
-            }}
-            div {{
-                label for="new-password-confirmation" {{ "Confirm new password" }}
-                input type="password" id="new-password-confirmation" name="new_password_confirmation" autocomplete="new-password" required;
-            }}
+            (password_field("current_password", "Current password",
+                FieldOptions::new().required().current_password().reveal_label("Show current password")))
+            (password_field("new_password", "New password",
+                FieldOptions::new().required().new_password().strength_hint().reveal_label("Show new password")))
+            (password_field("new_password_confirmation", "Confirm new password",
+                FieldOptions::new().required().new_password().reveal_label("Show confirmation")))
             button type="submit" {{ "Change Password" }}
         }}
         p {{ a href="/account" {{ "← Back to account" }} }}
@@ -4884,10 +4878,7 @@ fn render_change_email_form(
                 label for="new-email" {{ "New email address" }}
                 input type="email" id="new-email" name="new_email" autocomplete="email" required;
             }}
-            div {{
-                label for="current-password" {{ "Current password" }}
-                input type="password" id="current-password" name="current_password" autocomplete="current-password" required;
-            }}
+            (password_field("current_password", "Current password", FieldOptions::new().required().current_password().reveal()))
             button type="submit" {{ "Send Confirmation Link" }}
         }}
         p {{ a href="/account" {{ "← Back to account" }} }}
@@ -5244,10 +5235,7 @@ pub async fn reauth_form(
         form action="/reauth" method="post" {{
             @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             input type="hidden" name="return_to" value=(return_to);
-            div {{
-                label for="password" {{ "Password" }}
-                input type="password" id="password" name="password" autocomplete="current-password" required;
-            }}
+            (password_field("password", "Password", FieldOptions::new().required().current_password().reveal()))
             {totp_reauth_field}
             button type="submit" {{ "Confirm" }}
         }}
@@ -5307,10 +5295,7 @@ pub async fn reauth(
                 form action="/reauth" method="post" {{
                     @if let Some(ref csrf) = csrf {{ input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
                     input type="hidden" name="return_to" value=(ret);
-                    div {{
-                        label for="password" {{ "Password" }}
-                        input type="password" id="password" name="password" autocomplete="current-password" required;
-                    }}
+                    (password_field("password", "Password", FieldOptions::new().required().current_password().reveal()))
                     {totp_reauth_field}
                     button type="submit" {{ "Confirm" }}
                 }}
@@ -5564,11 +5549,8 @@ fn render_reset_password_form(
         form action="/reset-password" method="post" {{
             @if let Some(csrf) = csrf {{ input type="hidden" name=(csrf_field.map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }}
             input type="hidden" name="token" value=(token);
-            div {{
-                label for="password" {{ "New Password (" (min_len) "+ characters)" }}
-                input type="password" id="password" name="password" required
-                      autocomplete="new-password" minlength=(min_len);
-            }}
+            (password_field("password", &format!("New Password ({{min_len}}+ characters)"),
+                FieldOptions::new().required().new_password().minlength(min_len).strength_hint().reveal()))
             button type="submit" {{ "Set New Password" }}
         }}
     }})
@@ -8595,6 +8577,7 @@ const fn totp_imports_src() -> &'static str {
      use aes_gcm::{Aes256Gcm, Key, Nonce};\n\
      use base64::Engine as _;\n\
      use base64::engine::general_purpose::STANDARD as B64;\n\
+     use autumn_web::form::{OtpFormat, otp_input_with};\n\
      use totp_rs::{Algorithm, Secret, TOTP};\n\
      use crate::models::recovery_code::{NewRecoveryCode, RecoveryCode};\n\
      use crate::schema::recovery_codes;\n"
@@ -9077,22 +9060,16 @@ pub async fn two_factor_status(
             p { "You have " (remaining) " recovery codes remaining." }
             form action="/account/2fa/disable" method="post" {
                 @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
-                p {
-                    label for="disable-password" { "Confirm with your password" }
-                    input type="password" id="disable-password" name="password" autocomplete="current-password";
-                    label for="disable-code" { "or a current 6-digit code" }
-                    input type="text" id="disable-code" name="code" inputmode="numeric" autocomplete="one-time-code";
-                }
+                (password_field("password", "Confirm with your password", FieldOptions::new().current_password().reveal()))
+                // One input: paste and SMS autofill fill all six boxes.
+                (otp_input_with(&Changeset::new(()), "code", "or a current 6-digit code", OtpFormat::digits(6), &FieldOptions::new()))
                 button type="submit" { "Disable two-factor" }
             }
         } @else {
             p { "Two-factor authentication is " strong { "disabled" } "." }
             form action="/account/2fa/enable" method="post" {
                 @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
-                p {
-                    label for="enable-password" { "Confirm your password to begin enrollment:" }
-                    input type="password" id="enable-password" name="password" autocomplete="current-password" required;
-                }
+                (password_field("password", "Confirm your password to begin enrollment:", FieldOptions::new().required().current_password().reveal()))
                 button type="submit" { "Enable two-factor" }
             }
         }
@@ -9179,8 +9156,7 @@ pub async fn two_factor_enable(
         p { "Enter the 6-digit code shown in your app to finish enabling 2FA." }
         form action="/account/2fa/confirm" method="post" {
             @if let Some(ref csrf) = csrf { input type="hidden" name=(csrf_field.as_ref().map_or("_csrf", |f| f.0.as_str())) value=(csrf.token()); }
-            label for="confirm-code" { "6-digit code" }
-            input type="text" id="confirm-code" name="code" inputmode="numeric" autocomplete="one-time-code" required;
+            (otp_input_with(&Changeset::new(()), "code", "6-digit code", OtpFormat::digits(6), &FieldOptions::new().required()))
             button type="submit" { "Confirm and enable" }
         }
     }))
@@ -11407,6 +11383,20 @@ mod tests {
                     assert!(!ids.contains(&id), "duplicate id \"{id}\" in one form");
                     ids.push(id);
                 }
+                // A form helper (issue #3412) writes its label and its id
+                // at run time: the field name is both.
+                for helper in [
+                    "(password_field(\"",
+                    "(otp_input_with(&Changeset::new(()), \"",
+                ] {
+                    for (at, _) in form.match_indices(helper) {
+                        let rest = &form[at + helper.len()..];
+                        let id = &rest[..rest.find('"').expect("field name ends")];
+                        assert!(!ids.contains(&id), "duplicate id \"{id}\" in one form");
+                        ids.push(id);
+                        bound += 1;
+                    }
+                }
                 for (at, _) in form.match_indices("label ") {
                     if form[..at]
                         .chars()
@@ -11445,6 +11435,104 @@ mod tests {
             }
         }
         assert!(bound >= 40, "scan found too few labels: {bound}");
+    }
+
+    /// Issue #3412: each password field uses `password_input_with`, with a
+    /// reveal button and an `autocomplete` token. A new password also has a
+    /// strength hint. No raw password input stays.
+    #[test]
+    fn password_fields_use_the_form_helper() {
+        for (totp, magic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let routes = render_routes_file("User", "user", "users", &[], totp, magic);
+            assert!(
+                routes.contains("use autumn_web::form::{FieldOptions, password_input_with};"),
+                "missing import"
+            );
+            assert!(
+                routes.contains("password_input_with(&Changeset::new(()), field, label, &options)"),
+                "the helper uses the form helper"
+            );
+            assert!(
+                !routes.contains("input type=\"password\""),
+                "a raw password input stays:\n{routes}"
+            );
+            let calls: Vec<&str> = routes
+                .match_indices("(password_field(\"")
+                .map(|(at, _)| {
+                    let rest = &routes[at..];
+                    &rest[..rest.find("))").expect("call ends") + 2]
+                })
+                .collect();
+            let expected = if totp { 11 } else { 9 };
+            assert_eq!(calls.len(), expected, "password fields: {calls:#?}");
+            for call in &calls {
+                assert!(
+                    call.contains(".current_password()") || call.contains(".new_password()"),
+                    "no autocomplete token: {call}"
+                );
+                assert!(
+                    call.contains(".reveal()") || call.contains(".reveal_label(\"Show "),
+                    "no reveal button: {call}"
+                );
+            }
+            // Three buttons on one page have three names.
+            for label in [
+                "Show current password",
+                "Show new password",
+                "Show confirmation",
+            ] {
+                assert!(
+                    routes.contains(&format!(".reveal_label(\"{label}\")")),
+                    "{label}"
+                );
+            }
+            // Signup, reset and the new password of a change get the hint.
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.contains(".strength_hint()"))
+                    .count(),
+                3,
+                "{calls:#?}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|c| c.contains(".new_password().minlength(min_len)"))
+                    .count(),
+                2,
+                "signup and reset keep the minimum length: {calls:#?}"
+            );
+        }
+    }
+
+    /// Issue #3412: the two 6-digit fields on `/account/2fa` use
+    /// `otp_input_with`. `/login/verify` and `/reauth` also take a recovery
+    /// code (`a1b2c-3d4e5`), so they keep a text input.
+    #[test]
+    fn totp_code_fields_use_the_otp_helper() {
+        let routes = render_routes_file("User", "user", "users", &[], true, false);
+        assert!(routes.contains("use autumn_web::form::{OtpFormat, otp_input_with};"));
+        let calls = routes
+            .matches("(otp_input_with(&Changeset::new(()), \"code\"")
+            .count();
+        assert_eq!(calls, 2, "{routes}");
+        assert!(routes.contains("OtpFormat::digits(6), &FieldOptions::new().required()))"));
+        assert!(!routes.contains("id=\"confirm-code\""));
+        assert!(!routes.contains("id=\"disable-code\""));
+        // A recovery code has letters and a dash: no digits-only field.
+        let verify = &routes[routes
+            .find("pub async fn login_verify_form(")
+            .expect("form")..];
+        let verify = &verify[..verify.find("\n}\n").expect("fn ends")];
+        assert!(
+            verify.contains("input type=\"text\" id=\"code\" name=\"code\""),
+            "{verify}"
+        );
+        assert!(!verify.contains("otp_input"), "{verify}");
+        // Without --totp, nothing imports the OTP helper.
+        let plain = render_routes_file("User", "user", "users", &[], false, false);
+        assert!(!plain.contains("otp_input_with"));
     }
 
     /// Issue #3106: a placeholder is not a label or an instruction. The TOTP

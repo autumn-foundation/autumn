@@ -452,6 +452,227 @@
     }
 }
 
+/* ── Password and one-time code — issue #3412 ──────────────────────────── */
+
+/* The reveal button sits after the input. It has `hidden` until
+   autumn-widgets.js shows it. */
+.autumn-password {
+    display: flex;
+    gap: var(--space-2);
+    align-items: stretch;
+}
+
+.autumn-password > .autumn-field__input {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.autumn-password__reveal {
+    flex: 0 0 auto;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius);
+    font: inherit;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    color: var(--text);
+    background-color: var(--surface);
+    cursor: pointer;
+}
+
+.autumn-password__reveal[hidden] {
+    display: none;
+}
+
+.autumn-password__reveal[aria-pressed="true"] {
+    border-color: var(--primary);
+    color: var(--on-primary);
+    background-color: var(--primary);
+}
+
+.autumn-password__reveal:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-password__reveal:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+/* The strength hint is empty until the user types. It stays in the
+   accessibility tree, so a screen reader reads the first level. */
+.autumn-field__strength {
+    font-size: 0.8125rem;
+    font-weight: var(--font-weight-medium);
+    color: var(--text-muted);
+    margin: 0;
+}
+
+.autumn-field__strength[data-autumn-strength-level="0"] {
+    color: var(--danger);
+}
+
+.autumn-field__strength[data-autumn-strength-level="1"] {
+    color: var(--warning-text);
+}
+
+.autumn-field__strength[data-autumn-strength-level="2"],
+.autumn-field__strength[data-autumn-strength-level="3"] {
+    color: var(--success-text);
+}
+
+/* A one-time code is one input over a row of boxes. The boxes are
+   aria-hidden spans. Each cell is one pitch wide: the box and the gap. The
+   input has a monospace font and a letter spacing of one pitch, so each
+   digit is in the center of its box.
+
+   `--autumn-otp-span` is the cell count plus one pitch for the input. A
+   rule below sets it for each count of cells. A
+   narrow screen makes the boxes smaller, so the page does not scroll
+   sideways (WCAG 1.4.10). The 2rem is the page gutters. */
+.autumn-field--otp {
+    align-items: flex-start;
+}
+
+.autumn-otp {
+    --autumn-otp-span: 7;
+    --autumn-otp-pitch: min(3rem, (100vw - 2rem) / var(--autumn-otp-span));
+    --autumn-otp-gap: calc(var(--autumn-otp-pitch) / 6);
+    --autumn-otp-box: calc(var(--autumn-otp-pitch) - var(--autumn-otp-gap));
+    position: relative;
+    display: inline-flex;
+    direction: ltr;
+}
+
+.autumn-otp__cells {
+    display: flex;
+    gap: var(--autumn-otp-gap);
+}
+
+.autumn-otp__cell {
+    box-sizing: border-box;
+    width: var(--autumn-otp-box);
+    height: calc(var(--autumn-otp-box) * 1.2);
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius);
+    color: var(--text);
+    background-color: var(--surface);
+}
+
+.autumn-otp:has(.autumn-otp__cells > :nth-child(7)) {
+    --autumn-otp-span: 8;
+}
+
+.autumn-otp:has(.autumn-otp__cells > :nth-child(8)) {
+    --autumn-otp-span: 9;
+}
+
+.autumn-otp:has(.autumn-otp__cells > :nth-child(9)) {
+    --autumn-otp-span: 10;
+}
+
+.autumn-otp:has(.autumn-otp__cells > :nth-child(10)) {
+    --autumn-otp-span: 11;
+}
+
+.autumn-otp:has(.autumn-otp__cells > :nth-child(11)) {
+    --autumn-otp-span: 12;
+}
+
+.autumn-otp:has(.autumn-otp__cells > :nth-child(12)) {
+    --autumn-otp-span: 13;
+}
+
+.autumn-otp:has(.autumn-otp__cells > :nth-child(13)) {
+    --autumn-otp-span: 14;
+}
+
+.autumn-otp:has(.autumn-otp__cells > :nth-child(14)) {
+    --autumn-otp-span: 15;
+}
+
+/* A separator shows only when the runtime groups the digits. It and its
+   gap are half a pitch: the input's word spacing makes the group space
+   half a pitch too. */
+.autumn-otp__sep {
+    display: none;
+    width: calc(var(--autumn-otp-pitch) / 2 - var(--autumn-otp-gap));
+}
+
+.autumn-otp:has(> [data-autumn-otp-grouped]) .autumn-otp__sep {
+    display: block;
+}
+
+/* The input is one pitch wider than the boxes. The caret after the last
+   digit then does not scroll the text. */
+.autumn-field__input.autumn-otp__input {
+    position: absolute;
+    z-index: 1;
+    inset-block: 0;
+    inset-inline-start: 0;
+    width: calc(100% + var(--autumn-otp-pitch));
+    padding: 0;
+    padding-inline-start: calc((var(--autumn-otp-box) - 1ch) / 2);
+    border: 0;
+    font-family: var(--font-mono);
+    font-size: min(var(--font-size-lg), var(--autumn-otp-box) / 2);
+    font-variant-numeric: tabular-nums;
+    letter-spacing: calc(var(--autumn-otp-pitch) - 1ch);
+    word-spacing: calc(var(--autumn-otp-pitch) / -2);
+    color: var(--text);
+    background-color: transparent;
+    caret-color: var(--primary);
+}
+
+/* Chromium paints a color behind an autofilled input. A long transition
+   keeps the boxes visible. */
+.autumn-field__input.autumn-otp__input:autofill {
+    transition: background-color 600000s 0s;
+}
+
+.autumn-field__input.autumn-otp__input:focus {
+    border: 0;
+    outline: 0;
+    box-shadow: none;
+}
+
+.autumn-otp:focus-within .autumn-otp__cell {
+    border-color: var(--primary);
+}
+
+.autumn-otp:has(> :focus-visible) {
+    border-radius: var(--radius);
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-otp:has(> .autumn-field__input--invalid) .autumn-otp__cell,
+.autumn-otp:has(> :user-invalid) .autumn-otp__cell {
+    border-color: var(--danger);
+}
+
+.autumn-otp:has(> :disabled) .autumn-otp__cell {
+    opacity: 0.6;
+}
+
+@media (forced-colors: active) {
+    .autumn-otp__cell {
+        border-color: CanvasText;
+    }
+
+    .autumn-password__reveal[aria-pressed="true"] {
+        forced-color-adjust: none;
+        border-color: Highlight;
+        color: HighlightText;
+        background-color: Highlight;
+    }
+
+    .autumn-otp:has(> :focus-visible) {
+        outline-color: Highlight;
+    }
+}
+
 /* ── Rich text (autumn-rich-text) — issue #1255 ───────────────────────────── */
 
 .autumn-rich-text {

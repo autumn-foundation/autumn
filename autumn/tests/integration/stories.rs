@@ -263,6 +263,8 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "separator",
     "skeleton",
     "spinner",
+    // Password and one-time code (`autumn_web::form`, #3412).
+    "sign-in-inputs",
 ];
 
 /// Slugs of stories for feature-gated modules (#3398).
@@ -554,6 +556,8 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "modal",
     "nav-bar",
     "popover",
+    // Paste into the OTP field and the reveal toggle (#3412).
+    "sign-in-inputs",
     "tabs",
     "theme-toggle",
     "toast",

@@ -927,6 +927,207 @@ async fn keyboard_choice_controls() {
     page.expect_no_console_errors().await.expect("no errors");
 }
 
+/// Password and one-time code (#3412): a paste fills the one OTP input,
+/// and the reveal button toggles the password from the keyboard.
+#[allow(clippy::too_many_lines, reason = "one flow over the story page")]
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_sign_in_inputs() {
+    const REVEAL: &str = "[data-autumn-reveal][aria-controls=current]";
+    let value = |sel: &str| format!("document.querySelector({sel:?}).value");
+    let prop = |sel: &str, name: &str| format!("String(document.querySelector({sel:?}).{name})");
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/sign-in-inputs").await;
+
+    // The runtime removes the no-JS `maxlength`, so a paste is not cut.
+    assert_eq!(attr(&page, "#code", "maxlength").await, "");
+    // A paste fills the one input. The runtime keeps only the digits.
+    focus(&page, "#code").await;
+    page.paste("123-456").await.expect("paste");
+    assert_eq!(eval_string(&page, &value("#code")).await, "123456");
+    assert!(
+        eval_bool(&page, "document.querySelector('#code').validity.valid").await,
+        "the pasted code matches the pattern"
+    );
+    // A longer paste is cut to the length.
+    page.fill("#code", "").await.expect("clear");
+    page.paste("Your code is 987654 (valid 5 min)")
+        .await
+        .expect("paste");
+    assert_eq!(eval_string(&page, &value("#code")).await, "987654");
+    // Full-width digits become ASCII digits.
+    page.fill("#code", "").await.expect("clear");
+    page.paste("１２３４５６").await.expect("paste");
+    assert_eq!(eval_string(&page, &value("#code")).await, "123456");
+    // An IME entry is formatted once, when the composition ends.
+    assert_eq!(
+        eval_string(
+            &page,
+            "(() => { const i = document.querySelector('#code'); i.value = '12a'; \
+             i.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: true })); \
+             const during = i.value; \
+             i.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true })); \
+             return during + '|' + i.value; })()",
+        )
+        .await,
+        "12a|12"
+    );
+
+    // A grouped code shows a space between groups and the separator cell.
+    focus(&page, "#backup").await;
+    page.paste("1234 5678").await.expect("paste");
+    assert_eq!(eval_string(&page, &value("#backup")).await, "1234 5678");
+    assert_eq!(
+        eval_string(&page, &prop("#backup", "pattern")).await,
+        "[0-9]{4} [0-9]{4}"
+    );
+    assert!(
+        eval_bool(&page, "document.querySelector('#backup').validity.valid").await,
+        "the grouped code matches the grouped pattern"
+    );
+    assert!(
+        shown(&page, "#backup-field .autumn-otp__sep").await,
+        "the runtime shows the separator"
+    );
+    // The form data has the digits only.
+    assert_eq!(
+        eval_string(
+            &page,
+            "(() => { const f = document.createElement('form'); f.id = 'probe'; \
+             document.body.append(f); const i = document.querySelector('#backup'); \
+             i.setAttribute('form', 'probe'); const v = new FormData(f).get('backup'); \
+             i.removeAttribute('form'); f.remove(); return v; })()",
+        )
+        .await,
+        "12345678"
+    );
+    // Backspace after a group space deletes the digit before the space.
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { const i = document.querySelector('#backup'); i.focus(); \
+             i.setSelectionRange(5, 5); return document.activeElement === i; })()",
+        )
+        .await
+    );
+    press(&page, "Backspace").await;
+    assert_eq!(eval_string(&page, &value("#backup")).await, "1235 678");
+
+    // The runtime shows the reveal button. It toggles the input type.
+    wait_for(
+        &page,
+        &format!("!document.querySelector({REVEAL:?}).hidden"),
+    )
+    .await;
+    assert_eq!(
+        eval_string(&page, &prop("#current", "type")).await,
+        "password"
+    );
+    focus(&page, REVEAL).await;
+    press(&page, "Enter").await;
+    assert_eq!(eval_string(&page, &prop("#current", "type")).await, "text");
+    assert_eq!(attr(&page, REVEAL, "aria-pressed").await, "true");
+    assert_eq!(
+        active_text(&page).await,
+        "Show password",
+        "focus stays on the button and its label does not change"
+    );
+    press(&page, " ").await;
+    assert_eq!(
+        eval_string(&page, &prop("#current", "type")).await,
+        "password"
+    );
+    assert_eq!(attr(&page, REVEAL, "aria-pressed").await, "false");
+
+    // A real submit of the form with the password, a reset, a page hide and
+    // an htmx history snapshot hide the password again.
+    let in_form = |run: &str| {
+        format!(
+            "(() => {{ const field = document.querySelector('#current-field'); \
+             const f = document.createElement('form'); \
+             f.addEventListener('submit', e => e.preventDefault()); \
+             field.before(f); f.append(field); f.{run}; \
+             f.before(field); f.remove(); }})()"
+        )
+    };
+    for event in [
+        in_form("requestSubmit()"),
+        in_form("reset()"),
+        "window.dispatchEvent(new Event('pagehide'))".to_owned(),
+        "document.dispatchEvent(new Event('htmx:beforeHistorySave'))".to_owned(),
+    ] {
+        // A moved field loses focus, so focus the button again.
+        focus(&page, REVEAL).await;
+        press(&page, "Enter").await;
+        assert_eq!(eval_string(&page, &prop("#current", "type")).await, "text");
+        page.evaluate(event.as_str()).await.expect("dispatch");
+        assert_eq!(
+            eval_string(&page, &prop("#current", "type")).await,
+            "password",
+            "after `{event}`"
+        );
+        assert_eq!(attr(&page, REVEAL, "aria-pressed").await, "false");
+    }
+
+    // The strength hint follows the typed password.
+    assert!(
+        attr(&page, "#fresh", "aria-describedby")
+            .await
+            .contains("fresh-strength")
+    );
+    page.fill("#fresh", "abc").await.expect("fill");
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.querySelector('#fresh-strength').textContent"
+        )
+        .await,
+        "Strength: weak"
+    );
+    // One kind of character does not score Strong.
+    page.fill("#fresh", "aaaaaaaaaaaaaaaa").await.expect("fill");
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.querySelector('#fresh-strength').textContent"
+        )
+        .await,
+        "Strength: fair"
+    );
+    page.fill("#fresh", "Correct-Horse-9").await.expect("fill");
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.querySelector('#fresh-strength').textContent"
+        )
+        .await,
+        "Strength: strong"
+    );
+    assert_eq!(
+        attr(&page, "#fresh-strength", "data-autumn-strength-level").await,
+        "3"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+
+    // Without the script, the reveal button stays hidden.
+    let plain = runner.page().await.expect("page");
+    plain.set_javascript_enabled(false).await.expect("no JS");
+    plain
+        .visit("/_stories/sign-in-inputs")
+        .await
+        .expect("visit");
+    wait_for(&plain, "document.readyState === 'complete'").await;
+    assert!(
+        eval_bool(
+            &plain,
+            &format!("document.querySelector({REVEAL:?}).hidden")
+        )
+        .await,
+        "the reveal button is hidden without JS"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Chromium"]
 async fn keyboard_toast() {

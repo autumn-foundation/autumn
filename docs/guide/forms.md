@@ -146,7 +146,8 @@ text_input_with(&changeset, "email", "Email", &FieldOptions::new()
   label and the control (after the label for a checkbox). `aria-describedby`
   names the hint first, then the error.
 - The typed attributes (`placeholder`, `autocomplete`, `inputmode`, `pattern`,
-  `min`, `max`, `disabled`, `readonly`) render only on controls that use them.
+  `minlength`, `maxlength`, `min`, `max`, `disabled`, `readonly`) render only
+  on controls that use them.
 - `data` and `hx` add `data-*` and `hx-*` attributes. There is no setter for
   `id`, `name`, `class` or `aria-*`: the helper owns them. The htmx helpers also
   keep their own `hx-post`, `hx-params` and the other `hx-*` names they set.
@@ -169,6 +170,7 @@ text_input_with(&changeset, "email", "Email", &FieldOptions::new()
 | `switch_input`, `range_input`, `radio_group`, `checkbox_group`, `segmented_control` | `*_with` |
 | `email_input`, `tel_input`, `url_input`, `time_input`, `month_input`, `color_input` | `*_with` |
 | `hidden_input` | `hidden_input_with` |
+| `otp_input` | `otp_input_with` |
 
 The `*_with` htmx helpers take the submit-token field name. Pass
 `"_submit_token"` for the default. A nested-form `RowScope` has
@@ -234,6 +236,72 @@ use autumn_web::form::{FieldOptions, checkbox_group_with, radio_group, switch_in
 slider, a color, a hidden input or a checkbox group required.
 
 The "Native inputs" and "Choice controls" stories show each control.
+
+### Passwords and one-time codes
+
+A password field and a one-time code (OTP) field need more than a plain input
+(issue #3412). Both are in core, and the auth generator uses both.
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, OtpFormat, otp_input_with, password_input_with,
+    required_otp_input};
+
+(password_input_with(&changeset, "password", "Password", &FieldOptions::new()
+    .required()
+    .new_password()
+    .minlength(12)
+    .reveal()
+    .strength_hint()))
+(required_otp_input(&changeset, "code", "Authenticator code"))
+(otp_input_with(&changeset, "backup", "Backup code",
+    OtpFormat::digits(8).group(4), &FieldOptions::new()))
+```
+
+Password options (other controls ignore them):
+
+- `current_password()` and `new_password()` set `autocomplete`. Use the first
+  on a sign-in form. Use the second on a signup or a change form, so a
+  password manager can suggest a password.
+- `reveal()` adds a "Show password" button with `aria-pressed`. The button has
+  `hidden` until `autumn-widgets.js` shows it. A submit, a page hide and an
+  htmx history snapshot hide the password again. `reveal_label(text)` sets
+  the button text.
+- `strength_hint()` adds `<p id="{field}-strength" aria-live="polite">` and
+  puts its id in `aria-describedby`. The script writes "Strength: weak",
+  "fair", "good" or "strong" from the length and the character kinds. The
+  text changes only when the level changes. `strength_labels([..; 4])` sets
+  the four labels. Name the subject in each label: a screen reader reads the
+  label alone. It is a hint, not a policy: it does not know common
+  passwords. Check the password on the server.
+- A revealable password has `spellcheck="false"` and `autocapitalize="off"`,
+  so a cloud spellcheck does not read the revealed text.
+
+The OTP field is one `<input type="text" autocomplete="one-time-code"
+inputmode="numeric">`. CSS draws a box for each digit behind it. One real
+input keeps SMS autofill and paste working, and a screen reader finds one
+field.
+
+- `OtpFormat::digits(n)` sets the length, 4 to 10. The default is 6.
+- `pattern="[0-9]{n}"` checks the code on submit, also without JavaScript.
+  `maxlength="{n}"` keeps a page with no JavaScript from showing more digits
+  than boxes.
+- The script removes that `maxlength`. It keeps only the digits of a paste,
+  an autofill or an IME entry, up to the length. A paste of `123-456` gives
+  `123456`. Full-width digits (`１２３`) become ASCII digits.
+- `.group(g)` shows `1234 5678`. `g` is 2 to 5 and less than `n`. The group
+  needs the script. It changes `pattern`, shows the separator boxes, and
+  removes the spaces from the form data and from an htmx request, so the
+  server gets the digits only. Strip whitespace on the server too.
+- The value is never rendered: a code is used one time.
+- An `autocomplete`, `inputmode`, `pattern` or `maxlength` option replaces
+  the default. `placeholder` and `minlength` pass through.
+- On a narrow screen the boxes get smaller, so the page does not scroll
+  sideways.
+- Do not use it for a recovery code with letters. The generated
+  `/login/verify` page keeps a text input for that reason.
+
+`form_for` takes `FieldControl::Otp(OtpFormat)`. The "Sign-in inputs" story
+shows each option.
 
 ### The error summary
 

@@ -170,6 +170,8 @@ mod fleet_slot_guide;
 mod form_field_options;
 mod form_for_derive;
 mod form_native_inputs;
+#[cfg(feature = "maud")]
+mod form_otp_password;
 #[cfg(feature = "widgets-search")]
 mod form_search_widgets;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]

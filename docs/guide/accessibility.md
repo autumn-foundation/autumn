@@ -67,6 +67,27 @@ html! {
 }
 ```
 
+`password_input_with` has these options for a password (issue #3412). See
+[Forms](forms.md#passwords-and-one-time-codes).
+
+- `reveal()` adds a toggle button with `aria-pressed`. Its label does not
+  change, so a screen reader announces one control with a state. The button
+  is `hidden` until the script runs, so a user never finds a button that does
+  nothing.
+- `strength_hint()` adds a polite live region, linked by `aria-describedby`.
+  It speaks only when the level changes. The region is in the accessibility
+  tree before the first level, and each label names its subject
+  ("Strength: weak").
+- `current_password()` and `new_password()` set `autocomplete`, so a password
+  manager fills the field (WCAG 3.3.8).
+
+### `otp_input`
+
+One `<input autocomplete="one-time-code" inputmode="numeric">` over a row of
+`aria-hidden` boxes (issue #3412). A screen reader finds one field with one
+label, not one field for each digit. SMS autofill and paste fill the whole
+code.
+
 ### `required_text_input` and the other `required_*` helpers
 
 Like `text_input` but adds both the HTML `required` attribute and
