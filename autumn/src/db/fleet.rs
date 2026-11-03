@@ -4687,7 +4687,7 @@ fn lock_stripe(name: &str) -> u64 {
 ///
 /// The OS drops the lock when a process dies, so a crash leaves no stale lock.
 /// Keep `work` short: other keys on the same lock file wait for it.
-fn with_path_lock<T>(
+pub(crate) fn with_path_lock<T>(
     root: &Path,
     name: &str,
     work: impl FnOnce() -> Result<T, FleetError>,

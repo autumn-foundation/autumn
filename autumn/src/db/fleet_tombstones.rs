@@ -1374,6 +1374,115 @@ mod tests {
             assert_eq!(destination.keys(&key), Vec::<String>::new());
         }
 
+        /// Issue #3516: a pending row keeps the undo window. The destination
+        /// recovers before the retry task confirms the row.
+        #[tokio::test]
+        async fn a_create_on_demand_does_not_end_the_retention_of_a_pending_row() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let setup = Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::from_secs(3600),
+            };
+            let host = host_with(&setup, true, &clock);
+            let key = shipped(&host, "acme").await;
+            clock.advance(Duration::from_secs(1));
+            destination.lists_fail.store(true, Ordering::SeqCst);
+            assert!(host.fleet.delete(&key).await.unwrap());
+            let row = host.tombstones.get(&key.name()).await.unwrap().unwrap();
+            assert!(!row.confirmed, "no cutoff without the lookup");
+            destination.lists_fail.store(false, Ordering::SeqCst);
+            let kept = destination.keys(&key);
+            assert!(!kept.is_empty());
+
+            assert!(matches!(
+                host.fleet.open(&key).await,
+                Err(FleetError::Deleting { .. })
+            ));
+            assert!(!host.fleet.exists(&key));
+            assert_eq!(destination.keys(&key), kept, "the undo window stays");
+            assert!(host.tombstones.get(&key.name()).await.unwrap().is_some());
+
+            // The retry task confirms the row. The retention still holds.
+            clock.advance(STALE_PENDING + Duration::from_secs(1));
+            let report = host.fleet.purge_deleted_replicas().await;
+            assert_eq!((report.purged, report.waiting), (0, 1), "{report:?}");
+            assert!(matches!(
+                host.fleet.open(&key).await,
+                Err(FleetError::Deleting { .. })
+            ));
+            assert_eq!(destination.keys(&key), kept, "the undo window stays");
+
+            // Only an explicit provision ends the window.
+            host.fleet.provision(&key).await.unwrap();
+            assert_eq!(host.tombstones.get(&key.name()).await.unwrap(), None);
+        }
+
+        /// Issue #3516: two processes delete the same file at once. Both
+        /// fleets share one root and one control database. The test holds
+        /// the path lock, so both deletes start before either removes the
+        /// file. Exactly one delete removes it, and its tombstone stays.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn two_deletes_of_one_file_keep_its_tombstone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let destination = Switchable::new(&tmp.path().join("replicas"));
+            let clock = clock();
+            let setup = Setup {
+                volume: tmp.path(),
+                destination: &destination,
+                clock: &clock,
+                restore_missing: false,
+                retention: Duration::from_secs(3600),
+            };
+            let (a, b) = (host(&setup), host(&setup));
+            // The lock winner is random. Each round has a 1 in 2 chance to
+            // show the race; eight rounds make a miss rare.
+            for round in 0..8 {
+                let key = shipped(&a, &format!("acme{round}")).await;
+                let name = key.name();
+                let (held_tx, held_rx) = std::sync::mpsc::channel();
+                let (free_tx, free_rx) = std::sync::mpsc::channel::<()>();
+                let (root, lock_name) = (a.fleet.root().to_path_buf(), name.clone());
+                let holder = std::thread::spawn(move || {
+                    crate::db::fleet::with_path_lock(&root, &lock_name, || {
+                        held_tx.send(()).unwrap();
+                        free_rx.recv().unwrap();
+                        Ok(())
+                    })
+                });
+                held_rx.recv().unwrap();
+                let first = tokio::spawn({
+                    let (fleet, key) = (a.fleet.clone(), key.clone());
+                    async move { fleet.delete(&key).await }
+                });
+                let second = tokio::spawn({
+                    let (fleet, key) = (b.fleet.clone(), key.clone());
+                    async move { fleet.delete(&key).await }
+                });
+                // Both deletes reach the lock.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                free_tx.send(()).unwrap();
+                holder.join().unwrap().unwrap();
+                let first = first.await.unwrap().unwrap();
+                let second = second.await.unwrap().unwrap();
+
+                assert!(first ^ second, "round {round}: one delete removes the file");
+                let row = a.tombstones.get(&name).await.unwrap();
+                let row = row.unwrap_or_else(|| panic!("round {round}: the tombstone is lost"));
+                assert!(row.confirmed, "round {round}: {row:?}");
+                let (reader, marker_key) = (Arc::clone(&a.replication), key.clone());
+                let marker = crate::time::spawn_blocking(move || reader.marker(&marker_key))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(marker.is_some(), "round {round}: the marker is written");
+            }
+        }
+
         #[tokio::test]
         async fn a_create_on_demand_respects_another_hosts_retention() {
             let tmp = tempfile::tempdir().unwrap();
