@@ -17,6 +17,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError};
 
+#[cfg(all(loom_models, not(shuttle_models)))]
+use crate::sync_shim::TryUpdate as _;
 use crate::sync_shim::{AtomicU64, Mutex, Ordering};
 
 use crate::config::RetryBudgetConfig;
