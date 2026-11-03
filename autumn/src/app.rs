@@ -4262,12 +4262,25 @@ impl AppBuilder {
             inbound_mail_router,
         } = self;
 
+        // Names of the retention sweeps in `tasks`. The `retention`
+        // capability gates them, not `scheduler`. Names are unique (checked
+        // below), so a name identifies one task.
+        #[cfg_attr(
+            not(any(feature = "db", feature = "data-retention")),
+            allow(unused_mut)
+        )]
+        let mut retention_task_names: Vec<String> = Vec::new();
+
         // #1342: every `#[repository(..., retention(...))]` policy compiled
         // into this binary auto-registers here — no `tasks![...]` entry
         // required. `inventory`-collected, so this is a no-op allocation
         // when no model declares a policy.
         #[cfg(feature = "db")]
-        tasks.extend(crate::retention::collect_retention_tasks());
+        append_retention_tasks(
+            &mut tasks,
+            &mut retention_task_names,
+            crate::retention::collect_retention_tasks(),
+        );
 
         // `collect_retention_tasks()` catches collisions only among
         // retention-generated names; it cannot see hand-declared `tasks![...]`
@@ -4301,7 +4314,7 @@ impl AppBuilder {
         let retention_tasks = crate::data_retention::framework_retention_tasks(&config.retention);
         #[cfg(feature = "data-retention")]
         if !retention_tasks.is_empty() {
-            tasks.extend(retention_tasks);
+            append_retention_tasks(&mut tasks, &mut retention_task_names, retention_tasks);
             // Re-validate: the merged-name check above ran before this task
             // existed, and an app is free to declare a `#[scheduled]` fn
             // named `autumn-retention-sweep`, which would otherwise spawn two
@@ -4558,6 +4571,13 @@ impl AppBuilder {
             shards,
             #[cfg(feature = "ws")]
             channels_backend,
+        );
+        // Resolved once. Each subsystem below reads its own field (#3542).
+        let capabilities = state.capabilities();
+        tracing::info!(
+            role = role.as_str(),
+            capabilities = ?capabilities.enabled().map(crate::config::Capability::as_str).collect::<Vec<_>>(),
+            "process role resolved"
         );
 
         // Tee clock reads into the capsule of whatever request took them, so a
@@ -5213,7 +5233,7 @@ impl AppBuilder {
         // completeness section names them, which is the honest answer to "what
         // does this process serve".
         #[cfg(feature = "graph")]
-        let (graph_mounted, graph_opaque) = if role.serves_http() {
+        let (graph_mounted, graph_opaque) = if capabilities.serves_http {
             (
                 graph_mounted_routes(
                     &all_routes,
@@ -5238,7 +5258,7 @@ impl AppBuilder {
             crate::graph::manifest::audit(&graph_mounted, graph_opaque),
         );
 
-        let router_build = if role.serves_http() {
+        let router_build = if capabilities.serves_http {
             crate::router::try_build_router_with_static_inner(
                 all_routes,
                 &config,
@@ -5602,7 +5622,7 @@ impl AppBuilder {
             &state,
             &server_shutdown,
             &config.jobs,
-            role.runs_workers(),
+            capabilities.job_workers,
         ) {
             tracing::error!(error = %error, "job runtime initialization failed");
             // Post-DB failure: `process::exit` skips `on_shutdown`, so stop any
@@ -5644,14 +5664,14 @@ impl AppBuilder {
         }
 
         // Draining durable after-commit hook rows is background execution, so gate
-        // it on the process role exactly like the `#[job]` runtime above: a `web`
-        // replica must not claim or execute hook rows, while `worker` and
-        // `combined` replicas keep running it. The worker drains rows through a
+        // it on the `commit_hooks` capability: a `web` replica must not claim or
+        // execute hook rows, while `worker` and `combined` replicas keep running
+        // it. The worker drains rows through a
         // Postgres queue (in-process kick, polling and row-locked claiming). Under the
         // `sqlite` feature the runtime pool is a SQLite pool the Postgres worker
         // cannot drive, so the worker is not spawned.
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
-        if role.runs_workers()
+        if capabilities.commit_hooks
             && let Some(pool) = state.pool().cloned()
         {
             #[cfg(feature = "ws")]
@@ -5669,10 +5689,10 @@ impl AppBuilder {
                 server_shutdown.child_token(),
             );
         }
-        // The outbox relay is background work too: only roles that run
-        // workers send messages (issue #3062).
+        // The outbox relay is background work too: only a process with the
+        // `outbox_relay` capability sends messages (issue #3062).
         #[cfg(feature = "db")]
-        if role.runs_workers() {
+        if capabilities.outbox_relay {
             drop(crate::outbox::start_relay_worker(
                 state.clone(),
                 server_shutdown.child_token(),
@@ -5680,10 +5700,10 @@ impl AppBuilder {
         }
         // Repositories built over a shard pool (`with_pool`) enqueue durable
         // commit hooks into that shard's queue table; drain each one too — again
-        // only on a role that runs workers, so a web replica leaves shard hook
-        // rows for the worker tier.
+        // only with the `commit_hooks` capability, so a web replica leaves shard
+        // hook rows for the worker tier.
         #[cfg(all(feature = "db", not(feature = "sqlite")))]
-        if role.runs_workers()
+        if capabilities.commit_hooks
             && let Some(shards) = state.shards()
         {
             for shard in shards.iter() {
@@ -5703,10 +5723,10 @@ impl AppBuilder {
         // SQLite durable commit-hook worker (#1996 item 5): the runtime pool is a
         // single-node SQLite pool the Postgres queue worker cannot drive, so the
         // SQLite worker (BEGIN IMMEDIATE claim + in-process Notify kick + poll
-        // fallback) is spawned instead — same `role.runs_workers()` gate and same
+        // fallback) is spawned instead — same `commit_hooks` gate and same
         // `server_shutdown.child_token()` graceful-drain wiring as the Postgres tier.
         #[cfg(all(feature = "db", feature = "sqlite"))]
-        if role.runs_workers()
+        if capabilities.commit_hooks
             && let Some(pool) = state.pool().cloned()
         {
             #[cfg(feature = "ws")]
@@ -6454,10 +6474,13 @@ impl AppBuilder {
             };
 
         if !state.probes().is_shutting_down() {
-            // Web role runs no cron scheduler (workers/combined only). Skipping
-            // the scheduler must not regress readiness: mark_startup_complete and
-            // signal_serve_ready below still run.
-            if role.runs_workers() && !tasks.is_empty() {
+            // The `scheduler` capability gates app tasks and the `retention`
+            // capability gates retention sweeps. Skipping the scheduler must not
+            // regress readiness: mark_startup_complete and signal_serve_ready
+            // below still run.
+            let tasks =
+                scheduled_tasks_for_capabilities(tasks, &retention_task_names, capabilities);
+            if !tasks.is_empty() {
                 if let Some(warning) =
                     in_process_fleet_warning(&config, &tasks, &crate::config::OsEnv)
                 {
@@ -10245,6 +10268,39 @@ fn print_available_one_off_tasks(tasks: &[crate::task::OneOffTaskInfo]) {
             eprintln!("  {:<24} {}", task.name, task.description);
         }
     }
+}
+
+/// Append `retention_tasks` to `tasks`, and record each name in
+/// `retention_task_names` for [`scheduled_tasks_for_capabilities`].
+#[cfg_attr(not(any(feature = "db", feature = "data-retention")), allow(dead_code))]
+fn append_retention_tasks(
+    tasks: &mut Vec<crate::task::TaskInfo>,
+    retention_task_names: &mut Vec<String>,
+    retention_tasks: Vec<crate::task::TaskInfo>,
+) {
+    retention_task_names.extend(retention_tasks.iter().map(|task| task.name.clone()));
+    tasks.extend(retention_tasks);
+}
+
+/// The scheduled tasks that `capabilities` lets this process run, in order.
+///
+/// A task named in `retention_task_names` runs with the `retention`
+/// capability. Every other task runs with the `scheduler` capability.
+fn scheduled_tasks_for_capabilities(
+    tasks: Vec<crate::task::TaskInfo>,
+    retention_task_names: &[String],
+    capabilities: crate::config::RoleCapabilities,
+) -> Vec<crate::task::TaskInfo> {
+    tasks
+        .into_iter()
+        .filter(|task| {
+            if retention_task_names.contains(&task.name) {
+                capabilities.retention
+            } else {
+                capabilities.scheduler
+            }
+        })
+        .collect()
 }
 
 /// Start scheduled tasks in background Tokio tasks.
@@ -14092,9 +14148,9 @@ async fn start_fleet_ownership(
 ///
 /// The pending-work sweeper is installed in every role, so enqueue code marks
 /// its database. A failed install stops the process. Its loop runs only with
-/// `sweep` (a server, not a one-off task). A role that runs workers opens
-/// closed databases and relays their outbox; a `web` role drains the hooks of
-/// the databases it has open.
+/// `sweep` (a server, not a one-off task). A process with the `fleet_relay`
+/// capability opens closed databases and relays their outbox. Without it, the
+/// process drains the hooks of the databases it has open.
 #[cfg(feature = "sqlite")]
 async fn start_fleet_runtime(
     state: &AppState,
@@ -14117,7 +14173,7 @@ async fn start_fleet_runtime(
         channels: state.channels().clone(),
     }));
     let options = crate::db::fleet_sweeper::FleetSweeperOptions {
-        relay: state.role().runs_workers(),
+        relay: state.capabilities().fleet_relay,
         ..crate::db::fleet_sweeper::FleetSweeperOptions::default()
     };
     // Fatal: without the sweeper, enqueue code marks nothing, and work in a
@@ -14188,10 +14244,10 @@ fn start_fleet_replication(
     .with_retention_after_delete(fleet_config.map_or(std::time::Duration::ZERO, |f| {
         f.replica_retention_after_delete
     }))
-    // Worker roles only: the check downloads whole databases.
+    // The check downloads whole databases, so it needs its own capability.
     .with_restore_check(
         runtime.settings.verify_interval,
-        if state.role().runs_workers() {
+        if state.capabilities().restore_check {
             fleet_config.map_or(0, |f| f.restore_check_sample)
         } else {
             0
@@ -17063,6 +17119,7 @@ fn build_state(
             .and_then(|topology| topology.capture_gap().map(std::sync::Arc::from)),
         profile: config.profile.as_deref().map(Arc::from),
         role: config.role,
+        capabilities: config.capabilities(),
         started_at: crate::time::monotonic_now(),
         health_detailed: config.health.detailed,
         probes,
@@ -18581,8 +18638,7 @@ mod tests {
             None,
         );
         assert_eq!(state.role(), ProcessRole::Combined);
-        assert!(state.role().serves_http());
-        assert!(state.role().runs_workers());
+        assert_eq!(state.capabilities(), ProcessRole::Combined.capabilities());
 
         // A worker-role config flows through the exact same resolution the
         // framework uses to gate the job runtime, reachable via `state.role()`.
@@ -18597,8 +18653,9 @@ mod tests {
             None,
         );
         assert_eq!(state.role(), ProcessRole::Worker);
-        assert!(state.role().runs_workers());
-        assert!(!state.role().serves_http());
+        assert_eq!(state.capabilities(), config.capabilities());
+        assert!(state.capabilities().job_workers);
+        assert!(!state.capabilities().serves_http);
     }
 
     // Postgres-only fixture: it configures a distinct `replica_url`, which
@@ -19000,22 +19057,240 @@ mod tests {
     #[cfg(feature = "db")]
     #[test]
     fn repository_commit_hook_workers_are_gated_on_worker_role() {
-        // Draining durable after-commit hook rows is background execution, so the
-        // primary-pool and shard commit-hook worker starts on the normal server
-        // path must both be guarded by `role.runs_workers()` — a web-role replica
-        // must not claim/execute hook rows (that work belongs to the worker tier).
+        // A web replica must not claim or run hook rows. The primary-pool and
+        // shard workers both read the `commit_hooks` capability.
         let source = include_str!("app.rs").replace("\r\n", "\n");
         let primary_gate =
-            "if role.runs_workers()\n            && let Some(pool) = state.pool().cloned()";
-        let shard_gate = "if role.runs_workers()\n            && let Some(shards) = state.shards()";
-        assert!(
-            source.contains(primary_gate),
-            "primary-pool commit-hook worker must be gated on role.runs_workers()"
+            "if capabilities.commit_hooks\n            && let Some(pool) = state.pool().cloned()";
+        let shard_gate =
+            "if capabilities.commit_hooks\n            && let Some(shards) = state.shards()";
+        assert_eq!(
+            source.matches(primary_gate).count(),
+            2,
+            "the Postgres and SQLite primary-pool hook workers must read capabilities.commit_hooks"
         );
         assert!(
             source.contains(shard_gate),
-            "shard commit-hook workers must be gated on role.runs_workers()"
+            "shard commit-hook workers must read capabilities.commit_hooks"
         );
+    }
+
+    /// The legacy all-in-one predicate. Built at run time so that this test
+    /// does not match itself.
+    fn legacy_worker_predicate() -> String {
+        ["runs", "_workers"].concat()
+    }
+
+    /// Each line of `source` that names the legacy predicate, as
+    /// `(line number, trimmed line)`.
+    fn legacy_worker_predicate_lines(source: &str) -> Vec<(usize, String)> {
+        let legacy = legacy_worker_predicate();
+        source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(legacy.as_str()))
+            .map(|(index, line)| (index + 1, line.trim().to_owned()))
+            .collect()
+    }
+
+    /// Issue #3542: each subsystem names its own capability. A new gate on the
+    /// legacy predicate fails here. Use a field of `RoleCapabilities`.
+    #[test]
+    fn app_rs_has_no_gate_on_the_legacy_worker_predicate() {
+        let hits = legacy_worker_predicate_lines(include_str!("app.rs"));
+        assert!(
+            hits.is_empty(),
+            "app.rs must not read `{}`. Gate on a `RoleCapabilities` field \
+             (`state.capabilities().<field>`) instead. Found: {hits:?}",
+            legacy_worker_predicate()
+        );
+    }
+
+    /// The guard above finds a gate in each form a new one can take.
+    #[test]
+    fn legacy_worker_predicate_guard_finds_an_injected_gate() {
+        let legacy = legacy_worker_predicate();
+        let source = format!(
+            "fn boot() {{\n    if role.{legacy}() {{}}\n    let on = \
+             state.role().{legacy}();\n    let f = ProcessRole::{legacy};\n}}\n"
+        );
+        let hits = legacy_worker_predicate_lines(&source);
+        assert_eq!(
+            hits.iter().map(|(line, _)| *line).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        assert!(legacy_worker_predicate_lines("if caps.job_workers {}").is_empty());
+    }
+
+    /// Issue #3542: each background subsystem reads its own field. Each gate
+    /// is joined from two parts at run time, so it does not match this test.
+    #[test]
+    fn each_background_subsystem_reads_its_own_capability() {
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let gates: [(&str, [&str; 2], usize); 7] = [
+            (
+                "job workers",
+                ["capabilities.", "job_workers,\n        ) {"],
+                1,
+            ),
+            ("outbox relay", ["if capabilities.", "outbox_relay {"], 1),
+            (
+                "scheduler and retention",
+                [
+                    "scheduled_tasks_for_capabilities(",
+                    "tasks, &retention_task_names, capabilities)",
+                ],
+                1,
+            ),
+            (
+                "repository retention names",
+                [
+                    "append_retention_tasks(\n            &mut tasks,\n            &mut ",
+                    "retention_task_names,\n            crate::retention::collect_retention_tasks(),",
+                ],
+                1,
+            ),
+            (
+                "framework retention names",
+                [
+                    "append_retention_tasks(&mut tasks, &mut ",
+                    "retention_task_names, retention_tasks);",
+                ],
+                1,
+            ),
+            (
+                "fleet sweeper relay",
+                ["relay: state.capabilities().", "fleet_relay,"],
+                1,
+            ),
+            (
+                "restore check",
+                ["if state.capabilities().", "restore_check {"],
+                1,
+            ),
+        ];
+        for (subsystem, [head, tail], expected) in gates {
+            let gate = [head, tail].concat();
+            assert_eq!(
+                source.matches(gate.as_str()).count(),
+                expected,
+                "the {subsystem} gate must read its own capability: `{gate}`"
+            );
+        }
+    }
+
+    // The boot records the name of each framework retention sweep, so the
+    // `retention` capability gates it.
+    #[cfg(feature = "data-retention")]
+    #[test]
+    fn append_retention_tasks_records_each_framework_sweep() {
+        let config = crate::config::RetentionConfig {
+            job_history: Some("90d".to_owned()),
+            audit_archives: Some("400d".to_owned()),
+            ..Default::default()
+        };
+        let sweeps = crate::data_retention::framework_retention_tasks(&config);
+        assert_eq!(sweeps.len(), 2);
+
+        let mut tasks = vec![named_task("nightly-report")];
+        let mut names = Vec::new();
+        super::append_retention_tasks(&mut tasks, &mut names, sweeps);
+        assert_eq!(
+            names,
+            [
+                crate::data_retention::RETENTION_SWEEP_TASK_NAME,
+                crate::data_retention::RETENTION_ARCHIVE_TASK_NAME,
+            ]
+        );
+        assert_eq!(task_names(&tasks)[1..], names);
+
+        let mut scheduler_only = crate::config::ProcessRole::Worker.capabilities();
+        scheduler_only.retention = false;
+        let kept = super::scheduled_tasks_for_capabilities(tasks, &names, scheduler_only);
+        assert_eq!(task_names(&kept), ["nightly-report"]);
+    }
+
+    fn named_task(name: &str) -> crate::task::TaskInfo {
+        crate::task::TaskInfo {
+            name: name.to_owned(),
+            schedule: crate::task::Schedule::FixedDelay(std::time::Duration::from_secs(60)),
+            coordination: crate::task::TaskCoordination::Fleet,
+            handler: |_| Box::pin(async { Ok(()) }),
+        }
+    }
+
+    fn task_names(tasks: &[crate::task::TaskInfo]) -> Vec<&str> {
+        tasks.iter().map(|task| task.name.as_str()).collect()
+    }
+
+    fn mixed_tasks() -> Vec<crate::task::TaskInfo> {
+        vec![
+            named_task("nightly-report"),
+            named_task("retention-sweep-posts"),
+            named_task("autumn-retention-sweep"),
+            named_task("cache-warm"),
+        ]
+    }
+
+    fn retention_names() -> Vec<String> {
+        vec![
+            "retention-sweep-posts".to_owned(),
+            "autumn-retention-sweep".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn scheduled_tasks_for_built_in_roles_match_the_legacy_gate() {
+        use crate::config::ProcessRole;
+        for role in [ProcessRole::Combined, ProcessRole::Worker] {
+            let caps = role.capabilities();
+            let kept =
+                super::scheduled_tasks_for_capabilities(mixed_tasks(), &retention_names(), caps);
+            assert_eq!(
+                task_names(&kept),
+                task_names(&mixed_tasks()),
+                "role {} keeps every task, in order",
+                role.as_str()
+            );
+        }
+        let kept = super::scheduled_tasks_for_capabilities(
+            mixed_tasks(),
+            &retention_names(),
+            ProcessRole::Web.capabilities(),
+        );
+        assert!(kept.is_empty(), "the web role runs no scheduled task");
+    }
+
+    #[test]
+    fn scheduled_tasks_split_retention_from_the_scheduler() {
+        let mut scheduler_only = crate::config::ProcessRole::Combined.capabilities();
+        scheduler_only.retention = false;
+        let kept = super::scheduled_tasks_for_capabilities(
+            mixed_tasks(),
+            &retention_names(),
+            scheduler_only,
+        );
+        assert_eq!(task_names(&kept), ["nightly-report", "cache-warm"]);
+
+        let mut retention_only = crate::config::ProcessRole::Combined.capabilities();
+        retention_only.scheduler = false;
+        let kept = super::scheduled_tasks_for_capabilities(
+            mixed_tasks(),
+            &retention_names(),
+            retention_only,
+        );
+        assert_eq!(
+            task_names(&kept),
+            ["retention-sweep-posts", "autumn-retention-sweep"]
+        );
+    }
+
+    #[test]
+    fn scheduled_tasks_without_retention_names_treat_every_task_as_scheduled() {
+        let mut scheduler_only = crate::config::ProcessRole::Worker.capabilities();
+        scheduler_only.retention = false;
+        let kept = super::scheduled_tasks_for_capabilities(mixed_tasks(), &[], scheduler_only);
+        assert_eq!(task_names(&kept), task_names(&mixed_tasks()));
     }
 
     /// The replication loop's final flush must be *triggered* after the drain.

@@ -235,13 +235,53 @@ configuration error: AUTUMN_ROLE: unknown process role "workers" (accepted: comb
 An empty `AUTUMN_ROLE=` is unset: the `role` key applies, or `combined`.
 `autumn doctor` shows the same error on its `process_role_backend` row.
 
+### Role capabilities
+
+A process resolves its role into a capability set once at boot. Each
+framework subsystem reads its own capability:
+
+| Capability | Subsystem | `combined` | `web` | `worker` |
+|---|---|---|---|---|
+| `serves_http` | User routes | Yes | Yes | No |
+| `job_workers` | `#[job]` worker loops | Yes | No | Yes |
+| `scheduler` | `#[scheduled]` tasks | Yes | No | Yes |
+| `outbox_relay` | Outbox relay | Yes | No | Yes |
+| `commit_hooks` | Durable commit-hook workers (app pool and each shard) | Yes | No | Yes |
+| `fleet_relay` | SQLite fleet sweeper: open closed databases, relay, backfill | Yes | No | Yes |
+| `restore_check` | Fleet replication restore check | Yes | No | Yes |
+| `retention` | Retention sweeps (`#[repository(retention(...))]`, `[retention]`) | Yes | No | Yes |
+
+Read the set with `state.capabilities()`. Read one field, or ask about one
+subsystem with `state.capabilities().runs(Capability::Scheduler)`.
+`GET /actuator/info` shows the set under `role`. For a `worker`:
+
+```json
+"role": {
+  "name": "worker",
+  "capabilities": {
+    "serves_http": false,
+    "job_workers": true,
+    "scheduler": true,
+    "outbox_relay": true,
+    "commit_hooks": true,
+    "fleet_relay": true,
+    "restore_check": true,
+    "retention": true
+  }
+}
+```
+
+`serves_http()` and `runs_workers()` stay on `ProcessRole`. Framework code
+does not use `runs_workers()` as a gate: a test fails on a new gate in
+`autumn/src/app.rs`, so a new subsystem must name its capability.
+
 ### Self-gating app-owned background work
 
-The framework already uses the resolved role to gate the `#[job]` runtime, the
-`#[scheduled]` cron scheduler, and commit-hook workers — but that gate only
-covers **framework-managed** work. If your app wires its own background loop in
-an `on_startup` hook (a poller, a warm-cache refresher, a queue consumer you
-manage yourself), that loop runs on **every** replica unless you gate it too.
+The framework gates each subsystem in the [capability table](#role-capabilities)
+on its own capability. That gate covers only **framework-managed** work. If
+your app wires its own background loop in an `on_startup` hook (a poller, a
+warm-cache refresher, a queue consumer you manage yourself), that loop runs on
+**every** replica unless you gate it too.
 
 The resolved role is available as a first-class accessor on `AppState`, so you
 can self-gate without re-reading `AUTUMN_ROLE` by hand. It is the same value the
@@ -249,25 +289,25 @@ framework resolved (config + `AUTUMN_ROLE` env override + `--role` flag) — one
 source of truth, no second parse:
 
 ```rust
-use autumn_web::{AppState, ProcessRole};
+use autumn_web::{AppState, Capability};
 
 // In an on_startup hook, plugin, state_initializer, or handler:
 fn start_background_work(state: &AppState) {
-    if state.role().runs_workers() {
-        // Only replicas that run workers (combined or worker) spin up the loop.
+    if state.capabilities().job_workers {
+        // Only replicas that run job workers (combined or worker) start the loop.
         tokio::spawn(my_embedded_worker(state.clone()));
     }
 
-    if state.role().serves_http() {
+    if state.capabilities().runs(Capability::ServesHttp) {
         // Web-facing warmups belong on replicas that serve user routes.
         warm_render_caches(state);
     }
 }
 ```
 
-`state.role()` returns a `ProcessRole` (exported at `autumn_web::ProcessRole`);
-its `serves_http()` and `runs_workers()` predicates map roles to tiers exactly
-as the table above does. The value is reachable from `state_initializer`,
+`state.role()` returns a `ProcessRole` (exported at `autumn_web::ProcessRole`).
+`state.capabilities()` returns its `RoleCapabilities`, one field for each row
+of the capability table above. The value is reachable from `state_initializer`,
 `on_startup`/`on_shutdown` hooks, plugins, and request handlers.
 
 > **Footgun: `AUTUMN_ROLE` alone does not gate app-owned background work.**
@@ -275,11 +315,13 @@ as the table above does. The value is reachable from `state_initializer`,
 > workers, but a background task you `tokio::spawn` yourself in `on_startup` has
 > nothing to do with that gate — it will still run on your web replicas and
 > double-process work alongside the worker tier. Wrap app-owned loops in
-> `if state.role().runs_workers() { … }` so they land only where you intend.
+> the capability that matches the work: `job_workers` for a queue consumer,
+> `scheduler` for a periodic loop. For example,
+> `if state.capabilities().job_workers { … }`.
 
 Custom or named roles beyond `combined`/`web`/`worker` are not supported today;
 if you need finer-grained placement, use per-queue worker pinning (#1623)
-combined with app-level `state.role()` gating rather than inventing new role
+combined with app-level `state.capabilities()` gating rather than inventing new role
 names.
 
 ### Split roles require a durable backend

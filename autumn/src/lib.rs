@@ -2482,7 +2482,7 @@ pub mod test;
 mod test_html;
 /// Saturating time/duration arithmetic shared by the request-path modules.
 pub(crate) mod time_math;
-pub use config::ProcessRole;
+pub use config::{Capability, ProcessRole, RoleCapabilities};
 pub use state::AppState;
 
 #[cfg(test)]

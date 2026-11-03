@@ -357,19 +357,20 @@ exposed on `AppState` as the same value the framework used to gate its own
 workers, so self-gate app-owned loops instead of re-reading `AUTUMN_ROLE`:
 
 ```rust
-use autumn_web::{AppState, ProcessRole};
+use autumn_web::AppState;
 
-// on_startup hook: only start the embedded loop where workers run.
-if state.role().runs_workers() {
+// on_startup hook: only start the embedded loop where job workers run.
+if state.capabilities().job_workers {
     tokio::spawn(my_embedded_worker(state.clone()));
 }
 ```
 
-`state.role()` returns a `ProcessRole` with `serves_http()` / `runs_workers()`
-predicates; see
+`state.capabilities()` returns the `RoleCapabilities` the process resolved at
+boot, one field for each framework subsystem. `/actuator/info` shows the same
+set. See [Role capabilities](jobs.md#role-capabilities) and
 [Self-gating app-owned background work](jobs.md#self-gating-app-owned-background-work).
 Custom/named roles are unsupported today — for finer placement use per-queue
-worker pinning (#1623) plus app-level `state.role()` gating.
+worker pinning (#1623) plus app-level `state.capabilities()` gating.
 
 ## Migration Jobs
 

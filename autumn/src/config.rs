@@ -3616,11 +3616,157 @@ impl ProcessRole {
         matches!(self, Self::Combined | Self::Web)
     }
 
-    /// Whether this role runs background job workers and the cron scheduler
+    /// Whether this role runs background work
     /// ([`Combined`](Self::Combined) or [`Worker`](Self::Worker)).
+    ///
+    /// Kept for compatibility. To gate one subsystem, read its field in
+    /// [`capabilities`](Self::capabilities) or call [`runs`](Self::runs).
     #[must_use]
     pub const fn runs_workers(self) -> bool {
         matches!(self, Self::Combined | Self::Worker)
+    }
+
+    /// The subsystems this role runs.
+    ///
+    /// `combined` runs all of them. `web` only serves HTTP. `worker` runs all
+    /// of them except HTTP.
+    #[must_use]
+    pub const fn capabilities(self) -> RoleCapabilities {
+        let http = self.serves_http();
+        let background = self.runs_workers();
+        RoleCapabilities {
+            serves_http: http,
+            job_workers: background,
+            scheduler: background,
+            outbox_relay: background,
+            commit_hooks: background,
+            fleet_relay: background,
+            restore_check: background,
+            retention: background,
+        }
+    }
+
+    /// Whether this role runs `capability`.
+    #[must_use]
+    pub const fn runs(self, capability: Capability) -> bool {
+        self.capabilities().runs(capability)
+    }
+}
+
+/// One subsystem that a process can run. See [`RoleCapabilities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Capability {
+    /// Serve user HTTP routes.
+    ServesHttp,
+    /// Run the `#[job]` worker loops.
+    JobWorkers,
+    /// Run the `#[scheduled]` tasks of the app and its plugins.
+    Scheduler,
+    /// Run the outbox relay.
+    OutboxRelay,
+    /// Drain durable commit hooks on the app pool and on each shard.
+    CommitHooks,
+    /// Let the `SQLite` fleet sweeper open closed databases, relay their
+    /// outbox and run backfills.
+    FleetRelay,
+    /// Run the fleet replication restore check.
+    RestoreCheck,
+    /// Run the retention sweeps: `#[repository(..., retention(...))]` and
+    /// `[retention]`.
+    Retention,
+}
+
+impl Capability {
+    /// Every capability, in [`RoleCapabilities`] field order. A slice, so
+    /// that a new capability does not change its type.
+    pub const ALL: &'static [Self] = &[
+        Self::ServesHttp,
+        Self::JobWorkers,
+        Self::Scheduler,
+        Self::OutboxRelay,
+        Self::CommitHooks,
+        Self::FleetRelay,
+        Self::RestoreCheck,
+        Self::Retention,
+    ];
+
+    /// The stable `snake_case` name. It is also the [`RoleCapabilities`] field
+    /// name and the serialized name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ServesHttp => "serves_http",
+            Self::JobWorkers => "job_workers",
+            Self::Scheduler => "scheduler",
+            Self::OutboxRelay => "outbox_relay",
+            Self::CommitHooks => "commit_hooks",
+            Self::FleetRelay => "fleet_relay",
+            Self::RestoreCheck => "restore_check",
+            Self::Retention => "retention",
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The subsystems that one process runs. The process resolves this set once
+/// at boot. Each framework subsystem reads its own field.
+///
+/// Read it with [`AppState::capabilities`](crate::AppState::capabilities).
+/// [`ProcessRole::capabilities`] gives the set of a built-in role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one independent switch for each subsystem"
+)]
+pub struct RoleCapabilities {
+    /// See [`Capability::ServesHttp`].
+    pub serves_http: bool,
+    /// See [`Capability::JobWorkers`].
+    pub job_workers: bool,
+    /// See [`Capability::Scheduler`].
+    pub scheduler: bool,
+    /// See [`Capability::OutboxRelay`].
+    pub outbox_relay: bool,
+    /// See [`Capability::CommitHooks`].
+    pub commit_hooks: bool,
+    /// See [`Capability::FleetRelay`].
+    pub fleet_relay: bool,
+    /// See [`Capability::RestoreCheck`].
+    pub restore_check: bool,
+    /// See [`Capability::Retention`].
+    pub retention: bool,
+}
+
+impl RoleCapabilities {
+    /// Whether this set includes `capability`.
+    #[must_use]
+    pub const fn runs(self, capability: Capability) -> bool {
+        match capability {
+            Capability::ServesHttp => self.serves_http,
+            Capability::JobWorkers => self.job_workers,
+            Capability::Scheduler => self.scheduler,
+            Capability::OutboxRelay => self.outbox_relay,
+            Capability::CommitHooks => self.commit_hooks,
+            Capability::FleetRelay => self.fleet_relay,
+            Capability::RestoreCheck => self.restore_check,
+            Capability::Retention => self.retention,
+        }
+    }
+
+    /// The capabilities in this set, in [`Capability::ALL`] order.
+    pub fn enabled(self) -> impl Iterator<Item = Capability> {
+        Capability::ALL
+            .iter()
+            .copied()
+            .filter(move |capability| self.runs(*capability))
     }
 }
 
@@ -4925,6 +5071,12 @@ const MANUAL_SCHEMA_SECTIONS: &[(&str, &[&str])] = &[
 ];
 
 impl AutumnConfig {
+    /// The capability set of this process, resolved from [`role`](Self::role).
+    #[must_use]
+    pub const fn capabilities(&self) -> RoleCapabilities {
+        self.role.capabilities()
+    }
+
     /// Log a warning for each section whose feature is off.
     ///
     /// The file still parses, but the section does nothing.
@@ -23635,6 +23787,143 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert!(!ProcessRole::Web.runs_workers());
         assert!(!ProcessRole::Worker.serves_http());
         assert!(ProcessRole::Worker.runs_workers());
+    }
+
+    /// Every built-in role. The `match` has no wildcard, so a new variant does
+    /// not compile until it is added here and to the table below.
+    fn every_process_role() -> [ProcessRole; 3] {
+        let roles = [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker];
+        for role in roles {
+            match role {
+                ProcessRole::Combined | ProcessRole::Web | ProcessRole::Worker => {}
+            }
+        }
+        roles
+    }
+
+    /// The subsystems each role ran before #3542, written out by hand.
+    /// The order is the field order of `RoleCapabilities`.
+    fn legacy_subsystems(role: ProcessRole) -> [bool; 8] {
+        match role {
+            ProcessRole::Combined => [true; 8],
+            ProcessRole::Web => [true, false, false, false, false, false, false, false],
+            ProcessRole::Worker => [false, true, true, true, true, true, true, true],
+        }
+    }
+
+    #[test]
+    fn role_capabilities_table_matches_the_legacy_subsystems() {
+        for role in every_process_role() {
+            let caps = role.capabilities();
+            let actual = [
+                caps.serves_http,
+                caps.job_workers,
+                caps.scheduler,
+                caps.outbox_relay,
+                caps.commit_hooks,
+                caps.fleet_relay,
+                caps.restore_check,
+                caps.retention,
+            ];
+            assert_eq!(actual, legacy_subsystems(role), "role {}", role.as_str());
+        }
+    }
+
+    #[test]
+    fn role_capabilities_agree_with_the_legacy_predicates() {
+        for role in every_process_role() {
+            for &capability in Capability::ALL {
+                let legacy = match capability {
+                    Capability::ServesHttp => role.serves_http(),
+                    _ => role.runs_workers(),
+                };
+                assert_eq!(
+                    role.runs(capability),
+                    legacy,
+                    "role {} capability {}",
+                    role.as_str(),
+                    capability.as_str()
+                );
+                assert_eq!(role.capabilities().runs(capability), legacy);
+            }
+        }
+    }
+
+    #[test]
+    fn capability_all_lists_each_variant_once_in_field_order() {
+        // No wildcard: a new variant does not compile until it is named here.
+        let field = |capability: Capability| match capability {
+            Capability::ServesHttp => 0,
+            Capability::JobWorkers => 1,
+            Capability::Scheduler => 2,
+            Capability::OutboxRelay => 3,
+            Capability::CommitHooks => 4,
+            Capability::FleetRelay => 5,
+            Capability::RestoreCheck => 6,
+            Capability::Retention => 7,
+        };
+        let order: Vec<usize> = Capability::ALL.iter().map(|c| field(*c)).collect();
+        assert_eq!(order, (0..Capability::ALL.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn capability_names_are_stable_snake_case() {
+        let names: Vec<&str> = Capability::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "serves_http",
+                "job_workers",
+                "scheduler",
+                "outbox_relay",
+                "commit_hooks",
+                "fleet_relay",
+                "restore_check",
+                "retention",
+            ]
+        );
+        for &capability in Capability::ALL {
+            assert_eq!(
+                serde_json::to_value(capability).expect("serialize capability"),
+                serde_json::Value::from(capability.as_str())
+            );
+            assert_eq!(capability.to_string(), capability.as_str());
+        }
+    }
+
+    #[test]
+    fn role_capabilities_serialize_with_one_key_per_capability() {
+        let json = serde_json::to_value(ProcessRole::Web.capabilities()).expect("serialize");
+        let object = json.as_object().expect("an object");
+        assert_eq!(object.len(), Capability::ALL.len());
+        for &capability in Capability::ALL {
+            assert_eq!(
+                object[capability.as_str()],
+                serde_json::Value::Bool(ProcessRole::Web.runs(capability)),
+                "{}",
+                capability.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn role_capabilities_enabled_lists_the_true_fields_in_order() {
+        let enabled: Vec<Capability> = ProcessRole::Web.capabilities().enabled().collect();
+        assert_eq!(enabled, [Capability::ServesHttp]);
+        let enabled: Vec<Capability> = ProcessRole::Worker.capabilities().enabled().collect();
+        assert_eq!(enabled, Capability::ALL[1..]);
+        let enabled: Vec<Capability> = ProcessRole::Combined.capabilities().enabled().collect();
+        assert_eq!(enabled, Capability::ALL);
+    }
+
+    #[test]
+    fn config_capabilities_follow_the_resolved_role() {
+        let mut config = AutumnConfig::default();
+        assert_eq!(config.capabilities(), ProcessRole::Combined.capabilities());
+        for role in every_process_role() {
+            config.role = role;
+            assert_eq!(config.capabilities(), role.capabilities());
+        }
     }
 
     #[test]

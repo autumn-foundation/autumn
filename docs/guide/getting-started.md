@@ -295,7 +295,7 @@ routes are live immediately:
 | `/hello/world`        | A path-parameter handler                                |
 | `/health`             | Health check                                            |
 | `/actuator/health`    | Actuator health, with component detail                  |
-| `/actuator/info`      | Build provenance — git SHA, branch, build timestamp     |
+| `/actuator/info`      | Build provenance — git SHA, branch, build timestamp — and the process role with its capabilities |
 | `/actuator/metrics`   | Runtime metrics                                         |
 | `/live` `/ready` `/startup` | Kubernetes-style probes                           |
 
