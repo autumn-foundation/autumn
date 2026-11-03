@@ -5190,7 +5190,7 @@ struct FleetTopology {
     tiers: Vec<Vec<String>>,
     /// `[jobs.fleet] tiers` was present but not a list of lists, so no topology
     /// could be read from it. Reported as a failure rather than treated as
-    /// "nothing declared" — see [`resolve_fleet_topology`].
+    /// "nothing declared" — see [`resolve_fleet_topology_with_pin`].
     malformed: bool,
     /// The tiers come from `[roles.*]`, not from `[jobs.fleet] tiers` (#3543).
     derived: bool,
@@ -6571,15 +6571,9 @@ where
 /// into the repo as one source of truth for the fleet.
 ///
 /// With no `tiers` (or `tiers = []`), the tiers come from `[roles.*]`
-/// (#3543). This form reads `jobs.pin` from `table` only; `run()` passes the
-/// resolved pin through [`resolve_fleet_topology_with_pin`].
-#[cfg(test)]
-fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> {
-    resolve_fleet_topology_with_pin(table, None)
-}
-
-/// [`resolve_fleet_topology`], with the `jobs.pin` that a derived tier
-/// without its own `pin` inherits. `None` reads `jobs.pin` from `table`.
+/// (#3543). A derived tier without its own `pin` inherits `jobs_pin`: `run()`
+/// passes the pin it resolved, env included. `None` reads `jobs.pin` from
+/// `table`.
 fn resolve_fleet_topology_with_pin(
     table: Option<&toml::Table>,
     jobs_pin: Option<&[String]>,
@@ -6637,6 +6631,12 @@ fn resolve_fleet_topology_with_pin(
         malformed: false,
         derived: false,
     })
+}
+
+/// [`resolve_fleet_topology_with_pin`] with `jobs.pin` read from `table`.
+#[cfg(test)]
+fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> {
+    resolve_fleet_topology_with_pin(table, None)
 }
 
 /// The fleet topology that `[roles.*]` declares: one tier for each preset that
