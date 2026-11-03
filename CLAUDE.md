@@ -135,6 +135,12 @@ release time.
 - **A new script under `scripts/` needs a header comment.** `cargo xtask list`
   finds scripts by listing the directory and shows that header; a test fails
   on a script without one. No registry to edit.
+- **Docs gates are moving to `xtask/src/docs/`**, one per PR, on the shared
+  `corpus` and `markdown` modules. `cargo xtask check <name>` runs a ported
+  gate, else `scripts/check-<name>.sh`. A port deletes its script in the same
+  PR, carries the script's `--self-test` cases over as `#[test]`s, and shows
+  the same report as the script on the tree and on mutated copies of the
+  corpus. See `xtask/README.md` "Docs gates".
 - **xtask stays dependency-light**: default features only, and never
   autumn-web, diesel or sqlx. It is a workspace member, so its features are
   unified into every `cargo build --workspace`.

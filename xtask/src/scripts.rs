@@ -275,8 +275,8 @@ mod tests {
 
     #[test]
     fn resolve_suggests_close_names() {
-        let err = resolve(root(), "docs-links").unwrap_err().to_string();
-        assert!(err.contains("check-docs-links"), "{err}");
+        let err = resolve(root(), "docs-orphans").unwrap_err().to_string();
+        assert!(err.contains("check-docs-orphans"), "{err}");
         let err = resolve(root(), "zzzz").unwrap_err().to_string();
         assert!(err.contains("cargo xtask list"), "{err}");
     }

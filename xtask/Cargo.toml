@@ -13,6 +13,8 @@ publish = false
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# The docs gates' patterns. Already in the build through other crates.
+regex = "1"
 
 [lints]
 workspace = true

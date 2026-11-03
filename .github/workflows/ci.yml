@@ -152,6 +152,11 @@ jobs:
         # job exists standalone: no toolchain, no cache, reports in seconds,
         # and cannot be blocked by a clippy failure in `lint`.
         run: ./scripts/check-skill-version-markers.sh
+      # The docs gates ported to `cargo xtask` (xtask/src/docs/) need a
+      # toolchain to build that one small binary. These steps sit after the
+      # bash gates above, so those still report in seconds.
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
       - name: Markdown link gate
         # `check-docs.sh` gates rustdoc intra-doc links and
         # `check-plugin-freshness.sh` gates the docs/guide paths named from
@@ -164,11 +169,10 @@ jobs:
         # links to a directory that does not exist.
         #
         # Unlike a wrong sentence, a 404 is a defect the reader cannot route
-        # around, so this is a gate rather than a report.
-        #
-        # Shares this docs-only job for the same reason as the gates above:
-        # no toolchain, no cache, reports in seconds.
-        run: ./scripts/check-docs-links.sh
+        # around, so this is a gate rather than a report. The gate and its
+        # self-test (now `#[test]`s, run by `cargo test`) live in
+        # xtask/src/docs/links.rs.
+        run: cargo xtask check docs-links
       - name: CLI drift gate
         # The link gate above stops a reader being sent to a page that does not
         # exist. This one stops them being handed a *command* that does not

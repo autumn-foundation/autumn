@@ -3,7 +3,7 @@
 # someone to WRITE must exist in the config schema.
 #
 # WHY THIS EXISTS: the corpus gates the other things a reader copies off a page.
-# `scripts/check-docs-links.sh` gates its *links*, so nobody is sent to a page
+# `xtask/src/docs/links.rs` gates its *links*, so nobody is sent to a page
 # that does not exist; `scripts/check-docs-cli.sh` gates its *commands*, so
 # nobody is handed an `autumn …` line clap will reject; and
 # `scripts/check-docs-config.sh` gates the `AUTUMN_*` environment variables a
@@ -155,7 +155,7 @@
 # `autumn_version`, `primary_key`) fit no root at all.
 #
 # `examples/<app>/content/` is IN the corpus, and excluding it was a mistake worth
-# recording: `check-docs-links.sh` skips that tree because its paths are app
+# recording: `xtask/src/docs/links.rs` skips that tree because its paths are app
 # ROUTES rather than file paths — a fact about link resolution that says nothing
 # about whether the prose documents real config keys. `examples/wiki` embeds
 # `content/configuration.md` via `include_str!` and serves it at
@@ -459,7 +459,7 @@ ARCHIVE_FILES = (
 
 
 def corpus():
-    # NUL-delimited for the same reason check-docs-links.sh uses it: a path with
+    # NUL-delimited for the same reason xtask/src/docs/links.rs uses it: a path with
     # whitespace would otherwise split into fragments and be silently skipped.
     files = subprocess.run(
         ["git", "ls-files", "-z", "*.md"],
@@ -645,7 +645,7 @@ def classify(body, lead_in, known_roots, schema=None):
 # `autumn_version`, `primary_key`) fit no root at all.
 #
 # `examples/<app>/content/` is IN the corpus, and excluding it was a mistake worth
-# recording: `check-docs-links.sh` skips that tree because its paths are app
+# recording: `xtask/src/docs/links.rs` skips that tree because its paths are app
 # ROUTES rather than file paths — a fact about link resolution that says nothing
 # about whether the prose documents real config keys. `examples/wiki` embeds
 # `content/configuration.md` via `include_str!` and serves it at

@@ -5,10 +5,11 @@ The Autumn workspace's maintainer task runner. Run it with `cargo xtask`
 published. Why it exists: [ADR 0033](../docs/adr/0033-xtask-for-repo-tooling.md).
 
 ```bash
-cargo xtask list                      # every lane and every script
+cargo xtask list                      # every lane, docs gate and script
 cargo xtask pre-push                  # compile what CI compiles, before you push
 cargo xtask ci lint                   # CI's `lint` job, the same commands
-cargo xtask check docs-links          # scripts/check-docs-links.sh
+cargo xtask check docs-links          # a docs gate ported to Rust
+cargo xtask check msrv                # scripts/check-msrv.sh
 cargo xtask script update-changelog   # any script under scripts/
 ```
 
@@ -33,6 +34,32 @@ Options for both:
 Under GitHub Actions each step's log is a collapsible group, a failed step is
 an error annotation, and a summary table goes to the job summary.
 
+## Docs gates
+
+The `scripts/check-docs-*.sh` gates are being ported to
+[`src/docs/`](src/docs/), onto one shared model of the markdown corpus:
+
+- [`corpus.rs`](src/docs/corpus.rs): the tracked `*.md` files and how they
+  are decoded.
+- [`markdown.rs`](src/docs/markdown.rs): live prose (fences, comments and
+  code spans removed), heading anchors and link destinations.
+- One file per gate: [`links.rs`](src/docs/links.rs) so far.
+
+`cargo xtask check <name>` runs a ported gate first and falls back to
+`scripts/check-<name>.sh`, so CI and docs call a gate the same way before and
+after it is ported. `cargo xtask docs <name> --root <dir>` runs one over
+another checkout.
+
+To port a gate:
+
+1. Add `src/docs/<name>.rs` and an entry in `GATES` (`src/docs/mod.rs`),
+   building on `corpus` and `markdown` rather than re-parsing.
+2. Carry every case of the script's `--self-test` over as a `#[test]`.
+3. Show the port and the script agree: the same report on the tree, and on
+   mutated copies of the corpus, defect by defect.
+4. In the same change, delete the script and point its CI step at
+   `cargo xtask check <name>`. A test fails while both exist.
+
 ## Adding a check
 
 - **A lint check:** add a step to `lint()` in `src/lanes.rs`, with a comment
@@ -47,12 +74,14 @@ an error annotation, and a summary table goes to the job summary.
 
 ## Dependencies
 
-`anyhow` and `clap`, default features only, both already in `Cargo.lock`.
+`anyhow`, `clap` and `regex`, default features only, all already in the
+build through other crates.
 xtask is a workspace member, so whatever features it enables are unified into
 every `cargo build --workspace`. Never add autumn-web, diesel or sqlx.
 
 ## Windows
 
-Lanes and `cargo` steps run natively. Steps that call a `scripts/*.sh` need
+Lanes, `cargo` steps and the docs gates run natively (the docs gates need
+`git` on `PATH`). Steps that call a `scripts/*.sh` need
 `bash` on `PATH` (Git for Windows provides it); `*.py` scripts run under
 `python`.
