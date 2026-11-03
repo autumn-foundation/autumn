@@ -1976,6 +1976,22 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn a_late_claim_that_fails_keeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, _clock) = two_ranges_one_stuck(dir.path()).await;
+        let late = range(0, 9);
+        stuck.stuck.lock().unwrap().push(late);
+        a.refresh().await;
+        // Another host takes the range while the claim of `a` hangs.
+        stuck.inner.claim(late, &owner("b"), TTL, 0).await.unwrap();
+        stuck.stuck.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let report = a.refresh().await;
+        assert_eq!(report.waiting, vec![late]);
+        assert!(a.held().iter().all(|(r, _)| *r != late), "nothing kept");
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_claim_that_ends_late_is_renewed_not_reclaimed() {
         let dir = tempfile::tempdir().unwrap();
         let (_stuck, a, late) = late_claim(dir.path()).await;
