@@ -878,7 +878,12 @@
 
   function put(env, file, type, onProgress) {
     return new Promise(function (resolve, reject) {
-      var headers = env.headers || {};
+      var headers = Object.assign({}, env.headers);
+      // The local store is on this origin, behind the CSRF check. A store on
+      // another origin never gets the token.
+      var same = false;
+      try { same = new URL(env.url, location.href).origin === location.origin; } catch (err) { /* bad URL */ }
+      if (same) headers = Object.assign(csrfHeaders(), headers);
       var xhr = new XMLHttpRequest();
       xhr.open(env.method || 'PUT', env.url);
       Object.keys(headers).forEach(function (k) { xhr.setRequestHeader(k, headers[k]); });
@@ -967,6 +972,8 @@
       showErrors();
       if (!files.length) return;
       var mine = ++latest;
+      // A failed replacement must not leave the old key in the form.
+      if (!input.multiple) box.textContent = '';
       var done = [];
       pending++;
       root.setAttribute('aria-busy', 'true');

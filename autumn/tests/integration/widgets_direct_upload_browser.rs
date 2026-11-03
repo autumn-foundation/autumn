@@ -25,6 +25,7 @@ use maud::{DOCTYPE, Markup, html};
 type Stored = (String, Vec<u8>);
 
 static STORE: LazyLock<Mutex<HashMap<String, Stored>>> = LazyLock::new(Mutex::default);
+static PUT_TOKENS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::default);
 static PRESIGNS: LazyLock<Mutex<Vec<String>>> = LazyLock::new(Mutex::default);
 
 /// The presign log. A panic in another test must not poison it.
@@ -163,6 +164,15 @@ async fn put_mem(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
+    let token = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    PUT_TOKENS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.clone(), token);
     STORE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -726,4 +736,45 @@ async fn a_slow_older_upload_does_not_replace_the_latest_choice() {
     )
     .await;
     assert_eq!(hidden_values(&page).await, "avatar=up-j-new.txt");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_same_origin_upload_carries_the_csrf_token() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_with_script(&page, "/").await;
+    choose(&page, &[("k-csrf.txt", "text/plain", "x")]).await;
+    wait_for(
+        &page,
+        &format!("!!document.querySelector('{ROOT} input[type=hidden]')"),
+    )
+    .await;
+    let token = PUT_TOKENS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get("up-k-csrf.txt")
+        .cloned();
+    assert_eq!(token.as_deref(), Some("tok-123"));
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_failed_replacement_leaves_no_old_key() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_with_script(&page, "/").await;
+    choose(&page, &[("l-old.txt", "text/plain", "old")]).await;
+    wait_for(
+        &page,
+        &format!("!!document.querySelector('{ROOT} input[type=hidden]')"),
+    )
+    .await;
+    choose(&page, &[("fail.txt", "text/plain", "no")]).await;
+    wait_for(
+        &page,
+        &format!("document.querySelector('{ROOT} [role=alert]').textContent.trim() !== ''"),
+    )
+    .await;
+    assert_eq!(hidden_values(&page).await, "");
 }
