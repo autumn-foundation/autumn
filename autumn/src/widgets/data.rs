@@ -465,7 +465,7 @@ impl<'a> BadgeConfig<'a> {
     /// Set a `title` — useful when the visible label is abbreviated.
     ///
     /// Keyboard and touch users cannot see a `title`. For an accessible
-    /// tooltip on a focusable element, use [`tooltip`].
+    /// tooltip on a focusable element, use [`tooltip`](super::tooltip).
     #[must_use]
     pub const fn title(mut self, title: &'a str) -> Self {
         self.title = Some(title);

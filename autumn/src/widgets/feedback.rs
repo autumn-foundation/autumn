@@ -1201,8 +1201,9 @@ impl<'a> SpinnerConfig<'a> {
 /// `prefers-reduced-motion: reduce`, the ring does not turn. It fades in
 /// and out slowly.
 ///
-/// For a busy button, use [`ButtonConfig::loading_on_request`]. Do not
-/// put a spinner in a button.
+/// For a busy button, use
+/// [`ButtonConfig::loading_on_request`](super::ButtonConfig::loading_on_request).
+/// Do not put a spinner in a button.
 ///
 /// ```rust
 /// use autumn_web::widgets::spinner;
