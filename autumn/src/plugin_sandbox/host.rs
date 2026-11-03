@@ -4579,7 +4579,8 @@ path = "/hello/greet"
             ),
             "imports_of must refuse WAT text that walks as an empty module"
         );
-        // 64-bit memories are off: the walk reads 32-bit limits only.
+        // wasmi 0.40 has no memory64, so it refuses a 64-bit memory at compile.
+        // This fails if a wasmi raise turns memory64 on.
         let memory64 = wat::parse_str("(module (memory i64 1))").expect("valid WAT");
         assert!(
             matches!(

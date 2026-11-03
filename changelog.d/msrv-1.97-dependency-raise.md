@@ -23,8 +23,6 @@
   (`webpki-roots`), as before. They do not need a process-wide crypto
   provider. `autumn-media-plugin` clients use `aws-lc-rs` and the
   operating-system root store.
-- **plugins:** the sandbox loads binary Wasm only (`\0asm`, version 1). Text
-  is refused before the compiler sees it.
 - **openapi:** `serde-saphyr` 2 no longer quotes a string with an inline `#`,
   so `openapi.yaml` can change by a few bytes.
 

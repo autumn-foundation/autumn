@@ -22,7 +22,7 @@
 - **MSRV delta:** `1.88.0` → `1.97.0` (set by the maintainers; dependencies
   need 1.95; see [Toolchain](#toolchain-rust-1970-or-newer))
 - **Carried dependency majors:** `reqwest 0.12 → 0.13`,
-  `webauthn-rs 0.5 → 0.6`, `p256 0.13 → 0.14`
+  `webauthn-rs 0.5 → 0.6`, `p256 0.13 → 0.14`, `serde-saphyr 1 → 2`
 
 ## Summary
 
