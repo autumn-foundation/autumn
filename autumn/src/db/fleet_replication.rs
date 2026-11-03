@@ -1018,6 +1018,21 @@ impl FleetReplication {
         )
     }
 
+    /// A lake over these replicas (issue #3236). It carries the tombstones
+    /// and the entropy of this replication.
+    #[must_use]
+    pub fn lake(&self) -> super::fleet_lake::FleetLake {
+        let lake = super::fleet_lake::FleetLake::new(
+            Arc::clone(&self.destination),
+            self.settings.root.clone(),
+        )
+        .with_entropy(Arc::clone(&self.entropy));
+        match &self.tombstones {
+            Some(tombstones) => lake.with_tombstones(Arc::clone(tombstones)),
+            None => lake,
+        }
+    }
+
     /// The health indicator for every replicating database.
     #[must_use]
     pub fn indicator(self: &Arc<Self>) -> Arc<dyn HealthIndicator> {

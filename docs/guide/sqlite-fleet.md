@@ -127,7 +127,7 @@ apart.
 
 `CrossShard<R>`, `Shards::each_shard` and `across_tenants()` fan out over
 **every database on disk**, opening each. Use them on admin paths, not hot
-paths.
+paths. For analytics, [query the lake](#query-the-lake) instead.
 
 When a handler holds a `Db` past `database.slow_query_threshold`, Autumn
 logs `database connection held past slow_query_threshold` with `held_ms`.
@@ -204,7 +204,7 @@ backup.
 
 `autumn fleet` runs these operations from the command line. Use it when the
 app is stopped and when it runs. It reads `[database.fleet]` the same way the
-app does. `restore` also reads `[replication]`. The sources are
+app does. `delete`, `import`, `restore` and `lake` also read `[replication]`. The sources are
 `autumn.toml`, the `[profile.<p>]` overlay, `.env.<profile>` and `AUTUMN_*`
 overrides. Run it from the app directory. `--profile <p>` selects a profile.
 
@@ -222,6 +222,7 @@ cargo install autumn-cli --no-default-features --features sqlite
 | `autumn fleet import <key> <src>` | copy `src` into the fleet as `key`; the key must have no file |
 | `autumn fleet delete <key> --force` | remove one database and its sidecars; with replication, its replica too |
 | `autumn fleet restore <key> [--timestamp T] --force` | rebuild one database from its replica; `--timestamp` sets a point in time |
+| `autumn fleet lake <sql> [--out F] [--keep F] [--timestamp T]` | run one query over the replicas of every live tenant and write CSV; see [Query the lake](#query-the-lake) |
 
 ```shell
 autumn fleet list --open
@@ -236,7 +237,7 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
   `slot:<nnnnn>`. `tenant/<id>` and `slot/<n>` are also accepted.
 - No command creates the fleet root. Each command stops when
   `database.fleet.root` does not exist, so a wrong directory does not give an
-  empty fleet. For a new volume, create the root directory first.
+  empty fleet. `lake` does not read the root, so it runs without one. For a new volume, create the root directory first.
 - Only `restore` and `import` create a database file. The other commands do
   not.
 - `import` applies `migrations/` and the framework tables to the copy before
@@ -547,6 +548,69 @@ space for the largest sampled database on the fleet volume.
 `unreplicated`, not as a failure. Set `restore_check_sample = 0` or
 `verify_interval_secs = 0` to turn the check off.
 `fleet.check_replica_sample(n)` runs one check now.
+
+## Query the lake
+
+The lake runs SQL across tenants on their replicas in object storage, not
+on the volume (ADR 0032). It never opens a file under the fleet root. It
+runs on a host with no volume.
+
+```rust,ignore
+let snapshot = fleet.lake()?.materialize().await?;
+let rows = snapshot
+    .query("SELECT _autumn_tenant, COUNT(*), SUM(total) FROM orders GROUP BY 1")
+    .await?;
+```
+
+- `materialize()` restores each live tenant and copies its tables into one
+  scratch SQLite file. Each table gets the column `_autumn_tenant`.
+- `query(sql)` runs one `SELECT`, `WITH` or `VALUES` statement on a
+  read-only connection. `FleetLake::query(sql)` does the load, the query
+  and the cleanup in one call.
+- Drop the snapshot to remove its scratch directory. `persist(path)` keeps
+  a copy for `sqlite3`, DuckDB and other tools.
+- `snapshot.tenants()` gives the generation and effective time of each
+  tenant. `snapshot.skipped()` gives each tenant that is not loaded and why.
+
+On a host with no fleet, build the lake from the destination:
+`FleetLake::new(destination, "<prefix>/<profile>")`.
+
+| Setting | Default | Does |
+| --- | --- | --- |
+| `with_tombstones(t)` | from the fleet | skip tenants with a tombstone row |
+| `markers_only()` | off | load with no tombstone source; use the markers only |
+| `as_of(t)` | latest | each tenant at its newest state at or before `t` |
+| `with_tables([..])` | all | load only these tables |
+| `with_workers(n)` | 4 | restore `n` tenants at the same time |
+| `with_scratch_dir(p)` | system temp | parent of the scratch directory |
+| `skip_failed_tenants()` | off | report a failed tenant and load the rest |
+
+Rules:
+
+- **Consistency.** Each tenant is consistent at its own snapshot. The lake
+  has no atomic snapshot across tenants. `as_of(t)` does not make one
+  common instant either.
+- **Deleted tenants.** A tombstone row, or a marker that covers the newest
+  generation, skips the tenant. A lake with no tombstone source refuses to
+  load unless you call `markers_only()`.
+- **Failures.** A tenant that fails fails the load, so a total is never
+  silently short.
+- **Schema drift.** Columns union by name. A column that a tenant does not
+  have is `NULL`. Values keep their storage class. Lake columns have no
+  type affinity and use the `BINARY` collation, so write `COLLATE NOCASE`
+  in the query where the source column had it.
+- **Disk.** The lake needs about the size of the loaded tables, plus one
+  restored file per worker. Use `with_tables` to load less.
+- **Trust.** The SQL is operator SQL. Do not pass request input to it.
+
+```shell
+autumn fleet lake report.sql --out report.csv
+autumn fleet lake report.sql --timestamp 2026-10-01T00:00:00Z --keep lake.db
+```
+
+The CLI uses the control database when its file is on the host. Else pass
+`--markers-only`. It writes CSV: `NULL` is empty, a blob is hex. Slot fleets
+are not supported.
 
 ## Failover: slot ownership
 

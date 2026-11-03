@@ -115,7 +115,8 @@ helpers do not cover, read the state yourself:
 
 The free functions in `autumn_web::form` cover the rest of the control types:
 `password_input`, `textarea_input`, `checkbox_input`, `number_input`,
-`date_input`, `datetime_input`, and `select_input`.
+`date_input`, `datetime_input`, and `select_input`. The native inputs below
+add the switch, the slider, the groups and more types.
 
 Each control has a `required_*` variant. It adds `required`,
 `aria-required="true"` and a visual `*` marker in the label. The marker has
@@ -165,6 +166,9 @@ text_input_with(&changeset, "email", "Email", &FieldOptions::new()
 | `select_input` | `select_input_with` |
 | `rich_text_area_with_labels` | `rich_text_area_with` |
 | `rich_text_area_htmx_with_token_field_with_labels` | `rich_text_area_htmx_with` |
+| `switch_input`, `range_input`, `radio_group`, `checkbox_group`, `segmented_control` | `*_with` |
+| `email_input`, `tel_input`, `url_input`, `time_input`, `month_input`, `color_input` | `*_with` |
+| `hidden_input` | `hidden_input_with` |
 
 The `*_with` htmx helpers take the submit-token field name. Pass
 `"_submit_token"` for the default. A nested-form `RowScope` has
@@ -173,6 +177,63 @@ The `*_with` htmx helpers take the submit-token field name. Pass
 The Autumn stylesheet marks a field invalid with `:user-invalid`, so the
 browser's own check shows only after the user changes the field or submits.
 Server errors use the `autumn-field__input--invalid` class.
+
+### Native inputs
+
+These helpers use native HTML controls, so they work with JavaScript off
+(issue #3405). Each one has the wrapper, the hint, the errors and the
+passthrough above.
+
+| Helper | Control | Bind to | `required_*` |
+|---|---|---|---|
+| `switch_input` | `<input type="checkbox" role="switch">` | `#[serde(default)] bool` | yes |
+| `range_input(…, step)` | `<input type="range">` | a number | no |
+| `radio_group(…, choices)` | radios in a `<fieldset>` | a `String` or an enum | yes |
+| `checkbox_group(…, choices)` | boxes in a `<fieldset>` | `#[serde(default)] Vec<String>` | no |
+| `segmented_control(…, choices)` | radios that look like buttons | a `String` or an enum | yes |
+| `email_input`, `tel_input`, `url_input` | `type="email"`, `"tel"`, `"url"` | `String` | yes |
+| `time_input` | `type="time"` | `chrono::NaiveTime` | yes |
+| `month_input` | `type="month"` | `String` (`YYYY-MM`) | yes |
+| `color_input` | `type="color"` | `String` (`#rrggbb`) | no |
+| `hidden_input(changeset, field)` | `type="hidden"` | any | no |
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, checkbox_group_with, radio_group, switch_input};
+
+(switch_input(&changeset, "alerts", "Email alerts"))
+(radio_group(&changeset, "plan", "Plan", &[("free", "Free"), ("pro", "Pro")]))
+(checkbox_group_with(&changeset, "topics", "Topics",
+    &[("rust", "Rust"), ("web", "Web")],
+    &FieldOptions::new().hint("Choose one or more.")))
+```
+
+- A group is a `<fieldset>` with a `<legend>`. The hint and error links go on
+  the `<fieldset>`. The first input has `id="{field}"`, so an error summary
+  link moves focus to the group. The other inputs have `id="{field}-{index}"`.
+- A checkbox group posts one `topics=…` pair for each checked box, and no key
+  when no box is checked. `Changeset::field_values` checks the boxes again
+  after a 422.
+- `required` on a box means "check this box". So a required checkbox group
+  shows the marker only. Validate "one or more" on the server, for example
+  with `#[validate(length(min = 1))]`.
+- A radio has no `aria-required`, because ARIA does not allow it. `required` on
+  each radio makes the group required.
+- A slider, a color and a hidden input always have a value. They ignore
+  `required`.
+- The time value shows as `HH:MM`, or with seconds and `step="1"` when the
+  seconds are not zero. The month value shows as `YYYY-MM`, also from a date.
+  The color value shows as a lowercase `#rrggbb`. Any other color is not
+  shown.
+- A hidden input has no label, no wrapper and no error block. Show its errors
+  with the error summary.
+
+`form_for` takes the same controls: `FieldControl::Switch`, `Range { step }`,
+`Radio { options }`, `CheckboxGroup { options }`, `Segmented { options }`,
+`Email`, `Tel`, `Url`, `Time`, `Month`, `Color` and `Hidden`. A `#[model]`
+`NaiveTime` column gets `Time`. A non-null column does not make a switch, a
+slider, a color, a hidden input or a checkbox group required.
+
+The "Native inputs" and "Choice controls" stories show each control.
 
 ### The error summary
 

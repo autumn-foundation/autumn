@@ -48,7 +48,9 @@ fn scaffold_project(
 
 /// A representative column mix: string, text, integer, decimal, boolean,
 /// date-valued (datetime — the field DSL has no bare-date kind), tz datetime,
-/// enum, a foreign-key reference, and an optional (nullable) column.
+/// enum, a foreign-key reference, and an optional (nullable) column. The
+/// native control kinds of issue #3405 (time, phone, color, money) are here
+/// too, so the generated app with them is compiled.
 const WIDGET_COLUMNS: &[&str] = &[
     "name:String",
     "description:Text",
@@ -60,6 +62,11 @@ const WIDGET_COLUMNS: &[&str] = &[
     "status:enum{draft,live,retired}",
     "post:references",
     "notes:Option<String>",
+    "opens:time",
+    "closes:Option<time>",
+    "mobile:phone",
+    "accent:color",
+    "tip:money",
 ];
 
 /// `autumn new` + `generate model Post` + `generate scaffold Widget`: the

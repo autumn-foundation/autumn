@@ -187,6 +187,24 @@ html! {
 }
 ```
 
+### Native inputs and choice groups
+
+`switch_input`, `range_input`, `radio_group`, `checkbox_group`,
+`segmented_control`, `email_input`, `tel_input`, `url_input`, `time_input`,
+`month_input`, `color_input` and `hidden_input` use native controls (issue
+#3405). See [Forms](forms.md#native-inputs).
+
+- A switch is `<input type="checkbox" role="switch">`. A screen reader says
+  "on" or "off".
+- A radio group, a checkbox group and a segmented control are a `<fieldset>`
+  with a `<legend>`. The hint and error links (`aria-describedby`,
+  `aria-invalid`) go on the `<fieldset>`.
+- A radio gets `required`, not `aria-required`: ARIA does not allow
+  `aria-required` on a radio.
+- A segmented radio is visually hidden, but it stays in the Tab order. The
+  arrow keys move the selection, and the label shows the focus ring.
+- A hidden input has no label. It is not visible and not announced.
+
 ### `skip_link`
 
 Renders a visually hidden "Skip to …" anchor that becomes visible on keyboard

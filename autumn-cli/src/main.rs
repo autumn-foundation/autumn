@@ -1628,12 +1628,14 @@ enum Commands {
     /// Shard operations (e.g. moving a tenant's data between shards)
     Shard(ShardCommands),
     /// Operate a `SQLite` database fleet: list, migrate, back up, import, delete,
-    /// restore.
+    /// restore, query the lake.
     ///
-    /// Reads `[database.fleet]` from the app config. `delete`, `import` and
-    /// `restore` also read `[replication]`. Run it from the app directory: the fleet root must
-    /// exist. Works when the app is stopped and when it runs. Needs the
-    /// `sqlite` build of the CLI.
+    /// Reads `[database.fleet]` from the app config. `delete`, `import`,
+    /// `restore` and `lake` also read `[replication]`. Run it from the app
+    /// directory: the fleet root must exist, except for `lake`, which reads
+    /// object storage and the control database (or the markers only, with
+    /// `--markers-only`). Works when the app is stopped and when it runs.
+    /// Needs the `sqlite` build of the CLI.
     ///
     /// # Examples
     ///
@@ -1642,6 +1644,7 @@ enum Commands {
     ///   autumn fleet backup tenant:acme /backups/acme.db
     ///   autumn fleet import tenant:acme /backups/acme.db
     ///   autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
+    ///   autumn fleet lake report.sql --out report.csv
     #[command(subcommand, verbatim_doc_comment)]
     Fleet(FleetCommands),
     /// Live monitoring dashboard for a running Autumn application
@@ -3575,6 +3578,55 @@ enum FleetCommands {
         #[arg(long)]
         force: bool,
     },
+    /// Run one SQL query over the replicas of every tenant (the lake).
+    ///
+    /// Restores each live tenant from `[replication]` into a private scratch
+    /// directory, copies its tables into one `SQLite` file with an
+    /// `_autumn_tenant` column, and runs `SQL_FILE` on it. Writes CSV: NULL is
+    /// empty, a blob is hex. Deleted tenants are skipped: their tombstone rows
+    /// come from the control database. It never opens the fleet root, so it
+    /// runs on a host with no volume.
+    Lake {
+        /// Resolve the config under a profile overlay (see `db create`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+        /// A file with one SELECT, WITH or VALUES statement. `-` reads stdin.
+        #[arg(value_name = "SQL_FILE")]
+        sql: std::path::PathBuf,
+        /// Write the CSV to this file instead of stdout. It must not exist.
+        #[arg(long, value_name = "FILE")]
+        out: Option<std::path::PathBuf>,
+        /// Also keep the lake as a `SQLite` file. It must not exist. It holds
+        /// the rows of every tenant.
+        #[arg(long, value_name = "FILE")]
+        keep: Option<std::path::PathBuf>,
+        /// Restore each tenant to its newest state at or before this RFC 3339
+        /// instant. Each tenant is consistent on its own; tenants are not
+        /// taken at one common instant.
+        #[arg(long, value_name = "RFC3339")]
+        timestamp: Option<String>,
+        /// The number of tenants to restore at the same time. Each one needs
+        /// scratch space for a restored file.
+        #[arg(long, value_name = "N", default_value_t = 4,
+              value_parser = clap::value_parser!(u16).range(1..))]
+        concurrency: u16,
+        /// Load only this table. Repeat for more.
+        #[arg(long = "table", value_name = "TABLE")]
+        tables: Vec<String>,
+        /// Make the scratch directory under DIR (default: the system
+        /// temporary directory). It must exist and not be under the fleet root.
+        #[arg(long, value_name = "DIR")]
+        scratch: Option<std::path::PathBuf>,
+        /// Skip a tenant whose restore fails, and report it. By default it
+        /// fails the command.
+        #[arg(long)]
+        skip_failed: bool,
+        /// Read deleted tenants from the tombstone markers in object storage
+        /// only, and do not open the control database. A delete whose marker
+        /// is not written yet is then not seen.
+        #[arg(long)]
+        markers_only: bool,
+    },
 }
 
 impl FleetCommands {
@@ -3630,6 +3682,29 @@ impl FleetCommands {
                 key,
                 timestamp,
                 force,
+            },
+            Self::Lake {
+                profile,
+                sql,
+                out,
+                keep,
+                timestamp,
+                concurrency,
+                tables,
+                scratch,
+                skip_failed,
+                markers_only,
+            } => fleet::FleetCommand::Lake {
+                profile,
+                sql,
+                out,
+                keep,
+                timestamp,
+                concurrency: usize::from(concurrency),
+                tables,
+                scratch,
+                skip_failed,
+                markers_only,
             },
         }
     }
@@ -7688,8 +7763,37 @@ mod tests {
                 force: false
             }
         );
+        assert_eq!(
+            fleet_command(&[
+                "lake",
+                "q.sql",
+                "--out",
+                "q.csv",
+                "--table",
+                "notes",
+                "--table",
+                "orders",
+                "--markers-only"
+            ]),
+            FleetCommand::Lake {
+                profile: None,
+                sql: std::path::PathBuf::from("q.sql"),
+                out: Some(std::path::PathBuf::from("q.csv")),
+                keep: None,
+                timestamp: None,
+                concurrency: 4,
+                tables: vec!["notes".to_owned(), "orders".to_owned()],
+                scratch: None,
+                skip_failed: false,
+                markers_only: true
+            }
+        );
         // Zero would migrate nothing at all.
         assert!(Cli::try_parse_from(["autumn", "fleet", "migrate", "--concurrency", "0"]).is_err());
+        assert!(
+            Cli::try_parse_from(["autumn", "fleet", "lake", "q.sql", "--concurrency", "0"])
+                .is_err()
+        );
     }
 
     #[test]

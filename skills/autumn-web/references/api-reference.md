@@ -813,7 +813,23 @@ Free functions rendering changeset-aware, accessible inputs:
   `FieldControl` variants (`#[non_exhaustive]`): `Text`, `Textarea`,
   `Password`, `Number { step: Option<String> }`, `Checkbox`, `Date`,
   `DateTime`, `Select { options: Vec<(String, String)> }`, `File` (any
-  `File` field ⇒ `enctype="multipart/form-data"`).
+  `File` field ⇒ `enctype="multipart/form-data"`), and **(#3405)**
+  `Switch`, `Range { step }`, `Radio { options }`, `CheckboxGroup { options }`,
+  `Segmented { options }`, `Email`, `Tel`, `Url`, `Time` (derived for a
+  `NaiveTime` column), `Month`, `Color`, `Hidden`.
+- **(#3405)** native input helpers, each with `*_with(.., &FieldOptions)`:
+  `switch_input` (`role="switch"` checkbox, `#[serde(default)] bool`),
+  `range_input(.., step)`, `radio_group(.., &[(value, label)])`,
+  `checkbox_group(..)` (bind `#[serde(default)] Vec<String>`; prefilled from
+  `Changeset::field_values`), `segmented_control(..)`, `email_input`,
+  `tel_input`, `url_input`, `time_input` (`HH:MM`, reads into `NaiveTime`),
+  `month_input` (`YYYY-MM` `String`), `color_input` (lowercase `#rrggbb`),
+  `hidden_input(&cs, field)` (no label, no wrapper). `required_*` exists for
+  switch, radio group, segmented, email, tel, url, time, month. Range, color
+  and hidden drop `required`; a required checkbox group shows the marker
+  only (validate "one or more" on the server). A group is a `<fieldset>` +
+  `<legend>`; the first input has `id="{field}"` so `error_summary` links
+  land on it, the rest `id="{field}-{index}"`.
   Decode-side contracts handled by the `#[model]`-generated `NewX`:
   non-nullable `bool` columns are `#[serde(default)]` (unchecked checkbox ⇒
   `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`
@@ -1136,6 +1152,7 @@ in **Typed accessible primitives** above.)
 | `form::FieldContext::control(tag, attrs, body)` | Writes the control with `id`/`name`/`value`/`required`/`aria-*` + passthrough; drops owned names, `on*`/`hx-on*`, `style`; never pre-fills password/file/checkbox/radio. |
 | `form::FieldContext::group_item(tag, suffix, attrs, body)` | One input of a grouped (`<fieldset>`) control: `id="{field}-{suffix}"`, `name`, `required`, `aria-invalid`, passthrough. |
 | `widget_pack::element(tag, attrs, &FieldOptions, body)` | Root of a non-input widget with the app `data-*`/`hx-*` passthrough. |
+| `plugin_conformance::run_conformance(&ConformanceConfig::new(name).contract(c).no_routes(), &routes)` | For a plugin that mounts no routes (cache, background runtime): no route under the config name or the contract's `plugin`/`registered_as` skips `route-attribution`; such a route fails it. Take the contract from `builder.plugin_contracts()` (it carries `registered_as`); without that, every plugin route fails. Do not set a `prefix` with it. Library counterpart of `autumn plugin-check --no-routes`. |
 | `plugin_conformance::widgets::run_widget_conformance(&pack)` | Static: `widget-pack-name`, `widget-stories`, `widget-class-names`, `widget-markup-csp`, `widget-tokens`, `widget-scripts`. |
 | `plugin_conformance::widgets::browser::run_widget_browser_conformance(&pack, axe_src).await` | Feature `system-tests`: `widget-axe` (light + dark), `widget-console`, `widget-keyboard`. |
 | `Page::axe_violations(axe_src)` / `SystemTest::plugin_assets(&ASSETS)` | Shared axe check; serve a bundle in a system test. |

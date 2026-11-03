@@ -466,9 +466,8 @@ proofs are in `verification/fleet_replica_tombstones.rs`.
    ([#3234](https://github.com/autumn-foundation/autumn/issues/3234)).
 4. **Replica lifecycle.** Done: see section 8
    ([#3235](https://github.com/autumn-foundation/autumn/issues/3235)).
-5. **Query the lake.** Cross-tenant analytics over the replicas in object
-   storage (snapshots plus WAL segments), in the spirit of Athena / DuckDB
-   over S3, instead of opening every file on a production volume.
+5. **Query the lake.** Done: see [ADR 0032](0032-fleet-lake-query.md)
+   ([#3236](https://github.com/autumn-foundation/autumn/issues/3236)).
 
 ## Alternatives considered
 

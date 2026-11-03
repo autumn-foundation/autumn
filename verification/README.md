@@ -46,6 +46,21 @@ It proves that tokens are unique and strictly increasing per lock name, and
 that a stale write is rejected. It does not prove that holders never overlap;
 the fencing token makes overlap safe.
 
+## Choice item ids
+
+`choice_item_id.rs` models the ids of a radio group, a checkbox group and a
+segmented control (`push_choice_items` in `autumn/src/form.rs`, issue #3405).
+Verify it with:
+
+```sh
+verus verification/choice_item_id.rs
+```
+
+The first item has the field id. Item 1 and up has `{field}-{index}`. It
+proves that two items never share an id, and that an item id is never a
+hint, error, wrapper, label or nested-subfield id, or a plain field id. The
+proptest `choice_item_ids_never_collide` checks the rendered markup.
+
 ## Fleet slot ownership
 
 `fleet_slot_ownership.rs` models the slot-ownership table of a SQLite fleet
@@ -371,3 +386,26 @@ It proves these properties:
 - Each retry makes the input shorter, so the loop stops.
 
 The unit tests and the proptest in `form.rs` check the runtime index choice.
+
+## Fleet lake
+
+`fleet_lake.rs` models the fleet lake (`autumn/src/db/fleet_lake.rs`, issue
+#3236, ADR 0032). Verify it with:
+
+```sh
+verus verification/fleet_lake.rs
+```
+
+It proves these properties:
+
+- A tombstone row, or a marker that covers the generation, keeps a tenant
+  out of the lake. A tenant with no replica stays out too.
+- When the replicas are caught up, the lake row count equals the row count
+  of the live databases on the volume. This is the AC test.
+- The total does not depend on the order in which tenants are loaded.
+- A file in a fresh scratch directory is never under the fleet root when the
+  scratch parent is not under it.
+
+It does not model the restore, the schema union or the query. Tests cover
+them.
+

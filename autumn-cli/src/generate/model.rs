@@ -2730,6 +2730,7 @@ fn sql_default_literal(
         FieldKind::Uuid
         | FieldKind::NaiveDateTime
         | FieldKind::DateTime
+        | FieldKind::Time
         | FieldKind::Bytea
         | FieldKind::Attachment
         | FieldKind::References
@@ -3460,11 +3461,12 @@ mod tests {
 
     #[test]
     fn plan_rejects_unsupported_field_type() {
+        // `money` is a kind since #3405, so the example is `Currency`.
         let tmp = project();
         let err = plan_model(
             tmp.path(),
             "Post",
-            &["price:Money".into()],
+            &["price:Currency".into()],
             "20260427000000",
         )
         .unwrap_err();
