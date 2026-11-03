@@ -2695,6 +2695,8 @@ impl DatabaseFleet {
         let removed = self
             .with_provision_turn(&key, async {
                 // Before the lock: the lock then waits for one write only.
+                // The connection stays out of the pool while the lock is
+                // busy (at most the lock timeout).
                 let mut control = match &tombstones {
                     Some(tombstones) => Some(tombstones.checkout().await.map_err(unrecorded)?),
                     None => None,

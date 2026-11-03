@@ -89,7 +89,7 @@ pub struct Tombstone {
     pub deleted_at: DateTime<Utc>,
     /// `false` while the delete still removes the files.
     pub confirmed: bool,
-    /// The earliest purge: the time of the removal plus the retention.
+    /// The earliest purge: the time of the confirm plus the retention.
     pub purge_after: DateTime<Utc>,
     /// Failed purges so far.
     pub attempts: u32,

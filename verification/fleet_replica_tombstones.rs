@@ -15,7 +15,7 @@ pub struct Tombstone {
     pub deleted_at: int,
     /// `false` while the delete is still removing the file.
     pub confirmed: bool,
-    /// The earliest time of a purge: the removal plus the retention.
+    /// The earliest time of a purge: the confirm plus the retention.
     pub purge_after: int,
     pub attempts: nat,
     /// The earliest time of the next purge attempt.
@@ -73,7 +73,7 @@ pub open spec fn fresh(now: int, retention: nat, confirmed: bool, owner: nat) ->
     }
 }
 
-/// `FleetTombstones::confirm`: the retention runs from the removal `now`;
+/// `FleetTombstones::confirm`: the retention runs from the confirm `now`;
 /// the cutoff is the later of `now` and the newest generation `floor`.
 pub open spec fn confirmed(now: int, floor: int, retention: nat, owner: nat) -> Tombstone {
     Tombstone {
@@ -353,7 +353,7 @@ pub proof fn a_pending_row_blocks_a_create_on_demand(t: Tombstone, now: int)
 }
 
 /// A create on demand never ends the undo window: it runs only after the
-/// removal plus the retention.
+/// confirm plus the retention.
 pub proof fn a_create_on_demand_keeps_the_retention(removed: int, floor: int, owner: nat, retention: nat, now: int)
     requires
         create_on_demand_allowed(Some(confirmed(removed, floor, retention, owner)), now),
