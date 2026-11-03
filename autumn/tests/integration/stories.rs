@@ -551,6 +551,7 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "button",
     "choice-controls",
     "confirm-action",
+    "direct-upload",
     "drawer",
     "dropdown-menu",
     "flash",
@@ -563,9 +564,10 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "tooltip",
 ];
 
-/// Keyboard stories that a feature can turn off: `flash`, and the
-/// `widgets-search` stories (#3408).
-const FEATURE_GATED_KEYBOARD_SLUGS: &[&str] = &["flash", "active-search", "autocomplete"];
+/// Keyboard stories that a feature can turn off: `flash`, the
+/// `widgets-search` stories (#3408), and `direct-upload` (`storage`).
+const FEATURE_GATED_KEYBOARD_SLUGS: &[&str] =
+    &["flash", "active-search", "autocomplete", "direct-upload"];
 
 /// The browser test fn name for `slug`.
 fn keyboard_test_name(slug: &str) -> String {

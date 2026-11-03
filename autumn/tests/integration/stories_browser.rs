@@ -1042,6 +1042,39 @@ async fn keyboard_tooltip() {
     page.expect_no_console_errors().await.expect("no errors");
 }
 
+/// The file inputs are in the Tab order, and the script adds no trap. A
+/// visible label names each input. The hint shows because the script ran.
+#[cfg(feature = "storage")]
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_direct_upload() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/direct-upload").await;
+    wait_for(
+        &page,
+        "document.querySelector('[data-autumn-upload-hint]') && \
+         !document.querySelector('[data-autumn-upload-hint]').hidden",
+    )
+    .await;
+    focus(&page, "#upload-cover_image").await;
+    assert!(
+        eval_bool(
+            &page,
+            "document.activeElement.labels[0].textContent === 'Cover image'"
+        )
+        .await,
+        "a visible label names the input"
+    );
+    // Tab leaves the first field and reaches the second.
+    press(&page, "Tab").await;
+    assert!(
+        eval_bool(&page, "document.activeElement.id === 'upload-attachments'").await,
+        "Tab reaches the next upload field"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
 /// The busy state (#3406). Enter sends the htmx request. While it runs, the
 /// button has `aria-busy="true"` and shows its spinner. The label is
 /// transparent, not removed, so it stays the name. After the response,

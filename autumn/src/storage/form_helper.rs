@@ -154,7 +154,7 @@ pub fn direct_upload_field(
                 accept=[config.accept]
                 multiple[config.multiple]
                 aria-describedby=(format!("{id}-status {id}-error"))
-                data-direct-upload-target="input" {}
+                data-direct-upload-target="input";
             span class="autumn-upload-hint" data-autumn-upload-hint hidden="" {
                 @if config.multiple { "Or drop files here." } @else { "Or drop a file here." }
             }
