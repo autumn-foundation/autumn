@@ -146,7 +146,8 @@ text_input_with(&changeset, "email", "Email", &FieldOptions::new()
   label and the control (after the label for a checkbox). `aria-describedby`
   names the hint first, then the error.
 - The typed attributes (`placeholder`, `autocomplete`, `inputmode`, `pattern`,
-  `min`, `max`, `disabled`, `readonly`) render only on controls that use them.
+  `min`, `max`, `disabled`, `readonly`, `multiple`) render only on controls
+  that use them.
 - `data` and `hx` add `data-*` and `hx-*` attributes. There is no setter for
   `id`, `name`, `class` or `aria-*`: the helper owns them. The htmx helpers also
   keep their own `hx-post`, `hx-params` and the other `hx-*` names they set.
@@ -164,6 +165,7 @@ text_input_with(&changeset, "email", "Email", &FieldOptions::new()
 | `date_input` | `date_input_with` |
 | `datetime_input` | `datetime_input_with` |
 | `select_input` | `select_input_with` |
+| `grouped_select_input` | `grouped_select_input_with` |
 | `rich_text_area_with_labels` | `rich_text_area_with` |
 | `rich_text_area_htmx_with_token_field_with_labels` | `rich_text_area_htmx_with` |
 | `switch_input`, `range_input`, `radio_group`, `checkbox_group`, `segmented_control` | `*_with` |
@@ -234,6 +236,67 @@ use autumn_web::form::{FieldOptions, checkbox_group_with, radio_group, switch_in
 slider, a color, a hidden input or a checkbox group required.
 
 The "Native inputs" and "Choice controls" stories show each control.
+
+### Select: groups, multiple and style
+
+`select_input` renders a native `<select>` (issue #3409). The browser
+supplies the keyboard behaviour and the accessibility tree. There is no
+JavaScript.
+
+| Item | Use |
+|---|---|
+| `grouped_select_input(…, choices, groups)` | Top-level `choices`, then one `<optgroup>` for each `(label, options)` group |
+| `FieldOptions::multiple()` | `<select multiple>`. Bind to a `#[serde(default)] Vec<T>` |
+| `FieldOptions::styled_select()` | The `autumn-select` class: `appearance: base-select` where the browser supports it |
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, grouped_select_input_with, select_input_with};
+
+(grouped_select_input_with(&changeset, "city", "City",
+    &[("", "Choose a city")],
+    &[
+        ("France", &[("paris", "Paris"), ("lyon", "Lyon")]),
+        ("Japan", &[("tokyo", "Tokyo")]),
+    ],
+    &FieldOptions::new().required().styled_select()))
+(select_input_with(&changeset, "tags", "Tags",
+    &[("rust", "Rust"), ("web", "Web")],
+    &FieldOptions::new().multiple()))
+```
+
+- A single select marks the first option whose value is the field value.
+  It marks one option only, also when two options have that value.
+- A multiple select reads `Changeset::field_values`. It marks each option
+  whose value is in the list. Thus the chosen options show again after a
+  422. The browser posts one `tags=…` pair for each chosen option. It posts
+  no key when no option is chosen.
+- `required` on a multiple select means "choose one or more". Also validate
+  on the server, for example with `#[validate(length(min = 1))]`.
+- A multiple select on a `String` field gets a 422 when the user chooses two
+  options. Bind it to a `Vec<T>`.
+- Autumn also writes `multiple` on a file input. Read the files with
+  `ChangesetForm::files(field)`. Other controls ignore `multiple`.
+- `styled_select` is opt-in. Chrome 135+ and Safari 27 support
+  `appearance: base-select`. They draw the select and its picker from the
+  design tokens, in the light and the dark scheme. Other browsers keep the
+  native control with the field style. A multiple select keeps the native
+  list box in all browsers.
+- In a styled select, the arrow keys, Enter and Space open the picker.
+  The arrow keys move in the picker. Enter chooses an option. Escape closes
+  the picker.
+
+`form_for` takes `FieldControl::GroupedSelect { options, groups }`. For a
+multiple select:
+
+1. Use `.override_field(name, FieldControl::Select { options })`, or
+   `GroupedSelect`.
+2. Set `.field_options(name, FieldOptions::new().multiple())`.
+
+The model `required` flag does not make a multiple select required, because
+a `Vec` can be empty.
+
+The "Select" story shows the styled select, the native fallback, a grouped
+select and a multiple select.
 
 ### The error summary
 

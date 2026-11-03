@@ -188,6 +188,53 @@ fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Forms",
+            "Select",
+            {
+                use autumn_web::form::{
+                    Changeset, FieldOptions, grouped_select_input_with, select_input,
+                    select_input_with,
+                };
+
+                // Select (#3409). The element is a native <select>, so the
+                // keyboard and the screen reader work as usual, with no JS.
+                let changeset = Changeset::new(serde_json::json!({
+                    "plan": "pro",
+                    "plan_native": "pro",
+                    "city": "lyon",
+                    "tags": ["rust", "db"],
+                }));
+                let plans = [("free", "Free"), ("pro", "Pro"), ("team", "Team")];
+
+                maud::html! {
+                    // Styled: `appearance: base-select` where the browser
+                    // supports it. Other browsers show the native control.
+                    (select_input_with(&changeset, "plan", "Plan (styled)", &plans,
+                        &FieldOptions::new().styled_select()))
+                    // Fallback: the same select with no opt-in.
+                    (select_input(&changeset, "plan_native", "Plan (native fallback)", &plans))
+                    // Top-level options first, then one <optgroup> per group.
+                    (grouped_select_input_with(&changeset, "city", "City",
+                        &[("", "Choose a city")],
+                        &[
+                            ("France", &[("paris", "Paris"), ("lyon", "Lyon")]),
+                            ("Japan", &[("tokyo", "Tokyo"), ("osaka", "Osaka")]),
+                        ],
+                        &FieldOptions::new().required().styled_select()))
+                    // Bind to a `#[serde(default)] Vec<String>`. A multiple
+                    // select keeps the native list box.
+                    (select_input_with(&changeset, "tags", "Topics", &[
+                        ("rust", "Rust"),
+                        ("web", "Web"),
+                        ("db", "Databases"),
+                    ], &FieldOptions::new()
+                        .multiple()
+                        .styled_select()
+                        .hint("Choose one or more.")))
+                }
+            }
+        },
+        story! {
             "Display",
             "Property list",
             {

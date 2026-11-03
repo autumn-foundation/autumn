@@ -61,6 +61,21 @@ proves that two items never share an id, and that an item id is never a
 hint, error, wrapper, label or nested-subfield id, or a plain field id. The
 proptest `choice_item_ids_never_collide` checks the rendered markup.
 
+## Select marks
+
+`select_marks.rs` models which `<option>` a select marks `selected`
+(`push_select_options` in `autumn/src/form.rs`, issue #3409). Verify it
+with:
+
+```sh
+verus verification/select_marks.rs
+```
+
+It proves that a single select marks at most one option, and one option
+when a value matches. A match in an earlier group stops a mark in a later
+group. A multiple select marks each match, and a mark is always a match.
+The proptest `select_marks_follow_the_spec` checks the rendered markup.
+
 ## Fleet slot ownership
 
 `fleet_slot_ownership.rs` models the slot-ownership table of a SQLite fleet

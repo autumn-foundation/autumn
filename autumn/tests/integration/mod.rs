@@ -172,6 +172,7 @@ mod form_for_derive;
 mod form_native_inputs;
 #[cfg(feature = "widgets-search")]
 mod form_search_widgets;
+mod form_select;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
 mod framework_retention;
