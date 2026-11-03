@@ -309,6 +309,18 @@ pub trait ProvideActuatorState {
     /// has been running (e.g., "2d 4h 13m").
     fn uptime_display(&self) -> String;
 
+    /// Returns the process role that `/actuator/info` shows. The default
+    /// returns `None`.
+    fn process_role(&self) -> Option<crate::config::ProcessRole> {
+        None
+    }
+
+    /// Returns the resolved capability set that `/actuator/info` shows.
+    /// The default returns `None`. Then the endpoint omits the `role` key.
+    fn role_capabilities(&self) -> Option<crate::config::RoleCapabilities> {
+        None
+    }
+
     /// Returns a reference to the system [`crate::channels::Channels`] which
     /// broadcasts operational events to WebSocket streams.
     #[cfg(feature = "ws")]
@@ -3118,6 +3130,16 @@ pub(crate) struct ActuatorInfo {
     runtime: RuntimeInfo,
     /// Build + git provenance baked into the running binary (issue #1242).
     build: crate::build_info::BuildProvenance,
+    /// The process role and its resolved capabilities (issue #3542).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<RoleInfo>,
+}
+
+#[derive(Serialize)]
+struct RoleInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'static str>,
+    capabilities: crate::config::RoleCapabilities,
 }
 
 #[derive(Serialize)]
@@ -3157,6 +3179,10 @@ pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
             uptime: state.uptime_display(),
         },
         build: crate::build_info::build_provenance(),
+        role: state.role_capabilities().map(|capabilities| RoleInfo {
+            name: state.process_role().map(crate::config::ProcessRole::as_str),
+            capabilities,
+        }),
     })
 }
 
@@ -7610,6 +7636,56 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["autumn"]["version"].is_string());
         assert_eq!(json["autumn"]["profile"], "dev");
+        // A state that does not report its role omits the key.
+        assert!(json.get("role").is_none(), "{json}");
+    }
+
+    async fn info_json_for(state: crate::AppState) -> serde_json::Value {
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    // Issue #3542: operators see what this process runs.
+    #[tokio::test]
+    async fn actuator_info_reports_the_role_and_its_capabilities() {
+        use crate::config::{Capability, ProcessRole};
+        for role in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+            let mut state = crate::AppState::for_test();
+            state.role = role;
+            state.capabilities = role.capabilities();
+            let json = info_json_for(state).await;
+            assert_eq!(json["role"]["name"], role.as_str(), "{json}");
+            let caps = json["role"]["capabilities"]
+                .as_object()
+                .expect("capabilities object");
+            assert_eq!(caps.len(), Capability::ALL.len());
+            for &capability in Capability::ALL {
+                assert_eq!(
+                    caps[capability.as_str()],
+                    serde_json::Value::Bool(role.runs(capability)),
+                    "role {} capability {}",
+                    role.as_str(),
+                    capability.as_str()
+                );
+            }
+            // The existing keys stay.
+            for key in ["app", "autumn", "runtime", "build"] {
+                assert!(json.get(key).is_some(), "missing {key}: {json}");
+            }
+        }
     }
 
     #[tokio::test]

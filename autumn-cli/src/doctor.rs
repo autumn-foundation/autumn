@@ -5068,10 +5068,9 @@ fn check_split_topology_on_local(
 /// schedule. This check only reports, for operator awareness, what this process
 /// claims and which queues it does not.
 ///
-/// Gated on the resolved [`ProcessRole`]: a web-only role
-/// ([`runs_workers`](ProcessRole::runs_workers) `== false`) runs zero job
-/// workers, so queue-pinning coverage is irrelevant to it — it passes with a
-/// not-applicable note and never evaluates the pin.
+/// Gated on the `job_workers` capability of the resolved [`ProcessRole`]. A
+/// web-only role runs no job workers, so queue pinning does not apply. The
+/// check passes with a note and does not evaluate the pin.
 fn check_queue_coverage(
     role: ProcessRole,
     configured_queues: &[String],
@@ -5080,7 +5079,7 @@ fn check_queue_coverage(
     // Web-only role: runs no job workers at all, so queue pinning cannot leave a
     // queue uncovered *in this process* — the check is not applicable. Do not
     // evaluate pin/empty-schedule; this must never fail `--strict`.
-    if !role.runs_workers() {
+    if !role.capabilities().job_workers {
         return CheckResult {
             name: "jobs_queue_coverage",
             status: CheckStatus::Pass,
@@ -19461,8 +19460,8 @@ foo = "bar"
         // workers, so queue-pinning coverage is irrelevant to it: doctor must not
         // fail `--strict` on queue coverage for a web tier. Use a pin that would
         // otherwise Warn on a worker-bearing role — an empty effective schedule
-        // (pin references only unknown queues). The gate on
-        // `ProcessRole::runs_workers()` makes the web role Pass regardless.
+        // (pin references only unknown queues). The web role has no
+        // `job_workers` capability, so it passes regardless.
         let queues = vec!["default".to_string()];
         let pin = vec!["critical".to_string()]; // matches no known queue → would Warn on a worker
 

@@ -2592,7 +2592,11 @@ subset of queues — all config-only, no app-code change:
   `ProcessRole` (exported at `autumn_web::ProcessRole`) with `serves_http()` /
   `runs_workers()` predicates, so app-owned background loops in `on_startup`
   self-gate to the right tier instead of re-reading `AUTUMN_ROLE` (issue #1726).
-  See `docs/guide/jobs.md`.
+  `state.capabilities()` returns the `RoleCapabilities` resolved at boot: one
+  field for each subsystem (`job_workers`, `scheduler`, `outbox_relay`,
+  `commit_hooks`, `fleet_relay`, `restore_check`, `retention`, `serves_http`).
+  Gate on the field that matches the work. `/actuator/info` shows the set
+  (issue #3542). See `docs/guide/jobs.md#role-capabilities`.
 
 ## Operator alerts (0.6.0, issue #1610)
 

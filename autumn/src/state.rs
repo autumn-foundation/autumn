@@ -158,6 +158,11 @@ pub struct AppState {
     /// without re-reading `AUTUMN_ROLE` by hand.
     pub(crate) role: crate::config::ProcessRole,
 
+    /// The capability set resolved once at boot from the config. Each
+    /// framework subsystem reads its own field. See
+    /// [`capabilities`](Self::capabilities).
+    pub(crate) capabilities: crate::config::RoleCapabilities,
+
     /// When the application started, on the injected clock's monotonic
     /// timeline. Used for uptime calculation.
     ///
@@ -950,18 +955,41 @@ impl AppState {
     /// ```rust
     /// # use autumn_web::AppState;
     /// # fn example(state: &AppState) {
-    /// if state.role().runs_workers() {
-    ///     // start an embedded worker loop only on replicas that run workers
+    /// if state.role().serves_http() {
+    ///     // warm render caches only on replicas that serve user routes
     /// }
     /// # }
     /// ```
     ///
     /// [`serves_http`](crate::config::ProcessRole::serves_http) and
     /// [`runs_workers`](crate::config::ProcessRole::runs_workers) are reachable
-    /// on the returned value.
+    /// on the returned value. To gate one subsystem, use
+    /// [`capabilities`](Self::capabilities).
     #[must_use]
     pub const fn role(&self) -> crate::config::ProcessRole {
         self.role
+    }
+
+    /// Returns the subsystems this process runs, resolved once at boot.
+    ///
+    /// The framework gates each of its subsystems on one field of this set.
+    /// Gate app-owned background work on the field that matches it:
+    /// `job_workers` for a queue consumer, `scheduler` for a periodic loop.
+    ///
+    /// ```rust
+    /// # use autumn_web::{AppState, Capability};
+    /// # fn example(state: &AppState) {
+    /// if state.capabilities().job_workers {
+    ///     // start an embedded queue consumer only where job workers run
+    /// }
+    /// if state.capabilities().runs(Capability::Scheduler) {
+    ///     // start an app-owned periodic loop only where the scheduler runs
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub const fn capabilities(&self) -> crate::config::RoleCapabilities {
+        self.capabilities
     }
 
     /// Returns how long the application has been running.
@@ -1082,6 +1110,7 @@ impl AppState {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
+            capabilities: crate::config::ProcessRole::Combined.capabilities(),
             started_at: crate::time::monotonic_now(),
             health_detailed: true,
             probes: probe::ProbeState::ready_for_test(),
@@ -1246,6 +1275,14 @@ impl crate::actuator::ProvideActuatorState for AppState {
 
     fn uptime_display(&self) -> String {
         self.uptime_display()
+    }
+
+    fn process_role(&self) -> Option<crate::config::ProcessRole> {
+        Some(self.role)
+    }
+
+    fn role_capabilities(&self) -> Option<crate::config::RoleCapabilities> {
+        Some(self.capabilities)
     }
 
     fn metrics_source_registry(&self) -> Option<&crate::actuator::MetricsSourceRegistry> {
@@ -1423,6 +1460,7 @@ impl AppState {
             db_capture_gap: None,
             profile: None,
             role: crate::config::ProcessRole::Combined,
+            capabilities: crate::config::ProcessRole::Combined.capabilities(),
             started_at: crate::time::monotonic_now(),
             health_detailed: false,
             probes: crate::probe::ProbeState::ready_for_test(),
@@ -1452,6 +1490,26 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_states_run_every_capability_of_the_combined_role() {
+        let combined = crate::config::ProcessRole::Combined.capabilities();
+        assert_eq!(super::AppState::for_test().capabilities(), combined);
+        assert_eq!(super::AppState::detached().capabilities(), combined);
+    }
+
+    #[test]
+    fn provide_actuator_state_reports_the_role_and_capabilities() {
+        use crate::actuator::ProvideActuatorState as _;
+        let mut state = super::AppState::for_test();
+        state.role = crate::config::ProcessRole::Web;
+        state.capabilities = crate::config::ProcessRole::Web.capabilities();
+        assert_eq!(state.process_role(), Some(crate::config::ProcessRole::Web));
+        assert_eq!(
+            state.role_capabilities(),
+            Some(crate::config::ProcessRole::Web.capabilities())
+        );
+    }
+
     /// Counts checks of a health indicator.
     struct Counted(std::sync::atomic::AtomicUsize);
 

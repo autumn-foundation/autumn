@@ -2253,6 +2253,7 @@ impl TestApp {
             db_capture_gap: None,
             profile: self.config.profile.as_deref().map(std::sync::Arc::from),
             role: self.config.role,
+            capabilities: self.config.capabilities(),
             started_at,
             health_detailed: self.config.health.detailed,
             probes: probes.clone(),
