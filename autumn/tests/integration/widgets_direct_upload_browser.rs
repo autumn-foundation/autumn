@@ -778,3 +778,37 @@ async fn a_failed_replacement_leaves_no_old_key() {
     .await;
     assert_eq!(hidden_values(&page).await, "");
 }
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_form_reset_drops_the_keys_and_stops_a_running_upload() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_with_script(&page, "/multi").await;
+    choose(&page, &[("m-done.txt", "text/plain", "1")]).await;
+    wait_for(
+        &page,
+        &format!("!!document.querySelector('{ROOT} input[type=hidden]')"),
+    )
+    .await;
+    // A slow upload runs while the form resets.
+    choose(&page, &[("slow-m.txt", "text/plain", "s")]).await;
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { document.getElementById('f').reset(); return true; })()"
+        )
+        .await
+    );
+    assert_eq!(hidden_values(&page).await, "", "the reset drops the key");
+    wait_for(
+        &page,
+        &format!("!document.querySelector('{ROOT}').hasAttribute('aria-busy')"),
+    )
+    .await;
+    assert_eq!(
+        hidden_values(&page).await,
+        "",
+        "the old upload adds no key after the reset"
+    );
+}

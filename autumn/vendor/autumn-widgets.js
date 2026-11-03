@@ -836,6 +836,8 @@
   // only to storage. A hidden field holds each blob key. See
   // `storage::form_helper::direct_upload_field`.
   var UPLOAD = '[data-autumn-direct-upload]';
+  // Clears one field. Set by initUpload, used when the form resets.
+  var resetUpload = new WeakMap();
 
   function csrfHeaders() {
     var meta = document.querySelector('meta[name="csrf-token"],meta[name="autumn-csrf-token"]');
@@ -914,6 +916,7 @@
     var pending = 0;
     var errors = [];
     var latest = 0;
+    var epoch = 0;
 
     // A restored htmx snapshot can hold the state of a run that ended.
     root.removeAttribute('aria-busy');
@@ -972,6 +975,7 @@
       showErrors();
       if (!files.length) return;
       var mine = ++latest;
+      var born = epoch;
       // A failed replacement must not leave the old key in the form.
       if (!input.multiple) box.textContent = '';
       var done = [];
@@ -982,7 +986,7 @@
           status.textContent = 'Uploading ' + file.name + (files.length > 1 ? ' (' + (i + 1) + ' of ' + files.length + ')' : '') + '.';
           return upload(file).then(function (key) {
             // A newer pick replaces this one in a single-file field.
-            if (!input.multiple && mine !== latest) return;
+            if (born !== epoch || (!input.multiple && mine !== latest)) return;
             addKey(key, file);
             done.push(file.name);
           }, function () {
@@ -999,6 +1003,15 @@
         status.textContent = done.length === 1 ? done[0] + ' uploaded.' : done.length ? done.length + ' files uploaded.' : '';
       });
     }
+
+    // A form reset drops the keys. Uploads that still run must not add one.
+    resetUpload.set(root, function () {
+      epoch++;
+      errors = [];
+      box.textContent = '';
+      status.textContent = '';
+      showErrors();
+    });
 
     input.addEventListener('change', function () { run(input.files); });
 
@@ -1023,6 +1036,13 @@
       run(e.dataTransfer.files);
     });
   }
+
+  document.addEventListener('reset', function (e) {
+    if (e.target.querySelectorAll) e.target.querySelectorAll(UPLOAD).forEach(function (root) {
+      var reset = resetUpload.get(root);
+      if (reset) reset();
+    });
+  }, true);
 
   // A key is missing until its upload ends, so hold the form. One listener
   // for the page, so a swap leaves no stale listener on the form.
