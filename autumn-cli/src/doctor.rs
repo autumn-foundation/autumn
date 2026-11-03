@@ -10957,8 +10957,130 @@ pub fn run(opts: DoctorOptions) {
         ))
     }));
 
+    // 20. Table-ownership boundaries (#3549). Only when the app declares them.
+    let boundaries_path = std::path::Path::new(autumn_web::graph::boundaries::CONFIG_FILE);
+    if boundaries_path.exists() {
+        tasks.push(Box::new(move || check_table_boundaries(boundaries_path)));
+    }
+
     // ── Phase 3: spawn all tasks concurrently ────────────────────────────────
     run_doctor_tasks(tasks, opts);
+}
+
+/// Check the table-ownership boundaries (#3549).
+///
+/// Doctor does not build the app. So the graph rule reads the committed graph
+/// that `graph` in `boundaries.toml` names, and the crate rule runs
+/// `cargo metadata --offline` with a time budget.
+fn check_table_boundaries(config_path: &std::path::Path) -> CheckResult {
+    use crate::boundaries::{
+        DOCTOR_BUDGET, cargo_facts, load_baseline, load_config, load_graph, relative_to_config,
+    };
+    let config = match load_config(config_path) {
+        Ok(config) => config,
+        Err(e) => return table_boundaries_result(CheckStatus::Fail, e),
+    };
+    let graph = config
+        .graph
+        .as_deref()
+        .map(|p| load_graph(&relative_to_config(config_path, p)));
+    let dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let facts = cargo_facts(dir, true, Some(DOCTOR_BUDGET));
+    let baseline = config
+        .baseline
+        .as_deref()
+        .map(|p| load_baseline(&relative_to_config(config_path, p)))
+        .transpose()
+        .map(Option::flatten);
+    check_table_boundaries_impl(config, graph, facts, baseline)
+}
+
+/// The verdict of [`check_table_boundaries`], from its inputs.
+///
+/// A rule that cannot run warns, so `--strict` does not pass a check that did
+/// not happen. A violation warns too. A config that names one table, node or
+/// crate in two boundaries equally fails.
+fn check_table_boundaries_impl(
+    config: autumn_web::graph::boundaries::BoundaryConfig,
+    graph: Option<Result<autumn_web::graph::manifest::ArchitectureGraph, String>>,
+    facts: Result<crate::boundaries::CargoFacts, String>,
+    baseline: Result<Option<autumn_web::graph::boundaries::Baseline>, String>,
+) -> CheckResult {
+    let mut notes = Vec::new();
+    let graph = match graph {
+        None => {
+            notes.push(
+                "graph rule not run: set `graph` in boundaries.toml to a committed \
+                 architecture graph"
+                    .to_owned(),
+            );
+            None
+        }
+        Some(Err(e)) => {
+            notes.push(format!("graph rule not run: {e}"));
+            None
+        }
+        Some(Ok(graph)) => Some(graph),
+    };
+    let facts = match facts {
+        Ok(facts) => Some(facts),
+        Err(e) => {
+            notes.push(format!("crate rule not run: {e}"));
+            None
+        }
+    };
+    let baseline = match baseline {
+        Ok(baseline) => baseline,
+        Err(e) => return table_boundaries_result(CheckStatus::Warn, e),
+    };
+    let (result, _) = match crate::boundaries::evaluate(
+        config,
+        graph.as_ref(),
+        facts.as_ref(),
+        baseline.as_ref(),
+    ) {
+        Ok(evaluated) => evaluated,
+        Err(e) => return table_boundaries_result(CheckStatus::Fail, e),
+    };
+    if result.passes() && notes.is_empty() {
+        return CheckResult {
+            name: "table_boundaries",
+            status: CheckStatus::Pass,
+            detail: Some(format!(
+                "no new boundary violations ({} known in the baseline)",
+                result.known.len()
+            )),
+            hint: None,
+        };
+    }
+    let mut detail = if result.passes() {
+        String::new()
+    } else {
+        result.render().trim_end().to_owned()
+    };
+    for note in notes {
+        if !detail.is_empty() {
+            detail.push('\n');
+        }
+        detail.push_str(&note);
+    }
+    table_boundaries_result(CheckStatus::Warn, detail)
+}
+
+/// A `table_boundaries` result with the shared hint.
+fn table_boundaries_result(status: CheckStatus, detail: String) -> CheckResult {
+    CheckResult {
+        name: "table_boundaries",
+        status,
+        detail: Some(detail),
+        hint: Some(
+            "Run `autumn graph check-boundaries` for the full report. \
+             See docs/guide/table-ownership.md",
+        ),
+    }
 }
 
 fn run_doctor_tasks(tasks: Vec<Box<dyn FnOnce() -> CheckResult + Send>>, opts: DoctorOptions) {
@@ -23490,5 +23612,105 @@ redirect_uri = "http://localhost/callback"
             assert!(detail.contains("advisories"), "{detail}");
             assert!(detail.contains("licenses"), "{detail}");
         }
+    }
+}
+
+#[cfg(test)]
+mod table_boundaries_tests {
+    use autumn_web::graph::boundaries::{Baseline, BoundaryConfig, CrateGraph};
+    use autumn_web::graph::manifest::build;
+    use autumn_web::graph::{ModelGraphDescriptor, RouteGraphDescriptor};
+
+    use super::{CheckStatus, check_table_boundaries_impl};
+    use crate::boundaries::CargoFacts;
+
+    const MODELS: &[ModelGraphDescriptor] = &[ModelGraphDescriptor {
+        model: "Contact",
+        model_path: "core::Contact",
+        table: "contacts",
+        relations: &[],
+        module_path: "core::models",
+        file: "src/models.rs",
+        line: 1,
+        crate_version: "0.1.0",
+    }];
+
+    const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+        handler: "report",
+        module_path: "marketing::routes",
+        method: "GET",
+        path: "/report",
+        static_route: false,
+        file: "src/routes.rs",
+        line: 1,
+        crate_version: "0.1.0",
+        signature_symbols: &[],
+        body_symbols: &["contacts"],
+        sql_symbols: &[],
+    }];
+
+    fn config() -> BoundaryConfig {
+        BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\nmodules = [\"core\"]\n\
+             [boundaries.marketing]\nmodules = [\"marketing\"]\n",
+        )
+        .expect("valid")
+    }
+
+    fn facts() -> Result<CargoFacts, String> {
+        Ok(CargoFacts {
+            crates: CrateGraph::default(),
+            plugins: Vec::new(),
+        })
+    }
+
+    fn graph() -> Option<Result<autumn_web::graph::manifest::ArchitectureGraph, String>> {
+        Some(Ok(build(&[], 0, ROUTES, MODELS, &[], &[])))
+    }
+
+    #[test]
+    fn a_violation_warns_so_strict_fails() {
+        let result = check_table_boundaries_impl(config(), graph(), facts(), Ok(None));
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.expect("detail");
+        assert!(detail.contains("marketing -> core"), "{detail}");
+        assert!(detail.contains("GET /report"), "{detail}");
+    }
+
+    #[test]
+    fn a_baselined_violation_passes() {
+        let report = autumn_web::graph::boundaries::check(
+            &config(),
+            Some(&build(&[], 0, ROUTES, MODELS, &[], &[])),
+            None,
+        )
+        .expect("runs");
+        let baseline = Baseline::from_violations(&report.violations);
+        let result = check_table_boundaries_impl(config(), graph(), facts(), Ok(Some(baseline)));
+        assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
+    }
+
+    #[test]
+    fn a_rule_that_cannot_run_warns() {
+        let result = check_table_boundaries_impl(config(), None, facts(), Ok(None));
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.detail.expect("detail").contains("graph rule not run"));
+        let result = check_table_boundaries_impl(
+            config(),
+            graph(),
+            Err("no cargo".into()),
+            Ok(None),
+        );
+        assert!(result.detail.expect("detail").contains("crate rule not run"));
+    }
+
+    #[test]
+    fn an_ambiguous_config_fails() {
+        let config = BoundaryConfig::parse(
+            "[boundaries.a]\nowns = [\"contacts\"]\n[boundaries.b]\nowns = [\"contacts\"]\n",
+        )
+        .expect("valid");
+        let result = check_table_boundaries_impl(config, graph(), facts(), Ok(None));
+        assert_eq!(result.status, CheckStatus::Fail);
     }
 }

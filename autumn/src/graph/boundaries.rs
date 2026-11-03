@@ -1,0 +1,1478 @@
+//! Table-ownership boundaries, checked on the architecture graph (#3549).
+//!
+//! A boundary owns tables. Code in one boundary must not reach a table that
+//! another boundary owns, unless the boundary lists that table as an
+//! exception. Two rules check this:
+//!
+//! * **Graph rule.** An edge from a node in boundary A to a table that
+//!   boundary B owns is a violation.
+//! * **Crate rule.** A crate in boundary A that depends on a crate that holds
+//!   B's schema is a violation. The graph cannot follow a call into a helper.
+//!   This rule closes that gap.
+//!
+//! A [`Baseline`] holds the violations that exist today. A new violation
+//! fails. A fixed violation must leave the baseline, so the baseline only
+//! shrinks.
+//!
+//! This module does no IO. `autumn graph check-boundaries` and
+//! `autumn doctor` read the files and `cargo metadata`.
+//!
+//! See `docs/guide/table-ownership.md`.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::Write as _;
+
+use serde::{Deserialize, Serialize};
+
+use super::manifest::{ArchitectureGraph, GraphNode};
+use super::{Access, NodeKind, Provenance};
+
+/// The file that declares the boundaries, at the project root.
+pub const CONFIG_FILE: &str = "boundaries.toml";
+
+/// The schema version of a [`Baseline`] file.
+pub const BASELINE_VERSION: u32 = 1;
+
+// ── Configuration ────────────────────────────────────────────────────
+
+/// The contents of `boundaries.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundaryConfig {
+    /// The baseline file, relative to the config file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<String>,
+    /// A committed architecture graph, relative to the config file.
+    /// `autumn doctor` checks this file because it does not build the app.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<String>,
+    /// The boundaries, by name.
+    #[serde(default)]
+    pub boundaries: BTreeMap<String, Boundary>,
+}
+
+/// One boundary: the tables it owns and the code that is in it.
+///
+/// Every list holds glob patterns. `*` matches any run of characters.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Boundary {
+    /// The tables this boundary owns. Matched without case.
+    #[serde(default)]
+    pub owns: Vec<String>,
+    /// The crates (and plugins) in this boundary. `-` and `_` are equal.
+    #[serde(default)]
+    pub crates: Vec<String>,
+    /// The module paths in this boundary. `app::billing` also matches
+    /// `app::billing::routes`.
+    #[serde(default)]
+    pub modules: Vec<String>,
+    /// Tables of other boundaries that this boundary may read.
+    #[serde(default)]
+    pub may_read: Vec<String>,
+    /// Tables of other boundaries that this boundary may read and write.
+    #[serde(default)]
+    pub may_write: Vec<String>,
+    /// The crates that hold this boundary's schema. When empty, the crates
+    /// that declare the models of the owned tables are used.
+    #[serde(default)]
+    pub schema_crates: Vec<String>,
+}
+
+impl BoundaryConfig {
+    /// Parse `boundaries.toml`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BoundaryError::Parse`] for bad TOML or an unknown key, and
+    /// [`BoundaryError::Empty`] for a boundary that declares nothing.
+    pub fn parse(text: &str) -> Result<Self, BoundaryError> {
+        let config: Self = toml::from_str(text).map_err(|e| BoundaryError::Parse(e.to_string()))?;
+        for (name, boundary) in &config.boundaries {
+            if boundary.owns.is_empty() && boundary.crates.is_empty() && boundary.modules.is_empty()
+            {
+                return Err(BoundaryError::Empty(name.clone()));
+            }
+        }
+        Ok(config)
+    }
+
+    /// Add the tables a plugin crate declares that it owns.
+    ///
+    /// The plugin gets a boundary of its own name, with its crate in it. When
+    /// the config already has a boundary of that name, the lists are merged.
+    pub fn add_plugin(&mut self, krate: &str, owns: &[String]) {
+        let boundary = self.boundaries.entry(krate.to_owned()).or_default();
+        for table in owns {
+            if !boundary.owns.contains(table) {
+                boundary.owns.push(table.clone());
+            }
+        }
+        if !boundary.crates.iter().any(|c| c == krate) {
+            boundary.crates.push(krate.to_owned());
+        }
+    }
+}
+
+/// Why a boundary check cannot run.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BoundaryError {
+    /// `boundaries.toml` is not valid.
+    #[error("boundaries.toml is not valid: {0}")]
+    Parse(String),
+    /// A boundary declares no tables, crates or modules.
+    #[error("boundary `{0}` declares no `owns`, `crates` or `modules`")]
+    Empty(String),
+    /// Two boundaries claim one name with equally specific patterns.
+    #[error(
+        "{what} `{name}` matches boundary `{first}` and boundary `{second}` equally; \
+         make one pattern more specific"
+    )]
+    Ambiguous {
+        /// What is claimed: `table`, `node` or `crate`.
+        what: &'static str,
+        /// The claimed name.
+        name: String,
+        /// One boundary.
+        first: String,
+        /// The other boundary.
+        second: String,
+    },
+}
+
+// ── Inputs ───────────────────────────────────────────────────────────
+
+/// The normal (not dev, not build) dependencies of each crate, by name.
+///
+/// The CLI fills this from `cargo metadata`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CrateGraph {
+    /// Crate name to the names of the crates it depends on.
+    pub deps: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl CrateGraph {
+    /// Record that `krate` depends on `dep`.
+    pub fn add(&mut self, krate: &str, dep: &str) {
+        self.deps
+            .entry(krate.to_owned())
+            .or_default()
+            .insert(dep.to_owned());
+        self.deps.entry(dep.to_owned()).or_default();
+    }
+}
+
+// ── Findings ─────────────────────────────────────────────────────────
+
+/// A node in one boundary with an edge to a table another boundary owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableViolation {
+    /// The boundary of the node.
+    pub boundary: String,
+    /// The boundary that owns the table.
+    pub owner: String,
+    /// The node id.
+    pub node: String,
+    /// The node as the report shows it, for example `GET /report`.
+    pub label: String,
+    /// The node kind.
+    pub kind: NodeKind,
+    /// The table.
+    pub table: String,
+    /// The access of the edge.
+    pub access: Access,
+    /// The evidence of the edge.
+    pub provenance: Provenance,
+    /// The symbol that made the edge. Empty for a declaration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub symbol: String,
+    /// The repository the node reaches the table through, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+}
+
+/// A crate in one boundary that depends on a crate with another
+/// boundary's schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrateViolation {
+    /// The boundary of the crate.
+    pub boundary: String,
+    /// The boundary whose schema the dependency holds.
+    pub owner: String,
+    /// The crate.
+    #[serde(rename = "crate")]
+    pub krate: String,
+    /// The schema crate.
+    pub schema_crate: String,
+    /// The dependency path, from `krate` to `schema_crate`.
+    pub path: Vec<String>,
+}
+
+/// One boundary violation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "rule", rename_all = "snake_case")]
+pub enum Violation {
+    /// The graph rule.
+    Table(TableViolation),
+    /// The crate rule.
+    Crate(CrateViolation),
+}
+
+impl Violation {
+    /// The identity of the violation in a baseline.
+    ///
+    /// It has no provenance, symbol or location, so a refactor that keeps the
+    /// violation does not change its key.
+    #[must_use]
+    pub fn key(&self) -> BaselineEntry {
+        match self {
+            Self::Table(v) => BaselineEntry::Table {
+                boundary: v.boundary.clone(),
+                owner: v.owner.clone(),
+                node: v.node.clone(),
+                table: v.table.clone(),
+            },
+            Self::Crate(v) => BaselineEntry::Crate {
+                boundary: v.boundary.clone(),
+                owner: v.owner.clone(),
+                krate: v.krate.clone(),
+                schema_crate: v.schema_crate.clone(),
+            },
+        }
+    }
+
+    /// The violation as report lines. The first line names both boundaries.
+    #[must_use]
+    pub fn render(&self) -> String {
+        match self {
+            Self::Table(v) => {
+                let verb = match v.access {
+                    Access::Read => "reads",
+                    Access::Write => "writes",
+                    Access::ReadWrite => "reads and writes",
+                };
+                let mut text = format!(
+                    "{} -> {}: {} {} {verb} table `{}`\n    node: {}\n    edge: {}",
+                    v.boundary, v.owner, v.kind, v.label, v.table, v.node, v.provenance
+                );
+                if !v.symbol.is_empty() {
+                    let _ = write!(text, ", symbol `{}`", v.symbol);
+                }
+                if let Some(via) = &v.via {
+                    let _ = write!(text, ", via {via}");
+                }
+                text
+            }
+            Self::Crate(v) => format!(
+                "{} -> {}: crate {} depends on {}, which holds the schema of `{}`\n    path: {}",
+                v.boundary,
+                v.owner,
+                v.krate,
+                v.schema_crate,
+                v.owner,
+                v.path.join(" -> ")
+            ),
+        }
+    }
+}
+
+/// The result of a check before the baseline is applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Report {
+    /// Every violation, sorted by key.
+    pub violations: Vec<Violation>,
+    /// Patterns that match nothing, and other notes that do not fail.
+    pub warnings: Vec<String>,
+}
+
+/// Check the graph rule and the crate rule.
+///
+/// Give `None` for an input to skip its rule. The crate rule also reads the
+/// graph, to find the crate of each model.
+///
+/// # Errors
+///
+/// Returns [`BoundaryError::Ambiguous`] when one table, node or crate matches
+/// two boundaries equally.
+pub fn check(
+    config: &BoundaryConfig,
+    graph: Option<&ArchitectureGraph>,
+    crates: Option<&CrateGraph>,
+) -> Result<Report, BoundaryError> {
+    let resolver = Resolver { config };
+    let mut found: BTreeMap<BaselineEntry, Violation> = BTreeMap::new();
+    let mut warnings = Vec::new();
+    if let Some(graph) = graph {
+        graph_rule(&resolver, graph, &mut found)?;
+    }
+    if let Some(crates) = crates {
+        crate_rule(&resolver, graph, crates, &mut found)?;
+    }
+    unmatched_patterns(&resolver, graph, crates, &mut warnings)?;
+    Ok(Report {
+        violations: found.into_values().collect(),
+        warnings,
+    })
+}
+
+/// The graph rule: every edge from a node in a boundary to a table another
+/// boundary owns.
+fn graph_rule(
+    r: &Resolver<'_>,
+    graph: &ArchitectureGraph,
+    found: &mut BTreeMap<BaselineEntry, Violation>,
+) -> Result<(), BoundaryError> {
+    // Resolve every table and node first, so a conflict in the config is an
+    // error even where no edge crosses it.
+    for node in &graph.nodes {
+        if let Some(model) = &node.model {
+            r.owner(&model.table)?;
+        }
+        r.node_boundary(node)?;
+    }
+    let nodes: BTreeMap<&str, &GraphNode> =
+        graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    for edge in &graph.edges {
+        let Some(from) = nodes.get(edge.from.as_str()) else {
+            continue;
+        };
+        let Some(boundary) = r.node_boundary(from)? else {
+            continue;
+        };
+        for (table, via) in reached_tables(graph, &nodes, &edge.to) {
+            let Some(owner) = r.owner(&table)? else {
+                continue;
+            };
+            if owner == boundary || r.allows(boundary, &table, edge.access) {
+                continue;
+            }
+            let direct = via.is_none();
+            let violation = Violation::Table(TableViolation {
+                boundary: boundary.to_owned(),
+                owner: owner.to_owned(),
+                node: from.id.clone(),
+                label: from.label(),
+                kind: from.kind,
+                table,
+                access: edge.access,
+                provenance: edge.provenance,
+                symbol: edge.symbol.clone(),
+                via,
+            });
+            // One violation per node and table. A direct edge is the better
+            // evidence, so it replaces an edge through a repository.
+            let key = violation.key();
+            let keep_old = matches!(
+                found.get(&key),
+                Some(Violation::Table(old)) if old.via.is_none() || !direct
+            );
+            if !keep_old {
+                found.insert(key, violation);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The tables an edge target stands for, with the repository in between.
+///
+/// A model is its table. A repository is the tables of the models it has
+/// edges to, which include its declared relations.
+fn reached_tables(
+    graph: &ArchitectureGraph,
+    nodes: &BTreeMap<&str, &GraphNode>,
+    target: &str,
+) -> Vec<(String, Option<String>)> {
+    let Some(node) = nodes.get(target) else {
+        return Vec::new();
+    };
+    if let Some(model) = &node.model {
+        return vec![(model.table.clone(), None)];
+    }
+    let Some(repository) = &node.repository else {
+        return Vec::new();
+    };
+    let mut tables: BTreeSet<String> = graph
+        .edges
+        .iter()
+        .filter(|e| e.from == node.id)
+        .filter_map(|e| nodes.get(e.to.as_str()))
+        .filter_map(|n| n.model.as_ref().map(|m| m.table.clone()))
+        .collect();
+    if tables.is_empty() {
+        tables.insert(repository.table.clone());
+    }
+    tables
+        .into_iter()
+        .map(|t| (t, Some(node.id.clone())))
+        .collect()
+}
+
+/// The crate rule: every crate in a boundary that depends on another
+/// boundary's schema crate.
+///
+/// The search goes through crates in no boundary, such as a shared helper
+/// crate. It stops at a crate in a boundary: that crate is checked on its own.
+fn crate_rule(
+    r: &Resolver<'_>,
+    graph: Option<&ArchitectureGraph>,
+    crates: &CrateGraph,
+    found: &mut BTreeMap<BaselineEntry, Violation>,
+) -> Result<(), BoundaryError> {
+    let schema = schema_owners(r, graph, crates)?;
+    for start in crates.deps.keys() {
+        let Some(boundary) = r.crate_boundary(start)? else {
+            continue;
+        };
+        let mut parent: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut queue = VecDeque::from([start.as_str()]);
+        while let Some(current) = queue.pop_front() {
+            for dep in crates.deps.get(current).into_iter().flatten() {
+                if dep == start || parent.contains_key(dep.as_str()) {
+                    continue;
+                }
+                parent.insert(dep, current);
+                let dep_boundary = r.crate_boundary(dep)?;
+                for owner in schema.get(dep.as_str()).into_iter().flatten() {
+                    if *owner == boundary
+                        || dep_boundary == Some(boundary)
+                        || r.allows_schema_of(boundary, owner)
+                    {
+                        continue;
+                    }
+                    let mut path = vec![dep.clone()];
+                    let mut at = dep.as_str();
+                    while let Some(prev) = parent.get(at) {
+                        path.push((*prev).to_owned());
+                        at = prev;
+                    }
+                    path.reverse();
+                    let violation = Violation::Crate(CrateViolation {
+                        boundary: boundary.to_owned(),
+                        owner: (*owner).to_owned(),
+                        krate: start.clone(),
+                        schema_crate: dep.clone(),
+                        path,
+                    });
+                    found.entry(violation.key()).or_insert(violation);
+                }
+                if dep_boundary.is_none() {
+                    queue.push_back(dep);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The boundaries whose schema each crate holds.
+///
+/// `schema_crates` names them. When it is empty, they are the crates that
+/// declare a model of an owned table.
+fn schema_owners<'a>(
+    r: &Resolver<'a>,
+    graph: Option<&ArchitectureGraph>,
+    crates: &CrateGraph,
+) -> Result<BTreeMap<String, BTreeSet<&'a str>>, BoundaryError> {
+    // Keyed by normalized crate name: a module path spells `-` as `_`.
+    let mut by_crate: BTreeMap<String, BTreeSet<&'a str>> = BTreeMap::new();
+    for (name, boundary) in &r.config.boundaries {
+        for package in crates.deps.keys() {
+            let key = crate_key(package);
+            if boundary
+                .schema_crates
+                .iter()
+                .any(|p| glob(&crate_key(p), &key))
+            {
+                by_crate.entry(key).or_default().insert(name.as_str());
+            }
+        }
+    }
+    for node in graph.iter().flat_map(|g| &g.nodes) {
+        let Some(model) = &node.model else {
+            continue;
+        };
+        let Some(owner) = r.owner(&model.table)? else {
+            continue;
+        };
+        if r.config.boundaries[owner].schema_crates.is_empty() {
+            by_crate
+                .entry(crate_key(crate_root(&node.module)))
+                .or_default()
+                .insert(owner);
+        }
+    }
+    Ok(crates
+        .deps
+        .keys()
+        .filter_map(|p| by_crate.get(&crate_key(p)).map(|o| (p.clone(), o.clone())))
+        .collect())
+}
+
+/// A warning for each pattern that matches nothing in the inputs.
+///
+/// A typo in a pattern would make the check pass in silence. The warning
+/// makes the typo visible.
+fn unmatched_patterns(
+    r: &Resolver<'_>,
+    graph: Option<&ArchitectureGraph>,
+    crates: Option<&CrateGraph>,
+    warnings: &mut Vec<String>,
+) -> Result<(), BoundaryError> {
+    let tables: BTreeSet<String> = graph
+        .iter()
+        .flat_map(|g| &g.nodes)
+        .filter_map(|n| n.model.as_ref().map(|m| m.table.to_ascii_lowercase()))
+        .collect();
+    let mut crate_names: BTreeSet<String> = graph
+        .iter()
+        .flat_map(|g| &g.nodes)
+        .map(|n| crate_key(crate_root(&n.module)))
+        .collect();
+    crate_names.extend(
+        crates
+            .iter()
+            .flat_map(|c| c.deps.keys())
+            .map(|k| crate_key(k)),
+    );
+    for (name, b) in &r.config.boundaries {
+        let mut warn = |list: &str, pattern: &str, what: &str| {
+            warnings.push(format!(
+                "boundary `{name}`: `{list}` pattern `{pattern}` matches no {what}"
+            ));
+        };
+        if let Some(graph) = graph {
+            for p in &b.owns {
+                let p_lower = p.to_ascii_lowercase();
+                if !tables.iter().any(|t| glob(&p_lower, t)) {
+                    warn("owns", p, "table of a #[model] in the graph");
+                }
+            }
+            for p in &b.modules {
+                if !graph.nodes.iter().any(|n| module_matches(p, &n.module)) {
+                    warn("modules", p, "node in the graph");
+                }
+            }
+        }
+        if graph.is_some() || crates.is_some() {
+            for p in &b.crates {
+                let key = crate_key(p);
+                if !crate_names.iter().any(|c| glob(&key, c)) {
+                    warn("crates", p, "crate");
+                }
+            }
+        }
+        if let Some(crates) = crates {
+            for p in &b.schema_crates {
+                let key = crate_key(p);
+                if !crates.deps.keys().any(|c| glob(&key, &crate_key(c))) {
+                    warn("schema_crates", p, "crate");
+                }
+            }
+        }
+        for (list, entries) in [("may_read", &b.may_read), ("may_write", &b.may_write)] {
+            for t in entries {
+                if r.owner(t)?.is_none() {
+                    warn(list, t, "table that a boundary owns");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Baseline and ratchet ─────────────────────────────────────────────
+
+/// The identity of one known violation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "rule", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BaselineEntry {
+    /// A graph-rule violation.
+    Table {
+        /// The boundary of the node.
+        boundary: String,
+        /// The boundary that owns the table.
+        owner: String,
+        /// The node id.
+        node: String,
+        /// The table.
+        table: String,
+    },
+    /// A crate-rule violation.
+    Crate {
+        /// The boundary of the crate.
+        boundary: String,
+        /// The boundary whose schema the dependency holds.
+        owner: String,
+        /// The crate.
+        #[serde(rename = "crate")]
+        krate: String,
+        /// The schema crate.
+        schema_crate: String,
+    },
+}
+
+impl std::fmt::Display for BaselineEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Table {
+                boundary,
+                owner,
+                node,
+                table,
+            } => write!(f, "{boundary} -> {owner}.{table} ({node})"),
+            Self::Crate {
+                boundary,
+                owner,
+                krate,
+                schema_crate,
+            } => write!(
+                f,
+                "{boundary} -> {owner} (crate {krate} depends on {schema_crate})"
+            ),
+        }
+    }
+}
+
+/// The violations an app accepts today.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Baseline {
+    /// Always [`BASELINE_VERSION`].
+    pub version: u32,
+    /// The known violations, sorted.
+    pub violations: Vec<BaselineEntry>,
+}
+
+impl Baseline {
+    /// A baseline that holds `violations`.
+    #[must_use]
+    pub fn from_violations(violations: &[Violation]) -> Self {
+        let keys: BTreeSet<BaselineEntry> = violations.iter().map(Violation::key).collect();
+        Self {
+            version: BASELINE_VERSION,
+            violations: keys.into_iter().collect(),
+        }
+    }
+
+    /// Parse a baseline file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message for bad JSON or an unknown version.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let baseline: Self = serde_json::from_str(text).map_err(|e| e.to_string())?;
+        if baseline.version != BASELINE_VERSION {
+            return Err(format!(
+                "baseline version {} is not supported (expected {BASELINE_VERSION})",
+                baseline.version
+            ));
+        }
+        Ok(baseline)
+    }
+
+    /// The baseline as pretty JSON, with a final newline.
+    ///
+    /// # Panics
+    ///
+    /// Never: every field is a string or a number.
+    #[must_use]
+    pub fn to_json(&self) -> String {
+        let mut json = serde_json::to_string_pretty(self)
+            .unwrap_or_else(|e| panic!("a baseline is always serializable: {e}"));
+        json.push('\n');
+        json
+    }
+}
+
+/// A report compared with a baseline.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ratchet {
+    /// Violations the baseline does not hold. These fail.
+    pub new: Vec<Violation>,
+    /// Violations the baseline holds. These pass.
+    pub known: Vec<Violation>,
+    /// Baseline entries that no longer occur. These fail until the baseline
+    /// is updated, so the baseline cannot keep a slot for a regression.
+    pub fixed: Vec<BaselineEntry>,
+    /// Notes that do not fail.
+    pub warnings: Vec<String>,
+}
+
+impl Ratchet {
+    /// Whether the check passes.
+    #[must_use]
+    pub fn passes(&self) -> bool {
+        self.new.is_empty() && self.fixed.is_empty()
+    }
+
+    /// The human report.
+    #[must_use]
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        for warning in &self.warnings {
+            let _ = writeln!(out, "warning: {warning}");
+        }
+        if !self.new.is_empty() {
+            let _ = writeln!(
+                out,
+                "\u{2717} {} new boundary violation(s):",
+                self.new.len()
+            );
+            for v in &self.new {
+                let _ = writeln!(out, "  {}", v.render().replace('\n', "\n  "));
+            }
+        }
+        if !self.fixed.is_empty() {
+            let _ = writeln!(
+                out,
+                "\u{2717} {} baseline entry(s) no longer occur. Run with --update-baseline \
+                 to remove them:",
+                self.fixed.len()
+            );
+            for entry in &self.fixed {
+                let _ = writeln!(out, "  - {entry}");
+            }
+        }
+        if !self.known.is_empty() {
+            let _ = writeln!(
+                out,
+                "{} known violation(s) in the baseline.",
+                self.known.len()
+            );
+        }
+        if self.passes() {
+            let _ = writeln!(out, "\u{2713} No new boundary violations.");
+        }
+        out
+    }
+}
+
+/// Compare a report with a baseline. No baseline holds nothing.
+#[must_use]
+pub fn ratchet(report: Report, baseline: Option<&Baseline>) -> Ratchet {
+    let accepted: BTreeSet<&BaselineEntry> = baseline.iter().flat_map(|b| &b.violations).collect();
+    let current: BTreeSet<BaselineEntry> = report.violations.iter().map(Violation::key).collect();
+    let fixed = accepted
+        .iter()
+        .filter(|e| !current.contains(**e))
+        .map(|e| (*e).clone())
+        .collect();
+    let (known, new) = report
+        .violations
+        .into_iter()
+        .partition(|v| accepted.contains(&v.key()));
+    Ratchet {
+        new,
+        known,
+        fixed,
+        warnings: report.warnings,
+    }
+}
+
+// ── Matching ─────────────────────────────────────────────────────────
+
+/// Finds the boundary of a table, node or crate.
+struct Resolver<'a> {
+    config: &'a BoundaryConfig,
+}
+
+impl<'a> Resolver<'a> {
+    /// The boundary that owns `table`.
+    fn owner(&self, table: &str) -> Result<Option<&'a str>, BoundaryError> {
+        let table = table.to_ascii_lowercase();
+        let mut candidates = Vec::new();
+        for (name, b) in &self.config.boundaries {
+            for p in &b.owns {
+                if glob(&p.to_ascii_lowercase(), &table) {
+                    candidates.push((name.as_str(), specificity(p)));
+                }
+            }
+        }
+        pick("table", &table, &candidates)
+    }
+
+    /// The boundary of a graph node, by its crate or its module path.
+    fn node_boundary(&self, node: &GraphNode) -> Result<Option<&'a str>, BoundaryError> {
+        let root = crate_key(crate_root(&node.module));
+        let mut candidates = Vec::new();
+        for (name, b) in &self.config.boundaries {
+            for p in &b.crates {
+                if glob(&crate_key(p), &root) {
+                    candidates.push((name.as_str(), specificity(p)));
+                }
+            }
+            for p in &b.modules {
+                if module_matches(p, &node.module) {
+                    candidates.push((name.as_str(), specificity(p)));
+                }
+            }
+        }
+        pick("node", &node.id, &candidates)
+    }
+
+    /// The boundary of a crate, by its name.
+    fn crate_boundary(&self, krate: &str) -> Result<Option<&'a str>, BoundaryError> {
+        let key = crate_key(krate);
+        let mut candidates = Vec::new();
+        for (name, b) in &self.config.boundaries {
+            for p in &b.crates {
+                if glob(&crate_key(p), &key) {
+                    candidates.push((name.as_str(), specificity(p)));
+                }
+            }
+        }
+        pick("crate", krate, &candidates)
+    }
+
+    /// Whether `boundary` lists `table` as an exception for `access`.
+    ///
+    /// `may_write` allows every access. `may_read` allows a read only.
+    fn allows(&self, boundary: &str, table: &str, access: Access) -> bool {
+        let Some(b) = self.config.boundaries.get(boundary) else {
+            return false;
+        };
+        let table = table.to_ascii_lowercase();
+        let hit = |list: &[String]| list.iter().any(|p| glob(&p.to_ascii_lowercase(), &table));
+        hit(&b.may_write) || (access == Access::Read && hit(&b.may_read))
+    }
+
+    /// Whether `boundary` lists a table of `owner` as an exception. That
+    /// exception needs a dependency on `owner`'s schema crate.
+    fn allows_schema_of(&self, boundary: &str, owner: &str) -> bool {
+        let Some(b) = self.config.boundaries.get(boundary) else {
+            return false;
+        };
+        b.may_read
+            .iter()
+            .chain(&b.may_write)
+            .any(|t| matches!(self.owner(t), Ok(Some(o)) if o == owner))
+    }
+}
+
+/// The boundary with the most specific match. A tie between two boundaries
+/// is an error, because the config does not say which one is meant.
+fn pick<'a>(
+    what: &'static str,
+    name: &str,
+    candidates: &[(&'a str, usize)],
+) -> Result<Option<&'a str>, BoundaryError> {
+    let Some(top) = candidates.iter().map(|c| c.1).max() else {
+        return Ok(None);
+    };
+    let winners: BTreeSet<&str> = candidates
+        .iter()
+        .filter(|c| c.1 == top)
+        .map(|c| c.0)
+        .collect();
+    let mut winners = winners.into_iter();
+    match (winners.next(), winners.next()) {
+        (Some(first), Some(second)) => Err(BoundaryError::Ambiguous {
+            what,
+            name: name.to_owned(),
+            first: first.to_owned(),
+            second: second.to_owned(),
+        }),
+        (first, _) => Ok(first),
+    }
+}
+
+/// How specific a pattern is: its count of characters that are not `*`.
+fn specificity(pattern: &str) -> usize {
+    pattern.chars().filter(|c| *c != '*').count()
+}
+
+/// Whether a module pattern matches a module path or one of its children.
+fn module_matches(pattern: &str, module: &str) -> bool {
+    glob(pattern, module) || glob(&format!("{pattern}::*"), module)
+}
+
+/// The crate name at the start of a module path.
+fn crate_root(module: &str) -> &str {
+    module.split_once("::").map_or(module, |(root, _)| root)
+}
+
+/// A crate name with `-` as `_`, as `module_path!()` spells it.
+fn crate_key(name: &str) -> String {
+    name.replace('-', "_")
+}
+
+/// Whether `text` matches `pattern`, where `*` matches any run.
+fn glob(pattern: &str, text: &str) -> bool {
+    let mut parts = pattern.split('*');
+    let first = parts.next().unwrap_or_default();
+    let Some(mut rest) = text.strip_prefix(first) else {
+        return false;
+    };
+    let middle: Vec<&str> = parts.collect();
+    let Some((last, middle)) = middle.split_last() else {
+        // No `*`: the whole text must be the pattern.
+        return rest.is_empty();
+    };
+    for part in middle {
+        let Some(at) = rest.find(part) else {
+            return false;
+        };
+        rest = &rest[at + part.len()..];
+    }
+    rest.ends_with(last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::manifest::build;
+    use crate::graph::{ModelGraphDescriptor, RepositoryGraphDescriptor, RouteGraphDescriptor};
+
+    const fn model(
+        name: &'static str,
+        table: &'static str,
+        module_path: &'static str,
+    ) -> ModelGraphDescriptor {
+        ModelGraphDescriptor {
+            model: name,
+            model_path: name,
+            table,
+            relations: &[],
+            module_path,
+            file: "src/models.rs",
+            line: 1,
+            crate_version: "0.1.0",
+        }
+    }
+
+    const fn route(
+        handler: &'static str,
+        module_path: &'static str,
+        method: &'static str,
+        path: &'static str,
+    ) -> RouteGraphDescriptor {
+        RouteGraphDescriptor {
+            handler,
+            module_path,
+            method,
+            path,
+            static_route: false,
+            file: "src/routes.rs",
+            line: 1,
+            crate_version: "0.1.0",
+            signature_symbols: &[],
+            body_symbols: &[],
+            sql_symbols: &[],
+        }
+    }
+
+    const MODELS: &[ModelGraphDescriptor] = &[
+        model("Contact", "contacts", "crm_core::models"),
+        model("Campaign", "campaigns", "crm_marketing::models"),
+        model("Touch", "attribution_touches", "crm_marketing::models"),
+    ];
+
+    const REPOSITORIES: &[RepositoryGraphDescriptor] = &[RepositoryGraphDescriptor {
+        repository: "ContactRepository",
+        implementation: "PgContactRepository",
+        model: "Contact",
+        table: "contacts",
+        api: "",
+        module_path: "crm_core::repositories",
+        file: "src/repositories.rs",
+        line: 1,
+        crate_version: "0.1.0",
+    }];
+
+    const ROUTES: &[RouteGraphDescriptor] = &[
+        // Core reads its own table.
+        RouteGraphDescriptor {
+            body_symbols: &["contacts"],
+            ..route("list", "crm_core::routes", "GET", "/contacts")
+        },
+        // Marketing reads a core table through the Diesel DSL.
+        RouteGraphDescriptor {
+            body_symbols: &["Campaign", "contacts"],
+            ..route("report", "crm_marketing::routes", "GET", "/report")
+        },
+        // Marketing joins a core table in raw SQL.
+        RouteGraphDescriptor {
+            body_symbols: &["c", "campaigns", "contact_id", "contacts", "ct", "id"],
+            sql_symbols: &["c", "campaigns", "contact_id", "contacts", "ct", "id"],
+            ..route("joined", "crm_marketing::routes", "GET", "/joined")
+        },
+        // Marketing writes a core table through the core repository.
+        RouteGraphDescriptor {
+            signature_symbols: &["PgContactRepository"],
+            ..route("sync", "crm_marketing::routes", "POST", "/sync")
+        },
+        // Glue in no boundary is not checked.
+        RouteGraphDescriptor {
+            body_symbols: &["contacts", "campaigns"],
+            ..route("home", "crm_app::routes", "GET", "/")
+        },
+    ];
+
+    fn graph() -> ArchitectureGraph {
+        build(&[], 0, ROUTES, MODELS, REPOSITORIES, &[])
+    }
+
+    const CONFIG: &str = r#"
+[boundaries.core]
+owns = ["contacts"]
+crates = ["crm-core*"]
+
+[boundaries.marketing]
+owns = ["campaigns", "attribution_*"]
+crates = ["crm-marketing"]
+"#;
+
+    fn config(extra: &str) -> BoundaryConfig {
+        let mut text = CONFIG.to_owned();
+        text.push_str(extra);
+        BoundaryConfig::parse(&text).expect("valid config")
+    }
+
+    fn tables(report: &Report) -> Vec<&TableViolation> {
+        report
+            .violations
+            .iter()
+            .filter_map(|v| match v {
+                Violation::Table(t) => Some(t),
+                Violation::Crate(_) => None,
+            })
+            .collect()
+    }
+
+    fn crate_violations(report: &Report) -> Vec<&CrateViolation> {
+        report
+            .violations
+            .iter()
+            .filter_map(|v| match v {
+                Violation::Crate(c) => Some(c),
+                Violation::Table(_) => None,
+            })
+            .collect()
+    }
+
+    fn table_violation<'a>(report: &'a Report, handler: &str) -> Option<&'a TableViolation> {
+        tables(report)
+            .into_iter()
+            .find(|v| v.node.ends_with(&format!("::{handler}")))
+    }
+
+    // ── Config ───────────────────────────────────────────────────────
+
+    #[test]
+    fn the_config_parses_every_list() {
+        let config = config(
+            r#"
+[boundaries.billing]
+owns = ["invoices"]
+modules = ["app::billing"]
+may_read = ["contacts"]
+may_write = ["campaigns"]
+schema_crates = ["billing-schema"]
+"#,
+        );
+        let billing = &config.boundaries["billing"];
+        assert_eq!(billing.modules, ["app::billing"]);
+        assert_eq!(billing.may_read, ["contacts"]);
+        assert_eq!(billing.may_write, ["campaigns"]);
+        assert_eq!(billing.schema_crates, ["billing-schema"]);
+    }
+
+    #[test]
+    fn an_unknown_key_is_rejected() {
+        let err = BoundaryConfig::parse("[boundaries.core]\nowns = [\"a\"]\nmay_reed = []\n")
+            .expect_err("a typo must not pass");
+        assert!(
+            matches!(err, BoundaryError::Parse(ref m) if m.contains("may_reed")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_boundary_is_rejected() {
+        let err = BoundaryConfig::parse("[boundaries.core]\nmay_read = [\"a\"]\n")
+            .expect_err("a boundary with no members must not pass");
+        assert_eq!(err, BoundaryError::Empty("core".into()));
+    }
+
+    #[test]
+    fn a_plugin_adds_a_boundary_of_its_own() {
+        let mut config = config("");
+        config.add_plugin("autumn-admin-plugin", &["admin_audit_log".to_owned()]);
+        let plugin = &config.boundaries["autumn-admin-plugin"];
+        assert_eq!(plugin.owns, ["admin_audit_log"]);
+        assert_eq!(plugin.crates, ["autumn-admin-plugin"]);
+    }
+
+    // ── Graph rule ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_route_that_reads_another_boundarys_table_is_a_violation() {
+        let report = check(&config(""), Some(&graph()), None).expect("check runs");
+        let v = table_violation(&report, "report").expect("report reads contacts");
+        assert_eq!(v.boundary, "marketing");
+        assert_eq!(v.owner, "core");
+        assert_eq!(v.table, "contacts");
+        assert_eq!(v.access, Access::Read);
+        assert_eq!(v.provenance, Provenance::Body);
+        assert_eq!(v.symbol, "contacts");
+        assert_eq!(v.via, None);
+        let text = Violation::Table(v.clone()).render();
+        for needle in [
+            "marketing",
+            "core",
+            "contacts",
+            "GET /report",
+            "body",
+            "`contacts`",
+        ] {
+            assert!(text.contains(needle), "{needle} missing from {text}");
+        }
+    }
+
+    #[test]
+    fn may_read_clears_a_read_violation() {
+        let report = check(&config("may_read = [\"contacts\"]\n"), Some(&graph()), None)
+            .expect("check runs");
+        assert!(table_violation(&report, "report").is_none());
+        assert!(table_violation(&report, "joined").is_none());
+    }
+
+    #[test]
+    fn a_raw_sql_join_is_a_violation() {
+        let report = check(&config(""), Some(&graph()), None).expect("check runs");
+        let v = table_violation(&report, "joined").expect("the JOIN reaches contacts");
+        assert_eq!((v.owner.as_str(), v.table.as_str()), ("core", "contacts"));
+        assert_eq!(v.provenance, Provenance::Body);
+    }
+
+    #[test]
+    fn a_write_through_a_repository_names_the_repository() {
+        let report = check(&config(""), Some(&graph()), None).expect("check runs");
+        let v = table_violation(&report, "sync").expect("sync writes contacts");
+        assert_eq!(v.access, Access::Write);
+        assert_eq!(v.provenance, Provenance::Signature);
+        assert_eq!(
+            v.via.as_deref(),
+            Some("repository:crm_core::repositories::ContactRepository")
+        );
+        assert!(
+            Violation::Table(v.clone())
+                .render()
+                .contains("ContactRepository")
+        );
+    }
+
+    #[test]
+    fn a_direct_edge_wins_over_a_repository_edge() {
+        const BOTH: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            signature_symbols: &["PgContactRepository"],
+            body_symbols: &["contacts"],
+            ..route("both", "crm_marketing::routes", "GET", "/both")
+        }];
+        let graph = build(&[], 0, BOTH, MODELS, REPOSITORIES, &[]);
+        let report = check(&config(""), Some(&graph), None).expect("check runs");
+        let found = tables(&report);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].via, None);
+        assert_eq!(found[0].symbol, "contacts");
+    }
+
+    #[test]
+    fn may_read_does_not_clear_a_write() {
+        let report = check(&config("may_read = [\"contacts\"]\n"), Some(&graph()), None)
+            .expect("check runs");
+        assert!(table_violation(&report, "sync").is_some());
+    }
+
+    #[test]
+    fn may_write_clears_a_write() {
+        let report = check(
+            &config("may_write = [\"contacts\"]\n"),
+            Some(&graph()),
+            None,
+        )
+        .expect("check runs");
+        assert!(tables(&report).is_empty(), "{:?}", report.violations);
+    }
+
+    #[test]
+    fn own_tables_and_unbounded_nodes_are_not_checked() {
+        let report = check(&config(""), Some(&graph()), None).expect("check runs");
+        assert!(table_violation(&report, "list").is_none());
+        assert!(table_violation(&report, "home").is_none());
+        // The core repository over its own model is not a violation.
+        assert!(
+            !tables(&report)
+                .iter()
+                .any(|v| v.kind == NodeKind::Repository)
+        );
+        assert_eq!(tables(&report).len(), 3, "{:?}", report.violations);
+    }
+
+    #[test]
+    fn a_repository_in_one_boundary_over_another_boundarys_model_is_a_violation() {
+        let mut config = config("");
+        config
+            .boundaries
+            .get_mut("marketing")
+            .expect("marketing")
+            .modules
+            .push("crm_core::repositories".into());
+        let report = check(&config, Some(&graph()), None).expect("check runs");
+        // The module pattern is longer, so it beats `crm-core*`.
+        let v = tables(&report)
+            .into_iter()
+            .find(|v| v.kind == NodeKind::Repository)
+            .expect("the repository is now in marketing");
+        assert_eq!(v.access, Access::ReadWrite);
+        assert_eq!(v.provenance, Provenance::Declaration);
+    }
+
+    #[test]
+    fn the_more_specific_pattern_wins() {
+        // `crm-core*` and `crm-core-ad*` both match `crm_core_ad`.
+        let config = BoundaryConfig::parse(
+            r#"
+[boundaries.core]
+owns = ["contacts"]
+crates = ["crm-core*"]
+[boundaries.marketing]
+owns = ["campaigns"]
+crates = ["crm-core-ad*"]
+"#,
+        )
+        .expect("valid");
+        const ADS: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            body_symbols: &["contacts"],
+            ..route("ads", "crm_core_ad::routes", "GET", "/ads")
+        }];
+        let report =
+            check(&config, Some(&build(&[], 0, ADS, MODELS, &[], &[])), None).expect("runs");
+        let v = table_violation(&report, "ads").expect("ads is in marketing");
+        assert_eq!(v.boundary, "marketing");
+    }
+
+    #[test]
+    fn an_owns_glob_matches_a_table_without_case() {
+        let config = BoundaryConfig::parse(
+            "[boundaries.marketing]\nowns = [\"ATTRIBUTION_*\"]\nmodules = [\"x\"]\n\
+             [boundaries.core]\nowns = []\nmodules = [\"crm_core\"]\n",
+        )
+        .expect("valid");
+        const READER: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            body_symbols: &["Touch"],
+            ..route("touches", "crm_core::routes", "GET", "/touches")
+        }];
+        let report = check(
+            &config,
+            Some(&build(&[], 0, READER, MODELS, &[], &[])),
+            None,
+        )
+        .expect("runs");
+        let v = table_violation(&report, "touches").expect("core reads attribution_touches");
+        assert_eq!(
+            (v.owner.as_str(), v.table.as_str()),
+            ("marketing", "attribution_touches")
+        );
+    }
+
+    #[test]
+    fn a_table_two_boundaries_claim_equally_is_an_error() {
+        let config = BoundaryConfig::parse(
+            "[boundaries.a]\nowns = [\"contacts\"]\n[boundaries.b]\nowns = [\"contacts\"]\n",
+        )
+        .expect("valid");
+        let err = check(&config, Some(&graph()), None).expect_err("ambiguous");
+        assert!(
+            matches!(err, BoundaryError::Ambiguous { what: "table", .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_is_a_warning() {
+        let report = check(
+            &config("[boundaries.ghost]\nowns = [\"nothing_here\"]\nmodules = [\"no::such\"]\n"),
+            Some(&graph()),
+            None,
+        )
+        .expect("check runs");
+        let warnings = report.warnings.join("\n");
+        assert!(warnings.contains("nothing_here"), "{warnings}");
+        assert!(warnings.contains("no::such"), "{warnings}");
+    }
+
+    // ── Crate rule ───────────────────────────────────────────────────
+
+    fn crates(edges: &[(&str, &str)]) -> CrateGraph {
+        let mut graph = CrateGraph::default();
+        for (from, to) in edges {
+            graph.add(from, to);
+        }
+        graph
+    }
+
+    #[test]
+    fn a_crate_that_depends_on_another_boundarys_schema_crate_is_a_violation() {
+        let deps = crates(&[("crm-marketing", "crm-core"), ("crm-app", "crm-core")]);
+        let report = check(&config(""), Some(&graph()), Some(&deps)).expect("runs");
+        let found = crate_violations(&report);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let v = found[0];
+        assert_eq!(
+            (v.boundary.as_str(), v.owner.as_str()),
+            ("marketing", "core")
+        );
+        assert_eq!(v.krate, "crm-marketing");
+        assert_eq!(v.schema_crate, "crm-core");
+        assert_eq!(v.path, ["crm-marketing", "crm-core"]);
+        let text = Violation::Crate(v.clone()).render();
+        assert!(text.contains("crm-marketing -> crm-core"), "{text}");
+    }
+
+    #[test]
+    fn a_dependency_through_an_unbounded_helper_crate_is_a_violation() {
+        let deps = crates(&[
+            ("crm-marketing", "crm-helpers"),
+            ("crm-helpers", "crm-core"),
+        ]);
+        let report = check(&config(""), Some(&graph()), Some(&deps)).expect("runs");
+        let found = crate_violations(&report);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, ["crm-marketing", "crm-helpers", "crm-core"]);
+    }
+
+    #[test]
+    fn schema_crates_name_the_crate_that_holds_the_schema() {
+        let mut config = config("");
+        config
+            .boundaries
+            .get_mut("core")
+            .expect("core")
+            .schema_crates = vec!["crm-core-schema".into()];
+        // `crm-core` holds the models but is no longer the schema crate.
+        let deps = crates(&[
+            ("crm-marketing", "crm-core"),
+            ("crm-marketing", "crm-core-schema"),
+        ]);
+        let report = check(&config, Some(&graph()), Some(&deps)).expect("runs");
+        let found = crate_violations(&report);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].schema_crate, "crm-core-schema");
+    }
+
+    #[test]
+    fn may_read_allows_the_dependency_it_needs() {
+        let deps = crates(&[("crm-marketing", "crm-core")]);
+        let report = check(
+            &config("may_read = [\"contacts\"]\n"),
+            Some(&graph()),
+            Some(&deps),
+        )
+        .expect("runs");
+        assert!(crate_violations(&report).is_empty());
+    }
+
+    #[test]
+    fn a_dev_dependency_is_not_in_the_crate_graph() {
+        // The CLI leaves dev and build dependencies out. An empty graph has
+        // nothing to report.
+        let report =
+            check(&config(""), Some(&graph()), Some(&CrateGraph::default())).expect("runs");
+        assert!(crate_violations(&report).is_empty());
+    }
+
+    // ── Baseline and ratchet ─────────────────────────────────────────
+
+    fn current() -> Report {
+        check(&config(""), Some(&graph()), None).expect("check runs")
+    }
+
+    #[test]
+    fn with_no_baseline_every_violation_is_new() {
+        let result = ratchet(current(), None);
+        assert_eq!(result.new.len(), 3);
+        assert!(!result.passes());
+    }
+
+    #[test]
+    fn a_baseline_of_today_passes() {
+        let report = current();
+        let baseline = Baseline::from_violations(&report.violations);
+        assert_eq!(baseline.violations.len(), 3);
+        let result = ratchet(report, Some(&baseline));
+        assert!(result.passes(), "{}", result.render());
+        assert_eq!(result.known.len(), 3);
+    }
+
+    #[test]
+    fn a_new_violation_fails_against_the_baseline() {
+        let report = current();
+        let mut baseline = Baseline::from_violations(&report.violations);
+        let dropped = baseline.violations.remove(0);
+        let result = ratchet(report, Some(&baseline));
+        assert!(!result.passes());
+        assert_eq!(result.new.len(), 1);
+        assert_eq!(result.new[0].key(), dropped);
+        assert!(result.render().contains("new"), "{}", result.render());
+    }
+
+    #[test]
+    fn a_fixed_violation_must_leave_the_baseline() {
+        let report = current();
+        let mut baseline = Baseline::from_violations(&report.violations);
+        let gone = BaselineEntry::Table {
+            boundary: "marketing".into(),
+            owner: "core".into(),
+            node: "route:crm_marketing::routes::removed".into(),
+            table: "contacts".into(),
+        };
+        baseline.violations.push(gone.clone());
+        let result = ratchet(report, Some(&baseline));
+        assert!(!result.passes());
+        assert_eq!(result.fixed, [gone]);
+        assert!(
+            result.render().contains("--update-baseline"),
+            "{}",
+            result.render()
+        );
+    }
+
+    #[test]
+    fn the_baseline_round_trips_and_is_sorted() {
+        let report = current();
+        let baseline = Baseline::from_violations(&report.violations);
+        let mut sorted = baseline.violations.clone();
+        sorted.sort();
+        assert_eq!(baseline.violations, sorted);
+        let parsed = Baseline::parse(&baseline.to_json()).expect("round trip");
+        assert_eq!(parsed, baseline);
+        assert!(Baseline::parse("{\"version\":2,\"violations\":[]}").is_err());
+    }
+
+    #[test]
+    fn a_key_ignores_the_evidence() {
+        let report = current();
+        let Violation::Table(mut v) = report.violations[0].clone() else {
+            panic!("a table violation");
+        };
+        let before = Violation::Table(v.clone()).key();
+        v.provenance = Provenance::Signature;
+        v.symbol = "Other".into();
+        assert_eq!(Violation::Table(v).key(), before);
+    }
+
+    // ── Matching ─────────────────────────────────────────────────────
+
+    #[test]
+    fn glob_matches_runs() {
+        assert!(glob("attribution_*", "attribution_touches"));
+        assert!(glob("*", ""));
+        assert!(glob("a*c*e", "abcde"));
+        assert!(glob("contacts", "contacts"));
+        assert!(!glob("contacts", "contacts2"));
+        assert!(!glob("a*c", "abd"));
+        assert!(!glob("*s", "contact"));
+    }
+}

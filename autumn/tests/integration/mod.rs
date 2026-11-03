@@ -558,6 +558,8 @@ mod stories_browser;
 #[cfg(feature = "system-tests")]
 mod system_test_api;
 #[cfg(feature = "db")]
+mod table_boundaries;
+#[cfg(feature = "db")]
 mod tenancy;
 mod tenancy_unit;
 mod tenant_bulkhead;

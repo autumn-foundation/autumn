@@ -11,6 +11,7 @@ mod aeo;
 mod agents;
 mod alert;
 mod assets;
+mod boundaries;
 mod build;
 mod built_artifact;
 mod cache_audit;
@@ -492,6 +493,45 @@ pub struct GraphArgs {
     release: bool,
 }
 
+/// Arguments for `autumn graph check-boundaries` (issue #3549).
+#[derive(clap::Args, Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI flags, not a state machine
+pub struct CheckBoundariesArgs {
+    /// The file that declares the boundaries.
+    #[arg(long, value_name = "PATH", default_value = "boundaries.toml")]
+    config: String,
+    /// Check this committed graph instead of building the app.
+    #[arg(long, value_name = "PATH")]
+    graph: Option<String>,
+    /// The baseline of known violations. Overrides `baseline` in the config.
+    #[arg(long, value_name = "PATH")]
+    baseline: Option<String>,
+    /// Write the current violations to the baseline and exit 0.
+    #[arg(long)]
+    update_baseline: bool,
+    /// Print the result as JSON.
+    #[arg(long)]
+    json: bool,
+    /// Package to inspect (for workspaces).
+    #[arg(short, long)]
+    package: Option<String>,
+    /// Binary target to inspect (for packages with multiple bin targets).
+    #[arg(long, value_name = "BIN")]
+    bin: Option<String>,
+    /// Cargo features to build the inspected binary with (repeatable).
+    #[arg(long, value_name = "FEATURES")]
+    features: Vec<String>,
+    /// Build the inspected binary with all Cargo features enabled.
+    #[arg(long)]
+    all_features: bool,
+    /// Build the inspected binary without default Cargo features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Inspect the release binary rather than the debug one.
+    #[arg(long)]
+    release: bool,
+}
+
 /// Subcommands for `autumn graph`.
 #[derive(Subcommand, Clone, Debug, PartialEq, Eq)]
 pub enum GraphSubcommands {
@@ -511,6 +551,8 @@ pub enum GraphSubcommands {
         #[command(flatten)]
         args: GraphArgs,
     },
+    /// Fail when code in one boundary reaches a table another boundary owns.
+    CheckBoundaries(CheckBoundariesArgs),
 }
 
 /// Arguments for `autumn openapi export`.
@@ -5979,28 +6021,7 @@ fn run_command(command: Commands) {
                 release: args.release,
             });
         }
-        Commands::Graph(command) => {
-            let (query, args) = match command {
-                GraphSubcommands::Show(args) => (graph::Query::Show, args),
-                GraphSubcommands::Touches { name, args } => (graph::Query::Touches(name), args),
-                GraphSubcommands::Impact { name, args } => (graph::Query::Impact(name), args),
-            };
-            let features = routes::CargoFeatures {
-                features: args.features,
-                all: args.all_features,
-                no_default: args.no_default_features,
-            };
-            graph::run(&graph::GraphOptions {
-                query,
-                package: args.package.as_deref(),
-                bin: args.bin.as_deref(),
-                manifest: args.manifest.as_deref(),
-                json: args.json,
-                check: args.check.as_deref(),
-                features,
-                release: args.release,
-            });
-        }
+        Commands::Graph(command) => run_graph(command),
         Commands::DataFlow(args) => {
             let features = routes::CargoFeatures {
                 features: args.features,
@@ -7693,6 +7714,50 @@ fn run_generate_command(cmd: GenerateCommands, mode: ApplyMode) {
             }
         }
     }
+}
+
+/// Run one `autumn graph` subcommand.
+fn run_graph(command: GraphSubcommands) {
+    let (query, args) = match command {
+        GraphSubcommands::Show(args) => (graph::Query::Show, args),
+        GraphSubcommands::Touches { name, args } => (graph::Query::Touches(name), args),
+        GraphSubcommands::Impact { name, args } => (graph::Query::Impact(name), args),
+        GraphSubcommands::CheckBoundaries(args) => {
+            boundaries::run(&boundaries::CheckBoundariesOptions {
+                config: &args.config,
+                graph: args.graph.as_deref(),
+                baseline: args.baseline.as_deref(),
+                update_baseline: args.update_baseline,
+                json: args.json,
+                build: graph::BuildTarget {
+                    package: args.package.as_deref(),
+                    bin: args.bin.as_deref(),
+                    features: routes::CargoFeatures {
+                        features: args.features,
+                        all: args.all_features,
+                        no_default: args.no_default_features,
+                    },
+                    release: args.release,
+                },
+            });
+            return;
+        }
+    };
+    let features = routes::CargoFeatures {
+        features: args.features,
+        all: args.all_features,
+        no_default: args.no_default_features,
+    };
+    graph::run(&graph::GraphOptions {
+        query,
+        package: args.package.as_deref(),
+        bin: args.bin.as_deref(),
+        manifest: args.manifest.as_deref(),
+        json: args.json,
+        check: args.check.as_deref(),
+        features,
+        release: args.release,
+    });
 }
 
 #[cfg(test)]

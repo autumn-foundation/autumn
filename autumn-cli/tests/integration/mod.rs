@@ -64,6 +64,7 @@ mod seed_model_linking;
 mod serve;
 mod slo_generate;
 mod supply_chain;
+mod table_boundaries_cli;
 mod tauri_mobile_thin_client;
 mod test_command;
 mod upgrade_codemod;
