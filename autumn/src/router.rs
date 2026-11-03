@@ -9427,9 +9427,9 @@ mod tests {
     #[cfg(feature = "maud")]
     #[tokio::test]
     async fn every_listed_story_demo_route_is_mounted() {
-        let routes = crate::stories::demo_routes();
-        assert!(!routes.is_empty(), "the demo route list is empty");
-        for (path, handler) in routes {
+        let demos = crate::stories::demo_routes();
+        assert!(!demos.is_empty(), "the demo route list is empty");
+        for (path, handler) in demos {
             let router = build_router(
                 Vec::new(),
                 &story_gallery_config(),
