@@ -2382,6 +2382,45 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
+    // Issue #3408: the widgets the HTML routes render are in feature-gated
+    // families. The index wraps its list in `bulk_actions_form` and a
+    // state-machine field renders `transition_controls` (`widgets-workflow`).
+    // A searchable index renders `active_search_input` (`widgets-search`). A
+    // project with `default-features = false` needs each family named.
+    let workflow_widgets = bulk_delete_enabled || !sm_field_names.is_empty();
+    let search_widgets = search_enabled && !options_with_key.api;
+    for (feature, needed) in [
+        ("widgets-workflow", workflow_widgets),
+        ("widgets-search", search_widgets),
+    ] {
+        if !needed {
+            continue;
+        }
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, feature);
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // `owner_dir: None`: the markers in `emit::autumn_web_feature_markers`
+        // decide, so another scaffold or hand-written code that renders the
+        // same family keeps it.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: feature.to_owned(),
+            owner_dir: None,
+        });
+    }
+
     // #1236: a scaffold with attachment fields needs autumn-web's `storage` feature — the
     // model's `autumn_web::storage::Blob` column and the blob store — and its `multipart`
     // feature, since the create and update handlers take an
@@ -2673,6 +2712,8 @@ fn plan_scaffold_with_options_impl(
             ("markdown", !rich_text_views, None),
             ("ws", !options_with_key.live, None),
             ("htmx", !htmx_needed, htmx_owner),
+            ("widgets-workflow", !workflow_widgets, None),
+            ("widgets-search", !search_widgets, None),
         ];
         for (feature, unused, owner) in released {
             if unused {
@@ -27616,6 +27657,55 @@ exempt_paths = [
         }
 
         const POST: &[&str] = &["title:String", "body:Text"];
+
+        // ── Widget families (#3408) ─────────────────────────────────────
+
+        /// The index wraps its list in `bulk_actions_form`, which needs
+        /// `widgets-workflow`. An app without default features must get it.
+        #[test]
+        fn an_html_scaffold_enables_widgets_workflow() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let line = autumn_web_line(&tmp);
+            assert!(line.contains("widgets-workflow"), "{line}");
+            assert!(!line.contains("widgets-search"), "{line}");
+        }
+
+        /// A searchable index renders `active_search_input`, which needs
+        /// `widgets-search`.
+        #[test]
+        fn a_searchable_scaffold_enables_widgets_search() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            assert!(
+                autumn_web_line(&tmp).contains("widgets-search"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn dropping_searchable_releases_widgets_search() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let line = autumn_web_line(&tmp);
+            assert!(!line.contains("widgets-search"), "{line}");
+            assert!(line.contains("widgets-workflow"), "{line}");
+        }
+
+        /// An `--api` scaffold renders no widget, so it adds no family.
+        #[test]
+        fn an_api_scaffold_enables_no_widget_family() {
+            let tmp = project();
+            let api = ScaffoldOptions {
+                api: true,
+                ..searchable()
+            };
+            run(&tmp, "Post", POST, &api);
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(!cargo.contains("widgets-"), "{cargo}");
+        }
 
         #[test]
         fn dropping_searchable_releases_htmx() {

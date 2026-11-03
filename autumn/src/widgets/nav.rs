@@ -2,7 +2,7 @@
 //! theme toggle, popover and dropdown menu.
 
 #[cfg(feature = "maud")]
-use super::*;
+use super::merge_class;
 
 // ── breadcrumb ────────────────────────────────────────────────────────────
 

@@ -175,6 +175,15 @@ runtime. Without a family, `/static/css/autumn-widgets.css` has no rules for
 its classes. The gallery at `/_stories` shows only the stories of the enabled
 families.
 
+A build without `maud` loses `SearchMethod`, `ActiveSearchConfig`,
+`AutocompleteConfig` and `comment_dom_id`. Before, they compiled without
+`maud`. Now each one needs its family feature, which turns on `maud`.
+`localized_path`, `DEFAULT_TOAST_REGION_ID` and `DEFAULT_TOAST_DURATION`
+still need no feature.
+
+**Automation:** `manual` — the right family depends on which widgets the app
+uses, so no codemod can choose it.
+
 ### {Area}: {Short description}
 
 **Why:** One or two sentences on the motivation.

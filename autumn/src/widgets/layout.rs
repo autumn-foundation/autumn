@@ -1,7 +1,7 @@
 //! Layout and container widgets: card, stat card, hero, tabs,
 //! accordion, collapsible, modal, drawer, separator and button.
 
-use super::*;
+use super::{assert_named, heading, merge_class};
 
 // ── card ──────────────────────────────────────────────────────────────────
 
@@ -1795,6 +1795,7 @@ pub fn separator_with(config: &SeparatorConfig<'_>) -> maud::Markup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widgets::{property_list, selector_to_id};
     use maud::html;
 
     // ── selector_to_id ─────────────────────────────────────────────────

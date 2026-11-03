@@ -161,6 +161,20 @@ pub use social::*;
 #[cfg(feature = "widgets-workflow")]
 pub use workflow::*;
 
+// The toast constants need no `maud`, as before the split: an app without
+// `maud` can still target the region in an OOB swap or an `HX-Trigger`.
+
+/// The default id for the `toast_region` container, and the OOB target
+/// `toast` appends into.
+///
+/// Drop `toast_region(DEFAULT_TOAST_REGION_ID)` once in your base layout;
+/// `toast(msg, variant)` then appends into it out-of-band.
+pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
+
+/// The time a toast shows before it fades out, when you do not set
+/// `ToastConfig::duration`. The stylesheet default (`5s`) must match.
+pub const DEFAULT_TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Strip a leading `#` from a CSS ID selector to get a bare element ID.
 ///
 /// `aria-controls` takes an ID (no `#`), while `hx-target` takes a CSS selector.

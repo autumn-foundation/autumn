@@ -1199,6 +1199,7 @@ fn charts_stories() -> Vec<Story> {
 
 /// Stories for the `widgets-social` family (#3408).
 #[cfg(feature = "widgets-social")]
+#[allow(clippy::too_many_lines)]
 fn social_stories() -> Vec<Story> {
     vec![
         story! {

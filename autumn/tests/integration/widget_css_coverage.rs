@@ -17,6 +17,7 @@ use std::path::Path;
 ///   `autumn-dev-*` classes are self-styled, not part of the shared sheet.
 /// - `src/flash.rs` — uses the `.flash` / `.flash-<level>` convention, not
 ///   `autumn-*`, and is served as its own stylesheet (`FLASH_CSS`).
+///
 /// `src/widgets/` is listed from disk, so it is not named here.
 const WIDGET_SOURCES: &[&str] = &[
     "src/form.rs",
@@ -117,15 +118,43 @@ fn emitted_classes(source: &str) -> Vec<String> {
     classes
 }
 
+/// The family module that `path` is, and whether this build has its
+/// feature on. `None` for a core source.
+fn family_of(path: &str) -> Option<(&'static str, bool)> {
+    let module = path.strip_prefix("src/widgets/")?.strip_suffix(".rs")?;
+    let on = match module {
+        "search" => cfg!(feature = "widgets-search"),
+        "social" => cfg!(feature = "widgets-social"),
+        "workflow" => cfg!(feature = "widgets-workflow"),
+        "charts" => cfg!(feature = "widgets-charts"),
+        _ => return None,
+    };
+    FAMILY_MODULES
+        .iter()
+        .find(|m| **m == module)
+        .map(|m| (*m, on))
+}
+
 #[test]
 fn every_emitted_autumn_class_has_backing_css() {
     let mut missing = Vec::new();
 
     for path in all_widget_sources() {
         let source = read_source(&path);
+        // The served bundle holds a family's CSS only when its feature is
+        // on. For a family that is off, check the core file and its own file,
+        // the bundle it gets when it is on (#3408).
+        let css = match family_of(&path) {
+            Some((module, false)) => format!(
+                "{}{}",
+                autumn_web::ui::WIDGETS_COMPONENT_CSS,
+                read_source(&format!("src/ui/widgets/{module}.css"))
+            ),
+            _ => autumn_web::ui::WIDGETS_COMPONENT_CSS.to_owned(),
+        };
         for class in emitted_classes(&source) {
             let selector = format!(".{class}");
-            if !autumn_web::ui::WIDGETS_COMPONENT_CSS.contains(&selector) {
+            if !css.contains(&selector) {
                 missing.push(format!(
                     "{class} (emitted by {path}, expected `{selector}`)"
                 ));
@@ -257,7 +286,9 @@ fn widgets_css_path_and_selectors_are_stable() {
     for selector in [
         ".autumn-field",
         ".autumn-submit",
+        #[cfg(feature = "widgets-search")]
         ".autumn-search",
+        #[cfg(feature = "widgets-search")]
         ".autumn-autocomplete",
         ".autumn-nav",
         ".autumn-modal",

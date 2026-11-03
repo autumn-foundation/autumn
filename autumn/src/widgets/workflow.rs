@@ -317,7 +317,7 @@ pub fn bulk_select_checkbox(
 /// # Confirming a bulk action
 ///
 /// This widget deliberately emits **no** confirmation prompt. The framework's
-/// answer to `window.confirm()` is [`confirm_action`], whose dialog is
+/// answer to `window.confirm()` is [`confirm_action`](super::confirm_action), whose dialog is
 /// server-rendered and therefore assertable from a
 /// [`TestClient`](crate::test::TestClient) test — but it submits its own
 /// single-action `<form>`, so it cannot carry a bulk form's checkbox

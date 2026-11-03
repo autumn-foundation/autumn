@@ -1270,7 +1270,8 @@ jobs:
         # app can turn defaults off and name only the families it uses, so
         # the script checks all 16 combinations, plus the `#[commentable]`
         # router with and without `widgets-social`. A warning in widget code
-        # fails it too.
+        # fails it too. Then it runs the widget tests and specs with every
+        # family off, the branch the default `test` job never reaches.
         run: ./scripts/check-widget-features.sh
       - name: Run markdown-gated tests (user-content sanitizer)
         if: matrix.lane == 'markdown'

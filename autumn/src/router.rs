@@ -9397,7 +9397,8 @@ mod tests {
     }
 
     /// #2353: an `hx-*` story page loads htmx, and loads it before the
-    /// widget runtime.
+    /// widget runtime. The core "Button" story uses `hx-get`, so this test
+    /// needs no widget family (#3408).
     #[cfg(all(feature = "maud", feature = "htmx"))]
     #[tokio::test]
     async fn story_detail_route_loads_htmx_for_hx_stories() {
@@ -9407,7 +9408,7 @@ mod tests {
             stories_state_with_builtin(),
         );
 
-        let response = get_with_host(router, "/_stories/active-search").await;
+        let response = get_with_host(router, "/_stories/button").await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_text(response).await;
         assert!(body.contains("hx-get"), "story must use htmx: {body}");

@@ -1868,6 +1868,25 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
         // starts with `autumn_web::markdown`. The marker has no trailing `::`,
         // for the same reason as `storage` (issue #2186).
         "markdown" => &["autumn_web::markdown"],
+        // Widget families (issue #3408). A scaffold renders these widgets by
+        // their full path, and hand-written code may import them. Each marker
+        // is a widget fn or config type name of the family.
+        "widgets-search" => &[
+            "active_search",
+            "autocomplete_input",
+            "autocomplete_option",
+            "autocomplete_empty_state",
+            "ActiveSearchConfig",
+            "AutocompleteConfig",
+        ],
+        "widgets-workflow" => &[
+            "bulk_actions_form",
+            "bulk_actions_toolbar",
+            "bulk_select_checkbox",
+            "BulkActionsConfig",
+            "transition_controls",
+            "TransitionLabels",
+        ],
         // A scaffolded CSV export (issue #1315) enables `csv` for the
         // `CsvSchema` impl and `export_csv` call its `export.csv` route emits,
         // but a hand-written route, job or task can use the same module —

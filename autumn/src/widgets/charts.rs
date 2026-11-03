@@ -2,7 +2,7 @@
 //!
 //! Needs the `widgets-charts` feature (on by default).
 
-use super::*;
+use super::merge_class;
 
 // ── charts: sparkline / bar_chart / line_chart (#1231) ──────────────────────
 

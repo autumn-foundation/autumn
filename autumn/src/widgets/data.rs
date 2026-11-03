@@ -1,7 +1,7 @@
 //! Data display widgets: property list, data table, badge, avatar,
 //! avatar group and kbd.
 
-use super::*;
+use super::{assert_named, fnv1a_hash, merge_class};
 
 // ── property_list ─────────────────────────────────────────────────────────
 
@@ -943,6 +943,7 @@ const fn avatar_group_split(len: usize, total: Option<usize>, max: usize) -> (us
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widgets::{MeterConfig, meter_with, progress};
     use proptest::prelude::*;
 
     // ── property_list ──────────────────────────────────────────────────

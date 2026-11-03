@@ -1,7 +1,10 @@
 //! Feedback widgets: alert, error summary, toast, tooltip, spinner,
 //! skeleton, progress, meter, empty state and confirm action.
 
-use super::*;
+use super::{
+    DEFAULT_TOAST_REGION_ID, HeadingLevel, ModalConfig, assert_named, heading, merge_class, modal,
+    modal_close_button, modal_trigger, selector_to_id,
+};
 
 /// Configuration for a [`confirm_action`] confirmation dialog.
 ///
@@ -800,17 +803,6 @@ fn field_fragment(field: &str) -> Option<String> {
 
 // ── toast / toast_region (#1320, #3399) ─────────────────────────────────────
 
-/// The default id for the [`toast_region`] container, and the OOB target
-/// [`toast`] appends into.
-///
-/// Drop `toast_region(DEFAULT_TOAST_REGION_ID)` once in your base layout;
-/// `toast(msg, variant)` then appends into it out-of-band.
-pub const DEFAULT_TOAST_REGION_ID: &str = "toast-region";
-
-/// The time a toast shows before it fades out, when you do not set
-/// `ToastConfig::duration`. The stylesheet default (`5s`) must match.
-pub const DEFAULT_TOAST_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// The default accessible name of the toast close button.
 const DEFAULT_TOAST_CLOSE_LABEL: &str = "Dismiss notification";
 
@@ -922,7 +914,7 @@ impl<'a> ToastConfig<'a> {
     }
 
     /// Show the toast for this time before it fades out. The default is
-    /// [`DEFAULT_TOAST_DURATION`].
+    /// [`DEFAULT_TOAST_DURATION`](super::DEFAULT_TOAST_DURATION).
     ///
     /// The value rounds down to whole milliseconds. A zero duration hides the
     /// toast at once. For no timer, use [`persistent`](Self::persistent).
@@ -964,7 +956,7 @@ impl<'a> ToastConfig<'a> {
 /// `hx-swap-oob="beforeend:#toast-region"` — no full page reload. The widget
 /// emits **no `<script>`**.
 ///
-/// **Timer.** The toast fades out after [`DEFAULT_TOAST_DURATION`] (a CSS
+/// **Timer.** The toast fades out after [`DEFAULT_TOAST_DURATION`](super::DEFAULT_TOAST_DURATION) (a CSS
 /// `@keyframes` animation). Hover or focus on a toast pauses the timer of all
 /// toasts in the region. Hover also works without JS. The runtime removes a
 /// toast from the DOM when its fade ends. Use [`toast_with`] to set the

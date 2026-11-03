@@ -2,7 +2,7 @@
 //!
 //! Needs the `widgets-search` feature (on by default).
 
-use super::*;
+use super::selector_to_id;
 
 /// HTTP method for an [`ActiveSearchConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -557,6 +557,9 @@ pub fn autocomplete_empty_state(message: &str) -> maud::Markup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widgets::{
+        AlertConfig, AlertVariant, CardConfig, alert_with, card, nav_link, stat_card,
+    };
 
     // ── build_trigger ──────────────────────────────────────────────────
 

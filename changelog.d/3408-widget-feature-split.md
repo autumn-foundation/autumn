@@ -14,10 +14,17 @@
 
 - **widgets:** an app without a family does not compile its code, and
   `/static/css/autumn-widgets.css` and `/static/js/autumn-widgets.js` do not
-  include its CSS or script. The core stylesheet is 15% smaller and the core
-  script is 13% smaller.
+  include its CSS or script. With no family, the stylesheet is 14% smaller
+  and the script is 13% smaller.
 
 ### Fixed
 
 - **stories:** the `/_stories/demo/save` route is in the route listing and in
   the OpenAPI/MCP path check. One list now drives the gallery's demo routes.
+
+### Changed
+
+- **generators:** `autumn generate scaffold` adds `widgets-workflow` to
+  `autumn-web`'s features for an HTML resource (bulk actions, state-machine
+  transitions), and `widgets-search` for a searchable one (issue #3408). A
+  regenerate without search releases `widgets-search` again.
