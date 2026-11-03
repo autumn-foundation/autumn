@@ -275,7 +275,7 @@ fn expected_story_slugs() -> Vec<&'static str> {
     slugs.push("wizard-progress");
     // Widget families (#3408).
     #[cfg(feature = "widgets-search")]
-    slugs.extend(["active-search", "autocomplete"]);
+    slugs.extend(["active-search", "autocomplete", "tags-input"]);
     #[cfg(feature = "widgets-social")]
     slugs.extend(["comment-thread", "infinite-feed", "reaction-controls"]);
     #[cfg(feature = "widgets-workflow")]

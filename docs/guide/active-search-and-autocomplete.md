@@ -293,13 +293,17 @@ html! {
 }
 ```
 
-- `autocomplete_input_for` reads `Changeset::field_values("tags")`. It
-  finds each label in `.selected(…)`, then in `.fallback_options(…)`.
-  Else the label is the value.
+- `autocomplete_input_for` reads `Changeset::field_values("tags")`. The
+  changeset is the source of the chips. It finds each label in
+  `.selected(…)`, then in `.fallback_options(…)`. If no label is found,
+  the label is the value. This is correct for tags. It also shows the
+  field errors.
 - `.selected(&[("42", "rust")])` gives the first chips without a
   changeset, for example on an edit form.
-- `.remove_label("Entfernen")` translates the first word of each remove
-  button's `aria-label` (`"Remove rust"`).
+- `.remove_label("{label} entfernen")` translates the `aria-label` of each
+  remove button. `{label}` is the chip label. `.added_message(…)` and
+  `.removed_message(…)` translate the status text that a screen reader
+  speaks.
 
 To let the user create a tag, return a "create" entry after the matches:
 
@@ -314,11 +318,13 @@ html! {
 }
 ```
 
-A pick of the entry adds a chip that shows the value, not the label.
-Validate new values on the server.
+When the user selects this entry, the widget adds a chip. The chip shows
+the value, not the label. Validate new values on the server. Remove
+duplicate values on the server too.
 
-The listbox hides an option that is already a chip. A value is added one
-time only.
+The listbox does not show an option that is already a chip. The widget
+adds a value one time only. With `free_text`, a form submit adds the text
+that is still in the input.
 
 #### Tags keyboard
 
@@ -341,7 +347,17 @@ the input.
 The `<noscript>` fallback is a `<select multiple>`. The selected values
 are `selected`. A value with no fallback option gets its own option, so a
 resubmit keeps it. The server renders the chip list `hidden` and its
-inputs `disabled`, so with JavaScript off no value is sent two times.
+inputs `disabled`. The runtime enables them and disables the `<select>`.
+Thus the form sends each value one time.
+
+Without JavaScript, the user can select only the `.fallback_options`
+values. A new tag needs JavaScript.
+
+If JavaScript is on but `autumn-widgets.js` does not load, no chip
+submits. The field then decodes as an empty `Vec`. On an edit form, do
+not delete the stored tags because of an empty field alone. For example,
+also send a hidden `tags_present=1` input from the runtime-enabled form,
+or keep the edit in a separate request.
 
 ---
 

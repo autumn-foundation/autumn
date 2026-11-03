@@ -857,7 +857,7 @@ mod tests {
     /// `hx-indicator` resolver. It increased them from 44 KiB and 13 KiB.
     /// Issue #3410 added the tags mode of the combobox (chips). It
     /// increased them from 46 KiB and 14 KiB.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 50 * 1024;
+    const WIDGETS_JS_BUDGET_BYTES: usize = 52 * 1024;
     /// Gzip budget. Browsers download this size.
     const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 15 * 1024;
 

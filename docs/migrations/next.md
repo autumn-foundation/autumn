@@ -517,11 +517,12 @@ DatabaseFleetConfig {
 **Automation:** `manual` — a struct literal needs the values the app wants.
 A codemod cannot choose them.
 
-### Widgets: `AutocompleteConfig` has three new fields
+### Widgets: `AutocompleteConfig` has five new fields
 
 **Why:** `autocomplete_input` has a tags mode (issue #3410). `multiple`
-turns it on. `selected` holds the first chips. `remove_label` is the first
-word of each remove button's `aria-label`.
+turns it on. `selected` holds the first chips. `remove_label` is the
+`aria-label` of each remove button. `added_message` and `removed_message`
+are the status texts.
 
 **You are affected only if your code builds an `AutocompleteConfig` with
 a struct literal.** Code that calls `AutocompleteConfig::new` needs no
@@ -550,12 +551,14 @@ AutocompleteConfig {
     initial_value: None,
     multiple: false,
     selected: &[],
-    remove_label: "Remove",
+    remove_label: "Remove {label}",
+    added_message: "{label} added",
+    removed_message: "{label} removed",
 }
 ```
 
-**Automation:** `manual`. Better: use `AutocompleteConfig::new` and the
-builder methods.
+**Automation:** `manual`. Or use `AutocompleteConfig::new` and the
+builder methods. Then you need no change.
 
 ### Config: an unknown `AUTUMN_ROLE` stops the boot
 

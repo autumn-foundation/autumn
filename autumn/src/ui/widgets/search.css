@@ -116,6 +116,11 @@
 
 /* ── Tags mode chips (autumn-chip, #3410) ─────────────────────────────────── */
 
+/* The chips sit between the label and the input. */
+.autumn-autocomplete--multiple {
+    row-gap: var(--space-2);
+}
+
 .autumn-autocomplete__chips {
     display: flex;
     flex-wrap: wrap;
@@ -135,11 +140,21 @@
     display: inline-flex;
     align-items: center;
     gap: var(--space-1);
-    padding: 0 0 0 var(--space-2);
+    max-width: 100%;
+    padding-block: 0;
+    padding-inline: var(--space-2) 0;
+    /* Forced-colors mode removes the background. The border stays. */
+    border: 1px solid transparent;
     border-radius: var(--radius-full);
     font-size: var(--font-size-sm);
     background-color: var(--primary-light);
     color: var(--primary);
+}
+
+/* A long label wraps, so it does not push the page wider. */
+.autumn-chip__label {
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 /* 24 px is the WCAG 2.2 minimum target size. */

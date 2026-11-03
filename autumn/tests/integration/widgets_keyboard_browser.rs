@@ -112,6 +112,8 @@ fn page_body() -> Markup {
             "Swap outer"
         }
         div id="slot-outer" {}
+        button id="swap-tags" hx-get="/fragment-tags" hx-target="#slot-tags" { "Swap tags" }
+        div id="slot-tags" {}
         a id="jump" href="#t-billing" { "Go to billing" }
         button id="swap-inner" hx-get="/fragment-inner" hx-target="#t" hx-swap="innerHTML" {
             "Swap inner"
@@ -164,6 +166,22 @@ async fn fragment_inner() -> Markup {
 #[get("/fragment-outer")]
 async fn fragment_outer() -> Markup {
     settings_tabs("o")
+}
+
+/// A tags form for an htmx swap. htmx parses it with scripts off, so its
+/// `<noscript>` select is live markup.
+#[get("/fragment-tags")]
+async fn fragment_tags() -> Markup {
+    let tags = AutocompleteConfig::new("/colors", "color_ids")
+        .multiple()
+        .fallback_options(COLORS)
+        .selected(&[("2", "Grey")]);
+    html! {
+        form id="swapped" action="/submitted-multi" method="get" {
+            (autocomplete_input("swapped-tags", "Swapped colors", &tags))
+            button id="swapped-save" type="submit" { "Save swapped" }
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -237,6 +255,7 @@ async fn runner() -> SystemTestRunner {
                 fragment_inner,
                 fragment_outer,
                 fragment_same,
+                fragment_tags,
                 colors,
                 colors_create,
                 submitted,
@@ -934,13 +953,18 @@ async fn tags_hide_an_option_that_is_already_a_chip() {
     );
 
     // Blue is the only match and a chip: the popup has nothing to show.
+    // The runtime removes the option, so the empty listbox has no size.
     page.fill("#tags-query", "b").await.expect("fill");
-    wait_for(
-        &page,
-        "document.querySelector('#tags-options [data-value=\"4\"]') !== null",
-    )
-    .await;
     assert_eq!(attr(&page, "tags-query", "aria-expanded").await, "false");
+    assert!(
+        eval_bool(
+            &page,
+            "document.getElementById('tags-options').childElementCount === 0 \
+             && document.getElementById('tags-options').getBoundingClientRect().height === 0"
+        )
+        .await,
+        "no empty box"
+    );
 }
 
 #[tokio::test]
@@ -1130,6 +1154,68 @@ async fn tags_submit_as_repeated_keys() {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
+async fn tags_free_text_submit_adds_the_typed_text() {
+    // Text that the user typed but did not add with Enter is not lost.
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    page.fill("#words-query", "teal").await.expect("fill");
+    page.click("#multi-save").await.expect("submit");
+    wait_for(&page, "location.pathname === '/submitted-multi'").await;
+    assert_eq!(
+        eval_string(&page, "document.body.textContent.trim()").await,
+        r#"color_ids=["4"] words=["teal"]"#
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_status_region_says_what_was_added_and_removed() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    let status = "document.querySelector('#tags-wrapper [data-ac-status]').textContent";
+    pick(&page, "tags", "g", "Green").await;
+    assert_eq!(eval_string(&page, status).await, "Green added");
+    press(&page, "Backspace").await;
+    assert_eq!(eval_string(&page, status).await, "Green removed");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn tags_swapped_in_by_htmx_send_each_value_once() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/").await;
+    page.click("#swap-tags").await.expect("swap");
+    wait_for(
+        &page,
+        "document.getElementById('swapped-tags-chips') !== null",
+    )
+    .await;
+    wait_for(
+        &page,
+        "document.getElementById('swapped-tags-chips').hidden === false",
+    )
+    .await;
+    assert!(
+        eval_bool(
+            &page,
+            "[...document.querySelectorAll('#swapped select')].every(s => s.disabled)"
+        )
+        .await,
+        "the runtime disables a live noscript select"
+    );
+    page.click("#swapped-save").await.expect("submit");
+    wait_for(&page, "location.pathname === '/submitted-multi'").await;
+    assert_eq!(
+        eval_string(&page, "document.body.textContent.trim()").await,
+        r#"color_ids=["2"] words=[]"#
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
 async fn rtl_tags_swap_left_and_right() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");
@@ -1306,7 +1392,7 @@ async fn every_fallback_works_with_javascript_disabled() {
     );
 
     // Tags (#3410): a `<select multiple>` holds the server pick. The chip
-    // list is hidden and its inputs do not submit, so no value comes twice.
+    // list is hidden and its inputs do not submit, so the form sends each value one time.
     assert!(
         eval_bool(
             &page,

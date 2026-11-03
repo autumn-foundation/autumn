@@ -1150,25 +1150,33 @@ fn search_stories() -> Vec<Story> {
             "Forms",
             "Tags input",
             {
+                use autumn_web::form::Changeset;
                 use autumn_web::widgets::{
-                    AutocompleteConfig, autocomplete_create_option, autocomplete_input,
+                    AutocompleteConfig, autocomplete_create_option, autocomplete_input_for,
                     autocomplete_option,
                 };
 
                 // Tags mode (#3410). Each chip submits one `tags=…` input.
                 // See `stories::demo_tag_suggest` for the handler.
+                #[derive(serde::Serialize)]
+                struct PostForm {
+                    tags: Vec<String>,
+                }
+                // On a 422 re-render, this is the submitted form.
+                let changeset = Changeset::new(PostForm {
+                    tags: vec!["rust".to_owned()],
+                });
                 let config = AutocompleteConfig::new("/_stories/demo/tags/suggest", "tags")
                     .multiple()
                     .free_text()
-                    .placeholder("Add a tag…")
-                    .selected(&[("rust", "rust")]);
+                    .placeholder("Add a tag…");
                 maud::html! {
                     @if cfg!(feature = "htmx") {
                         p { em { "Try it. Type, then press Enter. Backspace removes the last tag." } }
                     } @else {
                         p { em { "This box is live only with the htmx feature." } }
                     }
-                    (autocomplete_input("tag-list", "Tags", &config))
+                    (autocomplete_input_for(&changeset, "tag-list", "Tags", &config))
                     p { em { "For reference, not live: what your handler returns." } }
                     div role="listbox" aria-label="Example tag options" {
                         (autocomplete_option("web", "web"))

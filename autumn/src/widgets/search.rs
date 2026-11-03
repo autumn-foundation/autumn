@@ -140,7 +140,8 @@ pub struct AutocompleteConfig<'a> {
     /// Query parameter name sent to the handler and used as the visible input's
     /// `name` (default: `"q"`).
     pub query_param: &'a str,
-    /// `name` attribute for the hidden input storing the selected record ID.
+    /// `name` attribute of the hidden input that holds the selected value.
+    /// In multiple mode, each chip's hidden input has this name.
     pub value_name: &'a str,
     /// Optional placeholder text for the visible input.
     pub placeholder: Option<&'a str>,
@@ -153,12 +154,16 @@ pub struct AutocompleteConfig<'a> {
     /// itself (e.g. `name="tag"` with `autocomplete_option(tag, tag)`). Leave
     /// `false` (the default) for ID-based lookups where the hidden field should
     /// only carry a value selected from the option list.
+    ///
+    /// In multiple mode, Enter adds the typed text as a chip when no option
+    /// is active. A form submit also adds the typed text as a chip.
     pub free_text: bool,
     /// Pre-fill the widget from a previous submission (e.g. re-rendering a
     /// form after a validation error), so free-text input the user already
     /// typed isn't silently dropped. Seeds both the visible query input's
     /// `value` and the hidden field's `value`. Leave unset (the default) for a
-    /// blank widget.
+    /// blank widget. Multiple mode does not use it. Use
+    /// [`selected`](Self::selected) there.
     pub initial_value: Option<&'a str>,
     /// Multi-value (tags) mode (issue #3410). Each pick is a removable
     /// chip. Each chip submits one hidden `{value_name}={value}` input, so a
@@ -166,10 +171,18 @@ pub struct AutocompleteConfig<'a> {
     pub multiple: bool,
     /// The `(value, label)` chips that show first in multiple mode, for
     /// example from the database on an edit form. Default: none.
+    ///
+    /// [`autocomplete_input_for`] uses these pairs only to find labels.
     pub selected: &'a [(&'a str, &'a str)],
-    /// The first word of the `aria-label` of each chip's remove button. The
-    /// chip label comes after it: `"Remove rust"`. Default: `"Remove"`.
+    /// The `aria-label` of each chip's remove button. `{label}` is replaced
+    /// by the chip label. Default: `"Remove {label}"`.
     pub remove_label: &'a str,
+    /// The status text after a chip is added. `{label}` is replaced by the
+    /// chip label. Default: `"{label} added"`.
+    pub added_message: &'a str,
+    /// The status text after a chip is removed. `{label}` is replaced by the
+    /// chip label. Default: `"{label} removed"`.
+    pub removed_message: &'a str,
 }
 
 impl<'a> AutocompleteConfig<'a> {
@@ -192,7 +205,9 @@ impl<'a> AutocompleteConfig<'a> {
             initial_value: None,
             multiple: false,
             selected: &[],
-            remove_label: "Remove",
+            remove_label: "Remove {label}",
+            added_message: "{label} added",
+            removed_message: "{label} removed",
         }
     }
 
@@ -270,21 +285,39 @@ impl<'a> AutocompleteConfig<'a> {
         self
     }
 
-    /// Show these `(value, label)` chips first (multiple mode only).
+    /// Show these `(value, label)` chips first (multiple mode).
     ///
     /// To pre-fill from a [`Changeset`](crate::form::Changeset), use
-    /// [`autocomplete_input_for`].
+    /// [`autocomplete_input_for`]. It uses these pairs to find labels, in
+    /// both modes.
     #[must_use]
     pub const fn selected(mut self, chips: &'a [(&'a str, &'a str)]) -> Self {
         self.selected = chips;
         self
     }
 
-    /// Set the first word of each remove button's `aria-label` (default:
-    /// `"Remove"`). Use it to translate the widget.
+    /// Set the `aria-label` of each remove button (default:
+    /// `"Remove {label}"`). `{label}` is replaced by the chip label. Use it
+    /// to translate the widget, for example `"{label} を削除"`.
     #[must_use]
-    pub const fn remove_label(mut self, text: &'a str) -> Self {
-        self.remove_label = text;
+    pub const fn remove_label(mut self, template: &'a str) -> Self {
+        self.remove_label = template;
+        self
+    }
+
+    /// Set the status text after a chip is added (default:
+    /// `"{label} added"`). A screen reader speaks it.
+    #[must_use]
+    pub const fn added_message(mut self, template: &'a str) -> Self {
+        self.added_message = template;
+        self
+    }
+
+    /// Set the status text after a chip is removed (default:
+    /// `"{label} removed"`). A screen reader speaks it.
+    #[must_use]
+    pub const fn removed_message(mut self, template: &'a str) -> Self {
+        self.removed_message = template;
         self
     }
 }
@@ -300,6 +333,15 @@ fn build_trigger(debounce_ms: u32, initial_load: bool) -> String {
         trigger.push_str(", load");
     }
     trigger
+}
+
+/// The `hx-trigger` of a tags-mode input: `input delay:{n}ms`.
+///
+/// It has no `changed` modifier. The runtime clears the input after each
+/// pick, and the clear fires no `input` event. With `changed`, htmx then
+/// keeps the old query, and the same query again sends no request.
+fn build_tags_trigger(debounce_ms: u32) -> String {
+    format!("input delay:{debounce_ms}ms")
 }
 
 /// Render a labeled `<input type="search">` with htmx active-search attributes.
@@ -468,17 +510,20 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 /// button. Each chip holds one hidden `{value_name}={value}` input, so a
 /// `#[serde(default)] Vec<T>` field gets every value. The single hidden
 /// input is not rendered. The `<noscript>` fallback is a `<select multiple>`.
+/// The widget skips an empty value and a value that is already a chip.
 ///
 /// The server renders the chip list `hidden` and the chip inputs
-/// `disabled`. The runtime shows and enables them. Thus with JS off, only
-/// the `<select>` submits, and no value comes two times.
+/// `disabled`. The runtime shows and enables them, and disables the
+/// `<noscript>` select. Thus only one of them submits, and the form sends
+/// each value one time.
 ///
 /// Keys (with `autumn-widgets.js`): Enter adds the active option.
 /// Backspace in an empty input removes the last chip. ArrowLeft at the
-/// start of the input moves to the chips (ArrowRight in RTL). In the chip
-/// list, the arrow keys, Home and End move. Delete, Backspace, Enter or
-/// Space removes the chip. ArrowRight on the last chip moves back to the
-/// input. The chip list is one tab stop.
+/// start of the input moves the focus to the last chip (ArrowRight in RTL).
+/// In the chip list, the arrow keys, Home and End move the focus. Delete,
+/// Backspace, Enter or Space removes the chip. ArrowRight on the last chip
+/// moves the focus to the input. The chip list is one tab stop. A status
+/// region tells a screen reader which chip was added or removed.
 ///
 /// Use [`autocomplete_option`] and [`autocomplete_empty_state`] to render
 /// option partials returned by your handler. Use
@@ -507,20 +552,30 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
         },
         value,
         chips: config.selected,
+        errors: &[],
     };
     render_autocomplete(id, label, config, &seed)
 }
 
 /// Render an [`autocomplete_input`] that is pre-filled from `changeset`.
 ///
-/// The field is [`AutocompleteConfig::value_name`]. In multiple mode, each
-/// [`Changeset::field_values`](crate::form::Changeset::field_values) entry
-/// is a chip. Else [`Changeset::field_value`](crate::form::Changeset::field_value)
-/// fills the hidden input. A missing field falls back to the config.
+/// The field is [`AutocompleteConfig::value_name`]. The changeset is the
+/// source of the values. Thus a user who removes every chip gets no chips
+/// after a 422.
+///
+/// - In multiple mode, each
+///   [`Changeset::field_values`](crate::form::Changeset::field_values)
+///   entry is a chip.
+/// - In single mode,
+///   [`Changeset::field_value`](crate::form::Changeset::field_value) fills
+///   the hidden input. The visible input shows its label.
 ///
 /// The label of a value comes from [`AutocompleteConfig::selected`], then
-/// from [`AutocompleteConfig::fallback_options`]. Else the label is the
-/// value, which is correct for tags.
+/// from [`AutocompleteConfig::fallback_options`]. If no label is found, the
+/// label is the value. This is correct for tags.
+///
+/// The field errors show below the input, as in the form helpers. The
+/// input gets `aria-invalid` and `aria-describedby`.
 ///
 /// # Example
 ///
@@ -540,11 +595,9 @@ pub fn autocomplete_input_for<T: serde::Serialize>(
     label: &str,
     config: &AutocompleteConfig<'_>,
 ) -> maud::Markup {
+    let errors = changeset.errors_for(config.value_name);
     if config.multiple {
         let values = changeset.field_values(config.value_name);
-        if values.is_empty() {
-            return autocomplete_input(id, label, config);
-        }
         let chips: Vec<(&str, &str)> = values
             .iter()
             .map(|value| (value.as_str(), label_of(config, value)))
@@ -553,16 +606,16 @@ pub fn autocomplete_input_for<T: serde::Serialize>(
             query: "",
             value: None,
             chips: &chips,
+            errors,
         };
         return render_autocomplete(id, label, config, &seed);
     }
-    let Some(value) = changeset.field_value(config.value_name) else {
-        return autocomplete_input(id, label, config);
-    };
+    let value = changeset.field_value(config.value_name);
     let seed = Seed {
-        query: label_of(config, &value),
-        value: Some(&value),
+        query: value.as_deref().map_or("", |v| label_of(config, v)),
+        value: value.as_deref(),
         chips: &[],
+        errors,
     };
     render_autocomplete(id, label, config, &seed)
 }
@@ -586,8 +639,25 @@ struct Seed<'s> {
     value: Option<&'s str>,
     /// `(value, label)` chips (multiple mode).
     chips: &'s [(&'s str, &'s str)],
+    /// Field errors from a changeset.
+    errors: &'s [String],
 }
 
+/// `chips` with no empty value and no value two times. The first wins.
+fn unique_chips<'c>(chips: &[(&'c str, &'c str)]) -> Vec<(&'c str, &'c str)> {
+    let mut out: Vec<(&str, &str)> = Vec::with_capacity(chips.len());
+    for &(value, label) in chips {
+        if !value.is_empty() && !out.iter().any(|(v, _)| *v == value) {
+            out.push((value, label));
+        }
+    }
+    out
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one maud template for both modes; the parts share ids"
+)]
 fn render_autocomplete(
     id: &str,
     label: &str,
@@ -595,13 +665,20 @@ fn render_autocomplete(
     seed: &Seed<'_>,
 ) -> maud::Markup {
     let query_id = format!("{id}-query");
-    let label_id = format!("{id}-label");
     let options_id = format!("{id}-options");
-    let trigger = build_trigger(config.debounce_ms, false);
-    let target = format!("#{options_id}");
+    let error_id = format!("{id}-error");
     let multiple = config.multiple;
+    let trigger = if multiple {
+        build_tags_trigger(config.debounce_ms)
+    } else {
+        build_trigger(config.debounce_ms, false)
+    };
+    let target = format!("#{options_id}");
+    let label_id = multiple.then(|| format!("{id}-label"));
     let value_id = (!multiple).then(|| format!("{id}-value"));
     let fallback = config.fallback_options.unwrap_or(&[]);
+    let chips = unique_chips(seed.chips);
+    let invalid = !seed.errors.is_empty();
     let class = if multiple {
         "autumn-autocomplete autumn-autocomplete--multiple"
     } else {
@@ -613,14 +690,16 @@ fn render_autocomplete(
     //  data-ac-value-id     — id of the single hidden input (single mode)
     //  data-ac-multiple     — tags mode: chips, one hidden input each
     //  data-ac-value-name   — form field name of the hidden input(s)
-    //  data-ac-remove-label — first word of a remove button's aria-label
+    //  data-ac-remove-label — aria-label of a remove button; `{label}` is the chip
+    //  data-ac-added / data-ac-removed — status text; `{label}` is the chip
     //  data-ac-free-text    — typed text is a value (see free_text())
     //  data-ac-query        — marks the visible search input
     //  data-ac-min-length   — minimum characters before htmx fires a request
     //
     // With JS off, only the <noscript><select> submits. The single hidden
     // input has no name, and the chip inputs are disabled, until the
-    // runtime runs.
+    // runtime runs. The runtime then disables the <select>: htmx parses a
+    // swap with scripts off, so a swapped-in <noscript> is live markup.
 
     maud::html! {
         div
@@ -630,9 +709,11 @@ fn render_autocomplete(
             data-ac-multiple[multiple]
             data-ac-value-name=(config.value_name)
             data-ac-remove-label=[multiple.then_some(config.remove_label)]
+            data-ac-added=[multiple.then_some(config.added_message)]
+            data-ac-removed=[multiple.then_some(config.removed_message)]
             data-ac-free-text[config.free_text] {
-            label id=(label_id) for=(query_id) class="autumn-autocomplete__label" { (label) }
-            @if multiple {
+            label id=[label_id.as_deref()] for=(query_id) class="autumn-autocomplete__label" { (label) }
+            @if let Some(label_id) = &label_id {
                 ul
                     id=(format!("{id}-chips"))
                     class="autumn-autocomplete__chips"
@@ -642,11 +723,12 @@ fn render_autocomplete(
                     data-autumn-orientation="horizontal"
                     data-autumn-wrap="false"
                     hidden {
-                    @for (value, text) in seed.chips {
+                    @for (value, text) in &chips {
                         (chip(config, value, text, true))
                     }
                 }
                 template data-ac-chip-template { (chip(config, "", "", false)) }
+                span class="autumn-visually-hidden" role="status" data-ac-status {}
             }
             input
                 type="search"
@@ -657,6 +739,8 @@ fn render_autocomplete(
                 aria-expanded="false"
                 aria-autocomplete="list"
                 aria-controls=(options_id)
+                aria-invalid=[invalid.then_some("true")]
+                aria-describedby=[invalid.then_some(error_id.as_str())]
                 value=(seed.query)
                 placeholder=[config.placeholder]
                 class="autumn-autocomplete__input"
@@ -678,14 +762,21 @@ fn render_autocomplete(
                 data-autumn-activedescendant
                 data-autumn-orientation="vertical"
                 data-autumn-dismiss {}
+            @if invalid {
+                div id=(error_id) role="alert" class="autumn-field__errors" {
+                    @for error in seed.errors {
+                        p class="autumn-field__error" { (error) }
+                    }
+                }
+            }
             noscript {
                 @if multiple {
                     select name=(config.value_name) aria-label=(label) multiple {
                         @for (val, lbl) in fallback {
-                            option value=(val) selected[seed.chips.iter().any(|(v, _)| v == val)] { (lbl) }
+                            option value=(val) selected[chips.iter().any(|(v, _)| v == val)] { (lbl) }
                         }
                         // A chip with no fallback option (a new tag) keeps its value.
-                        @for (val, lbl) in seed.chips {
+                        @for (val, lbl) in &chips {
                             @if !fallback.iter().any(|(v, _)| v == val) {
                                 option value=(val) selected { (lbl) }
                             }
@@ -707,13 +798,10 @@ fn render_autocomplete(
 /// One chip: its label, its hidden input and its remove button.
 ///
 /// A server chip's input is `disabled` until the runtime runs. A template
-/// chip is a clone source, so its input is live.
+/// chip is a clone source, so its input is live. The runtime sets its
+/// label and `aria-label`.
 fn chip(config: &AutocompleteConfig<'_>, value: &str, label: &str, server: bool) -> maud::Markup {
-    let remove = if label.is_empty() {
-        config.remove_label.to_owned()
-    } else {
-        format!("{} {label}", config.remove_label)
-    };
+    let remove = config.remove_label.replace("{label}", label);
     maud::html! {
         li class="autumn-chip" data-ac-chip {
             span class="autumn-chip__label" data-ac-chip-label { (label) }
@@ -722,7 +810,7 @@ fn chip(config: &AutocompleteConfig<'_>, value: &str, label: &str, server: bool)
                 type="button"
                 class="autumn-chip__remove"
                 tabindex="-1"
-                aria-label=(remove)
+                aria-label=(remove.trim())
                 data-ac-chip-remove {
                 span aria-hidden="true" { "×" }
             }
@@ -1423,7 +1511,7 @@ mod tests {
     /// The `<li>` chips of the chip list. The `<template>` is not a chip.
     fn chips(html: &str) -> Vec<&str> {
         let list = html
-            .split(r#"data-ac-chips"#)
+            .split("data-ac-chips")
             .nth(1)
             .and_then(|rest| rest.split("</ul>").next())
             .expect("chip list");
@@ -1437,7 +1525,9 @@ mod tests {
         let c = AutocompleteConfig::new("/ac", "tags");
         assert!(!c.multiple);
         assert!(c.selected.is_empty());
-        assert_eq!(c.remove_label, "Remove");
+        assert_eq!(c.remove_label, "Remove {label}");
+        assert_eq!(c.added_message, "{label} added");
+        assert_eq!(c.removed_message, "{label} removed");
     }
 
     #[test]
@@ -1448,6 +1538,10 @@ mod tests {
         assert!(!html.contains("data-ac-chips"), "{html}");
         assert!(!html.contains("<template"), "{html}");
         assert!(!html.contains("multiple"), "{html}");
+        // Single-mode markup is unchanged: no label id, no status region.
+        assert!(html.contains(r#"<label for="x-query""#), "{html}");
+        assert!(!html.contains("data-ac-status"), "{html}");
+        assert!(html.contains("input changed delay:"), "{html}");
     }
 
     #[test]
@@ -1461,7 +1555,15 @@ mod tests {
             "{wrapper}"
         );
         assert!(
-            wrapper.contains(r#"data-ac-remove-label="Remove""#),
+            wrapper.contains(r#"data-ac-remove-label="Remove {label}""#),
+            "{wrapper}"
+        );
+        assert!(
+            wrapper.contains(r#"data-ac-added="{label} added""#),
+            "{wrapper}"
+        );
+        assert!(
+            wrapper.contains(r#"data-ac-removed="{label} removed""#),
             "{wrapper}"
         );
         // The single-value hidden field is not rendered.
@@ -1518,7 +1620,7 @@ mod tests {
             let input = tag_with(chip, r#"type="hidden""#);
             assert!(input.contains(r#"name="tags""#), "{input}");
             assert!(input.contains(&format!(r#"value="{value}""#)), "{input}");
-            // With JS off the <noscript> select submits. Not both.
+            // With JS off, only the <noscript> select submits.
             assert!(input.contains("disabled"), "{input}");
             assert_eq!(chip.matches(r#"type="hidden""#).count(), 1, "{chip}");
         }
@@ -1529,13 +1631,14 @@ mod tests {
         let config = AutocompleteConfig::new("/ac", "tags")
             .multiple()
             .selected(PICKED)
-            .remove_label("Delete");
+            .remove_label("{label} löschen");
         let html = autocomplete_input("x", "Tags", &config).into_string();
         let chip = chips(&html)[0];
         let button = tag_with(chip, "data-ac-chip-remove");
         assert!(button.starts_with("<button"), "{button}");
         assert!(button.contains(r#"type="button""#), "{button}");
-        assert!(button.contains(r#"aria-label="Delete rust""#), "{button}");
+        // The template puts the label where the language needs it.
+        assert!(button.contains(r#"aria-label="rust löschen""#), "{button}");
         assert!(button.contains(r#"tabindex="-1""#), "{button}");
         assert!(chip.contains(r#"aria-hidden="true""#), "{chip}");
     }
@@ -1631,6 +1734,39 @@ mod tests {
         assert!(input.contains(r#"aria-controls="x-options""#), "{input}");
         assert!(input.contains(r#"value="""#), "{input}");
         assert!(html.contains(r##"hx-target="#x-options""##), "{html}");
+        // The runtime clears the input with no `input` event after a pick.
+        // With `changed`, the same query again would send no request.
+        assert!(
+            input.contains(r#"hx-trigger="input delay:300ms""#),
+            "{input}"
+        );
+    }
+
+    #[test]
+    fn multiple_has_a_status_region_for_added_and_removed_chips() {
+        let config = AutocompleteConfig::new("/ac", "tags").multiple();
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        let status = tag_with(&html, "data-ac-status");
+        assert!(status.contains(r#"role="status""#), "{status}");
+        assert!(status.contains("autumn-visually-hidden"), "{status}");
+    }
+
+    #[test]
+    fn multiple_skips_empty_and_duplicate_values() {
+        let pairs: &[(&str, &str)] = &[("rust", "rust"), ("", "blank"), ("rust", "again")];
+        let config = AutocompleteConfig::new("/ac", "tags")
+            .multiple()
+            .selected(pairs);
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        let chips = chips(&html);
+        assert_eq!(chips.len(), 1, "{html}");
+        assert!(chips[0].contains(">rust<"), "{}", chips[0]);
+        assert_eq!(
+            html.matches(r#"<option value="rust" selected>"#).count(),
+            1,
+            "{html}"
+        );
+        assert!(!html.contains("blank"), "{html}");
     }
 
     // ── autocomplete_input_for (#3410) ─────────────────────────────────
@@ -1688,6 +1824,63 @@ mod tests {
         assert_eq!(chips.len(), 2, "{html}");
         assert!(chips[0].contains(">13<"), "{}", chips[0]);
         assert!(chips[1].contains(">rust<"), "{}", chips[1]);
+    }
+
+    #[test]
+    fn input_for_an_empty_vec_ignores_the_selected_pairs() {
+        // The user removed every chip, then the form came back with a 422.
+        // The old chips must not come back.
+        let empty = crate::form::Changeset::new(Post {
+            tags: Vec::new(),
+            tag_ids: Vec::new(),
+            category_id: None,
+        });
+        let config = AutocompleteConfig::new("/ac", "tags")
+            .multiple()
+            .selected(&[("rust", "rust")]);
+        let html = autocomplete_input_for(&empty, "x", "Tags", &config).into_string();
+        assert!(chips(&html).is_empty(), "{html}");
+    }
+
+    #[test]
+    fn input_for_shows_the_field_errors() {
+        let mut errors = std::collections::HashMap::new();
+        errors.insert("tags".to_owned(), vec!["Add a tag.".to_owned()]);
+        let changeset = crate::form::Changeset::from_errors(
+            Post {
+                tags: Vec::new(),
+                tag_ids: Vec::new(),
+                category_id: None,
+            },
+            errors,
+        );
+        let config = AutocompleteConfig::new("/ac", "tags").multiple();
+        let html = autocomplete_input_for(&changeset, "x", "Tags", &config).into_string();
+        let input = tag_with(&html, r#"id="x-query""#);
+        assert!(input.contains(r#"aria-invalid="true""#), "{input}");
+        assert!(input.contains(r#"aria-describedby="x-error""#), "{input}");
+        let alert = tag_with(&html, r#"id="x-error""#);
+        assert!(alert.contains(r#"role="alert""#), "{alert}");
+        assert!(
+            html.contains(r#"<p class="autumn-field__error">Add a tag.</p>"#),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn input_for_a_valid_field_has_no_error_markup() {
+        let config = AutocompleteConfig::new("/ac", "tags").multiple();
+        let html = autocomplete_input_for(&post(), "x", "Tags", &config).into_string();
+        assert!(!html.contains("aria-invalid"), "{html}");
+        assert!(!html.contains("x-error"), "{html}");
+    }
+
+    #[test]
+    fn input_for_single_mode_with_no_value_is_blank() {
+        let config = AutocompleteConfig::new("/ac", "missing").initial_value("old");
+        let html = autocomplete_input_for(&post(), "x", "Category", &config).into_string();
+        let hidden = tag_with(&html, r#"type="hidden" id="x-value""#);
+        assert!(hidden.contains(r#"value="""#), "{hidden}");
     }
 
     #[test]

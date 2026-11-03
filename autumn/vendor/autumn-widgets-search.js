@@ -52,17 +52,26 @@
     return opt.dataset.label || opt.textContent.trim();
   }
 
+  // A key that this code must not use. An IME composition owns its keys
+  // (Safari sends keyCode 229 with isComposing false).
   function modifier(e) {
-    return e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.isComposing;
+    return e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey ||
+      e.isComposing || e.keyCode === 229;
   }
 
-  // Tags mode: the chip list. `changed` runs after a chip goes, so the
-  // listbox shows its option again.
-  function initChips(wrapper, queryInput, valueName, changed) {
+  // Put `label` in a server text. Its `{label}` marks the place.
+  function fill(text, label) {
+    return text.split('{label}').join(label).trim();
+  }
+
+  // Tags mode: the chip list.
+  function initChips(wrapper, queryInput, valueName) {
     var list = wrapper.querySelector('[data-ac-chips]');
     var tpl = wrapper.querySelector('template[data-ac-chip-template]');
-    if (!list || !tpl) return null;
-    var removeLabel = wrapper.dataset.acRemoveLabel || 'Remove';
+    var status = wrapper.querySelector('[data-ac-status]');
+    if (!list || !tpl || !tpl.content.firstElementChild) return null;
+    var d = wrapper.dataset;
+    function say(text, label) { if (status) status.textContent = fill(text, label); }
 
     function chips() {
       return Array.prototype.slice.call(list.querySelectorAll('[data-ac-chip]'));
@@ -95,9 +104,10 @@
       var input = chip.querySelector('input');
       input.name = valueName;
       input.value = value;
-      button(chip).setAttribute('aria-label', removeLabel + ' ' + label);
+      button(chip).setAttribute('aria-label', fill(d.acRemoveLabel || 'Remove {label}', label));
       list.appendChild(chip);
       rove();
+      say(d.acAdded || '{label} added', label);
     }
 
     // A key press moves focus to the next chip, else the previous chip,
@@ -106,10 +116,11 @@
       var all = chips();
       var i = all.indexOf(chip);
       var next = byKey && (all[i + 1] || all[i - 1]);
+      var label = chip.querySelector('[data-ac-chip-label]').textContent;
       chip.remove();
       rove();
       (next ? button(next) : queryInput).focus();
-      changed();
+      say(d.acRemoved || '{label} removed', label);
     }
 
     queryInput.addEventListener('keydown', function (e) {
@@ -117,7 +128,8 @@
       var all = chips();
       var start = queryInput.selectionStart === 0 && queryInput.selectionEnd === 0;
       if (!all.length || !start) return;
-      if (e.key === 'Backspace' && !queryInput.value) {
+      // A held key repeats. Only a new press removes a chip.
+      if (e.key === 'Backspace' && !queryInput.value && !e.repeat) {
         e.preventDefault();
         remove(all[all.length - 1], false);
       } else if (e.key === key(true)) {
@@ -157,9 +169,12 @@
     var freeText = 'acFreeText' in wrapper.dataset;
     var listbox = wrapper.querySelector('[role="listbox"]');
     if (!queryInput || !valueName || !listbox) return;
-    var tags = 'acMultiple' in wrapper.dataset &&
-      initChips(wrapper, queryInput, valueName, function () { sync(); });
+    var tags = 'acMultiple' in wrapper.dataset && initChips(wrapper, queryInput, valueName);
     if (!tags && !document.getElementById(valueId || '')) return;
+
+    // htmx parses a swap and a history snapshot with scripts off. Then the
+    // <noscript> select is live, and it must not submit a second value.
+    wrapper.querySelectorAll('noscript select').forEach(function (s) { s.disabled = true; });
 
     function getHidden() { return document.getElementById(valueId); }
 
@@ -193,17 +208,21 @@
     // New content (an htmx swap, or a clear) shows the popup again, unless
     // the user dismissed it. An empty listbox stays in the accessibility
     // tree, so its live region still speaks; the CSS gives it no size.
-    // Tags mode hides an option that is already a chip.
+    // Tags mode removes an option that is already a chip, so such a list
+    // is empty too.
     function sync() {
       var shown = 0;
       listbox.querySelectorAll('[role="option"]').forEach(function (o) {
+        if (tags && tags.has(o.dataset.value || '')) {
+          o.remove();
+          return;
+        }
         o.tabIndex = -1;
-        if (tags) o.hidden = tags.has(o.dataset.value || '');
         if (!o.hidden) shown++;
       });
       listbox.hidden = dismissed;
       queryInput.setAttribute('aria-expanded', !listbox.hidden && shown ? 'true' : 'false');
-      queryInput.removeAttribute('aria-activedescendant');
+      clearActive(queryInput, listbox);
     }
     // `subtree` also sees a morph swap that keeps the option count.
     new MutationObserver(sync).observe(listbox, { childList: true, subtree: true });
@@ -239,6 +258,15 @@
       selectOption(opt);
     });
 
+    // Free-text tags: a submit adds the typed text first.
+    if (tags && freeText) {
+      pending.set(wrapper, function () {
+        var text = queryInput.value.trim();
+        if (text) tags.add(text, text);
+        queryInput.value = '';
+      });
+    }
+
     queryInput.addEventListener('input', function () {
       dismissed = false;
       // The highlight belongs to the old query. Enter must not commit it.
@@ -262,6 +290,15 @@
       }
     });
   }
+
+  // The capture listener runs before htmx reads the form.
+  var pending = new WeakMap();
+  document.addEventListener('submit', function (e) {
+    e.target.querySelectorAll('[data-ac-multiple]').forEach(function (w) {
+      var add = pending.get(w);
+      if (add) add();
+    });
+  }, true);
 
   // The core fires `autumn:init` on each new root. This part is first in
   // the bundle, so the listener exists before the core boots.

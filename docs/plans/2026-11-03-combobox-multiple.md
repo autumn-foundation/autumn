@@ -42,13 +42,17 @@ Question: "How can we make this fail?" Each answer gives a guard.
 
 | Way to fail | Guard |
 |---|---|
-| With JS off, the chip inputs and the `<select>` both submit. Each value comes twice. | The server renders the chip inputs `disabled` and the chip list `hidden`. The JS enables them. A browser test with JS off checks it. |
+| With JS off, the chip inputs and the `<select>` both submit. Each value is sent two times. | The server renders the chip inputs `disabled` and the chip list `hidden`. The JS enables them. A browser test with JS off checks it. |
+| htmx parses a swap with scripts off, so a swapped-in `<noscript>` select is live. | The JS disables the `<noscript>` select at init. A browser test swaps the widget in and submits. |
+| A screen reader says nothing when Backspace removes a chip. | A `role="status"` region says "rust removed". The text is a template, so an app can translate it. |
+| A held Backspace removes all chips. | Only a new key press (not `e.repeat`) removes a chip. |
+| The same query after a pick sends no request (`hx-trigger` `changed`). | Tags mode uses `input delay:Nms` with no `changed`. |
 | A JS-off user sees remove buttons that do nothing. | The chip list is `hidden` until the JS runs. |
 | A label with `<script>` runs as code. | Maud escapes the server chips. The JS sets `textContent`, not `innerHTML`. A unit test checks the escape. |
 | Enter on typed text submits the form in tags mode. | With `free_text`, Enter with no active option adds a chip and calls `preventDefault`. |
-| The same tag is added two times. | `addChip` skips a value that is already a chip. A browser test checks it. |
+| The same tag is added two times. | `add` skips a value that is already a chip. The server skips duplicates too. Tests check both. |
 | Focus goes to `<body>` when a chip is removed. | Keyboard removal moves focus to the next chip, else the previous chip, else the input. Pointer removal moves focus to the input. |
-| A late htmx response shows an option that is already a chip. | `sync()` hides chosen options on each swap. |
+| A late htmx response shows an option that is already a chip. | `sync()` removes chosen options on each swap. |
 | The "create" option puts "Create “x”" in the chip. | The option has `data-label`. The chip uses it. |
 | RTL pages invert ArrowLeft and ArrowRight. | The JS reads `direction` and swaps the keys. |
 | The JS grows past its budget. | The size test. The budget increases with the reason in the docs. |
@@ -67,15 +71,13 @@ Question: "How can we make this fail?" Each answer gives a guard.
 - **Black (risk).** Duplicate values with JS off. Focus loss on removal.
   Two views of one selection with JS off. A remove button below 24 px
   fails WCAG 2.5.8. The budget increase must be stated.
-- **Yellow (value).** A free multi-select and tags input. Peers sell it
-  as a paid add-on. It reuses the keyboard core and #3394, so the new code
+- **Yellow (value).** A free multi-select and tags input. It reuses the keyboard core and #3394, so the new code
   is small.
 - **Green (alternatives).** The JS adds the "create" entry from a
   template. We did not do this: the client cannot know if a tag exists.
   `aria-multiselectable` on the listbox with the popup open after each
   pick. We did not do this: the server filters, and the query is cleared
-  after each pick. A live region that says "Removed x". We keep this for a
-  later issue (it needs new strings for each locale).
+  after each pick.
 - **Blue (process).** RED: unit tests in `search.rs`, browser tests in
   `widgets_keyboard_browser.rs` and `stories_browser.rs`. See them fail.
   GREEN: Rust markup, JS, CSS, story and demo route. REFACTOR: share the
@@ -84,9 +86,10 @@ Question: "How can we make this fail?" Each answer gives a guard.
 ## Scope
 
 In scope: `multiple()`, `selected()`, `remove_label()`,
+`added_message()`, `removed_message()`, a status region,
 `autocomplete_input_for`, `autocomplete_create_option`, chip keyboard and
 pointer removal, no-JS `<select multiple>`, CSS, a "Tags input" story,
 unit and browser tests, docs, changelog fragment.
 
-Out of scope: a live region that announces changes, a maximum chip
-count, and field errors on the widget. Each can be a later issue.
+Out of scope: a maximum chip count, and a separate name for the chip
+list. Each can be a later issue.
