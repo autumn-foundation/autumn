@@ -896,7 +896,9 @@ fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
 ///
 /// Each piece guards a failure that would otherwise be quiet:
 /// - the archive must be a `--workspace` build, or the unified feature set
-///   that decides which gated fixtures exist changes;
+///   that decides which gated fixtures exist changes, and it must hold only
+///   `integration_tests`, or the other test binaries fill the shard's disk
+///   (#3534);
 /// - a shard must extract into its own checkout, or the archive's
 ///   compile-time `env!` paths point nowhere;
 /// - a shard on another checkout path must build locally instead;
@@ -915,8 +917,8 @@ fn trybuild_shards_run_from_the_workspace_nextest_archive() {
 
     let build = ci_job(&ci, "test-build");
     assert!(
-        build.contains("cargo nextest archive --workspace"),
-        "`test-build` must archive the whole workspace test build"
+        build.contains("cargo nextest archive --workspace --test integration_tests"),
+        "`test-build` must archive a workspace build of `integration_tests` only"
     );
     assert!(
         build.contains("workspace: ${{ steps.workspace.outputs.path }}")

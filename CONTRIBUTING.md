@@ -54,7 +54,8 @@ Chromium `system-tests` lanes (those run in dedicated CI jobs); `cargo test -p
 In CI that blocking gate is **sharded across runners**, so a red PR points at
 one of several jobs rather than a single `Test (<os>)`: `test` runs the
 workspace suite, `trybuild` runs `compile_fail::` in four shards from one
-`cargo nextest archive --workspace` build (`test-build`),
+`cargo nextest archive --workspace --test integration_tests` build
+(`test-build`),
 `test-features` runs one job per non-default feature set, and `test-docker`
 runs the Linux testcontainer sweep. `Test suite` (`test-gate`) is the
 aggregate check that must be green. Nothing about how you *write* a test

@@ -954,11 +954,19 @@ jobs:
   # 14053 that compile was 20m35s of the 35-minute `Trybuild pass_a` job, and
   # all four shards paid it: about 80 runner-minutes of identical work.
   #
-  # `test-build` compiles it once with `cargo nextest archive --workspace` and
-  # uploads the archive. The shards download it and run their filter against
-  # the prebuilt `integration_tests` binary. It is still a `--workspace` build,
-  # so the globally unified feature set, which decides which `#[cfg]`-gated
-  # fixtures exist, is the same one `cargo test --workspace` sees.
+  # `test-build` compiles it once with `cargo nextest archive --workspace
+  # --test integration_tests` and uploads the archive. The shards download it
+  # and run their filter against the prebuilt `integration_tests` binary. It is
+  # still a `--workspace` build, so the globally unified feature set, which
+  # decides which `#[cfg]`-gated fixtures exist, is the same one `cargo test
+  # --workspace` sees.
+  #
+  # `--test integration_tests` keeps the archive to the one binary the shards
+  # run. An archive of every workspace test binary was 6.9 GB (275 binaries).
+  # Each shard then spent ~6 minutes downloading and extracting it, and the
+  # extracted binaries plus trybuild's own tree ran a `compile_pass` shard's
+  # disk out: `rust-lld` died with SIGBUS linking a fixture. That is the
+  # failure #3534 fixed by building only this target.
   #
   # Two things make an archive runnable on another runner, and both are
   # handled here rather than left to luck:
@@ -1016,7 +1024,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/nextest-archive"
-          cargo nextest archive --workspace \
+          cargo nextest archive --workspace --test integration_tests \
             --archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
           ls -lh "${RUNNER_TEMP}/nextest-archive"
           df -h
@@ -1163,7 +1171,9 @@ jobs:
         # disk bounded too, and keeps the hazard from returning silently if
         # anyone ever flips that flag back.
         shell: bash
-        run: rm -rf target/tests
+        run: |
+          df -h
+          rm -rf target/tests
 
   test-features:
     name: Test ${{ matrix.lane }}

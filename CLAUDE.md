@@ -156,7 +156,7 @@ so it is usually automatic:
 | Job | OS | What it runs |
 | --- | --- | --- |
 | `test` | all 3 | `cargo test --workspace -- --skip compile_fail:: --skip sim_` — the default lane, plus a second step running `sim_` at `--test-threads=1` |
-| `test-build` | Linux | `cargo nextest archive --workspace`, once; uploads the archive the `trybuild` shards run from |
+| `test-build` | Linux | `cargo nextest archive --workspace --test integration_tests`, once; uploads the archive the `trybuild` shards run from |
 | `trybuild` | Linux | `compile_fail::*` only, split into four shards, run with `cargo nextest run --archive-file` |
 | `test-features` | Linux | one job per non-default feature set (markdown, i18n, tls, …) |
 | `test-docker` | Linux | the `#[ignore]`d Docker/testcontainer sweep |
@@ -187,7 +187,9 @@ Rules that matter when editing tests:
   with `--no-tests=fail`, so a rename fails that shard loudly rather than
   silently skipping it. Rename the shard filter in `ci.yml` alongside.
 - **The `trybuild` shards do not compile the workspace.** `test-build` builds
-  it once with `cargo nextest archive --workspace` and the shards run from
+  it once with `cargo nextest archive --workspace --test integration_tests`
+  (only the binary they run: an archive of every test binary ran a shard's
+  disk out) and the shards run from
   that archive, extracted into their own checkout so compile-time `env!`
   paths resolve. A shard checked out at a different path (a self-hosted
   runner slot) builds locally instead. trybuild reads its fixtures' feature

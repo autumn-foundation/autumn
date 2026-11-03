@@ -21,8 +21,10 @@ package selection drops fixtures, and the shard still reports green.
 
 ## Decision
 
-- A new Linux job, `test-build`, runs `cargo nextest archive --workspace` and
-  uploads the archive as the `workspace-tests-linux` artifact.
+- A new Linux job, `test-build`, runs `cargo nextest archive --workspace
+  --test integration_tests` and uploads the archive as the
+  `workspace-tests-linux` artifact. `--workspace` keeps the unified feature
+  set. `--test integration_tests` keeps only the binary the shards run.
 - Each `trybuild` shard needs `test-build`, downloads the archive and runs
   `cargo nextest run --archive-file … --workspace-remap . --extract-to .`
   with a filterset over `binary_id(autumn-web::integration_tests)`.
@@ -41,7 +43,7 @@ package selection drops fixtures, and the shard still reports green.
 
 ```mermaid
 flowchart LR
-    lint[lint] --> build["test-build<br/>cargo nextest archive --workspace"]
+    lint[lint] --> build["test-build<br/>cargo nextest archive --workspace<br/>--test integration_tests"]
     build -- workspace-tests-linux --> fail[Trybuild fail]
     build --> pa[Trybuild pass_a]
     build --> pb[Trybuild pass_b]
@@ -69,6 +71,16 @@ trybuild then passes no features, so each gated fixture builds against default
 features. A throwaway crate with one gated fixture showed both cases on Rust
 1.97 and 1.99: `cannot find function` without the include, a pass with it.
 
+### Why only `integration_tests`
+
+The first version archived every workspace test binary: 6.9 GB, 275 binaries.
+Each shard spent about 6 minutes downloading and extracting it.
+`Trybuild pass_a` then failed: `rust-lld` died with SIGBUS (signal 7) linking a
+fixture. lld writes its output through `mmap`, and a filesystem that cannot
+allocate blocks raises SIGBUS rather than returning `ENOSPC`. The extracted
+binaries and trybuild's fixture tree shared one disk. This is the failure
+#3534 fixed by building only `--test integration_tests` in the shards.
+
 ## Consequences
 
 - The Linux workspace test build compiles twice per run (`test` and
@@ -78,6 +90,7 @@ features. A throwaway crate with one gated fixture showed both cases on Rust
   about the same: about 21 minutes of archive build, then the fixtures. The
   shards no longer restore the multi-GB cache, and they no longer compile.
 - The archive is uploaded for one day and is read only by this run.
-- Moving `test`'s own lanes onto the archive, or splitting them with
-  `--partition`, is not part of this change. Doctests do not run under
-  nextest. The macOS and Windows legs would also need their own archive.
+- Moving `test`'s own lanes onto an archive, or splitting them with
+  `--partition`, is not part of this change. It would need its own archive of
+  every test binary, not this one. Doctests do not run under nextest, and the
+  macOS and Windows legs would each need their own archive.
