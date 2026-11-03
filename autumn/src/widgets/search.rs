@@ -517,12 +517,12 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 /// `<noscript>` select. Thus only one of them submits, and the form sends
 /// each value one time.
 ///
-/// Keys (with `autumn-widgets.js`): Enter adds the active option.
-/// Backspace in an empty input removes the last chip. ArrowLeft at the
-/// start of the input moves the focus to the last chip (ArrowRight in RTL).
-/// In the chip list, the arrow keys, Home and End move the focus. Delete,
-/// Backspace, Enter or Space removes the chip. ArrowRight on the last chip
-/// moves the focus to the input. The chip list is one tab stop. A status
+/// Keys (with `autumn-widgets.js`): `Enter` adds the active option.
+/// `Backspace` in an empty input removes the last chip. `ArrowLeft` at the
+/// start of the input moves the focus to the last chip (`ArrowRight` in
+/// RTL). In the chip list, the arrow keys, `Home` and `End` move the focus.
+/// `Delete`, `Backspace`, `Enter` or `Space` removes the chip. `ArrowRight`
+/// on the last chip moves the focus to the input. The chip list is one tab stop. A status
 /// region tells a screen reader which chip was added or removed.
 ///
 /// Use [`autocomplete_option`] and [`autocomplete_empty_state`] to render
@@ -795,13 +795,16 @@ fn render_autocomplete(
     }
 }
 
+/// The mark in a text template that the chip label replaces.
+const LABEL_MARK: &str = concat!("{", "label", "}");
+
 /// One chip: its label, its hidden input and its remove button.
 ///
 /// A server chip's input is `disabled` until the runtime runs. A template
 /// chip is a clone source, so its input is live. The runtime sets its
 /// label and `aria-label`.
 fn chip(config: &AutocompleteConfig<'_>, value: &str, label: &str, server: bool) -> maud::Markup {
-    let remove = config.remove_label.replace("{label}", label);
+    let remove = config.remove_label.replace(LABEL_MARK, label);
     maud::html! {
         li class="autumn-chip" data-ac-chip {
             span class="autumn-chip__label" data-ac-chip-label { (label) }
