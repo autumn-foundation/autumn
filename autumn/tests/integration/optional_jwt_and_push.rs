@@ -30,6 +30,10 @@ fn jwt_tenancy() -> AutumnConfig {
 #[test]
 fn push_section_parses_in_every_build() {
     let (_dir, env) = toml_env("[server]\nstrict_config = true\n\n[push]\nttl_secs = 600\n");
+    // A custom profile has no profile defaults, so strict mode judges only
+    // the file above (the `dev` defaults name `[storage]`, which a build
+    // without `storage` reports as unknown).
+    let env = env.with("AUTUMN_PROFILE", "inert-section-spec");
     let config = AutumnConfig::load_with_env(&env).expect("a [push] table must parse");
 
     let result = config.validate_push();
