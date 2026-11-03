@@ -620,3 +620,87 @@ async fn the_widget_passes_axe_in_every_state() {
     let done = page.axe_violations(&axe).await.expect("axe");
     assert!(done.is_empty(), "done: {done:?}");
 }
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn an_early_run_does_not_end_the_state_of_a_later_run() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_with_script(&page, "/multi").await;
+    choose(&page, &[("g-fast.txt", "text/plain", "1")]).await;
+    wait_for(
+        &page,
+        &format!("!!document.querySelector('{ROOT} input[type=hidden]')"),
+    )
+    .await;
+    // A slow run starts. A fast run starts and ends while it runs.
+    choose(&page, &[("slow-g.txt", "text/plain", "s")]).await;
+    choose(&page, &[("g-quick.txt", "text/plain", "q")]).await;
+    wait_for(
+        &page,
+        &format!("document.querySelectorAll('{ROOT} input[type=hidden]').length === 2"),
+    )
+    .await;
+    assert!(
+        eval_bool(
+            &page,
+            &format!(
+                "document.querySelector('{ROOT}').hasAttribute('aria-busy') && \
+                 !document.querySelector('{ROOT} [role=progressbar]').hidden"
+            )
+        )
+        .await,
+        "the slow run still shows its state"
+    );
+    wait_for(
+        &page,
+        &format!("!document.querySelector('{ROOT}').hasAttribute('aria-busy')"),
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_file_with_no_reported_type_passes_a_mime_accept() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_with_script(&page, "/images").await;
+    choose(&page, &[("h-notype.png", "", "bytes")]).await;
+    wait_for(
+        &page,
+        &format!("!!document.querySelector('{ROOT} input[type=hidden]')"),
+    )
+    .await;
+    assert_eq!(hidden_values(&page).await, "pic=up-h-notype.png");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn a_refused_file_can_be_chosen_again() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open_with_script(&page, "/images").await;
+    choose(&page, &[("i-doc.pdf", "application/pdf", "pdf")]).await;
+    wait_for(
+        &page,
+        &format!("document.querySelector('{ROOT} [role=alert]').textContent.trim() !== ''"),
+    )
+    .await;
+    assert!(
+        eval_bool(
+            &page,
+            &format!("document.querySelector('{ROOT} input[type=file]').value === ''")
+        )
+        .await,
+        "the input is clear, so the same file fires `change` again"
+    );
+    assert!(
+        eval_bool(
+            &page,
+            &format!(
+                "document.querySelector('{ROOT} input[type=file]').getAttribute('aria-invalid') === 'true'"
+            )
+        )
+        .await
+    );
+}

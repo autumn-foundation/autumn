@@ -55,9 +55,11 @@ no-JS path.
 ## Decisions
 
 - No new feature flag. No new route.
-- JS budget: 46 to 50 KiB raw, 14 to 15 KiB gzip.
 - Messages are English constants. Localization is a follow-up.
-- Tests use `LocalBlobStore` on a temp dir with its signed PUT route.
+- Browser tests use an in-memory store behind a test PUT route. It stands in
+  for the backend.
+- One `submit` listener on the page holds a form during an upload.
+- JS budget is measured on the bundle with the search part: 54 KiB, 16 KiB gzip.
 
 ## Tests
 
@@ -66,7 +68,7 @@ RED first:
 1. Markup unit tests: label, no `aria-label`, regions, hooks, `multiple`.
 2. Browser tests (Chromium): upload to storage, hidden field, progress,
    drag and drop, presign error, submit block, no-JS multipart submit.
-3. Story slug and CSS selector gates.
+3. Story slug gate (feature `storage`).
 4. Size budget test.
 
 ## Files

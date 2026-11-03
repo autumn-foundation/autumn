@@ -381,8 +381,13 @@ async fn presign(
     Json(req): Json<PresignRequest>,
 ) -> AutumnResult<Json<PresignResponse>> {
     let store = blobs.store();
-    // Your app picks the key. Never trust a key from the browser.
-    let key = format!("uploads/{}", uuid::Uuid::new_v4());
+    // Allow only the types you serve. A browser can ask for any type.
+    if !["image/png", "image/jpeg"].contains(&req.content_type.as_str()) {
+        return Err(AutumnError::bad_request("type not allowed"));
+    }
+    // Your app picks the key. Put the user id in it: the browser can change
+    // the hidden field before the form is sent.
+    let key = format!("uploads/{}/{}", current_user_id, uuid::Uuid::new_v4());
     let result: PresignPutResult = store
         .presign_put(&key, &req.content_type, Duration::from_secs(300))
         .await?;
@@ -407,6 +412,10 @@ async fn complete(
     Json(req): Json<CompleteRequest>,
 ) -> AutumnResult<Json<serde_json::Value>> {
     let store = blobs.store();
+    // The key came from the browser. Accept only the user's own prefix.
+    if !req.key.starts_with(&format!("uploads/{current_user_id}/")) {
+        return Err(AutumnError::bad_request("bad key"));
+    }
     // HEAD-checks the object; returns NotFound if the browser didn't
     // actually upload yet or if the upload expired.
     let blob = complete_direct_upload(&**store, &req.key).await?;
@@ -453,13 +462,16 @@ With JavaScript, for each file the script:
 3. Sends the file to `url`. A progress bar shows the progress.
 4. Adds `<input type="hidden" name="avatar" value="{key}">`.
 
-The form then carries only the keys. Your handler calls
-`complete_direct_upload` with each key, then saves the `Blob`. The file input
-loses its `name`, so the bytes are not sent twice. A form that has a running
-upload does not submit.
+The form then carries only the keys. Your handler checks each key, calls
+`complete_direct_upload`, then saves the `Blob`. The key can change in the
+browser, so accept only keys that your app issued to this user (see the
+worked example). A failed upload adds no key, so check the field on the
+server. The file input loses its `name`, so the bytes go only to storage. A
+form with a running upload does not submit.
 
 The user can drop files on the field. The script checks `accept` on a drop.
-Your server must still check the type and the size.
+Your server must also check the type. The size and name in the presign request
+are hints: the presigned PUT does not enforce them.
 
 The script fires `autumn:upload` (`detail.key`, `detail.file`) and
 `autumn:upload-error` (`detail.file`) on the field. A screen reader hears the

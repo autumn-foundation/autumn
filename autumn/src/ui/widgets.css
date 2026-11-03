@@ -1540,7 +1540,8 @@
     flex-direction: column;
     gap: var(--space-2);
     padding: var(--space-3);
-    border: 1px dashed var(--border);
+    position: relative;
+    border: 1px dashed var(--text-muted);
     border-radius: var(--radius-md);
 }
 
@@ -1564,9 +1565,14 @@
     display: none;
 }
 
+/* An empty live region stays in the accessibility tree, but takes no room. */
 .autumn-upload-status:empty,
 .autumn-upload-error:empty {
-    display: none;
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
 }
 
 .autumn-upload-error {

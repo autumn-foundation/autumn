@@ -26,7 +26,7 @@ pub struct DirectUploadConfig<'a> {
 }
 
 impl<'a> DirectUploadConfig<'a> {
-    /// A config with the defaults: a label made from the field name, one file.
+    /// Make a config. The label comes from the field name. It takes one file.
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -91,15 +91,16 @@ fn humanize(name: &str) -> String {
 ///
 /// 1. `POST`s JSON `{filename, content_type, size}` to `presign_url`, with the
 ///    CSRF token from `<meta name="csrf-token">`.
-/// 2. Expects JSON `{url, method, headers, key}` back. Use the
-///    [`PresignPutResult`](super::PresignPutResult) fields plus a `key` that
-///    your app chooses.
+/// 2. Expects JSON `{url, method, headers, key}` back. `url`, `method` and
+///    `headers` come from [`PresignPutResult`](super::PresignPutResult).
+///    Your app chooses `key`.
 /// 3. Sends the bytes to `url` and shows the progress.
 /// 4. Adds `<input type="hidden" name="<name>" value="<key>">`.
 ///
 /// Your form handler then calls
 /// [`complete_direct_upload`](super::complete_direct_upload) with the key.
-/// The script sends no file bytes with the form.
+/// With the script, the form sends no file bytes. A failed upload adds no
+/// key, so check the field on the server.
 ///
 /// The script fires `autumn:upload` (`detail.key`, `detail.file`) and
 /// `autumn:upload-error` (`detail.file`) on the widget.
@@ -152,6 +153,7 @@ pub fn direct_upload_field(
                 name=(name)
                 accept=[config.accept]
                 multiple[config.multiple]
+                aria-describedby=(format!("{id}-status {id}-error"))
                 data-direct-upload-target="input" {}
             span class="autumn-upload-hint" data-autumn-upload-hint hidden="" {
                 @if config.multiple { "Or drop files here." } @else { "Or drop a file here." }
@@ -166,8 +168,8 @@ pub fn direct_upload_field(
                 hidden="" {
                 div class="autumn-upload-bar" {}
             }
-            p class="autumn-upload-status" role="status" {}
-            p class="autumn-upload-error" role="alert" {}
+            p class="autumn-upload-status" id=(format!("{id}-status")) role="status" {}
+            p class="autumn-upload-error" id=(format!("{id}-error")) role="alert" {}
             div data-autumn-upload-fields {}
             noscript {
                 p class="autumn-upload-noscript" {

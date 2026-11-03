@@ -853,6 +853,8 @@
       t = t.trim().toLowerCase();
       if (!t) return false;
       if (t.charAt(0) === '.') return name.slice(-t.length) === t;
+      // The OS may report no type. The server checks the real type.
+      if (!type) return true;
       if (t.slice(-2) === '/*') return type.indexOf(t.slice(0, -1)) === 0;
       return type === t;
     });
@@ -905,10 +907,24 @@
     var hint = root.querySelector('[data-autumn-upload-hint]');
     if (!input || !field || !bar || !status || !alertEl || !box) return;
     var pending = 0;
+    var errors = [];
+
+    // A restored htmx snapshot can hold the state of a run that ended.
+    root.removeAttribute('aria-busy');
+    root.removeAttribute('data-dragging');
+    bar.hidden = true;
+    status.textContent = '';
 
     // The bytes go to storage. The form sends only the hidden keys.
     input.removeAttribute('name');
     if (hint) hint.hidden = false;
+
+    // The bar is not live: only the status and error lines are announced.
+    function showErrors() {
+      alertEl.textContent = errors.join(' ');
+      if (errors.length) input.setAttribute('aria-invalid', 'true');
+      else input.removeAttribute('aria-invalid');
+    }
 
     function progress(n) {
       bar.hidden = false;
@@ -938,14 +954,16 @@
     function run(list) {
       var files = Array.prototype.slice.call(list);
       var accept = input.getAttribute('accept');
-      var errors = [];
+      // The same file can then be chosen again.
+      input.value = '';
+      if (!pending) errors = [];
       files = files.filter(function (f) {
         if (accepted(f, accept)) return true;
         errors.push(f.name + ' is not an accepted file type.');
         return false;
       });
       if (!input.multiple) files = files.slice(0, 1);
-      alertEl.textContent = errors.join(' ');
+      showErrors();
       if (!files.length) return;
       var done = [];
       pending++;
@@ -962,11 +980,12 @@
           });
         });
       }, Promise.resolve()).then(function () {
-        if (!--pending) root.removeAttribute('aria-busy');
+        // A later run still owns the bar and the lines.
+        if (--pending) return;
+        root.removeAttribute('aria-busy');
         bar.hidden = true;
-        alertEl.textContent = errors.join(' ');
+        showErrors();
         status.textContent = done.length === 1 ? done[0] + ' uploaded.' : done.length ? done.length + ' files uploaded.' : '';
-        input.value = '';
       });
     }
 
@@ -992,18 +1011,18 @@
       root.removeAttribute('data-dragging');
       run(e.dataTransfer.files);
     });
-
-    // A key is missing until its upload ends, so hold the form.
-    var form = root.closest('form');
-    if (form) {
-      form.addEventListener('submit', function (e) {
-        if (!pending) return;
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        alertEl.textContent = 'Wait for the upload to finish, then send the form again.';
-      }, true);
-    }
   }
+
+  // A key is missing until its upload ends, so hold the form. One listener
+  // for the page, so a swap leaves no stale listener on the form.
+  document.addEventListener('submit', function (e) {
+    var root = e.target.querySelector && e.target.querySelector(UPLOAD + '[aria-busy]');
+    if (!root) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    root.querySelector('[role="alert"]').textContent = 'Wait for the upload to finish, then send the form again.';
+    root.querySelector('input[type="file"]').focus();
+  }, true);
 
   // Run `fn` on `root` (when it matches) and on each match inside it.
   function each(root, selector, fn) {

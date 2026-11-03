@@ -1521,10 +1521,9 @@ fn gated_stories() -> Vec<Story> {
             };
 
             maud::html! {
-                // The form needs `multipart/form-data`. Without JS the
-                // file goes with the form. With `autumn-widgets.js`, the
-                // file goes straight to storage and a hidden field holds
-                // its key. Your app handles the presign URL.
+                // Without JS the file goes with the form. With
+                // `autumn-widgets.js` it goes to storage, and a hidden field
+                // holds its key.
                 form method="post" action="/posts" enctype="multipart/form-data" {
                     (direct_upload_input("cover_image", "/uploads/presign", Some("image/*")))
                     // Set the label, allow many files, filter by type.
