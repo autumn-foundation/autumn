@@ -110,11 +110,34 @@ release time.
 - **Test all**: `cargo test --workspace`
 - **Test specific package**: `cargo test -p <pkg>`
 - **Test specific target**: `cargo test -p <pkg> --test <target>`
-- **Pre-push gate**: `./scripts/pre-push-check.sh` — compile-only (`--no-run`)
-  mirror of CI's `lint` + `test` jobs. Run it before pushing: a narrow `cargo
-  test -p <pkg>` never links the autumn-web consolidated `integration_tests`
-  binary, so it misses cross-package compile breaks the CI `cargo test
-  --workspace` gate catches. See CONTRIBUTING.md "Before you push".
+- **Pre-push gate**: `cargo xtask pre-push` (or `./scripts/pre-push-check.sh`,
+  which runs it) — compile-only (`--no-run`) mirror of CI's `lint` + `test`
+  jobs. Run it before pushing: a narrow `cargo test -p <pkg>` never links the
+  autumn-web consolidated `integration_tests` binary, so it misses
+  cross-package compile breaks the CI `cargo test --workspace` gate catches.
+  See CONTRIBUTING.md "Before you push".
+- **CI lint job, locally**: `cargo xtask ci lint` (one step:
+  `--only <step>`; step names: `--list`).
+- **Every maintainer task and script**: `cargo xtask list`.
+
+## Repo tooling: `cargo xtask`
+
+`xtask/` is the maintainer task runner. It is never published. See
+`xtask/README.md` and `docs/adr/0033-xtask-for-repo-tooling.md`.
+
+- **CI's `lint` job is the `lint` lane** in `xtask/src/lanes.rs`; ci.yml runs
+  `cargo xtask ci lint`. Add or change a lint check there, not in ci.yml. The
+  pre-push lane reuses the same constants, so the two cannot drift.
+- **A CI clippy command stays one string literal on one line** in
+  `lanes.rs`, with `-p autumn-web`, a quoted `--features "…"` list and
+  `-D warnings`. `check-panic-gate.sh` and `check-determinism-gate.sh` read
+  those lines to prove each gated module is linted with its feature on.
+- **A new script under `scripts/` needs a header comment.** `cargo xtask list`
+  finds scripts by listing the directory and shows that header; a test fails
+  on a script without one. No registry to edit.
+- **xtask stays dependency-light**: default features only, and never
+  autumn-web, diesel or sqlx. It is a workspace member, so its features are
+  unified into every `cargo build --workspace`.
 
 ---
 

@@ -104,7 +104,7 @@ narrow `cargo test -p <pkg>` never links the consolidated `integration_tests`
 binary and misses cross-package breaks:
 
 ```bash
-./scripts/pre-push-check.sh
+cargo xtask pre-push
 ```
 
 ## Inspecting the running app

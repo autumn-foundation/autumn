@@ -57,25 +57,20 @@ jobs:
 
       # Each lane runs even if an earlier one failed, so one run reports
       # everything stable breaks rather than just the first thing.
+      # The commands are the `lint` lane's own (xtask/src/lanes.rs), one step
+      # each, so this workflow lints exactly what ci.yml's `lint` job lints.
       - name: Format
-        run: cargo fmt --all -- --check
+        run: cargo xtask ci lint --only fmt
 
       - name: Clippy (workspace, all targets)
         if: ${{ !cancelled() }}
-        # `-j 2` is ci.yml's cap for this exact command: at the default four
-        # workers it is OOM-killed on ubuntu-latest while checking autumn-web,
-        # which would read here as Rust-stable fallout when it is the runner.
-        run: cargo clippy -j 2 --workspace --all-targets -- -D warnings
+        run: cargo xtask ci lint --only clippy-workspace
 
       - name: Clippy (request-path gated features, all targets)
         if: ${{ !cancelled() }}
-        # Read from the script the `lint` job's list is kept in sync with, so this
-        # lane cannot drift from it. The default-feature lane above never compiles
-        # these modules, which is how 1.99 hid two `fetch_update` calls (#3082).
-        run: |
-          features="$(sed -n 's/^GATED_REQUEST_PATH_FEATURES="\(.*\)"$/\1/p' scripts/pre-push-check.sh)"
-          test -n "$features" || { echo "::error::could not read GATED_REQUEST_PATH_FEATURES from scripts/pre-push-check.sh"; exit 1; }
-          cargo clippy -p autumn-web --features "$features" --all-targets -- -D warnings
+        # The default-feature lane above never compiles these modules, which is
+        # how 1.99 hid two `fetch_update` calls (#3082).
+        run: cargo xtask ci lint --only clippy-gated
 
       - name: What to do
         if: ${{ failure() }}

@@ -37,7 +37,9 @@
 #   8. Feature reachability: a module gated behind a non-default Cargo feature must
 #      have that feature enabled by an ENFORCING ci.yml clippy lane (one that is
 #      not commented out and carries both `-p autumn-web` and `-D warnings`),
-#      otherwise its deny block is never compiled. The single knowing exception
+#      otherwise its deny block is never compiled. The `lint` job's clippy lanes
+#      are the commands in xtask/src/lanes.rs; they count while ci.yml runs
+#      `cargo xtask ci lint`. The single knowing exception
 #      (telemetry-otlp) is declared in FEATURE_LINT_EXEMPT and announced on every
 #      run; that list is itself validated so it cannot rot into a silent hole.
 #
@@ -46,7 +48,7 @@
 # clippy suppresses lints inside macro expansions and no source-level gate can
 # see them. Request-path modules must not invoke panic-expanding local macros.
 #
-# Called from the `lint` job in ci.yml. Run locally with:
+# Called from the `lint` job in ci.yml (`cargo xtask ci lint`). Run locally with:
 #
 #     ./scripts/check-panic-gate.sh              # self-test, then the real check
 #     ./scripts/check-panic-gate.sh --self-test  # synthetic fixtures only
@@ -397,8 +399,28 @@ attr_blocks() {
 # would ever fire, hiding a real hole (and, worse, force deletion of an honest
 # FEATURE_LINT_EXEMPT entry). One awk pass (this runs on every gate_check).
 ci_clippy_features() {
-  awk '
-    /^[[:space:]]*#/ { next }                               # skip YAML comment lines
+  clippy_features_in "$1" '^[[:space:]]*#'                  # skip YAML comment lines
+}
+
+# CI's `lint` job runs `cargo xtask ci lint`, whose clippy commands are string
+# literals in xtask/src/lanes.rs, one per line. Print their features the same
+# way, but only while the workflow file $1 really runs that lane: a lane file
+# CI never executes must not make a feature look linted, and neither may a
+# filtered run such as `cargo xtask ci lint --only fmt`. Rust comment lines are
+# skipped as YAML comments are above.
+XTASK_LANES="xtask/src/lanes.rs"
+xtask_clippy_features() {
+  local ci="$1" lanes="$2"
+  [[ -f "$lanes" ]] || return 0
+  grep -qE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*cargo xtask ci lint[[:space:]]*$' "$ci" \
+    || return 0
+  clippy_features_in "$lanes" '^[[:space:]]*//'
+}
+
+# clippy_features_in <file> <comment-line regex>
+clippy_features_in() {
+  awk -v comment="$2" '
+    $0 ~ comment { next }
     /cargo clippy/ && /-p autumn-web/ && /-D warnings/ {
       s = $0
       while (match(s, /--features "[^"]+"/)) {
@@ -637,11 +659,15 @@ check_feature_reachability() {
   [[ -f "$dir/$cargo_toml" ]] || die "cannot read $cargo_toml (feature-reachability check)"
 
   local ci_feats default_feats
-  ci_feats="$(ci_clippy_features "$dir/$ci_file")"
+  ci_feats="$( {
+    ci_clippy_features "$dir/$ci_file"
+    xtask_clippy_features "$dir/$ci_file" "$dir/$XTASK_LANES"
+  } | sort -u)"
   [[ -n "$ci_feats" ]] \
     || die "found no enforcing 'cargo clippy … -p autumn-web … --features \"…\" … -D warnings'
-  invocation in $ci_file — the feature-reachability check cannot verify that
-  feature-gated request-path modules are linted at all."
+  invocation in $ci_file or in the $XTASK_LANES lane it runs — the
+  feature-reachability check cannot verify that feature-gated request-path
+  modules are linted at all."
   default_feats="$(cargo_default_features "$dir/$cargo_toml")"
 
   # A feature is "linted" if it is on in a default-feature build or named by
@@ -1167,6 +1193,47 @@ EOF
     >"$d34/src/adjacent.rs"
   check_pass "non-required inner allow is fine" \
     gate_check "$d34" "$wf" Cargo.toml 1 src src/good.rs:default
+
+  # 35. A feature named only by a clippy command in xtask/src/lanes.rs counts
+  #     when ci.yml runs `cargo xtask ci lint`.
+  local d35="$tmp/d35"; make_fixture "$d35"
+  mkdir -p "$d35/xtask/src"
+  printf '        run: cargo xtask ci lint\n' >"$d35/.github/workflows/ci.yml"
+  printf 'pub const C: &str = r#"cargo clippy -p autumn-web --features "lanefeat" --all-targets -- -D warnings"#;\n' \
+    >"$d35/xtask/src/lanes.rs"
+  write_module "$d35/src/good.rs" </dev/null
+  check_pass "xtask lint lane enables a feature" \
+    gate_check "$d35" "$wf" Cargo.toml 1 src src/good.rs:lanefeat
+
+  # 36. The same lane file does NOT count when ci.yml does not run the lane
+  #     (here: only a commented-out `run:`).
+  local d36="$tmp/d36"; make_fixture "$d36"
+  mkdir -p "$d36/xtask/src"
+  printf '        # run: cargo xtask ci lint\n' >"$d36/.github/workflows/ci.yml"
+  cp "$d35/xtask/src/lanes.rs" "$d36/xtask/src/lanes.rs"
+  write_module "$d36/src/good.rs" </dev/null
+  check_fail "xtask lane CI does not run does not count" "no enforcing" \
+    gate_check "$d36" "$wf" Cargo.toml 1 src src/good.rs:lanefeat
+
+  # 37. A clippy command inside a Rust comment in the lane file does not count.
+  local d37="$tmp/d37"; make_fixture "$d37"
+  mkdir -p "$d37/xtask/src"
+  printf '        run: cargo xtask ci lint\n' >"$d37/.github/workflows/ci.yml"
+  printf '/// cargo clippy -p autumn-web --features "lanefeat" --all-targets -- -D warnings\n' \
+    >"$d37/xtask/src/lanes.rs"
+  write_module "$d37/src/good.rs" </dev/null
+  check_fail "commented clippy command in the lane file does not count" "no enforcing" \
+    gate_check "$d37" "$wf" Cargo.toml 1 src src/good.rs:lanefeat
+
+  # 38. A filtered lane run (`--only fmt`) does not count either: it runs no
+  #     clippy step.
+  local d38="$tmp/d38"; make_fixture "$d38"
+  mkdir -p "$d38/xtask/src"
+  printf '        run: cargo xtask ci lint --only fmt\n' >"$d38/.github/workflows/ci.yml"
+  cp "$d35/xtask/src/lanes.rs" "$d38/xtask/src/lanes.rs"
+  write_module "$d38/src/good.rs" </dev/null
+  check_fail "filtered xtask lane run does not count" "no enforcing" \
+    gate_check "$d38" "$wf" Cargo.toml 1 src src/good.rs:lanefeat
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]] || die "panic-gate self-test failed — the checker is not
