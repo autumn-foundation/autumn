@@ -36,13 +36,13 @@ The repository's maintainer tooling had no single entry point:
 
 Option 3, in phases.
 
-**Phase 0 (this change):** `xtask/` with `cargo xtask list`,
+**Phase 0 (#3590):** `xtask/` with `cargo xtask list`,
 `cargo xtask script <name>` and `cargo xtask check <name>`. Scripts are
 found by listing `scripts/`; the description is the script's header comment.
 There is no registry to keep in step, and a test fails on a script without a
 header.
 
-**Phase 1 (this change):** lanes are defined in Rust, in
+**Phase 1 (#3590):** lanes are defined in Rust, in
 `xtask/src/lanes.rs`.
 
 - CI's `lint` job is `cargo xtask ci lint`. The lane runs every step even
@@ -58,9 +58,32 @@ header.
   command literals in `lanes.rs`, and trust them only while `ci.yml` runs
   `cargo xtask ci lint`. Their self-tests cover both halves of that rule.
 
-**Later phases:** port the docs gates onto one shared Rust parser, one gate
-per change, deleting each bash version only once the Rust one gives the same
-result on the tree. Then the release tooling and the other CI lanes.
+**Phase 2 (in progress):** port the docs gates onto one shared model of the
+markdown corpus in `xtask/src/docs/`, one gate per change. A gate's script is
+deleted in the same change that ports it, and only once:
+
+- its self-test cases are `#[test]`s;
+- the port gives the same report on the tree;
+- the port gives the same report as the script on mutated copies of the
+  corpus (broken headings and links, injected edge cases, deleted and
+  duplicated lines), compared defect by defect.
+
+Ported so far:
+
+| Gate | Was | Now |
+| --- | --- | --- |
+| Markdown links and anchors | `scripts/check-docs-links.sh` | `xtask/src/docs/links.rs` (`cargo xtask check docs-links`) |
+
+The per-line markdown shapes (block quote, fence, list item, heading) are
+matched by hand rather than by regex. A regex there made the first port ten
+times slower than the Python in a debug build; the hand matchers are tested
+against the original patterns on every line of the corpus.
+
+The `migration-guides` job installs a toolchain for the ported gates, after
+its bash gates, so those still report in seconds.
+
+**Later phases:** the rest of the docs gates, then the release tooling and
+the other CI lanes.
 
 ## Consequences
 
@@ -72,9 +95,9 @@ result on the tree. Then the release tooling and the other CI lanes.
 - The `lint` job compiles the xtask binary before its first check, about
   20 seconds cold and nothing on a warm cache.
 - xtask is a workspace member, so its features are unified into every
-  `cargo build --workspace`. It uses `anyhow` and `clap` on default features,
-  both already in `Cargo.lock`, and must never depend on autumn-web, diesel or
-  sqlx.
+  `cargo build --workspace`. It uses `anyhow`, `clap` and `regex` on default
+  features, all already in the build through other crates, and must never
+  depend on autumn-web, diesel or sqlx.
 - The two clippy gates read `lanes.rs` as text. A CI clippy command stays one
   string literal on one line; an xtask test fails when a line the gates would
   read is not a command the `lint` lane runs.

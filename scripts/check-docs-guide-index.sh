@@ -3,7 +3,7 @@
 # `docs/guide/index.md`, and that index must be linked from `README.md`.
 #
 # WHY THIS EXISTS: the corpus gates every page a reader ALREADY REACHED — its
-# links (`check-docs-links.sh`), its commands (`check-docs-cli.sh`), its
+# links (`xtask/src/docs/links.rs`), its commands (`check-docs-cli.sh`), its
 # `AUTUMN_*` variables (`check-docs-config.sh`), its `autumn.toml` keys
 # (`check-docs-toml.sh`), its `autumn_web::…` paths (`check-docs-symbols.sh`),
 # its `/actuator/…` URLs (`check-docs-routes.sh`), its macro arguments, its
@@ -59,7 +59,7 @@
 #      shows one hit in each file — so entries are gathered from every index
 #      before any of them is judged.
 #   2. Every guide page an index links exists, and is a guide page. A link to
-#      a page that moved is caught by `check-docs-links.sh` as a 404; this
+#      a page that moved is caught by `xtask/src/docs/links.rs` as a 404; this
 #      catches an index pointing somewhere outside the corpus it indexes.
 #   3. Every entry sits under a `## ` section heading, so a page appended to
 #      the end of the file lands somewhere a reader is actually scanning.
@@ -154,7 +154,7 @@ README = "README.md"
 # A markdown link whose target is a guide page, written relative to the index
 # (`middleware.md`, `tutorial/index.md`) or from the repo root
 # (`docs/guide/middleware.md`). Both spellings resolve to the same page, and
-# both are accepted so the gate never argues with `check-docs-links.sh` about
+# both are accepted so the gate never argues with `xtask/src/docs/links.rs` about
 # relative depth — that is its sibling's job, not this one's.
 #
 # `(?<![!\\])` rejects two things that share every other character with a link
@@ -723,7 +723,7 @@ _DEFN_AT = re.compile(
 # Markdown drops a backslash only before ASCII PUNCTUATION. `\\index.md`
 # keeps its backslash and names no tracked file, so unescaping every
 # character turned a broken destination into a working one. Same class and
-# same spelling as `check-docs-links.sh`'s `ESCAPED_PUNCT`, which had this
+# same spelling as `ESCAPED_PUNCT` in `xtask/src/docs/markdown.rs`, which had this
 # right — the fourth finding traceable to differing from a sibling.
 # A URI scheme: a letter, then letters, digits, `+`, `-` or `.`, then `:`.
 URI_SCHEME = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*:")
@@ -1208,7 +1208,7 @@ def definitions(text):
 # downstream can reinterpret what an earlier construct already swallowed.
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 # A BLOCK-QUOTE marker, carrying up to three spaces of indentation. Same
-# pattern, same bound and same reason as `check-docs-links.sh`, which had
+# pattern, same bound and same reason as `xtask/src/docs/links.rs`, which had
 # this right: allowing four would let `    > ``` ` — an INDENTED CODE line
 # that merely begins with a quote marker — lose both its marker and its four
 # spaces and become a column-zero fence.
@@ -2182,7 +2182,7 @@ def normalise(target, base):
     # rather than beside the unquoting below.
     target = decode_char_refs(target)
     target = target.split("#", 1)[0].rstrip()
-    # A rendered link is a URL, and `check-docs-links.sh` already resolves
+    # A rendered link is a URL, and `xtask/src/docs/links.rs` already resolves
     # one this way. Disagreeing with the sibling gate about what a
     # destination means is worse than either convention on its own: the two
     # would accept different indexes. So the same three transformations, in
@@ -2209,7 +2209,7 @@ def normalise(target, base):
     # not this checkout, so a reader following it does not arrive. Dropping
     # the empty leading segment silently turned it into a repo path and
     # accepted a link that reaches nothing — and disagreed with
-    # `check-docs-links.sh`, which rejects the same target.
+    # `xtask/src/docs/links.rs`, which rejects the same target.
     if target.startswith("/"):
         return None
     if target.startswith("./"):
@@ -4019,7 +4019,7 @@ self_test() {
   _commit valid_tag_blanked
   _case "a label inside an attribute is not a reference" 1 valid_tag_blanked
 
-  # 133. A rendered link is a URL, and `check-docs-links.sh` already resolves
+  # 133. A rendered link is a URL, and `xtask/src/docs/links.rs` already resolves
   #      one this way. Comparing the query, the encoding or the markdown
   #      escape as part of the filename rejected ordinary rows — and would
   #      have had the two gates disagree about what an index may contain.
@@ -4055,7 +4055,7 @@ self_test() {
   _commit unbalanced_parens_dest
   _case "an unbalanced paren is not a destination" 1 unbalanced_parens_dest
 
-  # 136-138. Shapes `check-docs-links.sh` thought worth encoding, checked
+  # 136-138. Shapes `xtask/src/docs/links.rs` thought worth encoding, checked
   #     here because two gates over one corpus must agree about what a link
   #     is. All three already passed when first probed; they are pinned so
   #     they keep doing so, since nothing else in this suite covered them.
@@ -4342,7 +4342,7 @@ self_test() {
   # 160. A ROOT-RELATIVE destination leaves the repository: on every README
   #      renderer `/docs/guide/index.md` addresses the host root. Dropping
   #      the empty leading segment accepted a link that reaches nothing,
-  #      and disagreed with `check-docs-links.sh`, which rejects it.
+  #      and disagreed with `xtask/src/docs/links.rs`, which rejects it.
   _scaffold root_relative
   printf '# A\n' > "$tmp/root_relative/docs/guide/alpha.md"
   printf '# Guide\n\n## S\n\n- [A](alpha.md)\n' \

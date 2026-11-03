@@ -4,7 +4,7 @@
 #
 # WHY THIS EXISTS: the corpus already gates the six things a reader copies off a
 # page and the one thing they cannot copy at all.
-# `scripts/check-docs-links.sh` gates its *links* (a 404 on GitHub),
+# `xtask/src/docs/links.rs` gates its *links* (a 404 on GitHub),
 # `scripts/check-docs-cli.sh` its *commands* (`unrecognized subcommand`),
 # `scripts/check-docs-config.sh` the `AUTUMN_*` variables they SET (a silent
 # no-op), `scripts/check-docs-toml.sh` the `autumn.toml` keys they WRITE

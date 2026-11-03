@@ -2,19 +2,21 @@
 //!
 //! Run `cargo xtask list` for everything it can do. Lanes (CI's `lint` job,
 //! the local pre-push gate) are defined in [`lanes`]; the scripts under
-//! `scripts/` are found by listing the directory ([`scripts`]). See
-//! `xtask/README.md` and `docs/adr/0033-xtask-for-repo-tooling.md`.
+//! `scripts/` are found by listing the directory ([`scripts`]); docs gates
+//! ported from those scripts live in [`docs`]. See `xtask/README.md` and
+//! `docs/adr/0033-xtask-for-repo-tooling.md`.
 
 mod argv;
+mod docs;
 mod lanes;
 mod runner;
 mod scripts;
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::runner::{Selection, Style};
@@ -43,7 +45,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// List the lanes and every script under scripts/.
+    /// List the lanes, the docs gates and every script under scripts/.
     List,
     /// Run a CI lane (`lint`): the same commands, in the same order, as CI.
     Ci {
@@ -69,13 +71,22 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Run `scripts/check-<name>`, e.g. `cargo xtask check docs-links`.
+    /// Run a gate by name: a ported docs gate (`docs-links`), else
+    /// `scripts/check-<name>`, e.g. `cargo xtask check msrv`.
     Check {
         /// Gate name without the `check-` prefix.
         name: String,
         /// Arguments passed to the script.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Run a ported docs gate, e.g. `cargo xtask docs links`.
+    Docs {
+        /// Gate name, with or without `docs-` (`links`, `docs-links`).
+        gate: String,
+        /// Check this checkout instead of the one xtask was built from.
+        #[arg(long, value_name = "DIR")]
+        root: Option<PathBuf>,
     },
 }
 
@@ -151,9 +162,35 @@ fn dispatch(cli: Cli, out: &mut impl Write) -> Result<ExitCode> {
         Command::Script { name, args } => run_script(root, &name, &args),
         Command::Check { name, args } => {
             let name = name.trim_start_matches("check-");
+            if let Some(gate) = docs::gate(name) {
+                if !args.is_empty() {
+                    bail!("`{}` takes no arguments; it is not a script", gate.name);
+                }
+                return run_gate(gate, root, out);
+            }
             run_script(root, &format!("check-{name}"), &args)
         }
+        Command::Docs { gate, root: dir } => {
+            let name = if gate.starts_with("docs-") {
+                gate.clone()
+            } else {
+                format!("docs-{gate}")
+            };
+            let Some(found) = docs::gate(&name) else {
+                let known: Vec<_> = docs::GATES.iter().map(|g| g.name).collect();
+                bail!("no docs gate `{gate}`; known: {}", known.join(", "));
+            };
+            run_gate(found, dir.as_deref().unwrap_or(root), out)
+        }
     }
+}
+
+fn run_gate(gate: &docs::Gate, root: &Path, out: &mut impl Write) -> Result<ExitCode> {
+    Ok(if gate.run(root, out)? {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn run_lane(
@@ -211,6 +248,10 @@ fn list(root: &Path, out: &mut impl Write) -> Result<()> {
             lane.steps.len()
         )?;
     }
+    writeln!(out, "\nDocs gates  (cargo xtask check <name>)")?;
+    for gate in docs::GATES {
+        writeln!(out, "  {:<36} {}", gate.name, gate.about)?;
+    }
     let scripts = scripts::discover(root)?;
     let mut groups: Vec<&str> = scripts.iter().map(scripts::Script::group).collect();
     groups.dedup();
@@ -259,7 +300,9 @@ mod tests {
         assert!(out.contains("cargo xtask ci lint"), "{out}");
         assert!(out.contains("cargo xtask pre-push"), "{out}");
         assert!(out.contains("Scripts: docs gates"), "{out}");
-        assert!(out.contains("check-docs-links"), "{out}");
+        assert!(out.contains("check-docs-orphans"), "{out}");
+        assert!(out.contains("Docs gates"), "{out}");
+        assert!(out.contains("  docs-links "), "{out}");
         assert_eq!(out.matches("Scripts: gates ").count(), 1, "{out}");
     }
 
@@ -313,6 +356,58 @@ mod tests {
         };
         assert_eq!(name, "panic-gate");
         assert_eq!(args, ["--self-test"]);
+    }
+
+    #[test]
+    fn check_and_docs_run_a_ported_gate() {
+        for args in [
+            &["check", "docs-links"][..],
+            &["docs", "links"],
+            &["docs", "docs-links"],
+        ] {
+            let (code, out) = output(args);
+            assert_eq!(code, ExitCode::SUCCESS, "{args:?}: {out}");
+            assert!(out.contains("Markdown link gate OK."), "{args:?}: {out}");
+        }
+        assert!(
+            dispatch(
+                parse(&["check", "docs-links", "--self-test"]),
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+        assert!(dispatch(parse(&["docs", "nope"]), &mut Vec::new()).is_err());
+    }
+
+    /// Every `cargo xtask check <name>` a workflow runs must name a docs
+    /// gate or a script, or the step fails only when CI reaches it.
+    #[test]
+    fn every_workflow_check_names_a_gate_or_a_script() {
+        let dir = repo_root().join(".github/workflows");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let Some(at) = line.find("cargo xtask check ") else {
+                    continue;
+                };
+                if line.trim_start().starts_with('#') {
+                    continue;
+                }
+                let name = line[at + "cargo xtask check ".len()..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap();
+                seen += 1;
+                let script = format!("check-{}", name.trim_start_matches("check-"));
+                assert!(
+                    docs::gate(name).is_some() || scripts::resolve(repo_root(), &script).is_ok(),
+                    "{}: `cargo xtask check {name}` names no gate or script",
+                    path.display()
+                );
+            }
+        }
+        assert!(seen >= 1, "no `cargo xtask check` in any workflow");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 # docs tell someone to SET must name a config key that exists.
 #
 # WHY THIS EXISTS: the corpus already gates the two things a reader copies off a
-# page and finds out about immediately — its links (`check-docs-links.sh`, a 404)
+# page and finds out about immediately — its links (`xtask/src/docs/links.rs`, a 404)
 # and its commands (`check-docs-cli.sh`, `unrecognized subcommand`). This gates
 # the third thing they copy, and the only one of the three that fails *silently*.
 #
@@ -371,8 +371,8 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Kept in Python for the same reason as its two sibling gates: snapshot
 # prefix matching and code-fence-aware scanning are both work bash renders
-# unreadable, and python3 is already a dependency of check-docs-links.sh,
-# check-docs-cli.sh and check-plugin-freshness.sh.
+# unreadable, and python3 is already a dependency of check-docs-cli.sh and
+# check-plugin-freshness.sh.
 run_py() {
   python3 - "$@" <<'PYEOF'
 import tomllib

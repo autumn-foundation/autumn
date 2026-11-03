@@ -3,7 +3,7 @@
 # starting from a surface a reader actually enters through.
 #
 # WHY THIS EXISTS: the corpus already gates the three things a reader copies off
-# a page — its links (`check-docs-links.sh`, a 404), its commands
+# a page — its links (`xtask/src/docs/links.rs`, a 404), its commands
 # (`check-docs-cli.sh`, `unrecognized subcommand`), and its `AUTUMN_*` variables
 # (`check-docs-config.sh`, a silent no-op). All three check a page the reader
 # ALREADY REACHED. None of them can tell you whether the page can be reached at
@@ -93,7 +93,7 @@
 # stripped before extraction, fences are not.
 #
 # It also means this gate deliberately parts company with
-# `check-docs-links.sh`, which ignores fenced content because a sample link is
+# `xtask/src/docs/links.rs`, which ignores fenced content because a sample link is
 # not a link it should validate. Everywhere else the two agree ON PURPOSE, down
 # to sharing this file's destination grammar: they run in the same CI job, so a
 # link that resolves in one and not the other would fail a contributor's page in
@@ -159,7 +159,7 @@ INSTRUCTION_FILES = ('AGENTS.md', 'CLAUDE.md')
 HISTORY = ('CHANGELOG.md', 'docs/releases/')
 
 # NUL-delimited so a path containing whitespace is not split into fragments and
-# git does not quote unusual paths — same reason as check-docs-links.sh.
+# git does not quote unusual paths — same reason as xtask/src/docs/links.rs.
 tracked = [
     f for f in subprocess.run(['git', 'ls-files', '-z'], cwd=root,
                               capture_output=True, text=True).stdout.split('\0')
@@ -1128,7 +1128,7 @@ traversable = node_set | waypoints
 
 
 # `](target)`. The destination grammar is lifted from the sibling
-# `check-docs-links.sh` deliberately: the two gates run in the same CI job, so a
+# `xtask/src/docs/links.rs` deliberately: the two gates run in the same CI job, so a
 # link that resolves there and not here would pass one and be called an orphan
 # by the other. That means the angle form (the only way to write a path with
 # spaces), one level of balanced parentheses (`](guide(v2).md)`), and an
@@ -1474,7 +1474,7 @@ UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
 # named forms together, so there is no table to maintain here.
 #
 # NEITHER FORM CAN ACTUALLY BITE TODAY, and that is worth writing down rather
-# than discovering later. `check-docs-links.sh` does not decode references at
+# than discovering later. `xtask/src/docs/links.rs` does not decode references at
 # all: it reports `mail&#46;md` and `mail&period;md` as broken link targets, so
 # a page using one fails the docs job on that gate before reachability is ever
 # in question. Decoding here is therefore about not disagreeing with the
@@ -1483,7 +1483,7 @@ UNESCAPE = re.compile(r'\\([!-/:-@\[-`{-~])')
 # The two siblings disagree on this point: `check-migration-guides.sh` resolves
 # numeric references deliberately, with a test
 # (`…_resolves_a_character_reference_in_a_destination`), while
-# `check-docs-links.sh` rejects them. Reconciling that is a change to the link
+# `xtask/src/docs/links.rs` rejects them. Reconciling that is a change to the link
 # gate's contract and belongs in its own PR, not smuggled into this one.
 # CommonMark decodes only SEMICOLON-terminated references. `html.unescape` is
 # HTML5-lenient and takes `&#46md` too, which renders literally — so decoding it
@@ -1495,7 +1495,7 @@ def decode_char_refs(s):
     return CHAR_REF.sub(lambda m: html.unescape(m.group(0)), s)
 # A reference definition: `[mail]: mail.md`, optionally `<…>`-wrapped. Markdown
 # allows up to three leading spaces. Reference-style links are a syntax
-# check-docs-links.sh already parses and self-tests, so a page linked only that
+# xtask/src/docs/links.rs already parses and self-tests, so a page linked only that
 # way is genuinely reachable; without this the gate would report it as an
 # orphan and block a docs change written in a spelling the corpus supports.
 # The label honours escapes, so `[closing \]]: mail.md` is one definition whose
@@ -1693,7 +1693,7 @@ BARE = re.compile(
 
 def normalize(p):
     """Collapse `.`/`..` without touching the filesystem (targets may not exist;
-    that is check-docs-links.sh's defect to report, not this gate's)."""
+    that is xtask/src/docs/links.rs's defect to report, not this gate's)."""
     parts = []
     for seg in p.split('/'):
         if seg in ('', '.'):
@@ -1902,7 +1902,7 @@ def strip_comments(txt):
 
        CORRECTION to what this note said for several commits: it claimed no
        gate in the repo masks indented code, having checked only
-       `check-docs-links.sh`. That was wrong — `check-migration-guides.sh`
+       `xtask/src/docs/links.rs`. That was wrong — `check-migration-guides.sh`
        does, list-aware, and pins it with
        `migration_guide_gate_ignores_links_in_indented_code_blocks`. The
        conclusion stands but the reason is different: that logic lives inside
@@ -1931,7 +1931,7 @@ def strip_comments(txt):
        Destinations are still unrolled at 32 parens and are beatable at 33 in
        exactly the same way. Left as is deliberately: cmark itself caps
        destination nesting at 32, so that bound matches the renderer instead of
-       merely hoping. `check-docs-links.sh` still stops at one level of label
+       merely hoping. `xtask/src/docs/links.rs` still stops at one level of label
        nesting, so it is now the stricter of the two on this shape.
 
     4. Code spans are masked before comments are located, so a comment whose
@@ -3993,7 +3993,7 @@ def edges_from(f):
             # `STABILITY.md` already links `[migration guide](docs/migrations/)`
             # twice. Rejecting everything without a `.md` suffix discarded the
             # hop, so a guide reachable only through a directory index was an
-            # orphan. `check-docs-links.sh` accepts the same destination, so
+            # orphan. `xtask/src/docs/links.rs` accepts the same destination, so
             # this gate disagreeing with it was the defect.
             #
             # Appended rather than special-cased: a destination that names no
@@ -4018,7 +4018,7 @@ def edges_from(f):
         #
         # The comment here used to say "a site path, not a file path" and then
         # strip the slash anyway, which was the bug: the sentence was right and
-        # the line under it did the opposite. `check-docs-links.sh` is the
+        # the line under it did the opposite. `xtask/src/docs/links.rs` is the
         # repo's authority on whether a destination resolves, and it already
         # calls this one `link target escapes the repository` — `os.path.join`
         # discards the left side on an absolute path, so it lands outside the
@@ -4486,7 +4486,7 @@ self_test() {
   git -C "$c9" add -A && git -C "$c9" commit -qm bare
   check "a bare repo path counts as an edge" pass "$c9"
 
-  # Reference-style links are a spelling check-docs-links.sh already parses and
+  # Reference-style links are a spelling xtask/src/docs/links.rs already parses and
   # self-tests, so the gate must read them too — otherwise it reports a
   # perfectly reachable page as an orphan and blocks the docs change.
   local c9a="$tmp/c9a"; make_corpus "$c9a"
@@ -4666,7 +4666,7 @@ self_test() {
   git -C "$c9v" add -A && git -C "$c9v" commit -qm unclosed-in-code-span
   check "an unclosed comment in inline code does not hide later links" pass "$c9v"
 
-  # Destination grammar shared with check-docs-links.sh: balanced parens, an
+  # Destination grammar shared with xtask/src/docs/links.rs: balanced parens, an
   # escaped-paren spelling of the same path, and a link title.
   local c9w="$tmp/c9w"; make_corpus "$c9w"
   mv "$c9w/docs/guide/mail.md" "$c9w/docs/guide/mail(v2).md"
@@ -5648,7 +5648,7 @@ self_test() {
   # `/docs/guide/mail.md` addresses `github.com/docs/guide/mail.md`.
   # This case asserted the opposite for several commits, on nothing but an
   # assertion — while the code comment beside it already said "a site path,
-  # not a file path" and stripped the slash anyway. `check-docs-links.sh`
+  # not a file path" and stripped the slash anyway. `xtask/src/docs/links.rs`
   # settles it: run on a page containing exactly this link it reports
   # `link target escapes the repository`, so one gate was calling the link
   # broken while this one counted it as navigation.
