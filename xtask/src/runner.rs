@@ -1,7 +1,8 @@
 //! Run a lane's steps and report the outcome.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -237,7 +238,11 @@ pub fn command_for(root: &Path, argv: &[String]) -> Result<CommandBuilder> {
             .ok()
             .and_then(|text| text.lines().next().map(str::to_owned))
             .unwrap_or_default();
-        sh::cmd(shebang_interpreter(&first).unwrap_or(fallback)).arg(script)
+        match shebang_interpreter(&first).unwrap_or(fallback) {
+            "bash" => sh::cmd(bash()),
+            other => sh::cmd(other),
+        }
+        .arg(script)
     } else {
         sh::cmd(program)
     };
@@ -258,6 +263,54 @@ pub fn shebang_interpreter(first_line: &str) -> Option<&'static str> {
         n if n.starts_with("python") => Some(python()),
         _ => None,
     }
+}
+
+/// The `bash` to run a script with.
+///
+/// On Windows a bare `bash` is the wrong program: `CreateProcess`, and so
+/// Rust's `Command`, looks in the system directory before `PATH`, where
+/// `System32\bash.exe` is the WSL launcher. With no Linux distribution
+/// installed (GitHub's runners have none) it prints an install hint and
+/// exits 1, so every script "failed". The first `bash.exe` on `PATH` outside
+/// the Windows directory is Git for Windows' bash, which is what the scripts
+/// are written for.
+fn bash() -> OsString {
+    if cfg!(windows)
+        && let Some(found) = std::env::var_os("PATH").and_then(|path| {
+            bash_on_path(
+                &path,
+                std::env::var_os("SystemRoot").as_deref(),
+                "bash.exe",
+                &|p: &Path| p.is_file(),
+            )
+        })
+    {
+        return found.into_os_string();
+    }
+    OsString::from("bash")
+}
+
+/// The first `name` in the directories of `path` that is a file and does not
+/// sit under `system_root`, compared without regard to case as Windows paths
+/// are.
+fn bash_on_path(
+    path: &OsStr,
+    system_root: Option<&OsStr>,
+    name: &str,
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let system_root = system_root.map(|r| r.to_string_lossy().to_lowercase());
+    std::env::split_paths(path)
+        .map(|dir| dir.join(name))
+        .filter(|candidate| is_file(candidate))
+        .find(|candidate| {
+            system_root.as_ref().is_none_or(|root| {
+                !candidate
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .starts_with(root.as_str())
+            })
+        })
 }
 
 const fn python() -> &'static str {
@@ -539,7 +592,44 @@ mod tests {
     fn scripts_run_from_the_repo_root_under_their_interpreter() {
         let c = command_for(root(), &["scripts/check-msrv.sh".into(), "--x".into()]).unwrap();
         let script = root().join("scripts/check-msrv.sh");
-        assert_eq!(c.to_string(), format!("bash {} --x", script.display()));
+        let line = c.to_string();
+        assert!(line.contains("bash"), "{line}");
+        assert!(
+            line.ends_with(&format!("{} --x", script.display())),
+            "{line}"
+        );
+    }
+
+    /// `System32\bash.exe` is the WSL launcher, not a bash: skipping it, the
+    /// search finds Git for Windows' bash later on `PATH`.
+    #[test]
+    fn bash_search_skips_the_windows_directory() {
+        let path = std::env::join_paths(["/WINDOWS/system32", "/git/bin", "/other/bin"]).unwrap();
+        let exists = |p: &Path| p.starts_with("/WINDOWS/system32") || p.starts_with("/git/bin");
+        let found = bash_on_path(&path, Some(OsStr::new("/windows")), "bash.exe", &exists);
+        assert_eq!(found, Some(PathBuf::from("/git/bin/bash.exe")));
+    }
+
+    #[test]
+    fn bash_search_finds_nothing_without_a_bash_outside_the_windows_directory() {
+        let path = std::env::join_paths(["/WINDOWS/system32", "/other/bin"]).unwrap();
+        let exists = |p: &Path| p.starts_with("/WINDOWS/system32");
+        assert_eq!(
+            bash_on_path(&path, Some(OsStr::new("/Windows")), "bash.exe", &exists),
+            None
+        );
+        // Without a system root nothing is skipped.
+        assert_eq!(
+            bash_on_path(&path, None, "bash.exe", &exists),
+            Some(PathBuf::from("/WINDOWS/system32/bash.exe"))
+        );
+    }
+
+    #[test]
+    fn bash_is_plain_bash_off_windows() {
+        if !cfg!(windows) {
+            assert_eq!(bash(), OsString::from("bash"));
+        }
     }
 
     #[test]
