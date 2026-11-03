@@ -269,6 +269,80 @@ let config = AutocompleteConfig::new("/tags/autocomplete", "tag")
     .free_text(); // keep hidden field in sync with typed text
 ```
 
+### Multiple values (tags mode)
+
+Use `.multiple()` to select more than one value (issue #3410). Each pick
+is a chip with a remove button. Each chip submits one hidden
+`name=value` input, so the repeated keys decode into a `Vec<T>`:
+
+```rust
+#[derive(Deserialize, Serialize, Validate)]
+struct PostForm {
+    title: String,
+    #[serde(default)] // No chip posts no key.
+    tags: Vec<String>,
+}
+
+let config = AutocompleteConfig::new("/tags/suggest", "tags")
+    .multiple()
+    .free_text(); // Enter adds the typed text as a tag.
+
+html! {
+    // Pre-fill the chips from the changeset, for example after a 422.
+    (autocomplete_input_for(&changeset, "tags", "Tags", &config))
+}
+```
+
+- `autocomplete_input_for` reads `Changeset::field_values("tags")`. It
+  finds each label in `.selected(…)`, then in `.fallback_options(…)`.
+  Else the label is the value.
+- `.selected(&[("42", "rust")])` gives the first chips without a
+  changeset, for example on an edit form.
+- `.remove_label("Entfernen")` translates the first word of each remove
+  button's `aria-label` (`"Remove rust"`).
+
+To let the user create a tag, return a "create" entry after the matches:
+
+```rust
+use autumn_web::widgets::{autocomplete_create_option, autocomplete_option};
+
+html! {
+    @for tag in &tags { (autocomplete_option(&tag.name, &tag.name)) }
+    @if !tags.iter().any(|t| t.name == q) {
+        (autocomplete_create_option(q, &format!("Create “{q}”")))
+    }
+}
+```
+
+A pick of the entry adds a chip that shows the value, not the label.
+Validate new values on the server.
+
+The listbox hides an option that is already a chip. A value is added one
+time only.
+
+#### Tags keyboard
+
+| Key | Where | Effect |
+|---|---|---|
+| ArrowDown / ArrowUp, Enter, Escape | Input | As in the single mode. Enter adds a chip and clears the input. |
+| Enter | Input, no active option, `free_text` | Adds the typed text as a chip. |
+| Backspace | Empty input | Removes the last chip. |
+| ArrowLeft | Start of the input | Moves to the last chip. ArrowRight in RTL. |
+| ArrowLeft / ArrowRight, Home, End | Chip | Moves between chips. Does not wrap. |
+| ArrowRight | Last chip | Moves to the input. ArrowLeft in RTL. |
+| Delete, Backspace, Enter, Space | Chip | Removes the chip. Focus goes to the next chip, else the previous chip, else the input. |
+| Tab | Chip | Moves to the input. The chip list is one tab stop. |
+
+A pointer click on a remove button removes the chip and moves focus to
+the input.
+
+#### Tags without JavaScript
+
+The `<noscript>` fallback is a `<select multiple>`. The selected values
+are `selected`. A value with no fallback option gets its own option, so a
+resubmit keeps it. The server renders the chip list `hidden` and its
+inputs `disabled`, so with JavaScript off no value is sent two times.
+
 ---
 
 ## No-JavaScript fallback
@@ -315,6 +389,9 @@ All widgets include:
 - `role="option"` + `tabindex="-1"` on each autocomplete option (focus stays
   on the input; `aria-activedescendant` names the active option)
 - `role="status"` + `aria-live="polite"` on empty-state partials
+- Tags mode: a `<ul>` of chips named by the field label
+  (`aria-labelledby`), and a remove `<button>` per chip with
+  `aria-label="Remove {label}"` and a 24 px target
 
 ---
 

@@ -645,6 +645,98 @@ async fn keyboard_autocomplete() {
 
 #[tokio::test]
 #[ignore = "requires Chromium"]
+async fn keyboard_tags_input() {
+    const INPUT: &str = "#tag-list-query";
+    const VALUES: &str = "[...document.querySelectorAll('#tag-list-chips [data-ac-chip] \
+                          input[type=hidden]')].filter(i => !i.disabled).map(i => i.value).join()";
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/tags-input").await;
+    assert_eq!(
+        eval_string(&page, VALUES).await,
+        "rust",
+        "the story pre-fills a chip"
+    );
+
+    // Pick an option with the keyboard.
+    page.fill(INPUT, "a").await.expect("type a query");
+    wait_for(
+        &page,
+        "document.querySelector('#tag-list-query').getAttribute('aria-expanded') === 'true'",
+    )
+    .await;
+    focus(&page, INPUT).await;
+    press(&page, "ArrowDown").await;
+    press(&page, "Enter").await;
+    assert_eq!(eval_string(&page, VALUES).await, "rust,axum");
+    assert_eq!(active_id(&page).await, "tag-list-query");
+
+    // The "create" entry adds a new tag.
+    page.fill(INPUT, "zig").await.expect("type a new tag");
+    wait_for(
+        &page,
+        "document.querySelector('#tag-list-options [data-ac-create]') !== null",
+    )
+    .await;
+    focus(&page, INPUT).await;
+    press(&page, "ArrowDown").await;
+    press(&page, "Enter").await;
+    assert_eq!(eval_string(&page, VALUES).await, "rust,axum,zig");
+
+    // Backspace removes the last chip. ArrowLeft goes to the chips.
+    press(&page, "Backspace").await;
+    assert_eq!(eval_string(&page, VALUES).await, "rust,axum");
+    press(&page, "ArrowLeft").await;
+    assert_eq!(
+        eval_string(
+            &page,
+            "document.activeElement.getAttribute('aria-label') || ''"
+        )
+        .await,
+        "Remove axum"
+    );
+    press(&page, "Delete").await;
+    assert_eq!(eval_string(&page, VALUES).await, "rust");
+
+    // Pointer removal.
+    page.click("#tag-list-chips [data-ac-chip-remove]")
+        .await
+        .expect("click remove");
+    assert_eq!(eval_string(&page, VALUES).await, "");
+    assert_eq!(active_id(&page).await, "tag-list-query");
+
+    // A chip and a popup with options for the axe check.
+    page.fill(INPUT, "web").await.expect("type");
+    wait_for(
+        &page,
+        "document.querySelector('#tag-list-query').getAttribute('aria-expanded') === 'true'",
+    )
+    .await;
+    focus(&page, INPUT).await;
+    press(&page, "ArrowDown").await;
+    press(&page, "Enter").await;
+    page.fill(INPUT, "r").await.expect("type");
+    wait_for(
+        &page,
+        "document.querySelectorAll('#tag-list-options [role=option]').length > 0",
+    )
+    .await;
+    axe_in_both_schemes(&page, "tags input with chips and an open popup", || async {
+        focus(&page, INPUT).await;
+        press(&page, "ArrowDown").await;
+        wait_for(
+            &page,
+            "document.querySelector('#tag-list-query').getAttribute('aria-expanded') === 'true'",
+        )
+        .await;
+    })
+    .await;
+    assert_eq!(eval_string(&page, VALUES).await, "web");
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+#[tokio::test]
+#[ignore = "requires Chromium"]
 async fn keyboard_active_search() {
     let runner = runner().await;
     let page = runner.page().await.expect("page");

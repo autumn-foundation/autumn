@@ -160,6 +160,16 @@ pub struct AutocompleteConfig<'a> {
     /// `value` and the hidden field's `value`. Leave unset (the default) for a
     /// blank widget.
     pub initial_value: Option<&'a str>,
+    /// Multi-value (tags) mode (issue #3410). Each pick is a removable
+    /// chip. Each chip submits one hidden `{value_name}={value}` input, so a
+    /// `Vec<T>` field decodes the repeated keys. Default: `false`.
+    pub multiple: bool,
+    /// The `(value, label)` chips that show first in multiple mode, for
+    /// example from the database on an edit form. Default: none.
+    pub selected: &'a [(&'a str, &'a str)],
+    /// The first word of the `aria-label` of each chip's remove button. The
+    /// chip label comes after it: `"Remove rust"`. Default: `"Remove"`.
+    pub remove_label: &'a str,
 }
 
 impl<'a> AutocompleteConfig<'a> {
@@ -180,6 +190,9 @@ impl<'a> AutocompleteConfig<'a> {
             fallback_options: None,
             free_text: false,
             initial_value: None,
+            multiple: false,
+            selected: &[],
+            remove_label: "Remove",
         }
     }
 
@@ -243,6 +256,35 @@ impl<'a> AutocompleteConfig<'a> {
     #[must_use]
     pub const fn initial_value(mut self, value: &'a str) -> Self {
         self.initial_value = Some(value);
+        self
+    }
+
+    /// Turn on multi-value (tags) mode. See [`AutocompleteConfig::multiple`]
+    /// (the field).
+    ///
+    /// With [`free_text`](Self::free_text), Enter adds the typed text as a
+    /// chip when no option is active.
+    #[must_use]
+    pub const fn multiple(mut self) -> Self {
+        self.multiple = true;
+        self
+    }
+
+    /// Show these `(value, label)` chips first (multiple mode only).
+    ///
+    /// To pre-fill from a [`Changeset`](crate::form::Changeset), use
+    /// [`autocomplete_input_for`].
+    #[must_use]
+    pub const fn selected(mut self, chips: &'a [(&'a str, &'a str)]) -> Self {
+        self.selected = chips;
+        self
+    }
+
+    /// Set the first word of each remove button's `aria-label` (default:
+    /// `"Remove"`). Use it to translate the widget.
+    #[must_use]
+    pub const fn remove_label(mut self, text: &'a str) -> Self {
+        self.remove_label = text;
         self
     }
 }
@@ -403,7 +445,8 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 ///
 /// Emits:
 /// - A visible `<input type="search" role="combobox">` for typing.
-/// - A hidden `<input>` for storing the selected record's ID.
+/// - A hidden `<input>` for storing the selected record's ID (single mode),
+///   or a chip list (multiple mode).
 /// - A `<div role="listbox">` where the server renders option partials.
 /// - A `<noscript>` fallback `<select>`.
 ///
@@ -419,8 +462,27 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 /// re-rendering a form with this widget after a validation error, so text the
 /// user already typed isn't silently dropped.
 ///
+/// # Multiple (tags) mode
+///
+/// With [`AutocompleteConfig::multiple`], each pick is a chip with a remove
+/// button. Each chip holds one hidden `{value_name}={value}` input, so a
+/// `#[serde(default)] Vec<T>` field gets every value. The single hidden
+/// input is not rendered. The `<noscript>` fallback is a `<select multiple>`.
+///
+/// The server renders the chip list `hidden` and the chip inputs
+/// `disabled`. The runtime shows and enables them. Thus with JS off, only
+/// the `<select>` submits, and no value comes two times.
+///
+/// Keys (with `autumn-widgets.js`): Enter adds the active option.
+/// Backspace in an empty input removes the last chip. ArrowLeft at the
+/// start of the input moves to the chips (ArrowRight in RTL). In the chip
+/// list, the arrow keys, Home and End move. Delete, Backspace, Enter or
+/// Space removes the chip. ArrowRight on the last chip moves back to the
+/// input. The chip list is one tab stop.
+///
 /// Use [`autocomplete_option`] and [`autocomplete_empty_state`] to render
-/// option partials returned by your handler.
+/// option partials returned by your handler. Use
+/// [`autocomplete_create_option`] for a "create new" entry.
 ///
 /// # Example
 ///
@@ -436,32 +498,156 @@ pub fn active_search_empty_state(message: &str) -> maud::Markup {
 /// ```
 #[must_use]
 pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>) -> maud::Markup {
+    let value = config.initial_value;
+    let seed = Seed {
+        query: if config.multiple {
+            ""
+        } else {
+            value.unwrap_or("")
+        },
+        value,
+        chips: config.selected,
+    };
+    render_autocomplete(id, label, config, &seed)
+}
+
+/// Render an [`autocomplete_input`] that is pre-filled from `changeset`.
+///
+/// The field is [`AutocompleteConfig::value_name`]. In multiple mode, each
+/// [`Changeset::field_values`](crate::form::Changeset::field_values) entry
+/// is a chip. Else [`Changeset::field_value`](crate::form::Changeset::field_value)
+/// fills the hidden input. A missing field falls back to the config.
+///
+/// The label of a value comes from [`AutocompleteConfig::selected`], then
+/// from [`AutocompleteConfig::fallback_options`]. Else the label is the
+/// value, which is correct for tags.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{AutocompleteConfig, autocomplete_input_for};
+///
+/// // `PostForm { #[serde(default)] tags: Vec<String>, .. }`
+/// let config = AutocompleteConfig::new("/tags/autocomplete", "tags")
+///     .multiple()
+///     .free_text();
+/// html! { (autocomplete_input_for(&changeset, "tags", "Tags", &config)) }
+/// ```
+#[must_use]
+pub fn autocomplete_input_for<T: serde::Serialize>(
+    changeset: &crate::form::Changeset<T>,
+    id: &str,
+    label: &str,
+    config: &AutocompleteConfig<'_>,
+) -> maud::Markup {
+    if config.multiple {
+        let values = changeset.field_values(config.value_name);
+        if values.is_empty() {
+            return autocomplete_input(id, label, config);
+        }
+        let chips: Vec<(&str, &str)> = values
+            .iter()
+            .map(|value| (value.as_str(), label_of(config, value)))
+            .collect();
+        let seed = Seed {
+            query: "",
+            value: None,
+            chips: &chips,
+        };
+        return render_autocomplete(id, label, config, &seed);
+    }
+    let Some(value) = changeset.field_value(config.value_name) else {
+        return autocomplete_input(id, label, config);
+    };
+    let seed = Seed {
+        query: label_of(config, &value),
+        value: Some(&value),
+        chips: &[],
+    };
+    render_autocomplete(id, label, config, &seed)
+}
+
+/// The label of `value`: from `selected`, then `fallback_options`, else
+/// the value.
+fn label_of<'v>(config: &AutocompleteConfig<'v>, value: &'v str) -> &'v str {
+    config
+        .selected
+        .iter()
+        .chain(config.fallback_options.unwrap_or(&[]))
+        .find(|(v, _)| *v == value)
+        .map_or(value, |(_, label)| label)
+}
+
+/// The values that an autocomplete widget shows first.
+struct Seed<'s> {
+    /// Text of the visible query input.
+    query: &'s str,
+    /// Value of the single hidden input (single mode).
+    value: Option<&'s str>,
+    /// `(value, label)` chips (multiple mode).
+    chips: &'s [(&'s str, &'s str)],
+}
+
+fn render_autocomplete(
+    id: &str,
+    label: &str,
+    config: &AutocompleteConfig<'_>,
+    seed: &Seed<'_>,
+) -> maud::Markup {
     let query_id = format!("{id}-query");
-    let value_id = format!("{id}-value");
+    let label_id = format!("{id}-label");
     let options_id = format!("{id}-options");
     let trigger = build_trigger(config.debounce_ms, false);
     let target = format!("#{options_id}");
+    let multiple = config.multiple;
+    let value_id = (!multiple).then(|| format!("{id}-value"));
+    let fallback = config.fallback_options.unwrap_or(&[]);
+    let class = if multiple {
+        "autumn-autocomplete autumn-autocomplete--multiple"
+    } else {
+        "autumn-autocomplete"
+    };
 
-    // Interaction wiring is handled by the external autumn-widgets.js script
-    // (served at /static/js/autumn-widgets.js) via data-* attributes:
+    // autumn-widgets.js reads these data-* attributes:
     //
-    //  data-ac-value-id   — id of the hidden input that receives the selected value
-    //  data-ac-value-name — form field name assigned to the hidden input by JS
-    //  data-ac-free-text  — present when free-text typing is allowed (see free_text())
-    //  data-ac-query      — marks the visible search input
-    //  data-ac-min-length — minimum characters before htmx fires a request
+    //  data-ac-value-id     — id of the single hidden input (single mode)
+    //  data-ac-multiple     — tags mode: chips, one hidden input each
+    //  data-ac-value-name   — form field name of the hidden input(s)
+    //  data-ac-remove-label — first word of a remove button's aria-label
+    //  data-ac-free-text    — typed text is a value (see free_text())
+    //  data-ac-query        — marks the visible search input
+    //  data-ac-min-length   — minimum characters before htmx fires a request
     //
-    // The hidden input has no name attribute in HTML so no-JS form submission
-    // only sees the <noscript><select>, avoiding a duplicate-field conflict.
+    // With JS off, only the <noscript><select> submits. The single hidden
+    // input has no name, and the chip inputs are disabled, until the
+    // runtime runs.
 
     maud::html! {
         div
             id=(format!("{id}-wrapper"))
-            class="autumn-autocomplete"
-            data-ac-value-id=(value_id)
+            class=(class)
+            data-ac-value-id=[value_id.as_deref()]
+            data-ac-multiple[multiple]
             data-ac-value-name=(config.value_name)
+            data-ac-remove-label=[multiple.then_some(config.remove_label)]
             data-ac-free-text[config.free_text] {
-            label for=(query_id) class="autumn-autocomplete__label" { (label) }
+            label id=(label_id) for=(query_id) class="autumn-autocomplete__label" { (label) }
+            @if multiple {
+                ul
+                    id=(format!("{id}-chips"))
+                    class="autumn-autocomplete__chips"
+                    aria-labelledby=(label_id)
+                    data-ac-chips
+                    data-autumn-roving="[data-ac-chip-remove]"
+                    data-autumn-orientation="horizontal"
+                    data-autumn-wrap="false"
+                    hidden {
+                    @for (value, text) in seed.chips {
+                        (chip(config, value, text, true))
+                    }
+                }
+                template data-ac-chip-template { (chip(config, "", "", false)) }
+            }
             input
                 type="search"
                 id=(query_id)
@@ -471,7 +657,7 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 aria-expanded="false"
                 aria-autocomplete="list"
                 aria-controls=(options_id)
-                value=(config.initial_value.unwrap_or(""))
+                value=(seed.query)
                 placeholder=[config.placeholder]
                 class="autumn-autocomplete__input"
                 data-ac-query
@@ -480,10 +666,9 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 hx-trigger=(trigger)
                 hx-target=(target)
                 hx-indicator=[config.indicator];
-            input
-                type="hidden"
-                id=(value_id)
-                value=(config.initial_value.unwrap_or(""));
+            @if let Some(value_id) = &value_id {
+                input type="hidden" id=(value_id) value=(seed.value.unwrap_or(""));
+            }
             div
                 id=(options_id)
                 role="listbox"
@@ -494,14 +679,52 @@ pub fn autocomplete_input(id: &str, label: &str, config: &AutocompleteConfig<'_>
                 data-autumn-orientation="vertical"
                 data-autumn-dismiss {}
             noscript {
-                select name=(config.value_name) aria-label=(label) {
-                    option value="" { "— select —" }
-                    @if let Some(opts) = config.fallback_options {
-                        @for (val, lbl) in opts {
-                            option value=(val) selected[config.initial_value == Some(*val)] { (lbl) }
+                @if multiple {
+                    select name=(config.value_name) aria-label=(label) multiple {
+                        @for (val, lbl) in fallback {
+                            option value=(val) selected[seed.chips.iter().any(|(v, _)| v == val)] { (lbl) }
+                        }
+                        // A chip with no fallback option (a new tag) keeps its value.
+                        @for (val, lbl) in seed.chips {
+                            @if !fallback.iter().any(|(v, _)| v == val) {
+                                option value=(val) selected { (lbl) }
+                            }
+                        }
+                    }
+                } @else {
+                    select name=(config.value_name) aria-label=(label) {
+                        option value="" { "— select —" }
+                        @for (val, lbl) in fallback {
+                            option value=(val) selected[seed.value == Some(*val)] { (lbl) }
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+/// One chip: its label, its hidden input and its remove button.
+///
+/// A server chip's input is `disabled` until the runtime runs. A template
+/// chip is a clone source, so its input is live.
+fn chip(config: &AutocompleteConfig<'_>, value: &str, label: &str, server: bool) -> maud::Markup {
+    let remove = if label.is_empty() {
+        config.remove_label.to_owned()
+    } else {
+        format!("{} {label}", config.remove_label)
+    };
+    maud::html! {
+        li class="autumn-chip" data-ac-chip {
+            span class="autumn-chip__label" data-ac-chip-label { (label) }
+            input type="hidden" name=(config.value_name) value=(value) disabled[server];
+            button
+                type="button"
+                class="autumn-chip__remove"
+                tabindex="-1"
+                aria-label=(remove)
+                data-ac-chip-remove {
+                span aria-hidden="true" { "×" }
             }
         }
     }
@@ -534,6 +757,40 @@ pub fn autocomplete_option(value: &str, label: &str) -> maud::Markup {
             tabindex="-1"
             class="autumn-autocomplete__option"
             data-value=(value) {
+            (label)
+        }
+    }
+}
+
+/// Render a "create new" option partial for tags mode (issue #3410).
+///
+/// Return it from your handler, after the matches, when no record has the
+/// typed text. `value` is the new value. `label` is the visible text, for
+/// example `Create “zig”`. A pick adds a chip that shows `value`, not
+/// `label`. Check the new value on the server, as for all input.
+///
+/// # Example response fragment
+///
+/// ```rust,ignore
+/// use autumn_web::widgets::{autocomplete_create_option, autocomplete_option};
+///
+/// html! {
+///     @for tag in &tags { (autocomplete_option(&tag.name, &tag.name)) }
+///     @if !tags.iter().any(|t| t.name == q) {
+///         (autocomplete_create_option(q, &format!("Create “{q}”")))
+///     }
+/// }
+/// ```
+#[must_use]
+pub fn autocomplete_create_option(value: &str, label: &str) -> maud::Markup {
+    maud::html! {
+        div
+            role="option"
+            tabindex="-1"
+            class="autumn-autocomplete__option autumn-autocomplete__option--create"
+            data-value=(value)
+            data-label=(value)
+            data-ac-create {
             (label)
         }
     }
@@ -1149,6 +1406,330 @@ mod tests {
         assert!(listbox.contains("data-autumn-dismiss"), "{html}");
         // The core finds the controller through `aria-controls`.
         assert!(html.contains(r#"aria-controls="x-options""#), "{html}");
+    }
+
+    // ── multiple mode (#3410) ──────────────────────────────────────────
+
+    /// The markup of the first element that has `marker`, up to its `>`.
+    fn tag_with<'h>(html: &'h str, marker: &str) -> &'h str {
+        let at = html
+            .find(marker)
+            .unwrap_or_else(|| panic!("no {marker}: {html}"));
+        let start = html[..=at].rfind('<').expect("tag start");
+        let end = at + html[at..].find('>').expect("tag end");
+        &html[start..=end]
+    }
+
+    /// The `<li>` chips of the chip list. The `<template>` is not a chip.
+    fn chips(html: &str) -> Vec<&str> {
+        let list = html
+            .split(r#"data-ac-chips"#)
+            .nth(1)
+            .and_then(|rest| rest.split("</ul>").next())
+            .expect("chip list");
+        list.split("<li").skip(1).collect()
+    }
+
+    const PICKED: &[(&str, &str)] = &[("42", "rust"), ("7", "web")];
+
+    #[test]
+    fn multiple_defaults_off() {
+        let c = AutocompleteConfig::new("/ac", "tags");
+        assert!(!c.multiple);
+        assert!(c.selected.is_empty());
+        assert_eq!(c.remove_label, "Remove");
+    }
+
+    #[test]
+    fn single_mode_has_no_chip_markup() {
+        let config = AutocompleteConfig::new("/ac", "tag_id");
+        let html = autocomplete_input("x", "Tag", &config).into_string();
+        assert!(!html.contains("data-ac-multiple"), "{html}");
+        assert!(!html.contains("data-ac-chips"), "{html}");
+        assert!(!html.contains("<template"), "{html}");
+        assert!(!html.contains("multiple"), "{html}");
+    }
+
+    #[test]
+    fn multiple_wrapper_has_runtime_data_attributes() {
+        let config = AutocompleteConfig::new("/ac", "tags").multiple();
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        let wrapper = tag_with(&html, r#"id="x-wrapper""#);
+        assert!(wrapper.contains("data-ac-multiple"), "{wrapper}");
+        assert!(
+            wrapper.contains(r#"data-ac-value-name="tags""#),
+            "{wrapper}"
+        );
+        assert!(
+            wrapper.contains(r#"data-ac-remove-label="Remove""#),
+            "{wrapper}"
+        );
+        // The single-value hidden field is not rendered.
+        assert!(!wrapper.contains("data-ac-value-id"), "{wrapper}");
+        assert!(!html.contains(r#"id="x-value""#), "{html}");
+    }
+
+    #[test]
+    fn multiple_chip_list_is_a_roving_list_named_by_the_label() {
+        let config = AutocompleteConfig::new("/ac", "tags").multiple();
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        assert!(
+            html.contains(r#"<label id="x-label" for="x-query""#),
+            "{html}"
+        );
+        let list = tag_with(&html, "data-ac-chips");
+        assert!(list.starts_with("<ul"), "{list}");
+        assert!(list.contains(r#"id="x-chips""#), "{list}");
+        assert!(list.contains(r#"aria-labelledby="x-label""#), "{list}");
+        assert!(
+            list.contains(r#"data-autumn-roving="[data-ac-chip-remove]""#),
+            "{list}"
+        );
+        assert!(
+            list.contains(r#"data-autumn-orientation="horizontal""#),
+            "{list}"
+        );
+        assert!(list.contains(r#"data-autumn-wrap="false""#), "{list}");
+        // Hidden until the runtime runs: with JS off, the select is the control.
+        assert!(list.contains(" hidden"), "{list}");
+    }
+
+    #[test]
+    fn multiple_renders_a_chip_for_each_selected_pair() {
+        let config = AutocompleteConfig::new("/ac", "tags")
+            .multiple()
+            .selected(PICKED);
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        let chips = chips(&html);
+        assert_eq!(chips.len(), 2, "{html}");
+        assert!(chips[0].contains(">rust<"), "{}", chips[0]);
+        assert!(chips[1].contains(">web<"), "{}", chips[1]);
+        assert!(chips[0].contains("data-ac-chip"), "{}", chips[0]);
+        assert!(chips[0].contains(r#"class="autumn-chip""#), "{}", chips[0]);
+    }
+
+    #[test]
+    fn each_chip_has_one_named_hidden_input_disabled_until_the_runtime_runs() {
+        let config = AutocompleteConfig::new("/ac", "tags")
+            .multiple()
+            .selected(PICKED);
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        for (chip, value) in chips(&html).iter().zip(["42", "7"]) {
+            let input = tag_with(chip, r#"type="hidden""#);
+            assert!(input.contains(r#"name="tags""#), "{input}");
+            assert!(input.contains(&format!(r#"value="{value}""#)), "{input}");
+            // With JS off the <noscript> select submits. Not both.
+            assert!(input.contains("disabled"), "{input}");
+            assert_eq!(chip.matches(r#"type="hidden""#).count(), 1, "{chip}");
+        }
+    }
+
+    #[test]
+    fn each_chip_has_a_labelled_remove_button() {
+        let config = AutocompleteConfig::new("/ac", "tags")
+            .multiple()
+            .selected(PICKED)
+            .remove_label("Delete");
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        let chip = chips(&html)[0];
+        let button = tag_with(chip, "data-ac-chip-remove");
+        assert!(button.starts_with("<button"), "{button}");
+        assert!(button.contains(r#"type="button""#), "{button}");
+        assert!(button.contains(r#"aria-label="Delete rust""#), "{button}");
+        assert!(button.contains(r#"tabindex="-1""#), "{button}");
+        assert!(chip.contains(r#"aria-hidden="true""#), "{chip}");
+    }
+
+    #[test]
+    fn chip_labels_and_values_are_escaped() {
+        let pairs: &[(&str, &str)] = &[(r#"a"b"#, "<script>x</script>")];
+        let config = AutocompleteConfig::new("/ac", "tags")
+            .multiple()
+            .selected(pairs);
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        assert!(!html.contains("<script>"), "{html}");
+        assert!(html.contains("&lt;script&gt;x&lt;/script&gt;"), "{html}");
+        assert!(html.contains(r#"value="a&quot;b""#), "{html}");
+    }
+
+    #[test]
+    fn multiple_has_an_empty_chip_template_for_the_runtime() {
+        let config = AutocompleteConfig::new("/ac", "tags")
+            .multiple()
+            .selected(PICKED);
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        let template = html
+            .split("<template data-ac-chip-template>")
+            .nth(1)
+            .and_then(|rest| rest.split("</template>").next())
+            .expect("chip template");
+        assert!(template.contains("data-ac-chip"), "{template}");
+        assert!(template.contains("data-ac-chip-label"), "{template}");
+        assert!(template.contains(r#"name="tags""#), "{template}");
+        assert!(template.contains("data-ac-chip-remove"), "{template}");
+        assert!(!template.contains("rust"), "{template}");
+        // A clone is live at once, so the template input is not disabled.
+        assert!(!template.contains("disabled"), "{template}");
+    }
+
+    #[test]
+    fn multiple_noscript_is_a_select_multiple_with_the_selection() {
+        let opts: &[(&str, &str)] = &[("42", "rust"), ("7", "web"), ("13", "axum")];
+        let config = AutocompleteConfig::new("/ac", "tags")
+            .multiple()
+            .fallback_options(opts)
+            .selected(&[("13", "axum"), ("42", "rust")]);
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        let noscript = html
+            .split("<noscript>")
+            .nth(1)
+            .and_then(|rest| rest.split("</noscript>").next())
+            .expect("noscript");
+        let select = tag_with(noscript, "<select");
+        assert!(select.contains(r#"name="tags""#), "{select}");
+        assert!(select.contains("multiple"), "{select}");
+        assert!(noscript.contains(r#"value="42" selected"#), "{noscript}");
+        assert!(noscript.contains(r#"value="13" selected"#), "{noscript}");
+        assert!(!noscript.contains(r#"value="7" selected"#), "{noscript}");
+        // No "— select —" placeholder: an empty multi-select posts nothing.
+        assert!(!noscript.contains(r#"value="""#), "{noscript}");
+    }
+
+    #[test]
+    fn multiple_noscript_keeps_a_selected_value_with_no_fallback_option() {
+        // A created tag is not in `fallback_options`. A no-JS resubmit
+        // must keep it.
+        let opts: &[(&str, &str)] = &[("rust", "rust")];
+        let config = AutocompleteConfig::new("/ac", "tags")
+            .multiple()
+            .fallback_options(opts)
+            .selected(&[("brand-new", "brand-new")]);
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        assert!(
+            html.contains(r#"<option value="brand-new" selected>brand-new</option>"#),
+            "{html}"
+        );
+        assert!(!html.contains(r#"value="rust" selected"#), "{html}");
+    }
+
+    #[test]
+    fn multiple_free_text_sets_its_data_attribute() {
+        let config = AutocompleteConfig::new("/ac", "tags")
+            .multiple()
+            .free_text();
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        let wrapper = tag_with(&html, r#"id="x-wrapper""#);
+        assert!(wrapper.contains("data-ac-free-text"), "{wrapper}");
+    }
+
+    #[test]
+    fn multiple_query_input_is_still_an_apg_combobox() {
+        let config = AutocompleteConfig::new("/ac", "tags").multiple();
+        let html = autocomplete_input("x", "Tags", &config).into_string();
+        let input = tag_with(&html, r#"id="x-query""#);
+        assert!(input.contains(r#"role="combobox""#), "{input}");
+        assert!(input.contains(r#"aria-controls="x-options""#), "{input}");
+        assert!(input.contains(r#"value="""#), "{input}");
+        assert!(html.contains(r##"hx-target="#x-options""##), "{html}");
+    }
+
+    // ── autocomplete_input_for (#3410) ─────────────────────────────────
+
+    #[derive(serde::Serialize)]
+    struct Post {
+        tags: Vec<String>,
+        tag_ids: Vec<i64>,
+        category_id: Option<i64>,
+    }
+
+    fn post() -> crate::form::Changeset<Post> {
+        crate::form::Changeset::new(Post {
+            tags: vec!["rust".to_owned(), "new-tag".to_owned()],
+            tag_ids: vec![13, 42],
+            category_id: Some(7),
+        })
+    }
+
+    #[test]
+    fn input_for_prefills_chips_from_a_sequence_field() {
+        let config = AutocompleteConfig::new("/ac", "tags").multiple();
+        let html = autocomplete_input_for(&post(), "x", "Tags", &config).into_string();
+        let chips = chips(&html);
+        assert_eq!(chips.len(), 2, "{html}");
+        // No fallback label: the value is the label (tags mode).
+        assert!(chips[0].contains(">rust<"), "{}", chips[0]);
+        assert!(chips[0].contains(r#"value="rust""#), "{}", chips[0]);
+        assert!(chips[1].contains(">new-tag<"), "{}", chips[1]);
+    }
+
+    #[test]
+    fn input_for_finds_chip_labels_in_the_fallback_options() {
+        let opts: &[(&str, &str)] = &[("42", "rust"), ("13", "axum")];
+        let config = AutocompleteConfig::new("/ac", "tag_ids")
+            .multiple()
+            .fallback_options(opts);
+        let html = autocomplete_input_for(&post(), "x", "Tags", &config).into_string();
+        let chips = chips(&html);
+        assert_eq!(chips.len(), 2, "{html}");
+        assert!(chips[0].contains(">axum<"), "{}", chips[0]);
+        assert!(chips[0].contains(r#"value="13""#), "{}", chips[0]);
+        assert!(chips[1].contains(">rust<"), "{}", chips[1]);
+        assert!(html.contains(r#"value="42" selected"#), "{html}");
+    }
+
+    #[test]
+    fn input_for_finds_chip_labels_in_the_selected_pairs() {
+        let config = AutocompleteConfig::new("/ac", "tag_ids")
+            .multiple()
+            .selected(&[("42", "rust")]);
+        let html = autocomplete_input_for(&post(), "x", "Tags", &config).into_string();
+        let chips = chips(&html);
+        // The changeset is the source of truth: 13 and 42, not only 42.
+        assert_eq!(chips.len(), 2, "{html}");
+        assert!(chips[0].contains(">13<"), "{}", chips[0]);
+        assert!(chips[1].contains(">rust<"), "{}", chips[1]);
+    }
+
+    #[test]
+    fn input_for_an_empty_field_renders_no_chips() {
+        let config = AutocompleteConfig::new("/ac", "missing").multiple();
+        let html = autocomplete_input_for(&post(), "x", "Tags", &config).into_string();
+        assert!(chips(&html).is_empty(), "{html}");
+    }
+
+    #[test]
+    fn input_for_single_mode_prefills_the_value_and_its_label() {
+        let opts: &[(&str, &str)] = &[("7", "News"), ("8", "Blog")];
+        let config = AutocompleteConfig::new("/ac", "category_id").fallback_options(opts);
+        let html = autocomplete_input_for(&post(), "x", "Category", &config).into_string();
+        let hidden = tag_with(&html, r#"type="hidden" id="x-value""#);
+        assert!(hidden.contains(r#"value="7""#), "{hidden}");
+        let query = tag_with(&html, r#"id="x-query""#);
+        assert!(query.contains(r#"value="News""#), "{query}");
+        assert!(html.contains(r#"value="7" selected"#), "{html}");
+    }
+
+    // ── autocomplete_create_option (#3410) ─────────────────────────────
+
+    #[test]
+    fn create_option_is_an_option_with_the_new_value_as_its_label() {
+        let html = autocomplete_create_option("go", "Create “go”").into_string();
+        assert!(html.contains(r#"role="option""#), "{html}");
+        assert!(html.contains(r#"tabindex="-1""#), "{html}");
+        assert!(html.contains(r#"data-value="go""#), "{html}");
+        assert!(html.contains(r#"data-label="go""#), "{html}");
+        assert!(html.contains("data-ac-create"), "{html}");
+        assert!(
+            html.contains("autumn-autocomplete__option--create"),
+            "{html}"
+        );
+        assert!(html.contains("Create “go”"), "{html}");
+    }
+
+    #[test]
+    fn create_option_escapes_its_value() {
+        let html = autocomplete_create_option(r#""><b>"#, "x").into_string();
+        assert!(!html.contains("<b>"), "{html}");
     }
 
     // ── autocomplete_empty_state ───────────────────────────────────────

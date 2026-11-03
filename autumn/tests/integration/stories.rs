@@ -555,6 +555,8 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "nav-bar",
     "popover",
     "tabs",
+    // Tags mode of the combobox (#3410).
+    "tags-input",
     "theme-toggle",
     "toast",
     "tooltip",
@@ -562,7 +564,8 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
 
 /// Keyboard stories that a feature can turn off: `flash`, and the
 /// `widgets-search` stories (#3408).
-const FEATURE_GATED_KEYBOARD_SLUGS: &[&str] = &["flash", "active-search", "autocomplete"];
+const FEATURE_GATED_KEYBOARD_SLUGS: &[&str] =
+    &["flash", "active-search", "autocomplete", "tags-input"];
 
 /// The browser test fn name for `slug`.
 fn keyboard_test_name(slug: &str) -> String {

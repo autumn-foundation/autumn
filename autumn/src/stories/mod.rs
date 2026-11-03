@@ -56,6 +56,40 @@ const STORIES_DEMO_SAVE_DELAY: std::time::Duration = std::time::Duration::from_m
 /// Demo backend for the "Autocomplete" story. See [`demo_tag_search`].
 #[cfg(feature = "widgets-search")]
 const STORIES_DEMO_TAG_SEARCH_PATH: &str = "/_stories/demo/tags/search";
+/// Demo backend for the "Tags input" story (#3410). See [`demo_tag_suggest`].
+#[cfg(feature = "widgets-search")]
+const STORIES_DEMO_TAG_SUGGEST_PATH: &str = "/_stories/demo/tags/suggest";
+
+/// Demo backend for the "Tags input" story (#3410), mounted at
+/// [`STORIES_DEMO_TAG_SUGGEST_PATH`]. It returns the tags that contain `q`.
+/// The value of each option is its name. When no tag has the exact name,
+/// it adds a [`autocomplete_create_option`](crate::widgets::autocomplete_create_option).
+#[cfg(feature = "widgets-search")]
+async fn demo_tag_suggest(
+    crate::extract::Query(DemoQuery { q }): crate::extract::Query<DemoQuery>,
+) -> Html<String> {
+    const TAGS: &[&str] = &["rust", "web", "axum", "htmx"];
+    let typed = q.trim();
+    let query = typed.to_lowercase();
+    let matches: Vec<&str> = TAGS
+        .iter()
+        .copied()
+        .filter(|tag| !query.is_empty() && tag.contains(&query))
+        .collect();
+    let exact = matches.contains(&query.as_str());
+    let markup = maud::html! {
+        @for tag in &matches {
+            (crate::widgets::autocomplete_option(tag, tag))
+        }
+        @if !typed.is_empty() && !exact {
+            (crate::widgets::autocomplete_create_option(
+                typed,
+                &format!("Create \u{201c}{typed}\u{201d}"),
+            ))
+        }
+    };
+    Html(markup.into_string())
+}
 
 /// Demo backend for the "Infinite feed" story's sentinel. See
 /// [`demo_infinite_feed`].
@@ -441,6 +475,10 @@ pub(crate) fn demo_routes() -> Vec<(&'static str, &'static str)> {
             STORIES_DEMO_TAG_SEARCH_PATH,
             "story_gallery_demo_tag_search",
         ),
+        (
+            STORIES_DEMO_TAG_SUGGEST_PATH,
+            "story_gallery_demo_tag_suggest",
+        ),
     ]);
     #[cfg(feature = "widgets-social")]
     routes.push((STORIES_DEMO_FEED_PATH, "story_gallery_demo_infinite_feed"));
@@ -491,6 +529,10 @@ where
         .route(
             STORIES_DEMO_TAG_SEARCH_PATH,
             axum::routing::get(demo_tag_search),
+        )
+        .route(
+            STORIES_DEMO_TAG_SUGGEST_PATH,
+            axum::routing::get(demo_tag_suggest),
         );
     #[cfg(feature = "widgets-social")]
     let router = router.route(

@@ -14,6 +14,7 @@ The shipped widgets use the core:
 |---|---|---|
 | `tabs` | Tabs, automatic activation | ArrowLeft/ArrowRight, Home/End, Tab to the panel |
 | `autocomplete_input` | Combobox with listbox popup | ArrowDown/ArrowUp, Enter, Escape |
+| `autocomplete_input` with `.multiple()` | Combobox, and a roving list of chips | Backspace in an empty input removes the last chip. ArrowLeft moves to the chips. Delete removes one. See [Tags keyboard](active-search-and-autocomplete.md#tags-keyboard). |
 | `NavMenu` in `nav_bar`, `dropdown_menu` | Menu button | Enter, Space, ArrowDown or ArrowUp opens; ArrowDown/ArrowUp, Home/End, a letter, Escape, Tab. See [Popover and Dropdown Menu](popover-and-menu.md). |
 | `tooltip` | Tooltip | Escape hides the text. See [Tooltip](tooltip.md) |
 
@@ -168,8 +169,8 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 46 KiB |
-| `autumn-widgets.js`, gzip level 9 | 14 KiB |
+| `autumn-widgets.js`, raw | 50 KiB |
+| `autumn-widgets.js`, gzip level 9 | 15 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
 above the budget. Raise the budget only with a reason in the PR. Issue
@@ -177,7 +178,8 @@ above the budget. Raise the budget only with a reason in the PR. Issue
 10 KiB. Issue #3404 added the tooltip runtime, next to the #3403 drawer.
 Issue #3402 added the popover menu runtime. Together they increased them from
 36 KiB and 11 KiB. Issue #3406 added the busy state for htmx requests. It
-increased them from 44 KiB and 13 KiB.
+increased them from 44 KiB and 13 KiB. Issue #3410 added the tags mode of
+the combobox (chips). It increased them from 46 KiB and 14 KiB.
 
 ## Tests
 
