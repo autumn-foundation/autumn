@@ -3906,6 +3906,12 @@ impl PartialEq<ProcessRole> for RoleName {
     }
 }
 
+impl PartialEq<RoleName> for ProcessRole {
+    fn eq(&self, other: &RoleName) -> bool {
+        other == self
+    }
+}
+
 impl std::fmt::Display for RoleName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -4021,17 +4027,18 @@ pub enum RoleError {
     },
     /// An override turns on a capability that the base does not run.
     #[error(
-        "[roles.{name}]: {capability} = true is not allowed on base \"{base}\", which does not \
+        "[roles.{name}]: {capability} = true is not allowed on base \"{}\", which does not \
          run it; a preset can only turn a capability off, so use base = \"combined\" or \
-         \"worker\""
+         \"worker\"",
+        .base.as_str()
     )]
     AboveBase {
         /// The declared name.
         name: String,
         /// The capability.
         capability: Capability,
-        /// The base name.
-        base: &'static str,
+        /// The base.
+        base: ProcessRole,
     },
     /// `pin` names queues, but the role runs no job workers.
     #[error("[roles.{name}]: pin names queues, but this role runs no job workers")]
@@ -4163,7 +4170,7 @@ impl RolePreset {
             return Err(RoleError::AboveBase {
                 name: named(),
                 capability,
-                base: self.base.as_str(),
+                base: self.base,
             });
         }
         let job_workers = self.capabilities().job_workers;
@@ -4247,6 +4254,20 @@ impl Role {
         self.capabilities.serves_http
     }
 
+    /// The role that the split-role checks use: the durable jobs backend and
+    /// the file-backed `SQLite` database.
+    ///
+    /// This is the base, but a `combined` preset that runs no job workers
+    /// gives [`ProcessRole::Web`]. It enqueues jobs and does not drain them,
+    /// so another process must share its queue.
+    #[must_use]
+    pub const fn guard_base(&self) -> ProcessRole {
+        match self.base {
+            ProcessRole::Combined if !self.capabilities.job_workers => ProcessRole::Web,
+            base => base,
+        }
+    }
+
     /// Whether the base runs background work. Kept for compatibility. To gate
     /// one subsystem, read [`capabilities`](Self::capabilities).
     #[must_use]
@@ -4316,6 +4337,12 @@ impl From<ProcessRole> for Role {
 impl PartialEq<ProcessRole> for Role {
     fn eq(&self, other: &ProcessRole) -> bool {
         self.preset.is_none() && self.base == *other
+    }
+}
+
+impl PartialEq<Role> for ProcessRole {
+    fn eq(&self, other: &Role) -> bool {
+        other == self
     }
 }
 
@@ -5473,27 +5500,6 @@ pub struct JobFleetConfig {
     pub declared_queues: Vec<String>,
 }
 
-impl JobFleetConfig {
-    /// The tiers `autumn doctor` checks: [`tiers`](Self::tiers) when it is
-    /// set, else the tiers [`derive_fleet_tiers`] gets from `[roles.*]`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`RoleError`] of an invalid preset when the tiers are
-    /// derived.
-    pub fn effective_tiers(
-        &self,
-        roles: &BTreeMap<String, RolePreset>,
-        jobs_pin: &[String],
-    ) -> Result<Vec<Vec<String>>, RoleError> {
-        if self.tiers.is_empty() {
-            derive_fleet_tiers(roles, jobs_pin)
-        } else {
-            Ok(self.tiers.clone())
-        }
-    }
-}
-
 /// Redis backend configuration options for the job runner.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JobRedisConfig {
@@ -6369,9 +6375,10 @@ impl AutumnConfig {
         let mut config: Self = toml::from_str(&toml_str)?;
         config.profile = Some(profile);
 
-        // An unknown `AUTUMN_ROLE` fails the load, as a bad TOML `role` does
-        // (#3541). It must not boot as `combined`. Check it before the
-        // overrides, so the load error comes without their warning.
+        // An `AUTUMN_ROLE` that is not a role name fails the load, as a bad
+        // TOML `role` does (#3541). It must not boot as `combined`. Check the
+        // grammar before the overrides, so that error comes without their
+        // warning. An undeclared preset name fails after them.
         let role_from_env = Self::role_env_override(env)?.is_some();
         // A bad TOML `role` fails even when `AUTUMN_ROLE` is valid (#3541).
         // An undeclared preset name in the file is a bad role too (#3543).
@@ -7012,9 +7019,11 @@ impl AutumnConfig {
 
     /// Apply environment overrides using the provided env abstraction.
     ///
-    /// This does not fail. An unknown `AUTUMN_ROLE` leaves `role` as it is and
-    /// prints a warning. The loaders, such as
-    /// [`load_with_env`](Self::load_with_env), reject it.
+    /// This does not fail. An `AUTUMN_ROLE` that is not a role name leaves
+    /// `role` as it is and prints a warning. A valid preset name is applied
+    /// without a check that it is declared. The loaders, such as
+    /// [`load_with_env`](Self::load_with_env), reject both. The boot also
+    /// stops on a role that does not resolve.
     pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
         self.apply_server_env_overrides_with_env(env);
         self.apply_deploy_env_overrides_with_env(env);
@@ -8342,9 +8351,9 @@ impl AutumnConfig {
         );
     }
 
-    /// Set `role` from `AUTUMN_ROLE`. A blank value leaves it. An unknown
-    /// value leaves it and prints a warning. The loaders reject that value
-    /// before they get here.
+    /// Set `role` from `AUTUMN_ROLE`. A blank value leaves it. A value that is
+    /// not a role name leaves it and prints a warning. The loaders reject that
+    /// value before they get here.
     fn apply_role_env_overrides_with_env(&mut self, env: &dyn Env) {
         match Self::role_env_override(env) {
             Ok(Some(role)) => self.role = role,
@@ -25210,23 +25219,37 @@ workers = 2
 
     #[test]
     fn preset_pin_and_workers_contradictions_fail() {
-        for (body, needle) in [
-            ("base = \"web\"\npin = [\"a\"]", "pin"),
+        type Check = fn(&RoleError) -> bool;
+        let cases: [(&str, Check); 7] = [
+            ("base = \"web\"\npin = [\"a\"]", |e| {
+                matches!(e, RoleError::PinWithoutJobWorkers { .. })
+            }),
             (
                 "base = \"worker\"\njob_workers = false\npin = [\"a\"]",
-                "pin",
+                |e| matches!(e, RoleError::PinWithoutJobWorkers { .. }),
             ),
-            ("base = \"worker\"\njob_workers = true\npin = []", "pin"),
-            ("base = \"worker\"\npin = [\"\"]", "pin"),
-            ("base = \"worker\"\nworkers = 0", "workers"),
-            ("base = \"web\"\nworkers = 2", "workers"),
-            ("base = \"worker\"\npin = []\nworkers = 2", "workers"),
-        ] {
-            let toml = format!("[roles.x]\n{body}\n");
-            let config: AutumnConfig = toml::from_str(&toml).expect(body);
-            let err = config.validate().expect_err(body).to_string();
-            assert!(err.contains(needle), "{body}: {err}");
-            assert!(err.contains("roles.x"), "{body}: {err}");
+            ("base = \"worker\"\njob_workers = true\npin = []", |e| {
+                matches!(e, RoleError::EmptyPinWithJobWorkers { .. })
+            }),
+            ("base = \"worker\"\npin = [\"\"]", |e| {
+                matches!(e, RoleError::BlankPin { .. })
+            }),
+            ("base = \"worker\"\nworkers = 0", |e| {
+                matches!(e, RoleError::ZeroWorkers { .. })
+            }),
+            ("base = \"web\"\nworkers = 2", |e| {
+                matches!(e, RoleError::WorkersWithoutJobWorkers { .. })
+            }),
+            ("base = \"worker\"\npin = []\nworkers = 2", |e| {
+                matches!(e, RoleError::WorkersWithoutJobWorkers { .. })
+            }),
+        ];
+        for (body, is_expected) in cases {
+            let config: AutumnConfig = toml::from_str(&format!("[roles.x]\n{body}\n")).expect(body);
+            let err = validate_role_presets(&config.roles).expect_err(body);
+            assert!(is_expected(&err), "{body}: {err:?}");
+            assert!(err.to_string().starts_with("[roles.x]: "), "{body}: {err}");
+            assert!(config.validate().is_err(), "{body}");
         }
     }
 
@@ -25363,25 +25386,45 @@ workers = 2
                 .is_empty()
         );
 
-        // Explicit tiers win over the derived ones.
-        let mut explicit = config.clone();
-        explicit.jobs.fleet.tiers = vec![vec!["bulk".to_owned()]];
+        // A bad preset is an error, not a silently shorter list.
+        let mut bad = config.roles.clone();
+        bad.insert("worker".to_owned(), RolePreset::new(ProcessRole::Worker));
+        assert!(matches!(
+            derive_fleet_tiers(&bad, &[]),
+            Err(RoleError::Reserved { .. })
+        ));
+    }
+
+    /// A `combined` preset with no job workers enqueues and does not drain,
+    /// so the split-role checks treat it as `web`.
+    #[test]
+    fn guard_base_treats_a_non_draining_combined_preset_as_web() {
+        let resolve = |body: &str| {
+            let config: AutumnConfig =
+                toml::from_str(&format!("role = \"x\"\n[roles.x]\n{body}\n")).expect(body);
+            config.resolve_role().expect(body)
+        };
         assert_eq!(
-            explicit
-                .jobs
-                .fleet
-                .effective_tiers(&explicit.roles, &explicit.jobs.pin)
-                .expect("ok"),
-            vec![vec!["bulk".to_owned()]]
+            resolve("base = \"combined\"").guard_base(),
+            ProcessRole::Combined
         );
         assert_eq!(
-            config
-                .jobs
-                .fleet
-                .effective_tiers(&config.roles, &config.jobs.pin)
-                .expect("ok"),
-            tiers
+            resolve("base = \"combined\"\njob_workers = false").guard_base(),
+            ProcessRole::Web
         );
+        assert_eq!(
+            resolve("base = \"combined\"\npin = []").guard_base(),
+            ProcessRole::Web
+        );
+        assert_eq!(
+            resolve("base = \"worker\"\npin = []").guard_base(),
+            ProcessRole::Worker
+        );
+        assert_eq!(resolve("base = \"web\"").guard_base(), ProcessRole::Web);
+        for base in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+            assert_eq!(Role::from(base).guard_base(), base);
+            assert!(base == Role::from(base) && Role::from(base) == base);
+        }
     }
 
     /// Every base, every override and every `pin` shape, against the rules
@@ -25426,6 +25469,16 @@ workers = 2
                         .iter()
                         .any(|&c| preset.override_for(c) == Some(true) && !base_caps.runs(c));
                     let result = preset.validate("tier");
+                    let pin_conflict = match preset.pin.as_deref() {
+                        Some([]) => preset.job_workers == Some(true),
+                        Some(_) => !caps.job_workers,
+                        None => false,
+                    };
+                    assert_eq!(
+                        result.is_ok(),
+                        !above && !pin_conflict,
+                        "{preset:?}: {result:?}"
+                    );
                     if above {
                         assert!(
                             matches!(result, Err(RoleError::AboveBase { .. })),

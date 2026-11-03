@@ -583,6 +583,13 @@ config.role = ProcessRole::Web.into();
 `worker` is not equal to `ProcessRole::Worker`. Compare `base()` to include
 the presets. `state.role().name()` gives the name.
 
+A top-level `[roles]` table now belongs to the framework. If your
+`autumn.toml` uses `[roles]` for app data, move that data to another key. The
+load fails on it otherwise.
+
+A custom config loader that skips `validate()` and sets an undeclared
+`AUTUMN_ROLE` name no longer boots with a warning. The boot stops.
+
 **Automation:** `manual` — the right fix depends on whether the code means
 "this built-in role" or "every tier on this base".
 

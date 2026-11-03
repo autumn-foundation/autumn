@@ -3,7 +3,8 @@
 - **Breaking:** `state.role()` returns `&Role`, not `ProcessRole`, and
   `AutumnConfig::role` is a `RoleName` (issue #3543). `serves_http()` and
   `runs_workers()` still work on the result. Use `state.role().base()` for the
-  `ProcessRole` ([migration guide](docs/migrations/next.md)).
+  `ProcessRole`. A top-level `[roles]` table now belongs to the framework
+  ([migration guide](docs/migrations/next.md)).
 
 ### Added
 

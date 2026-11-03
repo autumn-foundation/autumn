@@ -12,7 +12,7 @@ verus! {
 // - `serves_http` is always the base value.
 // - A preset with no overrides runs exactly its base set.
 // - A valid preset gets the value of each override it sets.
-// - A valid preset over `web` runs no background work.
+// - A preset over `web` runs no background work.
 
 pub enum Base {
     Combined,

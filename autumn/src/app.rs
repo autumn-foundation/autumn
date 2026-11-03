@@ -5597,7 +5597,7 @@ impl AppBuilder {
         let prestop_grace = config.server.prestop_grace_secs;
 
         // A preset `pin` and `workers` replace `jobs.pin` and `jobs.workers`.
-        let role_jobs = state.role().jobs_config(&config.jobs).into_owned();
+        let role_jobs = role_job_config(state.role(), &config.jobs);
         if let Err(error) = initialize_job_runtime(
             jobs,
             &state,
@@ -11314,6 +11314,28 @@ fn dump_jobs_manifest(
     crate::job::render_jobs_manifest(cfg, &jobs)
 }
 
+/// `jobs` with the `pin` and `workers` of a `[roles.<name>]` preset applied
+/// (#3543). Logs a warning when the preset `pin` replaces a different
+/// `jobs.pin`, for example one from `AUTUMN_JOBS__PIN` or `autumn serve --pin`.
+fn role_job_config(
+    role: &crate::config::Role,
+    jobs: &crate::config::JobConfig,
+) -> crate::config::JobConfig {
+    if let Some(pin) = role.pin()
+        && !jobs.pin.is_empty()
+        && jobs.pin != pin
+    {
+        tracing::warn!(
+            role = role.name(),
+            preset_pin = ?pin,
+            ignored_pin = ?jobs.pin,
+            "the [roles.{}] pin replaces jobs.pin",
+            role.name()
+        );
+    }
+    role.jobs_config(jobs).into_owned()
+}
+
 fn initialize_job_runtime(
     jobs: Vec<crate::job::JobInfo>,
     state: &AppState,
@@ -15581,12 +15603,13 @@ fn validate_config_preconditions(
     let role = config
         .resolve_role()
         .map_err(|err| format!("role: {err}"))?;
-    // The checks read the base of a named role (#3543).
-    let base = role.base();
+    // The checks read the base of a named role (#3543). A `combined` preset
+    // that runs no job workers counts as `web`: it enqueues and does not drain.
+    let base = role.guard_base();
     let role_label = if role.is_preset() {
-        format!("{} (base {})", role.name(), base.as_str())
+        format!("{} (base {})", role.name(), role.base().as_str())
     } else {
-        base.as_str().to_owned()
+        role.name().to_owned()
     };
     if crate::config::split_role_requires_durable_backend(base, &config.jobs.backend) {
         return Err(format!(
@@ -18726,6 +18749,48 @@ mod tests {
         // A combined base enqueues and drains in one process.
         let config = named_role_config_3543("marketing", "local");
         validate_config_preconditions(&config, &[]).expect("combined base on local");
+    }
+
+    /// A `combined` preset with no job workers counts as split: it enqueues
+    /// into a queue that it does not drain.
+    #[test]
+    fn durable_backend_guard_fires_for_a_non_draining_combined_preset() {
+        for body in ["job_workers = false", "pin = []"] {
+            let toml = format!(
+                "role = \"api\"\n[jobs]\nbackend = \"local\"\n[roles.api]\nbase = \"combined\"\n{body}\n"
+            );
+            let config: AutumnConfig = toml::from_str(&toml).expect("config");
+            let err = validate_config_preconditions(&config, &[]).expect_err(body);
+            assert!(err.contains("api (base combined)"), "{body}: {err}");
+        }
+    }
+
+    /// The job runtime gets the preset `pin` and `workers`.
+    #[test]
+    fn role_job_config_applies_the_preset() {
+        let config = named_role_config_3543("critical", "postgres");
+        let role = config.resolve_role().expect("critical");
+        let mut jobs = config.jobs.clone();
+        jobs.pin = vec!["bulk".to_owned()];
+        assert_eq!(
+            role_job_config(&role, &jobs).pin,
+            vec!["critical".to_owned()]
+        );
+        let builtin = crate::config::Role::from(crate::config::ProcessRole::Worker);
+        assert_eq!(
+            role_job_config(&builtin, &jobs).pin,
+            vec!["bulk".to_owned()]
+        );
+
+        // The server boot passes that config to the job runtime.
+        let source = include_str!("app.rs").replace("\r\n", "\n");
+        let boot = "let role_jobs = role_job_config(state.role(), &config.jobs);\n        \
+                    if let Err(error) = initialize_job_runtime(\n            jobs,\n            \
+                    &state,\n            &server_shutdown,\n            &role_jobs,";
+        assert!(
+            source.contains(boot),
+            "the server boot must pass the preset job config"
+        );
     }
 
     /// The file-backed `SQLite` guard reads the base of a named role.

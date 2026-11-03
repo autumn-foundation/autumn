@@ -414,8 +414,9 @@ them.
 
 ## Role presets
 
-`role_presets.rs` models `RolePreset::capabilities` and
-`RolePreset::validate` in `autumn/src/config.rs` (issue #3543, ADR 0035).
+`role_presets.rs` models `RolePreset::capabilities` and the capability
+checks of `RolePreset::validate` in `autumn/src/config.rs` (issue #3543, ADR
+0035). It does not model the name, `pin` and `workers` checks.
 Verify it with:
 
 ```sh

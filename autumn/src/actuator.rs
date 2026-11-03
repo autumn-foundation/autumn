@@ -7459,7 +7459,7 @@ mod tests {
     #[test]
     fn prometheus_renders_breaker_slow_call_families() {
         let mut out = String::new();
-        write_builtin_circuit_breaker_metrics(&mut out, "stable", &[]);
+        write_builtin_circuit_breaker_metrics(&mut out, "version=\"stable\"", &[]);
         assert!(out.is_empty(), "no breaker: no family");
 
         let policy = crate::circuit_breaker::CircuitBreakerPolicy {
@@ -7475,7 +7475,7 @@ mod tests {
             crate::circuit_breaker::CircuitBreakerPolicy::default(),
         );
 
-        write_builtin_circuit_breaker_metrics(&mut out, "stable", &[slow, idle]);
+        write_builtin_circuit_breaker_metrics(&mut out, "version=\"stable\"", &[slow, idle]);
         let want = "\
 # HELP autumn_circuit_breaker_slow_calls_total Calls each circuit breaker counted as slow, cancelled slow calls included
 # TYPE autumn_circuit_breaker_slow_calls_total counter

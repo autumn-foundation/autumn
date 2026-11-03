@@ -1408,7 +1408,8 @@ enum Commands {
         /// --pin default`. A pinned process never claims jobs from queues
         /// outside the subset, on every backend. Forwarded to the app binary as
         /// `AUTUMN_JOBS__PIN`; omit it to let the app read `[jobs] pin` from its
-        /// own config (the default: drain every configured queue).
+        /// own config (the default: drain every configured queue). The `pin`
+        /// of a `[roles.<name>]` preset replaces it.
         #[arg(long, value_delimiter = ',', value_name = "QUEUE")]
         pin: Vec<String>,
     },
@@ -8678,11 +8679,7 @@ mod tests {
             let cli = Cli::try_parse_from(["autumn", "serve", "--role", given]).unwrap();
             match cli.command {
                 Commands::Serve { role, .. } => {
-                    assert_eq!(
-                        role.as_ref().map(|r| r.as_str()),
-                        Some(forwarded),
-                        "{given}"
-                    );
+                    assert_eq!(role.as_deref(), Some(forwarded), "{given}");
                 }
                 _ => panic!("expected Serve command"),
             }

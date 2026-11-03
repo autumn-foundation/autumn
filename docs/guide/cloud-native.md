@@ -405,12 +405,15 @@ scheduler = true
 
 - The base (`combined`, `web` or `worker`) is the safety contract. A preset can
   only turn a capability off. The durable-backend check reads the base.
+  A `combined` preset with no job workers counts as `web`.
 - `state.role().name()` is `"critical"`. `state.role().base()` is
   `ProcessRole::Worker`.
 - `/actuator/info`, `/actuator/jobs`, a `role` metric label and the default
   scheduler `replica_id` show the name.
 - `autumn doctor --strict` derives the fleet coverage from the presets. You do
-  not declare the tiers a second time in `[jobs.fleet]`.
+  not declare the tiers a second time in `[jobs.fleet]`. The derived list has
+  only the presets. If a tier runs as a plain built-in role, declare it as a
+  preset or set `[jobs.fleet] tiers`.
 - An undeclared name stops the boot.
 
 See [Named roles](jobs.md#named-roles) for every key and rule.

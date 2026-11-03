@@ -367,8 +367,10 @@ Rules:
 - **The base decides HTTP.** `serves_http` is not a key. A `worker`-based
   preset serves only the probes and the actuator.
 - **The guards read the base.** A preset over `web` or `worker` needs a
-  durable jobs backend and a file-backed SQLite database, as the built-in
-  roles do. See [Split roles require a durable backend](#split-roles-require-a-durable-backend).
+  durable jobs backend, as the built-in roles do. On the `sqlite` jobs
+  backend, it also needs a file-backed database. A `combined` preset with no
+  job workers counts as `web`: it enqueues jobs and does not drain them. See
+  [Split roles require a durable backend](#split-roles-require-a-durable-backend).
 - **The built-in names are reserved.** `[roles.worker]`, `[roles.jobs]` and
   every other built-in spelling fail the load.
 - **A name** starts with a lowercase letter and has only `a-z`, `0-9`, `_` and
@@ -376,7 +378,10 @@ Rules:
 - **A preset holds only role keys.** An unknown key fails the load, so a
   preset cannot become a second config profile.
 - **A preset `pin` wins** over `jobs.pin` from every source, including
-  `AUTUMN_JOBS__PIN`.
+  `AUTUMN_JOBS__PIN` and `autumn serve --pin`. The boot logs a warning when
+  it replaces a different pin.
+- **`[roles]` belongs to the framework.** Do not use a top-level `[roles]`
+  table for app data.
 - `pin` with no job workers, `pin = []` with `job_workers = true`, `workers`
   with no job workers, and `workers = 0` fail the load.
 - An undeclared name fails the load. The error lists the declared presets.
@@ -886,6 +891,11 @@ doctor derives it from the [named roles](#named-roles). Each preset that runs
 job workers is one tier: its `pin`, else `jobs.pin`. A preset with no job
 workers (`pin = []`, `job_workers = false`, or a `web` base) is not a tier.
 The check detail says `derived from [roles.*]`. An explicit `tiers` wins.
+`tiers = []` is the same as no `tiers`.
+
+A gap in derived tiers is a **warning**, not a failure, because a tier that
+runs as a plain built-in role can drain the gap. `autumn doctor --strict`
+turns the warning into a failure.
 
 ```toml
 [roles.critical]

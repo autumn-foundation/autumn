@@ -55,13 +55,19 @@ flowchart LR
 - A preset `pin` and `workers` replace `jobs.pin` and `jobs.workers` at the
   job runtime call site, not in the loader. A custom config loader gets the
   same result.
-- The guards (durable backend, file-backed SQLite) read the base.
+- The guards (durable backend, file-backed SQLite) read the base. A
+  `combined` preset with no job workers counts as `web`, because it enqueues
+  and does not drain.
 - `state.role()` returns `&Role`. A built-in role holds no preset data, so a
   clone of `AppState` costs no extra reference count.
 - A preset adds a `role` metric label and a `replica_id` prefix. A built-in
-  role does not, so an app that sets no new keys sees no change.
+  role does not, so its metric series and replica id do not change.
+  `/actuator/info` and `/actuator/jobs` add a `role` object for every role.
 - `autumn doctor` derives `[jobs.fleet] tiers` from the presets when `tiers`
-  is not set. It uses the same `autumn_web::config` functions as the boot.
+  is not set. It uses the same `autumn_web::config` functions as the boot. A
+  gap in derived tiers is a warning, because a built-in tier is not in the
+  list. `--strict` fails on it.
+- `[roles]` becomes a framework-owned top-level key.
 - Open question answers: a preset can set `workers`. A preset cannot set
   other config.
 

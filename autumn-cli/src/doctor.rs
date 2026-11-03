@@ -5004,7 +5004,8 @@ fn check_process_role(
 /// [`autumn_web::config::split_role_requires_durable_backend`] flags that invalid
 /// combo; the app itself rejects it at startup, and doctor surfaces it up front.
 ///
-/// A `[roles.<name>]` preset is checked on its base, as at boot (#3543).
+/// A `[roles.<name>]` preset is checked on its base, as at boot (#3543). A
+/// `combined` preset that runs no job workers counts as `web`.
 fn check_split_topology_on_local(
     role: &Role,
     jobs_backend: &str,
@@ -5012,7 +5013,7 @@ fn check_split_topology_on_local(
 ) -> CheckResult {
     let backend = jobs_backend.trim();
     let label = role_label(role);
-    let role = role.base();
+    let role = role.guard_base();
     // The sqlite queue is shareable only because both processes open the same
     // FILE. An in-memory target gives each its own database, so the web replica
     // enqueues where no worker can look (issue #1907).
@@ -5332,6 +5333,22 @@ fn check_queue_coverage_topology(
             )),
             hint: None,
         }
+    } else if fleet.derived {
+        // Derived tiers list only the presets. A tier that runs as a plain
+        // built-in role can drain the gap, so warn: `--strict` still fails.
+        CheckResult {
+            name: "jobs_queue_coverage",
+            status: CheckStatus::Warn,
+            detail: Some(format!(
+                "declared fleet topology ({tier_count} tier(s){source}) leaves queue(s) {} drained by no \
+                 [roles.<name>] preset; a tier that runs as a built-in role is not in this list",
+                gap.join(", ")
+            )),
+            hint: Some(
+                "Add the uncovered queue(s) to the pin of a [roles.<name>] preset, or set \
+                 [jobs.fleet] tiers to list every tier, built-in roles included",
+            ),
+        }
     } else {
         CheckResult {
             name: "jobs_queue_coverage",
@@ -5342,8 +5359,8 @@ fn check_queue_coverage_topology(
                 gap.join(", ")
             )),
             hint: Some(
-                "Add the uncovered queue(s) to a tier's jobs.pin in [jobs.fleet].tiers (or to the \
-                 pin of a [roles.<name>] preset), or run an unpinned tier that drains everything",
+                "Add the uncovered queue(s) to a tier's jobs.pin in [jobs.fleet].tiers, or run an \
+                 unpinned tier that drains everything",
             ),
         }
     }
@@ -6426,7 +6443,7 @@ where
             table
                 .keys()
                 .next()
-                .map_or(Ok(RoleName::default()), |name| name.parse())
+                .map_or_else(|| Ok(RoleName::default()), |name| name.parse())
                 .map_err(|err| format!("role: {err}"))?
         }
         Some(other) => {
@@ -6544,14 +6561,29 @@ where
 
 /// Resolve the declared fleet topology (#1756) from `[jobs.fleet] tiers`. Each
 /// entry is one worker tier's pin (a TOML array of queue names); an empty array
-/// is an unpinned tier that drains every queue. Returns `None` when the section
-/// is absent or declares no tiers, keeping the coverage check informational-only.
+/// is an unpinned tier that drains every queue. Returns `None` when neither
+/// `tiers` nor `[roles.*]` declares a tier, keeping the coverage check
+/// informational-only.
 ///
 /// Chosen as a config section (rather than a repeatable CLI flag) because doctor
 /// already resolves `jobs.queues` / `jobs.pin` from the merged active-profile
 /// table, so the topology lives beside them, is profile-aware, and is checked
 /// into the repo as one source of truth for the fleet.
+///
+/// With no `tiers` (or `tiers = []`), the tiers come from `[roles.*]`
+/// (#3543). This form reads `jobs.pin` from `table` only; `run()` passes the
+/// resolved pin through [`resolve_fleet_topology_with_pin`].
+#[cfg(test)]
 fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> {
+    resolve_fleet_topology_with_pin(table, None)
+}
+
+/// [`resolve_fleet_topology`], with the `jobs.pin` that a derived tier
+/// without its own `pin` inherits. `None` reads `jobs.pin` from `table`.
+fn resolve_fleet_topology_with_pin(
+    table: Option<&toml::Table>,
+    jobs_pin: Option<&[String]>,
+) -> Option<FleetTopology> {
     // A malformed `[jobs.fleet]` must NOT be silently dropped at ANY level.
     // Every `?` here would otherwise return `None`, which the caller reads as
     // "no topology declared" and answers with the informational-only report —
@@ -6563,13 +6595,13 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
         .and_then(toml::Value::as_table);
     // No `[jobs.fleet] tiers`: derive the tiers from `[roles.*]` (#3543).
     let Some(fleet) = jobs.and_then(|jobs| jobs.get("fleet")) else {
-        return derive_fleet_topology(table);
+        return derive_fleet_topology(table, jobs_pin);
     };
     let Some(fleet) = fleet.as_table() else {
         return Some(FleetTopology::malformed());
     };
     let Some(declared) = fleet.get("tiers") else {
-        return derive_fleet_topology(table);
+        return derive_fleet_topology(table, jobs_pin);
     };
     // `tiers = "critical"` — a bare value rather than a list of lists.
     let Some(declared) = declared.as_array() else {
@@ -6596,8 +6628,9 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
         }
         tiers.push(names);
     }
+    // `tiers = []` declares nothing: derive, as for an absent `tiers`.
     if tiers.is_empty() {
-        return None;
+        return derive_fleet_topology(table, jobs_pin);
     }
     Some(FleetTopology {
         tiers,
@@ -6609,8 +6642,19 @@ fn resolve_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> 
 /// The fleet topology that `[roles.*]` declares: one tier for each preset that
 /// runs job workers. `None` when no preset runs job workers. A bad preset also
 /// gives `None`: the `process_role_backend` row fails on it.
-fn derive_fleet_topology(table: Option<&toml::Table>) -> Option<FleetTopology> {
+fn derive_fleet_topology(
+    table: Option<&toml::Table>,
+    jobs_pin: Option<&[String]>,
+) -> Option<FleetTopology> {
     let roles = resolve_role_presets(table).ok()?;
+    if let Some(jobs_pin) = jobs_pin {
+        let tiers = autumn_web::config::derive_fleet_tiers(&roles, jobs_pin).ok()?;
+        return (!tiers.is_empty()).then_some(FleetTopology {
+            tiers,
+            malformed: false,
+            derived: true,
+        });
+    }
     let jobs_pin: Vec<String> = table
         .and_then(|t| t.get("jobs"))
         .and_then(|jobs| jobs.get("pin"))
@@ -9857,7 +9901,8 @@ pub fn run(opts: DoctorOptions) {
     // inline list). Absent both, `check_queue_coverage_topology` delegates to the
     // informational-only per-process report, so existing deployments never
     // regress.
-    let fleet_topology = resolve_fleet_topology(Some(&merged_jobs_toml));
+    // Derived tiers inherit the `jobs.pin` this process resolves, env included.
+    let fleet_topology = resolve_fleet_topology_with_pin(Some(&merged_jobs_toml), Some(&jobs_pin));
     let (declared_queues, declared_queues_manifest_error) =
         match resolve_declared_queues(Some(&merged_jobs_toml)) {
             Ok(queues) => (queues, None),
@@ -20889,7 +20934,9 @@ foo = "bar"
         let (queues, pin) = resolve_queues_and_pin_from_sources(|_| None, Some(&table));
         let role = autumn_web::config::Role::from(ProcessRole::Combined);
         let result = check_queue_coverage_topology(&role, &queues, &pin, &[], Some(&fleet), None);
-        assert_eq!(result.status, CheckStatus::Fail, "{:?}", result.detail);
+        // A plain built-in tier can drain the gap, so a derived gap warns.
+        // `--strict` turns the warning into a failure.
+        assert_eq!(result.status, CheckStatus::Warn, "{:?}", result.detail);
         let detail = result.detail.unwrap_or_default();
         assert!(detail.contains("default"), "{detail}");
         assert!(detail.contains("[roles.*]"), "{detail}");
@@ -20899,6 +20946,51 @@ foo = "bar"
         let fleet = resolve_fleet_topology(Some(&table)).expect("derived topology");
         let result = check_queue_coverage_topology(&role, &queues, &pin, &[], Some(&fleet), None);
         assert_eq!(result.status, CheckStatus::Pass, "{:?}", result.detail);
+    }
+
+    /// `[jobs.fleet]` with no `tiers`, or `tiers = []`, still derives.
+    #[test]
+    fn fleet_without_tiers_derives_from_roles() {
+        for fleet in [
+            "[jobs.fleet]\ndeclared_queues = [\"thumbnails\"]\n",
+            "[jobs.fleet]\ntiers = []\n",
+        ] {
+            let table = roles_table_3543(fleet);
+            let topology = resolve_fleet_topology(Some(&table)).expect(fleet);
+            assert!(topology.derived, "{fleet}");
+            assert_eq!(topology.tiers.len(), 2, "{fleet}");
+        }
+    }
+
+    /// A derived tier without its own `pin` inherits the resolved `jobs.pin`,
+    /// env included.
+    #[test]
+    fn derived_tier_inherits_the_resolved_jobs_pin() {
+        let table: toml::Table =
+            toml::from_str("[roles.rest]\nbase = \"worker\"\n").expect("parse toml");
+        let pin = vec!["bulk".to_owned()];
+        let fleet = resolve_fleet_topology_with_pin(Some(&table), Some(&pin)).expect("derived");
+        assert_eq!(fleet.tiers, vec![pin]);
+        let fleet = resolve_fleet_topology(Some(&table)).expect("derived");
+        assert_eq!(fleet.tiers, vec![Vec::<String>::new()]);
+    }
+
+    /// A `combined` preset that drains nothing counts as split.
+    #[test]
+    fn process_role_row_fails_for_a_non_draining_combined_preset() {
+        let table: toml::Table = toml::from_str(
+            "role = \"api\"\n[roles.api]\nbase = \"combined\"\njob_workers = false\n",
+        )
+        .expect("parse toml");
+        let (role, backend) = resolve_process_role_and_backend_from_sources(|_| None, Some(&table));
+        let result = check_process_role(&role, &backend, None);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result
+                .detail
+                .unwrap_or_default()
+                .contains("role=api (base combined)")
+        );
     }
 
     #[test]
