@@ -1085,9 +1085,8 @@ fn search_stories() -> Vec<Story> {
                 maud::html! {
                     // The claim below only holds when htmx is actually on
                     // the page — story_page only loads it under the `htmx`
-                    // feature (review follow-up: a maud-only, no-htmx build
-                    // still compiles this story, and its hx-* attributes
-                    // stay inert without htmx there to process them).
+                    // feature. A maud-only, no-htmx build still compiles this
+                    // story, and its hx-* attributes stay inert there.
                     @if cfg!(feature = "htmx") {
                         p { em { "Try it — this box is live, searching a small demo post list." } }
                     } @else {
@@ -1101,7 +1100,7 @@ fn search_stories() -> Vec<Story> {
                     // its own config, targeting its own results container —
                     // reusing `config` above would target
                     // "#post-search-results" (the first demo's), leaving this
-                    // one empty on a successful response (review follow-up).
+                    // one empty on a successful response.
                     div {
                         (active_search_input(
                             "post-search-split",
@@ -1129,7 +1128,7 @@ fn search_stories() -> Vec<Story> {
                     .placeholder("Start typing a tag…");
                 maud::html! {
                     // See the Active search story above for why this is
-                    // conditional (review follow-up).
+                    // conditional.
                     @if cfg!(feature = "htmx") {
                         p { em { "Try it — this box is live, matching against a small demo tag list." } }
                     } @else {

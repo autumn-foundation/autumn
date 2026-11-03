@@ -428,9 +428,9 @@ pub struct StoriesConfig {
 }
 
 /// Path and handler name of each demo backend that [`story_router`] mounts.
-/// The route listing and the router's path reservation read this list, so
-/// they cannot drift from the mounted routes. A family's demo routes exist
-/// only when its feature is on (#3408).
+/// The route listing and the router's path reservation read this list. A
+/// router test checks that each path in it is mounted. A family's demo routes
+/// exist only when its feature is on (#3408).
 pub(crate) fn demo_routes() -> Vec<(&'static str, &'static str)> {
     #[allow(unused_mut, reason = "each family extend has its own #[cfg]")]
     let mut routes = vec![(STORIES_DEMO_SAVE_PATH, "story_gallery_demo_save")];

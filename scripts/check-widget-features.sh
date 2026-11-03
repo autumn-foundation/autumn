@@ -8,7 +8,8 @@
 # Phase 1: each of the 16 family combinations must compile. Each run is
 # `--no-default-features`, with `maud` and `htmx` (the widget core and its
 # script bundle). Two more runs add `db,postgres`: the `#[commentable]`
-# router needs `widgets-social`, so it is checked with and without it. A
+# router needs `widgets-social`, so it is checked with and without it. One
+# more run has every family and no `htmx`. A
 # warning in widget code (a dead helper or an unused import in one
 # combination) also fails the run.
 #
@@ -48,6 +49,8 @@ for ((mask = 0; mask < (1 << count); mask++)); do
   COMBOS+=("$features")
 done
 COMBOS+=("maud,htmx,db,postgres" "maud,htmx,db,postgres,widgets-social")
+# Every family without `htmx`: the families must not need the script bundle.
+COMBOS+=("maud,widgets-search,widgets-social,widgets-workflow,widgets-charts")
 
 failures=0
 for combo in "${COMBOS[@]}"; do

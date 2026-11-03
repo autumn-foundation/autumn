@@ -9421,6 +9421,29 @@ mod tests {
         assert!(htmx_at < widgets_at, "htmx must load first: {body}");
     }
 
+    /// Each path in `stories::demo_routes()` is mounted. The route listing
+    /// and the path reservation read that list, so a path in it that the
+    /// gallery does not mount would be listed but answer 404 (#3408).
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn every_listed_story_demo_route_is_mounted() {
+        let routes = crate::stories::demo_routes();
+        assert!(!routes.is_empty(), "the demo route list is empty");
+        for (path, handler) in routes {
+            let router = build_router(
+                Vec::new(),
+                &story_gallery_config(),
+                stories_state_with_builtin(),
+            );
+            let response = get_with_host(router, path).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "listed demo route {path} ({handler}) is not mounted"
+            );
+        }
+    }
+
     /// T3 (AC4): a mounted gallery 404s unknown slugs while the index stays up.
     #[cfg(feature = "maud")]
     #[tokio::test]

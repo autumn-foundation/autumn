@@ -62,10 +62,11 @@ macro_rules! widgets_search_js {
 
 /// Autumn widget runtime JavaScript, embedded at compile time.
 ///
-/// Provides CSP-compatible event-listener wiring for built-in widgets
-/// (autocomplete selection, min-length enforcement). With the
-/// `widgets-search` feature, the search runtime comes first, then the core
-/// runtime (#3408). Served automatically
+/// Provides CSP-compatible wiring for the built-in widgets: the keyboard
+/// core, tabs, nav bar, popover menu, modal, drawer, theme toggle, toast and
+/// tooltip. With the `widgets-search` feature, the search runtime
+/// (autocomplete selection, min-length enforcement) comes first (#3408).
+/// Served automatically
 /// at [`AUTUMN_WIDGETS_JS_PATH`] and at the content-hashed URL
 /// `asset_url("js/autumn-widgets.js")` returns.
 ///

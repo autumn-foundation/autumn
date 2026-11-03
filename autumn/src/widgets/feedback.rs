@@ -1824,7 +1824,7 @@ mod tests {
         let config = ProgressConfig::new().visible_label();
         let html = progress_with("Upload", Some(99.6), 100.0, &config).into_string();
         assert!(html.contains(">99%</span>"), "{html}");
-        // Codex review: float error must not round a whole percent down.
+        // Float error must not round a whole percent down.
         for value in [29.0, 57.0, 58.0] {
             let html = progress_with("Upload", Some(value), 100.0, &config).into_string();
             assert!(html.contains(&format!(">{value}%</span>")), "{html}");
