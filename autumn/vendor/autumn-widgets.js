@@ -973,16 +973,18 @@
     if (t.matches && t.matches(OTP)) otpCollapsed.set(t, t.selectionStart === t.selectionEnd);
   });
 
-  // An IME writes the value in steps. Format it once, at the end.
+  // The capture phase runs before the listeners on the input, so an htmx
+  // trigger on `input` reads the formatted code. An IME writes the value in
+  // steps. Format it once, at the end.
   document.addEventListener('input', function (e) {
     var t = e.target;
     if (!t.matches || e.isComposing) return;
     if (t.matches(OTP)) formatOtp(t, e.inputType);
     else if (t.matches('input[aria-describedby]')) showStrength(t);
-  });
+  }, true);
   document.addEventListener('compositionend', function (e) {
     if (e.target.matches && e.target.matches(OTP)) formatOtp(e.target);
-  });
+  }, true);
 
   // A form reset hides the passwords and clears the strength hints.
   document.addEventListener('reset', function (e) {

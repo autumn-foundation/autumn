@@ -1034,10 +1034,20 @@ async fn keyboard_sign_in_inputs() {
 
     // The runtime removes the no-JS `maxlength`, so a paste is not cut.
     assert_eq!(attr(&page, "#code", "maxlength").await, "");
-    // A paste fills the one input. The runtime keeps only the digits.
+    // A paste fills the one input. The runtime keeps only the digits. A
+    // listener on the input (an htmx trigger) already reads the digits.
+    assert!(
+        eval_bool(
+            &page,
+            "(() => { const i = document.querySelector('#code'); \
+             i.addEventListener('input', () => { window.__seen = i.value; }); return true; })()",
+        )
+        .await
+    );
     focus(&page, "#code").await;
     page.paste("123-456").await.expect("paste");
     assert_eq!(eval_string(&page, &value("#code")).await, "123456");
+    assert_eq!(eval_string(&page, "String(window.__seen)").await, "123456");
     assert!(
         eval_bool(&page, "document.querySelector('#code').validity.valid").await,
         "the pasted code matches the pattern"
