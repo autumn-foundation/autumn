@@ -5327,16 +5327,6 @@ impl AppBuilder {
             std::process::exit(1);
         }
 
-        // A build without the `jwt` feature cannot verify a tenant token, so
-        // `tenancy.source = "jwt"` stops the boot rather than failing every
-        // request.
-        if let Err(e) = config.validate_tenancy_source() {
-            tracing::error!("Invalid [tenancy] configuration: {e}");
-            #[cfg(feature = "managed-pg")]
-            crate::managed_pg::emergency_stop_async().await;
-            std::process::exit(1);
-        }
-
         // Validate `[server.tls]` wiring before we bind anything, so a
         // misconfiguration is a clear pre-bind failure. Two cases fail fast:
         // (1) the section is present but this binary was built without the

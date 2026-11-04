@@ -111,6 +111,24 @@ fn jwt_tenancy_source_needs_the_jwt_feature() {
     }
 }
 
+/// The config load runs the check, so `run` stops before it binds: a load
+/// error exits the process with code 1.
+#[test]
+fn loading_jwt_tenancy_needs_the_jwt_feature() {
+    let (_dir, env) =
+        toml_env("[tenancy]\nenabled = true\nsource = \"jwt\"\njwt_secret = \"secret\"\n");
+    let result = AutumnConfig::load_with_env(&env);
+    if cfg!(feature = "jwt") {
+        assert!(result.is_ok(), "jwt build: {:?}", result.err());
+    } else {
+        let message = result
+            .err()
+            .expect("jwt tenancy must fail the config load")
+            .to_string();
+        assert!(message.contains("--features jwt"), "{message}");
+    }
+}
+
 /// The check reads only enabled tenancy, and only the `jwt` source.
 #[test]
 fn other_tenancy_configs_boot_in_every_build() {
