@@ -1539,6 +1539,45 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
+    padding: var(--space-3);
+    position: relative;
+    border: 1px dashed var(--text-muted);
+    border-radius: var(--radius-md);
+}
+
+.autumn-direct-upload[data-dragging] {
+    border-color: var(--primary);
+    background-color: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.autumn-upload-label {
+    font-weight: 600;
+}
+
+.autumn-upload-hint,
+.autumn-upload-status {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
+.autumn-upload-hint[hidden],
+.autumn-upload-progress[hidden] {
+    display: none;
+}
+
+/* An empty live region stays in the accessibility tree, but takes no room. */
+.autumn-upload-status:empty,
+.autumn-upload-error:empty {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+}
+
+.autumn-upload-error {
+    font-size: 0.8125rem;
+    color: var(--danger);
 }
 
 .autumn-upload-progress {
