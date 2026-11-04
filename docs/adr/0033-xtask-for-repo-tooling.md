@@ -96,8 +96,9 @@ the other CI lanes.
   20 seconds cold and nothing on a warm cache.
 - xtask is a workspace member, so its features are unified into every
   `cargo build --workspace`. It uses `anyhow`, `clap` and `regex` on default
-  features, all already in the build through other crates, and must never
-  depend on autumn-web, diesel or sqlx.
+  features, all already in the build through other crates, plus `smop` with
+  only its `sh` and `fs` modules, which adds no crate but smop itself. It must
+  never depend on autumn-web, diesel or sqlx.
 - The two clippy gates read `lanes.rs` as text. A CI clippy command stays one
   string literal on one line; an xtask test fails when a line the gates would
   read is not a command the `lint` lane runs.

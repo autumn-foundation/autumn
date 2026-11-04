@@ -74,8 +74,15 @@ To port a gate:
 
 ## Dependencies
 
-`anyhow`, `clap` and `regex`, default features only, all already in the
-build through other crates.
+`anyhow`, `clap` and `regex` on default features, all already in the build
+through other crates, and [`smop`](https://crates.io/crates/smop) with only its
+`sh` and `fs` modules (`default-features = false`), which adds smop itself and
+nothing else: `sh` has no dependencies and `fs` needs only `tempfile`.
+
+- `smop::sh` runs every lane step and script: `sh::cargo()` is the cargo that
+  launched xtask, and a failure names its exit code and command line.
+- `smop::fs` writes the job summary and gives the tests their temp dirs.
+
 xtask is a workspace member, so whatever features it enables are unified into
 every `cargo build --workspace`. Never add autumn-web, diesel or sqlx.
 
