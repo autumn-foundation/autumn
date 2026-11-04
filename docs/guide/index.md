@@ -4,8 +4,8 @@ Every guide page, grouped by what you came here to do. Each line says which
 question the page answers — open the one that matches yours.
 
 This page is an index only: it carries no answers of its own, so it can never
-disagree with the page it points at. `scripts/check-docs-guide-index.sh` fails
-the build when a guide page is missing from it, listed twice, or points
+disagree with the page it points at. `cargo xtask check docs-guide-index`
+fails the build when a guide page is missing from it, listed twice, or points
 nowhere.
 
 New to Autumn? Start with the first two entries under "Start here" below.

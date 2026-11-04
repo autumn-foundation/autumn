@@ -293,9 +293,9 @@ jobs:
         # a page added without an index line fails in the commit that adds it,
         # which is the only moment anyone has the context to write that line.
         #
-        # Shares this docs-only job for the same reason as the gates above:
-        # no toolchain, no cache, reports in seconds.
-        run: ./scripts/check-docs-guide-index.sh --self-test && ./scripts/check-docs-guide-index.sh
+        # The gate and its self-test (now `#[test]`s, run by `cargo test`)
+        # live in xtask/src/docs/guide_index.rs.
+        run: cargo xtask check docs-guide-index
       - name: TOML config-key drift gate
         # The env-var gate above covers the config a reader SETS. This covers
         # the config they WRITE — a key in `autumn.toml` itself — which is the

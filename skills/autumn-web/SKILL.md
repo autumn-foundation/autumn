@@ -39,7 +39,7 @@ when their details matter:
   `docs/guide/`, grouped by task, each entry naming the question that page
   answers. Start here when the topic you need is not covered by this file or
   the references below, rather than guessing a filename — the index is gated
-  by `scripts/check-docs-guide-index.sh`, so it lists every guide page that
+  by `cargo xtask check docs-guide-index`, so it lists every guide page that
   exists and nothing that does not.
 - `references/api-reference.md` - release-line API map, proc macros,
   feature flags, AppBuilder methods, config env names, and dependency versions.
