@@ -49,6 +49,10 @@ fn compile_fail_tests() {
     // or "sheddable" is a compile error, not a silent `default`.
     t.compile_fail("tests/compile-fail/route_criticality_invalid.rs");
 
+    // Route `group` (#3544): a blank group is a compile error, not the
+    // default group.
+    t.compile_fail("tests/compile-fail/route_group_blank.rs");
+
     // Static route macro failures
     t.compile_fail("tests/compile-fail/static_get_path_params.rs");
     t.compile_fail("tests/compile-fail/static_get_non_async.rs");

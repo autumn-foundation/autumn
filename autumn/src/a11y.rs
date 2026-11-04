@@ -1735,12 +1735,9 @@ impl Render for Checkbox<Labeled> {
 /// [`labelled_by`](FileField::labelled_by) consumes it and returns a
 /// `FileField<Labeled>`, the only state that implements [`maud::Render`].
 ///
-/// This is the typed, explicitly-labeled file input planned in issue #1933. It
-/// resolves the accessible-name caveat of the older
-/// `storage::form_helper::direct_upload_input` helper, whose *derived*
-/// `aria-label` takes ARIA precedence over a caller's visible `<label>`: with a
-/// visible label a `FileField` emits **no** competing `aria-label`, so the
-/// caller's `<label for=…>` is the control's accessible name.
+/// This is the typed, explicitly-labeled file input planned in issue #1933.
+/// With a visible label a `FileField` emits **no** competing `aria-label`, so
+/// the caller's `<label for=…>` is the control's accessible name.
 ///
 /// A file input has no repopulate-on-error value (a browser will not let markup
 /// pre-fill a file control), so `FileField` deliberately carries no `value`.
@@ -1905,8 +1902,7 @@ impl Render for FileField<Labeled> {
     fn render(&self) -> Markup {
         // With a visible label we deliberately emit NO `aria-label`: the
         // `<label for=…>` is the caller-controlled accessible name. This is the
-        // fix for the `direct_upload_input` derived-aria-label precedence caveat
-        // (issue #1933).
+        // fix for the derived-aria-label precedence caveat (issue #1933).
         let (visible_label, aria_label, aria_labelledby, aria_invalid, aria_required) =
             label_render_attrs(self.label.as_ref(), self.aria_invalid, self.aria_required);
         let input = html! {

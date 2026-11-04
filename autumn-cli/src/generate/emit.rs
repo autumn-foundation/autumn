@@ -1875,6 +1875,7 @@ fn autumn_web_feature_markers(feature: &str) -> &'static [&'static str] {
             "active_search",
             "autocomplete_input",
             "autocomplete_option",
+            "autocomplete_create_option",
             "autocomplete_empty_state",
             "ActiveSearchConfig",
             "AutocompleteConfig",

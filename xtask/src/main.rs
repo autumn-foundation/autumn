@@ -16,7 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 
 use crate::runner::{Selection, Style};
@@ -210,12 +210,7 @@ fn run_lane(
     if let Some(summary) = std::env::var_os("GITHUB_STEP_SUMMARY")
         && !options.dry_run
     {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&summary)
-            .with_context(|| format!("opening {}", Path::new(&summary).display()))?;
-        file.write_all(report.markdown(lane.name).as_bytes())?;
+        smop::fs::append(&summary, report.markdown(lane.name))?;
     }
     Ok(if report.passed() {
         ExitCode::SUCCESS
@@ -224,6 +219,8 @@ fn run_lane(
     })
 }
 
+/// `cargo xtask` exits with the script's own code: a usage error stays 2.
+/// A script killed by a signal has no code and exits 1.
 fn run_script(root: &Path, name: &str, args: &[String]) -> Result<ExitCode> {
     let script = scripts::resolve(root, name)?;
     let status = scripts::run(root, &script, args)?;
@@ -408,6 +405,24 @@ mod tests {
             }
         }
         assert!(seen >= 1, "no `cargo xtask check` in any workflow");
+    }
+
+    /// A script's exit code is passed through, not folded into 1, so a
+    /// caller can still tell a usage error (2) from a failed check (1).
+    #[test]
+    fn a_script_exit_code_passes_through() {
+        let root = smop::fs::temp_dir().unwrap();
+        let scripts = root.path().join("scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            scripts.join("exits.sh"),
+            "#!/usr/bin/env bash\n# Exit with the code given.\nexit \"$1\"\n",
+        )
+        .unwrap();
+        for (arg, want) in [("0", 0u8), ("1", 1), ("3", 3)] {
+            let code = run_script(root.path(), "exits", &[arg.to_owned()]).unwrap();
+            assert_eq!(code, ExitCode::from(want), "exit {arg}");
+        }
     }
 
     #[test]

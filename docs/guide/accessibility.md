@@ -176,8 +176,9 @@ struct EventForm {
 
 ### `select_input`
 
-Renders a labelled `<select>` from `(value, label)` option pairs, marking the
-option matching the changeset's current value as `selected`. This is the
+Renders a labelled `<select>` from `(value, label)` option pairs. It marks
+the first option that matches the changeset's current value as `selected`.
+This is the
 control closed-set fields (enums, references) target.
 
 ```rust
@@ -186,6 +187,18 @@ html! {
     (select_input(&changeset, "status", "Status", &statuses))
 }
 ```
+
+`grouped_select_input` adds `<optgroup>` elements, and
+`FieldOptions::multiple()` adds `multiple` (issue #3409). See
+[Forms](forms.md#select-groups-multiple-and-style).
+
+- The control stays a native `<select>`. The browser gives each group
+  label to assistive technology. The browser supplies the keyboard support.
+- `FieldOptions::styled_select()` changes only CSS (`appearance:
+  base-select`). The element and its role do not change. The browser keeps
+  the keyboard support: the arrow keys open the picker, Enter chooses an
+  option and Escape closes the picker. With no browser support, the native
+  control shows.
 
 ### Native inputs and choice groups
 

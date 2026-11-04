@@ -164,6 +164,8 @@ pub struct RouteAttrArgs {
     pub idempotent: bool,
     /// Route-level SEO meta tag defaults from the `seo(...)` argument.
     pub seo: SeoAttrArgs,
+    /// Route group from `group = "..."` (#3544).
+    pub group: Option<LitStr>,
 }
 
 /// Parsed `timeout_ms = ...` / `timeout = "off"` route attribute.
@@ -211,6 +213,7 @@ impl syn::parse::Parse for RouteAttrArgs {
         let mut idempotent = true;
         let mut seo = SeoAttrArgs::default();
         let mut seen_seo = false;
+        let mut group = None;
 
         while input.peek(Token![,]) {
             let _comma: Token![,] = input.parse()?;
@@ -265,32 +268,20 @@ impl syn::parse::Parse for RouteAttrArgs {
                         ));
                     }
                 }
+            } else if key == "group" {
+                group = Some(parse_group_value(input)?);
             } else if key == "idempotent" {
                 let val: syn::LitBool = input.parse()?;
                 idempotent = val.value();
             } else if key == "criticality" {
-                let val: LitStr = input.parse()?;
-                criticality = match val.value().as_str() {
-                    "critical" => RouteCriticalityAttr::Critical,
-                    "default" => RouteCriticalityAttr::Default,
-                    "sheddable" => RouteCriticalityAttr::Sheddable,
-                    other => {
-                        return Err(syn::Error::new(
-                            val.span(),
-                            format!(
-                                "invalid `criticality` value {other:?}. Use \"critical\", \
-                                 \"default\" or \"sheddable\"."
-                            ),
-                        ));
-                    }
-                };
+                criticality = parse_criticality_value(input)?;
             } else {
                 return Err(syn::Error::new(
                     key.span(),
                     format!(
                         "unknown route attribute key `{key}`. Supported keys: `name`, \
                          `api_version`, `sunset_opt_out`, `timeout_ms`, `timeout`, \
-                         `criticality`, `idempotent`, `seo(...)`."
+                         `criticality`, `idempotent`, `group`, `seo(...)`."
                     ),
                 ));
             }
@@ -305,8 +296,38 @@ impl syn::parse::Parse for RouteAttrArgs {
             criticality,
             idempotent,
             seo,
+            group,
         })
     }
+}
+
+/// Parse the value of `criticality = "..."` (#3068).
+fn parse_criticality_value(input: syn::parse::ParseStream) -> syn::Result<RouteCriticalityAttr> {
+    let val: LitStr = input.parse()?;
+    match val.value().as_str() {
+        "critical" => Ok(RouteCriticalityAttr::Critical),
+        "default" => Ok(RouteCriticalityAttr::Default),
+        "sheddable" => Ok(RouteCriticalityAttr::Sheddable),
+        other => Err(syn::Error::new(
+            val.span(),
+            format!(
+                "invalid `criticality` value {other:?}. Use \"critical\", \"default\" or \
+                 \"sheddable\"."
+            ),
+        )),
+    }
+}
+
+/// Parse the value of `group = "..."` (#3544). A blank group is an error.
+fn parse_group_value(input: syn::parse::ParseStream) -> syn::Result<LitStr> {
+    let val: LitStr = input.parse()?;
+    if val.value().trim().is_empty() {
+        return Err(syn::Error::new(
+            val.span(),
+            "route `group` must not be blank. Name the group, e.g. `group = \"marketing\"`.",
+        ));
+    }
+    Ok(val)
 }
 
 /// Parse and validate a route attribute with optional `name = "..."` override.

@@ -258,8 +258,8 @@ pub use crate::widgets::{
 #[cfg(feature = "widgets-search")]
 pub use crate::widgets::{
     ActiveSearchConfig, AutocompleteConfig, SearchMethod, active_search, active_search_empty_state,
-    active_search_input, active_search_results, autocomplete_empty_state, autocomplete_input,
-    autocomplete_option,
+    active_search_input, active_search_results, autocomplete_create_option,
+    autocomplete_empty_state, autocomplete_input, autocomplete_input_for, autocomplete_option,
 };
 #[cfg(feature = "widgets-social")]
 pub use crate::widgets::{

@@ -442,6 +442,10 @@ retention.sessions
 retention.sweep_interval
 retention.webhook_replay
 role
+roles
+route_groups
+route_groups.declared
+route_groups.manifest
 scheduler
 scheduler.backend
 scheduler.key_prefix

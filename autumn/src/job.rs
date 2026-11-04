@@ -6354,8 +6354,9 @@ pub(crate) fn start_local_runtime(
 /// `run_workers == false` (web role) installs the enqueue client but spawns no
 /// ingress/worker tasks, so `Jobs::enqueue` still works while zero `#[job]`
 /// loops run. The in-process `local` backend is non-durable, so a split role on
-/// it is rejected earlier at startup; this path only sees `run_workers == false`
-/// via direct calls in tests.
+/// it, or a `combined` preset with no job workers, is rejected earlier at
+/// startup; this path only sees `run_workers == false` via direct calls in
+/// tests.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn start_local_runtime_inner(
     jobs: Vec<JobInfo>,

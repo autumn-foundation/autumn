@@ -1874,6 +1874,8 @@ pub struct FieldOptions<'a> {
     min: Option<Cow<'a, str>>,
     max: Option<Cow<'a, str>>,
     auto_grow: bool,
+    multiple: bool,
+    styled_select: bool,
     /// `(prefix, name, value)`. The setters check `name`.
     extra: Vec<(&'static str, Cow<'a, str>, Cow<'a, str>)>,
 }
@@ -1895,6 +1897,8 @@ impl<'a> FieldOptions<'a> {
             min: None,
             max: None,
             auto_grow: false,
+            multiple: false,
+            styled_select: false,
             extra: Vec::new(),
         }
     }
@@ -1980,6 +1984,33 @@ impl<'a> FieldOptions<'a> {
         self
     }
 
+    /// Add `multiple` to a `<select>` or a file input. Other controls
+    /// ignore it.
+    ///
+    /// A multiple select marks each option whose value is in
+    /// [`Changeset::field_values`]. Bind it to a `#[serde(default)] Vec<T>`.
+    /// The browser posts one pair for each chosen option. It posts no key
+    /// when no option is chosen. `required` then means "choose one or
+    /// more". Also validate on the server, for example with
+    /// `#[validate(length(min = 1))]`.
+    #[must_use]
+    pub const fn multiple(mut self) -> Self {
+        self.multiple = true;
+        self
+    }
+
+    /// Style a `<select>` with `appearance: base-select` (issue #3409).
+    /// The select gets the `autumn-select` class. Other controls ignore it.
+    ///
+    /// A browser that supports `appearance: base-select` draws the select
+    /// and its picker from the design tokens. Other browsers, and a
+    /// multiple select, keep the native control. There is no JavaScript.
+    #[must_use]
+    pub const fn styled_select(mut self) -> Self {
+        self.styled_select = true;
+        self
+    }
+
     /// Add `data-{name}="{value}"`. The setter drops `name` if it is not
     /// `[a-z0-9-]+` or if it starts with `autumn-`.
     #[must_use]
@@ -2024,6 +2055,18 @@ impl<'a> FieldOptions<'a> {
     #[must_use]
     pub const fn is_auto_grow(&self) -> bool {
         self.auto_grow
+    }
+
+    /// Whether [`multiple`](Self::multiple) is set.
+    #[must_use]
+    pub const fn is_multiple(&self) -> bool {
+        self.multiple
+    }
+
+    /// Whether [`styled_select`](Self::styled_select) is set.
+    #[must_use]
+    pub const fn is_styled_select(&self) -> bool {
+        self.styled_select
     }
 
     /// The hint text, if set.
@@ -2174,6 +2217,11 @@ impl FieldKind {
         !matches!(self, Self::Range | Self::Color | Self::Hidden)
     }
 
+    /// The controls that get `multiple` from [`FieldOptions::multiple`].
+    const fn takes_multiple(self) -> bool {
+        matches!(self, Self::Select | Self::File)
+    }
+
     /// A box shows first, then the label. It posts `value="true"`.
     const fn is_box(self) -> bool {
         matches!(self, Self::Checkbox | Self::Switch)
@@ -2200,6 +2248,56 @@ pub(crate) enum SelectChoices<'a> {
     Owned(&'a [(String, String)]),
 }
 
+#[cfg(feature = "maud")]
+impl SelectChoices<'_> {
+    /// Call `f` with each `(value, label)` pair, in order.
+    fn for_each(self, mut f: impl FnMut(&str, &str)) {
+        match self {
+            Self::None => {}
+            Self::Borrowed(choices) => {
+                for (value, label) in choices {
+                    f(value, label);
+                }
+            }
+            Self::Owned(choices) => {
+                for (value, label) in choices {
+                    f(value, label);
+                }
+            }
+        }
+    }
+}
+
+/// The `<optgroup>` elements of a select: `(label, options)`, borrowed or
+/// owned.
+#[cfg(feature = "maud")]
+#[derive(Clone, Copy)]
+pub(crate) enum SelectGroups<'a> {
+    None,
+    Borrowed(&'a [(&'a str, &'a [(&'a str, &'a str)])]),
+    Owned(&'a [(String, Vec<(String, String)>)]),
+}
+
+#[cfg(feature = "maud")]
+impl SelectGroups<'_> {
+    /// Call `f` with each group label and its options, in order.
+    fn for_each(self, mut f: impl FnMut(&str, SelectChoices<'_>)) {
+        match self {
+            Self::None => {}
+            Self::Borrowed(groups) => {
+                for (label, choices) in groups {
+                    f(label, SelectChoices::Borrowed(choices));
+                }
+            }
+            Self::Owned(groups) => {
+                for (label, choices) in groups {
+                    f(label, SelectChoices::Owned(choices));
+                }
+            }
+        }
+    }
+}
+
 /// What [`render_field`] renders. The helpers fill it from the changeset.
 #[cfg(feature = "maud")]
 pub(crate) struct FieldSpec<'a> {
@@ -2212,11 +2310,13 @@ pub(crate) struct FieldSpec<'a> {
     /// The `value` attribute, or the textarea body. `None` for password and
     /// file (never pre-filled) and for select.
     pub(crate) value: Option<&'a str>,
-    /// The current value a select marks `selected`.
-    pub(crate) current: &'a str,
+    /// The values a select marks `selected`. See [`select_values`].
+    pub(crate) selected: &'a [String],
     pub(crate) checked: bool,
     pub(crate) step: Option<&'a str>,
     pub(crate) choices: SelectChoices<'a>,
+    /// The `<optgroup>` elements of a select, after `choices`.
+    pub(crate) groups: SelectGroups<'a>,
     /// `(validate_url, token_field)` for the htmx inline-validation input.
     pub(crate) htmx: Option<(&'a str, &'a str)>,
 }
@@ -2230,10 +2330,11 @@ impl<'a> FieldSpec<'a> {
             name: None,
             label,
             value: None,
-            current: "",
+            selected: &[],
             checked: false,
             step: None,
             choices: SelectChoices::None,
+            groups: SelectGroups::None,
             htmx: None,
         }
     }
@@ -2446,6 +2547,10 @@ pub(crate) fn render_field(
         out.push_str(field_html);
         out.push('"');
     }
+    let multiple = opts.multiple && kind.takes_multiple();
+    if multiple {
+        out.push_str(" multiple");
+    }
     if kind.is_box() {
         out.push_str(r#" value="true""#);
         if kind == FieldKind::Switch {
@@ -2471,6 +2576,9 @@ pub(crate) fn render_field(
     }
     if kind == FieldKind::Textarea && opts.auto_grow {
         out.push_str(" autumn-auto-grow");
+    }
+    if kind == FieldKind::Select && opts.styled_select {
+        out.push_str(" autumn-select");
     }
     out.push_str(if has_errors {
         r#"" aria-invalid="true""#
@@ -2502,29 +2610,7 @@ pub(crate) fn render_field(
             out.push_str("</textarea>");
         }
         FieldKind::Select => {
-            let mut push_option = |value: &str, label: &str| {
-                out.push_str("<option");
-                push_attr(&mut out, "value", value);
-                if value == spec.current {
-                    out.push_str(" selected");
-                }
-                out.push('>');
-                write_escaped(label, &mut out);
-                out.push_str("</option>");
-            };
-            match spec.choices {
-                SelectChoices::None => {}
-                SelectChoices::Borrowed(choices) => {
-                    for (value, label) in choices {
-                        push_option(value, label);
-                    }
-                }
-                SelectChoices::Owned(choices) => {
-                    for (value, label) in choices {
-                        push_option(value, label);
-                    }
-                }
-            }
+            push_select_options(&mut out, spec, multiple);
             out.push_str("</select>");
         }
         _ => {}
@@ -2541,6 +2627,52 @@ pub(crate) fn render_field(
     }
     out.push_str("</div>");
     maud::PreEscaped(out)
+}
+
+/// Append the `<option>` elements of a select, then each `<optgroup>`.
+///
+/// A multiple select marks each option whose value is in `spec.selected`.
+/// A single select marks only the first match in the whole select. The
+/// groups share this rule. See `verification/select_marks.rs`.
+#[cfg(feature = "maud")]
+fn push_select_options(out: &mut String, spec: &FieldSpec<'_>, multiple: bool) {
+    let mut found = false;
+    let mut push_option = |out: &mut String, value: &str, label: &str| {
+        let hit = spec.selected.iter().any(|s| s == value);
+        out.push_str("<option");
+        push_attr(out, "value", value);
+        if hit && (multiple || !found) {
+            out.push_str(" selected");
+        }
+        found |= hit;
+        out.push('>');
+        write_escaped(label, out);
+        out.push_str("</option>");
+    };
+    spec.choices
+        .for_each(|value, label| push_option(out, value, label));
+    spec.groups.for_each(|group, choices| {
+        out.push_str("<optgroup");
+        push_attr(out, "label", group);
+        out.push('>');
+        choices.for_each(|value, label| push_option(out, value, label));
+        out.push_str("</optgroup>");
+    });
+}
+
+/// The values a select marks: each value of a multiple select, else the
+/// one value. A missing value is `""`, so a `("", "None")` option is marked.
+#[cfg(feature = "maud")]
+fn select_values<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    options: &FieldOptions<'_>,
+) -> Vec<String> {
+    if options.multiple {
+        changeset.field_values(field)
+    } else {
+        vec![changeset.field_value(field).unwrap_or_default()]
+    }
 }
 
 /// Render a labeled `<input type="text">` tied to a changeset field.
@@ -4123,8 +4255,11 @@ pub fn required_datetime_input<T: Serialize>(
 /// Render a labeled `<select>` tied to a closed-set changeset field, with
 /// `options` given as `(value, label)` pairs.
 ///
-/// The option whose `value` matches the changeset's current field value
-/// (via [`Changeset::field_value`]) is marked `selected`. This is the
+/// It marks the first option whose `value` is the field value (from
+/// [`Changeset::field_value`]). For `<optgroup>` elements, use
+/// [`grouped_select_input`]. For more than one value, set
+/// [`FieldOptions::multiple`]. For the opt-in style, set
+/// [`FieldOptions::styled_select`]. This is the
 /// control the enum ([#1030]) and references ([#1026]) field types render
 /// once those field kinds ship — this slice ships the widget, not the DSL
 /// tokens that will target it.
@@ -4154,10 +4289,31 @@ pub fn select_input_with<T: Serialize>(
     choices: &[(&str, &str)],
     options: &FieldOptions<'_>,
 ) -> maud::Markup {
-    let current = changeset.field_value(field).unwrap_or_default();
+    render_select(
+        changeset,
+        field,
+        label,
+        SelectChoices::Borrowed(choices),
+        SelectGroups::None,
+        options,
+    )
+}
+
+/// Render a select of `field`, marked from [`select_values`].
+#[cfg(feature = "maud")]
+fn render_select<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: SelectChoices<'_>,
+    groups: SelectGroups<'_>,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let selected = select_values(changeset, field, options);
     let spec = FieldSpec {
-        current: &current,
-        choices: SelectChoices::Borrowed(choices),
+        selected: &selected,
+        choices,
+        groups,
         ..FieldSpec::new(FieldKind::Select, field, label)
     };
     render_field(&spec, changeset.errors_for(field), options)
@@ -4183,6 +4339,92 @@ pub fn required_select_input<T: Serialize>(
         field,
         label,
         options,
+        &FieldOptions::new().required(),
+    )
+}
+
+/// Render a labeled `<select>` with `<optgroup>` elements (issue #3409).
+///
+/// `choices` are top-level options before the groups, for example a blank
+/// `("", "Choose…")`. Pass `&[]` for none. Each `(label, options)` group is
+/// one `<optgroup label>`. It marks the value as [`select_input`] does. Use
+/// [`grouped_select_input_with`] with [`FieldOptions::multiple`] for a
+/// multiple select.
+///
+/// ```rust
+/// use autumn_web::form::{Changeset, grouped_select_input};
+///
+/// let changeset = Changeset::new(serde_json::json!({ "city": "lyon" }));
+/// let html = grouped_select_input(
+///     &changeset,
+///     "city",
+///     "City",
+///     &[("", "Choose a city")],
+///     &[("France", &[("paris", "Paris"), ("lyon", "Lyon")])],
+/// )
+/// .into_string();
+///
+/// assert!(html.contains(r#"<optgroup label="France">"#));
+/// assert!(html.contains(r#"<option value="lyon" selected>Lyon</option>"#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn grouped_select_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+    groups: &[(&str, &[(&str, &str)])],
+) -> maud::Markup {
+    grouped_select_input_with(
+        changeset,
+        field,
+        label,
+        choices,
+        groups,
+        &FieldOptions::new(),
+    )
+}
+
+/// [`grouped_select_input`] with a hint and typed attributes. See
+/// [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn grouped_select_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+    groups: &[(&str, &[(&str, &str)])],
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    render_select(
+        changeset,
+        field,
+        label,
+        SelectChoices::Borrowed(choices),
+        SelectGroups::Borrowed(groups),
+        options,
+    )
+}
+
+/// [`grouped_select_input`] for a required field. See
+/// [`required_select_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_grouped_select_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    choices: &[(&str, &str)],
+    groups: &[(&str, &[(&str, &str)])],
+) -> maud::Markup {
+    grouped_select_input_with(
+        changeset,
+        field,
+        label,
+        choices,
+        groups,
         &FieldOptions::new().required(),
     )
 }
@@ -4784,19 +5026,11 @@ fn push_choice_items(
         out.push_str("</label>");
         out.push_str(item_close);
     };
-    match choices {
-        SelectChoices::None => {}
-        SelectChoices::Borrowed(choices) => {
-            for (index, (value, label)) in choices.iter().enumerate() {
-                push_item(index, value, label);
-            }
-        }
-        SelectChoices::Owned(choices) => {
-            for (index, (value, label)) in choices.iter().enumerate() {
-                push_item(index, value, label);
-            }
-        }
-    }
+    let mut index = 0;
+    choices.for_each(|value, label| {
+        push_item(index, value, label);
+        index = index.saturating_add(1);
+    });
     out.push_str("</div>");
 }
 
@@ -4969,6 +5203,14 @@ pub enum FieldControl {
     Select {
         /// The `(value, label)` option pairs rendered as `<option>` elements.
         options: Vec<(String, String)>,
+    },
+    /// `<select>` with top-level options, then one `<optgroup>` for each
+    /// group (issue #3409). See [`grouped_select_input`].
+    GroupedSelect {
+        /// The `(value, label)` pairs before the groups.
+        options: Vec<(String, String)>,
+        /// The `(label, options)` pairs, one `<optgroup>` each.
+        groups: Vec<(String, Vec<(String, String)>)>,
     },
     /// `<input type="file">`. The presence of any `File` field makes
     /// [`FormFor::render`] emit `enctype="multipart/form-data"`.
@@ -5539,7 +5781,14 @@ fn render_form_control<T: Serialize>(
     // use only `FieldOptions::required`.
     // A switch, a slider, a color, a hidden input and a checkbox group
     // always have a value, or have no "must be set" meaning in HTML.
+    // A multiple select binds a `Vec`, which can be empty.
+    let multiple_select = options.multiple
+        && matches!(
+            field.control,
+            FieldControl::Select { .. } | FieldControl::GroupedSelect { .. }
+        );
     let required_by_model = field.required
+        && !multiple_select
         && !matches!(
             field.control,
             FieldControl::Checkbox
@@ -5568,15 +5817,25 @@ fn render_form_control<T: Serialize>(
         FieldControl::Checkbox => checkbox_input_with(changeset, name, label, options),
         FieldControl::Date => date_input_with(changeset, name, label, options),
         FieldControl::DateTime => datetime_input_with(changeset, name, label, options),
-        FieldControl::Select { options: choices } => {
-            let current = changeset.field_value(name).unwrap_or_default();
-            let spec = FieldSpec {
-                current: &current,
-                choices: SelectChoices::Owned(choices),
-                ..FieldSpec::new(FieldKind::Select, name, label)
-            };
-            render_field(&spec, changeset.errors_for(name), options)
-        }
+        FieldControl::Select { options: choices } => render_select(
+            changeset,
+            name,
+            label,
+            SelectChoices::Owned(choices),
+            SelectGroups::None,
+            options,
+        ),
+        FieldControl::GroupedSelect {
+            options: choices,
+            groups,
+        } => render_select(
+            changeset,
+            name,
+            label,
+            SelectChoices::Owned(choices),
+            SelectGroups::Owned(groups),
+            options,
+        ),
         // The browser does not let markup fill a file input. The
         // `FieldControl::File` variant, not this arm, makes the form
         // multipart.
@@ -5816,6 +6075,9 @@ impl<'a> FieldContext<'a> {
     /// The method writes these attributes:
     ///
     /// - `id` and, on a form element, `name`.
+    /// - `multiple` on a `select` or a file `input`, when
+    ///   [`FieldOptions::multiple`] is set. Read the values from
+    ///   [`values`](Self::values).
     /// - `value` on an `input`, from the changeset. A `password`, `file`,
     ///   `checkbox` or `radio` input gets no changeset value.
     /// - `required` on `input`, `select` and `textarea`. `aria-required` on
@@ -5867,6 +6129,11 @@ impl<'a> FieldContext<'a> {
         push_attr(&mut out, "id", self.field);
         if form_element {
             push_attr(&mut out, "name", self.field);
+        }
+        let takes_multiple = tag == "select"
+            || (tag == "input" && input_type.is_some_and(|t| t.eq_ignore_ascii_case("file")));
+        if self.options.multiple && takes_multiple && find("multiple").is_none() {
+            out.push_str(" multiple");
         }
         let prefill = tag == "input"
             && !input_type.is_some_and(|t| {

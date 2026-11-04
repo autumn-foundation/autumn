@@ -123,7 +123,8 @@ release time.
   PR, carries the script's `--self-test` cases over as `#[test]`s, and shows
   the same report as the script on the tree and on mutated copies of the
   corpus. See `xtask/README.md` "Docs gates".
-- **xtask stays dependency-light**: default features only, and never
+- **xtask stays dependency-light**: default features, or the smallest
+  feature set that covers the use (`smop`: `sh` and `fs` only), and never
   autumn-web, diesel or sqlx. It is a workspace member, so its features are
   unified into every `cargo build --workspace`.
 

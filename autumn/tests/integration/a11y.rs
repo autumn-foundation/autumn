@@ -446,8 +446,8 @@ fn file_field_renders_type_accept_and_multiple() {
 #[test]
 fn visible_labeled_file_field_emits_no_competing_aria_label() {
     // The key #1933 fix: a caller's visible `<label for>` is the accessible name,
-    // so the field emits NO derived `aria-label` to override it (the precedence
-    // caveat of `direct_upload_input`).
+    // so the field emits NO derived `aria-label` to override it (the derived-label
+    // precedence caveat).
     let markup = FileField::new("avatar")
         .accept("image/*")
         .label("Avatar")

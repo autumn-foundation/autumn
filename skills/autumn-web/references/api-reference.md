@@ -679,6 +679,14 @@ delete actions remain last-write-wins.
   `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
   to 5 attempts.
 
+## Hedged requests (`autumn_web::hedge`)
+
+- `hedged(HedgePolicy::new(delay).with_max_hedges(n), allow, |attempt| fut)`
+  starts `make(0)`, and after each `delay` of silence starts another copy
+  (up to `n`, default 1). It returns the first output and drops the rest.
+  `allow` is asked before each extra copy; return `false` (for example from a
+  retry budget) to stop hedging. Only hedge calls that are safe to run twice.
+
 ## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 
 Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
@@ -830,6 +838,18 @@ Free functions rendering changeset-aware, accessible inputs:
   only (validate "one or more" on the server). A group is a `<fieldset>` +
   `<legend>`; the first input has `id="{field}"` so `error_summary` links
   land on it, the rest `id="{field}-{index}"`.
+- **(#3409)** select: `grouped_select_input(&cs, field, label, &[(value,
+  label)], &[(group_label, &[(value, label)])])` (+ `_with`, `required_`)
+  writes top-level options, then one `<optgroup>` per group;
+  `FieldControl::GroupedSelect { options, groups }` for `form_for`.
+  `FieldOptions::multiple()` writes `multiple` on a `<select>` or a file
+  input; a multiple select marks every `Changeset::field_values` value (bind
+  `#[serde(default)] Vec<T>`; in `form_for` the model `required` flag skips
+  it). A single select marks only the first matching option.
+  `FieldOptions::styled_select()` adds `autumn-select`: `appearance:
+  base-select` behind `@supports`; other browsers and `multiple` keep the
+  native control. No JS. `FieldContext::control` writes `multiple` on a
+  custom `select` or file `input`.
   Decode-side contracts handled by the `#[model]`-generated `NewX`:
   non-nullable `bool` columns are `#[serde(default)]` (unchecked checkbox ⇒
   `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`

@@ -188,6 +188,53 @@ fn builtin_stories() -> Vec<Story> {
             }
         },
         story! {
+            "Forms",
+            "Select",
+            {
+                use autumn_web::form::{
+                    Changeset, FieldOptions, grouped_select_input_with, select_input,
+                    select_input_with,
+                };
+
+                // Select (#3409). The element is a native <select>, so the
+                // keyboard and the screen reader work as usual, with no JS.
+                let changeset = Changeset::new(serde_json::json!({
+                    "plan": "pro",
+                    "plan_native": "pro",
+                    "city": "lyon",
+                    "tags": ["rust", "db"],
+                }));
+                let plans = [("free", "Free"), ("pro", "Pro"), ("team", "Team")];
+
+                maud::html! {
+                    // Styled: `appearance: base-select` where the browser
+                    // supports it. Other browsers show the native control.
+                    (select_input_with(&changeset, "plan", "Plan (styled)", &plans,
+                        &FieldOptions::new().styled_select()))
+                    // Fallback: the same select with no opt-in.
+                    (select_input(&changeset, "plan_native", "Plan (native fallback)", &plans))
+                    // Top-level options first, then one <optgroup> per group.
+                    (grouped_select_input_with(&changeset, "city", "City",
+                        &[("", "Choose a city")],
+                        &[
+                            ("France", &[("paris", "Paris"), ("lyon", "Lyon")]),
+                            ("Japan", &[("tokyo", "Tokyo"), ("osaka", "Osaka")]),
+                        ],
+                        &FieldOptions::new().required().styled_select()))
+                    // Bind to a `#[serde(default)] Vec<String>`. A multiple
+                    // select keeps the native list box.
+                    (select_input_with(&changeset, "tags", "Topics", &[
+                        ("rust", "Rust"),
+                        ("web", "Web"),
+                        ("db", "Databases"),
+                    ], &FieldOptions::new()
+                        .multiple()
+                        .styled_select()
+                        .hint("Choose one or more.")))
+                }
+            }
+        },
+        story! {
             "Display",
             "Property list",
             {
@@ -1146,6 +1193,45 @@ fn search_stories() -> Vec<Story> {
                 }
             }
         },
+        story! {
+            "Forms",
+            "Tags input",
+            {
+                use autumn_web::form::Changeset;
+                use autumn_web::widgets::{
+                    AutocompleteConfig, autocomplete_create_option, autocomplete_input_for,
+                    autocomplete_option,
+                };
+
+                // Tags mode (#3410). Each chip submits one `tags=…` input.
+                // See `stories::demo_tag_suggest` for the handler.
+                #[derive(serde::Serialize)]
+                struct PostForm {
+                    tags: Vec<String>,
+                }
+                // On a 422 re-render, this is the submitted form.
+                let changeset = Changeset::new(PostForm {
+                    tags: vec!["rust".to_owned()],
+                });
+                let config = AutocompleteConfig::new("/_stories/demo/tags/suggest", "tags")
+                    .multiple()
+                    .free_text()
+                    .placeholder("Add a tag…");
+                maud::html! {
+                    @if cfg!(feature = "htmx") {
+                        p { em { "Try it. Type, then press Enter. Backspace removes the last tag." } }
+                    } @else {
+                        p { em { "This box is live only with the htmx feature." } }
+                    }
+                    (autocomplete_input_for(&changeset, "tag-list", "Tags", &config))
+                    p { em { "For reference, not live: what your handler returns." } }
+                    div role="listbox" aria-label="Example tag options" {
+                        (autocomplete_option("web", "web"))
+                        (autocomplete_create_option("zig", "Create “zig”"))
+                    }
+                }
+            }
+        },
     ]
 }
 
@@ -1508,6 +1594,35 @@ fn gated_stories() -> Vec<Story> {
                 (flash_messages_with(&messages, &FlashMessagesConfig::new().dismissible(true)))
                 p { em { "The markup inside Flash::render:" } }
                 (flash_message_divs(&messages[..1]))
+            }
+        }
+    });
+    #[cfg(feature = "storage")]
+    stories.push(story! {
+        "Forms",
+        "Direct upload",
+        {
+            use autumn_web::storage::form_helper::{
+                DirectUploadConfig, direct_upload_field, direct_upload_input,
+            };
+
+            maud::html! {
+                // Without JS the file goes with the form. With
+                // `autumn-widgets.js` it goes to storage, and a hidden field
+                // holds its key.
+                form method="post" action="/posts" enctype="multipart/form-data" {
+                    (direct_upload_input("cover_image", "/uploads/presign", Some("image/*")))
+                    // Set the label, allow many files, filter by type.
+                    (direct_upload_field(
+                        "attachments",
+                        "/uploads/presign",
+                        &DirectUploadConfig::new()
+                            .label("Attachments")
+                            .accept(".pdf,image/*")
+                            .multiple(true),
+                    ))
+                    button type="submit" { "Save" }
+                }
             }
         }
     });

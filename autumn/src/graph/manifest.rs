@@ -289,6 +289,11 @@ pub struct Completeness {
     /// Node ids of declared routes that no `routes![]` list mounts, sorted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmounted_routes: Vec<String>,
+    /// Node ids of declared routes that this role does not mount, but another
+    /// declared `[roles.<name>]` role does (#3544), sorted. They are not
+    /// drift, so they are not in [`Self::unmounted_routes`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounted_elsewhere: Vec<String>,
     /// Mounted routes with no macro-declared node — a route registered by a
     /// mechanism this graph cannot see (a raw `merge`/`nest` router, or a
     /// framework endpoint), sorted. Named rather than dropped so the document
@@ -352,6 +357,10 @@ impl ArchitectureGraph {
 
     /// The human report.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one block per report section, in print order"
+    )]
     pub fn summary(&self) -> String {
         let mut out = String::new();
         let _ = writeln!(
@@ -418,6 +427,16 @@ impl ArchitectureGraph {
                 c.unmounted_routes.len()
             );
             for id in &c.unmounted_routes {
+                let _ = writeln!(out, "  {id}");
+            }
+        }
+        if !c.mounted_elsewhere.is_empty() {
+            let _ = writeln!(
+                out,
+                "\nMounted by another role ({}):",
+                c.mounted_elsewhere.len()
+            );
+            for id in &c.mounted_elsewhere {
                 let _ = writeln!(out, "  {id}");
             }
         }
@@ -761,6 +780,33 @@ pub fn build(
     repositories: &[RepositoryGraphDescriptor],
     jobs: &[JobGraphDescriptor],
 ) -> ArchitectureGraph {
+    build_for_fleet(
+        mounted,
+        &[],
+        opaque_mounted_routers,
+        routes,
+        models,
+        repositories,
+        jobs,
+    )
+}
+
+/// [`build`] for one role of a fleet (#3544).
+///
+/// `elsewhere` holds the routes that another declared role mounts. A declared
+/// route that only `elsewhere` holds is not mounted here, and it goes to
+/// [`Completeness::mounted_elsewhere`], not to
+/// [`Completeness::unmounted_routes`].
+#[must_use]
+pub fn build_for_fleet(
+    mounted: &[MountedRoute],
+    elsewhere: &[MountedRoute],
+    opaque_mounted_routers: usize,
+    routes: &[RouteGraphDescriptor],
+    models: &[ModelGraphDescriptor],
+    repositories: &[RepositoryGraphDescriptor],
+    jobs: &[JobGraphDescriptor],
+) -> ArchitectureGraph {
     let ids = NodeIds::new(routes, models, repositories, jobs);
     let index = symbol_index(&ids, models, repositories);
     let sql_tables = sql_table_index(&ids, models);
@@ -773,6 +819,7 @@ pub fn build(
         &ids,
         routes,
         mounted,
+        elsewhere,
         &index,
         &sql_tables,
         &mut nodes,
@@ -791,6 +838,9 @@ pub fn build(
     let mut unmounted = route_totals.unmounted;
     unmounted.sort();
     unmounted.dedup();
+    let mut mounted_elsewhere = route_totals.elsewhere;
+    mounted_elsewhere.sort();
+    mounted_elsewhere.dedup();
 
     ArchitectureGraph {
         schema_version: MANIFEST_SCHEMA_VERSION,
@@ -803,6 +853,7 @@ pub fn build(
             generated_routes: surface.generated,
             opaque_mounted_routers,
             unmounted_routes: unmounted,
+            mounted_elsewhere,
             unmodelled_mounted_routes: surface.unmodelled,
             declared_mounts: surface.declared,
         },
@@ -944,15 +995,22 @@ struct RouteTotals {
     mounted: usize,
     /// Node ids of declared routes nothing mounts.
     unmounted: Vec<String>,
+    /// Node ids of declared routes only another role mounts.
+    elsewhere: Vec<String>,
     /// `(method, path)` pairs a declared route claimed.
     matched: BTreeSet<(String, String)>,
 }
 
 /// One route node per `#[route]`/`#[static_get]`, with its resolved edges.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the inputs and the two output maps of one build step"
+)]
 fn add_route_nodes(
     ids: &NodeIds,
     routes: &[RouteGraphDescriptor],
     mounted: &[MountedRoute],
+    elsewhere: &[MountedRoute],
     index: &BTreeMap<String, BTreeSet<String>>,
     sql_tables: &BTreeMap<String, BTreeSet<String>>,
     nodes: &mut BTreeMap<String, GraphNode>,
@@ -960,6 +1018,7 @@ fn add_route_nodes(
 ) -> RouteTotals {
     let mut mounted_count = 0usize;
     let mut unmounted: Vec<String> = Vec::new();
+    let mut mounted_elsewhere: Vec<String> = Vec::new();
     let mut matched_mounted: BTreeSet<(String, String)> = BTreeSet::new();
     for route in routes {
         let id = ids.route(route);
@@ -974,7 +1033,14 @@ fn add_route_nodes(
                     && m.method.eq_ignore_ascii_case(route.method)
             })
             .collect();
-        if hits.is_empty() {
+        let serves = |m: &MountedRoute| {
+            m.handler == route.handler
+                && m.module_path == route.module_path
+                && m.method.eq_ignore_ascii_case(route.method)
+        };
+        if hits.is_empty() && elsewhere.iter().any(serves) {
+            mounted_elsewhere.push(id.clone());
+        } else if hits.is_empty() {
             unmounted.push(id.clone());
         } else {
             mounted_count += 1;
@@ -1039,6 +1105,7 @@ fn add_route_nodes(
     RouteTotals {
         mounted: mounted_count,
         unmounted,
+        elsewhere: mounted_elsewhere,
         matched: matched_mounted,
     }
 }
@@ -1238,6 +1305,16 @@ fn add_auto_api_nodes(
 /// Assemble the graph from this binary's link-time registrations.
 #[must_use]
 pub fn audit(mounted: &[MountedRoute], opaque_mounted_routers: usize) -> ArchitectureGraph {
+    audit_for_fleet(mounted, &[], opaque_mounted_routers)
+}
+
+/// [`audit`] for one role of a fleet. See [`build_for_fleet`].
+#[must_use]
+pub fn audit_for_fleet(
+    mounted: &[MountedRoute],
+    elsewhere: &[MountedRoute],
+    opaque_mounted_routers: usize,
+) -> ArchitectureGraph {
     let routes: Vec<RouteGraphDescriptor> = inventory::iter::<RouteGraphDescriptor>
         .into_iter()
         .copied()
@@ -1254,8 +1331,9 @@ pub fn audit(mounted: &[MountedRoute], opaque_mounted_routers: usize) -> Archite
         .into_iter()
         .copied()
         .collect();
-    build(
+    build_for_fleet(
         mounted,
+        elsewhere,
         opaque_mounted_routers,
         &routes,
         &models,
@@ -1658,6 +1736,48 @@ mod tests {
             graph.completeness.unmounted_routes,
             vec!["route:app::routes::posts::orphan"]
         );
+    }
+
+    /// A route that another declared role mounts is not drift (#3544). It is
+    /// not mounted here, and it is listed in `mounted_elsewhere`.
+    #[test]
+    fn a_route_another_role_mounts_is_mounted_elsewhere_not_unmounted() {
+        let graph = build_for_fleet(
+            &[mounted("GET", "/landing", "landing")],
+            &[mounted("GET", "/desk", "desk")],
+            0,
+            &[
+                route("landing", "GET", "/landing", &[], &[]),
+                route("desk", "GET", "/desk", &[], &[]),
+                route("orphan", "GET", "/orphan", &[], &[]),
+            ],
+            &[],
+            &[],
+            &[],
+        );
+        let desk = graph
+            .nodes
+            .iter()
+            .find(|n| n.name == "desk")
+            .and_then(|n| n.route.as_ref())
+            .expect("desk node");
+        assert!(!desk.mounted, "this role does not serve /desk");
+        assert_eq!(graph.completeness.mounted_routes, 1);
+        assert_eq!(
+            graph.completeness.mounted_elsewhere,
+            vec!["route:app::routes::posts::desk"]
+        );
+        assert_eq!(
+            graph.completeness.unmounted_routes,
+            vec!["route:app::routes::posts::orphan"]
+        );
+    }
+
+    #[test]
+    fn mounted_elsewhere_is_omitted_when_empty() {
+        let graph = build(&[], 0, &[], &[], &[], &[]);
+        let json = serde_json::to_string(&graph.completeness).expect("json");
+        assert!(!json.contains("mounted_elsewhere"), "{json}");
     }
 
     #[test]
