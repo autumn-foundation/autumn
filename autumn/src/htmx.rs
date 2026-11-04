@@ -63,8 +63,9 @@ macro_rules! widgets_search_js {
 /// Autumn widget runtime JavaScript, embedded at compile time.
 ///
 /// Provides CSP-compatible wiring for the built-in widgets: the keyboard
-/// core, tabs, nav bar, popover menu, modal, drawer, theme toggle, toast and
-/// tooltip. With the `widgets-search` feature, the search runtime
+/// core, tabs, nav bar, popover menu, modal, drawer, theme toggle, toast,
+/// tooltip, password reveal and one-time code. With the `widgets-search`
+/// feature, the search runtime
 /// (autocomplete selection, min-length enforcement) comes first (#3408).
 /// Served automatically
 /// at [`AUTUMN_WIDGETS_JS_PATH`] and at the content-hashed URL
@@ -859,9 +860,11 @@ mod tests {
     /// 46 KiB and 14 KiB. The test measures the bundle with the search part.
     /// Issue #3410 added the tags mode of the combobox (chips). It increased
     /// them from 54 KiB and 16 KiB.
-    const WIDGETS_JS_BUDGET_BYTES: usize = 61 * 1024;
+    /// Issue #3412 added the password reveal, the strength hint and the
+    /// one-time code format. It increased them from 61 KiB and 18 KiB.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 70 * 1024;
     /// Gzip budget. Browsers download this size.
-    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 18 * 1024;
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 20 * 1024;
 
     /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
     /// CRLF checkout changes the bytes, the content hash and the size.
