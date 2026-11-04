@@ -679,6 +679,14 @@ delete actions remain last-write-wins.
   `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
   to 5 attempts.
 
+## Hedged requests (`autumn_web::hedge`)
+
+- `hedged(HedgePolicy::new(delay).with_max_hedges(n), allow, |attempt| fut)`
+  starts `make(0)`, and after each `delay` of silence starts another copy
+  (up to `n`, default 1). It returns the first output and drops the rest.
+  `allow` is asked before each extra copy; return `false` (for example from a
+  retry budget) to stop hedging. Only hedge calls that are safe to run twice.
+
 ## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 
 Not `autumn_web::ledger`, which is the bitemporal *record* ledger.

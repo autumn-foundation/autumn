@@ -231,6 +231,7 @@ pub mod feed;
 pub mod format;
 pub mod health;
 pub(crate) mod health_cache;
+pub mod hedge;
 #[cfg(feature = "db")]
 pub mod hooks;
 pub mod http_server;
