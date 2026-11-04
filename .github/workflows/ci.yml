@@ -620,9 +620,9 @@ jobs:
         # skill file. That is why this gate unescapes `%XX` before matching and
         # why a row is satisfied only by the page that answers the question.
         #
-        # Shares this docs-only job for the same reason as the gates above:
-        # no toolchain, no cache, reports in seconds.
-        run: ./scripts/check-docs-aliases.sh --self-test && ./scripts/check-docs-aliases.sh
+        # The gate and its self-test (now `#[test]`s, run by `cargo test`)
+        # live in xtask/src/docs/aliases.rs.
+        run: cargo xtask check docs-aliases
       - name: Docs retrieval gate
         # Every gate above checks a page a reader HAS REACHED, and
         # `check-docs-orphans.sh` checks that a path of links to it exists at

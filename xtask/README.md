@@ -49,8 +49,9 @@ The `scripts/check-docs-*.sh` gates are being ported to
   are decoded.
 - [`markdown.rs`](src/docs/markdown.rs): live prose (fences, comments and
   code spans removed), heading anchors and link destinations.
-- One module per gate: [`links.rs`](src/docs/links.rs) and
-  [`guide_index.rs`](src/docs/guide_index.rs). The guide-index gate reads
+- One module per gate: [`links.rs`](src/docs/links.rs),
+  [`guide_index.rs`](src/docs/guide_index.rs) and
+  [`aliases.rs`](src/docs/aliases.rs). The guide-index gate reads
   links inside block quotes, list items and raw HTML, so it carries a finer,
   character-indexed model of its own in `src/docs/guide_index/`.
 
