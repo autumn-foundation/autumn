@@ -110,7 +110,8 @@ assert_ran() {
 }
 
 cargo test -p autumn-web --no-default-features --features "$features" --lib \
-  -- tenancy:: static_get_route_reading_tenant_fails_closed_for_every_tenancy_source 2>&1 | tee "$LOG"
+  -- tenancy:: static_get_route_reading_tenant_fails_closed_for_every_tenancy_source \
+  boot_config_load_checks_the_jwt_tenancy_source 2>&1 | tee "$LOG"
 assert_ran "lib tenancy"
 cargo test -p autumn-web --no-default-features --features "$features" \
   --test integration_tests -- optional_jwt_and_push compile_gate_features tenancy_unit 2>&1 | tee "$LOG"

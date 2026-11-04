@@ -111,22 +111,16 @@ fn jwt_tenancy_source_needs_the_jwt_feature() {
     }
 }
 
-/// The config load runs the check, so `run` stops before it binds: a load
-/// error exits the process with code 1.
+/// A plain config load accepts jwt tenancy in every build. A tool built
+/// with other features, such as the CLI (`autumn deploy`, `autumn doctor`),
+/// must still read the app's config. Only the app's boot refuses it.
 #[test]
-fn loading_jwt_tenancy_needs_the_jwt_feature() {
+fn config_load_accepts_jwt_tenancy_in_every_build() {
     let (_dir, env) =
         toml_env("[tenancy]\nenabled = true\nsource = \"jwt\"\njwt_secret = \"secret\"\n");
-    let result = AutumnConfig::load_with_env(&env);
-    if cfg!(feature = "jwt") {
-        assert!(result.is_ok(), "jwt build: {:?}", result.err());
-    } else {
-        let message = result
-            .err()
-            .expect("jwt tenancy must fail the config load")
-            .to_string();
-        assert!(message.contains("--features jwt"), "{message}");
-    }
+    AutumnConfig::load_with_env(&env).expect("a plain config load must accept jwt tenancy");
+    AutumnConfig::load_with_env_lenient_unknown_roots(&env)
+        .expect("the CLI's lenient load must accept jwt tenancy");
 }
 
 /// The check reads only enabled tenancy, and only the `jwt` source.

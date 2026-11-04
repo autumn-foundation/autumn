@@ -5203,8 +5203,11 @@ impl AutumnConfig {
     }
 
     /// Check that this build can resolve the configured tenancy source.
-    /// [`validate`](Self::validate) runs it, so a config load fails on it
-    /// before `AppBuilder::run` binds.
+    ///
+    /// The app's boot runs it after the config loads, so `AppBuilder::run`
+    /// stops before it binds. A plain config load does not run it: a tool
+    /// built with other features, such as the CLI, still reads the app's
+    /// config.
     ///
     /// `tenancy.source = "jwt"` verifies a token with `jsonwebtoken`, which is
     /// behind the `jwt` feature. Without it, every request would fail tenant
@@ -6150,9 +6153,6 @@ impl AutumnConfig {
         self.http.client.retry_budget.validate()?;
         self.scheduler.validate()?;
         self.outbox.validate()?;
-        // `tenancy.source = "jwt"` without the `jwt` feature: every request
-        // would fail tenant resolution, so the load fails instead.
-        self.validate_tenancy_source()?;
         // #1605: reject an unparseable or zero retention window at boot rather
         // than silently skipping the dataset it names — a policy an operator
         // believes is enforced but isn't is worse than no policy.
