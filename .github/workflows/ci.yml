@@ -828,35 +828,218 @@ jobs:
   #      under disjoint feature sets. Run in sequence they are ~44 minutes of
   #      pure recompilation on Windows; run side by side they are ~11.
   #
-  # What is NOT sharded, deliberately: everything still runs `cargo test
-  # --workspace`, so every shard sees the same globally-unified feature set that
-  # decides which `#[cfg]`-gated trybuild fixtures exist. Narrowing a shard to
-  # `-p autumn-web --test integration_tests` would silently drop fixtures.
-  # The duplicated compile that costs is the price of that guarantee.
+  # Every test shard runs from a `cargo nextest archive --workspace` build, so
+  # each sees the same globally unified feature set that decides which
+  # `#[cfg]`-gated tests and trybuild fixtures exist. See "BUILD ONCE, RUN
+  # MANY" below.
   #
   # Adding a shard: add it to the matrix AND to `test-gate`'s `needs`. Branch
   # protection should require ONLY `Test suite` (the `test-gate` job) -- it is
   # the one check name that stays stable as shards are added and removed.
   # ---------------------------------------------------------------------------
 
-  test:
-    name: Test (${{ matrix.os }})
+  # ---------------------------------------------------------------------------
+  # BUILD ONCE, RUN MANY.
+  #
+  # Each OS compiles the workspace test build once, with `cargo nextest
+  # archive --workspace`, and uploads it. The test shards download it and run
+  # their slice without compiling anything:
+  #
+  #   - `test` runs the default lane as `--partition count:k/N` slices, plus a
+  #     `sim` shard per OS. On run 14466 the old one-job-per-OS `Run tests`
+  #     step was 31m52s on ubuntu, 48m18s on Windows and 1h58m38s on macOS,
+  #     compile included; macOS was the critical path of the whole workflow.
+  #   - `trybuild` runs `compile_fail::` from a second, smaller archive that
+  #     `test-build` writes from the same compile (see below).
+  #   - Doctests do not run under nextest. `doctest` runs them per OS.
+  #
+  # `test-build` (Linux) writes two archives from one compile:
+  #
+  #   - `workspace-tests-Linux`: every workspace test binary, for `test`.
+  #   - `trybuild-tests-linux`: `--test integration_tests` only, for
+  #     `trybuild`. An archive of every test binary was 6.9 GB (275 binaries).
+  #     Extracted next to trybuild's own fixture tree (~67 GB in a
+  #     `compile_pass` shard), it ran the shard's disk out: `rust-lld` died
+  #     with SIGBUS, and `pass_b` lost its log to "No space left on device".
+  #     That is the failure #3534 fixed by building only this target.
+  #
+  # `test-archive` does the same for macOS and Windows (one archive each). It
+  # is a job of its own so that `trybuild` waits only for Linux.
+  #
+  # Three things make an archive runnable on another runner, and all are
+  # handled here rather than left to luck:
+  #
+  #   1. Tests read `env!("CARGO_MANIFEST_DIR")` and `env!("CARGO_BIN_EXE_*")`,
+  #      which are absolute paths fixed at compile time. A consumer must check
+  #      out at the same path as the builder and extract the archive into its
+  #      own checkout (`--extract-to .`), so those paths resolve. GitHub-hosted
+  #      runners always use the same path per OS. The self-hosted pool does
+  #      not: each runner slot has its own work dir. So `test-build` publishes
+  #      its path as a job output, and a Linux shard on a different path builds
+  #      locally instead. macOS and Windows always run GitHub-hosted.
+  #   2. trybuild reads the feature set to build its fixtures with from
+  #      `target/debug/.fingerprint`, next to the test binary. A plain archive
+  #      leaves that directory out, and trybuild then quietly builds every
+  #      fixture with default features only. `.config/nextest.toml` adds it to
+  #      every archive and fails the archive if it is missing.
+  #   3. trybuild runs every nested `cargo` with `--offline`, and other tests
+  #      run `cargo` too. Compiling used to fill `~/.cargo/registry` as a side
+  #      effect, so every shard runs `cargo fetch --locked` first.
+  # ---------------------------------------------------------------------------
+
+  test-build:
+    name: Build tests (ubuntu-latest)
+    needs: [lint, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    outputs:
+      workspace: ${{ steps.workspace.outputs.path }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space (Linux)
+        run: |
+          # The full workspace build sits near the runner's disk ceiling; a
+          # cold-cache PR build tips it over ("No space left on device").
+          # Reclaim the preinstalled toolchains a Rust build never uses before
+          # the cache is restored.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+        with:
+          # This job, `test-archive` and `doctest` build the same `cargo test
+          # --workspace` units (`cargo nextest archive` is `cargo test
+          # --no-run` underneath), so they share one cache entry per OS. The
+          # two archive jobs write it; `doctest` and a shard that falls back to
+          # a local build only restore it.
+          shared-key: workspace-test
+          # Save the target dir even when a later step fails. rust-cache skips
+          # its save on a failed job by default, and a red job is exactly when
+          # a warm cache matters most, since a red suite is what you iterate
+          # against. What is cached is compiled artifacts; their validity does
+          # not depend on whether anything after the compile passed.
+          cache-on-failure: true
+      - uses: taiki-e/install-action@v2.87.31
+        with:
+          tool: cargo-nextest@0.9.149
+      - name: Archive the workspace test build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/nextest-archive" "${RUNNER_TEMP}/trybuild-archive"
+          cargo nextest archive --workspace \
+            --archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
+          # Same build, so this only packs: no compile.
+          cargo nextest archive --workspace --test integration_tests \
+            --archive-file "${RUNNER_TEMP}/trybuild-archive/trybuild-tests.tar.zst"
+          ls -lh "${RUNNER_TEMP}/nextest-archive" "${RUNNER_TEMP}/trybuild-archive"
+          df -h
+      - name: Record the checkout path
+        id: workspace
+        shell: bash
+        run: echo "path=${GITHUB_WORKSPACE}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: trybuild-tests-linux
+          path: ${{ runner.temp }}/trybuild-archive/trybuild-tests.tar.zst
+          if-no-files-found: error
+          # The archive is already zstd-compressed.
+          compression-level: 0
+          # Only this run's shards read it.
+          retention-days: 1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workspace-tests-${{ runner.os }}
+          path: ${{ runner.temp }}/nextest-archive/workspace-tests.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  test-archive:
+    name: Build tests (${{ matrix.os }})
     needs: [lint, meta]
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+        with:
+          # See `test-build`.
+          shared-key: workspace-test
+          cache-on-failure: true
+      - uses: taiki-e/install-action@v2.87.31
+        with:
+          tool: cargo-nextest@0.9.149
+      - name: Archive the workspace test build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/nextest-archive"
+          cargo nextest archive --workspace \
+            --archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
+          ls -lh "${RUNNER_TEMP}/nextest-archive"
+          df -h
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workspace-tests-${{ runner.os }}
+          path: ${{ runner.temp }}/nextest-archive/workspace-tests.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.shard }})
+    # `test-archive` too, so the Linux shards also wait for macOS and Windows
+    # to build: `needs` is per job, not per matrix entry. Linux is not the
+    # critical path, so that wait costs no wall-clock.
+    needs: [lint, meta, test-build, test-archive]
+    strategy:
+      fail-fast: false
+      matrix:
+        # `k/N` shards run `--partition count:k/N` of the default lane. The
+        # partitions of one OS must cover 1..N exactly, or a slice of the suite
+        # runs nowhere: `repo_hygiene` checks it. `sim` runs the `sim_` lane.
+        # Slices are sized from run 14466's `Run tests` step: macOS took
+        # 1h58m, Windows 48m, ubuntu 32m, compile included.
+        include:
+          - { os: ubuntu-latest, shard: "1/2" }
+          - { os: ubuntu-latest, shard: "2/2" }
+          - { os: ubuntu-latest, shard: sim }
+          - { os: windows-latest, shard: "1/3" }
+          - { os: windows-latest, shard: "2/3" }
+          - { os: windows-latest, shard: "3/3" }
+          - { os: windows-latest, shard: sim }
+          - { os: macos-latest, shard: "1/4" }
+          - { os: macos-latest, shard: "2/4" }
+          - { os: macos-latest, shard: "3/4" }
+          - { os: macos-latest, shard: "4/4" }
+          - { os: macos-latest, shard: sim }
     runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(needs.meta.outputs.heavy_runs_on) || matrix.os }}
+    env:
+      # True when this runner checked out at the path the archive was compiled
+      # at, so its compile-time paths resolve here. Only the Linux shards can
+      # land on a self-hosted slot; see "BUILD ONCE, RUN MANY" above.
+      REUSE_ARCHIVE: ${{ matrix.os != 'ubuntu-latest' || needs.test-build.outputs.workspace == github.workspace }}
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          # The full workspace build (and, in `test-docker`, the wide-feature
-          # Postgres-container sweep on top of it) sits near the runner's disk
-          # ceiling; a cold-cache PR build tips it over ("No space left on
-          # device"). Reclaim the preinstalled toolchains a Rust build never
-          # uses before the cache is restored.
+          # The extracted archive is most of a full workspace build. Reclaim
+          # the preinstalled toolchains a Rust build never uses first.
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -874,130 +1057,93 @@ jobs:
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: taiki-e/install-action@v2.87.31
+        with:
+          tool: cargo-nextest@0.9.149
+      - uses: actions/download-artifact@v8
+        if: env.REUSE_ARCHIVE == 'true'
+        with:
+          name: workspace-tests-${{ runner.os }}
+          path: ${{ runner.temp }}/nextest-archive
+      - name: Fetch the locked dependencies
+        # Tests that run `cargo` themselves need the registry. Compiling the
+        # workspace used to fill it as a side effect; running from the archive
+        # does not.
+        run: cargo fetch --locked
+      - name: Restore the build cache (local-build fallback)
+        if: env.REUSE_ARCHIVE != 'true'
+        uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
         with:
-          # This job and `test-build` run the IDENTICAL `cargo test
-          # --workspace` build (`cargo nextest archive` is `cargo test
-          # --no-run` underneath), so they share one cache entry. This job is
-          # the only writer (`test-build`, and a `trybuild` shard that falls
-          # back to a local build, set `save-if: false`).
           shared-key: workspace-test
-          # Save the target dir even when the test STEP fails. rust-cache skips
-          # its save on a failed job by default, and because this job is the
-          # sole writer of the shared key, a red `test` means no shard ever
-          # gets a warm cache — exactly when a warm cache matters most, since
-          # a red suite is what you iterate against. What is being cached is
-          # compiled artifacts; their validity does not depend on whether the
-          # tests that ran afterwards passed.
-          cache-on-failure: true
-      - name: Run tests
-        # Two skips, each handed to a lane of its own:
+          save-if: false
+      - name: Run the shard
+        # Two lanes, partitioning the suite with `trybuild`:
         #
-        # `compile_fail::` goes to the `trybuild` job below. `sim_` goes to the
-        # step right after this one. Both are substring skips over module paths
-        # that nothing else shares, so the three lanes partition the suite
-        # exactly — measured on the consolidated binary: 1840 + 10 + 37 = 1887,
-        # with no test matching two filters.
-        run: |
-          cargo test --workspace -- --skip compile_fail:: --skip sim_
-      - name: Run the simulation suite single-threaded
-        # WHY A SEPARATE, SINGLE-THREADED LANE.
+        # - `k/N`: everything except `compile_fail::` (the `trybuild` job) and
+        #   `sim_` (the `sim` shard), split into N slices. nextest partitions
+        #   after filtering, so the N slices of one OS cover the lane exactly.
+        # - `sim`: the `sim_` lane, one test at a time.
         #
-        # The `sim_*` modules are determinism tests: each builds a
+        # WHY `sim_` RUNS ONE AT A TIME. The `sim_*` modules are determinism
+        # tests: each builds a
         # `tokio::runtime::Builder::new_current_thread().start_paused(true)`
         # runtime and asserts a seed replays byte-identically. They are
-        # sensitive to CPU oversubscription, and sharding made that worse, not
-        # better. Pulling trybuild out of this binary freed the whole libtest
-        # thread pool: the same ~1880 tests that used to trickle through the
-        # gaps between trybuild's long-running cases (863s on ubuntu) now run at
-        # full parallelism in ~61s. On the 4-vCPU `ubuntu-latest` runner that
-        # 14x compression is enough to flip these tests — `Test (ubuntu-latest)`
-        # failed both attempts of run 8482, on `sim_retry_storm` and then
-        # `sim_fault_plan`, while macOS and Windows passed on re-run.
-        # Reproduced locally on a 4-core box: the same binary WITH trybuild
-        # (888s) shows no `sim_*` failure, WITHOUT it (27s) does.
+        # sensitive to CPU oversubscription. Pulling trybuild out of the
+        # consolidated binary freed the whole libtest thread pool, and on the
+        # 4-vCPU `ubuntu-latest` runner that was enough to flip them:
+        # `Test (ubuntu-latest)` failed both attempts of run 8482, on
+        # `sim_retry_storm` and then `sim_fault_plan`. So they get the
+        # environment they were written for. This is not a quarantine: every
+        # one of these tests still runs, still blocks merge, and is not skipped
+        # anywhere. The root cause is the tests' sensitivity to contention,
+        # which this only sidesteps.
         #
-        # So they get the environment they were written for. This is the same
-        # principle as the trybuild shard — a lane per execution requirement —
-        # not a quarantine: every one of these 37 tests still runs, still
-        # blocks merge, and is not skipped anywhere.
+        # The liveness watchdog is armed in the `sim` shard only (issue
+        # #2967): a deadlocked `#[sim_test]` fails with its seed instead of
+        # hanging the job. It is safe only one test at a time, because the
+        # paused clock also advances while a test waits on a lock another test
+        # holds. The budget is virtual time, so two years costs nothing and
+        # stays far above the longest `advance` in the suite (about two
+        # months).
         #
-        # It runs as a STEP of this job rather than a job of its own so it
-        # reuses the target dir just compiled above: no extra runner, no second
-        # workspace build, and the tests themselves take seconds.
-        #
-        # The root cause is the tests' sensitivity to contention, which this
-        # only sidesteps; making them robust under an oversubscribed pool is
-        # worth its own issue.
-        #
-        # The liveness watchdog is armed here (issue #2967): a deadlocked
-        # `#[sim_test]` fails with its seed instead of hanging the job. It is
-        # safe only at `--test-threads=1`, because the paused clock also
-        # advances while a test waits on a lock another test thread holds. The
-        # budget is virtual time, so two years costs nothing and stays far
-        # above the longest `advance` in the suite (about two months).
+        # `--no-tests=fail`: a filter or partition that matches nothing fails
+        # the shard instead of leaving it green having run nothing.
         shell: bash
-        env:
-          AUTUMN_SIM_LIVENESS_BUDGET_SECS: "63072000"
         run: |
           set -euo pipefail
-          cargo test --workspace -- sim_ --test-threads=1 | tee "${RUNNER_TEMP}/sim.log"
-          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/sim.log" \
-            || { echo "::error::the sim_ lane ran no tests — the filter no longer matches the sim_* modules"; exit 1; }
+          if [ "${{ matrix.shard }}" = sim ]; then
+            export AUTUMN_SIM_LIVENESS_BUDGET_SECS=63072000
+            lane=(-E 'test(sim_)' --test-threads 1)
+          else
+            lane=(-E 'not (test(compile_fail::) | test(sim_))'
+                  --partition "count:${{ matrix.shard }}")
+          fi
+          if [ "${REUSE_ARCHIVE}" = true ]; then
+            source=(--archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
+                    --workspace-remap . --extract-to . --extract-overwrite)
+          else
+            echo "::notice::checked out at ${GITHUB_WORKSPACE}, not the archive's path; building locally"
+            source=(--workspace)
+          fi
+          cargo nextest run "${source[@]}" --profile ci --no-tests=fail "${lane[@]}"
 
-  # ---------------------------------------------------------------------------
-  # BUILD ONCE, RUN MANY.
-  #
-  # Every `trybuild` shard used to compile the workspace test build itself
-  # before running its slice of `compile_fail::`. On the cold-cache trunk run
-  # 14053 that compile was 20m35s of the 35-minute `Trybuild pass_a` job, and
-  # all four shards paid it: about 80 runner-minutes of identical work.
-  #
-  # `test-build` compiles it once with `cargo nextest archive --workspace
-  # --test integration_tests` and uploads the archive. The shards download it
-  # and run their filter against the prebuilt `integration_tests` binary. It is
-  # still a `--workspace` build, so the globally unified feature set, which
-  # decides which `#[cfg]`-gated fixtures exist, is the same one `cargo test
-  # --workspace` sees.
-  #
-  # `--test integration_tests` keeps the archive to the one binary the shards
-  # run. An archive of every workspace test binary was 6.9 GB (275 binaries).
-  # Each shard then spent ~6 minutes downloading and extracting it, and the
-  # extracted binaries plus trybuild's own tree ran a `compile_pass` shard's
-  # disk out: `rust-lld` died with SIGBUS linking a fixture. That is the
-  # failure #3534 fixed by building only this target.
-  #
-  # Two things make an archive runnable on another runner, and both are
-  # handled here rather than left to luck:
-  #
-  #   1. Tests read `env!("CARGO_MANIFEST_DIR")` and `env!("CARGO_BIN_EXE_*")`,
-  #      which are absolute paths fixed at compile time. A consumer must check
-  #      out at the same path as the builder and extract the archive into its
-  #      own checkout (`--extract-to .`), so those paths resolve. GitHub-hosted
-  #      runners always use the same path. The self-hosted pool does not: each
-  #      runner slot has its own work dir. So `test-build` publishes its path
-  #      as a job output, and a shard on a different path builds locally
-  #      instead, exactly as it did before this job existed.
-  #   2. trybuild reads the feature set to build its fixtures with from
-  #      `target/debug/.fingerprint`, next to the test binary. A plain archive
-  #      leaves that directory out, and trybuild then quietly builds every
-  #      fixture with default features only. `.config/nextest.toml` adds it to
-  #      every archive and fails the archive if it is missing.
-  # ---------------------------------------------------------------------------
-
-  test-build:
-    name: Build tests (ubuntu-latest)
+  doctest:
+    name: Doctests (${{ matrix.os }})
+    # nextest does not run doctests, so they get a job of their own. It is not
+    # a step of the archive jobs because every shard would then wait for it.
     needs: [lint, meta]
-    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
-    outputs:
-      workspace: ${{ steps.workspace.outputs.path }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os == 'ubuntu-latest' && fromJSON(needs.meta.outputs.heavy_runs_on) || matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
         run: |
-          # The same reclaim the `test` job does: drop the preinstalled
-          # toolchains a Rust build never uses, before the cache is restored.
+          # The same reclaim `test-build` does, before the cache is restored.
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -1012,35 +1158,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
         with:
-          # Restore the entry the `test` job writes: same build, same features.
+          # See `test-build`. RESTORE ONLY: the archive jobs write this key.
           shared-key: workspace-test
-          # RESTORE ONLY. `test` is the single writer of this key.
           save-if: false
-      - uses: taiki-e/install-action@v2.87.31
-        with:
-          tool: cargo-nextest@0.9.149
-      - name: Archive the workspace test build
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/nextest-archive"
-          cargo nextest archive --workspace --test integration_tests \
-            --archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
-          ls -lh "${RUNNER_TEMP}/nextest-archive"
-          df -h
-      - name: Record the checkout path
-        id: workspace
-        shell: bash
-        run: echo "path=${GITHUB_WORKSPACE}" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: workspace-tests-linux
-          path: ${{ runner.temp }}/nextest-archive/workspace-tests.tar.zst
-          if-no-files-found: error
-          # The archive is already zstd-compressed.
-          compression-level: 0
-          # Only this run's shards read it.
-          retention-days: 1
+      - name: Run the doctests
+        run: cargo test --workspace --doc
 
   trybuild:
     name: Trybuild ${{ matrix.shard }}
@@ -1068,7 +1190,7 @@ jobs:
     # a diagnostic that differs per platform (a path separator or an OS-gated
     # `#[cfg]` reaching a fixture); nothing in the current fixture set is
     # OS-conditional, and a compile error that only appears on Windows would
-    # still be caught by `Test (windows-latest)` failing to build.
+    # still be caught by `Build tests (windows-latest)` failing to build.
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     env:
       # True when this runner checked out at the path `test-build` compiled
@@ -1101,8 +1223,8 @@ jobs:
       - uses: actions/download-artifact@v8
         if: env.REUSE_ARCHIVE == 'true'
         with:
-          name: workspace-tests-linux
-          path: ${{ runner.temp }}/nextest-archive
+          name: trybuild-tests-linux
+          path: ${{ runner.temp }}/trybuild-archive
       - name: Fetch the locked dependencies
         # trybuild runs every nested `cargo` with `--offline`, and so does the
         # doc-snippet check in the `rest` shard. Compiling the workspace used
@@ -1120,7 +1242,7 @@ jobs:
           # dir buys nothing, and on windows-latest that upload is what killed
           # `Trybuild pass_a` in run 8362 — the shard itself had already passed
           # at 53m, then the cache-save post step ran 47 more minutes and the
-          # runner dropped the job. `test` is the single writer.
+          # runner dropped the job. The archive jobs write this key.
           save-if: false
       - name: Run the trybuild shard
         # The filter is a nextest filterset over the one binary that holds
@@ -1152,7 +1274,7 @@ jobs:
                       - test(compile_fail::compile_pass_tests_b)' ;;
           esac
           if [ "${REUSE_ARCHIVE}" = true ]; then
-            source=(--archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
+            source=(--archive-file "${RUNNER_TEMP}/trybuild-archive/trybuild-tests.tar.zst"
                     --workspace-remap . --extract-to . --extract-overwrite)
           else
             echo "::notice::checked out at ${GITHUB_WORKSPACE}, not the archive's path; building locally"
@@ -1538,7 +1660,7 @@ jobs:
         if: matrix.lane == 'sla'
         # `sla` (#1826) is not a default feature, so the `test` job compiles
         # none of its suites. The `sim_sla*` modules are determinism tests, so
-        # they run at `--test-threads=1`, as in the `test` job's `sim_` step.
+        # they run at `--test-threads=1`, as in the `test` job's `sim` shard.
         # `assert_ran`: a filter that matches nothing exits 0.
         run: |
           set -euo pipefail
@@ -2268,7 +2390,7 @@ jobs:
     # skipped required check can never be satisfied, so the PR stops being
     # mergeable even once the real failure is understood. `coverage` and `loom`
     # were briefly wired here and hit exactly that; they depend on `test`.
-    needs: [test, test-build, trybuild, test-features, test-docker, test-docker-deploy]
+    needs: [test, test-build, test-archive, doctest, trybuild, test-features, test-docker, test-docker-deploy]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
@@ -3412,7 +3534,7 @@ jobs:
     runs-on: windows-latest
     # This is the gate behind the platform-support policy (issue #1616, AC-3).
     #
-    # `cargo test --workspace` on `windows-latest` (the `test` job above) proves
+    # The workspace suite on `windows-latest` (the `test` job above) proves
     # the code COMPILES and its unit tests pass there. It proves nothing about
     # the journey a Windows developer actually walks — scaffold a project, run
     # `doctor`, run `setup`, edit a file and watch it rebuild, boot a managed

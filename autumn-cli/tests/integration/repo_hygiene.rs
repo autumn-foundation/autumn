@@ -926,8 +926,8 @@ fn trybuild_shards_run_from_the_workspace_nextest_archive() {
         "`test-build` must publish the checkout path it compiled at"
     );
     assert!(
-        build.contains("name: workspace-tests-linux"),
-        "`test-build` must upload the archive the shards download"
+        build.contains("name: trybuild-tests-linux"),
+        "`test-build` must upload the archive the trybuild shards download"
     );
 
     let shards = ci_job(&ci, "trybuild");
@@ -942,7 +942,7 @@ fn trybuild_shards_run_from_the_workspace_nextest_archive() {
         "`trybuild` must compare its checkout path with the archive's"
     );
     for needle in [
-        "name: workspace-tests-linux",
+        "name: trybuild-tests-linux",
         "--workspace-remap . --extract-to . --extract-overwrite",
         "source=(--workspace --test integration_tests)",
         // trybuild builds its fixtures `--offline`; the archive brings no
@@ -992,6 +992,162 @@ fn trybuild_shards_run_from_the_workspace_nextest_archive() {
         "every nextest archive must carry `target/debug/.fingerprint` and fail without it; \
          got {includes:?}"
     );
+}
+
+/// The `{ os, shard }` entries of the `test` job's matrix, grouped by OS.
+/// Each entry is one line: `- { os: <os>, shard: "k/N" }` or `shard: sim`.
+fn test_matrix_shards(job: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut shards: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for line in job.lines().map(str::trim) {
+        let Some(entry) = line
+            .strip_prefix("- {")
+            .and_then(|rest| rest.strip_suffix('}'))
+        else {
+            continue;
+        };
+        let mut os = None;
+        let mut shard = None;
+        for field in entry.split(',') {
+            let (key, value) = field
+                .split_once(':')
+                .unwrap_or_else(|| panic!("malformed matrix entry `{line}`"));
+            let value = value.trim().trim_matches('"').to_owned();
+            match key.trim() {
+                "os" => os = Some(value),
+                "shard" => shard = Some(value),
+                other => panic!("unexpected key `{other}` in `{line}`"),
+            }
+        }
+        shards
+            .entry(os.unwrap_or_else(|| panic!("no os in `{line}`")))
+            .or_default()
+            .push(shard.unwrap_or_else(|| panic!("no shard in `{line}`")));
+    }
+    shards
+}
+
+/// One OS's `test` shards: exactly one `sim`, and `k/N` slices that are
+/// exactly `1/N..N/N` for a single `N`.
+fn assert_partitions_complete(os: &str, list: &[String]) {
+    assert_eq!(
+        list.iter().filter(|s| *s == "sim").count(),
+        1,
+        "{os} must have exactly one `sim` shard; got {list:?}"
+    );
+    let mut slices: Vec<(u32, u32)> = list
+        .iter()
+        .filter(|s| *s != "sim")
+        .map(|s| {
+            let (k, n) = s
+                .split_once('/')
+                .unwrap_or_else(|| panic!("{os}: shard `{s}` is not `k/N` or `sim`"));
+            (
+                k.parse().unwrap_or_else(|_| panic!("{os}: bad k in `{s}`")),
+                n.parse().unwrap_or_else(|_| panic!("{os}: bad N in `{s}`")),
+            )
+        })
+        .collect();
+    slices.sort_unstable();
+    let total = slices.first().map_or(0, |&(_, n)| n);
+    let expected: Vec<(u32, u32)> = (1..=total).map(|k| (k, total)).collect();
+    assert!(
+        total > 0 && slices == expected,
+        "{os}: partitions must be exactly 1/N..N/N for one N; got {slices:?}"
+    );
+}
+
+/// The `test` job runs the default lane as `--partition count:k/N` slices of
+/// one `cargo nextest archive --workspace` build per OS, plus a `sim` shard.
+///
+/// Each piece guards a failure that would otherwise be quiet:
+/// - every OS's `k/N` slices must cover `1..=N` exactly, with one `N`: a
+///   missing or duplicated slice leaves part of the suite running nowhere,
+///   and every shard still reports green;
+/// - every OS needs a `sim` shard, or the `sim_` lane runs nowhere;
+/// - the archives must be `--workspace` builds, so the unified feature set
+///   that decides which gated tests exist does not change;
+/// - the default lane must exclude exactly `compile_fail::` and `sim_`, the
+///   two lanes that run elsewhere;
+/// - doctests do not run under nextest, so `doctest` must run them on every
+///   OS;
+/// - `test-gate` must need every new job.
+#[test]
+fn test_shards_partition_the_workspace_nextest_archive() {
+    let root = workspace_root();
+    // A Windows checkout can turn LF into CRLF.
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace("\r\n", "\n");
+
+    let job = ci_job(&ci, "test");
+    let shards = test_matrix_shards(job);
+    assert_eq!(
+        shards.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["macos-latest", "ubuntu-latest", "windows-latest"],
+        "`test` must shard every OS; got {shards:?}"
+    );
+    for (os, list) in &shards {
+        assert_partitions_complete(os, list);
+    }
+    for needle in [
+        r#"--partition "count:${{ matrix.shard }}""#,
+        "-E 'not (test(compile_fail::) | test(sim_))'",
+        "-E 'test(sim_)' --test-threads 1",
+        "export AUTUMN_SIM_LIVENESS_BUDGET_SECS=",
+        "--workspace-remap . --extract-to . --extract-overwrite",
+        "name: workspace-tests-${{ runner.os }}",
+        "needs.test-build.outputs.workspace == github.workspace",
+        "run: cargo fetch --locked",
+        "--no-tests=fail",
+    ] {
+        assert!(job.contains(needle), "`test` must contain `{needle}`");
+    }
+    assert!(
+        job.lines().any(|l| {
+            l.trim_start().starts_with("needs:")
+                && l.contains("test-build")
+                && l.contains("test-archive")
+        }),
+        "`test` must need both archive jobs"
+    );
+
+    for name in ["test-build", "test-archive"] {
+        let build = ci_job(&ci, name);
+        assert!(
+            build.contains("cargo nextest archive --workspace \\\n"),
+            "`{name}` must archive every workspace test binary"
+        );
+        assert!(
+            build.contains("name: workspace-tests-${{ runner.os }}"),
+            "`{name}` must upload the archive the `test` shards download"
+        );
+    }
+    assert!(
+        ci_job(&ci, "test-archive").contains("os: [macos-latest, windows-latest]"),
+        "`test-archive` must build macOS and Windows"
+    );
+
+    let doctest = ci_job(&ci, "doctest");
+    assert!(
+        doctest.contains("os: [ubuntu-latest, macos-latest, windows-latest]")
+            && doctest.contains("run: cargo test --workspace --doc"),
+        "`doctest` must run the workspace doctests on every OS"
+    );
+
+    let gate = ci_job(&ci, "test-gate");
+    let needs = gate
+        .lines()
+        .find(|l| l.trim_start().starts_with("needs:"))
+        .expect("`test-gate` must have `needs:`");
+    for name in ["test", "test-build", "test-archive", "doctest", "trybuild"] {
+        assert!(
+            needs
+                .split(|c: char| !(c.is_alphanumeric() || c == '-'))
+                .any(|word| word == name),
+            "`test-gate` must need `{name}`; got `{needs}`"
+        );
+    }
 }
 
 #[test]
