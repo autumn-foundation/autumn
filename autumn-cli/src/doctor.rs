@@ -23729,6 +23729,40 @@ mod table_boundaries_tests {
     }
 
     #[test]
+    fn the_wrapper_reads_paths_relative_to_the_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("boundaries.toml");
+        std::fs::write(
+            &config_path,
+            "graph = \"architecture-graph.json\"\nbaseline = \"baseline.json\"\n\
+             [boundaries.core]\nowns = [\"contacts\"]\nmodules = [\"core\"]\n\
+             [boundaries.marketing]\nmodules = [\"marketing\"]\n",
+        )
+        .expect("write config");
+        std::fs::write(
+            dir.path().join("architecture-graph.json"),
+            graph().to_json(),
+        )
+        .expect("write graph");
+        // The temp dir is no Cargo project, so the crate rule cannot run.
+        let result = super::check_table_boundaries(&config_path);
+        assert_eq!(result.status, CheckStatus::Warn);
+        let detail = result.detail.expect("detail");
+        assert!(detail.contains("GET /report"), "{detail}");
+        assert!(detail.contains("crate rule not run"), "{detail}");
+        assert!(!detail.contains("graph rule not run"), "{detail}");
+    }
+
+    #[test]
+    fn a_bad_config_file_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("boundaries.toml");
+        std::fs::write(&config_path, "[boundaries.core]\nowns = 3\n").expect("write");
+        let result = super::check_table_boundaries(&config_path);
+        assert_eq!(result.status, CheckStatus::Fail);
+    }
+
+    #[test]
     fn an_ambiguous_config_fails() {
         let config = BoundaryConfig::parse(
             "[boundaries.a]\nowns = [\"contacts\"]\n[boundaries.b]\nowns = [\"contacts\"]\n",

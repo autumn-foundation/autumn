@@ -1268,6 +1268,28 @@ fn first_error(stream: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_returns_the_output_of_a_fast_command() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo bounded"]);
+        let output = run_bounded(&mut command, Some(Duration::from_secs(30))).expect("runs");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "bounded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_bounded_stops_a_command_past_its_budget() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let started = std::time::Instant::now();
+        let err = run_bounded(&mut command, Some(Duration::from_millis(100)))
+            .expect_err("the budget stops it");
+        assert_eq!(err.kind(), std::io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
     /// One `vulnerability` diagnostic plus the summary that proves the run
     /// finished. Shaped after real `cargo deny 0.20.2 --format json` output.
     const CRITICAL_VULN: &str = r#"
