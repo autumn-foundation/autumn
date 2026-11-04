@@ -3468,7 +3468,7 @@ mod tests {
         );
         assert!(
             policy.contains("RUSTSEC-2023-0071"),
-            "every flavor's tree reaches rsa through jsonwebtoken"
+            "every flavor keeps the default `jwt` feature, so its tree reaches rsa through jsonwebtoken"
         );
     }
 

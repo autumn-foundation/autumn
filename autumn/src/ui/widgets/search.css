@@ -109,6 +109,80 @@
     color: var(--primary);
 }
 
+/* The "create new" entry of tags mode (#3410). */
+.autumn-autocomplete__option--create {
+    font-style: italic;
+}
+
+/* ── Tags mode chips (autumn-chip, #3410) ─────────────────────────────────── */
+
+/* The chips sit between the label and the input. */
+.autumn-autocomplete--multiple {
+    row-gap: var(--space-2);
+}
+
+.autumn-autocomplete__chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+/* `display: flex` must not show a list that the server hides. */
+.autumn-autocomplete__chips[hidden],
+.autumn-autocomplete__chips:empty {
+    display: none;
+}
+
+.autumn-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    max-width: 100%;
+    padding-block: 0;
+    padding-inline: var(--space-2) 0;
+    /* Forced-colors mode removes the background. The border stays. */
+    border: 1px solid transparent;
+    border-radius: var(--radius-full);
+    font-size: var(--font-size-sm);
+    background-color: var(--primary-light);
+    color: var(--primary);
+}
+
+/* A long label wraps, so it does not push the page wider. */
+.autumn-chip__label {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+/* 24 px is the WCAG 2.2 minimum target size. */
+.autumn-chip__remove {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.5rem;
+    min-height: 1.5rem;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.autumn-chip__remove:hover {
+    background-color: var(--surface);
+}
+
+.autumn-chip__remove:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 1px;
+}
+
 /* ── Search empty states (#2354) ─────────────────────────────────────────── */
 
 .autumn-search-empty,

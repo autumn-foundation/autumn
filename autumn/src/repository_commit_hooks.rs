@@ -2443,6 +2443,21 @@ mod tests {
             .build()
             .expect("pool");
 
+        // The first call in a fresh process also pays one-time costs: paging in
+        // the code of the pool, driver and runtime paths it touches. nextest
+        // runs each test in its own process, and on a macOS runner that alone
+        // took the call past 750ms. Warm those paths first, under a bound wide
+        // enough for any runner that still fails a call that hangs.
+        let warm = tokio::time::timeout(
+            Duration::from_secs(30),
+            mark_repository_commit_hook_after_hook_failed(&pool, "hook-id", "owner", "boom"),
+        )
+        .await;
+        assert!(
+            warm.is_ok(),
+            "after-hook failure marking must not block a committed mutation forever when the pool/database is down"
+        );
+
         let result = tokio::time::timeout(
             Duration::from_millis(750),
             mark_repository_commit_hook_after_hook_failed(&pool, "hook-id", "owner", "boom"),
@@ -2451,7 +2466,7 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "after-hook failure marking must not block a committed mutation forever when the pool/database is down"
+            "after-hook failure marking must give up within its retry budget when the pool/database is down"
         );
     }
 

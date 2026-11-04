@@ -39,7 +39,7 @@ when their details matter:
   `docs/guide/`, grouped by task, each entry naming the question that page
   answers. Start here when the topic you need is not covered by this file or
   the references below, rather than guessing a filename — the index is gated
-  by `scripts/check-docs-guide-index.sh`, so it lists every guide page that
+  by `cargo xtask check docs-guide-index`, so it lists every guide page that
   exists and nothing that does not.
 - `references/api-reference.md` - release-line API map, proc macros,
   feature flags, AppBuilder methods, config env names, and dependency versions.
@@ -273,7 +273,9 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `flash` | Flash messages |
 | `multipart` | Multipart uploads |
 | `redis` | Redis sessions, channels, jobs, webhook replay, and integration points |
-| `oauth2` | OAuth2/OIDC helpers and `autumn generate auth --oauth` scaffolding |
+| `oauth2` | OAuth2/OIDC helpers and `autumn generate auth --oauth` scaffolding; implies `jwt` |
+| `jwt` | Default-on. JWT verification (`jsonwebtoken`): the `jwt` tenancy source and the OIDC `id_token` check |
+| `push` | Default-on. Web Push (`autumn_web::push`, `WebPush`, `[push]`) over `p256` |
 | `openapi` | OpenAPI route metadata and spec generation |
 | `mcp` | Project typed JSON endpoints as MCP tools; implies `openapi` |
 | `webmcp` | Routes (`#[api_doc(webmcp)]` + `mount_webmcp()`) and forms (`webmcp::form_tool`) as tools for the agent in the user's browser; implies `mcp` and `htmx`. Guide: `docs/guide/webmcp.md` |
@@ -2294,6 +2296,7 @@ for the common cases:
 | `comment_thread(&cfg, &CommentView::from_thread(&nodes))` / `CommentThread::new(dom_id, action)` | The view half of `#[commentable]` (#1367): nested `<ol>` comment thread with a `<details>`-disclosed inline reply form on every node. Ordinary `<form method="post">` (works with scripting off) that also carries `hx-post`/`hx-target`/`hx-swap="outerHTML"` to swap the thread in place. Thread `.csrf_token(...)` and `.return_to(path)` for the no-JS round trip, `.max_depth(n)` so the UI never offers a reply the write path would `422`, `.read_only(Some(prompt))` for a signed-out visitor |
 | `active_search(id, label, &ActiveSearchConfig)` / `active_search_empty_state(msg)` | Search box whose results appear as the user types — htmx-driven, server-rendered Maud fragments; you author no JavaScript, but the page must load htmx. The handler returns the results fragment; `active_search_empty_state` is the no-matches body. Emits a `<noscript>` GET-form fallback (`docs/guide/active-search-and-autocomplete.md`) |
 | `autocomplete_input(id, label, &AutocompleteConfig)` / `autocomplete_option(value, label)` / `autocomplete_empty_state(msg)` | Typeahead/autocomplete picker for choosing a related record and storing its ID — the companion to `active_search` when the user must pick one row rather than browse matches. Selection and input sync need the shipped `autumn-widgets.js` runtime (`<script src="/static/js/autumn-widgets.js" defer>`, no inline JS, CSP-compatible) on top of htmx; include it once in the layout or the picker will not select. Its `<noscript>` fallback is a bare `<select>`, NOT a form like `active_search`'s — it has to sit inside the surrounding application form to submit (`docs/guide/active-search-and-autocomplete.md`) |
+| `AutocompleteConfig::multiple()` (+ `.free_text()`, `.selected(..)`) / `autocomplete_input_for(&changeset, id, label, &config)` / `autocomplete_create_option(value, label)` | Tags / multi-select (issue #3410): each pick is a removable chip with one hidden `name=value` input, so bind a `#[serde(default)] Vec<T>` field — repeated keys decode into it. Use `autocomplete_input_for` on a 422 re-render: the changeset is the source of the chips and its field errors show. Return `autocomplete_create_option` after the matches for a "create new" entry; with `free_text()`, Enter adds the typed text. Validate and de-duplicate new values on the server. Needs `autumn-widgets.js`; the no-JS fallback is a `<select multiple>` that shows only `fallback_options` (`docs/guide/active-search-and-autocomplete.md`) |
 | `storage::form_helper::direct_upload_field(name, presign_url, &DirectUploadConfig::new().label(..).accept(..).multiple(..))` / `direct_upload_input(name, presign_url, accept)` | Direct-to-storage file field (feature `storage`, #3411). With `autumn-widgets.js` it `POST`s `{filename, content_type, size}` to your presign route (CSRF token from `<meta name="csrf-token">`), reads `{url, method, headers, key}`, sends the file with a progress bar (drag and drop works) and adds a hidden `name=key` field. The form carries only keys: check each key's prefix, then call `complete_direct_upload`. Without JS it is a plain file input in a `multipart/form-data` form. Has a visible `<label>` and live status and error regions (`docs/guide/storage.md`) |
 | `local_datetime(dt, tz)` (`autumn_web::time_zone`) | Render a `DateTime<Utc>` in a user's IANA zone. Pair with the `TimeZone` extractor (resolves the requesting user's zone) and `set_time_zone_in_session` / `parse_iana`; take "now" from the `Clock` extractor rather than `Utc::now()` so rendering stays test-injectable (`docs/guide/time-zones.md`) |
 | `wizard_progress(&ctx, step).await` / `wizard_progress_from_steps(&[WizardProgressStep])` (`autumn_web::wizard`) | Accessible step-progress `<nav>` (`aria-current="step"`, "Step N of M"). `wizard_progress` reads step states from the session; `wizard_progress_from_steps` is the sync form for steps you already have (#3398). The `/_stories` gallery shows it with pagination, flash and the `a11y` primitives |
@@ -2612,6 +2615,14 @@ subset of queues — all config-only, no app-code change:
   preset name, `.base()` the `ProcessRole`. Guards read the base; an
   undeclared name stops the boot. `autumn doctor --strict` derives
   `[jobs.fleet] tiers` from the presets. See `docs/guide/jobs.md#named-roles`.
+- **Route groups (issue #3544)** — `#[get("/x", group = "marketing")]`,
+  `.routes_in("marketing", routes![...])` or `Plugin::route_group()` (default
+  `Plugin::name()`) put routes in a group; the default is `app`. A preset over
+  `web`/`combined` sets `mount = ["marketing"]` to serve only those groups.
+  Probes, actuator and assets stay on every role; other routes get 404. Graph
+  and OpenAPI follow the mount. `[route_groups] declared`/`manifest` lets
+  `autumn doctor --strict` fail on a group no preset mounts. See
+  `docs/guide/route-groups.md`.
 
 ## Operator alerts (0.6.0, issue #1610)
 
@@ -3683,6 +3694,7 @@ autumn graph impact Post         # what a change to a model would affect: the re
 autumn graph show --manifest architecture-graph.json --check architecture-graph.json   # write it, and fail on drift, naming the node, edge or auth posture that moved
 # `--check` also names a changed secondary mount and a changed declared plugin mount (`completeness.declared_mounts`); after upgrading, run `autumn graph show --manifest <file>` once to refresh a committed graph (#2520)
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
+autumn graph check-boundaries    # fail when one boundary queries a table another boundary owns (#3549)
 autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
 autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
 autumn openapi export --check openapi.json --strict   # CI gate: fail on contract drift (compares parsed JSON, naming the operations added/removed/changed), and on any component schema that exports as an opaque `{"type":"object"}`
@@ -3713,6 +3725,11 @@ a route or job are read off that item's own tokens and are deliberately
 over-reported; the document carries its own `limits` section, and the biggest
 one is that a call into a helper in another module is not followed. See
 `docs/guide/architecture-graph.md`.
+
+To keep one module out of another module's tables, declare boundaries in
+`boundaries.toml` and run `autumn graph check-boundaries`. A baseline holds
+today's violations, so an existing app can adopt it. See
+`docs/guide/table-ownership.md`.
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629; 0.8.0, issue #1593)
 

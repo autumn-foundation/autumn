@@ -280,7 +280,7 @@ fn expected_story_slugs() -> Vec<&'static str> {
     slugs.push("direct-upload");
     // Widget families (#3408).
     #[cfg(feature = "widgets-search")]
-    slugs.extend(["active-search", "autocomplete"]);
+    slugs.extend(["active-search", "autocomplete", "tags-input"]);
     #[cfg(feature = "widgets-social")]
     slugs.extend(["comment-thread", "infinite-feed", "reaction-controls"]);
     #[cfg(feature = "widgets-workflow")]
@@ -562,6 +562,8 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "popover",
     "select",
     "tabs",
+    // Tags mode of the combobox (#3410).
+    "tags-input",
     "theme-toggle",
     "toast",
     "tooltip",
@@ -569,8 +571,13 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
 
 /// Keyboard stories that a feature can turn off: `flash`, the
 /// `widgets-search` stories (#3408), and `direct-upload` (`storage`).
-const FEATURE_GATED_KEYBOARD_SLUGS: &[&str] =
-    &["flash", "active-search", "autocomplete", "direct-upload"];
+const FEATURE_GATED_KEYBOARD_SLUGS: &[&str] = &[
+    "flash",
+    "active-search",
+    "autocomplete",
+    "tags-input",
+    "direct-upload",
+];
 
 /// The browser test fn name for `slug`.
 fn keyboard_test_name(slug: &str) -> String {

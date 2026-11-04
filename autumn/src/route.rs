@@ -8,6 +8,7 @@
 //! Users do not construct `Route` values directly -- they use the
 //! proc macros and the `routes![]` collection macro.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use axum::routing::MethodRouter;
@@ -127,6 +128,78 @@ pub enum RouteTimeout {
     Disabled,
 }
 
+/// The name of a route group (#3544).
+///
+/// A `[roles.<name>] mount = [...]` list selects groups by name. A route gets
+/// its group from, in order: `#[get("/x", group = "...")]` or
+/// [`Route::in_group`], then [`AppBuilder::routes_in`](crate::app::AppBuilder::routes_in),
+/// then the [`Plugin::route_group`](crate::plugin::Plugin::route_group) of the
+/// plugin that adds it, then [`RouteGroup::DEFAULT`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RouteGroup(Cow<'static, str>);
+
+impl RouteGroup {
+    /// The name of [`RouteGroup::DEFAULT`].
+    pub const DEFAULT_NAME: &'static str = "app";
+
+    /// The group of an app route that names no group.
+    pub const DEFAULT: Self = Self::from_static(Self::DEFAULT_NAME);
+
+    /// A group with a static name. The route macros use it.
+    #[must_use]
+    pub const fn from_static(name: &'static str) -> Self {
+        Self(Cow::Borrowed(name))
+    }
+
+    /// A group with the name `name`.
+    #[must_use]
+    pub fn new(name: impl Into<Cow<'static, str>>) -> Self {
+        Self(name.into())
+    }
+
+    /// The group name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for RouteGroup {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl From<&'static str> for RouteGroup {
+    fn from(name: &'static str) -> Self {
+        Self::from_static(name)
+    }
+}
+
+impl From<String> for RouteGroup {
+    fn from(name: String) -> Self {
+        Self(Cow::Owned(name))
+    }
+}
+
+impl From<Cow<'static, str>> for RouteGroup {
+    fn from(name: Cow<'static, str>) -> Self {
+        Self(name)
+    }
+}
+
+impl AsRef<str> for RouteGroup {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for RouteGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A single route binding an HTTP method + path to an Axum handler.
 ///
 /// Created by the `__autumn_route_info_{name}()` companion functions
@@ -197,9 +270,41 @@ pub struct Route {
     /// [`SeoMeta`](crate::seo::SeoMeta) extractor can hand handlers a
     /// pre-populated builder.
     pub seo: SeoRouteDefaults,
+
+    /// The route group (#3544). `None`: the group of the code that registers
+    /// the route. See [`RouteGroup`].
+    pub group: Option<RouteGroup>,
 }
 
 impl Route {
+    /// Put this route in `group`. This wins over
+    /// [`AppBuilder::routes_in`](crate::app::AppBuilder::routes_in) and over
+    /// the plugin group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `group` is blank.
+    #[must_use]
+    #[track_caller]
+    pub fn in_group(mut self, group: impl Into<RouteGroup>) -> Self {
+        let group = group.into();
+        assert!(
+            !group.as_str().trim().is_empty(),
+            "the route group name must not be blank"
+        );
+        self.group = Some(group);
+        self
+    }
+
+    /// The group this route is in: its own group, else
+    /// [`RouteGroup::DEFAULT`].
+    #[must_use]
+    pub fn group_name(&self) -> &str {
+        self.group
+            .as_ref()
+            .map_or(RouteGroup::DEFAULT_NAME, RouteGroup::as_str)
+    }
+
     /// Opt this route in as an MCP tool, equivalent to tagging the handler
     /// with `#[api_doc(mcp)]`.
     ///

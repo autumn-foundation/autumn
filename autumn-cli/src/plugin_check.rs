@@ -1106,6 +1106,7 @@ mod tests {
             sunset_opt_out: None,
             resource_shape: String::new(),
             pools: Vec::new(),
+            group: None,
         }
     }
 
@@ -1936,6 +1937,7 @@ mod contract_tests {
             sunset_opt_out: None,
             resource_shape: String::new(),
             pools: Vec::new(),
+            group: None,
         }
     }
 

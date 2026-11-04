@@ -715,7 +715,11 @@ pub struct TestApp {
     routes: Vec<Route>,
     scoped_groups: Vec<crate::app::ScopedGroup>,
     merge_routers: Vec<axum::Router<crate::state::AppState>>,
+    /// Parallel to `merge_routers`: the route group of each router (#3544).
+    merge_router_groups: Vec<Option<crate::route::RouteGroup>>,
     nest_routers: Vec<(String, axum::Router<crate::state::AppState>)>,
+    /// Parallel to `nest_routers`.
+    nest_router_groups: Vec<Option<crate::route::RouteGroup>>,
     /// Routes declared for opaque `nest` mounts, mirroring
     /// [`AppBuilder::declare_plugin_routes`]. Carried so a `TestApp` runs the
     /// same duplicate-route preflight production does — without this, a plugin
@@ -821,6 +825,17 @@ pub struct TestApp {
 
 type TestPolicyRegistration = Box<dyn FnOnce(&crate::authorization::PolicyRegistry) + Send>;
 
+/// The group of an app route that names no group (#3544).
+const fn default_route_group() -> crate::route::RouteGroup {
+    crate::route::RouteGroup::DEFAULT
+}
+
+/// Fill `groups` with shared entries up to `len`, so it stays parallel to its
+/// router list.
+fn pad_groups(groups: &mut Vec<Option<crate::route::RouteGroup>>, len: usize) {
+    groups.resize(len.max(groups.len()), None);
+}
+
 impl TestApp {
     /// Create a new test app builder with default configuration.
     #[must_use]
@@ -837,7 +852,9 @@ impl TestApp {
             routes: Vec::new(),
             scoped_groups: Vec::new(),
             merge_routers: Vec::new(),
+            merge_router_groups: Vec::new(),
             nest_routers: Vec::new(),
+            nest_router_groups: Vec::new(),
             declared_routes: Vec::new(),
             plugin_asset_bundles: Vec::new(),
             custom_layers: Vec::new(),
@@ -1103,6 +1120,7 @@ impl TestApp {
     #[must_use]
     pub fn merge(mut self, router: axum::Router<crate::state::AppState>) -> Self {
         self.merge_routers.push(router);
+        self.merge_router_groups.push(Some(default_route_group()));
         self
     }
 
@@ -1138,6 +1156,7 @@ impl TestApp {
     #[must_use]
     pub fn nest(mut self, path: &str, router: axum::Router<crate::state::AppState>) -> Self {
         self.nest_routers.push((path.to_owned(), router));
+        self.nest_router_groups.push(Some(default_route_group()));
         self
     }
 
@@ -1266,6 +1285,19 @@ impl TestApp {
         self
     }
 
+    /// Register routes in the route group `group`. Mirrors
+    /// [`AppBuilder::routes_in`](crate::app::AppBuilder::routes_in).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `group` is blank.
+    #[must_use]
+    #[track_caller]
+    pub fn routes_in(self, group: impl Into<crate::route::RouteGroup>, routes: Vec<Route>) -> Self {
+        let routes = crate::route_group::put_in_group(&group.into(), routes);
+        self.routes(routes)
+    }
+
     /// Register a callback to configure/initialize the application state before building the router.
     #[must_use]
     pub fn state_initializer<F>(mut self, f: F) -> Self
@@ -1345,6 +1377,7 @@ impl TestApp {
 
     /// Mirrors
     /// [`crate::app::AppBuilder::with_push_subscription_store`].
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_push_subscription_store<S>(mut self, store: S) -> Self
     where
@@ -1362,6 +1395,7 @@ impl TestApp {
     /// The usual reason is a
     /// [`RecordingPushTransport`](crate::push::RecordingPushTransport), so a
     /// test can assert exactly what would have gone to the push service.
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_web_push(mut self, push: crate::push::WebPush) -> Self {
         self.state_initializers.push(Box::new(move |state| {
@@ -1398,8 +1432,14 @@ impl TestApp {
         // Merge properties from the plugin's app_builder into self:
         self.routes.extend(app_builder.routes);
         self.scoped_groups.extend(app_builder.scoped_groups);
+        pad_groups(&mut self.merge_router_groups, self.merge_routers.len());
+        pad_groups(&mut self.nest_router_groups, self.nest_routers.len());
         self.merge_routers.extend(app_builder.merge_routers);
+        self.merge_router_groups
+            .extend(app_builder.merge_router_groups);
         self.nest_routers.extend(app_builder.nest_routers);
+        self.nest_router_groups
+            .extend(app_builder.nest_router_groups);
         self.declared_routes.extend(app_builder.declared_routes);
         self.plugin_asset_bundles = app_builder.plugin_asset_bundles;
         self.custom_layers.extend(app_builder.custom_layers);
@@ -1997,6 +2037,26 @@ impl TestApp {
     #[must_use]
     #[cfg_attr(not(feature = "inbound-mail"), allow(unused_mut))]
     pub fn build(mut self) -> TestClient {
+        // Keep only the route groups the test role mounts (#3544), as
+        // `AppBuilder::run` does. A bad role fails later, with its own message.
+        if let Ok(role) = self.config.resolve_role() {
+            pad_groups(&mut self.merge_router_groups, self.merge_routers.len());
+            pad_groups(&mut self.nest_router_groups, self.nest_routers.len());
+            let retained = crate::route_group::MountTargets {
+                routes: &mut self.routes,
+                route_sources: &mut Vec::new(),
+                scoped_groups: &mut self.scoped_groups,
+                merge_routers: &mut self.merge_routers,
+                merge_router_groups: &mut self.merge_router_groups,
+                nest_routers: &mut self.nest_routers,
+                nest_router_groups: &mut self.nest_router_groups,
+                declared_routes: &mut self.declared_routes,
+            }
+            .retain(&role);
+            if let Err(error) = retained {
+                panic!("{error}");
+            }
+        }
         // Reset the global cache to prevent cross-test contamination. Briefly
         // held so this can't land mid-flight inside another same-process
         // test's own global-cache critical section (issue #2218) — see
@@ -5205,6 +5265,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             },
             Route {
                 method: Method::POST,
@@ -5225,6 +5286,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             },
             Route {
                 method: Method::POST,
@@ -5245,6 +5307,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             },
         ]
     }
@@ -5419,6 +5482,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }];
         let client = TestApp::new().routes(routes).build();
 

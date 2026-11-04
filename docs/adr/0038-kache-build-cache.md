@@ -1,4 +1,4 @@
-# ADR 0036: Cache CI Builds per Compile With kache
+# ADR 0038: Cache CI Builds per Compile With kache
 
 - Status: Accepted
 - Date: 2026-11-04

@@ -1593,7 +1593,15 @@ pub struct AutumnConfig {
     /// leaving the app running with push silently dead. See
     /// [`crate::push::PushConfig`] and `docs/guide/web-push.md`.
     #[serde(default)]
+    #[cfg(feature = "push")]
     pub push: crate::push::PushConfig,
+
+    /// The `[push]` table, kept so the file stays valid without the `push`
+    /// feature. An `AUTUMN_PUSH__*` variable also sets it. The boot fails when
+    /// it is set: see [`validate_push`](Self::validate_push).
+    #[serde(default)]
+    #[cfg(not(feature = "push"))]
+    pub push: Option<InertSection>,
 
     /// HTTP idempotency-key middleware settings.
     #[serde(default)]
@@ -1631,6 +1639,11 @@ pub struct AutumnConfig {
     /// base plus role-shaped overrides. See [`RolePreset`].
     #[serde(default)]
     pub roles: BTreeMap<String, RolePreset>,
+
+    /// The route groups of the app, for `autumn doctor` (#3544). The runtime
+    /// does not read it. See [`RouteGroupsConfig`].
+    #[serde(default)]
+    pub route_groups: RouteGroupsConfig,
 
     /// Authentication settings.
     #[serde(default)]
@@ -3968,6 +3981,9 @@ impl<'de> Deserialize<'de> for RoleName {
 /// scheduler = false    # unset = the base default
 /// ```
 ///
+/// A preset over an HTTP base can also set `mount = ["marketing"]`: the route
+/// groups it serves (#3544). Unset: every group.
+///
 /// The base is the safety contract. An override can only turn a capability
 /// off. `serves_http` is not a key: the base decides it. Unknown keys fail the
 /// load, so a preset cannot set other config.
@@ -4004,6 +4020,10 @@ pub struct RolePreset {
     /// Override for [`Capability::Retention`].
     #[serde(default)]
     pub retention: Option<bool>,
+    /// The route groups this role serves (#3544). Unset: every group.
+    /// Framework routes (probes, actuator, assets) are always served.
+    #[serde(default)]
+    pub mount: Option<Vec<String>>,
 }
 
 /// An invalid `[roles.<name>]` preset, or a `role` that names no role.
@@ -4073,6 +4093,33 @@ pub enum RoleError {
         /// The declared name.
         name: String,
     },
+    /// `mount` is set, but the base serves no HTTP.
+    #[error(
+        "[roles.{name}]: mount names route groups, but base \"{}\" serves no routes; \
+         remove mount or use base = \"web\" or \"combined\"",
+        .base.as_str()
+    )]
+    MountWithoutHttp {
+        /// The declared name.
+        name: String,
+        /// The base.
+        base: ProcessRole,
+    },
+    /// `mount = []`.
+    #[error(
+        "[roles.{name}]: mount = [] serves no route group; name at least one group, or \
+         remove mount to serve every group"
+    )]
+    EmptyMount {
+        /// The declared name.
+        name: String,
+    },
+    /// `mount` has a blank group name.
+    #[error("[roles.{name}]: mount has a blank route group name")]
+    BlankMount {
+        /// The declared name.
+        name: String,
+    },
     /// `role` names no built-in role and no declared preset.
     #[error("{builtin}, and no [roles.{name}] is declared ({})", declared_roles_text(.declared))]
     Undeclared {
@@ -4108,7 +4155,15 @@ impl RolePreset {
             fleet_relay: None,
             restore_check: None,
             retention: None,
+            mount: None,
         }
+    }
+
+    /// Whether this preset serves the routes of `group`: the base serves
+    /// HTTP, and `mount` is unset or names `group`.
+    #[must_use]
+    pub fn mounts_group(&self, group: &str) -> bool {
+        mount_admits(self.base.serves_http(), self.mount.as_deref(), group)
     }
 
     /// The override for `capability`, if the preset sets one.
@@ -4187,8 +4242,21 @@ impl RolePreset {
             _ => {}
         }
         match self.workers {
-            Some(0) => Err(RoleError::ZeroWorkers { name: named() }),
-            Some(_) if !job_workers => Err(RoleError::WorkersWithoutJobWorkers { name: named() }),
+            Some(0) => return Err(RoleError::ZeroWorkers { name: named() }),
+            Some(_) if !job_workers => {
+                return Err(RoleError::WorkersWithoutJobWorkers { name: named() });
+            }
+            _ => {}
+        }
+        match self.mount.as_deref() {
+            Some(_) if !self.base.serves_http() => Err(RoleError::MountWithoutHttp {
+                name: named(),
+                base: self.base,
+            }),
+            Some([]) => Err(RoleError::EmptyMount { name: named() }),
+            Some(groups) if groups.iter().any(|g| g.trim().is_empty()) => {
+                Err(RoleError::BlankMount { name: named() })
+            }
             _ => Ok(()),
         }
     }
@@ -4212,6 +4280,13 @@ struct PresetRole {
     name: Box<str>,
     pin: Option<Vec<String>>,
     workers: Option<usize>,
+    mount: Option<Vec<String>>,
+}
+
+/// Whether a role with `serves_http` and `mount` serves the routes of
+/// `group`. Unset `mount` admits every group.
+fn mount_admits(serves_http: bool, mount: Option<&[String]>, group: &str) -> bool {
+    serves_http && mount.is_none_or(|groups| groups.iter().any(|g| g == group))
 }
 
 impl Role {
@@ -4289,6 +4364,22 @@ impl Role {
         self.preset.as_ref().and_then(|preset| preset.workers)
     }
 
+    /// The route groups the preset mounts, or `None` for every group (#3544).
+    #[must_use]
+    pub fn mount(&self) -> Option<&[String]> {
+        self.preset
+            .as_ref()
+            .and_then(|preset| preset.mount.as_deref())
+    }
+
+    /// Whether this role serves the routes of `group`. A role that serves no
+    /// HTTP serves no group. Framework routes do not have a group: every role
+    /// that serves HTTP serves them.
+    #[must_use]
+    pub fn mounts_group(&self, group: &str) -> bool {
+        mount_admits(self.serves_http(), self.mount(), group)
+    }
+
     /// `jobs` with the preset `pin` and `workers` applied. A role without
     /// them borrows `jobs` as it is.
     #[must_use]
@@ -4317,6 +4408,7 @@ impl Role {
                 name: name.into(),
                 pin: preset.pin.clone().filter(|pin| !pin.is_empty()),
                 workers: preset.workers,
+                mount: preset.mount.clone(),
             })),
         }
     }
@@ -4388,6 +4480,51 @@ pub fn resolve_role(
     };
     preset.validate(wanted)?;
     Ok(Role::from_preset(wanted, preset))
+}
+
+/// `[route_groups]`: the route groups `autumn doctor` checks (#3544).
+///
+/// `autumn doctor --strict` fails when a group here is mounted by no
+/// `[roles.<name>]` preset. The runtime does not read this section: it knows
+/// the groups from the code.
+///
+/// ```toml
+/// [route_groups]
+/// manifest = "routes.json"          # autumn routes --format json > routes.json
+/// declared = ["marketing", "app"]   # used when manifest is not set
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteGroupsConfig {
+    /// Route groups, written by hand.
+    #[serde(default)]
+    pub declared: Vec<String>,
+    /// Path to the output of `autumn routes --format json`. It wins over
+    /// `declared`.
+    #[serde(default)]
+    pub manifest: Option<String>,
+}
+
+/// The groups in `groups` that no `[roles.<name>]` preset mounts (#3544), in
+/// input order.
+///
+/// A preset over an HTTP base with no `mount` mounts every group. When no
+/// preset serves HTTP, the built-in roles serve every group, and this returns
+/// nothing. A built-in role is not counted when a preset serves HTTP, as for
+/// [`derive_fleet_tiers`].
+#[must_use]
+pub fn groups_mounted_by_no_preset(
+    roles: &BTreeMap<String, RolePreset>,
+    groups: &[String],
+) -> Vec<String> {
+    if !roles.values().any(|preset| preset.base.serves_http()) {
+        return Vec::new();
+    }
+    groups
+        .iter()
+        .filter(|group| !roles.values().any(|preset| preset.mounts_group(group)))
+        .cloned()
+        .collect()
 }
 
 /// The `[jobs.fleet] tiers` that `[roles.*]` declare: one tier for each preset
@@ -5730,6 +5867,74 @@ const MANUAL_SCHEMA_SECTIONS: &[(&str, &[&str])] = &[
     ("time_zone", &["identifier", "sources"]),
 ];
 
+/// A config table kept in a build without the feature that reads it.
+///
+/// It parses, so a config file that is valid with the feature stays valid
+/// without it, but nothing reads it. `Debug` prints only the key names: a
+/// table such as `[push]` holds a private key.
+///
+/// The inner value is a `toml::Value`, as `[alerts]` is without its feature,
+/// so strict config validation treats the table as one opaque leaf.
+#[cfg(not(feature = "push"))]
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct InertSection(toml::Value);
+
+#[cfg(not(feature = "push"))]
+impl Default for InertSection {
+    fn default() -> Self {
+        Self(toml::Value::Table(toml::Table::new()))
+    }
+}
+
+#[cfg(not(feature = "push"))]
+impl InertSection {
+    /// The keys set in the table, from the file or from the environment.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .as_table()
+            .into_iter()
+            .flat_map(|table| table.keys().map(String::as_str))
+    }
+
+    fn insert(&mut self, key: &str, value: toml::Value) {
+        if let toml::Value::Table(table) = &mut self.0 {
+            table.insert(key.to_owned(), value);
+        }
+    }
+}
+
+#[cfg(not(feature = "push"))]
+impl std::fmt::Debug for InertSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InertSection")
+            .field("keys", &self.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The boot error for `[push]` in a build without the `push` feature.
+#[cfg(not(feature = "push"))]
+pub(crate) const PUSH_FEATURE_MISSING: &str = "[push] is configured but this binary was built \
+     without the `push` feature; rebuild with `--features push`, or remove [push] and the \
+     AUTUMN_PUSH__* variables";
+
+/// The `AUTUMN_PUSH__*` variables and the `[push]` keys they set.
+#[cfg(not(feature = "push"))]
+const PUSH_ENV_KEYS: &[(&str, &str)] = &[
+    ("AUTUMN_PUSH__PRIVATE_KEY", "private_key"),
+    ("AUTUMN_PUSH__PUBLIC_KEY", "public_key"),
+    ("AUTUMN_PUSH__SUBJECT", "subject"),
+    ("AUTUMN_PUSH__TTL_SECS", "ttl_secs"),
+];
+
+/// The error for `tenancy.source = "jwt"` in a build without the `jwt`
+/// feature. The boot reports it, and so does tenant resolution on a router
+/// built without `run`.
+#[cfg(not(feature = "jwt"))]
+pub(crate) const JWT_FEATURE_MISSING: &str = "tenancy.source = \"jwt\" but this binary was built \
+     without the `jwt` feature; rebuild with `--features jwt`, or choose another tenancy source";
+
 impl AutumnConfig {
     /// Resolve [`role`](Self::role) against [`roles`](Self::roles).
     ///
@@ -5776,8 +5981,56 @@ impl AutumnConfig {
     /// # Errors
     ///
     /// See [`crate::push::PushConfig::load_vapid_key`].
+    #[cfg(feature = "push")]
     pub fn validate_push(&self) -> Result<(), crate::push::PushError> {
         self.push.load_vapid_key().map(|_| ())
+    }
+
+    /// Validate the `[push]` block in a build without the `push` feature, as
+    /// `AppBuilder::run` does before binding.
+    ///
+    /// Push cannot run in this build, so any `[push]` table or
+    /// `AUTUMN_PUSH__*` variable is a hard failure rather than a section that
+    /// is quietly ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] when `[push]` or an `AUTUMN_PUSH__*`
+    /// variable is set.
+    #[cfg(not(feature = "push"))]
+    pub fn validate_push(&self) -> Result<(), ConfigError> {
+        if self.push.is_some() {
+            return Err(ConfigError::Validation(PUSH_FEATURE_MISSING.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Check that this build can resolve the configured tenancy source.
+    ///
+    /// The app's boot runs it after the config loads, so `AppBuilder::run`
+    /// stops before it binds. A plain config load does not run it: a tool
+    /// built with other features, such as the CLI, still reads the app's
+    /// config.
+    ///
+    /// `tenancy.source = "jwt"` verifies a token with `jsonwebtoken`, which is
+    /// behind the `jwt` feature. Without it, every request would fail tenant
+    /// resolution, so the boot fails instead.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] when tenancy is enabled with
+    /// `source = "jwt"` and the `jwt` feature is off.
+    #[allow(
+        clippy::unused_self,
+        clippy::missing_const_for_fn,
+        reason = "reads `self` only when the `jwt` feature is off"
+    )]
+    pub fn validate_tenancy_source(&self) -> Result<(), ConfigError> {
+        #[cfg(not(feature = "jwt"))]
+        if self.tenancy.enabled && self.tenancy.source == "jwt" {
+            return Err(ConfigError::Validation(JWT_FEATURE_MISSING.to_owned()));
+        }
+        Ok(())
     }
 
     /// The load-shedding ceiling the profile supplies when
@@ -7089,6 +7342,7 @@ impl AutumnConfig {
     /// that documented deployment path silently leaves push unconfigured —
     /// every send failing `NotConfigured` and the public-key endpoint serving
     /// `503`, with the operator looking at a variable they did set.
+    #[cfg(feature = "push")]
     fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
         // Not `parse_env_option_secret`. That helper treats a blank value as "clear this
         // setting", which is right where unsetting via env is meaningful but wrong here,
@@ -7104,6 +7358,22 @@ impl AutumnConfig {
         parse_env_option_string(env, "AUTUMN_PUSH__PUBLIC_KEY", &mut self.push.public_key);
         parse_env_option_string(env, "AUTUMN_PUSH__SUBJECT", &mut self.push.subject);
         parse_env_option(env, "AUTUMN_PUSH__TTL_SECS", &mut self.push.ttl_secs);
+    }
+
+    /// Without the `push` feature, record each `AUTUMN_PUSH__*` variable in
+    /// the kept `[push]` table, so [`validate_push`](Self::validate_push)
+    /// refuses the boot. A variable the operator set must not be dropped
+    /// without a word. The value is not kept: the table records only which
+    /// variable set the key, so a private key never reaches the config.
+    #[cfg(not(feature = "push"))]
+    fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
+        for (var, key) in PUSH_ENV_KEYS {
+            if env.var(var).is_ok() {
+                self.push
+                    .get_or_insert_with(InertSection::default)
+                    .insert(key, toml::Value::String((*var).to_owned()));
+            }
+        }
     }
 
     fn apply_shadow_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -25510,6 +25780,163 @@ workers = 2
             }
         }
         assert_eq!(checked, 3 * 3_usize.pow(7) * 3);
+    }
+
+    // ── Route groups: `[roles.<name>] mount` (#3544) ──────────────────────
+
+    const MOUNT_3544: &str = r#"
+[roles.marketing]
+base = "web"
+mount = ["marketing"]
+
+[roles.service]
+base = "combined"
+mount = ["service", "app"]
+
+[roles.api]
+base = "web"
+
+[roles.bulk]
+base = "worker"
+"#;
+
+    fn mount_config_3544(role: &str) -> AutumnConfig {
+        let mut config: AutumnConfig = toml::from_str(MOUNT_3544).expect("mount parses");
+        config.role = role.parse().expect("role name");
+        config
+    }
+
+    #[test]
+    fn mount_selects_the_groups_a_role_serves() {
+        let role = mount_config_3544("marketing")
+            .resolve_role()
+            .expect("marketing resolves");
+        assert_eq!(role.mount(), Some(["marketing".to_owned()].as_slice()));
+        assert!(role.mounts_group("marketing"));
+        assert!(!role.mounts_group("service"));
+        assert!(!role.mounts_group(crate::route::RouteGroup::DEFAULT_NAME));
+    }
+
+    #[test]
+    fn a_role_without_mount_mounts_every_group() {
+        for name in ["api", "combined", "web"] {
+            let role = mount_config_3544(name).resolve_role().expect("resolves");
+            assert_eq!(role.mount(), None, "{name}");
+            assert!(role.mounts_group("marketing"), "{name}");
+            assert!(role.mounts_group("anything"), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_role_that_serves_no_http_mounts_no_group() {
+        for name in ["bulk", "worker"] {
+            let role = mount_config_3544(name).resolve_role().expect("resolves");
+            assert!(!role.mounts_group("marketing"), "{name}");
+        }
+    }
+
+    #[test]
+    fn mount_on_a_worker_base_is_rejected() {
+        let mut preset = RolePreset::new(ProcessRole::Worker);
+        preset.mount = Some(vec!["marketing".to_owned()]);
+        assert!(matches!(
+            preset.validate("bulk"),
+            Err(RoleError::MountWithoutHttp { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_and_blank_mount_are_rejected() {
+        let mut preset = RolePreset::new(ProcessRole::Web);
+        preset.mount = Some(Vec::new());
+        assert!(matches!(
+            preset.validate("site"),
+            Err(RoleError::EmptyMount { .. })
+        ));
+        preset.mount = Some(vec!["marketing".to_owned(), " ".to_owned()]);
+        assert!(matches!(
+            preset.validate("site"),
+            Err(RoleError::BlankMount { .. })
+        ));
+    }
+
+    #[test]
+    fn mount_error_stops_the_load() {
+        let toml = "[roles.bulk]\nbase = \"worker\"\nmount = [\"marketing\"]\n";
+        let config: AutumnConfig = toml::from_str(toml).expect("parses");
+        let err = config.validate().expect_err("worker base with mount");
+        assert!(err.to_string().contains("mount"), "{err}");
+    }
+
+    /// A group is fleet-mounted when some HTTP preset mounts it. A preset
+    /// without `mount` mounts every group.
+    #[test]
+    fn groups_mounted_by_no_preset_lists_uncovered_groups() {
+        let narrow: AutumnConfig = toml::from_str(
+            "[roles.marketing]\nbase = \"web\"\nmount = [\"marketing\"]\n\
+             [roles.bulk]\nbase = \"worker\"\n",
+        )
+        .expect("parses");
+        let groups = ["app", "marketing", "service"].map(str::to_owned);
+        assert_eq!(
+            groups_mounted_by_no_preset(&narrow.roles, &groups),
+            vec!["app".to_owned(), "service".to_owned()]
+        );
+        // A preset without `mount` covers every group.
+        let wide = mount_config_3544("combined");
+        assert!(groups_mounted_by_no_preset(&wide.roles, &groups).is_empty());
+        // No HTTP preset at all: the built-in roles serve every group, and the
+        // check has nothing to compare.
+        let none: AutumnConfig =
+            toml::from_str("[roles.bulk]\nbase = \"worker\"\n").expect("parses");
+        assert!(groups_mounted_by_no_preset(&none.roles, &groups).is_empty());
+    }
+
+    /// Strict config accepts `mount` and `[route_groups]`, and rejects an
+    /// unknown `[route_groups]` key.
+    #[test]
+    fn strict_config_accepts_mount_and_route_groups() {
+        let schema = AutumnConfig::get_schema_keys();
+        let toml = format!(
+            "{MOUNT_3544}\n[route_groups]\ndeclared = [\"marketing\"]\nmanifest = \"routes.json\"\n"
+        );
+        let errors = AutumnConfig::validate_toml(&toml, &schema);
+        assert!(errors.is_empty(), "{errors:?}");
+        let bad = toml::from_str::<AutumnConfig>("[route_groups]\ngroups = [\"a\"]\n");
+        assert!(bad.is_err(), "route_groups denies unknown keys");
+    }
+
+    /// Runtime twin of `verification/route_groups.rs`: every base, every
+    /// `mount` shape, every group.
+    #[test]
+    fn mount_matches_the_model() {
+        let mounts = [
+            None,
+            Some(Vec::new()),
+            Some(vec!["a".to_owned()]),
+            Some(vec!["a".to_owned(), "b".to_owned()]),
+        ];
+        for base in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+            for mount in &mounts {
+                let mut preset = RolePreset::new(base);
+                preset.mount.clone_from(mount);
+                let valid = preset.validate("tier").is_ok();
+                let model_valid = mount
+                    .as_ref()
+                    .is_none_or(|groups| base.serves_http() && !groups.is_empty());
+                assert_eq!(valid, model_valid, "{preset:?}");
+                if !valid {
+                    continue;
+                }
+                let role = Role::from_preset("tier", &preset);
+                for group in ["a", "b", "c"] {
+                    let model = base.serves_http()
+                        && mount.as_ref().is_none_or(|m| m.iter().any(|g| g == group));
+                    assert_eq!(role.mounts_group(group), model, "{preset:?} {group}");
+                    assert_eq!(preset.mounts_group(group), model, "{preset:?} {group}");
+                }
+            }
+        }
     }
 
     /// Strict config does not flag the keys of a preset.

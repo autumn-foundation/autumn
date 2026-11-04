@@ -7,7 +7,7 @@ description: >
 # kache caches each compile by the hash of its inputs, not a whole target
 # directory. A hit needs the same inputs, compiler and flags, so one store can
 # serve several feature sets and every workspace crate whose source did not
-# change. See docs/adr/0036-kache-build-cache.md.
+# change. See docs/adr/0038-kache-build-cache.md.
 #
 # The GitHub cache key is <prefix>-<kache version>-<os>-<arch>-<Cargo.lock
 # hash>, and the action never re-saves a key that exists. The first job to save

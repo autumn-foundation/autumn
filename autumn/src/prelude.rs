@@ -258,8 +258,8 @@ pub use crate::widgets::{
 #[cfg(feature = "widgets-search")]
 pub use crate::widgets::{
     ActiveSearchConfig, AutocompleteConfig, SearchMethod, active_search, active_search_empty_state,
-    active_search_input, active_search_results, autocomplete_empty_state, autocomplete_input,
-    autocomplete_option,
+    active_search_input, active_search_results, autocomplete_create_option,
+    autocomplete_empty_state, autocomplete_input, autocomplete_input_for, autocomplete_option,
 };
 #[cfg(feature = "widgets-social")]
 pub use crate::widgets::{
@@ -314,6 +314,7 @@ pub use crate::notifications::Notifications;
 /// Web Push service/extractor (deliver a notification to a subscribed browser
 /// even when the app's tab is closed). See [`crate::push`] for the full
 /// surface.
+#[cfg(feature = "push")]
 pub use crate::push::{PushMessage, WebPush};
 /// Session extractor for accessing per-user session data.
 pub use crate::session::Session;
@@ -413,6 +414,9 @@ pub use crate::format::format_datetime;
 /// Format a [`rust_decimal::Decimal`] as currency (`$1,234.50`) using sane defaults.
 #[cfg(feature = "maud")]
 pub use crate::format::number_to_currency;
+/// Render a byte count as a human-readable size (`1.5 KB`).
+#[cfg(feature = "maud")]
+pub use crate::format::number_to_human_size;
 /// Render an integer or decimal with grouped thousands (`1,234,567`).
 #[cfg(feature = "maud")]
 pub use crate::format::number_with_delimiter;

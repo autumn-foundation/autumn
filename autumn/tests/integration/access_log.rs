@@ -169,16 +169,21 @@ async fn error_responses_are_logged_with_their_status() {
 
 #[tokio::test]
 async fn route_field_never_contains_the_raw_path() {
+    // Thirteen digits: longer than any unbroken run in the random UUID the
+    // `request_id` field carries (8-4-4-4-12), so only a real leak of the path
+    // can put this value in a field. A short id such as `4242` turns up inside
+    // a random request id about once in 2,300 runs.
+    const ID: &str = "4242424242424";
     let (capture, _guard) = install_capture();
     let client = TestApp::new().routes(routes![show_user]).build();
 
-    client.get("/users/4242").send().await.assert_ok();
+    client.get(&format!("/users/{ID}")).send().await.assert_ok();
 
     let events = capture.captured();
     assert_eq!(events.len(), 1);
     for (key, value) in &events[0].fields {
         assert!(
-            !value.contains("4242"),
+            !value.contains(ID),
             "field {key} leaked the raw path parameter: {value}"
         );
     }

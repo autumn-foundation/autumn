@@ -4,8 +4,8 @@ Every guide page, grouped by what you came here to do. Each line says which
 question the page answers — open the one that matches yours.
 
 This page is an index only: it carries no answers of its own, so it can never
-disagree with the page it points at. `scripts/check-docs-guide-index.sh` fails
-the build when a guide page is missing from it, listed twice, or points
+disagree with the page it points at. `cargo xtask check docs-guide-index`
+fails the build when a guide page is missing from it, listed twice, or points
 nowhere.
 
 New to Autumn? Start with the first two entries under "Start here" below.
@@ -207,6 +207,7 @@ Looking for the API reference instead? That is
 - [Dev Request Inspector](dev-inspector.md) — the in-browser view of recent requests
 - [Dev Error Overlay](dev-error-overlay.md) — the error page that shows the failing source line
 - [The Architecture Graph](architecture-graph.md) — `autumn graph impact Post`: what a change touches, as a query
+- [Table Ownership Boundaries](table-ownership.md) — `autumn graph check-boundaries`: fail when one module queries another module's tables
 
 ## Deploying and operating
 
@@ -218,6 +219,7 @@ Looking for the API reference instead? That is
 - [Maintenance Mode](maintenance-mode.md) — taking the app offline deliberately, with probes still answering
 - [Cloud-Native Autumn](cloud-native.md) — containers, Kubernetes, liveness/readiness probes, and the twelve-factor surface
 - [Kubernetes](kubernetes.md) — the generated Helm chart and Kustomize base, and Argo Rollouts or Flagger canaries
+- [Route Groups and Per-Role Mounting](route-groups.md) — one image, different routes on different pods, with `[roles.<name>] mount`
 - [SLOs as Code](slo.md) — `[[slo]]` objectives, burn-rate alerts, a Grafana dashboard, canary analysis, and the deploy bake
 - [Staging Fault Injection](fault-injection.md) — latency and errors on routes, the database, Redis and outbound HTTP, with a burn-rate stop
 - [Server Connection Limits](connection-limits.md) — header-read and idle timeouts, header size and connection caps

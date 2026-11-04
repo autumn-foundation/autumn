@@ -13,14 +13,15 @@ fn ci() -> String {
         .replace("\r\n", "\n")
 }
 
-/// The `lint` job runs `cargo xtask ci lint`; the Bolt gate is a step of that
-/// lane in `xtask/src/lanes.rs`.
+/// The `lint-shard` jobs run the `lint` lane, one shard each; the Bolt gate
+/// is a step of that lane in `xtask/src/lanes.rs`. xtask's own tests prove the
+/// shard matrix names every shard.
 #[test]
 fn bolt_gate_runs_in_ci() {
     assert!(
         ci().lines()
-            .any(|l| l.trim_start() == "run: cargo xtask ci lint"),
-        "ci.yml's `lint` job must run `cargo xtask ci lint`"
+            .any(|l| l.trim_start() == "run: cargo xtask ci lint --shard ${{ matrix.shard }}"),
+        "ci.yml's `lint-shard` job must run `cargo xtask ci lint --shard ${{{{ matrix.shard }}}}`"
     );
     let lanes = std::fs::read_to_string(workspace_root().join("xtask/src/lanes.rs"))
         .expect("read xtask/src/lanes.rs");

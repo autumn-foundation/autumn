@@ -72,6 +72,9 @@ autumn-web = { version = "0.9.0", path = "../autumn", default-features = false, 
     # `alert`, `doctor`, `db scrub`, `generate wizard`). Each is default-on in
     # `autumn-web`; this list turns defaults off, so name them here (#2795).
     "slo", "alerts", "custom-domains", "wizard", "gdpr",
+    # `autumn generate pwa` names the `push_subscriptions` table from
+    # `autumn_web::push`. The CLI verifies no JWT, so `jwt` stays off.
+    "push",
     # `autumn plugin package` / `autumn plugin inspect` read and write the
     # `.autumn-plugin` container and load the module into the same sandbox the
     # runtime uses, so the CLI's verdict is the runtime's verdict. Backend-neutral
