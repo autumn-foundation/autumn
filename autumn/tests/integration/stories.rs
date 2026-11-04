@@ -247,6 +247,8 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "pagination",
     "popover",
     "property-list",
+    // Select with optgroup, multiple and the opt-in style (#3409).
+    "select",
     "stat-card",
     "tabs",
     "theme-toggle",
@@ -558,6 +560,7 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "modal",
     "nav-bar",
     "popover",
+    "select",
     "tabs",
     "theme-toggle",
     "toast",
