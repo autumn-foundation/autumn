@@ -956,7 +956,7 @@ impl<'a> Resolver<'a> {
             aliases
                 .entry(crate_key(lib))
                 .or_default()
-                .push(crate_key(package));
+                .push(crate_key(package_name(package)));
         }
         Self {
             config,
@@ -1831,6 +1831,27 @@ crates = ["crm-core-ad*"]
         let found = crate_violations(&report);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].schema_crate, "crm-core-pkg");
+    }
+
+    #[test]
+    fn a_versioned_package_with_a_library_name_keeps_its_nodes() {
+        // Two versions resolve, so the CLI keys the package `crm-mkt-pkg@1.0.0`.
+        const ROUTES: &[RouteGraphDescriptor] = &[RouteGraphDescriptor {
+            body_symbols: &["contacts"],
+            ..route("versioned_report", "crm_mkt::routes", "GET", "/versioned")
+        }];
+        let config = BoundaryConfig::parse(
+            "[boundaries.core]\nowns = [\"contacts\"]\ncrates = [\"crm-core\"]\n\
+             [boundaries.marketing]\nowns = [\"campaigns\"]\ncrates = [\"crm-mkt-pkg\"]\n",
+        )
+        .expect("valid");
+        let mut deps = crates(&[("crm-mkt-pkg@1.0.0", "crm-core")]);
+        deps.libs
+            .insert("crm-mkt-pkg@1.0.0".into(), "crm_mkt".into());
+        let graph = build(&[], 0, ROUTES, MODELS, &[], &[]);
+        let report = check(&config, Some(&graph), Some(&deps)).expect("runs");
+        let v = table_violation(&report, "versioned_report").expect("the route is in marketing");
+        assert_eq!(v.boundary, "marketing");
     }
 
     #[test]
