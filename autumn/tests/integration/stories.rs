@@ -247,6 +247,8 @@ const EXPECTED_STORY_SLUGS: &[&str] = &[
     "pagination",
     "popover",
     "property-list",
+    // Select with optgroup, multiple and the opt-in style (#3409).
+    "select",
     "stat-card",
     "tabs",
     "theme-toggle",
@@ -273,6 +275,9 @@ fn expected_story_slugs() -> Vec<&'static str> {
     slugs.push("flash");
     #[cfg(feature = "wizard")]
     slugs.push("wizard-progress");
+    // `storage::form_helper` (#3411).
+    #[cfg(feature = "storage")]
+    slugs.push("direct-upload");
     // Widget families (#3408).
     #[cfg(feature = "widgets-search")]
     slugs.extend(["active-search", "autocomplete", "tags-input"]);
@@ -548,12 +553,14 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "button",
     "choice-controls",
     "confirm-action",
+    "direct-upload",
     "drawer",
     "dropdown-menu",
     "flash",
     "modal",
     "nav-bar",
     "popover",
+    "select",
     "tabs",
     // Tags mode of the combobox (#3410).
     "tags-input",
@@ -562,10 +569,15 @@ const KEYBOARD_STORY_SLUGS: &[&str] = &[
     "tooltip",
 ];
 
-/// Keyboard stories that a feature can turn off: `flash`, and the
-/// `widgets-search` stories (#3408).
-const FEATURE_GATED_KEYBOARD_SLUGS: &[&str] =
-    &["flash", "active-search", "autocomplete", "tags-input"];
+/// Keyboard stories that a feature can turn off: `flash`, the
+/// `widgets-search` stories (#3408), and `direct-upload` (`storage`).
+const FEATURE_GATED_KEYBOARD_SLUGS: &[&str] = &[
+    "flash",
+    "active-search",
+    "autocomplete",
+    "tags-input",
+    "direct-upload",
+];
 
 /// The browser test fn name for `slug`.
 fn keyboard_test_name(slug: &str) -> String {

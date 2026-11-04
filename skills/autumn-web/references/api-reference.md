@@ -830,6 +830,18 @@ Free functions rendering changeset-aware, accessible inputs:
   only (validate "one or more" on the server). A group is a `<fieldset>` +
   `<legend>`; the first input has `id="{field}"` so `error_summary` links
   land on it, the rest `id="{field}-{index}"`.
+- **(#3409)** select: `grouped_select_input(&cs, field, label, &[(value,
+  label)], &[(group_label, &[(value, label)])])` (+ `_with`, `required_`)
+  writes top-level options, then one `<optgroup>` per group;
+  `FieldControl::GroupedSelect { options, groups }` for `form_for`.
+  `FieldOptions::multiple()` writes `multiple` on a `<select>` or a file
+  input; a multiple select marks every `Changeset::field_values` value (bind
+  `#[serde(default)] Vec<T>`; in `form_for` the model `required` flag skips
+  it). A single select marks only the first matching option.
+  `FieldOptions::styled_select()` adds `autumn-select`: `appearance:
+  base-select` behind `@supports`; other browsers and `multiple` keep the
+  native control. No JS. `FieldContext::control` writes `multiple` on a
+  custom `select` or file `input`.
   Decode-side contracts handled by the `#[model]`-generated `NewX`:
   non-nullable `bool` columns are `#[serde(default)]` (unchecked checkbox ⇒
   `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`

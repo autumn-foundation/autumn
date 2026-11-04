@@ -452,6 +452,108 @@
     }
 }
 
+/* ── Styled select — issue #3409 ──────────────────────────────────────────── */
+
+/* Opt-in with FieldOptions::styled_select(). Chrome 135+ and Safari 27 draw
+   the select with `appearance: base-select`. Other browsers keep the native
+   control with the field style above. A multiple select keeps the native
+   list box. A browser that does not know `::picker(select)` drops the whole
+   rule, so each `::picker` rule has one selector. */
+@supports (appearance: base-select) {
+    .autumn-select:not([multiple]) {
+        appearance: base-select;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-2);
+    }
+
+    .autumn-select:not([multiple]):enabled {
+        cursor: pointer;
+    }
+
+    .autumn-select:not([multiple])::picker(select) {
+        appearance: base-select;
+        padding: var(--space-1);
+        margin-block: var(--space-1);
+        border: 1px solid var(--control-border);
+        border-radius: var(--radius);
+        color: var(--text);
+        background-color: var(--surface);
+        box-shadow: var(--shadow);
+    }
+
+    .autumn-select:not([multiple])::picker-icon {
+        color: var(--text-muted);
+    }
+
+    .autumn-select:not([multiple]):open::picker-icon {
+        rotate: 180deg;
+    }
+
+    .autumn-select:not([multiple]) optgroup {
+        padding-block: var(--space-1);
+        font-size: 0.8125rem;
+        font-weight: var(--font-weight-medium);
+        color: var(--text-muted);
+    }
+
+    .autumn-select:not([multiple]) option {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        padding: var(--space-2) var(--space-3);
+        border-radius: var(--radius);
+        font-size: var(--font-size-sm);
+        font-weight: var(--font-weight-normal);
+        color: var(--text);
+        background-color: transparent;
+        cursor: pointer;
+    }
+
+    .autumn-select:not([multiple]) option:enabled:hover,
+    .autumn-select:not([multiple]) option:focus-visible {
+        color: var(--text);
+        background-color: var(--surface-muted);
+    }
+
+    .autumn-select:not([multiple]) option:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: -2px;
+    }
+
+    .autumn-select:not([multiple]) option:checked {
+        font-weight: var(--font-weight-medium);
+    }
+
+    .autumn-select:not([multiple]) option::checkmark {
+        color: var(--primary);
+    }
+
+    .autumn-select:not([multiple]) option:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+    }
+
+    /* The icon turns only for a user who did not ask for less motion. */
+    @media (prefers-reduced-motion: no-preference) {
+        .autumn-select:not([multiple])::picker-icon {
+            transition: rotate 0.15s ease;
+        }
+    }
+
+    /* Forced colors (Windows High Contrast): the page colors go away, so
+       show the hovered and the focused option with system colors. */
+    @media (forced-colors: active) {
+        .autumn-select:not([multiple]) option:enabled:hover,
+        .autumn-select:not([multiple]) option:focus-visible {
+            forced-color-adjust: none;
+            color: HighlightText;
+            background-color: Highlight;
+        }
+    }
+}
+
 /* ── Rich text (autumn-rich-text) — issue #1255 ───────────────────────────── */
 
 .autumn-rich-text {
@@ -1539,6 +1641,45 @@
     display: flex;
     flex-direction: column;
     gap: var(--space-2);
+    padding: var(--space-3);
+    position: relative;
+    border: 1px dashed var(--text-muted);
+    border-radius: var(--radius-md);
+}
+
+.autumn-direct-upload[data-dragging] {
+    border-color: var(--primary);
+    background-color: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.autumn-upload-label {
+    font-weight: 600;
+}
+
+.autumn-upload-hint,
+.autumn-upload-status {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
+.autumn-upload-hint[hidden],
+.autumn-upload-progress[hidden] {
+    display: none;
+}
+
+/* An empty live region stays in the accessibility tree, but takes no room. */
+.autumn-upload-status:empty,
+.autumn-upload-error:empty {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+}
+
+.autumn-upload-error {
+    font-size: 0.8125rem;
+    color: var(--danger);
 }
 
 .autumn-upload-progress {

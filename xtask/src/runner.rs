@@ -1,12 +1,12 @@
 //! Run a lane's steps and report the outcome.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use smop::sh::{self, CommandBuilder};
 
 use crate::argv;
 use crate::lanes::{Lane, Step, check_ids};
@@ -200,21 +200,19 @@ pub fn run(
 }
 
 fn execute(root: &Path, step: &Step) -> Outcome {
-    let mut command = match command_for(root, &step.argv) {
+    let command = match command_for(root, &step.argv) {
         Ok(c) => c,
         Err(e) => return Outcome::Failed(format!("{e:#}")),
     };
-    command.current_dir(root);
-    for (key, value) in &step.env {
-        command.env(key, value);
-    }
-    match command.status() {
-        Ok(status) if status.success() => Outcome::Passed,
-        Ok(status) => Outcome::Failed(status.code().map_or_else(
-            || "terminated by a signal".to_owned(),
-            |code| format!("exit status {code}"),
-        )),
-        Err(e) => Outcome::Failed(format!("could not start `{}`: {e}", step.argv[0])),
+    let command = step
+        .env
+        .iter()
+        .fold(command.dir(root), |c, (key, value)| c.env(key, value));
+    // The error names the exit code and the command line, or why the
+    // program could not start.
+    match command.run() {
+        Ok(()) => Outcome::Passed,
+        Err(e) => Outcome::Failed(format!("{e:#}")),
     }
 }
 
@@ -230,24 +228,25 @@ fn execute(root: &Path, step: &Step) -> Outcome {
 /// # Errors
 ///
 /// Returns an error for an empty `argv`.
-pub fn command_for(root: &Path, argv: &[String]) -> Result<Command> {
+pub fn command_for(root: &Path, argv: &[String]) -> Result<CommandBuilder> {
     let (program, rest) = argv.split_first().context("empty command")?;
-    let mut command = if program == "cargo" {
-        Command::new(std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo")))
+    let command = if program == "cargo" {
+        sh::cargo()
     } else if let Some(fallback) = interpreter_for(program) {
         let script = root.join(program);
         let first = std::fs::read_to_string(&script)
             .ok()
             .and_then(|text| text.lines().next().map(str::to_owned))
             .unwrap_or_default();
-        let mut c = Command::new(shebang_interpreter(&first).unwrap_or(fallback));
-        c.arg(root.join(program));
-        c
+        match shebang_interpreter(&first).unwrap_or(fallback) {
+            "bash" => sh::cmd(bash()),
+            other => sh::cmd(other),
+        }
+        .arg(script)
     } else {
-        Command::new(program)
+        sh::cmd(program)
     };
-    command.args(rest);
-    Ok(command)
+    Ok(command.args(rest))
 }
 
 /// The interpreter a `#!` line names, for the interpreters scripts here use.
@@ -264,6 +263,54 @@ pub fn shebang_interpreter(first_line: &str) -> Option<&'static str> {
         n if n.starts_with("python") => Some(python()),
         _ => None,
     }
+}
+
+/// The `bash` to run a script with.
+///
+/// On Windows a bare `bash` is the wrong program: `CreateProcess`, and so
+/// Rust's `Command`, looks in the system directory before `PATH`, where
+/// `System32\bash.exe` is the WSL launcher. With no Linux distribution
+/// installed (GitHub's runners have none) it prints an install hint and
+/// exits 1, so every script "failed". The first `bash.exe` on `PATH` outside
+/// the Windows directory is Git for Windows' bash, which is what the scripts
+/// are written for.
+fn bash() -> OsString {
+    if cfg!(windows)
+        && let Some(found) = std::env::var_os("PATH").and_then(|path| {
+            bash_on_path(
+                &path,
+                std::env::var_os("SystemRoot").as_deref(),
+                "bash.exe",
+                &|p: &Path| p.is_file(),
+            )
+        })
+    {
+        return found.into_os_string();
+    }
+    OsString::from("bash")
+}
+
+/// The first `name` in the directories of `path` that is a file and does not
+/// sit under `system_root`, compared without regard to case as Windows paths
+/// are.
+fn bash_on_path(
+    path: &OsStr,
+    system_root: Option<&OsStr>,
+    name: &str,
+    is_file: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let system_root = system_root.map(|r| r.to_string_lossy().to_lowercase());
+    std::env::split_paths(path)
+        .map(|dir| dir.join(name))
+        .filter(|candidate| is_file(candidate))
+        .find(|candidate| {
+            system_root.as_ref().is_none_or(|root| {
+                !candidate
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .starts_with(root.as_str())
+            })
+        })
 }
 
 const fn python() -> &'static str {
@@ -433,9 +480,15 @@ mod tests {
         let log = String::from_utf8(log).unwrap();
         assert!(log.contains("::group::bad (bad)"), "{log}");
         assert!(log.contains("::endgroup::"), "{log}");
-        assert!(log.contains("::error title=bad::exit status"), "{log}");
+        assert!(
+            log.contains("::error title=bad::Command failed with exit code"),
+            "{log}"
+        );
         let md = report.markdown("t");
-        assert!(md.contains("| `bad` bad | **failed**: exit status"), "{md}");
+        assert!(
+            md.contains("| `bad` bad | **failed**: Command failed with exit code"),
+            "{md}"
+        );
         assert!(md.contains("| `after` after | passed |"), "{md}");
     }
 
@@ -465,7 +518,7 @@ mod tests {
         )
         .unwrap();
         match &report.results[0].2 {
-            Outcome::Failed(why) => assert!(why.contains("could not start"), "{why}"),
+            Outcome::Failed(why) => assert!(why.contains("Failed to execute command"), "{why}"),
             other => panic!("expected a failure, got {other:?}"),
         }
     }
@@ -532,16 +585,51 @@ mod tests {
     #[test]
     fn a_python_script_named_sh_runs_under_python() {
         let c = command_for(root(), &["scripts/check-example-bin-names.sh".into()]).unwrap();
-        assert_eq!(c.get_program(), python());
+        assert!(c.to_string().starts_with(&format!("{} ", python())), "{c}");
     }
 
     #[test]
     fn scripts_run_from_the_repo_root_under_their_interpreter() {
         let c = command_for(root(), &["scripts/check-msrv.sh".into(), "--x".into()]).unwrap();
-        assert_eq!(c.get_program(), "bash");
-        let args: Vec<_> = c.get_args().collect();
-        assert_eq!(args[0], root().join("scripts/check-msrv.sh").as_os_str());
-        assert_eq!(args[1], "--x");
+        let script = root().join("scripts/check-msrv.sh");
+        let line = c.to_string();
+        assert!(line.contains("bash"), "{line}");
+        assert!(
+            line.ends_with(&format!("{} --x", script.display())),
+            "{line}"
+        );
+    }
+
+    /// `System32\bash.exe` is the WSL launcher, not a bash: skipping it, the
+    /// search finds Git for Windows' bash later on `PATH`.
+    #[test]
+    fn bash_search_skips_the_windows_directory() {
+        let path = std::env::join_paths(["/WINDOWS/system32", "/git/bin", "/other/bin"]).unwrap();
+        let exists = |p: &Path| p.starts_with("/WINDOWS/system32") || p.starts_with("/git/bin");
+        let found = bash_on_path(&path, Some(OsStr::new("/windows")), "bash.exe", &exists);
+        assert_eq!(found, Some(PathBuf::from("/git/bin/bash.exe")));
+    }
+
+    #[test]
+    fn bash_search_finds_nothing_without_a_bash_outside_the_windows_directory() {
+        let path = std::env::join_paths(["/WINDOWS/system32", "/other/bin"]).unwrap();
+        let exists = |p: &Path| p.starts_with("/WINDOWS/system32");
+        assert_eq!(
+            bash_on_path(&path, Some(OsStr::new("/Windows")), "bash.exe", &exists),
+            None
+        );
+        // Without a system root nothing is skipped.
+        assert_eq!(
+            bash_on_path(&path, None, "bash.exe", &exists),
+            Some(PathBuf::from("/WINDOWS/system32/bash.exe"))
+        );
+    }
+
+    #[test]
+    fn bash_is_plain_bash_off_windows() {
+        if !cfg!(windows) {
+            assert_eq!(bash(), OsString::from("bash"));
+        }
     }
 
     #[test]

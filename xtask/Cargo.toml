@@ -7,14 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
-# Keep this list short and keep every entry on default features. xtask is a
-# workspace member, so whatever features it turns on are unified into every
+# Keep this list short: default features, or the smallest feature set that
+# covers the use. xtask is a workspace member, so whatever features it turns on are unified into every
 # `cargo build --workspace`. It must never depend on autumn-web, diesel or sqlx.
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # The docs gates' patterns. Already in the build through other crates.
 regex = "1"
+# Process and file helpers: `sh` (command builder, `$CARGO`) and `fs`
+# (contextual file errors, temp dirs). Only these two modules: `sh` adds no
+# dependency and `fs` adds `tempfile`, already in the build.
+# 0.3.1 for `CommandBuilder::status()`, which passes a script's exit code through.
+smop = { version = "0.3.1", default-features = false, features = ["sh", "fs"] }
 
 [lints]
 workspace = true

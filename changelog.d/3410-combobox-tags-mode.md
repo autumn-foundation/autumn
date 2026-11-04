@@ -17,8 +17,8 @@
 
 ### Changed
 
-- **widgets:** the `autumn-widgets.js` size budget is now 52 KiB raw and
-  15 KiB gzip (from 46 KiB and 14 KiB), for the tags runtime.
+- **widgets:** the `autumn-widgets.js` size budget is now 61 KiB raw and
+  18 KiB gzip (from 54 KiB and 16 KiB), for the tags runtime.
 
 ### Breaking Changes
 

@@ -172,6 +172,7 @@ mod form_for_derive;
 mod form_native_inputs;
 #[cfg(feature = "widgets-search")]
 mod form_search_widgets;
+mod form_select;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
 mod framework_retention;
@@ -278,6 +279,7 @@ mod model_field_attrs;
 mod model_votable;
 #[cfg(feature = "db")]
 mod money_ledger_postgres;
+mod named_roles;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]
@@ -619,6 +621,8 @@ mod widgets_avatar;
 mod widgets_badge;
 #[cfg(feature = "widgets-charts")]
 mod widgets_charts;
+#[cfg(all(feature = "system-tests", feature = "maud", feature = "storage"))]
+mod widgets_direct_upload_browser;
 #[cfg(feature = "maud")]
 mod widgets_drawer;
 #[cfg(all(feature = "system-tests", feature = "maud"))]

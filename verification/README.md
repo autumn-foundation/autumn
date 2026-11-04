@@ -61,6 +61,21 @@ proves that two items never share an id, and that an item id is never a
 hint, error, wrapper, label or nested-subfield id, or a plain field id. The
 proptest `choice_item_ids_never_collide` checks the rendered markup.
 
+## Select marks
+
+`select_marks.rs` models which `<option>` a select marks `selected`
+(`push_select_options` in `autumn/src/form.rs`, issue #3409). Verify it
+with:
+
+```sh
+verus verification/select_marks.rs
+```
+
+It proves that a single select marks at most one option, and one option
+when a value matches. A match in an earlier group stops a mark in a later
+group. A multiple select marks each match, and a mark is always a match.
+The proptest `select_marks_follow_the_spec` checks the rendered markup.
+
 ## Fleet slot ownership
 
 `fleet_slot_ownership.rs` models the slot-ownership table of a SQLite fleet
@@ -411,4 +426,21 @@ It proves these properties:
 
 It does not model the restore, the schema union or the query. Tests cover
 them.
+
+## Role presets
+
+`role_presets.rs` models `RolePreset::capabilities` and the capability
+checks of `RolePreset::validate` in `autumn/src/config.rs` (issue #3543, ADR
+0035). It does not model the name, `pin` and `workers` checks.
+Verify it with:
+
+```sh
+verus verification/role_presets.rs
+```
+
+It proves that a preset never runs a capability that its base does not run,
+that the base decides `serves_http`, that a preset with no overrides is its
+base, and that a valid preset gets each override it sets. The exhaustive
+test `preset_capabilities_match_the_model` in `autumn/src/config.rs` checks
+the runtime against the same rules.
 

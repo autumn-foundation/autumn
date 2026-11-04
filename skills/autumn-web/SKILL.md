@@ -2295,6 +2295,7 @@ for the common cases:
 | `active_search(id, label, &ActiveSearchConfig)` / `active_search_empty_state(msg)` | Search box whose results appear as the user types — htmx-driven, server-rendered Maud fragments; you author no JavaScript, but the page must load htmx. The handler returns the results fragment; `active_search_empty_state` is the no-matches body. Emits a `<noscript>` GET-form fallback (`docs/guide/active-search-and-autocomplete.md`) |
 | `autocomplete_input(id, label, &AutocompleteConfig)` / `autocomplete_option(value, label)` / `autocomplete_empty_state(msg)` | Typeahead/autocomplete picker for choosing a related record and storing its ID — the companion to `active_search` when the user must pick one row rather than browse matches. Selection and input sync need the shipped `autumn-widgets.js` runtime (`<script src="/static/js/autumn-widgets.js" defer>`, no inline JS, CSP-compatible) on top of htmx; include it once in the layout or the picker will not select. Its `<noscript>` fallback is a bare `<select>`, NOT a form like `active_search`'s — it has to sit inside the surrounding application form to submit (`docs/guide/active-search-and-autocomplete.md`) |
 | `AutocompleteConfig::multiple()` (+ `.free_text()`, `.selected(..)`) / `autocomplete_input_for(&changeset, id, label, &config)` / `autocomplete_create_option(value, label)` | Tags / multi-select (issue #3410): each pick is a removable chip with one hidden `name=value` input, so bind a `#[serde(default)] Vec<T>` field — repeated keys decode into it. Use `autocomplete_input_for` on a 422 re-render: the changeset is the source of the chips and its field errors show. Return `autocomplete_create_option` after the matches for a "create new" entry; with `free_text()`, Enter adds the typed text. Validate and de-duplicate new values on the server. Needs `autumn-widgets.js`; the no-JS fallback is a `<select multiple>` that shows only `fallback_options` (`docs/guide/active-search-and-autocomplete.md`) |
+| `storage::form_helper::direct_upload_field(name, presign_url, &DirectUploadConfig::new().label(..).accept(..).multiple(..))` / `direct_upload_input(name, presign_url, accept)` | Direct-to-storage file field (feature `storage`, #3411). With `autumn-widgets.js` it `POST`s `{filename, content_type, size}` to your presign route (CSRF token from `<meta name="csrf-token">`), reads `{url, method, headers, key}`, sends the file with a progress bar (drag and drop works) and adds a hidden `name=key` field. The form carries only keys: check each key's prefix, then call `complete_direct_upload`. Without JS it is a plain file input in a `multipart/form-data` form. Has a visible `<label>` and live status and error regions (`docs/guide/storage.md`) |
 | `local_datetime(dt, tz)` (`autumn_web::time_zone`) | Render a `DateTime<Utc>` in a user's IANA zone. Pair with the `TimeZone` extractor (resolves the requesting user's zone) and `set_time_zone_in_session` / `parse_iana`; take "now" from the `Clock` extractor rather than `Utc::now()` so rendering stays test-injectable (`docs/guide/time-zones.md`) |
 | `wizard_progress(&ctx, step).await` / `wizard_progress_from_steps(&[WizardProgressStep])` (`autumn_web::wizard`) | Accessible step-progress `<nav>` (`aria-current="step"`, "Step N of M"). `wizard_progress` reads step states from the session; `wizard_progress_from_steps` is the sync form for steps you already have (#3398). The `/_stories` gallery shows it with pagination, flash and the `a11y` primitives |
 | `WidgetPack::new("pack").extend(stories).assets(&ASSETS)` + `app.widget_pack(pack)` (`autumn_web::widget_pack`) | Ship widgets as a plugin crate (#3400). Contract: `Render`, `&FieldOptions` passthrough, public tokens only (no raw colors, no setting `--primary`), `autumn-<pack>-*` classes, keyboard core `data-*` + `autumn:init` (no own arrow-key JS), CSP-safe, one story per widget with slug `<pack>-…`. `with_story_gallery` now ADDS (plugin galleries start from `StoryGallery::new()`). Non-input widgets write their root with `widget_pack::element(tag, attrs, &FieldOptions, body)`. Form inputs: `impl FieldRenderer` + `FieldContext::control` (radios: `grouped()` + `group_item`), then `custom_input_with(&cs, …)` or `form_for(..).override_field(f, FieldControl::custom(R))`. Check with `plugin_conformance::widgets::run_widget_conformance` and (feature `system-tests`) `browser::run_widget_browser_conformance(&pack, &axe_src)` (`docs/guide/widget-packs.md`) |
@@ -2596,8 +2597,8 @@ subset of queues — all config-only, no app-code change:
   queue absent from the latest survey resets to `depth` 0. The Redis survey pages
   the whole due-delayed ZSET so scheduled/retry bursts count exactly. The `local`
   backend keeps the in-process mark path. See `docs/guide/jobs.md`.
-- **`ProcessRole` on `AppState`** — `state.role()` returns the resolved
-  `ProcessRole` (exported at `autumn_web::ProcessRole`) with `serves_http()` /
+- **`Role` on `AppState`** — `state.role()` returns the resolved
+  `Role` (exported at `autumn_web::Role`) with `serves_http()` /
   `runs_workers()` predicates, so app-owned background loops in `on_startup`
   self-gate to the right tier instead of re-reading `AUTUMN_ROLE` (issue #1726).
   `state.capabilities()` returns the `RoleCapabilities` resolved at boot: one
@@ -2605,6 +2606,13 @@ subset of queues — all config-only, no app-code change:
   `commit_hooks`, `fleet_relay`, `restore_check`, `retention`, `serves_http`).
   Gate on the field that matches the work. `/actuator/info` shows the set
   (issue #3542). See `docs/guide/jobs.md#role-capabilities`.
+- **Named roles (`[roles.<name>]`, issue #3543)** — declare a tier once as a
+  preset: `base` (`combined`/`web`/`worker`), `pin`, `workers` and capability
+  overrides that can only turn a capability off. Select it with
+  `AUTUMN_ROLE=<name>`. `state.role()` returns `&Role`: `.name()` is the
+  preset name, `.base()` the `ProcessRole`. Guards read the base; an
+  undeclared name stops the boot. `autumn doctor --strict` derives
+  `[jobs.fleet] tiers` from the presets. See `docs/guide/jobs.md#named-roles`.
 
 ## Operator alerts (0.6.0, issue #1610)
 

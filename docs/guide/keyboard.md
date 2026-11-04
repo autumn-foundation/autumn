@@ -169,8 +169,8 @@ no `on*` attribute. The default CSP `script-src 'self'` does not change.
 
 | Measure | Budget |
 |---|---|
-| `autumn-widgets.js`, raw | 52 KiB |
-| `autumn-widgets.js`, gzip level 9 | 15 KiB |
+| `autumn-widgets.js`, raw | 61 KiB |
+| `autumn-widgets.js`, gzip level 9 | 18 KiB |
 
 `widgets_js_stays_inside_its_size_budget` in `autumn/src/htmx.rs` fails
 above the budget. Raise the budget only with a reason in the PR. Issue
@@ -178,8 +178,9 @@ above the budget. Raise the budget only with a reason in the PR. Issue
 10 KiB. Issue #3404 added the tooltip runtime, next to the #3403 drawer.
 Issue #3402 added the popover menu runtime. Together they increased them from
 36 KiB and 11 KiB. Issue #3406 added the busy state for htmx requests. It
-increased them from 44 KiB and 13 KiB. Issue #3410 added the tags mode of
-the combobox (chips). It increased them from 46 KiB and 14 KiB.
+increased them from 44 KiB and 13 KiB. Issue #3411 added the direct upload
+controller. It increased them from 46 KiB and 14 KiB. Issue #3410 added the
+tags mode of the combobox (chips). It increased them from 54 KiB and 16 KiB.
 
 ## Tests
 

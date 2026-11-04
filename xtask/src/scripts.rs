@@ -6,7 +6,7 @@
 //! (or a Python module's docstring), so a script without a header is a test
 //! failure.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitStatus;
 
 use anyhow::{Context, Result, bail};
@@ -172,19 +172,17 @@ pub fn resolve(root: &Path, name: &str) -> Result<Script> {
     )
 }
 
-/// Run a script from `root` with `args`, inheriting stdio.
+/// Run a script from `root` with `args`, inheriting stdio, and return how it
+/// exited, so the caller can pass the script's own exit code through.
 ///
 /// # Errors
 ///
-/// Returns an error when the interpreter cannot be started.
+/// Returns an error, naming the command line, when the interpreter cannot
+/// be started. A script that runs and fails is not an error here.
 pub fn run(root: &Path, script: &Script, args: &[String]) -> Result<ExitStatus> {
     let mut words = vec![format!("scripts/{}", script.file)];
     words.extend(args.iter().cloned());
-    let path: PathBuf = root.join("scripts").join(&script.file);
-    runner::command_for(root, &words)?
-        .current_dir(root)
-        .status()
-        .with_context(|| format!("starting {}", path.display()))
+    runner::command_for(root, &words)?.dir(root).status()
 }
 
 #[cfg(test)]

@@ -2252,8 +2252,10 @@ impl TestApp {
             #[cfg(all(feature = "db", feature = "reporting"))]
             db_capture_gap: None,
             profile: self.config.profile.as_deref().map(std::sync::Arc::from),
-            role: self.config.role,
-            capabilities: self.config.capabilities(),
+            role: self
+                .config
+                .resolve_role()
+                .expect("the test config role must name a built-in role or a declared preset"),
             started_at,
             health_detailed: self.config.health.detailed,
             probes: probes.clone(),

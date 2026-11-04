@@ -582,7 +582,7 @@ The app booted as `combined`.
 **After (`{(X+1).0}`):**
 
 ```text
-configuration error: AUTUMN_ROLE: unknown process role "workers" (accepted: combined, all, web_and_worker, server_and_worker, web, server, http, worker, jobs, worker_only)
+configuration error: AUTUMN_ROLE: unknown process role "workers" (accepted: combined, all, web_and_worker, server_and_worker, web, server, http, worker, jobs, worker_only), and no [roles.workers] is declared (no roles are declared)
 ```
 
 The app does not boot. Set a valid value, or remove the variable to get
@@ -594,6 +594,47 @@ report "No database URL found". If a CLI command fails in this way, examine
 `AUTUMN_ROLE` in your shell.
 
 **Automation:** `manual` — the fix is in the deployment env, not in code.
+
+### Config: `state.role()` returns `&Role`; `config.role` is a `RoleName`
+
+**Why:** a process can now run a named `[roles.<name>]` preset (issue #3543).
+`ProcessRole` is a closed enum and cannot hold a name. The new `Role` holds
+the name, the built-in base and the capability set.
+
+**You are affected only if your code compares `state.role()` with a
+`ProcessRole`, stores it as a `ProcessRole`, or sets `config.role`.** A call
+such as `state.role().serves_http()` or `state.role().runs_workers()` compiles
+as before.
+
+**Before (`{X.Y}`):**
+
+```rust
+let role: ProcessRole = state.role();
+if state.role() == ProcessRole::Worker { /* … */ }
+config.role = ProcessRole::Web;
+```
+
+**After (`{(X+1).0}`):**
+
+```rust
+let role: ProcessRole = state.role().base();
+if state.role().base() == ProcessRole::Worker { /* … */ }
+config.role = ProcessRole::Web.into();
+```
+
+`Role == ProcessRole` is `true` only for that built-in role. A preset over
+`worker` is not equal to `ProcessRole::Worker`. Compare `base()` to include
+the presets. `state.role().name()` gives the name.
+
+A top-level `[roles]` table now belongs to the framework. If your
+`autumn.toml` uses `[roles]` for app data, move that data to another key. The
+load fails on it otherwise.
+
+A custom config loader that skips `validate()` and sets an undeclared
+`AUTUMN_ROLE` name no longer boots with a warning. The boot stops.
+
+**Automation:** `manual` — the right fix depends on whether the code means
+"this built-in role" or "every tier on this base".
 
 ### Toolchain: Rust 1.97.0 or newer
 
