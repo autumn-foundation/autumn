@@ -19977,8 +19977,7 @@ mod tests {
             assert!(result.is_ok(), "jwt build: {:?}", result.err());
         } else {
             let message = result
-                .err()
-                .expect("jwt tenancy must stop the boot")
+                .expect_err("jwt tenancy must stop the boot")
                 .to_string();
             assert!(message.contains("--features jwt"), "{message}");
         }
