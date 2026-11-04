@@ -2613,6 +2613,14 @@ subset of queues — all config-only, no app-code change:
   preset name, `.base()` the `ProcessRole`. Guards read the base; an
   undeclared name stops the boot. `autumn doctor --strict` derives
   `[jobs.fleet] tiers` from the presets. See `docs/guide/jobs.md#named-roles`.
+- **Route groups (issue #3544)** — `#[get("/x", group = "marketing")]`,
+  `.routes_in("marketing", routes![...])` or `Plugin::route_group()` (default
+  `Plugin::name()`) put routes in a group; the default is `app`. A preset over
+  `web`/`combined` sets `mount = ["marketing"]` to serve only those groups.
+  Probes, actuator and assets stay on every role; other routes get 404. Graph
+  and OpenAPI follow the mount. `[route_groups] declared`/`manifest` lets
+  `autumn doctor --strict` fail on a group no preset mounts. See
+  `docs/guide/route-groups.md`.
 
 ## Operator alerts (0.6.0, issue #1610)
 

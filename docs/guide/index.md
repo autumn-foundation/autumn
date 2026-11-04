@@ -218,6 +218,7 @@ Looking for the API reference instead? That is
 - [Maintenance Mode](maintenance-mode.md) — taking the app offline deliberately, with probes still answering
 - [Cloud-Native Autumn](cloud-native.md) — containers, Kubernetes, liveness/readiness probes, and the twelve-factor surface
 - [Kubernetes](kubernetes.md) — the generated Helm chart and Kustomize base, and Argo Rollouts or Flagger canaries
+- [Route Groups and Per-Role Mounting](route-groups.md) — one image, different routes on different pods, with `[roles.<name>] mount`
 - [SLOs as Code](slo.md) — `[[slo]]` objectives, burn-rate alerts, a Grafana dashboard, canary analysis, and the deploy bake
 - [Staging Fault Injection](fault-injection.md) — latency and errors on routes, the database, Redis and outbound HTTP, with a burn-rate stop
 - [Server Connection Limits](connection-limits.md) — header-read and idle timeouts, header size and connection caps

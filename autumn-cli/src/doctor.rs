@@ -6486,6 +6486,144 @@ fn resolve_role_presets(
     Ok(roles)
 }
 
+/// Why `[route_groups] manifest` gave no groups.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RouteGroupsManifestError {
+    /// The file is not there. The row warns, so a typo in the path does not
+    /// turn the check off.
+    Missing(String),
+    /// The file has no `group` keys: it is old, or it is not a route dump.
+    NoGroups(String),
+    /// The file is not a JSON array of routes.
+    Corrupt(String),
+}
+
+/// The route groups `[route_groups]` declares: the `group` of each route in
+/// the `manifest` file (the `autumn routes --format json` output), else the
+/// `declared` list. `Ok(None)`: the section declares nothing.
+///
+/// # Errors
+///
+/// A manifest that is missing, has no groups, or is not a JSON array.
+fn resolve_route_groups<F>(
+    table: Option<&toml::Table>,
+    read_file: F,
+) -> Result<Option<Vec<String>>, RouteGroupsManifestError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(section) = table
+        .and_then(|t| t.get("route_groups"))
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(None);
+    };
+    if let Some(path) = section.get("manifest").and_then(toml::Value::as_str) {
+        let Some(contents) = read_file(path) else {
+            return Err(RouteGroupsManifestError::Missing(format!(
+                "route_groups.manifest {path:?} is not there"
+            )));
+        };
+        let routes: Vec<serde_json::Value> = serde_json::from_str(&contents).map_err(|err| {
+            RouteGroupsManifestError::Corrupt(format!(
+                "route_groups.manifest {path:?} is not `autumn routes --format json` output: {err}"
+            ))
+        })?;
+        let groups: std::collections::BTreeSet<String> = routes
+            .iter()
+            .filter_map(|route| route.get("group").and_then(serde_json::Value::as_str))
+            .map(str::to_owned)
+            .collect();
+        if groups.is_empty() {
+            return Err(RouteGroupsManifestError::NoGroups(format!(
+                "route_groups.manifest {path:?} names no route group"
+            )));
+        }
+        return Ok(Some(groups.into_iter().collect()));
+    }
+    let declared: Vec<String> = section
+        .get("declared")
+        .and_then(toml::Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((!declared.is_empty()).then_some(declared))
+}
+
+/// `route_group_mounts` row (#3544): each declared route group needs a
+/// `[roles.<name>]` preset that mounts it.
+///
+/// A gap is a warning, so `--strict` fails on it. A built-in role is not
+/// counted, as for the derived job tiers. The row passes when no preset sets
+/// `mount`, because then every HTTP role serves every group.
+fn check_route_group_mounts<F>(table: Option<&toml::Table>, read_file: F) -> CheckResult
+where
+    F: Fn(&str) -> Option<String>,
+{
+    const NAME: &str = "route_group_mounts";
+    let pass = |detail: String| CheckResult {
+        name: NAME,
+        status: CheckStatus::Pass,
+        detail: Some(detail),
+        hint: None,
+    };
+    let Ok(roles) = resolve_role_presets(table) else {
+        return pass("skipped: [roles] is invalid; see process_role_backend".to_owned());
+    };
+    if !roles.values().any(|preset| preset.mount.is_some()) {
+        return pass("no [roles.<name>] sets mount; every HTTP role serves every group".to_owned());
+    }
+    let groups = match resolve_route_groups(table, read_file) {
+        Ok(Some(groups)) => groups,
+        Ok(None) => {
+            return pass(
+                "not checked: set [route_groups] manifest or declared to check that each \
+                 group has a role"
+                    .to_owned(),
+            );
+        }
+        Err(error) => {
+            let (status, detail) = match error {
+                RouteGroupsManifestError::Corrupt(detail) => (CheckStatus::Fail, detail),
+                RouteGroupsManifestError::Missing(detail)
+                | RouteGroupsManifestError::NoGroups(detail) => (CheckStatus::Warn, detail),
+            };
+            return CheckResult {
+                name: NAME,
+                status,
+                detail: Some(detail),
+                hint: Some("Regenerate it: autumn routes --format json > <manifest path>"),
+            };
+        }
+    };
+    let missing = autumn_web::config::groups_mounted_by_no_preset(&roles, &groups);
+    if missing.is_empty() {
+        return pass(format!(
+            "{} route group(s), each mounted by a role",
+            groups.len()
+        ));
+    }
+    let names: Vec<String> = missing.iter().map(|g| format!("{g:?}")).collect();
+    CheckResult {
+        name: NAME,
+        status: CheckStatus::Warn,
+        detail: Some(format!(
+            "route group(s) {} mounted by no [roles.<name>] preset; no process serves \
+             their routes",
+            names.join(", ")
+        )),
+        hint: Some(
+            "Add each group to the mount list of a role, or add a role without mount. \
+             A built-in role (web, combined) is not counted.",
+        ),
+    }
+}
+
 /// Resolve the configured queue names and the effective `jobs.pin` for the
 /// zero-coverage guard (#1623). `jobs.queues` may be a TOML array (strict) or a
 /// `name = weight|table` map (weighted); either way we only need the names.
@@ -9919,6 +10057,15 @@ pub fn run(opts: DoctorOptions) {
             fleet_topology.as_ref(),
             declared_queues_manifest_error.as_ref(),
         )
+    }));
+
+    // Route groups (#3544): every declared group needs a role that mounts it.
+    // Read from the same merged active-profile table as the roles above.
+    let route_groups_toml = merged_jobs_toml;
+    tasks.push(Box::new(move || {
+        check_route_group_mounts(Some(&route_groups_toml), |path| {
+            std::fs::read_to_string(path).ok()
+        })
     }));
 
     // A `sqlite://` primary boots only as the lone, single-backend, unsharded database
@@ -21073,6 +21220,140 @@ foo = "bar"
         assert!(result.detail.unwrap_or_default().contains("worker"));
         let result = check_process_role(&Ok(ProcessRole::Combined.into()), "local", None);
         assert_eq!(result.status, CheckStatus::Pass);
+    }
+
+    // ── Route groups (#3544) ─────────────────────────────────────────────
+
+    const GROUPS_3544: &str = r#"
+[route_groups]
+declared = ["marketing", "service", "app"]
+
+[roles.marketing]
+base = "web"
+mount = ["marketing"]
+
+[roles.service]
+base = "web"
+mount = ["service"]
+"#;
+
+    fn groups_table_3544(extra: &str) -> toml::Table {
+        toml::from_str(&format!("{GROUPS_3544}{extra}")).expect("parse toml")
+    }
+
+    #[test]
+    fn route_group_mounts_warns_for_a_group_no_role_mounts() {
+        let table = groups_table_3544("");
+        let row = check_route_group_mounts(Some(&table), |_| None);
+        assert_eq!(row.name, "route_group_mounts");
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        let detail = row.detail.clone().unwrap_or_default();
+        assert!(detail.contains("\"app\""), "{detail}");
+        assert!(!detail.contains("\"marketing\""), "{detail}");
+        assert!(row.hint.is_some());
+        // `--strict` turns the warning into a failure.
+        let summary = compute_summary(&[row]);
+        assert_eq!(exit_code(&summary, true), 1);
+        assert_eq!(exit_code(&summary, false), 0);
+    }
+
+    #[test]
+    fn route_group_mounts_passes_when_every_group_is_mounted() {
+        let table = groups_table_3544("[roles.core]\nbase = \"combined\"\nmount = [\"app\"]\n");
+        let row = check_route_group_mounts(Some(&table), |_| None);
+        assert_eq!(row.status, CheckStatus::Pass, "{:?}", row.detail);
+        // A preset without `mount` mounts every group.
+        let table = groups_table_3544("[roles.api]\nbase = \"web\"\n");
+        let row = check_route_group_mounts(Some(&table), |_| None);
+        assert_eq!(row.status, CheckStatus::Pass, "{:?}", row.detail);
+    }
+
+    #[test]
+    fn route_group_mounts_reads_groups_from_the_routes_manifest() {
+        let table: toml::Table = toml::from_str(
+            "[route_groups]\nmanifest = \"routes.json\"\n\
+             [roles.marketing]\nbase = \"web\"\nmount = [\"marketing\"]\n",
+        )
+        .expect("parse");
+        let manifest = r#"[
+            {"method": "GET", "path": "/landing", "handler": "landing", "source": "user", "middleware": [], "group": "marketing"},
+            {"method": "GET", "path": "/desk", "handler": "desk", "source": "user", "middleware": [], "group": "service"},
+            {"method": "GET", "path": "/live", "handler": "live", "source": "framework", "middleware": []}
+        ]"#;
+        let row = check_route_group_mounts(Some(&table), |path| {
+            (path == "routes.json").then(|| manifest.to_owned())
+        });
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        let detail = row.detail.unwrap_or_default();
+        assert!(detail.contains("\"service\""), "{detail}");
+
+        // A corrupt manifest fails loudly.
+        let row = check_route_group_mounts(Some(&table), |_| Some("not json".to_owned()));
+        assert_eq!(row.status, CheckStatus::Fail, "{:?}", row.detail);
+    }
+
+    /// A manifest path with no file, or a manifest with no `group` key, does
+    /// not turn the check off: the row warns, so `--strict` fails.
+    #[test]
+    fn route_group_mounts_warns_for_a_missing_or_groupless_manifest() {
+        let table: toml::Table = toml::from_str(
+            "[route_groups]\nmanifest = \"routes.json\"\ndeclared = [\"marketing\"]\n\
+             [roles.marketing]\nbase = \"web\"\nmount = [\"marketing\"]\n",
+        )
+        .expect("parse");
+        let row = check_route_group_mounts(Some(&table), |_| None);
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        assert!(row.detail.unwrap_or_default().contains("is not there"));
+
+        let old_dump = r#"[{"method": "GET", "path": "/x", "handler": "x", "source": "user", "middleware": []}]"#;
+        let row = check_route_group_mounts(Some(&table), |_| Some(old_dump.to_owned()));
+        assert_eq!(row.status, CheckStatus::Warn, "{:?}", row.detail);
+        assert!(
+            row.detail
+                .unwrap_or_default()
+                .contains("names no route group")
+        );
+    }
+
+    /// `run()` pushes the `route_group_mounts` row.
+    #[test]
+    fn doctor_run_registers_route_group_mounts() {
+        let source = include_str!("doctor.rs");
+        let run = source.find("pub fn run(opts").expect("run exists");
+        let end = run
+            + source[run..]
+                .find("\nfn run_doctor_tasks")
+                .expect("tasks fn");
+        assert!(
+            source[run..end].contains("check_route_group_mounts(Some(&route_groups_toml)"),
+            "doctor run() must push the route_group_mounts row"
+        );
+    }
+
+    #[test]
+    fn route_group_mounts_passes_when_nothing_is_narrowed() {
+        // No preset sets `mount`: every HTTP role serves every group.
+        let table: toml::Table = toml::from_str(
+            "[route_groups]\ndeclared = [\"marketing\"]\n[roles.api]\nbase = \"web\"\n",
+        )
+        .expect("parse");
+        assert_eq!(
+            check_route_group_mounts(Some(&table), |_| None).status,
+            CheckStatus::Pass
+        );
+        // `mount` is set, but no group is declared: nothing to compare.
+        let table: toml::Table =
+            toml::from_str("[roles.m]\nbase = \"web\"\nmount = [\"marketing\"]\n").expect("parse");
+        let row = check_route_group_mounts(Some(&table), |_| None);
+        assert_eq!(row.status, CheckStatus::Pass);
+        assert!(
+            row.detail.unwrap_or_default().contains("[route_groups]"),
+            "the row says how to turn the check on"
+        );
+        assert_eq!(
+            check_route_group_mounts(None, |_| None).status,
+            CheckStatus::Pass
+        );
     }
 
     #[test]

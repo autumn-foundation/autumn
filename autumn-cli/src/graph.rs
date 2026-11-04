@@ -163,6 +163,11 @@ fn completeness_changes(committed: &Completeness, current: &Completeness) -> Vec
         &current.unmounted_routes,
     );
     list(
+        "route mounted by another role",
+        &committed.mounted_elsewhere,
+        &current.mounted_elsewhere,
+    );
+    list(
         "mounted with no macro declaration",
         &committed.unmodelled_mounted_routes,
         &current.unmodelled_mounted_routes,
@@ -561,6 +566,24 @@ mod tests {
     };
 
     use super::*;
+
+    /// A route that moves to another role shows in the `--check` drift
+    /// report (#3544).
+    #[test]
+    fn completeness_changes_reports_mounted_elsewhere() {
+        let committed = Completeness::default();
+        let current = Completeness {
+            mounted_elsewhere: vec!["route:app::desk".to_owned()],
+            ..Completeness::default()
+        };
+        let lines = completeness_changes(&committed, &current);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "  + route mounted by another role route:app::desk"),
+            "{lines:?}"
+        );
+    }
 
     const MODELS: &[ModelGraphDescriptor] = &[ModelGraphDescriptor {
         model: "Post",

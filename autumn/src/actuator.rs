@@ -3136,6 +3136,9 @@ struct RoleInfo {
     base: &'static str,
     preset: bool,
     capabilities: crate::config::RoleCapabilities,
+    /// The route groups the role mounts (#3544). Omitted: every group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mount: Option<Vec<String>>,
 }
 
 impl From<&crate::config::Role> for RoleInfo {
@@ -3145,6 +3148,7 @@ impl From<&crate::config::Role> for RoleInfo {
             base: role.base().as_str(),
             preset: role.is_preset(),
             capabilities: role.capabilities(),
+            mount: role.mount().map(<[String]>::to_vec),
         }
     }
 }
@@ -7738,6 +7742,27 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         assert_eq!(json["role"]["preset"], true, "{json}");
         assert_eq!(json["role"]["capabilities"]["scheduler"], false, "{json}");
         assert_eq!(json["role"]["capabilities"]["job_workers"], true, "{json}");
+    }
+
+    #[tokio::test]
+    async fn actuator_info_reports_the_role_mount() {
+        let config: AutumnConfig = toml::from_str(
+            "role = \"marketing\"\n[roles.marketing]\nbase = \"web\"\n\
+             mount = [\"marketing\"]\n",
+        )
+        .expect("roles config");
+        let mut state = crate::AppState::for_test();
+        state.role = config.resolve_role().expect("marketing resolves");
+        let json = info_json_for(state).await;
+        assert_eq!(
+            json["role"]["mount"],
+            serde_json::json!(["marketing"]),
+            "{json}"
+        );
+
+        // No `mount`: the key is omitted.
+        let json = info_json_for(crate::AppState::for_test()).await;
+        assert!(json["role"].get("mount").is_none(), "{json}");
     }
 
     #[tokio::test]

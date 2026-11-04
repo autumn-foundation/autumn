@@ -636,6 +636,52 @@ A custom config loader that skips `validate()` and sets an undeclared
 **Automation:** `manual` — the right fix depends on whether the code means
 "this built-in role" or "every tier on this base".
 
+### Routing: `Route` and `AutumnConfig` have new fields
+
+**Why:** route groups and per-role mounting (issue #3544) add `Route::group`
+and `AutumnConfig::route_groups`. These structs have public fields and are
+not `#[non_exhaustive]`, so an old struct literal does not compile. The
+route macros set `group` for you.
+
+**You are affected only if your code builds a `Route { .. }` literal, builds
+an `AutumnConfig { .. }` literal with no `..Default::default()`, or uses a
+top-level `[route_groups]` table for app data.**
+
+**Before (`{X.Y}`):**
+
+```rust,ignore
+let route = autumn_web::Route {
+    // …
+    criticality: autumn_web::Criticality::Default,
+    seo: Default::default(),
+};
+```
+
+**After (`{(X+1).0}`):**
+
+```rust,ignore
+let route = autumn_web::Route {
+    // …
+    criticality: autumn_web::Criticality::Default,
+    seo: Default::default(),
+    group: None,
+};
+```
+
+`group: None` puts the route in the group of the code that registers it:
+the `routes_in` group, else the plugin group, else `app`. A role without `mount` serves every group, so
+nothing else changes.
+
+`RouteInfo` has a new field `group`, and `graph::manifest::Completeness` has
+a new field `mounted_elsewhere`. Both derive `Default`. Use
+`..Default::default()` in a literal.
+
+A top-level `[route_groups]` table now belongs to the framework. If your
+`autumn.toml` uses it for app data, move that data to another key.
+
+**Automation:** `manual` — a codemod cannot know which group a hand-built
+route belongs to.
+
 ### Toolchain: Rust 1.97.0 or newer
 
 **Why:** The maintainers set the MSRV to 1.97.0. The newest dependency
@@ -795,6 +841,12 @@ Changes that still compile but behave differently at runtime. Examples:
 
 If nothing changed, delete this section.
 
+- **The graph counts routes that another role serves (#3544).** When an app
+  declares a `[roles.<name>]` preset over `web` or `combined`, the graph of
+  any other role (a worker, say) lists the routes that preset mounts under
+  `completeness.mounted_elsewhere`, not under `unmounted_routes`. A committed
+  graph of such a role changes once. Regenerate it with
+  `autumn graph show --manifest <path>`.
 - **Widgets follow the OS dark mode (#3396).** The widget stylesheet sets
   `color-scheme: light dark`, and each color token has a dark value. On a
   dark OS, fields, cards, alerts, modals and toasts become dark. A page whose

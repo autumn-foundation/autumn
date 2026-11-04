@@ -1954,6 +1954,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 

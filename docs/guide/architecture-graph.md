@@ -122,6 +122,14 @@ in, they are just not being served here. Its
 nothing else. `autumn graph` reads `role` from the app's configuration and
 shows the same worker view.
 
+A role with `[roles.<name>] mount = [...]` serves only its route groups, so
+its graph marks the routes of other groups `mounted: false` (#3544). A route
+that another declared preset mounts is in `completeness.mounted_elsewhere`,
+not in `unmounted_routes`: it is served, but not here. A route that no
+preset mounts stays in `unmounted_routes`. A worker preset gets the same
+`mounted_elsewhere` list. Set `AUTUMN_ROLE` to see the graph of one role. See
+[Route groups](route-groups.md).
+
 The dump reads configuration through the loader the app installs with
 `.with_config_loader(...)`, as normal startup does. It starts no telemetry,
 opens no database and binds no port. A configuration that fails to load falls

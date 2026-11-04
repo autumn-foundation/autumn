@@ -366,6 +366,7 @@ mod raw_router_escape_hatch;
 mod read_your_writes_routing;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod ready_db_ping;
+mod route_groups;
 // `test-support` exposes the monitor-step hook the test drives; the Docker
 // sweep enables it, so the test still runs there.
 #[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
