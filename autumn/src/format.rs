@@ -199,6 +199,51 @@ fn group_thousands(int_digits: &str, separator: char) -> String {
     out
 }
 
+// ── Human-readable sizes ─────────────────────────────────────────────────────
+
+const SIZE_UNITS: [&str; 7] = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB"];
+
+/// Format a byte count as a human-readable size: `512 Bytes`, `1.5 KB`,
+/// `3 MB`.
+///
+/// Units are binary (1 KB = 1024 bytes). The value is rounded to one decimal
+/// place and a trailing `.0` is dropped. Integer math only, so no float
+/// rounding surprises.
+#[must_use]
+pub fn human_size(bytes: u64) -> String {
+    if bytes == 1 {
+        return "1 Byte".to_owned();
+    }
+    let mut exp = 0usize;
+    let mut unit: u128 = 1;
+    while exp + 1 < SIZE_UNITS.len() && u128::from(bytes) >= unit * 1024 {
+        unit *= 1024;
+        exp += 1;
+    }
+    // Tenths of the unit, rounded half up.
+    let mut tenths = (u128::from(bytes) * 10 + unit / 2) / unit;
+    // 1023.96 KB rounds to 1024 KB; promote it to 1 MB.
+    if exp > 0 && exp + 1 < SIZE_UNITS.len() && tenths >= 10 * 1024 {
+        exp += 1;
+        tenths = (tenths + 512) / 1024;
+    }
+    let label = SIZE_UNITS.get(exp).copied().unwrap_or("EB");
+    if exp == 0 || tenths.is_multiple_of(10) {
+        format!("{} {label}", tenths / 10)
+    } else {
+        format!("{}.{} {label}", tenths / 10, tenths % 10)
+    }
+}
+
+/// Render a byte count as a human-readable size (see [`human_size`]), as
+/// escaped [`maud::Markup`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn number_to_human_size(bytes: u64) -> maud::Markup {
+    let text = human_size(bytes);
+    maud::html! { (text) }
+}
+
 // ── Pluralize ────────────────────────────────────────────────────────────────
 
 /// Render `"{count} {word}"`, pluralizing `singular` with a simple
@@ -396,6 +441,34 @@ mod tests {
 
     fn dec(s: &str) -> Decimal {
         s.parse().unwrap()
+    }
+
+    // ── human_size ──────────────────────────────────────────────────────
+
+    #[test]
+    fn human_size_formats_each_unit() {
+        let cases: [(u64, &str); 12] = [
+            (0, "0 Bytes"),
+            (1, "1 Byte"),
+            (512, "512 Bytes"),
+            (1023, "1023 Bytes"),
+            (1024, "1 KB"),
+            (1536, "1.5 KB"),
+            (3 * 1024 * 1024, "3 MB"),
+            (1024 * 1024 * 1024, "1 GB"),
+            (1024 * 1024 * 1024 * 1024, "1 TB"),
+            (1024 * 1024 - 1, "1 MB"),
+            (1024 * 1024 - 100, "1023.9 KB"),
+            (u64::MAX, "16 EB"),
+        ];
+        for (bytes, want) in cases {
+            assert_eq!(human_size(bytes), want, "bytes = {bytes}");
+        }
+    }
+
+    #[test]
+    fn number_to_human_size_is_markup() {
+        assert_eq!(number_to_human_size(2048).into_string(), "2 KB");
     }
 
     // ── number_to_currency / CurrencyOptions ────────────────────────────
