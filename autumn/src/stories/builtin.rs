@@ -92,6 +92,39 @@ fn builtin_stories() -> Vec<Story> {
         },
         story! {
             "Forms",
+            "Sign-in inputs",
+            {
+                use autumn_web::form::{
+                    Changeset, FieldOptions, OtpFormat, otp_input_with, password_input_with,
+                    required_otp_input,
+                };
+
+                // Password and one-time code (#3412). The reveal button and
+                // the strength hint need autumn-widgets.js.
+                let mut errors = std::collections::HashMap::new();
+                errors.insert("backup".to_string(), vec!["The code is not correct.".to_string()]);
+                let changeset = Changeset::from_errors(serde_json::json!({}), errors);
+
+                maud::html! {
+                    (password_input_with(&changeset, "current", "Current password", &FieldOptions::new()
+                        .current_password()
+                        .reveal()))
+                    (password_input_with(&changeset, "fresh", "New password", &FieldOptions::new()
+                        .new_password()
+                        .minlength(12)
+                        .hint("Use 12 or more characters.")
+                        .reveal()
+                        .strength_hint()))
+                    // One input: paste and SMS autofill fill all the boxes.
+                    (required_otp_input(&changeset, "code", "Authenticator code"))
+                    // A group needs autumn-widgets.js. The server gets the digits only.
+                    (otp_input_with(&changeset, "backup", "Backup code", OtpFormat::digits(8).group(4), &FieldOptions::new()
+                        .hint("Type the 8 digits from your backup sheet.")))
+                }
+            }
+        },
+        story! {
+            "Forms",
             "Native inputs",
             {
                 use autumn_web::form::{

@@ -825,7 +825,24 @@ Free functions rendering changeset-aware, accessible inputs:
   `File` field ⇒ `enctype="multipart/form-data"`), and **(0.10.0, #3405)**
   `Switch`, `Range { step }`, `Radio { options }`, `CheckboxGroup { options }`,
   `Segmented { options }`, `Email`, `Tel`, `Url`, `Time` (derived for a
-  `NaiveTime` column), `Month`, `Color`, `Hidden`.
+  `NaiveTime` column), `Month`, `Color`, `Hidden`, and **(0.10.0, #3412)**
+  `Otp(OtpFormat)`.
+- **(0.10.0, #3412)** `otp_input`, `required_otp_input`,
+  `otp_input_with(.., OtpFormat, &FieldOptions)`: one
+  `<input autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{n}">`
+  over `aria-hidden` boxes; the value is never rendered; `maxlength="{n}"`
+  for no-JS pages (the runtime removes it). An `autocomplete`, `inputmode`,
+  `pattern` or `maxlength` option replaces the default.
+  `OtpFormat::digits(n)` (clamped 4..=10, default 6), `.group(g)` (2..=5 and
+  `< n`, needs `autumn-widgets.js`; `formdata` and `htmx:configRequest` strip
+  the spaces). The runtime keeps only digits of a paste (full-width too). Password options on `FieldOptions`:
+  `.current_password()` / `.new_password()` (`autocomplete`), `.reveal()` /
+  `.reveal_label(t)` (`hidden` `aria-pressed` button; the input gets
+  `spellcheck="false"`; JS shows it, hides the password on submit /
+  `reset` / `pagehide`), `.strength_hint()` /
+  `.strength_labels([..; 4])` (`{field}-strength` polite live region in
+  `aria-describedby`; a hint, not a policy). Also `.minlength(n)` /
+  `.maxlength(n)` on text-entry controls.
 - **(0.10.0, #3405)** native input helpers, each with `*_with(.., &FieldOptions)`:
   `switch_input` (`role="switch"` checkbox, `#[serde(default)] bool`),
   `range_input(.., step)`, `radio_group(.., &[(value, label)])`,
@@ -1633,7 +1650,7 @@ middleware (tenant scoping, an auth shim, request enrichment) — mapping the
 layer onto individual handlers instead tests a stack the real app never
 serves.
 
-`Page`: `visit`, `fill`, `click`, `press`, `hover`, `move_mouse(x, y)`, `set_javascript_enabled`, `expect_text`, `expect_url`,
+`Page`: `visit`, `fill`, `click`, `press`, `paste(text)`, `hover`, `move_mouse(x, y)`, `set_javascript_enabled`, `expect_text`, `expect_url`,
 `expect_attribute`, `expect_on_top`, `expect_hx_settle`, `expect_sse_event`,
 `expect_no_console_errors`, `console_errors`, `snapshot`, `evaluate`. The
 `expect_*` assertions poll to a deadline and ignore the transient CDP errors a

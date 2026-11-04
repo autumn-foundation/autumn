@@ -74,6 +74,7 @@ Ported so far:
 | --- | --- | --- |
 | Markdown links and anchors | `scripts/check-docs-links.sh` | `xtask/src/docs/links.rs` (`cargo xtask check docs-links`) |
 | Guide index completeness | `scripts/check-docs-guide-index.sh` | `xtask/src/docs/guide_index.rs` (`cargo xtask check docs-guide-index`) |
+| Reader vocabulary | `scripts/check-docs-aliases.sh` | `xtask/src/docs/aliases.rs` (`cargo xtask check docs-aliases`) |
 
 The per-line markdown shapes (block quote, fence, list item, heading) are
 matched by hand rather than by regex. A regex there made the first port ten
@@ -90,6 +91,15 @@ and `\d` classes keep their meaning. The script's 297 self-test cases were
 captured mechanically, one `#[test]` each. The port matched the script on
 2,500 mutated copies of the indexes and README, and the patterns rewritten
 without lookahead matched Python's on 260,000 fuzzed inputs.
+
+The reader-vocabulary gate (`xtask/src/docs/aliases.rs`) matches its terms
+on an ASCII view of the visible text, in which every non-ASCII letter or
+number becomes `_` and every other non-ASCII character `\x01`. Rust's `\b`
+treats combining marks as word characters and Python's does not, and the
+reverse holds for `²`; the view makes the two agree. Its visible-text
+reduction matched the Python on 60,000 fuzzed inputs, term matching on
+80,000, and the whole gate matched the script on 1,200 mutated copies of
+its pages.
 
 The `migration-guides` job installs a toolchain for the ported gates, after
 its bash gates, so those still report in seconds.

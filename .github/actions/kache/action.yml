@@ -1,0 +1,126 @@
+name: kache build cache
+description: >
+  Restores this job's kache compiler cache, sets RUSTC_WRAPPER so every rustc
+  and C/C++ compile goes through it, and saves the cache after the job. The
+  one place the repo configures kunobi-ninja/kache-action.
+
+# kache caches each compile by the hash of its inputs, not a whole target
+# directory. A hit needs the same inputs, compiler and flags, so one store can
+# serve several feature sets and every workspace crate whose source did not
+# change. See docs/adr/0038-kache-build-cache.md.
+#
+# Two backends:
+#
+# - S3 (an S3-compatible bucket, such as R2). One content-addressed store for
+#   every job, branch and PR. A run on a protected ref (`github.ref_protected`:
+#   a push to trunk or trunk-dev, a schedule) uploads what it compiled, so the
+#   store grows with every push. Every other run, PRs included, only reads.
+#   Selected when the calling workflow's env carries AUTUMN_KACHE_S3_BUCKET and
+#   a read key; see "S3 settings" below.
+# - The GitHub Actions cache, when S3 is not configured, or the run has no
+#   read key (a fork PR gets no secrets). Its key is <prefix>-<kache version>-
+#   <os>-<arch>-<Cargo.lock hash>, and the action never re-saves a key that
+#   exists, so the prefix separates every job whose builds differ: workflow,
+#   job id, `key`, and the exact rustc.
+#
+# S3 settings. A composite action cannot read `secrets` or `vars`, so each
+# workflow that uses this action maps them into its env:
+#
+#   AUTUMN_KACHE_S3_BUCKET, _ENDPOINT, _REGION        repository variables
+#   AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID, _SECRET_KEY    a read-only token
+#   AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID, _SECRET_KEY   a read-write token,
+#                                                      mapped only when
+#                                                      github.ref_protected
+
+inputs:
+  key:
+    description: >
+      Extra key part for a job whose matrix legs build different things, such
+      as a feature lane. rustc and the OS are already in the key.
+    required: false
+    default: ""
+  shared-key:
+    description: >
+      Use one entry across several jobs that run the identical build. Replaces
+      the job id in the key.
+    required: false
+    default: ""
+  save:
+    description: "Set to false for a job that only restores."
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      env:
+        KEY: ${{ inputs.key }}
+        SHARED_KEY: ${{ inputs.shared-key }}
+      run: |
+        set -euo pipefail
+        workflow=$(printf '%s' "$GITHUB_WORKFLOW" | tr -c 'A-Za-z0-9._-' '-')
+        rustc_id=$(rustc -vV | awk '/^release:/ { r = $2 } /^commit-hash:/ { c = substr($2, 1, 12) } END { print r "-" c }')
+        if [ -n "$SHARED_KEY" ]; then
+          scope="$SHARED_KEY"
+        else
+          scope="$GITHUB_JOB${KEY:+-$KEY}"
+        fi
+        echo "scope=$workflow-$scope-$rustc_id" >> "$GITHUB_OUTPUT"
+        echo "prefix=kache-$workflow-$scope-$rustc_id" >> "$GITHUB_OUTPUT"
+    - id: backend
+      shell: bash
+      env:
+        BUCKET: ${{ env.AUTUMN_KACHE_S3_BUCKET }}
+        READ_KEY: ${{ env.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID }}
+        WRITE_KEY: ${{ env.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID }}
+        PROTECTED: ${{ github.ref_protected }}
+        SAVE: ${{ inputs.save }}
+      run: |
+        set -euo pipefail
+        if [ -n "$BUCKET" ] && [ -n "$READ_KEY" ]; then
+          # Write only from a protected ref, with the write token, and only in
+          # a job that saves at all. Anything else reads.
+          if [ "$PROTECTED" = true ] && [ -n "$WRITE_KEY" ] && [ "$SAVE" = true ]; then
+            write=true
+          else
+            write=false
+          fi
+          echo "s3=true" >> "$GITHUB_OUTPUT"
+          echo "write=$write" >> "$GITHUB_OUTPUT"
+          echo "save=$write" >> "$GITHUB_OUTPUT"
+          echo "kache: S3 remote, writes $write (protected ref: $PROTECTED)"
+        else
+          echo "s3=false" >> "$GITHUB_OUTPUT"
+          echo "write=false" >> "$GITHUB_OUTPUT"
+          echo "save=$SAVE" >> "$GITHUB_OUTPUT"
+          echo "kache: no S3 remote or read key; using the GitHub Actions cache"
+        fi
+    # v1 as of 2026-09-25.
+    - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed
+      with:
+        version: v2.0.0
+        cache-key-prefix: ${{ steps.key.outputs.prefix }}
+        save-cache: ${{ steps.backend.outputs.save }}
+        s3-bucket: ${{ steps.backend.outputs.s3 == 'true' && env.AUTUMN_KACHE_S3_BUCKET || '' }}
+        s3-endpoint: ${{ steps.backend.outputs.s3 == 'true' && env.AUTUMN_KACHE_S3_ENDPOINT || '' }}
+        s3-region: ${{ env.AUTUMN_KACHE_S3_REGION || 'auto' }}
+        # The `backend` step guarantees the chosen key is non-empty whenever
+        # `s3` is true, so the inner `||` never falls through to the other key.
+        s3-access-key-id: ${{ steps.backend.outputs.s3 == 'true' && (steps.backend.outputs.write == 'true' && env.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID || env.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID) || '' }}
+        s3-secret-access-key: ${{ steps.backend.outputs.s3 == 'true' && (steps.backend.outputs.write == 'true' && env.AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY || env.AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY) || '' }}
+        # One prefetch manifest per build variant, so lanes do not overwrite
+        # each other's. The store itself is shared.
+        manifest-key: ${{ steps.key.outputs.scope }}
+        # aws-lc-sys and other build scripts compile C through the cc crate.
+        # Without this, those compiles miss on every run. Off on Windows: with
+        # no CC set, the action swaps MSVC cl.exe for clang-cl there, which
+        # would change the C toolchain the build uses.
+        cache-c-cpp: ${{ runner.os != 'Windows' }}
+        # A Windows runner's default cache dir is on C: and the workspace on
+        # D:, so restores would copy instead of hardlink.
+        cache-dir: ${{ runner.os == 'Windows' && format('{0}/kache', runner.temp) || '' }}
+        # A sticky comment per job would notify everyone on the PR. The job
+        # summary carries the same stats.
+        pr-comment: false

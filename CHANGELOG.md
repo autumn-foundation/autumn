@@ -127,6 +127,23 @@ For a narrative tour of this release, see the
 
 ### Added
 
+- **form:** `otp_input`, `required_otp_input` and `otp_input_with` (issue
+  #3412). One `<input autocomplete="one-time-code" inputmode="numeric">` over
+  a row of boxes, so SMS autofill and paste work. `OtpFormat::digits(n)`
+  sets the length (4 to 10). `.group(g)` shows the digits in groups.
+  `FieldControl::Otp` renders it in `form_for`.
+- **form:** password options on `FieldOptions`: `current_password()`,
+  `new_password()`, `reveal()` (a "Show password" button with
+  `aria-pressed`), `strength_hint()` (a live region in `aria-describedby`),
+  and `reveal_label` and `strength_labels` for translations.
+- **form:** `FieldOptions::minlength` and `maxlength`.
+- **system tests:** `Page::paste(text)` pastes into the focused element.
+- **generate:** `autumn generate auth` renders each password field with a
+  reveal button and an `autocomplete` token. Signup, reset and the new
+  password get a strength hint. The two 6-digit fields on `/account/2fa` use
+  `otp_input_with`. In a new scaffold, a field id is its field name (for
+  example `current_password`, not `current-password`).
+
 - **plugin_conformance:** `ConformanceConfig::no_routes()`, the library
   counterpart of `autumn plugin-check --no-routes`. A plugin that mounts no
   routes (a cache, a background runtime) can now pass `run_conformance` in
@@ -622,6 +639,12 @@ For a narrative tour of this release, see the
   vcpkg.
 
 ### Fixed
+
+- **upgrade:** `autumn upgrade` no longer reports a scaffold file as a
+  conflict ("unreadable") when its planning read lands while another upgrade
+  is renaming that file back into place. On Windows such a read fails instead
+  of finding nothing; it now waits out the swap like a missing file does. A
+  file that cannot be read, with no swap in flight, is still a conflict.
 
 - **todo-app:** `POST /api/todos` and the `create_json` MCP tool now reject
   titles over 255 characters with `422`, like the HTML form (issue #2972).

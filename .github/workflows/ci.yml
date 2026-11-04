@@ -20,6 +20,16 @@ env:
   # are correct; only the stack they run on is marginal. Raise it explicitly
   # rather than leaving the suite one variant away from aborting.
   RUST_MIN_STACK: 8388608
+  # kache S3 remote (.github/actions/kache). Unset variables keep the GitHub
+  # Actions cache. The write token is mapped only on a protected ref, so only
+  # pushes to trunk and trunk-dev (and scheduled runs) add to the store.
+  AUTUMN_KACHE_S3_BUCKET: ${{ vars.AUTUMN_KACHE_S3_BUCKET }}
+  AUTUMN_KACHE_S3_ENDPOINT: ${{ vars.AUTUMN_KACHE_S3_ENDPOINT }}
+  AUTUMN_KACHE_S3_REGION: ${{ vars.AUTUMN_KACHE_S3_REGION }}
+  AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID: ${{ secrets.AUTUMN_KACHE_S3_READ_ACCESS_KEY_ID }}
+  AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY: ${{ secrets.AUTUMN_KACHE_S3_READ_SECRET_ACCESS_KEY }}
+  AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_ACCESS_KEY_ID || '' }}
+  AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY: ${{ github.ref_protected && secrets.AUTUMN_KACHE_S3_WRITE_SECRET_ACCESS_KEY || '' }}
 
 jobs:
   meta:
@@ -62,10 +72,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         with:
-          # rust-cache keys by job, not by matrix entry; without this the
-          # shards would restore and overwrite each other's target dirs.
+          # One entry per shard: each runs different checks, and the first
+          # job to save a key fixes its contents.
           key: ${{ matrix.shard }}
       - name: Lint lane shard (cargo xtask ci lint --shard)
         # Every check this job runs is a step of the `lint` lane in
@@ -187,7 +197,7 @@ jobs:
       # toolchain to build that one small binary. These steps sit after the
       # bash gates above, so those still report in seconds.
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - name: Markdown link gate
         # `check-docs.sh` gates rustdoc intra-doc links and
         # `check-plugin-freshness.sh` gates the docs/guide paths named from
@@ -620,9 +630,9 @@ jobs:
         # skill file. That is why this gate unescapes `%XX` before matching and
         # why a row is satisfied only by the page that answers the question.
         #
-        # Shares this docs-only job for the same reason as the gates above:
-        # no toolchain, no cache, reports in seconds.
-        run: ./scripts/check-docs-aliases.sh --self-test && ./scripts/check-docs-aliases.sh
+        # The gate and its self-test (now `#[test]`s, run by `cargo test`)
+        # live in xtask/src/docs/aliases.rs.
+        run: cargo xtask check docs-aliases
       - name: Docs retrieval gate
         # Every gate above checks a page a reader HAS REACHED, and
         # `check-docs-orphans.sh` checks that a path of links to it exists at
@@ -704,7 +714,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - name: Compile the pinned reference plugin against this framework
         # `autumn-plugin-reference` calls every surface declared
         # `SurfaceTier::Stable` in `autumn/src/plugin_contract.rs`. Removing,
@@ -719,8 +729,8 @@ jobs:
         #
         # Cost: the crate itself is tiny, but it depends on autumn-web with
         # DEFAULT features, so a cold cache is a full framework build (tens of
-        # minutes), and this job name gets its own `rust-cache` entry against
-        # the repo's shared cache budget. Warm runs are a couple of minutes.
+        # minutes), and this job name gets its own kache entry against the
+        # repo's shared cache budget. Warm runs are a couple of minutes.
         # `--all-features` also turns on `system-tests` (#3400): the swatch
         # pack browser test compiles here, and stays `#[ignore]`d. The
         # `widgets-browser` workflow runs it in Chromium.
@@ -780,7 +790,7 @@ jobs:
           # every PR in this repo's own CI.
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - name: Migration version collision gate
         # Diesel records applied migrations BY VERSION (the leading
         # `YYYYMMDDHHMMSS` directory prefix). When two directories share one
@@ -804,13 +814,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      # Registry cache only. `cache-bin` would restore $CARGO_HOME/bin, and
-      # install-action skips its verified download when the pinned version is
-      # already there — the auditor this gate trusts must come from the pin,
-      # not from a cache entry.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-bin: false
+      # kache caches compiler outputs only, never $CARGO_HOME/bin. That matters
+      # here: install-action skips its verified download when the pinned
+      # version is already there, and the auditor this gate trusts must come
+      # from the pin, not from a cache entry.
+      - uses: ./.github/actions/kache
       - uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-deny@0.20.2
@@ -943,7 +951,7 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
         with:
           # This job, `test-archive` and `doctest` build the same `cargo test
@@ -951,13 +959,9 @@ jobs:
           # --no-run` underneath), so they share one cache entry per OS. The
           # two archive jobs write it; `doctest` and a shard that falls back to
           # a local build only restore it.
+          # kache saves even when a later step fails, so a red job still
+          # warms the next run.
           shared-key: workspace-test
-          # Save the target dir even when a later step fails. rust-cache skips
-          # its save on a failed job by default, and a red job is exactly when
-          # a warm cache matters most, since a red suite is what you iterate
-          # against. What is cached is compiled artifacts; their validity does
-          # not depend on whether anything after the compile passed.
-          cache-on-failure: true
       - uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-nextest@0.9.149
@@ -1005,12 +1009,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
         with:
           # See `test-build`.
           shared-key: workspace-test
-          cache-on-failure: true
       - uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-nextest@0.9.149
@@ -1103,11 +1106,11 @@ jobs:
         run: cargo fetch --locked
       - name: Restore the build cache (local-build fallback)
         if: env.REUSE_ARCHIVE != 'true'
-        uses: Swatinem/rust-cache@v2.7.8
+        uses: ./.github/actions/kache
         continue-on-error: true
         with:
           shared-key: workspace-test
-          save-if: false
+          save: false
       - name: Run the shard
         # Two lanes, partitioning the suite with `trybuild`:
         #
@@ -1186,12 +1189,12 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
         with:
           # See `test-build`. RESTORE ONLY: the archive jobs write this key.
           shared-key: workspace-test
-          save-if: false
+          save: false
       - name: Run the doctests
         run: cargo test --workspace --doc
 
@@ -1265,16 +1268,16 @@ jobs:
         run: cargo fetch --locked
       - name: Restore the build cache (local-build fallback)
         if: env.REUSE_ARCHIVE != 'true'
-        uses: Swatinem/rust-cache@v2.7.8
+        uses: ./.github/actions/kache
         continue-on-error: true
         with:
           shared-key: workspace-test
-          # RESTORE ONLY. Four shards racing to upload the same multi-GB target
-          # dir buys nothing, and on windows-latest that upload is what killed
+          # RESTORE ONLY. Four shards racing to upload the same multi-GB cache
+          # buys nothing, and on windows-latest that upload is what killed
           # `Trybuild pass_a` in run 8362 — the shard itself had already passed
           # at 53m, then the cache-save post step ran 47 more minutes and the
           # runner dropped the job. The archive jobs write this key.
-          save-if: false
+          save: false
       - name: Run the trybuild shard
         # The filter is a nextest filterset over the one binary that holds
         # `compile_fail::`. `test(...)` matches a substring of the test name,
@@ -1320,7 +1323,7 @@ jobs:
         # `compile_pass` shard. It is pure scratch — regenerated each run,
         # never a build input — but no cache action's prune knows that layout,
         # so leaving it in place makes any post-run upload try to ship all of
-        # it. `save-if: false` above already prevents that; this keeps the
+        # it. `save: false` above already prevents that; this keeps the
         # disk bounded too, and keeps the hazard from returning silently if
         # anyone ever flips that flag back.
         shell: bash
@@ -1387,10 +1390,12 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
         with:
-          # One target dir per feature set; see the note on the trybuild job.
+          # One entry per feature set. The first job to save a key fixes its
+          # contents, so lanes sharing one key would each restore whichever
+          # lane saved first.
           key: ${{ matrix.lane }}
       - name: Run ledger-capture unit tests (statement normalization)
         if: matrix.lane == 'ledger-capture'
@@ -1816,7 +1821,7 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
       - name: Install Postgres client tools (Linux)
         if: runner.os == 'Linux'
@@ -2399,7 +2404,7 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
       - name: Install the ssh client
         # The test drives the real `ssh`/`scp`. The runner may lack them.
@@ -2503,10 +2508,10 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         with:
-          # One cache per lane: each builds a different feature set, so sharing
-          # a key would thrash the entry rather than warm it.
+          # One entry per lane: each builds a different feature set, and the
+          # first job to save a key fixes its contents.
           key: coverage-${{ matrix.lane }}
       - name: Install cargo-llvm-cov
         # Pin @v2 and pass the tool explicitly. The bare @cargo-llvm-cov tag form can
@@ -3023,7 +3028,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - name: Check MSRV alignment
         run: ./scripts/check-msrv.sh
       - name: Check the CI toolchain is pinned, and pinned consistently
@@ -3065,7 +3070,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - name: Build autumn-web under the sqlite backend
         run: cargo build -p autumn-web --features sqlite
       - name: Clippy (autumn-web lib, sqlite backend)
@@ -3332,7 +3337,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - name: Run the sim-sweep seed sweep
         run: cargo run -p autumn-web --release --features "sim-testing,sqlite" --bin sim-sweep
         env:
@@ -3355,7 +3360,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - name: Run loom model checks
         run: cargo test -p autumn-web --release --test loom_models
         env:
@@ -3380,7 +3385,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - name: Run Shuttle checks
         run: cargo test -p autumn-web --release --test shuttle_models
         env:
@@ -3400,7 +3405,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - name: Check the protocol models
         run: cargo test -p autumn-protocol-models
 
@@ -3435,7 +3440,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-wasip1
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - uses: actions/setup-node@v7
         # Tier J runs the web-standard JS host (`autumn-edge/js`, ADR-0024)
         # over the same corpus as the reference host.
@@ -3571,7 +3576,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
       - name: Fleet unit tests
         shell: bash
         run: |
@@ -3613,8 +3618,8 @@ jobs:
       run:
         shell: pwsh
     env:
-      # Point the scaffold's build at the workspace target dir, which
-      # `rust-cache` restores. Without this the job cold-compiles the whole
+      # Point the scaffold's build at the workspace target dir, which this job
+      # has already built into. Without this the job compiles the whole
       # autumn-web dependency graph a second time on every run — the difference
       # between a ~30 minute job and one that flirts with its own timeout.
       #
@@ -3658,7 +3663,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       - name: Resolve journey paths

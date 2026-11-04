@@ -1813,13 +1813,19 @@ fn concat_suffix(base: &str, suffix: &str) -> String {
 ///
 /// | Option | Controls |
 /// |---|---|
-/// | `placeholder`, `inputmode` | text, password, textarea, number, email, tel, url |
-/// | `pattern` | text, password, email, tel, url |
+/// | `placeholder`, `inputmode` | text, password, textarea, number, email, tel, url, OTP |
+/// | `pattern` | text, password, email, tel, url, OTP |
+/// | `minlength`, `maxlength` | text, password, textarea, email, tel, url, OTP |
 /// | `min`, `max` | number, date, datetime, time, month, range |
 /// | `readonly` | all except checkbox, switch, select, file, range, color, hidden and the groups |
 /// | `autocomplete` | all except checkbox, switch, file, hidden and the groups |
 /// | `required` | all except range, color and hidden (a checkbox group shows the marker only) |
 /// | `disabled` | all |
+/// | `reveal`, `strength_hint` | password |
+///
+/// The OTP field ([`otp_input`]) has defaults for `autocomplete`,
+/// `inputmode`, `pattern` and `maxlength`. An option that you set replaces
+/// the default.
 ///
 /// - [`data`](Self::data) and [`hx`](Self::hx) add `data-*` and `hx-*`
 ///   attributes. The helper adds the prefix, so the name cannot be a reserved
@@ -1873,7 +1879,13 @@ pub struct FieldOptions<'a> {
     pattern: Option<Cow<'a, str>>,
     min: Option<Cow<'a, str>>,
     max: Option<Cow<'a, str>>,
+    minlength: Option<usize>,
+    maxlength: Option<usize>,
     auto_grow: bool,
+    /// The reveal button label. `Some` adds the button.
+    reveal: Option<Cow<'a, str>>,
+    /// The strength labels, weakest first. `Some` adds the hint.
+    strength: Option<[Cow<'a, str>; 4]>,
     multiple: bool,
     styled_select: bool,
     /// `(prefix, name, value)`. The setters check `name`.
@@ -1896,7 +1908,11 @@ impl<'a> FieldOptions<'a> {
             pattern: None,
             min: None,
             max: None,
+            minlength: None,
+            maxlength: None,
             auto_grow: false,
+            reveal: None,
+            strength: None,
             multiple: false,
             styled_select: false,
             extra: Vec::new(),
@@ -1972,6 +1988,81 @@ impl<'a> FieldOptions<'a> {
     #[must_use]
     pub fn max(mut self, max: impl Into<Cow<'a, str>>) -> Self {
         self.max = Some(max.into());
+        self
+    }
+
+    /// Set `minlength`.
+    #[must_use]
+    pub const fn minlength(mut self, chars: usize) -> Self {
+        self.minlength = Some(chars);
+        self
+    }
+
+    /// Set `maxlength`.
+    #[must_use]
+    pub const fn maxlength(mut self, chars: usize) -> Self {
+        self.maxlength = Some(chars);
+        self
+    }
+
+    /// Set `autocomplete="current-password"`: the sign-in password. A
+    /// password manager fills the saved password.
+    #[must_use]
+    pub fn current_password(self) -> Self {
+        self.autocomplete("current-password")
+    }
+
+    /// Set `autocomplete="new-password"`: a signup or a password change. A
+    /// password manager can suggest a new password.
+    #[must_use]
+    pub fn new_password(self) -> Self {
+        self.autocomplete("new-password")
+    }
+
+    /// Add a "Show password" button after a password input (issue #3412).
+    ///
+    /// The button has `aria-pressed` and `hidden`. `autumn-widgets.js` shows
+    /// it and toggles the input between `password` and `text`. It hides the
+    /// password again on submit and when the page goes away. Without the
+    /// script, the button stays hidden. Other controls ignore this option.
+    #[must_use]
+    pub fn reveal(self) -> Self {
+        self.reveal_label("Show password")
+    }
+
+    /// [`reveal`](Self::reveal) with your button text, for example a
+    /// translation. The text does not change on toggle: `aria-pressed`
+    /// gives the state.
+    #[must_use]
+    pub fn reveal_label(mut self, text: impl Into<Cow<'a, str>>) -> Self {
+        self.reveal = Some(text.into());
+        self
+    }
+
+    /// Add a password strength hint (issue #3412).
+    ///
+    /// The hint is `<p id="{field}-strength" aria-live="polite">`. Its id
+    /// goes in `aria-describedby`, after the hint id. `autumn-widgets.js`
+    /// writes "Strength: weak", "fair", "good" or "strong" as the user
+    /// types, from the length and the character kinds. It is a hint, not a
+    /// policy: it does not know common passwords. Check the password on the
+    /// server. Other controls ignore this option.
+    #[must_use]
+    pub fn strength_hint(self) -> Self {
+        self.strength_labels([
+            "Strength: weak",
+            "Strength: fair",
+            "Strength: good",
+            "Strength: strong",
+        ])
+    }
+
+    /// [`strength_hint`](Self::strength_hint) with your four labels,
+    /// weakest first. Name the subject in each label (for example
+    /// "Strength: weak"): a screen reader reads the label alone.
+    #[must_use]
+    pub fn strength_labels(mut self, labels: [&'a str; 4]) -> Self {
+        self.strength = Some(labels.map(Cow::Borrowed));
         self
     }
 
@@ -2138,13 +2229,15 @@ pub(crate) enum FieldKind {
     /// A checkbox with `role="switch"`.
     Switch,
     Hidden,
+    /// A one-time code (issue #3412): `type="text"` over a row of boxes.
+    Otp,
 }
 
 #[cfg(feature = "maud")]
 impl FieldKind {
     const fn input_type(self) -> Option<&'static str> {
         match self {
-            Self::Text => Some("text"),
+            Self::Text | Self::Otp => Some("text"),
             Self::Password => Some("password"),
             Self::Checkbox | Self::Switch => Some("checkbox"),
             Self::Number => Some("number"),
@@ -2161,6 +2254,11 @@ impl FieldKind {
             Self::Hidden => Some("hidden"),
             Self::Textarea | Self::Select => None,
         }
+    }
+
+    /// `placeholder`.
+    const fn takes_placeholder(self) -> bool {
+        self.takes_text_entry() || matches!(self, Self::Otp)
     }
 
     /// `placeholder` and `inputmode`.
@@ -2184,6 +2282,19 @@ impl FieldKind {
         )
     }
 
+    /// `minlength`. `push_otp_attrs` writes the OTP `maxlength`.
+    const fn takes_minlength(self) -> bool {
+        self.takes_length() || matches!(self, Self::Otp)
+    }
+
+    /// `minlength` and `maxlength`.
+    const fn takes_length(self) -> bool {
+        matches!(
+            self,
+            Self::Text | Self::Password | Self::Textarea | Self::Email | Self::Tel | Self::Url
+        )
+    }
+
     const fn takes_range(self) -> bool {
         matches!(
             self,
@@ -2204,10 +2315,11 @@ impl FieldKind {
         )
     }
 
+    /// `push_otp_attrs` writes the OTP `autocomplete`.
     const fn takes_autocomplete(self) -> bool {
         !matches!(
             self,
-            Self::Checkbox | Self::Switch | Self::File | Self::Hidden
+            Self::Checkbox | Self::Switch | Self::File | Self::Hidden | Self::Otp
         )
     }
 
@@ -2234,6 +2346,7 @@ impl FieldKind {
             Self::Switch => "autumn-field autumn-field--checkbox autumn-field--switch",
             Self::Range => "autumn-field autumn-field--range",
             Self::Color => "autumn-field autumn-field--color",
+            Self::Otp => "autumn-field autumn-field--otp",
             _ => "autumn-field",
         }
     }
@@ -2319,6 +2432,8 @@ pub(crate) struct FieldSpec<'a> {
     pub(crate) groups: SelectGroups<'a>,
     /// `(validate_url, token_field)` for the htmx inline-validation input.
     pub(crate) htmx: Option<(&'a str, &'a str)>,
+    /// The format of an [`FieldKind::Otp`] field.
+    pub(crate) otp: OtpFormat,
 }
 
 #[cfg(feature = "maud")]
@@ -2336,6 +2451,7 @@ impl<'a> FieldSpec<'a> {
             choices: SelectChoices::None,
             groups: SelectGroups::None,
             htmx: None,
+            otp: OtpFormat::digits(6),
         }
     }
 }
@@ -2383,7 +2499,7 @@ fn push_option_attrs(
         (
             "placeholder",
             opts.placeholder.as_deref(),
-            takes(FieldKind::takes_text_entry),
+            takes(FieldKind::takes_placeholder),
         ),
         (
             "autocomplete",
@@ -2406,6 +2522,19 @@ fn push_option_attrs(
     for (name, value, accepted) in typed {
         if accepted && let Some(value) = value {
             push_attr(out, name, value);
+        }
+    }
+    let lengths = [
+        (
+            "minlength",
+            opts.minlength,
+            takes(FieldKind::takes_minlength),
+        ),
+        ("maxlength", opts.maxlength, takes(FieldKind::takes_length)),
+    ];
+    for (name, value, accepted) in lengths {
+        if accepted && let Some(value) = value {
+            push_attr(out, name, &value.to_string());
         }
     }
     if opts.disabled {
@@ -2455,20 +2584,106 @@ fn push_errors(out: &mut String, field_html: &str, errors: &[String]) {
 /// `None` when the field has neither, so the attribute is not emitted.
 #[cfg(feature = "maud")]
 fn described_by(field_html: &str, has_hint: bool, has_errors: bool) -> Option<String> {
-    match (has_hint, has_errors) {
-        (false, false) => None,
-        (true, false) => Some(concat_suffix(field_html, "-hint")),
-        (false, true) => Some(concat_suffix(field_html, "-error")),
-        (true, true) => {
-            let mut ids =
-                String::with_capacity(field_html.len().saturating_mul(2).saturating_add(12));
-            ids.push_str(field_html);
-            ids.push_str("-hint ");
-            ids.push_str(field_html);
-            ids.push_str("-error");
-            Some(ids)
+    described_by_parts(field_html, &[(has_hint, "-hint"), (has_errors, "-error")])
+}
+
+/// The `aria-describedby` value: `{field}{suffix}` for each part that is on,
+/// in order, with a space between. `None` when no part is on.
+#[cfg(feature = "maud")]
+fn described_by_parts(field_html: &str, parts: &[(bool, &str)]) -> Option<String> {
+    let on = parts.iter().filter(|(on, _)| *on);
+    let len: usize = on
+        .clone()
+        .map(|(_, suffix)| {
+            field_html
+                .len()
+                .saturating_add(suffix.len())
+                .saturating_add(1)
+        })
+        .sum();
+    if len == 0 {
+        return None;
+    }
+    let mut ids = String::with_capacity(len);
+    for (_, suffix) in on {
+        if !ids.is_empty() {
+            ids.push(' ');
+        }
+        ids.push_str(field_html);
+        ids.push_str(suffix);
+    }
+    Some(ids)
+}
+
+/// Append the OTP attributes: `autocomplete`, `inputmode`, `pattern` and
+/// `maxlength` (an option that the app sets replaces each default), then the
+/// runtime hooks.
+#[cfg(feature = "maud")]
+fn push_otp_attrs(out: &mut String, format: OtpFormat, opts: &FieldOptions<'_>) {
+    let digits = format.digit_count().to_string();
+    let pattern = format!("[0-9]{{{digits}}}");
+    push_attr(
+        out,
+        "autocomplete",
+        opts.autocomplete.as_deref().unwrap_or("one-time-code"),
+    );
+    push_attr(
+        out,
+        "inputmode",
+        opts.inputmode.as_deref().unwrap_or("numeric"),
+    );
+    push_attr(out, "pattern", opts.pattern.as_deref().unwrap_or(&pattern));
+    let maxlength = opts.maxlength.map(|n| n.to_string());
+    push_attr(out, "maxlength", maxlength.as_deref().unwrap_or(&digits));
+    out.push_str(r#" data-autumn-otp=""#);
+    out.push_str(&digits);
+    out.push('"');
+    if let Some(group) = format.group_size() {
+        out.push_str(r#" data-autumn-otp-group=""#);
+        out.push_str(&group.to_string());
+        out.push('"');
+    }
+}
+
+/// Append the `aria-hidden` boxes, then close the `.autumn-otp` wrapper. A
+/// separator sits after each full group that a digit follows.
+#[cfg(feature = "maud")]
+fn push_otp_cells(out: &mut String, format: OtpFormat) {
+    out.push_str(r#"<span class="autumn-otp__cells" aria-hidden="true">"#);
+    let group = format.group_size().unwrap_or(0);
+    for digit in 1..=format.digit_count() {
+        out.push_str(r#"<span class="autumn-otp__cell"></span>"#);
+        if digit.checked_rem(group) == Some(0) && digit < format.digit_count() {
+            out.push_str(r#"<span class="autumn-otp__sep"></span>"#);
         }
     }
+    out.push_str("</span></div>");
+}
+
+/// Append the reveal toggle, then close the `.autumn-password` wrapper.
+#[cfg(feature = "maud")]
+fn push_reveal_button(out: &mut String, field_html: &str, label: &str, disabled: bool) {
+    out.push_str(r#"<button type="button" class="autumn-password__reveal" aria-controls=""#);
+    out.push_str(field_html);
+    out.push_str(r#"" aria-pressed="false" data-autumn-reveal hidden"#);
+    if disabled {
+        out.push_str(" disabled");
+    }
+    out.push('>');
+    write_escaped(label, out);
+    out.push_str("</button></div>");
+}
+
+/// Append the empty strength live region. The runtime reads the labels
+/// from `data-autumn-strength`, a JSON array.
+#[cfg(feature = "maud")]
+fn push_strength(out: &mut String, field_html: &str, labels: &[Cow<'_, str>; 4]) {
+    out.push_str(r#"<p id=""#);
+    out.push_str(field_html);
+    out.push_str(r#"-strength" class="autumn-field__strength" aria-live="polite""#);
+    let json = serde_json::to_string(labels).unwrap_or_else(|_| "[]".to_owned());
+    push_attr(out, "data-autumn-strength", &json);
+    out.push_str("></p>");
 }
 
 /// Render one field: wrapper, label, hint, control and errors.
@@ -2494,7 +2709,18 @@ pub(crate) fn render_field(
     let hint = opts.hint.as_deref();
     let field_html = fast_escape(spec.field);
     let field_html = field_html.as_ref();
-    let describedby = described_by(field_html, hint.is_some(), has_errors);
+    // Password extras (issue #3412). Other controls ignore them.
+    let password = kind == FieldKind::Password;
+    let reveal = opts.reveal.as_deref().filter(|_| password);
+    let strength = opts.strength.as_ref().filter(|_| password);
+    let describedby = described_by_parts(
+        field_html,
+        &[
+            (hint.is_some(), "-hint"),
+            (strength.is_some(), "-strength"),
+            (has_errors, "-error"),
+        ],
+    );
 
     let errors_len: usize = errors.iter().map(|e| e.len().saturating_add(40)).sum();
     let mut out = String::with_capacity(
@@ -2532,6 +2758,11 @@ pub(crate) fn render_field(
         FieldKind::Select => "select",
         _ => "input",
     };
+    if reveal.is_some() {
+        out.push_str(r#"<div class="autumn-password">"#);
+    } else if kind == FieldKind::Otp {
+        out.push_str(r#"<div class="autumn-otp">"#);
+    }
     out.push('<');
     out.push_str(tag);
     if let Some(input_type) = kind.input_type() {
@@ -2571,6 +2802,9 @@ pub(crate) fn render_field(
         out.push_str(r#" required aria-required="true""#);
     }
     out.push_str(r#" class="autumn-field__input"#);
+    if kind == FieldKind::Otp {
+        out.push_str(" autumn-otp__input");
+    }
     if has_errors {
         out.push_str(" autumn-field__input--invalid");
     }
@@ -2589,6 +2823,14 @@ pub(crate) fn render_field(
         out.push_str(r#" aria-describedby=""#);
         out.push_str(ids);
         out.push('"');
+    }
+    if kind == FieldKind::Otp {
+        push_otp_attrs(&mut out, spec.otp, opts);
+    }
+    // A revealed password is a text field. A cloud spellcheck or autocorrect
+    // must not read it.
+    if reveal.is_some() {
+        out.push_str(r#" spellcheck="false" autocapitalize="off""#);
     }
     let reserved: &[&str] = if let Some((validate_url, token_field)) = spec.htmx {
         push_attr(&mut out, "hx-post", validate_url);
@@ -2614,6 +2856,14 @@ pub(crate) fn render_field(
             out.push_str("</select>");
         }
         _ => {}
+    }
+    if let Some(label) = reveal {
+        push_reveal_button(&mut out, field_html, label, opts.disabled);
+    } else if kind == FieldKind::Otp {
+        push_otp_cells(&mut out, spec.otp);
+    }
+    if let Some(labels) = strength {
+        push_strength(&mut out, field_html, labels);
     }
 
     if kind.is_box() {
@@ -2934,6 +3184,10 @@ pub fn submit_button(label: &str) -> maud::Markup {
 /// Wraps in `<div id="{field}-field">` for stable htmx targeting.
 /// ARIA annotations (`aria-invalid`, `aria-describedby`, error block) behave
 /// identically to [`text_input`].
+///
+/// Use [`password_input_with`] for the password options (issue #3412):
+/// [`FieldOptions::current_password`], [`FieldOptions::new_password`],
+/// [`FieldOptions::reveal`] and [`FieldOptions::strength_hint`].
 #[cfg(feature = "maud")]
 #[must_use]
 pub fn password_input<T: Serialize>(
@@ -2966,6 +3220,76 @@ pub fn password_input_with<T: Serialize>(
     options: &FieldOptions<'_>,
 ) -> maud::Markup {
     let spec = FieldSpec::new(FieldKind::Password, field, label);
+    render_field(&spec, changeset.errors_for(field), options)
+}
+
+/// Render a labeled one-time code field of 6 digits (issue #3412).
+///
+/// The field is one `<input type="text" autocomplete="one-time-code"
+/// inputmode="numeric" pattern="[0-9]{6}">` over a row of `aria-hidden`
+/// boxes. One real input keeps SMS autofill and paste working, and a screen
+/// reader finds one field. `autumn-widgets.js` keeps only the digits of a
+/// paste or an IME entry (full-width digits too), up to the length. Without
+/// the script, `pattern` checks the code when the form is submitted.
+///
+/// The value is never rendered: a code is used one time. `maxlength` keeps
+/// a page with no JS from showing more digits than boxes. The script
+/// removes it, so the browser does not cut a paste. An `autocomplete`,
+/// `inputmode`, `pattern` or `maxlength` option replaces the default. Use
+/// [`otp_input_with`] for another length or for groups.
+///
+/// ```rust
+/// use autumn_web::form::{Changeset, otp_input};
+///
+/// let changeset = Changeset::new(());
+/// let html = otp_input(&changeset, "code", "Code").into_string();
+/// assert!(html.contains(r#"autocomplete="one-time-code""#));
+/// assert!(html.contains(r#"inputmode="numeric""#));
+/// ```
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn otp_input<T: Serialize>(changeset: &Changeset<T>, field: &str, label: &str) -> maud::Markup {
+    otp_input_with(
+        changeset,
+        field,
+        label,
+        OtpFormat::default(),
+        &FieldOptions::new(),
+    )
+}
+
+/// [`otp_input`] for a required field. See [`required_text_input`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn required_otp_input<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+) -> maud::Markup {
+    otp_input_with(
+        changeset,
+        field,
+        label,
+        OtpFormat::default(),
+        &FieldOptions::new().required(),
+    )
+}
+
+/// [`otp_input`] with a digit count, a group, a hint and typed attributes.
+/// See [`OtpFormat`] and [`FieldOptions`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn otp_input_with<T: Serialize>(
+    changeset: &Changeset<T>,
+    field: &str,
+    label: &str,
+    format: OtpFormat,
+    options: &FieldOptions<'_>,
+) -> maud::Markup {
+    let spec = FieldSpec {
+        otp: format,
+        ..FieldSpec::new(FieldKind::Otp, field, label)
+    };
     render_field(&spec, changeset.errors_for(field), options)
 }
 
@@ -5252,6 +5576,8 @@ pub enum FieldControl {
     Color,
     /// `<input type="hidden">`, with no label and no wrapper.
     Hidden,
+    /// A one-time code field (issue #3412). See [`otp_input`].
+    Otp(OtpFormat),
     /// A control from a widget pack (issue #3400).
     ///
     /// The [`FieldRenderer`]
@@ -5259,6 +5585,95 @@ pub enum FieldControl {
     /// hint and the errors. Make one with [`FieldControl::custom`].
     #[cfg(feature = "maud")]
     Custom(CustomControl),
+}
+
+/// The digit count and the grouping of a one-time code field (issue #3412).
+///
+/// [`digits`](Self::digits) clamps the count to 4..=10. The default is 6.
+/// [`group`](Self::group) shows the digits in groups, for example `123 456`.
+/// The group needs `autumn-widgets.js`. The server gets the digits with no
+/// spaces. `verification/otp_format.rs` proves the bounds.
+///
+/// ```rust
+/// use autumn_web::form::OtpFormat;
+///
+/// let format = OtpFormat::digits(6).group(3);
+/// assert_eq!(format.digit_count(), 6);
+/// assert_eq!(format.group_size(), Some(3));
+/// assert_eq!(format.cells(), 7);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OtpFormat {
+    digits: u8,
+    /// `0` is no group.
+    group: u8,
+}
+
+impl OtpFormat {
+    /// The smallest digit count.
+    pub const MIN_DIGITS: u8 = 4;
+    /// The largest digit count.
+    pub const MAX_DIGITS: u8 = 10;
+
+    /// A code of `count` digits, clamped to 4..=10. No group.
+    #[must_use]
+    pub const fn digits(count: u8) -> Self {
+        let digits = if count < Self::MIN_DIGITS {
+            Self::MIN_DIGITS
+        } else if count > Self::MAX_DIGITS {
+            Self::MAX_DIGITS
+        } else {
+            count
+        };
+        Self { digits, group: 0 }
+    }
+
+    /// Show the digits in groups of `size`. A size that is not 2 to 5, or
+    /// that is not less than the digit count, removes the group. A
+    /// [`FieldOptions::pattern`] turns the group off in the browser, so that
+    /// pattern checks the code.
+    #[must_use]
+    pub const fn group(mut self, size: u8) -> Self {
+        self.group = if size >= 2 && size <= 5 && size < self.digits {
+            size
+        } else {
+            0
+        };
+        self
+    }
+
+    /// The digit count.
+    #[must_use]
+    pub const fn digit_count(self) -> u8 {
+        self.digits
+    }
+
+    /// The group size, if the digits are grouped.
+    #[must_use]
+    pub const fn group_size(self) -> Option<u8> {
+        if self.group == 0 {
+            None
+        } else {
+            Some(self.group)
+        }
+    }
+
+    /// The boxes: one for each digit, and one separator between two
+    /// groups. At most 14.
+    #[must_use]
+    pub const fn cells(self) -> u8 {
+        // A group of 0 gives `None`: no separator.
+        match self.digits.saturating_sub(1).checked_div(self.group) {
+            Some(separators) => self.digits.saturating_add(separators),
+            None => self.digits,
+        }
+    }
+}
+
+impl Default for OtpFormat {
+    fn default() -> Self {
+        Self::digits(6)
+    }
 }
 
 #[cfg(feature = "maud")]
@@ -5878,6 +6293,7 @@ fn render_form_control<T: Serialize>(
         FieldControl::Month => month_input_with(changeset, name, label, options),
         FieldControl::Color => color_input_with(changeset, name, label, options),
         FieldControl::Hidden => hidden_input_with(changeset, name, options),
+        FieldControl::Otp(format) => otp_input_with(changeset, name, label, *format, options),
         FieldControl::Custom(control) => {
             custom_input_with(changeset, name, label, control.renderer(), options)
         }
@@ -6324,6 +6740,8 @@ fn option_attr_names(opts: &FieldOptions<'_>) -> Vec<String> {
         ("pattern", opts.pattern.is_some()),
         ("min", opts.min.is_some()),
         ("max", opts.max.is_some()),
+        ("minlength", opts.minlength.is_some()),
+        ("maxlength", opts.maxlength.is_some()),
         ("disabled", opts.disabled),
         ("readonly", opts.readonly),
     ];

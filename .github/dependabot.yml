@@ -49,7 +49,11 @@ updates:
       - automated
 
   - package-ecosystem: github-actions
-    directory: /
+    # `/` covers .github/workflows. The local composite actions pin their own
+    # actions (kache-action in .github/actions/kache), so list them too.
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: weekly
       day: monday
