@@ -76,6 +76,21 @@ grouped `pattern` from `autumn-widgets.js` has one group more than the
 separator cells. The proptests `otp_format_stays_in_bounds` and
 `otp_markup_matches_the_format` check the runtime.
 
+## Select marks
+
+`select_marks.rs` models which `<option>` a select marks `selected`
+(`push_select_options` in `autumn/src/form.rs`, issue #3409). Verify it
+with:
+
+```sh
+verus verification/select_marks.rs
+```
+
+It proves that a single select marks at most one option, and one option
+when a value matches. A match in an earlier group stops a mark in a later
+group. A multiple select marks each match, and a mark is always a match.
+The proptest `select_marks_follow_the_spec` checks the rendered markup.
+
 ## Fleet slot ownership
 
 `fleet_slot_ownership.rs` models the slot-ownership table of a SQLite fleet

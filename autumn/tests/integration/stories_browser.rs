@@ -1144,6 +1144,83 @@ async fn keyboard_sign_in_inputs() {
     );
 }
 
+/// Select (#3409): the native `<select>`, with no script. Only the
+/// opted-in single select gets `appearance: base-select`.
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_select() {
+    const OPEN: &str = "document.querySelector('#plan').matches(':open')";
+    let appearance =
+        |sel: &str| format!("getComputedStyle(document.querySelector({sel:?})).appearance");
+    let value = |sel: &str| format!("document.querySelector({sel:?}).value");
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/select").await;
+
+    // The fallback and the multiple select keep the native control.
+    for sel in ["#plan_native", "#tags"] {
+        assert_ne!(
+            eval_string(&page, &appearance(sel)).await,
+            "base-select",
+            "{sel} keeps the native control"
+        );
+    }
+    let supported = eval_bool(&page, "CSS.supports('appearance', 'base-select')").await;
+    if !supported {
+        page.expect_no_console_errors().await.expect("no errors");
+        return;
+    }
+    for sel in ["#plan", "#city"] {
+        assert_eq!(
+            eval_string(&page, &appearance(sel)).await,
+            "base-select",
+            "{sel} is styled"
+        );
+    }
+
+    // Enter opens the picker on Linux and Windows. The browser gate runs
+    // on Linux. The open picker passes axe in both schemes.
+    axe_in_both_schemes(&page, "open select picker", || async {
+        focus(&page, "#plan").await;
+        press(&page, "Enter").await;
+        wait_for(&page, OPEN).await;
+    })
+    .await;
+
+    // Escape closes the picker and keeps the value.
+    focus(&page, "#plan").await;
+    press(&page, "Enter").await;
+    wait_for(&page, OPEN).await;
+    press(&page, "Escape").await;
+    wait_for(&page, &format!("!{OPEN}")).await;
+    assert_eq!(eval_string(&page, &value("#plan")).await, "pro");
+    assert_eq!(
+        active_id(&page).await,
+        "plan",
+        "focus goes back to the select"
+    );
+
+    // ArrowDown on the closed select opens the picker. The value stays.
+    press(&page, "ArrowDown").await;
+    wait_for(&page, OPEN).await;
+    assert_eq!(eval_string(&page, &value("#plan")).await, "pro");
+    press(&page, "Escape").await;
+    wait_for(&page, &format!("!{OPEN}")).await;
+
+    // In the picker, ArrowDown moves to the next option. Enter chooses it.
+    press(&page, "Enter").await;
+    wait_for(&page, OPEN).await;
+    press(&page, "ArrowDown").await;
+    press(&page, "Enter").await;
+    wait_for(&page, &format!("!{OPEN}")).await;
+    assert_eq!(
+        eval_string(&page, &value("#plan")).await,
+        "team",
+        "the keyboard chooses the next option"
+    );
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
 #[tokio::test]
 #[ignore = "requires Chromium"]
 async fn keyboard_toast() {
@@ -1256,6 +1333,39 @@ async fn keyboard_tooltip() {
         wait_for(&page, "document.getAnimations().length === 0").await;
     })
     .await;
+    page.expect_no_console_errors().await.expect("no errors");
+}
+
+/// The file inputs are in the Tab order, and the script adds no trap. A
+/// visible label names each input. The hint shows because the script ran.
+#[cfg(feature = "storage")]
+#[tokio::test]
+#[ignore = "requires Chromium"]
+async fn keyboard_direct_upload() {
+    let runner = runner().await;
+    let page = runner.page().await.expect("page");
+    open(&page, "/_stories/direct-upload").await;
+    wait_for(
+        &page,
+        "document.querySelector('[data-autumn-upload-hint]') && \
+         !document.querySelector('[data-autumn-upload-hint]').hidden",
+    )
+    .await;
+    focus(&page, "#upload-cover_image").await;
+    assert!(
+        eval_bool(
+            &page,
+            "document.activeElement.labels[0].textContent === 'Cover image'"
+        )
+        .await,
+        "a visible label names the input"
+    );
+    // Tab leaves the first field and reaches the second.
+    press(&page, "Tab").await;
+    assert!(
+        eval_bool(&page, "document.activeElement.id === 'upload-attachments'").await,
+        "Tab reaches the next upload field"
+    );
     page.expect_no_console_errors().await.expect("no errors");
 }
 

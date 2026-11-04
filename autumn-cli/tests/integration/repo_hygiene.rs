@@ -891,6 +891,109 @@ fn deploy_e2e_runs_in_its_own_ci_job_on_a_fresh_disk() {
     );
 }
 
+/// The `trybuild` shards run from one `cargo nextest archive --workspace`
+/// build instead of each compiling the workspace.
+///
+/// Each piece guards a failure that would otherwise be quiet:
+/// - the archive must be a `--workspace` build, or the unified feature set
+///   that decides which gated fixtures exist changes, and it must hold only
+///   `integration_tests`, or the other test binaries fill the shard's disk
+///   (#3534);
+/// - a shard must extract into its own checkout, or the archive's
+///   compile-time `env!` paths point nowhere;
+/// - a shard on another checkout path must build locally instead;
+/// - a shard filter that matches nothing must fail;
+/// - a shard must fetch the locked dependencies, because trybuild builds its
+///   fixtures `--offline` and the archive carries no registry;
+/// - the archive must carry `target/debug/.fingerprint`, or trybuild builds
+///   every fixture with default features only.
+#[test]
+fn trybuild_shards_run_from_the_workspace_nextest_archive() {
+    let root = workspace_root();
+    // A Windows checkout can turn LF into CRLF.
+    let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml"))
+        .expect("read ci.yml")
+        .replace("\r\n", "\n");
+
+    let build = ci_job(&ci, "test-build");
+    assert!(
+        build.contains("cargo nextest archive --workspace --test integration_tests"),
+        "`test-build` must archive a workspace build of `integration_tests` only"
+    );
+    assert!(
+        build.contains("workspace: ${{ steps.workspace.outputs.path }}")
+            && build.contains("path=${GITHUB_WORKSPACE}"),
+        "`test-build` must publish the checkout path it compiled at"
+    );
+    assert!(
+        build.contains("name: workspace-tests-linux"),
+        "`test-build` must upload the archive the shards download"
+    );
+
+    let shards = ci_job(&ci, "trybuild");
+    assert!(
+        shards
+            .lines()
+            .any(|l| l.trim_start().starts_with("needs:") && l.contains("test-build")),
+        "`trybuild` must need `test-build`"
+    );
+    assert!(
+        shards.contains("needs.test-build.outputs.workspace == github.workspace"),
+        "`trybuild` must compare its checkout path with the archive's"
+    );
+    for needle in [
+        "name: workspace-tests-linux",
+        "--workspace-remap . --extract-to . --extract-overwrite",
+        "source=(--workspace --test integration_tests)",
+        // trybuild builds its fixtures `--offline`; the archive brings no
+        // registry with it.
+        "run: cargo fetch --locked",
+        "--no-tests=fail",
+        "binary_id(autumn-web::integration_tests)",
+    ] {
+        assert!(
+            shards.contains(needle),
+            "`trybuild` must contain `{needle}`"
+        );
+    }
+
+    let gate = ci_job(&ci, "test-gate");
+    assert!(
+        gate.lines()
+            .any(|l| l.trim_start().starts_with("needs:") && l.contains("test-build")),
+        "`test-gate` must need `test-build`"
+    );
+
+    let config_path = root.join(".config/nextest.toml");
+    let config: toml::Value = toml::from_str(
+        &std::fs::read_to_string(&config_path)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", config_path.display())),
+    )
+    .expect(".config/nextest.toml parses");
+    let includes = config
+        .get("profile")
+        .and_then(|p| p.get("default"))
+        .and_then(|p| p.get("archive"))
+        .and_then(|a| a.get("include"))
+        .and_then(toml::Value::as_array)
+        .expect("`[[profile.default.archive.include]]` must exist");
+    let field = |entry: &toml::Value, key: &str| {
+        entry
+            .get(key)
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
+    };
+    assert!(
+        includes.iter().any(|entry| {
+            field(entry, "path").as_deref() == Some("debug/.fingerprint")
+                && field(entry, "relative-to").as_deref() == Some("target")
+                && field(entry, "on-missing").as_deref() == Some("error")
+        }),
+        "every nextest archive must carry `target/debug/.fingerprint` and fail without it; \
+         got {includes:?}"
+    );
+}
+
 #[test]
 fn publish_gate_prepare_release_does_not_mutate_changelog() {
     let root = workspace_root();

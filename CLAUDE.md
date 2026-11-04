@@ -141,7 +141,8 @@ release time.
   PR, carries the script's `--self-test` cases over as `#[test]`s, and shows
   the same report as the script on the tree and on mutated copies of the
   corpus. See `xtask/README.md` "Docs gates".
-- **xtask stays dependency-light**: default features only, and never
+- **xtask stays dependency-light**: default features, or the smallest
+  feature set that covers the use (`smop`: `sh` and `fs` only), and never
   autumn-web, diesel or sqlx. It is a workspace member, so its features are
   unified into every `cargo build --workspace`.
 
@@ -156,7 +157,8 @@ so it is usually automatic:
 | Job | OS | What it runs |
 | --- | --- | --- |
 | `test` | all 3 | `cargo test --workspace -- --skip compile_fail:: --skip sim_` — the default lane, plus a second step running `sim_` at `--test-threads=1` |
-| `trybuild` | Linux | `compile_fail::*` only, split into four shards |
+| `test-build` | Linux | `cargo nextest archive --workspace --test integration_tests`, once; uploads the archive the `trybuild` shards run from |
+| `trybuild` | Linux | `compile_fail::*` only, split into four shards, run with `cargo nextest run --archive-file` |
 | `test-features` | Linux | one job per non-default feature set (markdown, i18n, tls, …) |
 | `test-docker` | Linux | the `#[ignore]`d Docker/testcontainer sweep |
 | `test-docker-deploy` | Linux | `deploy_e2e` alone, on a fresh disk (#2547) |
@@ -182,9 +184,18 @@ Rules that matter when editing tests:
 
 - **`compile_fail.rs` is partitioned by test-function name.** A new `#[test]`
   in that module runs in the `rest` shard automatically. A **renamed** one does
-  not: `fail`, `pass_a` and `pass_b` name their functions explicitly and assert
-  a non-zero pass count, so a rename fails that shard loudly rather than
+  not: `fail`, `pass_a` and `pass_b` name their functions explicitly and run
+  with `--no-tests=fail`, so a rename fails that shard loudly rather than
   silently skipping it. Rename the shard filter in `ci.yml` alongside.
+- **The `trybuild` shards do not compile the workspace.** `test-build` builds
+  it once with `cargo nextest archive --workspace --test integration_tests`
+  (only the binary they run: an archive of every test binary ran a shard's
+  disk out) and the shards run from
+  that archive, extracted into their own checkout so compile-time `env!`
+  paths resolve. A shard checked out at a different path (a self-hosted
+  runner slot) builds locally instead. trybuild reads its fixtures' feature
+  set from `target/debug/.fingerprint`, so `.config/nextest.toml` adds that
+  directory to every archive; do not remove it.
 - **Branch protection should require `Test suite`** (the `test-gate` job), not
   the individual shards — it is the one check name that survives adding or
   removing a shard.
