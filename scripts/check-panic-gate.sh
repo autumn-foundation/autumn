@@ -39,7 +39,9 @@
 #      not commented out and carries both `-p autumn-web` and `-D warnings`),
 #      otherwise its deny block is never compiled. The `lint` job's clippy lanes
 #      are the commands in xtask/src/lanes.rs; they count while ci.yml runs
-#      `cargo xtask ci lint`. The single knowing exception
+#      `cargo xtask ci lint`, or its matrix of shards
+#      (`cargo xtask ci lint --shard ${{ matrix.shard }}`; xtask's own tests
+#      prove the matrix names every shard). The single knowing exception
 #      (telemetry-otlp) is declared in FEATURE_LINT_EXEMPT and announced on every
 #      run; that list is itself validated so it cannot rot into a silent hole.
 #
@@ -48,7 +50,7 @@
 # clippy suppresses lints inside macro expansions and no source-level gate can
 # see them. Request-path modules must not invoke panic-expanding local macros.
 #
-# Called from the `lint` job in ci.yml (`cargo xtask ci lint`). Run locally with:
+# Called from the `lint` lane in ci.yml (`cargo xtask ci lint --shard gates`). Run locally with:
 #
 #     ./scripts/check-panic-gate.sh              # self-test, then the real check
 #     ./scripts/check-panic-gate.sh --self-test  # synthetic fixtures only
@@ -406,13 +408,15 @@ ci_clippy_features() {
 # literals in xtask/src/lanes.rs, one per line. Print their features the same
 # way, but only while the workflow file $1 really runs that lane: a lane file
 # CI never executes must not make a feature look linted, and neither may a
-# filtered run such as `cargo xtask ci lint --only fmt`. Rust comment lines are
-# skipped as YAML comments are above.
+# filtered run such as `cargo xtask ci lint --only fmt` or one literal shard.
+# The matrix form `--shard ${{ matrix.shard }}` counts: xtask's
+# `ci_lint_shards_run_every_shard_of_the_lint_lane` test proves the matrix
+# names every shard. Rust comment lines are skipped as YAML comments are above.
 XTASK_LANES="xtask/src/lanes.rs"
 xtask_clippy_features() {
   local ci="$1" lanes="$2"
   [[ -f "$lanes" ]] || return 0
-  grep -qE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*cargo xtask ci lint[[:space:]]*$' "$ci" \
+  grep -qE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*cargo xtask ci lint([[:space:]]+--shard[[:space:]]+\$\{\{[[:space:]]*matrix\.shard[[:space:]]*\}\})?[[:space:]]*$' "$ci" \
     || return 0
   clippy_features_in "$lanes" '^[[:space:]]*//'
 }
@@ -1234,6 +1238,24 @@ EOF
   write_module "$d38/src/good.rs" </dev/null
   check_fail "filtered xtask lane run does not count" "no enforcing" \
     gate_check "$d38" "$wf" Cargo.toml 1 src src/good.rs:lanefeat
+
+  # 39. The lane run as a matrix of shards counts, as the whole lane does.
+  local d39="$tmp/d39"; make_fixture "$d39"
+  mkdir -p "$d39/xtask/src"
+  printf '        run: cargo xtask ci lint --shard ${{ matrix.shard }}\n' >"$d39/.github/workflows/ci.yml"
+  cp "$d35/xtask/src/lanes.rs" "$d39/xtask/src/lanes.rs"
+  write_module "$d39/src/good.rs" </dev/null
+  check_pass "xtask lint lane run as a shard matrix enables a feature" \
+    gate_check "$d39" "$wf" Cargo.toml 1 src src/good.rs:lanefeat
+
+  # 40. One literal shard does not: it runs that shard's steps only.
+  local d40="$tmp/d40"; make_fixture "$d40"
+  mkdir -p "$d40/xtask/src"
+  printf '        run: cargo xtask ci lint --shard gates\n' >"$d40/.github/workflows/ci.yml"
+  cp "$d35/xtask/src/lanes.rs" "$d40/xtask/src/lanes.rs"
+  write_module "$d40/src/good.rs" </dev/null
+  check_fail "one literal lint shard does not count" "no enforcing" \
+    gate_check "$d40" "$wf" Cargo.toml 1 src src/good.rs:lanefeat
 
   echo "self-test: $pass/$total passed"
   [[ "$pass" -eq "$total" ]] || die "panic-gate self-test failed — the checker is not

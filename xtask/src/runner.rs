@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use smop::sh::{self, CommandBuilder};
 
 use crate::argv;
@@ -20,6 +20,8 @@ pub struct Selection {
     pub skip: Vec<String>,
     /// Start at this step id, skipping the ones before it.
     pub from: Option<String>,
+    /// Run only the steps of this shard.
+    pub shard: Option<String>,
     /// Override the lane's own keep-going setting.
     pub keep_going: Option<bool>,
     /// Print the commands instead of running them.
@@ -31,9 +33,24 @@ impl Selection {
     ///
     /// # Errors
     ///
-    /// Returns an error when any id given does not name a step of the lane.
+    /// Returns an error when any id given does not name a step of the lane,
+    /// or the shard given is not one of the lane's.
     pub fn steps<'l>(&self, lane: &'l Lane) -> Result<Vec<&'l Step>> {
         check_ids(lane, self.only.iter().chain(&self.skip).chain(&self.from))?;
+        if let Some(shard) = &self.shard {
+            let known = lane.shards();
+            if !known.contains(&shard.as_str()) {
+                bail!(
+                    "lane `{}` has no shard `{shard}`; its shards are: {}",
+                    lane.name,
+                    if known.is_empty() {
+                        "(none)".to_owned()
+                    } else {
+                        known.join(", ")
+                    }
+                );
+            }
+        }
         let start = self
             .from
             .as_ref()
@@ -43,6 +60,7 @@ impl Selection {
             .iter()
             .filter(|s| self.only.is_empty() || self.only.iter().any(|o| o == s.id))
             .filter(|s| !self.skip.iter().any(|k| k == s.id))
+            .filter(|s| self.shard.as_deref().is_none_or(|w| s.shard == Some(w)))
             .collect())
     }
 }
@@ -339,6 +357,7 @@ mod tests {
             title: id,
             argv: argv::split(line).unwrap(),
             env: Vec::new(),
+            shard: None,
         }
     }
 
@@ -399,6 +418,26 @@ mod tests {
             ..Selection::default()
         };
         assert_eq!(ids(&s.steps(&l).unwrap()), ["b", "c"]);
+    }
+
+    #[test]
+    fn a_shard_selects_its_steps_and_an_unknown_one_is_an_error() {
+        let mut l = sample();
+        l.steps[0].shard = Some("one");
+        l.steps[1].shard = Some("two");
+        l.steps[2].shard = Some("one");
+        let s = Selection {
+            shard: Some("one".into()),
+            ..Selection::default()
+        };
+        assert_eq!(ids(&s.steps(&l).unwrap()), ["a", "c"]);
+
+        let s = Selection {
+            shard: Some("three".into()),
+            ..Selection::default()
+        };
+        let err = s.steps(&l).unwrap_err().to_string();
+        assert!(err.contains("`three`") && err.contains("one, two"), "{err}");
     }
 
     #[test]

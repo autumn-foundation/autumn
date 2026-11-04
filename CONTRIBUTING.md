@@ -12,7 +12,8 @@ cargo xtask pre-push
 (`./scripts/pre-push-check.sh` runs the same thing.) The steps are the
 `pre-push` lane in `xtask/src/lanes.rs`; `cargo xtask pre-push --list` names
 them, `--from <step>` resumes after a fix, and `--dry-run` prints the commands.
-CI's `lint` job is the `lint` lane of the same file (`cargo xtask ci lint`), and
+CI's `lint` job is the `lint` lane of the same file (`cargo xtask ci lint`,
+run in CI as one job per shard: `--shard <shard>`), and
 the two lanes share their clippy feature lists, so they cannot drift apart.
 `cargo xtask list` shows every lane and every script under `scripts/`.
 
@@ -52,10 +53,11 @@ Chromium `system-tests` lanes (those run in dedicated CI jobs); `cargo test -p
 `cargo xtask pre-push` before you push.
 
 In CI that blocking gate is **sharded across runners**, so a red PR points at
-one of several jobs rather than a single `Test (<os>)`: `test` runs the
-workspace suite, `trybuild` runs `compile_fail::` in four shards from one
-`cargo nextest archive --workspace --test integration_tests` build
-(`test-build`),
+one of several jobs rather than a single `Test (<os>)`. Each OS builds the
+workspace tests once with `cargo nextest archive --workspace` (`Build tests
+(<os>)`). From that build, `test` runs the workspace suite as partitioned
+slices plus a `sim` shard per OS, and `trybuild` runs `compile_fail::` in four
+shards. `doctest` runs the doctests, which nextest does not.
 `test-features` runs one job per non-default feature set, and `test-docker`
 runs the Linux testcontainer sweep. `Test suite` (`test-gate`) is the
 aggregate check that must be green. Nothing about how you *write* a test

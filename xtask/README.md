@@ -8,6 +8,7 @@ published. Why it exists: [ADR 0033](../docs/adr/0033-xtask-for-repo-tooling.md)
 cargo xtask list                      # every lane, docs gate and script
 cargo xtask pre-push                  # compile what CI compiles, before you push
 cargo xtask ci lint                   # CI's `lint` job, the same commands
+cargo xtask ci lint --shard gates     # one of the CI jobs it is split into
 cargo xtask check docs-links          # a docs gate ported to Rust
 cargo xtask check msrv                # scripts/check-msrv.sh
 cargo xtask script update-changelog   # any script under scripts/
@@ -19,14 +20,19 @@ A lane is an ordered list of steps, defined in [`src/lanes.rs`](src/lanes.rs).
 
 | Lane | Run with | Used by |
 | --- | --- | --- |
-| `lint` | `cargo xtask ci lint` | `ci.yml` `lint` job, `toolchain-drift.yml` |
+| `lint` | `cargo xtask ci lint` | `ci.yml` `lint-shard` jobs (one per shard), `toolchain-drift.yml` |
 | `pre-push` | `cargo xtask pre-push` | you, before pushing; `scripts/pre-push-check.sh` |
 
 Options for both:
 
-- `--list`: the step names.
+- `--list`: the step names, and each step's shard.
 - `--only <step>` / `--skip <step>` (repeatable), `--from <step>`. An unknown
   step name is an error, never a silent no-op.
+- `--shard <shard>`: the steps one CI job runs. CI runs the `lint` lane as a
+  matrix of its shards, side by side. Every `lint` step names a shard, and a
+  test checks that ci.yml's matrix lists every shard: the panic and determinism
+  gates trust the lane's clippy commands only while it does. An unknown shard
+  is an error.
 - `--dry-run`: print the commands.
 - `--keep-going` / `--fail-fast`: `lint` keeps going by default so one CI run
   reports every break; `pre-push` stops at the first.
