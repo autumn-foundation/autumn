@@ -427,3 +427,20 @@ It proves these properties:
 It does not model the restore, the schema union or the query. Tests cover
 them.
 
+## Role presets
+
+`role_presets.rs` models `RolePreset::capabilities` and the capability
+checks of `RolePreset::validate` in `autumn/src/config.rs` (issue #3543, ADR
+0035). It does not model the name, `pin` and `workers` checks.
+Verify it with:
+
+```sh
+verus verification/role_presets.rs
+```
+
+It proves that a preset never runs a capability that its base does not run,
+that the base decides `serves_http`, that a preset with no overrides is its
+base, and that a valid preset gets each override it sets. The exhaustive
+test `preset_capabilities_match_the_model` in `autumn/src/config.rs` checks
+the runtime against the same rules.
+

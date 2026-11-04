@@ -3166,7 +3166,8 @@ mod tests {
 
     #[test]
     fn base_command_forwards_role_env() {
-        for role in ["web", "worker", "combined"] {
+        // A `[roles.<name>]` preset name is forwarded as it is (#3543).
+        for role in ["web", "worker", "combined", "critical"] {
             let opts = serve_opts_with_role(Some(role));
             let cmd = base_command(Path::new("/bin/true"), None, &opts);
             assert_eq!(

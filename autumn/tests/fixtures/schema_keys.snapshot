@@ -442,6 +442,7 @@ retention.sessions
 retention.sweep_interval
 retention.webhook_replay
 role
+roles
 scheduler
 scheduler.backend
 scheduler.key_prefix
