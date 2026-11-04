@@ -111,6 +111,9 @@ struct LaneOptions {
     /// Start at this step.
     #[arg(long, value_name = "STEP")]
     from: Option<String>,
+    /// Run only the steps of this shard, as one CI job does.
+    #[arg(long, value_name = "SHARD")]
+    shard: Option<String>,
     /// Run every step even after one fails.
     #[arg(long, conflicts_with = "fail_fast")]
     keep_going: bool,
@@ -125,6 +128,7 @@ impl LaneOptions {
             only: self.only.clone(),
             skip: self.skip.clone(),
             from: self.from.clone(),
+            shard: self.shard.clone(),
             keep_going: if self.keep_going {
                 Some(true)
             } else if self.fail_fast {
@@ -202,7 +206,10 @@ fn run_lane(
     if options.list {
         writeln!(out, "lane `{}`: {}", lane.name, lane.about)?;
         for step in &lane.steps {
-            writeln!(out, "  {:<28} {}", step.id, step.title)?;
+            match step.shard {
+                Some(shard) => writeln!(out, "  {:<28} {:<22} {}", step.id, shard, step.title)?,
+                None => writeln!(out, "  {:<28} {}", step.id, step.title)?,
+            }
         }
         return Ok(ExitCode::SUCCESS);
     }

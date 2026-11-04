@@ -116,8 +116,8 @@ release time.
   autumn-web consolidated `integration_tests` binary, so it misses
   cross-package compile breaks the CI `cargo test --workspace` gate catches.
   See CONTRIBUTING.md "Before you push".
-- **CI lint job, locally**: `cargo xtask ci lint` (one step:
-  `--only <step>`; step names: `--list`).
+- **CI lint job, locally**: `cargo xtask ci lint` (one CI shard:
+  `--shard <shard>`; one step: `--only <step>`; steps and shards: `--list`).
 - **Every maintainer task and script**: `cargo xtask list`.
 
 ## Repo tooling: `cargo xtask`
@@ -126,8 +126,11 @@ release time.
 `xtask/README.md` and `docs/adr/0033-xtask-for-repo-tooling.md`.
 
 - **CI's `lint` job is the `lint` lane** in `xtask/src/lanes.rs`; ci.yml runs
-  `cargo xtask ci lint`. Add or change a lint check there, not in ci.yml. The
-  pre-push lane reuses the same constants, so the two cannot drift.
+  it as one `Lint (<shard>)` job per shard (`cargo xtask ci lint --shard
+  ${{ matrix.shard }}`), and `Lint` aggregates them. Add or change a lint
+  check there, not in ci.yml, and give it a shard: a test fails on a step with
+  none, and on a shard the ci.yml matrix does not list. The pre-push lane
+  reuses the same constants, so the two cannot drift.
 - **A CI clippy command stays one string literal on one line** in
   `lanes.rs`, with `-p autumn-web`, a quoted `--features "…"` list and
   `-D warnings`. `check-panic-gate.sh` and `check-determinism-gate.sh` read

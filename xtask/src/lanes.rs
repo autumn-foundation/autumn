@@ -9,7 +9,8 @@
 //! `scripts/check-determinism-gate.sh` collect the features of every enforcing
 //! `cargo clippy -p autumn-web … -D warnings` command to prove each gated module
 //! is linted with its feature on. They trust this file only while ci.yml runs
-//! `cargo xtask ci lint`. So:
+//! the lint lane, as the matrix `cargo xtask ci lint --shard ${{ matrix.shard }}`
+//! over every shard (a test below proves the matrix lists them all). So:
 //!
 //! - write each CI clippy command as one string literal on one line;
 //! - keep `-p autumn-web`, the quoted `--features "…"` list and `-D warnings`
@@ -84,6 +85,9 @@ pub struct Step {
     pub argv: Vec<String>,
     /// Extra environment for this step only.
     pub env: Vec<(&'static str, &'static str)>,
+    /// The CI job that runs this step, for a lane CI splits across runners
+    /// (`cargo xtask ci lint --shard <name>`). Every step of [`lint`] has one.
+    pub shard: Option<&'static str>,
 }
 
 impl Step {
@@ -101,6 +105,7 @@ impl Step {
             title,
             argv,
             env: Vec::new(),
+            shard: None,
         }
     }
 
@@ -113,11 +118,17 @@ impl Step {
             title,
             argv: words,
             env: Vec::new(),
+            shard: None,
         }
     }
 
     fn with_env(mut self, key: &'static str, value: &'static str) -> Self {
         self.env.push((key, value));
+        self
+    }
+
+    const fn in_shard(mut self, shard: &'static str) -> Self {
+        self.shard = Some(shard);
         self
     }
 }
@@ -134,6 +145,20 @@ pub struct Lane {
     /// Run every step and report all failures, rather than stopping at the
     /// first. CI wants the full list; locally the first break is enough.
     pub keep_going: bool,
+}
+
+impl Lane {
+    /// The lane's shard names, in the order their first step runs.
+    #[must_use]
+    pub fn shards(&self) -> Vec<&'static str> {
+        let mut shards = Vec::new();
+        for shard in self.steps.iter().filter_map(|s| s.shard) {
+            if !shards.contains(&shard) {
+                shards.push(shard);
+            }
+        }
+        shards
+    }
 }
 
 /// Every lane, for `cargo xtask list` and name lookup.
@@ -160,6 +185,14 @@ pub fn by_name(name: &str) -> Result<Lane> {
 ///
 /// Toolchain-free gates run first: they take seconds, and with `keep_going`
 /// their result is in the log before the multi-minute clippy runs start.
+///
+/// CI runs the lane as one job per shard (`cargo xtask ci lint --shard
+/// <name>`), side by side. Run in one job, the steps took 45 minutes on a
+/// cold cache: the four clippy lanes 13, 9, 8 and 7 minutes, the table-width
+/// and accessibility gates 6, the rest about 1. Each clippy lane is a shard of
+/// its own; the gates share one. Every step must name a shard, and ci.yml's
+/// matrix must list every shard: a test below checks both, and the panic and
+/// determinism gates trust the clippy commands here only while it holds.
 #[must_use]
 pub fn lint() -> Lane {
     Lane {
@@ -167,27 +200,31 @@ pub fn lint() -> Lane {
         about: "CI's `lint` job: formatting, clippy lanes, and the repo gates",
         keep_going: true,
         steps: vec![
-            Step::cmd("fmt", "Check formatting", FMT_CHECK),
+            Step::cmd("fmt", "Check formatting", FMT_CHECK).in_shard(GATES),
             // The Rust tests only search the widget runtime for strings, so a
             // syntax error there passes them (#3406). Node parses the file.
             Step::cmd(
                 "widget-runtime-parses",
                 "Check the widget runtime parses",
                 "node --check autumn/vendor/autumn-widgets.js",
-            ),
+            )
+            .in_shard(GATES),
             // The search family's runtime (#3408) is its own file. The server
             // joins it to the bundle when `widgets-search` is on.
             Step::cmd(
                 "widget-search-runtime-parses",
                 "Check the search widget runtime parses",
                 "node --check autumn/vendor/autumn-widgets-search.js",
-            ),
-            panic_gate(),
-            determinism_gate(),
+            )
+            .in_shard(GATES),
+            panic_gate().in_shard(GATES),
+            determinism_gate().in_shard(GATES),
             // The resolver layer asks `cargo metadata` what cargo resolves, so
             // CI requires it rather than letting the gate skip it.
-            sqlite_unification().with_env("SQLITE_GATE_REQUIRE_RESOLVE", "1"),
-            bin_names(),
+            sqlite_unification()
+                .with_env("SQLITE_GATE_REQUIRE_RESOLVE", "1")
+                .in_shard(GATES),
+            bin_names().in_shard(GATES),
             // Every `[[bench]]` needs an entry in docs/perf/bolt/workloads.toml
             // and a committed callgrind + dhat profile. No build. See
             // docs/perf/README.md.
@@ -196,19 +233,23 @@ pub fn lint() -> Lane {
                 "Bolt profile gate (every workload has a profile)",
                 "check-perf-profiles.py",
                 &["bolt"],
-            ),
-            Step::cmd("clippy-workspace", "Clippy", CLIPPY_WORKSPACE),
+            )
+            .in_shard(GATES),
+            Step::cmd("clippy-workspace", "Clippy", CLIPPY_WORKSPACE).in_shard("clippy-workspace"),
             Step::cmd(
                 "clippy-gated",
                 "Clippy (autumn-web, gated request-path features — panic gate)",
                 CLIPPY_GATED,
-            ),
+            )
+            .in_shard("clippy-gated"),
             Step::cmd(
                 "clippy-plugin-sandbox",
                 "Clippy (autumn-web, plugin-sandbox — panic gate)",
                 CLIPPY_PLUGIN_SANDBOX,
-            ),
-            Step::cmd("clippy-repl", "Clippy (autumn-web, repl)", CLIPPY_REPL),
+            )
+            .in_shard("clippy-plugin-sandbox"),
+            Step::cmd("clippy-repl", "Clippy (autumn-web, repl)", CLIPPY_REPL)
+                .in_shard("clippy-repl"),
             // No framework diesel declaration over 32 columns, and no wide
             // diesel feature: cargo unifies it onto every app. Apps get the
             // same findings as a warning from `autumn build`. See
@@ -217,7 +258,8 @@ pub fn lint() -> Lane {
                 "table-width",
                 "Diesel table-width gate (no framework declaration over 32 columns)",
                 "cargo run -p autumn-cli --bin autumn -- schema width .",
-            ),
+            )
+            .in_shard(GATES),
             // Raw `html!` fields that bypass the typed a11y primitives and have
             // no accessible name, over the whole repo (#1934). The scanner
             // skips `target/`, dot-dirs and `tests/`.
@@ -225,10 +267,15 @@ pub fn lint() -> Lane {
                 "a11y",
                 "Accessibility gate (raw html! escape hatches across the repo)",
                 "cargo run -p autumn-cli --bin autumn -- a11y verify .",
-            ),
+            )
+            .in_shard(GATES),
         ],
     }
 }
+
+/// The lint shard for every step that is not a clippy lane: formatting, the
+/// repo gates, and the two `autumn` CLI gates. About 7 minutes together.
+const GATES: &str = "gates";
 
 /// The local pre-push gate: compile what CI compiles, without running it.
 ///
@@ -417,6 +464,7 @@ fn integration_compile(id: &'static str, title: &'static str, features: &str) ->
         .map(str::to_owned)
         .to_vec(),
         env: Vec::new(),
+        shard: None,
     }
 }
 
@@ -655,14 +703,70 @@ mod tests {
         );
     }
 
-    /// The `lint` job runs the whole lane. The panic and determinism gates
-    /// trust the clippy commands here only on this exact line.
+    /// Every step of the lint lane runs in exactly one CI shard.
     #[test]
-    fn ci_lint_job_runs_the_whole_lint_lane() {
-        let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml")).unwrap();
+    fn every_lint_step_names_a_shard() {
+        let lane = lint();
+        let missing: Vec<_> = lane
+            .steps
+            .iter()
+            .filter(|s| s.shard.is_none())
+            .map(|s| s.id)
+            .collect();
         assert!(
-            ci.lines().any(|l| l.trim() == "run: cargo xtask ci lint"),
-            "ci.yml must run `cargo xtask ci lint`"
+            missing.is_empty(),
+            "lint steps without a shard: {missing:?}"
+        );
+        assert!(
+            lane.shards().len() > 1,
+            "the lint lane is split into shards"
+        );
+    }
+
+    /// ci.yml runs the lint lane as one job per shard. The panic and
+    /// determinism gates trust the clippy commands here only on this exact
+    /// line, so the matrix beside it must name every shard and nothing else:
+    /// a shard left out would drop its steps from CI with every job green.
+    #[test]
+    fn ci_lint_shards_run_every_shard_of_the_lint_lane() {
+        let ci = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        assert!(
+            ci.lines()
+                .any(|l| l.trim() == "run: cargo xtask ci lint --shard ${{ matrix.shard }}"),
+            "ci.yml must run `cargo xtask ci lint --shard ${{{{ matrix.shard }}}}`"
+        );
+        assert!(
+            !ci.lines().any(|l| l.trim() == "run: cargo xtask ci lint"),
+            "ci.yml runs the lint lane as shards; a whole-lane run beside them \
+             would lint everything twice"
+        );
+        let job = ci
+            .split("\n  lint-shard:\n")
+            .nth(1)
+            .expect("ci.yml must define the `lint-shard` job");
+        let matrix: Vec<&str> = job
+            .lines()
+            .map(str::trim)
+            .find_map(|l| l.strip_prefix("shard: ["))
+            .and_then(|l| l.strip_suffix(']'))
+            .expect("`lint-shard` must list its shards as `shard: [..]` on one line")
+            .split(',')
+            .map(str::trim)
+            .collect();
+        let mut listed = matrix.clone();
+        listed.sort_unstable();
+        let mut defined = lint().shards();
+        defined.sort_unstable();
+        assert_eq!(
+            listed, defined,
+            "ci.yml's `lint-shard` matrix must list exactly the lint lane's shards"
+        );
+        assert_eq!(
+            matrix.len(),
+            listed.iter().collect::<HashSet<_>>().len(),
+            "a shard listed twice runs twice: {matrix:?}"
         );
     }
 

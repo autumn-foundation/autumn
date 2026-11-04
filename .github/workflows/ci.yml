@@ -25,8 +25,19 @@ jobs:
   meta:
     uses: ./.github/workflows/runner-routing.yml
 
-  lint:
-    name: Lint
+  lint-shard:
+    name: Lint (${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # One job per shard of the `lint` lane, side by side. Run as one job
+        # the lane took 45 minutes on a cold cache; its longest step,
+        # `clippy-workspace`, is 13. The shards are defined in
+        # xtask/src/lanes.rs, next to the steps. This list must name every one
+        # of them: `ci_lint_shards_run_every_shard_of_the_lint_lane` in that
+        # file fails otherwise, and the panic and determinism gates trust the
+        # lane's clippy commands only while it holds.
+        shard: [gates, clippy-workspace, clippy-gated, clippy-plugin-sandbox, clippy-repl]
     runs-on: ubuntu-latest
     env:
       # `cargo clippy --workspace --all-targets` compiles autumn-web alongside
@@ -35,8 +46,8 @@ jobs:
       # job has repeatedly died ~60s in with `exit 143` and "The runner has
       # received a shutdown signal" — the host reclaiming the runner agent, not
       # a lint failure: when it survives, the same step passes in ~7 minutes.
-      # Capping the compile jobs bounds that peak. This job gates `test`,
-      # `loom` and `coverage`, so a runner death here skips the whole suite.
+      # Capping the compile jobs bounds that peak. Every shard keeps the cap:
+      # the step times the shards are sized by were measured with it.
       CARGO_BUILD_JOBS: 2
     steps:
       - uses: actions/checkout@v7
@@ -52,24 +63,44 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.7.8
-      - name: Lint lane (cargo xtask ci lint)
+        with:
+          # rust-cache keys by job, not by matrix entry; without this the
+          # shards would restore and overwrite each other's target dirs.
+          key: ${{ matrix.shard }}
+      - name: Lint lane shard (cargo xtask ci lint --shard)
         # Every check this job runs is a step of the `lint` lane in
         # xtask/src/lanes.rs: formatting, the widget-runtime parse, the
         # toolchain-free repo gates (panic, determinism, sqlite unification,
         # binary names, Bolt profiles), the four clippy lanes, the diesel
         # table-width gate and the accessibility gate. The reason for each
-        # lives next to its command there.
+        # lives next to its command there, and so does the shard it runs in.
         #
-        # The lane runs every step even after one fails and prints a summary,
-        # so one run reports every break. Each step's log is a collapsible
-        # group, a failing step is an error annotation, and the summary table
-        # goes to the job summary. To reproduce one step locally:
-        # `cargo xtask ci lint --only <step>`; `--list` shows the step names.
+        # A shard runs every one of its steps even after one fails and prints
+        # a summary, so one run reports every break. Each step's log is a
+        # collapsible group, a failing step is an error annotation, and the
+        # summary table goes to the job summary. To reproduce locally:
+        # `cargo xtask ci lint --shard <shard>`, or one step with
+        # `--only <step>`; `--list` shows the steps and their shards.
         #
         # `scripts/check-panic-gate.sh` and `scripts/check-determinism-gate.sh`
         # read the clippy commands in xtask/src/lanes.rs as this job's enforcing
-        # clippy lanes, and only while this line runs the lane.
-        run: cargo xtask ci lint
+        # clippy lanes, and only while this line runs the lane's shards.
+        run: cargo xtask ci lint --shard ${{ matrix.shard }}
+
+  lint:
+    name: Lint
+    # The stable check name for branch protection, and what every other job
+    # `needs`. It fails if any shard failed or was cancelled; a `needs:` alone
+    # would let a skipped shard pass.
+    needs: [lint-shard]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check shard results
+        run: |
+          result='${{ needs.lint-shard.result }}'
+          echo "lint shards: $result"
+          [ "$result" = "success" ] || { echo "::error::a lint shard did not succeed ($result)"; exit 1; }
 
   migration-guides:
     name: Migration guide coverage

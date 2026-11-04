@@ -12,7 +12,8 @@ cargo xtask pre-push
 (`./scripts/pre-push-check.sh` runs the same thing.) The steps are the
 `pre-push` lane in `xtask/src/lanes.rs`; `cargo xtask pre-push --list` names
 them, `--from <step>` resumes after a fix, and `--dry-run` prints the commands.
-CI's `lint` job is the `lint` lane of the same file (`cargo xtask ci lint`), and
+CI's `lint` job is the `lint` lane of the same file (`cargo xtask ci lint`,
+run in CI as one job per shard: `--shard <shard>`), and
 the two lanes share their clippy feature lists, so they cannot drift apart.
 `cargo xtask list` shows every lane and every script under `scripts/`.
 
