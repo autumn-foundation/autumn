@@ -298,7 +298,7 @@ enum Segment<'t> {
 }
 
 /// The first backtick run at or after `from` that is exactly `len` long.
-fn closing_run(text: &str, from: usize, len: usize) -> Option<usize> {
+const fn closing_run(text: &str, from: usize, len: usize) -> Option<usize> {
     let b = text.as_bytes();
     let mut p = from;
     while p < b.len() {
