@@ -53,7 +53,7 @@ did not have the `autumn-` prefix (issue #3396).
 ## Consequences
 
 - Apps that target the old class names must rename their selectors. See
-  `docs/migrations/next.md`.
+  `docs/migrations/0.10.0.md`.
 - An app that overrides a color with a plain value loses the dark value for
   that token. It can override with its own `light-dark()`.
 - A page cache shared between users must vary on `Cookie` when the layout
