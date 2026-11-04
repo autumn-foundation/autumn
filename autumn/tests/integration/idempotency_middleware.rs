@@ -737,6 +737,7 @@ async fn test_manual_route_registered_through_routes_fails_closed_without_replay
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
+        group: None,
     };
 
     let client = TestApp::new().routes(vec![route]).idempotent().build();
@@ -785,6 +786,7 @@ async fn test_manual_route_with_openapi_method_fails_closed_without_replay_stop(
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
+        group: None,
     };
 
     let client = TestApp::new().routes(vec![route]).idempotent().build();
@@ -826,6 +828,7 @@ async fn test_manual_scoped_route_registered_through_routes_fails_closed_without
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
+        group: None,
     };
 
     let client = TestApp::new()
@@ -1486,6 +1489,7 @@ async fn test_manual_layered_route_can_check_access_before_replay_stop() {
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
+        group: None,
     };
 
     let client = TestApp::new().routes(vec![route]).idempotent().build();
@@ -1538,6 +1542,7 @@ async fn test_manual_layered_direct_route_fails_closed_instead_of_stale_replay()
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
         api_version: None,
         sunset_opt_out: false,
+        group: None,
     };
 
     let client = TestApp::new().routes(vec![route]).idempotent().build();
@@ -2709,7 +2714,7 @@ fn test_default_store_ttl_trait_impl() {
 
     assert_eq!(
         BareStore.default_ttl(),
-        Duration::from_secs(86_400),
+        Duration::from_hours(24),
         "IdempotencyStore::default_ttl() must return 24 hours"
     );
 }

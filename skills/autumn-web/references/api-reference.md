@@ -679,6 +679,14 @@ delete actions remain last-write-wins.
   `.initial_backoff(d)` / `.max_backoff(d)`; retrying constructors default
   to 5 attempts.
 
+## Hedged requests (`autumn_web::hedge`)
+
+- `hedged(HedgePolicy::new(delay).with_max_hedges(n), allow, |attempt| fut)`
+  starts `make(0)`, and after each `delay` of silence starts another copy
+  (up to `n`, default 1). It returns the first output and drops the rest.
+  `allow` is asked before each extra copy; return `false` (for example from a
+  retry budget) to stop hedging. Only hedge calls that are safe to run twice.
+
 ## Money and the ledger (`autumn_web::money`, 0.8.0, #1837)
 
 Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
@@ -703,13 +711,14 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
 - `MoneyError` {`Overflow`, `CurrencyMismatch`, `UnknownCurrency`, `Inexact`,
   `InvalidWeights`} → 422, except `Overflow` → 500.
 - `money::ledger::{ensure_account, set_allow_negative, account, post, balance,
-  transaction_by_key, trial_balance}` — all take `&mut RuntimeConnection`, so
+  transaction_by_key, trial_balance, balance_drift}` — all take `&mut RuntimeConnection`, so
   they nest inside `Db::tx`. `post` **requires** a transaction.
 - `Account::new(id, currency)` / `.disallow_negative()`; `Posting::debit(...)` /
   `::credit(...)`; `Transaction::new(key, postings).memo(...)` /
   `.validate()`; `IdempotencyKey::new(s)` / `::derive(namespace, &postings)`;
   `PostOutcome::{Posted, Replayed}` with `is_posted` / `is_replayed` /
-  `transaction`; `PostedTransaction`, `CurrencyTotal`, `Side`.
+  `transaction`; `PostedTransaction`, `CurrencyTotal`, `BalanceDrift`
+  (`account_id` / `stored` / `posted`), `Side`.
 - `LedgerError` {`Money`, `Unbalanced`, `PostingCount`, `OneSided`,
   `ZeroPosting`, `MixedCurrencies`, `NegativeAmount`, `UnknownAccount`,
   `AccountCurrency`, `KeyReuse`, `InvalidText`, `NegativeBalance`,
@@ -718,7 +727,11 @@ Not `autumn_web::ledger`, which is the bitemporal *record* ledger.
   `EmptyTransaction` / `Database`, 422 for the rest.
 - Tables `ACCOUNTS_TABLE` / `TRANSACTIONS_TABLE` / `POSTINGS_TABLE`
   (`_autumn_money_*`), append-only by trigger on both backends, shipped in the
-  framework migration set.
+  framework migration set. The account row stores the balance
+  (`balance_minor`, #3339). A trigger keeps it, so `post` and `balance` do not
+  read the posting history, except one time for each account after the
+  migration. `NULL` means "not known": the next `post` sums the
+  postings and stores the result.
 
 ## SLA obligations (`autumn_web::sla`, 0.8.0, #1826)
 
@@ -808,7 +821,35 @@ Free functions rendering changeset-aware, accessible inputs:
   `FieldControl` variants (`#[non_exhaustive]`): `Text`, `Textarea`,
   `Password`, `Number { step: Option<String> }`, `Checkbox`, `Date`,
   `DateTime`, `Select { options: Vec<(String, String)> }`, `File` (any
-  `File` field ⇒ `enctype="multipart/form-data"`).
+  `File` field ⇒ `enctype="multipart/form-data"`), and **(#3405)**
+  `Switch`, `Range { step }`, `Radio { options }`, `CheckboxGroup { options }`,
+  `Segmented { options }`, `Email`, `Tel`, `Url`, `Time` (derived for a
+  `NaiveTime` column), `Month`, `Color`, `Hidden`.
+- **(#3405)** native input helpers, each with `*_with(.., &FieldOptions)`:
+  `switch_input` (`role="switch"` checkbox, `#[serde(default)] bool`),
+  `range_input(.., step)`, `radio_group(.., &[(value, label)])`,
+  `checkbox_group(..)` (bind `#[serde(default)] Vec<String>`; prefilled from
+  `Changeset::field_values`), `segmented_control(..)`, `email_input`,
+  `tel_input`, `url_input`, `time_input` (`HH:MM`, reads into `NaiveTime`),
+  `month_input` (`YYYY-MM` `String`), `color_input` (lowercase `#rrggbb`),
+  `hidden_input(&cs, field)` (no label, no wrapper). `required_*` exists for
+  switch, radio group, segmented, email, tel, url, time, month. Range, color
+  and hidden drop `required`; a required checkbox group shows the marker
+  only (validate "one or more" on the server). A group is a `<fieldset>` +
+  `<legend>`; the first input has `id="{field}"` so `error_summary` links
+  land on it, the rest `id="{field}-{index}"`.
+- **(#3409)** select: `grouped_select_input(&cs, field, label, &[(value,
+  label)], &[(group_label, &[(value, label)])])` (+ `_with`, `required_`)
+  writes top-level options, then one `<optgroup>` per group;
+  `FieldControl::GroupedSelect { options, groups }` for `form_for`.
+  `FieldOptions::multiple()` writes `multiple` on a `<select>` or a file
+  input; a multiple select marks every `Changeset::field_values` value (bind
+  `#[serde(default)] Vec<T>`; in `form_for` the model `required` flag skips
+  it). A single select marks only the first matching option.
+  `FieldOptions::styled_select()` adds `autumn-select`: `appearance:
+  base-select` behind `@supports`; other browsers and `multiple` keep the
+  native control. No JS. `FieldContext::control` writes `multiple` on a
+  custom `select` or file `input`.
   Decode-side contracts handled by the `#[model]`-generated `NewX`:
   non-nullable `bool` columns are `#[serde(default)]` (unchecked checkbox ⇒
   `false`); datetime columns attach `deserialize_datetime_local_utc[_option]`
@@ -912,7 +953,9 @@ Per-primitive setters (in addition to the shared set):
 - `autumn_web::widgets`: `card(&body, &CardConfig)`,
   `stat_card(label, value, link)`, `tabs(id, &[(id, label, markup)])`,
   `modal(id, title, &body, &ModalConfig)`, `modal_trigger`,
-  `modal_close_button`, `confirm_action(...)`.
+  `modal_close_button`, `confirm_action(...)`,
+  `drawer(id, title, &body, &DrawerConfig)`, `drawer_trigger` (#3403);
+  `DialogSize` sizes both, `close_button(label)` adds a ×.
 - `autumn_web::widgets::transition_controls(action, field, current,
   transitions, can, csrf, csrf_field)` (#1917) — renders one CSRF-protected,
   no-JS `POST` form + submit button per field-level `#[state_machine]`
@@ -1021,10 +1064,45 @@ Per-primitive setters (in addition to the shared set):
   `#field`; the root has `id="error-summary" tabindex="-1" autofocus`, so
   focus moves to it on a failed submit — one per page). All prelude
   re-exported.
+- `autumn_web::widgets` small display set (#3406,
+  `docs/guide/display-widgets.md`): `button(label, &ButtonConfig)` with
+  `ButtonVariant::{Primary,Secondary,Ghost,Destructive,Link}`,
+  `ButtonSize::{Small,Medium,Large}`, `.kind/.submit/.icon/.icon_only/
+  .disabled/.id/.class/.attrs`, `.loading()` (static `aria-busy="true"` +
+  `disabled`) and `.loading_on_request()` (`data-autumn-busy`: busy during its own
+  request — it sends it, submits the form, or `hx-indicator` names it;
+  `autumn-widgets.js` sets `aria-busy` on it and the swap target);
+  `.attrs` passes app attributes through (widget-owned names win); `button_group(label, &[Markup])` /
+  `button_group_with(.., &ButtonGroupConfig::new().vertical())`;
+  `spinner(label)` / `spinner_with(.., &SpinnerConfig)` (`SpinnerSize`,
+  `.indicator(id)`); `skeleton(SkeletonShape::{Line,Block,Circle})` /
+  `skeleton_with(.., &SkeletonConfig::new().count(n).indicator(id))` — an
+  indicator has `autumn-indicator`, hidden until `.htmx-request`;
+  `progress(label, Option<f64>, max)` / `progress_with(.., &ProgressConfig)`
+  and `meter(label, value, min..=max)` / `meter_with(.., &MeterConfig)`
+  (`low/high/optimum/visible_label/value_text`, values clamped);
+  `separator()` / `separator_with(&SeparatorConfig::new().vertical()
+  .decorative())`; `kbd(key)` / `kbd_combo(&[keys])`;
+  `empty_state(title, body, Option<&Markup>)` / `empty_state_with(..,
+  &EmptyStateConfig)`; `avatar_group(label, &[Markup])` /
+  `avatar_group_with(.., &AvatarGroupConfig)` (`max` counts the `+N` item,
+  default `DEFAULT_AVATAR_GROUP_MAX` = 5; `.total`, `.size`,
+  `.more_label("{count} more")`). `FieldOptions::auto_grow()` and
+  `a11y::TextArea::auto_grow()` add `autumn-auto-grow`
+  (`field-sizing: content`). All prelude re-exported.
+- `autumn_web::widgets::{accordion, collapsible, collapsible_with}` +
+  `AccordionConfig::new(name)` / `CollapsibleConfig` — no-JS disclosure on
+  native `<details>`. Exclusive by default; `.multiple()`, `.open(i)`,
+  `.level()`, `.class()`, `.attrs()`. See `docs/guide/accordion.md`.
 - `autumn_web::widgets` feedback atoms: `toast(message, AlertVariant)` /
-  `toast_in(region_id, message, AlertVariant)` / `toast_region(id)` +
+  `toast_in(region_id, message, AlertVariant)` /
+  `toast_with(message, AlertVariant, &ToastConfig)` / `toast_region(id)` +
   `DEFAULT_TOAST_REGION_ID` — transient htmx toast appended out-of-band
-  (`hx-swap-oob="beforeend:#<region-id>"`), CSS-only auto-dismiss (no JS).
+  (`hx-swap-oob="beforeend:#<region-id>"`), CSS auto-dismiss after
+  `DEFAULT_TOAST_DURATION` (5 s). Hover or focus pauses the timer.
+  `ToastConfig` setters: `region`, `duration`, `persistent`, `close_label`.
+  A persistent toast ignores `duration`. Each toast has a close button;
+  `autumn-widgets.js` shows it and moves focus on close (no JS: no button). The region is `popover="manual"`, so toasts show above a modal.
   `toast_region` is a persistent `aria-live="polite"` region; non-error toasts
   inherit its politeness (no own `role`/`aria-live`) while `Error` announces
   assertively via its own `role="alert"` (reuses the `AlertVariant` color
@@ -1033,7 +1111,12 @@ Per-primitive setters (in addition to the shared set):
   — htmx infinite-scroll / "Load more" feed from a `CursorPage`: one cursored
   `hx-get` sentinel appends the next page in place (no reload, no duplicate
   rows), progressive `<a href>` fallback; `feed_page` is the per-page append
-  fragment. All prelude re-exported.
+  fragment. `tooltip(id, text, |tip| trigger)` /
+  `tooltip_with(id, text, &TooltipConfig, |tip| trigger)` with
+  `TooltipPlacement::{Top,Bottom,Start,End}` — accessible tooltip: the
+  closure gets the `role="tooltip"` id for `aria-describedby` (or
+  `aria-labelledby`); hover/focus show it, Escape hides it, `interestfor` on
+  Chromium (`docs/guide/tooltip.md`). All prelude re-exported.
 - `autumn_web::flash::{flash_messages, flash_messages_with,
   FlashMessagesConfig}` — accessible flash-banner renderer (per-severity
   `role`/`aria-live`, `autumn-flash--<level>` classes, empty renders nothing,
@@ -1074,6 +1157,26 @@ Per-primitive setters (in addition to the shared set):
 (Typed accessible primitives — `Img` / `Button` / `Link` / `MenuItem` /
 `TextField` / `TextArea` / `Select` / `Checkbox` / `FileField` — are documented
 in **Typed accessible primitives** above.)
+
+## Widget packs (`autumn_web::widget_pack`, feature `maud`, #3400)
+
+| API | Notes |
+|---|---|
+| `WidgetPack::new(name)` | `name` is `[a-z0-9]` words joined by `-`; panics otherwise. Classes are `autumn-<name>-*`. |
+| `.extend(stories)` / `.assets(&'static PluginAssets)` | Stories (slug must start `<name>-`) and the CSS/JS bundle. |
+| `.head()` / `.gallery()` / `.stylesheet_urls()` / `.script_urls()` | Layout tags with SRI; a `StoryGallery` with the asset links. |
+| `AppBuilder::widget_pack(pack)` | Serves the bundle and merges the stories into `/_stories`. Second install of a name is a no-op. |
+| `AppBuilder::with_story_gallery(g)` | Adds (merges); duplicate slugs panic at startup. |
+| `StoryGallery::stylesheet(href)` / `.script(src)` / `.merge(other)` | Extra assets each gallery page links. |
+| `form::FieldRenderer` (`name`, `render`, `multipart`, `grouped`) | Plugin form control. `FieldControl::custom(r)`, `custom_input_with(&cs, field, label, &r, &opts)`. |
+| `form::FieldContext::control(tag, attrs, body)` | Writes the control with `id`/`name`/`value`/`required`/`aria-*` + passthrough; drops owned names, `on*`/`hx-on*`, `style`; never pre-fills password/file/checkbox/radio. |
+| `form::FieldContext::group_item(tag, suffix, attrs, body)` | One input of a grouped (`<fieldset>`) control: `id="{field}-{suffix}"`, `name`, `required`, `aria-invalid`, passthrough. |
+| `widget_pack::element(tag, attrs, &FieldOptions, body)` | Root of a non-input widget with the app `data-*`/`hx-*` passthrough. |
+| `plugin_conformance::run_conformance(&ConformanceConfig::new(name).contract(c).no_routes(), &routes)` | For a plugin that mounts no routes (cache, background runtime): no route under the config name or the contract's `plugin`/`registered_as` skips `route-attribution`; such a route fails it. Take the contract from `builder.plugin_contracts()` (it carries `registered_as`); without that, every plugin route fails. Do not set a `prefix` with it. Library counterpart of `autumn plugin-check --no-routes`. |
+| `plugin_conformance::widgets::run_widget_conformance(&pack)` | Static: `widget-pack-name`, `widget-stories`, `widget-class-names`, `widget-markup-csp`, `widget-tokens`, `widget-scripts`. |
+| `plugin_conformance::widgets::browser::run_widget_browser_conformance(&pack, axe_src).await` | Feature `system-tests`: `widget-axe` (light + dark), `widget-console`, `widget-keyboard`. |
+| `Page::axe_violations(axe_src)` / `SystemTest::plugin_assets(&ASSETS)` | Shared axe check; serve a bundle in a system test. |
+| `autumn:init` event | Fires on `document` at `DOMContentLoaded` and on each htmx-swapped root, before roving init. |
 
 ## Cache read-through (0.6.0)
 
@@ -1362,7 +1465,10 @@ double-submits and replays.
   `Auth`, `ApiToken`, `RequireApiToken`, `CsrfToken`, `CsrfFormField`,
   `PageRequest`, `Page`, `CursorRequest`, `CursorPage`, `Valid`,
   `ValidateExt`, `Validated`, `Flash`, `Multipart`, `HxRequest`,
-  `HxResponseExt`, `Sse`, `Event`, `TaskArgs`, `SignedWebhook`.
+  `HxResponseExt`, `Sse`, `Event`, `TaskArgs`, `SignedWebhook`. With CSRF off
+  (the dev default), `CsrfToken` is empty; `Option<CsrfToken>` is `None`.
+- Database: `autumn_web::db::prelude::*` (Diesel's prelude with the async
+  `RunQueryDsl`), `AppBuilder::migrations_for(MigrationScope, set)`.
 - Error and response: `AutumnError`, `AutumnResult`, `IntoResponse`,
   `StatusCode`, `Redirect`.
 - Data helpers: `Changeset`, `ChangesetForm`, `IntoChangeset`, mutation hook
@@ -1526,8 +1632,8 @@ middleware (tenant scoping, an auth shim, request enrichment) — mapping the
 layer onto individual handlers instead tests a stack the real app never
 serves.
 
-`Page`: `visit`, `fill`, `click`, `expect_text`, `expect_url`,
-`expect_attribute`, `expect_hx_settle`, `expect_sse_event`,
+`Page`: `visit`, `fill`, `click`, `press`, `hover`, `move_mouse(x, y)`, `set_javascript_enabled`, `expect_text`, `expect_url`,
+`expect_attribute`, `expect_on_top`, `expect_hx_settle`, `expect_sse_event`,
 `expect_no_console_errors`, `console_errors`, `snapshot`, `evaluate`. The
 `expect_*` assertions poll to a deadline and ignore the transient CDP errors a
 mid-poll navigation produces; `evaluate` is a single raw call that does not.
@@ -1621,6 +1727,7 @@ Limits are two independent sets. `Limits { max_bytes: 512 KiB, max_depth: 64,
 max_nodes: 20_000 }` bounds the **document** and is applied before and around
 deserialization. `RenderLimits { max_depth: 128, max_nodes: 50_000, max_each_items: 5_000,
 max_output_bytes: 4 MiB }` bounds the **expansion** against runtime state.
+Work is bounded too: 320 fuel units per allowed node, spent on nodes, expressions and bytes scanned.
 `max_output_bytes` spans the body and every portal together and also caps what
 one expression may *build* (`concat`/`array`/`obj`/`+` assemble a value inside
 the evaluator before any of it is emitted); `max_depth` caps the shape of state
@@ -2204,7 +2311,9 @@ record lives in the tenant's zone, where autumn holds no credential.
 A failure names the domain AND its tenant in the `custom_domains` health
 indicator and raises #1610's `scheduled_task_failure` alert for
 `custom_domain_certificates`, while every other domain keeps serving and
-renewing. `autumn doctor` grades the section and, with `--online`, flags
+renewing. The same indicator reports `issuance_budget` (orders used this hour,
+both caps, `global_retry_after_secs`, `domains_at_limit`). A spent budget stays
+`Up`: it means throttled, not broken. `autumn doctor` grades the section and, with `--online`, flags
 registered domains whose DNS no longer points here. Offboarding stops routing,
 serving and renewal and deletes the stored certificate; the `custom_domains`
 retention dataset prunes abandoned registrations and orphaned certificates.

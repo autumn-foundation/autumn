@@ -12,7 +12,7 @@ description: >
 
 **Repository**: https://github.com/autumn-foundation/autumn
 **Branch**: `trunk-dev`
-**Latest release**: 0.9.0 | **Edition**: 2024 | **MSRV**: 1.88.0
+**Latest release**: 0.9.0 | **Edition**: 2024 | **MSRV**: 1.97.0
 
 **Version identity trip wire**: the workspace on `trunk-dev` is versioned
 0.9.0, and `v0.9.0` is the current release line — `autumn-web = "0.9"`,
@@ -39,7 +39,7 @@ when their details matter:
   `docs/guide/`, grouped by task, each entry naming the question that page
   answers. Start here when the topic you need is not covered by this file or
   the references below, rather than guessing a filename — the index is gated
-  by `scripts/check-docs-guide-index.sh`, so it lists every guide page that
+  by `cargo xtask check docs-guide-index`, so it lists every guide page that
   exists and nothing that does not.
 - `references/api-reference.md` - release-line API map, proc macros,
   feature flags, AppBuilder methods, config env names, and dependency versions.
@@ -214,6 +214,18 @@ my-app/
 > changed action on an existing foreign key. If the database already has the
 > action, declare it on the model. See `docs/guide/declarative-schema.md`.
 
+> **Keep every Diesel `table!` and `#[model]` at 32 columns or fewer.** A 33rd
+> column in one declaration forces diesel's `64-column-tables` feature, and
+> Cargo turns it on for the whole build: every crate that uses diesel then
+> compiles slower and needs more memory (one crate measured 1.16 GB / 1m18s at
+> 32, 2.92 GB / 2m04s at 64 and 9.95 GB / 8m16s at 128). The cap is per
+> declaration, not per database table: declare a wide table in halves, the
+> second with `#[sql_name = "<table>"]`, and put each `#[model(table = …)]` on
+> one half. Every `NOT NULL` column without a default goes in the half you
+> insert through. `autumn build` warns about a wide declaration but does not
+> fail. `autumn schema width` lists them and exits non-zero. See
+> `docs/guide/table-width.md`.
+
 ## Cargo.toml
 
 ```toml
@@ -261,7 +273,9 @@ Defaults: `maud`, `htmx`, `tailwind`, `db`, `cache-moka`.
 | `flash` | Flash messages |
 | `multipart` | Multipart uploads |
 | `redis` | Redis sessions, channels, jobs, webhook replay, and integration points |
-| `oauth2` | OAuth2/OIDC helpers and `autumn generate auth --oauth` scaffolding |
+| `oauth2` | OAuth2/OIDC helpers and `autumn generate auth --oauth` scaffolding; implies `jwt` |
+| `jwt` | Default-on. JWT verification (`jsonwebtoken`): the `jwt` tenancy source and the OIDC `id_token` check |
+| `push` | Default-on. Web Push (`autumn_web::push`, `WebPush`, `[push]`) over `p256` |
 | `openapi` | OpenAPI route metadata and spec generation |
 | `mcp` | Project typed JSON endpoints as MCP tools; implies `openapi` |
 | `webmcp` | Routes (`#[api_doc(webmcp)]` + `mount_webmcp()`) and forms (`webmcp::form_tool`) as tools for the agent in the user's browser; implies `mcp` and `htmx`. Guide: `docs/guide/webmcp.md` |
@@ -333,6 +347,7 @@ error. See `docs/guide/getting-started.md` "Tuning the Tokio runtime".
 | `.jobs(jobs![...])` | Register request-triggered `#[job]` work |
 | `.one_off_tasks(one_off_tasks![...])` | Register operational `#[task]` commands |
 | `.migrations(MIGRATIONS)` | Register embedded Diesel migrations |
+| `.migrations_for(MigrationScope::Control \| Shards, MIGRATIONS)` | Register a set for the control database only, or for the shards and fleet files only. Do not run `autumn migrate` on such an app; use `AUTUMN_MIGRATE=1` |
 | `.plugin_migrations(name, MIGRATIONS)` | Register a plugin's embedded Diesel migrations (named; version collisions with other sources auto-resolve) |
 | `.plugin(plugin)` / `.plugins((...))` | Install first- or third-party plugins |
 | `.plugin_assets(&ASSETS)` | Serve a plugin crate's JS/CSS/fonts (`PluginAssets`, from `plugin_assets!("ns")` or `PluginAssets::from_files`) at content-hashed `immutable` URLs under `/static/_plugins/<ns>/`, with SRI; call it from `Plugin::build`. Never hand-roll a fixed-URL asset route in a plugin (see `docs/guide/plugin-assets.md`) |
@@ -872,8 +887,12 @@ The column defaults to `{snake(child)}_count` — **singular**, matching
 caller's tenant (both tables must carry that column); without it no tenant
 predicate is emitted. `parent_pk = "<column>"` names the parent's primary-key
 column when it is not `id` (a renamed `#[id]` or `#[diesel(column_name)]`) —
-the child cannot see the parent's fields, so it is never inferred (#2662). It
-is a **`belongs_to`** option only — on a `has_many`, on
+the child cannot see the parent's fields, so it is never inferred (#2662).
+`#[belongs_to(Post, references = "<column>")]` names that key once for the
+leg (#3033): the preload loader, counter cache and derivations inherit it, and
+a conflicting `parent_pk` is a compile error. A `#[model]` may use any
+primary-key column; `#[repository]` still assumes `id`. `parent_pk` is a
+**`belongs_to`** option only — on a `has_many`, on
 a `through =` join table, with a non-identifier column, with two legs resolving
 onto one parent column, or on a composite `#[id]`, it is a directed compile
 error.
@@ -1301,14 +1320,18 @@ Rules that matter:
   currency the account does not hold, and a balance that would leave `i64`.
 - The same key for *different* money is `LedgerError::KeyReuse` (409), never a
   silent replay of the wrong result.
-- `ledger::balance(conn, id)` sums an account. `ledger::trial_balance(conn)`
-  returns every currency's total, each of which must be zero — run it from a
-  scheduled job or a health check.
+- `ledger::balance(conn, id)` reads the balance the account row stores. A
+  trigger keeps it, so the cost does not increase with the history.
+  `ledger::trial_balance(conn)` returns every currency's total, each of which
+  must be zero — run it from a scheduled job or a health check.
+  `ledger::balance_drift(conn)` returns each account whose stored balance is
+  not the sum of its postings; it must be empty. It reads every posting, so
+  run it from a scheduled job only.
 - The tables (`_autumn_money_*`) ship in Autumn's own migration set, in the
   **control** database. Nothing to add to the app's `migrations/`. They are
   append-only by trigger — `UPDATE`, `DELETE`, `TRUNCATE` and an SQLite
   `INSERT OR REPLACE` all abort. An account's currency is fixed the same way;
-  only `allow_negative` stays editable. The SQLite half uses
+  only `allow_negative` and `balance_minor` change. The SQLite half uses
   `BEFORE INSERT` guards on the row keys, because SQLite skips `DELETE`
   triggers for the row a `REPLACE` removes and the pragma that changes that
   would alter every application trigger's recursion semantics.
@@ -2236,6 +2259,13 @@ reject_on_content_type_mismatch = true  # declared-vs-sniffed mismatch (or an
 
 ## View helpers and widgets (0.6.0)
 
+Core widgets need only `maud`. Four families are default-on features
+(#3408): `widgets-search` (active search, autocomplete), `widgets-social`
+(reactions, comment thread, infinite feed, the `#[commentable]` router),
+`widgets-workflow` (transition controls, bulk actions) and `widgets-charts`.
+With `default-features = false`, name each family the app uses. Paths stay
+`autumn_web::widgets::*` (`docs/guide/widget-styling.md`).
+
 Trunk-dev ships framework view widgets — prefer these over hand-rolled Maud
 for the common cases:
 
@@ -2245,21 +2275,34 @@ for the common cases:
 | `button_to(label, href, Method, csrf_token)` / `button_to_with` | Single-button form for state-changing actions; CSRF is a required arg; non-GET emits hidden `_method` override |
 | `card(&body, &CardConfig::new().title("..."))` / `stat_card(label, value, link)` | Titled panels and metric tiles (`autumn_web::widgets`, prelude re-export) |
 | `sparkline(&points)` / `bar_chart(&series)` / `line_chart(&series)` (+ `_with(&ChartConfig)`) | Server-rendered, accessible, zero-JS **SVG charts** from `&[(&str, f64)]` (`/_stories` gallery). `bar_chart` anchors bars at zero; `ChartConfig::new().title(...).min(...).max(...)` sets an axis override / accessible name (#1231) |
-| `tabs(id, &[(id, label, markup)])` | No-JS CSS-only tab switcher (`docs/guide/tabs.md`) |
+| `tabs(id, Some(active) \| None, &[(id, label, markup)])` | Tab switcher: `:target` CSS with JS off; APG arrow keys with `autumn-widgets.js` (`docs/guide/tabs.md`, `docs/guide/keyboard.md`) |
+| `popover(label, &content, &PopoverConfig::new(id).side(..).align(..))` / `dropdown_menu(label, &[MenuEntry::link/action/separator/group(..).destructive()], &PopoverConfig::new(id))` | Native `popover` + `command`/`commandfor` + CSS anchor positioning (flips at the edge); `dropdown_menu` is an APG menu button (`role=menu`, `button_to` items with CSRF work with JS off, arrow keys/typeahead need `autumn-widgets.js`). `NavMenu` uses the same markup (#3402, `docs/guide/popover-and-menu.md`) |
+| `accordion(&[(title, markup)], &AccordionConfig::new(name))` / `collapsible(summary, &markup)` / `collapsible_with(.., &CollapsibleConfig)` | No-JS disclosure on native `<details>` (#3401). Exclusive by default (shared `name`); `.multiple()` lets items open on their own; `.open(i)`, `.level(HeadingLevel)`, `.class()`, `.attrs()`. Titles are escaped; Enter/Space on `<summary>` are native (`docs/guide/accordion.md`) |
 | `modal(id, title, &body, &ModalConfig)` / `confirm_action(...)` | Native `<dialog>` confirm for destructive actions — replaces `hx-confirm`/`window.confirm()` |
+| `drawer(id, title, &body, &DrawerConfig)` / `drawer_trigger(...)` | Edge `<dialog>` (left/right/top/bottom), modal or not; `DialogSize` and `close_button(label)` also on `ModalConfig` (`docs/guide/drawer.md`) |
 | `badge(label, BadgeVariant::for_label(status))` / `status_tag(label)` | Semantic status pill; `BadgeVariant` = `Neutral`/`Info`/`Success`/`Warning`/`Danger`, `for_label` picks a deterministic color; `badge_with`/`BadgeConfig` set `title`/`aria-label`. Composes inside a `data_table` cell |
 | `avatar(name, &AvatarConfig::new().image(url).size(AvatarSize::Small))` | Person chip: `<img>` (lazy, square, name `alt`) or a deterministic colored-initials fallback — never a broken image, no JS, no external call |
 | `alert(AlertVariant::Info, body)` / `alert_with(..., &AlertConfig::new().title("...").icon(true).dismissible(true))` | Inline callout / empty-state / error box; `role` per variant, optional title + inline-SVG icon + no-JS dismiss. `error_summary(&changeset)` renders an `Error` alert of all field errors (or `None` when valid); each entry links to `#field` and the summary takes focus |
 | `flash_messages(&flash.consume().await)` (`autumn_web::flash`) | Accessible flash banners: per-severity `role`/`aria-live`, `autumn-flash--<level>` classes, empty slice renders nothing; `flash_messages_with` adds a no-JS dismiss |
 | `pagination_nav(&page, &PagerOptions::new("/posts"))` / `cursor_pagination_nav` | Accessible, filter-preserving, htmx-opt-in pager from a `Page`/`CursorPage` (prelude re-export) |
-| `toast(message, variant)` / `toast_region(DEFAULT_TOAST_REGION_ID)` / `toast_in(region_id, ...)` | Transient htmx action feedback: drop `toast_region` once in the layout, then return `toast(...)` next to your swapped fragment — it appends into the region OOB (`hx-swap-oob="beforeend:#toast-region"`). CSS-only auto-dismiss (no `<script>`); `variant` reuses `AlertVariant`. `toast_region` is a persistent `aria-live="polite"` region — non-error toasts inherit its politeness (no own `role`/`aria-live`); `Error` announces assertively via its own `role="alert"` |
+| `toast(message, variant)` / `toast_region(DEFAULT_TOAST_REGION_ID)` / `toast_in(region_id, ...)` / `toast_with(message, variant, &ToastConfig)` | Transient htmx action feedback: drop `toast_region` once in the layout, then return `toast(...)` next to your swapped fragment — it appends into the region OOB (`hx-swap-oob="beforeend:#toast-region"`). CSS auto-dismiss (no `<script>`); hover/focus pauses it; `ToastConfig` sets `duration`, `persistent`, `region`, `close_label`. A close button (shown by `autumn-widgets.js`; hidden without JS) removes the toast; the region is `popover="manual"` so it sits above modals; `variant` reuses `AlertVariant`. `toast_region` is a persistent `aria-live="polite"` region — non-error toasts inherit its politeness (no own `role`/`aria-live`); `Error` announces assertively via its own `role="alert"` |
+| `tooltip(id, text, \|tip\| html! { button aria-describedby=(tip) {…} })` / `tooltip_with(id, text, &TooltipConfig::new().placement(TooltipPlacement::Bottom), …)` | Accessible tooltip (#3404). The closure gets the text id: put it in `aria-describedby` (or `aria-labelledby` for an icon-only trigger). Text only — use a popover for links or buttons; never use `title` as a tooltip. CSS shows it on hover and keyboard focus and places it with anchor positioning; Escape hides it (keyboard core `data-autumn-dismiss="escape"`); a hover bridge keeps it open (WCAG 1.4.13). On Chromium the runtime adds `interestfor` + `popover="hint"` (`docs/guide/tooltip.md`) |
+| `button(label, &ButtonConfig::new().variant(ButtonVariant::Secondary).size(ButtonSize::Small).icon(svg))` / `button_group(label, &[buttons])` | Styled `<button>` (#3406): `Primary`/`Secondary`/`Ghost`/`Destructive`/`Link`, `.submit()`, `.icon_only()` (label stays as hidden name), `.disabled()`, `.attrs(&[("hx-post", url)])` (passes through as given; widget-owned names win). `.loading()` = static `aria-busy="true"` + `disabled` + spinner; `.loading_on_request()` = `data-autumn-busy`: busy during its own request (it sends it, submits the form, or `hx-indicator` names it); the runtime sets `aria-busy` on it and the swap target and clears it on `loadend`. Use `hx-sync="this:drop"` against double clicks, not `hx-disabled-elt` (focus loss). Classes also style `link_to_with`/`button_to_with`. `button_group` is a named `role="group"` (`docs/guide/display-widgets.md`) |
+| `spinner(label)` / `skeleton(SkeletonShape::Line)` (+ `_with`, `.indicator(id)`) | `role="status"` spinner with hidden label (reduced motion: fades, no turn); `aria-hidden` line/block/circle skeleton (`.count(n)`). `.indicator(id)` adds `autumn-indicator`: hidden until `.htmx-request` (a spinner keeps its `role="status"` root and hides its content) — point `hx-indicator="#id"` at it (no htmx inline style needed) |
+| `progress(label, Some(v), max)` / `meter(label, v, min..=max)` (+ `_with`) | Native `<progress>`/`<meter>` with `aria-label`; values clamped, `None`/`NaN` progress = indeterminate; `MeterConfig::low/high/optimum`, `.visible_label()`, `.value_text("3 of 8")` (also `aria-valuetext`) |
+| `separator()` / `kbd("Esc")` / `kbd_combo(&["Ctrl", "K"])` / `empty_state(title, body, Some(&action))` / `avatar_group(label, &avatars)` | `<hr>` (vertical = `role="separator"`, decorative = `role="none"`); nested `<kbd>`; empty state with heading (`EmptyStateConfig::level/icon`); overlapping avatars with `+N` (`AvatarGroupConfig::max` counts the `+N` item, default 5; `.total(n)`, `.more_label("{count} more")`). `FieldOptions::auto_grow()` / `a11y::TextArea::auto_grow()` = `field-sizing: content` textarea |
 | `infinite_feed(items, next_cursor, &FeedConfig)` / `feed_page(items, next_cursor, &FeedConfig)` | htmx infinite-scroll / "Load more" feed from a `CursorPage`: single `hx-get` sentinel carries the cursor and appends the next page in place (no reload, no duplicate rows). `FeedMode::{Reveal,Button}`; progressive `<a href>` fallback. `feed_page` is the append fragment a handler returns for each page (`page.next_cursor.as_deref()`) |
 | `bulk_actions_form(&BulkActionsConfig, csrf_token, csrf_field, submit_token, submit_field, content)` / `bulk_select_checkbox(id, &cfg)` / `bulk_actions_toolbar(&cfg)` | No-JS bulk-select + "Delete selected" over a list (#1312): wrap the list in `bulk_actions_form` (a `POST` form carrying the hidden CSRF and one-time submit-token fields plus the submit button), and put one `bulk_select_checkbox` — `name="ids"`, `aria-label="Select row <id>"` — in each row's first cell. Keep page furniture ("New …" link, search box) *outside* the form. Always pass the submit-token pair on a destructive form: a tokenless request passes through `SubmitTokenLayer` unguarded, so a double-click would re-run the whole batch. `BulkActionsConfig::new(action)` + `.field_name(..)`/`.submit_label(..)`/`.select_label(..)`. The toolbar emits no confirmation prompt: inline `onclick` confirms are blocked by the default `script-src 'self'` CSP, and `confirm_action` submits its own form so it cannot carry the selection — to confirm a batch, post it to an interstitial page that lists the rows and asks for a second submit. `autumn generate scaffold` wires all of this automatically |
 | `comment_thread(&cfg, &CommentView::from_thread(&nodes))` / `CommentThread::new(dom_id, action)` | The view half of `#[commentable]` (#1367): nested `<ol>` comment thread with a `<details>`-disclosed inline reply form on every node. Ordinary `<form method="post">` (works with scripting off) that also carries `hx-post`/`hx-target`/`hx-swap="outerHTML"` to swap the thread in place. Thread `.csrf_token(...)` and `.return_to(path)` for the no-JS round trip, `.max_depth(n)` so the UI never offers a reply the write path would `422`, `.read_only(Some(prompt))` for a signed-out visitor |
 | `active_search(id, label, &ActiveSearchConfig)` / `active_search_empty_state(msg)` | Search box whose results appear as the user types — htmx-driven, server-rendered Maud fragments; you author no JavaScript, but the page must load htmx. The handler returns the results fragment; `active_search_empty_state` is the no-matches body. Emits a `<noscript>` GET-form fallback (`docs/guide/active-search-and-autocomplete.md`) |
 | `autocomplete_input(id, label, &AutocompleteConfig)` / `autocomplete_option(value, label)` / `autocomplete_empty_state(msg)` | Typeahead/autocomplete picker for choosing a related record and storing its ID — the companion to `active_search` when the user must pick one row rather than browse matches. Selection and input sync need the shipped `autumn-widgets.js` runtime (`<script src="/static/js/autumn-widgets.js" defer>`, no inline JS, CSP-compatible) on top of htmx; include it once in the layout or the picker will not select. Its `<noscript>` fallback is a bare `<select>`, NOT a form like `active_search`'s — it has to sit inside the surrounding application form to submit (`docs/guide/active-search-and-autocomplete.md`) |
+| `AutocompleteConfig::multiple()` (+ `.free_text()`, `.selected(..)`) / `autocomplete_input_for(&changeset, id, label, &config)` / `autocomplete_create_option(value, label)` | Tags / multi-select (issue #3410): each pick is a removable chip with one hidden `name=value` input, so bind a `#[serde(default)] Vec<T>` field — repeated keys decode into it. Use `autocomplete_input_for` on a 422 re-render: the changeset is the source of the chips and its field errors show. Return `autocomplete_create_option` after the matches for a "create new" entry; with `free_text()`, Enter adds the typed text. Validate and de-duplicate new values on the server. Needs `autumn-widgets.js`; the no-JS fallback is a `<select multiple>` that shows only `fallback_options` (`docs/guide/active-search-and-autocomplete.md`) |
+| `storage::form_helper::direct_upload_field(name, presign_url, &DirectUploadConfig::new().label(..).accept(..).multiple(..))` / `direct_upload_input(name, presign_url, accept)` | Direct-to-storage file field (feature `storage`, #3411). With `autumn-widgets.js` it `POST`s `{filename, content_type, size}` to your presign route (CSRF token from `<meta name="csrf-token">`), reads `{url, method, headers, key}`, sends the file with a progress bar (drag and drop works) and adds a hidden `name=key` field. The form carries only keys: check each key's prefix, then call `complete_direct_upload`. Without JS it is a plain file input in a `multipart/form-data` form. Has a visible `<label>` and live status and error regions (`docs/guide/storage.md`) |
 | `local_datetime(dt, tz)` (`autumn_web::time_zone`) | Render a `DateTime<Utc>` in a user's IANA zone. Pair with the `TimeZone` extractor (resolves the requesting user's zone) and `set_time_zone_in_session` / `parse_iana`; take "now" from the `Clock` extractor rather than `Utc::now()` so rendering stays test-injectable (`docs/guide/time-zones.md`) |
+| `wizard_progress(&ctx, step).await` / `wizard_progress_from_steps(&[WizardProgressStep])` (`autumn_web::wizard`) | Accessible step-progress `<nav>` (`aria-current="step"`, "Step N of M"). `wizard_progress` reads step states from the session; `wizard_progress_from_steps` is the sync form for steps you already have (#3398). The `/_stories` gallery shows it with pagination, flash and the `a11y` primitives |
+| `WidgetPack::new("pack").extend(stories).assets(&ASSETS)` + `app.widget_pack(pack)` (`autumn_web::widget_pack`) | Ship widgets as a plugin crate (#3400). Contract: `Render`, `&FieldOptions` passthrough, public tokens only (no raw colors, no setting `--primary`), `autumn-<pack>-*` classes, keyboard core `data-*` + `autumn:init` (no own arrow-key JS), CSP-safe, one story per widget with slug `<pack>-…`. `with_story_gallery` now ADDS (plugin galleries start from `StoryGallery::new()`). Non-input widgets write their root with `widget_pack::element(tag, attrs, &FieldOptions, body)`. Form inputs: `impl FieldRenderer` + `FieldContext::control` (radios: `grouped()` + `group_item`), then `custom_input_with(&cs, …)` or `form_for(..).override_field(f, FieldControl::custom(R))`. Check with `plugin_conformance::widgets::run_widget_conformance` and (feature `system-tests`) `browser::run_widget_browser_conformance(&pack, &axe_src)` (`docs/guide/widget-packs.md`) |
 | `autumn_web::ui::WIDGETS_CSS` / `WIDGETS_CSS_PATH` | One shipped stylesheet backing every `autumn-*` widget class — link `href=(WIDGETS_CSS_PATH)` instead of copying widget CSS into `input.css`. Accent now follows `var(--primary)` (violet), not the old hardcoded indigo (`docs/guide/widget-styling.md`) |
+| `theme_toggle(&ThemeToggleConfig::new(theme).csrf(token, "_csrf"))` + `ui::theme::{Theme, Density, router}` | Dark mode (#3396). Tokens are `light-dark()`: the OS selects the scheme, `data-theme="light\|dark"` overrides it, `data-density="compact\|comfortable\|spacious"` scales `--space-*`. `Theme` is an extractor for the `autumn.theme` cookie — render `html data-theme=[theme.data_theme()]` in the layout. `.merge(ui::theme::router())` mounts the no-JS `POST /_autumn/theme`; `autumn-widgets.js` applies it in place. Classes are `autumn-alert--<v>`, `autumn-badge--<v>`, `autumn-wizard-*` (no unprefixed `alert`/`badge`/`wizard-*`). Text on a `--primary`/`--danger` fill uses `--on-primary`/`--on-danger`, never white (`docs/guide/widget-styling.md`) |
 
 ### Whole-form rendering — `form_for` (0.6.0)
 
@@ -2503,6 +2546,10 @@ app-code change) via `role = "web"|"worker"|"combined"` in config or the
 | `worker` | no (probe-only router) | yes |
 
 - Run a specific tier: `autumn serve --role web|worker|combined`.
+- An unknown value stops the boot; it does not fall back to `combined`
+  (#3541). `role` and `AUTUMN_ROLE` accept the same values (case-insensitive;
+  aliases in `ProcessRole::ACCEPTED_VALUES`). An empty `AUTUMN_ROLE=` is unset.
+  `autumn doctor` shows the same error on its `process_role_backend` row.
 - A split (non-`combined`) role **requires a `postgres`/`redis`/`sqlite` jobs
   backend** — an in-memory queue can't cross processes. `sqlite` qualifies only
   within one host, since its queue is a table in one file (#1907).
@@ -2552,11 +2599,30 @@ subset of queues — all config-only, no app-code change:
   queue absent from the latest survey resets to `depth` 0. The Redis survey pages
   the whole due-delayed ZSET so scheduled/retry bursts count exactly. The `local`
   backend keeps the in-process mark path. See `docs/guide/jobs.md`.
-- **`ProcessRole` on `AppState`** — `state.role()` returns the resolved
-  `ProcessRole` (exported at `autumn_web::ProcessRole`) with `serves_http()` /
+- **`Role` on `AppState`** — `state.role()` returns the resolved
+  `Role` (exported at `autumn_web::Role`) with `serves_http()` /
   `runs_workers()` predicates, so app-owned background loops in `on_startup`
   self-gate to the right tier instead of re-reading `AUTUMN_ROLE` (issue #1726).
-  See `docs/guide/jobs.md`.
+  `state.capabilities()` returns the `RoleCapabilities` resolved at boot: one
+  field for each subsystem (`job_workers`, `scheduler`, `outbox_relay`,
+  `commit_hooks`, `fleet_relay`, `restore_check`, `retention`, `serves_http`).
+  Gate on the field that matches the work. `/actuator/info` shows the set
+  (issue #3542). See `docs/guide/jobs.md#role-capabilities`.
+- **Named roles (`[roles.<name>]`, issue #3543)** — declare a tier once as a
+  preset: `base` (`combined`/`web`/`worker`), `pin`, `workers` and capability
+  overrides that can only turn a capability off. Select it with
+  `AUTUMN_ROLE=<name>`. `state.role()` returns `&Role`: `.name()` is the
+  preset name, `.base()` the `ProcessRole`. Guards read the base; an
+  undeclared name stops the boot. `autumn doctor --strict` derives
+  `[jobs.fleet] tiers` from the presets. See `docs/guide/jobs.md#named-roles`.
+- **Route groups (issue #3544)** — `#[get("/x", group = "marketing")]`,
+  `.routes_in("marketing", routes![...])` or `Plugin::route_group()` (default
+  `Plugin::name()`) put routes in a group; the default is `app`. A preset over
+  `web`/`combined` sets `mount = ["marketing"]` to serve only those groups.
+  Probes, actuator and assets stay on every role; other routes get 404. Graph
+  and OpenAPI follow the mount. `[route_groups] declared`/`manifest` lets
+  `autumn doctor --strict` fail on a group no preset mounts. See
+  `docs/guide/route-groups.md`.
 
 ## Operator alerts (0.6.0, issue #1610)
 
@@ -2681,13 +2747,12 @@ the build.
   `{ id = "RUSTSEC-…", reason = "why this is acceptable here; review-by <date>" }`.
   A waiver lets exactly one id through; the gate stays on and every other
   advisory still fails.
-- A fresh scaffold ships one waiver already — RUSTSEC-2023-0071 (`rsa`, reached
-  through the unconditional `jsonwebtoken` dependency, no patched release
-  exists) — which is why day-one CI is green. Do not remove it without checking
-  whether a fixed `rsa` has shipped. `--bundled-pg` apps get a second waiver
-  (RUSTSEC-2024-0384, `instant`, via the embedded-Postgres build stack); other
-  flavors deliberately do not, so an unused-waiver warning still means one of
-  the app author's own waivers went stale.
+- A fresh scaffold ships two waivers already — RUSTSEC-2023-0071 (`rsa`) and
+  RUSTSEC-2026-0387 (`crypto-bigint` 0.5), both reached through the
+  unconditional `jsonwebtoken` dependency, no patched release exists — which is
+  why day-one CI is green. Do not remove either without checking
+  whether a fixed release has shipped. An unused-waiver warning means one of the
+  app author's own waivers went stale.
 - An app upgraded from a release before this gate existed receives the workflow
   but not `deny.toml` (the policy is the app's, so `autumn upgrade` never
   writes it). The audit step says so and stops; copy the file from a freshly
@@ -2998,8 +3063,22 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   tenants: call `shards.fleet().unwrap().provision(&fleet.key_for(id)?)` on
   signup (`404` until then, `409` if it exists).
 - `DatabaseFleet` (`autumn_web::db::fleet`): `open_for`, `provision`,
-  `delete` (`410` meanwhile), `backup` (`VACUUM INTO`), `restore`, `list`,
-  `each`, `migrate_all`, `stats`. Health: `db:fleet`.
+  `delete` (`410` meanwhile), `backup` (`VACUUM INTO`), `import` (copy a
+  file into the fleet: check, migrate, publish; `409` when the key has a
+  file, `422` for a bad file),
+  `restore`, `list`, `each`, `migrate_all`, `stats`. Health: `db:fleet`.
+  Use `import`, not a `FleetLifecycle::restore_missing` hook, for a local
+  backup.
+- `max_open` is a soft limit: a database in use or used within
+  `min_residency` (default `"2s"`) is not closed, and an open never waits.
+  A burst can open far more files than `max_open`. Size `ulimit -n` for the
+  peak (about `2 × pool_size + 1` fds per open database).
+- Control-only or tenant-only tables: `.migrations_for(MigrationScope::Control,
+  SET)` / `.migrations_for(MigrationScope::Shards, SET)`
+  (`autumn_web::migrate::MigrationScope`), not one set for both.
+- A SQLite build names the generated repository `Sqlite<Trait>` too (alias
+  of `Pg<Trait>`). In a module with `#[model]`/`#[repository]`, import
+  `autumn_web::db::prelude::*`, never `diesel::prelude::*` (E0034).
 - A slot fleet shares files between tenants: keep `tenant_scoped` on its
   repositories. `CrossShard` / `each_shard` open every database on disk —
   admin paths only.
@@ -3007,18 +3086,46 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   `fleet/tenant/<id>` / `fleet/slot/<n>` (health `replication:fleet`);
   `restore_missing = true` serves a missing database from its replica on a
   fresh volume. A replicated fleet root is served by one process (one
-  replicator per database).
+  replicator per database). `replication_workers` (default `4`) threads ship
+  the databases. With many busy databases per host, monitor
+  `worst_lag_seconds` and `last_pass_ms` in `replication:fleet`.
+- Delete with replication (issue #3235): `delete` also purges the replica.
+  It writes a tombstone row (`_autumn_fleet_tombstones`) on the control
+  database first; no row, no delete (`503`). A failed purge keeps the row,
+  and the maintenance task retries it (`purge_deleted_replicas`).
+  `restore_missing` does not restore a tombstoned key; `restore` does, and
+  drops the tombstone. `replica_retention_after_delete = "30d"` keeps the
+  replica for undo; during it, a create on demand answers `410` and
+  `provision` purges the old replica and ends it. `restore_check_sample` (default `1`) restores random databases every
+  `[replication] verify_interval_secs`; a failure turns `replication:fleet`
+  `Down`. Do not write an `on_delete` hook to delete replicas. Guide:
+  "Deleting a database's replica" in `docs/guide/sqlite-fleet.md`.
 - Failover: turn on `[database.fleet.ownership]` (`owner` unique per volume,
   `slots = ["0-8191"]`, `lease_secs = 30`) with `restore_missing`. A host
   serves only the slot ranges it claims; an unowned slot is `421`
   (`FleetError::NotOwner`), and `restore_missing` runs only for an owned key.
   Each claim gets an epoch: a restore selects the newest epoch, and an old
   owner's replicator stops. A host that gets a range back restores files
-  older than the replica before it serves them. Health: `fleet:ownership`. The built-in table is
+  older than the replica before it serves them, with or without
+  `restore_missing`. Replication is asynchronous: a takeover loses the
+  unshipped writes (`rpo_secs` in steady state), and a fail-back does not
+  recover them. A crash costs up to `lease_secs + lease_secs / 3` of outage.
+  Guide: "What a failover costs".
+  Health: `fleet:ownership`. The built-in table is
   on the control database, so it fences the processes of one host only;
   hosts on different machines implement `SlotOwnershipStore`
   (`autumn_web::db::fleet_ownership`). Guide: "Failover: slot ownership" in
   `docs/guide/sqlite-fleet.md`.
+- Cross-tenant analytics (issue #3236): query the lake, not the volume.
+  `fleet.lake()?.materialize().await?.query(sql)`
+  (`autumn_web::db::fleet_lake`) restores each live tenant from its replica
+  into a scratch SQLite file. Each table gets `_autumn_tenant`. One
+  `SELECT`/`WITH`/`VALUES` on a read-only connection; grouped `SUM`/`AVG`
+  work across tenants. It never opens the fleet root (`FleetLake::new(dest,
+  base)` on a host with no volume). Deleted tenants are skipped. No
+  tombstone source: `markers_only()`. Each tenant is consistent on its own;
+  no atomic snapshot. CLI: `autumn fleet lake q.sql --out q.csv`. Never
+  pass request input as the SQL. Guide: "Query the lake".
 - The control database lives outside `root` (validation refuses it inside).
 - Outbox rows, commit hooks and `#[derivation]` backfills work on fleet
   databases, also closed ones (issue #3234). Write outbox rows in a
@@ -3034,7 +3141,7 @@ root = "/var/lib/app/fleet"  # path defaults to "{bucket}/{tenant}.db"
   before the first request, then `sweep_once()` to run a pass.
 - Out of band (stopped or live app), with the `sqlite` CLI build:
   `autumn fleet list --open`, `migrate [--key K]`, `backup <key> <dest>`,
-  `delete <key> --force`, `restore <key> [--timestamp T] --force`. Keys are
+  `import <key> <src>`, `delete <key> --force`, `restore <key> [--timestamp T] --force`. Keys are
   `tenant:<id>` / `slot:<nnnnn>`. A file another process has open is refused
   ("open in another process"). `migrate` reads `migrations/` only: plugin
   sets need `AUTUMN_MIGRATE=1`. Run it from the app directory.
@@ -3537,7 +3644,7 @@ autumn db backup --keep 7        # dump control DB + shards to ./backups/<profil
 autumn db backup --upload --keep 7   # + upload each verified run offsite (S3/MinIO/R2); db offsite list; db restore offsite:<profile>/latest  # (0.6.0)
 autumn db replica restore --force        # SQLite tier: rebuild from the continuous replica; --timestamp <RFC3339> for PITR, --overwrite to replace an existing file  # (0.7.0)
 autumn db replica status --json          # replica generation, segments, and current replication lag; db replica verify proves it restorable  # (0.7.0)
-autumn fleet list --open                 # SQLite fleet (sqlite CLI build): every tenant/slot database; migrate | backup <key> <dest> | delete <key> --force | restore <key> [--timestamp T] --force
+autumn fleet list --open                 # SQLite fleet (sqlite CLI build): every tenant/slot database; migrate | backup <key> <dest> | import <key> <src> | delete <key> --force | restore <key> [--timestamp T] --force
 autumn db scrub --artifact backups/prod/<run> --force   # restore a prod backup into staging, then anonymize every PII column; --check for CI
 autumn db scrub --sample users=1% --seed 42            # scrub AND subset in one pass: 1% of users plus every row they relate to, reproducibly
 autumn db retention --dry-run    # per-dataset retention window, its source, and rows eligible for purge; --purge to enforce now (needs --force outside dev/test), --dataset X, --json  # (0.7.0)
@@ -3587,6 +3694,7 @@ autumn graph impact Post         # what a change to a model would affect: the re
 autumn graph show --manifest architecture-graph.json --check architecture-graph.json   # write it, and fail on drift, naming the node, edge or auth posture that moved
 # `--check` also names a changed secondary mount and a changed declared plugin mount (`completeness.declared_mounts`); after upgrading, run `autumn graph show --manifest <file>` once to refresh a committed graph (#2520)
 autumn graph impact Post --json  # every verb honours --json; `show --json` emits the whole document
+autumn graph check-boundaries    # fail when one boundary queries a table another boundary owns (#3549)
 autumn openapi export            # the app's OpenAPI 3.1 document, without booting it: no port bound, no database opened. Same document `/openapi.json` serves, built through the same pair, so an export cannot drift from what the server answers (#802)
 autumn openapi export --out openapi.json   # write it to a file; pipe it to `openapi-typescript` or `progenitor` for a typed client — autumn ships no client emitters of its own
 autumn openapi export --check openapi.json --strict   # CI gate: fail on contract drift (compares parsed JSON, naming the operations added/removed/changed), and on any component schema that exports as an opaque `{"type":"object"}`
@@ -3617,6 +3725,11 @@ a route or job are read off that item's own tokens and are deliberately
 over-reported; the document carries its own `limits` section, and the biggest
 one is that a call into a helper in another module is not followed. See
 `docs/guide/architecture-graph.md`.
+
+To keep one module out of another module's tables, declare boundaries in
+`boundaries.toml` and run `autumn graph check-boundaries`. A baseline holds
+today's violations, so an existing app can adopt it. See
+`docs/guide/table-ownership.md`.
 
 ### Upgrading an app across releases — `autumn upgrade` (0.7.0, issue #1629; 0.8.0, issue #1593)
 
@@ -4551,6 +4664,9 @@ touched crate so examples compile from an external-consumer perspective.
 - `docs/guide/middleware.md`
 - `docs/guide/widget-styling.md`
 - `docs/guide/tabs.md`
+- `docs/guide/drawer.md`
+- `docs/guide/accordion.md`
+- `docs/guide/display-widgets.md`
 - `docs/guide/maintenance-mode.md`
 - `docs/guide/deployment.md`
 - `docs/guide/fleet-deploys.md`

@@ -224,8 +224,8 @@ for a single-host config, where the defaults are right.
 That warning is the **only** place this surfaces. It comes from the rollout
 driver, after the preflight report — so `deploy check`, `deploy plan` and
 `deploy status` say nothing about it, and neither does `autumn doctor` (its
-`process_role_backend` check only fires for a split `web`/`worker` role, and
-fleet hosts are all combined-role). Sessions and rate limiting get no warning at
+`process_role_backend` check fails only on an unknown role or a split
+`web`/`worker` role, and fleet hosts are all combined-role). Sessions and rate limiting get no warning at
 all. Work the table above yourself rather than waiting to be told.
 
 Full backend comparison, delivery semantics and the migration note are in the

@@ -1,5 +1,5 @@
 framework: Loco 0.14.1
-language:  Rust 1.88.0
+language:  Rust 1.97.0
 async-rt:  Tokio 1.x
 http:      Axum 0.8.x
 db:        SeaORM 1.x + sea-orm-migration

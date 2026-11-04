@@ -18,6 +18,44 @@ dhat passes have taken it to the floor, and the remainder is allocator cost
 driven by the tower layer-clone cascade (tracked in #2830). Pick another
 `autumn/benches/*` target instead, and skip building that bench.
 
+## Performance profiles (Bolt and Ledger)
+
+Every workload and every query has a committed profile, and CI fails a new one
+that has none. See `docs/perf/README.md`.
+
+- **A new `[[bench]]`** needs a `[[workload]]` entry in
+  `docs/perf/bolt/workloads.toml` and a profile from
+  `scripts/bolt-profile.sh <package>/<bench>` (callgrind + dhat). The `lint`
+  job runs `scripts/check-perf-profiles.py bolt`.
+- **A new SQL statement** needs `docs/perf/ledger/queries/<fingerprint>.toml`.
+  The Docker sweep builds with `ledger-capture` and records every statement
+  the framework issues. The step after it runs
+  `scripts/check-perf-profiles.py ledger`. Write the missing profiles with
+  `scripts/ledger-profile.sh`, or run `scripts/perf/ledger_catalog.py update`
+  on the `ledger-capture` artifact of the failed run.
+
+## Diesel table width: 32 columns or fewer
+
+**No framework Diesel declaration (`table!` or `#[model]`) goes over 32
+columns**, and no Autumn crate turns on diesel's `64-column-tables` or
+`128-column-tables`. Diesel compiles its tuple impls up to that cap, and Cargo
+unifies the feature, so one wide declaration makes every crate that uses
+diesel compile the larger set. Every app built on Autumn pays for it. Measured
+on one crate: 1.16 GB / 1m18s at 32, 2.92 GB / 2m04s at 64, 9.95 GB / 8m16s at
+128.
+
+- The cap is per **declaration**, not per database table. A table past 32
+  columns is declared in halves: a second `table!` with
+  `#[sql_name = "<table>"]` maps the same rows. Each `#[model(table = …)]`
+  sits on one half. Every `NOT NULL` column without a default goes in the half
+  you insert through.
+- The `lint` job runs `autumn schema width .`. It reads every `table!` and
+  `#[model]`, replays every migration set, and fails on a declaration over 32
+  columns, a migration table over 32 that no declaration maps, or a wide
+  diesel feature.
+- Apps are not blocked. `autumn build` prints the same findings as a warning
+  and keeps building. See `docs/guide/table-width.md`.
+
 ## Changelog
 
 **Never edit `CHANGELOG.md` in a feature PR**, and never create a new
@@ -54,11 +92,44 @@ release time.
 - **Test all**: `cargo test --workspace`
 - **Test specific package**: `cargo test -p <pkg>`
 - **Test specific target**: `cargo test -p <pkg> --test <target>`
-- **Pre-push gate**: `./scripts/pre-push-check.sh` — compile-only (`--no-run`)
-  mirror of CI's `lint` + `test` jobs. Run it before pushing: a narrow `cargo
-  test -p <pkg>` never links the autumn-web consolidated `integration_tests`
-  binary, so it misses cross-package compile breaks the CI `cargo test
-  --workspace` gate catches. See CONTRIBUTING.md "Before you push".
+- **Pre-push gate**: `cargo xtask pre-push` (or `./scripts/pre-push-check.sh`,
+  which runs it) — compile-only (`--no-run`) mirror of CI's `lint` + `test`
+  jobs. Run it before pushing: a narrow `cargo test -p <pkg>` never links the
+  autumn-web consolidated `integration_tests` binary, so it misses
+  cross-package compile breaks the CI `cargo test --workspace` gate catches.
+  See CONTRIBUTING.md "Before you push".
+- **CI lint job, locally**: `cargo xtask ci lint` (one CI shard:
+  `--shard <shard>`; one step: `--only <step>`; steps and shards: `--list`).
+- **Every maintainer task and script**: `cargo xtask list`.
+
+## Repo tooling: `cargo xtask`
+
+`xtask/` is the maintainer task runner. It is never published. See
+`xtask/README.md` and `docs/adr/0033-xtask-for-repo-tooling.md`.
+
+- **CI's `lint` job is the `lint` lane** in `xtask/src/lanes.rs`; ci.yml runs
+  it as one `Lint (<shard>)` job per shard (`cargo xtask ci lint --shard
+  ${{ matrix.shard }}`), and `Lint` aggregates them. Add or change a lint
+  check there, not in ci.yml, and give it a shard: a test fails on a step with
+  none, and on a shard the ci.yml matrix does not list. The pre-push lane
+  reuses the same constants, so the two cannot drift.
+- **A CI clippy command stays one string literal on one line** in
+  `lanes.rs`, with `-p autumn-web`, a quoted `--features "…"` list and
+  `-D warnings`. `check-panic-gate.sh` and `check-determinism-gate.sh` read
+  those lines to prove each gated module is linted with its feature on.
+- **A new script under `scripts/` needs a header comment.** `cargo xtask list`
+  finds scripts by listing the directory and shows that header; a test fails
+  on a script without one. No registry to edit.
+- **Docs gates are moving to `xtask/src/docs/`**, one per PR, on the shared
+  `corpus` and `markdown` modules. `cargo xtask check <name>` runs a ported
+  gate, else `scripts/check-<name>.sh`. A port deletes its script in the same
+  PR, carries the script's `--self-test` cases over as `#[test]`s, and shows
+  the same report as the script on the tree and on mutated copies of the
+  corpus. See `xtask/README.md` "Docs gates".
+- **xtask stays dependency-light**: default features, or the smallest
+  feature set that covers the use (`smop`: `sh` and `fs` only), and never
+  autumn-web, diesel or sqlx. It is a workspace member, so its features are
+  unified into every `cargo build --workspace`.
 
 ---
 

@@ -1,0 +1,52 @@
+/* The swatch widget pack (#3400). Public tokens only: no raw colors. */
+.autumn-swatch-picker,
+.autumn-swatch-toolbar {
+    --autumn-swatch-size: var(--space-4);
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+}
+
+.autumn-swatch-option,
+.autumn-swatch-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-1) var(--space-3);
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius-full);
+    color: var(--text);
+    background: var(--surface);
+    font: inherit;
+    cursor: pointer;
+}
+
+.autumn-swatch-option:has(.autumn-swatch-radio:checked),
+.autumn-swatch-toggle[aria-pressed="true"] {
+    border-color: var(--primary);
+    background: var(--primary-light);
+}
+
+.autumn-swatch-option:has(.autumn-swatch-radio:focus-visible),
+.autumn-swatch-toggle:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-swatch-radio {
+    margin: 0;
+}
+
+.autumn-swatch-chip {
+    display: inline-block;
+    width: var(--autumn-swatch-size);
+    height: var(--autumn-swatch-size);
+    border-radius: var(--radius-full);
+    border: 1px solid var(--border);
+}
+
+.autumn-swatch-chip--primary { background: var(--primary); }
+.autumn-swatch-chip--success { background: var(--success); }
+.autumn-swatch-chip--warning { background: var(--warning); }
+.autumn-swatch-chip--danger { background: var(--danger); }
+.autumn-swatch-chip--info { background: var(--info); }

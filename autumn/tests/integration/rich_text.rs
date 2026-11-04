@@ -12,7 +12,7 @@
 
 use autumn_web::markdown::{
     RICH_TEXT_ALLOWED_TAGS, RICH_TEXT_ALLOWED_URL_SCHEMES, render_user_content,
-    render_user_content_html, sanitize_user_html,
+    render_user_content_html, render_user_content_html_bounded, sanitize_user_html,
 };
 
 /// Tag-open markers that must never appear *as live markup* in the rendered
@@ -617,4 +617,33 @@ fn very_long_input_does_not_panic() {
     let source = "a **b** [c](https://d.example)\n\n".repeat(5_000);
     let html = render_user_content_html(&source);
     assert!(html.contains("<strong>b</strong>"));
+}
+
+#[test]
+fn bounded_render_matches_the_unbounded_render_within_the_limit() {
+    let source = "a **b** [c](https://d.example)";
+    assert_eq!(
+        render_user_content_html_bounded(source, 4096).unwrap(),
+        render_user_content_html(source)
+    );
+}
+
+#[test]
+fn bounded_render_fails_when_the_html_exceeds_the_limit() {
+    // 4 bytes of source give 11 bytes of HTML per repeat.
+    let source = "*a* ".repeat(1_000);
+    let err = render_user_content_html_bounded(&source, 256).unwrap_err();
+    assert_eq!(err.limit(), 256);
+    assert_eq!(err.to_string(), "rendered HTML exceeds the 256-byte limit");
+}
+
+#[test]
+fn parser_events_past_the_cap_are_dropped() {
+    // Four events per repeat: well over the 1,048,576-event cap.
+    let repeats = 400_000;
+    let source = "*a* ".repeat(repeats);
+    let html = render_user_content_html(&source);
+    let full = "<em>a</em> ".len() * repeats;
+    assert!(html.len() < full, "{} >= {full}", html.len());
+    assert!(html.contains("<em>a</em>"), "{}", &html[..100]);
 }

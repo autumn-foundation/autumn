@@ -45,10 +45,28 @@ pub const HTMX_SSE_JS: &[u8] = include_bytes!("../vendor/sse.js");
 /// Same-origin path where Autumn serves embedded htmx SSE extension.
 pub const HTMX_SSE_JS_PATH: &str = "/static/js/sse.js";
 
+// The search runtime when `widgets-search` is on, else `""` (#3408).
+// `concat!` expands it, so the bundle stays `const`.
+#[cfg(feature = "widgets-search")]
+macro_rules! widgets_search_js {
+    () => {
+        include_str!("../vendor/autumn-widgets-search.js")
+    };
+}
+#[cfg(not(feature = "widgets-search"))]
+macro_rules! widgets_search_js {
+    () => {
+        ""
+    };
+}
+
 /// Autumn widget runtime JavaScript, embedded at compile time.
 ///
-/// Provides CSP-compatible event-listener wiring for built-in widgets
-/// (autocomplete selection, min-length enforcement). Served automatically
+/// Provides CSP-compatible wiring for the built-in widgets: the keyboard
+/// core, tabs, nav bar, popover menu, modal, drawer, theme toggle, toast and
+/// tooltip. With the `widgets-search` feature, the search runtime
+/// (autocomplete selection, min-length enforcement) comes first (#3408).
+/// Served automatically
 /// at [`AUTUMN_WIDGETS_JS_PATH`] and at the content-hashed URL
 /// `asset_url("js/autumn-widgets.js")` returns.
 ///
@@ -57,7 +75,11 @@ pub const HTMX_SSE_JS_PATH: &str = "/static/js/sse.js";
 /// ```html
 /// <script src="/static/js/autumn-widgets.js" defer></script>
 /// ```
-pub const AUTUMN_WIDGETS_JS: &[u8] = include_bytes!("../vendor/autumn-widgets.js");
+pub const AUTUMN_WIDGETS_JS: &[u8] = concat!(
+    widgets_search_js!(),
+    include_str!("../vendor/autumn-widgets.js")
+)
+.as_bytes();
 
 /// Same-origin path where Autumn serves the widget runtime script.
 pub const AUTUMN_WIDGETS_JS_PATH: &str = "/static/js/autumn-widgets.js";
@@ -432,7 +454,7 @@ struct OobFragment {
 /// use maud::Render;
 ///
 /// let primary = html! { div { "Task created successfully!" } };
-/// let flash = html! { div id="flash-message" class="alert alert-success" { "Succesfully saved!" } };
+/// let flash = html! { div id="flash-message" class="autumn-alert autumn-alert--success" { "Succesfully saved!" } };
 /// let counter = html! { span { "5" } };
 ///
 /// let response = HtmxFragments::new(primary)
@@ -791,9 +813,19 @@ mod tests {
             .expect("autumn-widgets.js should be valid UTF-8");
         assert!(js.contains("data-autumn-nav"), "{js}");
         assert!(js.contains("data-nav-toggle"), "{js}");
-        assert!(js.contains("data-nav-menu-toggle"), "{js}");
         assert!(js.contains("aria-expanded"), "{js}");
         assert!(js.contains("Escape"), "{js}");
+    }
+
+    #[test]
+    fn widgets_js_wires_popover_menu() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        assert!(js.contains("data-autumn-menu"), "{js}");
+        assert!(js.contains("showPopover"), "{js}");
+        assert!(js.contains("hidePopover"), "{js}");
+        assert!(js.contains("data-popover-toggle"), "{js}");
+        assert!(!js.contains("data-nav-menu-toggle"), "{js}");
     }
 
     #[test]
@@ -813,6 +845,177 @@ mod tests {
         // The whole point of this widget is to replace the native
         // window.confirm() dialog with a server-rendered, testable one.
         assert!(!js.contains("window.confirm"), "{js}");
+    }
+
+    /// Byte budget for `autumn-widgets.js` (issue #3397). See
+    /// `docs/guide/keyboard.md`. Raise it only with a reason in the PR.
+    /// Issue #3399 added the toast runtime. It increased the budgets from
+    /// 32 KiB and 10 KiB. Issue #3404 added the tooltip runtime, next to the
+    /// #3403 drawer. Issue #3402 added the popover menu runtime. Together they
+    /// increased them from 36 KiB and 11 KiB. Issue #3406 added the busy
+    /// state for htmx requests (`data-autumn-busy`), with its own
+    /// `hx-indicator` resolver. It increased them from 44 KiB and 13 KiB.
+    /// Issue #3411 added the direct upload controller. It increased them from
+    /// 46 KiB and 14 KiB. The test measures the bundle with the search part.
+    /// Issue #3410 added the tags mode of the combobox (chips). It increased
+    /// them from 54 KiB and 16 KiB.
+    const WIDGETS_JS_BUDGET_BYTES: usize = 61 * 1024;
+    /// Gzip budget. Browsers download this size.
+    const WIDGETS_JS_BUDGET_GZIP_BYTES: usize = 18 * 1024;
+
+    /// Shipped assets have LF line ends on every OS (`.gitattributes`). A
+    /// CRLF checkout changes the bytes, the content hash and the size.
+    #[test]
+    fn shipped_assets_have_lf_line_ends() {
+        for (name, bytes) in [
+            ("autumn-widgets.js", AUTUMN_WIDGETS_JS),
+            ("widgets.css", crate::ui::WIDGETS_CSS.as_bytes()),
+        ] {
+            assert!(!bytes.contains(&b'\r'), "{name} has a CR byte");
+        }
+    }
+
+    #[test]
+    fn widgets_js_stays_inside_its_size_budget() {
+        use std::io::Write as _;
+        let raw = AUTUMN_WIDGETS_JS.len();
+        assert!(
+            raw <= WIDGETS_JS_BUDGET_BYTES,
+            "autumn-widgets.js is {raw} bytes; budget {WIDGETS_JS_BUDGET_BYTES}"
+        );
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(AUTUMN_WIDGETS_JS).expect("gzip");
+        let gzip = gz.finish().expect("gzip").len();
+        assert!(
+            gzip <= WIDGETS_JS_BUDGET_GZIP_BYTES,
+            "autumn-widgets.js is {gzip} bytes gzipped; budget {WIDGETS_JS_BUDGET_GZIP_BYTES}"
+        );
+    }
+
+    /// Issue #3406: a `data-autumn-busy` element gets `aria-busy` during
+    /// its own htmx request: it sends it, it is the form submitter, or
+    /// `hx-indicator` names it. htmx 2 sets no `aria-busy`. The XHR
+    /// `loadend` clears it on every path, also when a swap or an error
+    /// removed the requester. Only an `aria-busy` that the runtime set is
+    /// removed.
+    #[test]
+    fn widgets_js_sets_aria_busy_for_the_request_only() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS).expect("utf8");
+        for needle in [
+            "'htmx:beforeSend'",
+            "matches('[data-autumn-busy]')",
+            "ev && ev.submitter",
+            // This request's own indicators, shared ones too: resolve the
+            // inherited `hx-indicator` as htmx does (Codex review).
+            "function indicatorsOf(elt)",
+            "closest('[hx-indicator],[data-hx-indicator]')",
+            "s === 'this' ? host",
+            "indicatorsOf(e.target)",
+            "d.target",
+            "busyCount",
+            "setAttribute('aria-busy', 'true')",
+            "addEventListener('loadend'",
+            "removeAttribute('aria-busy')",
+        ] {
+            assert!(js.contains(needle), "autumn-widgets.js has no `{needle}`");
+        }
+    }
+
+    #[test]
+    fn widgets_js_has_the_keyboard_core_contract() {
+        // The documented `data-*` contract (issue #3397). Plugins bind to
+        // these names, so a rename is a breaking change.
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        for name in [
+            "data-autumn-roving",
+            "data-autumn-orientation",
+            "data-autumn-wrap",
+            "data-autumn-typeahead",
+            "data-autumn-activedescendant",
+            "data-autumn-dismiss",
+            "autumn:navigate",
+            "autumn:dismiss",
+            "autumn:init",
+            "aria-activedescendant",
+            "Home",
+            "End",
+        ] {
+            assert!(js.contains(name), "missing `{name}`");
+        }
+    }
+
+    /// The tooltip runtime (issue #3404): the Escape-only dismiss mode, the
+    /// `aria-describedby` trigger lookup, and the Chromium enhancement.
+    #[test]
+    fn widgets_js_has_the_tooltip_contract() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        for name in [
+            "[data-autumn-tooltip]",
+            "'escape'",
+            "aria-describedby",
+            "aria-labelledby",
+            "interestForElement",
+            "interestfor",
+            "'hint'",
+            // A disabled button gets no interest. It keeps the CSS mode.
+            "button:not(:disabled)",
+            // `:popover-open` throws where popovers are missing.
+            "selector(:popover-open)",
+        ] {
+            assert!(js.contains(name), "missing `{name}`");
+        }
+        let init_all = &js[js.find("function initAll(root)").expect("initAll")..];
+        assert!(
+            init_all[..init_all.find("\n  }").expect("end")].contains("initTooltip"),
+            "initAll must init tooltips, so an htmx swap enhances them"
+        );
+    }
+
+    /// Plugin JS hooks `autumn:init` (issue #3400).
+    ///
+    /// The runtime fires it on
+    /// each new root after core widget init and before roving init, so a
+    /// plugin can set roles that roving reads. The first init waits for
+    /// `DOMContentLoaded`, so a deferred plugin script that loads after the
+    /// runtime still gets the page-load event.
+    #[test]
+    fn widgets_js_fires_autumn_init_for_plugins() {
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        let init_all = js
+            .find("function initAll(root)")
+            .expect("initAll must exist");
+        let body = &js[init_all..];
+        let fire = body
+            .find("'autumn:init'")
+            .expect("initAll must fire autumn:init");
+        let roving = body
+            .find("initRoving)")
+            .expect("initAll must init roving lists");
+        assert!(fire < roving, "autumn:init must fire before roving init");
+        assert!(
+            js.contains("document.addEventListener('DOMContentLoaded', boot)"),
+            "the first init must wait for DOMContentLoaded"
+        );
+    }
+
+    #[test]
+    fn widgets_js_needs_no_unsafe_eval() {
+        // CSP stays `script-src 'self'`: no eval, no string timers, no
+        // inline handlers written into the DOM.
+        let js = std::str::from_utf8(AUTUMN_WIDGETS_JS)
+            .expect("autumn-widgets.js should be valid UTF-8");
+        for bad in [
+            "eval(",
+            "new Function",
+            "setTimeout('",
+            "setAttribute('on",
+            ".innerHTML = '<",
+        ] {
+            assert!(!js.contains(bad), "found `{bad}`");
+        }
     }
 
     #[test]

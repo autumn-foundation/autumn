@@ -138,6 +138,26 @@ autumn_web::app().with_story_gallery(StoryGallery::builtin().extend(app_stories(
 autumn_web::app().with_story_gallery(StoryGallery::new().extend(app_stories()));
 ```
 
+## Stories from plugins
+
+`with_story_gallery` adds to the gallery (#3400). Each call adds its
+stories. Thus a plugin can add its own stories. Start a plugin gallery from
+`StoryGallery::new()`, not `StoryGallery::builtin()`. If two stories have
+the same slug, the app panics at startup.
+
+A plugin story can have its own CSS and JS. Add the URLs to the gallery.
+Each gallery page links them after the core assets:
+
+```rust
+StoryGallery::new()
+    .extend(pack_stories())
+    .stylesheet("/static/_plugins/swatch/swatch.css")
+    .script("/static/_plugins/swatch/swatch.js")
+```
+
+`AppBuilder::widget_pack` does all of this for a widget pack. See
+[Widget Packs](widget-packs.md).
+
 `StoryGallery::routes()` returns the underlying sub-router if you need to
 mount it manually; note the handlers read the registry from the `AppState`
 extension, so `with_story_gallery` (which installs it) is the normal path.
@@ -152,12 +172,18 @@ then enforces that widgets cannot ship without examples:
 
 1. an `EXPECTED_STORY_SLUGS` inventory is diffed both ways against
    `stories::builtin()`, and
-2. every public widget fn in `src/widgets.rs` must appear in at least one
-   builtin story's source.
+2. every public render fn in `src/widgets/`, `src/ui/pagination.rs`,
+   `src/flash.rs` and `src/wizard.rs`, and every `src/a11y.rs` primitive, must
+   appear in at least one builtin story's source.
 
 Adding a widget without a story fails CI with instructions: add a `story!`
 block in `autumn/src/stories/builtin.rs` and, for a new top-level widget, add
 its slug to the inventory.
+
+The `widgets-browser.yml` job also loads each story page in Chromium
+(issue #3398). The job fails when axe-core finds a serious or critical
+violation, in the light scheme or in the dark scheme. Each interactive story
+has a keyboard test. See CONTRIBUTING.md "Widget browser gate".
 
 ## Reference
 

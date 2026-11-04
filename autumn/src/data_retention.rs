@@ -821,6 +821,19 @@ fn elapsed_ms(started: crate::time::MonotonicInstant) -> u64 {
 ///
 /// Reports "not enabled" rather than a zero when custom domains are off, so a
 /// configured window never reads as an enforced policy over nothing.
+#[cfg(not(feature = "custom-domains"))]
+#[allow(clippy::unused_async)]
+async fn apply_custom_domain_prune(
+    _state: &AppState,
+    _cutoff: DateTime<Utc>,
+    _dry_run: bool,
+    report: &mut RetentionDatasetReport,
+) {
+    report.skipped =
+        Some("custom domains are not compiled in (feature `custom-domains`)".to_owned());
+}
+
+#[cfg(feature = "custom-domains")]
 async fn apply_custom_domain_prune(
     state: &AppState,
     cutoff: DateTime<Utc>,

@@ -75,6 +75,7 @@ mod collab_session;
 mod commentable;
 mod commit_hook_drain;
 mod compile_fail;
+mod compile_gate_features;
 mod compression_middleware;
 #[cfg(feature = "db")]
 mod confidential_model;
@@ -163,10 +164,15 @@ mod fake_generators;
 mod fault_injection;
 mod feature_flags_integration;
 mod feed;
+mod fleet_failover_guide;
+mod fleet_slot_guide;
 #[cfg(feature = "maud")]
 mod form_field_options;
 mod form_for_derive;
+mod form_native_inputs;
+#[cfg(feature = "widgets-search")]
 mod form_search_widgets;
+mod form_select;
 #[cfg(all(feature = "maud", feature = "cache-moka"))]
 mod fragment_cache_integration;
 mod framework_retention;
@@ -273,6 +279,7 @@ mod model_field_attrs;
 mod model_votable;
 #[cfg(feature = "db")]
 mod money_ledger_postgres;
+mod named_roles;
 #[cfg(feature = "maud")]
 mod negotiate;
 #[cfg(all(feature = "db", feature = "test-support"))]
@@ -301,6 +308,8 @@ mod openapi;
 mod openapi_direction;
 #[cfg(feature = "openapi")]
 mod openapi_export;
+// The `jwt` and `push` feature-off paths (default-on features).
+mod optional_jwt_and_push;
 #[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
 mod outbox_claim_profile;
 #[cfg(feature = "db")]
@@ -339,9 +348,11 @@ mod plugin_sandbox;
 // outbound HTTP, DB, jobs, render hooks, quotas and the audit surface.
 #[cfg(all(feature = "plugin-sandbox", feature = "test-support"))]
 mod plugin_sandbox_capabilities;
+#[cfg(feature = "push")]
 mod push_end_to_end;
+#[cfg(feature = "push")]
 mod push_router;
-#[cfg(feature = "db")]
+#[cfg(all(feature = "db", feature = "push"))]
 mod push_send_many_subscription_lookup_profile;
 mod query_count_asserts;
 mod query_structured;
@@ -359,6 +370,7 @@ mod raw_router_escape_hatch;
 mod read_your_writes_routing;
 #[cfg(all(feature = "db", not(feature = "sqlite")))]
 mod ready_db_ping;
+mod route_groups;
 // `test-support` exposes the monitor-step hook the test drives; the Docker
 // sweep enables it, so the test still runs there.
 #[cfg(all(feature = "db", feature = "test-support", not(feature = "sqlite")))]
@@ -374,6 +386,31 @@ mod redis_job_admin_ci_coverage;
 // path; this fails if either is renamed (#2111 follow-up). No feature gate:
 // it only reads job.rs and ci.yml as text.
 mod pg_relative_delay_ci_coverage;
+// ci.yml names the `--lib` Postgres claim Docker tests by full path. This
+// module fails if a test gets a new name (#3182). It has no feature gate,
+// because it reads job.rs and ci.yml as text.
+mod pg_claim_ci_coverage;
+// The Ledger capture covers only connections established after it installs,
+// and nothing can run before `main` under `unsafe_code = "forbid"`. libtest
+// starts tests in name order, and `__` sorts before every module here, so
+// this test installs the capture before any other test connects. It is
+// `#[ignore]`d so the `--ignored` Docker sweep runs it. It also fails when
+// AUTUMN_LEDGER_CAPTURE_DIR is set and the capture did not turn on.
+#[cfg(feature = "ledger-capture")]
+#[test]
+#[ignore = "installs the Ledger capture for the Docker sweep"]
+fn __ledger_capture_installs_first() {
+    autumn_web::ledger_capture::install();
+    if std::env::var_os(autumn_web::ledger_capture::CAPTURE_DIR_ENV).is_some() {
+        assert!(
+            autumn_web::ledger_capture::enabled(),
+            "AUTUMN_LEDGER_CAPTURE_DIR is set, but the capture could not open its output file"
+        );
+    }
+}
+// ci.yml runs the Bolt and Ledger profile gates (docs/perf/README.md). Reads
+// ci.yml as text, so no feature gate.
+mod perf_profile_gates_ci_coverage;
 // Postgres tier of the bitemporal, tamper-evident record ledger (issue #1699).
 // The Docker-free golden test lives in `tests/sqlite_ledger.rs`; this proves the
 // Postgres fork (jsonb snapshot cast, Timestamptz binds, COALESCE unique index).
@@ -382,6 +419,8 @@ mod ledger_postgres;
 // Ledger findings/fix harness for the generated `ledger_as_of`/`ledger_diff`
 // read path: profiles the unbounded full-chain read against a deep,
 // production-shaped chain and (after the fix) the bounded replacement.
+#[cfg(feature = "db")]
+mod db_prelude;
 #[cfg(feature = "db")]
 mod ledger_as_of_deep_chain_profile;
 #[cfg(feature = "db")]
@@ -521,8 +560,12 @@ mod step_up_route;
 mod storage_local_integration;
 #[cfg(feature = "maud")]
 mod stories;
+#[cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
+mod stories_browser;
 #[cfg(feature = "system-tests")]
 mod system_test_api;
+#[cfg(feature = "db")]
+mod table_boundaries;
 #[cfg(feature = "db")]
 mod tenancy;
 mod tenancy_unit;
@@ -572,21 +615,45 @@ mod webmcp_shim;
 #[cfg(feature = "maud")]
 mod widget_css_coverage;
 #[cfg(feature = "maud")]
+mod widget_features;
+#[cfg(all(feature = "system-tests", feature = "maud", feature = "htmx"))]
+mod widget_pack_browser;
+#[cfg(feature = "maud")]
+mod widgets_accordion;
+#[cfg(feature = "maud")]
 mod widgets_alert;
 #[cfg(feature = "maud")]
 mod widgets_avatar;
 #[cfg(feature = "maud")]
 mod widgets_badge;
-#[cfg(feature = "maud")]
+#[cfg(feature = "widgets-charts")]
 mod widgets_charts;
+#[cfg(all(feature = "system-tests", feature = "maud", feature = "storage"))]
+mod widgets_direct_upload_browser;
 #[cfg(feature = "maud")]
+mod widgets_drawer;
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_drawer_browser;
+#[cfg(feature = "widgets-social")]
 mod widgets_infinite_feed;
+#[cfg(all(feature = "system-tests", feature = "widgets-search"))]
+mod widgets_keyboard_browser;
 mod widgets_modal;
-#[cfg(feature = "maud")]
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_popover_browser;
+#[cfg(feature = "widgets-social")]
 mod widgets_reaction_controls;
 mod widgets_tabs;
 #[cfg(feature = "maud")]
+mod widgets_theme_toggle;
+#[cfg(feature = "maud")]
 mod widgets_toast;
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_toast_browser;
+#[cfg(feature = "maud")]
+mod widgets_tooltip;
+#[cfg(all(feature = "system-tests", feature = "maud"))]
+mod widgets_tooltip_browser;
 #[cfg(feature = "ws")]
 mod ws_integration;
 #[cfg(feature = "ws")]

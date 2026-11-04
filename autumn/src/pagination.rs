@@ -348,7 +348,7 @@ impl SortDir {
     /// typo, or a missing parameter — falls back to [`SortDir::Asc`]**. A list
     /// endpoint must never 400 on a malformed direction.
     #[must_use]
-    pub fn from_param(value: &str) -> Self {
+    pub const fn from_param(value: &str) -> Self {
         if value.eq_ignore_ascii_case("desc") {
             Self::Desc
         } else {
@@ -758,31 +758,16 @@ where
 const BASE64URL_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-// `clippy::chunks_exact_to_as_chunks` (armed by rustc 1.98) suggests
-// `as_chunks::<3>()`. That API stabilized in 1.88, which is this workspace's
-// exact MSRV — CI builds a `1.88.0` lane, so adopting it leaves zero margin for
-// an MSRV the project may want to hold. Not a trade worth making for an
-// incidental cleanup; revisit when the MSRV moves past 1.88.
-//
-// `unknown_lints` is allowed alongside it because the lint below does not exist
-// on every toolchain the workspace is built with, in *either* direction: it was
-// added in 1.98 (the MSRV lane is 1.88) and has since been renamed away on
-// current stable. On any toolchain that does not know the name, a bare `allow`
-// of it is itself a `-D warnings` failure, so the allow has to be forward- and
-// backward-compatible to be useful.
-#[allow(unknown_lints)]
-#[allow(clippy::chunks_exact_to_as_chunks)]
 fn base64url_encode(input: &[u8]) -> String {
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    let mut chunks = input.chunks_exact(3);
-    for chunk in &mut chunks {
+    let (chunks, rem) = input.as_chunks::<3>();
+    for chunk in chunks {
         let n = (u32::from(chunk[0]) << 16) | (u32::from(chunk[1]) << 8) | u32::from(chunk[2]);
         out.push(BASE64URL_ALPHABET[((n >> 18) & 0x3F) as usize] as char);
         out.push(BASE64URL_ALPHABET[((n >> 12) & 0x3F) as usize] as char);
         out.push(BASE64URL_ALPHABET[((n >> 6) & 0x3F) as usize] as char);
         out.push(BASE64URL_ALPHABET[(n & 0x3F) as usize] as char);
     }
-    let rem = chunks.remainder();
     match rem.len() {
         0 => {}
         1 => {
@@ -796,7 +781,7 @@ fn base64url_encode(input: &[u8]) -> String {
             out.push(BASE64URL_ALPHABET[((n >> 12) & 0x3F) as usize] as char);
             out.push(BASE64URL_ALPHABET[((n >> 6) & 0x3F) as usize] as char);
         }
-        _ => unreachable!("chunks_exact remainder is < 3 by construction"),
+        _ => unreachable!("as_chunks remainder is < 3 by construction"),
     }
     out
 }
@@ -937,10 +922,11 @@ impl Cursor {
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     // `Hmac::new_from_slice` accepts any key length.
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
     mac.finalize().into_bytes().into()
 }

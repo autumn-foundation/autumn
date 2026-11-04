@@ -89,10 +89,14 @@
 //! | `AUTUMN_DATABASE__FLEET__ROOT` | `database.fleet.root` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__PATH` | `database.fleet.path` | `String` |
 //! | `AUTUMN_DATABASE__FLEET__MAX_OPEN` | `database.fleet.max_open` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__MIN_RESIDENCY` | `database.fleet.min_residency` | duration; empty is `2s` |
 //! | `AUTUMN_DATABASE__FLEET__POOL_SIZE` | `database.fleet.pool_size` | `usize` |
 //! | `AUTUMN_DATABASE__FLEET__CREATE_ON_DEMAND` | `database.fleet.create_on_demand` | `Option<bool>` |
 //! | `AUTUMN_DATABASE__FLEET__IDLE_CLOSE_SECS` | `database.fleet.idle_close_secs` | `u64` |
 //! | `AUTUMN_DATABASE__FLEET__RESTORE_MISSING` | `database.fleet.restore_missing` | `bool` |
+//! | `AUTUMN_DATABASE__FLEET__REPLICA_RETENTION_AFTER_DELETE` | `database.fleet.replica_retention_after_delete` | duration; empty is `0` |
+//! | `AUTUMN_DATABASE__FLEET__RESTORE_CHECK_SAMPLE` | `database.fleet.restore_check_sample` | `usize` |
+//! | `AUTUMN_DATABASE__FLEET__REPLICATION_WORKERS` | `database.fleet.replication_workers` | `usize` |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER` | `database.fleet.ownership.owner` | `String` (creates the section) |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__SLOTS` | `database.fleet.ownership.slots` | comma-separated `N` / `A-B` |
 //! | `AUTUMN_DATABASE__FLEET__OWNERSHIP__LEASE_SECS` | `database.fleet.ownership.lease_secs` | `u64` |
@@ -253,6 +257,7 @@
 //! | `AUTUMN_SHADOW__MAX_SAMPLE_BYTES` | `shadow.max_sample_bytes` | `usize` |
 //! | `AUTUMN_FAULT_INJECTION__ENABLED` | `fault_injection.enabled` | `bool` |
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -614,6 +619,11 @@ allowed_origins = ["*"]
 # `allow_local_in_production = true`) or `s3`.
 [storage]
 backend = "local"
+
+# Dev: plain http on localhost. Most clients do not return a `Secure`
+# cookie over http, so session sign-in would fail.
+[session]
+secure = false
 
 [security.trusted_proxies]
 # Dev: trust X-Forwarded-* from loopback only so local reverse
@@ -1156,6 +1166,10 @@ pub struct ReplicationConfig {
     /// The recovery point objective in seconds: the steady-state upper bound on
     /// how much recently committed data a total loss of the machine costs.
     /// Defaults to 10 (AC #2).
+    ///
+    /// Replication is asynchronous. The host acknowledges a write before the
+    /// replicator ships it. So a failover to another volume can lose an
+    /// acknowledged write.
     #[serde(default = "default_rpo_secs")]
     pub rpo_secs: u64,
 
@@ -1433,7 +1447,14 @@ pub struct AutumnConfig {
     /// Keep this field above `database`, for the same reason as `deploy`:
     /// strict validation then checks the keys in each table.
     #[serde(default)]
+    #[cfg(feature = "slo")]
     pub slo: Vec<crate::slo::SloConfig>,
+
+    /// `[[slo]]` tables, kept so the file stays valid without the `slo`
+    /// feature. Nothing reads them.
+    #[serde(default)]
+    #[cfg(not(feature = "slo"))]
+    pub slo: Vec<toml::Value>,
 
     /// Deterministic replay capsule settings (`[failure_capture]` section,
     /// issue #1598).
@@ -1572,7 +1593,15 @@ pub struct AutumnConfig {
     /// leaving the app running with push silently dead. See
     /// [`crate::push::PushConfig`] and `docs/guide/web-push.md`.
     #[serde(default)]
+    #[cfg(feature = "push")]
     pub push: crate::push::PushConfig,
+
+    /// The `[push]` table, kept so the file stays valid without the `push`
+    /// feature. An `AUTUMN_PUSH__*` variable also sets it. The boot fails when
+    /// it is set: see [`validate_push`](Self::validate_push).
+    #[serde(default)]
+    #[cfg(not(feature = "push"))]
+    pub push: Option<InertSection>,
 
     /// HTTP idempotency-key middleware settings.
     #[serde(default)]
@@ -1598,12 +1627,23 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub scheduler: SchedulerConfig,
 
-    /// Process role: which slice of the runtime this replica runs (web tier,
-    /// worker tier, or both). Defaults to [`ProcessRole::Combined`] so existing
-    /// single-process deployments are unaffected. Also settable via the flat
-    /// `AUTUMN_ROLE` env var.
+    /// Process role: a built-in role (`combined`, `web`, `worker`) or the
+    /// name of a `[roles.<name>]` preset. Defaults to
+    /// [`ProcessRole::Combined`], so existing single-process deployments are
+    /// unaffected. Also settable via the flat `AUTUMN_ROLE` env var. Resolve
+    /// it with [`resolve_role`](Self::resolve_role).
     #[serde(default)]
-    pub role: ProcessRole,
+    pub role: RoleName,
+
+    /// Named role presets, `[roles.<name>]` (#3543). Each one is a built-in
+    /// base plus role-shaped overrides. See [`RolePreset`].
+    #[serde(default)]
+    pub roles: BTreeMap<String, RolePreset>,
+
+    /// The route groups of the app, for `autumn doctor` (#3544). The runtime
+    /// does not read it. See [`RouteGroupsConfig`].
+    #[serde(default)]
+    pub route_groups: RouteGroupsConfig,
 
     /// Authentication settings.
     #[serde(default)]
@@ -1776,6 +1816,7 @@ pub struct AutumnConfig {
     #[serde(default)]
     pub cost: CostConfig,
 
+    #[cfg(feature = "alerts")]
     /// Operator alerts settings (`[alerts]` section in `autumn.toml`).
     ///
     /// Configure an operator email and/or a webhook URL to receive alerts for
@@ -1792,6 +1833,12 @@ pub struct AutumnConfig {
     /// reads/writes still work through `Deref`/`DerefMut`.
     #[serde(default)]
     pub alerts: Box<crate::alerts::AlertConfig>,
+
+    /// The `[alerts]` table, kept so the file stays valid without the
+    /// `alerts` feature. Nothing reads it.
+    #[serde(default)]
+    #[cfg(not(feature = "alerts"))]
+    pub alerts: Option<toml::Value>,
 
     /// Unified data-retention policy for framework-owned data
     /// (`[retention]` section in `autumn.toml`, issue #1605).
@@ -3422,41 +3469,154 @@ impl SchedulerBackend {
 ///   does **not** serve user routes, but still binds the HTTP listener to serve
 ///   only the liveness/readiness probes and the actuator (so orchestrators can
 ///   supervise it and `/actuator/jobs` works).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+///
+/// `role` in TOML and `AUTUMN_ROLE` use one parser, [`FromStr`](std::str::FromStr). An unknown
+/// value is an error on both paths (#3541).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessRole {
     /// Serve HTTP and run background workers + scheduler (default; unchanged
     /// single-process behavior).
-    #[serde(
-        alias = "all",
-        alias = "combined",
-        alias = "web_and_worker",
-        alias = "server_and_worker"
-    )]
     #[default]
     Combined,
     /// Serve HTTP (and enqueue jobs) only — no worker loops, no scheduler.
-    #[serde(alias = "server", alias = "http")]
     Web,
     /// Run workers + scheduler only — probe/actuator HTTP only, no user routes.
-    #[serde(alias = "jobs", alias = "worker_only")]
     Worker,
 }
 
-impl ProcessRole {
-    /// Parse an environment variable / flag value for process-role selection.
+/// Each accepted spelling and its role. The order is the error order.
+const PROCESS_ROLE_SPELLINGS: [(&str, ProcessRole); 10] = [
+    ("combined", ProcessRole::Combined),
+    ("all", ProcessRole::Combined),
+    ("web_and_worker", ProcessRole::Combined),
+    ("server_and_worker", ProcessRole::Combined),
+    ("web", ProcessRole::Web),
+    ("server", ProcessRole::Web),
+    ("http", ProcessRole::Web),
+    ("worker", ProcessRole::Worker),
+    ("jobs", ProcessRole::Worker),
+    ("worker_only", ProcessRole::Worker),
+];
+
+/// The spellings of [`PROCESS_ROLE_SPELLINGS`], in the same order.
+const PROCESS_ROLE_NAMES: [&str; PROCESS_ROLE_SPELLINGS.len()] = {
+    let mut names = [""; PROCESS_ROLE_SPELLINGS.len()];
+    let mut i = 0;
+    while i < PROCESS_ROLE_SPELLINGS.len() {
+        names[i] = PROCESS_ROLE_SPELLINGS[i].0;
+        i += 1;
+    }
+    names
+};
+
+/// A `role` or `AUTUMN_ROLE` value that names no [`ProcessRole`].
+///
+/// The message names the value and lists the accepted spellings.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "unknown process role {value:?} (accepted: {})",
+    ProcessRole::ACCEPTED_VALUES.join(", ")
+)]
+pub struct ParseProcessRoleError {
+    value: String,
+}
+
+impl ParseProcessRoleError {
+    /// The value as given, before trim.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl std::str::FromStr for ProcessRole {
+    type Err = ParseProcessRoleError;
+
+    /// Parse a role. Case-insensitive. Leading and trailing spaces are
+    /// ignored.
     ///
-    /// Accepts (case-insensitive, trimmed): `combined`/`all`, `web`/`server`/
-    /// `http`, `worker`/`jobs`. Returns `None` for anything else so callers can
-    /// warn and keep the default.
+    /// # Errors
+    ///
+    /// Returns [`ParseProcessRoleError`] when the value is not in
+    /// [`ProcessRole::ACCEPTED_VALUES`]. A blank value is an error.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let wanted = value.trim().to_ascii_lowercase();
+        PROCESS_ROLE_SPELLINGS
+            .iter()
+            .find(|(spelling, _)| *spelling == wanted)
+            .map(|(_, role)| *role)
+            .ok_or_else(|| ParseProcessRoleError {
+                value: value.to_owned(),
+            })
+    }
+}
+
+/// The `Deserialize` visitor for [`ProcessRole`]. A string or a unit enum
+/// variant goes through [`FromStr`](std::str::FromStr).
+struct ProcessRoleVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ProcessRoleVisitor {
+    type Value = ProcessRole;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a process role string")
+    }
+
+    /// For a format that gives an enum as a plain string.
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<ProcessRole, E> {
+        value.parse().map_err(E::custom)
+    }
+
+    fn visit_enum<A>(self, data: A) -> Result<ProcessRole, A::Error>
+    where
+        A: serde::de::EnumAccess<'de>,
+    {
+        use serde::de::{Error as _, VariantAccess as _};
+        let (name, variant): (String, _) = data.variant()?;
+        variant.unit_variant()?;
+        name.parse().map_err(A::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Canonical names. The schema walker probes with the first one.
+        const VARIANTS: &[&str] = &["combined", "web", "worker"];
+
+        // `deserialize_enum`, not `deserialize_str`: the strict-config schema
+        // walker gives a real variant name only through this path.
+        deserializer.deserialize_enum("ProcessRole", VARIANTS, ProcessRoleVisitor)
+    }
+}
+
+impl ProcessRole {
+    /// Every spelling [`FromStr`](std::str::FromStr) accepts, in error order.
+    pub const ACCEPTED_VALUES: &'static [&'static str] = &PROCESS_ROLE_NAMES;
+
+    /// Parse a role value. Returns `None` for an unknown or blank value.
+    ///
+    /// Use [`FromStr`](std::str::FromStr) to get the error, or
+    /// [`parse_env_override`](Self::parse_env_override) for `AUTUMN_ROLE`.
     #[must_use]
     pub fn from_env_value(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "combined" | "all" | "web_and_worker" | "server_and_worker" => Some(Self::Combined),
-            "web" | "server" | "http" => Some(Self::Web),
-            "worker" | "jobs" | "worker_only" => Some(Self::Worker),
-            _ => None,
+        value.parse().ok()
+    }
+
+    /// Parse an `AUTUMN_ROLE` value.
+    ///
+    /// A blank value is unset: `Ok(None)`, and the configured role stays.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseProcessRoleError`] for a value that names no role.
+    pub fn parse_env_override(value: &str) -> Result<Option<Self>, ParseProcessRoleError> {
+        if value.trim().is_empty() {
+            return Ok(None);
         }
+        value.parse().map(Some)
     }
 
     /// Stable lowercase identifier for the role (round-trips `from_env_value`).
@@ -3476,12 +3636,918 @@ impl ProcessRole {
         matches!(self, Self::Combined | Self::Web)
     }
 
-    /// Whether this role runs background job workers and the cron scheduler
+    /// Whether this role runs background work
     /// ([`Combined`](Self::Combined) or [`Worker`](Self::Worker)).
+    ///
+    /// Kept for compatibility. To gate one subsystem, read its field in
+    /// [`capabilities`](Self::capabilities) or call [`runs`](Self::runs).
     #[must_use]
     pub const fn runs_workers(self) -> bool {
         matches!(self, Self::Combined | Self::Worker)
     }
+
+    /// The subsystems this role runs.
+    ///
+    /// `combined` runs all of them. `web` only serves HTTP. `worker` runs all
+    /// of them except HTTP.
+    #[must_use]
+    pub const fn capabilities(self) -> RoleCapabilities {
+        let http = self.serves_http();
+        let background = self.runs_workers();
+        RoleCapabilities {
+            serves_http: http,
+            job_workers: background,
+            scheduler: background,
+            outbox_relay: background,
+            commit_hooks: background,
+            fleet_relay: background,
+            restore_check: background,
+            retention: background,
+        }
+    }
+
+    /// Whether this role runs `capability`.
+    #[must_use]
+    pub const fn runs(self, capability: Capability) -> bool {
+        self.capabilities().runs(capability)
+    }
+}
+
+/// One subsystem that a process can run. See [`RoleCapabilities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Capability {
+    /// Serve user HTTP routes.
+    ServesHttp,
+    /// Run the `#[job]` worker loops.
+    JobWorkers,
+    /// Run the `#[scheduled]` tasks of the app and its plugins.
+    Scheduler,
+    /// Run the outbox relay.
+    OutboxRelay,
+    /// Drain durable commit hooks on the app pool and on each shard.
+    CommitHooks,
+    /// Let the `SQLite` fleet sweeper open closed databases, relay their
+    /// outbox and run backfills.
+    FleetRelay,
+    /// Run the fleet replication restore check.
+    RestoreCheck,
+    /// Run the retention sweeps: `#[repository(..., retention(...))]` and
+    /// `[retention]`.
+    Retention,
+}
+
+impl Capability {
+    /// Every capability, in [`RoleCapabilities`] field order. A slice, so
+    /// that a new capability does not change its type.
+    pub const ALL: &'static [Self] = &[
+        Self::ServesHttp,
+        Self::JobWorkers,
+        Self::Scheduler,
+        Self::OutboxRelay,
+        Self::CommitHooks,
+        Self::FleetRelay,
+        Self::RestoreCheck,
+        Self::Retention,
+    ];
+
+    /// The stable `snake_case` name. It is also the [`RoleCapabilities`] field
+    /// name and the serialized name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ServesHttp => "serves_http",
+            Self::JobWorkers => "job_workers",
+            Self::Scheduler => "scheduler",
+            Self::OutboxRelay => "outbox_relay",
+            Self::CommitHooks => "commit_hooks",
+            Self::FleetRelay => "fleet_relay",
+            Self::RestoreCheck => "restore_check",
+            Self::Retention => "retention",
+        }
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The subsystems that one process runs. The process resolves this set once
+/// at boot. Each framework subsystem reads its own field.
+///
+/// Read it with [`AppState::capabilities`](crate::AppState::capabilities).
+/// [`ProcessRole::capabilities`] gives the set of a built-in role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "one independent switch for each subsystem"
+)]
+pub struct RoleCapabilities {
+    /// See [`Capability::ServesHttp`].
+    pub serves_http: bool,
+    /// See [`Capability::JobWorkers`].
+    pub job_workers: bool,
+    /// See [`Capability::Scheduler`].
+    pub scheduler: bool,
+    /// See [`Capability::OutboxRelay`].
+    pub outbox_relay: bool,
+    /// See [`Capability::CommitHooks`].
+    pub commit_hooks: bool,
+    /// See [`Capability::FleetRelay`].
+    pub fleet_relay: bool,
+    /// See [`Capability::RestoreCheck`].
+    pub restore_check: bool,
+    /// See [`Capability::Retention`].
+    pub retention: bool,
+}
+
+impl RoleCapabilities {
+    /// Whether this set includes `capability`.
+    #[must_use]
+    pub const fn runs(self, capability: Capability) -> bool {
+        match capability {
+            Capability::ServesHttp => self.serves_http,
+            Capability::JobWorkers => self.job_workers,
+            Capability::Scheduler => self.scheduler,
+            Capability::OutboxRelay => self.outbox_relay,
+            Capability::CommitHooks => self.commit_hooks,
+            Capability::FleetRelay => self.fleet_relay,
+            Capability::RestoreCheck => self.restore_check,
+            Capability::Retention => self.retention,
+        }
+    }
+
+    /// The capabilities in this set, in [`Capability::ALL`] order.
+    pub fn enabled(self) -> impl Iterator<Item = Capability> {
+        Capability::ALL
+            .iter()
+            .copied()
+            .filter(move |capability| self.runs(*capability))
+    }
+}
+
+/// The longest role name. It fits a Kubernetes label value.
+const ROLE_NAME_MAX_LEN: usize = 63;
+
+/// The grammar of a role name, for error messages.
+const ROLE_NAME_RULE: &str = "a role name starts with a lowercase letter, has only a-z, 0-9, \
+                              '_' and '-', and has at most 63 characters";
+
+/// Whether `name` is a valid `[roles.<name>]` name. The name is also a
+/// metric label value and a `replica_id` prefix, so the grammar is narrow.
+fn is_valid_role_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    name.len() <= ROLE_NAME_MAX_LEN
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// The `role` value: a built-in [`ProcessRole`] or the name of a
+/// `[roles.<name>]` preset (#3543).
+///
+/// Parsing ignores case and leading and trailing spaces. A built-in spelling
+/// (see [`ProcessRole::ACCEPTED_VALUES`]) gives that built-in role. Any other
+/// value must be a valid role name. The loader then checks that the preset is
+/// declared. See [`AutumnConfig::resolve_role`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoleName(RoleNameRepr);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoleNameRepr {
+    Builtin(ProcessRole),
+    Preset(Box<str>),
+}
+
+impl Default for RoleNameRepr {
+    fn default() -> Self {
+        Self::Builtin(ProcessRole::default())
+    }
+}
+
+/// A `role` or `AUTUMN_ROLE` value that is not a built-in role and not a valid
+/// role name.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "invalid process role {value:?}: use a built-in role ({}) or a [roles.<name>] name; {}",
+    ProcessRole::ACCEPTED_VALUES.join(", "),
+    ROLE_NAME_RULE
+)]
+pub struct RoleNameError {
+    value: String,
+}
+
+impl RoleNameError {
+    /// The value as given, before trim.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl RoleName {
+    /// The canonical name: the built-in name, or the lowercase preset name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match &self.0 {
+            RoleNameRepr::Builtin(role) => role.as_str(),
+            RoleNameRepr::Preset(name) => name,
+        }
+    }
+
+    /// The built-in role this value names, or `None` for a preset name.
+    #[must_use]
+    pub const fn builtin(&self) -> Option<ProcessRole> {
+        match &self.0 {
+            RoleNameRepr::Builtin(role) => Some(*role),
+            RoleNameRepr::Preset(_) => None,
+        }
+    }
+
+    /// Parse an `AUTUMN_ROLE` value. A blank value is unset: `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoleNameError`] for a value that is not a built-in role and
+    /// not a valid role name.
+    pub fn parse_env_override(value: &str) -> Result<Option<Self>, RoleNameError> {
+        if value.trim().is_empty() {
+            return Ok(None);
+        }
+        value.parse().map(Some)
+    }
+}
+
+impl std::str::FromStr for RoleName {
+    type Err = RoleNameError;
+
+    /// Parse a role value. Case-insensitive. Leading and trailing spaces are
+    /// ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoleNameError`] for a blank value, or for a value that is not
+    /// a built-in role and not a valid role name.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Ok(role) = value.parse::<ProcessRole>() {
+            return Ok(Self(RoleNameRepr::Builtin(role)));
+        }
+        let name = value.trim().to_ascii_lowercase();
+        if is_valid_role_name(&name) {
+            Ok(Self(RoleNameRepr::Preset(name.into_boxed_str())))
+        } else {
+            Err(RoleNameError {
+                value: value.to_owned(),
+            })
+        }
+    }
+}
+
+impl From<ProcessRole> for RoleName {
+    fn from(role: ProcessRole) -> Self {
+        Self(RoleNameRepr::Builtin(role))
+    }
+}
+
+/// `true` only when this value names that built-in role.
+impl PartialEq<ProcessRole> for RoleName {
+    fn eq(&self, other: &ProcessRole) -> bool {
+        self.builtin() == Some(*other)
+    }
+}
+
+impl PartialEq<RoleName> for ProcessRole {
+    fn eq(&self, other: &RoleName) -> bool {
+        other == self
+    }
+}
+
+impl std::fmt::Display for RoleName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The `Deserialize` visitor for [`RoleName`]. A string or a unit enum
+/// variant goes through [`FromStr`](std::str::FromStr).
+struct RoleNameVisitor;
+
+impl<'de> serde::de::Visitor<'de> for RoleNameVisitor {
+    type Value = RoleName;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a process role string")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<RoleName, E> {
+        value.parse().map_err(E::custom)
+    }
+
+    fn visit_enum<A>(self, data: A) -> Result<RoleName, A::Error>
+    where
+        A: serde::de::EnumAccess<'de>,
+    {
+        use serde::de::{Error as _, VariantAccess as _};
+        let (name, variant): (String, _) = data.variant()?;
+        variant.unit_variant()?;
+        name.parse().map_err(A::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for RoleName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Canonical names. The schema walker probes with the first one.
+        const VARIANTS: &[&str] = &["combined", "web", "worker"];
+        // `deserialize_enum`, as for `ProcessRole`: the strict-config schema
+        // walker gives a real variant name only through this path.
+        deserializer.deserialize_enum("RoleName", VARIANTS, RoleNameVisitor)
+    }
+}
+
+/// One `[roles.<name>]` preset (#3543): a built-in base plus role-shaped
+/// overrides.
+///
+/// ```toml
+/// [roles.critical]
+/// base = "worker"      # combined | web | worker
+/// pin = ["critical"]   # replaces jobs.pin; [] = no job workers
+/// workers = 8          # replaces jobs.workers
+/// scheduler = false    # unset = the base default
+/// ```
+///
+/// A preset over an HTTP base can also set `mount = ["marketing"]`: the route
+/// groups it serves (#3544). Unset: every group.
+///
+/// The base is the safety contract. An override can only turn a capability
+/// off. `serves_http` is not a key: the base decides it. Unknown keys fail the
+/// load, so a preset cannot set other config.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct RolePreset {
+    /// The built-in role this preset narrows.
+    pub base: ProcessRole,
+    /// Queues this role drains. Unset: `jobs.pin`. Empty: no job workers.
+    #[serde(default)]
+    pub pin: Option<Vec<String>>,
+    /// Concurrent worker loops. Unset: `jobs.workers`.
+    #[serde(default)]
+    pub workers: Option<usize>,
+    /// Override for [`Capability::JobWorkers`].
+    #[serde(default)]
+    pub job_workers: Option<bool>,
+    /// Override for [`Capability::Scheduler`].
+    #[serde(default)]
+    pub scheduler: Option<bool>,
+    /// Override for [`Capability::OutboxRelay`].
+    #[serde(default)]
+    pub outbox_relay: Option<bool>,
+    /// Override for [`Capability::CommitHooks`].
+    #[serde(default)]
+    pub commit_hooks: Option<bool>,
+    /// Override for [`Capability::FleetRelay`].
+    #[serde(default)]
+    pub fleet_relay: Option<bool>,
+    /// Override for [`Capability::RestoreCheck`].
+    #[serde(default)]
+    pub restore_check: Option<bool>,
+    /// Override for [`Capability::Retention`].
+    #[serde(default)]
+    pub retention: Option<bool>,
+    /// The route groups this role serves (#3544). Unset: every group.
+    /// Framework routes (probes, actuator, assets) are always served.
+    #[serde(default)]
+    pub mount: Option<Vec<String>>,
+}
+
+/// An invalid `[roles.<name>]` preset, or a `role` that names no role.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum RoleError {
+    /// The preset name breaks the role name grammar.
+    #[error("[roles.{name}]: invalid role name {name:?}; {}", ROLE_NAME_RULE)]
+    InvalidName {
+        /// The declared name.
+        name: String,
+    },
+    /// The preset name is a built-in role spelling.
+    #[error(
+        "[roles.{name}]: {name:?} is a reserved built-in role name; pick another name and set \
+         base = \"{name}\" if you want that base"
+    )]
+    Reserved {
+        /// The declared name.
+        name: String,
+    },
+    /// An override turns on a capability that the base does not run.
+    #[error(
+        "[roles.{name}]: {capability} = true is not allowed on base \"{}\", which does not \
+         run it; a preset can only turn a capability off, so use base = \"combined\" or \
+         \"worker\"",
+        .base.as_str()
+    )]
+    AboveBase {
+        /// The declared name.
+        name: String,
+        /// The capability.
+        capability: Capability,
+        /// The base.
+        base: ProcessRole,
+    },
+    /// `pin` names queues, but the role runs no job workers.
+    #[error("[roles.{name}]: pin names queues, but this role runs no job workers")]
+    PinWithoutJobWorkers {
+        /// The declared name.
+        name: String,
+    },
+    /// `pin = []` and `job_workers = true` contradict each other.
+    #[error("[roles.{name}]: pin = [] means no job workers, but job_workers = true; remove one")]
+    EmptyPinWithJobWorkers {
+        /// The declared name.
+        name: String,
+    },
+    /// `pin` has a blank queue name.
+    #[error("[roles.{name}]: pin has a blank queue name")]
+    BlankPin {
+        /// The declared name.
+        name: String,
+    },
+    /// `workers = 0`.
+    #[error(
+        "[roles.{name}]: workers must be 1 or more; to run no job workers, set \
+         job_workers = false"
+    )]
+    ZeroWorkers {
+        /// The declared name.
+        name: String,
+    },
+    /// `workers` is set, but the role runs no job workers.
+    #[error("[roles.{name}]: workers is set, but this role runs no job workers")]
+    WorkersWithoutJobWorkers {
+        /// The declared name.
+        name: String,
+    },
+    /// `mount` is set, but the base serves no HTTP.
+    #[error(
+        "[roles.{name}]: mount names route groups, but base \"{}\" serves no routes; \
+         remove mount or use base = \"web\" or \"combined\"",
+        .base.as_str()
+    )]
+    MountWithoutHttp {
+        /// The declared name.
+        name: String,
+        /// The base.
+        base: ProcessRole,
+    },
+    /// `mount = []`.
+    #[error(
+        "[roles.{name}]: mount = [] serves no route group; name at least one group, or \
+         remove mount to serve every group"
+    )]
+    EmptyMount {
+        /// The declared name.
+        name: String,
+    },
+    /// `mount` has a blank group name.
+    #[error("[roles.{name}]: mount has a blank route group name")]
+    BlankMount {
+        /// The declared name.
+        name: String,
+    },
+    /// `role` names no built-in role and no declared preset.
+    #[error("{builtin}, and no [roles.{name}] is declared ({})", declared_roles_text(.declared))]
+    Undeclared {
+        /// The canonical name.
+        name: String,
+        /// The built-in parse error, with the accepted spellings.
+        builtin: ParseProcessRoleError,
+        /// The declared preset names.
+        declared: Vec<String>,
+    },
+}
+
+fn declared_roles_text(declared: &[String]) -> String {
+    if declared.is_empty() {
+        "no roles are declared".to_owned()
+    } else {
+        format!("declared roles: {}", declared.join(", "))
+    }
+}
+
+impl RolePreset {
+    /// A preset over `base` with no overrides.
+    #[must_use]
+    pub const fn new(base: ProcessRole) -> Self {
+        Self {
+            base,
+            pin: None,
+            workers: None,
+            job_workers: None,
+            scheduler: None,
+            outbox_relay: None,
+            commit_hooks: None,
+            fleet_relay: None,
+            restore_check: None,
+            retention: None,
+            mount: None,
+        }
+    }
+
+    /// Whether this preset serves the routes of `group`: the base serves
+    /// HTTP, and `mount` is unset or names `group`.
+    #[must_use]
+    pub fn mounts_group(&self, group: &str) -> bool {
+        mount_admits(self.base.serves_http(), self.mount.as_deref(), group)
+    }
+
+    /// The override for `capability`, if the preset sets one.
+    const fn override_for(&self, capability: Capability) -> Option<bool> {
+        match capability {
+            Capability::ServesHttp => None,
+            Capability::JobWorkers => self.job_workers,
+            Capability::Scheduler => self.scheduler,
+            Capability::OutboxRelay => self.outbox_relay,
+            Capability::CommitHooks => self.commit_hooks,
+            Capability::FleetRelay => self.fleet_relay,
+            Capability::RestoreCheck => self.restore_check,
+            Capability::Retention => self.retention,
+        }
+    }
+
+    /// The capability set: the base set, with each override applied, and no
+    /// job workers for `pin = []`. A capability the base does not run stays
+    /// off.
+    #[must_use]
+    pub fn capabilities(&self) -> RoleCapabilities {
+        let base = self.base.capabilities();
+        let on = |capability: Capability| {
+            base.runs(capability) && self.override_for(capability).unwrap_or(true)
+        };
+        RoleCapabilities {
+            serves_http: base.serves_http,
+            job_workers: on(Capability::JobWorkers)
+                && !self.pin.as_ref().is_some_and(Vec::is_empty),
+            scheduler: on(Capability::Scheduler),
+            outbox_relay: on(Capability::OutboxRelay),
+            commit_hooks: on(Capability::CommitHooks),
+            fleet_relay: on(Capability::FleetRelay),
+            restore_check: on(Capability::RestoreCheck),
+            retention: on(Capability::Retention),
+        }
+    }
+
+    /// Check this preset, declared as `[roles.<name>]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoleError`] for a bad or reserved name, an override above
+    /// the base, or a `pin` / `workers` value that contradicts the
+    /// capabilities.
+    pub fn validate(&self, name: &str) -> Result<(), RoleError> {
+        let named = || name.to_owned();
+        if name.parse::<ProcessRole>().is_ok() {
+            return Err(RoleError::Reserved { name: named() });
+        }
+        if !is_valid_role_name(name) {
+            return Err(RoleError::InvalidName { name: named() });
+        }
+        let base = self.base.capabilities();
+        if let Some(&capability) = Capability::ALL
+            .iter()
+            .find(|&&c| self.override_for(c) == Some(true) && !base.runs(c))
+        {
+            return Err(RoleError::AboveBase {
+                name: named(),
+                capability,
+                base: self.base,
+            });
+        }
+        let job_workers = self.capabilities().job_workers;
+        match self.pin.as_deref() {
+            Some([]) if self.job_workers == Some(true) => {
+                return Err(RoleError::EmptyPinWithJobWorkers { name: named() });
+            }
+            Some(pin) if pin.iter().any(|q| q.trim().is_empty()) => {
+                return Err(RoleError::BlankPin { name: named() });
+            }
+            Some([_, ..]) if !job_workers => {
+                return Err(RoleError::PinWithoutJobWorkers { name: named() });
+            }
+            _ => {}
+        }
+        match self.workers {
+            Some(0) => return Err(RoleError::ZeroWorkers { name: named() }),
+            Some(_) if !job_workers => {
+                return Err(RoleError::WorkersWithoutJobWorkers { name: named() });
+            }
+            _ => {}
+        }
+        match self.mount.as_deref() {
+            Some(_) if !self.base.serves_http() => Err(RoleError::MountWithoutHttp {
+                name: named(),
+                base: self.base,
+            }),
+            Some([]) => Err(RoleError::EmptyMount { name: named() }),
+            Some(groups) if groups.iter().any(|g| g.trim().is_empty()) => {
+                Err(RoleError::BlankMount { name: named() })
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The resolved role of this process: its name, its built-in base and its
+/// capability set (#3543).
+///
+/// Read it with [`AppState::role`](crate::AppState::role). A built-in role has
+/// its own name and carries no preset data, so it costs no allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Role {
+    base: ProcessRole,
+    capabilities: RoleCapabilities,
+    preset: Option<Arc<PresetRole>>,
+}
+
+/// The preset part of a [`Role`].
+#[derive(Debug, PartialEq, Eq)]
+struct PresetRole {
+    name: Box<str>,
+    pin: Option<Vec<String>>,
+    workers: Option<usize>,
+    mount: Option<Vec<String>>,
+}
+
+/// Whether a role with `serves_http` and `mount` serves the routes of
+/// `group`. Unset `mount` admits every group.
+fn mount_admits(serves_http: bool, mount: Option<&[String]>, group: &str) -> bool {
+    serves_http && mount.is_none_or(|groups| groups.iter().any(|g| g == group))
+}
+
+impl Role {
+    /// The role name: the preset name, or the built-in name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.preset
+            .as_ref()
+            .map_or_else(|| self.base.as_str(), |preset| &preset.name)
+    }
+
+    /// The built-in role this role is based on. The framework applies the
+    /// safety checks of the base.
+    #[must_use]
+    pub const fn base(&self) -> ProcessRole {
+        self.base
+    }
+
+    /// The subsystems this process runs.
+    #[must_use]
+    pub const fn capabilities(&self) -> RoleCapabilities {
+        self.capabilities
+    }
+
+    /// Whether this role runs `capability`.
+    #[must_use]
+    pub const fn runs(&self, capability: Capability) -> bool {
+        self.capabilities.runs(capability)
+    }
+
+    /// Whether this role comes from a `[roles.<name>]` preset.
+    #[must_use]
+    pub const fn is_preset(&self) -> bool {
+        self.preset.is_some()
+    }
+
+    /// Whether this process serves user HTTP routes. The base decides.
+    #[must_use]
+    pub const fn serves_http(&self) -> bool {
+        self.capabilities.serves_http
+    }
+
+    /// The role that the split-role checks use: the durable jobs backend and
+    /// the file-backed `SQLite` database.
+    ///
+    /// This is the base, but a `combined` preset that runs no job workers
+    /// gives [`ProcessRole::Web`]. It enqueues jobs and does not drain them,
+    /// so another process must share its queue.
+    #[must_use]
+    pub const fn guard_base(&self) -> ProcessRole {
+        match self.base {
+            ProcessRole::Combined if !self.capabilities.job_workers => ProcessRole::Web,
+            base => base,
+        }
+    }
+
+    /// Whether the base runs background work. Kept for compatibility. To gate
+    /// one subsystem, read [`capabilities`](Self::capabilities).
+    #[must_use]
+    pub const fn runs_workers(&self) -> bool {
+        self.base.runs_workers()
+    }
+
+    /// The queues the preset pins, or `None` to use `jobs.pin`.
+    #[must_use]
+    pub fn pin(&self) -> Option<&[String]> {
+        self.preset
+            .as_ref()
+            .and_then(|preset| preset.pin.as_deref())
+    }
+
+    /// The worker loop count the preset sets, or `None` to use `jobs.workers`.
+    #[must_use]
+    pub fn workers(&self) -> Option<usize> {
+        self.preset.as_ref().and_then(|preset| preset.workers)
+    }
+
+    /// The route groups the preset mounts, or `None` for every group (#3544).
+    #[must_use]
+    pub fn mount(&self) -> Option<&[String]> {
+        self.preset
+            .as_ref()
+            .and_then(|preset| preset.mount.as_deref())
+    }
+
+    /// Whether this role serves the routes of `group`. A role that serves no
+    /// HTTP serves no group. Framework routes do not have a group: every role
+    /// that serves HTTP serves them.
+    #[must_use]
+    pub fn mounts_group(&self, group: &str) -> bool {
+        mount_admits(self.serves_http(), self.mount(), group)
+    }
+
+    /// `jobs` with the preset `pin` and `workers` applied. A role without
+    /// them borrows `jobs` as it is.
+    #[must_use]
+    pub fn jobs_config<'a>(&self, jobs: &'a JobConfig) -> std::borrow::Cow<'a, JobConfig> {
+        let (pin, workers) = (self.pin(), self.workers());
+        if pin.is_none() && workers.is_none() {
+            return std::borrow::Cow::Borrowed(jobs);
+        }
+        let mut jobs = jobs.clone();
+        if let Some(pin) = pin {
+            jobs.pin = pin.to_vec();
+        }
+        if let Some(workers) = workers {
+            jobs.workers = workers;
+        }
+        std::borrow::Cow::Owned(jobs)
+    }
+
+    /// Resolve a `[roles.<name>]` preset. The caller validates it first.
+    fn from_preset(name: &str, preset: &RolePreset) -> Self {
+        let capabilities = preset.capabilities();
+        Self {
+            base: preset.base,
+            capabilities,
+            preset: Some(Arc::new(PresetRole {
+                name: name.into(),
+                pin: preset.pin.clone().filter(|pin| !pin.is_empty()),
+                workers: preset.workers,
+                mount: preset.mount.clone(),
+            })),
+        }
+    }
+}
+
+impl From<ProcessRole> for Role {
+    fn from(base: ProcessRole) -> Self {
+        Self {
+            base,
+            capabilities: base.capabilities(),
+            preset: None,
+        }
+    }
+}
+
+/// `true` only for that built-in role. A preset is not equal to its base:
+/// compare [`Role::base`] for that.
+impl PartialEq<ProcessRole> for Role {
+    fn eq(&self, other: &ProcessRole) -> bool {
+        self.preset.is_none() && self.base == *other
+    }
+}
+
+impl PartialEq<Role> for ProcessRole {
+    fn eq(&self, other: &Role) -> bool {
+        other == self
+    }
+}
+
+impl std::fmt::Display for Role {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Check every `[roles.<name>]` preset.
+///
+/// # Errors
+///
+/// Returns the first [`RoleError`], in name order.
+pub fn validate_role_presets(roles: &BTreeMap<String, RolePreset>) -> Result<(), RoleError> {
+    roles
+        .iter()
+        .try_for_each(|(name, preset)| preset.validate(name))
+}
+
+/// Resolve `name` against the declared presets.
+///
+/// # Errors
+///
+/// Returns [`RoleError::Undeclared`] for a preset name with no
+/// `[roles.<name>]`, or the [`RolePreset::validate`] error of the preset.
+pub fn resolve_role(
+    name: &RoleName,
+    roles: &BTreeMap<String, RolePreset>,
+) -> Result<Role, RoleError> {
+    if let Some(base) = name.builtin() {
+        return Ok(Role::from(base));
+    }
+    let wanted = name.as_str();
+    let Some(preset) = roles.get(wanted) else {
+        return Err(RoleError::Undeclared {
+            name: wanted.to_owned(),
+            builtin: ParseProcessRoleError {
+                value: wanted.to_owned(),
+            },
+            declared: roles.keys().cloned().collect(),
+        });
+    };
+    preset.validate(wanted)?;
+    Ok(Role::from_preset(wanted, preset))
+}
+
+/// `[route_groups]`: the route groups `autumn doctor` checks (#3544).
+///
+/// `autumn doctor --strict` fails when a group here is mounted by no
+/// `[roles.<name>]` preset. The runtime does not read this section: it knows
+/// the groups from the code.
+///
+/// ```toml
+/// [route_groups]
+/// manifest = "routes.json"          # autumn routes --format json > routes.json
+/// declared = ["marketing", "app"]   # used when manifest is not set
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteGroupsConfig {
+    /// Route groups, written by hand.
+    #[serde(default)]
+    pub declared: Vec<String>,
+    /// Path to the output of `autumn routes --format json`. It wins over
+    /// `declared`.
+    #[serde(default)]
+    pub manifest: Option<String>,
+}
+
+/// The groups in `groups` that no `[roles.<name>]` preset mounts (#3544), in
+/// input order.
+///
+/// A preset over an HTTP base with no `mount` mounts every group. When no
+/// preset serves HTTP, the built-in roles serve every group, and this returns
+/// nothing. A built-in role is not counted when a preset serves HTTP, as for
+/// [`derive_fleet_tiers`].
+#[must_use]
+pub fn groups_mounted_by_no_preset(
+    roles: &BTreeMap<String, RolePreset>,
+    groups: &[String],
+) -> Vec<String> {
+    if !roles.values().any(|preset| preset.base.serves_http()) {
+        return Vec::new();
+    }
+    groups
+        .iter()
+        .filter(|group| !roles.values().any(|preset| preset.mounts_group(group)))
+        .cloned()
+        .collect()
+}
+
+/// The `[jobs.fleet] tiers` that `[roles.*]` declare: one tier for each preset
+/// that runs job workers, in name order. A tier is the preset `pin`, else
+/// `jobs_pin`. An empty tier drains every queue.
+///
+/// # Errors
+///
+/// Returns the first [`RoleError`] of an invalid preset.
+pub fn derive_fleet_tiers(
+    roles: &BTreeMap<String, RolePreset>,
+    jobs_pin: &[String],
+) -> Result<Vec<Vec<String>>, RoleError> {
+    validate_role_presets(roles)?;
+    Ok(roles
+        .iter()
+        .map(|(name, preset)| Role::from_preset(name, preset))
+        .filter(|role| role.capabilities.job_workers)
+        .map(|role| {
+            role.pin()
+                .map_or_else(|| jobs_pin.to_vec(), <[String]>::to_vec)
+        })
+        .collect())
 }
 
 /// Whether a `role` / `jobs.backend` combination is invalid because a split
@@ -3856,6 +4922,23 @@ impl SchedulerConfig {
             .unwrap_or_else(|| format!("pid-{}", std::process::id()))
     }
 
+    /// [`resolved_replica_id`](Self::resolved_replica_id) for a process with
+    /// `role`. When `replica_id` is unset, a preset role prefixes the default
+    /// with its name: `critical-<host>`. A built-in role keeps the default.
+    #[must_use]
+    pub fn resolved_replica_id_for(&self, role: &Role) -> String {
+        let id = self.resolved_replica_id();
+        let explicit = self
+            .replica_id
+            .as_ref()
+            .is_some_and(|id| !id.trim().is_empty());
+        if role.is_preset() && !explicit {
+            format!("{}-{id}", role.name())
+        } else {
+            id
+        }
+    }
+
     /// Validate scheduler-specific config shape.
     ///
     /// # Errors
@@ -3999,8 +5082,11 @@ const fn default_idempotency_ttl_secs() -> u64 {
     86_400
 }
 
+/// Seconds an idempotency lock lives before a retry may take it.
+pub(crate) const DEFAULT_IDEMPOTENCY_IN_FLIGHT_TTL_SECS: u64 = 60;
+
 const fn default_idempotency_in_flight_ttl_secs() -> u64 {
-    crate::idempotency::DEFAULT_IN_FLIGHT_TTL.as_secs()
+    DEFAULT_IDEMPOTENCY_IN_FLIGHT_TTL_SECS
 }
 
 /// `OpenAPI` spec runtime exposure settings.
@@ -4781,7 +5867,110 @@ const MANUAL_SCHEMA_SECTIONS: &[(&str, &[&str])] = &[
     ("time_zone", &["identifier", "sources"]),
 ];
 
+/// A config table kept in a build without the feature that reads it.
+///
+/// It parses, so a config file that is valid with the feature stays valid
+/// without it, but nothing reads it. `Debug` prints only the key names: a
+/// table such as `[push]` holds a private key.
+///
+/// The inner value is a `toml::Value`, as `[alerts]` is without its feature,
+/// so strict config validation treats the table as one opaque leaf.
+#[cfg(not(feature = "push"))]
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct InertSection(toml::Value);
+
+#[cfg(not(feature = "push"))]
+impl Default for InertSection {
+    fn default() -> Self {
+        Self(toml::Value::Table(toml::Table::new()))
+    }
+}
+
+#[cfg(not(feature = "push"))]
+impl InertSection {
+    /// The keys set in the table, from the file or from the environment.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .as_table()
+            .into_iter()
+            .flat_map(|table| table.keys().map(String::as_str))
+    }
+
+    fn insert(&mut self, key: &str, value: toml::Value) {
+        if let toml::Value::Table(table) = &mut self.0 {
+            table.insert(key.to_owned(), value);
+        }
+    }
+}
+
+#[cfg(not(feature = "push"))]
+impl std::fmt::Debug for InertSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InertSection")
+            .field("keys", &self.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The boot error for `[push]` in a build without the `push` feature.
+#[cfg(not(feature = "push"))]
+pub(crate) const PUSH_FEATURE_MISSING: &str = "[push] is configured but this binary was built \
+     without the `push` feature; rebuild with `--features push`, or remove [push] and the \
+     AUTUMN_PUSH__* variables";
+
+/// The `AUTUMN_PUSH__*` variables and the `[push]` keys they set.
+#[cfg(not(feature = "push"))]
+const PUSH_ENV_KEYS: &[(&str, &str)] = &[
+    ("AUTUMN_PUSH__PRIVATE_KEY", "private_key"),
+    ("AUTUMN_PUSH__PUBLIC_KEY", "public_key"),
+    ("AUTUMN_PUSH__SUBJECT", "subject"),
+    ("AUTUMN_PUSH__TTL_SECS", "ttl_secs"),
+];
+
+/// The error for `tenancy.source = "jwt"` in a build without the `jwt`
+/// feature. The boot reports it, and so does tenant resolution on a router
+/// built without `run`.
+#[cfg(not(feature = "jwt"))]
+pub(crate) const JWT_FEATURE_MISSING: &str = "tenancy.source = \"jwt\" but this binary was built \
+     without the `jwt` feature; rebuild with `--features jwt`, or choose another tenancy source";
+
 impl AutumnConfig {
+    /// Resolve [`role`](Self::role) against [`roles`](Self::roles).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RoleError`] when `role` names no declared preset, or when the
+    /// selected preset is invalid. The loaders reject both.
+    pub fn resolve_role(&self) -> Result<Role, RoleError> {
+        resolve_role(&self.role, &self.roles)
+    }
+
+    /// Check every preset, then resolve the role. `source` names the origin of
+    /// the role value in the error.
+    fn check_role(&self, source: &str) -> Result<(), ConfigError> {
+        validate_role_presets(&self.roles)
+            .map_err(|err| ConfigError::Validation(err.to_string()))?;
+        self.resolve_role()
+            .map(drop)
+            .map_err(|err| ConfigError::Validation(format!("{source}: {err}")))
+    }
+
+    /// Log a warning for each section whose feature is off.
+    ///
+    /// The file still parses, but the section does nothing.
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
+    pub(crate) fn warn_on_inert_sections(&self) {
+        #[cfg(not(feature = "alerts"))]
+        if self.alerts.is_some() {
+            tracing::warn!("[alerts] is set, but this build lacks the `alerts` feature");
+        }
+        #[cfg(not(feature = "slo"))]
+        if !self.slo.is_empty() {
+            tracing::warn!("[[slo]] is set, but this build lacks the `slo` feature");
+        }
+    }
+
     /// Validate the `[push]` block, as `AppBuilder::run` does before binding.
     ///
     /// Factored out of the boot path so the rule it enforces — a VAPID key
@@ -4792,8 +5981,56 @@ impl AutumnConfig {
     /// # Errors
     ///
     /// See [`crate::push::PushConfig::load_vapid_key`].
+    #[cfg(feature = "push")]
     pub fn validate_push(&self) -> Result<(), crate::push::PushError> {
         self.push.load_vapid_key().map(|_| ())
+    }
+
+    /// Validate the `[push]` block in a build without the `push` feature, as
+    /// `AppBuilder::run` does before binding.
+    ///
+    /// Push cannot run in this build, so any `[push]` table or
+    /// `AUTUMN_PUSH__*` variable is a hard failure rather than a section that
+    /// is quietly ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] when `[push]` or an `AUTUMN_PUSH__*`
+    /// variable is set.
+    #[cfg(not(feature = "push"))]
+    pub fn validate_push(&self) -> Result<(), ConfigError> {
+        if self.push.is_some() {
+            return Err(ConfigError::Validation(PUSH_FEATURE_MISSING.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Check that this build can resolve the configured tenancy source.
+    ///
+    /// The app's boot runs it after the config loads, so `AppBuilder::run`
+    /// stops before it binds. A plain config load does not run it: a tool
+    /// built with other features, such as the CLI, still reads the app's
+    /// config.
+    ///
+    /// `tenancy.source = "jwt"` verifies a token with `jsonwebtoken`, which is
+    /// behind the `jwt` feature. Without it, every request would fail tenant
+    /// resolution, so the boot fails instead.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Validation`] when tenancy is enabled with
+    /// `source = "jwt"` and the `jwt` feature is off.
+    #[allow(
+        clippy::unused_self,
+        clippy::missing_const_for_fn,
+        reason = "reads `self` only when the `jwt` feature is off"
+    )]
+    pub fn validate_tenancy_source(&self) -> Result<(), ConfigError> {
+        #[cfg(not(feature = "jwt"))]
+        if self.tenancy.enabled && self.tenancy.source == "jwt" {
+            return Err(ConfigError::Validation(JWT_FEATURE_MISSING.to_owned()));
+        }
+        Ok(())
     }
 
     /// The load-shedding ceiling the profile supplies when
@@ -5391,8 +6628,20 @@ impl AutumnConfig {
         let mut config: Self = toml::from_str(&toml_str)?;
         config.profile = Some(profile);
 
+        // An `AUTUMN_ROLE` that is not a role name fails the load, as a bad
+        // TOML `role` does (#3541). It must not boot as `combined`. Check the
+        // grammar before the overrides, so that error comes without their
+        // warning. An undeclared preset name fails after them.
+        let role_from_env = Self::role_env_override(env)?.is_some();
+        // A bad TOML `role` fails even when `AUTUMN_ROLE` is valid (#3541).
+        // An undeclared preset name in the file is a bad role too (#3543).
+        config.check_role("role")?;
+
         // Layer 6: env var overrides (highest priority)
         config.apply_env_overrides_with_env(env);
+
+        // An undeclared role name fails the load (#3543).
+        config.check_role(if role_from_env { "AUTUMN_ROLE" } else { "role" })?;
 
         // Env overrides already applied `AUTUMN_SERVER__STRICT_CONFIG`.
         if config.server.strict_config {
@@ -5703,6 +6952,7 @@ impl AutumnConfig {
     /// Returns [`ConfigError::Validation`] when a field combination is
     /// syntactically well-formed TOML but semantically invalid.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.check_role("role")?;
         self.database.validate()?;
         self.server.http.validate()?;
         self.realtime.validate()?;
@@ -6021,6 +7271,12 @@ impl AutumnConfig {
     }
 
     /// Apply environment overrides using the provided env abstraction.
+    ///
+    /// This does not fail. An `AUTUMN_ROLE` that is not a role name leaves
+    /// `role` as it is and prints a warning. A valid preset name is applied
+    /// without a check that it is declared. The loaders, such as
+    /// [`load_with_env`](Self::load_with_env), reject both. The boot also
+    /// stops on a role that does not resolve.
     pub fn apply_env_overrides_with_env(&mut self, env: &dyn Env) {
         self.apply_server_env_overrides_with_env(env);
         self.apply_deploy_env_overrides_with_env(env);
@@ -6062,6 +7318,7 @@ impl AutumnConfig {
         self.apply_stories_env_overrides_with_env(env);
         self.apply_resilience_env_overrides_with_env(env);
         self.apply_time_zone_env_overrides_with_env(env);
+        #[cfg(feature = "alerts")]
         self.apply_alerts_env_overrides_with_env(env);
         self.apply_tenancy_env_overrides_with_env(env);
         self.apply_cluster_env_overrides_with_env(env);
@@ -6085,6 +7342,7 @@ impl AutumnConfig {
     /// that documented deployment path silently leaves push unconfigured —
     /// every send failing `NotConfigured` and the public-key endpoint serving
     /// `503`, with the operator looking at a variable they did set.
+    #[cfg(feature = "push")]
     fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
         // Not `parse_env_option_secret`. That helper treats a blank value as "clear this
         // setting", which is right where unsetting via env is meaningful but wrong here,
@@ -6100,6 +7358,22 @@ impl AutumnConfig {
         parse_env_option_string(env, "AUTUMN_PUSH__PUBLIC_KEY", &mut self.push.public_key);
         parse_env_option_string(env, "AUTUMN_PUSH__SUBJECT", &mut self.push.subject);
         parse_env_option(env, "AUTUMN_PUSH__TTL_SECS", &mut self.push.ttl_secs);
+    }
+
+    /// Without the `push` feature, record each `AUTUMN_PUSH__*` variable in
+    /// the kept `[push]` table, so [`validate_push`](Self::validate_push)
+    /// refuses the boot. A variable the operator set must not be dropped
+    /// without a word. The value is not kept: the table records only which
+    /// variable set the key, so a private key never reaches the config.
+    #[cfg(not(feature = "push"))]
+    fn apply_push_env_overrides_with_env(&mut self, env: &dyn Env) {
+        for (var, key) in PUSH_ENV_KEYS {
+            if env.var(var).is_ok() {
+                self.push
+                    .get_or_insert_with(InertSection::default)
+                    .insert(key, toml::Value::String((*var).to_owned()));
+            }
+        }
     }
 
     fn apply_shadow_env_overrides_with_env(&mut self, env: &dyn Env) {
@@ -6253,6 +7527,7 @@ impl AutumnConfig {
         );
     }
 
+    #[cfg(feature = "alerts")]
     fn apply_alerts_env_overrides_with_env(&mut self, env: &dyn Env) {
         parse_env_bool(env, "AUTUMN_ALERTS__ENABLED", &mut self.alerts.enabled);
         parse_env_option_string(env, "AUTUMN_ALERTS__EMAIL", &mut self.alerts.email);
@@ -6823,11 +8098,15 @@ impl AutumnConfig {
                 root,
                 path: None,
                 max_open: default_fleet_max_open(),
+                min_residency: default_fleet_min_residency(),
                 pool_size: default_fleet_pool_size(),
                 create_on_demand: None,
                 idle_close_secs: default_fleet_idle_close_secs(),
                 restore_missing: false,
                 ownership: None,
+                replica_retention_after_delete: std::time::Duration::ZERO,
+                restore_check_sample: default_fleet_restore_check_sample(),
+                replication_workers: default_fleet_replication_workers(),
             });
         }
         let Some(fleet) = self.database.fleet.as_mut() else {
@@ -6837,6 +8116,9 @@ impl AutumnConfig {
         parse_env(env, "AUTUMN_DATABASE__FLEET__ROOT", &mut fleet.root);
         parse_env_option_string(env, "AUTUMN_DATABASE__FLEET__PATH", &mut fleet.path);
         parse_env(env, "AUTUMN_DATABASE__FLEET__MAX_OPEN", &mut fleet.max_open);
+        let mut residency = Some(fleet.min_residency);
+        parse_env_option_duration(env, "AUTUMN_DATABASE__FLEET__MIN_RESIDENCY", &mut residency);
+        fleet.min_residency = residency.unwrap_or_else(default_fleet_min_residency);
         parse_env(
             env,
             "AUTUMN_DATABASE__FLEET__POOL_SIZE",
@@ -6857,6 +8139,7 @@ impl AutumnConfig {
             "AUTUMN_DATABASE__FLEET__RESTORE_MISSING",
             &mut fleet.restore_missing,
         );
+        apply_fleet_replica_env_overrides(fleet, env);
         // Setting `..._OWNER` creates the ownership section.
         if fleet.ownership.is_none() {
             if let Ok(owner) = env.var("AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER") {
@@ -7338,16 +8621,24 @@ impl AutumnConfig {
         );
     }
 
+    /// Set `role` from `AUTUMN_ROLE`. A blank value leaves it. A value that is
+    /// not a role name leaves it and prints a warning. The loaders reject that
+    /// value before they get here.
     fn apply_role_env_overrides_with_env(&mut self, env: &dyn Env) {
-        if let Ok(val) = env.var("AUTUMN_ROLE") {
-            match ProcessRole::from_env_value(&val) {
-                Some(role) => self.role = role,
-                None => eprintln!(
-                    "Warning: AUTUMN_ROLE={val:?} is not valid \
-                     (expected combined, web, or worker), ignoring"
-                ),
-            }
+        match Self::role_env_override(env) {
+            Ok(Some(role)) => self.role = role,
+            Ok(None) => {}
+            Err(err) => eprintln!("Warning: {err}; role not changed"),
         }
+    }
+
+    /// Read `AUTUMN_ROLE` (#3541). `Ok(None)` when it is absent or blank.
+    /// A preset name is accepted here. The loader checks that it is declared.
+    fn role_env_override(env: &dyn Env) -> Result<Option<RoleName>, ConfigError> {
+        env.var("AUTUMN_ROLE").map_or(Ok(None), |value| {
+            RoleName::parse_env_override(&value)
+                .map_err(|err| ConfigError::Validation(format!("AUTUMN_ROLE: {err}")))
+        })
     }
 
     /// `AUTUMN_RETENTION__*` overrides for the unified retention policy
@@ -9013,26 +10304,15 @@ impl ClientAuthConfig {
                      path prefix starting with `/`"
                 ));
             }
-            // Requests are normalized before matching (`security::path::clean_path`)
-            // but the configured prefix is not, so a noncanonical prefix silently
-            // matches less than it appears to: `/internal//` reduces to
-            // `/internal/` after the matcher strips ONE trailing slash, and
-            // `/internal/keys` then fails to match it. A prefix that protects
-            // less than the operator wrote is the failure this whole section
-            // exists to prevent, so refuse it rather than normalize it silently.
-            if path.contains("//") {
+            // The matcher compares a prefix with the normalized request path
+            // (`security::path::clean_path`). A prefix that normalization
+            // changes (`//`, dot segments, `%2F`) or that holds a route
+            // template can never match, so it protects nothing. Refuse it.
+            if path.contains(['{', '}']) || crate::security::path::clean_path(path) != *path {
                 return Err(format!(
-                    "[server.tls.client_auth] required_paths entry `{path}` contains an empty \
-                     path segment; write it as a canonical prefix like `/internal/`"
-                ));
-            }
-            if path
-                .split('/')
-                .any(|segment| segment == "." || segment == "..")
-            {
-                return Err(format!(
-                    "[server.tls.client_auth] required_paths entry `{path}` contains a dot \
-                     segment; write the resolved prefix instead"
+                    "[server.tls.client_auth] required_paths entry `{path}` is not canonical, so it does \
+                     not match the normalized request path; write the canonical prefix, such as `/internal/`, with no \
+                     `{{}}` templates, encoded slashes or dots, empty segments or dot segments"
                 ));
             }
         }
@@ -9259,6 +10539,7 @@ impl CustomDomainsConfig {
     /// ingress would never resolve, and every subdomain domain would sit at
     /// `pending_dns` with nothing to explain why.
     fn validate_ingress_hostname(&self) -> Result<(), String> {
+        #[cfg(feature = "custom-domains")]
         if let Some(raw) = self
             .ingress_hostname
             .as_ref()
@@ -9390,6 +10671,7 @@ impl CustomDomainsConfig {
     /// A hostname or address that does not parse is dropped here;
     /// [`validate`](Self::validate) has already refused the configuration, so
     /// the app never reaches this with a bad value.
+    #[cfg(feature = "custom-domains")]
     #[must_use]
     pub fn ingress(&self) -> crate::custom_domain::ExpectedIngress {
         crate::custom_domain::ExpectedIngress {
@@ -10318,6 +11600,11 @@ pub struct DatabaseConfig {
     pub migration_lock_retries: u32,
 
     /// Slow query threshold. Default: `500ms`.
+    ///
+    /// Two warnings use it. `slow database query`: one instrumented
+    /// statement took this long. `database connection held past
+    /// slow_query_threshold`: a handler held a `Db` this long. A hold covers
+    /// all work in that time, not one statement.
     #[serde(
         deserialize_with = "deserialize_duration",
         default = "default_slow_query_threshold"
@@ -10400,12 +11687,34 @@ pub struct DatabaseFleetConfig {
     #[serde(default)]
     pub path: Option<String>,
 
-    /// Most databases kept open at once. The least recently used idle one is
-    /// closed past this. Default: `256`. Each open database holds up to
-    /// [`pool_size`](Self::pool_size) connections and three file descriptors
-    /// per connection (database, `-wal`, `-shm`).
+    /// Databases kept open at once, as a soft limit. Default: `256`.
+    ///
+    /// Past this, the sweeper closes the least recently used idle database.
+    /// It does not close a database that is in use or that was used within
+    /// [`min_residency`](Self::min_residency), and an open never waits for
+    /// room. Thus a burst across many keys can open more databases than this
+    /// value. The count decreases when the burst stops.
+    ///
+    /// Each open database holds up to [`pool_size`](Self::pool_size)
+    /// connections, and about `2 × pool_size + 1` file descriptors (the
+    /// database and `-wal` per connection, one `-shm`). Set the open-file
+    /// limit (`ulimit -n`) for the peak count, not for this value.
     #[serde(default = "default_fleet_max_open")]
     pub max_open: usize,
+
+    /// How long a database stays open after its last use before the
+    /// [`max_open`](Self::max_open) sweep can close it. Default: `"2s"`.
+    ///
+    /// The grace covers a request between the time it gets its database and
+    /// the time it gets a connection. A lower value keeps the open count
+    /// nearer to `max_open` during a burst, but a request can then reopen a
+    /// database that it used a moment before. Use a duration string
+    /// (`"500ms"`, `"2s"`). A bare number is milliseconds.
+    #[serde(
+        default = "default_fleet_min_residency",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub min_residency: std::time::Duration,
 
     /// Connections per open database. Default: `2`. `SQLite` has one writer
     /// per database, so a large pool only adds lock contention.
@@ -10432,6 +11741,10 @@ pub struct DatabaseFleetConfig {
     /// tenant: the first request restores the database from object storage.
     /// Turn on [`ownership`](Self::ownership) too, so the old owner is fenced
     /// first (ADR 0019 §7).
+    ///
+    /// This setting is only for a missing file. With ownership and
+    /// `[replication]` on, a host that gets a range back restores a stale
+    /// file without this setting.
     #[serde(default)]
     pub restore_missing: bool,
 
@@ -10439,6 +11752,32 @@ pub struct DatabaseFleetConfig {
     /// host serves every slot and nothing fences it.
     #[serde(default)]
     pub ownership: Option<FleetOwnershipConfig>,
+
+    /// With `[replication]` on, keep a deleted database's replica this long,
+    /// then purge it (issue #3235). Default: `0`, purge at once. Use it as an
+    /// undo window: until the retention ends, `DatabaseFleet::restore` and
+    /// `autumn fleet restore` bring the database back. Use a duration string
+    /// (`"30d"`, `"12h"`). A bare number is milliseconds, and a value under
+    /// one minute is refused.
+    #[serde(default, deserialize_with = "deserialize_duration")]
+    pub replica_retention_after_delete: std::time::Duration,
+
+    /// With `[replication]` on, each worker-role process restores this many
+    /// random databases into a scratch directory every `[replication]
+    /// verify_interval_secs`, and checks `PRAGMA integrity_check` and the
+    /// identity row. The first check runs one interval after start.
+    /// `/actuator/health` reports the result under `replication:fleet`.
+    /// Default: `1`. `0`, or `verify_interval_secs = 0`, turns the check off.
+    #[serde(default = "default_fleet_restore_check_sample")]
+    pub restore_check_sample: usize,
+
+    /// With `[replication]` on, the number of threads that ship the fleet
+    /// databases. Default: `4`. Range: `1` to `64`. The RPO holds while one
+    /// pass over the open databases fits in `sync_interval_secs`. Increase
+    /// this value when `last_pass_ms` in `replication:fleet` is near that
+    /// interval.
+    #[serde(default = "default_fleet_replication_workers")]
+    pub replication_workers: usize,
 }
 
 /// `[database.fleet.ownership]`: the slot ranges this host claims on the
@@ -10465,6 +11804,10 @@ pub struct FleetOwnershipConfig {
     /// The lease, in seconds. The host renews every third of it. Default:
     /// `30`. From `3` to `3600`. Clock skew plus the longest request must be
     /// less than a third of it.
+    ///
+    /// The lease also sets the takeover time. After a crash, another host
+    /// serves the range at most `lease_secs + lease_secs / 3` after the last
+    /// renew. A long lease gives a long outage.
     #[serde(default = "default_fleet_lease_secs")]
     pub lease_secs: u64,
 }
@@ -10589,8 +11932,21 @@ impl DatabaseFleetConfig {
                 "database.fleet.pool_size must be at least 1".to_owned(),
             ));
         }
+        if !(1..=64).contains(&self.replication_workers) {
+            return Err(ConfigError::Validation(
+                "database.fleet.replication_workers must be 1 to 64".to_owned(),
+            ));
+        }
         if let Some(ownership) = &self.ownership {
             ownership.validate()?;
+        }
+        // A bare number is milliseconds: `30` is not 30 days.
+        let retention = self.replica_retention_after_delete;
+        if !retention.is_zero() && retention < std::time::Duration::from_secs(60) {
+            return Err(ConfigError::Validation(format!(
+                "database.fleet.replica_retention_after_delete is {retention:?}; use at least \
+                 one minute with a unit (\"30d\", \"12h\"), or 0 to purge at once"
+            )));
         }
         Ok(())
     }
@@ -10600,12 +11956,123 @@ const fn default_fleet_max_open() -> usize {
     256
 }
 
+const fn default_fleet_min_residency() -> std::time::Duration {
+    std::time::Duration::from_secs(2)
+}
+
 const fn default_fleet_pool_size() -> usize {
     2
 }
 
 const fn default_fleet_idle_close_secs() -> u64 {
     300
+}
+
+const fn default_fleet_restore_check_sample() -> usize {
+    1
+}
+
+const fn default_fleet_replication_workers() -> usize {
+    4
+}
+
+/// The backend that selects the advice in the boot connection warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionBackend {
+    /// Postgres: the budget is each server's `max_connections`.
+    Postgres,
+    /// `SQLite`: the budget is the open-file limit of the process.
+    Sqlite {
+        /// The database files that the pools open: one per pool, and
+        /// `max_open` for a fleet.
+        databases: usize,
+    },
+}
+
+/// The files that `SQLite` keeps open: the database and its `-wal` for each
+/// connection, and one `-shm` for each database.
+pub(crate) const fn sqlite_open_files(connections: usize, databases: usize) -> usize {
+    connections.saturating_mul(2).saturating_add(databases)
+}
+
+/// The boot warning for a high connection count, or `None` below the
+/// threshold.
+pub(crate) fn total_connections_warning(
+    total: usize,
+    threshold: usize,
+    backend: ConnectionBackend,
+) -> Option<String> {
+    if !should_warn_total_connections(total, threshold) {
+        return None;
+    }
+    let advice = match backend {
+        ConnectionBackend::Sqlite { databases } => format!(
+            "These connections keep about {files} files open on SQLite (the \
+             database and its -wal for each connection, one -shm for each \
+             database). database.fleet.max_open is a soft limit: a burst opens \
+             more. Set the open-file limit of the process (ulimit -n) above the \
+             peak. Or decrease database.fleet.max_open, database.fleet.pool_size or \
+             database.pool_size.",
+            files = sqlite_open_files(total, databases),
+        ),
+        ConnectionBackend::Postgres => "Ensure each Postgres server's max_connections \
+             (plus headroom for migrations and psql) exceeds the pools that target \
+             it, or lower database.pool_size."
+            .to_owned(),
+    };
+    Some(format!(
+        "Aggregate database connection count is high: the control topology and \
+         all shard pools together may open {total} connections (warn threshold \
+         {threshold}). {advice} Set database.max_connections_warn_threshold = 0 \
+         to silence."
+    ))
+}
+
+/// The boot warning for `SQLite` open files near the process limit, or
+/// `None`. It fires at 80 % of `limit`, because the process also needs files
+/// for sockets and logs. A `threshold` of `0` silences it, as it silences
+/// [`total_connections_warning`].
+pub(crate) fn open_files_warning(
+    files: usize,
+    limit: Option<u64>,
+    threshold: usize,
+) -> Option<String> {
+    let limit = limit?;
+    let files_wide = u128::try_from(files).unwrap_or(u128::MAX);
+    if threshold == 0 || files_wide.saturating_mul(5) < u128::from(limit).saturating_mul(4) {
+        return None;
+    }
+    Some(format!(
+        "SQLite may keep about {files} files open at database.fleet.max_open, near \
+         the open-file limit of {limit} (ulimit -n). The process also needs files \
+         for sockets and logs. database.fleet.max_open is a soft limit: a burst \
+         opens more. Increase ulimit -n. Or decrease database.fleet.max_open, \
+         database.fleet.pool_size or database.pool_size. Set \
+         database.max_connections_warn_threshold = 0 to silence."
+    ))
+}
+
+/// The soft open-file limit of the process (`RLIMIT_NOFILE`), or `None` when
+/// it is unlimited or the platform has no such limit.
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unnecessary_wraps,
+        clippy::missing_const_for_fn,
+        reason = "the unix build reads the limit; other platforms have none"
+    )
+)]
+pub(crate) fn open_file_limit() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use nix::sys::resource::{RLIM_INFINITY, Resource, getrlimit};
+        let (soft, _hard) = getrlimit(Resource::RLIMIT_NOFILE).ok()?;
+        (soft != RLIM_INFINITY).then_some(soft)
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
 }
 
 /// Decide whether the aggregate connection count warrants a startup warning.
@@ -12009,6 +13476,27 @@ pub fn apply_deploy_env_overrides(deploy: &mut Option<DeployConfig>, env: &dyn E
     parse_env_option(env, "AUTUMN_DEPLOY__BAKE__MAX_P99_MS", &mut bake.max_p99_ms);
 }
 
+/// The replica lifecycle keys of `[database.fleet]` (issue #3235).
+fn apply_fleet_replica_env_overrides(fleet: &mut DatabaseFleetConfig, env: &dyn Env) {
+    let mut retention = Some(fleet.replica_retention_after_delete);
+    parse_env_option_duration(
+        env,
+        "AUTUMN_DATABASE__FLEET__REPLICA_RETENTION_AFTER_DELETE",
+        &mut retention,
+    );
+    fleet.replica_retention_after_delete = retention.unwrap_or_default();
+    parse_env(
+        env,
+        "AUTUMN_DATABASE__FLEET__RESTORE_CHECK_SAMPLE",
+        &mut fleet.restore_check_sample,
+    );
+    parse_env(
+        env,
+        "AUTUMN_DATABASE__FLEET__REPLICATION_WORKERS",
+        &mut fleet.replication_workers,
+    );
+}
+
 /// Parse an environment variable into a typed target, logging a warning on failure.
 fn parse_env<T: std::str::FromStr>(env: &dyn Env, key: &str, target: &mut T) {
     if let Ok(val) = env.var(key) {
@@ -12630,7 +14118,7 @@ const fn default_slow_query_threshold() -> std::time::Duration {
     std::time::Duration::from_millis(500)
 }
 
-/// Parses a duration string like "500ms", "5s", "2m", "1h",
+/// Parses a duration string like "500ms", "5s", "2m", "1h", "30d",
 /// or a plain integer representing milliseconds.
 ///
 /// # Errors
@@ -12676,6 +14164,16 @@ pub fn parse_duration_str(s: &str) -> Result<std::time::Duration, String> {
             .parse::<u64>()
             .map_err(|e| format!("invalid duration integer: {e}"))?;
         let secs = val.checked_mul(3600).ok_or_else(|| {
+            format!("duration overflow: '{s}' exceeds maximum representable value")
+        })?;
+        return Ok(std::time::Duration::from_secs(secs));
+    }
+
+    if let Some(val_str) = s.strip_suffix('d') {
+        let val = val_str
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration integer: {e}"))?;
+        let secs = val.checked_mul(86_400).ok_or_else(|| {
             format!("duration overflow: '{s}' exceeds maximum representable value")
         })?;
         return Ok(std::time::Duration::from_secs(secs));
@@ -14371,6 +15869,90 @@ mod tests {
         // A zero threshold silences the warning regardless of the total.
         assert!(!should_warn_total_connections(0, 0));
         assert!(!should_warn_total_connections(10_000, 0));
+    }
+
+    #[test]
+    fn the_connection_warning_speaks_sqlite_to_a_sqlite_app() {
+        // A SQLite app gets SQLite advice, not Postgres advice.
+        let sqlite_backend = ConnectionBackend::Sqlite { databases: 65 };
+        let sqlite = total_connections_warning(266, 100, sqlite_backend).expect("warns");
+        assert!(!sqlite.contains("Postgres"), "{sqlite}");
+        assert!(sqlite.contains("266"), "{sqlite}");
+        assert!(sqlite.contains("database.fleet.max_open"), "{sqlite}");
+        assert!(sqlite.contains("max_connections_warn_threshold = 0"));
+        let postgres =
+            total_connections_warning(266, 100, ConnectionBackend::Postgres).expect("warns");
+        assert!(postgres.contains("Postgres"), "{postgres}");
+        assert!(total_connections_warning(99, 100, sqlite_backend).is_none());
+        assert!(total_connections_warning(10_000, 0, ConnectionBackend::Postgres).is_none());
+    }
+
+    #[test]
+    fn the_sqlite_warning_gives_the_open_file_count() {
+        // On SQLite the budget is open files, not connections.
+        // 64 fleet files x 2 connections, plus a control file with 10.
+        let backend = ConnectionBackend::Sqlite { databases: 65 };
+        let message = total_connections_warning(138, 100, backend).expect("warns");
+        // 2 x 138 (database and -wal) + 65 (-shm).
+        assert!(message.contains("about 341 files open"), "{message}");
+        assert!(message.contains("-wal"), "{message}");
+        assert!(message.contains("soft limit"), "{message}");
+        assert!(message.contains("ulimit -n"), "{message}");
+        assert!(!message.contains("Postgres"), "{message}");
+    }
+
+    #[test]
+    fn the_open_file_warning_fires_below_the_connection_threshold() {
+        // 99 connections stay under the connection threshold of 100, but
+        // their 297 files pass a limit of 256 (the macOS default).
+        let files = sqlite_open_files(99, 99);
+        assert!(
+            total_connections_warning(99, 100, ConnectionBackend::Sqlite { databases: 99 })
+                .is_none()
+        );
+        let message = open_files_warning(files, Some(256), 100).expect("warns");
+        assert!(message.contains("about 297 files"), "{message}");
+        assert!(message.contains("limit of 256"), "{message}");
+        assert!(message.contains("ulimit -n"), "{message}");
+        assert!(message.contains("soft limit"), "{message}");
+        assert!(message.contains("max_connections_warn_threshold = 0"));
+    }
+
+    #[test]
+    fn the_open_file_warning_fires_at_eighty_percent_of_the_limit() {
+        // The process also needs files for sockets and logs.
+        assert!(open_files_warning(205, Some(256), 100).is_some());
+        assert!(open_files_warning(204, Some(256), 100).is_none());
+        assert!(open_files_warning(100, Some(1024), 100).is_none());
+    }
+
+    #[test]
+    fn the_open_file_warning_needs_a_limit_and_a_threshold() {
+        assert!(open_files_warning(10_000, None, 100).is_none(), "no limit");
+        assert!(
+            open_files_warning(10_000, Some(256), 0).is_none(),
+            "silenced"
+        );
+        assert!(open_files_warning(usize::MAX, Some(u64::MAX), 100).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_open_file_limit_reads_the_process_limit() {
+        // `None` only for an unlimited process.
+        assert!(open_file_limit().is_none_or(|limit| limit > 0));
+    }
+
+    #[test]
+    fn sqlite_open_files_counts_two_per_connection_and_one_per_database() {
+        assert_eq!(sqlite_open_files(0, 0), 0);
+        assert_eq!(
+            sqlite_open_files(2, 1),
+            5,
+            "the fleet guide's 2 x pool_size + 1"
+        );
+        assert_eq!(sqlite_open_files(128, 64), 64 * 5);
+        assert_eq!(sqlite_open_files(usize::MAX, 1), usize::MAX, "saturates");
     }
 
     #[test]
@@ -18641,14 +20223,14 @@ path = "/healthz"
 
     #[test]
     fn an_empty_deploy_hosts_env_override_behaves_as_unset() {
-        // #1621 review finding 13. `AUTUMN_DEPLOY__HOSTS=` is the shape a CI or
-        // compose env template produces for "fill in for a fleet" — exactly what
-        // the sibling `AUTUMN_DEPLOY__HOST=` harmlessly takes. Splitting it
-        // unconditionally yielded `[""]`, a NON-empty fleet list holding a blank
-        // string, so a project keeping `[deploy] host` in autumn.toml hard-failed
-        // every `autumn deploy` subcommand (and `autumn doctor`) with "`[deploy]
-        // host` and `[deploy] hosts` are mutually exclusive" — naming a key the
-        // operator never set.
+        // `AUTUMN_DEPLOY__HOSTS=` is the shape a CI or compose env template
+        // produces for "fill in for a fleet" — exactly what the sibling
+        // `AUTUMN_DEPLOY__HOST=` harmlessly takes. Splitting it
+        // unconditionally yielded `[""]`, a NON-empty fleet list holding a
+        // blank string, so a project keeping `[deploy] host` in autumn.toml
+        // hard-failed every `autumn deploy` subcommand (and `autumn doctor`)
+        // with "`[deploy] host` and `[deploy] hosts` are mutually exclusive" —
+        // naming a key the operator never set.
         for blank in ["", "   ", ",", " , "] {
             let mut config: AutumnConfig = toml::from_str(
                 r#"
@@ -18676,10 +20258,10 @@ path = "/healthz"
 
     #[test]
     fn a_trailing_comma_in_the_deploy_hosts_env_override_is_tolerated() {
-        // #1621 review finding 13. Generated env lists routinely carry a trailing
-        // (or doubled) comma; the blank segment it produces used to reach the CLI
-        // as a blank fleet entry and refuse the whole command. Blank segments are
-        // dropped, so the list is exactly the addresses the operator wrote.
+        // Generated env lists routinely carry a trailing (or doubled) comma;
+        // the blank segment it produces used to reach the CLI as a blank fleet
+        // entry and refuse the whole command. Blank segments are dropped, so
+        // the list is exactly the addresses the operator wrote.
         for (value, expected) in [
             ("10.0.0.1,10.0.0.2,", vec!["10.0.0.1", "10.0.0.2"]),
             ("10.0.0.1,,10.0.0.2", vec!["10.0.0.1", "10.0.0.2"]),
@@ -19033,6 +20615,29 @@ path = "/healthz"
                 ..ClientAuthConfig::default()
             };
             assert!(ca.validate().is_ok(), "`{good}` should be accepted");
+        }
+    }
+
+    #[test]
+    fn client_auth_rejects_required_paths_the_matcher_cannot_match() {
+        // A prefix that `clean_path` rewrites, or that holds a route template,
+        // can never match a request path (#2706).
+        for bad in [
+            "/users/{id}",
+            "/files/{*rest}",
+            "/internal%2F",
+            "/a/%2e%2e/b",
+        ] {
+            let ca = ClientAuthConfig {
+                mode: ClientAuthMode::Required,
+                ca_bundle_path: Some(PathBuf::from("ca.pem")),
+                required_paths: vec![bad.to_owned()],
+                ..ClientAuthConfig::default()
+            };
+            let Err(err) = ca.validate() else {
+                panic!("`{bad}` should be rejected");
+            };
+            assert!(err.contains(bad), "message must name the entry: {err}");
         }
     }
 
@@ -20312,6 +21917,10 @@ path = "/healthz"
             idle_close_secs: 300,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
         }
     }
 
@@ -20468,13 +22077,16 @@ path = "/healthz"
     fn validate_rejects_malformed_fleet_sections() {
         use crate::fleet_layout::FleetMode;
         type Mutate = fn(&mut DatabaseFleetConfig);
-        let cases: [(&str, Mutate); 6] = [
+        let cases: [(&str, Mutate); 7] = [
             ("root", |f| f.root = "  ".to_owned()),
             ("not a database URL", |f| f.root = "sqlite:///x".to_owned()),
             ("{tenant}", |f| f.path = Some("{bucket}/all.db".to_owned())),
             ("..", |f| f.path = Some("../{tenant}.db".to_owned())),
             ("max_open", |f| f.max_open = 0),
             ("pool_size", |f| f.pool_size = 0),
+            ("replica_retention_after_delete", |f| {
+                f.replica_retention_after_delete = std::time::Duration::from_millis(30);
+            }),
         ];
         for (needle, mutate) in cases {
             let mut section = fleet(FleetMode::Tenant);
@@ -20513,6 +22125,126 @@ path = "/healthz"
         assert!(fleet.effective_create_on_demand());
         assert_eq!(fleet.idle_close_secs, 0);
         assert!(fleet.restore_missing);
+        // Issue #3235: the defaults, then the overrides.
+        assert_eq!(
+            fleet.replica_retention_after_delete,
+            std::time::Duration::ZERO
+        );
+        assert_eq!(fleet.restore_check_sample, 1);
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(
+            &env.with(
+                "AUTUMN_DATABASE__FLEET__REPLICA_RETENTION_AFTER_DELETE",
+                "30d",
+            )
+            .with("AUTUMN_DATABASE__FLEET__RESTORE_CHECK_SAMPLE", "0"),
+        );
+        let fleet = config.database.fleet.expect("env creates the fleet");
+        assert_eq!(
+            fleet.replica_retention_after_delete,
+            std::time::Duration::from_hours(30 * 24)
+        );
+        assert_eq!(fleet.restore_check_sample, 0);
+    }
+
+    #[test]
+    fn fleet_replication_workers_default_parse_and_validate() {
+        let parse = |extra: &str| {
+            toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\n\n\
+                 [database.fleet]\nmode = \"tenant\"\nroot = \"/var/lib/app/fleet\"\n{extra}"
+            ))
+            .unwrap()
+            .database
+            .fleet
+            .unwrap()
+        };
+        let fleet = parse("");
+        assert_eq!(fleet.replication_workers, 4);
+        assert!(fleet.validate().is_ok());
+        assert_eq!(parse("replication_workers = 8").replication_workers, 8);
+        for bad in [0, 65] {
+            let error = parse(&format!("replication_workers = {bad}"))
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("replication_workers"), "{error}");
+        }
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "tenant")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__REPLICATION_WORKERS", "2");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.database.fleet.unwrap().replication_workers, 2);
+    }
+
+    #[test]
+    fn fleet_min_residency_default_parse_and_env() {
+        let parse = |extra: &str| {
+            toml::from_str::<AutumnConfig>(&format!(
+                "[database]\nurl = \"sqlite:///var/lib/app/control.db\"\n\n\
+                 [database.fleet]\nmode = \"tenant\"\nroot = \"/var/lib/app/fleet\"\n{extra}"
+            ))
+            .unwrap()
+            .database
+            .fleet
+            .unwrap()
+        };
+        assert_eq!(parse("").min_residency, std::time::Duration::from_secs(2));
+        assert_eq!(
+            parse("min_residency = \"500ms\"").min_residency,
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse("min_residency = \"0s\"").min_residency,
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            parse("min_residency = 500").min_residency,
+            std::time::Duration::from_millis(500),
+            "a bare number is milliseconds"
+        );
+        let env = MockEnv::new()
+            .with("AUTUMN_DATABASE__FLEET__MODE", "tenant")
+            .with("AUTUMN_DATABASE__FLEET__ROOT", "/data/fleet")
+            .with("AUTUMN_DATABASE__FLEET__MIN_RESIDENCY", "250ms");
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(
+            config.database.fleet.unwrap().min_residency,
+            std::time::Duration::from_millis(250)
+        );
+        let mut config = AutumnConfig::default();
+        config.apply_env_overrides_with_env(&env.with("AUTUMN_DATABASE__FLEET__MIN_RESIDENCY", ""));
+        assert_eq!(
+            config.database.fleet.unwrap().min_residency,
+            std::time::Duration::from_secs(2),
+            "an empty value is the default"
+        );
+    }
+
+    #[test]
+    fn fleet_replica_lifecycle_keys_deserialize() {
+        let config: AutumnConfig = toml::from_str(
+            r#"
+            [database]
+            url = "sqlite:///var/lib/app/control.db"
+
+            [database.fleet]
+            mode = "tenant"
+            root = "/var/lib/app/fleet"
+            replica_retention_after_delete = "30d"
+            restore_check_sample = 3
+            "#,
+        )
+        .unwrap();
+        let fleet = config.database.fleet.unwrap();
+        assert_eq!(
+            fleet.replica_retention_after_delete,
+            std::time::Duration::from_hours(30 * 24)
+        );
+        assert_eq!(fleet.restore_check_sample, 3);
     }
 
     #[test]
@@ -20823,6 +22555,30 @@ path = "/healthz"
             !config.security.headers.strict_transport_security,
             "dev profile must not force HSTS on (local http development)"
         );
+    }
+
+    #[test]
+    fn dev_profile_sends_the_session_cookie_over_plain_http() {
+        let parse = |profile: &str| -> AutumnConfig {
+            toml::from_str(&toml::to_string(&profile_defaults_as_toml(profile)).unwrap()).unwrap()
+        };
+        assert!(
+            !parse("dev").session.secure,
+            "dev serves plain http on localhost; a Secure cookie is not sent back"
+        );
+        assert!(parse("prod").session.secure);
+        assert!(
+            parse("staging").session.secure,
+            "no profile default: secure"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("autumn.toml"), "[session]\nsecure = true\n").unwrap();
+        let env = MockEnv::new()
+            .with("AUTUMN_PROFILE", "dev")
+            .with("AUTUMN_MANIFEST_DIR", dir.path().to_str().unwrap());
+        let config = AutumnConfig::load_with_env(&env).unwrap();
+        assert!(config.session.secure, "the app's own setting wins");
     }
 
     #[test]
@@ -21940,6 +23696,12 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
             parse_duration_str("1000").unwrap(),
             std::time::Duration::from_secs(1)
         );
+        assert_eq!(
+            parse_duration_str("30d").unwrap(),
+            std::time::Duration::from_hours(30 * 24)
+        );
+        assert!(parse_duration_str("1x").is_err());
+        assert!(parse_duration_str(&format!("{}d", u64::MAX)).is_err());
         assert!(parse_duration_str("abc").is_err());
         assert!(parse_duration_str("").is_err());
     }
@@ -22982,6 +24744,144 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert!(ProcessRole::Worker.runs_workers());
     }
 
+    /// Every built-in role. The `match` has no wildcard, so a new variant does
+    /// not compile until it is added here and to the table below.
+    fn every_process_role() -> [ProcessRole; 3] {
+        let roles = [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker];
+        for role in roles {
+            match role {
+                ProcessRole::Combined | ProcessRole::Web | ProcessRole::Worker => {}
+            }
+        }
+        roles
+    }
+
+    /// The subsystems each role ran before #3542, written out by hand.
+    /// The order is the field order of `RoleCapabilities`.
+    fn legacy_subsystems(role: ProcessRole) -> [bool; 8] {
+        match role {
+            ProcessRole::Combined => [true; 8],
+            ProcessRole::Web => [true, false, false, false, false, false, false, false],
+            ProcessRole::Worker => [false, true, true, true, true, true, true, true],
+        }
+    }
+
+    #[test]
+    fn role_capabilities_table_matches_the_legacy_subsystems() {
+        for role in every_process_role() {
+            let caps = role.capabilities();
+            let actual = [
+                caps.serves_http,
+                caps.job_workers,
+                caps.scheduler,
+                caps.outbox_relay,
+                caps.commit_hooks,
+                caps.fleet_relay,
+                caps.restore_check,
+                caps.retention,
+            ];
+            assert_eq!(actual, legacy_subsystems(role), "role {}", role.as_str());
+        }
+    }
+
+    #[test]
+    fn role_capabilities_agree_with_the_legacy_predicates() {
+        for role in every_process_role() {
+            for &capability in Capability::ALL {
+                let legacy = match capability {
+                    Capability::ServesHttp => role.serves_http(),
+                    _ => role.runs_workers(),
+                };
+                assert_eq!(
+                    role.runs(capability),
+                    legacy,
+                    "role {} capability {}",
+                    role.as_str(),
+                    capability.as_str()
+                );
+                assert_eq!(role.capabilities().runs(capability), legacy);
+            }
+        }
+    }
+
+    #[test]
+    fn capability_all_lists_each_variant_once_in_field_order() {
+        // No wildcard: a new variant does not compile until it is named here.
+        let field = |capability: Capability| match capability {
+            Capability::ServesHttp => 0,
+            Capability::JobWorkers => 1,
+            Capability::Scheduler => 2,
+            Capability::OutboxRelay => 3,
+            Capability::CommitHooks => 4,
+            Capability::FleetRelay => 5,
+            Capability::RestoreCheck => 6,
+            Capability::Retention => 7,
+        };
+        let order: Vec<usize> = Capability::ALL.iter().map(|c| field(*c)).collect();
+        assert_eq!(order, (0..Capability::ALL.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn capability_names_are_stable_snake_case() {
+        let names: Vec<&str> = Capability::ALL.iter().map(|c| c.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "serves_http",
+                "job_workers",
+                "scheduler",
+                "outbox_relay",
+                "commit_hooks",
+                "fleet_relay",
+                "restore_check",
+                "retention",
+            ]
+        );
+        for &capability in Capability::ALL {
+            assert_eq!(
+                serde_json::to_value(capability).expect("serialize capability"),
+                serde_json::Value::from(capability.as_str())
+            );
+            assert_eq!(capability.to_string(), capability.as_str());
+        }
+    }
+
+    #[test]
+    fn role_capabilities_serialize_with_one_key_per_capability() {
+        let json = serde_json::to_value(ProcessRole::Web.capabilities()).expect("serialize");
+        let object = json.as_object().expect("an object");
+        assert_eq!(object.len(), Capability::ALL.len());
+        for &capability in Capability::ALL {
+            assert_eq!(
+                object[capability.as_str()],
+                serde_json::Value::Bool(ProcessRole::Web.runs(capability)),
+                "{}",
+                capability.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn role_capabilities_enabled_lists_the_true_fields_in_order() {
+        let enabled: Vec<Capability> = ProcessRole::Web.capabilities().enabled().collect();
+        assert_eq!(enabled, [Capability::ServesHttp]);
+        let enabled: Vec<Capability> = ProcessRole::Worker.capabilities().enabled().collect();
+        assert_eq!(enabled, Capability::ALL[1..]);
+        let enabled: Vec<Capability> = ProcessRole::Combined.capabilities().enabled().collect();
+        assert_eq!(enabled, Capability::ALL);
+    }
+
+    #[test]
+    fn config_capabilities_follow_the_resolved_role() {
+        let mut config = AutumnConfig::default();
+        let caps = |config: &AutumnConfig| config.resolve_role().expect("built-in").capabilities();
+        assert_eq!(caps(&config), ProcessRole::Combined.capabilities());
+        for role in every_process_role() {
+            config.role = role.into();
+            assert_eq!(caps(&config), role.capabilities());
+        }
+    }
+
     #[test]
     fn process_role_deserializes_from_toml() {
         let web: AutumnConfig = toml::from_str("role = \"web\"\n").expect("web role");
@@ -23184,21 +25084,866 @@ redirect_uri = "http://localhost:3000/auth/github/callback"
         assert_eq!(config.role, ProcessRole::Web);
     }
 
+    /// `apply_env_overrides_with_env` does not validate. An unknown value
+    /// leaves `role` as it is. The loaders reject it (#3541). A valid preset
+    /// name is applied: the loader checks that it is declared (#3543).
     #[test]
-    fn autumn_role_env_override_ignores_invalid_value_keeping_default() {
-        let env = MockEnv::new().with("AUTUMN_ROLE", "nonsense");
-        // Start from a non-default to prove invalid values do not reset it and
-        // do not force it either — they leave the current value untouched.
+    fn apply_env_overrides_leaves_role_on_unknown_value() {
+        let env = MockEnv::new().with("AUTUMN_ROLE", "non sense");
         let mut config = AutumnConfig {
-            role: ProcessRole::Worker,
+            role: ProcessRole::Worker.into(),
             ..Default::default()
         };
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.role, ProcessRole::Worker);
 
-        // And from the default, an invalid value keeps Combined.
         let mut config = AutumnConfig::default();
         config.apply_env_overrides_with_env(&env);
         assert_eq!(config.role, ProcessRole::Combined);
+
+        let env = MockEnv::new().with("AUTUMN_ROLE", "critical");
+        config.apply_env_overrides_with_env(&env);
+        assert_eq!(config.role.as_str(), "critical");
+    }
+
+    // ── Unknown AUTUMN_ROLE fails the load (#3541) ──────────────────────────
+
+    /// The accepted spellings, in the order the error lists them.
+    const ROLE_SPELLINGS_3541: [&str; 10] = [
+        "combined",
+        "all",
+        "web_and_worker",
+        "server_and_worker",
+        "web",
+        "server",
+        "http",
+        "worker",
+        "jobs",
+        "worker_only",
+    ];
+
+    /// An env with no config file and the given extra variables.
+    fn role_env_3541(dir: &std::path::Path, vars: &[(&str, &str)]) -> MockEnv {
+        let mut env = MockEnv::new()
+            .with("AUTUMN_ENV", "test")
+            .with("AUTUMN_MANIFEST_DIR", dir.to_str().expect("utf-8 temp dir"));
+        for (key, value) in vars {
+            env = env.with(key, value);
+        }
+        env
+    }
+
+    #[test]
+    fn process_role_from_str_accepts_aliases() {
+        assert_eq!("jobs".parse::<ProcessRole>(), Ok(ProcessRole::Worker));
+        assert_eq!("server".parse::<ProcessRole>(), Ok(ProcessRole::Web));
+        assert_eq!("all".parse::<ProcessRole>(), Ok(ProcessRole::Combined));
+        assert_eq!(" WEB ".parse::<ProcessRole>(), Ok(ProcessRole::Web));
+        for spelling in ROLE_SPELLINGS_3541 {
+            assert!(spelling.parse::<ProcessRole>().is_ok(), "{spelling}");
+        }
+        assert_eq!(ProcessRole::ACCEPTED_VALUES, ROLE_SPELLINGS_3541.as_slice());
+    }
+
+    #[test]
+    fn process_role_from_str_error_names_value_and_accepted_spellings() {
+        let err = "workers"
+            .parse::<ProcessRole>()
+            .expect_err("workers is unknown");
+        assert_eq!(err.value(), "workers");
+        let message = err.to_string();
+        assert!(message.contains("\"workers\""), "{message}");
+        for spelling in ROLE_SPELLINGS_3541 {
+            assert!(message.contains(spelling), "{spelling} missing: {message}");
+        }
+        // A blank string is not a role.
+        assert!("".parse::<ProcessRole>().is_err());
+    }
+
+    #[test]
+    fn process_role_parse_env_override_treats_blank_as_unset() {
+        assert_eq!(ProcessRole::parse_env_override(""), Ok(None));
+        assert_eq!(ProcessRole::parse_env_override("  "), Ok(None));
+        assert_eq!(
+            ProcessRole::parse_env_override("jobs"),
+            Ok(Some(ProcessRole::Worker))
+        );
+        let err = ProcessRole::parse_env_override("workers").expect_err("unknown");
+        assert_eq!(err.value(), "workers");
+    }
+
+    #[test]
+    fn autumn_role_env_unknown_value_fails_config_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", "workers")]);
+
+        let err = AutumnConfig::load_with_env(&env).expect_err("unknown role must fail");
+        assert!(matches!(err, ConfigError::Validation(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("AUTUMN_ROLE"), "{message}");
+        assert!(message.contains("\"workers\""), "{message}");
+
+        // The deploy CLI loader agrees.
+        assert!(AutumnConfig::load_with_env_lenient_unknown_roots(&env).is_err());
+    }
+
+    #[test]
+    fn autumn_role_env_and_toml_reject_the_same_bad_value_alike() {
+        let expected = "workers"
+            .parse::<ProcessRole>()
+            .expect_err("unknown")
+            .to_string();
+
+        let env_dir = tempfile::tempdir().expect("temp dir");
+        let env = role_env_3541(env_dir.path(), &[("AUTUMN_ROLE", "workers")]);
+        let env_err = AutumnConfig::load_with_env(&env)
+            .expect_err("env must fail")
+            .to_string();
+
+        let toml_dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(toml_dir.path().join("autumn.toml"), "role = \"workers\"\n")
+            .expect("write autumn.toml");
+        let env = role_env_3541(toml_dir.path(), &[]);
+        let toml_err = AutumnConfig::load_with_env(&env)
+            .expect_err("toml must fail")
+            .to_string();
+
+        assert!(env_err.contains(&expected), "env: {env_err}");
+        assert!(toml_err.contains(&expected), "toml: {toml_err}");
+
+        // The same good value also gives the same role on both paths.
+        let from_toml: AutumnConfig = toml::from_str("role = \" JOBS \"\n").expect("JOBS");
+        let env = role_env_3541(env_dir.path(), &[("AUTUMN_ROLE", " JOBS ")]);
+        let from_env = AutumnConfig::load_with_env(&env).expect("JOBS");
+        assert_eq!(from_toml.role, ProcessRole::Worker);
+        assert_eq!(from_env.role, from_toml.role);
+    }
+
+    /// The bug in #3541: a valid TOML role and a typo in the env. The load
+    /// must fail. It must not keep the TOML role or fall back to `combined`.
+    #[test]
+    fn autumn_role_env_typo_over_valid_toml_role_fails_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("autumn.toml"), "role = \"worker\"\n")
+            .expect("write autumn.toml");
+        let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", "workers")]);
+        let err = AutumnConfig::load_with_env(&env).expect_err("typo must fail");
+        assert!(err.to_string().contains("\"workers\""), "{err}");
+    }
+
+    #[test]
+    fn autumn_role_env_aliases_load() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for (value, role) in [
+            ("jobs", ProcessRole::Worker),
+            ("server", ProcessRole::Web),
+            ("all", ProcessRole::Combined),
+        ] {
+            let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", value)]);
+            let config = AutumnConfig::load_with_env(&env).expect(value);
+            assert_eq!(config.role, role, "{value}");
+        }
+    }
+
+    /// An empty `AUTUMN_ROLE=` is unset: the configured role stays.
+    #[test]
+    fn autumn_role_env_blank_keeps_configured_role() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for value in ["", "   "] {
+            let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", value)]);
+            let config = AutumnConfig::load_with_env(&env).expect("blank is unset");
+            assert_eq!(config.role, ProcessRole::Combined, "{value:?}");
+        }
+
+        std::fs::write(dir.path().join("autumn.toml"), "role = \"web\"\n")
+            .expect("write autumn.toml");
+        let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", "")]);
+        let config = AutumnConfig::load_with_env(&env).expect("blank is unset");
+        assert_eq!(config.role, ProcessRole::Web);
+    }
+
+    /// A TOML `role = ""` stays an error, as before.
+    #[test]
+    fn toml_blank_role_is_an_error() {
+        assert!(toml::from_str::<AutumnConfig>("role = \"\"\n").is_err());
+    }
+
+    /// Each path of the `role` visitor: a plain string, a unit variant, and
+    /// the text for a wrong type.
+    #[test]
+    fn process_role_visitor_paths() {
+        use serde::de::Visitor as _;
+        let role = ProcessRoleVisitor
+            .visit_str::<serde::de::value::Error>(" jobs ")
+            .expect("plain string");
+        assert_eq!(role, ProcessRole::Worker);
+        let err = ProcessRoleVisitor
+            .visit_str::<serde::de::value::Error>("workers")
+            .expect_err("unknown");
+        assert!(err.to_string().contains("\"workers\""), "{err}");
+
+        assert_eq!(
+            serde_json::from_str::<ProcessRole>("\"server\"").expect("json string"),
+            ProcessRole::Web
+        );
+        let expected = &ProcessRoleVisitor as &dyn serde::de::Expected;
+        assert_eq!(expected.to_string(), "a process role string");
+    }
+
+    /// The custom `role` parser must not stop the strict-config schema walk.
+    #[test]
+    fn schema_walk_reaches_fields_after_role() {
+        let schema = AutumnConfig::get_schema_keys();
+        let root = schema.get("").expect("root keys");
+        for key in ["role", "roles", "auth", "security"] {
+            assert!(root.contains(key), "{key} missing from schema root");
+        }
+    }
+
+    // ── Named roles: `[roles.<name>]` presets (#3543) ─────────────────────
+
+    const ROLES_3543: &str = r#"
+[jobs]
+backend = "postgres"
+pin = ["default"]
+workers = 4
+
+[roles.critical]
+base = "worker"
+pin = ["critical"]
+scheduler = false
+outbox_relay = false
+
+[roles.cron]
+base = "worker"
+pin = []
+scheduler = true
+
+[roles.marketing]
+base = "combined"
+workers = 2
+"#;
+
+    fn roles_config_3543(role: &str) -> AutumnConfig {
+        let mut config: AutumnConfig = toml::from_str(ROLES_3543).expect("roles parse");
+        config.role = role.parse().expect("role name");
+        config
+    }
+
+    #[test]
+    fn named_role_parses_and_resolves() {
+        let config = roles_config_3543("critical");
+        assert_eq!(config.roles.len(), 3);
+        let role = config.resolve_role().expect("critical resolves");
+        assert_eq!(role.name(), "critical");
+        assert_eq!(role.base(), ProcessRole::Worker);
+        assert!(role.is_preset());
+        assert!(!role.serves_http());
+        let caps = role.capabilities();
+        assert!(caps.job_workers);
+        assert!(!caps.scheduler);
+        assert!(!caps.outbox_relay);
+        // Unset overrides keep the base default.
+        assert!(caps.commit_hooks && caps.fleet_relay && caps.restore_check && caps.retention);
+        assert_eq!(role.pin(), Some(["critical".to_owned()].as_slice()));
+        assert_eq!(role.workers(), None);
+    }
+
+    #[test]
+    fn named_role_selected_from_toml_role_key() {
+        let toml = format!("role = \"Critical\"\n{ROLES_3543}");
+        let config: AutumnConfig = toml::from_str(&toml).expect("parse");
+        assert_eq!(config.role.as_str(), "critical");
+        assert_eq!(config.resolve_role().expect("resolve").name(), "critical");
+    }
+
+    /// `pin = []` in a preset drains no queue: the role runs no job workers.
+    #[test]
+    fn named_role_empty_pin_runs_no_job_workers() {
+        let role = roles_config_3543("cron").resolve_role().expect("cron");
+        assert!(!role.capabilities().job_workers);
+        assert!(role.capabilities().scheduler);
+        assert_eq!(role.pin(), None);
+    }
+
+    #[test]
+    fn named_role_jobs_config_overrides_pin_and_workers() {
+        let config = roles_config_3543("critical");
+        let role = config.resolve_role().expect("critical");
+        let jobs = role.jobs_config(&config.jobs);
+        assert_eq!(jobs.pin, vec!["critical".to_owned()]);
+        assert_eq!(jobs.workers, 4, "unset workers keeps jobs.workers");
+
+        let config = roles_config_3543("marketing");
+        let role = config.resolve_role().expect("marketing");
+        let jobs = role.jobs_config(&config.jobs);
+        assert_eq!(
+            jobs.pin,
+            vec!["default".to_owned()],
+            "unset pin keeps jobs.pin"
+        );
+        assert_eq!(jobs.workers, 2);
+        assert!(role.serves_http());
+
+        // A built-in role borrows the config as it is.
+        let config = roles_config_3543("worker");
+        let role = config.resolve_role().expect("worker");
+        assert!(matches!(
+            role.jobs_config(&config.jobs),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// The built-in roles resolve exactly as before, with or without presets.
+    #[test]
+    fn builtin_roles_resolve_unchanged() {
+        for base in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+            let config = roles_config_3543(base.as_str());
+            let role = config.resolve_role().expect("built-in");
+            assert_eq!(role.name(), base.as_str());
+            assert_eq!(role.base(), base);
+            assert!(!role.is_preset());
+            assert_eq!(role.capabilities(), base.capabilities());
+            assert_eq!(role, Role::from(base));
+            assert_eq!(config.role, base);
+        }
+        let role = AutumnConfig::default().resolve_role().expect("default");
+        assert_eq!(role, Role::from(ProcessRole::Combined));
+    }
+
+    #[test]
+    fn builtin_role_names_cannot_be_redeclared() {
+        for name in ProcessRole::ACCEPTED_VALUES {
+            let toml = format!("[roles.{name}]\nbase = \"worker\"\n");
+            let config: AutumnConfig = toml::from_str(&toml).expect("parse");
+            let err = config.validate().expect_err(name).to_string();
+            assert!(err.contains("reserved"), "{name}: {err}");
+            assert!(err.contains(name), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn role_names_follow_the_grammar() {
+        for bad in [
+            "Critical",
+            "1st",
+            "-a",
+            "a b",
+            "a.b",
+            "a/b",
+            &"a".repeat(64),
+        ] {
+            let toml = format!("[roles.\"{bad}\"]\nbase = \"worker\"\n");
+            let config: AutumnConfig = toml::from_str(&toml).expect("parse");
+            let err = config.validate().expect_err(bad).to_string();
+            assert!(err.contains("role name"), "{bad}: {err}");
+        }
+        for good in ["critical", "bulk-2", "eu_west", &"a".repeat(63)] {
+            assert!(good.parse::<RoleName>().is_ok(), "{good}");
+        }
+        for bad in ["", " ", "a b", "a\"b", "1st"] {
+            assert!(bad.parse::<RoleName>().is_err(), "{bad:?}");
+        }
+    }
+
+    /// A preset can only turn a capability off. Its base is the ceiling.
+    #[test]
+    fn preset_cannot_enable_a_capability_its_base_lacks() {
+        let config: AutumnConfig =
+            toml::from_str("[roles.api]\nbase = \"web\"\nscheduler = true\n").expect("parse");
+        let err = config
+            .validate()
+            .expect_err("web has no scheduler")
+            .to_string();
+        assert!(err.contains("api"), "{err}");
+        assert!(err.contains("scheduler"), "{err}");
+        assert!(err.contains("web"), "{err}");
+
+        // Repeating the base default is fine.
+        let config: AutumnConfig =
+            toml::from_str("[roles.cron]\nbase = \"worker\"\nscheduler = true\n").expect("parse");
+        config.validate().expect("worker runs the scheduler");
+        let config: AutumnConfig =
+            toml::from_str("[roles.api]\nbase = \"web\"\nscheduler = false\n").expect("parse");
+        config.validate().expect("web off is off");
+    }
+
+    #[test]
+    fn preset_rejects_unknown_keys_and_serves_http() {
+        for body in [
+            "schedular = false",
+            "serves_http = true",
+            "[roles.x.jobs]\nbackend = \"redis\"",
+        ] {
+            let toml = format!("[roles.x]\nbase = \"worker\"\n{body}\n");
+            assert!(toml::from_str::<AutumnConfig>(&toml).is_err(), "{body}");
+        }
+        // `base` is required.
+        assert!(toml::from_str::<AutumnConfig>("[roles.x]\npin = [\"a\"]\n").is_err());
+        // An unknown base is the #3541 error.
+        let err = toml::from_str::<AutumnConfig>("[roles.x]\nbase = \"workers\"\n")
+            .expect_err("bad base")
+            .to_string();
+        assert!(err.contains("\"workers\""), "{err}");
+    }
+
+    #[test]
+    fn preset_pin_and_workers_contradictions_fail() {
+        type Check = fn(&RoleError) -> bool;
+        let cases: [(&str, Check); 7] = [
+            ("base = \"web\"\npin = [\"a\"]", |e| {
+                matches!(e, RoleError::PinWithoutJobWorkers { .. })
+            }),
+            (
+                "base = \"worker\"\njob_workers = false\npin = [\"a\"]",
+                |e| matches!(e, RoleError::PinWithoutJobWorkers { .. }),
+            ),
+            ("base = \"worker\"\njob_workers = true\npin = []", |e| {
+                matches!(e, RoleError::EmptyPinWithJobWorkers { .. })
+            }),
+            ("base = \"worker\"\npin = [\"\"]", |e| {
+                matches!(e, RoleError::BlankPin { .. })
+            }),
+            ("base = \"worker\"\nworkers = 0", |e| {
+                matches!(e, RoleError::ZeroWorkers { .. })
+            }),
+            ("base = \"web\"\nworkers = 2", |e| {
+                matches!(e, RoleError::WorkersWithoutJobWorkers { .. })
+            }),
+            ("base = \"worker\"\npin = []\nworkers = 2", |e| {
+                matches!(e, RoleError::WorkersWithoutJobWorkers { .. })
+            }),
+        ];
+        for (body, is_expected) in cases {
+            let config: AutumnConfig = toml::from_str(&format!("[roles.x]\n{body}\n")).expect(body);
+            let err = validate_role_presets(&config.roles).expect_err(body);
+            assert!(is_expected(&err), "{body}: {err:?}");
+            assert!(err.to_string().starts_with("[roles.x]: "), "{body}: {err}");
+            assert!(config.validate().is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn undeclared_role_name_fails_and_lists_declared_roles() {
+        let config = roles_config_3543("critcal");
+        let err = config.resolve_role().expect_err("typo").to_string();
+        let builtin = "critcal"
+            .parse::<ProcessRole>()
+            .expect_err("unknown")
+            .to_string();
+        assert!(err.contains(&builtin), "{err}");
+        for declared in ["critical", "cron", "marketing"] {
+            assert!(err.contains(declared), "{declared}: {err}");
+        }
+        assert!(config.validate().is_err());
+
+        let none = AutumnConfig {
+            role: "critical".parse().expect("name"),
+            ..AutumnConfig::default()
+        };
+        let err = none
+            .resolve_role()
+            .expect_err("nothing declared")
+            .to_string();
+        assert!(err.contains("no roles are declared"), "{err}");
+    }
+
+    /// An undeclared TOML `role` fails the load even when `AUTUMN_ROLE` is
+    /// valid, as a bad built-in does (#3541).
+    #[test]
+    fn undeclared_toml_role_fails_under_valid_env() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("autumn.toml"), "role = \"wrker\"\n")
+            .expect("write autumn.toml");
+        let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", "worker")]);
+        let err = AutumnConfig::load_with_env(&env)
+            .expect_err("bad TOML role")
+            .to_string();
+        assert!(
+            err.starts_with("role: ") || err.contains(" role: "),
+            "{err}"
+        );
+        assert!(err.contains("\"wrker\""), "{err}");
+    }
+
+    #[test]
+    fn autumn_role_env_selects_a_named_role() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("autumn.toml"), ROLES_3543).expect("write autumn.toml");
+        let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", " CRON ")]);
+        let config = AutumnConfig::load_with_env(&env).expect("cron loads");
+        assert_eq!(config.role.as_str(), "cron");
+        assert_eq!(config.resolve_role().expect("cron").name(), "cron");
+
+        let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", "critcal")]);
+        let err = AutumnConfig::load_with_env(&env)
+            .expect_err("typo")
+            .to_string();
+        assert!(err.contains("AUTUMN_ROLE"), "{err}");
+        assert!(err.contains("critical"), "lists declared roles: {err}");
+
+        // A grammar error fails before the overrides, as #3541 does.
+        let env = role_env_3541(dir.path(), &[("AUTUMN_ROLE", "a b")]);
+        let err = AutumnConfig::load_with_env(&env)
+            .expect_err("grammar")
+            .to_string();
+        assert!(err.contains("AUTUMN_ROLE"), "{err}");
+    }
+
+    #[test]
+    fn role_name_compares_with_process_role_and_round_trips() {
+        let name: RoleName = ProcessRole::Web.into();
+        assert_eq!(name, ProcessRole::Web);
+        assert_eq!(name.builtin(), Some(ProcessRole::Web));
+        assert_eq!(
+            "server".parse::<RoleName>().expect("alias"),
+            ProcessRole::Web
+        );
+        let named: RoleName = "critical".parse().expect("named");
+        assert_eq!(named.builtin(), None);
+        assert_ne!(named, ProcessRole::Worker);
+        assert_eq!(named.to_string(), "critical");
+        assert_eq!(RoleName::default(), ProcessRole::Combined);
+        assert_eq!(RoleName::parse_env_override("  ").expect("blank"), None);
+        assert_eq!(
+            serde_json::from_str::<RoleName>("\"Bulk\"")
+                .expect("json")
+                .as_str(),
+            "bulk"
+        );
+        // The table form of a unit variant still loads (#3541).
+        let config: AutumnConfig = toml::from_str("[role.web]\n").expect("table form");
+        assert_eq!(config.role, ProcessRole::Web);
+    }
+
+    /// The scheduler `replica_id` of a preset starts with its name.
+    #[test]
+    fn scheduler_replica_id_prefix_for_named_role() {
+        let unset = SchedulerConfig::default();
+        let bare = unset.resolved_replica_id();
+        assert_eq!(
+            unset.resolved_replica_id_for(&Role::from(ProcessRole::Worker)),
+            bare
+        );
+        let role = roles_config_3543("critical")
+            .resolve_role()
+            .expect("critical");
+        assert_eq!(
+            unset.resolved_replica_id_for(&role),
+            format!("critical-{bare}")
+        );
+
+        let explicit = SchedulerConfig {
+            replica_id: Some("pod-7".to_owned()),
+            ..SchedulerConfig::default()
+        };
+        assert_eq!(explicit.resolved_replica_id_for(&role), "pod-7");
+    }
+
+    /// `[jobs.fleet] tiers` derived from the presets that run job workers.
+    #[test]
+    fn fleet_tiers_derive_from_presets() {
+        let config = roles_config_3543("combined");
+        let tiers = derive_fleet_tiers(&config.roles, &config.jobs.pin).expect("valid");
+        // critical: its pin. cron: no job workers. marketing: jobs.pin.
+        assert_eq!(
+            tiers,
+            vec![vec!["critical".to_owned()], vec!["default".to_owned()]]
+        );
+        assert!(
+            derive_fleet_tiers(&std::collections::BTreeMap::new(), &[])
+                .expect("empty")
+                .is_empty()
+        );
+
+        // A bad preset is an error, not a silently shorter list.
+        let mut bad = config.roles;
+        bad.insert("worker".to_owned(), RolePreset::new(ProcessRole::Worker));
+        assert!(matches!(
+            derive_fleet_tiers(&bad, &[]),
+            Err(RoleError::Reserved { .. })
+        ));
+    }
+
+    /// A `combined` preset with no job workers enqueues and does not drain,
+    /// so the split-role checks treat it as `web`.
+    #[test]
+    fn guard_base_treats_a_non_draining_combined_preset_as_web() {
+        let resolve = |body: &str| {
+            let config: AutumnConfig =
+                toml::from_str(&format!("role = \"x\"\n[roles.x]\n{body}\n")).expect(body);
+            config.resolve_role().expect(body)
+        };
+        assert_eq!(
+            resolve("base = \"combined\"").guard_base(),
+            ProcessRole::Combined
+        );
+        assert_eq!(
+            resolve("base = \"combined\"\njob_workers = false").guard_base(),
+            ProcessRole::Web
+        );
+        assert_eq!(
+            resolve("base = \"combined\"\npin = []").guard_base(),
+            ProcessRole::Web
+        );
+        assert_eq!(
+            resolve("base = \"worker\"\npin = []").guard_base(),
+            ProcessRole::Worker
+        );
+        assert_eq!(resolve("base = \"web\"").guard_base(), ProcessRole::Web);
+        for base in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+            let role = Role::from(base);
+            assert_eq!(role.guard_base(), base);
+            // `PartialEq` works in both directions.
+            assert_eq!(base, role);
+            assert_eq!(role, base);
+        }
+    }
+
+    /// Every base, every override and every `pin` shape, against the rules
+    /// `verification/role_presets.rs` proves.
+    #[test]
+    fn preset_capabilities_match_the_model() {
+        const STATES: [Option<bool>; 3] = [None, Some(false), Some(true)];
+        let background = &Capability::ALL[1..];
+        let pins = [None, Some(Vec::new()), Some(vec!["q".to_owned()])];
+        let mut checked = 0_usize;
+        for base in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+            let base_caps = base.capabilities();
+            for combo in 0..STATES
+                .len()
+                .pow(u32::try_from(background.len()).expect("small"))
+            {
+                for pin in &pins {
+                    let mut preset = RolePreset::new(base);
+                    preset.pin.clone_from(pin);
+                    let mut rest = combo;
+                    for &capability in background {
+                        let state = STATES[rest % STATES.len()];
+                        rest /= STATES.len();
+                        match capability {
+                            Capability::JobWorkers => preset.job_workers = state,
+                            Capability::Scheduler => preset.scheduler = state,
+                            Capability::OutboxRelay => preset.outbox_relay = state,
+                            Capability::CommitHooks => preset.commit_hooks = state,
+                            Capability::FleetRelay => preset.fleet_relay = state,
+                            Capability::RestoreCheck => preset.restore_check = state,
+                            Capability::Retention => preset.retention = state,
+                            Capability::ServesHttp => unreachable!("not a background capability"),
+                        }
+                    }
+                    let caps = preset.capabilities();
+                    // Within the base, and the base decides HTTP.
+                    assert_eq!(caps.serves_http, base_caps.serves_http);
+                    for &capability in Capability::ALL {
+                        assert!(!caps.runs(capability) || base_caps.runs(capability));
+                    }
+                    let above = background
+                        .iter()
+                        .any(|&c| preset.override_for(c) == Some(true) && !base_caps.runs(c));
+                    let result = preset.validate("tier");
+                    let pin_conflict = match preset.pin.as_deref() {
+                        Some([]) => preset.job_workers == Some(true),
+                        Some(_) => !caps.job_workers,
+                        None => false,
+                    };
+                    assert_eq!(
+                        result.is_ok(),
+                        !above && !pin_conflict,
+                        "{preset:?}: {result:?}"
+                    );
+                    if above {
+                        assert!(
+                            matches!(result, Err(RoleError::AboveBase { .. })),
+                            "{preset:?}"
+                        );
+                    }
+                    if result.is_ok() {
+                        // A valid preset gets each override it sets.
+                        for &capability in background {
+                            if let Some(wanted) = preset.override_for(capability) {
+                                assert_eq!(caps.runs(capability), wanted, "{preset:?}");
+                            }
+                        }
+                        assert_eq!(
+                            caps.job_workers,
+                            preset.pin.as_ref().is_none_or(|p| !p.is_empty())
+                                && preset.job_workers != Some(false)
+                                && base_caps.job_workers
+                        );
+                    }
+                    if combo == 0 && pin.is_none() {
+                        assert_eq!(caps, base_caps, "a preset with no overrides is its base");
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 3 * 3_usize.pow(7) * 3);
+    }
+
+    // ── Route groups: `[roles.<name>] mount` (#3544) ──────────────────────
+
+    const MOUNT_3544: &str = r#"
+[roles.marketing]
+base = "web"
+mount = ["marketing"]
+
+[roles.service]
+base = "combined"
+mount = ["service", "app"]
+
+[roles.api]
+base = "web"
+
+[roles.bulk]
+base = "worker"
+"#;
+
+    fn mount_config_3544(role: &str) -> AutumnConfig {
+        let mut config: AutumnConfig = toml::from_str(MOUNT_3544).expect("mount parses");
+        config.role = role.parse().expect("role name");
+        config
+    }
+
+    #[test]
+    fn mount_selects_the_groups_a_role_serves() {
+        let role = mount_config_3544("marketing")
+            .resolve_role()
+            .expect("marketing resolves");
+        assert_eq!(role.mount(), Some(["marketing".to_owned()].as_slice()));
+        assert!(role.mounts_group("marketing"));
+        assert!(!role.mounts_group("service"));
+        assert!(!role.mounts_group(crate::route::RouteGroup::DEFAULT_NAME));
+    }
+
+    #[test]
+    fn a_role_without_mount_mounts_every_group() {
+        for name in ["api", "combined", "web"] {
+            let role = mount_config_3544(name).resolve_role().expect("resolves");
+            assert_eq!(role.mount(), None, "{name}");
+            assert!(role.mounts_group("marketing"), "{name}");
+            assert!(role.mounts_group("anything"), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_role_that_serves_no_http_mounts_no_group() {
+        for name in ["bulk", "worker"] {
+            let role = mount_config_3544(name).resolve_role().expect("resolves");
+            assert!(!role.mounts_group("marketing"), "{name}");
+        }
+    }
+
+    #[test]
+    fn mount_on_a_worker_base_is_rejected() {
+        let mut preset = RolePreset::new(ProcessRole::Worker);
+        preset.mount = Some(vec!["marketing".to_owned()]);
+        assert!(matches!(
+            preset.validate("bulk"),
+            Err(RoleError::MountWithoutHttp { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_and_blank_mount_are_rejected() {
+        let mut preset = RolePreset::new(ProcessRole::Web);
+        preset.mount = Some(Vec::new());
+        assert!(matches!(
+            preset.validate("site"),
+            Err(RoleError::EmptyMount { .. })
+        ));
+        preset.mount = Some(vec!["marketing".to_owned(), " ".to_owned()]);
+        assert!(matches!(
+            preset.validate("site"),
+            Err(RoleError::BlankMount { .. })
+        ));
+    }
+
+    #[test]
+    fn mount_error_stops_the_load() {
+        let toml = "[roles.bulk]\nbase = \"worker\"\nmount = [\"marketing\"]\n";
+        let config: AutumnConfig = toml::from_str(toml).expect("parses");
+        let err = config.validate().expect_err("worker base with mount");
+        assert!(err.to_string().contains("mount"), "{err}");
+    }
+
+    /// A group is fleet-mounted when some HTTP preset mounts it. A preset
+    /// without `mount` mounts every group.
+    #[test]
+    fn groups_mounted_by_no_preset_lists_uncovered_groups() {
+        let narrow: AutumnConfig = toml::from_str(
+            "[roles.marketing]\nbase = \"web\"\nmount = [\"marketing\"]\n\
+             [roles.bulk]\nbase = \"worker\"\n",
+        )
+        .expect("parses");
+        let groups = ["app", "marketing", "service"].map(str::to_owned);
+        assert_eq!(
+            groups_mounted_by_no_preset(&narrow.roles, &groups),
+            vec!["app".to_owned(), "service".to_owned()]
+        );
+        // A preset without `mount` covers every group.
+        let wide = mount_config_3544("combined");
+        assert!(groups_mounted_by_no_preset(&wide.roles, &groups).is_empty());
+        // No HTTP preset at all: the built-in roles serve every group, and the
+        // check has nothing to compare.
+        let none: AutumnConfig =
+            toml::from_str("[roles.bulk]\nbase = \"worker\"\n").expect("parses");
+        assert!(groups_mounted_by_no_preset(&none.roles, &groups).is_empty());
+    }
+
+    /// Strict config accepts `mount` and `[route_groups]`, and rejects an
+    /// unknown `[route_groups]` key.
+    #[test]
+    fn strict_config_accepts_mount_and_route_groups() {
+        let schema = AutumnConfig::get_schema_keys();
+        let toml = format!(
+            "{MOUNT_3544}\n[route_groups]\ndeclared = [\"marketing\"]\nmanifest = \"routes.json\"\n"
+        );
+        let errors = AutumnConfig::validate_toml(&toml, &schema);
+        assert!(errors.is_empty(), "{errors:?}");
+        let bad = toml::from_str::<AutumnConfig>("[route_groups]\ngroups = [\"a\"]\n");
+        assert!(bad.is_err(), "route_groups denies unknown keys");
+    }
+
+    /// Runtime twin of `verification/route_groups.rs`: every base, every
+    /// `mount` shape, every group.
+    #[test]
+    fn mount_matches_the_model() {
+        let mounts = [
+            None,
+            Some(Vec::new()),
+            Some(vec!["a".to_owned()]),
+            Some(vec!["a".to_owned(), "b".to_owned()]),
+        ];
+        for base in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+            for mount in &mounts {
+                let mut preset = RolePreset::new(base);
+                preset.mount.clone_from(mount);
+                let valid = preset.validate("tier").is_ok();
+                let model_valid = mount
+                    .as_ref()
+                    .is_none_or(|groups| base.serves_http() && !groups.is_empty());
+                assert_eq!(valid, model_valid, "{preset:?}");
+                if !valid {
+                    continue;
+                }
+                let role = Role::from_preset("tier", &preset);
+                for group in ["a", "b", "c"] {
+                    let model = base.serves_http()
+                        && mount.as_ref().is_none_or(|m| m.iter().any(|g| g == group));
+                    assert_eq!(role.mounts_group(group), model, "{preset:?} {group}");
+                    assert_eq!(preset.mounts_group(group), model, "{preset:?} {group}");
+                }
+            }
+        }
+    }
+
+    /// Strict config does not flag the keys of a preset.
+    #[test]
+    fn strict_config_accepts_role_presets() {
+        let schema = AutumnConfig::get_schema_keys();
+        let errors = AutumnConfig::validate_toml(ROLES_3543, &schema);
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

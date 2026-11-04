@@ -451,9 +451,10 @@ mod active_search_tests {
     }
 
     #[test]
-    fn autocomplete_option_is_keyboard_focusable() {
+    fn autocomplete_option_is_not_a_tab_stop() {
+        // APG combobox: focus stays on the input (issue #3397).
         let html = autocomplete_option("1", "Option").into_string();
-        assert!(html.contains("tabindex"), "{html}");
+        assert!(html.contains(r#"tabindex="-1""#), "{html}");
     }
 
     // ── autocomplete_empty_state ──────────────────────────────────────

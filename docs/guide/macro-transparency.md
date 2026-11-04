@@ -3,7 +3,7 @@
 Autumn relies on procedural macros to eliminate boilerplate. This guide shows
 you exactly what those macros generate so there are no surprises at runtime.
 
-Examples in this guide track the Autumn 0.9.x line and Rust 1.88.0+ as of
+Examples in this guide track the Autumn 0.9.x line and Rust 1.97.0+ as of
 2026-10-01.
 
 The code snippets are **illustrative**, not compiled doctests: the "what it

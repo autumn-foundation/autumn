@@ -8,12 +8,13 @@
 /// Reusable Maud pagination-nav renderers (offset and cursor).
 #[cfg(feature = "maud")]
 pub mod pagination;
+pub mod theme;
 pub mod tokens;
 /// Framework-owned widget component CSS — see [`widgets_css`] for docs.
 ///
 /// Gated on `maud` like every module it backs (`form`, `widgets`, `wizard`,
 /// `pagination`, `storage::form_helper`, `job_tracking`'s render helpers) —
-/// there's no configuration where a widget emits an `autumn-*`/`wizard-*`
+/// there's no configuration where a widget emits an `autumn-*`
 /// class without maud, so the CSS serving it is scoped the same way instead
 /// of being reachable-but-unrouted.
 #[cfg(feature = "maud")]

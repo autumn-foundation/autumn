@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/csrf_verify
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+          61,873   16.9%  __memcpy_avx_unaligned_erms
+          30,426    8.3%  _int_malloc
+          28,539    7.8%  _int_free
+          21,188    5.8%  malloc
+          21,187    5.8%  core::ptr::drop_glue
+          20,862    5.7%  sha2::sha256::compress256
+          14,508    4.0%  free
+           9,911    2.7%  <autumn_web::state::AppState as core::clone::Clone>::clone
+           6,972    1.9%  <tower::util::map_future::MapFuture as tower::util::boxed_clone_sync::CloneService>::clone_box
+           6,700    1.8%  malloc_consolidate
+           4,260    1.2%  <core::iter::adapters::map::Map as core::iter::traits::iterator::Iterator>::next
+           4,212    1.2%  __rustc::__rdl_alloc
+           4,083    1.1%  <hashbrown::raw::RawTable>::reserve_rehash
+           3,807    1.0%  <tokio::task::task_local::TaskLocalFuture as core::future::future::Future>::poll
+           3,733    1.0%  unlink_chunk.isra.0
+           3,717    1.0%  <hashbrown::map::HashMap>::insert
+           3,714    1.0%  autumn_web::security::csrf::constant_time_eq
+           3,243    0.9%  <alloc::string::String as core::iter::traits::collect::FromIterator>::from_iter
+           3,192    0.9%  <http::header::map::HeaderMap>::try_insert2
+           2,730    0.7%  <tokio::task::task_local::LocalKey>::sync_scope
+           2,445    0.7%  <tower::util::either::Either as core::clone::Clone>::clone
+           2,322    0.6%  <alloc::raw_vec::RawVecInner>::finish_grow
+           2,235    0.6%  <hex::BytesToHexChars as core::iter::traits::iterator::Iterator>::next
+           2,178    0.6%  http::header::map::hash_elem_using
+           2,065    0.6%  <autumn_web::router::TrustedHostService as core::clone::Clone>::clone
+           2,026    0.6%  <autumn_web::test::RequestBuilder>::send::{closure#0}
+           1,869    0.5%  <autumn_web::security::config::ResolvedSigningKeys>::verify
+           1,820    0.5%  core::slice::memchr::memchr_aligned
+           1,815    0.5%  subtle::black_box
+           1,800    0.5%  <autumn_web::session::SessionService as core::clone::Clone>::clone
+
+         365,227  100.0%  TOTAL

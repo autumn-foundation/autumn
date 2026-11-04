@@ -1,0 +1,38 @@
+# Bolt profile: autumn-web/feed_render
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=callgrind, self cost by function
+
+              Ir   share  function
+
+          33,704   20.5%  autumn_web::feed::skip_clean
+          16,165    9.8%  chrono::format::formatting::write_rfc3339
+          12,758    7.7%  _int_malloc
+          11,826    7.2%  autumn_web::feed::push_escaped
+          11,576    7.0%  __memcpy_avx_unaligned_erms
+          11,556    7.0%  _int_free
+           8,534    5.2%  malloc
+           7,801    4.7%  core::fmt::write
+           6,637    4.0%  <alloc::string::String as core::fmt::Write>::write_str
+           5,842    3.5%  <autumn_web::feed::Feed>::render
+           5,797    3.5%  free
+           4,145    2.5%  feed_render::sample_feed
+           3,483    2.1%  malloc_consolidate
+           3,111    1.9%  <chrono::datetime::DateTime>::to_rfc3339_opts
+           2,940    1.8%  alloc::fmt::format::format_inner
+           1,710    1.0%  <core::fmt::Formatter>::pad_integral
+           1,683    1.0%  __rustc::__rdl_alloc
+           1,647    1.0%  <chrono::format::OffsetFormat>::format
+           1,647    1.0%  <chrono::naive::datetime::NaiveDateTime>::checked_add_offset
+           1,525    0.9%  <core::fmt::Formatter>::pad
+           1,405    0.9%  unlink_chunk.isra.0
+           1,132    0.7%  core::ptr::drop_glue
+             998    0.6%  <u64>::_fmt_inner
+             990    0.6%  <alloc::string::String as core::clone::Clone>::clone
+             750    0.5%  <u64 as core::fmt::Display>::fmt
+             720    0.4%  realloc
+             660    0.4%  _int_free_merge_chunk
+             630    0.4%  <core::fmt::Formatter>::pad_integral::write_prefix
+             596    0.4%  _int_realloc
+             429    0.3%  <alloc::raw_vec::RawVecInner>::finish_grow
+
+         164,769  100.0%  TOTAL

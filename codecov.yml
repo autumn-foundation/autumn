@@ -42,5 +42,6 @@ ignore:
   - "autumn-cache-redis/**"     # Requires a live Redis server (testcontainers); all tests are #[ignore] for cross-platform CI
   - "example-e2e/**"    # Spawns real example binaries against testcontainers Postgres + headless Chromium (issue #1192); all tests are #[ignore] for cross-platform CI, same pattern as autumn-cache-redis
   - "autumn/src/system_test.rs"  # SystemTest/Page/SystemTestRunner drive a live headless-Chromium browser over CDP — untestable without a real browser; all such tests are #[ignore] for cross-platform CI, same pattern as autumn-cache-redis
+  - "autumn/src/plugin_conformance/widgets/browser.rs"  # Widget-pack browser gate (issue #3400): drives headless Chromium through SystemTest/Page — untestable without a real browser, same pattern as system_test.rs. Its canary tests run in the widgets-browser workflow.
   - "**/*_test.rs"
   - "**/tests/**"

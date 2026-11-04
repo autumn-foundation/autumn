@@ -9,11 +9,12 @@ use std::collections::HashMap;
 
 use autumn_web::form::{
     Changeset, FieldControl, FieldOptions, FormField, FormModel, RichTextLabels,
-    checkbox_input_with, date_input_with, datetime_input_with, form_for, number_input_with,
-    password_input, password_input_with, required_checkbox_input, required_password_input,
-    required_select_input, required_text_input, required_textarea_input, rich_text_area_htmx_with,
-    rich_text_area_with, select_input_with, text_input, text_input_htmx_with, text_input_with,
-    textarea_input_with,
+    checkbox_input_with, date_input_with, datetime_input_with, email_input_with, form_for,
+    month_input_with, number_input_with, password_input, password_input_with,
+    required_checkbox_input, required_password_input, required_select_input, required_text_input,
+    required_textarea_input, rich_text_area_htmx_with, rich_text_area_with, select_input_with,
+    switch_input_with, tel_input_with, text_input, text_input_htmx_with, text_input_with,
+    textarea_input_with, time_input_with, url_input_with,
 };
 use autumn_web::nested_form::{
     InputsForOptions, NestedChild, decode_nested_urlencoded, inputs_for,
@@ -83,6 +84,25 @@ fn helpers() -> Vec<(&'static str, &'static str, Render)> {
         }),
         ("rich_text", "bio", |cs, o| {
             rich_text_area_with(cs, "bio", "Bio", &RichTextLabels::new(), o).into_string()
+        }),
+        // Native inputs (#3405).
+        ("switch", "agree", |cs, o| {
+            switch_input_with(cs, "agree", "Agree", o).into_string()
+        }),
+        ("email", "email", |cs, o| {
+            email_input_with(cs, "email", "Email", o).into_string()
+        }),
+        ("tel", "email", |cs, o| {
+            tel_input_with(cs, "email", "Email", o).into_string()
+        }),
+        ("url", "email", |cs, o| {
+            url_input_with(cs, "email", "Email", o).into_string()
+        }),
+        ("time", "starts", |cs, o| {
+            time_input_with(cs, "starts", "Starts", o).into_string()
+        }),
+        ("month", "born", |cs, o| {
+            month_input_with(cs, "born", "Born", o).into_string()
         }),
         ("rich_text_htmx", "bio", |cs, o| {
             rich_text_area_htmx_with(
@@ -461,6 +481,23 @@ fn every_control() -> Vec<FieldControl> {
             options: vec![("a".into(), "A".into())],
         },
         FieldControl::File,
+        // Native inputs (#3405). Range, color and hidden take no required
+        // state, so they have their own tests.
+        FieldControl::Switch,
+        FieldControl::Email,
+        FieldControl::Tel,
+        FieldControl::Url,
+        FieldControl::Time,
+        FieldControl::Month,
+        FieldControl::Radio {
+            options: vec![("a".into(), "A".into())],
+        },
+        FieldControl::Segmented {
+            options: vec![("a".into(), "A".into())],
+        },
+        FieldControl::CheckboxGroup {
+            options: vec![("a".into(), "A".into())],
+        },
     ]
 }
 

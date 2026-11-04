@@ -107,7 +107,8 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 /// nothing wipes, so the parts are fed to the MAC directly. The prefix is a
 /// constant, so the split adds no ambiguity.
 fn hmac_sha256_parts(key: &[u8], first: &[u8], second: &[u8]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac =
+        <HmacSha256 as KeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(first);
     mac.update(second);
     mac.finalize().into_bytes().into()
@@ -398,9 +399,10 @@ impl RootKey {
         let cipher = Aes256Gcm::new(&seal_key.into());
         seal_key.zeroize();
 
+        let nonce = <&Nonce<_>>::try_from(nonce).map_err(|_| ConfidentialError::UnsealFailed)?;
         let plaintext = cipher
             .decrypt(
-                <&Nonce<_>>::from(nonce),
+                nonce,
                 Payload {
                     msg: ciphertext,
                     aad: &ctx.aad(),

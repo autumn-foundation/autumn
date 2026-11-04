@@ -401,7 +401,7 @@ impl HttpShadowTransport {
         max_body_bytes: usize,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            client: reqwest::Client::builder()
+            client: crate::reqwest_tls::client_builder()
                 .timeout(timeout)
                 // No ambient proxy. Mirrored requests carry the end user's
                 // session cookie and `Authorization` header, and reqwest

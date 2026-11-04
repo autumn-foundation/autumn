@@ -117,6 +117,7 @@ pub struct AdminPageCtx {
     show_config: bool,
     csrf: AdminCsrf,
     banner: Option<templates::ImpersonationBanner>,
+    theme: autumn_web::ui::theme::Theme,
 }
 
 impl AdminPageCtx {
@@ -132,6 +133,7 @@ impl AdminPageCtx {
             messages,
             show_config: self.show_config,
             impersonation: self.banner.as_ref(),
+            theme: self.theme,
         }
     }
 }
@@ -161,6 +163,7 @@ impl FromRequestParts<AppState> for AdminPageCtx {
             show_config,
             csrf,
             banner,
+            theme: autumn_web::ui::theme::Theme::from_headers(&parts.headers),
         })
     }
 }

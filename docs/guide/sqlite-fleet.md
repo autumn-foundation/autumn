@@ -32,11 +32,15 @@ url = "sqlite:///var/lib/app/control.db"
 mode = "tenant"                 # or "slot"
 root = "/var/lib/app/fleet"     # on the host's local volume
 # path = "{bucket}/{tenant}.db" # default for mode = "tenant"
-max_open = 256                  # open databases at most (LRU past this)
+max_open = 256                  # soft limit on open databases (LRU past this)
+# min_residency = "2s"          # LRU does not close a database used this recently
 pool_size = 2                   # connections per open database
 idle_close_secs = 300           # close a database idle this long
 # create_on_demand = false      # default: false for tenants, true for slots
 # restore_missing = false       # see "Replication" below
+# replica_retention_after_delete = "0s"  # see "Deleting a database's replica"
+# restore_check_sample = 1      # see "Restore check"
+# replication_workers = 4       # see "Replication lag"
 
 # [database.fleet.ownership]    # see "Failover: slot ownership" below
 # owner = "host-a"
@@ -78,6 +82,11 @@ nothing. Uppercase is refused rather than folded: on a case-insensitive file
 system `Acme` and `acme` would share a file. If your ids are UUIDs, send them
 lowercase.
 
+A slot fleet takes any routing key: the key never names a file. So an app
+that moves from tenant to slot mode loses this id check. Check ids where they
+enter the app, for example with `TenantDbId::parse`
+(`autumn_web::fleet_layout`).
+
 ## Handlers
 
 Nothing changes. The fleet is the app's shard set:
@@ -96,10 +105,19 @@ async fn create(mut db: ShardedDb, Path(body): Path<String>) -> AutumnResult<Str
 pub trait NoteRepository {}
 
 #[get("/notes")]
-async fn list(repo: PgNoteRepository) -> AutumnResult<Json<Vec<Note>>> {
+async fn list(repo: SqliteNoteRepository) -> AutumnResult<Json<Vec<Note>>> {
     Ok(Json(repo.find_all().await?))
 }
 ```
+
+`#[repository]` generates `PgNoteRepository`. A SQLite build also names it
+`SqliteNoteRepository`. The two names are one type. The generators still
+write the `Pg` name.
+
+In a module with `#[model]` or `#[repository]`, use
+`autumn_web::db::prelude::*`, not `diesel::prelude::*`. Diesel's prelude also
+imports the blocking `RunQueryDsl`, and the generated code then fails with
+E0034 ("multiple applicable items in scope").
 
 The routing key is the tenant id, resolved exactly as for `ShardedDb`
 (`ShardKeyOverride`, then the tenancy middleware, then `[tenancy]`
@@ -109,7 +127,12 @@ apart.
 
 `CrossShard<R>`, `Shards::each_shard` and `across_tenants()` fan out over
 **every database on disk**, opening each. Use them on admin paths, not hot
-paths.
+paths. For analytics, [query the lake](#query-the-lake) instead.
+
+When a handler holds a `Db` past `database.slow_query_threshold`, Autumn
+logs `database connection held past slow_query_threshold` with `held_ms`.
+The time covers all work in the hold, not one statement. For a fan-out, take
+`LazyDb`. Call `checkout()` after the fan-out.
 
 ## Provisioning, deletion, backup
 
@@ -129,19 +152,59 @@ async fn signup(shards: Shards, Path(tenant): Path<String>) -> AutumnResult<Stat
 | --- | --- |
 | `fleet.provision(&key)` | create and migrate (`409` when it exists) |
 | `fleet.open(&key)` | open (`404` when missing and not created on demand) |
-| `fleet.delete(&key)` | close, then remove the file, its sidecars and the emptied bucket; requests get `410` meanwhile; `409` when another process still has it open |
+| `fleet.delete(&key)` | close, then remove the file, its sidecars and the emptied bucket; requests get `410` meanwhile; `409` when another process still has it open. With replication, the replica goes too: see [Deleting a database's replica](#deleting-a-databases-replica) |
 | `fleet.backup(&key, &dest)` | consistent copy with `VACUUM INTO`; writers keep running |
+| `fleet.import(&key, &src)` | copy a file into the fleet as `key`: check, migrate, publish (`409` when the key has a file, `422` for a bad file). See [Import a backup](#import-a-backup) |
 | `fleet.list()` | every database on disk |
 | `fleet.each(n, f)` | run `f` on every database, `n` at a time |
 | `fleet.migrate_all(n)` | migrate every database, report failures per database |
 | `fleet.restore(&key, at)` | rebuild from the replica (needs replication); `409` when another process still has it open |
 | `fleet.stats()` | counters (also on `/actuator/health` as `db:fleet`) |
 
+### Import a backup
+
+`fleet.import(&key, &src)` copies a database file into the fleet as `key`,
+for example a file that `fleet.backup` wrote before a delete:
+
+```rust
+fleet.backup(&key, &archive).await?;
+fleet.delete(&key).await?;
+// Later: undo the delete.
+fleet.import(&key, &archive).await?;
+```
+
+The import does not change `src`. It copies `src` with `VACUUM INTO` into a
+private staging file. Then it does these steps:
+
+1. It runs `PRAGMA integrity_check`.
+2. It reads the identity row. The row must record `key`. A file with no
+   identity row (a file that no fleet made) is refused.
+3. It applies the pending migrations. With ownership, it sets the epoch of
+   the copy to this host's epoch. Without ownership, it removes the epoch.
+4. With replication, it purges the tombstone and the old replica of a
+   deleted key, as `provision` does. It does this only after steps 1 to 3
+   pass. Thus a refused file keeps the replica.
+5. It publishes the file in one step. It never replaces a file.
+
+A refused source answers `422` (`FleetError::InvalidSource`), and a key that
+has a file answers `409`. Nothing is published then. `fleet.import_file` does
+the same steps, but does not open the database.
+
+Import only files that you trust: the copy keeps the schema, the triggers and
+the migration records of `src`. On Windows, the import opens `src` read-write,
+so SQLite can apply a `-wal` or a hot journal to it.
+
+`FleetLifecycle::restore_missing` is a lower-level hook. Each request-path
+open of a missing file asks it, under the path lock, whatever
+`[database.fleet] restore_missing` says. A background open does not ask. With
+replication, an open of a deleted key does not ask. Use `import` for a local
+backup.
+
 ## Operating the fleet
 
 `autumn fleet` runs these operations from the command line. Use it when the
 app is stopped and when it runs. It reads `[database.fleet]` the same way the
-app does. `restore` also reads `[replication]`. The sources are
+app does. `delete`, `import`, `restore` and `lake` also read `[replication]`. The sources are
 `autumn.toml`, the `[profile.<p>]` overlay, `.env.<profile>` and `AUTUMN_*`
 overrides. Run it from the app directory. `--profile <p>` selects a profile.
 
@@ -156,13 +219,16 @@ cargo install autumn-cli --no-default-features --features sqlite
 | `autumn fleet list [--open] [--json]` | name, size and path of each database; `--open` adds the identity row, the latest applied app migration and the number of pending app migrations |
 | `autumn fleet migrate [--concurrency N] [--key K]` | apply `migrations/` and the framework tables to every database, or to one |
 | `autumn fleet backup <key> <dest>` | copy one database with `VACUUM INTO`; `dest` must not exist |
-| `autumn fleet delete <key> --force` | remove one database and its sidecars |
+| `autumn fleet import <key> <src>` | copy `src` into the fleet as `key`; the key must have no file |
+| `autumn fleet delete <key> --force` | remove one database and its sidecars; with replication, its replica too |
 | `autumn fleet restore <key> [--timestamp T] --force` | rebuild one database from its replica; `--timestamp` sets a point in time |
+| `autumn fleet lake <sql> [--out F] [--keep F] [--timestamp T]` | run one query over the replicas of every live tenant and write CSV; see [Query the lake](#query-the-lake) |
 
 ```shell
 autumn fleet list --open
 autumn fleet migrate --concurrency 4
 autumn fleet backup tenant:acme /backups/acme.db
+autumn fleet import tenant:acme /backups/acme.db
 autumn fleet delete tenant:acme --force
 autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
 ```
@@ -171,8 +237,15 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
   `slot:<nnnnn>`. `tenant/<id>` and `slot/<n>` are also accepted.
 - No command creates the fleet root. Each command stops when
   `database.fleet.root` does not exist, so a wrong directory does not give an
-  empty fleet. For a new volume, create the root directory first.
-- Only `restore` creates a database file. The other commands do not.
+  empty fleet. `lake` does not read the root, so it runs without one. For a new volume, create the root directory first.
+- Only `restore` and `import` create a database file. The other commands do
+  not.
+- `import` applies `migrations/` and the framework tables to the copy before
+  it publishes it. Like `migrate`, it stops when the copy records a migration
+  that is not in these sets. With `[replication]` on, it needs the replica
+  destination and the control database, to purge the old replica of a deleted
+  database. With `[database.fleet.ownership]` on, it stops: this command holds
+  no slot lease. Call `DatabaseFleet::import` in the app that owns the slot.
 - Like boot, each command validates `[database]` first and stops when the
   control database resolves inside the fleet root.
 - `list --open` reads each file and changes no data. It exits non-zero when
@@ -204,8 +277,13 @@ autumn fleet restore tenant:acme --timestamp 2026-10-01T12:00:00Z --force
   until the app closes the database (`idle_close_secs`), or stop the app.
 - `restore` verifies the replica chain before it replaces the file, as
   `autumn db replica restore` does.
-- `delete` does not remove the replica. With `restore_missing = true`, the app
-  restores a deleted database on the next request for it.
+- With `[replication]` on, `delete` also removes the replica, or keeps it for
+  `replica_retention_after_delete`, and prints which. It needs the replica
+  destination and the control database. If the purge fails, the command
+  prints the error and a tombstone records it: the app tries the purge
+  again. See [Deleting a database's replica](#deleting-a-databases-replica).
+- `restore` also brings back a deleted database whose replica is still
+  there. It drops the tombstone, so it needs the control database.
 - On Windows, another process can open the database while `delete` or
   `restore` removes files (see [Limits](#limits)). The command then
   stops with "open in another process" or "created ... during the restore".
@@ -229,21 +307,59 @@ Each database's run is one `BEGIN IMMEDIATE` transaction: atomic, and safe
 when two processes race. During a rollout the fleet is mixed, so write
 migrations expand-then-contract.
 
+### Control-only and tenant-only sets
+
+`AppBuilder::migrations` sends a set to the control database and to every
+fleet database. To keep a set on one side, use `migrations_for`:
+
+```rust
+use autumn_web::migrate::{EmbeddedMigrations, MigrationScope, embed_migrations};
+
+const CONTROL: EmbeddedMigrations = embed_migrations!("migrations-control");
+const TENANT: EmbeddedMigrations = embed_migrations!("migrations");
+
+autumn_web::app()
+    .migrations_for(MigrationScope::Control, CONTROL) // control database only
+    .migrations_for(MigrationScope::Shards, TENANT)   // each fleet database only
+```
+
+Boot and `AUTUMN_MIGRATE=1` obey the scope. `autumn migrate` and
+`autumn fleet migrate` read `migrations/` and do not know a scope. Keep the
+tenant set in `migrations/` and the control set in its own directory. Then
+`autumn fleet migrate` is correct for the fleet. Do not run `autumn migrate`
+on this app: it applies `migrations/` to the control database. Use
+`AUTUMN_MIGRATE=1`.
+
 ## Opening and closing
 
 - The first request for a database opens it (about half a millisecond for a
   small schema). Concurrent first requests share that one open.
 - A file that records another key's name (it was copied or renamed by hand)
   is refused with `500` rather than served.
-- Past `max_open`, the least recently used idle database closes. A database
-  with a connection checked out, used in the last two seconds, or held by a
-  request (a `ShardedDb`, a sharded repository) is never closed, so the cap is
-  soft under load.
+- `max_open` is a soft limit. Past it, the least recently used idle database
+  closes. The sweep does not close a database that has a connection checked
+  out, that a request holds (a `ShardedDb`, a sharded repository), or that
+  was used within `min_residency` (default `2s`). An open never waits for
+  room. Thus a burst across many keys opens more databases than `max_open`.
+  In one measurement, 1,000 tenants at about 1,300 requests per second gave
+  594 open databases with `max_open = 16`. The count decreased to 16 about
+  12 seconds after the burst.
+- A lower `min_residency` keeps the count nearer to `max_open` during a burst.
+  A request can then reopen a database that it used a moment before.
 - A new database is built and migrated in a private staging file, then
   published in one step: it is absent or complete, never half made. When two
   processes on one volume create the same database, both end up on one file.
-- Budget: `max_open × pool_size` connections and roughly
-  `max_open × (2 × pool_size + 1)` file descriptors.
+- Budget: `pool_size` connections and about `2 × pool_size + 1` file
+  descriptors (database and `-wal` per connection, one `-shm`) per open
+  database. Size the open-file limit (`ulimit -n`) for the peak open count
+  under a burst, not for `max_open`. The default limit on macOS is 256: 594
+  open databases go past it.
+- When connections reach `database.max_connections_warn_threshold`
+  (default 100), the boot warning gives the open files at `max_open`. The
+  formula is `2 × connections + databases`. It counts the control database.
+- On Unix, boot also warns when those files reach 80 % of the open-file limit
+  (`ulimit -n`), at any connection count. The rest is for sockets and logs.
+  `database.max_connections_warn_threshold = 0` silences both warnings.
 - Metrics label every fleet database `shard=fleet`; the database name goes on
   spans and logs only, so a tenant fleet cannot explode metric cardinality.
 
@@ -312,6 +428,14 @@ control database, under `<prefix>/<profile>/fleet/tenant/<id>` or
   by serving it. Turn on [slot ownership](#failover-slot-ownership) with it:
   without ownership, nothing stops the previous owner, and the two copies
   diverge. Boot logs a warning for `restore_missing` without ownership.
+  This setting is only for a missing file. With ownership on, a host also
+  restores a stale file (older than the replica) without `restore_missing`.
+  See step 5 of [the failover procedure](#the-failover-procedure).
+
+**Replication is asynchronous.** A host acknowledges a write when the write
+is on its own volume. The next pass ships it to the replica. So a failover
+to another volume can lose an acknowledged write. See
+[What a failover costs](#what-a-failover-costs).
 
 **Processes can share a replicated fleet root.** Only one process replicates a
 database. It holds the lock file `<db>.replicator.lock`. The other processes
@@ -323,6 +447,176 @@ file systems.
 `/actuator/health` reports `replication:fleet` with the number of databases
 replicating, the number this process does not own (`unowned`), the worst lag
 and which database has it.
+
+### Replication lag
+
+The `[replication] rpo_secs` bound holds while one pass over the open
+databases fits in `sync_interval_secs`. A pass ticks each open database once.
+It starts one interval after the last pass started, or at once if the last
+pass took longer. `replication_workers` threads (default `4`, `1` to `64`)
+ship databases at the same time. The database that shipped longest ago goes
+first.
+
+Many busy databases in one process make a pass long. Monitor these values in
+`replication:fleet`:
+
+- `worst_lag_seconds`: the longest time since a database was last caught
+  up. A takeover can lose this much of that database. The indicator is
+  `DOWN` above three times `rpo_secs`.
+- `last_pass_ms`: the time of the last pass. If it is near
+  `sync_interval_secs × 1000`, increase `replication_workers`, or put fewer
+  busy databases on each host.
+- `ship_workers`: the threads that ship.
+
+`unowned` counts open databases that this process does not replicate.
+Usually another process on the same root holds their lock. A database that
+closes and opens again during a pass can show as `unowned` for some
+milliseconds. The next pass claims it.
+
+### Deleting a database's replica
+
+`fleet.delete(&key)` and `autumn fleet delete` remove the replica too:
+
+1. The delete writes a tombstone row to `_autumn_fleet_tombstones` on the
+   control database. If it cannot write the row, the delete fails (`503`)
+   and removes nothing.
+2. The delete removes the files.
+3. The delete writes a marker object, `<prefix>/tombstone`, in the replica.
+4. The delete purges the replica, then drops the row. If
+   `replica_retention_after_delete` is set, the delete keeps the replica
+   until the retention ends.
+
+The purge sends one delete request for each object, and the delete call
+waits for it. On a versioned bucket, a delete request only adds a delete
+marker: add a lifecycle rule that removes old versions.
+
+If the purge fails, the local delete is not rolled back. The row stays. A
+task tries the purge again every minute. After each failure, it waits
+longer, up to 1 hour. If the marker write failed, the task writes the
+marker again. `replication:fleet` shows the last pass under `tombstones`
+(`purged`, `failed`, `waiting`, `failing`, `last_error`). A failed purge
+does not turn the indicator `Down`.
+
+A tombstone stops the restore of a deleted database:
+
+- `restore_missing` does not restore a key that has a row.
+- On a host with its own control database, the marker stops the restore.
+  The marker stops each generation that is not newer than the delete.
+- `fleet.restore(&key, at)` and `autumn fleet restore` ignore the
+  tombstone. They take the row first, and drop the marker after the
+  restore. If the restore fails, the row goes back.
+
+Use the retention as an undo window:
+
+```toml
+[database.fleet]
+replica_retention_after_delete = "30d"  # default "0s": purge at once
+```
+
+Use a unit: a bare number is milliseconds. A value under one minute is
+refused.
+
+Rules:
+
+- During the retention, a create on demand (`create_on_demand`) of the key
+  answers `410`. With `restore_missing`, a host with its own control
+  database also answers `410`: it reads the retention from the marker.
+- A create on demand also answers `410` while the row is pending, with any
+  retention. A pending row has no cutoff yet. The task confirms the row when
+  it is older than 10 minutes, the file is not on disk, this host owns the
+  slot, and the replica can be read. Until then, only `provision` makes the
+  database again.
+- `provision` makes a new database: it purges the old replica
+  first and drops the row. This ends the undo window. If the purge fails,
+  `provision` fails with `503`: try again.
+- A purge removes each generation that is not newer than the delete. A newer
+  generation is a new database with the same key, and it stays. The delete
+  time is the later of the app clock and the newest generation, so a host
+  clock that is ahead does not keep the deleted data.
+- A host purges only a key whose slot it owns, and only when the file is not
+  on its disk. A row next to a live file is old: the task drops it.
+
+### Restore check
+
+A replica that does not restore is not a backup. Every `[replication]
+verify_interval_secs` (default 6 hours), each worker-role process restores
+`restore_check_sample` random databases (default `1`) into scratch files
+under `<root>/.fleet-locks/restore-check/`. The first check runs one
+interval after start. For each database, the check runs
+`PRAGMA integrity_check` and reads the identity row, then removes the file.
+A failed check is tried once more. Scratch files older than one day (from a
+process that stopped during a check) are removed. Each check needs free
+space for the largest sampled database on the fleet volume.
+
+`replication:fleet` shows the result under `restore_check` (`checked_at`,
+`passed`, `unreplicated`, `failed`). A failed check turns the indicator
+`Down` until a check passes. A database with no replica yet counts as
+`unreplicated`, not as a failure. Set `restore_check_sample = 0` or
+`verify_interval_secs = 0` to turn the check off.
+`fleet.check_replica_sample(n)` runs one check now.
+
+## Query the lake
+
+The lake runs SQL across tenants on their replicas in object storage, not
+on the volume (ADR 0032). It never opens a file under the fleet root. It
+runs on a host with no volume.
+
+```rust,ignore
+let snapshot = fleet.lake()?.materialize().await?;
+let rows = snapshot
+    .query("SELECT _autumn_tenant, COUNT(*), SUM(total) FROM orders GROUP BY 1")
+    .await?;
+```
+
+- `materialize()` restores each live tenant and copies its tables into one
+  scratch SQLite file. Each table gets the column `_autumn_tenant`.
+- `query(sql)` runs one `SELECT`, `WITH` or `VALUES` statement on a
+  read-only connection. `FleetLake::query(sql)` does the load, the query
+  and the cleanup in one call.
+- Drop the snapshot to remove its scratch directory. `persist(path)` keeps
+  a copy for `sqlite3`, DuckDB and other tools.
+- `snapshot.tenants()` gives the generation and effective time of each
+  tenant. `snapshot.skipped()` gives each tenant that is not loaded and why.
+
+On a host with no fleet, build the lake from the destination:
+`FleetLake::new(destination, "<prefix>/<profile>")`.
+
+| Setting | Default | Does |
+| --- | --- | --- |
+| `with_tombstones(t)` | from the fleet | skip tenants with a tombstone row |
+| `markers_only()` | off | load with no tombstone source; use the markers only |
+| `as_of(t)` | latest | each tenant at its newest state at or before `t` |
+| `with_tables([..])` | all | load only these tables |
+| `with_workers(n)` | 4 | restore `n` tenants at the same time |
+| `with_scratch_dir(p)` | system temp | parent of the scratch directory |
+| `skip_failed_tenants()` | off | report a failed tenant and load the rest |
+
+Rules:
+
+- **Consistency.** Each tenant is consistent at its own snapshot. The lake
+  has no atomic snapshot across tenants. `as_of(t)` does not make one
+  common instant either.
+- **Deleted tenants.** A tombstone row, or a marker that covers the newest
+  generation, skips the tenant. A lake with no tombstone source refuses to
+  load unless you call `markers_only()`.
+- **Failures.** A tenant that fails fails the load, so a total is never
+  silently short.
+- **Schema drift.** Columns union by name. A column that a tenant does not
+  have is `NULL`. Values keep their storage class. Lake columns have no
+  type affinity and use the `BINARY` collation, so write `COLLATE NOCASE`
+  in the query where the source column had it.
+- **Disk.** The lake needs about the size of the loaded tables, plus one
+  restored file per worker. Use `with_tables` to load less.
+- **Trust.** The SQL is operator SQL. Do not pass request input to it.
+
+```shell
+autumn fleet lake report.sql --out report.csv
+autumn fleet lake report.sql --timestamp 2026-10-01T00:00:00Z --keep lake.db
+```
+
+The CLI uses the control database when its file is on the host. Else pass
+`--markers-only`. It writes CSV: `NULL` is empty, a blob is hex. Slot fleets
+are not supported.
 
 ## Failover: slot ownership
 
@@ -343,6 +637,9 @@ owner = "host-a"     # one id per volume
 slots = ["0-8191"]   # default: every slot, as one range
 lease_secs = 30      # default; 3 to 3600
 ```
+
+The lease also sets the takeover time after a crash. See
+[What a failover costs](#what-a-failover-costs) before you change it.
 
 The overrides are `AUTUMN_DATABASE__FLEET__OWNERSHIP__OWNER`, `..._SLOTS`
 (comma-separated) and `..._LEASE_SECS`. The processes on one volume (a `web`
@@ -384,17 +681,24 @@ the first request.
    Start the new host with the same `slots`. The new host claims the ranges
    when the old lease ends: after at most `lease_secs`, plus one renew
    interval and the clock skew. Then it serves at a new epoch.
+   The first request to each database restores it from the replica, so the
+   first requests after a takeover are slow. A host that claims many
+   databases at once can use all its CPU for restores. Limit the number of
+   requests that open databases at the same time. Or open the claimed
+   databases in the background before traffic arrives.
+   A takeover loses the commits that the old host did not ship. See
+   [What a failover costs](#what-a-failover-costs).
 4. If the old host is still alive, it stops serving when its local lease
    ends, and returns `421`. When it can reach the table again, its renew
    fails. It claims the range again only when the new owner lets it go, at a
-   newer epoch.
+   newer epoch. Until then, `fleet:ownership` shows the range as `waiting`.
 5. **Fail back.** When the old host gets a range back, its files on disk are
    older than the replica. Each file records the epoch it was last opened
    under. On the first open at the newer epoch, the host compares that epoch
    with the newest epoch at the replica. If the replica's is newer, the host
-   restores the file from the replica before it serves it. Without
-   `[replication]` there is nothing to compare with: give the old host an
-   empty volume.
+   restores the file from the replica before it serves it. This works
+   without `restore_missing`. Without `[replication]` there is nothing to
+   compare with: give the old host an empty volume.
 6. **Move part of a range.** Change `slots` on the owner, for example from
    `"0-8191"` to `"0-4095"`, and restart it. A clean shutdown releases the
    old range, so the owner claims `"0-4095"` at once at a new epoch. Another
@@ -406,6 +710,28 @@ the `held` ranges with their epoch and whether the host serves them now, and
 the ranges that are `waiting`, `lost` or `failed`. The status is `Down` when
 the last claim or renew could not reach the table, or when a held range
 stopped serving because a renew did not come back in time.
+
+### What a failover costs
+
+Replication is asynchronous (see
+[Replication](#replication-object-storage-between-volumes)). A failover
+costs data and time:
+
+| Cost | Bound | Default |
+| --- | --- | --- |
+| Data | The writes that the old host did not ship. In steady state, at most `rpo_secs` (see [Replication lag](#replication-lag)). At worst, the last `worst_lag_seconds` in `replication:fleet` before the failover. | 10 s (`rpo_secs`) |
+| Time, old host crashed | At most `lease_secs + lease_secs / 3` after the last renew of the old host, plus the clock skew and the first restore. The lease ends, then the waiting host claims at its next renew interval (every `lease_secs / 3`). | 40 s |
+| Time, old lease already ended | At most `lease_secs / 3`: the next renew interval of the waiting host. | 10 s |
+
+- A long lease gives a long outage after a crash. A short lease allows less
+  clock skew (see [Clocks](#clocks)).
+- A crashed host loses all the writes that it did not ship.
+- A paused host (`SIGSTOP`, a frozen VM) loses the unshipped writes of each
+  database that the new owner opened during the pause. When the paused host
+  continues, it ships its other writes. The new owner restores them later.
+- A fail-back does not recover the lost writes. If the new owner shipped a
+  database, the old host restores the replica over its stale file (step 5).
+  If not, the old host keeps its own file.
 
 ### Clocks
 
@@ -439,11 +765,16 @@ above the epoch that the replicator found.
   the row.
 - A replicated database takes a fresh base snapshot each time it reopens.
   Size `max_open` so busy tenants stay open.
-- A deleted database's replica stays in object storage until you remove it.
 - On Windows, `delete` and `restore` close the guard connection before they
   remove files. If another process opens the database in that gap, `delete`
   answers `409`. `restore` also answers `409` if that process creates the
   file before `restore` publishes.
+
+## With `autumn-harvest-sqlite`
+
+`autumn-harvest-sqlite` and the `sqlite` feature of `autumn-web` use the same
+`libsqlite3-sys`, so the two link one SQLite. `SqliteRuntime` and its drive
+future are `Send`: one tokio task can own the runtime.
 
 ## See also
 

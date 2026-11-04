@@ -1716,6 +1716,10 @@ mod tests {
 
     #[test]
     fn test_verify_timestamp_valid() {
+        #[allow(
+            clippy::duration_suboptimal_units,
+            reason = "a Unix timestamp reads in seconds"
+        )]
         let received_at = UNIX_EPOCH + Duration::from_secs(1_614_556_800);
         assert!(verify_timestamp(1_614_556_800, received_at, 300).is_ok());
         assert!(verify_timestamp(1_614_556_800 + 300, received_at, 300).is_ok());
@@ -1724,6 +1728,10 @@ mod tests {
 
     #[test]
     fn test_verify_timestamp_stale() {
+        #[allow(
+            clippy::duration_suboptimal_units,
+            reason = "a Unix timestamp reads in seconds"
+        )]
         let received_at = UNIX_EPOCH + Duration::from_secs(1_614_556_800);
         let err = verify_timestamp(1_614_556_800 + 301, received_at, 300).unwrap_err();
         assert!(matches!(err, WebhookVerifyError::StaleTimestamp));

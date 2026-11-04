@@ -1,0 +1,180 @@
+# Bolt workload manifest: one entry per `[[bench]]` target in the workspace.
+#
+# `scripts/check-perf-profiles.py bolt` fails CI when a bench target has no
+# entry here, when an entry names a bench that no longer exists, or when an
+# entry has no committed profile under `docs/perf/bolt/<package>/<bench>/`.
+# `scripts/bolt-profile.sh <package>/<bench>` writes that profile.
+#
+# Fields:
+#   package, bench   the cargo package and bench target name.
+#   features         extra cargo features for the release build.
+#   mode             how the profile isolates the workload:
+#                      "marginal"  two runs, `{n}` = 0 and `{n}` = N; the
+#                                  profile is the difference, per iteration.
+#                      "whole"     one run of a fixed workload; whole process.
+#                      "criterion" a criterion bench under `--profile-time`;
+#                                  the iteration count is wall-clock bound,
+#                                  so read the shares, not the totals.
+#   args             bench arguments; `{n}` is the iteration count.
+#   callgrind_n      N for the callgrind run (marginal mode).
+#   dhat_n           N for the dhat run (marginal mode).
+#   env              extra environment, `KEY=value` strings.
+#   ledger           "postgres": also write ledger.txt, the statements per
+#                    iteration from pg_stat_statements (marginal mode only).
+#   exempt           a reason; the bench has no committed profile.
+
+[[workload]]
+package = "autumn-web"
+bench = "admission"
+mode = "criterion"
+args = ["--bench", "--profile-time", "1"]
+
+[[workload]]
+package = "autumn-web"
+bench = "attribute_encryption"
+mode = "whole"
+
+[[workload]]
+package = "autumn-web"
+bench = "captcha_check"
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 1000
+dhat_n = 200
+
+[[workload]]
+package = "autumn-web"
+bench = "collab_edit"
+features = ["collab"]
+mode = "marginal"
+args = ["--chars", "{n}"]
+callgrind_n = 6000
+dhat_n = 6000
+
+[[workload]]
+package = "autumn-web"
+bench = "csrf_verify"
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 1000
+dhat_n = 200
+
+[[workload]]
+package = "autumn-web"
+bench = "feed_render"
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 2000
+dhat_n = 500
+
+[[workload]]
+package = "autumn-web"
+bench = "form_render"
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 2000
+dhat_n = 2000
+
+[[workload]]
+package = "autumn-web"
+bench = "inspector"
+mode = "whole"
+
+[[workload]]
+package = "autumn-web"
+bench = "ledger_post"
+features = ["sqlite"]
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 300
+dhat_n = 300
+
+[[workload]]
+package = "autumn-web"
+bench = "markdown_render"
+features = ["markdown"]
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 2000
+dhat_n = 500
+
+[[workload]]
+package = "autumn-web"
+bench = "mcp_search"
+features = ["mcp"]
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 1000
+dhat_n = 200
+
+[[workload]]
+package = "autumn-web"
+bench = "metrics_record"
+mode = "criterion"
+args = ["--bench", "--profile-time", "1"]
+
+[[workload]]
+package = "autumn-web"
+bench = "pdf_render"
+features = ["pdf"]
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 500
+dhat_n = 500
+
+[[workload]]
+package = "autumn-web"
+bench = "query_decode"
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 2000
+dhat_n = 500
+
+[[workload]]
+package = "autumn-web"
+bench = "repository_crud"
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 500
+dhat_n = 200
+# Needs a TLS-free Postgres. The runner passes BOLT_PG_URL through as
+# DATABASE_URL.
+env = ["DATABASE_URL={BOLT_PG_URL}"]
+ledger = "postgres"
+
+[[workload]]
+package = "autumn-web"
+bench = "request_pipeline"
+exempt = """Exhausted: repeated callgrind and dhat passes took it to the floor \
+(about 95.2M Ir at --iterations 300). The rest is allocator cost from the \
+tower layer-clone cascade (#2830). AGENTS.md forbids profiling it again."""
+
+[[workload]]
+package = "autumn-web"
+bench = "throttle_check"
+mode = "marginal"
+args = ["--iterations", "{n}", "--route", "throttled"]
+callgrind_n = 1000
+dhat_n = 200
+
+[[workload]]
+package = "autumn-web"
+bench = "version_history"
+mode = "whole"
+args = ["borrowed"]
+
+[[workload]]
+package = "autumn-search"
+bench = "keyword_search"
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 2000
+dhat_n = 2000
+
+[[workload]]
+package = "autumn-search"
+bench = "vector_search"
+mode = "marginal"
+args = ["--iterations", "{n}"]
+callgrind_n = 2000
+dhat_n = 2000

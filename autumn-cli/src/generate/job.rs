@@ -58,10 +58,12 @@ fn job_deps(fields: &[Field], backend: DatabaseBackend) -> Vec<(&'static str, &'
     if fields.iter().any(|f| matches!(f.kind, FieldKind::Uuid)) {
         deps.push(JOB_DEPS_UUID);
     }
-    if fields
-        .iter()
-        .any(|f| matches!(f.kind, FieldKind::NaiveDateTime | FieldKind::DateTime))
-    {
+    if fields.iter().any(|f| {
+        matches!(
+            f.kind,
+            FieldKind::NaiveDateTime | FieldKind::DateTime | FieldKind::Time
+        )
+    }) {
         deps.push(JOB_DEPS_CHRONO);
     }
     if fields.iter().any(|f| f.kind.is_decimal()) {
@@ -315,6 +317,15 @@ async fn main() {
         .await;
 }
 "#
+    }
+
+    #[test]
+    fn a_time_field_adds_the_chrono_dependency() {
+        // Issue #3405: a `time` field is a `chrono::NaiveTime`.
+        let fields = crate::generate::dsl::parse_fields(&["opens:time".to_owned()]).unwrap();
+        assert!(job_deps(&fields, DatabaseBackend::Postgres).contains(&JOB_DEPS_CHRONO));
+        let fields = crate::generate::dsl::parse_fields(&["name:String".to_owned()]).unwrap();
+        assert!(!job_deps(&fields, DatabaseBackend::Postgres).contains(&JOB_DEPS_CHRONO));
     }
 
     #[test]

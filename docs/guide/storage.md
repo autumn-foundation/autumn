@@ -352,19 +352,21 @@ policy allows `PUT` from your app's origin if you call from browser JavaScript
 
 ```rust,ignore
 use std::time::Duration;
-use autumn_web::security::CsrfToken;
 use autumn_web::storage::{BlobStoreState, PresignPutResult, complete_direct_upload};
 use autumn_web::{AutumnResult, Json, secured, State, post};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 struct PresignRequest {
+    filename: String,
     content_type: String,
-    key: String,
+    size: u64,
 }
 
 #[derive(Serialize)]
 struct PresignResponse {
+    /// The blob key. `direct_upload_input` puts it in a hidden field.
+    key: String,
     url: String,
     method: String,
     headers: std::collections::HashMap<String, String>,
@@ -375,15 +377,22 @@ struct PresignResponse {
 #[secured]
 #[post("/uploads/presign")]
 async fn presign(
-    _csrf: CsrfToken,                   // ensures caller has a valid session
     State(blobs): State<BlobStoreState>,
     Json(req): Json<PresignRequest>,
 ) -> AutumnResult<Json<PresignResponse>> {
     let store = blobs.store();
+    // Allow only the types you serve. A browser can ask for any type.
+    if !["image/png", "image/jpeg"].contains(&req.content_type.as_str()) {
+        return Err(AutumnError::bad_request("type not allowed"));
+    }
+    // Your app picks the key. Put the user id in it: the browser can change
+    // the hidden field before the form is sent.
+    let key = format!("uploads/{}/{}", current_user_id, uuid::Uuid::new_v4());
     let result: PresignPutResult = store
-        .presign_put(&req.key, &req.content_type, Duration::from_secs(300))
+        .presign_put(&key, &req.content_type, Duration::from_secs(300))
         .await?;
     Ok(Json(PresignResponse {
+        key,
         url: result.url,
         method: result.method,
         headers: result.headers,
@@ -398,12 +407,15 @@ struct CompleteRequest { key: String }
 #[secured]
 #[post("/uploads/complete")]
 async fn complete(
-    _csrf: CsrfToken,
     State(blobs): State<BlobStoreState>,
     mut db: Db,
     Json(req): Json<CompleteRequest>,
 ) -> AutumnResult<Json<serde_json::Value>> {
     let store = blobs.store();
+    // The key came from the browser. Accept only the user's own prefix.
+    if !req.key.starts_with(&format!("uploads/{current_user_id}/")) {
+        return Err(AutumnError::bad_request("bad key"));
+    }
     // HEAD-checks the object; returns NotFound if the browser didn't
     // actually upload yet or if the upload expired.
     let blob = complete_direct_upload(&**store, &req.key).await?;
@@ -420,23 +432,53 @@ async fn complete(
 
 ### Maud form helper
 
-If your Maud templates use a standard `<input type="file">` with htmx for
-progressive enhancement, the `autumn_web::storage::form_helper` module (feature
-`maud`) provides a pre-wired input:
+`autumn_web::storage::form_helper` (feature `maud`) renders the upload field.
+`autumn-widgets.js` drives it. Include the script once in your layout:
 
 ```rust,ignore
-use autumn_web::storage::form_helper::direct_upload_input;
+use autumn_web::storage::form_helper::{DirectUploadConfig, direct_upload_field};
 
 html! {
-    (direct_upload_input("avatar", &presign_url, Some("image/*")))
+    form method="post" action="/profile" enctype="multipart/form-data" {
+        (direct_upload_field(
+            "avatar",
+            "/uploads/presign",
+            &DirectUploadConfig::new().label("Avatar").accept("image/*"),
+        ))
+        button type="submit" { "Save" }
+    }
 }
 ```
 
-Renders a file input with `data-controller="direct-upload"` for Stimulus-style JS
-enhancement and an accessible progress bar placeholder. When JavaScript is unavailable,
-users see a notice explaining the dependency. To provide a fallback upload path for
-no-JS users, wrap the component in a `<noscript>` block with an alternative
-`enctype="multipart/form-data"` form and handler.
+`direct_upload_input("avatar", "/uploads/presign", Some("image/*"))` is the
+short form. `DirectUploadConfig` sets the label, the `id`, `accept` and
+`multiple`.
+
+With JavaScript, for each file the script:
+
+1. `POST`s JSON `{filename, content_type, size}` to the presign URL. It sends
+   the token from `<meta name="csrf-token">` in `X-CSRF-Token`.
+2. Reads `{url, method, headers, key}` from the response.
+3. Sends the file to `url`. A progress bar shows the progress.
+4. Adds `<input type="hidden" name="avatar" value="{key}">`.
+
+The form then carries only the keys. Your handler checks each key, calls
+`complete_direct_upload`, then saves the `Blob`. The key can change in the
+browser, so accept only keys that your app issued to this user (see the
+worked example). A failed upload adds no key, so check the field on the
+server. The file input loses its `name`, so the bytes go only to storage. A
+form with a running upload does not submit.
+
+The user can drop files on the field. The script checks `accept` on a drop.
+Your server must also check the type. The size and name in the presign request
+are hints: the presigned PUT does not enforce them.
+
+The script fires `autumn:upload` (`detail.key`, `detail.file`) and
+`autumn:upload-error` (`detail.file`) on the field. A screen reader hears the
+status and the errors in live regions.
+
+**Without JavaScript** the input is a plain file field. It sends the file with
+the form, so use `enctype="multipart/form-data"` and a multipart handler.
 
 ### Orphan handling
 

@@ -65,18 +65,27 @@
 //! features across the workspace — measured **14**, because `oauth2` (enabled
 //! by `examples/blog`) contributed an extra HTTP-interceptor `from_fn`. #2214
 //! converted that interceptor along with the always-on `from_fn`s, so both
-//! configurations now measure **9** (D = 5, C = 4).
-//!
-//! The assertion is still a window rather than an equality: a feature not
-//! enabled anywhere in this workspace could reintroduce the spread, and the
-//! ceiling is derived from the widest *predicted* configuration rather than the
-//! widest current one, so the gate fails on the way back up. See
+//! configurations measured **9** (D = 5, C = 4) after #2214. See
 //! [`INGRESS_TRAVERSAL_WINDOW`] for the arithmetic.
 //!
-//! The lower bound matters too. Without it, a refactor that mounted merged raw
-//! routers *after* the middleware — which is exactly how `/mcp` is treated —
-//! would drop the probe out of the framework stack entirely (1-3 traversals),
-//! and a ceiling-only assertion would stay green while measuring nothing.
+//! # Since #2830: the cascade stops at a shared pointer
+//!
+//! The erased seed of the operator layers holds the services below it in a
+//! `SharedService`. A clone of it is one reference count. Thus the deep clones
+//! from the outer `Route` levels stop at the seed, and each call clones the
+//! services below the seed one time. The leaf probe now counts only what is
+//! below the seed: the seed call, plus the base `Route` box. It measures
+//! **2**.
+//!
+//! The leaf probe no longer sees a `Route` level above the seed. A second
+//! probe, registered as an operator layer, sits just above the seed. It counts
+//! each outer `Route` level and each clone-on-call service in the merged
+//! tuple. See [`OPERATOR_TRAVERSALS`].
+//!
+//! The old lower bound found a probe that fell out of the framework stack (1-3
+//! traversals). The real count is now 2, so a lower bound cannot do that. The
+//! probe response must carry `x-request-id` and the security headers instead:
+//! only a probe inside the stack gets them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -161,6 +170,13 @@ async fn unused() -> &'static str {
 /// | CI workspace-unified features, after #2198 | 5 | 9 | **14** |
 /// | default features, after #2214 | 5 | 4 | **9** |
 /// | CI workspace-unified features, after #2214 | 5 | 4 | **9** |
+/// | default features, after #2830 | 1 | 1 | **2** |
+///
+/// #2830 puts the services below the erased seed behind one `Arc`. The deep
+/// clones from above stop at the seed: *D* is now the base `Route` box only,
+/// and *C* is the one clone that the seed makes for each call. A clone-on-call
+/// service in the inner group, or a `Router::layer` call below the merged
+/// tuple, still adds one.
 ///
 /// #2198 removes three box levels by folding `apply_middleware`'s four
 /// remaining `Router::layer` calls — the inner group, the middle group, the
@@ -182,30 +198,20 @@ async fn unused() -> &'static str {
 /// disappears with them: `oauth2`'s HTTP-interceptor `from_fn` is converted
 /// too, so the default and workspace-unified measurements now agree.
 ///
-/// **Upper bound 9** is the measurement itself, not the measurement plus slack.
-/// Before #2214 this bound carried a `+1` of headroom to absorb the feature
-/// spread — and that headroom is exactly what made the gate blind to the
-/// regression it is named for, since restoring one `from_fn` inside an existing
-/// tuple, or one collapsed `Router::layer` call, moves the number by exactly
-/// one. With `oauth2`'s interceptor converted there is no spread left to
-/// absorb: 9 was measured under the 8 default features AND under a
-/// 13-feature build adding `oauth2`, `mail`, `storage`, `ws` and `openapi`.
-/// So the bound is set to the measurement, and either regression fails it.
+/// **Upper bound 2** is the measurement itself, not the measurement plus
+/// slack. One more clone-on-call service or one more `Router::layer` call
+/// below the seed moves the number by one, so either regression fails it.
+/// Before #2214 the bound had a `+1` of headroom for a feature spread, and
+/// that headroom made the gate blind to the regression it is named for.
 ///
-/// If a feature this workspace does not currently enable ever contributes a
-/// tenth traversal, this gate will fail on it. That is the intended outcome:
-/// identify the clone-on-call service the feature adds, convert it the way
-/// #2214 converted the rest, or widen the window deliberately with the
-/// measurement written down here — do not nudge the bound to make a red run
-/// green.
+/// If a feature ever adds a third traversal, this gate fails on it. Find the
+/// clone-on-call service the feature adds and give it a named future, or
+/// widen the window with the measurement written here. Do not nudge the bound
+/// to make a red run green.
 ///
-/// **Lower bound 6** is a sentinel, not a budget. It sits under the current
-/// floor (five box levels plus the four remaining clone-on-call services) and
-/// well above the 1-3 a probe measures once it has fallen out of the framework
-/// stack entirely — the failure mode described in the module header. It is
-/// deliberately slack: tightening it toward the real measurement would make
-/// every feature-set difference a failure without catching anything the ceiling
-/// does not already catch.
+/// **Lower bound 2** is the measurement too. It can no longer find a probe
+/// that fell out of the stack (see the module header); the header check in
+/// [`ingress_traversals_with`] does that now.
 ///
 /// # What this gate is blind to
 ///
@@ -228,7 +234,7 @@ async fn unused() -> &'static str {
 /// `tests/config_alloc_gate.rs` pin the blocks and bytes a request actually
 /// allocates, which is what a `from_fn` box costs and what this count can only
 /// stand proxy for.
-const INGRESS_TRAVERSAL_WINDOW: std::ops::RangeInclusive<usize> = 6..=9;
+const INGRESS_TRAVERSAL_WINDOW: std::ops::RangeInclusive<usize> = 2..=2;
 
 /// Build the production router with a clone-counting probe at the innermost
 /// position, drive one request through it, and return the traversal count.
@@ -267,10 +273,50 @@ async fn ingress_traversals_with(customize: impl FnOnce(TestApp) -> TestApp) -> 
     // Router assembly itself clones services (e.g. the MCP dispatch snapshot);
     // only per-request traversals are being measured.
     clones.store(0, Ordering::Relaxed);
-    client.get("/probe").send().await.assert_status(200);
+    let response = client.get("/probe").send().await;
+    response.assert_status(200);
+    let traversals = clones.load(Ordering::Relaxed);
 
+    // Only a probe inside the framework stack gets these headers. Without
+    // this check, a probe that fell out of the stack measures a small count
+    // that looks like a good result.
+    assert!(
+        response.header("x-request-id").is_some()
+            && response.header("x-content-type-options").is_some(),
+        "the probe is not inside the framework's ingress stack, so this gate \
+         measures nothing. Check that `mount_raw_routers` still runs BEFORE \
+         `apply_middleware`. headers = {:?}",
+        response.headers
+    );
+    traversals
+}
+
+/// The clones of an operator-layer probe for one request.
+///
+/// The probe is registered with `AppBuilder::layer`, so it sits in the merged
+/// tuple, just above the erased seed. See [`OPERATOR_TRAVERSALS`].
+async fn operator_traversals_with(customize: impl FnOnce(TestApp) -> TestApp) -> usize {
+    let clones = Arc::new(AtomicUsize::new(0));
+    let probe = CloneCountLayer {
+        clones: Arc::clone(&clones),
+    };
+    let client = customize(TestApp::new().routes(routes![unused]).layer(probe)).build();
+
+    clones.store(0, Ordering::Relaxed);
+    client.get("/unused").send().await.assert_status(200);
     clones.load(Ordering::Relaxed)
 }
+
+/// Clones of the operator-layer probe for one request (#2830).
+///
+/// It is 4: one for each `Route` level above the probe. Those are the merged
+/// tuple, the event-context group, the security-header group and the
+/// response-side fallbacks of `TestApp`. Each service in the merged tuple
+/// above the operator layers calls its inner service at once, with no clone.
+/// A service that clones its inner service on call (an
+/// `axum::middleware::from_fn`, or a boxed future that owns the inner service)
+/// adds one. So does a new `Router::layer` call above the probe.
+const OPERATOR_TRAVERSALS: usize = 4;
 
 /// App-wide operator layer whose service forwards without cloning its inner —
 /// so the ONLY thing registering it can add to the traversal count is the box
@@ -318,9 +364,11 @@ async fn ingress_stack_depth_stays_within_budget() {
     assert!(
         traversals <= *INGRESS_TRAVERSAL_WINDOW.end(),
         "a single request deep-cloned the ingress stack {traversals} times \
-         (max {}). Expected exactly 9 on every feature set. 10 means one more \
-         clone-on-call service or one more `Router::layer` call than the \
-         stack is supposed to have; 13-14 is the pre-#2214 \
+         (max {}). Expected exactly 2 (#2830): the base `Route` box and the \
+         one clone that the seed makes for each call. 3 means one more \
+         clone-on-call service or one more `Router::layer` call below the \
+         seed. 9 is the pre-#2830 measurement: check that the seed still \
+         holds a `SharedService`. 13-14 is the pre-#2214 \
          measurement, i.e. an `axum::middleware::from_fn` is back on the \
          always-on ingress path — each one clones the whole stack beneath it \
          AND heap-allocates a `Box::pin` for its own future on every request \
@@ -345,14 +393,26 @@ async fn ingress_stack_depth_stays_within_budget() {
 
     assert!(
         traversals >= *INGRESS_TRAVERSAL_WINDOW.start(),
-        "the probe saw only {traversals} traversals (min {}), which is below the \
-         floor of the current stack (five box levels alone account for it) and \
-         means the probe is no longer inside the \
-         framework's ingress stack — so this gate is measuring nothing. Check \
-         that `mount_raw_routers` still runs BEFORE `apply_middleware`; if \
-         merged routers moved after it (the way `/mcp` is mounted), this test \
-         needs a different probe, not a lower bound.",
+        "the probe saw only {traversals} traversals (min {}). The seed of the \
+         merged stack must clone the services below it one time for each call \
+         (#2830); check that `SharedService` still drives a clone with \
+         `Oneshot`.",
         INGRESS_TRAVERSAL_WINDOW.start(),
+    );
+}
+
+#[tokio::test]
+async fn operator_probe_sees_one_traversal_per_outer_route_level() {
+    let traversals = operator_traversals_with(|app| app).await;
+    println!("operator-layer traversals/request: {traversals}");
+    assert_eq!(
+        traversals, OPERATOR_TRAVERSALS,
+        "an operator layer was cloned {traversals} times for one request \
+         (expected {OPERATOR_TRAVERSALS}). A service in the merged tuple above \
+         the operator layers now clones its inner service on call, or a new \
+         `Router::layer` call is above them. Give the service a named future \
+         that calls its inner service at once, or put the layer in an existing \
+         `Router::layer` call (issues #2214, #2830)."
     );
 }
 
@@ -481,6 +541,10 @@ async fn merged_stack_preserves_ingress_order() {
 /// single merged application, so the box-level count `D` — and with it this
 /// probe's traversal count — does not move at all.
 ///
+/// Since #2830 the leaf probe cannot see a `Route` level above the seed. The
+/// operator-layer probe below sees each one. `a_static_gate_and_compression_add_no_route_level`
+/// in `tests/config_alloc_gate.rs` also gates a static gate by blocks.
+///
 /// The passthrough layers here neither box nor clone on call, so the ONLY
 /// thing their registration can contribute is composition overhead — which is
 /// exactly what this test pins to zero. A layer whose own `Service::call`
@@ -503,6 +567,20 @@ async fn operator_layers_do_not_deepen_the_framework_cascade() {
          count from {bare} to {with_layers}: each registration is being applied \
          as its own `Router::layer` call (one nesting level per layer) instead \
          of being erased into the framework's single merged application"
+    );
+
+    let operator_bare = operator_traversals_with(|app| app).await;
+    let operator_with_layers = operator_traversals_with(|app| {
+        app.layer(PassthroughLayer)
+            .layer(PassthroughLayer)
+            .layer(PassthroughLayer)
+    })
+    .await;
+    assert_eq!(
+        operator_with_layers, operator_bare,
+        "three more operator layers moved the clones of an operator-layer \
+         probe from {operator_bare} to {operator_with_layers}: the \
+         registrations no longer compose into one erased run"
     );
 
     let with_gate = ingress_traversals_with(|app| app.static_gate(PassthroughLayer)).await;
@@ -532,6 +610,11 @@ async fn operator_layers_do_not_deepen_the_framework_cascade() {
 /// unaffected (compression contributed zero `Router::layer` calls when
 /// disabled, before and after #2371) — only the enabled case is expected to
 /// change.
+///
+/// Since #2830 this probe sees a `Router::layer` call below the seed only. The
+/// operator-layer probe sees a call above the seed, and
+/// `a_static_gate_and_compression_add_no_route_level` in
+/// `tests/config_alloc_gate.rs` gates the same case by blocks.
 #[tokio::test]
 async fn compression_enabled_does_not_deepen_the_framework_cascade() {
     let bare = ingress_traversals_per_request().await;

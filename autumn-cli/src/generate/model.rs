@@ -370,7 +370,8 @@ fn plan_model_with_options_impl(
                      `.nest(\"/comments\", autumn_web::commentable::router(Default::default()))\
                      .declare_plugin_routes(autumn_web::commentable::route_infos(\"/comments\"))`, \
                      and render a thread with \
-                     `autumn_web::widgets::comment_thread`.",
+                     `autumn_web::widgets::comment_thread`. Both need autumn-web's \
+                     `widgets-social` feature (on by default).",
                     table = super::commentable::COMMENTS_TABLE,
                 )
             } else {
@@ -1738,11 +1739,10 @@ pub(super) fn warn_if_existing_dep_below_version(
     if existing_dep_version_below(existing_cargo_toml, crate_name, min_major, min_minor) {
         plan.warn(format!(
             "Cargo.toml already declares '{crate_name}', but not provably at \
-             version >= {min_major}.{min_minor} — the generated passkeys/2FA \
-             handlers use the '{crate_name}' 0.21+ `Engine`/\
-             `engine::general_purpose` API; make sure '{crate_name}' >= \
-             {min_major}.{min_minor} by hand or the generated code may fail to \
-             compile."
+             version >= {min_major}.{min_minor}. The generated auth code uses \
+             the '{crate_name}' {min_major}.{min_minor} API. Raise \
+             '{crate_name}' to >= {min_major}.{min_minor} by hand, or the \
+             generated code may fail to compile."
         ));
     }
 }
@@ -1884,6 +1884,7 @@ fn validate_enum_field_collisions(
             format!("{pascal_name}Factory"),
             format!("{pascal_name}Repository"),
             format!("Pg{pascal_name}Repository"),
+            format!("Sqlite{pascal_name}Repository"),
             "DecodedForm".to_owned(),
         ];
         if reserved.contains(&enum_ty) {
@@ -2729,6 +2730,7 @@ fn sql_default_literal(
         FieldKind::Uuid
         | FieldKind::NaiveDateTime
         | FieldKind::DateTime
+        | FieldKind::Time
         | FieldKind::Bytea
         | FieldKind::Attachment
         | FieldKind::References
@@ -3459,11 +3461,12 @@ mod tests {
 
     #[test]
     fn plan_rejects_unsupported_field_type() {
+        // `money` is a kind since #3405, so the example is `Currency`.
         let tmp = project();
         let err = plan_model(
             tmp.path(),
             "Post",
-            &["price:Money".into()],
+            &["price:Currency".into()],
             "20260427000000",
         )
         .unwrap_err();

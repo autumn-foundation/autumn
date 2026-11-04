@@ -21,13 +21,16 @@
 //!
 //! **Bolt / perf agents: this workload is exhausted — pick another bench.**
 //! Repeated callgrind + dhat passes (#2193, #2198, #2205, #2214, #2216, #2224,
-//! #2830, #3076) have taken it to the floor: what remains is glibc
-//! malloc/free/memcpy (~50% of Ir) driven by the tower layer-clone cascade and
-//! boxed futures (tracked in #2830), `AppState::clone` (all-`Arc` fields,
-//! ~3%), and vendored `http`/`axum`/`sha2` internals. A fresh run reproduces
-//! ~95.2M Ir at `--iterations 300` and finds nothing new. Profile another
+//! #2830, #3076) have taken it to the floor. #2830 stopped the tower
+//! layer-clone cascade at a shared pointer and removed the boxed futures of
+//! the default ingress layers: a request now allocates 98 blocks, not 133
+//! (`tests/config_alloc_gate.rs`). What remains is `AppState::clone`
+//! (all-`Arc` fields), the clones of the outer `Route` levels down to that
+//! pointer, and vendored `http`/`axum`/`sha2` internals. A shared pointer at
+//! the start of the merged tuple saves 3 more blocks, but it adds 223 MB of
+//! debug info to each app binary (#2830). Profile another
 //! `autumn/benches/*` target instead (`collab_edit`, `ledger_post`,
-//! `markdown_render`, `pdf_render`, …) unless #2830's structural change lands.
+//! `markdown_render`, `pdf_render`, …).
 //!
 //! ```sh
 //! cargo build --release -p autumn-web --bench request_pipeline

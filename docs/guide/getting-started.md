@@ -25,7 +25,7 @@ around Rust web frameworks and just want CRUD on screen, jump straight to
 
 ## Prerequisites
 
-- **Rust 1.88.0+** (edition 2024) — install via [rustup](https://rustup.rs/)
+- **Rust 1.97.0+** (edition 2024) — install via [rustup](https://rustup.rs/)
 - **The PostgreSQL client library (`libpq`)** — required to *build*, not just
   to run. The `postgres` feature is on by default, so a fresh project links `libpq`
   even before you configure a database. Install `libpq-dev` (Debian/Ubuntu),
@@ -41,7 +41,7 @@ around Rust web frameworks and just want CRUD on screen, jump straight to
 Verify your toolchain:
 
 ```bash
-rustc --version   # 1.88.0 or later
+rustc --version   # 1.97.0 or later
 cargo --version
 ```
 
@@ -219,7 +219,7 @@ On a fresh project, before `autumn setup`, you will see something like:
 ```
 🍂 autumn doctor
 
-✅ rust_toolchain — rustc 1.88.0 ≥ MSRV 1.88.0
+✅ rust_toolchain — rustc 1.97.0 ≥ MSRV 1.97.0
 ✅ version_compat — autumn-cli 0.9.0 matches autumn-web 0.9.0
 ✅ autumn_toml — autumn.toml and profile configurations are valid
 ✅ database_topology — database not configured
@@ -295,7 +295,7 @@ routes are live immediately:
 | `/hello/world`        | A path-parameter handler                                |
 | `/health`             | Health check                                            |
 | `/actuator/health`    | Actuator health, with component detail                  |
-| `/actuator/info`      | Build provenance — git SHA, branch, build timestamp     |
+| `/actuator/info`      | Build provenance — git SHA, branch, build timestamp — and the process role with its capabilities |
 | `/actuator/metrics`   | Runtime metrics                                         |
 | `/live` `/ready` `/startup` | Kubernetes-style probes                           |
 

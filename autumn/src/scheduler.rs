@@ -412,7 +412,7 @@ const MIN_TICK_RETENTION: Duration = Duration::from_secs(1);
 /// Cap on how long a tick row stays: 100 years. A longer interval is out of
 /// range for Postgres, and every claim would fail.
 #[cfg(feature = "db")]
-const MAX_TICK_HOLD: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+const MAX_TICK_HOLD: Duration = Duration::from_hours(100 * 365 * 24);
 
 /// How long a claimed tick stays claimed: the retention plus the period.
 ///
@@ -969,7 +969,8 @@ pub fn coordinator_from_config(
     config: &SchedulerConfig,
     state: &AppState,
 ) -> AutumnResult<Arc<dyn SchedulerCoordinator>> {
-    let replica_id = config.resolved_replica_id();
+    // A preset role prefixes the default replica id with its name (#3543).
+    let replica_id = config.resolved_replica_id_for(state.role());
     match config.backend {
         SchedulerBackend::InProcess => Ok(Arc::new(InProcessSchedulerCoordinator::new(replica_id))),
         SchedulerBackend::Sqlite => {
@@ -1181,6 +1182,25 @@ mod tests {
     // via a minimal double, without a database.
     /// Issue #1907: `scheduler.backend = "sqlite"` is refused on a build with
     /// no `SQLite` backend, and the refusal names the Postgres alternative.
+    /// The coordinator of a `[roles.<name>]` preset gets the name as its
+    /// replica id prefix (#3543). A built-in role keeps the plain id.
+    #[test]
+    fn coordinator_replica_id_has_the_preset_prefix() {
+        let config = SchedulerConfig::default();
+        let plain = config.resolved_replica_id();
+        let coordinator = coordinator_from_config(&config, &AppState::for_test())
+            .expect("in-process coordinator");
+        assert_eq!(coordinator.replica_id(), plain);
+
+        let app: crate::config::AutumnConfig =
+            toml::from_str("role = \"critical\"\n[roles.critical]\nbase = \"worker\"\n")
+                .expect("roles config");
+        let mut state = AppState::for_test();
+        state.role = app.resolve_role().expect("critical");
+        let coordinator = coordinator_from_config(&config, &state).expect("in-process coordinator");
+        assert_eq!(coordinator.replica_id(), format!("critical-{plain}"));
+    }
+
     #[cfg(not(feature = "sqlite"))]
     #[test]
     fn sqlite_scheduler_backend_is_refused_without_the_sqlite_feature() {

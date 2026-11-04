@@ -40,7 +40,23 @@ use testcontainers_modules::postgres::Postgres;
 /// sailing past it.
 const LEDGER_UP: &str = include_str!("../../migrations/20260917120000_create_money_ledger/up.sql");
 
+/// The running-balance migration (issue #3339). It applies after `LEDGER_UP`.
+const BALANCE_UP: &str =
+    include_str!("../../migrations/20261029183512_add_money_account_balance/up.sql");
+const BALANCE_DOWN: &str =
+    include_str!("../../migrations/20261029183512_add_money_account_balance/down.sql");
+
 async fn setup_pool() -> (
+    Pool<AsyncPgConnection>,
+    testcontainers::ContainerAsync<Postgres>,
+) {
+    setup_pool_with(&[LEDGER_UP, BALANCE_UP]).await
+}
+
+/// A pool with only the `ddl` applied, so a test can stop before a migration.
+async fn setup_pool_with(
+    ddl: &[&str],
+) -> (
     Pool<AsyncPgConnection>,
     testcontainers::ContainerAsync<Postgres>,
 ) {
@@ -57,9 +73,11 @@ async fn setup_pool() -> (
     let pool = Pool::builder(manager).max_size(16).build().expect("pool");
 
     let mut conn = pool.get().await.expect("conn");
-    conn.batch_execute(LEDGER_UP)
-        .await
-        .unwrap_or_else(|err| panic!("apply the ledger migration: {err}"));
+    for ddl in ddl {
+        conn.batch_execute(ddl)
+            .await
+            .unwrap_or_else(|err| panic!("apply the ledger migration: {err}"));
+    }
 
     (pool, container)
 }
@@ -126,6 +144,31 @@ async fn assert_books_balance(pool: &Pool<AsyncPgConnection>) {
             total.total()
         );
     }
+    let drift = ledger::balance_drift(&mut conn)
+        .await
+        .expect("balance drift");
+    assert!(drift.is_empty(), "stored balances drifted: {drift:?}");
+}
+
+#[derive(diesel::QueryableByName)]
+struct StoredBalanceRow {
+    #[diesel(sql_type = diesel::sql_types::Nullable<BigInt>)]
+    balance_minor: Option<i64>,
+}
+
+/// The `balance_minor` column of one account. `None` means "not known".
+async fn stored_balance(pool: &Pool<AsyncPgConnection>, account: &str) -> Option<i64> {
+    let mut conn = pool.get().await.expect("conn");
+    let rows: Vec<StoredBalanceRow> = diesel::sql_query(format!(
+        "SELECT balance_minor FROM _autumn_money_accounts WHERE id = '{account}'"
+    ))
+    .load(&mut conn)
+    .await
+    .expect("read the stored balance");
+    rows.into_iter()
+        .next()
+        .expect("the account exists")
+        .balance_minor
 }
 
 #[tokio::test]
@@ -328,6 +371,7 @@ async fn a_negative_balance_check_holds_under_concurrency() {
             .minor(),
         0
     );
+    assert_eq!(stored_balance(&pool, "platform:float").await, Some(0));
     assert_books_balance(&pool).await;
 }
 
@@ -542,4 +586,357 @@ async fn the_same_key_for_different_money_is_refused_on_postgres() {
     assert!(matches!(error, LedgerError::KeyReuse { .. }), "{error}");
     assert_eq!(count_rows(&pool, "_autumn_money_transactions").await, 1);
     assert_books_balance(&pool).await;
+}
+
+// ── The stored balance (issue #3339) ────────────────────────────────────────
+
+/// Legacy rows, written as a ledger from before the stored balance holds them:
+/// a funded `platform:float` (100.00) that refuses a negative balance.
+const LEGACY_ROWS: &str = "\
+    INSERT INTO _autumn_money_accounts (id, currency, allow_negative) \
+    VALUES ('platform:cash', 'USD', TRUE), ('platform:float', 'USD', FALSE); \
+    INSERT INTO _autumn_money_transactions (id, idempotency_key, request_hash, currency) \
+    VALUES ('legacy-1', 'legacy:1', 'legacy', 'USD'); \
+    INSERT INTO _autumn_money_postings (transaction_id, seq, account_id, amount_minor, currency) \
+    VALUES ('legacy-1', 0, 'platform:float', 10000, 'USD'), \
+           ('legacy-1', 1, 'platform:cash', -10000, 'USD');";
+
+fn payout(amount: i64, label: &str) -> Transaction {
+    let postings = vec![
+        Posting::credit("platform:float", usd(amount)),
+        Posting::debit("platform:cash", usd(amount)),
+    ];
+    let key = IdempotencyKey::derive(label, &postings);
+    Transaction::new(key, postings)
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn concurrent_posts_keep_the_stored_balance_exact_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    open_accounts(&pool).await;
+
+    let mut handles = Vec::new();
+    for order in 0..16_i64 {
+        let pool = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let mut conn = pool.get().await.expect("conn");
+            post_tx(&mut conn, &charge(100 + order, &format!("order:{order}"))).await
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("task joins").expect("post");
+    }
+
+    let total: i64 = (0..16_i64).map(|order| 100 + order).sum();
+    assert_eq!(stored_balance(&pool, "platform:cash").await, Some(total));
+    assert_eq!(
+        stored_balance(&pool, "platform:revenue").await,
+        Some(-total)
+    );
+    assert_books_balance(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_posting_written_around_post_still_moves_the_stored_balance_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    {
+        let mut conn = pool.get().await.expect("conn");
+        conn.batch_execute(LEGACY_ROWS)
+            .await
+            .expect("write rows around post");
+    }
+    assert_eq!(stored_balance(&pool, "platform:float").await, Some(10_000));
+    assert_eq!(stored_balance(&pool, "platform:cash").await, Some(-10_000));
+    assert_books_balance(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_account_from_before_the_stored_balance_is_summed_once_on_postgres() {
+    let (pool, _container) = setup_pool_with(&[LEDGER_UP]).await;
+    let mut conn = pool.get().await.expect("conn");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("write legacy rows");
+    conn.batch_execute(BALANCE_UP)
+        .await
+        .expect("the balance migration applies over existing rows");
+    assert_eq!(stored_balance(&pool, "platform:float").await, None);
+    assert_eq!(
+        ledger::balance(&mut conn, "platform:float")
+            .await
+            .expect("balance")
+            .minor(),
+        10_000
+    );
+
+    let error = post_tx(&mut conn, &payout(15_000, "too-much"))
+        .await
+        .expect_err("the float holds 100.00 only");
+    assert!(
+        matches!(error, LedgerError::NegativeBalance { balance: -5000, .. }),
+        "{error}"
+    );
+    post_tx(&mut conn, &payout(6000, "fits"))
+        .await
+        .expect("a payout that fits");
+    assert_eq!(stored_balance(&pool, "platform:float").await, Some(4000));
+    assert_eq!(stored_balance(&pool, "platform:cash").await, Some(-4000));
+    assert_books_balance(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_drifted_balance_is_reported_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    open_accounts(&pool).await;
+    let mut conn = pool.get().await.expect("conn");
+    post_tx(&mut conn, &charge(2500, "order:1"))
+        .await
+        .expect("post");
+
+    conn.batch_execute(
+        "UPDATE _autumn_money_accounts SET balance_minor = 1 WHERE id = 'platform:cash'",
+    )
+    .await
+    .expect("drift the cash account");
+    let drift = ledger::balance_drift(&mut conn).await.expect("drift");
+    let [cash] = drift.as_slice() else {
+        panic!("expected one drifted account: {drift:?}");
+    };
+    assert_eq!(cash.account_id(), "platform:cash");
+    assert_eq!(cash.stored().minor(), 1);
+    assert_eq!(cash.posted().minor(), 2500);
+
+    conn.batch_execute(
+        "UPDATE _autumn_money_accounts SET balance_minor = NULL WHERE id = 'platform:cash'",
+    )
+    .await
+    .expect("forget the cash balance");
+    post_tx(&mut conn, &charge(1000, "order:2"))
+        .await
+        .expect("post");
+    assert_eq!(stored_balance(&pool, "platform:cash").await, Some(3500));
+    assert_books_balance(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn the_balance_migration_reverts_and_applies_again_on_postgres() {
+    let (pool, _container) = setup_pool_with(&[LEDGER_UP]).await;
+    let mut conn = pool.get().await.expect("conn");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("write legacy rows");
+    conn.batch_execute(BALANCE_UP).await.expect("up");
+    conn.batch_execute(BALANCE_DOWN).await.expect("down");
+    assert!(
+        conn.batch_execute("SELECT balance_minor FROM _autumn_money_accounts")
+            .await
+            .is_err(),
+        "down drops the column"
+    );
+    conn.batch_execute(BALANCE_UP).await.expect("up again");
+
+    post_tx(&mut conn, &payout(6000, "after-redo"))
+        .await
+        .expect("post after up, down, up");
+    assert_eq!(stored_balance(&pool, "platform:float").await, Some(4000));
+    assert_books_balance(&pool).await;
+}
+
+/// The trigger nets each statement per account, so an offsetting pair at the
+/// top of the range keeps an exact stored balance.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_offsetting_pair_at_the_range_edge_keeps_the_stored_balance_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    open_accounts(&pool).await;
+    let mut conn = pool.get().await.expect("conn");
+    let fill = vec![
+        Posting::debit("platform:cash", usd(i64::MAX)),
+        Posting::credit("platform:revenue", usd(i64::MAX)),
+    ];
+    let key = IdempotencyKey::derive("fill", &fill);
+    post_tx(&mut conn, &Transaction::new(key, fill))
+        .await
+        .expect("fill the account to i64::MAX");
+
+    let pair = vec![
+        Posting::debit("platform:cash", usd(i64::MAX)),
+        Posting::credit("platform:cash", usd(i64::MAX)),
+    ];
+    let key = IdempotencyKey::new("net:pair").expect("key");
+    post_tx(&mut conn, &Transaction::new(key, pair))
+        .await
+        .expect("an offsetting pair posts");
+    assert_eq!(stored_balance(&pool, "platform:cash").await, Some(i64::MAX));
+    assert_books_balance(&pool).await;
+}
+
+/// Review finding on #3339. A `REPEATABLE READ` post takes its snapshot. Then
+/// another session inserts postings for an account whose balance is `NULL`.
+/// The trigger must still write a new row version, so that the post gets a
+/// serialization error. Otherwise the post stores the sum from its old
+/// snapshot, and the drift stays.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_repeatable_read_post_cannot_store_a_stale_sum_on_postgres() {
+    let (pool, _container) = setup_pool_with(&[LEDGER_UP]).await;
+    let mut conn = pool.get().await.expect("conn");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("write legacy rows");
+    conn.batch_execute(BALANCE_UP)
+        .await
+        .expect("apply the balance migration");
+    assert_eq!(stored_balance(&pool, "platform:float").await, None);
+
+    let other = pool.clone();
+    let result = conn
+        .transaction::<_, LedgerError, _>(async move |conn| {
+            conn.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .await?;
+            // The first query takes the snapshot.
+            conn.batch_execute("SELECT 1").await?;
+
+            // Another session posts around `post`, and commits.
+            let mut other = other.get().await.expect("conn");
+            other
+                .batch_execute(
+                    "INSERT INTO _autumn_money_transactions \
+                         (id, idempotency_key, request_hash, currency) \
+                     VALUES ('around-1', 'around:1', 'around', 'USD'); \
+                     INSERT INTO _autumn_money_postings \
+                         (transaction_id, seq, account_id, amount_minor, currency) \
+                     VALUES ('around-1', 0, 'platform:float', 500, 'USD'), \
+                            ('around-1', 1, 'platform:cash', -500, 'USD');",
+                )
+                .await
+                .expect("post around `post`");
+
+            ledger::post(conn, &payout(6000, "stale")).await
+        })
+        .await;
+    let error = result.expect_err("the stale snapshot must not commit");
+    assert!(
+        error.to_string().contains("could not serialize"),
+        "expected a serialization error, got {error}"
+    );
+
+    // The retry sees the new postings and stores the true balance.
+    post_tx(&mut conn, &payout(6000, "retry"))
+        .await
+        .expect("the retry posts");
+    assert_eq!(stored_balance(&pool, "platform:float").await, Some(4500));
+    assert_books_balance(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn two_posts_in_one_transaction_see_each_other_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("fund the float");
+
+    // Each payout fits on its own. The two together do not.
+    let error = conn
+        .transaction::<(), LedgerError, _>(async move |conn| {
+            ledger::post(conn, &payout(6000, "first")).await?;
+            ledger::post(conn, &payout(6000, "second")).await?;
+            Ok(())
+        })
+        .await
+        .expect_err("the second payout sees the first");
+    assert!(
+        matches!(error, LedgerError::NegativeBalance { balance: -2000, .. }),
+        "{error}"
+    );
+    assert_eq!(stored_balance(&pool, "platform:float").await, Some(10_000));
+    assert_books_balance(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refused_or_rolled_back_post_does_not_move_the_stored_balance_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("fund the float");
+
+    post_tx(&mut conn, &payout(15_000, "refused"))
+        .await
+        .expect_err("the float holds 100.00 only");
+    assert_eq!(stored_balance(&pool, "platform:float").await, Some(10_000));
+
+    let rolled_back = conn
+        .transaction::<(), LedgerError, _>(async move |conn| {
+            ledger::post(conn, &payout(2500, "rolled-back")).await?;
+            Err(LedgerError::Conflict {
+                key: "roll back".to_owned(),
+            })
+        })
+        .await;
+    assert!(rolled_back.is_err());
+    assert_eq!(stored_balance(&pool, "platform:float").await, Some(10_000));
+    assert_books_balance(&pool).await;
+}
+
+/// `post` reads the stored balance, not the posting history (issue #3339).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn post_reads_the_stored_balance_not_the_history_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    let mut conn = pool.get().await.expect("conn");
+    conn.batch_execute(LEGACY_ROWS)
+        .await
+        .expect("fund the float");
+    conn.batch_execute(
+        "UPDATE _autumn_money_accounts SET balance_minor = 0 WHERE id = 'platform:float'",
+    )
+    .await
+    .expect("drift the float");
+
+    let error = post_tx(&mut conn, &payout(6000, "fits-the-history"))
+        .await
+        .expect_err("the stored balance says the float is empty");
+    assert!(
+        matches!(error, LedgerError::NegativeBalance { balance: -6000, .. }),
+        "{error}"
+    );
+}
+
+/// An `INSERT` from outside `post` that takes a balance out of `BIGINT` makes
+/// the stored balance unknown. It does not fail the `INSERT`.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_outside_insert_past_bigint_makes_the_balance_unknown_on_postgres() {
+    let (pool, _container) = setup_pool().await;
+    open_accounts(&pool).await;
+    let mut conn = pool.get().await.expect("conn");
+    let fill = vec![
+        Posting::debit("platform:cash", usd(i64::MAX)),
+        Posting::credit("platform:revenue", usd(i64::MAX)),
+    ];
+    let key = IdempotencyKey::derive("fill", &fill);
+    post_tx(&mut conn, &Transaction::new(key, fill))
+        .await
+        .expect("fill the account to i64::MAX");
+
+    conn.batch_execute(
+        "INSERT INTO _autumn_money_transactions (id, idempotency_key, request_hash, currency) \
+         VALUES ('over-1', 'over:1', 'over', 'USD'); \
+         INSERT INTO _autumn_money_postings \
+             (transaction_id, seq, account_id, amount_minor, currency) \
+         VALUES ('over-1', 0, 'platform:cash', 1, 'USD'), \
+                ('over-1', 1, 'platform:revenue', -1, 'USD');",
+    )
+    .await
+    .expect("the INSERT itself does not fail");
+    assert_eq!(stored_balance(&pool, "platform:cash").await, None);
 }

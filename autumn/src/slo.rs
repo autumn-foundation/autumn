@@ -28,7 +28,8 @@ use std::fmt;
 use serde::Deserialize;
 
 /// One million: the denominator of every ratio in this module.
-pub const PPM: u32 = 1_000_000;
+pub use crate::ppm::PPM;
+use crate::ppm::objective_to_ppm;
 
 /// Latency histogram bucket bounds, in milliseconds.
 ///
@@ -330,32 +331,6 @@ fn check_description(description: &str) -> Result<(), String> {
         return Err("description must not contain control characters".to_owned());
     }
     Ok(())
-}
-
-/// Convert a percentage to ppm. Reject values outside `(0, 100)` and values
-/// with more than four decimals.
-pub(crate) fn objective_to_ppm(objective: f64) -> Result<u32, String> {
-    if !objective.is_finite() || objective <= 0.0 || objective >= 100.0 {
-        return Err(format!(
-            "objective = {objective} must be greater than 0 and less than 100"
-        ));
-    }
-    let scaled = objective * 10_000.0;
-    let rounded = scaled.round();
-    if (scaled - rounded).abs() > 1e-6 {
-        return Err(format!(
-            "objective = {objective} has more than four decimal places"
-        ));
-    }
-    // The range check above keeps `rounded` in 1..=999_999.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let ppm = rounded as u32;
-    if ppm == 0 || ppm >= PPM {
-        return Err(format!(
-            "objective = {objective} must be greater than 0 and less than 100"
-        ));
-    }
-    Ok(ppm)
 }
 
 fn bucket_list() -> String {

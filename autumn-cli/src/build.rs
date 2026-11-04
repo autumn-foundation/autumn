@@ -600,6 +600,18 @@ pub fn run(
 ) {
     eprintln!("\u{1F342} autumn build\n");
 
+    // ── Diesel table width ───────────────────────────────────────────────────
+    // A warning, never a stop: a table over 32 columns forces diesel's
+    // `64-column-tables` feature on the whole graph, which costs every crate
+    // that uses diesel compile time and memory. The app may want that table
+    // anyway; it should know the price. Pure source reading plus one
+    // `cargo metadata`, before the compile so it is seen early.
+    if let Some(warning) =
+        crate::schema::width::format_build_warning(&crate::schema::width::scan(Path::new(".")))
+    {
+        eprintln!("{warning}\n");
+    }
+
     let profile = if debug { "dev" } else { "release" };
 
     // ── Edge preflight (issue #1790) ─────────────────────────────────────────

@@ -56,3 +56,28 @@
 
 2. Update `SWAGGER_UI_VERSION` in `autumn/src/openapi.rs` to match.
 3. Run the OpenAPI and security tests to verify the same-origin UI still works under the default CSP.
+
+## axe-core (test only)
+
+- **Version:** 4.14.0
+- **Source:** <https://registry.npmjs.org/axe-core/-/axe-core-4.14.0.tgz>
+  (`package/axe.min.js`, `package/LICENSE`)
+- **Integrity (npm):** `sha512-9WTZxEjsZ7b13TH8JPmbV2z8CHbl80/2hm3XPEG4JgNdQLK81IBRXmSxHfMAOkSqQeRxT/0dwNDz2GOm3zzpcQ==`
+- **SHA-256 of `axe.min.js`:** `20c09fe157a8a34a30e241aaa1fcdade657734f08ab379ecfbeb7d45cc46e878`
+- **License:** MPL-2.0 (see `autumn/tests/fixtures/axe-core/LICENSE`)
+- **Location:** `autumn/tests/fixtures/axe-core/`. It is not served, not
+  embedded and not published (`exclude` in `autumn/Cargo.toml`). Only the
+  `stories_browser` tests load it (issue #3398).
+
+### How to update
+
+1. Download the tarball. Compare
+   `echo "sha512-$(openssl dgst -sha512 -binary axe-core-<VERSION>.tgz | base64 -w0)"`
+   with `npm view axe-core@<VERSION> dist.integrity`.
+2. Copy `package/axe.min.js` and `package/LICENSE` to
+   `autumn/tests/fixtures/axe-core/`.
+3. Update the version, the integrity and the SHA-256 above
+   (`sha256sum autumn/tests/fixtures/axe-core/axe.min.js`).
+4. Run the `stories_browser` suite (see CONTRIBUTING.md "Widget browser gate").
+   Fix each new violation in the widget. Do not disable a rule.
+

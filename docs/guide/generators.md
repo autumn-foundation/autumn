@@ -81,6 +81,10 @@ set.
 | `token:Uuid`      | `uuid::Uuid`                    | `Uuid`             | `UUID`              |
 | `at:NaiveDateTime`| `chrono::NaiveDateTime`         | `Timestamp`        | `TIMESTAMP`         |
 | `at:DateTime`     | `chrono::DateTime<chrono::Utc>` | `Timestamptz`      | `TIMESTAMPTZ`       |
+| `opens:time` *(or `NaiveTime`)* | `chrono::NaiveTime` | `Time`         | `TIME`              |
+| `mobile:phone` *(or `tel`)* | `String`              | `Text`             | `TEXT`              |
+| `accent:color`    | `String` (`#rrggbb`)            | `Text`             | `TEXT`              |
+| `price:money`     | `rust_decimal::Decimal`         | `Numeric`          | `NUMERIC(12,2)`     |
 | `data:Bytea` *(or `Vec<u8>`)* | `Vec<u8>`           | `Bytea`            | `BYTEA`             |
 | `post:references` | `i64`                           | `Int8`             | `BIGINT`            |
 | `slug:slug{from:title}` | `String`                  | `Text`              | `TEXT`              |
@@ -91,6 +95,24 @@ set.
 Wrap any of the above in `Option<…>` to make the column nullable
 (`Option<String>`, `Option<i64>`, `Option<NaiveDateTime>`, …). The generator
 emits both `NULL` in the migration SQL and `Nullable<T>` in `schema.rs`.
+
+### `time`, `phone`, `color` and `money` — native form controls
+
+These kinds pick a native form control (issue #3405):
+
+| Kind | Form control | Notes |
+|---|---|---|
+| `time` | `<input type="time">` (`FieldControl::Time`) | The browser posts `HH:MM`. On `SQLite` the column is `TEXT`. |
+| `phone` (alias `tel`) | `<input type="tel">` (`FieldControl::Tel`) | A `String` column. The browser does not check the format. |
+| `color` | `<input type="color">` (`FieldControl::Color`) | A `String` column. The browser posts a lowercase `#rrggbb`. A color input always posts a value, so `Option<color>` is an error: use `Option<String>`. |
+| `money` | `<input type="number" step="0.01">` | The same column as a bare `decimal`: `NUMERIC(12,2)`. |
+
+`phone` and `color` take no `{…}` modifier. Use `String{…}` for a constrained
+text column, and `decimal{p,s}` for another precision or scale.
+
+```bash
+autumn generate scaffold Shop name:String opens:time mobile:phone accent:color price:money
+```
 
 ### `json`/`jsonb` — flexible structured data
 
@@ -1268,7 +1290,7 @@ JavaScript at all. Autumn's default CSP is `script-src 'self'` with no
 `'unsafe-inline'`, so an inline `onclick="return confirm(..)"` is blocked
 by the browser — the form would submit with no prompt, which is worse
 than not promising one. The framework's server-rendered replacement for
-`window.confirm()`, [`confirm_action`](../../autumn/src/widgets.rs), submits
+`window.confirm()`, [`confirm_action`](../../autumn/src/widgets/feedback.rs), submits
 its own single-action form and so cannot carry a bulk form's checkbox
 selection (HTML forbids nesting forms). To confirm a batch, post the
 selection to an interstitial page that lists the affected rows and asks
@@ -1648,7 +1670,7 @@ Contract of the generated handler:
 | CSRF and double submit | The POST is `#[secured]` and the form renders the shipped CSRF and one-time submit-token hidden inputs as its **first** fields, so both land inside `security.csrf.token_scan_bytes` on a multipart body. Keep them first if you rearrange the form. |
 | Rate limiting | No `#[throttle]` (unlike the export): the route is `#[secured]`, and its work is bounded by `MAX_IMPORT_BYTES` and `MAX_IMPORT_ROWS` rather than by the size of the table. It also does not fit: the handler declares 9 extractors on a policy-enabled scaffold (10 under `--i18n`), `#[secured]` injects 3 more and `#[throttle]` 8, and axum's `Handler` tops out at 16. To add one, drop extractors to make room — the submit-token pair is the cheapest, at the cost of double-submit protection. `--no-policy` (7 params) does leave room. |
 | Record policy wiring on (an owner column, the default) | The handler is `#[secured]` and calls `authorize_create::<Model>` once, exactly like `create`: an import has no loaded row to authorize per record, any more than a create does. A per-row rule therefore does not apply here either; add the check inside the row closure if your policy needs one. |
-| Line numbers | 1-based lines of the uploaded file, header included — and the **same numbers for CRLF and LF** files. (The underlying CSV parser's own counter runs one behind on CRLF, the dialect Excel writes; `import_csv` calibrates against the header and corrects for it, and strips the parser's own uncalibrated line number out of the message so a reader never sees two.) A quoted field containing a newline moves the rows after it down, and the reported numbers move with them. A header that itself spans a quoted newline is accounted for, so it does not shift the rows under it. The shift is measured once, so only a file that *mixes* terminators drifts. |
+| Line numbers | 1-based lines of the uploaded file, header included — and the **same numbers for CRLF and LF** files. (The underlying CSV parser's own counter runs one behind on CRLF, the dialect Excel writes; `import_csv` calibrates against the header and corrects for it, and strips the parser's own uncalibrated line number out of the message so a reader never sees two.) A quoted field containing a newline moves the rows after it down, and the reported numbers move with them. A header that itself spans a quoted newline is accounted for, so it does not shift the rows under it. Blank lines are skipped but still count, so a row after them is reported on its own line. The shift is measured once, so only a file that *mixes* terminators drifts. |
 | Existing records | **Never matched or updated.** Every row is inserted as a new record and an `id` column in the file is ignored, so re-uploading an exported file *duplicates* it rather than updating it in place. `ImportMode::Upsert { by }` exists in the framework for update-in-place; wiring it up means matching on the `by` columns in the row closure and calling the repository's update path, which is deliberately left to you rather than guessed at. |
 | Columns the import cannot set | Named on the upload page, from an emitted `CSV_IGNORED_COLUMNS`: `id` and `created_at` (the database assigns both), an `Attachment` (a storage key in a cell is not a file), and anything dropped from the form — a `--default`ed column, for instance. They are in the file the export writes, so without that line an operator could edit one, re-upload, and watch nothing happen. |
 | An `#[encrypted]` column | **Refuses the whole surface.** The export omits an at-rest encrypted column (#1340 — the model holds plaintext), but the generated form requires it, so a file headed by `csv_columns()` could never satisfy it and every row would fail with "missing field". `--import` generates nothing there and warns, naming the column. |
@@ -1701,7 +1723,7 @@ methods were waiting for (issue #1332) — zero lines of user code:
 - Per row: a **Restore** submit posting to
   `POST /<plural>/{id}/restore`, and a **Purge** control posting to
   `POST /<plural>/{id}/purge` behind
-  [`confirm_action`](../../autumn/src/widgets.rs)'s server-rendered dialog
+  [`confirm_action`](../../autumn/src/widgets/feedback.rs)'s server-rendered dialog
   (titled per row, so the person confirming an irreversible delete can see
   which record it is). Both carry the CSRF hidden field.
 - A `Deleted At` column showing each row's `deleted_at` stamp, so the page
@@ -2060,17 +2082,11 @@ The live HTTP test requires Docker access for the Postgres testcontainer and
 the `diesel` CLI on `PATH`, because `autumn migrate` delegates to
 `diesel migration run`.
 
-### WebAuthn native dependency note
+### WebAuthn dependency note
 
 `autumn generate auth --passkeys` enables the `webauthn` feature and adds
-`webauthn-rs`. That dependency currently builds through OpenSSL. On Ubuntu CI
-the system OpenSSL toolchain is already available, but Windows developers need
-to install the OpenSSL libraries through `vcpkg` and set `VCPKG_ROOT` so
-`openssl-sys` can find them.
-
-The release SemVer gate checks `autumn-web` optional public feature APIs, so this
-native dependency must be present on machines that run `scripts/check-semver.sh`
-locally.
+`webauthn-rs`. Since 0.6, `webauthn-rs` uses pure-Rust crypto. It needs no
+OpenSSL and no native libraries on any platform.
 
 ## `autumn generate policy`
 
@@ -2262,6 +2278,12 @@ plan does not name the old file, but the manifest does. `destroy` sweeps it:
 - It never sweeps a migration, a project file such as `Cargo.toml` or
   `src/main.rs`, a path with a dot segment (`.env`, `.git/`), a file under
   `target/`, or a path through a symlink.
+
+On a case-insensitive file system (macOS, Windows), a template can change
+only the case of a name (`Foo.rs` to `foo.rs`, or `src/widgets` to
+`src/Widgets`). The two spellings name one file. `destroy` uses the manifest
+entry of the old spelling. On a case-sensitive file system, the two spellings
+are two files.
 
 The manifest decides what the sweep can delete, so review changes to
 `.autumn/generated.toml` as you review code.

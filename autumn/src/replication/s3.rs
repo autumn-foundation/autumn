@@ -189,7 +189,7 @@ impl S3Destination {
         if let Some(endpoint) = &settings.endpoint {
             validate_endpoint(endpoint)?;
         }
-        let http = reqwest::blocking::Client::builder()
+        let http = crate::reqwest_tls::blocking_client_builder()
             .connect_timeout(CONNECT_TIMEOUT)
             // No client-wide total timeout: a base snapshot upload is
             // legitimately long. Small requests set their own below.

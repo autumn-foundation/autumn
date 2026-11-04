@@ -192,6 +192,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "Register typed routes from `routes![]`. Plugin routes registered this way are attributed automatically.",
     },
     PluginSurface {
+        name: "AppBuilder::widget_pack",
+        tier: SurfaceTier::Stable,
+        note: "Install a `WidgetPack`: serve its `PluginAssets` bundle and add its stories and asset links to the story gallery (requires the `maud` feature).",
+    },
+    PluginSurface {
         name: "AppBuilder::with_config_loader",
         tier: SurfaceTier::Stable,
         note: "Replace the tier-1 configuration loader (e.g. a secrets-manager backend).",
@@ -215,6 +220,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "AppBuilder::with_session_store",
         tier: SurfaceTier::Stable,
         note: "Replace the tier-1 session store.",
+    },
+    PluginSurface {
+        name: "AppBuilder::with_story_gallery",
+        tier: SurfaceTier::Stable,
+        note: "Add stories to the `/_stories` gallery. Each call adds; a plugin starts from `StoryGallery::new` (requires the `maud` feature).",
     },
     PluginSurface {
         name: "AppBuilder::with_telemetry_provider",
@@ -247,9 +257,14 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         note: "The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature).",
     },
     PluginSurface {
+        name: "form::FieldRenderer",
+        tier: SurfaceTier::Stable,
+        note: "Bind a plugin form control to `Changeset<T>` (`custom_input_with`) and `form_for` (`FieldControl::custom`), with `FieldContext` and `CustomControl` (requires the `maud` feature).",
+    },
+    PluginSurface {
         name: "plugin_conformance",
         tier: SurfaceTier::Stable,
-        note: "The library-level conformance harness plugin authors run in their own test suite.",
+        note: "The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack.",
     },
     PluginSurface {
         name: "plugin_contract",
@@ -260,6 +275,11 @@ pub const PLUGIN_SURFACES: &[PluginSurface] = &[
         name: "route_listing::RouteInfo",
         tier: SurfaceTier::Stable,
         note: "The route manifest type the conformance harness and `autumn routes --format json` share.",
+    },
+    PluginSurface {
+        name: "widget_pack",
+        tier: SurfaceTier::Stable,
+        note: "The widget contract and `WidgetPack`: render, passthrough, tokens, `autumn-<pack>-*` classes, keyboard core, CSP, stories (requires the `maud` feature).",
     },
 ];
 

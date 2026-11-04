@@ -1,0 +1,30 @@
+# Bolt profile: autumn-web/repository_crud
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 59,213
+blocks allocated: 404
+peak live bytes (whole run): 137,787
+
+         bytes      blocks  site
+
+        21,120          10  <diesel_async::pg::AsyncPgConnection>::with_prepared_statement_after_sql_built
+         4,800           4  <futures_util::stream::try_stream::try_collect::TryCollect as core::future::future::Future>::poll
+         4,352           4  <diesel::connection::statement_cache::StatementCache>::cached_statement_non_generic
+         3,768           0  <tokio_util::codec::framed_impl::FramedImpl as futures_core::stream::Stream>::poll_next
+         3,600          72  futures_channel::mpsc::channel
+         3,264          26  <tokio_postgres::row::Row>::new
+         2,973          32  <diesel::pg::query_builder::PgQueryBuilder as diesel::query_builder::QueryBuilder>::push_sql
+         1,961          44  <(i64, alloc::string::String, alloc::string::String, i64, bool, chrono::naive::datetime::NaiveDateTime) as diesel::deserialize::FromStaticSqlRow>::build_from_row
+         1,928          23  <diesel_async::pg::AsyncPgConnection>::with_prepared_statement_after_sql_built::{closure#0}
+         1,680          10  <diesel_async::pg::AsyncPgConnection>::run_with_connection_future
+         1,392          12  <(alloc::vec::Vec, alloc::vec::Vec) as core::iter::traits::collect::default_extend::SpecExtend>::extend
+         1,296          18  <futures_channel::mpsc::UnboundedSender>::do_send_nb
+         1,049          14  <diesel::query_builder::bind_collector::RawBytesBindCollector as diesel::query_builder::bind_collector::BindCollector>::push_bound_value
+         1,027           3  <tokio_postgres::client::InnerClient>::with_buf
+           960           3  repository_crud::main::{closure#4}::{closure#0}
+           822          17  <futures_util::future::try_future::into_future::IntoFuture as core::future::future::Future>::poll
+           632          48  <str>::replace
+           586          15  <futures_channel::mpsc::queue::Queue>::push
+           458           5  diesel_async::pg::prepare_statement_helper
+           394           4  <diesel_async::stmt_cache::QueryFragmentHelper as diesel::connection::statement_cache::QueryFragmentForCachedStatement>::construct_sql

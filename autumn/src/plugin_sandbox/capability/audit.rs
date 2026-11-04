@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn a_request_s_drops_count_while_its_last_drop_is_in_the_window() {
-        // #2523 finding 18. The span of one request's drops is known, not the
+        // #2523. The span of one request's drops is known, not the
         // time of each drop. Key the record at the last drop: never under-report.
         use std::sync::Arc;
 
@@ -920,7 +920,7 @@ mod tests {
             // Past the coalescing span, so each is its own record.
             clock.advance(Duration::from_secs(2));
         }
-        let summary = log.summary("shop", Duration::from_secs(86_400));
+        let summary = log.summary("shop", Duration::from_hours(24));
         assert_eq!(summary.dropped, records as u64);
     }
 
@@ -960,7 +960,7 @@ mod tests {
         // Window: only the recent records. All 4096 + 1 are in it; the evicted
         // old events are not.
         // The recent window holds every recent record and nothing old.
-        let recent = log.summary("shop", Duration::from_secs(3 * 3600));
+        let recent = log.summary("shop", Duration::from_hours(3));
         assert_eq!(recent.dropped, MAX_LOG_EVENTS as u64 + 1);
         // A wider window adds the old events the ring evicted.
         let wide = log.summary("shop", 24 * hour);
@@ -990,7 +990,7 @@ mod tests {
         // 12,000 drops fit in the hour; one bucket of slack, never hours.
         assert!(hour <= 12_000 + 4, "the last hour reported {hour} drops");
         assert!(hour >= 12_000, "the last hour lost drops: {hour}");
-        let all = log.summary("shop", Duration::from_secs(6 * 3600)).dropped;
+        let all = log.summary("shop", Duration::from_hours(6)).dropped;
         assert_eq!(all, 60_000);
     }
 

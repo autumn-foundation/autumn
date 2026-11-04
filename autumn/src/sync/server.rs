@@ -1899,9 +1899,19 @@ mod tests {
     async fn a_route_statement_timeout_reaches_sync_calls() {
         let defaults = crate::db::TxTimeouts::new(Some(std::time::Duration::from_secs(30)), None);
         let route = crate::db::StatementTimeout(std::time::Duration::from_secs(90));
-        let set_local = defaults
-            .scope_request(async { super::request_tx_set_local(Some(axum::Extension(route))) })
-            .await;
+        let set_local = tower::ServiceExt::oneshot(
+            tower::Layer::layer(
+                &crate::db::TxTimeoutsLayer::new(defaults),
+                tower::service_fn(move |_req: axum::extract::Request| async move {
+                    Ok::<_, std::convert::Infallible>(super::request_tx_set_local(Some(
+                        axum::Extension(route),
+                    )))
+                }),
+            ),
+            axum::extract::Request::new(axum::body::Body::empty()),
+        )
+        .await
+        .expect("infallible");
         assert_eq!(
             set_local,
             crate::db::TxTimeouts::new(Some(std::time::Duration::from_secs(90)), None)

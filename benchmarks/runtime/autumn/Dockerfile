@@ -1,4 +1,4 @@
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 WORKDIR /workspace
 ENV LIBSQLITE3_SYS_USE_PKG_CONFIG=1
 

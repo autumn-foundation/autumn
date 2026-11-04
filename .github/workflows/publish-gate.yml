@@ -243,6 +243,70 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/webmcp-browser.log" \
             || { echo "::error::no WebMCP browser tests ran"; exit 1; }
 
+      # Widget keyboard core in a real browser (#3397): APG keys for tabs,
+      # combobox and menu button, the no-JS fallback and the default CSP.
+      # A filter that matches nothing exits 0, so check the count.
+      - name: Run the widget keyboard browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_keyboard_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-keyboard-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-keyboard-browser.log" \
+            || { echo "::error::no widget keyboard browser tests ran"; exit 1; }
+
+      # Toast behaviour in a real browser (#3399): pause, close, focus and
+      # the top layer. A filter that matches nothing exits 0, so check the
+      # count.
+      - name: Run the toast browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_toast_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-toast-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-toast-browser.log" \
+            || { echo "::error::no toast browser tests ran"; exit 1; }
+
+      # Direct upload controller in a real browser (#3411).
+      - name: Run the direct upload suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features "system-tests,storage" \
+            --test integration_tests widgets_direct_upload_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-direct-upload-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-direct-upload-browser.log" \
+            || { echo "::error::no direct upload browser tests ran"; exit 1; }
+
+      # Popover and dropdown menu in a real browser (#3402).
+      - name: Run the popover browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_popover_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-popover-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-popover-browser.log" \
+            || { echo "::error::no popover browser tests ran"; exit 1; }
+
+      # Drawer and modal in a real browser (#3403).
+      - name: Run the drawer browser suite
+        env:
+          AUTUMN_CHROMIUM: ${{ steps.setup-chrome.outputs.chrome-path }}
+        run: |
+          set -euo pipefail
+          cargo test -p autumn-web --features system-tests \
+            --test integration_tests widgets_drawer_browser -- --include-ignored \
+            | tee "${RUNNER_TEMP}/widgets-drawer-browser.log"
+          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/widgets-drawer-browser.log" \
+            || { echo "::error::no drawer browser tests ran"; exit 1; }
+
   # ---------------------------------------------------------------------------
   # 1. Crate metadata
   # ---------------------------------------------------------------------------
@@ -297,10 +361,9 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      # Pinned toolchain for cargo-semver-checks — must stay in sync with
-      # AUTUMN_SEMVER_RUST_VERSION's default in scripts/check-semver.sh
-      # (1.94.1: aws-smithy MSRV floor; 1.96.0 ICEs — see script comment).
-      - uses: dtolnay/rust-toolchain@1.94.1
+      # Pinned toolchain for cargo-semver-checks: the MSRV. Keep in sync with
+      # AUTUMN_SEMVER_RUST_VERSION's default in scripts/check-semver.sh.
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
       # protoc is required by telemetry-otlp (prost/tonic) in the broadened
       # feature set check-semver.sh enables; it is not in the standard

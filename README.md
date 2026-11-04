@@ -3,7 +3,7 @@
 [![CI](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml/badge.svg)](https://github.com/autumn-foundation/autumn/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/autumn-foundation/autumn/branch/trunk/graph/badge.svg)](https://codecov.io/gh/autumn-foundation/autumn)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](#license)
-[![Rust: 1.88.0+](https://img.shields.io/badge/rust-1.88.0%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust: 1.97.0+](https://img.shields.io/badge/rust-1.97.0%2B-orange.svg)](https://www.rust-lang.org)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/autumn-foundation/autumn)
 
 > Spring Boot-style web framework for Rust, built on [Axum](https://github.com/tokio-rs/axum).
@@ -21,6 +21,7 @@ for that same "ship the app, not the plumbing" shape in Rust.
 - **Configuration and profiles** - defaults, `autumn.toml`, `autumn-{profile}.toml`, and `AUTUMN_*` overrides
 - **Database ergonomics** - async Postgres primary/replica pools, `Db` extractor for the primary/write role, `#[model]`, `#[repository]`, hooks, and embedded migrations
 - **HTML stack** - Maud templating, bundled htmx, Tailwind build pipeline, and static asset serving
+- **Widgets** - server-rendered, CSP-safe widgets. Core widgets need `maud`; the search, social, workflow and chart families are default-on features (`widgets-search`, `widgets-social`, `widgets-workflow`, `widgets-charts`), so a lean app compiles only what it uses (see [widget styling](docs/guide/widget-styling.md#widget-families))
 - **Operations** - `/health`, `/actuator/*`, structured logging, metrics, and graceful shutdown
 - **Background work** - `#[scheduled]` tasks, `#[job]` handlers, one-off `#[task]` scripts via `autumn task`, and runtime task visibility at `/actuator/tasks`
 - **Companion workflows** - [Autumn Harvest](docs/autumn-workflow-architecture.md) is the separate durable workflow engine for multi-step orchestration when `#[scheduled]` or `#[job]` is not enough
@@ -324,7 +325,7 @@ Until `1.0.0`, Autumn is in its `0.x` series — see the
 
 ## Requirements
 
-- Rust 1.88.0+ (edition 2024)
+- Rust 1.97.0+ (edition 2024)
 - PostgreSQL for database-backed apps
 
 Autumn can still run without a database if you omit the `[database]` section.

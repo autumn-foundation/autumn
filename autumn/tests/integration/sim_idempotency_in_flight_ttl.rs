@@ -70,7 +70,7 @@ async fn sim_idempotency_failed_save_holds_the_key_for_the_in_flight_ttl_only(si
     CALLS.store(0, Ordering::SeqCst);
 
     let store = Arc::new(SetFailsStore {
-        inner: MemoryIdempotencyStore::new(Duration::from_secs(86_400)),
+        inner: MemoryIdempotencyStore::new(Duration::from_hours(24)),
     });
     // The default layer: no explicit in-flight TTL.
     let app = axum::Router::new()

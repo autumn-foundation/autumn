@@ -744,6 +744,19 @@ ingress_ipv4     = ["203.0.113.10"]      # A records, for tenant APEX domains
 # resolvers = ["1.1.1.1:53", "8.8.8.8:53"]  # read ownership TXT records
 ```
 
+Each tick checks pending domains 16 at a time, for at most half of
+`poll_interval_secs`. A check that takes more than 20 seconds fails and backs
+off. Domains the tick did not reach wait for the next tick. Issuance and
+renewal then start on time, even when one tenant's DNS is slow.
+
+A renewal DNS check that takes more than 10 seconds is treated as a DNS error.
+Autumn renews the certificate anyway.
+
+With the default 60-second interval, verification gets 30 seconds per tick.
+Each round of 16 checks takes at most 20 seconds. With an interval under 40
+seconds, the limit for one check is half of the verification time. A sweep of 1,000 new domains
+can therefore take several ticks.
+
 `ingress_hostname` is what tenants CNAME at. An **apex** domain
 (`clientco.com`) cannot carry a CNAME, so it needs `ingress_ipv4` /
 `ingress_ipv6` instead; set both kinds if you accept both.
@@ -953,7 +966,11 @@ The `custom_domains` health indicator reports how many domains are registered
 and active, and names every unhealthy one **with its tenant** — so an operator
 reading `/actuator/health` can act without a registry lookup. It is `Down` only
 when a certificate has actually expired: one tenant's pending retry is not a
-deployment outage. A failed order also raises the
+deployment outage. It also reports `issuance_budget`: `global_used` and
+`global_limit` (orders this hour), `global_retry_after_secs` (when room
+returns, `null` while there is room), `per_domain_limit`, and
+`domains_at_limit` (domains that spent their daily cap). A spent budget keeps
+the status `Up`. It means throttled, not broken. A failed order also raises the
 [`scheduled_task_failure`](./operator-alerts.md) alert for
 `custom_domain_certificates`, naming the domain and tenant, and that alert
 clears when the **last** failing domain recovers — or is offboarded, since a
@@ -1014,9 +1031,12 @@ A `process.role = "worker"` replica serves only the probes and the actuator,
 but it serves them over the same listener, so `required_paths` applies there
 too — a prefix covering `/actuator/` holds on every role.
 
-Prefixes are taken as written. Startup refuses a noncanonical entry — an empty
-segment (`//`) or a `.` / `..` segment — because it would protect less than it
-appears to. Write the resolved prefix.
+Prefixes are taken as written. Startup refuses a prefix that is not canonical, so it
+does not match the normalized request path. This covers an empty segment (`//`), a `.` or `..` segment, a `{}`
+route template, and an encoded `%2F` or `%2e`. Write the resolved prefix.
+
+`autumn doctor` fails on the same prefixes. It also fails when `required_paths`,
+`crl_path` or `reload_interval_secs` has the wrong type.
 
 **Per-route requirements** come from `required_paths`, matched at segment
 boundaries — so `/internal/` covers `/internal/keys` but not `/internal-tools`.

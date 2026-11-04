@@ -726,7 +726,22 @@ struct Held {
 }
 
 /// A store call that runs on its own task.
-type PendingCall = tokio::task::JoinHandle<()>;
+struct PendingCall {
+    task: tokio::task::JoinHandle<()>,
+    /// Set when the call outlived its time limit and was a claim.
+    late: Option<LateClaim>,
+}
+
+/// The answer of a claim that outlived its time limit.
+struct LateClaim {
+    answer: tokio::sync::oneshot::Receiver<Result<Grant, OwnershipError>>,
+}
+
+impl PendingCall {
+    fn running(&self) -> bool {
+        !self.task.is_finished()
+    }
+}
 
 /// The `failed` text of a call that took longer than one renew interval.
 const TIMED_OUT: &str = "the store call timed out";
@@ -775,7 +790,8 @@ pub struct FleetOwnership {
     /// destination for a slot in it. Claims of the range go above it.
     fence_floors: Vec<std::sync::atomic::AtomicU64>,
     /// Per range of `ranges`: a store call that outlived its time limit. It
-    /// runs on, so the range makes no new call until it ends.
+    /// runs on, so the range makes no new call until it ends. A claim keeps
+    /// its answer here until `settle_late` reads it.
     pending: Vec<Mutex<Option<PendingCall>>>,
     /// A store call outlived the shutdown wait. It may still land and
     /// extend a lease, so the ranges lapse instead of being released.
@@ -871,6 +887,9 @@ impl FleetOwnership {
     /// A range whose store call is slow fails alone: the other ranges still
     /// renew. The report keeps the order of the configured ranges. The order
     /// of the epochs between ranges is not fixed.
+    ///
+    /// A claim that ends late is kept. The next refresh renews it, so the
+    /// report lists it as `renewed`, not `claimed`.
     pub async fn refresh(&self) -> RefreshReport {
         let calls = self
             .ranges
@@ -907,21 +926,24 @@ impl FleetOwnership {
         floor: &std::sync::atomic::AtomicU64,
         pending: &Mutex<Option<PendingCall>>,
     ) -> Outcome {
+        if pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(PendingCall::running)
         {
-            let mut slot = pending.lock().unwrap_or_else(PoisonError::into_inner);
-            if slot.as_ref().is_some_and(|call| !call.is_finished()) {
-                return Outcome::Busy;
-            }
-            // An ended call is stale: a newer call replaces its answer.
-            *slot = None;
+            return Outcome::Busy;
         }
+        // A claim that ended late is held now, so this call renews it.
+        self.settle_late(range, floor, pending);
         let held = self.held_epoch(range);
         // Sent before the call: the local lease must not outlive the store's.
         let sent = tokio::time::Instant::now();
         let (store, owner, ttl) = (Arc::clone(&self.store), self.owner.clone(), self.ttl);
         let floor_now = floor.load(std::sync::atomic::Ordering::Acquire);
-        let (answer, answered) = tokio::sync::oneshot::channel();
-        let call = tokio::spawn(async move {
+        let valid_until = later(sent, self.ttl.saturating_sub(self.renew_interval()));
+        let (answer, mut answered) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
             let result = if let Some(epoch) = held {
                 store.renew(range, &owner, epoch, ttl).await
             } else {
@@ -931,8 +953,9 @@ impl FleetOwnership {
         });
         // Tracked at once: if this refresh is dropped, the call still runs and
         // `unsettled` must say so.
-        *pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(call);
-        let result = match tokio::time::timeout(self.renew_interval(), answered).await {
+        *pending.lock().unwrap_or_else(PoisonError::into_inner) =
+            Some(PendingCall { task, late: None });
+        let result = match tokio::time::timeout(self.renew_interval(), &mut answered).await {
             Ok(Ok(result)) => {
                 // The call ended. Nothing runs for this range now.
                 *pending.lock().unwrap_or_else(PoisonError::into_inner) = None;
@@ -946,26 +969,20 @@ impl FleetOwnership {
                 // The call may still extend the lease at the store. The local
                 // lease does not grow, so serving stays safe.
                 tracing::warn!(range = %range, "fleet slot ownership call timed out");
+                // A late renew is dropped: the next call renews anyway.
+                if held.is_none()
+                    && let Some(call) = pending
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .as_mut()
+                {
+                    call.late = Some(LateClaim { answer: answered });
+                }
                 return Outcome::TimedOut;
             }
         };
         match result {
-            // A replicator saw a newer epoch in this range while the call ran.
-            Ok(grant) if grant.epoch.get() < floor.load(std::sync::atomic::Ordering::Acquire) => {
-                tracing::warn!(range = %range, epoch = %grant.epoch, "fleet slot range fenced while the store call ran");
-                self.drop_range(range);
-                Outcome::Lost
-            }
-            Ok(grant) => {
-                let valid_for = self.ttl.saturating_sub(self.renew_interval());
-                self.hold(grant, later(sent, valid_for));
-                if held.is_some() {
-                    Outcome::Renewed
-                } else {
-                    tracing::info!(range = %range, epoch = %grant.epoch, owner = %self.owner, "fleet slot range claimed");
-                    Outcome::Claimed(grant.epoch)
-                }
-            }
+            Ok(grant) => self.accept(range, grant, floor, valid_until, held.is_some()),
             Err(OwnershipError::Lost { .. }) => {
                 tracing::warn!(range = %range, owner = %self.owner, "fleet slot range lost to another host");
                 self.drop_range(range);
@@ -976,6 +993,53 @@ impl FleetOwnership {
                 tracing::warn!(range = %range, %error, "fleet slot ownership call failed");
                 Outcome::Failed(error.to_string())
             }
+        }
+    }
+
+    /// Hold a grant, unless a replicator saw a newer epoch while the call ran.
+    fn accept(
+        &self,
+        range: SlotRange,
+        grant: Grant,
+        floor: &std::sync::atomic::AtomicU64,
+        valid_until: tokio::time::Instant,
+        renewed: bool,
+    ) -> Outcome {
+        if grant.epoch.get() < floor.load(std::sync::atomic::Ordering::Acquire) {
+            tracing::warn!(range = %range, epoch = %grant.epoch, "fleet slot range fenced while the store call ran");
+            self.drop_range(range);
+            return Outcome::Lost;
+        }
+        self.hold(grant, valid_until);
+        if renewed {
+            Outcome::Renewed
+        } else {
+            tracing::info!(range = %range, epoch = %grant.epoch, owner = %self.owner, "fleet slot range claimed");
+            Outcome::Claimed(grant.epoch)
+        }
+    }
+
+    /// Read the answer of a claim that ended late, and hold the grant with a
+    /// lease that is already over: the range is not served until a renew.
+    /// `release_all` releases the grant. This also clears the slot.
+    fn settle_late(
+        &self,
+        range: SlotRange,
+        floor: &std::sync::atomic::AtomicU64,
+        pending: &Mutex<Option<PendingCall>>,
+    ) {
+        let late = {
+            let mut slot = pending.lock().unwrap_or_else(PoisonError::into_inner);
+            if slot.as_ref().is_some_and(PendingCall::running) {
+                return;
+            }
+            slot.take().and_then(|call| call.late)
+        };
+        let Some(mut late) = late else { return };
+        // A late error or a closed channel is a failed claim: nothing to keep.
+        if let Ok(Ok(grant)) = late.answer.try_recv() {
+            tracing::info!(range = %range, epoch = %grant.epoch, "fleet slot claim ended late; kept");
+            self.accept(range, grant, floor, tokio::time::Instant::now(), false);
         }
     }
 
@@ -1054,9 +1118,18 @@ impl FleetOwnership {
         range.is_some()
     }
 
-    /// Release every held range, so another host can claim it at once. Call
-    /// it after the fleet closed its databases.
+    /// Release every held range, so another host can claim it at once. A
+    /// claim that ended late is released too. Call it after the fleet closed
+    /// its databases.
     pub async fn release_all(&self) {
+        for ((&range, floor), pending) in self
+            .ranges
+            .iter()
+            .zip(&self.fence_floors)
+            .zip(&self.pending)
+        {
+            self.settle_late(range, floor, pending);
+        }
         let held: Vec<Held> = std::mem::take(&mut *self.write_held());
         for held in held {
             if let Err(error) = self
@@ -1120,7 +1193,7 @@ impl FleetOwnership {
                 slot.lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .as_ref()
-                    .is_some_and(|call| !call.is_finished())
+                    .is_some_and(PendingCall::running)
             })
     }
 
@@ -1752,6 +1825,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (stuck, a, clock) = two_ranges_one_stuck(dir.path()).await;
         assert_eq!(a.refresh().await.claimed.len(), 2);
+        // The two ranges claim at the same time, so either one can get epoch 1.
+        let live = a.epoch_for(15).expect("10-19 is held");
         stuck.stuck.lock().unwrap().push(range(0, 9));
 
         // Three cycles: more than one local lease.
@@ -1765,7 +1840,7 @@ mod tests {
         }
         assert_eq!(report.failed.len(), 1);
         assert_eq!(report.failed[0].0, range(0, 9));
-        assert_eq!(a.epoch_for(15), Some(token(2)), "the live range serves");
+        assert_eq!(a.epoch_for(15), Some(live), "the live range serves");
         assert_eq!(a.epoch_for(3), None, "the stuck range lapsed");
         assert!(a.unsettled(), "a timed out call may still land");
 
@@ -1830,14 +1905,14 @@ mod tests {
             )]
         );
 
-        // The store answers; the next refresh claims the range.
+        // The store answers late; the next refresh renews the kept claim.
         stuck.stuck.lock().unwrap().clear();
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(!a.unsettled(), "no call runs now");
         let report = a.refresh().await;
         assert!(report.failed.is_empty());
-        assert_eq!(report.claimed.len(), 1);
-        assert_eq!(report.renewed, vec![range(10, 19)]);
+        assert!(report.claimed.is_empty());
+        assert_eq!(report.renewed, vec![range(0, 9), range(10, 19)]);
         // 0-9 was claimed after 10-19, but the details keep config order.
         let health = a.indicator().check().await;
         assert_eq!(health.details["held"][0]["range"], "0-9");
@@ -1861,6 +1936,105 @@ mod tests {
         // One call for the stuck range, three for the live one.
         let after = stuck.calls.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(after - before, 4);
+    }
+
+    /// A claim that ends after its time limit.
+    async fn late_claim(
+        dir: &std::path::Path,
+    ) -> (Arc<StuckRanges>, Arc<FleetOwnership>, SlotRange) {
+        let (stuck, a, _clock) = two_ranges_one_stuck(dir).await;
+        let late = range(0, 9);
+        stuck.stuck.lock().unwrap().push(late);
+        let report = a.refresh().await;
+        assert!(report.failed.iter().any(|(r, _)| *r == late));
+        stuck.stuck.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        (stuck, a, late)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_that_ends_late_is_released_at_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, late) = late_claim(dir.path()).await;
+        assert!(!a.unsettled(), "the call ended");
+        let b = FleetOwnership::new(stuck.clone(), owner("b"), vec![late], TTL).unwrap();
+        assert_eq!(b.refresh().await.waiting, vec![late], "the store holds it");
+        a.release_all().await;
+        assert!(a.held().is_empty());
+        assert_eq!(b.refresh().await.claimed.len(), 1, "claimable at once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_claim_below_the_fence_floor_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, late) = late_claim(dir.path()).await;
+        // A replicator saw a newer epoch for this range.
+        a.lose(3, token(9));
+        a.release_all().await;
+        assert!(a.held().iter().all(|(r, _)| *r != late), "not kept");
+        // Nothing released it, so the store lease stays until its end.
+        let b = FleetOwnership::new(stuck.clone(), owner("b"), vec![late], TTL).unwrap();
+        assert_eq!(b.refresh().await.waiting, vec![late]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_claim_that_fails_keeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, _clock) = two_ranges_one_stuck(dir.path()).await;
+        let late = range(0, 9);
+        stuck.stuck.lock().unwrap().push(late);
+        a.refresh().await;
+        // Another host takes the range while the claim of `a` hangs.
+        stuck.inner.claim(late, &owner("b"), TTL, 0).await.unwrap();
+        stuck.stuck.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let report = a.refresh().await;
+        assert_eq!(report.waiting, vec![late]);
+        assert!(a.held().iter().all(|(r, _)| *r != late), "nothing kept");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_claim_that_ends_late_is_renewed_not_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_stuck, a, late) = late_claim(dir.path()).await;
+        let report = a.refresh().await;
+        assert!(report.renewed.contains(&late), "the grant was kept");
+        assert!(report.claimed.is_empty());
+        assert!(a.epoch_for(3).is_some(), "the renew made it valid");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_late_grant_is_not_served_before_a_renew() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, late) = late_claim(dir.path()).await;
+        // The renew hangs. The grant was settled inside the old lease.
+        stuck.stuck.lock().unwrap().push(late);
+        let running = Arc::clone(&a);
+        let refresh = tokio::spawn(async move { running.refresh().await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(a.epoch_for(3), None, "not served before a renew");
+        assert!(
+            a.held().iter().any(|(r, _)| *r == late),
+            "but the grant is known"
+        );
+        refresh.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_renew_that_ends_late_keeps_its_old_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        let (stuck, a, _clock) = two_ranges_one_stuck(dir.path()).await;
+        a.refresh().await;
+        let before = a.held();
+        stuck.stuck.lock().unwrap().push(range(0, 9));
+        let report = a.refresh().await;
+        assert_eq!(report.failed.len(), 1);
+        stuck.stuck.lock().unwrap().clear();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!a.unsettled(), "the call ended");
+        assert_eq!(a.held(), before, "a late renew changes nothing here");
+        let report = a.refresh().await;
+        assert_eq!(report.renewed.len(), 2);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2075,13 +2249,20 @@ mod tests {
         let shared = Arc::new(store(dir.path(), &clock).await);
         let a =
             FleetOwnership::new(shared, owner("a"), vec![range(0, 9), range(10, 19)], TTL).unwrap();
-        assert_eq!(a.refresh().await.claimed.len(), 2);
+        let claimed = a.refresh().await.claimed;
+        assert_eq!(claimed.len(), 2);
+        // The two claims run at the same time, so either can get epoch 1.
+        let held = claimed
+            .iter()
+            .find(|(claimed, _)| *claimed == range(10, 19))
+            .map(|(_, epoch)| *epoch);
+        assert!(held.is_some());
         assert!(a.lose(3, token(9)));
         let report = a.refresh().await;
         assert_eq!(report.renewed, vec![range(10, 19)]);
         assert!(report.lost.is_empty());
         assert_eq!(report.claimed, vec![(range(0, 9), token(10))]);
-        assert_eq!(a.epoch_for(15), Some(token(2)));
+        assert_eq!(a.epoch_for(15), held, "the other range keeps its epoch");
     }
 
     #[tokio::test]
@@ -2140,7 +2321,19 @@ mod tests {
             store_clock: &crate::time::TickingClock,
             ranges: Vec<SlotRange>,
         ) -> Host {
-            let (fleet, replication, clock) = plain(dir, volume);
+            host_with(dir, volume, name, store_clock, ranges, true).await
+        }
+
+        /// As `host_on`, with `restore_missing` as given.
+        async fn host_with(
+            dir: &std::path::Path,
+            volume: &str,
+            name: &str,
+            store_clock: &crate::time::TickingClock,
+            ranges: Vec<SlotRange>,
+            restore_missing: bool,
+        ) -> Host {
+            let (fleet, replication, clock) = plain_with(dir, volume, restore_missing);
             let store = Arc::new(store(dir, store_clock).await);
             let ownership = Arc::new(FleetOwnership::new(store, owner(name), ranges, TTL).unwrap());
             fleet.start_ownership(Arc::clone(&ownership)).await.unwrap();
@@ -2161,6 +2354,19 @@ mod tests {
             Arc<FleetReplication>,
             crate::time::TickingClock,
         ) {
+            plain_with(dir, volume, true)
+        }
+
+        /// As `plain`, with `restore_missing` as given.
+        fn plain_with(
+            dir: &std::path::Path,
+            volume: &str,
+            restore_missing: bool,
+        ) -> (
+            DatabaseFleet,
+            Arc<FleetReplication>,
+            crate::time::TickingClock,
+        ) {
             let fleet = DatabaseFleet::builder(DatabaseFleetConfig {
                 mode: FleetMode::Tenant,
                 root: dir.join(volume).display().to_string(),
@@ -2169,8 +2375,12 @@ mod tests {
                 pool_size: 2,
                 create_on_demand: Some(true),
                 idle_close_secs: 0,
-                restore_missing: true,
+                restore_missing,
                 ownership: None,
+                replica_retention_after_delete: std::time::Duration::ZERO,
+                restore_check_sample: 0,
+                replication_workers: 4,
+                min_residency: std::time::Duration::from_secs(2),
             })
             .build()
             .unwrap();
@@ -2189,7 +2399,7 @@ mod tests {
                     verify_interval: None,
                 },
                 Duration::from_secs(30),
-                true,
+                restore_missing,
                 Arc::new(clock.clone()),
             ));
             assert!(fleet.install_replication(Arc::clone(&replication)).is_ok());
@@ -2612,6 +2822,140 @@ mod tests {
             // Under the same epoch, its own file is current.
             let db_a = a.fleet.open(&key).await.unwrap();
             assert_eq!(bodies(&db_a).await, vec!["a1", "b1", "a3"]);
+            drop(db_a);
+            a.fleet.close_all().await;
+        }
+
+        /// Replication is asynchronous. A takeover loses the writes that the
+        /// old owner did not ship. The new owner opened the database during
+        /// the pause, so a fail-back does not recover them, though they are
+        /// on the old owner's volume.
+        #[tokio::test]
+        async fn a_takeover_and_a_fail_back_lose_the_unshipped_writes() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            exec(&db_a, "INSERT INTO notes VALUES ('shipped')")
+                .await
+                .unwrap();
+            tick(&a.replication).await;
+            // Acknowledged. A freezes before the next pass ships it.
+            exec(&db_a, "INSERT INTO notes VALUES ('not shipped')")
+                .await
+                .unwrap();
+            drop(db_a);
+
+            // The lease ends. B takes over from the replica, without the tail.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+            let db_b = b.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_b).await, vec!["shipped"]);
+            exec(&db_b, "INSERT INTO notes VALUES ('b1')")
+                .await
+                .unwrap();
+            tick(&b.replication).await;
+            drop(db_b);
+
+            // A thaws, finds the range lost and closes its database.
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            assert_eq!(a.fleet.fence_unowned(), 1);
+            a.fleet.close(&key).await;
+            b.fleet.close_all().await;
+            assert!(b.fleet.release_ownership().await);
+
+            // A gets the range back. The replica replaces its file, so the
+            // unshipped write on A's own volume is gone.
+            assert_eq!(
+                a.ownership.refresh().await.claimed,
+                vec![(SlotRange::ALL, token(3))]
+            );
+            let db_a = a.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_a).await, vec!["shipped", "b1"]);
+            drop(db_a);
+            a.fleet.close_all().await;
+        }
+
+        /// A paused host ships its unshipped writes when it continues. If the
+        /// new owner did not open the database meanwhile, they are not lost.
+        #[tokio::test]
+        async fn a_paused_host_ships_the_tail_of_a_database_the_new_owner_did_not_open() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host(dir.path(), "a", &clock, vec![SlotRange::ALL]).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            exec(&db_a, "INSERT INTO notes VALUES ('shipped')")
+                .await
+                .unwrap();
+            tick(&a.replication).await;
+            // Acknowledged. A pauses before the next pass ships it.
+            exec(&db_a, "INSERT INTO notes VALUES ('not shipped')")
+                .await
+                .unwrap();
+            drop(db_a);
+
+            // B claims the range but does not open the database yet.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+
+            // A continues, finds the range lost and closes the database. The
+            // close ships the tail.
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            assert_eq!(a.fleet.fence_unowned(), 1);
+            a.fleet.close(&key).await;
+
+            let db_b = b.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_b).await, vec!["shipped", "not shipped"]);
+            drop(db_b);
+            b.fleet.close_all().await;
+        }
+
+        /// `restore_missing` is for a missing file only. A fail-back restores
+        /// a stale file without it.
+        #[tokio::test]
+        async fn a_fail_back_restores_a_stale_file_without_restore_missing() {
+            let dir = tempfile::tempdir().unwrap();
+            let clock = clock_at(1_000_000);
+            let a = host_with(dir.path(), "a", "a", &clock, vec![SlotRange::ALL], false).await;
+            let key = acme(&a.fleet);
+            let db_a = a.fleet.open(&key).await.unwrap();
+            exec(&db_a, "CREATE TABLE notes (body TEXT NOT NULL)")
+                .await
+                .unwrap();
+            exec(&db_a, "INSERT INTO notes VALUES ('a1')")
+                .await
+                .unwrap();
+            tick(&a.replication).await;
+            drop(db_a);
+            a.fleet.close(&key).await;
+
+            // B, on an empty volume, needs `restore_missing` to take over.
+            clock.advance(TTL);
+            let b = host(dir.path(), "b", &clock, vec![SlotRange::ALL]).await;
+            assert_eq!(a.ownership.refresh().await.lost, vec![SlotRange::ALL]);
+            let db_b = b.fleet.open(&key).await.unwrap();
+            exec(&db_b, "INSERT INTO notes VALUES ('b1')")
+                .await
+                .unwrap();
+            tick(&b.replication).await;
+            drop(db_b);
+            b.fleet.close_all().await;
+            assert!(b.fleet.release_ownership().await);
+
+            assert_eq!(
+                a.ownership.refresh().await.claimed,
+                vec![(SlotRange::ALL, token(3))]
+            );
+            let db_a = a.fleet.open(&key).await.unwrap();
+            assert_eq!(bodies(&db_a).await, vec!["a1", "b1"]);
             drop(db_a);
             a.fleet.close_all().await;
         }

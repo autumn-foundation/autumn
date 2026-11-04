@@ -620,6 +620,30 @@ where
     })
 }
 
+/// Like [`spawn_blocking`], with the ambient clock, but `f` does not wait for
+/// a turn of the sim gate.
+///
+/// Use it only for blocking work that touches no sim state and must run while
+/// the sim runtime thread cannot park, for example a `SQLite` connection setup
+/// for a startup hook that the runtime thread waits for. Gated work then waits
+/// for the 2 s give-up and makes the run not sure to replay.
+#[cfg(feature = "sqlite")]
+pub(crate) fn spawn_blocking_ungated<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let carried = ambient_entry();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "the sanctioned ungated spawn_blocking: it carries the ambient clock"
+    )]
+    tokio::task::spawn_blocking(move || {
+        let _guard = carried.map(|(clock, floor, start)| install_ambient_at(clock, floor, start));
+        f()
+    })
+}
+
 thread_local! {
     /// The latest instant an ambient clock gave out on this thread, as an
     /// offset after `MONOTONIC_ORIGIN`.
@@ -824,7 +848,7 @@ mod tests {
         let clock = TickingClock::starting_at(start);
         let clone = clock.clone();
 
-        clock.advance(std::time::Duration::from_secs(86400));
+        clock.advance(std::time::Duration::from_hours(24));
         assert_eq!(clone.now(), start + chrono::Duration::days(1));
     }
 
@@ -1079,6 +1103,32 @@ mod tests {
             offenders.is_empty(),
             "use crate::time::spawn_blocking instead of tokio::task::spawn_blocking in {offenders:?}"
         );
+    }
+
+    /// The ungated helper carries the clock as the gated one does, and it
+    /// runs while a sim is alive and the runtime thread cannot park.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sim_spawn_blocking_ungated_carries_the_clock_and_skips_the_gate() {
+        let rt = crate::sim::gate::runtime().unwrap();
+        let seat = crate::sim::gate::SimSeat::default();
+        seat.take();
+        let before = crate::sim::gate::give_ups();
+        rt.block_on(async {
+            let epoch = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap();
+            let clock = TickingClock::starting_at(epoch);
+            let _guard = install_ambient(Arc::new(clock.clone()));
+            let here = ambient_now();
+            let handle = spawn_blocking_ungated(ambient_now);
+            // Block the runtime thread, so it cannot park, until the work ends.
+            while !handle.is_finished() {
+                std::thread::yield_now();
+            }
+            assert_eq!(handle.await.unwrap(), here, "the clock is carried");
+        });
+        let after = crate::sim::gate::give_ups();
+        seat.leave();
+        assert_eq!(after, before, "the work did not wait for the gate");
     }
 
     #[tokio::test]

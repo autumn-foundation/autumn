@@ -1,7 +1,7 @@
 # Docs Smoke Procedure
 
 This docs-smoke procedure certifies the public first-run path for the published
-Autumn 0.9.x line. It must use Rust 1.88.0+ and the published `autumn-cli` and
+Autumn 0.9.x line. It must use Rust 1.97.0+ and the published `autumn-cli` and
 `autumn-web` crates unless the release is explicitly in a pre-publish rehearsal.
 
 Run it in a clean temporary directory, not inside the Autumn checkout:

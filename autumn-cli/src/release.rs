@@ -748,10 +748,7 @@ fn render_for_cli(
         .replace("{{app_role_env}}", web_role_env)
         .replace("{{k8s_name}}", &k8s_name(project_name))
         .replace("{{project_name}}", project_name)
-        .replace(
-            "{{rust_version}}",
-            option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0"),
-        )
+        .replace("{{rust_version}}", crate::MSRV)
         .replace("{{autumn_cli_version}}", cli_version)
         .replace("{{diesel_cli_version}}", "2.3.8")
         .replace("{{build_step}}", build_step)
@@ -981,7 +978,7 @@ mod tests {
         let dir = make_project(&tmp, "my-app");
         init(&dir, "my-app", false, Target::Default, false).unwrap();
         let content = fs::read_to_string(dir.join("Dockerfile")).unwrap();
-        let msrv = option_env!("CARGO_PKG_RUST_VERSION").unwrap_or("1.88.0");
+        let msrv = crate::MSRV;
 
         assert!(
             content.contains(&format!("FROM rust:{msrv}-bookworm AS chef")),

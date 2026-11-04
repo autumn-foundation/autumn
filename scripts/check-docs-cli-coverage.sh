@@ -6,7 +6,7 @@
 # runs in the same direction — docs -> code. `check-docs-cli.sh` asks whether
 # the commands the pages name still exist, `check-docs-symbols.sh` whether the
 # `autumn_web::…` paths still resolve, `check-docs-config.sh` whether the
-# `AUTUMN_*` variables are still read, `check-docs-links.sh` whether the links
+# `AUTUMN_*` variables are still read, `xtask/src/docs/links.rs` whether the links
 # still land. All twelve ask "is what we wrote still true?", which is DRIFT.
 # None asks "is what we shipped written down anywhere?", which is COVERAGE.
 #

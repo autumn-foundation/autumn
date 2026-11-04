@@ -1,0 +1,15 @@
+# Bolt profile: autumn-web/query_decode
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 2,746
+blocks allocated: 57
+peak live bytes (whole run): 2,180
+
+         bytes      blocks  site
+
+         2,110          20  autumn_web::query_string::insert
+           256           2  autumn_web::query_string::parse_key
+           231          25  autumn_web::query_string::build_tree
+            83           4  <autumn_web::query_string::NodeDeserializer as serde_core::de::Deserializer>::deserialize_seq
+            66           6  <autumn_web::query_string::NodeMap as serde_core::de::MapAccess>::next_value

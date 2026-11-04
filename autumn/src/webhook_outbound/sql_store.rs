@@ -299,16 +299,22 @@ impl SqlOutboundWebhookStore {
             .map_err(|error| db_error("schema", &error))
     }
 
-    /// Delete delivery logs older than `cutoff`, except DLQ logs. Returns the
-    /// number of deleted rows. Nothing calls it for you: the table grows
-    /// until you call it.
+    /// Delete delivered (2xx) logs older than `cutoff`. Returns the number of
+    /// deleted rows. Nothing calls it for you: the table grows until you call
+    /// it.
+    ///
+    /// It keeps every other log. A pending or retrying delivery job reads its
+    /// log, so a queue backlog older than `cutoff` must not lose it. DLQ logs
+    /// stay for replay. Logs of deliveries skipped for a disabled or failed
+    /// subscription also stay: delete them yourself if you need to.
     ///
     /// # Errors
     ///
     /// Returns an error when the delete fails.
     pub async fn purge_deliveries_before(&self, cutoff: DateTime<Utc>) -> AutumnResult<usize> {
         diesel::sql_query(sql(
-            "DELETE FROM autumn_webhook_deliveries WHERE logged_at < $1 AND NOT is_dlq",
+            "DELETE FROM autumn_webhook_deliveries WHERE logged_at < $1 AND NOT is_dlq \
+             AND response_status BETWEEN 200 AND 299",
         ))
         .bind::<BigInt, _>(cutoff.timestamp_millis())
         .execute(&mut self.conn().await?)

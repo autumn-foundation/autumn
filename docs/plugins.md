@@ -591,20 +591,24 @@ framework (see [The framework-side gate](#the-framework-side-gate)).
 | `AppBuilder::plugin_migrations` | stable | Contribute embedded database migrations tagged with the plugin's own name. Needs `reexports::diesel_migrations` in scope, because `embed_migrations!` expands to unqualified paths (requires the `db` feature). |
 | `AppBuilder::plugins` | stable | Mount a tuple of up to eight plugins in declaration order. |
 | `AppBuilder::routes` | stable | Register typed routes from `routes![]`. Plugin routes registered this way are attributed automatically. |
+| `AppBuilder::widget_pack` | stable | Install a `WidgetPack`: serve its `PluginAssets` bundle and add its stories and asset links to the story gallery (requires the `maud` feature). |
 | `AppBuilder::with_config_loader` | stable | Replace the tier-1 configuration loader (e.g. a secrets-manager backend). |
 | `AppBuilder::with_edge_kv` | experimental | Edge-capsule KV binding (requires the `edge` feature). The whole edge lane (issue #1790) may change in any release; the capsule wire protocol carries its own version field. |
 | `AppBuilder::with_extension` | stable | Publish a typed value into application state for handlers to extract. |
 | `AppBuilder::with_pool_provider` | stable | Replace the tier-1 database pool provider (requires the `db` feature). |
 | `AppBuilder::with_session_store` | stable | Replace the tier-1 session store. |
+| `AppBuilder::with_story_gallery` | stable | Add stories to the `/_stories` gallery. Each call adds; a plugin starts from `StoryGallery::new` (requires the `maud` feature). |
 | `AppBuilder::with_telemetry_provider` | stable | Replace the tier-1 telemetry provider. |
 | `Plugin::build` | stable | The one required method: apply the plugin's wiring to the builder. Runs exactly once per app. |
 | `Plugin::contract` | stable | Declare the `autumn-web` range this plugin supports and any experimental surface it uses. |
 | `Plugin::name` | stable | Stable identifier used for duplicate-registration detection and route attribution. |
 | `autumn_edge::host` | experimental | Reference edge-capsule host API. Experimental alongside the rest of the edge lane (issue #1790). |
 | `db::Pool` | stable | The pool type `DatabasePoolProvider::create_pool` returns, re-exported so a plugin need not depend on `diesel-async` itself (requires the `db` feature). |
-| `plugin_conformance` | stable | The library-level conformance harness plugin authors run in their own test suite. |
+| `form::FieldRenderer` | stable | Bind a plugin form control to `Changeset<T>` (`custom_input_with`) and `form_for` (`FieldControl::custom`), with `FieldContext` and `CustomControl` (requires the `maud` feature). |
+| `plugin_conformance` | stable | The library-level conformance harness plugin authors run in their own test suite. `plugin_conformance::widgets` checks a widget pack. |
 | `plugin_contract` | stable | This module: `PluginContract`, `PLUGIN_SURFACES`, `SurfaceTier`, `evaluate`, `lockstep_range`, and the `PLUGIN_CONTRACT_MARKER` dump protocol. |
 | `route_listing::RouteInfo` | stable | The route manifest type the conformance harness and `autumn routes --format json` share. |
+| `widget_pack` | stable | The widget contract and `WidgetPack`: render, passthrough, tokens, `autumn-<pack>-*` classes, keyboard core, CSP, stories (requires the `maud` feature). |
 
 ### Declaring what your plugin supports
 
@@ -750,6 +754,16 @@ declared surface that does not update
 
 ---
 
+## Widget packs
+
+A plugin can put widgets in a widget pack. A pack has stories, CSS that
+uses only tokens, JS that uses the keyboard core, and form controls. Install
+a pack with `AppBuilder::widget_pack`. Check it with
+`plugin_conformance::widgets`.
+See [Widget Packs](guide/widget-packs.md).
+
+---
+
 ## Plugin conformance and publishing checklist
 
 Before publishing a plugin crate to crates.io, run the Autumn conformance
@@ -833,6 +847,19 @@ mod conformance_tests {
     }
 }
 ```
+
+A plugin that mounts no routes (a cache, a background runtime) calls
+`ConformanceConfig::new(..).contract(..).no_routes()`. It is the library
+counterpart of `autumn plugin-check --no-routes`. No route under a name of the
+plugin skips `route-attribution`, and such a route fails it. The names are the
+config's plugin name and the contract's `plugin` and `registered_as`. Routes
+carry `Plugin::name()`, which defaults to the type path, and only
+`AppBuilder::plugin` fills `registered_as`. So pass the contract from
+`builder.plugin_contracts()`. With no `registered_as`, every plugin route
+fails the check.
+Unlike the CLI, the library check does not need a contract to skip. Do not set
+a `prefix` with `no_routes`; the two contradict each other, and `route-prefix`
+fails.
 
 ### 3. Publishing checklist
 

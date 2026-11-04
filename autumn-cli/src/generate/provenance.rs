@@ -28,6 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::config::GENERATE_CONFIG_FILENAME;
+use super::spelling;
 
 /// Project-relative location of the generator provenance manifest.
 ///
@@ -374,13 +375,13 @@ impl Provenance {
     ///
     /// False when nothing is recorded — an unproven file is never assumed ours
     /// — and false when a different command recorded it (see [`Entry`]).
+    /// Reads the entry of another spelling when there is no exact entry
+    /// (issue #3382).
     #[must_use]
     pub fn is_ours(&self, root: &Path, path: &Path, digest: &str, invocation: &str) -> bool {
-        key(root, path).is_some_and(|k| {
-            self.entries
-                .get(&k)
-                .is_some_and(|e| e.digest == digest && e.invocation == invocation)
-        })
+        self.owners(root, path)
+            .iter()
+            .any(|e| e.digest == digest && e.invocation == invocation)
     }
 
     /// Whether ANY command wrote exactly `digest` to `path`.
@@ -393,7 +394,7 @@ impl Provenance {
     /// does before it asks.
     #[must_use]
     pub fn was_written(&self, root: &Path, path: &Path, digest: &str) -> bool {
-        key(root, path).is_some_and(|k| self.entries.get(&k).is_some_and(|e| e.digest == digest))
+        self.owners(root, path).iter().any(|e| e.digest == digest)
     }
 
     /// Every entry `invocation` wrote, for the orphan sweep (issue #2557).
@@ -426,7 +427,8 @@ impl Provenance {
         if let Some(k) = key(root, path) {
             // Keyed by path, so the newest writer replaces the previous one:
             // a file has exactly one owner, and the manifest cannot grow an
-            // entry per regeneration.
+            // entry per regeneration. Another spelling of the file goes too.
+            self.forget(root, path);
             self.entries.insert(
                 k,
                 Entry {
@@ -490,11 +492,55 @@ impl Provenance {
         self.runs.remove(&run_id(invocation));
     }
 
-    /// Drop the entry for `path`, if any.
+    /// Drop the entries of [`Self::keys_for`].
+    ///
+    /// Another spelling resolves only while the file exists. After a delete,
+    /// use [`Self::forget_key`] with the keys you read before the delete.
     pub fn forget(&mut self, root: &Path, path: &Path) {
-        if let Some(k) = key(root, path) {
+        for k in self.keys_for(root, path) {
             self.entries.remove(&k);
         }
+    }
+
+    /// Every recorded key for the file at `path` (issue #3382).
+    ///
+    /// The key of `path`, and each key that is another spelling of the same
+    /// directory entry (see [`spelling::one_entry`]). For example, on a
+    /// case-insensitive file system, `foo.rs` finds the entry for `Foo.rs`.
+    /// On a case-sensitive host, only the exact key matches.
+    #[must_use]
+    pub fn keys_for(&self, root: &Path, path: &Path) -> Vec<String> {
+        let Some(own) = key(root, path) else {
+            return Vec::new();
+        };
+        self.entries
+            .keys()
+            .filter(|k| **k == own || is_alias(root, k, &own, path))
+            .cloned()
+            .collect()
+    }
+
+    /// The entries that tell who wrote `path`.
+    ///
+    /// The exact entry, when there is one: the newest writer is recorded
+    /// under it. Otherwise, the entries of [`Self::keys_for`].
+    fn owners(&self, root: &Path, path: &Path) -> Vec<&Entry> {
+        let Some(own) = key(root, path) else {
+            return Vec::new();
+        };
+        if let Some(entry) = self.entries.get(&own) {
+            return vec![entry];
+        }
+        self.entries
+            .iter()
+            .filter(|(k, _)| is_alias(root, k, &own, path))
+            .map(|(_, e)| e)
+            .collect()
+    }
+
+    /// Drop the entry with exactly the key `k`, if any.
+    pub fn forget_key(&mut self, k: &str) {
+        self.entries.remove(k);
     }
 
     /// Drop every entry for a file under `dir` — what removing a whole
@@ -600,6 +646,12 @@ fn refuse_symlink(root: &Path, path: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether the recorded key `k` is another spelling of `own`, the key of
+/// `path` (issue #3382).
+fn is_alias(root: &Path, k: &str, own: &str, path: &Path) -> bool {
+    k.eq_ignore_ascii_case(own) && spelling::one_entry(&root.join(k), path)
 }
 
 /// `path` as a project-relative, forward-slashed manifest key.
@@ -1286,5 +1338,190 @@ mod tests {
 
         assert!(p.save(dir.path()).is_err());
         assert!(!outside.path().join("escaped.toml").exists());
+    }
+
+    /// Write `contents` at `rel` and record it for [`OWNER`].
+    fn written(p: &mut Provenance, root: &Path, rel: &str, contents: &str) -> PathBuf {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        p.record(
+            root,
+            &path,
+            text_digest(contents),
+            OWNER,
+            Some(Scope::Owned),
+        );
+        path
+    }
+
+    #[test]
+    fn a_case_only_alias_is_ours_only_when_it_is_one_entry() {
+        // Issue #3382: a template renamed `Foo.rs` to `foo.rs`.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        let one_entry = new.exists();
+        let digest = text_digest("// v1\n");
+
+        assert_eq!(p.is_ours(root, &new, &digest, OWNER), one_entry);
+        assert_eq!(p.was_written(root, &new, &digest), one_entry);
+        assert!(!p.is_ours(root, &new, &digest, "other"), "another command");
+        let aliases: Vec<String> = if one_entry {
+            vec!["src/Foo.rs".to_owned()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(p.keys_for(root, &new), aliases);
+        assert_eq!(p.keys_for(root, &old), vec!["src/Foo.rs".to_owned()]);
+    }
+
+    #[test]
+    fn a_second_file_with_a_case_only_name_is_not_an_alias() {
+        // A case-sensitive host holds two files. Each keeps its own entry.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if new.exists() {
+            return; // case-insensitive: one entry, not two.
+        }
+        std::fs::write(&new, "// v1\n").unwrap();
+        let digest = text_digest("// v1\n");
+
+        assert!(!p.is_ours(root, &new, &digest, OWNER));
+        assert!(!p.was_written(root, &new, &digest));
+        assert!(p.keys_for(root, &new).is_empty());
+        p.forget(root, &new);
+        assert!(p.contains("src/Foo.rs"));
+    }
+
+    #[test]
+    fn a_hard_linked_case_only_name_is_not_an_alias() {
+        // Two hard-linked names are two entries to remove.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if new.exists() || std::fs::hard_link(&old, &new).is_err() {
+            return; // case-insensitive, or no hard links: nothing to test.
+        }
+
+        assert!(!p.is_ours(root, &new, &text_digest("// v1\n"), OWNER));
+        assert!(p.keys_for(root, &new).is_empty());
+    }
+
+    #[test]
+    fn forget_drops_a_case_only_alias_while_the_file_exists() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if !new.exists() {
+            return; // case-sensitive: `foo.rs` is no alias.
+        }
+
+        p.forget(root, &new);
+
+        assert!(!p.contains("src/Foo.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_case_only_name_is_not_an_alias() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if new.exists() {
+            return; // case-insensitive: one name, no room for a link.
+        }
+        std::os::unix::fs::symlink(&old, &new).unwrap();
+
+        assert!(!p.is_ours(root, &new, &text_digest("// v1\n"), OWNER));
+        assert!(p.keys_for(root, &new).is_empty());
+    }
+
+    #[test]
+    fn the_exact_entry_decides_when_both_spellings_are_recorded() {
+        // An older manifest can hold `Foo.rs` and `foo.rs` for one file. The
+        // newest writer is under the exact key, so only it owns the file.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        if !new.exists() {
+            return; // case-sensitive: two files, see the tests above.
+        }
+        p.entries.insert(
+            "src/foo.rs".to_owned(),
+            Entry {
+                digest: text_digest("// v1\n"),
+                invocation: "newer".to_owned(),
+                scope: None,
+            },
+        );
+        let digest = text_digest("// v1\n");
+
+        assert!(p.is_ours(root, &new, &digest, "newer"));
+        assert!(!p.is_ours(root, &new, &digest, OWNER), "a stale alias");
+        let mut keys = p.keys_for(root, &new);
+        keys.sort();
+        assert_eq!(keys, vec!["src/Foo.rs".to_owned(), "src/foo.rs".to_owned()]);
+    }
+
+    #[test]
+    fn record_replaces_the_entry_of_another_spelling() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        let one_entry = new.exists();
+        if !one_entry {
+            std::fs::write(&new, "// v2\n").unwrap(); // a second file.
+        }
+
+        p.record(root, &new, text_digest("// v2\n"), OWNER, None);
+
+        assert!(p.contains("src/foo.rs"));
+        assert_eq!(p.contains("src/Foo.rs"), !one_entry);
+    }
+
+    #[test]
+    fn forget_after_the_delete_finds_only_the_exact_key() {
+        // Why `destroy` reads the keys before it deletes a file.
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        let old = written(&mut p, root, "src/Foo.rs", "// v1\n");
+        let new = root.join("src/foo.rs");
+        std::fs::remove_file(&old).unwrap();
+
+        p.forget(root, &new);
+        assert!(p.contains("src/Foo.rs"));
+        p.forget_key("src/Foo.rs");
+        assert!(!p.contains("src/Foo.rs"));
+    }
+
+    #[test]
+    fn forget_key_drops_only_that_key() {
+        let dir = tmp();
+        let root = dir.path();
+        let mut p = Provenance::default();
+        written(&mut p, root, "src/a.rs", "a");
+        written(&mut p, root, "src/b.rs", "b");
+
+        p.forget_key("src/a.rs");
+
+        assert!(!p.contains("src/a.rs"));
+        assert!(p.contains("src/b.rs"));
     }
 }

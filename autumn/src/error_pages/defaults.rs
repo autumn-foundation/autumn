@@ -169,17 +169,11 @@ fn error_page_layout(ctx: &ErrorContext, content: &Markup) -> Markup {
 /// Tailwind CSS loaded. Provides the essential layout and dark mode styling.
 ///
 /// Built at compile time by concatenating the shared [`crate::ui::tokens::TOKENS_CSS`]
-/// block with a small set of layout rules. Values that change in dark mode
-/// (`--bg`, `--text`) are overridden inside a `prefers-color-scheme: dark`
-/// block — other tokens are inherited.
+/// block with a small set of layout rules. The tokens carry the dark scheme.
 const FALLBACK_STYLES: &str = concat!(
     "<style>",
-    ":root { color-scheme: light dark; }",
     include_str!("../ui/tokens.css"),
     "
-@media (prefers-color-scheme: dark) {
-    :root { --bg: #0a0a0a; --text: #eee; --surface: #1a1a1a; --border: #2a2a2a; --text-muted: #888; }
-}
 body {
     font-family: var(--font-family);
     margin: 0;
@@ -224,6 +218,17 @@ mod tests {
             details: None,
             is_dev: false,
         }
+    }
+
+    /// Issue #3396: the core tokens carry the dark scheme. The error page
+    /// must not keep a second, partial dark palette.
+    #[test]
+    fn fallback_styles_use_the_core_dark_tokens() {
+        assert!(FALLBACK_STYLES.contains(crate::ui::tokens::TOKENS_CSS));
+        assert!(
+            !FALLBACK_STYLES.contains("prefers-color-scheme"),
+            "{FALLBACK_STYLES}"
+        );
     }
 
     #[test]

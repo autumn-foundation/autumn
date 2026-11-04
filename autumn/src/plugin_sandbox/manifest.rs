@@ -1093,7 +1093,7 @@ impl SandboxManifest {
         // `self.capabilities.len()` performed — on a list a direct caller chose — exactly
         // the unbounded allocation this check exists to refuse.
         //
-        // Pigeonhole bounds the scan: a list longer than the number of distinct
+        // The pigeonhole principle bounds the scan: a list longer than the number of distinct
         // capabilities must repeat one, so a duplicate is certain within the first
         // `ALL.len() + 1` entries and looking past them cannot change the answer. Derived
         // from `ALL` rather than written as a number, so it stays right as the vocabulary
@@ -1104,7 +1104,7 @@ impl SandboxManifest {
         // embedder filled in by hand, where no byte ceiling applies — and this
         // type is no longer the ZST it was when it had one variant, so a
         // capacity taken from it is an allocation an untrusted number sizes.
-        // Pigeonhole is what makes the smaller capacity sufficient rather than
+        // The pigeonhole principle makes the smaller capacity sufficient, not
         // merely cheaper: a list longer than the number of distinct
         // capabilities must repeat one, so the loop below returns before it
         // could ever push entry `ALL.len() + 1`.

@@ -162,6 +162,119 @@ pub struct ErrorPageContextService<S> {
     is_dev: bool,
 }
 
+/// The request data that an error page needs. The layer takes it before the
+/// request moves into the inner service, and adds it to an error response
+/// only.
+struct PendingContext {
+    wants_html: bool,
+    uri: axum::http::Uri,
+    request_id: Option<crate::middleware::RequestId>,
+    headers: axum::http::HeaderMap,
+    method: axum::http::Method,
+    content_type: Option<String>,
+    body_bytes: Option<bytes::Bytes>,
+    body_truncated: bool,
+}
+
+impl PendingContext {
+    /// Add the context to `response` if it is an error response.
+    ///
+    /// `WantsHtml` and `ErrorPageRequestContext` are read only by the
+    /// exception-filter chain, which `ExceptionFilterService` (the layer
+    /// directly outside this one) runs only for a response carrying
+    /// `AutumnErrorInfo`. Any other response would carry both unread, so a
+    /// success response skips building them, and the context text (request
+    /// id, query, method, cookies) is rendered for errors only.
+    fn add_to(self, response: &mut Response) {
+        if response
+            .extensions()
+            .get::<crate::middleware::AutumnErrorInfo>()
+            .is_none()
+        {
+            return;
+        }
+
+        response.extensions_mut().insert(WantsHtml(self.wants_html));
+        let request_id = self
+            .request_id
+            .as_ref()
+            .map(std::string::ToString::to_string)
+            .or_else(|| {
+                response
+                    .headers()
+                    .get("x-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned)
+            });
+        let uri = self.uri;
+        let query = uri.query().map(str::to_owned);
+        let method = Some(self.method.to_string());
+        let matched_path = response
+            .extensions()
+            .get::<crate::middleware::dev::DevMatchedPath>()
+            .map(|m| m.0.clone());
+        let path_params = matched_path
+            .as_deref()
+            .map(|pattern| extract_path_params(pattern, uri.path()));
+        let cookies = self
+            .headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .map(parse_cookie_header);
+        let headers = Some(self.headers);
+        let sql_queries = response
+            .extensions()
+            .get::<crate::inspector::RequestQueryList>()
+            .map(crate::inspector::RequestQueryList::snapshot)
+            .unwrap_or_default();
+        response.extensions_mut().insert(ErrorPageRequestContext {
+            uri,
+            request_id,
+            query,
+            headers,
+            method,
+            matched_path,
+            cookies,
+            path_params,
+            sql_queries,
+            body_bytes: self.body_bytes,
+            content_type: self.content_type,
+            body_truncated: self.body_truncated,
+        });
+    }
+}
+
+pin_project_lite::pin_project! {
+    /// Future of [`ErrorPageContextService`] when it does not read the body.
+    ///
+    /// It holds the inner future inline: no box and no clone (issue #2830).
+    pub struct ErrorPageContextFuture<F> {
+        #[pin]
+        inner: F,
+        // Private: `PendingContext` is not a public type.
+        context: Option<PendingContext>,
+    }
+}
+
+impl<F, E> std::future::Future for ErrorPageContextFuture<F>
+where
+    F: std::future::Future<Output = Result<Response, E>>,
+{
+    type Output = Result<Response, E>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.project();
+        let mut response = std::task::ready!(this.inner.poll(cx))?;
+        if let Some(context) = this.context.take() {
+            context.add_to(&mut response);
+        }
+        std::task::Poll::Ready(Ok(response))
+    }
+}
+
 impl<S> tower::Service<axum::http::Request<axum::body::Body>> for ErrorPageContextService<S>
 where
     S: tower::Service<axum::http::Request<axum::body::Body>, Response = Response>
@@ -173,8 +286,11 @@ where
 {
     type Response = Response;
     type Error = S::Error;
-    type Future =
-        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, S::Error>> + Send>>;
+    /// A named future, or a box when dev mode reads the request body first.
+    type Future = futures::future::Either<
+        ErrorPageContextFuture<S::Future>,
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<Response, S::Error>> + Send>>,
+    >;
 
     fn poll_ready(
         &mut self,
@@ -184,129 +300,77 @@ where
     }
 
     fn call(&mut self, req: axum::http::Request<axum::body::Body>) -> Self::Future {
-        let wants_html = accepts_html(&req);
-        let uri = req.uri().clone();
         // Kept as the id itself, and the method as a `Method`: both are
-        // rendered to text only for an error response, below. The headers are
-        // the one input that must be copied now, before the request moves into
+        // rendered to text only for an error response. The headers are the
+        // one input that must be copied now, before the request moves into
         // the inner service; the cookies parsed from them wait as well.
-        let request_id = req
-            .extensions()
-            .get::<crate::middleware::RequestId>()
-            .cloned();
-        let headers = req.headers().clone();
-        let method = req.method().clone();
-        let is_dev = self.is_dev;
-        let captures_body = is_dev && should_capture_body(Some(method.as_str()));
-        let content_type = if captures_body {
-            req.headers()
-                .get(axum::http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned)
-        } else {
-            None
+        let captures_body = self.is_dev && should_capture_body(Some(req.method().as_str()));
+        let context = PendingContext {
+            wants_html: accepts_html(&req),
+            uri: req.uri().clone(),
+            request_id: req
+                .extensions()
+                .get::<crate::middleware::RequestId>()
+                .cloned(),
+            headers: req.headers().clone(),
+            method: req.method().clone(),
+            content_type: if captures_body {
+                req.headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            } else {
+                None
+            },
+            body_bytes: None,
+            body_truncated: false,
         };
 
-        // Use clone-and-replace so we can move inner into the async block while
-        // still having called poll_ready on the original.
+        if !captures_body {
+            return futures::future::Either::Left(ErrorPageContextFuture {
+                inner: self.inner.call(req),
+                context: Some(context),
+            });
+        }
+
+        // Dev mode reads the body before the inner call, so the inner service
+        // must move into the future. Use clone-and-replace so we can move inner
+        // into the async block while still having called poll_ready on the
+        // original.
         let cloned = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, cloned);
 
-        Box::pin(async move {
-            let (req, body_bytes, body_truncated) = if captures_body {
-                // Check Content-Length first to avoid consuming the body when it's
-                // clearly over the cap (preserving the stream for the inner service).
-                let declared_len = req
-                    .headers()
-                    .get(axum::http::header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<usize>().ok());
+        futures::future::Either::Right(Box::pin(async move {
+            let mut context = context;
+            // Check Content-Length first to avoid consuming the body when it's
+            // clearly over the cap (preserving the stream for the inner service).
+            let declared_len = req
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<usize>().ok());
 
-                if declared_len.is_none_or(|len| len > BODY_CAPTURE_LIMIT) {
-                    // Body size is unknown or known to be too large — don't consume
-                    // the stream at all so the downstream handler receives it intact.
-                    (
-                        req,
-                        None,
-                        declared_len.is_some_and(|len| len > BODY_CAPTURE_LIMIT),
-                    )
-                } else {
-                    // Content-Length is present and within cap; read the full body
-                    // so we can reconstruct it exactly for the downstream handler.
-                    let (parts, body) = req.into_parts();
-                    let bytes = axum::body::to_bytes(body, BODY_CAPTURE_LIMIT + 1)
-                        .await
-                        .unwrap_or_default();
-                    let new_body = axum::body::Body::from(bytes.clone());
-                    let req = axum::http::Request::from_parts(parts, new_body);
-                    (req, Some(bytes), false)
-                }
+            let req = if declared_len.is_none_or(|len| len > BODY_CAPTURE_LIMIT) {
+                // Body size is unknown or known to be too large — don't consume
+                // the stream at all so the downstream handler receives it intact.
+                context.body_truncated = declared_len.is_some_and(|len| len > BODY_CAPTURE_LIMIT);
+                req
             } else {
-                (req, None, false)
+                // Content-Length is present and within cap; read the full body
+                // so we can reconstruct it exactly for the downstream handler.
+                let (parts, body) = req.into_parts();
+                let bytes = axum::body::to_bytes(body, BODY_CAPTURE_LIMIT + 1)
+                    .await
+                    .unwrap_or_default();
+                let new_body = axum::body::Body::from(bytes.clone());
+                context.body_bytes = Some(bytes);
+                axum::http::Request::from_parts(parts, new_body)
             };
 
             let mut response = inner.call(req).await?;
-
-            // `WantsHtml` and `ErrorPageRequestContext` are read only by the
-            // exception-filter chain, which `ExceptionFilterService` (the layer
-            // directly outside this one) runs only for a response carrying
-            // `AutumnErrorInfo`. Any other response would carry both unread, so
-            // a success response skips building them, and the context text
-            // (request id, query, method, cookies) is rendered for errors only.
-            if response
-                .extensions()
-                .get::<crate::middleware::AutumnErrorInfo>()
-                .is_none()
-            {
-                return Ok(response);
-            }
-
-            response.extensions_mut().insert(WantsHtml(wants_html));
-            let request_id = request_id
-                .as_ref()
-                .map(std::string::ToString::to_string)
-                .or_else(|| {
-                    response
-                        .headers()
-                        .get("x-request-id")
-                        .and_then(|value| value.to_str().ok())
-                        .map(str::to_owned)
-                });
-            let query = uri.query().map(str::to_owned);
-            let method = Some(method.to_string());
-            let matched_path = response
-                .extensions()
-                .get::<crate::middleware::dev::DevMatchedPath>()
-                .map(|m| m.0.clone());
-            let path_params = matched_path
-                .as_deref()
-                .map(|pattern| extract_path_params(pattern, uri.path()));
-            let cookies = headers
-                .get(axum::http::header::COOKIE)
-                .and_then(|v| v.to_str().ok())
-                .map(parse_cookie_header);
-            let headers = Some(headers);
-            let sql_queries = response
-                .extensions()
-                .get::<crate::inspector::RequestQueryList>()
-                .map(crate::inspector::RequestQueryList::snapshot)
-                .unwrap_or_default();
-            response.extensions_mut().insert(ErrorPageRequestContext {
-                uri,
-                request_id,
-                query,
-                headers,
-                method,
-                matched_path,
-                cookies,
-                path_params,
-                sql_queries,
-                body_bytes,
-                content_type,
-                body_truncated,
-            });
+            context.add_to(&mut response);
             Ok(response)
-        })
+        }))
     }
 }
 

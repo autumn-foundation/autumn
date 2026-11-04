@@ -106,7 +106,8 @@ impl fmt::Display for EdgeHostError {
 impl std::error::Error for EdgeHostError {}
 
 /// Fuel budget for one request's guest execution (roughly one unit per
-/// instruction).
+/// instruction). Host work in `fd_write`, including `kv_get` answers, also
+/// costs fuel.
 ///
 /// Sized for headroom, not precision: rendering a page costs on the order of
 /// millions of instructions, so a billion-unit budget is ~100× slack for any
@@ -130,12 +131,24 @@ pub const MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// Stdout is the wire: complete NDJSON lines are consumed and cleared as they
 /// arrive, so this bounds only a line that never ends — a guest streaming
 /// bytes without `\n` would otherwise grow a host-owned buffer without limit,
-/// unmetered by fuel (host-side copies burn no guest fuel) or the linear-memory
-/// ceiling (which bounds each chunk, not their sum). Sized above any honest
+/// without limit. The linear-memory ceiling bounds each chunk, not their sum.
+/// Fuel bounds the copy and parse work, not this size. Sized above any honest
 /// frame: a response with a 16 MiB body is ~22 MiB base64'd. Exceeding it
 /// fails the guest's `fd_write` with `ENOSPC`, which ends as a
 /// [`FallthroughReason::CapsuleError`].
 pub const STDOUT_LINE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Cap on host-to-guest bytes the guest has not read yet (64 MiB).
+///
+/// Each `kv_get` answer is appended to `stdin`. A guest that asks and never
+/// reads would grow it without limit. The cap equals the stdout cap. A 16 MiB
+/// value is about 22 MiB in base64. An answer that does not fit ends the request
+/// as a [`FallthroughReason::CapsuleError`].
+pub const STDIN_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Bytes that a `kv_value` frame adds around the base64 value. The number is
+/// rounded up.
+const KV_FRAME_OVERHEAD_BYTES: usize = 64;
 
 /// Scratch-buffer size for host-side copies of guest-supplied ranges (64 KiB).
 ///
@@ -146,6 +159,12 @@ pub const STDOUT_LINE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// size instead, and the output budgets apply per chunk, so a runaway write
 /// fails long before its full length is copied.
 const HOST_IO_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Bytes of bulk host copy that cost one fuel unit.
+///
+/// One copy instruction moves many bytes, so the rate is per 64 bytes. The
+/// stdout line parser reads each byte, so it also costs one unit per byte.
+const BYTES_PER_FUEL: u64 = 64;
 
 /// Cap on accumulated guest stderr, in bytes (1 MiB).
 ///
@@ -164,6 +183,8 @@ pub const STDERR_BUDGET_BYTES: usize = 1024 * 1024;
 pub struct EdgeArtifact {
     engine: Engine,
     module: Module,
+    /// Fuel per request. Always [`FUEL_BUDGET`] outside unit tests.
+    fuel_budget: u64,
 }
 
 impl fmt::Debug for EdgeArtifact {
@@ -189,7 +210,11 @@ impl EdgeArtifact {
         let engine = Engine::new(&config);
         let module =
             Module::new(&engine, wasm).map_err(|err| EdgeHostError::Load(err.to_string()))?;
-        Ok(Self { engine, module })
+        Ok(Self {
+            engine,
+            module,
+            fuel_budget: FUEL_BUDGET,
+        })
     }
 
     /// Every import the module declares, as `module::name`.
@@ -235,7 +260,7 @@ impl EdgeArtifact {
         // burn fuel too. Exhaustion at any point traps the guest; the check
         // after `_start` translates it into a deterministic fallthrough.
         store
-            .set_fuel(FUEL_BUDGET)
+            .set_fuel(self.fuel_budget)
             .map_err(|err| EdgeHostError::Host(format!("could not set the fuel budget: {err}")))?;
         store.limiter(|state| &mut state.limits);
         let mut linker = <Linker<HostState<'_>>>::new(&self.engine);
@@ -275,9 +300,10 @@ impl EdgeArtifact {
             return Ok(capsule_error(
                 &state,
                 &format!(
-                    "the capsule exceeded its execution budget of {FUEL_BUDGET} fuel units \
+                    "the capsule exceeded its execution budget of {} fuel units \
                      without answering — a runaway loop falls through to the origin instead \
-                     of hanging the host"
+                     of hanging the host",
+                    self.fuel_budget
                 ),
             ));
         }
@@ -312,6 +338,9 @@ struct HostState<'kv> {
     /// Whether this host offered the `kv` capability for this request.
     kv_provided: bool,
     terminal: Option<EdgeOutcome>,
+    /// Fuel owed for host work done in `on_guest_line`, which has no `Caller`.
+    /// `fd_write` pays it after the write returns.
+    pending_fuel: u64,
     /// Fixed-seed PRNG state, so `random_get` is reproducible.
     random_state: u64,
     /// Resource ceilings ([`MEMORY_BUDGET_BYTES`]) the store's limiter answers
@@ -332,6 +361,7 @@ impl<'kv> HostState<'kv> {
             kv,
             kv_provided,
             terminal: None,
+            pending_fuel: 0,
             random_state: Self::RANDOM_SEED,
             limits: StoreLimitsBuilder::new()
                 .memory_size(MEMORY_BUDGET_BYTES)
@@ -373,8 +403,32 @@ impl<'kv> HostState<'kv> {
                     // than deadlocking it.
                     None
                 };
+                let value_len = value.as_ref().map_or(0, Vec::len);
+                // Check the size before encoding, so a refused answer costs no
+                // large allocation.
+                let answer_len = value_len
+                    .div_ceil(3)
+                    .saturating_mul(4)
+                    .saturating_add(KV_FRAME_OVERHEAD_BYTES);
+                if self.stdin.len().saturating_add(answer_len) > STDIN_BUDGET_BYTES {
+                    self.terminal = Some(EdgeOutcome::fallthrough(
+                        FallthroughReason::CapsuleError,
+                        format!(
+                            "the capsule left too many kv answers unread: \
+                             stdin is capped at {STDIN_BUDGET_BYTES} bytes"
+                        ),
+                    ));
+                    return;
+                }
                 match to_line(&HostFrame::KvValue { value }) {
-                    Ok(line) => self.feed(&line),
+                    Ok(line) => {
+                        // Charge one unit per value byte, plus the copy cost.
+                        self.pending_fuel = self
+                            .pending_fuel
+                            .saturating_add(u64::try_from(value_len).unwrap_or(u64::MAX))
+                            .saturating_add(copy_fuel(line.len()));
+                        self.feed(&line);
+                    }
                     Err(err) => {
                         self.terminal = Some(EdgeOutcome::fallthrough(
                             FallthroughReason::CapsuleError,
@@ -416,6 +470,11 @@ impl<'kv> HostState<'kv> {
         if let Some(kept) = bytes.get(..bytes.len().min(room)) {
             self.stderr.extend_from_slice(kept);
         }
+    }
+
+    /// True when stderr has reached its budget.
+    const fn stderr_is_full(&self) -> bool {
+        self.stderr.len() >= STDERR_BUDGET_BYTES
     }
 
     fn stderr_excerpt(&self) -> String {
@@ -523,28 +582,34 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
              fd: i32,
              iovs: i32,
              iovs_len: i32,
-             nread: i32| {
+             nread: i32|
+             -> Result<i32, wasmi::Error> {
                 if fd != 0 {
-                    return errno::BADF;
+                    return Ok(errno::BADF);
                 }
                 let Some(memory) = memory_of(&caller) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
 
                 let mut total: u32 = 0;
                 for index in 0..iovs_len {
+                    // Per-iovec descriptor work, even for a zero-length iovec.
+                    charge_units(&mut caller, 1)?;
                     let Some((pointer, length)) = iovec(&caller, memory, iovs, index) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
+                    // Charge for the bytes the host copies, not the bytes asked.
+                    let take = length.min(caller.data().stdin.len());
+                    charge_bytes(&mut caller, take)?;
                     let chunk = caller.data_mut().take_stdin(length);
                     if memory.write(&mut caller, pointer, &chunk).is_err() {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     }
                     let Ok(read) = u32::try_from(chunk.len()) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     let Some(sum) = total.checked_add(read) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     total = sum;
                     if chunk.len() < length {
@@ -553,12 +618,12 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                 }
 
                 let Ok(at) = usize::try_from(nread) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
                 if write_u32(&mut caller, memory, at, total).is_none() {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 }
-                errno::SUCCESS
+                Ok(errno::SUCCESS)
             },
         )
         .map_err(host_error)?;
@@ -571,18 +636,21 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
              fd: i32,
              iovs: i32,
              iovs_len: i32,
-             nwritten: i32| {
+             nwritten: i32|
+             -> Result<i32, wasmi::Error> {
                 if fd != 1 && fd != 2 {
-                    return errno::BADF;
+                    return Ok(errno::BADF);
                 }
                 let Some(memory) = memory_of(&caller) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
 
                 let mut total: u32 = 0;
                 for index in 0..iovs_len {
+                    // Per-iovec descriptor work, even for a zero-length iovec.
+                    charge_units(&mut caller, 1)?;
                     let Some((pointer, length)) = iovec(&caller, memory, iovs, index) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     // Bounds-check BEFORE any copy: `length` is guest-chosen,
                     // and a `u32::MAX` iovec must fail with EINVAL. A range
@@ -591,13 +659,13 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                         .checked_add(length)
                         .is_some_and(|end| end <= memory.data_size(&caller));
                     if !in_bounds {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     }
                     let Ok(written) = u32::try_from(length) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     let Some(sum) = total.checked_add(written) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     total = sum;
 
@@ -608,34 +676,54 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                     // before its full length is copied.
                     let mut offset = 0usize;
                     while offset < length {
+                        // Stderr past its budget is discarded. Do not copy it.
+                        if fd == 2 && caller.data().stderr_is_full() {
+                            break;
+                        }
                         let step = HOST_IO_CHUNK_BYTES.min(length.saturating_sub(offset));
+                        // Host work does not use guest fuel. Charge it here (#3323).
+                        charge_bytes(&mut caller, step)?;
+                        if fd == 1 {
+                            charge_units(&mut caller, u64::try_from(step).unwrap_or(u64::MAX))?;
+                        }
                         let mut chunk = vec![0u8; step];
                         let Some(at) = pointer.checked_add(offset) else {
-                            return errno::INVAL;
+                            return Ok(errno::INVAL);
                         };
                         if memory.read(&caller, at, &mut chunk).is_err() {
-                            return errno::INVAL;
+                            return Ok(errno::INVAL);
                         }
                         let state = caller.data_mut();
                         if fd == 2 {
                             state.write_stderr(&chunk);
-                        } else if !state.write_stdout(&chunk) {
-                            // A single stdout line has outgrown any honest
-                            // frame: fail the write so the guest aborts and
-                            // the request falls through.
-                            return errno::NOSPC;
+                        } else {
+                            let accepted = state.write_stdout(&chunk);
+                            // Pay fuel for `kv_get` answers made while parsing (#3502).
+                            let owed = std::mem::take(&mut state.pending_fuel);
+                            if let Err(err) = charge_units(&mut caller, owed) {
+                                // An unpaid budget beats a frame from the same
+                                // chunk. Else the guest gets free work.
+                                caller.data_mut().terminal = None;
+                                return Err(err);
+                            }
+                            if !accepted {
+                                // A single stdout line has outgrown any honest
+                                // frame: fail the write so the guest aborts and
+                                // the request falls through.
+                                return Ok(errno::NOSPC);
+                            }
                         }
                         offset = offset.saturating_add(step);
                     }
                 }
 
                 let Ok(at) = usize::try_from(nwritten) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
                 if write_u32(&mut caller, memory, at, total).is_none() {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 }
-                errno::SUCCESS
+                Ok(errno::SUCCESS)
             },
         )
         .map_err(host_error)?;
@@ -644,13 +732,16 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
         .func_wrap(
             WASI,
             "random_get",
-            |mut caller: Caller<'_, HostState<'_>>, pointer: i32, len: i32| {
+            |mut caller: Caller<'_, HostState<'_>>,
+             pointer: i32,
+             len: i32|
+             -> Result<i32, wasmi::Error> {
                 let Some(memory) = memory_of(&caller) else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
                 let (Ok(pointer), Ok(len)) = (usize::try_from(pointer), usize::try_from(len))
                 else {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 };
                 // Same bounds-before-allocate rule as `fd_write`: the write
                 // below would reject an out-of-range destination, but only
@@ -659,26 +750,28 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
                     .checked_add(len)
                     .is_some_and(|end| end <= memory.data_size(&caller));
                 if !in_bounds {
-                    return errno::INVAL;
+                    return Ok(errno::INVAL);
                 }
                 // Chunked like `fd_write`: an in-bounds `len` can span the
                 // whole guest memory, and the host buffer must stay bounded.
                 let mut offset = 0usize;
                 while offset < len {
                     let step = HOST_IO_CHUNK_BYTES.min(len.saturating_sub(offset));
+                    // The host makes each byte, so charge one unit per byte.
+                    charge_units(&mut caller, u64::try_from(step).unwrap_or(u64::MAX))?;
                     let bytes: Vec<u8> = {
                         let state = caller.data_mut();
                         (0..step).map(|_| state.next_random_byte()).collect()
                     };
                     let Some(at) = pointer.checked_add(offset) else {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     };
                     if memory.write(&mut caller, at, &bytes).is_err() {
-                        return errno::INVAL;
+                        return Ok(errno::INVAL);
                     }
                     offset = offset.saturating_add(step);
                 }
-                errno::SUCCESS
+                Ok(errno::SUCCESS)
             },
         )
         .map_err(host_error)?;
@@ -808,6 +901,25 @@ fn define_wasi_shim(linker: &mut Shim<'_>) -> Result<(), EdgeHostError> {
     Ok(())
 }
 
+/// Charge fuel for a bulk host copy of `bytes`, with a minimum of one unit.
+fn charge_bytes(caller: &mut Caller<'_, HostState<'_>>, bytes: usize) -> Result<(), wasmi::Error> {
+    charge_units(caller, copy_fuel(bytes))
+}
+
+/// Fuel for a bulk copy of `bytes`: [`BYTES_PER_FUEL`] bytes per unit, minimum 1.
+fn copy_fuel(bytes: usize) -> u64 {
+    (u64::try_from(bytes).unwrap_or(u64::MAX) / BYTES_PER_FUEL).saturating_add(1)
+}
+
+/// Debit `units` of fuel. Traps with `OutOfFuel` when the budget is short.
+fn charge_units(caller: &mut Caller<'_, HostState<'_>>, units: u64) -> Result<(), wasmi::Error> {
+    let left = caller.get_fuel()?;
+    let remaining = left
+        .checked_sub(units)
+        .ok_or_else(|| wasmi::Error::from(wasmi::core::TrapCode::OutOfFuel))?;
+    caller.set_fuel(remaining)
+}
+
 fn write_two_zeroes(mut caller: Caller<'_, HostState<'_>>, first: i32, second: i32) -> i32 {
     let Some(memory) = memory_of(&caller) else {
         return errno::INVAL;
@@ -895,6 +1007,37 @@ mod tests {
         assert!(detail.contains("execution budget"), "{detail}");
     }
 
+    /// A guest that loops on a failing `memory.grow` runs out of fuel and
+    /// falls through. It must not overflow the host thread. (wasmi 2.0's
+    /// tail-call dispatch did, in a release build too.) The thread has the
+    /// 2 MiB stack of a tokio worker.
+    #[test]
+    fn a_failing_memory_grow_loop_exhausts_its_fuel_and_falls_through() {
+        let wat = r#"(module
+  (memory (export "memory") 1 1)
+  (func (export "_start")
+    (loop $grow (drop (memory.grow (i32.const 1))) (br $grow))))"#;
+        let wasm = wat::parse_str(wat).expect("valid WAT");
+        let artifact = EdgeArtifact::from_bytes(&wasm).expect("valid module");
+        let outcome = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let kv = InMemoryEdgeKv::new();
+                artifact
+                    .run(&EdgeRequest::get("/grow"), &[], &kv)
+                    .expect("host setup succeeds")
+            })
+            .expect("spawn")
+            .join()
+            .expect("the guest must not crash the host thread");
+
+        let EdgeOutcome::Fallthrough { reason, detail } = outcome else {
+            panic!("expected a fallthrough");
+        };
+        assert_eq!(reason, FallthroughReason::CapsuleError);
+        assert!(detail.contains("execution budget"), "{detail}");
+    }
+
     #[test]
     fn stdout_line_budget_fails_the_write_and_stderr_budget_drops_the_excess() {
         let kv = InMemoryEdgeKv::new();
@@ -947,6 +1090,128 @@ mod tests {
         assert!(detail.contains("instantiated"), "{detail}");
     }
 
+    /// Run a WAT guest with a small fuel budget, so metering tests stay fast.
+    fn run_small_budget(wat: &str, budget: u64) -> EdgeOutcome {
+        let wasm = wat::parse_str(wat).expect("valid WAT");
+        let mut artifact = EdgeArtifact::from_bytes(&wasm).expect("valid module");
+        artifact.fuel_budget = budget;
+        artifact
+            .run(&EdgeRequest::get("/meter"), &[], &InMemoryEdgeKv::new())
+            .expect("host setup succeeds")
+    }
+
+    fn assert_out_of_fuel(outcome: &EdgeOutcome, what: &str) {
+        let EdgeOutcome::Fallthrough { reason, detail } = outcome else {
+            panic!("expected a fallthrough, the guest was served: {outcome:?}");
+        };
+        assert_eq!(*reason, FallthroughReason::CapsuleError);
+        assert!(
+            detail.contains("execution budget"),
+            "{what} must cost fuel, got: {detail}"
+        );
+    }
+
+    /// Host work in `fd_write` costs fuel (#3323). The guest writes a 1 MiB
+    /// padded `kv_get` line 20 times. Each write costs few guest
+    /// instructions. The host copies and parses every byte, about 1.07M fuel
+    /// per write. A 5M budget ends the guest after 5 writes.
+    #[test]
+    fn padded_stdout_lines_cost_fuel() {
+        let outcome = run_small_budget(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 17)
+  (data (i32.const 1048550) "{\"op\":\"kv_get\",\"key\":\"k\"}\n")
+  (func (export "_start")
+    (local $i i32)
+    (memory.fill (i32.const 0) (i32.const 32) (i32.const 1048550))
+    (i32.store (i32.const 1048576) (i32.const 0))
+    (i32.store (i32.const 1048580) (i32.const 1048576))
+    (loop $again
+      (drop (call $fd_write (i32.const 1) (i32.const 1048576) (i32.const 1) (i32.const 1048592)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $again (i32.lt_u (local.get $i) (i32.const 20))))))
+"#,
+            5_000_000,
+        );
+        assert_out_of_fuel(&outcome, "host stdout work");
+    }
+
+    /// Host work in `random_get` costs fuel (#3323). The host makes every byte.
+    #[test]
+    fn random_get_costs_fuel() {
+        let outcome = run_small_budget(
+            r#"(module
+  (import "wasi_snapshot_preview1" "random_get"
+    (func $random_get (param i32 i32) (result i32)))
+  (memory (export "memory") 16)
+  (func (export "_start")
+    (local $i i32)
+    (loop $again
+      (drop (call $random_get (i32.const 0) (i32.const 1048576)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $again (i32.lt_u (local.get $i) (i32.const 20))))))
+"#,
+            5_000_000,
+        );
+        assert_out_of_fuel(&outcome, "random_get");
+    }
+
+    /// Host work in `fd_read` costs fuel (#3323). The guest passes a huge
+    /// `iovs_len` over a zeroed table. The host walks the table to the end of
+    /// memory on every call: 8192 entries in one page.
+    #[test]
+    fn fd_read_descriptor_walk_costs_fuel() {
+        let outcome = run_small_budget(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_read"
+    (func $fd_read (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (func (export "_start")
+    (local $i i32)
+    (loop $again
+      (drop (call $fd_read (i32.const 0) (i32.const 0) (i32.const 0x7fffffff) (i32.const 0)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $again (i32.lt_u (local.get $i) (i32.const 1000))))))
+"#,
+            1_000_000,
+        );
+        assert_out_of_fuel(&outcome, "the fd_read descriptor walk");
+    }
+
+    /// Stderr past its cap is not copied. A guest that fills stderr can still
+    /// answer on stdout after that.
+    #[test]
+    fn full_stderr_does_not_block_stdout() {
+        let outcome = run_small_budget(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 33)
+  (data (i32.const 2097152) "{\"op\":\"response\",\"status\":200,\"headers\":[],\"body_b64\":\"\"}\n")
+  (func (export "_start")
+    (i32.store (i32.const 2097400) (i32.const 0))
+    (i32.store (i32.const 2097404) (i32.const 2097152))
+    (drop (call $fd_write (i32.const 2) (i32.const 2097400) (i32.const 1) (i32.const 2097420)))
+    (i32.store (i32.const 2097400) (i32.const 2097152))
+    (i32.store (i32.const 2097404) (i32.const 58))
+    (drop (call $fd_write (i32.const 2) (i32.const 2097400) (i32.const 1) (i32.const 2097420)))
+    (drop (call $fd_write (i32.const 1) (i32.const 2097400) (i32.const 1) (i32.const 2097420)))))
+"#,
+            1_000_000_000,
+        );
+        assert!(matches!(outcome, EdgeOutcome::Served(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn copy_fuel_is_one_unit_per_64_bytes_with_a_floor_of_one() {
+        assert_eq!(copy_fuel(0), 1);
+        assert_eq!(copy_fuel(63), 1);
+        assert_eq!(copy_fuel(64), 2);
+        assert_eq!(copy_fuel(HOST_IO_CHUNK_BYTES), 1025);
+    }
+
     #[test]
     fn a_response_line_becomes_the_terminal_outcome() {
         let kv = InMemoryEdgeKv::new();
@@ -987,6 +1252,113 @@ mod tests {
 
         let answer: String = state.stdin.iter().map(|byte| char::from(*byte)).collect();
         assert_eq!(answer.trim_end(), r#"{"op":"kv_value","value_b64":null}"#);
+    }
+
+    /// Host work for a `kv_get` answer costs fuel (#3502). The guest sends a
+    /// 26-byte line 20 times. Each answer encodes a 1 MiB value. A 5M budget
+    /// ends the guest after about 5 answers.
+    #[test]
+    fn kv_get_answers_cost_fuel_by_value_size() {
+        let wasm = wat::parse_str(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{\"op\":\"kv_get\",\"key\":\"k\"}\n")
+  (func (export "_start")
+    (local $i i32)
+    (i32.store (i32.const 100) (i32.const 0))
+    (i32.store (i32.const 104) (i32.const 26))
+    (loop $again
+      (drop (call $fd_write (i32.const 1) (i32.const 100) (i32.const 1) (i32.const 120)))
+      (local.set $i (i32.add (local.get $i) (i32.const 1)))
+      (br_if $again (i32.lt_u (local.get $i) (i32.const 20))))))
+"#,
+        )
+        .expect("valid WAT");
+        let mut artifact = EdgeArtifact::from_bytes(&wasm).expect("valid module");
+        artifact.fuel_budget = 5_000_000;
+        let kv = InMemoryEdgeKv::new().with("k", vec![7u8; 1024 * 1024]);
+        let outcome = artifact
+            .run(&EdgeRequest::get("/meter"), &[EdgeCapability::Kv], &kv)
+            .expect("host setup succeeds");
+        assert_out_of_fuel(&outcome, "a kv_get answer");
+    }
+
+    /// A `kv_get` and a response in one write (#3502). The `kv_get` charge
+    /// fails, so the budget error wins over the response.
+    #[test]
+    fn an_unpaid_kv_get_beats_a_response_in_the_same_write() {
+        let wasm = wat::parse_str(
+            r#"(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{\"op\":\"kv_get\",\"key\":\"k\"}\n{\"op\":\"response\",\"status\":200,\"headers\":[],\"body_b64\":\"\"}\n")
+  (func (export "_start")
+    (i32.store (i32.const 100) (i32.const 0))
+    (i32.store (i32.const 104) (i32.const 84))
+    (drop (call $fd_write (i32.const 1) (i32.const 100) (i32.const 1) (i32.const 120)))))
+"#,
+        )
+        .expect("valid WAT");
+        let mut artifact = EdgeArtifact::from_bytes(&wasm).expect("valid module");
+        artifact.fuel_budget = 500_000;
+        let kv = InMemoryEdgeKv::new().with("k", vec![7u8; 1024 * 1024]);
+        let outcome = artifact
+            .run(&EdgeRequest::get("/meter"), &[EdgeCapability::Kv], &kv)
+            .expect("host setup succeeds");
+        assert_out_of_fuel(&outcome, "a kv_get beside a response");
+    }
+
+    #[test]
+    fn a_kv_get_records_a_fuel_charge_for_the_value() {
+        let kv = InMemoryEdgeKv::new().with("k", vec![1u8; 4096]);
+        let mut state = state_with(&kv, true);
+
+        assert!(state.write_stdout(b"{\"op\":\"kv_get\",\"key\":\"k\"}\n"));
+
+        assert!(state.pending_fuel >= 4096, "{}", state.pending_fuel);
+    }
+
+    #[test]
+    fn a_miss_still_records_a_fuel_charge() {
+        let kv = InMemoryEdgeKv::new();
+        let mut state = state_with(&kv, true);
+
+        assert!(state.write_stdout(b"{\"op\":\"kv_get\",\"key\":\"k\"}\n"));
+
+        assert!(state.pending_fuel >= 1, "{}", state.pending_fuel);
+    }
+
+    /// Unread answers pile up in `stdin` (#3502). The cap ends the request.
+    #[test]
+    fn unread_kv_answers_hit_the_stdin_cap() {
+        let big = vec![0u8; STDIN_BUDGET_BYTES / 2];
+        let kv = InMemoryEdgeKv::new().with("k", big);
+        let mut state = state_with(&kv, true);
+        let get = b"{\"op\":\"kv_get\",\"key\":\"k\"}\n";
+
+        assert!(state.write_stdout(get));
+        assert_eq!(state.terminal, None);
+        assert!(state.write_stdout(get));
+
+        let Some(EdgeOutcome::Fallthrough { reason, detail }) = state.terminal.clone() else {
+            panic!("expected a fallthrough: {:?}", state.terminal);
+        };
+        assert_eq!(reason, FallthroughReason::CapsuleError);
+        assert!(detail.contains("stdin"), "{detail}");
+        assert!(state.stdin.len() <= STDIN_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn a_16_mib_value_fits_under_the_stdin_cap() {
+        let kv = InMemoryEdgeKv::new().with("k", vec![0u8; 16 * 1024 * 1024]);
+        let mut state = state_with(&kv, true);
+
+        assert!(state.write_stdout(b"{\"op\":\"kv_get\",\"key\":\"k\"}\n"));
+
+        assert_eq!(state.terminal, None);
     }
 
     #[test]

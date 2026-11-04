@@ -42,7 +42,7 @@ See [Typed Lifecycles](../../docs/guide/lifecycle.md).
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 
 No database or external services required.
 

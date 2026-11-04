@@ -28,6 +28,13 @@ the framework schema. There is nothing to add to your own `migrations/`.
 They live in the **control** database. A sharded app posts money against the
 control database, not against a shard.
 
+Each account row also stores its balance (issue #3339). The migration
+`20261029183512_add_money_account_balance` adds the column. Run
+`autumn migrate` before you deploy the new binary. Without the migration, each
+ledger call fails with `LedgerError::Database`. The migration does not read
+the postings, so it is fast on a large ledger. Old and new binaries can post
+at the same time. The trigger keeps the balance for both.
+
 ## The money value
 
 `autumn_web::money::Money<C>` is an amount in one currency. The currency is a
@@ -273,6 +280,47 @@ for total in ledger::trial_balance(conn).await? {
 proof that something wrote around `post` — run it from a scheduled job or a
 health check.
 
+### The stored balance
+
+Each account row stores its balance in the `balance_minor` column. `post`
+reads the balance from that column, so the cost of a post does not increase
+with the history. A trigger on the postings table keeps the column. The
+trigger fires for each `INSERT`. This includes an `INSERT` that does not come
+from `post`.
+
+`NULL` in `balance_minor` means "not known". When the value is `NULL`, `post`
+and `balance` sum the postings, and `post` writes the sum back.
+`balance_minor` is `NULL` in these cases:
+
+- An account that existed before the migration.
+- An account that SQLite replaced with `INSERT OR REPLACE`.
+- An SQLite account where one step of a transaction went outside `i64`. The
+  post succeeds, because the net change stays in range.
+
+A stored balance that is not the sum of the postings is drift. A write around
+the trigger causes it, for example a manual `UPDATE` of `balance_minor`, or an
+`INSERT` while the trigger is off. `balance_drift` finds it:
+
+```rust,no_run
+use autumn_web::money::ledger;
+# async fn check(conn: &mut autumn_web::db::RuntimeConnection) -> Result<(), ledger::LedgerError> {
+for drift in ledger::balance_drift(conn).await? {
+    eprintln!("{}: stored {}, posted {}", drift.account_id(), drift.stored(), drift.posted());
+}
+# Ok(())
+# }
+```
+
+To repair an account, set `balance_minor` to `NULL`. The next `post` to that
+account sums the postings and stores the result. Like `trial_balance`,
+`balance_drift` reads every posting, so run it from a scheduled job.
+
+A data-only restore (`pg_dump --data-only`) writes the accounts with their
+balances, then the postings. The trigger then adds the postings a second time.
+After such a restore, run
+`UPDATE _autumn_money_accounts SET balance_minor = NULL`, then
+`balance_drift`. A restore with `--disable-triggers` needs the same step.
+
 ## What the framework enforces
 
 | Rule | Where it is enforced |
@@ -286,8 +334,9 @@ health check.
 | The same key posts once | `UNIQUE (idempotency_key)`, with `ON CONFLICT DO NOTHING` |
 | The same key for different money is refused | a stored request hash |
 | No negative balance where forbidden | the balance the posting would leave, read before anything is written |
+| The stored balance is the sum of the postings | a trigger on the postings table, on both backends; `balance_drift` reports a difference |
 | Nothing is rewritten | database triggers on both backends, `TRUNCATE` and SQLite `REPLACE` included |
-| An account never changes currency | a trigger on both backends; only `allow_negative` stays editable |
+| An account never changes currency | a trigger on both backends; only `allow_negative` and `balance_minor` change |
 | A cancelled `post` never half-writes | the postings go in before their transaction row, behind a deferred foreign key |
 
 The last two matter most.

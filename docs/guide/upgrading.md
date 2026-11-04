@@ -163,12 +163,12 @@ Dockerfile (conflict)
 
 clippy.toml (add)
 @@ line 1 @@
-+msrv = "1.88.0"
++msrv = "1.97.0"
 
 rust-toolchain.toml (add)
 @@ lines 1-3 @@
 +[toolchain]
-+channel = "1.88.0"
++channel = "1.97.0"
 +components = ["rustfmt", "clippy"]
 
 2 file(s) would be written; 1 conflict(s) need review.

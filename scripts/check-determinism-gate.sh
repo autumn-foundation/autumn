@@ -61,7 +61,11 @@
 #   10. Feature reachability: a gated module behind a non-default Cargo feature
 #       must have that feature enabled by an ENFORCING ci.yml clippy lane (one
 #       that is not commented out and carries both `-p autumn-web` and
-#       `-D warnings`), otherwise its deny block is never compiled.
+#       `-D warnings`), otherwise its deny block is never compiled. The `lint`
+#       job's clippy lanes are the commands in xtask/src/lanes.rs; they count
+#       while ci.yml runs `cargo xtask ci lint`, or its matrix of shards
+#       (`cargo xtask ci lint --shard ${{ matrix.shard }}`; xtask's own tests
+#       prove the matrix names every shard).
 #
 # NOT covered: a banned call reached only through a `macro_rules!` expansion
 # (clippy suppresses lints inside macro expansions), and the generated code
@@ -69,7 +73,7 @@
 # own `#[allow]` with a reason and is named as a known-open gap in
 # CONTRIBUTING.md "Determinism seam gate".
 #
-# Called from the `lint` job in ci.yml. Run locally with:
+# Called from the `lint` lane in ci.yml (`cargo xtask ci lint --shard gates`). Run locally with:
 #
 #     ./scripts/check-determinism-gate.sh              # self-test, then the real check
 #     ./scripts/check-determinism-gate.sh --self-test  # synthetic fixtures only
@@ -112,9 +116,11 @@ GATED_MODULES=(
   # The SQLite database fleet (ADR 0019): sqlite-only modules, so their
   # enforcing clippy lane is the sqlite one.
   autumn/src/db/fleet.rs:sqlite
+  autumn/src/db/fleet_lake.rs:sqlite
   autumn/src/db/fleet_ownership.rs:sqlite
   autumn/src/db/fleet_replication.rs:sqlite
   autumn/src/db/fleet_sweeper.rs:sqlite
+  autumn/src/db/fleet_tombstones.rs:sqlite
   # The ratified W3 identifier sites. They carry no off-seam production call at
   # all — every id they mint already comes from the injected `Entropy` — so
   # gating them costs nothing and is what makes the `Uuid::new_v4` clause of the
@@ -246,6 +252,7 @@ SCAN_DIRS=("autumn/src")
 CLIPPY_TOML="clippy.toml"
 ROOT_MANIFEST="Cargo.toml"
 CI_WORKFLOW=".github/workflows/ci.yml"
+XTASK_LANES="xtask/src/lanes.rs"
 
 # A `reason = "…"` with at least one character. The `+` is load-bearing:
 # `reason = ""` must fail.
@@ -637,8 +644,18 @@ check_feature_reachability() {
   [[ -f "$wf" ]] || die "$CI_WORKFLOW is missing"
   # Feature lists from ENFORCING clippy lanes only: uncommented `cargo clippy`
   # runs that target autumn-web and deny warnings.
+  # The `lint` job runs `cargo xtask ci lint`; its clippy commands are string
+  # literals in xtask/src/lanes.rs. They count only while ci.yml runs that
+  # whole lane, or its matrix of shards (`--shard ${{ matrix.shard }}`, which
+  # xtask's tests prove names every shard) -- not a filtered `--only` run or
+  # one literal shard, and never from a Rust comment.
+  local lanes="$tree/$XTASK_LANES" lane_lines=""
+  if [[ -f "$lanes" ]] \
+    && grep -qE '^[[:space:]]*(-[[:space:]]+)?run:[[:space:]]*cargo xtask ci lint([[:space:]]+--shard[[:space:]]+\$\{\{[[:space:]]*matrix\.shard[[:space:]]*\}\})?[[:space:]]*$' "$wf"; then
+    lane_lines="$(grep -vE '^[[:space:]]*//' "$lanes" | grep -F 'cargo clippy' || true)"
+  fi
   local enabled
-  enabled="$(grep -E '^[[:space:]]*run:[[:space:]]*cargo clippy' "$wf" \
+  enabled="$( { grep -E '^[[:space:]]*run:[[:space:]]*cargo clippy' "$wf" || true; printf '%s\n' "$lane_lines"; } \
              | grep -F -- '-p autumn-web' | grep -F -- '-D warnings' \
              | grep -oE '\-\-features "[^"]*"' | tr -d '"' | sed 's/--features //' | tr ',' '\n' | tr -d ' ' | sort -u || true)"
   local entry feature
@@ -776,6 +793,53 @@ EOF
   make_fixture "$tmp/reachable"
   GATED_MODULES=(autumn/src/gated.rs:tls)
   expect_pass "$tmp/reachable" "feature reachable via an enforcing lane"
+  GATED_MODULES=(autumn/src/gated.rs:default)
+
+  # A feature named only by a clippy command in xtask/src/lanes.rs counts when
+  # ci.yml runs `cargo xtask ci lint`...
+  make_fixture "$tmp/xtasklane"
+  mkdir -p "$tmp/xtasklane/xtask/src"
+  printf '        run: cargo xtask ci lint\n' > "$tmp/xtasklane/.github/workflows/ci.yml"
+  printf 'pub const C: &str = r#"cargo clippy -p autumn-web --features "acme" --all-targets -- -D warnings"#;\n' \
+    > "$tmp/xtasklane/xtask/src/lanes.rs"
+  GATED_MODULES=(autumn/src/gated.rs:acme)
+  expect_pass "$tmp/xtasklane" "feature reachable via the xtask lint lane"
+
+  # ...and not when ci.yml does not run the lane...
+  make_fixture "$tmp/xtasknotrun"
+  mkdir -p "$tmp/xtasknotrun/xtask/src"
+  printf '        # run: cargo xtask ci lint\n' > "$tmp/xtasknotrun/.github/workflows/ci.yml"
+  cp "$tmp/xtasklane/xtask/src/lanes.rs" "$tmp/xtasknotrun/xtask/src/lanes.rs"
+  expect_fail "$tmp/xtasknotrun" "no enforcing ci.yml clippy lane enables" "xtask lane CI does not run does not count"
+
+  # ...nor from a filtered run of it...
+  make_fixture "$tmp/xtaskfiltered"
+  mkdir -p "$tmp/xtaskfiltered/xtask/src"
+  printf '        run: cargo xtask ci lint --only fmt\n' > "$tmp/xtaskfiltered/.github/workflows/ci.yml"
+  cp "$tmp/xtasklane/xtask/src/lanes.rs" "$tmp/xtaskfiltered/xtask/src/lanes.rs"
+  expect_fail "$tmp/xtaskfiltered" "no enforcing ci.yml clippy lane enables" "filtered xtask lane run does not count"
+
+  # ...but does from the lane run as a matrix of shards...
+  make_fixture "$tmp/xtasksharded"
+  mkdir -p "$tmp/xtasksharded/xtask/src"
+  printf '        run: cargo xtask ci lint --shard ${{ matrix.shard }}\n' > "$tmp/xtasksharded/.github/workflows/ci.yml"
+  cp "$tmp/xtasklane/xtask/src/lanes.rs" "$tmp/xtasksharded/xtask/src/lanes.rs"
+  expect_pass "$tmp/xtasksharded" "feature reachable via the xtask lint lane's shard matrix"
+
+  # ...not from one literal shard of it...
+  make_fixture "$tmp/xtaskoneshard"
+  mkdir -p "$tmp/xtaskoneshard/xtask/src"
+  printf '        run: cargo xtask ci lint --shard gates\n' > "$tmp/xtaskoneshard/.github/workflows/ci.yml"
+  cp "$tmp/xtasklane/xtask/src/lanes.rs" "$tmp/xtaskoneshard/xtask/src/lanes.rs"
+  expect_fail "$tmp/xtaskoneshard" "no enforcing ci.yml clippy lane enables" "one literal lint shard does not count"
+
+  # ...nor from a Rust comment in the lane file.
+  make_fixture "$tmp/xtaskcomment"
+  mkdir -p "$tmp/xtaskcomment/xtask/src"
+  printf '        run: cargo xtask ci lint\n' > "$tmp/xtaskcomment/.github/workflows/ci.yml"
+  printf '/// cargo clippy -p autumn-web --features "acme" --all-targets -- -D warnings\n' \
+    > "$tmp/xtaskcomment/xtask/src/lanes.rs"
+  expect_fail "$tmp/xtaskcomment" "no enforcing ci.yml clippy lane enables" "commented clippy command in the lane file does not count"
   GATED_MODULES=(autumn/src/gated.rs:default)
 
   # Floor enforcement.

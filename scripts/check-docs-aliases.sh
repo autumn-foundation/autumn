@@ -4,7 +4,7 @@
 #
 # WHY THIS EXISTS: most of the corpus's docs gates answer the same shape of
 # question — is what this page says TRUE?
-# `scripts/check-docs-links.sh` gates its *links* (a 404),
+# `xtask/src/docs/links.rs` gates its *links* (a 404),
 # `scripts/check-docs-cli.sh` its *commands* (`unrecognized subcommand`),
 # `scripts/check-docs-config.sh` the `AUTUMN_*` variables they SET (a silent
 # no-op), `scripts/check-docs-toml.sh` the `autumn.toml` keys they WRITE

@@ -49,6 +49,10 @@ fn compile_fail_tests() {
     // or "sheddable" is a compile error, not a silent `default`.
     t.compile_fail("tests/compile-fail/route_criticality_invalid.rs");
 
+    // Route `group` (#3544): a blank group is a compile error, not the
+    // default group.
+    t.compile_fail("tests/compile-fail/route_group_blank.rs");
+
     // Static route macro failures
     t.compile_fail("tests/compile-fail/static_get_path_params.rs");
     t.compile_fail("tests/compile-fail/static_get_non_async.rs");
@@ -726,6 +730,10 @@ fn compile_pass_tests_a() {
     // #2662: the `parent_pk` override reaches the preload loader.
     #[cfg(feature = "db")]
     t.pass("tests/compile-pass/model_counter_cache_parent_pk.rs");
+
+    // #3033: a `#[model]` keyed on a column other than `id`.
+    #[cfg(feature = "db")]
+    t.pass("tests/compile-pass/model_non_id_pk.rs");
 
     // Model draft accessors (requires db feature)
     #[cfg(feature = "db")]

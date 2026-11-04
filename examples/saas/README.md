@@ -22,7 +22,7 @@ stamps all inserts with the current tenant — enforced in SQL.
 
 ## Prerequisites
 
-- Rust 1.88.0+
+- Rust 1.97.0+
 - PostgreSQL (a `docker-compose.yml` is included for local development)
 
 ## Quick start

@@ -309,6 +309,13 @@ pub trait ProvideActuatorState {
     /// has been running (e.g., "2d 4h 13m").
     fn uptime_display(&self) -> String;
 
+    /// Returns the resolved role that `/actuator/info`, `/actuator/jobs` and
+    /// the metrics show. The default returns `None`. Then the endpoints omit
+    /// the `role` key.
+    fn process_role(&self) -> Option<crate::config::Role> {
+        None
+    }
+
     /// Returns a reference to the system [`crate::channels::Channels`] which
     /// broadcasts operational events to WebSocket streams.
     #[cfg(feature = "ws")]
@@ -414,6 +421,7 @@ pub trait ProvideActuatorState {
         None
     }
 
+    #[cfg(feature = "graph")]
     /// Returns the serialized architecture graph served at `/actuator/graph`.
     ///
     /// The default returns `None`, and the endpoint answers `503`.
@@ -434,6 +442,7 @@ pub trait ProvideActuatorState {
         None
     }
 
+    #[cfg(feature = "gdpr")]
     /// Returns the data-capsule service of `{prefix}/capsules/*` (issue #1811).
     ///
     /// The default gives an error, so the endpoints answer `501`.
@@ -3116,6 +3125,32 @@ pub(crate) struct ActuatorInfo {
     runtime: RuntimeInfo,
     /// Build + git provenance baked into the running binary (issue #1242).
     build: crate::build_info::BuildProvenance,
+    /// The process role and its resolved capabilities (#3542, #3543).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<RoleInfo>,
+}
+
+#[derive(Serialize)]
+struct RoleInfo {
+    name: String,
+    base: &'static str,
+    preset: bool,
+    capabilities: crate::config::RoleCapabilities,
+    /// The route groups the role mounts (#3544). Omitted: every group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mount: Option<Vec<String>>,
+}
+
+impl From<&crate::config::Role> for RoleInfo {
+    fn from(role: &crate::config::Role) -> Self {
+        Self {
+            name: role.name().to_owned(),
+            base: role.base().as_str(),
+            preset: role.is_preset(),
+            capabilities: role.capabilities(),
+            mount: role.mount().map(<[String]>::to_vec),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -3155,6 +3190,7 @@ pub(crate) async fn info<S: ProvideActuatorState + Send + Sync + 'static>(
             uptime: state.uptime_display(),
         },
         build: crate::build_info::build_provenance(),
+        role: state.process_role().as_ref().map(RoleInfo::from),
     })
 }
 
@@ -3678,7 +3714,7 @@ fn render_plugin_sources(
 /// `autumn_admission_shed_total` (#3068).
 fn write_admission_metrics(
     out: &mut String,
-    version: &str,
+    labels: &str,
     http: &crate::middleware::metrics::HttpMetrics,
 ) {
     use std::fmt::Write as _;
@@ -3691,7 +3727,7 @@ fn write_admission_metrics(
     out.push_str("# TYPE autumn_requests_shed_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_requests_shed_total{{version=\"{version}\"}} {}",
+        "autumn_requests_shed_total{{{labels}}} {}",
         http.requests_shed_total
     );
 
@@ -3702,7 +3738,7 @@ fn write_admission_metrics(
     out.push_str("# TYPE autumn_admission_limit gauge\n");
     let _ = writeln!(
         out,
-        "autumn_admission_limit{{version=\"{version}\"}} {}",
+        "autumn_admission_limit{{{labels}}} {}",
         admission.limit
     );
     out.push_str(
@@ -3716,7 +3752,7 @@ fn write_admission_metrics(
     ] {
         let _ = writeln!(
             out,
-            "autumn_admission_shed_total{{version=\"{version}\",criticality=\"{criticality}\"}} {count}"
+            "autumn_admission_shed_total{{{labels},criticality=\"{criticality}\"}} {count}"
         );
     }
     out.push_str(
@@ -3730,7 +3766,7 @@ fn write_admission_metrics(
     ] {
         let _ = writeln!(
             out,
-            "autumn_tenant_bulkhead_rejections_total{{version=\"{version}\",kind=\"{kind}\"}} {count}"
+            "autumn_tenant_bulkhead_rejections_total{{{labels},kind=\"{kind}\"}} {count}"
         );
     }
 }
@@ -3740,7 +3776,7 @@ fn write_admission_metrics(
 /// compared by a controller scraping both.
 fn write_builtin_http_metrics(
     out: &mut String,
-    version: &str,
+    labels: &str,
     snapshot: &crate::middleware::metrics::MetricsSnapshot,
     duration_series: &[crate::middleware::metrics::DurationSeries],
 ) {
@@ -3751,7 +3787,7 @@ fn write_builtin_http_metrics(
     out.push_str("# TYPE autumn_http_requests_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_http_requests_total{{version=\"{version}\"}} {}",
+        "autumn_http_requests_total{{{labels}}} {}",
         snapshot.http.requests_total
     );
 
@@ -3760,7 +3796,7 @@ fn write_builtin_http_metrics(
     out.push_str("# TYPE autumn_http_requests_active gauge\n");
     let _ = writeln!(
         out,
-        "autumn_http_requests_active{{version=\"{version}\"}} {}",
+        "autumn_http_requests_active{{{labels}}} {}",
         snapshot.http.requests_active
     );
 
@@ -3775,13 +3811,13 @@ fn write_builtin_http_metrics(
     ] {
         let _ = writeln!(
             out,
-            "autumn_http_responses_total{{version=\"{version}\",status=\"{status}\"}} {count}"
+            "autumn_http_responses_total{{{labels},status=\"{status}\"}} {count}"
         );
     }
 
-    write_http_duration_histogram(out, version, duration_series);
+    write_http_duration_histogram(out, labels, duration_series);
 
-    write_http_duration_quantiles(out, version, snapshot);
+    write_http_duration_quantiles(out, labels, snapshot);
 
     // autumn_shutdown_aborted_requests_total
     out.push_str(
@@ -3791,7 +3827,7 @@ fn write_builtin_http_metrics(
     out.push_str("# TYPE autumn_shutdown_aborted_requests_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_shutdown_aborted_requests_total{{version=\"{version}\"}} {}",
+        "autumn_shutdown_aborted_requests_total{{{labels}}} {}",
         snapshot.http.shutdown_aborted_requests_total
     );
 
@@ -3803,7 +3839,7 @@ fn write_builtin_http_metrics(
     out.push_str("# TYPE autumn_request_timeouts_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_request_timeouts_total{{version=\"{version}\"}} {}",
+        "autumn_request_timeouts_total{{{labels}}} {}",
         snapshot.http.request_timeouts_total
     );
 
@@ -3815,11 +3851,11 @@ fn write_builtin_http_metrics(
     out.push_str("# TYPE autumn_read_your_writes_pins_total counter\n");
     let _ = writeln!(
         out,
-        "autumn_read_your_writes_pins_total{{version=\"{version}\"}} {}",
+        "autumn_read_your_writes_pins_total{{{labels}}} {}",
         snapshot.read_your_writes_pins_total
     );
 
-    write_admission_metrics(out, version, &snapshot.http);
+    write_admission_metrics(out, labels, &snapshot.http);
     // by_route
     if !snapshot.http.by_route.is_empty() {
         out.push_str("# HELP autumn_http_route_requests_total HTTP requests by route and method\n");
@@ -3832,7 +3868,7 @@ fn write_builtin_http_metrics(
             if let Some((method, path)) = route_key.split_once(' ') {
                 let _ = writeln!(
                     out,
-                    "autumn_http_route_requests_total{{version=\"{version}\",method=\"{method}\",route=\"{path}\"}} {}",
+                    "autumn_http_route_requests_total{{{labels},method=\"{method}\",route=\"{path}\"}} {}",
                     metrics.count
                 );
             }
@@ -3844,7 +3880,7 @@ fn write_builtin_http_metrics(
 /// add summaries from different replicas. Use the histogram instead.
 fn write_http_duration_quantiles(
     out: &mut String,
-    version: &str,
+    labels: &str,
     snapshot: &crate::middleware::metrics::MetricsSnapshot,
 ) {
     use std::fmt::Write;
@@ -3863,10 +3899,7 @@ fn write_http_duration_quantiles(
     ] {
         #[allow(clippy::cast_precision_loss)]
         let seconds = millis as f64 / 1000.0;
-        let _ = writeln!(
-            out,
-            "{name}{{version=\"{version}\",quantile=\"{quantile}\"}} {seconds}"
-        );
+        let _ = writeln!(out, "{name}{{{labels},quantile=\"{quantile}\"}} {seconds}");
     }
 }
 
@@ -3877,7 +3910,7 @@ fn write_http_duration_quantiles(
 /// `method` is a standard method, or `_other`.
 fn write_http_duration_histogram(
     out: &mut String,
-    version: &str,
+    labels: &str,
     series: &[crate::middleware::metrics::DurationSeries],
 ) {
     use std::fmt::Write;
@@ -3887,7 +3920,7 @@ fn write_http_duration_histogram(
     let _ = writeln!(out, "# TYPE {name} histogram");
     for entry in series {
         let labels = format!(
-            "version=\"{version}\",method=\"{}\",route=\"{}\",status_class=\"{}\"",
+            "{labels},method=\"{}\",route=\"{}\",status_class=\"{}\"",
             escape_prometheus_label_value(&entry.method),
             escape_prometheus_label_value(&entry.route),
             entry.status_class,
@@ -3930,7 +3963,7 @@ fn write_histogram_samples(
 /// without app state), unlike the HTTP metrics which come from per-app state.
 fn write_builtin_cache_metrics(
     out: &mut String,
-    version: &str,
+    labels: &str,
     snapshot: &crate::cache::ReadThroughMetricsSnapshot,
 ) {
     use std::fmt::Write;
@@ -3991,7 +4024,7 @@ fn write_builtin_cache_metrics(
     ] {
         let _ = writeln!(out, "# HELP {name} {help}");
         let _ = writeln!(out, "# TYPE {name} counter");
-        let _ = writeln!(out, "{name}{{version=\"{version}\"}} {value}");
+        let _ = writeln!(out, "{name}{{{labels}}} {value}");
     }
 }
 
@@ -4000,7 +4033,7 @@ fn write_builtin_cache_metrics(
 /// Every family is always present, so an alert on `increase()` sees a `0`
 /// sample before the first event. The `queue` and `job` label values come from
 /// registered jobs and surveyed queues, so the label set is bounded.
-fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegistry) {
+fn write_builtin_job_metrics(out: &mut String, labels: &str, registry: &JobRegistry) {
     use std::fmt::Write;
 
     let name = DEAD_LETTER_TRIMMED_FAMILY;
@@ -4011,7 +4044,7 @@ fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegi
     let _ = writeln!(out, "# TYPE {name} counter");
     let _ = writeln!(
         out,
-        "{name}{{version=\"{version}\"}} {}",
+        "{name}{{{labels}}} {}",
         registry.dead_letter_trimmed_total()
     );
 
@@ -4026,7 +4059,7 @@ fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegi
         let queue = escape_prometheus_label_value(queue);
         let _ = writeln!(
             out,
-            "autumn_jobs_queue_depth{{version=\"{version}\",queue=\"{queue}\"}} {}",
+            "autumn_jobs_queue_depth{{{labels},queue=\"{queue}\"}} {}",
             status.depth
         );
     }
@@ -4041,7 +4074,7 @@ fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegi
         let seconds = status.oldest_waiting_age_ms as f64 / 1000.0;
         let _ = writeln!(
             out,
-            "autumn_jobs_oldest_age_seconds{{version=\"{version}\",queue=\"{queue}\"}} {}",
+            "autumn_jobs_oldest_age_seconds{{{labels},queue=\"{queue}\"}} {}",
             format_sample_value(seconds)
         );
     }
@@ -4057,7 +4090,7 @@ fn write_builtin_job_metrics(out: &mut String, version: &str, registry: &JobRegi
         let job = escape_prometheus_label_value(job);
         let _ = writeln!(
             out,
-            "autumn_jobs_dead_letter_total{{version=\"{version}\",job=\"{job}\"}} {}",
+            "autumn_jobs_dead_letter_total{{{labels},job=\"{job}\"}} {}",
             status.dead_letters
         );
     }
@@ -4074,7 +4107,7 @@ type PoolGauge = (&'static str, &'static str, fn(&deadpool::Status) -> usize);
 /// `shard:<name>:primary` and `shard:<name>:replica` for a sharded app.
 fn write_builtin_db_pool_metrics<S: ProvideActuatorState>(
     out: &mut String,
-    version: &str,
+    labels: &str,
     state: &S,
 ) {
     use std::fmt::Write;
@@ -4085,12 +4118,7 @@ fn write_builtin_db_pool_metrics<S: ProvideActuatorState>(
         "# HELP {name} Time a Db checkout took to get a pool connection, connect time included"
     );
     let _ = writeln!(out, "# TYPE {name} histogram");
-    write_histogram_samples(
-        out,
-        name,
-        &format!("version=\"{version}\""),
-        &state.metrics().db_pool_wait(),
-    );
+    write_histogram_samples(out, name, labels, &state.metrics().db_pool_wait());
 
     #[cfg(feature = "db")]
     {
@@ -4140,11 +4168,7 @@ fn write_builtin_db_pool_metrics<S: ProvideActuatorState>(
             let _ = writeln!(out, "# TYPE {gauge} gauge");
             for (label, status) in &pools {
                 let label = escape_prometheus_label_value(label);
-                let _ = writeln!(
-                    out,
-                    "{gauge}{{version=\"{version}\",pool=\"{label}\"}} {}",
-                    read(status)
-                );
+                let _ = writeln!(out, "{gauge}{{{labels},pool=\"{label}\"}} {}", read(status));
             }
         }
     }
@@ -4156,7 +4180,7 @@ fn write_builtin_db_pool_metrics<S: ProvideActuatorState>(
 /// breaker, sorted by name. Names are escaped: a host name is a breaker name.
 fn write_builtin_circuit_breaker_metrics(
     out: &mut String,
-    version: &str,
+    labels: &str,
     breakers: &[crate::circuit_breaker::CircuitBreaker],
 ) {
     use std::fmt::Write;
@@ -4177,7 +4201,7 @@ fn write_builtin_circuit_breaker_metrics(
         let label = escape_prometheus_label_value(breaker.name());
         let _ = writeln!(
             out,
-            "{name}{{version=\"{version}\",name=\"{label}\"}} {}",
+            "{name}{{{labels},name=\"{label}\"}} {}",
             breaker.slow_calls_total()
         );
     }
@@ -4192,7 +4216,7 @@ fn write_builtin_circuit_breaker_metrics(
         let label = escape_prometheus_label_value(breaker.name());
         let _ = writeln!(
             out,
-            "{name}{{version=\"{version}\",name=\"{label}\"}} {}",
+            "{name}{{{labels},name=\"{label}\"}} {}",
             breaker.slow_call_ratio()
         );
     }
@@ -4211,7 +4235,7 @@ fn write_builtin_circuit_breaker_metrics(
 /// template.
 fn write_builtin_shadow_metrics(
     out: &mut String,
-    version: &str,
+    labels: &str,
     snapshot: &crate::shadow::ShadowSnapshot,
 ) {
     use std::fmt::Write;
@@ -4240,7 +4264,7 @@ fn write_builtin_shadow_metrics(
             let label = escape_prometheus_label_value(&entry.label);
             let _ = writeln!(
                 out,
-                "{name}{{version=\"{version}\",route=\"{route}\",{label_name}=\"{label}\"}} {}",
+                "{name}{{{labels},route=\"{route}\",{label_name}=\"{label}\"}} {}",
                 entry.count
             );
         }
@@ -4397,37 +4421,53 @@ fn write_app_dropped_family(out: &mut String, dropped: &[(&str, u64)]) {
     }
 }
 
+/// The labels every framework metric sample carries, without braces:
+/// `version="…"`, then `role="…"` for a `[roles.<name>]` preset (#3543). A
+/// built-in role adds no label, so its series stay as they were.
+fn framework_metric_labels(version: &str, role: Option<&crate::config::Role>) -> String {
+    let version = escape_prometheus_label_value(version);
+    role.filter(|role| role.is_preset()).map_or_else(
+        || format!("version=\"{version}\""),
+        |role| {
+            format!(
+                "version=\"{version}\",role=\"{}\"",
+                escape_prometheus_label_value(role.name())
+            )
+        },
+    )
+}
+
 /// `GET <actuator-prefix>/prometheus` -- export metrics in Prometheus format.
 pub(crate) async fn prometheus_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
 ) -> impl IntoResponse {
     let snapshot = state.metrics().snapshot();
     // Deploy-version label so a canary controller can compare canary vs. stable
-    // cohorts. Escaped defensively in case an operator sets an exotic value via
-    // AUTUMN_DEPLOY_VERSION.
-    let version = escape_prometheus_label_value(&state.deploy_version());
+    // cohorts, plus the role label of a preset. Escaped defensively in case an
+    // operator sets an exotic value via AUTUMN_DEPLOY_VERSION.
+    let labels = framework_metric_labels(&state.deploy_version(), state.process_role().as_ref());
     let mut out = String::with_capacity(2048);
 
     write_builtin_http_metrics(
         &mut out,
-        &version,
+        &labels,
         &snapshot,
         &state.metrics().duration_series(),
     );
     write_builtin_cache_metrics(
         &mut out,
-        &version,
+        &labels,
         &crate::cache::read_through_metrics().snapshot(),
     );
-    write_builtin_job_metrics(&mut out, &version, state.job_registry());
-    write_builtin_db_pool_metrics(&mut out, &version, &state);
+    write_builtin_job_metrics(&mut out, &labels, state.job_registry());
+    write_builtin_db_pool_metrics(&mut out, &labels, &state);
     write_builtin_circuit_breaker_metrics(
         &mut out,
-        &version,
+        &labels,
         &crate::circuit_breaker::global_registry().all_breakers(),
     );
     if let Some(handle) = state.shadow() {
-        write_builtin_shadow_metrics(&mut out, &version, &handle.snapshot());
+        write_builtin_shadow_metrics(&mut out, &labels, &handle.snapshot());
     }
 
     // Name ownership, in precedence order: built-in families first, then the
@@ -4681,7 +4721,15 @@ pub(crate) async fn jobs_endpoint<S: ProvideActuatorState + Send + Sync + 'stati
 ) -> Json<serde_json::Value> {
     let jobs = state.job_registry().snapshot();
     let queues = state.job_registry().queue_snapshot();
-    Json(serde_json::json!({ "jobs": jobs, "queues": queues }))
+    let mut body = serde_json::json!({ "jobs": jobs, "queues": queues });
+    if let Some(role) = state.process_role() {
+        let mut info = serde_json::json!({ "name": role.name(), "base": role.base().as_str() });
+        if let Some(pin) = role.pin() {
+            info["pin"] = serde_json::json!(pin);
+        }
+        body["role"] = info;
+    }
+    Json(body)
 }
 
 /// `GET <actuator-prefix>/derivations` -- maintained derived read models
@@ -4802,6 +4850,7 @@ fn derivation_report(
         .collect()
 }
 
+#[cfg(feature = "graph")]
 /// `GET <actuator-prefix>/graph` -- the application's architecture graph
 /// (issue #1747).
 ///
@@ -4826,6 +4875,7 @@ pub(crate) async fn graph_endpoint<S: ProvideActuatorState + Send + Sync + 'stat
     graph_response(state.architecture_graph_json())
 }
 
+#[cfg(feature = "graph")]
 /// Render the `/actuator/graph` response for a given installed graph.
 ///
 /// This function is separate from the handler. Tests use it to examine the
@@ -4901,18 +4951,21 @@ pub(crate) async fn shadow_endpoint<S: ProvideActuatorState + Send + Sync + 'sta
 
 // ── Data capsules (issue #1811) ─────────────────────────────────────────────
 
+#[cfg(feature = "gdpr")]
 /// Request body for `POST <actuator-prefix>/capsules/export`.
 #[derive(Deserialize)]
 pub(crate) struct CapsuleExportRequest {
     subject: String,
 }
 
+#[cfg(feature = "gdpr")]
 /// Request body for `POST <actuator-prefix>/capsules/{import,verify}`.
 #[derive(Deserialize)]
 pub(crate) struct CapsuleNameRequest {
     capsule: String,
 }
 
+#[cfg(feature = "gdpr")]
 fn capsule_error(error: &crate::gdpr::portability::DataCapsuleError) -> axum::response::Response {
     use crate::gdpr::portability::DataCapsuleError as E;
     let status = match error {
@@ -4933,6 +4986,7 @@ fn capsule_error(error: &crate::gdpr::portability::DataCapsuleError) -> axum::re
         .into_response()
 }
 
+#[cfg(feature = "gdpr")]
 /// The service and the path of an existing capsule, or the error response.
 #[allow(
     clippy::result_large_err,
@@ -4958,6 +5012,7 @@ fn existing_capsule<S: ProvideActuatorState>(
     Ok((service, path))
 }
 
+#[cfg(feature = "gdpr")]
 /// `POST <actuator-prefix>/capsules/export` -- write a capsule for a subject.
 pub(crate) async fn capsules_export_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -4982,6 +5037,7 @@ pub(crate) async fn capsules_export_endpoint<S: ProvideActuatorState + Send + Sy
     }
 }
 
+#[cfg(feature = "gdpr")]
 /// `POST <actuator-prefix>/capsules/verify` -- check a capsule signature and hashes.
 pub(crate) async fn capsules_verify_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -5001,6 +5057,7 @@ pub(crate) async fn capsules_verify_endpoint<S: ProvideActuatorState + Send + Sy
     }
 }
 
+#[cfg(feature = "gdpr")]
 /// `POST <actuator-prefix>/capsules/import` -- verify, then import a capsule.
 pub(crate) async fn capsules_import_endpoint<S: ProvideActuatorState + Send + Sync + 'static>(
     State(state): State<S>,
@@ -5356,6 +5413,7 @@ pub(crate) fn actuator_route_path(prefix: &str, suffix: &str) -> String {
     }
 }
 
+#[cfg(feature = "gdpr")]
 /// The data-capsule routes (issue #1811). All are `POST` and sensitive.
 const CAPSULE_ROUTES: [&str; 3] = ["/capsules/export", "/capsules/import", "/capsules/verify"];
 
@@ -5388,9 +5446,11 @@ pub(crate) fn actuator_endpoint_paths(
         paths.push(actuator_route_path(prefix, "/ui/tasks"));
         paths.push(actuator_route_path(prefix, "/shadow"));
         paths.push(actuator_route_path(prefix, "/cost"));
+        #[cfg(feature = "graph")]
         paths.push(actuator_route_path(prefix, "/graph"));
         // POST-only, like `/webhooks/replay` below: listed so the startup
         // barrier lets them through.
+        #[cfg(feature = "gdpr")]
         for suffix in CAPSULE_ROUTES {
             paths.push(actuator_route_path(prefix, suffix));
         }
@@ -5442,6 +5502,7 @@ pub(crate) fn actuator_mutating_routes(
 
     if sensitive {
         routes.push(("PUT", actuator_route_path(prefix, "/loggers/{name}")));
+        #[cfg(feature = "gdpr")]
         for suffix in CAPSULE_ROUTES {
             routes.push(("POST", actuator_route_path(prefix, suffix)));
         }
@@ -5553,23 +5614,30 @@ pub(crate) fn actuator_router_with_prefix<
             .route(
                 &actuator_route_path(prefix, "/cost"),
                 axum::routing::get(cost_endpoint::<S>),
-            )
-            .route(
+            );
+        #[cfg(feature = "graph")]
+        {
+            router = router.route(
                 &actuator_route_path(prefix, "/graph"),
                 axum::routing::get(graph_endpoint::<S>),
-            )
-            .route(
-                &actuator_route_path(prefix, "/capsules/export"),
-                axum::routing::post(capsules_export_endpoint::<S>),
-            )
-            .route(
-                &actuator_route_path(prefix, "/capsules/import"),
-                axum::routing::post(capsules_import_endpoint::<S>),
-            )
-            .route(
-                &actuator_route_path(prefix, "/capsules/verify"),
-                axum::routing::post(capsules_verify_endpoint::<S>),
             );
+        }
+        #[cfg(feature = "gdpr")]
+        {
+            router = router
+                .route(
+                    &actuator_route_path(prefix, "/capsules/export"),
+                    axum::routing::post(capsules_export_endpoint::<S>),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/capsules/import"),
+                    axum::routing::post(capsules_import_endpoint::<S>),
+                )
+                .route(
+                    &actuator_route_path(prefix, "/capsules/verify"),
+                    axum::routing::post(capsules_verify_endpoint::<S>),
+                );
+        }
         #[cfg(feature = "db")]
         {
             router = router.route(
@@ -7395,7 +7463,7 @@ mod tests {
     #[test]
     fn prometheus_renders_breaker_slow_call_families() {
         let mut out = String::new();
-        write_builtin_circuit_breaker_metrics(&mut out, "stable", &[]);
+        write_builtin_circuit_breaker_metrics(&mut out, "version=\"stable\"", &[]);
         assert!(out.is_empty(), "no breaker: no family");
 
         let policy = crate::circuit_breaker::CircuitBreakerPolicy {
@@ -7411,7 +7479,7 @@ mod tests {
             crate::circuit_breaker::CircuitBreakerPolicy::default(),
         );
 
-        write_builtin_circuit_breaker_metrics(&mut out, "stable", &[slow, idle]);
+        write_builtin_circuit_breaker_metrics(&mut out, "version=\"stable\"", &[slow, idle]);
         let want = "\
 # HELP autumn_circuit_breaker_slow_calls_total Calls each circuit breaker counted as slow, cancelled slow calls included
 # TYPE autumn_circuit_breaker_slow_calls_total counter
@@ -7588,6 +7656,170 @@ autumn_circuit_breaker_slow_call_ratio{version=\"stable\",name=\"b\\\"slow\"} 1
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["autumn"]["version"].is_string());
         assert_eq!(json["autumn"]["profile"], "dev");
+        // A state that does not report its role omits the key.
+        assert!(json.get("role").is_none(), "{json}");
+    }
+
+    async fn info_json_for(state: crate::AppState) -> serde_json::Value {
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/actuator/info")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    // Issue #3542: operators see what this process runs.
+    #[tokio::test]
+    async fn actuator_info_reports_the_role_and_its_capabilities() {
+        use crate::config::{Capability, ProcessRole};
+        for role in [ProcessRole::Combined, ProcessRole::Web, ProcessRole::Worker] {
+            let mut state = crate::AppState::for_test();
+            state.role = role.into();
+            let json = info_json_for(state).await;
+            assert_eq!(json["role"]["name"], role.as_str(), "{json}");
+            assert_eq!(json["role"]["base"], role.as_str(), "{json}");
+            assert_eq!(json["role"]["preset"], false, "{json}");
+            let caps = json["role"]["capabilities"]
+                .as_object()
+                .expect("capabilities object");
+            assert_eq!(caps.len(), Capability::ALL.len());
+            for &capability in Capability::ALL {
+                assert_eq!(
+                    caps[capability.as_str()],
+                    serde_json::Value::Bool(role.runs(capability)),
+                    "role {} capability {}",
+                    role.as_str(),
+                    capability.as_str()
+                );
+            }
+            // The existing keys stay.
+            for key in ["app", "autumn", "runtime", "build"] {
+                assert!(json.get(key).is_some(), "missing {key}: {json}");
+            }
+        }
+    }
+
+    /// A resolved `[roles.critical]` preset over `worker` (#3543).
+    fn critical_role_3543() -> crate::config::Role {
+        let config: AutumnConfig = toml::from_str(
+            "role = \"critical\"\n[roles.critical]\nbase = \"worker\"\n\
+             pin = [\"critical\"]\nscheduler = false\n",
+        )
+        .expect("roles config");
+        config.resolve_role().expect("critical resolves")
+    }
+
+    async fn get_body(state: crate::AppState, uri: &str) -> String {
+        let app = actuator_router(true).with_state(state);
+        let resp = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn actuator_info_reports_a_named_role() {
+        let mut state = crate::AppState::for_test();
+        state.role = critical_role_3543();
+        let json = info_json_for(state).await;
+        assert_eq!(json["role"]["name"], "critical", "{json}");
+        assert_eq!(json["role"]["base"], "worker", "{json}");
+        assert_eq!(json["role"]["preset"], true, "{json}");
+        assert_eq!(json["role"]["capabilities"]["scheduler"], false, "{json}");
+        assert_eq!(json["role"]["capabilities"]["job_workers"], true, "{json}");
+    }
+
+    #[tokio::test]
+    async fn actuator_info_reports_the_role_mount() {
+        let config: AutumnConfig = toml::from_str(
+            "role = \"marketing\"\n[roles.marketing]\nbase = \"web\"\n\
+             mount = [\"marketing\"]\n",
+        )
+        .expect("roles config");
+        let mut state = crate::AppState::for_test();
+        state.role = config.resolve_role().expect("marketing resolves");
+        let json = info_json_for(state).await;
+        assert_eq!(
+            json["role"]["mount"],
+            serde_json::json!(["marketing"]),
+            "{json}"
+        );
+
+        // No `mount`: the key is omitted.
+        let json = info_json_for(crate::AppState::for_test()).await;
+        assert!(json["role"].get("mount").is_none(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn actuator_jobs_reports_the_role() {
+        let mut state = crate::AppState::for_test();
+        state.role = critical_role_3543();
+        let body = get_body(state, "/actuator/jobs").await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["role"]["name"], "critical", "{json}");
+        assert_eq!(json["role"]["base"], "worker", "{json}");
+        assert_eq!(
+            json["role"]["pin"],
+            serde_json::json!(["critical"]),
+            "{json}"
+        );
+        assert!(
+            json.get("jobs").is_some() && json.get("queues").is_some(),
+            "{json}"
+        );
+
+        let body = get_body(crate::AppState::for_test(), "/actuator/jobs").await;
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["role"]["name"], "combined", "{json}");
+        assert!(json["role"].get("pin").is_none(), "{json}");
+    }
+
+    /// A preset adds a `role` label to the framework metric families. A
+    /// built-in role keeps the label set it had.
+    #[tokio::test]
+    async fn actuator_prometheus_labels_framework_metrics_with_a_named_role() {
+        let mut state = crate::AppState::for_test();
+        state.role = critical_role_3543();
+        state.metrics().record("GET", "/x", 200, 10);
+        let text = get_body(state, "/actuator/prometheus").await;
+        assert!(
+            text.contains("autumn_http_requests_total{version=\"stable\",role=\"critical\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "autumn_http_responses_total{version=\"stable\",role=\"critical\",status=\"2xx\"} 1"
+            ),
+            "{text}"
+        );
+        // Every framework sample that carries `version` carries `role` too.
+        for line in text.lines().filter(|l| l.contains("version=\"stable\"")) {
+            assert!(line.contains("role=\"critical\""), "{line}");
+        }
+
+        let state = crate::AppState::for_test();
+        state.metrics().record("GET", "/x", 200, 10);
+        let text = get_body(state, "/actuator/prometheus").await;
+        assert!(
+            text.contains("autumn_http_requests_total{version=\"stable\"} 1"),
+            "{text}"
+        );
+        assert!(!text.contains("role="), "{text}");
     }
 
     #[tokio::test]

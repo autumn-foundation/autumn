@@ -66,6 +66,7 @@ use serde_json::{Map, Value};
 use super::ast::{BinaryOp, Expr, RouteSource, StylePreset};
 use super::budget::{Budget, SLOT_BYTES};
 use super::error::{ConstelaError, Diagnostic, codes};
+use super::path::Path;
 
 /// The route values an [`Expr::Route`] reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -162,11 +163,13 @@ pub(crate) struct EvalCtx<'a> {
 }
 
 impl EvalCtx<'_> {
-    /// A context one level deeper, or an error if the budget is spent.
-    fn descend(&self, path: &str) -> Result<Self, ConstelaError> {
+    /// A context one level deeper, or an error if the depth or the fuel is
+    /// spent. Burns one unit of fuel: each `eval_ref` call comes through here.
+    fn descend(&self, path: Path<'_>) -> Result<Self, ConstelaError> {
+        self.budget.burn(1, path)?;
         if self.depth == 0 {
             return Err(ConstelaError::Render(Diagnostic::new(
-                path,
+                path.to_string(),
                 codes::RENDER_LIMIT,
                 "expression nests deeper than the configured render depth limit",
             )));
@@ -248,7 +251,7 @@ pub fn text_of(value: &Value) -> String {
 pub(crate) fn coerce<'v>(
     value: &'v Value,
     budget: &Budget,
-    path: &str,
+    path: Path<'_>,
 ) -> Result<Cow<'v, str>, ConstelaError> {
     match value {
         Value::String(text) => Ok(Cow::Borrowed(text)),
@@ -263,7 +266,7 @@ pub(crate) fn coerce<'v>(
 pub(crate) fn text_coerce<'v>(
     value: &'v Value,
     budget: &Budget,
-    path: &str,
+    path: Path<'_>,
 ) -> Result<Cow<'v, str>, ConstelaError> {
     if value.is_null() {
         Ok(Cow::Borrowed(""))
@@ -404,6 +407,22 @@ fn select_path<'a>(base: Cow<'a, Value>, path: &str) -> Cow<'a, Value> {
     }
 }
 
+/// Spend fuel for the length of a dotted path that a lookup will walk.
+fn burn_sub(budget: &Budget, sub: Option<&str>, path: Path<'_>) -> Result<(), ConstelaError> {
+    sub.map_or(Ok(()), |sub| budget.burn_scan(sub.len(), path))
+}
+
+/// Read a binding, then follow its optional dotted path. Borrows.
+fn read<'a>(
+    base: Option<&'a Value>,
+    sub: Option<&str>,
+    budget: &Budget,
+    path: Path<'_>,
+) -> Result<Cow<'a, Value>, ConstelaError> {
+    burn_sub(budget, sub, path)?;
+    Ok(lookup(base, sub))
+}
+
 /// Apply an optional dotted path to a looked-up base value. Borrows.
 fn lookup<'a>(base: Option<&'a Value>, path: Option<&str>) -> Cow<'a, Value> {
     let Some(base) = base else {
@@ -421,7 +440,7 @@ fn lookup<'a>(base: Option<&'a Value>, path: Option<&str>) -> Cow<'a, Value> {
 /// # Errors
 ///
 /// As [`eval_ref`].
-pub(crate) fn eval(expr: &Expr, ctx: &EvalCtx<'_>, path: &str) -> Result<Value, ConstelaError> {
+pub(crate) fn eval(expr: &Expr, ctx: &EvalCtx<'_>, path: Path<'_>) -> Result<Value, ConstelaError> {
     let value = eval_ref(expr, ctx, path)?;
     ctx.budget.own(value, path)
 }
@@ -444,14 +463,18 @@ pub(crate) fn eval(expr: &Expr, ctx: &EvalCtx<'_>, path: &str) -> Result<Value, 
 pub(crate) fn eval_ref<'a>(
     expr: &'a Expr,
     ctx: &EvalCtx<'a>,
-    path: &str,
+    path: Path<'_>,
 ) -> Result<Cow<'a, Value>, ConstelaError> {
     let inner = ctx.descend(path)?;
     match expr {
         Expr::Lit { value } => Ok(Cow::Borrowed(value)),
-        Expr::State { name, path: sub } => Ok(lookup(ctx.state.get(name), sub.as_deref())),
-        Expr::Var { name, path: sub } => Ok(lookup(ctx.env.var(name), sub.as_deref())),
-        Expr::Param { name, path: sub } => Ok(lookup(ctx.env.param(name), sub.as_deref())),
+        Expr::State { name, path: sub } => {
+            read(ctx.state.get(name), sub.as_deref(), ctx.budget, path)
+        }
+        Expr::Var { name, path: sub } => read(ctx.env.var(name), sub.as_deref(), ctx.budget, path),
+        Expr::Param { name, path: sub } => {
+            read(ctx.env.param(name), sub.as_deref(), ctx.budget, path)
+        }
         Expr::Route { name, source } => {
             let looked_up = match source {
                 RouteSource::Param => ctx.route.params.get(name).map(String::as_str),
@@ -465,7 +488,7 @@ pub(crate) fn eval_ref<'a>(
             Ok(Cow::Owned(Value::String(text.to_string())))
         }
         Expr::Not { operand } => {
-            let value = eval_ref(operand, &inner, &format!("{path}.operand"))?;
+            let value = eval_ref(operand, &inner, path.key("operand"))?;
             Ok(Cow::Owned(Value::Bool(!truthy(&value))))
         }
         Expr::Cond {
@@ -473,26 +496,27 @@ pub(crate) fn eval_ref<'a>(
             then,
             otherwise,
         } => {
-            let test = eval_ref(condition, &inner, &format!("{path}.if"))?;
+            let test = eval_ref(condition, &inner, path.key("if"))?;
             if truthy(&test) {
-                eval_ref(then, &inner, &format!("{path}.then"))
+                eval_ref(then, &inner, path.key("then"))
             } else {
-                eval_ref(otherwise, &inner, &format!("{path}.else"))
+                eval_ref(otherwise, &inner, path.key("else"))
             }
         }
         Expr::Get { base, path: sub } => {
-            let base = eval_ref(base, &inner, &format!("{path}.base"))?;
+            let base = eval_ref(base, &inner, path.key("base"))?;
+            burn_sub(ctx.budget, Some(sub), path)?;
             Ok(select_path(base, sub))
         }
         Expr::Index { base, key } => {
-            let base = eval_ref(base, &inner, &format!("{path}.base"))?;
-            let key = eval_ref(key, &inner, &format!("{path}.key"))?;
+            let base = eval_ref(base, &inner, path.key("base"))?;
+            let key = eval_ref(key, &inner, path.key("key"))?;
             index_into(base, &key, ctx.budget, path)
         }
         Expr::Concat { items } => {
             let mut out = String::new();
             for (i, item) in items.iter().enumerate() {
-                let value = eval_ref(item, &inner, &format!("{path}.items[{i}]"))?;
+                let value = eval_ref(item, &inner, path.key("items").index(i))?;
                 // Charged per piece, so the string is refused as it grows
                 // rather than after it is whole. A converted piece was
                 // charged when it was converted.
@@ -513,7 +537,7 @@ pub(crate) fn eval_ref<'a>(
             for (i, element) in elements.iter().enumerate() {
                 // `eval`, not `eval_ref`: the element is kept, so a borrowed
                 // one is charged and copied.
-                out.push(eval(element, &inner, &format!("{path}.elements[{i}]"))?);
+                out.push(eval(element, &inner, path.key("elements").index(i))?);
             }
             Ok(Cow::Owned(Value::Array(out)))
         }
@@ -522,30 +546,44 @@ pub(crate) fn eval_ref<'a>(
             for (key, value) in props {
                 ctx.budget
                     .charge(key.len().saturating_add(SLOT_BYTES), path)?;
-                let value = eval(value, &inner, &format!("{path}.props.{key}"))?;
+                let value = eval(value, &inner, path.key("props").name(key))?;
                 out.insert(key.clone(), value);
             }
             Ok(Cow::Owned(Value::Object(out)))
         }
         Expr::Bin { op, left, right } => eval_binary(*op, left, right, &inner, path),
-        Expr::Style { name, variants } => {
-            let Some(preset) = ctx.styles.get(name) else {
-                return Ok(Cow::Owned(Value::String(String::new())));
-            };
-            let mut values = Vec::with_capacity(variants.len());
-            for (axis, expr) in variants {
-                let value = eval_ref(expr, &inner, &format!("{path}.variants.{axis}"))?;
-                values.push((axis.as_str(), value));
-            }
-            let mut selected = BTreeMap::new();
-            for (axis, value) in &values {
-                selected.insert(*axis, text_coerce(value, ctx.budget, path)?);
-            }
-            let classes = resolve_style(preset, &selected);
-            ctx.budget.charge(classes.len(), path)?;
-            Ok(Cow::Owned(Value::String(classes)))
-        }
+        Expr::Style { name, variants } => eval_style(name, variants, &inner, ctx, path),
     }
+}
+
+/// Evaluate a style expression: the preset's classes for the selected variants.
+fn eval_style<'a>(
+    name: &str,
+    variants: &'a BTreeMap<String, Expr>,
+    inner: &EvalCtx<'a>,
+    ctx: &EvalCtx<'a>,
+    path: Path<'_>,
+) -> Result<Cow<'a, Value>, ConstelaError> {
+    let Some(preset) = ctx.styles.get(name) else {
+        return Ok(Cow::Owned(Value::String(String::new())));
+    };
+    let mut values = Vec::with_capacity(variants.len());
+    for (axis, expr) in variants {
+        let value = eval_ref(expr, inner, path.key("variants").name(axis))?;
+        values.push((axis.as_str(), value));
+    }
+    let mut selected = BTreeMap::new();
+    for (axis, value) in &values {
+        selected.insert(*axis, text_coerce(value, ctx.budget, path)?);
+    }
+    // `resolve_style` visits every axis of the preset.
+    ctx.budget.burn(
+        u64::try_from(preset.variants.len()).unwrap_or(u64::MAX),
+        path,
+    )?;
+    let classes = resolve_style(preset, &selected);
+    ctx.budget.charge(classes.len(), path)?;
+    Ok(Cow::Owned(Value::String(classes)))
 }
 
 /// `null`, borrowed.
@@ -572,6 +610,16 @@ fn array_slot(key: &Value) -> Option<usize> {
 ///
 /// JS indexes a string by code unit; indexing by chars is the closest total
 /// equivalent that cannot split a UTF-8 sequence.
+/// Bytes that `string_char` can walk: at most four for each character up to
+/// the index, and never more than the text.
+fn string_walk(text: &str, key: &Value) -> usize {
+    key.as_u64()
+        .and_then(|index| usize::try_from(index).ok())
+        .map_or(0, |index| {
+            index.saturating_add(1).saturating_mul(4).min(text.len())
+        })
+}
+
 fn string_char<'a>(text: &str, key: &Value) -> Cow<'a, Value> {
     key.as_u64()
         .and_then(|index| usize::try_from(index).ok())
@@ -586,7 +634,7 @@ fn index_into<'a>(
     base: Cow<'a, Value>,
     key: &Value,
     budget: &Budget,
-    path: &str,
+    path: Path<'_>,
 ) -> Result<Cow<'a, Value>, ConstelaError> {
     Ok(match base {
         Cow::Borrowed(base) => match base {
@@ -595,9 +643,13 @@ fn index_into<'a>(
                 .map_or_else(null, Cow::Borrowed),
             Value::Object(map) => {
                 let key = coerce(key, budget, path)?;
+                budget.burn_scan(key.len(), path)?;
                 map.get(key.as_ref()).map_or_else(null, Cow::Borrowed)
             }
-            Value::String(text) => string_char(text, key),
+            Value::String(text) => {
+                budget.burn_scan(string_walk(text, key), path)?;
+                string_char(text, key)
+            }
             _ => null(),
         },
         Cow::Owned(base) => match base {
@@ -606,9 +658,13 @@ fn index_into<'a>(
                 .map_or_else(null, Cow::Owned),
             Value::Object(mut map) => {
                 let key = coerce(key, budget, path)?;
+                budget.burn_scan(key.len(), path)?;
                 map.remove(key.as_ref()).map_or_else(null, Cow::Owned)
             }
-            Value::String(text) => string_char(&text, key),
+            Value::String(text) => {
+                budget.burn_scan(string_walk(&text, key), path)?;
+                string_char(&text, key)
+            }
             _ => null(),
         },
     })
@@ -644,15 +700,15 @@ fn eval_binary<'a>(
     left: &'a Expr,
     right: &'a Expr,
     ctx: &EvalCtx<'a>,
-    path: &str,
+    path: Path<'_>,
 ) -> Result<Cow<'a, Value>, ConstelaError> {
-    let left_path = format!("{path}.left");
-    let right_path = format!("{path}.right");
+    let left_path = path.key("left");
+    let right_path = path.key("right");
 
     // Short-circuit first, and yield the *operand*, not a boolean — `a || b`
     // is JavaScript's, not Rust's.
     if matches!(op, BinaryOp::And | BinaryOp::Or) {
-        let left = eval_ref(left, ctx, &left_path)?;
+        let left = eval_ref(left, ctx, left_path)?;
         let take_left = if op == BinaryOp::And {
             !truthy(&left)
         } else {
@@ -661,12 +717,12 @@ fn eval_binary<'a>(
         return if take_left {
             Ok(left)
         } else {
-            eval_ref(right, ctx, &right_path)
+            eval_ref(right, ctx, right_path)
         };
     }
 
-    let left = eval_ref(left, ctx, &left_path)?;
-    let right = eval_ref(right, ctx, &right_path)?;
+    let left = eval_ref(left, ctx, left_path)?;
+    let right = eval_ref(right, ctx, right_path)?;
 
     Ok(Cow::Owned(match op {
         BinaryOp::Add => {
@@ -708,13 +764,22 @@ fn eval_binary<'a>(
                 number_value(as_number(&left) % divisor)
             }
         }
-        BinaryOp::Eq => Value::Bool(strict_eq(&left, &right)),
-        BinaryOp::Ne => Value::Bool(!strict_eq(&left, &right)),
+        BinaryOp::Eq => {
+            ctx.budget.burn_compare(&left, &right, path)?;
+            Value::Bool(strict_eq(&left, &right))
+        }
+        BinaryOp::Ne => {
+            ctx.budget.burn_compare(&left, &right, path)?;
+            Value::Bool(!strict_eq(&left, &right))
+        }
         BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
             let ordering = if left.is_number() && right.is_number() {
                 as_number(&left).partial_cmp(&as_number(&right))
             } else {
-                Some(coerce(&left, ctx.budget, path)?.cmp(&coerce(&right, ctx.budget, path)?))
+                let left = coerce(&left, ctx.budget, path)?;
+                let right = coerce(&right, ctx.budget, path)?;
+                ctx.budget.burn_scan(left.len().min(right.len()), path)?;
+                Some(left.cmp(&right))
             };
             let Some(ordering) = ordering else {
                 return Ok(Cow::Owned(Value::Bool(false)));
@@ -760,7 +825,7 @@ mod tests {
             depth: 64,
             budget: &budget,
         };
-        eval(&expr, &ctx, "expr").expect("evaluates")
+        eval(&expr, &ctx, Path::root("expr")).expect("evaluates")
     }
 
     #[test]
@@ -1005,7 +1070,7 @@ mod tests {
             depth: 3,
             budget: &budget,
         };
-        let err = eval(&expr, &ctx, "expr").expect_err("over budget");
+        let err = eval(&expr, &ctx, Path::root("expr")).expect_err("over budget");
         assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
     }
 
@@ -1027,7 +1092,7 @@ mod tests {
             depth: 64,
             budget,
         };
-        eval(&expr, &ctx, "expr")
+        eval(&expr, &ctx, Path::root("expr"))
     }
 
     #[test]
@@ -1211,10 +1276,10 @@ mod tests {
             budget: &budget,
         };
         // Borrowed: no charge, so a 10-byte budget is enough.
-        let read = eval_ref(&expr, &ctx, "expr").expect("borrows");
+        let read = eval_ref(&expr, &ctx, Path::root("expr")).expect("borrows");
         assert!(matches!(read, Cow::Borrowed(_)));
         // Owned: the copy is charged, and 100 bytes is over the budget.
-        let err = eval(&expr, &ctx, "expr").expect_err("copy over budget");
+        let err = eval(&expr, &ctx, Path::root("expr")).expect_err("copy over budget");
         assert_eq!(err.diagnostics()[0].code, codes::RENDER_LIMIT);
     }
 
@@ -1222,14 +1287,14 @@ mod tests {
     fn coercing_a_non_string_charges_the_budget() {
         let budget = Budget::new(4);
         let value = json!([1, 2, 3]);
-        coerce(&value, &budget, "p").expect_err("over a 4-byte budget");
+        coerce(&value, &budget, Path::root("p")).expect_err("over a 4-byte budget");
         let text = json!("plain");
         assert!(matches!(
-            coerce(&text, &Budget::new(0), "p").expect("strings borrow"),
+            coerce(&text, &Budget::new(0), Path::root("p")).expect("strings borrow"),
             Cow::Borrowed("plain")
         ));
         assert_eq!(
-            text_coerce(&json!(null), &Budget::new(0), "p").expect("null is empty"),
+            text_coerce(&json!(null), &Budget::new(0), Path::root("p")).expect("null is empty"),
             ""
         );
     }

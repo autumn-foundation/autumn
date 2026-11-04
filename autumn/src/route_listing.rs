@@ -414,6 +414,11 @@ pub struct RouteInfo {
     /// dimensions of the routes manifest carry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pools: Vec<String>,
+    /// The route group (#3544). A `[roles.<name>] mount` list selects routes
+    /// by group. `None` for a framework route or a plugin asset: every role
+    /// that serves HTTP serves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// `skip_serializing_if` helper: elide `false` booleans from JSON output.
@@ -623,6 +628,10 @@ fn pools_of(
 /// # Errors
 ///
 /// Returns `RouterBuildError::UnregisteredApiVersion` if a route's version is not registered.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one field initialiser per `RouteInfo` field, for top-level and scoped routes"
+)]
 pub fn collect_route_infos(
     routes: &[Route],
     route_sources: &[RouteSource],
@@ -696,6 +705,7 @@ pub fn collect_route_infos(
             agent_grant: agent_grant_of(&route.api_doc),
             resource_shape: ResourceShape::from_pools(&pools),
             pools,
+            group: Some(route.group_name().to_owned()),
         });
     }
 
@@ -727,6 +737,7 @@ pub fn collect_route_infos(
                 agent_grant: agent_grant_of(&route.api_doc),
                 resource_shape: ResourceShape::from_pools(&pools),
                 pools,
+                group: Some(route.group_name().to_owned()),
             });
         }
     }
@@ -894,22 +905,15 @@ pub(crate) fn append_framework_routes_with_env(
     // enables them (same gating condition as the router mount).
     #[cfg(feature = "maud")]
     if config.stories.enabled {
+        // The demo backends come from the gallery's own list, so this
+        // listing matches the mounted routes (#3408).
         for (path, handler) in [
             (crate::stories::STORIES_PATH, "story_gallery_index"),
             ("/_stories/{slug}", "story_gallery_story"),
-            // Live demo backends for the Active search / Autocomplete /
-            // Infinite feed stories (review follow-up — route-dump
-            // consumers couldn't see these three without an entry here).
-            ("/_stories/demo/search", "story_gallery_demo_search"),
-            (
-                "/_stories/demo/tags/search",
-                "story_gallery_demo_tag_search",
-            ),
-            (
-                "/_stories/demo/posts/feed",
-                "story_gallery_demo_infinite_feed",
-            ),
-        ] {
+        ]
+        .into_iter()
+        .chain(crate::stories::demo_routes())
+        {
             infos.push(RouteInfo::framework_get(path.to_owned(), handler));
         }
     }
@@ -930,6 +934,7 @@ pub(crate) fn append_framework_routes_with_env(
     // `GET /_autumn/jobs/{token}` when `jobs.tracking.route_enabled` (default
     // true), gated identically to the router mount. List it so the manifest
     // reflects the mounted route.
+    #[cfg(feature = "job-tracking")]
     if config.jobs.tracking.route_enabled {
         infos.push(RouteInfo::framework_get(
             crate::job_tracking::JOB_STATUS_ROUTE_PATH.to_owned(),
@@ -1096,6 +1101,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 
@@ -1118,6 +1124,29 @@ mod tests {
         assert_eq!(infos[0].handler, "list_posts");
         assert_eq!(infos[0].source, RouteSource::User);
         assert!(infos[0].middleware.is_empty());
+    }
+
+    /// The listing carries the route group (#3544): `app` by default, the
+    /// route's own group otherwise, in a scoped group too.
+    #[test]
+    fn collect_route_infos_sets_the_route_group() {
+        let routes = vec![
+            make_route(Method::GET, "/posts", "list_posts"),
+            make_route(Method::GET, "/landing", "landing").in_group("marketing"),
+        ];
+        let scoped = vec![ScopedGroup {
+            prefix: "/m".to_owned(),
+            routes: vec![make_route(Method::GET, "/promo", "promo").in_group("marketing")],
+            source: RouteSource::User,
+            layer_guarded: false,
+            apply_layer: Box::new(|router| router),
+        }];
+        let infos = collect_route_infos(&routes, &[], &scoped, &[]).unwrap();
+        let groups: Vec<Option<&str>> = infos.iter().map(|i| i.group.as_deref()).collect();
+        assert_eq!(
+            groups,
+            vec![Some("app"), Some("marketing"), Some("marketing")]
+        );
     }
 
     #[test]
@@ -2134,11 +2163,7 @@ mod tests {
         // stories' live demo backends must be listed too, or route-dump
         // consumers can't see them and the OpenAPI/MCP collision preflight
         // (`collect_framework_get_paths` in router.rs) can't reserve them.
-        for demo_path in [
-            "/_stories/demo/search",
-            "/_stories/demo/tags/search",
-            "/_stories/demo/posts/feed",
-        ] {
+        for (demo_path, _) in crate::stories::demo_routes() {
             assert!(
                 paths.contains(&demo_path),
                 "enabled stories must list the demo route {demo_path}: {paths:?}"

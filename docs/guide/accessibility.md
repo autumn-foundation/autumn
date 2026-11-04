@@ -176,8 +176,9 @@ struct EventForm {
 
 ### `select_input`
 
-Renders a labelled `<select>` from `(value, label)` option pairs, marking the
-option matching the changeset's current value as `selected`. This is the
+Renders a labelled `<select>` from `(value, label)` option pairs. It marks
+the first option that matches the changeset's current value as `selected`.
+This is the
 control closed-set fields (enums, references) target.
 
 ```rust
@@ -186,6 +187,36 @@ html! {
     (select_input(&changeset, "status", "Status", &statuses))
 }
 ```
+
+`grouped_select_input` adds `<optgroup>` elements, and
+`FieldOptions::multiple()` adds `multiple` (issue #3409). See
+[Forms](forms.md#select-groups-multiple-and-style).
+
+- The control stays a native `<select>`. The browser gives each group
+  label to assistive technology. The browser supplies the keyboard support.
+- `FieldOptions::styled_select()` changes only CSS (`appearance:
+  base-select`). The element and its role do not change. The browser keeps
+  the keyboard support: the arrow keys open the picker, Enter chooses an
+  option and Escape closes the picker. With no browser support, the native
+  control shows.
+
+### Native inputs and choice groups
+
+`switch_input`, `range_input`, `radio_group`, `checkbox_group`,
+`segmented_control`, `email_input`, `tel_input`, `url_input`, `time_input`,
+`month_input`, `color_input` and `hidden_input` use native controls (issue
+#3405). See [Forms](forms.md#native-inputs).
+
+- A switch is `<input type="checkbox" role="switch">`. A screen reader says
+  "on" or "off".
+- A radio group, a checkbox group and a segmented control are a `<fieldset>`
+  with a `<legend>`. The hint and error links (`aria-describedby`,
+  `aria-invalid`) go on the `<fieldset>`.
+- A radio gets `required`, not `aria-required`: ARIA does not allow
+  `aria-required` on a radio.
+- A segmented radio is visually hidden, but it stays in the Tab order. The
+  arrow keys move the selection, and the label shows the focus ring.
+- A hidden input has no label. It is not visible and not announced.
 
 ### `skip_link`
 
@@ -329,6 +360,8 @@ Perform this manual checklist before shipping any new page or component:
 - [ ] htmx-powered interactions do not silently replace content — the live
       region announces the change
 - [ ] No keyboard trap: pressing Escape or Tab always allows leaving a widget
+- [ ] Tabs, menus and listboxes use the APG arrow keys. See the
+      [keyboard core](keyboard.md).
 - [ ] Images have meaningful `alt` text; purely decorative images use `alt=""`
 - [ ] All form fields have a visible `<label>` (not just `placeholder`)
 
@@ -541,8 +574,10 @@ least one. A visible group name renders `<fieldset><legend>`; `.aria_label(..)` 
 `.labelled_by(..)` render a `<div>` instead. Both carry `role="radiogroup"` —
 `<fieldset>` alone maps to role `group`, which does not support `aria-required`.
 Each choice gets an `id` that pairs it with its own `<label for=…>`, derived
-from the group name and the choice value. A `-` inside either is doubled, so
-group `a-b` choice `c` and group `a` choice `b-c` cannot collide. The same group
+from the group name and the choice value. Each byte other than a
+letter, digit or `_` is written `--HH` (upper-case hex), so two groups never
+give the same id: `plan-type` gives `plan--2Dtype-…`. The second choice with the
+same value ends in `--n1`. The third ends in `--n2`. The same group
 rendered repeatedly — one per table row — shares its form name by design, so
 `.id_prefix(..)` supplies the discriminator. An id is also a valid CSS selector,
 so `hx-target="#…"` and `querySelector` work on it. If the first part of the
@@ -703,17 +738,53 @@ function that shares it. `#[cfg(test)]` items are skipped, and the `path` is the
 path **as declared**: mount-time prefixes (a `scope`, a nested router) are
 applied at runtime and are not resolved here.
 
-An item, statement, match arm or field under `#[cfg(…)]` is used only when the
-predicate is true for the enabled features. Thus a gated handler is not a
-route, a gated helper is not a target, and a gated call is not followed. The
-scan reads `[features] default` from the nearest `Cargo.toml`. `--features a,b`
-adds features in every crate of the scan, `--all-features` turns on every
-feature (as Cargo does, an optional dependency that a `dep:` entry names is
-not a feature), and `--no-default-features` turns the default
-set off. A predicate the scan cannot decide (`target_os = "linux"`), or a file
-with no package manifest, keeps the item. A finding inside a gated item or
-statement that is off has no route. The features change only the route
-attribution. They do not change the findings or the exit code.
+An item, statement, match arm or field under `#[cfg(…)]` counts only when the
+predicate is true for the enabled features. A `#[cfg_attr(…, cfg(…))]` counts
+when its condition is true. A gated handler is not a route. A gated helper is
+not a target. The scan does not follow a gated call.
+
+The scan parses each file with `syn`, so a gated node ends where the Rust
+grammar ends it. It also applies these rules:
+
+- It reads a macro body as Rust when the body parses as Rust.
+- A `#![cfg(…)]` that is off takes out its file, module, function or block.
+- A `mod name;` under a `cfg` that is off takes out the module files.
+- In `cfg_if!`, it keeps only the branch that builds.
+
+The scan solves the features as `cargo build --workspace` solves them. It reads
+`[features] default` from the nearest `Cargo.toml`.
+
+- `--features a,b` turns on each name in each crate that declares it.
+  `views/a` names one crate.
+- `--all-features` turns on every feature. As in Cargo, an optional
+  dependency that a `dep:` entry names is not a feature.
+- `--no-default-features` turns off the default set.
+
+A crate also turns on what it asks for in a path dependency of the same
+workspace:
+
+- the `features` list of the dependency,
+- the default features, unless `default-features = false`,
+- the `views/a` and `views?/a` entries of its enabled features.
+
+A `[workspace.dependencies]` entry and a `[patch]` entry with a path count
+too. A target table counts when its `cfg` or its triple matches the host. A
+target `cfg` that the scan cannot decide does not count. Each workspace is
+solved alone. Resolver 1 also counts dev and build dependencies.
+
+A predicate that the scan cannot decide (`target_env = "gnu"`) keeps the item.
+A file with no package manifest also keeps it. A finding inside a gated item
+or statement that is off has no route. The features change only the route
+attribution. They do not change the findings or the exit code. A `--features`
+name that no crate declares gets a warning on stderr.
+
+Known limits:
+
+- When `syn` cannot parse a file, the scan reads its tokens. It also reads
+  the tokens of a macro body that is not Rust. The token reader finds the end
+  of a gated node by heuristics.
+- A crate outside the scan root does not turn on features in the scan.
+- The scan does not follow a `mod` with a `#[path]` attribute.
 
 Attribution is therefore a lower bound. `status: "pass"` means no finding was
 attributed to that route, not that the page is proven clean — read it alongside

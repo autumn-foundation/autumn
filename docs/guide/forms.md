@@ -115,7 +115,8 @@ helpers do not cover, read the state yourself:
 
 The free functions in `autumn_web::form` cover the rest of the control types:
 `password_input`, `textarea_input`, `checkbox_input`, `number_input`,
-`date_input`, `datetime_input`, and `select_input`.
+`date_input`, `datetime_input`, and `select_input`. The native inputs below
+add the switch, the slider, the groups and more types.
 
 Each control has a `required_*` variant. It adds `required`,
 `aria-required="true"` and a visual `*` marker in the label. The marker has
@@ -145,7 +146,8 @@ text_input_with(&changeset, "email", "Email", &FieldOptions::new()
   label and the control (after the label for a checkbox). `aria-describedby`
   names the hint first, then the error.
 - The typed attributes (`placeholder`, `autocomplete`, `inputmode`, `pattern`,
-  `min`, `max`, `disabled`, `readonly`) render only on controls that use them.
+  `min`, `max`, `disabled`, `readonly`, `multiple`) render only on controls
+  that use them.
 - `data` and `hx` add `data-*` and `hx-*` attributes. There is no setter for
   `id`, `name`, `class` or `aria-*`: the helper owns them. The htmx helpers also
   keep their own `hx-post`, `hx-params` and the other `hx-*` names they set.
@@ -163,8 +165,12 @@ text_input_with(&changeset, "email", "Email", &FieldOptions::new()
 | `date_input` | `date_input_with` |
 | `datetime_input` | `datetime_input_with` |
 | `select_input` | `select_input_with` |
+| `grouped_select_input` | `grouped_select_input_with` |
 | `rich_text_area_with_labels` | `rich_text_area_with` |
 | `rich_text_area_htmx_with_token_field_with_labels` | `rich_text_area_htmx_with` |
+| `switch_input`, `range_input`, `radio_group`, `checkbox_group`, `segmented_control` | `*_with` |
+| `email_input`, `tel_input`, `url_input`, `time_input`, `month_input`, `color_input` | `*_with` |
+| `hidden_input` | `hidden_input_with` |
 
 The `*_with` htmx helpers take the submit-token field name. Pass
 `"_submit_token"` for the default. A nested-form `RowScope` has
@@ -173,6 +179,124 @@ The `*_with` htmx helpers take the submit-token field name. Pass
 The Autumn stylesheet marks a field invalid with `:user-invalid`, so the
 browser's own check shows only after the user changes the field or submits.
 Server errors use the `autumn-field__input--invalid` class.
+
+### Native inputs
+
+These helpers use native HTML controls, so they work with JavaScript off
+(issue #3405). Each one has the wrapper, the hint, the errors and the
+passthrough above.
+
+| Helper | Control | Bind to | `required_*` |
+|---|---|---|---|
+| `switch_input` | `<input type="checkbox" role="switch">` | `#[serde(default)] bool` | yes |
+| `range_input(…, step)` | `<input type="range">` | a number | no |
+| `radio_group(…, choices)` | radios in a `<fieldset>` | a `String` or an enum | yes |
+| `checkbox_group(…, choices)` | boxes in a `<fieldset>` | `#[serde(default)] Vec<String>` | no |
+| `segmented_control(…, choices)` | radios that look like buttons | a `String` or an enum | yes |
+| `email_input`, `tel_input`, `url_input` | `type="email"`, `"tel"`, `"url"` | `String` | yes |
+| `time_input` | `type="time"` | `chrono::NaiveTime` | yes |
+| `month_input` | `type="month"` | `String` (`YYYY-MM`) | yes |
+| `color_input` | `type="color"` | `String` (`#rrggbb`) | no |
+| `hidden_input(changeset, field)` | `type="hidden"` | any | no |
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, checkbox_group_with, radio_group, switch_input};
+
+(switch_input(&changeset, "alerts", "Email alerts"))
+(radio_group(&changeset, "plan", "Plan", &[("free", "Free"), ("pro", "Pro")]))
+(checkbox_group_with(&changeset, "topics", "Topics",
+    &[("rust", "Rust"), ("web", "Web")],
+    &FieldOptions::new().hint("Choose one or more.")))
+```
+
+- A group is a `<fieldset>` with a `<legend>`. The hint and error links go on
+  the `<fieldset>`. The first input has `id="{field}"`, so an error summary
+  link moves focus to the group. The other inputs have `id="{field}-{index}"`.
+- A checkbox group posts one `topics=…` pair for each checked box, and no key
+  when no box is checked. `Changeset::field_values` checks the boxes again
+  after a 422.
+- `required` on a box means "check this box". So a required checkbox group
+  shows the marker only. Validate "one or more" on the server, for example
+  with `#[validate(length(min = 1))]`.
+- A radio has no `aria-required`, because ARIA does not allow it. `required` on
+  each radio makes the group required.
+- A slider, a color and a hidden input always have a value. They ignore
+  `required`.
+- The time value shows as `HH:MM`, or with seconds and `step="1"` when the
+  seconds are not zero. The month value shows as `YYYY-MM`, also from a date.
+  The color value shows as a lowercase `#rrggbb`. Any other color is not
+  shown.
+- A hidden input has no label, no wrapper and no error block. Show its errors
+  with the error summary.
+
+`form_for` takes the same controls: `FieldControl::Switch`, `Range { step }`,
+`Radio { options }`, `CheckboxGroup { options }`, `Segmented { options }`,
+`Email`, `Tel`, `Url`, `Time`, `Month`, `Color` and `Hidden`. A `#[model]`
+`NaiveTime` column gets `Time`. A non-null column does not make a switch, a
+slider, a color, a hidden input or a checkbox group required.
+
+The "Native inputs" and "Choice controls" stories show each control.
+
+### Select: groups, multiple and style
+
+`select_input` renders a native `<select>` (issue #3409). The browser
+supplies the keyboard behaviour and the accessibility tree. There is no
+JavaScript.
+
+| Item | Use |
+|---|---|
+| `grouped_select_input(…, choices, groups)` | Top-level `choices`, then one `<optgroup>` for each `(label, options)` group |
+| `FieldOptions::multiple()` | `<select multiple>`. Bind to a `#[serde(default)] Vec<T>` |
+| `FieldOptions::styled_select()` | The `autumn-select` class: `appearance: base-select` where the browser supports it |
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, grouped_select_input_with, select_input_with};
+
+(grouped_select_input_with(&changeset, "city", "City",
+    &[("", "Choose a city")],
+    &[
+        ("France", &[("paris", "Paris"), ("lyon", "Lyon")]),
+        ("Japan", &[("tokyo", "Tokyo")]),
+    ],
+    &FieldOptions::new().required().styled_select()))
+(select_input_with(&changeset, "tags", "Tags",
+    &[("rust", "Rust"), ("web", "Web")],
+    &FieldOptions::new().multiple()))
+```
+
+- A single select marks the first option whose value is the field value.
+  It marks one option only, also when two options have that value.
+- A multiple select reads `Changeset::field_values`. It marks each option
+  whose value is in the list. Thus the chosen options show again after a
+  422. The browser posts one `tags=…` pair for each chosen option. It posts
+  no key when no option is chosen.
+- `required` on a multiple select means "choose one or more". Also validate
+  on the server, for example with `#[validate(length(min = 1))]`.
+- A multiple select on a `String` field gets a 422 when the user chooses two
+  options. Bind it to a `Vec<T>`.
+- Autumn also writes `multiple` on a file input. Read the files with
+  `ChangesetForm::files(field)`. Other controls ignore `multiple`.
+- `styled_select` is opt-in. Chrome 135+ and Safari 27 support
+  `appearance: base-select`. They draw the select and its picker from the
+  design tokens, in the light and the dark scheme. Other browsers keep the
+  native control with the field style. A multiple select keeps the native
+  list box in all browsers.
+- In a styled select, the arrow keys, Enter and Space open the picker.
+  The arrow keys move in the picker. Enter chooses an option. Escape closes
+  the picker.
+
+`form_for` takes `FieldControl::GroupedSelect { options, groups }`. For a
+multiple select:
+
+1. Use `.override_field(name, FieldControl::Select { options })`, or
+   `GroupedSelect`.
+2. Set `.field_options(name, FieldOptions::new().multiple())`.
+
+The model `required` flag does not make a multiple select required, because
+a `Vec` can be empty.
+
+The "Select" story shows the styled select, the native fallback, a grouped
+select and a multiple select.
 
 ### The error summary
 
@@ -206,6 +330,26 @@ the browser never fills a password field again on an edit form.
 
 This is what the scaffold generator emits. Reach for the individual helpers when
 the form's layout matters; reach for `form_for` when it does not.
+
+### Controls from a widget pack
+
+A widget pack (for example a date picker) gives a `FieldRenderer`. Bind it
+to one field in two ways:
+
+```rust,ignore
+use autumn_web::form::{FieldControl, FieldOptions, custom_input_with};
+
+// With a changeset:
+custom_input_with(&changeset, "due", "Due", &DatePicker, &FieldOptions::new())
+
+// With form_for:
+form_for(&changeset, "/tasks", "post")
+    .override_field("due", FieldControl::custom(DatePicker))
+    .render()
+```
+
+The control gets the same wrapper, label, hint, errors and passthrough as a
+core control. See [Widget Packs](widget-packs.md#bind-a-form-input).
 
 ---
 

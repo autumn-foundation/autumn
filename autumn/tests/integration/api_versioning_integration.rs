@@ -81,7 +81,7 @@ async fn test_api_versioning_integration() {
     assert_eq!(resp.header("Sunset").unwrap(), expected_sunset_header);
 
     // 4. Move past sunset: should return 410 Gone with Sunset header
-    client.advance_clock(Duration::from_secs(24 * 3600)); // past sunset (June 3)
+    client.advance_clock(Duration::from_hours(24)); // past sunset (June 3)
     let resp = client.get("/api/info").send().await;
     resp.assert_status(410);
     assert_eq!(resp.header("Sunset").unwrap(), expected_sunset_header);

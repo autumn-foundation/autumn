@@ -382,6 +382,29 @@ pub fn plan(
     target: Option<DateTime<Utc>>,
 ) -> Result<RestorePlan, RestoreError> {
     let keys = destination.list(&segment::generations_prefix(root))?;
+    plan_from_listing(destination, root, &keys, target)
+}
+
+/// [`plan`] from a listing the caller already has. `keys` holds at least
+/// every key under `root`'s generations; other keys are ignored. The
+/// fleet lake (issue #3236) lists a whole fleet once and plans each
+/// database from that listing.
+///
+/// # Errors
+///
+/// See [`RestoreError`].
+pub(crate) fn plan_from_listing(
+    destination: &dyn ReplicaDestination,
+    root: &str,
+    keys: &[String],
+    target: Option<DateTime<Utc>>,
+) -> Result<RestorePlan, RestoreError> {
+    let generations = segment::generations_prefix(root);
+    let keys: Vec<String> = keys
+        .iter()
+        .filter(|key| key.starts_with(&generations))
+        .cloned()
+        .collect();
 
     // A generation counts only once its snapshot metadata (written last) exists.
     // Its epoch (issue #3233) is in the same listing; none means 0.
@@ -423,11 +446,42 @@ pub fn plan(
         });
     };
 
-    // Segment keys carry `seq` and ship time, so the selection needs no downloads.
-    let segment_keys = destination.list(&segment::segments_prefix(root, &generation))?;
-    let mut refs: Vec<(segment::SegmentRef, String)> = segment_keys
-        .into_iter()
-        .filter_map(|key| segment::parse_segment_key(&key).map(|r| (r, key)))
+    let segments = chain_of(root, &keys, &generation, target_ms)?;
+
+    if target.is_none() {
+        check_reaches_head(destination, root, &generation, &segments)?;
+    }
+
+    let generation_started_at = ms_to_utc(generation_ms);
+    let effective = segments
+        .last()
+        .map_or(generation_started_at, |s| s.created_at);
+
+    Ok(RestorePlan {
+        snapshot_key: segment::snapshot_key(root, &generation),
+        snapshot_meta_key: segment::snapshot_meta_key(root, &generation),
+        generation,
+        generation_started_at,
+        segments,
+        requested: target,
+        effective,
+    })
+}
+
+/// The segments of `generation` to replay, in order, up to `target_ms`.
+/// Segment keys carry `seq` and ship time, so the selection needs no
+/// downloads. They are in the generations listing.
+fn chain_of(
+    root: &str,
+    keys: &[String],
+    generation: &str,
+    target_ms: i64,
+) -> Result<Vec<PlannedSegment>, RestoreError> {
+    let segments_prefix = segment::segments_prefix(root, generation);
+    let mut refs: Vec<(segment::SegmentRef, String)> = keys
+        .iter()
+        .filter(|key| key.starts_with(&segments_prefix))
+        .filter_map(|key| segment::parse_segment_key(key).map(|r| (r, key.clone())))
         .collect();
     // `SegmentRef` orders by (index, seq) — replication order.
     refs.sort_by_key(|entry| entry.0);
@@ -452,7 +506,7 @@ pub fn plan(
                 });
             if !opens_the_chain {
                 return Err(RestoreError::SegmentGap {
-                    generation,
+                    generation: generation.to_owned(),
                     expected_index: expected_index.unwrap_or(0),
                     expected_seq,
                     found_index: reference.index,
@@ -464,7 +518,7 @@ pub fn plan(
         }
         if reference.seq != expected_seq {
             return Err(RestoreError::SegmentGap {
-                generation,
+                generation: generation.to_owned(),
                 expected_index: expected_index.unwrap_or(0),
                 expected_seq,
                 found_index: reference.index,
@@ -480,24 +534,7 @@ pub fn plan(
         });
     }
 
-    if target.is_none() {
-        check_reaches_head(destination, root, &generation, &segments)?;
-    }
-
-    let generation_started_at = ms_to_utc(generation_ms);
-    let effective = segments
-        .last()
-        .map_or(generation_started_at, |s| s.created_at);
-
-    Ok(RestorePlan {
-        snapshot_key: segment::snapshot_key(root, &generation),
-        snapshot_meta_key: segment::snapshot_meta_key(root, &generation),
-        generation,
-        generation_started_at,
-        segments,
-        requested: target,
-        effective,
-    })
+    Ok(segments)
 }
 
 /// Download, verify and reconstruct the database described by `plan`, writing it

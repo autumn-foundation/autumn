@@ -36,6 +36,7 @@ pub mod pwa;
 pub mod scaffold;
 mod scaffold_i18n;
 pub mod schema_edit;
+mod spelling;
 mod sweep;
 pub mod system_test;
 pub mod task;
@@ -1019,7 +1020,7 @@ mod tests {
         );
     }
 
-    // ── dotenv-backed backend detection (issue #1614 finding 8) ────────────
+    // ── dotenv-backed backend detection (issue #1614) ──────────────────────
 
     /// A DB URL that lives ONLY in the project `.env` (no `autumn.toml` url, no
     /// process env) must be detected — `autumn migrate` overlays `.env` before

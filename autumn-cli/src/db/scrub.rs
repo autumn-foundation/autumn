@@ -1689,10 +1689,11 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
                     let token = token_expr(table, &column.name, unique);
                     replacement_expr(plan.strategy, column, &token, unique)
                 }
-                Dialect::Sqlite => {
-                    let token = sqlite::token_expr(table, inputs.facts, &column.name, unique);
-                    sqlite::replacement_expr(plan.strategy, column, &token)
-                }
+                Dialect::Sqlite => sqlite::replacement_for(
+                    plan.strategy,
+                    column,
+                    sqlite::token_expr(table, inputs.facts, &column.name, unique),
+                ),
             }
             .map_err(|e| qualify(e, &qualified))?;
             assignments.push(assignment(column, &value, plan.strategy));
@@ -1702,7 +1703,13 @@ pub fn build_plan(inputs: &ClassificationInputs<'_>) -> Result<ScrubPlan, ScrubE
             Dialect::Postgres => (qualified_ident(&table.name), row_key_expr(table)),
             Dialect::Sqlite => (
                 quote_ident(&table.name),
-                sqlite::row_key_expr(table, inputs.facts),
+                // Only an encrypted rewrite reads the key. Build it then, so a
+                // table the scrub does not rewrite is never refused for it.
+                if encrypted_rewrites.is_empty() {
+                    String::new()
+                } else {
+                    sqlite::row_key_expr(table, inputs.facts)?
+                },
             ),
         };
         out.tables.push(TablePlan {
@@ -4800,10 +4807,14 @@ pub enum Dialect {
 pub struct DatabaseFacts {
     /// The dialect the plan's SQL is written in. Defaults to Postgres.
     pub dialect: Dialect,
-    /// `SQLite` tables that have a `rowid` (all but `WITHOUT ROWID` tables).
-    /// Such a table can hold several rows whose non-integer primary key is
-    /// `NULL`, so the row key falls back to `rowid`. Empty on Postgres.
+    /// `SQLite` tables that have a `rowid` and a primary key that can be
+    /// `NULL`. Such a table can hold several rows with a `NULL` key, so the row
+    /// key falls back to `rowid`. Empty on Postgres.
     pub rowid_tables: BTreeSet<String>,
+    /// The name that reads a rowid table's hidden row id. A user column can
+    /// shadow `rowid`, `_rowid_` or `oid`. `None` means all three are shadowed.
+    /// A table not listed uses `rowid`. Empty on Postgres.
+    pub rowid_aliases: BTreeMap<String, Option<&'static str>>,
     /// Every column on either side of any foreign key, all components of a
     /// composite key included, as `(table, column)`. Rewriting any of them
     /// breaks referential integrity (or is silently cascaded into a child).
@@ -5903,6 +5914,7 @@ fn probe_database_facts(
     Ok(DatabaseFacts {
         dialect: Dialect::Postgres,
         rowid_tables: BTreeSet::new(),
+        rowid_aliases: BTreeMap::new(),
         foreign_key_columns,
         checked_columns,
         generated_columns,
@@ -9731,6 +9743,116 @@ mod tests {
             matches!(err, ScrubError::PlaintextIntoEncrypted { ref columns } if columns[0].starts_with("users.email")),
             "got {err:?}"
         );
+    }
+
+    /// `SQLite` facts for `users`: a rowid table with no free row id name.
+    fn shadowed_rowid_facts() -> DatabaseFacts {
+        DatabaseFacts {
+            dialect: Dialect::Sqlite,
+            rowid_tables: BTreeSet::from(["users".to_owned()]),
+            rowid_aliases: BTreeMap::from([("users".to_owned(), None)]),
+            ..DatabaseFacts::default()
+        }
+    }
+
+    #[test]
+    fn sqlite_refuses_an_encrypted_table_with_no_free_rowid_name() {
+        let config = parse_config_str(
+            "[defaults]\nsafe_columns = [\"id\", \"created_at\", \"full_name\", \"bio\"]",
+        )
+        .unwrap();
+        let encrypted = encrypted_columns_of("users", &["email"]);
+        let err = plan_with_facts(
+            &[users_table()],
+            &config,
+            &encrypted,
+            &no_anonymize(),
+            &shadowed_rowid_facts(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ScrubError::UnsupportedOnSqlite { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn sqlite_builds_a_token_from_the_row_key_and_a_free_rowid_name() {
+        let config = parse_config_str(
+            "[defaults]\nsafe_columns = [\"id\", \"created_at\", \"full_name\", \"bio\"]\n[tables.users.pii]\nemail = \"email\"",
+        )
+        .unwrap();
+        let facts = DatabaseFacts {
+            dialect: Dialect::Sqlite,
+            rowid_tables: BTreeSet::from(["users".to_owned()]),
+            rowid_aliases: BTreeMap::from([("users".to_owned(), Some("oid"))]),
+            ..DatabaseFacts::default()
+        };
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &facts,
+        )
+        .unwrap();
+        let sql = sql_of(&plan, "users");
+        assert!(sql.contains("autumn_sha256("), "{sql}");
+        assert!(sql.contains("THEN 'rowid:' || oid"), "{sql}");
+        assert!(plan.tables[0].row_key.is_empty(), "no encrypted rewrite");
+    }
+
+    #[test]
+    fn sqlite_constant_strategies_need_no_rowid_name() {
+        let config = parse_config_str(
+            "[defaults]\nsafe_columns = [\"id\", \"email\", \"created_at\", \"full_name\"]\n\
+             [tables.users.pii]\nbio = \"null\"",
+        )
+        .unwrap();
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &shadowed_rowid_facts(),
+        )
+        .expect("NULL reads no row id");
+        assert!(sql_of(&plan, "users").contains("NULL"));
+        // A strategy that reads the token still needs one.
+        let config = parse_config_str(
+            "[defaults]\nsafe_columns = [\"id\", \"email\", \"created_at\", \"full_name\"]\n\
+             [tables.users.pii]\nbio = \"redact\"",
+        )
+        .unwrap();
+        let err = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &shadowed_rowid_facts(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ScrubError::UnsupportedOnSqlite { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn sqlite_does_not_refuse_a_table_it_never_rewrites() {
+        let config = parse_config_str(
+            "[defaults]\nsafe_columns = [\"id\", \"email\", \"created_at\", \"full_name\", \"bio\"]",
+        )
+        .unwrap();
+        let plan = plan_with_facts(
+            &[users_table()],
+            &config,
+            &empty_encrypted(),
+            &no_anonymize(),
+            &shadowed_rowid_facts(),
+        )
+        .expect("nothing to rewrite, nothing to refuse");
+        assert!(plan.tables.is_empty(), "no rewrite, no table plan");
     }
 
     #[test]

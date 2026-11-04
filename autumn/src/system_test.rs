@@ -152,6 +152,14 @@ use crate::browser_detect::{browser_candidates, find_chromium};
 
 // ── SystemTestError ────────────────────────────────────────────────────────
 
+/// Run axe-core and return the serious and critical violations as a JSON
+/// array of strings. See [`Page::axe_violations`].
+const AXE_RUN_JS: &str = "axe.run(document, { resultTypes: ['violations'] }).then(r => JSON.stringify(\
+    r.violations\
+      .filter(v => v.impact === 'serious' || v.impact === 'critical')\
+      .map(v => `${v.id} (${v.impact}): ${v.help} -> ` \
+        + v.nodes.slice(0, 5).map(n => n.target.join(' ')).join(', '))))";
+
 /// Errors produced by the system-test harness.
 #[derive(Debug, thiserror::Error)]
 pub enum SystemTestError {
@@ -342,6 +350,8 @@ pub struct SystemTest {
     /// App-wide Tower layers registered via [`SystemTest::layer`], applied in
     /// the same router position as [`crate::app::AppBuilder::layer`].
     custom_layers: Vec<crate::app::CustomLayerRegistration>,
+    /// Asset bundles from [`SystemTest::plugin_assets`].
+    plugin_assets: Vec<&'static crate::assets::PluginAssets>,
     /// `WebMCP` settings from [`SystemTest::mount_webmcp`].
     #[cfg(feature = "webmcp")]
     webmcp: Option<crate::webmcp::WebMcpRuntime>,
@@ -372,6 +382,7 @@ impl SystemTest {
             hx_settle_timeout: DEFAULT_HX_SETTLE_TIMEOUT,
             state_override: None,
             custom_layers: Vec::new(),
+            plugin_assets: Vec::new(),
             #[cfg(feature = "webmcp")]
             webmcp: None,
         }
@@ -464,6 +475,22 @@ impl SystemTest {
                 type_name: std::any::type_name::<L>(),
                 layer: layer.erase(),
             });
+        self
+    }
+
+    /// Serve a [`PluginAssets`](crate::assets::PluginAssets) bundle.
+    ///
+    /// It works as
+    /// [`AppBuilder::plugin_assets`](crate::app::AppBuilder::plugin_assets)
+    /// does. A widget pack test uses it for the pack CSS and JS.
+    pub fn plugin_assets(mut self, assets: &'static crate::assets::PluginAssets) -> Self {
+        if !self
+            .plugin_assets
+            .iter()
+            .any(|installed| std::ptr::eq(*installed, assets))
+        {
+            self.plugin_assets.push(assets);
+        }
         self
     }
 
@@ -577,8 +604,18 @@ impl SystemTest {
                 .collect();
             crate::webmcp::install(&state, &docs, runtime, None, &config);
         }
-        crate::router::try_build_router_with_layers(self.routes, &config, state, self.custom_layers)
-            .unwrap_or_else(|error| panic!("invalid router configuration: {error}"))
+        let mut router = crate::router::try_build_router_with_layers(
+            self.routes,
+            &config,
+            state,
+            self.custom_layers,
+        )
+        .unwrap_or_else(|error| panic!("invalid router configuration: {error}"));
+        for assets in self.plugin_assets {
+            crate::assets::plugin::register(assets);
+            router = router.merge(assets.router());
+        }
+        router
     }
 
     /// Launch a managed headless Chromium and attach it to an **already
@@ -875,6 +912,21 @@ fn remote_object_to_string(obj: &chromiumoxide::cdp::js_protocol::runtime::Remot
         .unwrap_or_default()
 }
 
+/// Look up a DOM key name for [`Page::press`].
+///
+/// Prefers the main-keyboard entry (`code == key`, e.g. `ArrowDown`). The
+/// first entry with that key name can be the numpad one (`Numpad2`).
+fn known_key(key: &str) -> Result<&'static chromiumoxide::keys::KeyDefinition, SystemTestError> {
+    chromiumoxide::keys::USKEYBOARD_LAYOUT
+        .iter()
+        .find(|def| def.key == key && def.code == key)
+        .or_else(|| chromiumoxide::keys::get_key_definition(key))
+        .ok_or_else(|| SystemTestError::AssertionFailed {
+            message: format!("unknown key: {key}"),
+            artifact_path: None,
+        })
+}
+
 // ── Page ───────────────────────────────────────────────────────────────────
 
 /// Browser page with htmx-aware assertions.
@@ -1002,6 +1054,107 @@ impl Page {
         Ok(self)
     }
 
+    /// Move the mouse to the center of the element that matches `selector`,
+    /// as a user does. CSS `:hover` then applies. To move the mouse away,
+    /// hover a different element.
+    ///
+    /// # Errors
+    /// CDP errors, for example when no element matches.
+    pub async fn hover(&self, selector: &str) -> Result<&Self, SystemTestError> {
+        self.inner.find_element(selector).await?.hover().await?;
+        Ok(self)
+    }
+
+    /// Move the mouse to the point (`x`, `y`), in CSS pixels from the top
+    /// left of the viewport. CSS `:hover` then applies at that point. Use it
+    /// to move the pointer through a gap, as a user does.
+    ///
+    /// # Errors
+    /// CDP errors.
+    pub async fn move_mouse(&self, x: f64, y: f64) -> Result<&Self, SystemTestError> {
+        self.inner
+            .move_mouse(chromiumoxide::layout::Point::new(x, y))
+            .await?;
+        Ok(self)
+    }
+
+    /// Click the viewport point `(x, y)` with a real mouse event.
+    ///
+    /// Use it to hit what has no element, such as a dialog backdrop.
+    ///
+    /// # Errors
+    /// CDP errors.
+    pub async fn click_at(&self, x: f64, y: f64) -> Result<&Self, SystemTestError> {
+        self.inner
+            .click(chromiumoxide::layout::Point::new(x, y))
+            .await?;
+        self.wait_for_hx_settle().await?;
+        Ok(self)
+    }
+
+    /// Press one key on the focused element, as a user does.
+    ///
+    /// Sends real CDP `keyDown`/`keyUp` events, so the browser runs its
+    /// default actions (`Tab` moves focus, `Enter` follows a link). `key` is a
+    /// DOM key name, for example `"ArrowDown"`, `"Escape"`, `"Tab"` or `"g"`.
+    /// Auto-waits for htmx to settle.
+    ///
+    /// # Errors
+    /// [`SystemTestError::AssertionFailed`] for an unknown key, or CDP errors.
+    pub async fn press(&self, key: &str) -> Result<&Self, SystemTestError> {
+        use chromiumoxide::cdp::browser_protocol::input::{
+            DispatchKeyEventParams, DispatchKeyEventType,
+        };
+        let def = known_key(key)?;
+        let text = def
+            .text
+            .or_else(|| (def.key.chars().count() == 1).then_some(def.key));
+        let down_type = if text.is_some() {
+            DispatchKeyEventType::KeyDown
+        } else {
+            DispatchKeyEventType::RawKeyDown
+        };
+        let mut down = DispatchKeyEventParams::builder()
+            .r#type(down_type)
+            .key(def.key)
+            .code(def.code)
+            .windows_virtual_key_code(def.key_code)
+            .native_virtual_key_code(def.key_code);
+        if let Some(text) = text {
+            down = down.text(text);
+        }
+        let up = DispatchKeyEventParams::builder()
+            .r#type(DispatchKeyEventType::KeyUp)
+            .key(def.key)
+            .code(def.code)
+            .windows_virtual_key_code(def.key_code)
+            .native_virtual_key_code(def.key_code);
+        for params in [down.build(), up.build()] {
+            let params = params.map_err(|message| SystemTestError::AssertionFailed {
+                message,
+                artifact_path: None,
+            })?;
+            self.inner.execute(params).await?;
+        }
+        self.wait_for_hx_settle().await?;
+        Ok(self)
+    }
+
+    /// Turn page scripts on or off for this page.
+    ///
+    /// Call it before [`visit`](Self::visit) to load a page with JS off and
+    /// prove its no-JS fallback. [`evaluate`](Self::evaluate) still works.
+    ///
+    /// # Errors
+    /// CDP errors.
+    pub async fn set_javascript_enabled(&self, enabled: bool) -> Result<&Self, SystemTestError> {
+        use chromiumoxide::cdp::browser_protocol::emulation::SetScriptExecutionDisabledParams;
+        self.inner
+            .execute(SetScriptExecutionDisabledParams::new(!enabled))
+            .await?;
+        Ok(self)
+    }
+
     // ── Assertions ────────────────────────────────────────────────────────
 
     /// Assert that `text` appears somewhere in the visible page content.
@@ -1025,6 +1178,31 @@ impl Page {
         let artifact = self.write_failure_artifacts("expect_text").await.ok();
         Err(SystemTestError::AssertionFailed {
             message: format!("expected text {text:?} in page body"),
+            artifact_path: artifact,
+        })
+    }
+
+    /// Assert that the element that matches `selector` paints on top at its
+    /// center: no other element, for example a modal backdrop, covers it.
+    ///
+    /// The hit test includes content that a modal `<dialog>` makes inert,
+    /// and content with `pointer-events: none`. It does not use
+    /// `document.elementFromPoint`, because that call skips both. The element
+    /// is scrolled into view first. Auto-waits until the element is found
+    /// and on top. A transparent layer above the element, such as the
+    /// `::backdrop` of another open popover, also counts as a cover.
+    ///
+    /// # Errors
+    /// [`SystemTestError::AssertionFailed`] when the element is not found,
+    /// not visible, or covered until the timeout. CDP errors.
+    pub async fn expect_on_top(&self, selector: &str) -> Result<&Self, SystemTestError> {
+        let deadline = tokio::time::Instant::now() + ASSERTION_TIMEOUT;
+        if poll_until_deadline(deadline, false, || self.on_top(selector)).await? {
+            return Ok(self);
+        }
+        let artifact = self.write_failure_artifacts("expect_on_top").await.ok();
+        Err(SystemTestError::AssertionFailed {
+            message: format!("{selector} is not found, not visible, or covered at its center"),
             artifact_path: artifact,
         })
     }
@@ -1263,6 +1441,44 @@ impl Page {
         Ok(res)
     }
 
+    /// Run axe-core on the page and return the serious and critical
+    /// violations, one line each: `rule (impact): help -> targets`.
+    ///
+    /// `axe_source` is the axe-core 4.x script. Autumn does not ship it: a
+    /// test reads its own vendored copy. The script goes in through CDP, so
+    /// the page CSP does not block it. The core `/_stories` gate and
+    /// [`plugin_conformance::widgets`](crate::plugin_conformance::widgets)
+    /// both use this method (issue #3400), so the two gates stay the same.
+    ///
+    /// # Errors
+    /// [`SystemTestError::AssertionFailed`] when axe-core does not load or
+    /// its report does not parse, or CDP errors.
+    pub async fn axe_violations(&self, axe_source: &str) -> Result<Vec<String>, SystemTestError> {
+        self.inner.evaluate(axe_source.to_owned()).await?;
+        let loaded = self
+            .evaluate_bool(
+                "typeof axe === 'object' && /^4\\./.test(axe.version)".to_owned(),
+                false,
+            )
+            .await?;
+        if !loaded {
+            return Err(SystemTestError::AssertionFailed {
+                message: "axe-core 4.x did not load".into(),
+                artifact_path: None,
+            });
+        }
+        let report = self
+            .inner
+            .evaluate(AXE_RUN_JS)
+            .await?
+            .into_value::<String>()
+            .unwrap_or_default();
+        serde_json::from_str(&report).map_err(|err| SystemTestError::AssertionFailed {
+            message: format!("axe report {report:?}: {err}"),
+            artifact_path: None,
+        })
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────
 
     async fn wait_for_hx_settle(&self) -> Result<(), SystemTestError> {
@@ -1289,6 +1505,58 @@ impl Page {
             message: "htmx did not settle".into(),
             timeout: self.hx_settle_timeout,
         })
+    }
+
+    /// True when the node at the center of `selector` is that element or a
+    /// node in it. A missing or hidden element reads as `false`, so the
+    /// caller polls again. A pseudo-element (such as `::backdrop`) does not
+    /// resolve, so it reads as covered.
+    async fn on_top(&self, selector: &str) -> Result<bool, chromiumoxide::error::CdpError> {
+        use chromiumoxide::cdp::browser_protocol::dom::{
+            GetNodeForLocationParams, ResolveNodeParams,
+        };
+        use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
+        let Ok(element) = self.inner.find_element(selector).await else {
+            return Ok(false);
+        };
+        if element.scroll_into_view().await.is_err() {
+            return Ok(false);
+        }
+        let Ok(point) = element.clickable_point().await else {
+            return Ok(false);
+        };
+        // CDP takes whole CSS pixels.
+        #[allow(clippy::cast_possible_truncation)]
+        let hit = GetNodeForLocationParams::builder()
+            .x(point.x as i64)
+            .y(point.y as i64)
+            .ignore_pointer_events_none(true)
+            .build()
+            .map_err(chromiumoxide::error::CdpError::msg)?;
+        let hit = self.inner.execute(hit).await?;
+        let resolve = ResolveNodeParams::builder()
+            .backend_node_id(hit.result.backend_node_id)
+            .build();
+        let Ok(node) = self.inner.execute(resolve).await else {
+            return Ok(false);
+        };
+        let Some(hit_id) = node.result.object.object_id.clone() else {
+            return Ok(false);
+        };
+        let call = CallFunctionOnParams::builder()
+            .function_declaration("function (hit) { return this.contains(hit); }")
+            .object_id(element.remote_object_id.clone())
+            .argument(CallArgument::builder().object_id(hit_id).build())
+            .return_by_value(true)
+            .build()
+            .map_err(chromiumoxide::error::CdpError::msg)?;
+        let result = self.inner.execute(call).await?;
+        Ok(result
+            .result
+            .result
+            .value
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
     }
 
     /// Evaluate `js` and read the result as a bool, using `default` when the
@@ -1686,6 +1954,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 
@@ -1824,6 +2093,31 @@ mod tests {
             "a layer registered on SystemTest must see the request ID, as it \
              does under AppBuilder::layer"
         );
+    }
+
+    #[test]
+    fn known_key_accepts_dom_key_names() {
+        for key in [
+            "ArrowDown",
+            "ArrowUp",
+            "Home",
+            "End",
+            "Escape",
+            "Tab",
+            "Enter",
+            "g",
+        ] {
+            assert_eq!(known_key(key).expect(key).key, key);
+        }
+        for key in ["ArrowDown", "ArrowUp", "Home", "End"] {
+            assert_eq!(known_key(key).expect(key).code, key, "not the numpad key");
+        }
+    }
+
+    #[test]
+    fn known_key_refuses_an_unknown_key() {
+        let err = known_key("NotAKey").expect_err("unknown");
+        assert!(err.to_string().contains("NotAKey"), "{err}");
     }
 
     #[test]

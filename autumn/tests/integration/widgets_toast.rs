@@ -1,10 +1,15 @@
-//! Tests for the `toast` / `toast_region` widgets (issue #1320).
+//! Tests for the `toast` / `toast_region` widgets (issues #1320, #3399).
 //!
 //! Run with `cargo test --test integration_tests widgets_toast`.
 
 #![cfg(feature = "maud")]
 
-use autumn_web::widgets::{AlertVariant, DEFAULT_TOAST_REGION_ID, toast, toast_in, toast_region};
+use std::time::Duration;
+
+use autumn_web::widgets::{
+    AlertVariant, DEFAULT_TOAST_DURATION, DEFAULT_TOAST_REGION_ID, ToastConfig, toast, toast_in,
+    toast_region, toast_with,
+};
 
 // ── region ──────────────────────────────────────────────────────────────────
 
@@ -212,4 +217,174 @@ fn message_html_is_escaped() {
     let out = toast("<script>alert(1)</script>", AlertVariant::Error).into_string();
     assert!(!out.contains("<script>alert"), "{out}");
     assert!(out.contains("&lt;script&gt;"), "{out}");
+}
+
+// ── #3399: close button, pause, duration, top layer ─────────────────────────
+
+/// The opening tag of the first element whose tag starts with `prefix`.
+fn tag<'a>(html: &'a str, prefix: &str) -> &'a str {
+    let start = html
+        .find(prefix)
+        .unwrap_or_else(|| panic!("no `{prefix}` in {html}"));
+    let end = html[start..].find('>').expect("tag end") + start;
+    &html[start..=end]
+}
+
+#[test]
+fn region_renders_in_the_top_layer_as_a_manual_popover() {
+    let out = toast_region(DEFAULT_TOAST_REGION_ID).into_string();
+    assert!(out.contains(r#"popover="manual""#), "{out}");
+    assert!(out.contains("data-autumn-toast-region"), "{out}");
+}
+
+#[test]
+fn toast_has_a_close_button_with_an_accessible_name() {
+    let out = toast("Saved", AlertVariant::Success).into_string();
+    let button = tag(&out, "<button");
+    assert!(button.contains(r#"type="button""#), "{button}");
+    assert!(
+        button.contains(r#"class="autumn-toast__close""#),
+        "{button}"
+    );
+    assert!(button.contains("data-autumn-toast-close"), "{button}");
+    assert!(
+        button.contains(r#"aria-label="Dismiss notification""#),
+        "{button}"
+    );
+    // The glyph is decoration. The name comes from `aria-label`.
+    assert!(
+        out.contains(r#"<span aria-hidden="true">×</span>"#),
+        "{out}"
+    );
+}
+
+#[test]
+fn close_button_is_hidden_until_the_runtime_shows_it() {
+    // Without JS the button does nothing, so it must not show.
+    let out = toast("Saved", AlertVariant::Success).into_string();
+    assert!(tag(&out, "<button").contains(" hidden"), "{out}");
+}
+
+#[test]
+fn close_label_is_configurable_and_escaped() {
+    let config = ToastConfig::new().close_label("Fermer <x>");
+    let out = toast_with("ok", AlertVariant::Info, &config).into_string();
+    assert!(out.contains(r#"aria-label="Fermer &lt;x&gt;""#), "{out}");
+}
+
+#[test]
+fn toast_root_carries_the_runtime_hook() {
+    let out = toast("Saved", AlertVariant::Success).into_string();
+    assert!(
+        tag(&out, r#"<div class="autumn-toast"#).contains("data-autumn-toast"),
+        "{out}"
+    );
+}
+
+#[test]
+fn default_toast_uses_the_stylesheet_duration() {
+    // No attribute: the CSS default (5 s) applies, also without JS.
+    assert_eq!(DEFAULT_TOAST_DURATION, Duration::from_secs(5));
+    let out = toast("Saved", AlertVariant::Success).into_string();
+    assert!(!out.contains("data-autumn-toast-duration"), "{out}");
+    assert!(!out.contains("autumn-toast--persistent"), "{out}");
+}
+
+#[test]
+fn duration_is_rendered_in_milliseconds() {
+    let config = ToastConfig::new().duration(Duration::from_millis(8_250));
+    let out = toast_with("Saved", AlertVariant::Success, &config).into_string();
+    assert!(
+        out.contains(r#"data-autumn-toast-duration="8250""#),
+        "{out}"
+    );
+}
+
+#[test]
+fn persistent_toast_never_times_out() {
+    let config = ToastConfig::new()
+        .duration(Duration::from_secs(3))
+        .persistent(true);
+    let out = toast_with("Action needed", AlertVariant::Warning, &config).into_string();
+    assert!(
+        out.contains(r#"class="autumn-toast autumn-toast--warning autumn-toast--persistent""#),
+        "{out}"
+    );
+    // A persistent toast has no timer, so the duration is not rendered.
+    assert!(!out.contains("data-autumn-toast-duration"), "{out}");
+    assert!(
+        out.contains("autumn-toast__close"),
+        "it can still close: {out}"
+    );
+}
+
+#[test]
+fn toast_with_targets_the_configured_region() {
+    let config = ToastConfig::new().region("#top-toasts");
+    let out = toast_with("Uploaded", AlertVariant::Info, &config).into_string();
+    assert!(
+        out.starts_with(r#"<div hx-swap-oob="beforeend:#top-toasts">"#),
+        "{out}"
+    );
+}
+
+#[test]
+fn toast_and_toast_in_equal_toast_with_defaults() {
+    assert_eq!(
+        toast("a", AlertVariant::Error).into_string(),
+        toast_with("a", AlertVariant::Error, &ToastConfig::new()).into_string()
+    );
+    assert_eq!(
+        toast_in("r", "a", AlertVariant::Info).into_string(),
+        toast_with("a", AlertVariant::Info, &ToastConfig::new().region("r")).into_string()
+    );
+}
+
+#[test]
+fn role_split_by_severity_is_kept_with_the_new_options() {
+    let config = ToastConfig::new().persistent(true);
+    let error = toast_with("Boom", AlertVariant::Error, &config).into_string();
+    assert!(error.contains(r#"role="alert""#), "{error}");
+    assert!(error.contains(r#"aria-live="assertive""#), "{error}");
+    for variant in [
+        AlertVariant::Success,
+        AlertVariant::Info,
+        AlertVariant::Warning,
+    ] {
+        let out = toast_with("ok", variant, &config).into_string();
+        assert!(!out.contains("role="), "{out}");
+        assert!(!out.contains("aria-live="), "{out}");
+    }
+}
+
+#[test]
+fn configured_toast_emits_no_script_or_inline_style() {
+    let config = ToastConfig::new()
+        .duration(Duration::from_secs(9))
+        .close_label("Close");
+    let out = toast_with("x", AlertVariant::Info, &config).into_string();
+    assert!(!out.contains("<script"), "{out}");
+    assert!(!out.contains("style="), "{out}");
+    assert!(!out.contains("onclick"), "{out}");
+}
+
+#[test]
+fn error_alert_wraps_the_message_not_the_close_button() {
+    // The close label must not be part of the alert announcement.
+    let out = toast("Boom", AlertVariant::Error).into_string();
+    let message = tag(&out, r#"<span class="autumn-toast__message""#);
+    assert!(message.contains(r#"role="alert""#), "{message}");
+    assert!(message.contains(r#"aria-live="assertive""#), "{message}");
+    assert!(message.contains(r#"aria-atomic="true""#), "{message}");
+    let root = tag(&out, r#"<div class="autumn-toast"#);
+    assert!(!root.contains("role="), "{root}");
+    let alert_end = out.find("</span>").expect("message end");
+    assert!(out.find("<button").expect("button") > alert_end, "{out}");
+}
+
+#[test]
+fn zero_duration_renders_zero_ms() {
+    let config = ToastConfig::new().duration(Duration::ZERO);
+    let out = toast_with("x", AlertVariant::Info, &config).into_string();
+    assert!(out.contains(r#"data-autumn-toast-duration="0""#), "{out}");
 }

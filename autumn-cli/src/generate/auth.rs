@@ -29,9 +29,9 @@ use super::{Flags, GenerateError, ensure_project_root, read_or_empty, timestamp_
 const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
     ("axum", "\"0.8\""),
     ("maud", "{ version = \"0.27\", features = [\"axum\"] }"),
-    ("sha2", "{ version = \"0.10\", features = [] }"),
+    ("sha2", "{ version = \"0.11\", features = [] }"),
     ("hex", "\"0.4\""),
-    ("rand", "{ version = \"0.9\", features = [\"os_rng\"] }"),
+    ("rand", "{ version = \"0.10\", features = [\"sys_rng\"] }"),
     ("tokio", "{ version = \"1\", features = [\"time\"] }"),
     ("tracing", "\"0.1\""),
 ];
@@ -42,14 +42,14 @@ const AUTH_EXTRA_DEPS: &[(&str, &str)] = &[
 ///   `WebAuthn` ceremony implementation. State serialisation lets the in-progress
 ///   ceremony challenge survive across requests via the session.
 /// - `uuid` generates random credential IDs if the authenticator doesn't supply one.
-/// - `conditional-ui` gates `start/finish_discoverable_authentication` in webauthn-rs 0.5.
+/// - `conditional-ui` gates `start/finish_discoverable_authentication` in webauthn-rs.
 const PASSKEY_EXTRA_DEPS: &[(&str, &str)] = &[
     (
         "webauthn-rs",
-        "{ version = \"0.5\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }",
+        "{ version = \"0.6\", features = [\"danger-allow-state-serialisation\", \"conditional-ui\"] }",
     ),
     ("uuid", "{ version = \"1\", features = [\"v4\"] }"),
-    ("base64", "\"0.22\""),
+    ("base64", "\"0.23\""),
 ];
 
 /// The byte index of the first occurrence of `needle` in `s` that falls
@@ -224,7 +224,7 @@ fn ensure_webauthn_rs_features(toml: &str) -> String {
             .collect();
 
         if let Some(rest) = trimmed.strip_prefix(&simple_prefix) {
-            let version = rest.split('"').next().unwrap_or("0.5");
+            let version = rest.split('"').next().unwrap_or("0.6");
             lines[i] = format!(
                 "{indent}{CRATE} = {{ version = \"{version}\", features = [{feats_csv}] }}"
             );
@@ -356,8 +356,8 @@ const TOTP_EXTRA_DEPS: &[(&str, &str)] = &[
         "totp-rs",
         "{ version = \"5\", features = [\"qr\", \"gen_secret\", \"otpauth\"] }",
     ),
-    ("aes-gcm", "\"0.10\""),
-    ("base64", "\"0.22\""),
+    ("aes-gcm", "\"0.11\""),
+    ("base64", "\"0.23\""),
 ];
 
 /// `totp-rs` cargo features the generated `--totp` routes rely on
@@ -1100,7 +1100,10 @@ fn plan_auth_with_providers_ex_impl(
         .chain(AUTH_EXTRA_DEPS.iter().copied())
         .chain(if totp { TOTP_EXTRA_DEPS } else { &[] }.iter().copied())
         .collect();
-    // The `--totp` routes add `base64 = "0.22"` and use its 0.21+ `Engine`
+    // `ensure_cargo_dependencies` is name-only, so an app that pins an older
+    // crate keeps it. The generated code uses the `rand` 0.10 API. Warn.
+    super::model::warn_if_existing_dep_below_version(&mut plan, &cargo_existing, "rand", 0, 10);
+    // The `--totp` routes add `base64 = "0.23"` and use its 0.21+ `Engine`
     // API; `ensure_cargo_dependencies` is name-only, so an app pinning an older
     // `base64` keeps it and the generated 2FA code won't compile. Warn instead.
     if totp {
@@ -1628,9 +1631,17 @@ fn plan_auth_options_impl(
             .unwrap_or_else(|| read_or_empty(&cargo_toml_path));
         let all_passkey_deps: Vec<(&str, &str)> = PASSKEY_EXTRA_DEPS.to_vec();
         // `ensure_cargo_dependencies` is name-only, so an app that already pins
-        // an older `base64` keeps it and never gets `0.22`; the emitted
+        // an older `base64` keeps it and never gets `0.23`; the emitted
         // `encode_cred_id` needs the 0.21+ `Engine` API, so warn if it's too old.
         super::model::warn_if_existing_dep_below_version(&mut plan, &base_cargo, "base64", 0, 22);
+        // The emitted passkey code uses the `webauthn-rs` 0.6 API.
+        super::model::warn_if_existing_dep_below_version(
+            &mut plan,
+            &base_cargo,
+            "webauthn-rs",
+            0,
+            6,
+        );
         let with_deps = super::model::ensure_cargo_dependencies(&base_cargo, &all_passkey_deps);
         // If the project already declared webauthn-rs without the required features,
         // ensure_cargo_dependencies would have skipped it; merge them here.
@@ -3713,7 +3724,8 @@ fn sessions_list_fragment(
                             @if let Some(csrf) = csrf {{
                                 input type="hidden" name=(csrf_name) value=(csrf.token());
                             }}
-                            input type="text" name="label" aria-label="Device label" placeholder="Device label"
+                            label for={{ "device-label-" (s.id) }} {{ "Device label" }}
+                            input type="text" id={{ "device-label-" (s.id) }} name="label"
                                 value=[s.label.as_deref()];
                             button type="submit" {{ "Save label" }}
                         }}
@@ -5729,9 +5741,9 @@ pub async fn reset_password(
 
 /// Generate a 32-byte cryptographically-random reset token, hex-encoded.
 fn generate_reset_token() -> String {{
-    use rand::TryRngCore;
+    use rand::TryRng;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("OS RNG failed");
     hex::encode(bytes)
@@ -5997,9 +6009,9 @@ pub async fn resend_confirmation(
 
 /// Generate a 32-byte cryptographically-random confirmation token, hex-encoded.
 fn generate_confirmation_token() -> String {{
-    use rand::TryRngCore;
+    use rand::TryRng;
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("OS RNG failed");
     hex::encode(bytes)
@@ -7673,7 +7685,7 @@ password hashing, and mail primitives.
 
 - **Passwords**: Hashed with bcrypt (cost 12) via `autumn_web::auth::hash_password`.
   Raw passwords are never logged or stored.
-- **Reset tokens**: 32-byte random values generated with `OsRng`; only the
+- **Reset tokens**: 32-byte random values generated with `SysRng`; only the
   SHA-256 digest is stored in `reset_token_digest`. The raw token is sent by
   email only and expires after 2 hours.
 - **Non-enumeration**: Duplicate signup, failed login, unconfirmed-login,
@@ -8739,8 +8751,8 @@ fn totp_reauth_field_src() -> String {
     "            div {{\n\
      \x20               label for=\"totp-code\" {{ \"Authenticator code\" }}\n\
      \x20               input type=\"text\" id=\"totp-code\" name=\"totp_code\" autocomplete=\"one-time-code\"\n\
-     \x20                   inputmode=\"text\" pattern=\"[0-9a-fA-F \\\\-]*\" placeholder=\"6-digit code or recovery code\";\n\
-     \x20               small {{ \"Required if your account uses two-factor authentication.\" }}\n\
+     \x20                   inputmode=\"text\" pattern=\"[0-9a-fA-F \\\\-]*\" aria-describedby=\"totp-hint\";\n\
+     \x20               small id=\"totp-hint\" {{ \"Enter the 6-digit code or a recovery code. Required if your account uses two-factor authentication.\" }}\n\
      \x20           }}\n"
         .to_owned()
 }
@@ -8769,9 +8781,9 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     div {{
                         label for="totp-code" {{ "Authenticator code" }}
                         input type="text" id="totp-code" name="totp_code" autocomplete="one-time-code"
-                            inputmode="numeric" pattern="[0-9 ]*" required
-                            placeholder="6-digit code or recovery code";
-                        small {{ "Required if your account uses two-factor authentication." }}
+                            inputmode="text" pattern="[0-9a-fA-F \\-]*" required
+                            aria-describedby="totp-hint";
+                        small id="totp-hint" {{ "Enter the 6-digit code or a recovery code. Required if your account uses two-factor authentication." }}
                     }}
                     button type="submit" {{ "Confirm" }}
                 }}
@@ -8835,9 +8847,9 @@ fn totp_reauth_check_src(snake_name: &str, table: &str) -> String {
                     div {{
                         label for="totp-code" {{ "Authenticator code" }}
                         input type="text" id="totp-code" name="totp_code" autocomplete="one-time-code"
-                            inputmode="numeric" pattern="[0-9 ]*" required
-                            placeholder="6-digit code or recovery code";
-                        small {{ "Required if your account uses two-factor authentication." }}
+                            inputmode="text" pattern="[0-9a-fA-F \\-]*" required
+                            aria-describedby="totp-hint";
+                        small id="totp-hint" {{ "Enter the 6-digit code or a recovery code. Required if your account uses two-factor authentication." }}
                     }}
                     button type="submit" {{ "Confirm" }}
                 }}
@@ -8935,11 +8947,11 @@ fn totp_enc_key() -> AutumnResult<[u8; 32]> {
 
 /// Encrypt a TOTP secret for storage. Output is base64(nonce ‖ ciphertext).
 fn encrypt_secret(plaintext: &[u8]) -> AutumnResult<String> {
-    use rand::TryRngCore;
+    use rand::TryRng;
     let key = totp_enc_key()?;
     let cipher = Aes256Gcm::new(<&Key<Aes256Gcm>>::from(&key));
     let mut nonce_bytes = [0u8; 12];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut nonce_bytes)
         .map_err(|_| AutumnError::internal_server_error_msg("RNG failure generating nonce"))?;
     let nonce = <&Nonce<_>>::from(&nonce_bytes);
@@ -8964,7 +8976,8 @@ fn decrypt_secret(stored: &str) -> AutumnResult<Vec<u8>> {
         ));
     }
     let (nonce_bytes, ct) = raw.split_at(12);
-    let nonce = <&Nonce<_>>::from(nonce_bytes);
+    let nonce = <&Nonce<_>>::try_from(nonce_bytes)
+        .map_err(|_| AutumnError::internal_server_error_msg("stored TOTP secret is malformed"))?;
     cipher
         .decrypt(nonce, ct)
         .map_err(|_| AutumnError::internal_server_error_msg("failed to decrypt TOTP secret"))
@@ -9023,9 +9036,9 @@ fn verify_totp_code(totp: &TOTP, code: &str) -> Option<i64> {
 
 /// Generate one human-friendly single-use recovery code (10 hex chars, grouped).
 fn generate_recovery_code() -> String {
-    use rand::TryRngCore;
+    use rand::TryRng;
     let mut bytes = [0u8; 5];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .expect("OS RNG failed");
     let hexs = hex::encode(bytes);
@@ -9714,7 +9727,7 @@ fn magic_link_routes_section_src(
 // Generated by `autumn generate auth --magic-link` (issue #1328). Edit freely.
 //
 // Security properties:
-// - Tokens are 32-byte random values (`OsRng`); only their SHA-256 digest is
+// - Tokens are 32-byte random values (`SysRng`); only their SHA-256 digest is
 //   persisted (`magic_link_tokens.token_digest`). The raw token appears only in
 //   the emailed link — never in the database, logs, or error reports.
 // - Scanner-safe verify: `GET /login/magic/verify?token=…` NEVER consumes the
@@ -9836,7 +9849,7 @@ pub async fn magic_link_request(
             .unwrap_or(0);
 
         if recent == 0 {
-            // Reuse the reset-token generator: 32-byte OsRng hex. Only the
+            // Reuse the reset-token generator: 32-byte SysRng hex. Only the
             // SHA-256 digest is stored; the raw token appears only in the link.
             let raw_token = generate_reset_token();
             let token_digest = sha256_hex(&raw_token);
@@ -10438,12 +10451,11 @@ use webauthn_rs::prelude::*;
 
 /// Encode an opaque credential ID as a base64url (no padding) string.
 ///
-/// webauthn-rs 0.5's `CredentialID` is a `HumanBinaryData` newtype over
-/// `Vec<u8>` and no longer implements `Display`/`ToString`, so encode the raw
-/// bytes explicitly. Registration and login use this same helper, keeping the
-/// stored `credential_id` and the login lookup key byte-for-byte consistent.
+/// `CredentialID` is a `Vec<u8>` and has no `Display`, so encode the raw
+/// bytes. Registration and login use this helper, so the stored
+/// `credential_id` and the login lookup key are the same bytes.
 fn encode_cred_id(cred_id: &CredentialID) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_id.as_ref())
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(cred_id.as_slice())
 }
 
 fn redirect_to(url: &str) -> axum::response::Redirect {
@@ -11281,6 +11293,61 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// The generated app stamps the majors that this release supports.
+    #[test]
+    fn generated_auth_stamps_current_dependency_majors() {
+        let stamp = |deps: &[(&str, &'static str)], name: &str| {
+            deps.iter()
+                .find(|(crate_name, _)| *crate_name == name)
+                .map_or_else(|| panic!("{name} must be stamped"), |(_, spec)| *spec)
+        };
+        for (deps, name, version) in [
+            (AUTH_EXTRA_DEPS, "sha2", "\"0.11\""),
+            (AUTH_EXTRA_DEPS, "rand", "\"0.10\""),
+            (PASSKEY_EXTRA_DEPS, "webauthn-rs", "\"0.6\""),
+            (PASSKEY_EXTRA_DEPS, "base64", "\"0.23\""),
+            (TOTP_EXTRA_DEPS, "aes-gcm", "\"0.11\""),
+            (TOTP_EXTRA_DEPS, "base64", "\"0.23\""),
+        ] {
+            let spec = stamp(deps, name);
+            assert!(
+                spec.contains(version),
+                "{name} must be stamped at {version}, got {spec}"
+            );
+        }
+    }
+
+    /// `ensure_cargo_dependencies` keeps a crate the app already declares. The
+    /// generated code uses the `rand` 0.10 and `webauthn-rs` 0.6 APIs, so an
+    /// older pin must give a warning, not a silent compile error.
+    #[test]
+    fn generated_auth_warns_about_an_older_rand_or_webauthn_pin() {
+        let tmp = project_with_main();
+        fs::write(
+            tmp.path().join("Cargo.toml"),
+            "[package]\nname=\"x\"\n\n[dependencies]\nautumn-web = \"0.3\"\n\
+             rand = \"0.9\"\nwebauthn-rs = \"0.5\"\n",
+        )
+        .unwrap();
+        let plan = plan_auth_full_ex2(
+            tmp.path(),
+            "User",
+            "20260508000000",
+            &AuthOAuthOptions::default(),
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        for name in ["'rand'", "'webauthn-rs'"] {
+            assert!(
+                plan.warnings.iter().any(|warning| warning.contains(name)),
+                "no warning names {name}: {:?}",
+                plan.warnings
+            );
+        }
+    }
+
     /// Issue #3170: every `<label>` must name a control. A bare label gives a
     /// screen reader no accessible name. A label is bound by `for` plus a
     /// matching `id` in the same form, or by wrapping a checkbox. Every visible
@@ -11369,13 +11436,66 @@ mod tests {
                         continue;
                     }
                     assert!(
-                        stmt.contains("id=\"") || stmt.contains("aria-label="),
+                        stmt.contains("id=\"")
+                            || stmt.contains("id={")
+                            || stmt.contains("aria-label="),
                         "input has no id or aria-label:\n{stmt}"
                     );
                 }
             }
         }
         assert!(bound >= 40, "scan found too few labels: {bound}");
+    }
+
+    /// Issue #3106: a placeholder is not a label or an instruction. The TOTP
+    /// code fields keep their hint in a `<small id>` that the input names with
+    /// `aria-describedby`. The placeholder holds no instruction.
+    #[test]
+    fn totp_code_fields_link_a_visible_hint() {
+        let routes = render_routes_file("User", "user", "users", &[], true, false);
+        let sources = [routes, totp_reauth_field_src()];
+        let (mut fields, mut hints) = (0, 0);
+        for src in &sources {
+            for (at, _) in src.match_indices("input type=\"text\" id=\"totp-code\"") {
+                let stmt = &src[at..at + src[at..].find(';').expect("input ends")];
+                fields += 1;
+                assert!(
+                    stmt.contains("aria-describedby=\"totp-hint\""),
+                    "totp input has no aria-describedby:\n{stmt}"
+                );
+                assert!(!stmt.contains("placeholder="), "placeholder in:\n{stmt}");
+            }
+            hints += src.matches("small id=\"totp-hint\"").count();
+            hints += src.matches("small id=\\\"totp-hint\\\"").count();
+            assert!(src.contains("6-digit code or a recovery code"));
+        }
+        assert!(fields >= 3, "expected 3 or more totp inputs, got {fields}");
+        assert_eq!(hints, fields, "each input needs its own hint");
+    }
+
+    /// Issue #3106: the session device-label input has a visible `<label>`
+    /// bound by `for`/`id`. A row id keeps the id unique on the page.
+    #[test]
+    fn device_label_input_has_a_bound_visible_label() {
+        let routes = render_routes_file("User", "user", "users", &[], false, false);
+        let rows = routes.find("\"/account/sessions/\"").expect("session rows");
+        let at = rows
+            + routes[rows..]
+                .find("name=\"label\"")
+                .expect("device label input");
+        let before = &routes[..at];
+        let input = &before[before.rfind("input type=\"text\"").expect("input start")..];
+        assert!(
+            input.contains("id={ \"device-label-\" (s.id) }"),
+            "no row id:\n{input}"
+        );
+        let form = &before[before
+            .rfind("form action={ \"/account/sessions/\"")
+            .expect("form")..];
+        assert!(
+            form.contains("label for={ \"device-label-\" (s.id) }"),
+            "no bound label:\n{form}"
+        );
     }
 
     /// Issue #2347: while impersonating, `{snake}_id` is the target but the

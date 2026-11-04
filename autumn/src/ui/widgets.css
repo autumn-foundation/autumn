@@ -1,106 +1,110 @@
 /*
  * Autumn — framework-owned widget component CSS (issue #1215)
  *
- * Backs every `autumn-*` (and `wizard-*`) class emitted by
+ * Backs every `autumn-*` class emitted by
  * `autumn_web::{form, widgets, wizard, ui::pagination, storage::form_helper,
  * job_tracking}`. Plain CSS — no `@import`/`@apply` — so it works standalone,
- * without a Tailwind build. Colors, borders, and radius reference the shared
- * design tokens (`ui/tokens.css`); re-theme by overriding the token
- * `:root` variables, not by forking these rules.
+ * without a Tailwind build. Colors, spacing, type, radius and z-index use the
+ * shared design tokens (`ui/tokens.css`). Re-theme by overriding the tokens,
+ * not by forking these rules. The tokens carry the dark scheme and density.
  *
  * Not included here: `autumn-dev-*` (dev-error badge ships its own inline
  * `<style>`) and `.flash`/`.flash-*` (served separately as `FLASH_CSS`).
+ *
+ * The opt-in widget families (search, social, workflow, charts) keep their
+ * rules in `ui/widgets/<family>.css`. The server adds each file only when its
+ * feature is on (#3408).
  */
 
 /* ── Wizard progress stepper ──────────────────────────────────────────────── */
 
-.wizard-progress {
+.autumn-wizard-progress {
     display: flex;
     align-items: flex-start;
     list-style: none;
     padding: 0;
-    margin: 0 0 1.5rem 0;
+    margin: 0 0 var(--space-6) 0;
 }
 
-.wizard-step {
+.autumn-wizard-step {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: var(--space-2);
     flex-shrink: 0;
 }
 
-.wizard-step + .wizard-step {
+.autumn-wizard-step + .autumn-wizard-step {
     flex: 1;
 }
 
-.wizard-step + .wizard-step::before {
+.autumn-wizard-step + .autumn-wizard-step::before {
     content: '';
     flex: 1;
     height: 2px;
     background-color: var(--border);
 }
 
-.wizard-step--completed + .wizard-step::before {
+.autumn-wizard-step--completed + .autumn-wizard-step::before {
     background-color: var(--primary);
 }
 
-.wizard-step__number {
+.autumn-wizard-step__number {
     display: flex;
     align-items: center;
     justify-content: center;
     width: 2rem;
     height: 2rem;
-    border-radius: 9999px;
+    border-radius: var(--radius-full);
     font-size: 0.8125rem;
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     flex-shrink: 0;
-    background-color: var(--border);
+    background-color: var(--surface-muted);
     color: var(--text-muted);
 }
 
-.wizard-step__label {
-    font-size: 0.875rem;
+.autumn-wizard-step__label {
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
     text-transform: capitalize;
     white-space: nowrap;
 }
 
-.wizard-step--completed .wizard-step__number {
+.autumn-wizard-step--completed .autumn-wizard-step__number {
     background-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
 }
 
-.wizard-step--completed .wizard-step__label {
+.autumn-wizard-step--completed .autumn-wizard-step__label {
     color: var(--primary);
 }
 
-.wizard-step--current .wizard-step__number {
+.autumn-wizard-step--current .autumn-wizard-step__number {
     background-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
     box-shadow: 0 0 0 3px var(--primary-light);
 }
 
-.wizard-step--current .wizard-step__label {
+.autumn-wizard-step--current .autumn-wizard-step__label {
     color: var(--text);
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
 }
 
-/* Same as the unmodified .wizard-step__number/__label defaults — stated
+/* Same as the unmodified .autumn-wizard-step__number/__label defaults — stated
    explicitly so every state the widget emits has a rule, per the coverage
    test in tests/integration/widget_css_coverage.rs. */
-.wizard-step--upcoming .wizard-step__number {
-    background-color: var(--border);
+.autumn-wizard-step--upcoming .autumn-wizard-step__number {
+    background-color: var(--surface-muted);
     color: var(--text);
 }
 
-.wizard-step--upcoming .wizard-step__label {
+.autumn-wizard-step--upcoming .autumn-wizard-step__label {
     color: var(--text-muted);
 }
 
-.wizard-progress__summary {
-    font-size: 0.75rem;
+.autumn-wizard-progress__summary {
+    font-size: var(--font-size-xs);
     color: var(--text-muted);
-    margin-top: 0.5rem;
+    margin-top: var(--space-2);
 }
 
 /* ── Form fields (autumn-field) ───────────────────────────────────────────── */
@@ -108,23 +112,36 @@
 .autumn-field {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 1rem;
+    gap: var(--space-1);
+    margin-bottom: var(--space-4);
+}
+
+/* A grouped custom control (#3400): a <fieldset> with a <legend>. */
+.autumn-field--group {
+    min-inline-size: 0;
+    padding: 0;
+    border: 0;
+}
+
+/* A legend is not a flex item, so it takes the label gap as a margin. */
+.autumn-field--group > legend {
+    padding: 0;
+    margin-bottom: var(--space-1);
 }
 
 .autumn-field__label {
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     color: var(--text);
 }
 
 .autumn-field__input {
     width: 100%;
-    padding: 0.5rem 0.75rem;
-    border: 1px solid var(--border);
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--control-border);
     border-radius: var(--radius);
-    font-size: 0.875rem;
-    line-height: 1.5;
+    font-size: var(--font-size-sm);
+    line-height: var(--line-height-normal);
     color: var(--text);
     background-color: var(--surface);
     transition: border-color 0.15s ease, box-shadow 0.15s ease;
@@ -168,7 +185,7 @@
 
 .autumn-field__required {
     color: var(--danger);
-    margin-left: 0.25rem;
+    margin-left: var(--space-1);
 }
 
 /* A checkbox shows the box, then the label, on one line. */
@@ -176,7 +193,7 @@
     flex-direction: row;
     flex-wrap: wrap;
     align-items: center;
-    gap: 0.5rem;
+    gap: var(--space-2);
 }
 
 .autumn-field--checkbox .autumn-field__input {
@@ -210,13 +227,331 @@
    input can't be repopulated, so this line is the only signal that the record
    already holds a blob. */
 .autumn-field__current {
-    font-size: 0.875rem;
-    margin: 0 0 0.25rem;
+    font-size: var(--font-size-sm);
+    margin: 0 0 var(--space-1);
 }
 
 .autumn-attachment__meta {
     font-size: 0.8125rem;
     color: var(--text-muted);
+}
+
+/* ── Native inputs — issue #3405 ──────────────────────────────────────────── */
+
+/* A switch is a native checkbox, drawn as a track and a thumb. */
+.autumn-field--switch .autumn-field__input {
+    appearance: none;
+    position: relative;
+    flex-shrink: 0;
+    width: 2.25rem;
+    height: 1.25rem;
+    padding: 0;
+    margin: 0;
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius-full);
+    color: var(--text);
+    background-color: var(--surface-muted);
+    cursor: pointer;
+}
+
+/* Logical offsets, so the thumb moves the other way in a right-to-left page. */
+.autumn-field--switch .autumn-field__input::before {
+    content: '';
+    position: absolute;
+    top: 50%;
+    inset-inline-start: 0.125rem;
+    width: 0.875rem;
+    height: 0.875rem;
+    border-radius: var(--radius-full);
+    background-color: var(--text-muted);
+    transform: translateY(-50%);
+    transition: inset-inline-start 0.15s ease, background-color 0.15s ease;
+}
+
+.autumn-field--switch .autumn-field__input:checked {
+    border-color: var(--primary);
+    background-color: var(--primary);
+}
+
+.autumn-field--switch .autumn-field__input:checked::before {
+    inset-inline-start: calc(100% - 1rem);
+    background-color: var(--on-primary);
+}
+
+/* The switch rule above is more specific than the shared invalid and
+   disabled rules, so state them again. */
+.autumn-field--switch .autumn-field__input--invalid,
+.autumn-field--switch .autumn-field__input:user-invalid {
+    border-color: var(--danger);
+}
+
+.autumn-field--switch .autumn-field__input:disabled {
+    cursor: not-allowed;
+}
+
+.autumn-field--switch .autumn-field__input:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+/* A slider has no box. The browser draws the track and the thumb. */
+.autumn-field--range .autumn-field__input {
+    padding: 0;
+    border: 0;
+    background-color: transparent;
+    accent-color: var(--primary);
+}
+
+.autumn-field--range .autumn-field__input:focus {
+    box-shadow: none;
+}
+
+.autumn-field--range .autumn-field__input:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-field--color .autumn-field__input {
+    width: 3rem;
+    height: 2.5rem;
+    padding: var(--space-1);
+    cursor: pointer;
+}
+
+/* A radio group and a checkbox group: one choice for each line. */
+.autumn-choices {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.autumn-choice {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.autumn-choice__input {
+    margin: 0;
+    accent-color: var(--primary);
+}
+
+.autumn-choice__input:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-choice__label {
+    font-size: var(--font-size-sm);
+    color: var(--text);
+    cursor: pointer;
+}
+
+/* A segmented control: radios with a visible label for each segment. The
+   radio stays in the tab order (clip pattern, not display:none), so the
+   native arrow keys move the selection. */
+.autumn-segmented {
+    position: relative;
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-self: flex-start;
+    border: 1px solid var(--control-border);
+    border-radius: var(--radius);
+}
+
+.autumn-segmented__input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+}
+
+.autumn-segmented__option {
+    padding: var(--space-2) var(--space-3);
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    color: var(--text);
+    background-color: var(--surface);
+    cursor: pointer;
+}
+
+.autumn-segmented__option:first-of-type {
+    border-start-start-radius: var(--radius);
+    border-end-start-radius: var(--radius);
+}
+
+.autumn-segmented__option:last-of-type {
+    border-start-end-radius: var(--radius);
+    border-end-end-radius: var(--radius);
+}
+
+.autumn-segmented__option ~ .autumn-segmented__option {
+    border-inline-start: 1px solid var(--control-border);
+}
+
+.autumn-segmented__input:checked + .autumn-segmented__option {
+    color: var(--on-primary);
+    background-color: var(--primary);
+}
+
+.autumn-segmented__input:focus-visible + .autumn-segmented__option {
+    position: relative;
+    z-index: 1;
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-segmented__input:disabled + .autumn-segmented__option {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.autumn-field--group[aria-invalid="true"] .autumn-segmented {
+    border-color: var(--danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .autumn-field--switch .autumn-field__input::before {
+        transition: none;
+    }
+}
+
+/* Forced colors (Windows High Contrast): the page colors go away, so draw
+   the switch and the selected segment with system colors. */
+@media (forced-colors: active) {
+    .autumn-field--switch .autumn-field__input {
+        border-color: CanvasText;
+    }
+
+    .autumn-field--switch .autumn-field__input::before {
+        background-color: CanvasText;
+    }
+
+    .autumn-field--switch .autumn-field__input:checked {
+        border-color: Highlight;
+        background-color: Highlight;
+    }
+
+    .autumn-field--switch .autumn-field__input:checked::before {
+        background-color: HighlightText;
+    }
+
+    .autumn-segmented__input:checked + .autumn-segmented__option {
+        forced-color-adjust: none;
+        color: HighlightText;
+        background-color: Highlight;
+    }
+
+    .autumn-segmented__input:focus-visible + .autumn-segmented__option {
+        outline-color: CanvasText;
+    }
+}
+
+/* ── Styled select — issue #3409 ──────────────────────────────────────────── */
+
+/* Opt-in with FieldOptions::styled_select(). Chrome 135+ and Safari 27 draw
+   the select with `appearance: base-select`. Other browsers keep the native
+   control with the field style above. A multiple select keeps the native
+   list box. A browser that does not know `::picker(select)` drops the whole
+   rule, so each `::picker` rule has one selector. */
+@supports (appearance: base-select) {
+    .autumn-select:not([multiple]) {
+        appearance: base-select;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: var(--space-2);
+    }
+
+    .autumn-select:not([multiple]):enabled {
+        cursor: pointer;
+    }
+
+    .autumn-select:not([multiple])::picker(select) {
+        appearance: base-select;
+        padding: var(--space-1);
+        margin-block: var(--space-1);
+        border: 1px solid var(--control-border);
+        border-radius: var(--radius);
+        color: var(--text);
+        background-color: var(--surface);
+        box-shadow: var(--shadow);
+    }
+
+    .autumn-select:not([multiple])::picker-icon {
+        color: var(--text-muted);
+    }
+
+    .autumn-select:not([multiple]):open::picker-icon {
+        rotate: 180deg;
+    }
+
+    .autumn-select:not([multiple]) optgroup {
+        padding-block: var(--space-1);
+        font-size: 0.8125rem;
+        font-weight: var(--font-weight-medium);
+        color: var(--text-muted);
+    }
+
+    .autumn-select:not([multiple]) option {
+        display: flex;
+        align-items: center;
+        gap: var(--space-2);
+        padding: var(--space-2) var(--space-3);
+        border-radius: var(--radius);
+        font-size: var(--font-size-sm);
+        font-weight: var(--font-weight-normal);
+        color: var(--text);
+        background-color: transparent;
+        cursor: pointer;
+    }
+
+    .autumn-select:not([multiple]) option:enabled:hover,
+    .autumn-select:not([multiple]) option:focus-visible {
+        color: var(--text);
+        background-color: var(--surface-muted);
+    }
+
+    .autumn-select:not([multiple]) option:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: -2px;
+    }
+
+    .autumn-select:not([multiple]) option:checked {
+        font-weight: var(--font-weight-medium);
+    }
+
+    .autumn-select:not([multiple]) option::checkmark {
+        color: var(--primary);
+    }
+
+    .autumn-select:not([multiple]) option:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+    }
+
+    /* The icon turns only for a user who did not ask for less motion. */
+    @media (prefers-reduced-motion: no-preference) {
+        .autumn-select:not([multiple])::picker-icon {
+            transition: rotate 0.15s ease;
+        }
+    }
+
+    /* Forced colors (Windows High Contrast): the page colors go away, so
+       show the hovered and the focused option with system colors. */
+    @media (forced-colors: active) {
+        .autumn-select:not([multiple]) option:enabled:hover,
+        .autumn-select:not([multiple]) option:focus-visible {
+            forced-color-adjust: none;
+            color: HighlightText;
+            background-color: Highlight;
+        }
+    }
 }
 
 /* ── Rich text (autumn-rich-text) — issue #1255 ───────────────────────────── */
@@ -228,19 +563,20 @@
 .autumn-rich-text__toolbar {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.5rem;
-    padding: 0.375rem 0.5rem;
+    gap: var(--space-2);
+    padding: 0.375rem var(--space-2);
     border: 1px solid var(--border);
     border-bottom: none;
     border-radius: var(--radius) var(--radius) 0 0;
     background-color: var(--surface);
+    color: var(--text);
 }
 
 .autumn-rich-text__toolbar-item {
     display: inline-flex;
     align-items: baseline;
-    gap: 0.25rem;
-    font-size: 0.75rem;
+    gap: var(--space-1);
+    font-size: var(--font-size-xs);
 }
 
 .autumn-rich-text__toolbar-label {
@@ -273,23 +609,23 @@
 .autumn-rich-text__preview-wrapper {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
-    margin-top: 0.5rem;
+    gap: var(--space-1);
+    margin-top: var(--space-2);
 }
 
 .autumn-rich-text__preview-label {
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     color: var(--text);
 }
 
 .autumn-rich-text__preview {
-    padding: 0.75rem;
+    padding: var(--space-3);
     border: 1px dashed var(--border);
     border-radius: var(--radius);
     background-color: var(--surface);
     color: var(--text);
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
     line-height: 1.6;
     overflow-wrap: anywhere;
 }
@@ -313,7 +649,7 @@
 .autumn-rich-text__preview th,
 .autumn-rich-text__preview td {
     border: 1px solid var(--border);
-    padding: 0.25rem 0.5rem;
+    padding: var(--space-1) var(--space-2);
 }
 
 /* ── Submit button (autumn-submit) ────────────────────────────────────────── */
@@ -322,13 +658,13 @@
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 0.5rem 1.25rem;
+    padding: var(--space-2) var(--space-5);
     background-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
     border: none;
     border-radius: var(--radius);
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     cursor: pointer;
     transition: background-color 0.15s ease;
 }
@@ -347,112 +683,13 @@
     cursor: not-allowed;
 }
 
-/* ── Active search input (autumn-search) ──────────────────────────────────── */
-
-.autumn-search {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 1rem;
-}
-
-.autumn-search__label {
-    font-size: 0.875rem;
-    font-weight: 500;
-    color: var(--text);
-}
-
-.autumn-search__input {
-    width: 100%;
-    padding: 0.5rem 0.75rem 0.5rem 2.25rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    font-size: 0.875rem;
-    color: var(--text);
-    background-color: var(--surface);
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%239ca3af' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cline x1='21' y1='21' x2='16.65' y2='16.65'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: 0.625rem center;
-    background-size: 1rem 1rem;
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.autumn-search__input:focus {
-    outline: 2px solid transparent;
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--primary-light);
-}
-
-/* ── Autocomplete (autumn-autocomplete) ───────────────────────────────────── */
-
-.autumn-autocomplete {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 1rem;
-}
-
-.autumn-autocomplete__label {
-    font-size: 0.875rem;
-    font-weight: 500;
-    color: var(--text);
-}
-
-.autumn-autocomplete__input {
-    width: 100%;
-    padding: 0.5rem 0.75rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    font-size: 0.875rem;
-    color: var(--text);
-    background-color: var(--surface);
-    transition: border-color 0.15s ease, box-shadow 0.15s ease;
-}
-
-.autumn-autocomplete__input:focus {
-    outline: 2px solid transparent;
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--primary-light);
-}
-
-.autumn-autocomplete__options {
-    position: absolute;
-    top: 100%;
-    left: 0;
-    right: 0;
-    z-index: 50;
-    background-color: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    box-shadow: var(--shadow);
-    max-height: 15rem;
-    overflow-y: auto;
-    list-style: none;
-    margin: 0.25rem 0 0 0;
-    padding: 0.25rem 0;
-}
-
-.autumn-autocomplete__option {
-    padding: 0.5rem 0.75rem;
-    font-size: 0.875rem;
-    color: var(--text);
-    cursor: pointer;
-}
-
-.autumn-autocomplete__option:hover,
-.autumn-autocomplete__option[aria-selected="true"] {
-    background-color: var(--primary-light);
-    color: var(--primary);
-}
-
 /* ── Nav bar (autumn-nav) ──────────────────────────────────────────────────── */
 
 .autumn-nav {
     display: flex;
     align-items: center;
-    gap: 1rem;
-    padding: 0.75rem 1rem;
+    gap: var(--space-4);
+    padding: var(--space-3) var(--space-4);
 }
 
 .autumn-nav--sidebar {
@@ -461,7 +698,7 @@
 }
 
 .autumn-nav__brand {
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     color: var(--text);
     text-decoration: none;
 }
@@ -478,14 +715,14 @@
 .autumn-nav__collapse {
     display: flex;
     align-items: center;
-    gap: 1rem;
+    gap: var(--space-4);
     flex: 1;
 }
 
 .autumn-nav__items {
     display: flex;
     align-items: center;
-    gap: 1rem;
+    gap: var(--space-4);
     list-style: none;
     margin: 0;
     padding: 0;
@@ -500,12 +737,12 @@
     align-items: center;
 }
 
-.autumn-nav__item a {
+.autumn-nav__item a:not(.autumn-menu__item) {
     color: var(--text);
     text-decoration: none;
 }
 
-.autumn-nav__item a:hover {
+.autumn-nav__item a:not(.autumn-menu__item):hover {
     color: var(--primary);
 }
 
@@ -514,8 +751,8 @@
 }
 
 .autumn-nav__section {
-    font-size: 0.75rem;
-    font-weight: 600;
+    font-size: var(--font-size-xs);
+    font-weight: var(--font-weight-semibold);
     text-transform: uppercase;
     color: var(--text-muted);
 }
@@ -526,16 +763,6 @@
     color: inherit;
     font: inherit;
     cursor: pointer;
-}
-
-.autumn-nav__menu {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-}
-
-.autumn-nav__menu[hidden] {
-    display: none;
 }
 
 @media (max-width: 768px) {
@@ -569,7 +796,7 @@
 .autumn-locale-switcher {
     display: flex;
     align-items: center;
-    gap: 0.5rem;
+    gap: var(--space-2);
 }
 
 .autumn-locale-switcher a {
@@ -582,15 +809,57 @@
 }
 
 .autumn-locale-switcher__current {
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     color: var(--text-muted);
+}
+
+/* ── Theme toggle (autumn-theme-toggle, issue #3396) ───────────────────────── */
+
+.autumn-theme-toggle {
+    display: inline-flex;
+    margin: 0;
+}
+
+.autumn-theme-toggle__group {
+    display: inline-flex;
+    gap: var(--space-1);
+    padding: var(--space-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-full);
+    background: var(--surface);
+    color: var(--text);
+}
+
+.autumn-theme-toggle__option {
+    padding: var(--space-1) var(--space-3);
+    border: 0;
+    border-radius: var(--radius-full);
+    background: transparent;
+    color: var(--text-muted);
+    font: inherit;
+    font-size: var(--font-size-sm);
+    cursor: pointer;
+}
+
+.autumn-theme-toggle__option:hover {
+    color: var(--text);
+}
+
+.autumn-theme-toggle__option[aria-pressed="true"] {
+    background: var(--primary);
+    color: var(--on-primary);
+}
+
+.autumn-theme-toggle__option:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
 }
 
 /* ── Breadcrumb (autumn-breadcrumb) ───────────────────────────────────────── */
 
 .autumn-breadcrumb {
-    font-size: 0.875rem;
-    margin-bottom: 1rem;
+    font-size: var(--font-size-sm);
+    margin-bottom: var(--space-4);
 }
 
 .autumn-breadcrumb__list {
@@ -625,7 +894,7 @@
 
 .autumn-breadcrumb__current {
     color: var(--text);
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
 }
 
 .autumn-breadcrumb__text {
@@ -635,45 +904,45 @@
 /* ── Hero (autumn-hero) ────────────────────────────────────────────────────── */
 
 .autumn-hero {
-    padding: 3rem 1.5rem;
+    padding: 3rem var(--space-6);
     text-align: center;
 }
 
 .autumn-hero__title {
     margin: 0;
     font-size: 2rem;
-    font-weight: 700;
+    font-weight: var(--font-weight-bold);
     color: var(--text);
 }
 
 .autumn-hero__subtitle {
-    margin: 0.75rem 0 0 0;
-    font-size: 1.125rem;
+    margin: var(--space-3) 0 0 0;
+    font-size: var(--font-size-lg);
     color: var(--text-muted);
 }
 
 .autumn-hero__actions {
     display: flex;
     justify-content: center;
-    gap: 0.75rem;
-    margin-top: 1.5rem;
+    gap: var(--space-3);
+    margin-top: var(--space-6);
 }
 
 .autumn-hero__cta {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    padding: 0.625rem 1.5rem;
+    padding: 0.625rem var(--space-6);
     border-radius: var(--radius);
     font-size: 0.9375rem;
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
     text-decoration: none;
     transition: background-color 0.15s ease, border-color 0.15s ease;
 }
 
 .autumn-hero__cta--primary {
     background-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
     border: 1px solid var(--primary);
 }
 
@@ -697,18 +966,138 @@
 .autumn-property-list {
     display: grid;
     grid-template-columns: minmax(8rem, max-content) 1fr;
-    gap: 0.5rem 1rem;
+    gap: var(--space-2) var(--space-4);
     margin: 0;
 }
 
 .autumn-property-list dt {
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
     color: var(--text-muted);
 }
 
 .autumn-property-list dd {
     margin: 0;
     color: var(--text);
+}
+
+/* ── Popover + dropdown menu (autumn-popover, autumn-menu) ─────────────────── */
+
+.autumn-popover {
+    display: inline-block;
+}
+
+.autumn-popover__trigger {
+    font: inherit;
+    cursor: pointer;
+}
+
+/* The popover is in the top layer. The trigger is its implicit anchor, so
+   `position-area` needs no anchor name. `position-try-fallbacks` flips the
+   panel when it does not fit. Without anchor positioning, the UA centers it. */
+.autumn-popover__panel {
+    padding: var(--space-3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+    max-width: min(24rem, calc(100vw - 2rem));
+}
+
+@supports (position-area: bottom) {
+    .autumn-popover__panel {
+        inset: auto;
+        margin: 0;
+        position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+        position-visibility: anchors-visible;
+    }
+
+    .autumn-popover__panel[data-side="bottom"] { position-area: block-end span-inline-end; }
+    .autumn-popover__panel[data-side="bottom"][data-align="center"] { position-area: block-end; }
+    .autumn-popover__panel[data-side="bottom"][data-align="end"] { position-area: block-end span-inline-start; }
+    .autumn-popover__panel[data-side="top"] { position-area: block-start span-inline-end; }
+    .autumn-popover__panel[data-side="top"][data-align="center"] { position-area: block-start; }
+    .autumn-popover__panel[data-side="top"][data-align="end"] { position-area: block-start span-inline-start; }
+    .autumn-popover__panel[data-side="end"] { position-area: inline-end span-block-end; }
+    .autumn-popover__panel[data-side="end"][data-align="center"] { position-area: inline-end; }
+    .autumn-popover__panel[data-side="end"][data-align="end"] { position-area: inline-end span-block-start; }
+    .autumn-popover__panel[data-side="start"] { position-area: inline-start span-block-end; }
+    .autumn-popover__panel[data-side="start"][data-align="center"] { position-area: inline-start; }
+    .autumn-popover__panel[data-side="start"][data-align="end"] { position-area: inline-start span-block-start; }
+}
+
+/* `display` only while open: a `display` on the closed popover would beat the
+   UA rule that hides it. */
+.autumn-menu:popover-open {
+    display: flex;
+}
+
+.autumn-menu {
+    flex-direction: column;
+    min-width: 10rem;
+    padding: var(--space-1);
+    list-style: none;
+}
+
+.autumn-menu__form {
+    display: contents;
+}
+
+.autumn-menu__item {
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    padding: var(--space-2) var(--space-3);
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: none;
+    color: inherit;
+    font: inherit;
+    font-size: var(--font-size-sm);
+    text-align: start;
+    text-decoration: none;
+    cursor: pointer;
+}
+
+.autumn-menu__item:hover,
+.autumn-menu__item:focus-visible {
+    background-color: var(--surface-muted);
+}
+
+.autumn-menu__item:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+}
+
+.autumn-menu__item--destructive {
+    color: var(--danger);
+}
+
+@media (forced-colors: active) {
+    .autumn-menu__item:hover {
+        outline: 1px solid Highlight;
+        outline-offset: -1px;
+    }
+}
+
+.autumn-menu__separator {
+    height: 1px;
+    margin: var(--space-1) 0;
+    border: 0;
+    background-color: var(--border);
+}
+
+.autumn-menu__group {
+    display: flex;
+    flex-direction: column;
+}
+
+.autumn-menu__label {
+    padding: var(--space-1) var(--space-3);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    font-weight: var(--font-weight-semibold);
+    text-transform: uppercase;
 }
 
 /* ── Modal / confirm dialog (autumn-modal, autumn-confirm) ────────────────── */
@@ -719,8 +1108,10 @@
 
 .autumn-modal {
     padding: 0;
-    border: none;
+    border: 1px solid var(--border);
     border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
     box-shadow: var(--shadow);
     max-width: 28rem;
     width: calc(100% - 2rem);
@@ -733,14 +1124,14 @@
 .autumn-modal__content {
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
-    padding: 1.5rem;
+    gap: var(--space-3);
+    padding: var(--space-6);
 }
 
 .autumn-modal__title {
     margin: 0;
-    font-size: 1.125rem;
-    font-weight: 600;
+    font-size: var(--font-size-lg);
+    font-weight: var(--font-weight-semibold);
     color: var(--text);
 }
 
@@ -752,8 +1143,66 @@
 .autumn-modal__footer {
     display: flex;
     justify-content: flex-end;
-    gap: 0.5rem;
-    margin-top: 0.25rem;
+    gap: var(--space-2);
+    margin-top: var(--space-1);
+}
+
+.autumn-modal--sm {
+    max-width: 20rem;
+}
+
+.autumn-modal--lg {
+    max-width: 48rem;
+}
+
+.autumn-modal--full {
+    max-width: none;
+    width: 100%;
+    max-height: none;
+    height: 100%;
+    margin: 0;
+    border-radius: 0;
+}
+
+.autumn-modal__content,
+.autumn-drawer__content {
+    position: relative;
+}
+
+.autumn-modal__close,
+.autumn-drawer__close {
+    position: absolute;
+    top: var(--space-3);
+    right: var(--space-3);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    padding: 0;
+    background: transparent;
+    color: var(--text);
+    border: 0;
+    border-radius: var(--radius);
+    font-size: var(--font-size-lg);
+    line-height: 1;
+    cursor: pointer;
+}
+
+.autumn-modal__close:hover,
+.autumn-drawer__close:hover {
+    background-color: var(--bg);
+}
+
+.autumn-modal__close:focus-visible,
+.autumn-drawer__close:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-modal__close ~ .autumn-modal__title,
+.autumn-drawer__close ~ .autumn-drawer__title {
+    padding-right: var(--space-8);
 }
 
 .autumn-modal__confirm-form {
@@ -761,13 +1210,13 @@
 }
 
 .autumn-modal__cancel {
-    padding: 0.5rem 1.25rem;
+    padding: var(--space-2) var(--space-5);
     background-color: var(--surface);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     cursor: pointer;
 }
 
@@ -776,13 +1225,13 @@
 }
 
 .autumn-modal__confirm {
-    padding: 0.5rem 1.25rem;
+    padding: var(--space-2) var(--space-5);
     background-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
     border: 1px solid var(--primary);
     border-radius: var(--radius);
-    font-size: 0.875rem;
-    font-weight: 500;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
     cursor: pointer;
 }
 
@@ -793,7 +1242,7 @@
 .autumn-modal__confirm--danger {
     background-color: var(--danger);
     border-color: var(--danger);
-    color: #fff;
+    color: var(--on-danger);
 }
 
 .autumn-modal__confirm--danger:hover {
@@ -801,20 +1250,230 @@
     border-color: var(--danger-hover);
 }
 
+/* ── Drawer / sheet (autumn-drawer) ────────────────────────────────────────── */
+
+.autumn-drawer {
+    --autumn-drawer-size: 24rem;
+    box-sizing: border-box;
+    position: fixed;
+    z-index: var(--z-banner);
+    margin: 0;
+    padding: 0;
+    max-width: none;
+    max-height: none;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: var(--shadow);
+}
+
+.autumn-drawer[open] {
+    display: flex;
+    flex-direction: column;
+}
+
+.autumn-drawer::backdrop {
+    background-color: rgba(17, 24, 39, 0.5);
+}
+
+.autumn-drawer--sm {
+    --autumn-drawer-size: 16rem;
+}
+
+.autumn-drawer--lg {
+    --autumn-drawer-size: 40rem;
+}
+
+.autumn-drawer--full {
+    --autumn-drawer-size: 100%;
+}
+
+.autumn-drawer--left,
+.autumn-drawer--right {
+    top: 0;
+    bottom: 0;
+    width: var(--autumn-drawer-size);
+    max-width: 100%;
+    height: 100%;
+}
+
+.autumn-drawer--left {
+    left: 0;
+    right: auto;
+    border-width: 0 1px 0 0;
+}
+
+.autumn-drawer--right {
+    right: 0;
+    left: auto;
+    border-width: 0 0 0 1px;
+}
+
+.autumn-drawer--top,
+.autumn-drawer--bottom {
+    left: 0;
+    right: 0;
+    height: var(--autumn-drawer-size);
+    max-height: 100%;
+    width: 100%;
+}
+
+.autumn-drawer--top {
+    top: 0;
+    bottom: auto;
+    border-width: 0 0 1px;
+}
+
+.autumn-drawer--bottom {
+    bottom: 0;
+    top: auto;
+    border-width: 1px 0 0;
+}
+
+.autumn-drawer__content {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    gap: var(--space-3);
+    padding: var(--space-6);
+    overflow: auto;
+}
+
+.autumn-drawer__title {
+    margin: 0;
+    font-size: var(--font-size-lg);
+    font-weight: var(--font-weight-semibold);
+    color: var(--text);
+}
+
+.autumn-drawer__body {
+    flex: 1;
+    color: var(--text);
+    font-size: 0.9375rem;
+}
+
+.autumn-drawer__footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+}
+
+@keyframes autumn-drawer-in-x {
+    from { translate: var(--autumn-drawer-from, 100%) 0; }
+}
+
+@keyframes autumn-drawer-in-y {
+    from { translate: 0 var(--autumn-drawer-from, 100%); }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .autumn-drawer--left[open] { --autumn-drawer-from: -100%; animation: autumn-drawer-in-x 0.2s ease-out; }
+    .autumn-drawer--right[open] { animation: autumn-drawer-in-x 0.2s ease-out; }
+    .autumn-drawer--top[open] { --autumn-drawer-from: -100%; animation: autumn-drawer-in-y 0.2s ease-out; }
+    .autumn-drawer--bottom[open] { animation: autumn-drawer-in-y 0.2s ease-out; }
+}
+
+/* ── Accordion and collapsible (autumn-accordion, autumn-collapsible) ──────── */
+
+.autumn-accordion {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    overflow: hidden;
+}
+
+.autumn-accordion__item + .autumn-accordion__item {
+    border-top: 1px solid var(--border);
+}
+
+.autumn-collapsible {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--surface);
+    color: var(--text);
+    overflow: hidden;
+}
+
+.autumn-accordion__summary,
+.autumn-collapsible__summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-4);
+    color: var(--text);
+    font-weight: var(--font-weight-medium);
+    cursor: pointer;
+    list-style: none;
+}
+
+.autumn-accordion__summary::-webkit-details-marker,
+.autumn-collapsible__summary::-webkit-details-marker {
+    display: none;
+}
+
+/* The chevron is a border, so it needs no icon font and follows the text color. */
+.autumn-accordion__summary::after,
+.autumn-collapsible__summary::after {
+    content: "";
+    flex: none;
+    width: 0.5rem;
+    height: 0.5rem;
+    border-right: 2px solid var(--text-muted);
+    border-bottom: 2px solid var(--text-muted);
+    transform: rotate(45deg);
+}
+
+:is(.autumn-accordion__item, .autumn-collapsible)[open] > :is(.autumn-accordion__summary, .autumn-collapsible__summary)::after {
+    transform: rotate(-135deg);
+}
+
+.autumn-accordion__summary:hover,
+.autumn-collapsible__summary:hover {
+    background: var(--surface-muted);
+}
+
+.autumn-accordion__summary:focus-visible,
+.autumn-collapsible__summary:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+}
+
+.autumn-accordion__heading {
+    margin: 0;
+    font: inherit;
+}
+
+.autumn-accordion__body,
+.autumn-collapsible__body {
+    padding: var(--space-3) var(--space-4) var(--space-4);
+    color: var(--text);
+}
+
+/* Motion is opt-in: reduced motion is the default. */
+@media (prefers-reduced-motion: no-preference) {
+    .autumn-accordion__summary::after,
+    .autumn-collapsible__summary::after {
+        transition: transform 0.15s ease;
+    }
+}
+
 /* ── Tabs (autumn-tabs) ────────────────────────────────────────────────────── */
 
 .autumn-tabs__list {
     display: flex;
-    gap: 0.25rem;
+    gap: var(--space-1);
     border-bottom: 1px solid var(--border);
-    margin-bottom: 1rem;
+    margin-bottom: var(--space-4);
 }
 
 .autumn-tabs__tab {
-    padding: 0.5rem 1rem;
+    padding: var(--space-2) var(--space-4);
     margin-bottom: -1px;
     color: var(--text-muted);
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
     font-size: 0.9375rem;
     text-decoration: none;
     border-bottom: 2px solid transparent;
@@ -840,10 +1499,10 @@
    `tabs()` call rendered inside another's panel body): without it, the
    ancestor panel that merely contains the nested widget would stay
    `display: none` and hide the correctly-targeted inner panel along with
-   it, even though the inner panel's own `:target` rule matched. This half
-   is deliberately unscoped (no `>`) since the target may be arbitrarily
-   deep. */
-.autumn-tabs__panel:is(:target, :has(:target)) {
+   it, even though the inner panel's own `:target` rule matched. The
+   `:has()` argument is deliberately unscoped, since the target may be
+   arbitrarily deep. */
+.autumn-tabs:not(.autumn-tabs--enhanced) > .autumn-tabs__panel:is(:target, :has(:target)) {
     display: block;
 }
 
@@ -868,7 +1527,14 @@
    *consequent* (`> .autumn-tabs__panel--active`) IS scoped to direct
    children, so this rule only ever reveals THIS widget's own default
    panel, never a nested widget's. */
-.autumn-tabs:not(:has(:target)) > .autumn-tabs__panel--active {
+.autumn-tabs:not(.autumn-tabs--enhanced):not(:has(:target)) > .autumn-tabs__panel--active {
+    display: block;
+}
+
+/* With JS (issue #3397): autumn-widgets.js adds `autumn-tabs--enhanced` and
+   sets `hidden` on each panel that is not selected. The `:target` rules
+   above and below apply only without JS. */
+.autumn-tabs.autumn-tabs--enhanced > .autumn-tabs__panel:not([hidden]) {
     display: block;
 }
 
@@ -901,17 +1567,17 @@
    nesting `:has()` inside `:has()`, which CSS disallows, so in that case
    no tab gets highlighted (a graceful degrade: no tab looks active,
    rather than the wrong one). */
-.autumn-tabs:has(:target) > .autumn-tabs__list > .autumn-tabs__tab--active {
+.autumn-tabs:not(.autumn-tabs--enhanced):has(:target) > .autumn-tabs__list > .autumn-tabs__tab--active {
     color: var(--text-muted);
     border-bottom-color: transparent;
 }
 
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(1):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(1),
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(2):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(2),
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(3):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(3),
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(4):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(4),
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(5):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(5),
-.autumn-tabs:has(> .autumn-tabs__panel:nth-of-type(6):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(6) {
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(1):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(1),
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(2):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(2),
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(3):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(3),
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(4):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(4),
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(5):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(5),
+.autumn-tabs:not(.autumn-tabs--enhanced):has(> .autumn-tabs__panel:nth-of-type(6):target) > .autumn-tabs__list > .autumn-tabs__tab:nth-child(6) {
     color: var(--text);
     border-bottom-color: var(--primary);
 }
@@ -922,7 +1588,7 @@
 .autumn-pager--cursor {
     display: flex;
     align-items: center;
-    gap: 0.25rem;
+    gap: var(--space-1);
 }
 
 .autumn-pager__link,
@@ -932,10 +1598,10 @@
     align-items: center;
     justify-content: center;
     min-width: 2rem;
-    padding: 0.375rem 0.75rem;
+    padding: 0.375rem var(--space-3);
     border: 1px solid var(--border);
     border-radius: var(--radius);
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
     color: var(--text);
     text-decoration: none;
 }
@@ -956,7 +1622,7 @@
 .autumn-pager__current {
     background-color: var(--primary);
     border-color: var(--primary);
-    color: #fff;
+    color: var(--on-primary);
 }
 
 .autumn-pager__ellipsis {
@@ -974,18 +1640,57 @@
 .autumn-direct-upload {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: var(--space-2);
+    padding: var(--space-3);
+    position: relative;
+    border: 1px dashed var(--text-muted);
+    border-radius: var(--radius-md);
+}
+
+.autumn-direct-upload[data-dragging] {
+    border-color: var(--primary);
+    background-color: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.autumn-upload-label {
+    font-weight: 600;
+}
+
+.autumn-upload-hint,
+.autumn-upload-status {
+    font-size: 0.8125rem;
+    color: var(--text-muted);
+}
+
+.autumn-upload-hint[hidden],
+.autumn-upload-progress[hidden] {
+    display: none;
+}
+
+/* An empty live region stays in the accessibility tree, but takes no room. */
+.autumn-upload-status:empty,
+.autumn-upload-error:empty {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+}
+
+.autumn-upload-error {
+    font-size: 0.8125rem;
+    color: var(--danger);
 }
 
 .autumn-upload-progress {
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: var(--space-1);
 }
 
 .autumn-upload-bar {
     height: 0.375rem;
-    border-radius: 9999px;
+    border-radius: var(--radius-full);
     background-color: var(--border);
     overflow: hidden;
 }
@@ -1009,75 +1714,72 @@
 .autumn-job-status {
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: var(--space-2);
 }
 
 .autumn-job-status__bar {
     width: 100%;
     height: 0.5rem;
-    border-radius: 9999px;
+    border-radius: var(--radius-full);
     accent-color: var(--primary);
 }
 
 .autumn-job-status__message {
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
     color: var(--text-muted);
 }
 
 .autumn-job-status__success {
-    font-size: 0.875rem;
-    color: #065f46;
-    color: color-mix(in srgb, var(--success, #059669) 60%, var(--text, #111827));
+    font-size: var(--font-size-sm);
+    color: var(--success-text);
 }
 
 .autumn-job-status__error {
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
     color: var(--danger);
 }
 
 /* ── Badge / status pill (#1259) ──────────────────────────────────────────── */
 
-.badge {
+.autumn-badge {
     display: inline-flex;
     align-items: center;
-    gap: 0.25rem;
-    padding: 0.125rem 0.5rem;
-    font-size: 0.75rem;
-    font-weight: 600;
-    line-height: 1.25;
+    gap: var(--space-1);
+    padding: 0.125rem var(--space-2);
+    font-size: var(--font-size-xs);
+    font-weight: var(--font-weight-semibold);
+    line-height: var(--line-height-tight);
     border-radius: var(--radius);
     border: 1px solid transparent;
     white-space: nowrap;
 }
 
-.badge--neutral {
-    background: var(--surface-muted, #f1f5f9);
+.autumn-badge--neutral {
+    background: var(--surface-muted);
     color: var(--text-muted);
     border-color: var(--border);
 }
 
-.badge--info {
-    background: var(--info-light, #eff6ff);
-    color: var(--info, #1e3a8a);
-    border-color: var(--info, #93c5fd);
+.autumn-badge--info {
+    background: var(--info-light);
+    color: var(--info);
+    border-color: var(--info);
 }
 
-.badge--success {
-    background: var(--success-light, #ecfdf5);
-    color: #065f46;
-    color: var(--success-text, color-mix(in srgb, var(--success, #059669) 60%, #111827));
+.autumn-badge--success {
+    background: var(--success-light);
+    color: var(--success-text);
     border-color: var(--success);
 }
 
-.badge--warning {
-    background: var(--warning-light, #fffbeb);
-    color: #92400e;
-    color: var(--warning-text, color-mix(in srgb, var(--warning, #d97706) 60%, #111827));
-    border-color: var(--warning, #fcd34d);
+.autumn-badge--warning {
+    background: var(--warning-light);
+    color: var(--warning-text);
+    border-color: var(--warning);
 }
 
-.badge--danger {
-    background: var(--danger-light, #fef2f2);
+.autumn-badge--danger {
+    background: var(--danger-light);
     color: var(--danger-hover);
     border-color: var(--danger);
 }
@@ -1089,7 +1791,7 @@
     align-items: center;
     justify-content: center;
     flex: 0 0 auto;
-    border-radius: 9999px;
+    border-radius: var(--radius-full);
     overflow: hidden;
     vertical-align: middle;
     border: 1px solid var(--border);
@@ -1101,23 +1803,24 @@
 
 .autumn-avatar--initials {
     color: #fff;
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     text-transform: uppercase;
     /* Fallback; the deterministic per-name color is one of the
        .autumn-avatar--cN palette classes below (defined after this rule so it
        wins at equal specificity). Class-based — not an inline style — so it
        survives a nonce CSP that forbids inline `style` attributes. */
-    background: var(--primary);
+    background: hsl(262, 60%, 45%);
 }
 
 /* Deterministic per-name background palette (selected by avatar_palette_class).
-   Class-based so no inline `style` attribute is emitted. */
+   Class-based so no inline `style` attribute is emitted. Each color gives
+   white initials 4.5:1 (WCAG 1.4.3); a test in widgets_css.rs checks it. */
 .autumn-avatar--c0 { background: hsl(0, 60%, 42%); }
 .autumn-avatar--c1 { background: hsl(30, 60%, 40%); }
-.autumn-avatar--c2 { background: hsl(60, 55%, 36%); }
-.autumn-avatar--c3 { background: hsl(90, 55%, 34%); }
+.autumn-avatar--c2 { background: hsl(60, 55%, 30%); }
+.autumn-avatar--c3 { background: hsl(90, 55%, 32%); }
 .autumn-avatar--c4 { background: hsl(120, 50%, 34%); }
-.autumn-avatar--c5 { background: hsl(150, 55%, 34%); }
+.autumn-avatar--c5 { background: hsl(150, 55%, 33%); }
 .autumn-avatar--c6 { background: hsl(180, 55%, 32%); }
 .autumn-avatar--c7 { background: hsl(210, 60%, 42%); }
 .autumn-avatar--c8 { background: hsl(240, 55%, 50%); }
@@ -1134,7 +1837,7 @@
 .autumn-avatar--md {
     width: 40px;
     height: 40px;
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
 }
 
 .autumn-avatar--lg {
@@ -1150,56 +1853,56 @@
 
 /* ── Alert / callout (#1314) ──────────────────────────────────────────────── */
 
-.alert {
+.autumn-alert {
     display: flex;
     align-items: flex-start;
     gap: 0.625rem;
-    padding: 0.75rem 1rem;
+    padding: var(--space-3) var(--space-4);
     border-radius: var(--radius);
     border: 1px solid var(--border);
-    margin-bottom: 1rem;
+    margin-bottom: var(--space-4);
 }
 
-.alert__icon {
+.autumn-alert__icon {
     flex: 0 0 auto;
     display: inline-flex;
     line-height: 1;
 }
 
-.alert__content {
+.autumn-alert__content {
     flex: 1 1 auto;
     min-width: 0;
 }
 
-.alert__title {
-    margin: 0 0 0.25rem;
+.autumn-alert__title {
+    margin: 0 0 var(--space-1);
     font-size: 0.9375rem;
-    font-weight: 700;
+    font-weight: var(--font-weight-bold);
 }
 
-.alert__body {
-    font-size: 0.875rem;
+.autumn-alert__body {
+    font-size: var(--font-size-sm);
 }
 
-.alert__errors {
+.autumn-alert__errors {
     margin: 0;
-    padding-left: 1.25rem;
+    padding-left: var(--space-5);
 }
 
-.alert__dismiss {
+.autumn-alert__dismiss {
     flex: 0 0 auto;
     cursor: pointer;
     line-height: 1;
-    font-size: 1.25rem;
+    font-size: var(--font-size-xl);
     color: inherit;
-    padding: 0 0.25rem;
+    padding: 0 var(--space-1);
     background: none;
     border: 0;
 }
 
 /* Visually hidden but kept in tab order / focusable (WCAG 2.1.1) — never
    `display:none`/`hidden`, which would remove it from the keyboard path. */
-.alert__dismiss-toggle {
+.autumn-alert__dismiss-toggle {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -1211,37 +1914,35 @@
     border: 0;
 }
 
-.alert__dismiss:has(.alert__dismiss-toggle:focus-visible) {
+.autumn-alert__dismiss:has(.autumn-alert__dismiss-toggle:focus-visible) {
     outline: 2px solid var(--primary);
     outline-offset: 2px;
 }
 
-.alert:has(.alert__dismiss-toggle:checked) {
+.autumn-alert:has(.autumn-alert__dismiss-toggle:checked) {
     display: none;
 }
 
-.alert-info {
-    background: var(--info-light, #eff6ff);
-    color: var(--info, #1e3a8a);
-    border-color: var(--info, #93c5fd);
+.autumn-alert--info {
+    background: var(--info-light);
+    color: var(--info);
+    border-color: var(--info);
 }
 
-.alert-success {
-    background: var(--success-light, #ecfdf5);
-    color: #065f46;
-    color: var(--success-text, color-mix(in srgb, var(--success, #059669) 60%, #111827));
+.autumn-alert--success {
+    background: var(--success-light);
+    color: var(--success-text);
     border-color: var(--success);
 }
 
-.alert-warning {
-    background: var(--warning-light, #fffbeb);
-    color: #92400e;
-    color: var(--warning-text, color-mix(in srgb, var(--warning, #d97706) 60%, #111827));
-    border-color: var(--warning, #fcd34d);
+.autumn-alert--warning {
+    background: var(--warning-light);
+    color: var(--warning-text);
+    border-color: var(--warning);
 }
 
-.alert-error {
-    background: var(--danger-light, #fef2f2);
+.autumn-alert--error {
+    background: var(--danger-light);
     color: var(--danger-hover);
     border-color: var(--danger);
 }
@@ -1249,30 +1950,49 @@
 /* ── Toast (autumn-toast) ──────────────────────────────────────────────────── */
 
 /* Fixed stacking context dropped once in the layout; `pointer-events: none`
-   so the empty region never blocks clicks, re-enabled on each toast below. */
+   so the empty region never blocks clicks, re-enabled on each toast below.
+   The region is `popover="manual"` (#3399). The runtime opens it in the top
+   layer, where `z-index` does not apply. These rules reset the UA popover
+   box. `display` overrides the UA `display: none`, so the region also shows
+   without JS. */
 .autumn-toast-region {
     position: fixed;
-    bottom: 1rem;
-    right: 1rem;
-    z-index: 1000;
+    inset: auto 1rem 1rem auto;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    overflow: visible;
+    z-index: var(--z-toast);
     display: flex;
     flex-direction: column;
-    gap: 0.5rem;
+    gap: var(--space-2);
     max-width: min(24rem, calc(100vw - 2rem));
     pointer-events: none;
 }
 
-/* Auto-dismiss is CSS-only: a slide/fade in, then a fade+collapse out after a
-   visible dwell — no JavaScript. The element stays in the DOM (CSS cannot
-   remove nodes) but ends `visibility: hidden` with zero height, so it neither
-   shows nor occupies space. */
+/* A popover has a transparent full-page `::backdrop`. The region does not
+   need one. */
+.autumn-toast-region::backdrop {
+    display: none;
+}
+
+/* CSS runs the timer: a slide and fade in, then a fade and collapse out
+   after the dwell. The runtime sets `--autumn-toast-duration` from
+   `data-autumn-toast-duration`, and removes the toast when the fade ends.
+   Without JS the toast stays in the DOM, `visibility: hidden` with zero
+   height. */
 .autumn-toast {
     pointer-events: auto;
-    padding: 0.75rem 1rem;
+    display: flex;
+    align-items: flex-start;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-4);
     border: 1px solid var(--border);
     border-left-width: 4px;
     border-radius: var(--radius);
-    background: var(--surface, #fff);
+    background: var(--surface);
     color: var(--text);
     box-shadow: 0 4px 12px rgb(0 0 0 / 12%);
     font-size: 0.9375rem;
@@ -1282,11 +2002,57 @@
     max-height: 200px;
     animation:
         autumn-toast-in 200ms ease-out,
-        autumn-toast-out 400ms ease-in 5s forwards;
+        autumn-toast-out 400ms ease-in var(--autumn-toast-duration, 5s) forwards;
+}
+
+/* WCAG 2.2.1: hover or focus on a toast pauses the timer of every toast in
+   the region. Then the user can read and act. Only the exit animation (the
+   second one) pauses. A toast that arrives during the pause still fades in. */
+.autumn-toast-region:hover .autumn-toast,
+.autumn-toast-region:focus-within .autumn-toast,
+.autumn-toast:hover,
+.autumn-toast:focus-within {
+    animation-play-state: running, paused;
+}
+
+/* No timer: the user closes the toast. */
+.autumn-toast--persistent {
+    animation: autumn-toast-in 200ms ease-out;
+}
+
+/* `display: flex` above overrides the UA `[hidden]` rule. */
+.autumn-toast[hidden] {
+    display: none;
 }
 
 .autumn-toast__message {
     display: block;
+    flex: 1 1 auto;
+}
+
+/* The runtime shows the button. Without JS it does nothing, so it stays
+   hidden. The target is at least 24 px (WCAG 2.5.8). */
+.autumn-toast__close {
+    flex: 0 0 auto;
+    min-width: 1.5rem;
+    min-height: 1.5rem;
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius);
+    background: none;
+    color: inherit;
+    cursor: pointer;
+    font-size: var(--font-size-xl);
+    line-height: 1;
+}
+
+.autumn-toast__close[hidden] {
+    display: none;
+}
+
+.autumn-toast__close:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
 }
 
 .autumn-toast--success {
@@ -1294,11 +2060,11 @@
 }
 
 .autumn-toast--info {
-    border-left-color: var(--info, #3b82f6);
+    border-left-color: var(--info);
 }
 
 .autumn-toast--warning {
-    border-left-color: var(--warning, #d97706);
+    border-left-color: var(--warning);
 }
 
 .autumn-toast--error {
@@ -1322,216 +2088,209 @@
         opacity: 0;
         visibility: hidden;
         max-height: 0;
-        margin-top: -0.5rem;
+        margin-top: calc(-1 * var(--space-2));
         padding-top: 0;
         padding-bottom: 0;
     }
 }
 
-/* Respect reduced-motion: skip the entrance/exit transforms but still
-   auto-hide after the dwell so toasts don't pile up. */
+/* Reduced motion: no slide or fade. A timed toast still hides after the
+   dwell, so toasts do not pile up. A persistent toast has no animation. */
 @media (prefers-reduced-motion: reduce) {
+    /* A 0s entrance keeps the exit animation second, as the pause needs. */
     .autumn-toast {
-        animation: autumn-toast-out 0s linear 5s forwards;
+        animation:
+            autumn-toast-in 0s,
+            autumn-toast-out 0s linear var(--autumn-toast-duration, 5s) forwards;
+    }
+
+    .autumn-toast--persistent {
+        animation: none;
     }
 }
 
-/* ── Infinite feed (autumn-feed) ───────────────────────────────────────────── */
+/* ── Tooltip (autumn-tooltip, #3404) ───────────────────────────────────────── */
 
-.autumn-feed {
-    display: flex;
-    flex-direction: column;
-    gap: 1rem;
+/* The root is the anchor. `anchor-scope` keeps each tooltip on its own
+   trigger. `display: inline` keeps a long link trigger in the text flow.
+   The fallback places the text with `position: absolute`. */
+.autumn-tooltip {
+    --autumn-tooltip-gap: var(--space-2);
+    position: relative;
+    display: inline;
+    anchor-name: --autumn-tooltip;
+    anchor-scope: --autumn-tooltip;
 }
 
-.autumn-feed__sentinel {
-    display: flex;
-    justify-content: center;
-    padding: 1rem 0;
+/* Hidden: `display: none`, so a hidden text adds no scroll overflow.
+   `aria-describedby` still reads it. `pointer-events: auto` lets the
+   pointer move onto it (WCAG 1.4.13). The transparent border shows in
+   forced colors. */
+.autumn-tooltip__bubble {
+    display: none;
+    position: absolute;
+    z-index: var(--z-tooltip);
+    box-sizing: border-box;
+    width: max-content;
+    max-width: min(20rem, calc(100vw - 2 * var(--space-2)));
+    margin: 0;
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background: var(--text);
+    color: var(--surface);
+    box-shadow: var(--shadow);
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-normal);
+    line-height: var(--line-height-normal);
+    text-align: start;
+    white-space: normal;
+    overflow-wrap: break-word;
+    pointer-events: auto;
+    opacity: 1;
+    transition: opacity 120ms ease-out;
 }
 
-.autumn-feed__more {
-    display: inline-block;
-    padding: 0.5rem 1.25rem;
-    color: var(--primary);
-    font-weight: 500;
-    font-size: 0.9375rem;
-    text-decoration: none;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
+/* The hover bridge: a transparent box that covers the gap on each side. */
+.autumn-tooltip__bubble::before {
+    content: "";
+    position: absolute;
+    inset: calc(-1 * var(--autumn-tooltip-gap));
 }
 
-.autumn-feed__more:hover {
-    border-color: var(--primary);
-}
-
-.autumn-feed__more:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
-}
-
-/* ── charts: sparkline / bar / line (#1231) ─────────────────────────────────
-   Pure inline SVG. Colors/strokes come from tokens via these classes — never
-   an inline `style=` — so charts re-theme by overriding `--primary` etc. and
-   survive a strict style-src/nonce CSP. Per-datum geometry lives in SVG
-   presentation attributes (x/y/width/height/points/cx/cy), not CSS. */
-.autumn-chart {
+/* One rule for each selector: a browser drops a whole list when it does
+   not know one pseudo-class in it. A popover shows only when open. */
+.autumn-tooltip:hover > .autumn-tooltip__bubble:not([popover]) {
     display: block;
-    width: 100%;
-    max-width: 100%;
-    color: var(--primary);
 }
 
-.autumn-chart__svg {
+.autumn-tooltip:has(:focus-visible) > .autumn-tooltip__bubble:not([popover]) {
     display: block;
-    width: 100%;
-    height: auto;
+}
+
+.autumn-tooltip > .autumn-tooltip__bubble[popover]:popover-open {
+    display: block;
+}
+
+/* Without `:has()`, any focus shows the text. */
+@supports not selector(:has(a)) {
+    .autumn-tooltip:focus-within > .autumn-tooltip__bubble:not([popover]) {
+        display: block;
+    }
+}
+
+/* Fade in from transparent. */
+@starting-style {
+    .autumn-tooltip__bubble {
+        opacity: 0;
+    }
+}
+
+/* Escape sets `hidden`. An empty text never shows. `!important` wins over
+   each show rule above. */
+.autumn-tooltip__bubble[hidden],
+.autumn-tooltip__bubble:empty {
+    display: none !important;
+}
+
+/* Fallback placement, without anchor positioning. */
+.autumn-tooltip--top > .autumn-tooltip__bubble {
+    bottom: 100%;
+    left: 50%;
+    translate: -50% 0;
+    margin-bottom: var(--autumn-tooltip-gap);
+}
+
+.autumn-tooltip--bottom > .autumn-tooltip__bubble {
+    top: 100%;
+    left: 50%;
+    translate: -50% 0;
+    margin-top: var(--autumn-tooltip-gap);
+}
+
+.autumn-tooltip--start > .autumn-tooltip__bubble {
+    top: 50%;
+    inset-inline-end: 100%;
+    translate: 0 -50%;
+    margin-inline-end: var(--autumn-tooltip-gap);
+}
+
+.autumn-tooltip--end > .autumn-tooltip__bubble {
+    top: 50%;
+    inset-inline-start: 100%;
+    translate: 0 -50%;
+    margin-inline-start: var(--autumn-tooltip-gap);
+}
+
+/* Anchor positioning. `position: fixed` escapes an `overflow` clip. The
+   text tries the other side, then above and below. `self-*` areas follow
+   the direction of the tooltip, not of the page. `unsafe` alignment keeps
+   the text off its trigger when no block area fits. */
+@supports (anchor-scope: all) {
+    .autumn-tooltip > .autumn-tooltip__bubble {
+        position: fixed;
+        position-anchor: --autumn-tooltip;
+        inset: auto;
+        translate: none;
+        margin: 0;
+    }
+
+    .autumn-tooltip--top > .autumn-tooltip__bubble {
+        position-area: block-start;
+        align-self: unsafe end;
+        margin-block-end: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-block;
+    }
+
+    .autumn-tooltip--bottom > .autumn-tooltip__bubble {
+        position-area: block-end;
+        align-self: unsafe start;
+        margin-block-start: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-block;
+    }
+
+    .autumn-tooltip--start > .autumn-tooltip__bubble {
+        position-area: self-inline-start;
+        margin-inline-end: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-inline, --autumn-tooltip-above, --autumn-tooltip-below;
+    }
+
+    .autumn-tooltip--end > .autumn-tooltip__bubble {
+        position-area: self-inline-end;
+        margin-inline-start: var(--autumn-tooltip-gap);
+        position-try-fallbacks: flip-inline, --autumn-tooltip-above, --autumn-tooltip-below;
+    }
+}
+
+@position-try --autumn-tooltip-above {
+    position-area: block-start;
+    align-self: unsafe end;
+    justify-self: anchor-center;
+    margin: 0 0 var(--autumn-tooltip-gap);
+}
+
+@position-try --autumn-tooltip-below {
+    position-area: block-end;
+    align-self: unsafe start;
+    justify-self: anchor-center;
+    margin: var(--autumn-tooltip-gap) 0 0;
+}
+
+/* Chromium: the runtime makes the text a `popover="hint"`. The browser
+   shows it in the top layer. Reset the UA popover box, and place the text
+   at the implicit anchor (the `interestfor` trigger). */
+.autumn-tooltip__bubble[popover] {
+    position: fixed;
+    position-anchor: auto;
+    inset: auto;
+    translate: none;
     overflow: visible;
 }
 
-.autumn-chart--sparkline .autumn-chart__svg {
-    height: 2rem;
-}
-
-.autumn-chart--bar .autumn-chart__svg,
-.autumn-chart--line .autumn-chart__svg {
-    height: 8rem;
-}
-
-.autumn-chart__line {
-    fill: none;
-    stroke: var(--primary);
-    stroke-width: 1.5;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-    vector-effect: non-scaling-stroke;
-}
-
-.autumn-chart__point {
-    fill: var(--primary);
-    stroke: none;
-}
-
-.autumn-chart__bar {
-    fill: var(--primary);
-}
-
-/* The (label, value) data table fallback — present for assistive tech and
-   no-CSS clients, hidden from sighted users without leaving the a11y tree. */
-.autumn-chart__table {
-    border-collapse: collapse;
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-}
-
-/* ── Transition controls (autumn-transition-controls, autumn-transition) ──── */
-
-/* The grouping container holds one no-JS POST form per legal edge leaving the
-   current state; lay them out in a wrapping row of action buttons. */
-.autumn-transition-controls {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    align-items: center;
-}
-
-/* Each transition is its own inline form so the buttons sit side by side. */
-.autumn-transition {
-    display: inline-flex;
-    margin: 0;
-}
-
-.autumn-transition button {
-    padding: 0.5rem 1rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background-color: var(--surface);
-    color: var(--text);
-    cursor: pointer;
-}
-
-.autumn-transition button[disabled] {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
-
-/* ── Reaction controls (autumn-reaction-*, issue #1362) ───────────────────── */
-
-/* The `role="group"` container holds one no-JS POST form per direction with
-   the aggregate between them. A column stacks up / count / down into the
-   familiar vote-arrow strip; `likes` mode simply renders one form and the
-   count, so the same rule serves both. */
-.autumn-reaction-controls {
-    display: inline-flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.125rem;
-}
-
-/* Each direction is its own form so it can be submitted without JS; strip the
-   default block-level margin so the arrows sit tight against the count. */
-.autumn-reaction {
-    display: inline-flex;
-    margin: 0;
-}
-
-/* The direction modifiers carry no geometry of their own -- they exist as
-   styling/targeting hooks so an app can re-colour a single direction (e.g. a
-   warm upvote, a cool downvote) without forking the base rules. */
-.autumn-reaction-up {
-    color: inherit;
-}
-
-.autumn-reaction-down {
-    color: inherit;
-}
-
-.autumn-reaction-like {
-    color: inherit;
-}
-
-/* Borderless icon button: the glyph is the affordance, so no chrome until
-   hover/focus. `color: inherit` keeps the resting arrow the same weight as
-   surrounding text; `--text-muted` would drop below 3:1 on `--surface`. */
-.autumn-reaction-button {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0.125rem 0.375rem;
-    border: 1px solid transparent;
-    border-radius: var(--radius);
-    background-color: transparent;
-    color: var(--text);
-    font: inherit;
-    line-height: 1;
-    cursor: pointer;
-}
-
-.autumn-reaction-button:hover {
-    background-color: var(--surface);
-    border-color: var(--border);
-}
-
-.autumn-reaction-button:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
-}
-
-/* The viewer's own reaction (`aria-pressed="true"`). Colour is a redundant
-   cue only -- `aria-pressed` is the machine-readable state -- so this never
-   has to carry the meaning alone. */
-.autumn-reaction-active {
-    color: var(--primary);
-    border-color: var(--primary);
-}
-
-/* The aggregate, announced via `aria-live="polite"` after an htmx swap.
-   `tabular-nums` stops the strip from reflowing as the score changes width. */
-.autumn-reaction-count {
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    color: var(--text);
+@media (prefers-reduced-motion: reduce) {
+    .autumn-tooltip__bubble {
+        transition: none;
+    }
 }
 
 /* ── Cookie-consent banner (issue #1214) ──────────────────────────────────── */
@@ -1554,13 +2313,13 @@
     left: 0;
     right: 0;
     bottom: 0;
-    z-index: 1000;
+    z-index: var(--z-banner);
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     justify-content: space-between;
-    gap: 1rem;
-    padding: 1rem 1.5rem;
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-6);
     background-color: var(--surface);
     border-top: 1px solid var(--text-muted);
     box-shadow: var(--shadow);
@@ -1576,7 +2335,7 @@
 .autumn-consent-banner__actions {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.5rem;
+    gap: var(--space-2);
     margin: 0;
 }
 
@@ -1587,7 +2346,7 @@
    dark-pattern "big Accept button, buried Reject link" this widget exists
    to avoid. */
 .autumn-consent-banner__button {
-    padding: 0.5rem 1rem;
+    padding: var(--space-2) var(--space-4);
     border: 1px solid var(--text-muted);
     border-radius: var(--radius);
     background-color: var(--surface);
@@ -1605,60 +2364,10 @@
     outline-offset: 2px;
 }
 
-/* ── Bulk actions (autumn-bulk-*, issue #1312) ────────────────────────────── */
+/* ── Visually hidden (autumn-visually-hidden) ─────────────────────────────── */
 
-/* The wrapping `<form method="post">` around a list and its toolbar. It carries
-   no geometry of its own: it must not disturb the layout of whatever list it
-   wraps (a `data_table`, a `<ul>`, a card grid), so it stays a plain block and
-   only strips the default form margin. */
-.autumn-bulk-form {
-    margin: 0;
-}
-
-/* The `role="group"` holding the submit button, below the list it applies to.
-   Aligned to the start so it reads as an action on the selection above rather
-   than as page-level navigation. */
-.autumn-bulk-actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    align-items: center;
-    margin-top: 0.75rem;
-}
-
-.autumn-bulk-actions button {
-    padding: 0.5rem 1rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background-color: var(--surface);
-    color: var(--text);
-    cursor: pointer;
-}
-
-.autumn-bulk-actions button:hover {
-    border-color: var(--primary);
-}
-
-.autumn-bulk-actions button:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
-}
-
-/* One per row, in the list's leading cell. Sized up slightly from the browser
-   default: this is the primary hit target for the whole flow, and a row is
-   selected by hitting a single small checkbox. */
-.autumn-bulk-select {
-    width: 1rem;
-    height: 1rem;
-    cursor: pointer;
-    vertical-align: middle;
-}
-
-.autumn-bulk-select:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
-}
-
+/* Core widgets (spinner, icon-only button) and the chart and bulk-action
+   families use it, so it stays in the core file (#3408). */
 /* Visually hidden but still exposed to assistive technology — the standard
    clip pattern (never `display:none`, which removes it from the a11y tree). */
 .autumn-visually-hidden {
@@ -1673,158 +2382,6 @@
     border: 0;
 }
 
-/* ── Comment threads (autumn-comment-*, issue #1367) ──────────────────────── */
-
-/* The region landmark wrapping the whole thread. It is also the htmx swap
-   target, so it must not itself be positioned or transformed -- an outerHTML
-   swap replaces this element wholesale. */
-.autumn-comments {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-}
-
-/* Every nesting level is an `<ol>`: the order is meaningful (chronological),
-   and a list is what a screen reader announces the depth of. The list markers
-   are suppressed; the indent guide below is the visual cue instead. */
-.autumn-comment-list {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-}
-
-/* A nested level indents behind a rule, which is what makes depth legible
-   without a per-level class (the widget renders arbitrarily deep). The
-   `border-inline-start` is logical, so it flips for RTL locales. */
-.autumn-comment .autumn-comment-list {
-    margin-block-start: 0.75rem;
-    padding-inline-start: 0.875rem;
-    border-inline-start: 2px solid var(--border);
-}
-
-.autumn-comment {
-    display: flex;
-    flex-direction: column;
-    gap: 0.375rem;
-}
-
-.autumn-comment-meta {
-    font-size: 0.8125rem;
-    color: var(--text-muted);
-}
-
-.autumn-comment-author {
-    font-weight: 600;
-    color: var(--text);
-}
-
-/* `tabular-nums` keeps a column of timestamps from shifting as digits change. */
-.autumn-comment-time {
-    font-variant-numeric: tabular-nums;
-}
-
-/* `overflow-wrap` rather than `word-break`: a pasted URL has to wrap, but
-   ordinary prose must still break on spaces. */
-.autumn-comment-body {
-    color: var(--text);
-    overflow-wrap: anywhere;
-}
-
-.autumn-comment-body p {
-    margin: 0 0 0.5rem;
-}
-
-.autumn-comment-body p:last-child {
-    margin-bottom: 0;
-}
-
-/* `<details>`/`<summary>` gives progressive disclosure with no JavaScript at
-   all -- the reply form is in the DOM and reachable by keyboard whether or not
-   htmx (or any script) loaded. */
-.autumn-comment-reply {
-    font-size: 0.875rem;
-}
-
-.autumn-comment-reply-toggle {
-    cursor: pointer;
-    color: var(--primary);
-    width: fit-content;
-}
-
-.autumn-comment-reply-toggle:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
-}
-
-.autumn-comment-form {
-    display: flex;
-    flex-direction: column;
-    gap: 0.375rem;
-    margin: 0.5rem 0 0;
-}
-
-/* The label doubles as the visible prompt, so it is not visually hidden -- a
-   placeholder alone is not an accessible name. */
-.autumn-comment-label {
-    font-size: 0.8125rem;
-    color: var(--text-muted);
-}
-
-.autumn-comment-input {
-    width: 100%;
-    padding: 0.5rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background-color: var(--surface);
-    color: var(--text);
-    font: inherit;
-    resize: vertical;
-}
-
-.autumn-comment-input:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 1px;
-}
-
-.autumn-comment-submit {
-    align-self: flex-start;
-    padding: 0.375rem 0.75rem;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background-color: var(--surface);
-    color: var(--text);
-    font: inherit;
-    cursor: pointer;
-}
-
-.autumn-comment-submit:hover {
-    border-color: var(--primary);
-}
-
-.autumn-comment-submit:focus-visible {
-    outline: 2px solid var(--primary);
-    outline-offset: 2px;
-}
-
-.autumn-comments-empty,
-.autumn-comments-prompt {
-    margin: 0;
-    color: var(--text-muted);
-}
-
-/* A rejected comment, announced via `role="alert"`. Colour is a redundant cue
-   only -- the role is the machine-readable state. */
-.autumn-comments-error {
-    margin: 0;
-    padding: 0.5rem 0.75rem;
-    border: 1px solid var(--danger, #b3261e);
-    border-radius: var(--radius);
-    color: var(--danger, #b3261e);
-}
-
 /* ── Card (#2354) ──────────────────────────────────────────────────────────
    The card()/stat_card() widgets emit these namespaced hooks. They were
    unprefixed (card, card-header, stat-card, …) before 0.8.0 and had no
@@ -1832,59 +2389,61 @@
 
 .autumn-card {
     background-color: var(--surface);
+    color: var(--text);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: var(--shadow);
-    margin-bottom: 1.5rem;
+    margin-bottom: var(--space-6);
 }
 
 .autumn-card__header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    gap: 1rem;
-    padding: 1rem 1.5rem 0.75rem;
+    gap: var(--space-4);
+    padding: var(--space-4) var(--space-6) var(--space-3);
     border-bottom: 1px solid var(--border);
 }
 
 .autumn-card__title {
     margin: 0;
-    font-size: 1.125rem;
-    font-weight: 600;
+    font-size: var(--font-size-lg);
+    font-weight: var(--font-weight-semibold);
     color: var(--text);
 }
 
 .autumn-card__body {
-    padding: 1.5rem;
+    padding: var(--space-6);
 }
 
 .autumn-card__footer {
-    padding: 0.75rem 1.5rem;
+    padding: var(--space-3) var(--space-6);
     border-top: 1px solid var(--border);
     color: var(--text-muted);
-    font-size: 0.875rem;
+    font-size: var(--font-size-sm);
 }
 
 /* ── Stat card (#2354) ───────────────────────────────────────────────────── */
 
 .autumn-stat-card {
     background-color: var(--surface);
+    color: var(--text);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     box-shadow: var(--shadow);
-    padding: 1.25rem;
+    padding: var(--space-5);
 }
 
 .autumn-stat-card__label {
     font-size: 0.8125rem;
-    font-weight: 500;
+    font-weight: var(--font-weight-medium);
     color: var(--text-muted);
 }
 
 .autumn-stat-card__value {
-    margin-top: 0.25rem;
+    margin-top: var(--space-1);
     font-size: 1.75rem;
-    font-weight: 700;
+    font-weight: var(--font-weight-bold);
     color: var(--text);
 }
 
@@ -1893,24 +2452,605 @@
     font-size: 0.8125rem;
 }
 
-/* ── Empty states (#2354) ────────────────────────────────────────────────── */
-
-.autumn-search-empty,
-.autumn-autocomplete-empty {
-    margin: 0;
-    padding: 0.75rem 1rem;
-    color: var(--text-muted);
-}
-
 /* ── Alert icon (#2354) ──────────────────────────────────────────────────── */
 
 .autumn-alert__icon-svg {
     flex-shrink: 0;
 }
 
+/* The circle is currentColor. The glyph uses the surface color, so it is
+   visible in both schemes. */
+.autumn-alert__icon-glyph {
+    fill: var(--surface);
+}
+
 /* ── Active nav link (#2354) ─────────────────────────────────────────────── */
 
 .autumn-active {
-    font-weight: 600;
+    font-weight: var(--font-weight-semibold);
     color: var(--primary);
+}
+
+/* ── Button (autumn-button, #3406) ────────────────────────────────────────── */
+
+.autumn-button {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--space-2);
+    padding: 0 var(--space-4);
+    border: 1px solid transparent;
+    border-radius: var(--radius);
+    font-family: inherit;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    line-height: var(--line-height-tight);
+    text-decoration: none;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.autumn-button:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: 2px;
+}
+
+.autumn-button:disabled,
+.autumn-button[aria-disabled="true"] {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+/* A busy button is disabled too. It keeps full opacity: the spinner shows. */
+.autumn-button[aria-busy="true"] {
+    opacity: 1;
+    cursor: progress;
+}
+
+/* Sizes come before the variants, so the link variant can drop the padding. */
+.autumn-button--sm {
+    min-block-size: var(--space-8);
+    padding-inline: var(--space-3);
+}
+
+.autumn-button--md {
+    min-block-size: calc(var(--space-8) + var(--space-2));
+    padding-inline: var(--space-4);
+}
+
+.autumn-button--lg {
+    min-block-size: calc(var(--space-8) + var(--space-4));
+    padding-inline: var(--space-6);
+    font-size: var(--font-size-md);
+}
+
+/* An icon-only button is square. */
+.autumn-button--icon {
+    padding-inline: 0;
+    min-inline-size: calc(var(--space-8) + var(--space-2));
+}
+
+.autumn-button--icon.autumn-button--sm {
+    min-inline-size: var(--space-8);
+}
+
+.autumn-button--icon.autumn-button--lg {
+    min-inline-size: calc(var(--space-8) + var(--space-4));
+}
+
+.autumn-button--primary {
+    background-color: var(--primary);
+    color: var(--on-primary);
+}
+
+.autumn-button--primary:hover {
+    background-color: var(--primary-hover);
+}
+
+.autumn-button--secondary {
+    background-color: var(--surface);
+    color: var(--text);
+    border-color: var(--control-border);
+}
+
+.autumn-button--secondary:hover {
+    background-color: var(--surface-muted);
+}
+
+.autumn-button--ghost {
+    background-color: transparent;
+    color: var(--text);
+}
+
+.autumn-button--ghost:hover {
+    background-color: var(--surface-muted);
+}
+
+.autumn-button--destructive {
+    background-color: var(--danger);
+    color: var(--on-danger);
+}
+
+.autumn-button--destructive:hover {
+    background-color: var(--danger-hover);
+}
+
+/* A link button keeps a 24px target (WCAG 2.5.8). A fixed size, not a
+   space token: the minimum must not scale down with density. */
+.autumn-button--link {
+    min-block-size: 1.5rem;
+    padding: 0;
+    background-color: transparent;
+    color: var(--primary);
+    text-decoration: underline;
+    text-underline-offset: 0.15em;
+}
+
+.autumn-button--link:hover {
+    color: var(--primary-hover);
+}
+
+.autumn-button__icon {
+    display: inline-flex;
+    flex: none;
+}
+
+.autumn-button__label {
+    min-inline-size: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* The spinner sits on top of the label, so the width does not change.
+   Two classes: this rule must beat the `.autumn-spinner__icon` display. */
+.autumn-button > .autumn-button__spinner {
+    display: none;
+    position: absolute;
+    inset: 0;
+    margin: auto;
+}
+
+/* Busy: `aria-busy` (from the server, or from the runtime for the
+   submitter of a form), or htmx marks the button itself (it sends the
+   request, or `hx-indicator` names it). Three classes: these beat the
+   rule above. */
+.autumn-button[aria-busy="true"] > .autumn-button__spinner,
+.autumn-button.htmx-request > .autumn-button__spinner {
+    display: block;
+}
+
+/* Hide the icon and the label with opacity only. They stay in the
+   accessibility tree, so the button keeps its name. */
+.autumn-button[aria-busy="true"] > .autumn-button__spinner ~ *,
+.autumn-button.htmx-request > .autumn-button__spinner ~ * {
+    opacity: 0;
+}
+
+/* ── Button group (autumn-button-group, #3406) ────────────────────────────── */
+
+.autumn-button-group {
+    display: inline-flex;
+    isolation: isolate;
+}
+
+.autumn-button-group--vertical {
+    flex-direction: column;
+}
+
+/* The focus ring shows above the next button. */
+.autumn-button-group > :focus-visible {
+    z-index: 1;
+}
+
+/* The buttons touch. -1px puts two borders on one line. */
+.autumn-button-group:not(.autumn-button-group--vertical) > :not(:first-child) {
+    margin-inline-start: -1px;
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
+}
+
+.autumn-button-group:not(.autumn-button-group--vertical) > :not(:last-child) {
+    border-start-end-radius: 0;
+    border-end-end-radius: 0;
+}
+
+.autumn-button-group--vertical > :not(:first-child) {
+    margin-block-start: -1px;
+    border-start-start-radius: 0;
+    border-start-end-radius: 0;
+}
+
+.autumn-button-group--vertical > :not(:last-child) {
+    border-end-start-radius: 0;
+    border-end-end-radius: 0;
+}
+
+/* ── Spinner (autumn-spinner, #3406) ──────────────────────────────────────── */
+
+.autumn-spinner {
+    display: inline-flex;
+    align-items: center;
+    vertical-align: middle;
+    color: var(--primary);
+}
+
+.autumn-spinner--sm {
+    font-size: var(--font-size-md);
+}
+
+.autumn-spinner--md {
+    font-size: var(--font-size-2xl);
+}
+
+.autumn-spinner--lg {
+    font-size: calc(2 * var(--font-size-md));
+}
+
+/* A ring with one colored arc. The busy button uses it too. Without
+   color-mix(), the track is transparent and the arc still shows. */
+.autumn-spinner__icon {
+    display: inline-block;
+    flex: none;
+    inline-size: 1em;
+    block-size: 1em;
+    box-sizing: border-box;
+    border: 0.15em solid transparent;
+    border-color: color-mix(in srgb, currentColor 25%, transparent);
+    border-block-start-color: currentColor;
+    border-radius: var(--radius-full);
+}
+
+@keyframes autumn-spin {
+    to { transform: rotate(1turn); }
+}
+
+/* Opacity only: no motion. */
+@keyframes autumn-pulse {
+    50% { opacity: 0.4; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+    .autumn-spinner__icon {
+        animation: autumn-spin 0.8s linear infinite;
+    }
+}
+
+/* Reduced motion: the ring does not turn. It fades slowly. */
+@media (prefers-reduced-motion: reduce) {
+    .autumn-spinner__icon {
+        animation: autumn-pulse 2s ease-in-out infinite;
+    }
+}
+
+/* Forced colors makes every border one color, and the arc goes. */
+@media (forced-colors: active) {
+    .autumn-spinner__icon {
+        forced-color-adjust: none;
+        border-color: GrayText;
+        border-block-start-color: CanvasText;
+    }
+}
+
+/* An htmx indicator is hidden until htmx gives it, or an element around
+   it, the `htmx-request` class. A spinner keeps its `role="status"` root
+   in the tree and hides only its content, so a screen reader reads the
+   label when it shows. */
+.autumn-indicator:not(.autumn-spinner):not(.htmx-request, .htmx-request *),
+.autumn-spinner.autumn-indicator:not(.htmx-request, .htmx-request *) > * {
+    display: none;
+}
+
+/* ── Skeleton (autumn-skeleton, #3406) ────────────────────────────────────── */
+
+.autumn-skeleton {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.autumn-skeleton--circle {
+    flex-direction: row;
+}
+
+/* Forced colors removes the background. The transparent border keeps an
+   edge, because forced colors paints it. */
+.autumn-skeleton__item {
+    display: block;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    background-color: var(--border);
+}
+
+.autumn-skeleton--line .autumn-skeleton__item {
+    inline-size: 100%;
+    block-size: 1em;
+}
+
+.autumn-skeleton--line .autumn-skeleton__item:last-child:not(:only-child) {
+    inline-size: 60%;
+}
+
+.autumn-skeleton--block .autumn-skeleton__item {
+    block-size: calc(3 * var(--space-8));
+    border-radius: var(--radius);
+}
+
+.autumn-skeleton--circle .autumn-skeleton__item {
+    flex: none;
+    inline-size: calc(var(--space-8) + var(--space-2));
+    block-size: calc(var(--space-8) + var(--space-2));
+    border-radius: var(--radius-full);
+}
+
+/* The skeleton pulses. Reduced motion: it does not. */
+@media (prefers-reduced-motion: no-preference) {
+    .autumn-skeleton__item {
+        animation: autumn-pulse 1.5s ease-in-out infinite;
+    }
+}
+
+/* ── Progress and meter (autumn-progress, autumn-meter, #3406) ────────────── */
+
+.autumn-progress {
+    display: block;
+    inline-size: 100%;
+    block-size: var(--space-2);
+    accent-color: var(--primary);
+}
+
+/* The browser colors a meter good, average or bad. These rules use the
+   tokens. Keep each engine's pseudo-element in its own rule: one unknown
+   selector drops the whole rule. Use the `background` shorthand: the UA
+   paints a gradient image over a `background-color`. */
+.autumn-meter {
+    display: block;
+    inline-size: 100%;
+    block-size: var(--space-2);
+    appearance: none;
+    border: 0;
+    border-radius: var(--radius-full);
+    background: var(--surface-muted);
+    color: var(--text);
+}
+
+.autumn-meter::-webkit-meter-bar {
+    block-size: var(--space-2);
+    border: 0;
+    border-radius: var(--radius-full);
+    background: var(--surface-muted);
+}
+
+.autumn-meter::-webkit-meter-optimum-value {
+    border-radius: var(--radius-full);
+    background: var(--success);
+}
+
+.autumn-meter::-webkit-meter-suboptimum-value {
+    border-radius: var(--radius-full);
+    background: var(--warning-text);
+}
+
+.autumn-meter::-webkit-meter-even-less-good-value {
+    border-radius: var(--radius-full);
+    background: var(--danger);
+}
+
+.autumn-meter::-moz-meter-bar {
+    border-radius: var(--radius-full);
+    background: var(--success);
+}
+
+.autumn-meter:-moz-meter-optimum::-moz-meter-bar {
+    background: var(--success);
+}
+
+.autumn-meter:-moz-meter-sub-optimum::-moz-meter-bar {
+    background: var(--warning-text);
+}
+
+.autumn-meter:-moz-meter-sub-sub-optimum::-moz-meter-bar {
+    background: var(--danger);
+}
+
+/* Forced colors removes the backgrounds, and the bar goes. Use system
+   colors: a Canvas track with an edge and a Highlight fill. */
+@media (forced-colors: active) {
+    .autumn-meter {
+        forced-color-adjust: none;
+        border: 1px solid CanvasText;
+        background: Canvas;
+    }
+
+    .autumn-meter::-webkit-meter-bar {
+        background: Canvas;
+    }
+
+    .autumn-meter::-webkit-meter-optimum-value {
+        background: Highlight;
+    }
+
+    .autumn-meter::-webkit-meter-suboptimum-value {
+        background: Highlight;
+    }
+
+    .autumn-meter::-webkit-meter-even-less-good-value {
+        background: Highlight;
+    }
+
+    .autumn-meter::-moz-meter-bar {
+        background: Highlight;
+    }
+
+    .autumn-meter:-moz-meter-optimum::-moz-meter-bar {
+        background: Highlight;
+    }
+
+    .autumn-meter:-moz-meter-sub-optimum::-moz-meter-bar {
+        background: Highlight;
+    }
+
+    .autumn-meter:-moz-meter-sub-sub-optimum::-moz-meter-bar {
+        background: Highlight;
+    }
+}
+
+.autumn-progress-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.autumn-progress-field__header {
+    display: flex;
+    justify-content: space-between;
+    gap: var(--space-2);
+    font-size: var(--font-size-sm);
+}
+
+.autumn-progress-field__label {
+    font-weight: var(--font-weight-medium);
+    color: var(--text);
+}
+
+.autumn-progress-field__value {
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+/* ── Separator (autumn-separator, #3406) ──────────────────────────────────── */
+
+.autumn-separator {
+    block-size: 0;
+    margin: var(--space-4) 0;
+    border: 0;
+    border-block-start: 1px solid var(--border);
+}
+
+.autumn-separator--vertical {
+    display: inline-block;
+    align-self: stretch;
+    inline-size: 0;
+    block-size: auto;
+    min-block-size: 1em;
+    margin: 0 var(--space-2);
+    border-block-start: 0;
+    border-inline-start: 1px solid var(--border);
+    vertical-align: middle;
+}
+
+/* ── Kbd (autumn-kbd, #3406) ──────────────────────────────────────────────── */
+
+.autumn-kbd {
+    display: inline-block;
+    min-inline-size: 1.5em;
+    padding: 0 var(--space-1);
+    border: 1px solid var(--border);
+    border-block-end-width: 2px;
+    border-radius: var(--radius-sm);
+    background-color: var(--surface-muted);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    line-height: var(--line-height-normal);
+    text-align: center;
+    white-space: nowrap;
+}
+
+.autumn-kbd-combo {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    font-family: var(--font-mono);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* ── Empty state (autumn-empty-state, #3406) ──────────────────────────────── */
+
+.autumn-empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-8) var(--space-4);
+    text-align: center;
+}
+
+.autumn-empty-state__icon {
+    display: inline-flex;
+    color: var(--text-muted);
+    font-size: var(--font-size-2xl);
+}
+
+.autumn-empty-state__title {
+    margin: 0;
+    color: var(--text);
+    font-size: var(--font-size-lg);
+    font-weight: var(--font-weight-semibold);
+}
+
+.autumn-empty-state__body {
+    max-inline-size: 40ch;
+    margin: 0;
+    color: var(--text-muted);
+}
+
+.autumn-empty-state__action {
+    margin-block-start: var(--space-2);
+}
+
+/* ── Avatar group (autumn-avatar-group, #3406) ────────────────────────────── */
+
+.autumn-avatar-group {
+    display: inline-flex;
+    align-items: center;
+}
+
+/* A ring in the surface color shows where two avatars overlap. */
+.autumn-avatar-group > .autumn-avatar {
+    box-shadow: 0 0 0 2px var(--surface);
+}
+
+.autumn-avatar-group > .autumn-avatar + .autumn-avatar {
+    margin-inline-start: calc(-1 * var(--space-2));
+}
+
+/* The +N item is a pill: a long count or large text does not clip
+   (WCAG 1.4.4). Its minimum sizes match the .autumn-avatar--* sizes. */
+.autumn-avatar-group__more {
+    width: auto;
+    height: auto;
+    padding: 0 var(--space-1);
+    background-color: var(--surface-muted);
+    color: var(--text);
+    font-weight: var(--font-weight-semibold);
+}
+
+.autumn-avatar-group__more.autumn-avatar--sm {
+    min-width: 24px;
+    min-height: 24px;
+}
+
+.autumn-avatar-group__more.autumn-avatar--md {
+    min-width: 40px;
+    min-height: 40px;
+}
+
+.autumn-avatar-group__more.autumn-avatar--lg {
+    min-width: 64px;
+    min-height: 64px;
+}
+
+/* ── Auto-grow textarea (autumn-auto-grow, #3406) ─────────────────────────── */
+
+/* The textarea grows with its text. A browser with no `field-sizing` keeps
+   the `rows` height. `field-sizing` also sizes the width to the text, so
+   the width is set. */
+.autumn-auto-grow {
+    inline-size: 100%;
+    field-sizing: content;
+    min-block-size: 3lh;
+    max-block-size: 50vh;
 }

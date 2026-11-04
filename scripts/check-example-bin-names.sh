@@ -17,19 +17,23 @@ WHAT IT CHECKS
   cargo automatically treats as members even when `members` does not name them
   (including `[workspace.dependencies]`-inherited paths) —
   it enumerates the binary target names cargo would build, honoring cargo's
-  auto-discovery rules (including the edition-2015 manual-target opt-out and
+  auto-discovery rules (including the edition-2015 `[[bin]]` opt-out and
   `edition.workspace = true` inheritance). `[workspace].exclude` follows
   cargo's `WorkspaceRootConfig::is_excluded` exactly: entries are literal path
   prefixes (never globs), and an explicitly listed `members` entry always wins
   over `exclude`.
 
   - explicit `[[bin]]` entries in the member's Cargo.toml, plus
-  - auto-discovered targets whenever `[package] autobins` is not `false`:
+  - auto-discovered targets when `[package] autobins` is `true`, or when it is
+    unset (see the 2015 exception below):
     `src/main.rs` (named after the package), `src/bin/*.rs` (named after the
     file stem), and `src/bin/<name>/main.rs` (named after the directory).
 
   An explicit `[[bin]]` does NOT disable auto-discovery (autumn #2690): only
-  `autobins = false` does. Auto-discovered paths already claimed by an
+  `autobins = false` does. One exception: in edition 2015 (the default), with
+  `autobins` unset and a `[[bin]]` declared, cargo turns discovery off
+  (autumn #2745). `autobins = true` overrides that. `[lib]` never turns
+  discovery off. Auto-discovered paths already claimed by an
   explicit entry — via its `path`, or the default `src/bin/<name>.rs` when no
   `path` is given — are excluded so one target is not counted twice.
 
@@ -211,29 +215,34 @@ def explicit_bins(member_dir: Path) -> tuple[list[str], set[Path]]:
     return names, claimed
 
 
+def _autobins_enabled(manifest: dict, workspace_edition: str | None) -> bool:
+    """Return True when cargo auto-discovers bins.
+
+    An explicit `[package] autobins` wins. If it is unset, discovery is on.
+    Exception: edition 2015 (the default) with a `bin` key turns it off.
+    `[lib]` has no effect. `edition.workspace = true` uses the root edition.
+    """
+    package = manifest.get("package", {})
+    autobins = package.get("autobins")
+    if isinstance(autobins, bool):
+        return autobins
+    edition: object = package.get("edition", "2015")
+    if (
+        isinstance(edition, dict)
+        and edition.get("workspace") is True
+        and workspace_edition is not None
+    ):
+        edition = workspace_edition
+    return not (str(edition) == "2015" and "bin" in manifest)
+
+
 def bin_target_names(member_dir: Path, workspace_edition: str | None = None) -> list[str]:
     manifest = tomllib.loads((member_dir / "Cargo.toml").read_text())
     package = manifest.get("package", {})
     explicit_names, claimed_paths = explicit_bins(member_dir)
 
     discovered: list[str] = []
-    # Auto-discovery is on unless `[package] autobins = false` — EXCEPT in
-    # edition 2015 (also the default when `edition` is omitted), where any
-    # manually specified target ([[bin]] or [lib]) disables auto-discovery
-    # entirely. (In edition 2018+ explicit [[bin]] entries do NOT disable it.)
-    # The edition itself may be inherited: `edition.workspace = true` resolves
-    # against the root's `[workspace.package] edition`.
-    edition_spec: object = package.get("edition", "2015")
-    if (
-        isinstance(edition_spec, dict)
-        and edition_spec.get("workspace") is True
-        and workspace_edition is not None
-    ):
-        edition_spec = workspace_edition
-    auto = package.get("autobins", True) is not False
-    if auto and str(edition_spec) == "2015":
-        auto = not ("bin" in manifest or "lib" in manifest)
-    if auto:
+    if _autobins_enabled(manifest, workspace_edition):
         src = member_dir / "src"
         # `src/main.rs` is auto-discovered as a binary named after the package
         # (cargo `inferred_bins`): it is NOT limited to explicit [[bin]]
@@ -358,7 +367,7 @@ def self_test() -> int:
     # Case 1 (#2690): explicit [[bin]] plus an auto-discovered helper in the
     # SAME member — the old script returned early on `explicit` and missed it.
     # (Edition 2021: explicit targets do not disable auto-discovery there;
-    # case 19 covers the edition-2015 opt-out.)
+    # cases 19 and 23-26 cover the edition-2015 opt-out.)
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         root = _make_workspace(tmp, ["app"])
@@ -746,7 +755,7 @@ def self_test() -> int:
         )
 
     # Case 19 (Codex review): edition 2015 (the default when `edition` is
-    # omitted) plus any explicit target disables auto-discovery entirely —
+    # omitted) plus a `[[bin]]` and no `autobins` disables auto-discovery —
     # `src/bin/extra.rs` is NOT a target, so no false collision is reported.
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -764,7 +773,7 @@ def self_test() -> int:
         )
         total, collisions = check(root)
         expect(
-            "edition-2015 explicit target disables auto-discovery; no false collision",
+            "edition-2015 [[bin]] disables auto-discovery; no false collision",
             not collisions and sorted(bin_target_names(root / "a")) == ["real"],
         )
 
@@ -845,12 +854,122 @@ def self_test() -> int:
             and ".secret" not in names_a,
         )
 
+    # Case 23 (issue #2745): on edition 2015, an explicit `autobins = true`
+    # keeps auto-discovery on even with a `[[bin]]`, so the other bins still
+    # collide across members.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a", "b"])
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\nautobins = true\n\n'
+            '[[bin]]\nname = "real"\npath = "src/bin/real.rs"\n',
+            {"src/bin/real.rs": "fn main() {}\n", "src/bin/extra.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "b",
+            '[package]\nname = "b"\nversion = "0.1.0"\n',
+            {"src/bin/extra.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "edition-2015 autobins = true keeps auto-discovery; collision caught",
+            "extra" in collisions
+            and sorted(bin_target_names(root / "a")) == ["extra", "real"],
+        )
+
+    # Case 24 (issue #2745): `[lib]` alone never disables bin discovery,
+    # on edition 2015 too.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a", "b"])
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\n\n[lib]\nname = "a_lib"\n',
+            {"src/bin/extra.rs": "fn main() {}\n"},
+        )
+        _make_member(
+            tmp / "root", "b",
+            '[package]\nname = "b"\nversion = "0.1.0"\n',
+            {"src/bin/extra.rs": "fn main() {}\n"},
+        )
+        total, collisions = check(root)
+        expect(
+            "edition-2015 [lib] alone keeps bin discovery; collision caught",
+            "extra" in collisions,
+        )
+
+    # Case 25 (issue #2745): an explicit `autobins = false` still disables
+    # discovery on edition 2015.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a"])
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\nautobins = false\n',
+            {"src/bin/extra.rs": "fn main() {}\n"},
+        )
+        expect(
+            "edition-2015 autobins = false disables discovery",
+            bin_target_names(root / "a") == [],
+        )
+
+    # Case 26 (issue #2745): cargo checks that the `bin` key exists. An empty
+    # `bin = []` also turns discovery off on edition 2015.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a"])
+        _make_member(
+            tmp / "root", "a",
+            'bin = []\n\n[package]\nname = "a"\nversion = "0.1.0"\n',
+            {"src/bin/extra.rs": "fn main() {}\n"},
+        )
+        expect(
+            "edition-2015 empty bin array disables discovery",
+            bin_target_names(root / "a") == [],
+        )
+
+    # Case 27 (issue #2745): edition 2018+ with a `[[bin]]` and no `autobins`
+    # keeps discovery on. Only edition 2015 has the opt-out.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(tmp, ["a"])
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\nedition = "2018"\n\n'
+            '[[bin]]\nname = "real"\npath = "src/bin/real.rs"\n',
+            {"src/bin/real.rs": "fn main() {}\n", "src/bin/extra.rs": "fn main() {}\n"},
+        )
+        expect(
+            "edition-2018 [[bin]] keeps auto-discovery",
+            sorted(bin_target_names(root / "a")) == ["extra", "real"],
+        )
+
+    # Case 28 (issue #2745): inherited edition 2015 plus `autobins = true`
+    # keeps discovery on.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        root = _make_workspace(
+            tmp, ["a"],
+            extra='[workspace.package]\nedition = "2015"\n',
+        )
+        _make_member(
+            tmp / "root", "a",
+            '[package]\nname = "a"\nversion = "0.1.0"\nedition.workspace = true\n'
+            'autobins = true\n\n[[bin]]\nname = "real"\npath = "src/bin/real.rs"\n',
+            {"src/bin/real.rs": "fn main() {}\n", "src/bin/extra.rs": "fn main() {}\n"},
+        )
+        expect(
+            "inherited edition-2015 autobins = true keeps auto-discovery",
+            sorted(bin_target_names(root / "a", "2015")) == ["extra", "real"],
+        )
+
     if failures:
         print(f"self-test: {len(failures)} case(s) FAILED", file=sys.stderr)
         for label in failures:
             print(f"  - {label}", file=sys.stderr)
         return 1
-    print("self-test: all 22 cases passed")
+    print("self-test: all cases passed")
     return 0
 
 

@@ -1578,6 +1578,10 @@ mod tests {
             idle_close_secs: 0,
             restore_missing: false,
             ownership: None,
+            replica_retention_after_delete: std::time::Duration::ZERO,
+            restore_check_sample: 0,
+            replication_workers: 4,
+            min_residency: std::time::Duration::from_secs(2),
         })
         .min_residency(Duration::ZERO)
         .framework_migrations()

@@ -136,7 +136,7 @@ fn schema_migrate_applies_to_a_sqlite_file_and_advances_snapshot_at_generation()
         "migrate must leave the snapshot byte-for-byte unchanged"
     );
 
-    // Finding 1 (#2036): introduce a NEW, ungenerated model change (add `body`)
+    // #2036: introduce a NEW, ungenerated model change (add `body`)
     // WITHOUT generating/applying a migration for it. The next `schema migrate`
     // has nothing pending to apply, so it is a no-op — and MUST leave the
     // snapshot untouched (migrate no longer touches the snapshot at all).

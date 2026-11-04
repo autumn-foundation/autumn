@@ -111,7 +111,6 @@ pub struct PresignPutResult {
 /// #[secured]  // enforces session authentication
 /// async fn complete_upload(
 ///     State(state): State<AppState>,
-///     CsrfFormField(_): CsrfFormField,  // enforces CSRF
 ///     Form(form): Form<CompleteForm>,
 /// ) -> AutumnResult<Markup> {
 ///     let blobs = state.extension::<BlobStoreState>().unwrap();
@@ -262,7 +261,7 @@ mod tests {
             url: "https://s3.example.com/bucket/key?sig=abc".into(),
             method: "PUT".into(),
             headers: HashMap::from([("Content-Type".into(), "image/jpeg".into())]),
-            expires_in: Duration::from_secs(900),
+            expires_in: Duration::from_mins(15),
         };
         let cloned = r.clone();
         assert_eq!(cloned.url, r.url);

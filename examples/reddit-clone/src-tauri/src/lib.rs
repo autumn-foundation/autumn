@@ -392,7 +392,7 @@ fn load_or_generate_signing_secret(
     }
     let mut bytes = [0u8; 32];
     // Propagate RNG failure — an all-zero secret would be trivially guessable.
-    getrandom::getrandom(&mut bytes)?;
+    getrandom::fill(&mut bytes)?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     // Write with restricted permissions: signing secrets must not be world-readable.
     // On Unix create the file with mode 0600; on other platforms use the default ACLs.

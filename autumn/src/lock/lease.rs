@@ -35,7 +35,7 @@ const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 const MIN_LEASE_TTL: Duration = Duration::from_secs(1);
 
 /// Ceiling on the lease duration. It keeps the `interval` arithmetic in range.
-const MAX_LEASE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_LEASE_TTL: Duration = Duration::from_hours(24);
 
 /// A holder renews every `ttl / RENEW_DIVISOR`.
 const RENEW_DIVISOR: u32 = 3;

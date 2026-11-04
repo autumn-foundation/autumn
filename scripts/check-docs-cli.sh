@@ -3,7 +3,7 @@
 # to RUN must exist in the CLI.
 #
 # WHY THIS EXISTS: the corpus already gates its *links*
-# (`scripts/check-docs-links.sh`) and its *rustdoc* intra-doc links
+# (`xtask/src/docs/links.rs`) and its *rustdoc* intra-doc links
 # (`scripts/check-docs.sh`), so a reader can no longer be sent to a page that
 # does not exist. Nothing checked the other thing readers copy off a page: the
 # command. `autumn-cli` carries 51 top-level commands and 174 command paths,
@@ -270,10 +270,11 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
-# Kept in Python for the same reason as scripts/check-docs-links.sh: brace
-# matching over clap derive input and code-fence stripping are both work that
-# bash renders unreadable, and python3 is already a dependency of
-# scripts/check-plugin-freshness.sh and scripts/check-docs-links.sh.
+# Kept in Python because brace matching over clap derive input and
+# code-fence stripping are both work that bash renders unreadable, and
+# python3 is already a dependency of scripts/check-plugin-freshness.sh.
+# (The link gate it once shared that reasoning with is now Rust:
+# xtask/src/docs/links.rs.)
 run_py() {
   python3 - "$@" <<'PYEOF'
 import tomllib

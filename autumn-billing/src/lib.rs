@@ -121,6 +121,24 @@ pub struct BillingService {
     catalog: Arc<PlanCatalog>,
     config: Arc<BillingConfig>,
     hooks: Arc<dyn BillingHooks>,
+    /// Users with a checkout request in progress.
+    checkouts_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// Holds a user's checkout slot. Dropping it frees the slot.
+pub(crate) struct CheckoutSlot {
+    service: Arc<BillingService>,
+    user_id: String,
+}
+
+impl Drop for CheckoutSlot {
+    fn drop(&mut self) {
+        self.service
+            .checkouts_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.user_id);
+    }
 }
 
 impl std::fmt::Debug for BillingService {
@@ -147,7 +165,24 @@ impl BillingService {
             catalog: Arc::new(catalog),
             config: Arc::new(config),
             hooks,
+            checkouts_in_flight: std::sync::Mutex::default(),
         }
+    }
+
+    /// Claim the checkout slot for `user_id`. It returns `None` when one is in progress.
+    ///
+    /// The slot stays held from the live-subscription check to the end of the provider call.
+    /// It is per process. Replicas do not share it.
+    pub(crate) fn begin_checkout(self: &Arc<Self>, user_id: &str) -> Option<CheckoutSlot> {
+        let claimed = self
+            .checkouts_in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(user_id.to_owned());
+        claimed.then(|| CheckoutSlot {
+            service: Arc::clone(self),
+            user_id: user_id.to_owned(),
+        })
     }
 
     /// The service installed on `state`, if the plugin started.
@@ -357,6 +392,7 @@ impl Plugin for BillingPlugin {
                     catalog: Arc::new(catalog),
                     config: Arc::new(config),
                     hooks,
+                    checkouts_in_flight: std::sync::Mutex::default(),
                 });
                 let service = BillingService::require(&state)?;
                 dunning::rearm_pending(state.clone(), service);

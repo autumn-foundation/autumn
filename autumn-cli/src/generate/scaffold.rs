@@ -15,7 +15,8 @@ use std::path::Path;
 use autumn_web::config::DatabaseBackend;
 
 use super::dsl::{
-    EncryptedMode, Field, FieldKind, IdType, parse_fields, randomized_equality_lookup_reason,
+    EncryptedMode, Field, FieldKind, IdType, StringWidget, parse_fields,
+    randomized_equality_lookup_reason,
 };
 use super::emit::{Action, Plan, Revert};
 use super::model::{
@@ -1900,9 +1901,10 @@ fn plan_scaffold_with_options_impl(
             .validations()
             .keys()
             .filter(|name| {
-                !fields
-                    .iter()
-                    .any(|f| &&f.name == name && f.kind.is_rich_text())
+                !fields.iter().any(|f| {
+                    // A phone or color control has no htmx path (#3405).
+                    &&f.name == name && (f.kind.is_rich_text() || f.constraints.widget.is_some())
+                })
             })
             .cloned()
             .collect()
@@ -2380,6 +2382,45 @@ fn plan_scaffold_with_options_impl(
         });
     }
 
+    // Issue #3408: the widgets the HTML routes render are in feature-gated
+    // families. The index wraps its list in `bulk_actions_form` and a
+    // state-machine field renders `transition_controls` (`widgets-workflow`).
+    // A searchable index renders `active_search_input` (`widgets-search`). A
+    // project with `default-features = false` needs each family named.
+    let workflow_widgets = bulk_delete_enabled || !sm_field_names.is_empty();
+    let search_widgets = search_enabled && !options_with_key.api;
+    for (feature, needed) in [
+        ("widgets-workflow", workflow_widgets),
+        ("widgets-search", search_widgets),
+    ] {
+        if !needed {
+            continue;
+        }
+        let cargo_path = project_root.join("Cargo.toml");
+        let base = plan
+            .actions
+            .iter()
+            .rev()
+            .find_map(|a| match a {
+                Action::Modify { path, contents } if path == &cargo_path => Some(contents.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| read_or_empty(&cargo_path));
+        let updated = ensure_autumn_web_feature(&base, feature);
+        if updated != base {
+            plan.actions.retain(|a| a.path() != cargo_path);
+            plan.modify(cargo_path.clone(), updated);
+        }
+        // `owner_dir: None`: the markers in `emit::autumn_web_feature_markers`
+        // decide, so another scaffold or hand-written code that renders the
+        // same family keeps it.
+        plan.push_revert(Revert::CargoAutumnWebFeature {
+            path: cargo_path,
+            feature: feature.to_owned(),
+            owner_dir: None,
+        });
+    }
+
     // #1236: a scaffold with attachment fields needs autumn-web's `storage` feature — the
     // model's `autumn_web::storage::Blob` column and the blob store — and its `multipart`
     // feature, since the create and update handlers take an
@@ -2671,6 +2712,8 @@ fn plan_scaffold_with_options_impl(
             ("markdown", !rich_text_views, None),
             ("ws", !options_with_key.live, None),
             ("htmx", !htmx_needed, htmx_owner),
+            ("widgets-workflow", !workflow_widgets, None),
+            ("widgets-search", !search_widgets, None),
         ];
         for (feature, unused, owner) in released {
             if unused {
@@ -3461,6 +3504,8 @@ fn render_model_form(
                     | FieldKind::Uuid
                     | FieldKind::Decimal { .. }
                     | FieldKind::References
+                    // `NaiveTime::default()` is midnight (issue #3405).
+                    | FieldKind::Time
             )
         {
             // Represented as a `String` on the form, exactly like a required enum
@@ -7404,9 +7449,10 @@ pub async fn index(
     let htmx_validated: Vec<(&String, &Vec<String>)> = validations
         .iter()
         .filter(|(name, _)| {
-            !fields
-                .iter()
-                .any(|f| &&f.name == name && f.kind.is_rich_text())
+            !fields.iter().any(|f| {
+                // A phone or color control has no htmx path (#3405).
+                &&f.name == name && (f.kind.is_rich_text() || f.constraints.widget.is_some())
+            })
         })
         .collect();
     let validate_handlers = if live_validation {
@@ -9240,6 +9286,18 @@ fn render_form_for_helper(
             // the attachment arm uses. The value is re-filled from the
             // changeset so the 422 re-render keeps entered input, and the
             // inline-error/ARIA skeleton matches the derived controls.
+            // Issue #3405: a `phone` or `color` column is a `String` with its
+            // own native control. A `time` column needs no override: the
+            // derive maps `NaiveTime` to `FieldControl::Time`.
+            _ if f.constraints.widget.is_some() => {
+                if let Some(widget) = f.constraints.widget {
+                    let _ = write!(
+                        builder_calls,
+                        "\n        .override_field(\"{name}\", autumn_web::form::FieldControl::{})",
+                        widget.field_control()
+                    );
+                }
+            }
             _ => {
                 if let Some((input_type, _)) = html5_constraint_spec(f) {
                     let label =
@@ -9782,6 +9840,26 @@ fn render_changeset_form_inputs(
                 ),
                 (FieldKind::NaiveDateTime | FieldKind::DateTime, true) => {
                     format!("(autumn_web::form::datetime_input(&{cv}, \"{name}\", \"{label}\"))")
+                }
+                // Issue #3405: the native time, phone and color controls.
+                (FieldKind::Time, false) => format!(
+                    "(autumn_web::form::required_time_input(&{cv}, \"{name}\", \"{label}\"))"
+                ),
+                (FieldKind::Time, true) => {
+                    format!("(autumn_web::form::time_input(&{cv}, \"{name}\", \"{label}\"))")
+                }
+                (FieldKind::String, nullable) if f.constraints.widget.is_some() => {
+                    match (f.constraints.widget, nullable) {
+                        (Some(StringWidget::Color), _) => format!(
+                            "(autumn_web::form::color_input(&{cv}, \"{name}\", \"{label}\"))"
+                        ),
+                        (_, false) => format!(
+                            "(autumn_web::form::required_tel_input(&{cv}, \"{name}\", \"{label}\"))"
+                        ),
+                        (_, true) => {
+                            format!("(autumn_web::form::tel_input(&{cv}, \"{name}\", \"{label}\"))")
+                        }
+                    }
                 }
                 // Issue #1341: a real `<textarea>`, not the derived control's
                 // single-line text input fallback. There is no
@@ -12362,12 +12440,12 @@ const fn encryption_wrapper_type(mode: EncryptedMode) -> &'static str {
 /// rejects a single prepared statement that contains more than one SQL
 /// command, so a migration's `CREATE TABLE` followed by one or more
 /// `CREATE INDEX` statements must be executed one at a time. Reuses
-/// [`crate::migrate::safety::split_statements`] (dollar-quote- and
-/// comment-aware) rather than a naive `;`-terminated-line splitter, so it
+/// [`crate::migrate::safety::split_statements`] (quote- and comment-aware for
+/// the backend) rather than a naive `;`-terminated-line splitter, so it
 /// stays correct if a future `--default` value embeds a semicolon.
-fn render_execute_sql_calls(sql: &str) -> String {
+fn render_execute_sql_calls(backend: DatabaseBackend, sql: &str) -> String {
     let mut out = String::new();
-    for statement in crate::migrate::safety::split_statements(sql) {
+    for statement in crate::migrate::safety::split_statements(backend, sql) {
         let escaped = escape_sql_for_rust_literal(&statement);
         let _ = writeln!(out, "db.execute_sql(\"{escaped};\").await;");
     }
@@ -12556,8 +12634,10 @@ fn render_api_smoke_test(
     // `execute` uses the extended protocol, which rejects several `;`-separated
     // statements in a single call. The single-statement required-column branch
     // is unaffected (it renders exactly one call).
-    let seed_calls =
-        render_execute_sql_calls(&render_api_seed_sql(backend, plural, fields, defaults));
+    let seed_calls = render_execute_sql_calls(
+        backend,
+        &render_api_seed_sql(backend, plural, fields, defaults),
+    );
     format!(
         "//! Smoke test generated by `autumn generate scaffold --api`.\n\
          //!\n\
@@ -12738,8 +12818,8 @@ fn render_smoke_test(
     let create_table_sql = create_table_sql_with_metadata_and_id_for(
         backend, plural, fields, indexes, defaults, id_type,
     );
-    let mut setup_calls = render_execute_sql_calls(&stub_tables_sql);
-    setup_calls.push_str(&render_execute_sql_calls(&create_table_sql));
+    let mut setup_calls = render_execute_sql_calls(backend, &stub_tables_sql);
+    setup_calls.push_str(&render_execute_sql_calls(backend, &create_table_sql));
     let id_schema_type = id_type.schema_type_for(backend);
 
     let base = if api {
@@ -14714,6 +14794,9 @@ fn sql_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
         FieldKind::Uuid => "gen_random_uuid()".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime if sqlite => "CURRENT_TIMESTAMP".to_owned(),
         FieldKind::NaiveDateTime | FieldKind::DateTime => "NOW()".to_owned(),
+        // A `TIME` column (issue #3405). Postgres casts the literal; SQLite
+        // stores it as text, which diesel reads back as a `NaiveTime`.
+        FieldKind::Time => "'09:30:00'".to_owned(),
         FieldKind::Bytea if sqlite => "X'00'".to_owned(),
         FieldKind::Bytea => "'\\x00'::bytea".to_owned(),
         // Always nullable (see `FieldKind::Attachment`'s doc comment), so it
@@ -14762,6 +14845,10 @@ fn sql_seed_value_expr(backend: DatabaseBackend, f: &Field) -> String {
         FieldKind::NaiveDateTime | FieldKind::DateTime => {
             "NOW() + (g || ' seconds')::interval".to_owned()
         }
+        // Vary a time per row too (issue #3405), so a `unique` time column
+        // does not collide.
+        FieldKind::Time if sqlite => "time('00:00:00', '+' || g || ' seconds')".to_owned(),
+        FieldKind::Time => "TIME '00:00:00' + (g || ' seconds')::interval".to_owned(),
         // Enum must stay inside its declared set — pick a real variant.
         FieldKind::Enum => {
             format!("'{}'", f.variants.first().expect("enum field has variants"))
@@ -15018,6 +15105,7 @@ fn unique_sample_literal(backend: DatabaseBackend, kind: FieldKind) -> String {
         }
         FieldKind::NaiveDateTime => "'2024-01-01 00:00:00'::timestamp".to_owned(),
         FieldKind::DateTime => "'2024-01-01 00:00:00+00'::timestamptz".to_owned(),
+        FieldKind::Time => "'10:00:00'".to_owned(),
         FieldKind::Bytea if sqlite => "X'DEADBEEF'".to_owned(),
         FieldKind::Bytea => "'\\xDEADBEEF'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
@@ -15065,6 +15153,7 @@ fn unique_sample_literal_variant(backend: DatabaseBackend, kind: FieldKind) -> S
         }
         FieldKind::NaiveDateTime => "'2024-01-02 00:00:00'::timestamp".to_owned(),
         FieldKind::DateTime => "'2024-01-02 00:00:00+00'::timestamptz".to_owned(),
+        FieldKind::Time => "'11:00:00'".to_owned(),
         FieldKind::Bytea if sqlite => "X'BEEFDEAD'".to_owned(),
         FieldKind::Bytea => "'\\xBEEFDEAD'::bytea".to_owned(),
         FieldKind::Attachment => "NULL".to_owned(),
@@ -18224,6 +18313,134 @@ async fn main() {
         // `autumn-web` dependency line to modify, which this stub-Cargo.toml
         // harness doesn't provide; it is proven end-to-end by the integration
         // test `scaffold_attachment_emits_zero_js_multipart_handlers`.
+    }
+
+    /// The DSL kinds of issue #3405 for one test model.
+    fn native_control_fields() -> Vec<String> {
+        [
+            "name:String",
+            "opens:time",
+            "closes:Option<time>",
+            "mobile:phone",
+            "fax:Option<tel>",
+            "accent:color",
+            "price:money",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    #[test]
+    fn execute_maps_native_control_kinds_onto_the_form_helpers() {
+        // Issue #3405: `time`, `phone`, `color` and `money` render the native
+        // control in the standard `form_for` path.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold(
+            tmp.path(),
+            "Shop",
+            &native_control_fields(),
+            "20260427000000",
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/shops.rs")).unwrap();
+        let model = fs::read_to_string(tmp.path().join("src/models/shop.rs")).unwrap();
+        let migration = fs::read_to_string(
+            tmp.path()
+                .join("migrations/20260427000000_create_shops/up.sql"),
+        )
+        .unwrap();
+
+        for (field, control) in [("mobile", "Tel"), ("fax", "Tel"), ("accent", "Color")] {
+            assert!(
+                routes.contains(&format!(
+                    ".override_field(\"{field}\", autumn_web::form::FieldControl::{control})"
+                )),
+                "{field}: {routes}"
+            );
+        }
+        // The derive maps `NaiveTime` to `FieldControl::Time`.
+        for field in ["opens", "closes"] {
+            assert!(
+                !routes.contains(&format!(".override_field(\"{field}\"")),
+                "{field}: {routes}"
+            );
+        }
+        assert!(
+            routes.contains(
+                ".override_field(\"price\", autumn_web::form::FieldControl::Number { step: Some(\"0.01\".into()) })"
+            ),
+            "{routes}"
+        );
+
+        // A required time is a `String` on the form, so the new form does
+        // not show the `Default` midnight.
+        assert!(routes.contains("    pub opens: String,"), "{routes}");
+        assert!(
+            routes.contains("form.opens.parse::<chrono::NaiveTime>()"),
+            "{routes}"
+        );
+        assert!(
+            routes.contains("    pub closes: Option<chrono::NaiveTime>,"),
+            "{routes}"
+        );
+
+        assert!(model.contains("pub opens: chrono::NaiveTime"), "{model}");
+        assert!(
+            model.contains("pub closes: Option<chrono::NaiveTime>"),
+            "{model}"
+        );
+        assert!(model.contains("pub mobile: String"), "{model}");
+        assert!(model.contains("pub fax: Option<String>"), "{model}");
+        assert!(model.contains("pub accent: String"), "{model}");
+        assert!(
+            model.contains("pub price: rust_decimal::Decimal"),
+            "{model}"
+        );
+
+        assert!(migration.contains("opens TIME NOT NULL"), "{migration}");
+        assert!(migration.contains("closes TIME"), "{migration}");
+        assert!(!migration.contains("closes TIME NOT NULL"), "{migration}");
+        assert!(migration.contains("mobile TEXT NOT NULL"), "{migration}");
+        assert!(migration.contains("accent TEXT NOT NULL"), "{migration}");
+        assert!(
+            migration.contains("price NUMERIC(12,2) NOT NULL"),
+            "{migration}"
+        );
+    }
+
+    #[test]
+    fn execute_maps_native_control_kinds_in_the_live_validation_path() {
+        // Issue #3405: the `--live-validation` per-field path calls the
+        // helpers directly.
+        let tmp = project_with_main(default_main());
+        let plan = plan_scaffold_with_options(
+            tmp.path(),
+            "Shop",
+            &native_control_fields(),
+            "20260427000000",
+            &ScaffoldOptions {
+                live_validation: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        plan.execute(Flags::default()).unwrap();
+
+        let routes = fs::read_to_string(tmp.path().join("src/routes/shops.rs")).unwrap();
+        for call in [
+            "autumn_web::form::required_time_input(&changeset, \"opens\", \"Opens\")",
+            "autumn_web::form::time_input(&changeset, \"closes\", \"Closes\")",
+            "autumn_web::form::required_tel_input(&changeset, \"mobile\", \"Mobile\")",
+            "autumn_web::form::tel_input(&changeset, \"fax\", \"Fax\")",
+            "autumn_web::form::color_input(&changeset, \"accent\", \"Accent\")",
+            "autumn_web::form::required_number_input(&changeset, \"price\", \"Price\", Some(\"0.01\"))",
+        ] {
+            assert!(routes.contains(call), "{call}: {routes}");
+        }
+        // A color input always has a value, so it has no `required_` helper.
+        assert!(!routes.contains("required_color_input"), "{routes}");
     }
 
     #[test]
@@ -27440,6 +27657,55 @@ exempt_paths = [
         }
 
         const POST: &[&str] = &["title:String", "body:Text"];
+
+        // ── Widget families (#3408) ─────────────────────────────────────
+
+        /// The index wraps its list in `bulk_actions_form`, which needs
+        /// `widgets-workflow`. An app without default features must get it.
+        #[test]
+        fn an_html_scaffold_enables_widgets_workflow() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let line = autumn_web_line(&tmp);
+            assert!(line.contains("widgets-workflow"), "{line}");
+            assert!(!line.contains("widgets-search"), "{line}");
+        }
+
+        /// A searchable index renders `active_search_input`, which needs
+        /// `widgets-search`.
+        #[test]
+        fn a_searchable_scaffold_enables_widgets_search() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            assert!(
+                autumn_web_line(&tmp).contains("widgets-search"),
+                "{}",
+                autumn_web_line(&tmp)
+            );
+        }
+
+        #[test]
+        fn dropping_searchable_releases_widgets_search() {
+            let tmp = project();
+            run(&tmp, "Post", POST, &searchable());
+            run(&tmp, "Post", POST, &ScaffoldOptions::default());
+            let line = autumn_web_line(&tmp);
+            assert!(!line.contains("widgets-search"), "{line}");
+            assert!(line.contains("widgets-workflow"), "{line}");
+        }
+
+        /// An `--api` scaffold renders no widget, so it adds no family.
+        #[test]
+        fn an_api_scaffold_enables_no_widget_family() {
+            let tmp = project();
+            let api = ScaffoldOptions {
+                api: true,
+                ..searchable()
+            };
+            run(&tmp, "Post", POST, &api);
+            let cargo = fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap();
+            assert!(!cargo.contains("widgets-"), "{cargo}");
+        }
 
         #[test]
         fn dropping_searchable_releases_htmx() {

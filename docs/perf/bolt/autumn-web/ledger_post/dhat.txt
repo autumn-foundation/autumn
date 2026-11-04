@@ -1,0 +1,30 @@
+# Bolt profile: autumn-web/ledger_post
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 586,525
+blocks allocated: 2,594
+peak live bytes (whole run): 2,918,401
+
+         bytes      blocks  site
+
+       421,430         991  sqlite3MemMalloc
+        98,687         692  autumn_web::money::ledger::post::{closure#0}
+        20,233          42  autumn_web::money::ledger::load_transaction::{closure#0}
+        10,938         174  <diesel::sqlite::connection::bind_collector::SqliteBindCollector as diesel::query_builder::bind_collector::MoveableBindCollector>::append_bind_data
+        10,080          11  <tokio::runtime::blocking::task::BlockingTask as core::future::future::Future>::poll
+         5,364          84  autumn_web::money::ledger::push_normalized_postings
+         4,248           6  <diesel::sqlite::connection::stmt::BoundStatement>::bind_buffers
+         4,203          43  ledger_post::payout
+         3,653         104  <diesel::sqlite::connection::row::SqliteRow as diesel::row::IntoOwnedRow>::into_owned
+         2,386           8  <&str as <alloc::ffi::c_str::CString>::new::SpecNewImpl>::spec_new_impl
+         2,367           6  <diesel::sqlite::query_builder::SqliteQueryBuilder as diesel::query_builder::QueryBuilder>::push_sql
+           667          80  <autumn_web::money::ledger::PostingRow as diesel::deserialize::FromSqlRow>::build_from_row
+           667          80  <autumn_web::money::ledger::AccountRow as diesel::deserialize::FromSqlRow>::build_from_row
+           512           2  __rustc::__rdl_alloc
+           384           3  <diesel::sqlite::connection::statement_iterator::StatementIterator as core::iter::traits::iterator::Iterator>::next
+           250         250  autumn_web::money::ledger::ph
+           203           6  <autumn_web::money::ledger::TransactionRow as diesel::deserialize::FromSqlRow>::build_from_row
+            80           4  <diesel_async::sync_connection_wrapper::implementation::SyncConnectionWrapper>::spawn_blocking
+            64           1  <autumn_web::money::ledger::Transaction>::request_hash
+            64           1  <autumn_web::money::ledger::IdempotencyKey>::derive

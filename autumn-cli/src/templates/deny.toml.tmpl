@@ -78,9 +78,12 @@ ignore = [
     # https://rustsec.org/advisories/RUSTSEC-2023-0071
     #
     # Ships pre-waived because it is unavoidable rather than accepted lightly:
-    # `rsa` reaches every Autumn app through `jsonwebtoken`, an unconditional
-    # autumn-web dependency, and no patched `rsa` release exists (the advisory
-    # says "no safe upgrade is available"). The vulnerable path is RSA-family
+    # `rsa` reaches an Autumn app through `jsonwebtoken`, which autumn-web
+    # compiles behind its default-on `jwt` feature (and a passkey app through
+    # `webauthn-rs`, for public-key checks only), and no patched `rsa` release
+    # exists (the advisory says "no safe upgrade is available"). An app that
+    # turns off default features and leaves out `jwt` and `oauth2` (and
+    # `webauthn`) does not compile `rsa`, and can delete this waiver. The vulnerable path is RSA-family
     # JWT signing/verification; key recovery needs an attacker-timed RSA
     # private-key operation oracle, which an Autumn app does not expose by
     # default. Autumn re-triages this every release and drops the waiver when a
@@ -89,7 +92,7 @@ ignore = [
     # newest autumn-web and re-run the audit before assuming it still stands.
     # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05: still no fixed
     # rsa release; see docs/reports/2026-10-05-ballast-dependency-ledger-audit.md).
-    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
+    { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release exists; reaches this app only through jsonwebtoken's RSA-family JWT path (autumn-web `jwt` feature, default-on); reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
     # RUSTSEC-2026-0387 — `crypto-bigint` has secret-dependent branches in
     # nominally constant-time operations.
     # https://rustsec.org/advisories/RUSTSEC-2026-0387
@@ -98,21 +101,10 @@ ignore = [
     # RustCrypto elliptic-curve stack that autumn-web's `jsonwebtoken`
     # (ES256/ES384) uses is still on 0.5.x. A microarchitectural timing leak on
     # ECDSA secrets; no network-reachable signing oracle. Drop this waiver when
-    # `cargo update` resolves crypto-bigint >=0.7.6. Review-by: 2026-11-08.
-    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.x via jsonwebtoken ES256/ES384 -> p256/p384 -> elliptic-curve 0.13; fix needs crypto-bigint >=0.7.6; review-by 2026-11-08" },
-    # >>> autumn:bundled-pg-waiver
-    # RUSTSEC-2024-0384 — `instant` is unmaintained.
-    # https://rustsec.org/advisories/RUSTSEC-2024-0384
-    #
-    # Present because this app enables autumn-web's `managed-pg-bundled` feature
-    # (`autumn new --bundled-pg`), where `instant` arrives as a *build-time*
-    # transitive of the embedded-Postgres stack:
-    # instant -> parking_lot -> reqwest-retry -> postgresql_archive ->
-    # (build) postgresql_embedded. Unmaintained, not vulnerable — there is no
-    # exploit here, and no safe upgrade (the author recommends `web-time`).
-    # Review-by: 2026-11-02 (reconfirmed unchanged 2026-10-05).
-    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; build-time transitive of the managed-pg-bundled embedded-Postgres stack; no safe upgrade; reconfirmed unchanged 2026-10-05; review-by 2026-11-02" },
-    # <<< autumn:bundled-pg-waiver
+    # `jsonwebtoken` moves to p256 0.14 (crypto-bigint 0.7), or when this app
+    # leaves out autumn-web's `jwt` feature (and `oauth2`, which turns it on).
+    # Review-by: 2026-11-08.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.x via jsonwebtoken ES256/ES384 (autumn-web `jwt` feature, default-on) -> p256/p384 -> elliptic-curve 0.13; fix needs crypto-bigint >=0.7.6; review-by 2026-11-08" },
 ]
 
 # ── Licenses (optional) ─────────────────────────────────────────────────────

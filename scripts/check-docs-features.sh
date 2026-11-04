@@ -5,7 +5,7 @@
 #
 # WHY THIS EXISTS: the corpus already gates the seven things a reader copies off
 # a page and the one thing they cannot copy at all.
-# `scripts/check-docs-links.sh` gates its *links* (a 404 on GitHub),
+# `xtask/src/docs/links.rs` gates its *links* (a 404 on GitHub),
 # `scripts/check-docs-cli.sh` its *commands* (`unrecognized subcommand`),
 # `scripts/check-docs-config.sh` the `AUTUMN_*` variables they SET (a silent
 # no-op), `scripts/check-docs-toml.sh` the `autumn.toml` keys they WRITE
@@ -29,7 +29,7 @@
 # That reasoning is right, and it leaves a hole exactly the shape of its own
 # premise. The symbol gate proves `autumn_web::ws::WebSocket` EXISTS. It cannot
 # ask the only question the reader has, which is whether it exists **in their
-# build** — and `autumn-web`'s default feature set is eight features wide
+# build** — and `autumn-web`'s default feature set is wide
 # (`maud`, `htmx`, `tailwind`, `db`, `cache-moka`, `http-client`, `reporting`,
 # `flash`) out of fifty. `ws`, `mail`, `pdf`, `storage`, `i18n`, `presence`,
 # `markdown`, `mcp`, `seed`, `tls` and the rest are off unless the reader turns
@@ -155,7 +155,7 @@
 # moves with it in the same commit.
 #
 #   - The default closure is computed TRANSITIVELY from `[features]`, because
-#     `default` names eight features and those name more (`db` implies
+#     `default` names many features and those name more (`db` implies
 #     `autumn-macros/db`, `oauth2` implies `http-client`). Taking the literal
 #     `default = [...]` list instead would report `reporting`'s items — pulled
 #     in by nothing else — as needing to be enabled, on every page that shows a

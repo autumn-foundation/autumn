@@ -56,7 +56,8 @@ const DEFAULT_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
 
 /// Default in-flight lock TTL. It applies only after a crash, a cancelled
 /// request, or a failed record write. It is separate from the response TTL.
-pub const DEFAULT_IN_FLIGHT_TTL: Duration = Duration::from_secs(60);
+pub const DEFAULT_IN_FLIGHT_TTL: Duration =
+    Duration::from_secs(crate::config::DEFAULT_IDEMPOTENCY_IN_FLIGHT_TTL_SECS);
 
 const fn is_mutating_method(method: &Method) -> bool {
     matches!(
@@ -532,7 +533,7 @@ pub trait IdempotencyStore: std::any::Any + Send + Sync {
 
     /// The response retention for [`IdempotencyLayer::new`]. Default: 24 hours.
     fn default_ttl(&self) -> Duration {
-        Duration::from_secs(86_400)
+        Duration::from_hours(24)
     }
 }
 
@@ -813,7 +814,7 @@ impl StoredEntry {
                 metadata: entry.metadata,
             },
             body_hash: entry.body_hash,
-            expires_at: saturating_deadline(Duration::from_secs(86_400)),
+            expires_at: saturating_deadline(Duration::from_hours(24)),
         })
     }
 }
@@ -1150,7 +1151,9 @@ where
 {
     type Response = Response<Body>;
     type Error = std::convert::Infallible;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    /// The replay response, or the inner future. No box (issue #2830).
+    type Future =
+        futures::future::Either<std::future::Ready<Result<Self::Response, Self::Error>>, S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -1158,19 +1161,11 @@ where
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         if let Some(replay) = req.extensions_mut().remove::<IdempotencyReplayResponse>() {
-            return Box::pin(async move { Ok(replay.into_response()) });
+            return futures::future::Either::Left(std::future::ready(Ok(replay.into_response())));
         }
-
-        // The overwhelming majority of requests carry no replay marker (only
-        // the capsule replay driver ever sets one), so this runs for nearly
-        // every request through this layer. Nothing here needs `self.inner`
-        // cloned into an owned value first: `self.inner.call(req)` can be
-        // boxed directly instead of cloning `self.inner` (a
-        // `BoxCloneSyncService` at this point in the stack, whose `Clone`
-        // impl allocates a fresh box) purely to move the clone into an
-        // `async move` block that immediately `.await`s it and does nothing
-        // else.
-        Box::pin(self.inner.call(req))
+        // Almost no request has a replay marker. Only the capsule replay
+        // driver sets one.
+        futures::future::Either::Right(self.inner.call(req))
     }
 }
 
@@ -1663,6 +1658,15 @@ impl DeferredIdempotencyCommit {
             state.lock.hold_until_ttl();
         }
     }
+}
+
+/// `true` when `response` has a deferred commit that the session layer must
+/// finalize.
+pub(crate) fn has_deferred_session_commit(response: &Response<Body>) -> bool {
+    response
+        .extensions()
+        .get::<DeferredIdempotencyCommit>()
+        .is_some()
 }
 
 /// Take the deferred commit and return the future that stores the record with

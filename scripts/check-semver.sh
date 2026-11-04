@@ -58,16 +58,14 @@ workspace_version="$(workspace_package_value "version")"
 [[ -n "$workspace_version" ]] || die "could not parse workspace version from Cargo.toml"
 migration_guide="docs/migrations/${workspace_version}.md"
 
-# cargo-semver-checks 0.48 requires rustc >= 1.91.0, while rustc 1.96.0 has
-# ICE'd in the rustdoc JSON path for the Diesel/diesel-async graph. Keep this
-# pinned to a known-good toolchain instead of following latest stable.
-# Floor raised from 1.92.0 to 1.94.1: the aws-smithy-* releases of 2026-07-07
-# (e.g. aws-smithy-async 1.3.0) declare rust-version 1.94.1, and
-# cargo-semver-checks builds the autumn-storage-s3 crates.io baseline with a
-# fresh lockfile, so any toolchain below that MSRV fails the baseline build.
+# Pinned, not latest stable: rustdoc JSON changes between releases, and rustc
+# 1.96.0 had an internal compiler error (ICE) in that path for the Diesel and
+# diesel-async graph. The pin is
+# the MSRV. Cargo does not build a crate on a toolchain below its
+# `rust-version`, and `scripts/check-msrv.sh` fails if this is below the MSRV.
 # Keep in sync with the dtolnay/rust-toolchain pin in the semver job of
 # .github/workflows/publish-gate.yml.
-semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.94.1}"
+semver_toolchain="${AUTUMN_SEMVER_RUST_VERSION:-1.97.0}"
 
 command -v rustup &>/dev/null || die "rustup is required to run SemVer checks with Rust $semver_toolchain"
 if ! rustup toolchain list | grep -Fq "${semver_toolchain}-"; then
@@ -334,7 +332,7 @@ for crate in "${CRATES[@]}"; do
     # invocation outright ("does not have feature") and turns the gate into a
     # tool error instead of a check. Each joins the list when a baseline
     # carries it, as `collab` (#1806) did for this release.
-    autumn_web_semver_features="maud,htmx,tailwind,db,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme,sim-testing,pdf,edge,collab,sla,constela,plugin-sandbox"
+    autumn_web_semver_features="maud,htmx,tailwind,db,postgres,cache-moka,ws,flash,multipart,http-client,oauth2,openapi,mcp,redis,i18n,storage,variants,mail,seed,system-info,markdown,csv,reporting,presence,webauthn,inbound-mail,inbound-mailgun,inbound-ses,telemetry-otlp,offline-sync,embed-assets,tls,acme,sim-testing,pdf,edge,collab,sla,constela,plugin-sandbox"
     # The SQLite backend surface: the SAME list plus `sqlite`.
     #
     # It was `sqlite` alone at first, on the theory that a minimal set is the
@@ -355,17 +353,18 @@ for crate in "${CRATES[@]}"; do
     # Keep the two lists in step: a feature added to the Postgres list belongs
     # here too, against the same demonstrated compile.
     autumn_web_semver_sqlite_features="${autumn_web_semver_features},sqlite"
-    # The `postgres` feature now holds the Postgres client. `db` alone does not
-    # compile (#2605). The 0.8.0 baseline has no `postgres` feature, so name it
-    # for the current build only. Both passes then check the same surface as
-    # the baseline's `db`.
-    autumn_web_semver_current_only="postgres"
+    # `db` alone does not compile (#2605): `postgres` holds the Postgres
+    # client. The 0.9.0 baseline has `postgres`, so both builds name it in the
+    # shared list. Use this for a feature only the current build has.
+    # The widget families (#3408) gate items the baseline has under `maud`
+    # alone. Without them here, those items look removed.
+    autumn_web_semver_current_only="widgets-search,widgets-social,widgets-workflow,widgets-charts"
 
     echo "  pass 1/2: Postgres surface (--features $autumn_web_semver_features)"
     pg_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features \
       --features "$autumn_web_semver_features" \
-      --current-features "$autumn_web_semver_current_only" 2>&1)"
+      ${autumn_web_semver_current_only:+--current-features "$autumn_web_semver_current_only"} 2>&1)"
     pg_exit_code=$?
 
     # Run the SQLite pass regardless of pass 1's outcome, so one report names
@@ -375,7 +374,7 @@ for crate in "${CRATES[@]}"; do
     sqlite_output="$("${SEMVER_CARGO[@]}" semver-checks check-release --package "$crate" \
       --only-explicit-features \
       --features "$autumn_web_semver_sqlite_features" \
-      --current-features "$autumn_web_semver_current_only" 2>&1)"
+      ${autumn_web_semver_current_only:+--current-features "$autumn_web_semver_current_only"} 2>&1)"
     sqlite_exit_code=$?
     set -e
 

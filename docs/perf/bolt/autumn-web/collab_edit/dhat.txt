@@ -1,0 +1,13 @@
+# Bolt profile: autumn-web/collab_edit
+# unit: per iteration (N-iteration run minus zero-iteration run, divided by N)
+# tool: valgrind --tool=dhat, by first workspace frame
+
+bytes allocated: 398
+blocks allocated: 7
+peak live bytes (whole run): 982,916
+
+         bytes      blocks  site
+
+           305           3  <autumn_web::collab::text::CollabText>::integrate
+            84           3  <autumn_web::collab::text::CollabText>::mint
+            10           1  collab_edit::main

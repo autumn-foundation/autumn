@@ -20,6 +20,7 @@ use crate::app::ScopedGroup;
 use crate::config::AutumnConfig;
 #[cfg(feature = "maud")]
 use crate::error_pages::{self, SharedRenderer};
+#[cfg(feature = "idempotency")]
 use crate::idempotency::{IdempotencyLayer, IdempotencyStore, MemoryIdempotencyStore};
 use crate::middleware::RequestIdLayer;
 use crate::middleware::dev;
@@ -31,6 +32,9 @@ use crate::state::AppState;
 use axum::response::IntoResponse;
 use http::{Request, StatusCode};
 use thiserror::Error;
+/// With `idempotency` off no layer is ever built, so `Identity` stands in.
+#[cfg(not(feature = "idempotency"))]
+use tower::layer::util::Identity as IdempotencyLayer;
 
 pub const DEFAULT_FAVICON_PATH: &str = "/favicon.ico";
 
@@ -1862,13 +1866,12 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     if config.stories.enabled {
         claimed.insert(crate::stories::STORIES_PATH.to_owned());
         claimed.insert("/_stories/{slug}".to_owned());
-        // The Active search / Autocomplete / Infinite feed stories' live
-        // demo backends (review follow-up — these three were missing from
-        // the preflight, so a colliding OpenAPI/MCP mount here would panic
-        // in `router.merge` instead of surfacing the typed collision error).
-        claimed.insert("/_stories/demo/search".to_owned());
-        claimed.insert("/_stories/demo/tags/search".to_owned());
-        claimed.insert("/_stories/demo/posts/feed".to_owned());
+        // The stories' live demo backends. Without them here, a colliding
+        // OpenAPI/MCP mount would panic in `router.merge` instead of
+        // surfacing the typed collision error.
+        for (path, _) in crate::stories::demo_routes() {
+            claimed.insert(path.to_owned());
+        }
     }
     // The default unsubscribe endpoint merges a GET (+POST) at `UNSUBSCRIBE_PATH`
     // before the late-merged OpenAPI/MCP routers, so reserve it too — otherwise an
@@ -1882,6 +1885,7 @@ fn collect_framework_get_paths(config: &AutumnConfig) -> std::collections::HashS
     // OpenAPI/MCP routers, so reserve it too (same rationale as unsubscribe
     // above): an OpenAPI/MCP mount at this path should surface the typed
     // collision instead of panicking in `router.merge`.
+    #[cfg(feature = "job-tracking")]
     if config.jobs.tracking.route_enabled {
         claimed.insert(crate::job_tracking::JOB_STATUS_ROUTE_PATH.to_owned());
     }
@@ -3595,6 +3599,7 @@ fn mount_framework_routes(
 
     // Tracked-job status endpoint (enqueue_tracked / #[job] JobContext) — on
     // by default; opt out via `jobs.tracking.route_enabled = false`.
+    #[cfg(feature = "job-tracking")]
     if config.jobs.tracking.route_enabled {
         router = router.merge(crate::job_tracking::status_router());
         tracing::debug!(
@@ -4090,6 +4095,7 @@ fn build_csrf_layer(
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Apply the one-time submit-token guard (issue #1360).
 ///
 /// Enabled by default. The layer is applied *inner* to the CSRF layer (it is
@@ -4124,11 +4130,12 @@ where
 /// composed ingress stack rather than costing its own nesting level
 /// (issue #2193). The production memory-backend guard still surfaces as an
 /// `Err`, before any layer is applied.
+#[cfg(feature = "idempotency")]
 fn build_submit_token_layer(
     config: &AutumnConfig,
     state: &AppState,
     is_production: bool,
-) -> Result<Option<crate::security::SubmitTokenLayer>, RouterBuildError> {
+) -> Result<Option<SubmitLayer>, RouterBuildError> {
     let cfg = &config.security.submit_token;
     if !cfg.enabled {
         return Ok(None);
@@ -5371,6 +5378,7 @@ fn deadline_exceeded_response(
     response
 }
 
+#[cfg(feature = "idempotency")]
 /// Build the store for `backend`. `label` names the config section in errors.
 fn build_idempotency_store(
     backend: crate::config::IdempotencyBackend,
@@ -5423,6 +5431,7 @@ fn build_idempotency_store(
     }
 }
 
+#[cfg(feature = "idempotency")]
 /// Tell the operator when a request can outlive its in-flight lock. Then a
 /// retry can run the handler while the first request still runs. Only a
 /// handler that uses `IdempotencyTx::commit` on the database store is fenced.
@@ -5455,10 +5464,11 @@ fn timeout_retry_after_secs(entropy: &dyn crate::entropy::Entropy) -> u64 {
 }
 
 struct BuiltIdempotencyLayers {
-    route: crate::idempotency::IdempotencyLayer,
-    manual: crate::idempotency::IdempotencyLayer,
+    route: IdempotencyLayer,
+    manual: IdempotencyLayer,
 }
 
+#[cfg(feature = "idempotency")]
 fn build_idempotency_layers(
     config: &AutumnConfig,
     state: &AppState,
@@ -5497,6 +5507,38 @@ fn build_idempotency_layers(
     }))
 }
 
+#[cfg(not(feature = "idempotency"))]
+#[allow(clippy::unnecessary_wraps)]
+fn build_idempotency_layers(
+    _config: &AutumnConfig,
+    _state: &AppState,
+) -> Result<Option<BuiltIdempotencyLayers>, RouterBuildError> {
+    Ok(None)
+}
+
+/// The layer type `build_submit_token_layer` returns.
+#[cfg(feature = "idempotency")]
+type SubmitLayer = crate::security::SubmitTokenLayer;
+/// With `idempotency` off there is no submit-token layer.
+#[cfg(not(feature = "idempotency"))]
+type SubmitLayer = tower::layer::util::Identity;
+
+#[cfg(not(feature = "idempotency"))]
+#[allow(clippy::unnecessary_wraps)]
+fn build_submit_token_layer(
+    config: &AutumnConfig,
+    _state: &AppState,
+    is_production: bool,
+) -> Result<Option<SubmitLayer>, RouterBuildError> {
+    if is_production && config.security.submit_token.enabled {
+        tracing::warn!(
+            "[security.submit_token] is enabled, but this build lacks the `idempotency` \
+             feature. Duplicate submits are not blocked"
+        );
+    }
+    Ok(None)
+}
+
 /// A run of user-registered layers ([`AppBuilder::layer`](crate::app::AppBuilder::layer),
 /// [`AppBuilder::static_gate`](crate::app::AppBuilder::static_gate), plugin
 /// layers) composed into a SINGLE `tower::Layer`, so an arbitrary number of
@@ -5515,9 +5557,12 @@ fn build_idempotency_layers(
 ///
 /// The fold costs exactly one boxing adapter for the whole run (the
 /// `ErasedAppService::new` seed), regardless of how many layers it contains.
-/// That box does NOT clone on call — `BoxCloneSyncService::call` forwards to
-/// the inner service — so it adds no traversal to the cascade either; its
-/// runtime cost is one `Box::pin` per request.
+/// Its runtime cost is one `Box::pin` per request.
+///
+/// The seed holds the services below it in a [`SharedService`]. Thus a clone
+/// of the seed, which each outer `Route` level makes on each request, is one
+/// small box and one reference count. The services below the seed are cloned
+/// one time for each call (#2830).
 ///
 /// # Why an EMPTY run is still composed in `apply_middleware`
 ///
@@ -5576,11 +5621,53 @@ where
         // outermost. Getting this backwards still compiles, because every layer
         // here is `Request -> Response` with `Error = Infallible`, so only
         // behavioural tests catch it.
-        let mut svc = crate::app::ErasedAppService::new(inner);
+        let mut svc = crate::app::ErasedAppService::new(SharedService::new(inner));
         for registered in self.0.iter().rev() {
             svc = registered.layer(svc);
         }
         svc
+    }
+}
+
+/// A service behind an `Arc`. A clone is one reference count.
+///
+/// Each outer `Route` level clones all the services below it on each request
+/// (issue #2830). This type stops that deep clone. A call clones the service
+/// one time and drives the clone with `Oneshot`, as `axum::routing::Route`
+/// does. The future has a name, so the call adds no box.
+struct SharedService<S>(Arc<S>);
+
+impl<S> SharedService<S> {
+    fn new(inner: S) -> Self {
+        Self(Arc::new(inner))
+    }
+}
+
+impl<S> Clone for SharedService<S> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<S, Req> tower::Service<Req> for SharedService<S>
+where
+    S: tower::Service<Req> + Clone,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = tower::util::Oneshot<S, Req>;
+
+    /// Always ready. The clone that `call` makes is made ready in its
+    /// `Oneshot`, as in `axum::routing::Route`.
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Req) -> Self::Future {
+        tower::util::Oneshot::new(S::clone(&self.0), req)
     }
 }
 
@@ -6081,11 +6168,8 @@ fn apply_middleware(
     // when no global timeout is set.
     #[cfg(all(feature = "db", not(feature = "sqlite")))]
     let tx_timeouts_layer = {
-        let timeouts = crate::db::TxTimeouts::from_config(&config.database);
-        Some(axum::middleware::from_fn(
-            move |req: axum::extract::Request, next: axum::middleware::Next| {
-                timeouts.scope_request(next.run(req))
-            },
+        Some(crate::db::TxTimeoutsLayer::new(
+            crate::db::TxTimeouts::from_config(&config.database),
         ))
     };
     #[cfg(not(all(feature = "db", not(feature = "sqlite"))))]
@@ -6335,6 +6419,11 @@ fn apply_middleware(
     // `ComposedRegisteredLayers` occupies the user-layer slot unconditionally,
     // even with no layer registered — see its docs for why an empty run still
     // earns its boxing adapter.
+    //
+    // Do not put a `SharedService` at the start of this group too. It saves 3
+    // blocks for each request, but it makes a second set of generic code over
+    // the full type of this group. That added 223 MB of debug info to each
+    // app binary (#2830).
     let router = router.layer((
         compression_layer,
         outer_stack,
@@ -6789,13 +6878,26 @@ fn mounted_paths(path: &str, config: &AutumnConfig) -> Vec<String> {
     vec![path.to_owned()]
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
     dist_dir: Option<&std::path::Path>,
+    ctx: RouterContext,
+) -> Result<axum::Router, RouterBuildError> {
+    try_build_router_with_static_pages(route_list, config, state, dist_dir, ctx, None)
+}
+
+/// [`try_build_router_with_static_inner`] that serves only the pre-rendered
+/// pages whose URL path `keep_page` admits (#3544). `None` serves every page.
+#[allow(clippy::too_many_lines)]
+pub fn try_build_router_with_static_pages(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    dist_dir: Option<&std::path::Path>,
     mut ctx: RouterContext,
+    keep_page: Option<&dyn Fn(&str) -> bool>,
 ) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
 
@@ -6819,6 +6921,10 @@ pub fn try_build_router_with_static_inner(
             config,
             &startup_barrier_state,
         ));
+    };
+    let layer = match keep_page {
+        Some(keep) => layer.retain_routes(keep),
+        None => layer,
     };
 
     for (route, entry) in &layer.manifest().routes {
@@ -8222,6 +8328,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         // Before the fix this panicked inside `axum::Router::route`; now it
@@ -8773,6 +8880,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -9308,7 +9416,8 @@ mod tests {
     }
 
     /// #2353: an `hx-*` story page loads htmx, and loads it before the
-    /// widget runtime.
+    /// widget runtime. The core "Button" story uses `hx-get`, so this test
+    /// needs no widget family (#3408).
     #[cfg(all(feature = "maud", feature = "htmx"))]
     #[tokio::test]
     async fn story_detail_route_loads_htmx_for_hx_stories() {
@@ -9318,7 +9427,7 @@ mod tests {
             stories_state_with_builtin(),
         );
 
-        let response = get_with_host(router, "/_stories/active-search").await;
+        let response = get_with_host(router, "/_stories/button").await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = response_text(response).await;
         assert!(body.contains("hx-get"), "story must use htmx: {body}");
@@ -9329,6 +9438,29 @@ mod tests {
             .find(crate::htmx::AUTUMN_WIDGETS_JS_PATH)
             .unwrap_or_else(|| panic!("page must load autumn-widgets.js: {body}"));
         assert!(htmx_at < widgets_at, "htmx must load first: {body}");
+    }
+
+    /// Each path in `stories::demo_routes()` is mounted. The route listing
+    /// and the path reservation read that list, so a path in it that the
+    /// gallery does not mount would be listed but answer 404 (#3408).
+    #[cfg(feature = "maud")]
+    #[tokio::test]
+    async fn every_listed_story_demo_route_is_mounted() {
+        let demos = crate::stories::demo_routes();
+        assert!(!demos.is_empty(), "the demo route list is empty");
+        for (path, handler) in demos {
+            let router = build_router(
+                Vec::new(),
+                &story_gallery_config(),
+                stories_state_with_builtin(),
+            );
+            let response = get_with_host(router, path).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "listed demo route {path} ({handler}) is not mounted"
+            );
+        }
     }
 
     /// T3 (AC4): a mounted gallery 404s unknown slugs while the index stays up.
@@ -9408,6 +9540,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9497,6 +9630,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9520,6 +9654,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9543,6 +9678,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9903,6 +10039,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             };
 
             // Before the fix, the redirect's `any()` claimed GET at /health
@@ -10780,6 +10917,7 @@ enabled = true
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }],
             source: crate::route_listing::RouteSource::User,
             layer_guarded: false,
@@ -10998,6 +11136,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
@@ -11068,6 +11207,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let protected_routes = vec![route];
@@ -11243,6 +11383,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let ctx = RouterContext {
@@ -11329,6 +11470,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let ctx = RouterContext {
@@ -11554,15 +11696,15 @@ enabled = true
     #[cfg(all(feature = "openapi", feature = "maud"))]
     #[tokio::test]
     async fn try_build_router_rejects_openapi_path_on_story_gallery_demo_route() {
-        // Review follow-up: the Active search / Autocomplete / Infinite feed
-        // stories' live demo backends merge GETs the same way the index/detail
-        // routes above do, but were missing from the preflight reservation —
-        // an OpenAPI mount here would panic in `router.merge` instead of
-        // surfacing this typed collision.
+        // The stories' live demo backends merge GETs the same way the
+        // index/detail routes above do. Without the preflight reservation, an
+        // OpenAPI mount here would panic in `router.merge` instead of
+        // surfacing this typed collision. `demo/save` is mounted with no
+        // widget family (#3408).
         let mut config = AutumnConfig::default();
         config.stories.enabled = true;
         let openapi = crate::openapi::OpenApiConfig::new("Demo", "1.0.0")
-            .openapi_json_path("/_stories/demo/search");
+            .openapi_json_path("/_stories/demo/save");
         let ctx = RouterContext {
             exception_filters: Vec::new(),
             scoped_groups: Vec::new(),
@@ -11579,15 +11721,14 @@ enabled = true
             #[cfg(feature = "webmcp")]
             webmcp: None,
         };
-        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx).expect_err(
-            "story gallery demo search path should be reserved while stories are enabled",
-        );
+        let err = super::try_build_router_inner(Vec::new(), &config, test_state(), ctx)
+            .expect_err("story gallery demo path should be reserved while stories are enabled");
         assert!(matches!(
             err,
             RouterBuildError::OpenApiPathCollision {
                 field: "openapi_json_path",
                 ref path,
-            } if path == "/_stories/demo/search"
+            } if path == "/_stories/demo/save"
         ));
     }
 
@@ -11681,6 +11822,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 
@@ -12318,7 +12460,7 @@ enabled = true
             .expect("opaque nest routers must not fail the duplicate preflight");
     }
 
-    /// Finding 1 (issue #1012 review): two handlers that differ ONLY by capture
+    /// Issue #1012: two handlers that differ ONLY by capture
     /// name — `/users/{id}` vs `/users/{slug}` — key by literal template so they
     /// look distinct to a naive preflight, but axum's matcher (verified against
     /// axum 0.8.9: matchit reports a "conflict") rejects the second route shape
@@ -12355,7 +12497,7 @@ enabled = true
         );
     }
 
-    /// Finding 1, scoped-group variant: the capture-name normalization must run
+    /// Scoped-group variant of the test above: the capture-name normalization must run
     /// AFTER `join_nested_path` prefix resolution, so a scoped `/users/{slug}`
     /// under `/api` collides with a top-level `/api/users/{id}`.
     #[tokio::test]
@@ -12389,7 +12531,7 @@ enabled = true
         );
     }
 
-    /// Finding 1 NEGATIVE guard: normalization must not over-flag. Two genuinely
+    /// NEGATIVE guard: normalization must not over-flag. Two genuinely
     /// different shapes that axum's matcher accepts (verified: `/users/{id}` and
     /// `/users/{id}/posts` do NOT conflict) must still build cleanly.
     #[tokio::test]
@@ -12402,7 +12544,7 @@ enabled = true
                 .expect("distinct route shapes must not be flagged as duplicates");
     }
 
-    /// Finding 2 (issue #1012 review): `#[ws]` records the synthetic `WS` method
+    /// Issue #1012: `#[ws]` records the synthetic `WS` method
     /// but `group_and_mount_routes` mounts its handler via `axum::routing::get`,
     /// so `#[get("/live")]` + `#[ws("/live")]` produce two overlapping `GET`
     /// `MethodRouter`s that panic on merge. Normalizing `WS` to its effective
@@ -14064,6 +14206,7 @@ enabled = true
             timeout: crate::route::RouteTimeout::default(),
             criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         };
 
         let tmp = create_ssg_dist_with_types(&[(
@@ -14416,6 +14559,7 @@ enabled = true
             timeout: crate::route::RouteTimeout::default(),
             criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         };
 
         // Manifest does NOT contain /dynamic, so the request falls through to
@@ -15861,6 +16005,7 @@ mod trusted_host_tests {
             api_version: None,
             sunset_opt_out: false,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         }
     }
 
@@ -16234,6 +16379,46 @@ mod trusted_host_tests {
         }
     }
 
+    /// A role mount drops the pre-rendered pages of its unmounted routes
+    /// (#3544): the request falls through to the router, which 404s.
+    #[tokio::test]
+    async fn static_pages_follow_the_role_mount() {
+        let (_tmp, dist) = build_cached_dist("<h1>cached</h1>");
+        let config = AutumnConfig::default();
+        let get_root = |app: axum::Router| async move {
+            app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        };
+        let empty_ctx = || RouterContext {
+            static_gate_layers: Vec::new(),
+            ..ctx_with_static_gate(redirect_gate_registration())
+        };
+
+        let served = super::try_build_router_with_static_pages(
+            Vec::new(),
+            &config,
+            crate::state::AppState::for_test(),
+            Some(dist.as_path()),
+            empty_ctx(),
+            Some(&|_: &str| true),
+        )
+        .expect("router builds");
+        assert_eq!(get_root(served).await, StatusCode::OK);
+
+        let dropped = super::try_build_router_with_static_pages(
+            Vec::new(),
+            &config,
+            crate::state::AppState::for_test(),
+            Some(dist.as_path()),
+            empty_ctx(),
+            Some(&|path: &str| path != "/"),
+        )
+        .expect("router builds");
+        assert_eq!(get_root(dropped).await, StatusCode::NOT_FOUND);
+    }
+
     /// #3071: on the SSG/ISG path the fault layers go outside the static
     /// cache, so a route fault reaches a cached page, and only once.
     #[tokio::test]
@@ -16358,6 +16543,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let config = AutumnConfig::default();
         let ctx = ctx_with_static_gate(redirect_gate_registration());
@@ -16513,6 +16699,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let mut config = AutumnConfig::default();
@@ -16673,6 +16860,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let mut config = AutumnConfig::default();
         config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
@@ -16797,6 +16985,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let config = AutumnConfig::default();
         let ctx = ctx_with_static_gate(redirect_gate_registration());
@@ -16850,9 +17039,10 @@ mod trusted_host_tests {
     ///
     /// A hand-rolled `tower::Service` fixes it only if its `Future` associated
     /// type is genuinely named all the way down. Writing one that still returns
-    /// `Pin<Box<dyn Future>>` — the shape `SessionService`, `LogContextService`
-    /// and `TrustedProxiesService` use — would satisfy every behavioural test in
-    /// the suite while allocating exactly as much as before. This test is what
+    /// `Pin<Box<dyn Future>>` — the shape `RequireAuthService` keeps, because it
+    /// must wait for the session before it calls the inner service — would
+    /// satisfy every behavioural test in the suite while allocating exactly as
+    /// much as before. This test is what
     /// makes that impossible to do by accident: the sibling allocation gate in
     /// `tests/config_alloc_gate.rs` pins the *total*, and this pins *where* the
     /// total comes from.
@@ -16900,6 +17090,20 @@ mod trusted_host_tests {
             "MethodOverrideRejectionService",
         );
         assert_unboxed::<crate::aeo::negotiate::NegotiateService<Inner>>("NegotiateService");
+        // #2830.
+        assert_unboxed::<crate::middleware::LogContextService<Inner>>("LogContextService");
+        assert_unboxed::<crate::session::SessionService<crate::session::MemoryStore, Inner>>(
+            "SessionService",
+        );
+        assert_unboxed::<crate::security::trusted_proxies::TrustedProxiesService<Inner>>(
+            "TrustedProxiesService",
+        );
+        #[cfg(feature = "idempotency")]
+        assert_unboxed::<crate::idempotency::IdempotencyReplayService<Inner>>(
+            "IdempotencyReplayService",
+        );
+        #[cfg(feature = "db")]
+        assert_unboxed::<crate::db::TxTimeoutsService<Inner>>("TxTimeoutsService");
         #[cfg(feature = "oauth2")]
         assert_unboxed::<super::HttpInterceptorService<Inner>>("HttpInterceptorService");
     }
@@ -16939,6 +17143,286 @@ mod trusted_host_tests {
              allocation on every request rather than only on a failed webhook \
              delivery (issue #2214)"
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // #2830: no boxed future and no deep clone of the inner service
+    // ----------------------------------------------------------------------
+
+    /// A ready future that holds 1 KiB. A future that holds it inline is at
+    /// least 1 KiB. A boxed future is only a pointer.
+    struct LargeFuture(#[allow(dead_code)] [u8; LARGE_FUTURE_BYTES]);
+
+    const LARGE_FUTURE_BYTES: usize = 1024;
+
+    impl std::future::Future for LargeFuture {
+        type Output = Result<axum::response::Response, std::convert::Infallible>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Ready(Ok(axum::response::Response::new(Body::empty())))
+        }
+    }
+
+    /// An inner service that returns a [`LargeFuture`] and counts its clones.
+    struct LargeFutureService {
+        clones: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl LargeFutureService {
+        fn new() -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let clones = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    clones: Arc::clone(&clones),
+                },
+                clones,
+            )
+        }
+    }
+
+    impl Clone for LargeFutureService {
+        fn clone(&self) -> Self {
+            self.clones
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self {
+                clones: Arc::clone(&self.clones),
+            }
+        }
+    }
+
+    impl tower::Service<axum::extract::Request> for LargeFutureService {
+        type Response = axum::response::Response;
+        type Error = std::convert::Infallible;
+        type Future = LargeFuture;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: axum::extract::Request) -> Self::Future {
+            LargeFuture([0; LARGE_FUTURE_BYTES])
+        }
+    }
+
+    /// The future of `Svc` must hold the inner future inline.
+    ///
+    /// A `type_name` check does not see a box in a private field. This check
+    /// does: a boxed inner future makes the future smaller than the inner one.
+    fn assert_inner_future_inline<Svc>(what: &str)
+    where
+        Svc: tower::Service<axum::extract::Request>,
+    {
+        let size = std::mem::size_of::<Svc::Future>();
+        assert!(
+            size >= LARGE_FUTURE_BYTES,
+            "{what} must hold the inner future inline, but its future is only \
+             {size} bytes. A boxed future is one heap allocation on each \
+             request (issue #2830)."
+        );
+    }
+
+    /// The ingress services of issue #2830 hold the inner future inline.
+    #[test]
+    fn ingress_services_hold_the_inner_future_inline() {
+        type Inner = LargeFutureService;
+
+        assert_inner_future_inline::<crate::middleware::LogContextService<Inner>>(
+            "LogContextService",
+        );
+        assert_inner_future_inline::<
+            crate::session::SessionService<crate::session::MemoryStore, Inner>,
+        >("SessionService");
+        assert_inner_future_inline::<crate::security::trusted_proxies::TrustedProxiesService<Inner>>(
+            "TrustedProxiesService",
+        );
+        assert_inner_future_inline::<crate::middleware::MethodOverrideService<Inner>>(
+            "MethodOverrideService",
+        );
+        assert_inner_future_inline::<
+            crate::middleware::error_page_filter::ErrorPageContextService<Inner>,
+        >("ErrorPageContextService");
+        #[cfg(feature = "idempotency")]
+        {
+            assert_inner_future_inline::<crate::idempotency::IdempotencyReplayService<Inner>>(
+                "IdempotencyReplayService",
+            );
+            assert_inner_future_inline::<crate::security::submit_token::SubmitTokenService<Inner>>(
+                "SubmitTokenService",
+            );
+        }
+    }
+
+    /// Calls `svc` once with `req`, then returns the clones of the inner
+    /// service that the call made.
+    async fn inner_clones_for_one_call<Svc>(
+        mut svc: Svc,
+        clones: &std::sync::atomic::AtomicUsize,
+        req: axum::extract::Request,
+    ) -> usize
+    where
+        Svc: tower::Service<axum::extract::Request>,
+        Svc::Error: std::fmt::Debug,
+    {
+        use tower::ServiceExt as _;
+
+        svc.ready().await.expect("service is ready");
+        let before = clones.load(std::sync::atomic::Ordering::Relaxed);
+        let _response = svc.call(req).await.expect("infallible");
+        clones.load(std::sync::atomic::Ordering::Relaxed) - before
+    }
+
+    fn get_request() -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .uri("/")
+            .body(Body::empty())
+            .expect("request builds")
+    }
+
+    fn json_post_request() -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .method("POST")
+            .uri("/users")
+            .header("content-type", "application/json")
+            .header("content-length", "2")
+            .body(Body::from("{}"))
+            .expect("request builds")
+    }
+
+    /// A clone of the erased seed of the merged stack must not clone the
+    /// services below it. Each outer `Route` level clones the stack on each
+    /// request, so a deep clone here repeats once for each level.
+    #[tokio::test]
+    async fn erased_seed_clone_stops_at_a_shared_pointer() {
+        use tower::Layer as _;
+
+        let (inner, clones) = LargeFutureService::new();
+        let seed = super::ComposedRegisteredLayers::new(Vec::new()).layer(inner);
+        let copies: Vec<_> = (0..5).map(|_| seed.clone()).collect();
+        assert_eq!(
+            clones.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a clone of the erased seed must not clone the inner service"
+        );
+
+        let per_call = inner_clones_for_one_call(seed, &clones, get_request()).await;
+        assert!(
+            per_call <= 1,
+            "one call through the erased seed may clone the inner service once, \
+             not {per_call} times"
+        );
+        drop(copies);
+    }
+
+    /// A session request without a cookie does not wait before it calls the
+    /// inner service. Thus it must not clone the inner service.
+    #[tokio::test]
+    async fn session_does_not_clone_the_inner_service_without_a_cookie() {
+        use tower::Layer as _;
+
+        let (inner, clones) = LargeFutureService::new();
+        let layer = crate::session::SessionLayer::new(
+            crate::session::MemoryStore::new(),
+            crate::session::SessionConfig::default(),
+        );
+        let without_cookie =
+            inner_clones_for_one_call(layer.layer(inner.clone()), &clones, get_request()).await;
+        assert_eq!(
+            without_cookie, 0,
+            "no cookie: no clone of the inner service"
+        );
+
+        // A cookie makes the layer load the session first. That path clones.
+        let mut with_cookie = get_request();
+        with_cookie.headers_mut().insert(
+            axum::http::header::COOKIE,
+            axum::http::HeaderValue::from_static("autumn.sid=unknown-id"),
+        );
+        let with_cookie = inner_clones_for_one_call(layer.layer(inner), &clones, with_cookie).await;
+        assert_eq!(with_cookie, 1, "a cookie: one clone, for the load");
+    }
+
+    /// Outside body capture, the error-page context does not wait before it
+    /// calls the inner service. Thus it must not clone the inner service.
+    #[tokio::test]
+    async fn error_page_context_does_not_clone_the_inner_service() {
+        use tower::Layer as _;
+
+        let layer = crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev: false };
+        for (name, req) in [("GET", get_request()), ("POST", json_post_request())] {
+            let (inner, clones) = LargeFutureService::new();
+            let per_call = inner_clones_for_one_call(layer.layer(inner), &clones, req).await;
+            assert_eq!(per_call, 0, "{name}: no clone of the inner service");
+        }
+    }
+
+    /// The error-page context boxes its future only when dev mode reads the
+    /// request body. Each other request holds the inner future inline.
+    #[test]
+    fn error_page_context_boxes_only_for_dev_body_capture() {
+        use tower::{Layer as _, Service as _};
+
+        /// Dev mode, method, request, and if the future is boxed.
+        type Case = (bool, &'static str, fn() -> axum::extract::Request, bool);
+
+        let cases: [Case; 4] = [
+            (false, "GET", get_request, false),
+            (false, "POST", json_post_request, false),
+            (true, "GET", get_request, false),
+            (true, "POST", json_post_request, true),
+        ];
+        for (is_dev, name, request, boxed) in cases {
+            let (inner, _) = LargeFutureService::new();
+            let mut svc =
+                crate::middleware::error_page_filter::ErrorPageContextLayer { is_dev }.layer(inner);
+            let future = svc.call(request());
+            assert_eq!(
+                matches!(future, futures::future::Either::Right(_)),
+                boxed,
+                "is_dev = {is_dev}, {name}: only a dev body capture takes the box"
+            );
+        }
+    }
+
+    /// A request that is not a form has no submit token to read. Thus the
+    /// submit-token layer must not clone the inner service for it.
+    #[cfg(feature = "idempotency")]
+    #[tokio::test]
+    async fn submit_token_does_not_clone_the_inner_service_without_a_form() {
+        use tower::Layer as _;
+
+        let layer = crate::security::SubmitTokenLayer::new(
+            Arc::new(crate::idempotency::MemoryIdempotencyStore::new(
+                std::time::Duration::from_secs(60),
+            )),
+            &crate::security::config::SubmitTokenConfig::default(),
+        );
+        for (name, req) in [("GET", get_request()), ("JSON POST", json_post_request())] {
+            let (inner, clones) = LargeFutureService::new();
+            let per_call = inner_clones_for_one_call(layer.layer(inner), &clones, req).await;
+            assert_eq!(per_call, 0, "{name}: no clone of the inner service");
+        }
+    }
+
+    /// The request transaction timeouts were an `axum::middleware::from_fn`.
+    /// It cloned the inner service and boxed a future on each request.
+    #[cfg(feature = "db")]
+    #[tokio::test]
+    async fn tx_timeouts_layer_does_not_box_or_clone() {
+        use tower::Layer as _;
+
+        assert_inner_future_inline::<crate::db::TxTimeoutsService<LargeFutureService>>(
+            "TxTimeoutsService",
+        );
+        let (inner, clones) = LargeFutureService::new();
+        let svc = crate::db::TxTimeoutsLayer::new(crate::db::TxTimeouts::default()).layer(inner);
+        let per_call = inner_clones_for_one_call(svc, &clones, get_request()).await;
+        assert_eq!(per_call, 0, "no clone of the inner service");
     }
 
     /// The startup barrier's short-circuit branch: until the app reports startup
@@ -17026,6 +17510,7 @@ pub struct TrustedHostPolicy {
     /// time, after the router is built. `None` for a policy built without a
     /// state (the MCP unit tests); an app that does not enable custom domains
     /// publishes no registry, so the lookup finds nothing.
+    #[cfg(feature = "custom-domains")]
     custom_domains: Option<crate::state::LateExtensions>,
 }
 
@@ -17055,6 +17540,7 @@ impl TrustedHostPolicy {
             allow_any,
             allow_missing_host: !is_production,
             probe_bypass_paths: Arc::new(probe_bypass_paths),
+            #[cfg(feature = "custom-domains")]
             custom_domains: None,
         }
     }
@@ -17065,8 +17551,10 @@ impl TrustedHostPolicy {
     /// Every ingress policy is built this way. The state is read per request,
     /// so a domain connected — or offboarded — while the app runs takes effect
     /// without a restart.
+    #[cfg_attr(not(feature = "custom-domains"), allow(unused_variables))]
     pub(crate) fn from_config_with_state(config: &AutumnConfig, state: &AppState) -> Self {
         Self {
+            #[cfg(feature = "custom-domains")]
             custom_domains: Some(state.late_extensions()),
             ..Self::from_config(config)
         }
@@ -17107,6 +17595,13 @@ impl TrustedHostPolicy {
     /// comparison. Only a *servable* (`active`) domain passes, which is the
     /// rule SNI already applies at the handshake: a registration stuck at
     /// `pending_dns` must not become a way past host validation.
+    #[cfg(not(feature = "custom-domains"))]
+    #[allow(clippy::unused_self)]
+    fn is_connected_domain(&self, _host: &str) -> bool {
+        false
+    }
+
+    #[cfg(feature = "custom-domains")]
     fn is_connected_domain(&self, host: &str) -> bool {
         self.custom_domains.as_ref().is_some_and(|extensions| {
             extensions

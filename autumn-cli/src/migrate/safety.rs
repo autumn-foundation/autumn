@@ -11,21 +11,19 @@
 //! grants. A statement the backend cannot parse is
 //! [`RiskLevel::Unsupported`].
 //!
+//! # Lexing
+//!
+//! A tokenizer ([`tokens`]) reads the SQL with the quote rules of the backend
+//! (see the table at [`quoted_len`]). A `;`, `--` or `/*` in a comment or a
+//! quoted span is text.
+//!
+//! Each dialect has its own comment rules. Postgres block comments nest, and
+//! a `\r` also ends a `--` comment. `SQLite` block comments do not nest.
+//!
 //! # Known limitations
 //!
-//! - Statement splitting uses `;` as the delimiter with awareness of
-//!   `PostgreSQL` dollar-quoted blocks (`$$…$$` and `$tag$…$tag$`), `--` line
-//!   comments, and single-quoted string literals (including the standard
-//!   `''`-doubled escaped quote). Semicolons inside any of these are kept
-//!   intact so they do not produce spurious statement fragments -- e.g. a
-//!   `DEFAULT 'hello; world'` clause splits as one statement, not two.
-//! - Line comment stripping matches `--` by position on each line, checked
-//!   only *outside* single-quoted literals and dollar-quoted blocks (both
-//!   handled above). A `--` or `;` sequence inside a double-quoted identifier
-//!   (e.g. a quoted column name) is not handled; this pattern is essentially
-//!   absent from real migration files.
-//! - Block comment stripping (`/* … */`) similarly does not handle `/*` or `*/`
-//!   tokens that appear inside string literals.
+//! - In a plain `'..'` literal, `\` does not escape a quote. This is Postgres
+//!   with `standard_conforming_strings = on`, the default since 9.1.
 
 use std::fmt;
 
@@ -108,8 +106,7 @@ pub fn classify_sql_for(backend: DatabaseBackend, sql: &str) -> Vec<SafetyFindin
     // Strip block comments at the whole-SQL level before splitting so that a
     // semicolon inside a block comment (e.g. `/* note; end */`) does not produce
     // a spurious empty statement fragment.
-    let without_block_comments = strip_block_comments(sql);
-    let stmts = split_statements(&without_block_comments);
+    let stmts = statements(backend, sql);
 
     // Tables created within this migration have no existing rows or live traffic,
     // so a non-concurrent index build on them is safe.  Collect the names upfront
@@ -118,21 +115,21 @@ pub fn classify_sql_for(backend: DatabaseBackend, sql: &str) -> Vec<SafetyFindin
     let newly_created: Vec<String> = stmts
         .iter()
         .filter(|s| !has_review_suppression(s))
-        .filter_map(|s| extract_created_table_name(&normalize_statement(s)))
+        .filter_map(|s| extract_created_table_name(&normalize_statement(backend, s)))
         .collect();
 
     stmts
         .iter()
         .filter(|stmt| !has_review_suppression(stmt))
         .flat_map(|stmt| {
-            let normalized = normalize_statement(stmt);
+            let normalized = normalize_statement(backend, stmt);
             let mut findings = classify_statement(backend, &normalized, &newly_created);
             // Drop any index-build finding whose table was created earlier in
             // this same migration file (either backend's spelling of it).
             findings.retain(|f| {
                 (f.operation != CREATE_INDEX_PG_OP && f.operation != CREATE_INDEX_SQLITE_OP)
                     || extract_index_table_name(&normalized)
-                        .is_none_or(|t| !newly_created.iter().any(|c| c == t))
+                        .is_none_or(|t| !newly_created.iter().any(|c| same_table(backend, c, t)))
             });
             findings
         })
@@ -166,17 +163,26 @@ pub fn has_unsafe_findings(findings: &[SafetyFinding]) -> bool {
 /// Used to gate `autumn migrate down`: a `down.sql` that is blank or contains
 /// only comments is treated as absent — the command refuses to proceed and
 /// names the offending migration.
-pub fn has_executable_sql(sql: &str) -> bool {
-    let without_block_comments = strip_block_comments(sql);
-    split_statements(&without_block_comments)
-        .iter()
-        .any(|stmt| {
-            stmt.lines()
-                .any(|line| !line.trim().is_empty() && !line.trim().starts_with("--"))
-        })
+///
+/// The comment rules are those of `backend`: a nested `/*` differs.
+pub fn has_executable_sql(backend: DatabaseBackend, sql: &str) -> bool {
+    statements(backend, sql).iter().any(|stmt| {
+        stmt.lines()
+            .any(|line| !line.trim().is_empty() && !line.trim().starts_with("--"))
+    })
 }
 
 // ── internals ────────────────────────────────────────────────────────────────
+
+/// Whether two table names from normalized statements name one table.
+/// `SQLite` names ignore ASCII case, also in quotes. A quoted Postgres name
+/// keeps its case.
+fn same_table(backend: DatabaseBackend, a: &str, b: &str) -> bool {
+    match backend {
+        DatabaseBackend::Postgres => a == b,
+        DatabaseBackend::Sqlite => a.eq_ignore_ascii_case(b),
+    }
+}
 
 /// Extract the table name from a normalized `CREATE TABLE name …` statement.
 /// Only unconditional creates that are known to create a fresh table are matched.
@@ -209,92 +215,33 @@ fn extract_altered_table_name(normalized: &str) -> Option<&str> {
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// Split `sql` into individual statements, using `;` as the delimiter. Each
-/// returned statement has its terminating `;` stripped.
+/// Strip block comments, then split `sql` into statements.
+fn statements(backend: DatabaseBackend, sql: &str) -> Vec<String> {
+    split_statements(backend, &strip_block_comments(backend, sql))
+}
+
+/// Split `sql` into statements at each `;`. The result drops each terminating
+/// `;`, trims each statement and skips empty ones.
 ///
-/// Dollar-quoted blocks (`$$…$$`, `$tag$…$tag$`) are kept intact so that
-/// semicolons inside a function body do not produce spurious fragments.
-pub fn split_statements(sql: &str) -> Vec<String> {
+/// A `;` in a comment or a quoted span (see [`quoted_len`]) does not split.
+pub fn split_statements(backend: DatabaseBackend, sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
-    let mut i = 0;
-
-    while i < sql.len() {
-        let rest = &sql[i..];
-
-        // Detect a dollar-quote opening: $identifier$ (identifier may be empty → $$).
-        // When found, consume everything up to and including the matching closing tag
-        // so that semicolons inside the body are not treated as statement separators.
-        if let Some(after_dollar) = rest.strip_prefix('$')
-            && let Some(close_in_rest1) = after_dollar.find('$')
-        {
-            let tag_body = &after_dollar[..close_in_rest1];
-            if tag_body.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                let tag_len = 1 + close_in_rest1 + 1; // opening $ + body + closing $
-                let tag = &rest[..tag_len];
-                if let Some(close_pos) = rest[tag_len..].find(tag) {
-                    // Push opening tag + body + closing tag as one chunk.
-                    current.push_str(&rest[..tag_len + close_pos + tag_len]);
-                    i += tag_len + close_pos + tag_len;
-                } else {
-                    // Unclosed dollar-quote: consume to end of input.
-                    current.push_str(rest);
-                    i = sql.len();
-                }
-                continue;
-            }
-        }
-
-        // Single-quoted string literal: consume to the closing quote, treating
-        // a doubled `''` as an escaped quote (the standard SQL convention --
-        // matches how `sql_default_literal` escapes user-supplied defaults) so
-        // a semicolon inside a literal (e.g. a `DEFAULT 'hello; world'`) is
-        // never treated as a statement separator.
-        if rest.starts_with('\'') {
-            let mut j = 1;
-            loop {
-                if let Some(rel) = rest[j..].find('\'') {
-                    let abs = j + rel;
-                    if rest[abs + 1..].starts_with('\'') {
-                        j = abs + 2; // escaped '' -- keep scanning
-                    } else {
-                        j = abs + 1; // closing quote
-                        break;
-                    }
-                } else {
-                    j = rest.len(); // unclosed literal: consume to end of input
-                    break;
-                }
-            }
-            current.push_str(&rest[..j]);
-            i += j;
-            continue;
-        }
-
-        // Line comment: consume to end-of-line without treating the semicolons
-        // inside the comment as statement separators.  The comment text is kept
-        // in `current` so that `has_review_suppression` can still see it.
-        if rest.starts_with("--") {
-            let end = rest.find('\n').unwrap_or(rest.len());
-            current.push_str(&rest[..end]);
-            i += end;
-        } else if rest.starts_with(';') {
-            let trimmed = current.trim().to_owned();
+    for (kind, text) in tokens(backend, sql) {
+        if kind == TokenKind::Plain && text == ";" {
+            let trimmed = current.trim();
             if !trimmed.is_empty() {
-                statements.push(trimmed);
+                statements.push(trimmed.to_owned());
             }
             current.clear();
-            i += 1;
         } else {
-            let c = rest.chars().next().unwrap();
-            current.push(c);
-            i += c.len_utf8();
+            // Comments stay: `has_review_suppression` reads them.
+            current.push_str(text);
         }
     }
-
-    let trimmed = current.trim().to_owned();
+    let trimmed = current.trim();
     if !trimmed.is_empty() {
-        statements.push(trimmed);
+        statements.push(trimmed.to_owned());
     }
     statements
 }
@@ -302,39 +249,40 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 /// Split a normalized `ALTER TABLE` statement into individual subcommand strings.
 ///
 /// Strips the `alter table <name>` prefix and splits the remaining text on
-/// commas outside parentheses, trimming each segment. With `quote_aware`, a
-/// comma in quoted text does not split. Only `SQLite` input sets it. The
-/// scanner does not know Postgres dollar quotes or `E'..\'` escapes, and a
-/// wrong guess there could merge a `DROP COLUMN` into its neighbour.
-fn alter_table_subcommands(normalized: &str, quote_aware: bool) -> Vec<&str> {
-    let after_prefix = normalized.strip_prefix("alter table ").unwrap_or("");
-    let subcommands_start = after_prefix.find(' ').map_or(after_prefix.len(), |i| i + 1);
-    let subcommands = &after_prefix[subcommands_start..];
+/// commas outside parentheses, trimming each segment. A space or comma in a
+/// quoted span of the `backend` dialect does not split.
+fn alter_table_subcommands(backend: DatabaseBackend, normalized: &str) -> Vec<&str> {
+    let mut rest = normalized.strip_prefix("alter table ").unwrap_or("");
+    // `SQLite` has no `IF EXISTS` or `ONLY` here. They stay in its first
+    // subcommand, and the grammar rule rejects them.
+    if backend == DatabaseBackend::Postgres {
+        for keyword in ["if exists ", "only "] {
+            rest = rest.strip_prefix(keyword).unwrap_or(rest);
+        }
+    }
+    let name_len: usize = tokens(backend, rest)
+        .take_while(|&(kind, text)| !(kind == TokenKind::Plain && text == " "))
+        .map(|(_, text)| text.len())
+        .sum();
+    let subcommands = rest[name_len..].trim_start();
 
     let mut result = Vec::new();
     let mut depth: i32 = 0;
-    let mut quote: Option<char> = None;
     let mut start = 0;
-    for (i, c) in subcommands.char_indices() {
-        // In quoted text, only the closing quote counts. A doubled quote
-        // closes and reopens the text.
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
+    let mut i = 0;
+    for (kind, text) in tokens(backend, subcommands) {
+        if kind == TokenKind::Plain {
+            match text {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                "," if depth == 0 => {
+                    result.push(subcommands[start..i].trim());
+                    start = i + 1;
+                }
+                _ => {}
             }
-            continue;
         }
-        match c {
-            '\'' | '"' | '`' if quote_aware => quote = Some(c),
-            '[' if quote_aware => quote = Some(']'),
-            '(' => depth += 1,
-            ')' => depth -= 1,
-            ',' if depth == 0 => {
-                result.push(subcommands[start..i].trim());
-                start = i + 1;
-            }
-            _ => {}
-        }
+        i += text.len();
     }
     let last = subcommands[start..].trim();
     if !last.is_empty() {
@@ -375,7 +323,7 @@ fn canonical_sqlite_alter(normalized: &str) -> String {
     if !normalized.starts_with("alter table ") {
         return normalized.to_owned();
     }
-    let subcommands = alter_table_subcommands(normalized, true);
+    let subcommands = alter_table_subcommands(DatabaseBackend::Sqlite, normalized);
     if subcommands.is_empty() {
         return normalized.to_owned();
     }
@@ -689,7 +637,9 @@ fn sqlite_unsupported_clause(normalized: &str) -> Option<SafetyFinding> {
             "SQLite has no row-level locking clause — a write transaction locks the whole \
              database. Drop the clause.",
         )
-    } else if without_string_literals(normalized).contains("on conflict on constraint ") {
+    } else if blank_quoted_spans(DatabaseBackend::Sqlite, normalized)
+        .contains("on conflict on constraint ")
+    {
         (
             "ON CONFLICT ON CONSTRAINT (unsupported on SQLite)",
             "SQLite's upsert target is a column list, not a constraint name. Write \
@@ -714,10 +664,10 @@ fn sqlite_unsupported_clause(normalized: &str) -> Option<SafetyFinding> {
 
 /// Whether the statement carries a Postgres row-locking clause.
 ///
-/// Searches the literal-blanked form: an INSERT of the text
+/// Searches the form with blank quoted spans: an INSERT of the text
 /// `'waiting for update'` is data, not a locking clause.
 fn has_row_locking_clause(normalized: &str) -> bool {
-    let bare = without_string_literals(normalized);
+    let bare = blank_quoted_spans(DatabaseBackend::Sqlite, normalized);
     bare.contains(" for update") || bare.contains(" for share")
 }
 
@@ -730,7 +680,7 @@ fn is_create_index_statement(normalized: &str) -> bool {
 /// `WHERE` (partial), `COLLATE` and `DESC` are absent from the list: `SQLite`
 /// supports all three.
 fn has_postgres_index_clause(normalized: &str) -> bool {
-    let sql = without_string_literals(normalized);
+    let sql = blank_quoted_spans(DatabaseBackend::Sqlite, normalized);
     sql.contains(" using ")
         || sql.contains(" include (")
         || sql.contains(" with (")
@@ -740,7 +690,7 @@ fn has_postgres_index_clause(normalized: &str) -> bool {
 
 /// Whether a `CREATE TABLE` carries a clause `SQLite` has no grammar for.
 fn has_postgres_table_clause(normalized: &str) -> bool {
-    let sql = without_string_literals(normalized);
+    let sql = blank_quoted_spans(DatabaseBackend::Sqlite, normalized);
     sql.contains(" partition by ")
         || sql.contains(" partition of ")
         || sql.contains(" as identity")
@@ -752,26 +702,27 @@ fn has_postgres_table_clause(normalized: &str) -> bool {
 /// `SELECT` there.
 fn contains_data_modifying_cte(normalized: &str) -> bool {
     // `AS ( DELETE FROM …` is ordinary formatting; close the paren up first.
-    let sql = without_string_literals(normalized).replace("( ", "(");
+    let sql = blank_quoted_spans(DatabaseBackend::Sqlite, normalized).replace("( ", "(");
     ["(update ", "(delete ", "(insert into "]
         .iter()
         .any(|p| sql.contains(p))
 }
 
-/// Blank out the contents of single-quoted literals, keeping the quotes and the
-/// string's length. Lets a keyword search run over SQL without matching a word
-/// that only appears inside a value (`DEFAULT 'not unique yet'`).
-fn without_string_literals(sql: &str) -> String {
+/// Blank the text in each quoted span, but keep its first and last character
+/// and its character count. A keyword search then does not match a word in a
+/// quoted span (`DEFAULT 'not unique yet'`, `"it's"`).
+fn blank_quoted_spans(backend: DatabaseBackend, sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
-    let mut in_literal = false;
-    for c in sql.chars() {
-        match c {
-            '\'' => {
-                in_literal = !in_literal;
-                out.push(c);
-            }
-            _ if in_literal => out.push(' '),
-            _ => out.push(c),
+    for (kind, text) in tokens(backend, sql) {
+        if kind == TokenKind::Quoted {
+            let last = text.chars().count() - 1;
+            out.extend(
+                text.chars()
+                    .enumerate()
+                    .map(|(i, c)| if i == 0 || i == last { c } else { ' ' }),
+            );
+        } else {
+            out.push_str(text);
         }
     }
     out
@@ -784,45 +735,270 @@ fn has_inline_unique_constraint(subcommand: &str) -> bool {
     subcommand.contains(" unique ") || subcommand.ends_with(" unique")
 }
 
-/// Remove `/* ... */` block comments from `sql`.
+/// A token kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    /// One character of SQL, or one `SQLite` variable (see
+    /// [`sqlite_variable_len`]).
+    Plain,
+    /// A `--` comment. The line end is not part of it.
+    LineComment,
+    /// A `/* */` comment. Postgres comments nest. `SQLite` comments do not.
+    BlockComment,
+    /// A quoted span: a literal, a quoted identifier or a dollar-quoted block.
+    Quoted,
+}
+
+/// Split `sql` into tokens for `backend`. Each item is a kind and its text.
+/// The texts join back to `sql`.
+fn tokens(backend: DatabaseBackend, sql: &str) -> impl Iterator<Item = (TokenKind, &str)> {
+    let mut rest = sql;
+    let mut prev = None;
+    std::iter::from_fn(move || {
+        let (kind, len) = token_at(backend, rest, prev)?;
+        let (text, tail) = rest.split_at(len);
+        rest = tail;
+        prev = text.chars().next_back();
+        Some((kind, text))
+    })
+}
+
+/// The kind and byte length of the token at the start of `rest`, or `None`
+/// when `rest` is empty. `prev` is the character before `rest`.
+fn token_at(
+    backend: DatabaseBackend,
+    rest: &str,
+    prev: Option<char>,
+) -> Option<(TokenKind, usize)> {
+    let first = rest.chars().next()?;
+    if let Some(len) = line_comment_len(backend, rest) {
+        return Some((TokenKind::LineComment, len));
+    }
+    if let Some(len) = block_comment_len(backend, rest) {
+        return Some((TokenKind::BlockComment, len));
+    }
+    if let Some(len) = quoted_len(backend, rest, prev) {
+        return Some((TokenKind::Quoted, len));
+    }
+    if backend == DatabaseBackend::Sqlite
+        && prev.is_none_or(|c| !is_identifier_char(c))
+        && let Some(len) = sqlite_variable_len(rest)
+    {
+        return Some((TokenKind::Plain, len));
+    }
+    Some((TokenKind::Plain, first.len_utf8()))
+}
+
+/// Byte length of the quoted span at the start of `rest`, or `None`. `prev` is
+/// the character before `rest`. In a span, `--`, `/*` and `;` are text.
 ///
-/// Handles single-line and multi-line block comments. Unclosed block comments
-/// are consumed to end-of-input. Block comments inside string literals are an
-/// edge case not handled here (same limitation as `--` in strings).
-pub fn strip_block_comments(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '/' && chars.peek() == Some(&'*') {
-            chars.next(); // consume '*'
-            loop {
-                match chars.next() {
-                    Some('*') if chars.peek() == Some(&'/') => {
-                        chars.next(); // consume '/'
-                        result.push(' '); // preserve token boundary where the comment was
-                        break;
-                    }
-                    None => break, // unclosed block comment
-                    _ => {}
-                }
+/// The span forms follow the dialect:
+///
+/// | Form | Escaped quote | Postgres | `SQLite` |
+/// | --- | --- | --- | --- |
+/// | `'..'` literal | doubled | yes | yes |
+/// | `E'..'` literal | doubled or `\'` | yes | no |
+/// | `".."` identifier | doubled | yes | yes |
+/// | `` `..` `` identifier | doubled | no | yes |
+/// | `[..]` identifier | none | no | yes |
+/// | `$tag$..$tag$` block | none | yes | no |
+///
+/// `E'` and `$` start a span only at the start of a word: in `xe'..'` and
+/// `a$b$`, Postgres reads them as part of the identifier. An unclosed span
+/// runs to the end of `rest`.
+fn quoted_len(backend: DatabaseBackend, rest: &str, prev: Option<char>) -> Option<usize> {
+    let postgres = backend == DatabaseBackend::Postgres;
+    let word_start = prev.is_none_or(|c| !is_identifier_char(c));
+    match rest.as_bytes().first()? {
+        b'\'' => Some(doubled_quote_len(rest, '\'')),
+        b'"' => Some(doubled_quote_len(rest, '"')),
+        b'`' if !postgres => Some(doubled_quote_len(rest, '`')),
+        b'[' if !postgres => Some(rest[1..].find(']').map_or(rest.len(), |p| p + 2)),
+        b'e' | b'E' if postgres && word_start && rest[1..].starts_with('\'') => {
+            Some(1 + escape_string_len(&rest[1..]))
+        }
+        b'$' if postgres && word_start => dollar_quote_len(rest),
+        _ => None,
+    }
+}
+
+/// Whether `c` can be part of an identifier. Postgres and `SQLite` agree.
+const fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '_' | '$') || !c.is_ascii()
+}
+
+/// Byte length of the span at the start of `rest` that `close` ends.
+///
+/// `rest` must start with a one-byte opening character. A doubled `close` is
+/// an escaped `close`. An unclosed span runs to the end of `rest`.
+fn doubled_quote_len(rest: &str, close: char) -> usize {
+    let mut j = 1;
+    while let Some(rel) = rest[j..].find(close) {
+        let abs = j + rel;
+        if rest[abs + 1..].starts_with(close) {
+            j = abs + 2;
+        } else {
+            return abs + 1;
+        }
+    }
+    rest.len()
+}
+
+/// Byte length of the `'` literal at the start of `rest`, where `\` escapes
+/// the next character (the body of a Postgres `E'..'` string). A doubled `''`
+/// is also an escaped quote. An unclosed literal runs to the end of `rest`.
+fn escape_string_len(rest: &str) -> usize {
+    let mut chars = rest.char_indices().skip(1);
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\'' if rest[i + 1..].starts_with('\'') => {
+                chars.next();
+            }
+            '\'' => return i + 1,
+            _ => {}
+        }
+    }
+    rest.len()
+}
+
+/// Byte length of the dollar-quoted block (`$$…$$`, `$tag$…$tag$`) at the
+/// start of `rest`, or `None` when `rest` does not start one. An unclosed
+/// block runs to the end of `rest`.
+fn dollar_quote_len(rest: &str) -> Option<usize> {
+    let after = rest.strip_prefix('$')?;
+    let tag_body = &after[..after.find('$')?];
+    // `$1` is a parameter, so a tag cannot start with a digit.
+    if tag_body.starts_with(|c: char| c.is_ascii_digit())
+        || !tag_body.chars().all(|c| is_identifier_char(c) && c != '$')
+    {
+        return None;
+    }
+    let tag_len = tag_body.len() + 2;
+    let tag = &rest[..tag_len];
+    Some(
+        rest[tag_len..]
+            .find(tag)
+            .map_or(rest.len(), |p| p + 2 * tag_len),
+    )
+}
+
+/// Byte length of the line comment at the start of `rest`, or `None`. The
+/// line end is not part of the comment. Postgres ends the comment at `\n` or
+/// `\r`. `SQLite` ends it at `\n` only.
+fn line_comment_len(backend: DatabaseBackend, rest: &str) -> Option<usize> {
+    let end: &[char] = match backend {
+        DatabaseBackend::Postgres => &['\n', '\r'],
+        DatabaseBackend::Sqlite => &['\n'],
+    };
+    rest.starts_with("--")
+        .then(|| rest.find(end).unwrap_or(rest.len()))
+}
+
+/// Byte length of the block comment at the start of `rest`, or `None`.
+/// Postgres comments nest, so each `/*` needs its own `*/`. `SQLite` comments
+/// end at the first `*/`. An unclosed comment runs to the end of `rest`.
+fn block_comment_len(backend: DatabaseBackend, rest: &str) -> Option<usize> {
+    if !rest.starts_with("/*") {
+        return None;
+    }
+    let nests = backend == DatabaseBackend::Postgres;
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i..].starts_with("/*") && (nests || depth == 0) {
+            depth += 1;
+            i += 2;
+        } else if rest[i..].starts_with("*/") {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Some(i);
             }
         } else {
-            result.push(c);
+            i += rest[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    Some(rest.len())
+}
+
+/// Byte length of the `SQLite` variable at the start of `rest`, or `None`.
+///
+/// A variable is `$`, `@`, `:` or `#`, then name characters. A `(` after the
+/// name runs to `)` or to a space, as in `$a(x)`. A quote in the variable is
+/// text, as in `SQLite`.
+fn sqlite_variable_len(rest: &str) -> Option<usize> {
+    let body = rest.strip_prefix(['$', '@', ':', '#'])?;
+    let name_len: usize = body
+        .chars()
+        .take_while(|&c| is_identifier_char(c))
+        .map(char::len_utf8)
+        .sum();
+    if name_len == 0 {
+        return None;
+    }
+    let after = &body[name_len..];
+    let args_len = if after.starts_with('(') {
+        after
+            .find(|c: char| c == ')' || c.is_whitespace())
+            .map_or(after.len(), |p| {
+                p + usize::from(after[p..].starts_with(')'))
+            })
+    } else {
+        0
+    };
+    Some(1 + name_len + args_len)
+}
+
+/// Replace each `/* ... */` block comment in `sql` with one space.
+///
+/// A `/*` in a `--` comment or a quoted span starts nothing. Line comments
+/// stay because `has_review_suppression` reads them.
+pub fn strip_block_comments(backend: DatabaseBackend, sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    for (kind, text) in tokens(backend, sql) {
+        if kind == TokenKind::BlockComment {
+            result.push(' '); // keep the token boundary
+        } else {
+            result.push_str(text);
         }
     }
     result
 }
 
-/// Strip line comments, collapse whitespace, and lowercase a single statement.
-pub fn normalize_statement(stmt: &str) -> String {
-    let without_block_comments = strip_block_comments(stmt);
-    without_block_comments
-        .lines()
-        .map(|line| line.find("--").map_or(line, |i| &line[..i]))
-        .flat_map(str::split_whitespace)
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase()
+/// Remove `--` line comments from `sql`, keeping newlines. A `--` in a quoted
+/// span is text.
+fn strip_line_comments(backend: DatabaseBackend, sql: &str) -> String {
+    tokens(backend, sql)
+        .filter(|(kind, _)| *kind != TokenKind::LineComment)
+        .map(|(_, text)| text)
+        .collect()
+}
+
+/// Strip comments, collapse whitespace, and lowercase a single statement.
+///
+/// Quoted spans stay as they are. A later scan of the result then reads the
+/// same spans: Postgres dollar tags are case-sensitive (`$A$` is not `$a$`).
+pub fn normalize_statement(backend: DatabaseBackend, stmt: &str) -> String {
+    let stripped = strip_line_comments(backend, &strip_block_comments(backend, stmt));
+    let mut out = String::with_capacity(stripped.len());
+    for (kind, text) in tokens(backend, &stripped) {
+        if kind == TokenKind::Quoted {
+            out.push_str(text);
+            continue;
+        }
+        for c in text.chars() {
+            if !c.is_whitespace() {
+                out.extend(c.to_lowercase());
+            } else if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+        }
+    }
+    out.truncate(out.trim_end().len());
+    out
 }
 
 /// Returns `true` when `sql` contains an executable concurrent index operation
@@ -831,9 +1007,11 @@ pub fn normalize_statement(stmt: &str) -> String {
 /// Uses the same comment-stripping and whitespace-normalization pipeline as
 /// [`classify_sql_for`] so that concurrent index keywords mentioned only inside a
 /// SQL comment (e.g. `-- CREATE INDEX CONCURRENTLY ...`) are not counted.
+/// `CONCURRENTLY` is Postgres only, so the scan uses the Postgres dialect.
 pub fn contains_concurrent_index(sql: &str) -> bool {
-    split_statements(sql).iter().any(|stmt| {
-        let normalized = normalize_statement(stmt);
+    let pg = DatabaseBackend::Postgres;
+    statements(pg, sql).iter().any(|stmt| {
+        let normalized = normalize_statement(pg, stmt);
         normalized.contains("create index concurrently ")
             || normalized.contains("create unique index concurrently ")
             || normalized.starts_with("drop index concurrently ")
@@ -907,7 +1085,7 @@ fn classify_statement(
     // set: SQLite rejects them on an empty table too.
     let fresh_table = sqlite
         && extract_altered_table_name(normalized)
-            .is_some_and(|t| newly_created.iter().any(|c| *c == t));
+            .is_some_and(|t| newly_created.iter().any(|c| same_table(backend, c, t)));
 
     // DROP TABLE — check first; it subsumes DROP COLUMN detection
     if normalized.starts_with("drop table") {
@@ -1019,7 +1197,7 @@ fn classify_statement(
     // spelling, ADD/DROP CONSTRAINT, SET SCHEMA, OWNER TO — is a parse error, so
     // one rule covers them all rather than a list that can fall behind Postgres.
     if sqlite && normalized.starts_with("alter table") {
-        let subcommands = alter_table_subcommands(normalized, sqlite);
+        let subcommands = alter_table_subcommands(backend, normalized);
         // SQLite takes exactly one action per ALTER TABLE; Postgres allows a
         // comma-separated list.
         if subcommands.len() > 1 {
@@ -1078,7 +1256,7 @@ fn classify_statement(
     //     function per-row and cannot use the fast constant-default path (PG 11+),
     //     so the table is still rewritten under the exclusive lock.
     if normalized.starts_with("alter table") {
-        for subcommand in alter_table_subcommands(normalized, sqlite) {
+        for subcommand in alter_table_subcommands(backend, normalized) {
             if subcommand.starts_with("add column ") && subcommand.contains("not null") {
                 // SQLite drops a literal `DEFAULT NULL` before applying the
                 // NOT NULL check, so it is not a default there.
@@ -1153,11 +1331,11 @@ fn classify_statement(
     // ADD COLUMN with inline UNIQUE — implicitly builds a non-concurrent unique index
     // ADD COLUMN with inline REFERENCES — scans existing rows to validate the FK
     if normalized.starts_with("alter table") {
-        for subcommand in alter_table_subcommands(normalized, sqlite) {
+        for subcommand in alter_table_subcommands(backend, normalized) {
             if !subcommand.starts_with("add column ") {
                 continue;
             }
-            if has_inline_unique_constraint(&without_string_literals(subcommand)) {
+            if has_inline_unique_constraint(&blank_quoted_spans(backend, subcommand)) {
                 findings.push(if sqlite {
                     // SQLite: "Cannot add a UNIQUE column".
                     SafetyFinding {
@@ -1248,7 +1426,7 @@ fn classify_statement(
     // prevents a known-safe subcommand (e.g. ADD COLUMN) from hiding an unknown one
     // (e.g. DROP CONSTRAINT) in the same multi-action ALTER TABLE.
     if normalized.starts_with("alter table") {
-        let subcommands = alter_table_subcommands(normalized, sqlite);
+        let subcommands = alter_table_subcommands(backend, normalized);
         let all_known = subcommands
             .iter()
             .all(|s| is_known_alter_subcommand(backend, s));
@@ -2304,6 +2482,477 @@ mod tests {
     }
 
     #[test]
+    fn block_open_inside_line_comment_does_not_hide_statements() {
+        // Issue #3437: `/*` in a `--` comment has no meaning.
+        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+            for sql in [
+                "--/*\nDROP TABLE t;",
+                "-- load /var/data/*.csv later\nDROP TABLE t;",
+            ] {
+                let findings = classify_sql_for(backend, sql);
+                assert_eq!(findings.len(), 1, "{backend:?} {sql:?}");
+                assert_eq!(findings[0].risk, RiskLevel::Destructive);
+            }
+        }
+    }
+
+    #[test]
+    fn block_open_inside_literal_does_not_hide_statements() {
+        let sql = "INSERT INTO t VALUES ('/*');\nDROP TABLE t;";
+        let findings = classify_sql(sql);
+        assert!(findings.iter().any(|f| f.risk == RiskLevel::Destructive));
+    }
+
+    #[test]
+    fn line_comment_marker_inside_literal_does_not_hide_clause() {
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT '--', DROP COLUMN b;";
+        let findings = classify_sql(sql);
+        assert!(
+            findings.iter().any(|f| f.operation == "DROP COLUMN"),
+            "{findings:?}"
+        );
+    }
+
+    #[test]
+    fn review_marker_survives_block_stripping() {
+        let sql = "-- autumn-safety: reviewed /* ok\nDROP TABLE t;";
+        assert!(classify_sql(sql).is_empty());
+    }
+
+    #[test]
+    fn block_comment_after_line_comment_is_still_stripped() {
+        let sql = "-- note\n/* DROP TABLE a; */ SELECT 1;";
+        assert!(classify_sql(sql).is_empty());
+    }
+
+    #[test]
+    fn has_executable_sql_sees_statement_after_line_comment_with_block_open() {
+        assert!(has_executable_sql(
+            DatabaseBackend::Postgres,
+            "-- x /* y\nDROP TABLE t;"
+        ));
+        assert!(!has_executable_sql(
+            DatabaseBackend::Postgres,
+            "-- x /* y\n-- z"
+        ));
+    }
+
+    #[test]
+    fn concurrent_index_scan_strips_block_comments_first() {
+        assert!(contains_concurrent_index(
+            "CREATE INDEX /* a; b */ CONCURRENTLY idx ON t (c);"
+        ));
+        assert!(!contains_concurrent_index(
+            "/* x; CREATE INDEX CONCURRENTLY i ON t (c) */"
+        ));
+    }
+
+    #[test]
+    fn apostrophe_in_dollar_quote_does_not_keep_later_comment() {
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT $$it's$$ -- drop column b\n;";
+        assert!(
+            classify_sql(sql)
+                .iter()
+                .all(|f| f.operation != "DROP COLUMN")
+        );
+    }
+
+    #[test]
+    fn unclosed_spans_run_to_end_of_input() {
+        let sql = "DROP TABLE a; SELECT 'oops --/* DROP TABLE b;";
+        assert_eq!(classify_sql(sql).len(), 1);
+        assert_eq!(
+            strip_line_comments(DatabaseBackend::Postgres, "SELECT 'a -- b"),
+            "SELECT 'a -- b"
+        );
+        assert_eq!(
+            strip_block_comments(
+                DatabaseBackend::Postgres,
+                "DROP TABLE a; /* open\nDROP TABLE b;"
+            ),
+            "DROP TABLE a;  "
+        );
+        assert_eq!(strip_block_comments(DatabaseBackend::Postgres, "/*/"), " ");
+        let dollar = "SELECT $$ /* x\nDROP TABLE t;";
+        assert_eq!(
+            strip_block_comments(DatabaseBackend::Postgres, dollar),
+            dollar
+        );
+    }
+
+    #[test]
+    fn block_comments_nest_on_postgres_only() {
+        let sql = "/* a /* b */ DROP TABLE t; */";
+        assert!(classify_sql(sql).is_empty());
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"]);
+    }
+
+    #[test]
+    fn multibyte_text_does_not_break_scanning() {
+        let sql = "-- é/*\nDROP TABLE tést; /* ü */ SELECT '日本--', $é$ ; $é$;";
+        let findings = classify_sql(sql);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].risk, RiskLevel::Destructive);
+    }
+
+    #[test]
+    fn lexer_helpers_measure_spans() {
+        assert_eq!(doubled_quote_len("'a''b'x", '\''), 6);
+        assert_eq!(doubled_quote_len("`a", '`'), 2);
+        assert_eq!(escape_string_len(r"'a\'b'x"), 6);
+        assert_eq!(escape_string_len(r"'a''b'x"), 6);
+        assert_eq!(escape_string_len(r"'a\"), 3);
+        let lite = DatabaseBackend::Sqlite;
+        assert_eq!(quoted_len(lite, "[a b", None), Some(4));
+        assert_eq!(quoted_len(lite, "$$x$$", None), None);
+        // Postgres has no backtick or bracket quotes.
+        let pg = DatabaseBackend::Postgres;
+        assert_eq!(quoted_len(pg, "`a`", None), None);
+        assert_eq!(quoted_len(pg, "[a]", None), None);
+        assert_eq!(quoted_len(pg, "E'a'", Some('x')), None);
+        assert_eq!(quoted_len(pg, "$b$x$b$", Some('a')), None);
+        assert_eq!(blank_quoted_spans(pg, "a 'bc d"), "a '   d");
+        assert_eq!(dollar_quote_len("$1 AND"), None);
+        assert_eq!(dollar_quote_len("$a b$ x"), None);
+        assert_eq!(dollar_quote_len("$$x$$y"), Some(5));
+        assert_eq!(
+            line_comment_len(DatabaseBackend::Postgres, "--a\nb"),
+            Some(3)
+        );
+        assert_eq!(line_comment_len(DatabaseBackend::Postgres, "a--"), None);
+    }
+
+    #[test]
+    fn quote_in_line_comment_opens_no_literal() {
+        let findings = classify_sql("-- don't\nDROP TABLE t;");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            strip_line_comments(DatabaseBackend::Postgres, "-- don't\nx"),
+            "\nx"
+        );
+    }
+
+    #[test]
+    fn dollar_quote_hides_line_comment_marker() {
+        let sql = "DO $$ BEGIN -- x\n END $$";
+        assert_eq!(
+            normalize_statement(DatabaseBackend::Postgres, sql),
+            "do $$ BEGIN -- x\n END $$"
+        );
+    }
+
+    #[test]
+    fn has_executable_sql_follows_the_dialect() {
+        // A `SQLite` comment ends at the first `*/`. A Postgres comment nests.
+        let sql = "/* a /* */ DROP TABLE t;";
+        assert!(has_executable_sql(DatabaseBackend::Sqlite, sql));
+        assert!(!has_executable_sql(DatabaseBackend::Postgres, sql));
+    }
+
+    #[test]
+    fn quoted_table_names_follow_the_dialect_case_rule() {
+        // `SQLite` names ignore case, also in quotes. Postgres quoted names do not.
+        let lite = DatabaseBackend::Sqlite;
+        let sql =
+            r#"CREATE TABLE "Users" (id int); ALTER TABLE "users" ADD COLUMN z int NOT NULL;"#;
+        assert!(is_safe(&classify_sql_for(lite, sql)), "{sql}");
+        let sql = r#"CREATE TABLE "Users" (id int); CREATE INDEX i ON "users" (id);"#;
+        assert_eq!(ops(lite, sql), Vec::<String>::new());
+        assert_eq!(
+            ops(DatabaseBackend::Postgres, sql),
+            ["CREATE INDEX (non-concurrent)"]
+        );
+    }
+
+    #[test]
+    fn has_executable_sql_edge_inputs() {
+        assert!(has_executable_sql(
+            DatabaseBackend::Postgres,
+            "SELECT '--';"
+        ));
+        assert!(!has_executable_sql(DatabaseBackend::Postgres, ""));
+        assert!(!has_executable_sql(DatabaseBackend::Postgres, "/* only */"));
+    }
+
+    #[test]
+    fn identifier_quoting_forms_do_not_hide_later_statements() {
+        for (backend, sql) in [
+            (
+                DatabaseBackend::Postgres,
+                "SELECT ARRAY[$$]$$]; DROP TABLE t;",
+            ),
+            (
+                DatabaseBackend::Postgres,
+                "SELECT ARRAY['a]']; DROP TABLE t;",
+            ),
+            (
+                DatabaseBackend::Sqlite,
+                "CREATE TABLE `a\"b` (id int); DROP TABLE t;",
+            ),
+            (
+                DatabaseBackend::Sqlite,
+                "CREATE TABLE [a\"b] (id int); DROP TABLE t;",
+            ),
+        ] {
+            let f = classify_sql_for(backend, sql);
+            assert!(
+                f.iter().any(|f| f.risk == RiskLevel::Destructive),
+                "{sql}: {f:?}"
+            );
+        }
+    }
+
+    /// Operations found in `sql` for `backend`.
+    fn ops(backend: DatabaseBackend, sql: &str) -> Vec<String> {
+        classify_sql_for(backend, sql)
+            .into_iter()
+            .map(|f| f.operation)
+            .collect()
+    }
+
+    #[test]
+    fn markers_in_quoted_identifiers_hide_no_statement() {
+        // Issue #3518. Each identifier holds a `/*`, `--`, `'` or `;`.
+        let pg = DatabaseBackend::Postgres;
+        let lite = DatabaseBackend::Sqlite;
+        let mut cases = Vec::new();
+        for backend in [pg, lite] {
+            for ident in [
+                r#""a/*b""#,
+                r#""a--b""#,
+                r#""a'b""#,
+                r#""a;drop table y""#,
+                r#""a""/*b""#,
+            ] {
+                cases.push((backend, ident));
+            }
+        }
+        for ident in [
+            "`a/*b`",
+            "`a--b`",
+            "`a'b`",
+            "`a;drop table y`",
+            "`a``/*b`",
+            "[a/*b]",
+            "[a--b]",
+            "[a'b]",
+            "[a;drop table y]",
+        ] {
+            cases.push((lite, ident));
+        }
+        for (backend, ident) in cases {
+            let sql = format!("CREATE TABLE {ident} (id int); DROP TABLE x;");
+            assert_eq!(ops(backend, &sql), ["DROP TABLE"], "{backend:?} {sql}");
+            let sql = format!("CREATE TABLE {ident} (id int);\nDROP TABLE x;");
+            assert_eq!(ops(backend, &sql), ["DROP TABLE"], "{backend:?} {sql}");
+        }
+    }
+
+    #[test]
+    fn escape_string_hides_no_statement() {
+        // Issue #3518. In a Postgres `E'..'` string, `\'` is a quote. Outside
+        // `E'..'`, `\` is text.
+        for lit in [
+            r"E'\''",
+            r"e'\''",
+            r"E'a\'b'",
+            r"E'\\'",
+            r"E'\'--/*;'",
+            r"E'it''s; x'",
+            r"E'\é'",
+            r#""x"E'\''"#,
+            r"U&'\0041'",
+            r"'C:\'",
+            r"xe'\'",
+        ] {
+            let sql = format!("SELECT {lit}; DROP TABLE x;");
+            assert_eq!(
+                ops(DatabaseBackend::Postgres, &sql),
+                ["DROP TABLE"],
+                "{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn dollar_quote_rules_follow_the_dialect() {
+        // Issue #3518. `a$b$` is one identifier. `SQLite` has no dollar quotes.
+        let sql = "CREATE TABLE t (a$b$ int); DROP TABLE x;";
+        for backend in [DatabaseBackend::Postgres, DatabaseBackend::Sqlite] {
+            assert_eq!(ops(backend, sql), ["DROP TABLE"], "{backend:?}");
+        }
+        let sql = "SELECT $y$z; DROP TABLE x;";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"]);
+        // Postgres still keeps a function body whole.
+        let sql = "CREATE FUNCTION f() RETURNS int AS $b$ SELECT 1; $b$ LANGUAGE sql;";
+        assert_eq!(ops(DatabaseBackend::Postgres, sql), ["Unclassified DDL"]);
+        // `SQLite` has no `E'..'` strings, so `\` is text there.
+        let sql = r"SELECT E'\'; DROP TABLE x;";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"]);
+    }
+
+    #[test]
+    fn quote_in_identifier_hides_no_clause() {
+        // Issue #3518. A `'` in an identifier opens no literal.
+        let pg = DatabaseBackend::Postgres;
+        let lite = DatabaseBackend::Sqlite;
+        let sql = r#"ALTER TABLE t ADD COLUMN "it's" text UNIQUE;"#;
+        assert_eq!(ops(pg, sql), ["ADD COLUMN UNIQUE (inline constraint)"]);
+        let sql = "ALTER TABLE t ADD COLUMN [it's] text UNIQUE;";
+        assert_eq!(
+            ops(lite, sql),
+            ["ADD COLUMN UNIQUE (unsupported on SQLite)"]
+        );
+        let sql = r#"CREATE TABLE "it's" (id int) PARTITION BY RANGE (id);"#;
+        assert_eq!(
+            ops(lite, sql),
+            ["CREATE TABLE with a Postgres-only clause (unsupported on SQLite)"]
+        );
+        // A `\'` in an escape string and a word in a dollar quote are text.
+        for sql in [
+            r"ALTER TABLE t ADD COLUMN a text DEFAULT E'\' unique ';",
+            "ALTER TABLE t ADD COLUMN a text DEFAULT $$ not unique $$;",
+        ] {
+            assert_eq!(ops(pg, sql), Vec::<String>::new(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn comma_in_quoted_span_splits_no_alter_subcommand() {
+        // Issue #3518. A `,` in a quoted span is text on both backends.
+        for (backend, sql) in [
+            (
+                DatabaseBackend::Postgres,
+                r#"ALTER TABLE t ADD COLUMN "a,b" text DEFAULT 'x, y', DROP COLUMN c;"#,
+            ),
+            (
+                DatabaseBackend::Postgres,
+                r"ALTER TABLE t ADD COLUMN a text DEFAULT E'\', y', DROP COLUMN c;",
+            ),
+            (
+                DatabaseBackend::Postgres,
+                "ALTER TABLE t ADD COLUMN a text DEFAULT $$x, y$$, DROP COLUMN c;",
+            ),
+            (DatabaseBackend::Sqlite, "ALTER TABLE t DROP COLUMN [a,b];"),
+        ] {
+            assert_eq!(ops(backend, sql), ["DROP COLUMN"], "{backend:?} {sql}");
+        }
+    }
+
+    #[test]
+    fn quoted_table_name_merges_no_alter_subcommand() {
+        // Issue #3518. A space in a quoted table name does not end the name.
+        let pg = DatabaseBackend::Postgres;
+        for table in [r#""my table""#, r#"s."my table""#] {
+            for head in ["", "IF EXISTS ", "ONLY ", "IF EXISTS ONLY "] {
+                let sql = format!(
+                    "ALTER TABLE {head}{table} ADD COLUMN a int, ADD COLUMN b int NOT NULL;"
+                );
+                assert_eq!(ops(pg, &sql), ["ADD COLUMN NOT NULL (no default)"], "{sql}");
+            }
+        }
+        let sql = r#"ALTER TABLE "my table" ADD COLUMN b int UNIQUE;"#;
+        assert_eq!(ops(pg, sql), ["ADD COLUMN UNIQUE (inline constraint)"]);
+        let sql = "ALTER TABLE [my table] ADD COLUMN b int UNIQUE;";
+        assert_eq!(
+            ops(DatabaseBackend::Sqlite, sql),
+            ["ADD COLUMN UNIQUE (unsupported on SQLite)"]
+        );
+    }
+
+    #[test]
+    fn paren_in_quoted_span_merges_no_alter_subcommand() {
+        // Issue #3518. A `(` in a literal does not change the depth.
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT '(', ALTER COLUMN b SET NOT NULL;";
+        assert_eq!(
+            ops(DatabaseBackend::Postgres, sql),
+            ["Unclassified ALTER TABLE"]
+        );
+    }
+
+    #[test]
+    fn postgres_lexer_rules_hide_no_statement() {
+        // Issue #3518. Each case follows a Postgres lexer rule.
+        for sql in [
+            // Dollar tags are case-sensitive.
+            "ALTER TABLE t ADD COLUMN c text DEFAULT $A$ $a$ ' $A$, ADD COLUMN z int NOT NULL;",
+            // Block comments nest.
+            "/*\nCREATE TABLE old (id int); /* legacy */\n*/\nALTER TABLE t ADD COLUMN z int NOT NULL;",
+            "/* /* */ ' */ ALTER TABLE t ADD COLUMN z int NOT NULL; -- '",
+            // A tag can hold any non-ASCII character.
+            "SELECT $€$/*$€$; ALTER TABLE t ADD COLUMN z int NOT NULL;",
+            // A bare CR ends a line comment.
+            "-- note\rALTER TABLE t ADD COLUMN z int NOT NULL;",
+        ] {
+            assert_eq!(
+                ops(DatabaseBackend::Postgres, sql),
+                ["ADD COLUMN NOT NULL (no default)"],
+                "{sql:?}"
+            );
+        }
+        // A tag cannot start with a digit: `$1` is a parameter.
+        assert_eq!(dollar_quote_len("$1$x$1$"), None);
+        assert_eq!(dollar_quote_len("$t1$x$t1$"), Some(9));
+    }
+
+    #[test]
+    fn sqlite_lexer_rules_hide_no_statement() {
+        // Issue #3518. A `SQLite` variable such as `$a(..)` runs to `)` or a space.
+        for sql in [
+            "SELECT $a([); DROP TABLE x; -- ]",
+            "SELECT :a(\"); DROP TABLE x; -- \"",
+            "SELECT @a(`); DROP TABLE x; -- `",
+            "SELECT $a('); DROP TABLE x; SELECT '';",
+        ] {
+            assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"], "{sql}");
+        }
+        // Block comments do not nest, and only `\n` ends a line comment.
+        let sql = "/* a /* b */ DROP TABLE x;";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), ["DROP TABLE"]);
+        let sql = "-- a\rDROP TABLE x;\nSELECT 1;";
+        assert_eq!(ops(DatabaseBackend::Sqlite, sql), Vec::<String>::new());
+        assert_eq!(sqlite_variable_len("$a(x y"), Some(4));
+        assert_eq!(sqlite_variable_len(":a(x)y"), Some(5));
+        assert_eq!(sqlite_variable_len("$("), None);
+        // In `a$b(`, `$b` is part of the name `a$b`.
+        let texts: Vec<_> = tokens(DatabaseBackend::Sqlite, "a$b(")
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(texts, ["a", "$", "b", "("]);
+    }
+
+    mod quoted_identifier_proptest {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// Issue #3518. No identifier text hides a later statement.
+            #[test]
+            fn quoted_identifier_hides_no_statement(
+                body in "[a-z;'\"`\\[\\]$/*\\- \n]{0,12}",
+                form in 0..4usize,
+            ) {
+                let (backend, ident) = match form {
+                    0 => (DatabaseBackend::Postgres, format!("\"{}\"", body.replace('"', "\"\""))),
+                    1 => (DatabaseBackend::Sqlite, format!("\"{}\"", body.replace('"', "\"\""))),
+                    2 => (DatabaseBackend::Sqlite, format!("`{}`", body.replace('`', "``"))),
+                    _ => (DatabaseBackend::Sqlite, format!("[{}]", body.replace(']', ""))),
+                };
+                let sql = format!("CREATE TABLE {ident} (id int); DROP TABLE x;");
+                prop_assert_eq!(ops(backend, &sql), ["DROP TABLE"], "{}", sql);
+            }
+
+            /// The token texts join back to the input.
+            #[test]
+            fn tokens_join_back_to_the_input(sql in any::<String>(), pg in any::<bool>()) {
+                let backend = if pg { DatabaseBackend::Postgres } else { DatabaseBackend::Sqlite };
+                let joined: String = tokens(backend, &sql).map(|(_, text)| text).collect();
+                prop_assert_eq!(joined, sql);
+            }
+        }
+    }
+
+    #[test]
     fn block_comment_between_keywords_preserves_token_boundary() {
         // `DROP/* note */TABLE posts` must not concatenate to `DROPTABLE posts`,
         // which would miss both the `drop table` rule and the `drop ` catch-all.
@@ -2369,7 +3018,7 @@ mod tests {
              title TEXT NOT NULL DEFAULT 'hello; world',\n    \
              created_at TIMESTAMP NOT NULL DEFAULT NOW()\n\
              );";
-        let statements = split_statements(sql);
+        let statements = split_statements(DatabaseBackend::Postgres, sql);
         assert_eq!(
             statements.len(),
             1,
@@ -2383,14 +3032,14 @@ mod tests {
         // `''` is the standard SQL-escaped single quote; a semicolon after one
         // must still be treated as inside the (still-open) literal.
         let sql = "INSERT INTO posts (title) VALUES ('it''s; still one literal');";
-        let statements = split_statements(sql);
+        let statements = split_statements(DatabaseBackend::Postgres, sql);
         assert_eq!(statements.len(), 1, "got: {statements:?}");
     }
 
     #[test]
     fn split_statements_multiple_string_literals_with_semicolons() {
         let sql = "CREATE TABLE posts (a TEXT DEFAULT 'x;y', b TEXT DEFAULT 'p;q');";
-        let statements = split_statements(sql);
+        let statements = split_statements(DatabaseBackend::Postgres, sql);
         assert_eq!(statements.len(), 1, "got: {statements:?}");
     }
 
@@ -2450,39 +3099,55 @@ mod tests {
 
     #[test]
     fn has_executable_sql_empty_string_is_false() {
-        assert!(!has_executable_sql(""));
+        assert!(!has_executable_sql(DatabaseBackend::Postgres, ""));
     }
 
     #[test]
     fn has_executable_sql_whitespace_only_is_false() {
-        assert!(!has_executable_sql("   \n\t\n  "));
+        assert!(!has_executable_sql(
+            DatabaseBackend::Postgres,
+            "   \n\t\n  "
+        ));
     }
 
     #[test]
     fn has_executable_sql_line_comment_only_is_false() {
-        assert!(!has_executable_sql("-- nothing here\n-- just comments"));
+        assert!(!has_executable_sql(
+            DatabaseBackend::Postgres,
+            "-- nothing here\n-- just comments"
+        ));
     }
 
     #[test]
     fn has_executable_sql_block_comment_only_is_false() {
-        assert!(!has_executable_sql("/* block comment only */"));
+        assert!(!has_executable_sql(
+            DatabaseBackend::Postgres,
+            "/* block comment only */"
+        ));
     }
 
     #[test]
     fn has_executable_sql_real_sql_is_true() {
-        assert!(has_executable_sql("DROP TABLE posts;"));
+        assert!(has_executable_sql(
+            DatabaseBackend::Postgres,
+            "DROP TABLE posts;"
+        ));
     }
 
     #[test]
     fn has_executable_sql_comment_plus_sql_is_true() {
         assert!(has_executable_sql(
+            DatabaseBackend::Postgres,
             "-- undo the migration\nDROP TABLE posts;"
         ));
     }
 
     #[test]
     fn has_executable_sql_no_trailing_semicolon_is_true() {
-        assert!(has_executable_sql("DROP TABLE posts"));
+        assert!(has_executable_sql(
+            DatabaseBackend::Postgres,
+            "DROP TABLE posts"
+        ));
     }
 
     // ── SQLite dialect (#1906) ────────────────────────────────────────────────
@@ -3020,33 +3685,215 @@ mod tests {
 
     #[test]
     fn alter_table_subcommands_ignores_a_comma_in_a_string_literal() {
-        let subs =
-            alter_table_subcommands("alter table posts add column l text default 'a,b'", true);
+        let subs = alter_table_subcommands(
+            DatabaseBackend::Sqlite,
+            "alter table posts add column l text default 'a,b'",
+        );
         assert_eq!(subs, ["add column l text default 'a,b'"]);
         let subs = alter_table_subcommands(
+            DatabaseBackend::Sqlite,
             "alter table posts add column l text default 'it''s,x'",
-            true,
         );
         assert_eq!(subs.len(), 1, "{subs:?}");
-        let subs = alter_table_subcommands("alter table posts drop column \"a,b\"", true);
+        let subs = alter_table_subcommands(
+            DatabaseBackend::Sqlite,
+            "alter table posts drop column \"a,b\"",
+        );
         assert_eq!(subs.len(), 1, "{subs:?}");
     }
 
     #[test]
     fn alter_table_subcommands_splits_after_an_escaped_quote() {
         let subs = alter_table_subcommands(
+            DatabaseBackend::Sqlite,
             "alter table posts add column a text default 'it''s', add column b text",
-            true,
         );
         assert_eq!(
             subs,
             ["add column a text default 'it''s'", "add column b text"]
         );
         let subs = alter_table_subcommands(
+            DatabaseBackend::Sqlite,
             "alter table posts add column a text default 'it''s,x'",
-            true,
         );
         assert_eq!(subs, ["add column a text default 'it''s,x'"]);
+    }
+
+    // ── #3527 (issue #3521): Postgres ALTER TABLE split ──────────────────────
+
+    fn pg_subs(sql: &str) -> Vec<&str> {
+        alter_table_subcommands(DatabaseBackend::Postgres, sql)
+    }
+
+    #[test]
+    fn pg_split_ignores_a_paren_in_a_string_literal() {
+        for lit in ["'('", "')'", "'/* ( */'", "'it''s ('"] {
+            let sql = format!("alter table t add column a text default {lit}, add column b int");
+            assert_eq!(pg_subs(&sql).len(), 2, "{lit}");
+        }
+    }
+
+    #[test]
+    fn pg_split_ignores_a_paren_in_a_dollar_quote() {
+        for lit in ["$$($$", "$tag$($tag$", "$$ ( ' $$"] {
+            let sql = format!("alter table t add column a text default {lit}, add column b int");
+            assert_eq!(pg_subs(&sql).len(), 2, "{lit}");
+        }
+    }
+
+    #[test]
+    fn pg_split_honours_backslash_escapes_in_e_strings() {
+        let subs = pg_subs("alter table t add column a text default e'it\\'s', add column b int");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        let subs = pg_subs("alter table t add column a text default e'\\'(', add column b int");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_ignores_a_quote_inside_a_quoted_name() {
+        for name in [r#""a'b""#, r#""$$""#, r#""e'""#, r#""a""'b""#, r#""a(b""#] {
+            let sql = format!("alter table t add column {name} int, drop column c");
+            let subs = pg_subs(&sql);
+            assert_eq!(subs.len(), 2, "{name}: {subs:?}");
+        }
+    }
+
+    #[test]
+    fn quote_in_a_quoted_name_does_not_hide_a_drop_column() {
+        let sql = r#"ALTER TABLE t ADD COLUMN "a'b" int, DROP COLUMN c;"#;
+        assert_eq!(ops(DatabaseBackend::Postgres, sql), ["DROP COLUMN"]);
+    }
+
+    #[test]
+    fn dollar_tag_cannot_start_with_a_digit() {
+        assert_eq!(dollar_quote_len("$1$ x $1$"), None);
+        assert_eq!(dollar_quote_len("$a1$ x $a1$"), Some(11));
+        let subs =
+            pg_subs("alter table t add column a int default $1$, add column b int, drop column c$");
+        assert_eq!(subs.len(), 3, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_reads_a_quoted_table_name_with_spaces() {
+        for table in [r#""my table""#, r#""x add column y""#, r#"s."my table""#] {
+            let sql = format!(
+                "alter table {table} add column a text default 'ok', add column b int not null"
+            );
+            assert_eq!(
+                pg_subs(&sql),
+                [
+                    "add column a text default 'ok'",
+                    "add column b int not null"
+                ],
+                "{table}"
+            );
+        }
+    }
+
+    #[test]
+    fn dollar_tag_case_does_not_close_a_literal_early() {
+        for lit in [
+            "$tag$ $TAG$ $tag$",
+            "$tag$ x$TAG$y $tag$",
+            "$Tag$ $tag$ $Tag$",
+            "$Tag$ $X$Tag$",
+            "$a$ $A$A$ $a$",
+            "'$A$', $B$ $b$ $B$",
+        ] {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a text DEFAULT {lit}, ADD COLUMN b int NOT NULL;"
+            );
+            assert!(
+                ops(DatabaseBackend::Postgres, &sql)
+                    .contains(&"ADD COLUMN NOT NULL (no default)".to_owned()),
+                "{lit}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_quoted_spans_verbatim() {
+        let pg = DatabaseBackend::Postgres;
+        for (sql, want) in [
+            ("SELECT $Tag$ ABC", "select $Tag$ ABC"),
+            ("SELECT $Tag$", "select $Tag$"),
+            ("SELECT E'A''B'", "select E'A''B'"),
+            ("SELECT E'A\\'B' X", "select E'A\\'B' x"),
+            ("SELECT E'AB", "select E'AB"),
+            (
+                "SELECT $Tag$ ABC $Tag$ $$ X $$",
+                "select $Tag$ ABC $Tag$ $$ X $$",
+            ),
+        ] {
+            assert_eq!(normalize_statement(pg, sql), want, "{sql}");
+        }
+    }
+
+    #[test]
+    fn pg_split_handles_unclosed_and_escaped_names_and_e_strings() {
+        assert_eq!(
+            pg_subs(r#"alter table t drop column "a, drop column b"#).len(),
+            1
+        );
+        assert!(pg_subs(r#"alter table "t, add column a int"#).is_empty());
+        let subs = pg_subs("alter table t add column a text default e'x''(', drop column b");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        assert_eq!(
+            pg_subs("alter table t add column a text default e'x(, y").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn sqlite_table_name_with_a_double_quote_inside_backticks() {
+        let sql = "ALTER TABLE `a\"b` ADD COLUMN c INT NOT NULL;";
+        assert_eq!(
+            ops(DatabaseBackend::Sqlite, sql),
+            ["ADD COLUMN NOT NULL (no default)"]
+        );
+    }
+
+    #[test]
+    fn pg_split_keeps_a_comma_inside_a_literal_together() {
+        let subs = pg_subs("alter table t add column a text default 'x,y', drop column b");
+        assert_eq!(subs, ["add column a text default 'x,y'", "drop column b"]);
+    }
+
+    #[test]
+    fn pg_split_does_not_treat_a_name_ending_in_e_or_dollar_as_a_quote() {
+        let subs = pg_subs("alter table t add column name text default ('a'), drop column b");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        let subs = pg_subs("alter table t add column a$b$ int, drop column b");
+        assert_eq!(subs.len(), 2, "{subs:?}");
+    }
+
+    #[test]
+    fn pg_split_survives_an_unclosed_literal() {
+        for sql in [
+            "alter table t add column a text default '(, x",
+            "alter table t add column a text default $$(, x",
+        ] {
+            assert_eq!(pg_subs(sql).len(), 1, "{sql}");
+        }
+    }
+
+    #[test]
+    fn paren_in_a_literal_does_not_hide_a_finding() {
+        let sql = "ALTER TABLE t ADD COLUMN a text DEFAULT '(', ADD COLUMN b int NOT NULL;";
+        assert_eq!(
+            ops(DatabaseBackend::Postgres, sql),
+            ["ADD COLUMN NOT NULL (no default)"]
+        );
+        for lit in ["'('", "')'", "$$($$", "'/* ( */'"] {
+            let sql = format!(
+                "ALTER TABLE t ADD COLUMN a text DEFAULT {lit}, DROP CONSTRAINT important_check;"
+            );
+            let f = classify_sql_for(DatabaseBackend::Postgres, &sql);
+            assert!(
+                f.iter().any(|f| f.risk == RiskLevel::ManualReview),
+                "{lit}: {f:?}"
+            );
+        }
     }
 
     #[test]
@@ -3055,7 +3902,11 @@ mod tests {
             "alter table posts drop `a,b`",
             "alter table posts drop [a,b]",
         ] {
-            assert_eq!(alter_table_subcommands(sql, true).len(), 1, "{sql}");
+            assert_eq!(
+                alter_table_subcommands(DatabaseBackend::Sqlite, sql).len(),
+                1,
+                "{sql}"
+            );
         }
     }
 
@@ -3091,8 +3942,8 @@ mod tests {
 
     #[test]
     fn postgres_dollar_quote_cannot_hide_a_drop_column() {
-        // Quote tracking is SQLite-only. On Postgres the apostrophe in `$$..$$`
-        // must not merge the DROP COLUMN into the ADD COLUMN.
+        // The apostrophe in `$$..$$` must not merge the DROP COLUMN into the
+        // ADD COLUMN.
         let f = classify_sql_for(
             DatabaseBackend::Postgres,
             "ALTER TABLE t ADD COLUMN a text DEFAULT $$it's$$, DROP COLUMN b;",

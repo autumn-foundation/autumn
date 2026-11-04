@@ -39,6 +39,10 @@
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 
+/// The futures of the public ingress services (#2830).
+#[path = "request_meta_alloc_gate/ingress_futures.rs"]
+mod ingress_futures;
+
 use autumn_web::log::filter::ParameterFilter;
 use autumn_web::middleware::{AccessLogLayer, LogContextLayer, RequestId};
 use axum::body::Body;

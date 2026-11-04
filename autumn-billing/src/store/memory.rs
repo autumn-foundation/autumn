@@ -75,9 +75,9 @@ impl BillingStore for MemoryBillingStore {
             let stale_after =
                 chrono::Duration::from_std(stale_after).unwrap_or(chrono::Duration::MAX);
             match inner.events.get_mut(event_id) {
-                Some(row) if row.applied_at.is_some() => EventClaim::Duplicate,
+                Some(row) if row.applied_at.is_some() => EventClaim::Applied,
                 Some(row) if now.signed_duration_since(row.claimed_at) < stale_after => {
-                    EventClaim::Duplicate
+                    EventClaim::InFlight
                 }
                 Some(row) => {
                     row.claimed_at = now;
@@ -604,7 +604,7 @@ mod tests {
         );
         assert_eq!(
             store.claim_event("evt_1", "x", at(1), ttl).await.unwrap(),
-            EventClaim::Duplicate
+            EventClaim::InFlight
         );
         store.release_event("evt_1").await.unwrap();
         assert_eq!(
@@ -615,7 +615,7 @@ mod tests {
         store.release_event("evt_1").await.unwrap();
         assert_eq!(
             store.claim_event("evt_1", "x", at(4), ttl).await.unwrap(),
-            EventClaim::Duplicate
+            EventClaim::Applied
         );
         assert_eq!(store.applied_event_count().await.unwrap(), 1);
     }

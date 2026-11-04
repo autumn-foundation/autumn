@@ -720,8 +720,8 @@ fn path_requires_mtls(path: &str, required_paths: &[String]) -> bool {
 }
 
 /// Build the `mtls` dimension (declared): one entry per route, flagged when the
-/// listener requests certificates AND the route matches a `required_paths`
-/// prefix.
+/// listener requests certificates AND either the mode is `required` or the
+/// route matches a `required_paths` prefix.
 ///
 /// Every route gets an entry, not just the required ones: the diff's job is to
 /// notice a route that *stopped* requiring mTLS, which needs the negative rows
@@ -733,13 +733,17 @@ fn build_mtls_dimension(routes: &[AuditRoute], client_auth: &ClientAuthDump) -> 
     // `mode = "off"` never requests a certificate, so no route can require one
     // — mirroring `ClientAuthMode::requests_certificate`.
     let listener_requests = client_auth.mode != "off";
+    // `required` fails the handshake without a certificate, so every route is
+    // protected whatever `required_paths` holds.
+    let listener_mandates = client_auth.mode == "required";
 
     let mut entries: Vec<MtlsEntry> = routes
         .iter()
         .map(|r| MtlsEntry {
             path: r.path.clone(),
             method: r.method.clone(),
-            mtls_required: listener_requests && path_requires_mtls(&r.path, &required_paths),
+            mtls_required: listener_requests
+                && (listener_mandates || path_requires_mtls(&r.path, &required_paths)),
         })
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
@@ -1458,6 +1462,25 @@ mod tests {
         // Every route gets a row, including the negative ones — the diff needs
         // them to notice a route that STOPPED requiring a certificate.
         assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn mtls_required_mode_protects_every_route() {
+        // The handshake demands a certificate for every route (#2706).
+        let routes = vec![
+            route("GET", "/internal/keys", "keys", "gated"),
+            route("GET", "/health", "health", "framework"),
+        ];
+        for paths in [&[][..], &["/internal"][..]] {
+            let json = manifest_value(&build_manifest(
+                &routes,
+                Some(&security_dump_with_mtls("required", paths)),
+            ));
+            let entries = json["dimensions"]["mtls"]["entries"]
+                .as_array()
+                .expect("entries");
+            assert!(entries.iter().all(|e| e["mtls_required"] == true));
+        }
     }
 
     #[test]

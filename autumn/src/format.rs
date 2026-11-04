@@ -69,6 +69,8 @@ impl<'a> CurrencyOptions<'a> {
     }
 
     /// Set the number of decimal places to round and display (default `2`).
+    ///
+    /// A value above 28 (`Decimal::MAX_SCALE`) is treated as 28.
     #[must_use]
     pub const fn precision(mut self, precision: u32) -> Self {
         self.precision = precision;
@@ -113,24 +115,22 @@ pub fn number_to_currency(value: Decimal) -> maud::Markup {
 
 #[cfg(feature = "maud")]
 fn format_currency(value: Decimal, options: &CurrencyOptions<'_>) -> String {
-    // `round_dp` rounds but does not pad trailing zeros onto a shorter scale
-    // (e.g. 1234.5 stays scale=1), so the digit string is built by rounding
-    // first, then formatting with an explicit precision to force zero-padding.
+    // `Decimal`'s `Display` panics when a requested precision overflows its
+    // 32-char buffer. Round, print without a precision, then pad zeros here.
+    // A `Decimal` has at most `MAX_SCALE` places, so clamp to that.
+    let precision = options.precision.min(Decimal::MAX_SCALE);
     let rounded = value.round_dp_with_strategy(
-        options.precision,
+        precision,
         rust_decimal::RoundingStrategy::MidpointAwayFromZero,
     );
     let negative = rounded.is_sign_negative() && !rounded.is_zero();
-    let digits = format!(
-        "{:.prec$}",
-        rounded.abs(),
-        prec = options.precision as usize
-    );
+    let digits = rounded.abs().to_string();
     let (int_part, frac_part) = split_decimal_string(&digits);
+    let frac = format!("{frac_part:0<width$}", width = precision as usize);
     assemble_signed_grouped(
         negative,
         int_part,
-        frac_part,
+        &frac,
         options.thousands_separator,
         options.decimal_separator,
         options.symbol,
@@ -197,6 +197,51 @@ fn group_thousands(int_digits: &str, separator: char) -> String {
         out.push(ch);
     }
     out
+}
+
+// ── Human-readable sizes ─────────────────────────────────────────────────────
+
+const SIZE_UNITS: [&str; 7] = ["Bytes", "KB", "MB", "GB", "TB", "PB", "EB"];
+
+/// Format a byte count as a human-readable size: `512 Bytes`, `1.5 KB`,
+/// `3 MB`.
+///
+/// Units are binary (1 KB = 1024 bytes). The value is rounded to one decimal
+/// place and a trailing `.0` is dropped. Integer math only, so no float
+/// rounding surprises.
+#[must_use]
+pub fn human_size(bytes: u64) -> String {
+    if bytes == 1 {
+        return "1 Byte".to_owned();
+    }
+    let mut exp = 0usize;
+    let mut unit: u128 = 1;
+    while exp + 1 < SIZE_UNITS.len() && u128::from(bytes) >= unit * 1024 {
+        unit *= 1024;
+        exp += 1;
+    }
+    // Tenths of the unit, rounded half up.
+    let mut tenths = (u128::from(bytes) * 10 + unit / 2) / unit;
+    // 1023.96 KB rounds to 1024 KB; promote it to 1 MB.
+    if exp > 0 && exp + 1 < SIZE_UNITS.len() && tenths >= 10 * 1024 {
+        exp += 1;
+        tenths = (tenths + 512) / 1024;
+    }
+    let label = SIZE_UNITS.get(exp).copied().unwrap_or("EB");
+    if exp == 0 || tenths.is_multiple_of(10) {
+        format!("{} {label}", tenths / 10)
+    } else {
+        format!("{}.{} {label}", tenths / 10, tenths % 10)
+    }
+}
+
+/// Render a byte count as a human-readable size (see [`human_size`]), as
+/// escaped [`maud::Markup`].
+#[cfg(feature = "maud")]
+#[must_use]
+pub fn number_to_human_size(bytes: u64) -> maud::Markup {
+    let text = human_size(bytes);
+    maud::html! { (text) }
 }
 
 // ── Pluralize ────────────────────────────────────────────────────────────────
@@ -398,6 +443,34 @@ mod tests {
         s.parse().unwrap()
     }
 
+    // ── human_size ──────────────────────────────────────────────────────
+
+    #[test]
+    fn human_size_formats_each_unit() {
+        let cases: [(u64, &str); 12] = [
+            (0, "0 Bytes"),
+            (1, "1 Byte"),
+            (512, "512 Bytes"),
+            (1023, "1023 Bytes"),
+            (1024, "1 KB"),
+            (1536, "1.5 KB"),
+            (3 * 1024 * 1024, "3 MB"),
+            (1024 * 1024 * 1024, "1 GB"),
+            (1024 * 1024 * 1024 * 1024, "1 TB"),
+            (1024 * 1024 - 1, "1 MB"),
+            (1024 * 1024 - 100, "1023.9 KB"),
+            (u64::MAX, "16 EB"),
+        ];
+        for (bytes, want) in cases {
+            assert_eq!(human_size(bytes), want, "bytes = {bytes}");
+        }
+    }
+
+    #[test]
+    fn number_to_human_size_is_markup() {
+        assert_eq!(number_to_human_size(2048).into_string(), "2 KB");
+    }
+
     // ── number_to_currency / CurrencyOptions ────────────────────────────
 
     #[test]
@@ -442,6 +515,91 @@ mod tests {
     fn currency_zero_precision_omits_decimal_separator() {
         let opts = CurrencyOptions::new().precision(0);
         assert_eq!(opts.format(dec("42.6")).into_string(), "$43");
+    }
+
+    #[test]
+    fn currency_high_precision_large_value_does_not_panic() {
+        // Issue #3432: 4 integer digits + '.' + 28 places is 33 chars.
+        let opts = CurrencyOptions::new().precision(28);
+        assert_eq!(
+            opts.format(dec("1000")).into_string(),
+            "$1,000.0000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn currency_wei_precision_with_many_integer_digits() {
+        let opts = CurrencyOptions::new().precision(18);
+        assert_eq!(
+            opts.format(dec("12345678901234")).into_string(),
+            "$12,345,678,901,234.000000000000000000"
+        );
+    }
+
+    #[test]
+    fn currency_precision_above_decimal_scale_is_clamped() {
+        let opts = CurrencyOptions::new().precision(40);
+        let clamped = CurrencyOptions::new().precision(28);
+        assert_eq!(
+            opts.format(dec("1.5")).into_string(),
+            clamped.format(dec("1.5")).into_string()
+        );
+        assert_eq!(
+            opts.format(Decimal::MAX).into_string(),
+            clamped.format(Decimal::MAX).into_string()
+        );
+    }
+
+    #[test]
+    fn currency_boundary_32_chars_still_works() {
+        let opts = CurrencyOptions::new().precision(28);
+        assert_eq!(
+            opts.format(dec("999")).into_string(),
+            "$999.0000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn currency_negative_large_high_precision() {
+        let opts = CurrencyOptions::new().precision(28);
+        assert_eq!(
+            opts.format(dec("-1000")).into_string(),
+            "-$1,000.0000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn currency_zero_at_max_precision() {
+        let opts = CurrencyOptions::new().precision(28);
+        assert_eq!(
+            opts.format(dec("-0")).into_string(),
+            "$0.0000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn currency_rounding_carry_grows_integer_part() {
+        let opts = CurrencyOptions::new().precision(3);
+        assert_eq!(opts.format(dec("999.9995")).into_string(), "$1,000.000");
+        assert_eq!(opts.format(dec("-999.9995")).into_string(), "-$1,000.000");
+    }
+
+    #[test]
+    fn currency_decimal_extremes_are_exact() {
+        let p0 = CurrencyOptions::new().precision(0);
+        assert_eq!(
+            p0.format(Decimal::MAX).into_string(),
+            "$79,228,162,514,264,337,593,543,950,335"
+        );
+        assert_eq!(
+            p0.format(Decimal::MIN).into_string(),
+            "-$79,228,162,514,264,337,593,543,950,335"
+        );
+        let max = CurrencyOptions::new().precision(u32::MAX);
+        assert_eq!(
+            max.format(Decimal::MAX).into_string(),
+            "$79,228,162,514,264,337,593,543,950,335.0000000000000000000000000000"
+        );
     }
 
     #[test]

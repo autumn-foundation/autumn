@@ -238,12 +238,20 @@ jobs:
     # Fail fast instead of burning GitHub's 360-minute default if a
     # generated app wedges on boot (these jobs compile AND run one).
     # 90 -> 150 (#1945): 15 more scaffold-and-cargo-check/build/run steps
-    # landed in the "cli_tests per-test triage" block below. The 1.88.0 leg's
+    # landed in the "cli_tests per-test triage" block below. The MSRV leg's
     # existing ~31 steps already ran ~78-81 min against the old 90-minute
     # budget (per recent run history), and these new steps average ~2 min
     # each, so the old budget would have started failing on timeout rather
     # than on a real regression.
-    timeout-minutes: 150
+    # 150 -> 90 (#3572): by 2026-11 the MSRV leg (then 1.88.0) had 58 steps (median 2.35
+    # min) and ran 1h55m-2h26m, cancelled at 150 min once on #3560. Every
+    # step compiled the generated app's dependency tree from cold. With one
+    # shared CARGO_TARGET_DIR for the generated apps (the step after
+    # rust-cache below) the MSRV leg ran in 34.5 min and stable in 27 min.
+    # 90 is ~2.6x the slower leg, which leaves room for a cold rust-cache, and
+    # still stops a wedged app quickly. If this leg nears 90 again, split it
+    # into shards rather than raise the limit.
+    timeout-minutes: 90
     env:
       # The generated projects build with line tables only, not full debug
       # info. With full debug info, the `cargo test` link of an attachment
@@ -254,7 +262,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     strategy:
       matrix:
-        toolchain: [stable, "1.88.0"]
+        toolchain: [stable, "1.97.0"]
     steps:
       - uses: actions/checkout@v7
 
@@ -271,6 +279,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
 
+      - name: Share one target dir across the generated apps
+        # Each step below scaffolds a fresh app in a temp dir and runs cargo
+        # on it. With the app's own `target/`, every one of the ~58 steps
+        # compiled the same autumn-web dependency tree from cold (median 2.35
+        # min a step). Every generated app inherits this CARGO_TARGET_DIR, so
+        # a `cargo check` step reuses the previous checks' output and a
+        # `cargo build`/`test` step the previous builds'. Measured on 4 vCPUs:
+        # a second check-only scaffold went from 2.4 to 1.2 min. A test that
+        # needs its own dir still sets CARGO_TARGET_DIR itself, which wins.
+        # The outer `cargo test` passes `--target-dir target` (a flag beats
+        # the env var), so its build stays in ./target where rust-cache
+        # restores it.
+        run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/generated-target" >> "$GITHUB_ENV"
+
       - name: generated_project_compiles_runs_and_serves
         run: |
           set -euo pipefail
@@ -278,7 +300,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test e2e \
+          cargo test --target-dir target -p autumn-cli --test e2e \
             generated_project_compiles_runs_and_serves -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_project_compiles_runs_and_serves.log"
 
@@ -290,7 +312,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_scaffold_cargo_checks -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_scaffold_cargo_checks.log"
 
@@ -306,7 +328,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_sqlite_scaffold_cargo_checks -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_sqlite_scaffold_cargo_checks.log"
 
@@ -319,7 +341,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_sqlite_scaffold_smoke_tests_pass -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_sqlite_scaffold_smoke_tests_pass.log"
 
@@ -331,7 +353,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_policy_scaffold_cargo_checks -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_policy_scaffold_cargo_checks.log"
 
@@ -347,7 +369,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_nested_scaffold_cargo_checks -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_nested_scaffold_cargo_checks.log"
 
@@ -363,7 +385,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_counter_cache_scaffold_cargo_checks -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_counter_cache_scaffold_cargo_checks.log"
 
@@ -375,7 +397,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_scaffold_config_cargo_checks -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_scaffold_config_cargo_checks.log"
 
@@ -391,7 +413,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_validated_scaffold_round_trip_test_passes -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_validated_scaffold_round_trip_test_passes.log"
           assert_ran "$RUNNER_TEMP/conformance-generated_validated_scaffold_round_trip_test_passes.log" generated_validated_scaffold_round_trip_test_passes
@@ -402,7 +424,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             controller_generates_compiles_and_lists_routes -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-controller_generates_compiles_and_lists_routes.log"
 
@@ -414,7 +436,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             controller_api_generates_json -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-controller_api_generates_json.log"
 
@@ -426,7 +448,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_job_cargo_checks -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_job_cargo_checks.log"
 
@@ -438,7 +460,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_channel_cargo_checks -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_channel_cargo_checks.log"
 
@@ -450,7 +472,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_channel_ws_cargo_checks -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_channel_ws_cargo_checks.log"
 
@@ -462,7 +484,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_channel_smoke_test_passes -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_channel_smoke_test_passes.log"
 
@@ -481,7 +503,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_webhook_cargo_checks -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_webhook_cargo_checks.log"
 
@@ -493,7 +515,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test generate \
+          cargo test --target-dir target -p autumn-cli --test generate \
             generated_webhook_tests_pass -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_webhook_tests_pass.log"
 
@@ -513,7 +535,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::console::console_bare_playground_target_compiles_untouched \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-console_bare_playground_target_compiles_untouched.log"
@@ -526,7 +548,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::console::console_playground_target_compiles_with_a_repository_round_trip \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-console_playground_target_compiles_with_a_repository_round_trip.log"
@@ -539,7 +561,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::console::console_run_exits_non_zero_when_the_database_is_unreachable \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-console_run_exits_non_zero_when_the_database_is_unreachable.log"
@@ -552,7 +574,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::console::console_run_surfaces_a_compile_error_in_the_playground \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-console_run_surfaces_a_compile_error_in_the_playground.log"
@@ -565,7 +587,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::console::console_repl_runs_and_reports_errors_as_script_errors \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-console_repl_runs_and_reports_errors_as_script_errors.log"
@@ -588,7 +610,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_form_for::generated_attachment_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_attachment_scaffold_cargo_checks.log"
@@ -601,7 +623,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_form_for::generated_attachment_scaffold_multipart_test_passes \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_attachment_scaffold_multipart_test_passes.log"
@@ -624,7 +646,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_i18n::i18n_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-i18n_scaffold_cargo_checks.log"
@@ -637,7 +659,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_i18n::i18n_scaffold_with_trash_and_search_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-i18n_scaffold_with_trash_and_search_cargo_checks.log"
@@ -650,7 +672,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_i18n::i18n_scaffold_with_owner_scoped_search_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-i18n_scaffold_with_owner_scoped_search_cargo_checks.log"
@@ -663,7 +685,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_i18n::i18n_scaffold_with_state_machine_and_attachment_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-i18n_scaffold_with_state_machine_and_attachment_cargo_checks.log"
@@ -688,7 +710,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_encrypted::encrypted_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-encrypted_scaffold_cargo_checks.log"
@@ -701,7 +723,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_encrypted::encrypted_api_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-encrypted_api_scaffold_cargo_checks.log"
@@ -714,7 +736,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_encrypted::encrypted_live_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-encrypted_live_scaffold_cargo_checks.log"
@@ -727,7 +749,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_encrypted::encrypted_nested_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-encrypted_nested_scaffold_cargo_checks.log"
@@ -740,7 +762,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_encrypted::encrypted_admin_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-encrypted_admin_scaffold_cargo_checks.log"
@@ -762,7 +784,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_validation::constrained_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-constrained_scaffold_cargo_checks.log"
@@ -786,7 +808,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_validation::documented_scaffold_example_builds_without_warnings \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-documented_scaffold_example_builds_without_warnings.log"
@@ -810,7 +832,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::api_scaffold::api_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-api_scaffold_cargo_checks.log"
@@ -823,7 +845,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::cloud_native_scaffold::scaffolded_app_passes_routes_audit_gate \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-scaffolded_app_passes_routes_audit_gate.log"
@@ -836,7 +858,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::cloud_native_scaffold::scaffolded_api_app_passes_routes_audit_gate \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-scaffolded_api_app_passes_routes_audit_gate.log"
@@ -849,7 +871,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::generate_position_scaffold::unscoped_position_generated_project_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-unscoped_position_generated_project_cargo_checks.log"
@@ -862,7 +884,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::generate_position_scaffold::scoped_position_generated_project_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-scoped_position_generated_project_cargo_checks.log"
@@ -875,7 +897,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::generate_position_scaffold::soft_delete_position_generated_project_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-soft_delete_position_generated_project_cargo_checks.log"
@@ -888,7 +910,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_belongs_to::belongs_to_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-belongs_to_scaffold_cargo_checks.log"
@@ -901,7 +923,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_bulk_delete::bulk_delete_generated_project_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-bulk_delete_generated_project_cargo_checks.log"
@@ -914,7 +936,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_rich_text::richtext_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-richtext_scaffold_cargo_checks.log"
@@ -927,7 +949,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_search::searchable_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-searchable_scaffold_cargo_checks.log"
@@ -940,7 +962,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_trash::trash_generated_project_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-trash_generated_project_cargo_checks.log"
@@ -953,7 +975,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::seed_model_linking::linked_seed_binary_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-linked_seed_binary_cargo_checks.log"
@@ -966,7 +988,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::serve::serve_daemon_start_status_stop_over_unix_socket \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-serve_daemon_start_status_stop_over_unix_socket.log"
@@ -979,7 +1001,7 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_form_for::generated_form_for_scaffold_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_form_for_scaffold_cargo_checks.log"
@@ -992,12 +1014,18 @@ jobs:
             grep -qE 'test result: ok\. [1-9][0-9]* passed' "$1" \
               || { echo "::error::no tests ran for $2 — the --exact filter matched zero tests"; exit 1; }
           }
-          cargo test -p autumn-cli --test cli_tests \
+          cargo test --target-dir target -p autumn-cli --test cli_tests \
             integration::scaffold_form_for::generated_scaffold_with_missing_reference_target_cargo_checks \
             -- --ignored --exact 2>&1 \
             | tee "$RUNNER_TEMP/conformance-generated_scaffold_with_missing_reference_target_cargo_checks.log"
 
           assert_ran "$RUNNER_TEMP/conformance-generated_scaffold_with_missing_reference_target_cargo_checks.log" generated_scaffold_with_missing_reference_target_cargo_checks
+
+      - name: Shared generated-app target dir size
+        if: always()
+        run: |
+          df -h "$RUNNER_TEMP"
+          du -sh "$RUNNER_TEMP/generated-target" 2>/dev/null || true
   # ── Generated-app variant conformance matrix ────────────────────────────────
   #
   # One matrixed job that scaffolds a fresh project in a specific "variant"
@@ -1033,7 +1061,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        toolchain: [stable, "1.88.0"]
+        toolchain: [stable, "1.97.0"]
         variant:
           - name: totp
             test: generated_auth_totp_cargo_checks
@@ -1133,7 +1161,7 @@ jobs:
     timeout-minutes: 90
     strategy:
       matrix:
-        toolchain: [stable, "1.88.0"]
+        toolchain: [stable, "1.97.0"]
     steps:
       - uses: actions/checkout@v7
 

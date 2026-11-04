@@ -332,3 +332,84 @@ async fn version_history_is_tenant_isolated_on_sqlite() {
         seen_by_b.entries
     );
 }
+
+/// The bulk paths write history in one batch (#3345). Each row gets the entry
+/// the single-row path writes: the same op, actor and changes.
+#[tokio::test]
+async fn bulk_writes_record_the_history_the_single_row_path_records() {
+    let pool = boot_pool("vh_bulk").await;
+    let repo = PgVhNoteRepository::with_pool_untracked(pool);
+
+    let (single, bulk) = with_actor("bob", async {
+        let single = repo
+            .save(&NewVhNote {
+                content: "v1".to_string(),
+            })
+            .await
+            .expect("save");
+        repo.update(
+            single.id,
+            &UpdateVhNote {
+                content: Patch::Set("v2".to_string()),
+            },
+        )
+        .await
+        .expect("update");
+        repo.delete_by_id(single.id).await.expect("delete");
+
+        let bulk = repo
+            .save_many(&[
+                NewVhNote {
+                    content: "v1".to_string(),
+                },
+                NewVhNote {
+                    content: "v1".to_string(),
+                },
+            ])
+            .await
+            .expect("save_many");
+        let ids: Vec<i64> = bulk.iter().map(|r| r.id).collect();
+        repo.update_many(
+            &ids,
+            &UpdateVhNote {
+                content: Patch::Set("v2".to_string()),
+            },
+        )
+        .await
+        .expect("update_many");
+        repo.delete_many(&ids).await.expect("delete_many");
+        (single.id, ids)
+    })
+    .await;
+
+    // The entry without the fields that differ by record.
+    let shape = |entry: &autumn_web::version_history::VersionEntry| {
+        let changes: Vec<_> = entry
+            .changes
+            .iter()
+            .filter(|c| c.column != "id")
+            .map(|c| (c.column.clone(), c.before.clone(), c.after.clone()))
+            .collect();
+        (entry.op, entry.actor.clone(), changes)
+    };
+    let expected: Vec<_> = repo
+        .version_history(single, VersionFilter::default())
+        .await
+        .expect("history")
+        .entries
+        .iter()
+        .map(shape)
+        .collect();
+    assert_eq!(expected.len(), 3);
+    for id in bulk {
+        let got: Vec<_> = repo
+            .version_history(id, VersionFilter::default())
+            .await
+            .expect("history")
+            .entries
+            .iter()
+            .map(shape)
+            .collect();
+        assert_eq!(got, expected, "record {id}");
+    }
+}

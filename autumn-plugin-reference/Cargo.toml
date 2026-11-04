@@ -22,6 +22,10 @@ autumn-web = { path = "../autumn" }
 # the same as `autumn-admin-plugin` does. Carried here so the reference plugin
 # proves that seam the way a real plugin has to reach it.
 maud = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
 
 [features]
 # `db` gates `AppBuilder::plugin_migrations` and `AppBuilder::with_pool_provider`,
@@ -30,6 +34,9 @@ maud = { workspace = true }
 # every declared stable surface. Turning it off narrows what this crate proves.
 default = ["db"]
 db = ["autumn-web/db"]
+# The browser half of widget pack conformance (#3400). CI runs it in the
+# `widgets-browser` workflow.
+system-tests = ["autumn-web/system-tests"]
 
 # Inherit the workspace lint profile, like every other first-party plugin crate.
 # That brings `clippy::pedantic`/`nursery` and the workspace `check-cfg` list —
