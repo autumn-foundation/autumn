@@ -4,12 +4,14 @@
 //! - [`corpus`]: which files a gate reads, and how they are decoded.
 //! - [`markdown`]: live prose, heading anchors and link destinations.
 //! - [`links`]: the markdown link gate.
+//! - [`guide_index`]: every guide page listed in the index that owns it.
 //!
 //! A ported gate replaces its script only once it gives the same result on
 //! the tree, with the script's self-test carried over as `#[test]`s. See
 //! `docs/adr/0033-xtask-for-repo-tooling.md`.
 
 pub mod corpus;
+pub mod guide_index;
 pub mod links;
 pub mod markdown;
 mod re;
@@ -43,11 +45,18 @@ impl Gate {
 }
 
 /// Every ported docs gate.
-pub const GATES: &[Gate] = &[Gate {
-    name: "docs-links",
-    about: "Markdown link gate: every relative link and heading anchor in the tracked markdown corpus must resolve.",
-    run: |root, mut out| links::run(root, &mut out),
-}];
+pub const GATES: &[Gate] = &[
+    Gate {
+        name: "docs-links",
+        about: "Markdown link gate: every relative link and heading anchor in the tracked markdown corpus must resolve.",
+        run: |root, mut out| links::run(root, &mut out),
+    },
+    Gate {
+        name: "docs-guide-index",
+        about: "Guide-index gate: every page in docs/guide/ is listed once in the index that owns it, and README.md links the index.",
+        run: |root, mut out| guide_index::run(root, &mut out),
+    },
+];
 
 /// The gate called `name`, accepting it with or without `check-`.
 #[must_use]

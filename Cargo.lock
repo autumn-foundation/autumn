@@ -10930,6 +10930,8 @@ dependencies = [
  "clap",
  "regex",
  "smop",
+ "unicase",
+ "unicode-general-category",
 ]
 
 [[package]]
