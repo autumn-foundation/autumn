@@ -75,6 +75,7 @@ Ported so far:
 | Markdown links and anchors | `scripts/check-docs-links.sh` | `xtask/src/docs/links.rs` (`cargo xtask check docs-links`) |
 | Guide index completeness | `scripts/check-docs-guide-index.sh` | `xtask/src/docs/guide_index.rs` (`cargo xtask check docs-guide-index`) |
 | Reader vocabulary | `scripts/check-docs-aliases.sh` | `xtask/src/docs/aliases.rs` (`cargo xtask check docs-aliases`) |
+| Actuator paths | `scripts/check-docs-routes.sh` | `xtask/src/docs/routes.rs` (`cargo xtask check docs-routes`) |
 
 The per-line markdown shapes (block quote, fence, list item, heading) are
 matched by hand rather than by regex. A regex there made the first port ten

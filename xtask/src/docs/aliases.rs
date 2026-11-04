@@ -39,7 +39,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use regex::Regex;
 
-use crate::docs::re::pattern;
+use crate::docs::re::{pattern, py_ascii_view};
 
 /// One capability: its label, the page that documents it, and the reader's
 /// words for it, every one of which must appear.
@@ -407,41 +407,9 @@ pub fn prose(text: &str) -> String {
 }
 
 /// `text` as an ASCII term sees it under Python's `re.IGNORECASE` and `\b`.
-///
-/// Rust's `\b` counts a combining mark as a word character and Python's does
-/// not, and Python counts `²` (category `No`) where Rust does not. Mapping
-/// every non-ASCII character to an ASCII stand-in makes both engines agree:
-/// a Python word character (category `L` or `N`) becomes `_`, which no term
-/// contains, anything else becomes `\x01`, and the four characters Python
-/// folds onto an ASCII letter (`İ`, `ı`, `ſ`, the Kelvin sign) become that
-/// letter. Terms are ASCII, which a test holds.
+/// Terms are ASCII, which a test holds.
 fn term_view(text: &str) -> String {
-    text.chars()
-        .map(|c| match c {
-            _ if c.is_ascii() => c,
-            '\u{130}' | '\u{131}' => 'i',
-            '\u{17f}' => 's',
-            '\u{212a}' => 'k',
-            _ if is_python_word(c) => '_',
-            _ => '\x01',
-        })
-        .collect()
-}
-
-/// Python's `\w` for a non-ASCII character: a letter or a number.
-fn is_python_word(c: char) -> bool {
-    use unicode_general_category::GeneralCategory as G;
-    matches!(
-        unicode_general_category::get_general_category(c),
-        G::UppercaseLetter
-            | G::LowercaseLetter
-            | G::TitlecaseLetter
-            | G::ModifierLetter
-            | G::OtherLetter
-            | G::DecimalNumber
-            | G::LetterNumber
-            | G::OtherNumber
-    )
+    py_ascii_view(text, true)
 }
 
 /// One missing word.

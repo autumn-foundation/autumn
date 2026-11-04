@@ -475,9 +475,10 @@ jobs:
         # drift it is checking for, which is the same reason `#[cfg(test)]`
         # bodies are stripped.
         #
-        # Shares this docs-only job for the same reason as the gates above:
-        # no toolchain, no cache, reports in seconds.
-        run: ./scripts/check-docs-routes.sh --self-test && ./scripts/check-docs-routes.sh
+        # The gate and its self-test (now `#[test]`s, run by `cargo test`)
+        # live in xtask/src/docs/routes.rs; `cargo xtask docs routes --list`
+        # prints the mounted surface it read.
+        run: cargo xtask check docs-routes
       - name: Macro argument gate
         # The seventh thing a reader copies off a page: the keyword arguments
         # inside an Autumn attribute macro. The gates above cover the links,
