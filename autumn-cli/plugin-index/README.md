@@ -76,7 +76,7 @@ prefix = "/<name>"          # or `no_routes = true` for a plugin with none
 [plugin.conformance]
 result = "pass"
 autumn_web = "0.10.0"
-checked = "2026-10-26"
+checked = "2026-11-04"
 ```
 
 ## Admission rules
