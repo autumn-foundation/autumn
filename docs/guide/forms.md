@@ -241,6 +241,134 @@ The "Native inputs" and "Choice controls" stories show each control.
   `minlength`, `maxlength`, `min`, `max`, `disabled`, `readonly`, `multiple`)
   render only on controls that use them.
 
+### Passwords and one-time codes
+
+A password field and a one-time code (OTP) field need more than a plain input
+(issue #3412). Both are in core, and the auth generator uses both.
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, OtpFormat, otp_input_with, password_input_with,
+    required_otp_input};
+
+(password_input_with(&changeset, "password", "Password", &FieldOptions::new()
+    .required()
+    .new_password()
+    .minlength(12)
+    .reveal()
+    .strength_hint()))
+(required_otp_input(&changeset, "code", "Authenticator code"))
+(otp_input_with(&changeset, "backup", "Backup code",
+    OtpFormat::digits(8).group(4), &FieldOptions::new()))
+```
+
+Password options (other controls ignore them):
+
+- `current_password()` and `new_password()` set `autocomplete`. Use the first
+  on a sign-in form. Use the second on a signup or a change form, so a
+  password manager can suggest a password.
+- `reveal()` adds a "Show password" button with `aria-pressed`. The button has
+  `hidden` until `autumn-widgets.js` shows it. A submit, a page hide and an
+  htmx history snapshot hide the password again. `reveal_label(text)` sets
+  the button text.
+- `strength_hint()` adds `<p id="{field}-strength" aria-live="polite">` and
+  puts its id in `aria-describedby`. The script writes "Strength: weak",
+  "fair", "good" or "strong" from the length and the character kinds. The
+  text changes only when the level changes. `strength_labels([..; 4])` sets
+  the four labels. Name the subject in each label: a screen reader reads the
+  label alone. It is a hint, not a policy: it does not know common
+  passwords. Check the password on the server.
+- A revealable password has `spellcheck="false"` and `autocapitalize="off"`,
+  so a cloud spellcheck does not read the revealed text.
+
+The OTP field is one `<input type="text" autocomplete="one-time-code"
+inputmode="numeric">`. CSS draws a box for each digit behind it. One real
+input keeps SMS autofill and paste working, and a screen reader finds one
+field.
+
+- `OtpFormat::digits(n)` sets the length, 4 to 10. The default is 6.
+- `pattern="[0-9]{n}"` checks the code on submit, also without JavaScript.
+  `maxlength="{n}"` keeps a page with no JavaScript from showing more digits
+  than boxes.
+- The script removes that `maxlength`. It keeps only the digits of a paste,
+  an autofill or an IME entry, up to the length. A paste of `123-456` gives
+  `123456`. Full-width digits (`１２３`) become ASCII digits.
+- `.group(g)` shows `1234 5678`. `g` is 2 to 5 and less than `n`. The group
+  needs the script. It changes `pattern`, shows the separator boxes, and
+  removes the spaces from the form data and from an htmx request, so the
+  server gets the digits only. Strip whitespace on the server too. A
+  `pattern` option turns the group off, so your pattern checks the code.
+- The value is never rendered: a code is used one time.
+- An `autocomplete`, `inputmode`, `pattern` or `maxlength` option replaces
+  the default. `placeholder` and `minlength` pass through.
+- On a narrow screen the boxes get smaller, so the page does not scroll
+  sideways.
+- Do not use it for a recovery code with letters. The generated
+  `/login/verify` page keeps a text input for that reason.
+
+`form_for` takes `FieldControl::Otp(OtpFormat)`. The "Sign-in inputs" story
+shows each option.
+
+### Select: groups, multiple and style
+
+`select_input` renders a native `<select>` (issue #3409). The browser
+supplies the keyboard behaviour and the accessibility tree. There is no
+JavaScript.
+
+| Item | Use |
+|---|---|
+| `grouped_select_input(…, choices, groups)` | Top-level `choices`, then one `<optgroup>` for each `(label, options)` group |
+| `FieldOptions::multiple()` | `<select multiple>`. Bind to a `#[serde(default)] Vec<T>` |
+| `FieldOptions::styled_select()` | The `autumn-select` class: `appearance: base-select` where the browser supports it |
+
+```rust,ignore
+use autumn_web::form::{FieldOptions, grouped_select_input_with, select_input_with};
+
+(grouped_select_input_with(&changeset, "city", "City",
+    &[("", "Choose a city")],
+    &[
+        ("France", &[("paris", "Paris"), ("lyon", "Lyon")]),
+        ("Japan", &[("tokyo", "Tokyo")]),
+    ],
+    &FieldOptions::new().required().styled_select()))
+(select_input_with(&changeset, "tags", "Tags",
+    &[("rust", "Rust"), ("web", "Web")],
+    &FieldOptions::new().multiple()))
+```
+
+- A single select marks the first option whose value is the field value.
+  It marks one option only, also when two options have that value.
+- A multiple select reads `Changeset::field_values`. It marks each option
+  whose value is in the list. Thus the chosen options show again after a
+  422. The browser posts one `tags=…` pair for each chosen option. It posts
+  no key when no option is chosen.
+- `required` on a multiple select means "choose one or more". Also validate
+  on the server, for example with `#[validate(length(min = 1))]`.
+- A multiple select on a `String` field gets a 422 when the user chooses two
+  options. Bind it to a `Vec<T>`.
+- Autumn also writes `multiple` on a file input. Read the files with
+  `ChangesetForm::files(field)`. Other controls ignore `multiple`.
+- `styled_select` is opt-in. Chrome 135+ and Safari 27 support
+  `appearance: base-select`. They draw the select and its picker from the
+  design tokens, in the light and the dark scheme. Other browsers keep the
+  native control with the field style. A multiple select keeps the native
+  list box in all browsers.
+- In a styled select, the arrow keys, Enter and Space open the picker.
+  The arrow keys move in the picker. Enter chooses an option. Escape closes
+  the picker.
+
+`form_for` takes `FieldControl::GroupedSelect { options, groups }`. For a
+multiple select:
+
+1. Use `.override_field(name, FieldControl::Select { options })`, or
+   `GroupedSelect`.
+2. Set `.field_options(name, FieldOptions::new().multiple())`.
+
+The model `required` flag does not make a multiple select required, because
+a `Vec` can be empty.
+
+The "Select" story shows the styled select, the native fallback, a grouped
+select and a multiple select.
+
 ### The error summary
 
 `autumn_web::widgets::error_summary(&changeset)` lists every error at the top of
