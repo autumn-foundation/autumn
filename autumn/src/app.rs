@@ -4538,11 +4538,7 @@ impl AppBuilder {
             declared_routes: &mut declared_routes,
         };
         warn_on_groups_mounted_by_no_preset(&config, &mount_targets.groups());
-        let routes_before: Vec<(&'static str, &'static str)> = mount_targets
-            .routes
-            .iter()
-            .map(|r| (r.name, r.path))
-            .collect();
+        let routes_before = static_route_keys(mount_targets.routes, mount_targets.scoped_groups);
         if let Err(error) = mount_targets.retain(&mount_role) {
             tracing::error!("{error}");
             #[cfg(feature = "managed-pg")]
@@ -4551,8 +4547,11 @@ impl AppBuilder {
         }
         // A pre-rendered page of an unmounted route leaves the sitemap and
         // the static layer too.
-        let dropped_pages =
-            drop_unmounted_static_routes(&mut static_metas, &routes_before, &all_routes);
+        let dropped_pages = drop_unmounted_static_routes(
+            &mut static_metas,
+            &routes_before,
+            &static_route_keys(&all_routes, &scoped_groups),
+        );
         let keep_page = |path: &str| {
             !dropped_pages
                 .iter()
@@ -9291,20 +9290,22 @@ impl AppBuilder {
     #[allow(clippy::too_many_lines)]
     async fn run_replay_mode(self, capsule_path: String) {
         let Self {
-            routes,
+            mut routes,
             api_versions,
             listeners,
             exception_filters,
-            scoped_groups,
-            merge_routers,
-            nest_routers,
+            mut scoped_groups,
+            mut merge_routers,
+            mut merge_router_groups,
+            mut nest_routers,
+            mut nest_router_groups,
             // Bound rather than dropped with the rest: a nested router is
             // opaque, so these declarations are the ONLY thing that lets the
             // collision preflight see inside a sandboxed plugin's mount.
             // Replaying with the nests but without them would skip the checks
             // and reach the axum mount panic the preflight exists to replace
             // with a refusal.
-            declared_routes,
+            mut declared_routes,
             custom_layers,
             state_initializers,
             config_loader_factory,
@@ -9520,6 +9521,29 @@ impl AppBuilder {
         // comment in `run()`.
         state.insert_extension(config.clone());
 
+        // Rebuild the router of the recorded role: only the route groups it
+        // mounts (#3544), as `run()` does. Two groups can own one path, so the
+        // unfiltered lists can fail the duplicate-route check.
+        if let Ok(role) = config.resolve_role() {
+            let retained = crate::route_group::MountTargets {
+                routes: &mut routes,
+                route_sources: &mut Vec::new(),
+                scoped_groups: &mut scoped_groups,
+                merge_routers: &mut merge_routers,
+                merge_router_groups: &mut merge_router_groups,
+                nest_routers: &mut nest_routers,
+                nest_router_groups: &mut nest_router_groups,
+                declared_routes: &mut declared_routes,
+            }
+            .retain(&role);
+            if let Err(error) = retained {
+                std::process::exit(crate::capsule::print_refusal(
+                    &format!("the application's router could not be rebuilt: {error}"),
+                    &path,
+                ));
+            }
+        }
+
         // Cloned before the builder consumes it, so a job capsule can dispatch
         // its handler against the same rebuilt state the router serves from.
         let router_state = state.clone();
@@ -9686,20 +9710,40 @@ pub(crate) fn is_dump_jobs_mode() -> bool {
     std::env::var("AUTUMN_DUMP_JOBS").as_deref() == Ok("1")
 }
 
+/// The `(name, mounted path)` of each top-level and scoped route. A static
+/// route meta matches its route by this key (#3544).
+fn static_route_keys(routes: &[Route], scoped_groups: &[ScopedGroup]) -> Vec<(String, String)> {
+    routes
+        .iter()
+        .map(|r| (r.name.to_owned(), r.path.to_owned()))
+        .chain(scoped_groups.iter().flat_map(|group| {
+            group.routes.iter().map(|r| {
+                (
+                    r.name.to_owned(),
+                    crate::router::join_nested_path(&group.prefix, r.path),
+                )
+            })
+        }))
+        .collect()
+}
+
 /// Drop the static route metas whose route the role mount removed (#3544).
 /// Returns their path patterns, so the static layer drops their pages too.
 ///
-/// `before` is the `(name, path)` of each top-level route before the filter.
-/// A meta with no route in `before` stays: no group owns it.
+/// `before` and `after` are the [`static_route_keys`] before and after the
+/// filter. A meta with no route in `before` stays: no group owns it.
 fn drop_unmounted_static_routes(
     static_metas: &mut Vec<crate::static_gen::StaticRouteMeta>,
-    before: &[(&'static str, &'static str)],
-    after: &[Route],
+    before: &[(String, String)],
+    after: &[(String, String)],
 ) -> Vec<&'static str> {
     let mut dropped = Vec::new();
     static_metas.retain(|meta| {
-        let key = (meta.name, meta.path);
-        let removed = before.contains(&key) && !after.iter().any(|r| (r.name, r.path) == key);
+        let owned = |keys: &[(String, String)]| {
+            keys.iter()
+                .any(|(name, path)| name == meta.name && path == meta.path)
+        };
+        let removed = owned(before) && !owned(after);
         if removed {
             dropped.push(meta.path);
         }
@@ -20653,16 +20697,27 @@ mount = ["service"]
             meta("landing", "/"),
             meta("about", "/about"),
             meta("posts", "/posts/{slug}"),
+            meta("promo", "/m/promo"),
             meta("unowned", "/legal"),
         ];
-        let before = [
-            ("landing", "/"),
-            ("about", "/about"),
-            ("posts", "/posts/{slug}"),
-        ];
-        let after = vec![test_get_route("/", "landing")];
+        let scoped = |routes: Vec<Route>| ScopedGroup {
+            prefix: "/m".to_owned(),
+            routes,
+            source: crate::route_listing::RouteSource::User,
+            layer_guarded: false,
+            apply_layer: Box::new(|router| router),
+        };
+        let before = static_route_keys(
+            &[
+                test_get_route("/", "landing"),
+                test_get_route("/about", "about"),
+                test_get_route("/posts/{slug}", "posts"),
+            ],
+            &[scoped(vec![test_get_route("/promo", "promo")])],
+        );
+        let after = static_route_keys(&[test_get_route("/", "landing")], &[]);
         let dropped = drop_unmounted_static_routes(&mut metas, &before, &after);
-        assert_eq!(dropped, vec!["/about", "/posts/{slug}"]);
+        assert_eq!(dropped, vec!["/about", "/posts/{slug}", "/m/promo"]);
         let kept: Vec<&str> = metas.iter().map(|m| m.path).collect();
         assert_eq!(kept, vec!["/", "/legal"]);
     }
@@ -20723,6 +20778,10 @@ mount = ["service"]
             (
                 "async fn run_dump_openapi_mode(self)",
                 "/// Dump the effective drained-queue manifest",
+            ),
+            (
+                "async fn run_replay_mode(self, capsule_path: String)",
+                "// A job capsule has no request to drive",
             ),
         ] {
             let from = source.find(start).expect(start);
