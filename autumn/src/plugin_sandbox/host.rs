@@ -4013,6 +4013,17 @@ fn define_wasi_shim(linker: &mut Shim) -> Result<(), SandboxLoadError> {
         )
         .map_err(engine_error)?;
 
+    // Clone class: `wasi-fd_write-fuel-metering`. This `fd_write`'s fuel
+    // accounting — per-iovec `charge_units`, the `HOST_IO_CHUNK_BYTES`-chunked
+    // copy, and the extra per-byte `charge_units` for fd 1 because the stdout
+    // line parser inspects every byte — mirrors
+    // `autumn_edge::host::fd_write`'s. The two copies have already missed a
+    // fix on each other once: this fix, `fix(plugin-sandbox): charge stdout
+    // parsing per byte (#3300)`, landed 2026-10-14, and the identical gap in
+    // the edge copy — charging the bulk copy but not the per-byte
+    // stdout-parse cost — wasn't caught there until `fix(autumn-edge): meter
+    // fd_write, fd_read and random_get in fuel (#3503)` landed 15 days later,
+    // 2026-10-29. If you change the fuel formula in one, check the other.
     linker
         .func_wrap(
             WASI,
