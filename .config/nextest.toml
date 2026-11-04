@@ -1,0 +1,26 @@
+# cargo-nextest configuration.
+#
+# CI builds the workspace tests once with `cargo nextest archive --workspace`
+# (the `test-build` job) and runs the `trybuild` shards from that archive. See
+# the note above `test-build` in `.github/workflows/ci.yml`.
+
+# trybuild builds its fixtures with the features of the test binary that runs
+# it. It reads them from `target/debug/.fingerprint/<unit>/*.json`, next to
+# `target/debug/deps/<test binary>`. An archive does not carry that directory
+# unless it is listed here. Without it trybuild falls back to the crate's
+# default features, so every `#[cfg(feature = ...)]`-gated fixture is built
+# without the feature it tests. Set on the default profile so that every
+# archive carries it, whichever profile it is built under.
+[[profile.default.archive.include]]
+path = "debug/.fingerprint"
+relative-to = "target"
+# `.fingerprint/<unit>/<file>`.
+depth = 2
+on-missing = "error"
+
+[profile.ci]
+# Report every failure in a shard, not only the first one.
+fail-fast = false
+# Print a failure's output when it happens and again in the summary at the end,
+# so it is not lost in a long log.
+failure-output = "immediate-final"

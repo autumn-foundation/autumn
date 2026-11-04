@@ -877,10 +877,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
         with:
-          # This job and every `trybuild` shard run the IDENTICAL `cargo test
-          # --workspace` build and differ only in which tests they then run, so
-          # they share one cache entry instead of five near-identical copies.
-          # This job is the only writer (the shards set `save-if: false`).
+          # This job and `test-build` run the IDENTICAL `cargo test
+          # --workspace` build (`cargo nextest archive` is `cargo test
+          # --no-run` underneath), so they share one cache entry. This job is
+          # the only writer (`test-build`, and a `trybuild` shard that falls
+          # back to a local build, set `save-if: false`).
           shared-key: workspace-test
           # Save the target dir even when the test STEP fails. rust-cache skips
           # its save on a failed job by default, and because this job is the
@@ -945,9 +946,105 @@ jobs:
           grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/sim.log" \
             || { echo "::error::the sim_ lane ran no tests — the filter no longer matches the sim_* modules"; exit 1; }
 
+  # ---------------------------------------------------------------------------
+  # BUILD ONCE, RUN MANY.
+  #
+  # Every `trybuild` shard used to compile the workspace test build itself
+  # before running its slice of `compile_fail::`. On the cold-cache trunk run
+  # 14053 that compile was 20m35s of the 35-minute `Trybuild pass_a` job, and
+  # all four shards paid it: about 80 runner-minutes of identical work.
+  #
+  # `test-build` compiles it once with `cargo nextest archive --workspace
+  # --test integration_tests` and uploads the archive. The shards download it
+  # and run their filter against the prebuilt `integration_tests` binary. It is
+  # still a `--workspace` build, so the globally unified feature set, which
+  # decides which `#[cfg]`-gated fixtures exist, is the same one `cargo test
+  # --workspace` sees.
+  #
+  # `--test integration_tests` keeps the archive to the one binary the shards
+  # run. An archive of every workspace test binary was 6.9 GB (275 binaries).
+  # Each shard then spent ~6 minutes downloading and extracting it, and the
+  # extracted binaries plus trybuild's own tree ran a `compile_pass` shard's
+  # disk out: `rust-lld` died with SIGBUS linking a fixture. That is the
+  # failure #3534 fixed by building only this target.
+  #
+  # Two things make an archive runnable on another runner, and both are
+  # handled here rather than left to luck:
+  #
+  #   1. Tests read `env!("CARGO_MANIFEST_DIR")` and `env!("CARGO_BIN_EXE_*")`,
+  #      which are absolute paths fixed at compile time. A consumer must check
+  #      out at the same path as the builder and extract the archive into its
+  #      own checkout (`--extract-to .`), so those paths resolve. GitHub-hosted
+  #      runners always use the same path. The self-hosted pool does not: each
+  #      runner slot has its own work dir. So `test-build` publishes its path
+  #      as a job output, and a shard on a different path builds locally
+  #      instead, exactly as it did before this job existed.
+  #   2. trybuild reads the feature set to build its fixtures with from
+  #      `target/debug/.fingerprint`, next to the test binary. A plain archive
+  #      leaves that directory out, and trybuild then quietly builds every
+  #      fixture with default features only. `.config/nextest.toml` adds it to
+  #      every archive and fails the archive if it is missing.
+  # ---------------------------------------------------------------------------
+
+  test-build:
+    name: Build tests (ubuntu-latest)
+    needs: [lint, meta]
+    runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    outputs:
+      workspace: ${{ steps.workspace.outputs.path }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Free disk space (Linux)
+        run: |
+          # The same reclaim the `test` job does: drop the preinstalled
+          # toolchains a Rust build never uses, before the cache is restored.
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache \
+            /usr/local/share/boost \
+            /usr/local/lib/node_modules \
+            /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - uses: Swatinem/rust-cache@v2.7.8
+        continue-on-error: true
+        with:
+          # Restore the entry the `test` job writes: same build, same features.
+          shared-key: workspace-test
+          # RESTORE ONLY. `test` is the single writer of this key.
+          save-if: false
+      - uses: taiki-e/install-action@v2.87.31
+        with:
+          tool: cargo-nextest@0.9.149
+      - name: Archive the workspace test build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/nextest-archive"
+          cargo nextest archive --workspace --test integration_tests \
+            --archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
+          ls -lh "${RUNNER_TEMP}/nextest-archive"
+          df -h
+      - name: Record the checkout path
+        id: workspace
+        shell: bash
+        run: echo "path=${GITHUB_WORKSPACE}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: workspace-tests-linux
+          path: ${{ runner.temp }}/nextest-archive/workspace-tests.tar.zst
+          if-no-files-found: error
+          # The archive is already zstd-compressed.
+          compression-level: 0
+          # Only this run's shards read it.
+          retention-days: 1
+
   trybuild:
     name: Trybuild ${{ matrix.shard }}
-    needs: [lint, meta]
+    needs: [lint, meta, test-build]
     strategy:
       fail-fast: false
       matrix:
@@ -973,16 +1070,20 @@ jobs:
     # OS-conditional, and a compile error that only appears on Windows would
     # still be caught by `Test (windows-latest)` failing to build.
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
+    env:
+      # True when this runner checked out at the path `test-build` compiled
+      # at, so the archive's compile-time paths resolve here. See the note
+      # above `test-build`.
+      REUSE_ARCHIVE: ${{ needs.test-build.outputs.workspace == github.workspace }}
     steps:
       - uses: actions/checkout@v7
       - name: Free disk space (Linux)
         if: runner.os == 'Linux'
         run: |
-          # The full workspace build (and, in `test-docker`, the wide-feature
-          # Postgres-container sweep on top of it) sits near the runner's disk
-          # ceiling; a cold-cache PR build tips it over ("No space left on
-          # device"). Reclaim the preinstalled toolchains a Rust build never
-          # uses before the cache is restored.
+          # trybuild compiles every fixture as a real crate under
+          # `target/tests/trybuild` (~16 GB after a `compile_pass` shard), on
+          # top of the extracted archive. Reclaim the preinstalled toolchains a
+          # Rust build never uses first.
           sudo rm -rf \
             /usr/share/dotnet \
             /usr/local/lib/android \
@@ -994,10 +1095,26 @@ jobs:
           sudo docker image prune --all --force || true
           df -h
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: taiki-e/install-action@v2.87.31
+        with:
+          tool: cargo-nextest@0.9.149
+      - uses: actions/download-artifact@v8
+        if: env.REUSE_ARCHIVE == 'true'
+        with:
+          name: workspace-tests-linux
+          path: ${{ runner.temp }}/nextest-archive
+      - name: Fetch the locked dependencies
+        # trybuild runs every nested `cargo` with `--offline`, and so does the
+        # doc-snippet check in the `rest` shard. Compiling the workspace used
+        # to fill `~/.cargo/registry` as a side effect; running from the
+        # archive does not, so a fresh runner has nothing for an offline build
+        # to resolve against. Fetch exactly what `Cargo.lock` pins.
+        run: cargo fetch --locked
+      - name: Restore the build cache (local-build fallback)
+        if: env.REUSE_ARCHIVE != 'true'
+        uses: Swatinem/rust-cache@v2.7.8
         continue-on-error: true
         with:
-          # Restore the entry the `test` job writes: same build, same features.
           shared-key: workspace-test
           # RESTORE ONLY. Four shards racing to upload the same multi-GB target
           # dir buys nothing, and on windows-latest that upload is what killed
@@ -1006,38 +1123,43 @@ jobs:
           # runner dropped the job. `test` is the single writer.
           save-if: false
       - name: Run the trybuild shard
-        # `cargo test --workspace` (not `-p autumn-web --test integration_tests`)
-        # on purpose: the fixtures registered by `compile_fail.rs` are
-        # `#[cfg(feature = ...)]`-gated, so the set that exists depends on the
-        # GLOBALLY unified feature resolution of a workspace build. Narrowing
-        # the package selection here would quietly compile fewer of them out and
-        # still report green.
+        # The filter is a nextest filterset over the one binary that holds
+        # `compile_fail::`. `test(...)` matches a substring of the test name,
+        # as libtest's own filter and `--skip` do.
         #
-        # `--test integration_tests` keeps that workspace feature set, but builds
-        # only the target that holds `compile_fail::`. The other ~100 test
-        # binaries filled the runner disk before the fixtures finished: the
-        # runner then lost its own log, and `pass_b` failed with no output
-        # (#3534).
+        # From the archive, `--extract-to .` puts its `target/` back where the
+        # binary was built, and `--workspace-remap .` points it at this
+        # checkout. Without a usable archive the shard builds locally:
+        # `cargo nextest run --workspace --test integration_tests` (not `-p
+        # autumn-web`) keeps the workspace feature set, and builds only the
+        # target that holds `compile_fail::`. The other ~100 test binaries
+        # filled the runner disk before the fixtures finished: the runner then
+        # lost its own log, and `pass_b` failed with no output (#3534).
         #
-        # `assert_ran` for the reason the TLS/ACME lanes give: `cargo test` exits
-        # 0 when a filter matches NOTHING, so a rename in `compile_fail.rs` would
-        # otherwise leave a shard green having compiled nothing at all.
+        # `--no-tests=fail` for the reason the TLS/ACME lanes check a pass
+        # count: a rename in `compile_fail.rs` would otherwise leave a shard
+        # green having compiled nothing at all.
         shell: bash
         run: |
           set -euo pipefail
           case "${{ matrix.shard }}" in
-            fail)   filter=(compile_fail::compile_fail_tests) ;;
-            pass_a) filter=(compile_fail::compile_pass_tests_a) ;;
-            pass_b) filter=(compile_fail::compile_pass_tests_b) ;;
-            rest)   filter=(compile_fail::
-                      --skip compile_fail::compile_fail_tests
-                      --skip compile_fail::compile_pass_tests_a
-                      --skip compile_fail::compile_pass_tests_b) ;;
+            fail)   filter='test(compile_fail::compile_fail_tests)' ;;
+            pass_a) filter='test(compile_fail::compile_pass_tests_a)' ;;
+            pass_b) filter='test(compile_fail::compile_pass_tests_b)' ;;
+            rest)   filter='test(compile_fail::)
+                      - test(compile_fail::compile_fail_tests)
+                      - test(compile_fail::compile_pass_tests_a)
+                      - test(compile_fail::compile_pass_tests_b)' ;;
           esac
-          cargo test --workspace --test integration_tests -- "${filter[@]}" \
-            | tee "${RUNNER_TEMP}/trybuild.log"
-          grep -qE 'test result: ok\. [1-9][0-9]* passed' "${RUNNER_TEMP}/trybuild.log" \
-            || { echo "::error::trybuild shard ${{ matrix.shard }} ran no tests — the filter no longer matches anything in compile_fail.rs"; exit 1; }
+          if [ "${REUSE_ARCHIVE}" = true ]; then
+            source=(--archive-file "${RUNNER_TEMP}/nextest-archive/workspace-tests.tar.zst"
+                    --workspace-remap . --extract-to . --extract-overwrite)
+          else
+            echo "::notice::checked out at ${GITHUB_WORKSPACE}, not the archive's path; building locally"
+            source=(--workspace --test integration_tests)
+          fi
+          cargo nextest run "${source[@]}" --profile ci --no-tests=fail \
+            -E "binary_id(autumn-web::integration_tests) & (${filter})"
       - name: Drop the trybuild scratch tree
         if: always()
         # trybuild compiles every case as a real crate under
@@ -1049,7 +1171,9 @@ jobs:
         # disk bounded too, and keeps the hazard from returning silently if
         # anyone ever flips that flag back.
         shell: bash
-        run: rm -rf target/tests
+        run: |
+          df -h
+          rm -rf target/tests
 
   test-features:
     name: Test ${{ matrix.lane }}
@@ -2144,7 +2268,7 @@ jobs:
     # skipped required check can never be satisfied, so the PR stops being
     # mergeable even once the real failure is understood. `coverage` and `loom`
     # were briefly wired here and hit exactly that; they depend on `test`.
-    needs: [test, trybuild, test-features, test-docker, test-docker-deploy]
+    needs: [test, test-build, trybuild, test-features, test-docker, test-docker-deploy]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
