@@ -15,10 +15,10 @@ autotests = false
 exclude = ["tests/fixtures/axe-core/"]
 
 [features]
-# The last 16 names are the compile gates (#2795, ADR 0027). Default-on; the
+# The last 18 names are the compile gates (#2795, ADR 0027). Default-on; the
 # no-DB daemon starter drops them. Keep this on one line: the panic gate
 # (scripts/check-panic-gate.sh) reads it with grep.
-default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph"]
+default = ["maud", "htmx", "tailwind", "db", "postgres", "cache-moka", "http-client", "reporting", "flash", "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts", "ledger", "experiments", "feature-flags", "idempotency", "custom-domains", "job-tracking", "upgrade", "nested-form", "alerts", "data-retention", "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt", "push"]
 # Compile gates (#2795, ADR 0027). Each gates one module. See the default list.
 ledger = ["version-history"]
 experiments = ["feature-flags"]
@@ -36,6 +36,15 @@ money = []
 gdpr = []
 slo = []
 graph = ["autumn-macros/graph"]
+# JWT verification: the `jwt` tenancy source and the OIDC `id_token` check.
+# `jsonwebtoken`'s RustCrypto backend compiles `rsa` 0.9 (RUSTSEC-2023-0071,
+# no fixed release) and the elliptic-curve 0.13 stack, which carries
+# `crypto-bigint` 0.5 (RUSTSEC-2026-0387). An app with neither JWT tenancy nor
+# OIDC drops this feature and compiles neither crate.
+jwt = ["dep:jsonwebtoken"]
+# Web Push (`autumn_web::push`, issue #1392): VAPID signing and RFC 8291
+# payload encryption over `p256`.
+push = ["dep:p256"]
 ws = ["dep:tokio-stream"]
 presence = ["ws"]
 # Conflict-free collaborative editing (issue #1806). Adds
@@ -65,7 +74,7 @@ tailwind = []
 # (auth::password) needs SHA-1 for HIBP k-anonymity, and that path only exists
 # when an HTTP client is available.
 http-client = ["dep:reqwest", "dep:sha1", "dep:rustls", "dep:webpki-roots"]
-oauth2 = ["http-client"]
+oauth2 = ["http-client", "jwt"]
 webauthn = ["dep:webauthn-rs"]
 openapi = ["dep:serde-saphyr"]
 # Project typed JSON endpoints as MCP (Model Context Protocol) tools so AI
@@ -512,10 +521,11 @@ rhai = { workspace = true, optional = true }
 rustyline = { workspace = true, optional = true }
 subtle = "2.6.1"
 base64 = "0.23"
-# Ed25519 signing for Web Bot Auth (`aeo::web_bot_auth`). Adds NO new crate:
-# `jsonwebtoken`'s `rust_crypto` backend already compiles ed25519-dalek 2.
-# Held at 2: version 3 exists, but `jsonwebtoken` 11.1 (the newest) uses 2,
-# so a raise compiles a second curve25519 stack in every app.
+# Ed25519 signing for Web Bot Auth (`aeo::web_bot_auth`). With `jwt` on it
+# adds no crate: `jsonwebtoken`'s `rust_crypto` backend compiles
+# ed25519-dalek 2 too. Held at 2: version 3 exists, but `jsonwebtoken` 11.1
+# (the newest) uses 2, so a raise compiles a second curve25519 stack in every
+# app with `jwt`.
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
 url = "2.5.8"
 percent-encoding = "2"
@@ -523,7 +533,8 @@ percent-encoding = "2"
 # clients get a `ring` config from `reqwest_tls` instead.
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls-no-provider"], optional = true }
 webauthn-rs = { version = "0.6", features = ["danger-allow-state-serialisation"], optional = true }
-jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"] }
+# Behind `jwt`. See that feature for the advisories it brings in.
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["rust_crypto"], optional = true }
 secrecy = { version = "0.10.3", features = ["serde"] }
 lru = "0.19"
 hmac = "0.13"
@@ -542,8 +553,8 @@ zeroize = "1"
 # NIST P-256 (prime256v1) for Web Push (issue #1392): ES256 VAPID JWT signing
 # (RFC 8292) and the ECDH half of RFC 8291 payload encryption. 0.14 uses
 # crypto-bigint 0.7, which fixes RUSTSEC-2026-0387. `jsonwebtoken` 11.1 still
-# compiles its own p256 0.13 for ES256 JWTs.
-p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "std"] }
+# compiles its own p256 0.13 for ES256 JWTs. Behind `push`.
+p256 = { version = "0.14", default-features = false, features = ["ecdh", "ecdsa", "std"], optional = true }
 getrandom = "0.4"
 hex = "0.4"
 # Public Suffix List for custom-domain apex detection (issue #2643, ADR 0026).
@@ -677,7 +688,8 @@ features = [
   # docs keep every module if docs.rs ever turns default features off.
   "ledger", "experiments", "feature-flags", "idempotency", "custom-domains",
   "job-tracking", "upgrade", "nested-form", "alerts", "data-retention",
-  "version-history", "wizard", "money", "gdpr", "slo", "graph",
+  "version-history", "wizard", "money", "gdpr", "slo", "graph", "jwt",
+  "push",
   # The widget families (#3408). Default-on, named for the same reason.
   "widgets-search", "widgets-social", "widgets-workflow", "widgets-charts",
 ]

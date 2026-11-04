@@ -3084,6 +3084,7 @@ impl AppBuilder {
     /// ```
     ///
     /// [`WebPush`]: crate::push::WebPush
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_push_subscription_store<S>(self, store: S) -> Self
     where
@@ -3124,6 +3125,7 @@ impl AppBuilder {
     ///
     /// [`WebPush`]: crate::push::WebPush
     /// [`PushTransport`]: crate::push::PushTransport
+    #[cfg(feature = "push")]
     #[must_use]
     pub fn with_web_push(self, push: crate::push::WebPush) -> Self {
         self.state_initializer(move |state| {
@@ -5465,7 +5467,8 @@ impl AppBuilder {
         // mismatched public/private pair — is a hard boot failure rather than a
         // quiet fallback to "push disabled". The failure this guards is an app
         // that starts cleanly, records subscriptions, and silently delivers
-        // nothing (#1392). An app with no `[push]` block is unaffected.
+        // nothing (#1392). An app with no `[push]` block is unaffected. A build
+        // without the `push` feature refuses any `[push]` block here.
         if let Err(e) = config.validate_push() {
             tracing::error!("Invalid [push] configuration: {e}");
             #[cfg(feature = "managed-pg")]
@@ -13458,6 +13461,11 @@ async fn try_load_config(
         }
     }?;
 
+    // A build without the `jwt` feature cannot verify a tenant token. This
+    // runs for every loader, and only on the app's own boot path: a tool built
+    // with other features (the CLI) loads the same config without it.
+    config.validate_tenancy_source()?;
+
     // `autumn serve --daemon` binds the app on a private Unix socket and then
     // discovers/health-probes it by path. A custom `with_config_loader` can
     // construct its `ServerConfig` from scratch and silently drop the
@@ -20509,6 +20517,34 @@ mod tests {
             "{:?}",
             census_paths(&surface.mounted)
         );
+    }
+
+    /// The boot's config load refuses jwt tenancy in a build that cannot
+    /// verify the token, whichever loader supplied the config.
+    #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard spans the config load, which resets the global metric limits"
+    )]
+    async fn boot_config_load_checks_the_jwt_tenancy_source() {
+        // `try_load_config` resets the process-global metric limits. See
+        // `metrics::LIMITS_TEST_LOCK`.
+        let _limits_lock = crate::metrics::LIMITS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut config = AutumnConfig::default();
+        config.tenancy.enabled = true;
+        "jwt".clone_into(&mut config.tenancy.source);
+        let builder = app().with_config_loader(CensusLoader(Ok(config)));
+        let result = try_load_config(builder.config_loader_factory, BTreeSet::new()).await;
+        if cfg!(feature = "jwt") {
+            assert!(result.is_ok(), "jwt build: {:?}", result.err());
+        } else {
+            let message = result
+                .expect_err("jwt tenancy must stop the boot")
+                .to_string();
+            assert!(message.contains("--features jwt"), "{message}");
+        }
     }
 
     const FLEET_3544: &str = r#"

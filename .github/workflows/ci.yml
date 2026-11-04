@@ -1210,6 +1210,7 @@ jobs:
             webmcp,
             ledger-capture,
             widgets,
+            jwt-push,
           ]
     runs-on: ${{ fromJSON(needs.meta.outputs.heavy_runs_on) }}
     steps:
@@ -1262,6 +1263,14 @@ jobs:
         # fails it too. Then it runs the widget tests and specs with every
         # family off, the branch the default `test` job never reaches.
         run: ./scripts/check-widget-features.sh
+      - name: Check the jwt and push features
+        if: matrix.lane == 'jwt-push'
+        # `jwt` (jsonwebtoken) and `push` (p256) are default-on, so
+        # `cargo test --workspace` never builds a set with one turned off. The
+        # script checks each combination compiles and links only the crates it
+        # names, then runs the specs with both off: the boot checks that refuse
+        # `[push]` and `tenancy.source = "jwt"`, and the fail-closed tenancy arm.
+        run: ./scripts/check-jwt-push-features.sh
       - name: Run markdown-gated tests (user-content sanitizer)
         if: matrix.lane == 'markdown'
         # `markdown` is not a default feature, so the `test` job's `cargo test
@@ -2551,6 +2560,15 @@ jobs:
           # as a new uncovered surface. No Docker, ~0.01s of runtime.
           cargo llvm-cov --no-report -p autumn-admin-plugin --features autumn-web/sqlite \
             --test custom_admin_model -- --ignored
+          # The `jwt` and `push` feature-off code: the boot checks and the
+          # fail-closed jwt tenancy arm. autumn-cli builds autumn-web without
+          # `jwt`, so the `db-ignored` lane instruments that code but runs none
+          # of it. The features are autumn-web's `default` list without the two.
+          no_jwt_push=$(grep -E '^default = \[' autumn/Cargo.toml \
+            | sed -E 's/^default = \[(.*)\]/\1/; s/[" ]//g' \
+            | tr ',' '\n' | grep -vxE 'jwt|push' | paste -sd, -)
+          cargo llvm-cov --no-report -p autumn-web --no-default-features --features "$no_jwt_push" \
+            --test integration_tests -- optional_jwt_and_push
           cargo llvm-cov report --lcov --output-path lcov.info
       - name: Pull Docker Hub images through a mirror
         if: matrix.lane == 'db-ignored'
@@ -2909,7 +2927,7 @@ jobs:
         # step writes the tree to a file. Then a failed `cargo tree` fails the
         # step.
         env:
-          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile,alerts,experiments,feature-flags,job-tracking,nested-form,slo,upgrade,wizard,widgets-search,widgets-social,widgets-workflow,widgets-charts
+          SQLITE_ONLY_FEATURES: sqlite,maud,htmx,tailwind,cache-moka,http-client,reporting,flash,ws,presence,collab,storage,variants,multipart,i18n,openapi,mcp,webmcp,csv,markdown,constela,pdf,oauth2,webauthn,redis,mail,inbound-ses,inbound-mailgun,offline-sync,seed,embed-assets,tls,acme,sla,system-info,edge,plugin-sandbox,sim-testing,telemetry-otlp,repl,ledger-profile,alerts,experiments,feature-flags,job-tracking,nested-form,slo,upgrade,wizard,widgets-search,widgets-social,widgets-workflow,widgets-charts,jwt,push
         run: |
           cargo clippy -p autumn-web --no-default-features --features "$SQLITE_ONLY_FEATURES" --lib -- -D warnings
           tree="${RUNNER_TEMP}/sqlite-only-tree.txt"
