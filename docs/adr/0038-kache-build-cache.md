@@ -46,11 +46,28 @@ Cargo file, and about half changed autumn-web or autumn-macros source.
   configures `kunobi-ninja/kache-action`: the pinned action commit, kache
   v2.0.0, `cache-c-cpp` (except on Windows), the Windows cache directory, and
   no PR comments.
-- The GitHub cache key is `<prefix>-<kache version>-<os>-<arch>-<Cargo.lock
-  hash>`, and the action never re-saves a key that exists. The composite
-  builds the prefix from the workflow, the job id, an optional `key`, and the
-  exact rustc (release and commit). Jobs that run the identical build share an
-  entry with `shared-key`; restore-only jobs pass `save: false`.
+- The primary store is an S3-compatible bucket (S3 or R2). Every job, branch
+  and PR reads one content-addressed store, so a crate compiled anywhere is a
+  hit everywhere with the same inputs, and there is no per-repository quota.
+  - Only a run on a protected ref (`github.ref_protected`) writes: a push to
+    `trunk` or `trunk-dev`, or a scheduled run. Its jobs get the read-write
+    token, and the store grows with every push. `trunk-dev` must be a
+    protected branch, or nothing is ever written.
+  - Every other run, PRs included, gets a read-only token and passes
+    `save-cache: false`, which sets `KACHE_REMOTE_READONLY` for the daemon.
+  - A composite action cannot read `secrets` or `vars`, so each workflow maps
+    them into its env as `AUTUMN_KACHE_S3_*`. The bucket, endpoint and region
+    are repository variables. The two tokens are repository secrets.
+  - `publish-gate.yml` does not map them and stays on the GitHub cache. Its
+    jobs prepare releases, which should not depend on a store other runs
+    write to.
+- Without S3 settings, or with no read key (a fork PR gets no secrets), the
+  composite falls back to the GitHub Actions cache. Its key is
+  `<prefix>-<kache version>-<os>-<arch>-<Cargo.lock hash>`, and the action
+  never re-saves a key that exists. The prefix is the workflow, the job id, an
+  optional `key`, and the exact rustc (release and commit). Jobs that run the
+  identical build share an entry with `shared-key`; restore-only jobs pass
+  `save: false`.
 - Jobs that time compiles (the dev-loop, dev-loop scaling and cold-start
   measurements) blank `RUSTC_WRAPPER` and unset the CMake launchers in the
   timed step, so they time the plain toolchain.
@@ -60,9 +77,12 @@ Cargo file, and about half changed autumn-web or autumn-macros source.
 ```mermaid
 flowchart LR
   A[checkout + toolchain] --> B[.github/actions/kache]
-  B -->|prefix: workflow, job, key, rustc| C[kache-action restore]
-  C --> D[cargo build/test<br/>RUSTC_WRAPPER=kache]
-  D --> E[post step: save store<br/>unless the key exists or save: false]
+  B -->|S3 settings and a read key| S[S3 store<br/>shared by every job]
+  B -->|otherwise| G[GitHub Actions cache<br/>prefix: workflow, job, key, rustc]
+  S --> D[cargo build/test<br/>RUSTC_WRAPPER=kache]
+  G --> D
+  D -->|protected ref: write token| U[upload new artifacts]
+  D -->|PR or other ref| R[read only]
 ```
 
 ## Consequences
@@ -75,16 +95,22 @@ flowchart LR
   which the cargo-deny gates already required.
 - A different feature set still recompiles autumn-web, whose key includes its
   features. Per-lane keys stay.
-- The first job to save a key fixes its contents until `Cargo.lock`, rustc or
-  kache changes. Entries go stale as workspace code moves on, as rust-cache
-  entries did.
+- On the GitHub cache fallback, the first job to save a key fixes its
+  contents until `Cargo.lock`, rustc or kache changes. The S3 store has no
+  such limit: every protected push adds what it compiled.
 - C/C++ objects are cached on Linux and macOS only. On Windows,
   `cache-c-cpp` would replace MSVC `cl.exe` with `clang-cl`, which changes the
   C toolchain the build uses.
-- The store counts against the repository's 10 GB Actions cache in place of
-  the target directories. If entries start evicting each other, the next step
-  is a remote store (S3 or R2) through the action's `s3-*` inputs, or
-  `node-cache` on the self-hosted runners.
+- The S3 store needs its own expiry. A lifecycle rule on the bucket that
+  deletes objects not read for some weeks keeps it bounded.
+- The write token is mapped in each workflow's own env, and a
+  `pull_request` run uses the PR's copy of the workflow files. A PR from a
+  branch in this repository could therefore change the mapping and receive
+  the write token, then upload altered artifacts that protected runs would
+  restore. Fork PRs receive no secrets at all. Closing this for same-repo
+  PRs means moving the write token into a GitHub environment whose
+  deployment branches are limited to protected branches, and naming that
+  environment on the jobs that write.
 - Scaffolded apps (`autumn-cli/src/templates/.github/workflows/*.tmpl`) still
   use rust-cache. What a generated app's CI uses is a separate decision for
   its users.
