@@ -6878,13 +6878,26 @@ fn mounted_paths(path: &str, config: &AutumnConfig) -> Vec<String> {
     vec![path.to_owned()]
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn try_build_router_with_static_inner(
     route_list: Vec<Route>,
     config: &AutumnConfig,
     state: AppState,
     dist_dir: Option<&std::path::Path>,
+    ctx: RouterContext,
+) -> Result<axum::Router, RouterBuildError> {
+    try_build_router_with_static_pages(route_list, config, state, dist_dir, ctx, None)
+}
+
+/// [`try_build_router_with_static_inner`] that serves only the pre-rendered
+/// pages whose URL path `keep_page` admits (#3544). `None` serves every page.
+#[allow(clippy::too_many_lines)]
+pub fn try_build_router_with_static_pages(
+    route_list: Vec<Route>,
+    config: &AutumnConfig,
+    state: AppState,
+    dist_dir: Option<&std::path::Path>,
     mut ctx: RouterContext,
+    keep_page: Option<&dyn Fn(&str) -> bool>,
 ) -> Result<axum::Router, RouterBuildError> {
     let startup_barrier_state = state.clone();
 
@@ -6908,6 +6921,10 @@ pub fn try_build_router_with_static_inner(
             config,
             &startup_barrier_state,
         ));
+    };
+    let layer = match keep_page {
+        Some(keep) => layer.retain_routes(keep),
+        None => layer,
     };
 
     for (route, entry) in &layer.manifest().routes {
@@ -8311,6 +8328,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         // Before the fix this panicked inside `axum::Router::route`; now it
@@ -8862,6 +8880,7 @@ mod tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -9521,6 +9540,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9610,6 +9630,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9633,6 +9654,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -9656,6 +9678,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }
         }
 
@@ -10016,6 +10039,7 @@ mod tests {
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             };
 
             // Before the fix, the redirect's `any()` claimed GET at /health
@@ -10893,6 +10917,7 @@ enabled = true
                 seo: crate::seo::SeoRouteDefaults::EMPTY,
                 api_version: None,
                 sunset_opt_out: false,
+                group: None,
             }],
             source: crate::route_listing::RouteSource::User,
             layer_guarded: false,
@@ -11111,6 +11136,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let group = crate::app::ScopedGroup {
             prefix: "/orgs/{org_id}".to_owned(),
@@ -11181,6 +11207,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let protected_routes = vec![route];
@@ -11356,6 +11383,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let ctx = RouterContext {
@@ -11442,6 +11470,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let ctx = RouterContext {
@@ -11793,6 +11822,7 @@ enabled = true
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         }
     }
 
@@ -14176,6 +14206,7 @@ enabled = true
             timeout: crate::route::RouteTimeout::default(),
             criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         };
 
         let tmp = create_ssg_dist_with_types(&[(
@@ -14528,6 +14559,7 @@ enabled = true
             timeout: crate::route::RouteTimeout::default(),
             criticality: crate::admission::Criticality::Default,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         };
 
         // Manifest does NOT contain /dynamic, so the request falls through to
@@ -15973,6 +16005,7 @@ mod trusted_host_tests {
             api_version: None,
             sunset_opt_out: false,
             seo: crate::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         }
     }
 
@@ -16346,6 +16379,46 @@ mod trusted_host_tests {
         }
     }
 
+    /// A role mount drops the pre-rendered pages of its unmounted routes
+    /// (#3544): the request falls through to the router, which 404s.
+    #[tokio::test]
+    async fn static_pages_follow_the_role_mount() {
+        let (_tmp, dist) = build_cached_dist("<h1>cached</h1>");
+        let config = AutumnConfig::default();
+        let get_root = |app: axum::Router| async move {
+            app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        };
+        let empty_ctx = || RouterContext {
+            static_gate_layers: Vec::new(),
+            ..ctx_with_static_gate(redirect_gate_registration())
+        };
+
+        let served = super::try_build_router_with_static_pages(
+            Vec::new(),
+            &config,
+            crate::state::AppState::for_test(),
+            Some(dist.as_path()),
+            empty_ctx(),
+            Some(&|_: &str| true),
+        )
+        .expect("router builds");
+        assert_eq!(get_root(served).await, StatusCode::OK);
+
+        let dropped = super::try_build_router_with_static_pages(
+            Vec::new(),
+            &config,
+            crate::state::AppState::for_test(),
+            Some(dist.as_path()),
+            empty_ctx(),
+            Some(&|path: &str| path != "/"),
+        )
+        .expect("router builds");
+        assert_eq!(get_root(dropped).await, StatusCode::NOT_FOUND);
+    }
+
     /// #3071: on the SSG/ISG path the fault layers go outside the static
     /// cache, so a route fault reaches a cached page, and only once.
     #[tokio::test]
@@ -16470,6 +16543,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let config = AutumnConfig::default();
         let ctx = ctx_with_static_gate(redirect_gate_registration());
@@ -16625,6 +16699,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
 
         let mut config = AutumnConfig::default();
@@ -16785,6 +16860,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let mut config = AutumnConfig::default();
         config.security.trusted_hosts.hosts = vec!["app.example".to_owned()];
@@ -16909,6 +16985,7 @@ mod trusted_host_tests {
             seo: crate::seo::SeoRouteDefaults::EMPTY,
             api_version: None,
             sunset_opt_out: false,
+            group: None,
         };
         let config = AutumnConfig::default();
         let ctx = ctx_with_static_gate(redirect_gate_registration());

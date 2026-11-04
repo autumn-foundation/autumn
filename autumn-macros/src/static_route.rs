@@ -479,6 +479,7 @@ pub fn static_get_macro(attr: TokenStream, item: TokenStream) -> TokenStream {
                 api_version: ::core::option::Option::None,
                 sunset_opt_out: false,
                 seo: #seo_defaults,
+                group: ::core::option::Option::None,
             }
         }
 

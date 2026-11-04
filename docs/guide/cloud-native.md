@@ -418,6 +418,14 @@ scheduler = true
 
 See [Named roles](jobs.md#named-roles) for every key and rule.
 
+### Route groups on HTTP tiers
+
+A preset over `web` or `combined` can serve only some route groups. Set
+`mount = ["marketing"]`. One image then runs a `marketing` role and a
+`service` role. Probes and the actuator stay on every role. See
+[Route groups and per-role mounting](route-groups.md) for a worked example on
+Fly `[processes]` and on two Kubernetes Deployments.
+
 ## Migration Jobs
 
 For multi-replica deployments, do not rely on each web process racing to apply

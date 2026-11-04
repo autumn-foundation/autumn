@@ -355,6 +355,17 @@ impl StaticFileLayer {
         self
     }
 
+    /// Keep only the manifest pages whose URL path `keep` admits (#3544). A
+    /// role with `mount` drops the pages of its unmounted route groups.
+    #[must_use]
+    pub(crate) fn retain_routes(mut self, keep: &dyn Fn(&str) -> bool) -> Self {
+        let mut manifest = (*self.manifest).clone();
+        manifest.routes.retain(|path, _| keep(path));
+        self.isr_state = Arc::new(build_isr_state(&manifest));
+        self.manifest = Arc::new(manifest);
+        self
+    }
+
     /// Reference to the loaded manifest.
     #[must_use]
     pub fn manifest(&self) -> &StaticManifest {

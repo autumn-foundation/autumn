@@ -444,3 +444,19 @@ base, and that a valid preset gets each override it sets. The exhaustive
 test `preset_capabilities_match_the_model` in `autumn/src/config.rs` checks
 the runtime against the same rules.
 
+
+## Route groups
+
+`route_groups.rs` models the `mount` rules of `RolePreset` and `Role`, the
+route filter and the fleet drift check (issue #3544, ADR 0036). A group is an
+integer. Verify it with:
+
+```sh
+verus verification/route_groups.rs
+```
+
+It proves that a role without `mount` mounts every group, that a role with no
+HTTP mounts no group, that a valid `mount` list is exact, that a framework
+route is served on every HTTP role, and that a group another fleet role mounts
+is not drift. The test `mount_matches_the_model` in `autumn/src/config.rs`
+checks the runtime against the same rules.

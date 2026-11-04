@@ -399,6 +399,7 @@ macro_rules! embed_locales {
 pub mod system_info;
 pub use plugin::{Plugin, Plugins};
 
+pub(crate) mod route_group;
 pub mod route_listing;
 
 /// In-place upgrades: swap a running app to a new binary without dropping
@@ -708,7 +709,7 @@ pub use presence::presence_stream;
 pub use presence::{Presence, PresenceEntry, PresenceEvent, PresenceHandle};
 pub(crate) mod route;
 pub use admission::Criticality;
-pub use route::{RepositoryApiMeta, Route, RouteIdempotency, RouteTimeout};
+pub use route::{RepositoryApiMeta, Route, RouteGroup, RouteIdempotency, RouteTimeout};
 // Re-exported alongside the other `Route` field types so a hand-built
 // `Route { .. }` needs only the `autumn_web::` prefix.
 pub use seo::SeoRouteDefaults;

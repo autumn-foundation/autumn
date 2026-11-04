@@ -23,6 +23,7 @@ fn test_route_version_fields() {
         timeout: autumn_web::RouteTimeout::Inherit,
         criticality: autumn_web::Criticality::Default,
         seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
+        group: None,
     };
 
     assert_eq!(route.api_version, Some("v1"));
@@ -110,6 +111,7 @@ fn test_route_listing_with_version_and_status() {
             timeout: autumn_web::RouteTimeout::Inherit,
             criticality: autumn_web::Criticality::Default,
             seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         },
         autumn_web::Route {
             method: http::Method::GET,
@@ -124,6 +126,7 @@ fn test_route_listing_with_version_and_status() {
             timeout: autumn_web::RouteTimeout::Inherit,
             criticality: autumn_web::Criticality::Default,
             seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         },
         autumn_web::Route {
             method: http::Method::GET,
@@ -138,6 +141,7 @@ fn test_route_listing_with_version_and_status() {
             timeout: autumn_web::RouteTimeout::Inherit,
             criticality: autumn_web::Criticality::Default,
             seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         },
         autumn_web::Route {
             method: http::Method::GET,
@@ -152,6 +156,7 @@ fn test_route_listing_with_version_and_status() {
             timeout: autumn_web::RouteTimeout::Inherit,
             criticality: autumn_web::Criticality::Default,
             seo: autumn_web::seo::SeoRouteDefaults::EMPTY,
+            group: None,
         },
     ];
 

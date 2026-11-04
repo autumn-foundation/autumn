@@ -358,6 +358,7 @@ Select a preset with `AUTUMN_ROLE=critical`, `role = "critical"` or
 | `pin` | Queues this role drains. `[]` = no job workers. | `jobs.pin` |
 | `workers` | Concurrent worker loops. 1 or more. | `jobs.workers` |
 | `job_workers`, `scheduler`, `outbox_relay`, `commit_hooks`, `fleet_relay`, `restore_check`, `retention` | `true` or `false` | the base default |
+| `mount` | Route groups this role serves. Needs a `web` or `combined` base. See [Route groups](route-groups.md). | every group |
 
 Rules:
 

@@ -58,6 +58,10 @@ pub struct RouteInfo {
     /// Pool tags the route's handler provably touches.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pools: Vec<String>,
+    /// The route group (#3544). `None` for a framework route or a plugin
+    /// asset. `autumn doctor` reads it from a `[route_groups] manifest`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// Options controlling `autumn routes` behaviour.
@@ -785,6 +789,7 @@ mod tests {
             sunset_opt_out: None,
             resource_shape: String::new(),
             pools: Vec::new(),
+            group: None,
         }
     }
 
@@ -993,6 +998,7 @@ mod tests {
             sunset_opt_out: None,
             resource_shape: String::new(),
             pools: Vec::new(),
+            group: None,
         };
         let table = format_table(&[route]);
         assert!(table.contains("secured"), "missing middleware label");
@@ -1007,6 +1013,24 @@ mod tests {
         let json_str = serde_json::to_string_pretty(&routes).unwrap();
         let parsed: Vec<RouteInfo> = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed.len(), routes.len());
+    }
+
+    /// `autumn routes --format json` keeps the route group (#3544). The
+    /// `[route_groups] manifest` of `autumn doctor` reads it.
+    #[test]
+    fn json_round_trip_keeps_route_group() {
+        let dump = r#"[
+            {"method": "GET", "path": "/landing", "handler": "landing", "source": "user",
+             "middleware": [], "group": "marketing"},
+            {"method": "GET", "path": "/live", "handler": "live", "source": "framework",
+             "middleware": []}
+        ]"#;
+        let routes: Vec<RouteInfo> = serde_json::from_str(dump).expect("dump parses");
+        assert_eq!(routes[0].group.as_deref(), Some("marketing"));
+        assert_eq!(routes[1].group, None);
+        let json = serde_json::to_string_pretty(&routes).expect("serializes");
+        assert!(json.contains("\"group\": \"marketing\""), "{json}");
+        assert_eq!(json.matches("\"group\"").count(), 1, "{json}");
     }
 
     // ── format_mermaid ─────────────────────────────────────────────────────
