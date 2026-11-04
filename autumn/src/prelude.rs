@@ -414,6 +414,9 @@ pub use crate::format::format_datetime;
 /// Format a [`rust_decimal::Decimal`] as currency (`$1,234.50`) using sane defaults.
 #[cfg(feature = "maud")]
 pub use crate::format::number_to_currency;
+/// Render a byte count as a human-readable size (`1.5 KB`).
+#[cfg(feature = "maud")]
+pub use crate::format::number_to_human_size;
 /// Render an integer or decimal with grouped thousands (`1,234,567`).
 #[cfg(feature = "maud")]
 pub use crate::format::number_with_delimiter;
