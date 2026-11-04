@@ -4,12 +4,14 @@
 //! - [`corpus`]: which files a gate reads, and how they are decoded.
 //! - [`markdown`]: live prose, heading anchors and link destinations.
 //! - [`links`]: the markdown link gate.
+//! - [`aliases`]: every capability page carries the word readers search by.
 //! - [`guide_index`]: every guide page listed in the index that owns it.
 //!
 //! A ported gate replaces its script only once it gives the same result on
 //! the tree, with the script's self-test carried over as `#[test]`s. See
 //! `docs/adr/0033-xtask-for-repo-tooling.md`.
 
+pub mod aliases;
 pub mod corpus;
 pub mod guide_index;
 pub mod links;
@@ -55,6 +57,11 @@ pub const GATES: &[Gate] = &[
         name: "docs-guide-index",
         about: "Guide-index gate: every page in docs/guide/ is listed once in the index that owns it, and README.md links the index.",
         run: |root, mut out| guide_index::run(root, &mut out),
+    },
+    Gate {
+        name: "docs-aliases",
+        about: "Reader-vocabulary gate: the page that documents a capability carries the word a reader searches for it by.",
+        run: |root, mut out| aliases::run(root, &mut out),
     },
 ];
 
