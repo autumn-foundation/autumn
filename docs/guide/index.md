@@ -207,6 +207,7 @@ Looking for the API reference instead? That is
 - [Dev Request Inspector](dev-inspector.md) — the in-browser view of recent requests
 - [Dev Error Overlay](dev-error-overlay.md) — the error page that shows the failing source line
 - [The Architecture Graph](architecture-graph.md) — `autumn graph impact Post`: what a change touches, as a query
+- [Table Ownership Boundaries](table-ownership.md) — `autumn graph check-boundaries`: fail when one module queries another module's tables
 
 ## Deploying and operating
 

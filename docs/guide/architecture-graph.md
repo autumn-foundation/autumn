@@ -264,6 +264,8 @@ graph describes the binary that produced it, and an element behind
 
 ## Related
 
+* [Table ownership boundaries](table-ownership.md) — fails when code in one
+  boundary reaches a table another boundary owns. It reads this graph.
 * [Route auth coverage](route-auth-coverage.md) — proves each route's auth posture; the
   graph *states* it.
 * [Data classification](data-classification.md) — which columns can leave the
