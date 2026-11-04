@@ -1001,6 +1001,12 @@ jobs:
   test-archive:
     name: Build tests (${{ matrix.os }})
     needs: [lint, meta]
+    # The macOS leg is CI's critical path (about 1h30m cold, against 23m for
+    # the same build on Linux). It is not the linker: measured on run 14519
+    # (Xcode 26.6, 3 cores, 7 GB), the build's 409 links took 1478s in total
+    # with Xcode's ld-prime and 1956s with the toolchain's rust-lld on the same
+    # objects, so ld-prime stays. What the run did show is memory: swap was in
+    # use 10 minutes in and reached 3.3 GB by the end.
     strategy:
       fail-fast: false
       matrix:
