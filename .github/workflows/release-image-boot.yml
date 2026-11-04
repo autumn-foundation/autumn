@@ -120,7 +120,7 @@ jobs:
           df -h
 
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       - name: Build the autumn CLI (scaffold under test)
@@ -176,7 +176,7 @@ jobs:
           df -h
 
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       - name: Build the autumn CLI (scaffold under test)
@@ -212,7 +212,7 @@ jobs:
           df -h
 
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       - name: Build the autumn CLI (scaffold under test)

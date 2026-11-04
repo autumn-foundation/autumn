@@ -38,7 +38,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Compare stable with the pin
         id: versions

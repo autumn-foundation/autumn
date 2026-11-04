@@ -78,7 +78,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Build CLI
         run: cargo build -p autumn-cli
@@ -96,7 +96,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Run cold-start measurement unit tests
         # `shell: bash` enables `pipefail` on the runner, so a failing
@@ -132,7 +132,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Build CLI
         run: cargo build -p autumn-cli
@@ -145,6 +145,11 @@ jobs:
         # the `tee` pipeline.
         shell: bash
         run: |
+          # Time the plain toolchain, not the CI cache. The driver already
+          # blanks RUSTC_WRAPPER for its cold build; the CMake compiler
+          # launchers kache-action exports would still wrap C builds.
+          export RUSTC_WRAPPER=""
+          unset CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER
           export AUTUMN_BENCH_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           export AUTUMN_BENCH_RUST_VERSION="$(rustc --version)"
           RUNS="${{ inputs.runs || '3' }}"

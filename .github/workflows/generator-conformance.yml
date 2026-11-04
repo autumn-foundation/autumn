@@ -247,8 +247,8 @@ jobs:
     # min) and ran 1h55m-2h26m, cancelled at 150 min once on #3560. Every
     # step compiled the generated app's dependency tree from cold. With one
     # shared CARGO_TARGET_DIR for the generated apps (the step after
-    # rust-cache below) the MSRV leg ran in 34.5 min and stable in 27 min.
-    # 90 is ~2.6x the slower leg, which leaves room for a cold rust-cache, and
+    # the build cache below) the MSRV leg ran in 34.5 min and stable in 27 min.
+    # 90 is ~2.6x the slower leg, which leaves room for a cold cache, and
     # still stops a wedged app quickly. If this leg nears 90 again, split it
     # into shards rather than raise the limit.
     timeout-minutes: 90
@@ -276,7 +276,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain == 'stable' && '1.99.0' || matrix.toolchain }}
 
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       - name: Share one target dir across the generated apps
@@ -289,8 +289,7 @@ jobs:
         # a second check-only scaffold went from 2.4 to 1.2 min. A test that
         # needs its own dir still sets CARGO_TARGET_DIR itself, which wins.
         # The outer `cargo test` passes `--target-dir target` (a flag beats
-        # the env var), so its build stays in ./target where rust-cache
-        # restores it.
+        # the env var), so its build stays in ./target.
         run: echo "CARGO_TARGET_DIR=$RUNNER_TEMP/generated-target" >> "$GITHUB_ENV"
 
       - name: generated_project_compiles_runs_and_serves
@@ -1099,14 +1098,13 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain == 'stable' && '1.99.0' || matrix.toolchain }}
 
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       - name: Pre-fetch TOTP deps (absent from workspace Cargo.lock)
         # totp-rs is not a workspace dep, so it is absent from the workspace
-        # Cargo.lock and not covered by rust-cache. Pre-fetching it here
-        # ensures the cargo registry cache is warm before the auth gate runs,
-        # avoiding a full download on every CI run. Only the totp leg needs it.
+        # Cargo.lock. Pre-fetching it here puts it in the cargo registry before
+        # the auth gate runs. Only the totp leg needs it.
         if: matrix.variant.name == 'totp'
         run: |
           tmp=$(mktemp -d)
@@ -1185,7 +1183,7 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain == 'stable' && '1.99.0' || matrix.toolchain }}
 
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       - name: Install diesel_cli
@@ -1328,7 +1326,7 @@ jobs:
           df -h
 
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
 
       - name: plugin_add_first_party_scaffolds_cargo_check

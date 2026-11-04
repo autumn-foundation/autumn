@@ -72,7 +72,7 @@ jobs:
         with:
           ref: ${{ inputs.sha }}
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         continue-on-error: true
       - name: Run tests, do not stop at the first failure
         run: cargo test --workspace --no-fail-fast 2>&1 | tee run.log

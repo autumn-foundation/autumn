@@ -1,0 +1,69 @@
+name: kache build cache
+description: >
+  Restores this job's kache compiler cache, sets RUSTC_WRAPPER so every rustc
+  and C/C++ compile goes through it, and saves the cache after the job. The
+  one place the repo configures kunobi-ninja/kache-action.
+
+# kache caches each compile by the hash of its inputs, not a whole target
+# directory. A hit needs the same inputs, compiler and flags, so one store can
+# serve several feature sets and every workspace crate whose source did not
+# change. See docs/adr/0036-kache-build-cache.md.
+#
+# The GitHub cache key is <prefix>-<kache version>-<os>-<arch>-<Cargo.lock
+# hash>, and the action never re-saves a key that exists. The first job to save
+# a key fixes its contents, so the prefix below must separate every job whose
+# builds differ: workflow, job id, `key`, and the exact rustc.
+
+inputs:
+  key:
+    description: >
+      Extra key part for a job whose matrix legs build different things, such
+      as a feature lane. rustc and the OS are already in the key.
+    required: false
+    default: ""
+  shared-key:
+    description: >
+      Use one entry across several jobs that run the identical build. Replaces
+      the job id in the key.
+    required: false
+    default: ""
+  save:
+    description: "Set to false for a job that only restores."
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      env:
+        KEY: ${{ inputs.key }}
+        SHARED_KEY: ${{ inputs.shared-key }}
+      run: |
+        set -euo pipefail
+        workflow=$(printf '%s' "$GITHUB_WORKFLOW" | tr -c 'A-Za-z0-9._-' '-')
+        rustc_id=$(rustc -vV | awk '/^release:/ { r = $2 } /^commit-hash:/ { c = substr($2, 1, 12) } END { print r "-" c }')
+        if [ -n "$SHARED_KEY" ]; then
+          scope="$SHARED_KEY"
+        else
+          scope="$GITHUB_JOB${KEY:+-$KEY}"
+        fi
+        echo "prefix=kache-$workflow-$scope-$rustc_id" >> "$GITHUB_OUTPUT"
+    # v1 as of 2026-09-25.
+    - uses: kunobi-ninja/kache-action@ad7317540dcdd71c904f7a60a87b620a0c0e67ed
+      with:
+        version: v2.0.0
+        cache-key-prefix: ${{ steps.key.outputs.prefix }}
+        save-cache: ${{ inputs.save }}
+        # aws-lc-sys and other build scripts compile C through the cc crate.
+        # Without this, those compiles miss on every run. Off on Windows: with
+        # no CC set, the action swaps MSVC cl.exe for clang-cl there, which
+        # would change the C toolchain the build uses.
+        cache-c-cpp: ${{ runner.os != 'Windows' }}
+        # A Windows runner's default cache dir is on C: and the workspace on
+        # D:, so restores would copy instead of hardlink.
+        cache-dir: ${{ runner.os == 'Windows' && format('{0}/kache', runner.temp) || '' }}
+        # A sticky comment per job would notify everyone on the PR. The job
+        # summary carries the same stats.
+        pr-comment: false

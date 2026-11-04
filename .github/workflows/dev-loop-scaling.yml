@@ -62,7 +62,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Build CLI
         run: cargo build -p autumn-cli
@@ -80,7 +80,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Run scaling unit tests
         shell: bash
@@ -109,7 +109,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       - name: Build CLI
         run: cargo build -p autumn-cli
@@ -118,6 +118,12 @@ jobs:
         id: bench
         shell: bash
         run: |
+          # Time the plain toolchain, not the CI cache. kache-action exports
+          # RUSTC_WRAPPER (which the cc crate follows) and the CMake compiler
+          # launchers for the whole job. An empty RUSTC_WRAPPER turns kache off
+          # for every cargo this step starts.
+          export RUSTC_WRAPPER=""
+          unset CMAKE_C_COMPILER_LAUNCHER CMAKE_CXX_COMPILER_LAUNCHER
           export AUTUMN_BENCH_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           export AUTUMN_BENCH_RUST_VERSION="$(rustc --version)"
           SIZES="${{ inputs.sizes || '1,25,50,100' }}"

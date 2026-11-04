@@ -77,7 +77,7 @@ jobs:
           df -h
 
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
 
       # protoc is required by telemetry-otlp in both Phase A (each-feature sweep)
       # and Phase B (curated combo). It is not available in the standard ubuntu-latest image.

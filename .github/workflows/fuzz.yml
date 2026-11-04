@@ -47,8 +47,8 @@ jobs:
         # shutdown signal" — the runner agent is killed, so it takes the log
         # with it and no OOM line survives to read.
         #
-        # Warm caches were hiding this. Swatinem/rust-cache keys per matrix
-        # job, so each target has its own cache: whichever targets happened to
+        # Warm caches were hiding this. The build cache was keyed per matrix
+        # job, so each target had its own cache: whichever targets happened to
         # restore one passed, and the cold ones died. That is why an arbitrary
         # 2 of 5 failed per run (idempotency+headers on trunk-dev dd9e8ae3,
         # body+routing on #2182) and why touching fuzz/Cargo.toml — a
@@ -74,9 +74,7 @@ jobs:
         uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@v2.7.8
-        with:
-          workspaces: fuzz
+      - uses: ./.github/actions/kache
       - name: Fuzz ${{ matrix.target }} (30s burst, seeded from committed corpus)
         # Corpus dir defaults to fuzz/corpus/${{ matrix.target }}; -max_total_time
         # caps the run and -timeout flags any single input that hangs past 10s.

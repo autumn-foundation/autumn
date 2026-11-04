@@ -51,9 +51,7 @@ jobs:
         uses: taiki-e/install-action@v2.87.31
         with:
           tool: cargo-fuzz
-      - uses: Swatinem/rust-cache@v2.7.8
-        with:
-          workspaces: fuzz
+      - uses: ./.github/actions/kache
       # Restore the accumulated corpus for THIS target from the previous run.
       # libFuzzer only appends coverage-increasing inputs, so this corpus grows
       # monotonically; the cache is keyed per target so each of the five matrix

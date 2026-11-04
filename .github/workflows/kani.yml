@@ -57,10 +57,10 @@ jobs:
       - uses: actions/checkout@v7
       # Kani installs and pins its own nightly toolchain in `cargo kani setup`.
       - uses: dtolnay/rust-toolchain@1.99.0
-      - uses: Swatinem/rust-cache@v2.7.8
+      - uses: ./.github/actions/kache
         with:
-          # Kani builds into `target/kani`; cache it apart from the normal
-          # build, whose artifacts it cannot reuse.
+          # Kani compiles with its own nightly and driver, so none of the normal
+          # build's entries match. Keep its entry apart.
           key: kani-${{ env.KANI_VERSION }}
       - name: Install Kani
         run: |
