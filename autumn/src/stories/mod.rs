@@ -1738,6 +1738,66 @@ mod tests {
         );
     }
 
+    // The "Tags input" demo (#3410): the value of each option is its name,
+    // and a "create" entry follows when no tag has the exact name.
+    #[cfg(feature = "widgets-search")]
+    #[tokio::test]
+    async fn demo_tag_suggest_lists_matches_then_a_create_entry() {
+        let some = demo_tag_suggest(crate::extract::Query(DemoQuery { q: "A".to_owned() }))
+            .await
+            .0;
+        assert!(some.contains(r#"data-value="axum""#), "{some}");
+        assert!(!some.contains(r#"data-value="rust""#), "{some}");
+        assert!(some.contains("data-ac-create"), "{some}");
+        assert!(some.contains(r#"data-label="A""#), "the typed text: {some}");
+
+        let new_tag = demo_tag_suggest(crate::extract::Query(DemoQuery {
+            q: " zig ".to_owned(),
+        }))
+        .await
+        .0;
+        assert!(!new_tag.contains(r#"data-value="rust""#), "{new_tag}");
+        assert!(new_tag.contains(r#"data-value="zig""#), "{new_tag}");
+        assert!(new_tag.contains("Create \u{201c}zig\u{201d}"), "{new_tag}");
+    }
+
+    #[cfg(feature = "widgets-search")]
+    #[tokio::test]
+    async fn demo_tag_suggest_has_no_create_entry_for_an_exact_or_empty_query() {
+        let exact = demo_tag_suggest(crate::extract::Query(DemoQuery {
+            q: "Web".to_owned(),
+        }))
+        .await
+        .0;
+        assert!(exact.contains(r#"data-value="web""#), "{exact}");
+        assert!(!exact.contains("data-ac-create"), "{exact}");
+
+        let empty = demo_tag_suggest(crate::extract::Query(DemoQuery { q: "  ".to_owned() }))
+            .await
+            .0;
+        assert!(empty.is_empty(), "{empty}");
+    }
+
+    #[cfg(feature = "widgets-search")]
+    #[test]
+    fn tags_input_story_points_at_its_registered_demo_route() {
+        let registry = builtin();
+        let tags = registry
+            .find("tags-input")
+            .expect("tags-input story exists");
+        assert!(
+            tags.source().contains(STORIES_DEMO_TAG_SUGGEST_PATH),
+            "Tags input story must point at {STORIES_DEMO_TAG_SUGGEST_PATH}: {}",
+            tags.source()
+        );
+        assert!(
+            demo_routes()
+                .iter()
+                .any(|(path, _)| *path == STORIES_DEMO_TAG_SUGGEST_PATH),
+            "the demo route is listed"
+        );
+    }
+
     // U15 (interactivity follow-up): the feed demo must terminate (no
     // further sentinel) — otherwise it would just keep auto-firing.
     #[cfg(feature = "widgets-social")]
